@@ -23,6 +23,8 @@ from typing import Any
 
 from coord.models import Assignment, Board
 
+_ACTIVE_STATUSES = ("running", "pending")
+
 
 def json_loads(s: Any) -> Any:
     """Decode a JSON column.
@@ -112,6 +114,32 @@ def row_to_assignment(row: object) -> Assignment:
         # #618: short launch-failure reason; None for successfully-launched rows.
         failure_reason=d.get("failure_reason"),
     )
+
+
+def assemble_board(
+    rows: list,
+    plans: dict[str, dict],
+    round_number: object,
+) -> Board:
+    """Build a :class:`Board` from assignment rows + a plan map (#749).
+
+    Storage-neutral core shared by ``coord.state._query_board`` (SQLite rows)
+    and ``coord.client.board_from_payload`` (daemon JSON rows) — the two used
+    to hand-roll the identical row→``Assignment``→active/completed bucketing
+    loop independently, which is exactly the "dual projection" duplication
+    #749 set out to collapse. Deliberately does NOT call
+    :func:`infer_review_state` — callers that need it (both of the above) run
+    it themselves against their own review rows, since the two paths fetch
+    those from different sources (a live cursor vs. the JSON payload).
+    """
+    active: list[Assignment] = []
+    completed: list[Assignment] = []
+    for row in rows:
+        a = row_to_assignment(row)
+        if a.assignment_id and a.assignment_id in plans:
+            a.plan = plans[a.assignment_id]
+        (active if a.status in _ACTIVE_STATUSES else completed).append(a)
+    return Board(active=active, completed=completed, round_number=int(round_number or 0))
 
 
 def infer_review_state(

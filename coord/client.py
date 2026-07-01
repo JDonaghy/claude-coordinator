@@ -26,7 +26,7 @@ from pathlib import Path
 
 import httpx
 
-from coord._board_mapping import infer_review_state, row_to_assignment
+from coord._board_mapping import assemble_board, infer_review_state
 from coord.models import Board
 
 COORD_DIR = Path.home() / ".coord"
@@ -81,23 +81,14 @@ def fetch_board_payload(svc: ServiceConfig, *, timeout: float = _DEFAULT_TIMEOUT
 def board_from_payload(payload: dict) -> Board:
     """Reconstruct a :class:`Board` from a ``/board`` payload.
 
-    Mirrors ``coord.state._query_board`` + ``build_board`` (incl. the shared
-    ``infer_review_state`` core) so the remote board matches a locally-built one.
+    Delegates row→Board assembly to ``coord._board_mapping.assemble_board`` —
+    the same core ``coord.state._query_board`` uses — so the remote board
+    can't drift from a locally-built one (#749: the dual state.py/client.py
+    projection is now one shared implementation).
     """
     assignments_raw = payload.get("assignments", [])
     plans = payload.get("plans") or {}
-    active: list = []
-    completed: list = []
-    for d in assignments_raw:
-        a = row_to_assignment(d)
-        if a.assignment_id and a.assignment_id in plans:
-            a.plan = plans[a.assignment_id]
-        (active if a.status in ("running", "pending") else completed).append(a)
-    board = Board(
-        active=active,
-        completed=completed,
-        round_number=int(payload.get("round_number") or 0),
-    )
+    board = assemble_board(assignments_raw, plans, payload.get("round_number") or 0)
     review_rows = [
         {
             "assignment_id": d.get("assignment_id"),
@@ -115,6 +106,36 @@ def board_from_payload(payload: dict) -> Board:
 def fetch_remote_board(svc: ServiceConfig, *, timeout: float = _DEFAULT_TIMEOUT) -> Board:
     """GET /board and reconstruct a :class:`Board`."""
     return board_from_payload(fetch_board_payload(svc, timeout=timeout))
+
+
+def serialize_board(board: Board) -> dict:
+    """Serialize *board* for ``POST /board`` — the inverse of :func:`board_from_payload`.
+
+    Only ships what ``coord.state.save_board`` actually persists: assignment
+    rows (``dataclasses.asdict``, so JSON columns are native lists/dicts —
+    tolerated by ``row_to_assignment`` on the way back in) + ``round_number``.
+    ``save_board`` is upsert-only (never deletes), so POSTing a client's full
+    in-memory board is a safe, non-lossy drop-in for what today runs directly
+    against the local DB (#749).
+    """
+    from dataclasses import asdict  # noqa: PLC0415
+
+    return {
+        "assignments": [asdict(a) for a in board.active + board.completed],
+        "round_number": board.round_number,
+    }
+
+
+def post_board(svc: ServiceConfig, board: Board, *, timeout: float = _WRITE_TIMEOUT) -> None:
+    """POST the full board to the daemon's generic upsert endpoint (#749).
+
+    Backs ``coord.board_service.write_board`` for the commands that still
+    read-modify-write the whole board locally (``assign``/``approve``/``stop``/
+    ``retry``/``resume``/``bounce``/``done``/``pr``/… and the dashboard/auto_loop
+    call sites) — replacing a local ``save_board`` that used to silently no-op
+    on a thin client.
+    """
+    post_record(svc, "/board", serialize_board(board), timeout=timeout)
 
 
 def post_record(

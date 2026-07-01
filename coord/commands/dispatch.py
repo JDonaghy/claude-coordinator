@@ -118,16 +118,15 @@ def approve(
     ids: str, config_path: Path, dry_run: bool, auto_pull: bool, skip_freshness: bool
 ) -> None:
     from coord import freshness as fresh
+    from coord.board_service import read_board, write_board
     from coord.deps import blocked_repos as compute_blocked, build_dep_graph, transitive_deps
     from coord.dispatch import compute_do_not_touch, dispatch, dispatch_with_retry, post_briefing
     from coord.network import classify_error, fetch_repos
     from coord.state import (
-        build_board,
         clear_proposals,
         load_dispatched,
         load_proposals,
         record_dispatched,
-        save_board,
     )
 
     cfg = _load_config(config_path)
@@ -149,7 +148,7 @@ def approve(
         sys.exit(2)
 
     # Warn about dependency-blocked repos
-    board = build_board()
+    board = read_board()
     blocked = compute_blocked(cfg.repos, board.active)
     for p in selected:
         if p.repo_name in blocked:
@@ -313,9 +312,9 @@ def approve(
 
     if not dry_run:
         clear_proposals()
-        board = build_board()
+        board = read_board()
         board.round_number += 1
-        save_board(board)
+        write_board(board)
         click.echo("\nPending proposals cleared. Board saved.")
 
         # Mark session start on first dispatch of the session
@@ -855,22 +854,23 @@ def _build_interactive_launch_setup(
         or machine_obj.host.split(".")[0].lower() == _local_hn
     )
 
-    # #590: on a thin client the local board/DB is empty, so resolve the
+    # #590/#749: on a thin client the local board/DB is empty, so resolve the
     # interactive-launch target (--review-of/--fix-of/--rework-of/--smoke-of/
     # --merge-of) from the daemon's board, and skip the local post-dispatch
     # save_board (record_dispatched_assignment already routed the row to the
     # daemon; a local save would write/resurrect an empty local coord.db).
-    from coord.client import (  # noqa: PLC0415
-        fetch_remote_board as _fetch_remote_board,
-        resolve_board_service as _resolve_svc,
-    )
+    from coord.board_service import read_board as _read_interactive_board
+    from coord.board_service import resolve as _resolve_svc  # noqa: PLC0415
 
     _svc = _resolve_svc()
 
     def _interactive_board(_local_build):
-        """The board used to resolve a launch target: remote when a board
-        service is set, else the local build."""
-        return _fetch_remote_board(_svc) if _svc is not None else _local_build()
+        """The board used to resolve a launch target: routes through
+        board_service.read_board() (daemon when configured, else local) —
+        *_local_build* (each call site's own ``build_board``) is accepted for
+        backward-compat call-site signatures but no longer called directly."""
+        del _local_build
+        return _read_interactive_board()
 
     # #603: the per-issue context digest, prepended to the TOP of EVERY
     # interactive briefing below so each agent reads prior-attempt findings
@@ -916,11 +916,11 @@ def inject(assignment_id: str, text: tuple[str, ...], config_path: Path) -> None
     tool calls, not mid-tool.  Useful for adding guidance to a worker
     that's going off the rails without having to stop + re-dispatch.
     """
+    from coord.board_service import read_board
     from coord.network import inject_message
-    from coord.state import build_board, load_board
 
     cfg = _load_config(config_path)
-    board = load_board() or build_board()
+    board = read_board()
 
     assignment = board.find_by_id(assignment_id)
     if assignment is None:
@@ -1119,10 +1119,10 @@ def chat_continue(
 @click.argument("assignment_id")
 @_CONFIG_OPTION
 def stop(assignment_id: str, config_path: Path) -> None:
-    from coord.state import build_board, load_board, save_board
+    from coord.board_service import read_board, write_board
 
     cfg = _load_config(config_path)
-    board = load_board() or build_board()
+    board = read_board()
 
     assignment = board.find_by_id(assignment_id)
     if assignment is None:
@@ -1147,7 +1147,7 @@ def stop(assignment_id: str, config_path: Path) -> None:
         click.echo(f"warning: could not reach agent on {machine.name}: {e}", err=True)
 
     board.mark_failed_by_id(assignment_id)
-    save_board(board)
+    write_board(board)
     click.echo(f"Board updated: {assignment.repo_name} #{assignment.issue_number} marked failed")
 
 
@@ -1155,11 +1155,11 @@ def stop(assignment_id: str, config_path: Path) -> None:
 @click.argument("assignment_id")
 @_CONFIG_OPTION
 def retry(assignment_id: str, config_path: Path) -> None:
+    from coord.board_service import read_board, write_board
     from coord.reconcile import _reassign
-    from coord.state import build_board, load_board, save_board
 
     cfg = _load_config(config_path)
-    board = load_board() or build_board()
+    board = read_board()
 
     assignment = board.find_by_id(assignment_id)
     if assignment is None:
@@ -1184,7 +1184,7 @@ def retry(assignment_id: str, config_path: Path) -> None:
         click.echo("error: no available machine to retry on", err=True)
         sys.exit(1)
 
-    save_board(board)
+    write_board(board)
     click.echo(
         f"Retried: {result.machine_name} → {result.repo_name} "
         f"#{result.issue_number} (assignment {result.assignment_id})"

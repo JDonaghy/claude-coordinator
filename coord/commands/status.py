@@ -3,7 +3,6 @@ machine reporting. Extracted from coord/cli.py (#747)."""
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
@@ -29,9 +28,10 @@ from coord.commands._common import _CONFIG_OPTION, _load_config
 def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, timeout: float, freshness: bool) -> None:
     from coord import freshness as fresh
     from coord.deps import blocked_repos as compute_blocked, build_dep_graph
-    from coord.client import fetch_remote_board, fetch_remote_config, resolve_board_service
+    from coord.board_service import read_board, write_board
+    from coord.client import fetch_remote_config, resolve_board_service
     from coord.network import check_all, fetch_repos, fetch_status
-    from coord.state import build_board, load_board, load_dispatched, load_notified, save_board
+    from coord.state import load_dispatched, load_notified
 
     # #584: when a board service is configured, read the board + config from the
     # daemon instead of local SQLite.  Unset ⇒ unchanged local behaviour.
@@ -135,10 +135,11 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
                     click.echo(f"    latest: {updates[-1]}")
 
     # Reconcile board with live agent data
-    board = fetch_remote_board(svc) if svc else (load_board() or build_board())
-    if not no_reconcile and agent_completed and not svc:
-        # Remote board service owns reconciliation + writes (#590); a thin client
-        # must not write to a local DB.
+    board = read_board()
+    if not no_reconcile and agent_completed:
+        # #749: write_board() routes to the daemon's /board upsert when a
+        # board service is configured, so a thin client's reconciliation now
+        # actually lands on the shared DB instead of being skipped entirely.
         reconciled = 0
         for a in board.active[:]:
             if a.assignment_id is None:
@@ -177,7 +178,7 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
                 )
             reconciled += 1
         if reconciled:
-            save_board(board)
+            write_board(board)
             click.echo(f"\n  (reconciled {reconciled} assignment(s) from live agent data)")
 
     # #448: surface advisory assignments (0 commits, clean exit) so the
@@ -363,10 +364,11 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
 @click.command("show-plan", help="Pretty-print the structured plan for a plan-only assignment.")
 @click.argument("assignment_id")
 def show_plan(assignment_id: str) -> None:
+    from coord.board_service import read_board
     from coord.plan_parser import WorkerPlan, parse_plan_from_log
-    from coord.state import COORD_DIR, build_board, load_board, load_plans
+    from coord.state import COORD_DIR, load_plans
 
-    board = load_board() or build_board()
+    board = read_board()
     assignment = board.find_by_id(assignment_id)
     if assignment is None:
         click.echo(f"error: assignment {assignment_id!r} not found in board", err=True)
@@ -554,10 +556,10 @@ def diagnose(
     # #584: the canonical board + gh + fleet ssh live on the daemon host, so on
     # a thin client this must run there (an empty local board would no-op).
     # COORD_DIAGNOSE_ON_DAEMON guards the daemon against re-routing to itself.
-    from coord.client import resolve_board_service  # noqa: PLC0415
+    from coord.board_service import daemon_reroute_target  # noqa: PLC0415
 
-    _svc = resolve_board_service()
-    if _svc is not None and not os.environ.get("COORD_DIAGNOSE_ON_DAEMON"):
+    _svc = daemon_reroute_target("COORD_DIAGNOSE_ON_DAEMON")
+    if _svc is not None:
         _diagnose_via_daemon(
             _svc,
             {
@@ -614,10 +616,11 @@ def _diagnose_orphan_worktrees(config_path: Path, *, dry_run: bool) -> None:
         tmux_session_name,
         tmux_session_alive,
     )
-    from coord.state import COORD_DIR, build_board  # noqa: PLC0415
+    from coord.board_service import read_board  # noqa: PLC0415
+    from coord.state import COORD_DIR  # noqa: PLC0415
 
     cfg = _load_config(config_path)
-    board = build_board()
+    board = read_board()
     worktrees_dir = COORD_DIR / "worktrees"
 
     if not worktrees_dir.exists():
@@ -710,10 +713,11 @@ def _diagnose_orphan_worktrees(config_path: Path, *, dry_run: bool) -> None:
 
 
 def usage(config_path: Path, remote: bool, timeout: float) -> None:
-    from coord.state import build_board, load_board, load_session
+    from coord.board_service import read_board
+    from coord.state import load_session
     from coord.usage import build_session_usage, format_usage_report
 
-    board = load_board() or build_board()
+    board = read_board()
     all_assignments = list(board.active) + list(board.completed)
 
     # Resolve session start time from session.json

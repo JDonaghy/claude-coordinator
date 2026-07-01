@@ -941,12 +941,15 @@ def _dispatch_board_pending_reviews(config: Config) -> None:
     also triggers review dispatch — not just ``coord status --reconcile``.
     Safe to call even when the board file doesn't exist.
     """
+    from coord.board_service import read_board, write_board
     from coord.review import dispatch_pending_reviews
-    from coord.state import load_board, save_board
 
-    board = load_board()
-    if board is None:
-        return
+    # #749: read_board()/write_board() route through the daemon when
+    # board_service is configured, so this no longer silently no-ops on a
+    # thin client's empty local DB — read_board() falls back to an
+    # effectively-empty board when nothing has been saved yet, which is
+    # exactly as harmless as the old "return early" guard.
+    board = read_board()
 
     # #465: review fires immediately on work completion — no manual smoke
     # prerequisite.  Mirrors reconcile().  dispatch_pending_reviews() enforces
@@ -954,7 +957,7 @@ def _dispatch_board_pending_reviews(config: Config) -> None:
     # 2026-06-08) and the #459 active-fix dedupe, so notify can't flood either.
     dispatched = dispatch_pending_reviews(board, config)
     if dispatched:
-        save_board(board)
+        write_board(board)
 
 
 def run(config: Config) -> tuple[list[Transition], list[StuckDetection]]:

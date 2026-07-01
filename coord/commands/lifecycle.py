@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import os
 import socket
 import subprocess
 import sys
@@ -57,10 +56,10 @@ def _print_housekeeping_result(resp: dict) -> None:
 
 def housekeeping(dry_run: bool) -> None:
     """#762: archive stale terminal board rows (active/recent/referenced kept)."""
-    from coord.client import resolve_board_service  # noqa: PLC0415
+    from coord.board_service import daemon_reroute_target  # noqa: PLC0415
 
-    _svc = resolve_board_service()
-    if _svc is not None and not os.environ.get("COORD_HOUSEKEEPING_ON_DAEMON"):
+    _svc = daemon_reroute_target("COORD_HOUSEKEEPING_ON_DAEMON")
+    if _svc is not None:
         from coord.client import post_record  # noqa: PLC0415
 
         try:
@@ -79,9 +78,9 @@ def housekeeping(dry_run: bool) -> None:
 @click.command(help="Poll agents and post completion/failure comments on GitHub.")
 @_CONFIG_OPTION
 def notify(config_path: Path) -> None:
+    from coord.board_service import read_board, write_board
     from coord.hooks import is_round_complete, run_hooks
     from coord.notify import run as run_notify
-    from coord.state import build_board, save_board
 
     cfg = _load_config(config_path)
     posted, stuck = run_notify(cfg)
@@ -103,7 +102,7 @@ def notify(config_path: Path) -> None:
                 f"#{s.issue_number} (assignment {s.assignment_id})"
             )
             click.echo(f"    {s.stuck_message}")
-    board = build_board()
+    board = read_board()
 
     if is_round_complete(board) and cfg.hooks.on_round_complete:
         click.echo("\nRound complete — running hooks:")
@@ -111,20 +110,25 @@ def notify(config_path: Path) -> None:
             status = "ok" if result.ok else "FAILED"
             click.echo(f"  [{status}] {result.hook}: {result.message}")
 
-    save_board(board)
+    write_board(board)
 
 
 @click.command(help="Recover board state after a crash or restart.")
 @_CONFIG_OPTION
 def resume(config_path: Path) -> None:
+    from coord.board_service import is_remote, read_board, write_board
     from coord.reconcile import reconcile
-    from coord.state import build_board, load_board, save_board
 
     cfg = _load_config(config_path)
-    board = load_board()
-    if board is None:
-        click.echo("No saved board found. Rebuilding from dispatched ledger...")
-        board = build_board()
+    if not is_remote():
+        # Informational only (local mode): distinguish "no board saved yet" from
+        # "loaded an existing board" — read_board() below does the actual
+        # local/remote read.
+        from coord.state import load_board as _peek_local_board  # noqa: PLC0415
+
+        if _peek_local_board() is None:
+            click.echo("No saved board found. Rebuilding from dispatched ledger...")
+    board = read_board()
 
     click.echo(f"Board round: {board.round_number}")
     click.echo(f"  active:    {len(board.active)} assignment(s)")
@@ -163,7 +167,7 @@ def resume(config_path: Path) -> None:
     if removed:
         click.echo(f"\nGC: pruned {removed} old completed assignment(s)")
 
-    save_board(board)
+    write_board(board)
     click.echo(f"\nBoard saved ({len(board.active)} active, {len(board.completed)} completed)")
 
     if board.active:
@@ -175,11 +179,11 @@ def resume(config_path: Path) -> None:
 @click.command(help="End the session — run housekeeping hooks and show summary.")
 @_CONFIG_OPTION
 def done(config_path: Path) -> None:
+    from coord.board_service import read_board, write_board
     from coord.hooks import run_hooks
-    from coord.state import build_board, load_board, save_board
 
     cfg = _load_config(config_path)
-    board = load_board() or build_board()
+    board = read_board()
 
     if board.active:
         click.echo(
@@ -247,7 +251,7 @@ def done(config_path: Path) -> None:
     else:
         click.echo("\nCould not determine local machine — skipping repo housekeeping")
 
-    save_board(board)
+    write_board(board)
 
     # Write session end summary — use the usage module so the output matches `coord usage`.
     import datetime

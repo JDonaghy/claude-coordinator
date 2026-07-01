@@ -1065,8 +1065,9 @@ class TestRunForReviewTransition:
         """If there is no saved board, run_for_review_transition returns []."""
         record = {"type": "review"}
         entry: dict = {}
-        # coord_db fixture not used → no board exists
-        with patch("coord.auto_loop.load_board", return_value=None):
+        # coord_db fixture not used → no board exists; read_board() (#749)
+        # falls back to an empty Board rather than None.
+        with patch("coord.auto_loop.read_board", return_value=Board()):
             actions = run_for_review_transition("r-1", record, entry, config)
         assert actions == []
 
@@ -1683,7 +1684,8 @@ class TestRunForFixTransition:
 
     def test_run_for_fix_transition_no_board(self, config: Config) -> None:
         """No saved board → returns empty list without raising."""
-        with patch("coord.auto_loop.load_board", return_value=None):
+        # read_board() (#749) falls back to an empty Board rather than None.
+        with patch("coord.auto_loop.read_board", return_value=Board()):
             actions = run_for_fix_transition("fix-1", config)
         assert actions == []
 

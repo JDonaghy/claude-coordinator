@@ -78,7 +78,7 @@ class TestBoardAPI:
         )
 
         client = _client()
-        with patch("coord.dashboard.server.load_board") as mock_load:
+        with patch("coord.dashboard.server.read_board") as mock_load:
             mock_load.return_value = board
             r = client.get("/api/board")
 
@@ -91,8 +91,7 @@ class TestBoardAPI:
     def test_empty_board(self) -> None:
         client = _client()
         with (
-            patch("coord.dashboard.server.load_board", return_value=None),
-            patch("coord.dashboard.server.build_board", return_value=Board()),
+            patch("coord.dashboard.server.read_board", return_value=Board()),
         ):
             r = client.get("/api/board")
         assert r.status_code == 200
@@ -150,6 +149,10 @@ class TestProposalsAPI:
 
 
 class TestApproveAPI:
+    # #749: board_service.read_board() tries load_board() before build_board()
+    # — mock both so the real load_board() (which needs a live connection on
+    # this thread) never runs.
+    @patch("coord.state.load_board", return_value=None)
     @patch("coord.state.build_board", return_value=Board())
     @patch("coord.state.save_board")
     @patch("coord.state.clear_proposals")
@@ -160,7 +163,7 @@ class TestApproveAPI:
     @patch("coord.dispatch.httpx.post")
     def test_approve_dispatches(
         self, mock_post, mock_briefing, mock_load_p, mock_load_d,
-        mock_record, mock_clear, mock_save, mock_build,
+        mock_record, mock_clear, mock_save, mock_build, mock_load_board,
     ) -> None:
         mock_load_p.return_value = [
             Proposal(
@@ -228,8 +231,7 @@ class TestDiffAPI:
     def test_diff_not_found(self) -> None:
         client = _client()
         with (
-            patch("coord.dashboard.server.load_board", return_value=Board()),
-            patch("coord.dashboard.server.build_board", return_value=Board()),
+            patch("coord.dashboard.server.read_board", return_value=Board()),
         ):
             r = client.get("/api/diff/nonexistent")
         assert r.status_code == 404
@@ -241,7 +243,7 @@ class TestDiffAPI:
                        branch=None),
         ])
         client = _client()
-        with patch("coord.dashboard.server.load_board", return_value=board):
+        with patch("coord.dashboard.server.read_board", return_value=board):
             r = client.get("/api/diff/abc")
         assert r.status_code == 404
         assert "no branch" in r.json()["error"]
@@ -255,13 +257,15 @@ class TestDiffAPI:
         ])
         mock_gh.return_value = "diff --git a/f.py b/f.py\n+new line"
         client = _client()
-        with patch("coord.dashboard.server.load_board", return_value=board):
+        with patch("coord.dashboard.server.read_board", return_value=board):
             r = client.get("/api/diff/abc")
         assert r.status_code == 200
         assert "new line" in r.json()["diff"]
 
 
 class TestBriefingOverride:
+    # #749: board_service.read_board() tries load_board() before build_board().
+    @patch("coord.state.load_board", return_value=None)
     @patch("coord.state.build_board", return_value=Board())
     @patch("coord.state.save_board")
     @patch("coord.state.clear_proposals")
@@ -335,8 +339,7 @@ class TestChatAPI:
             return mock_proc
 
         with (
-            patch("coord.dashboard.server.load_board", return_value=Board()),
-            patch("coord.dashboard.server.build_board", return_value=Board()),
+            patch("coord.dashboard.server.read_board", return_value=Board()),
             patch("asyncio.create_subprocess_exec", side_effect=fake_exec),
         ):
             client = _client()
@@ -379,9 +382,9 @@ class TestPipelineAction:
         )
         client = _client()
         with (
-            patch("coord.dashboard.server.load_board", return_value=self._board_with_done()),
+            patch("coord.dashboard.server.read_board", return_value=self._board_with_done()),
             patch("coord.review.dispatch_review", return_value=review_assignment) as mock_dr,
-            patch("coord.dashboard.server.save_board"),
+            patch("coord.dashboard.server.write_board"),
         ):
             r = client.post("/api/pipeline/action", json={
                 "assignment_id": "work001",
@@ -396,7 +399,7 @@ class TestPipelineAction:
     def test_dispatch_review_none_returns_error(self) -> None:
         client = _client()
         with (
-            patch("coord.dashboard.server.load_board", return_value=self._board_with_done()),
+            patch("coord.dashboard.server.read_board", return_value=self._board_with_done()),
             patch("coord.review.dispatch_review", return_value=None),
         ):
             r = client.post("/api/pipeline/action", json={
@@ -412,7 +415,7 @@ class TestPipelineAction:
     def test_dispatch_review_exception_returns_500(self) -> None:
         client = _client()
         with (
-            patch("coord.dashboard.server.load_board", return_value=self._board_with_done()),
+            patch("coord.dashboard.server.read_board", return_value=self._board_with_done()),
             patch("coord.review.dispatch_review", side_effect=RuntimeError("agent down")),
         ):
             r = client.post("/api/pipeline/action", json={
@@ -432,9 +435,9 @@ class TestPipelineAction:
         )
         client = _client()
         with (
-            patch("coord.dashboard.server.load_board", return_value=self._board_with_done()),
+            patch("coord.dashboard.server.read_board", return_value=self._board_with_done()),
             patch("coord.smoke.dispatch_smoke", return_value=smoke_assignment),
-            patch("coord.dashboard.server.save_board"),
+            patch("coord.dashboard.server.write_board"),
         ):
             r = client.post("/api/pipeline/action", json={
                 "assignment_id": "work001",
@@ -449,7 +452,7 @@ class TestPipelineAction:
     def test_dispatch_smoke_none_returns_error(self) -> None:
         client = _client()
         with (
-            patch("coord.dashboard.server.load_board", return_value=self._board_with_done()),
+            patch("coord.dashboard.server.read_board", return_value=self._board_with_done()),
             patch("coord.smoke.dispatch_smoke", return_value=None),
         ):
             r = client.post("/api/pipeline/action", json={
@@ -463,7 +466,7 @@ class TestPipelineAction:
 
     def test_pipeline_action_unknown_assignment(self) -> None:
         client = _client()
-        with patch("coord.dashboard.server.load_board", return_value=Board()):
+        with patch("coord.dashboard.server.read_board", return_value=Board()):
             r = client.post("/api/pipeline/action", json={
                 "assignment_id": "doesnotexist",
                 "action": "dispatch_review",
@@ -496,7 +499,7 @@ class TestPipelineActionTestVerdict:
     def test_pass_verdict_records_passed(self) -> None:
         client = _client()
         with (
-            patch("coord.dashboard.server.load_board", return_value=self._board_with_done()),
+            patch("coord.dashboard.server.read_board", return_value=self._board_with_done()),
             patch("coord.state.record_test_verdict") as mock_rtv,
         ):
             r = client.post("/api/pipeline/action", json={
@@ -519,7 +522,7 @@ class TestPipelineActionTestVerdict:
     def test_fail_verdict_records_failed_with_reason(self) -> None:
         client = _client()
         with (
-            patch("coord.dashboard.server.load_board", return_value=self._board_with_done()),
+            patch("coord.dashboard.server.read_board", return_value=self._board_with_done()),
             patch("coord.state.record_test_verdict") as mock_rtv,
         ):
             r = client.post("/api/pipeline/action", json={
@@ -543,7 +546,7 @@ class TestPipelineActionTestVerdict:
     def test_skip_verdict_records_skipped(self) -> None:
         client = _client()
         with (
-            patch("coord.dashboard.server.load_board", return_value=self._board_with_done()),
+            patch("coord.dashboard.server.read_board", return_value=self._board_with_done()),
             patch("coord.state.record_test_verdict") as mock_rtv,
         ):
             r = client.post("/api/pipeline/action", json={
@@ -566,7 +569,7 @@ class TestPipelineActionTestVerdict:
 
     def test_invalid_verdict_returns_400(self) -> None:
         client = _client()
-        with patch("coord.dashboard.server.load_board", return_value=self._board_with_done()):
+        with patch("coord.dashboard.server.read_board", return_value=self._board_with_done()):
             r = client.post("/api/pipeline/action", json={
                 "assignment_id": "work001",
                 "action": "test-verdict",
@@ -578,7 +581,7 @@ class TestPipelineActionTestVerdict:
     def test_exception_returns_500(self) -> None:
         client = _client()
         with (
-            patch("coord.dashboard.server.load_board", return_value=self._board_with_done()),
+            patch("coord.dashboard.server.read_board", return_value=self._board_with_done()),
             patch("coord.state.record_test_verdict", side_effect=RuntimeError("db locked")),
         ):
             r = client.post("/api/pipeline/action", json={
@@ -641,7 +644,7 @@ class TestPipelineActionRecordReviewVerdict:
         """The mock must be called with the review assignment id, not the work id."""
         client = _client()
         with (
-            patch("coord.dashboard.server.load_board", return_value=self._board_with_work_and_review()),
+            patch("coord.dashboard.server.read_board", return_value=self._board_with_work_and_review()),
             patch("coord.notify._persist_review_findings") as mock_prf,
         ):
             r = client.post("/api/pipeline/action", json={
@@ -659,7 +662,7 @@ class TestPipelineActionRecordReviewVerdict:
     def test_request_changes_verdict_persists_to_review_id(self) -> None:
         client = _client()
         with (
-            patch("coord.dashboard.server.load_board", return_value=self._board_with_work_and_review()),
+            patch("coord.dashboard.server.read_board", return_value=self._board_with_work_and_review()),
             patch("coord.notify._persist_review_findings") as mock_prf,
         ):
             r = client.post("/api/pipeline/action", json={
@@ -677,7 +680,7 @@ class TestPipelineActionRecordReviewVerdict:
     def test_no_review_assignment_returns_404(self) -> None:
         """404 when the work assignment has no linked review assignment."""
         client = _client()
-        with patch("coord.dashboard.server.load_board", return_value=self._board_with_work_only()):
+        with patch("coord.dashboard.server.read_board", return_value=self._board_with_work_only()):
             r = client.post("/api/pipeline/action", json={
                 "assignment_id": "work001",
                 "action": "record-review-verdict",
@@ -689,7 +692,7 @@ class TestPipelineActionRecordReviewVerdict:
 
     def test_invalid_verdict_returns_400(self) -> None:
         client = _client()
-        with patch("coord.dashboard.server.load_board", return_value=self._board_with_work_and_review()):
+        with patch("coord.dashboard.server.read_board", return_value=self._board_with_work_and_review()):
             r = client.post("/api/pipeline/action", json={
                 "assignment_id": "work001",
                 "action": "record-review-verdict",
@@ -701,7 +704,7 @@ class TestPipelineActionRecordReviewVerdict:
 
     def test_missing_body_returns_400(self) -> None:
         client = _client()
-        with patch("coord.dashboard.server.load_board", return_value=self._board_with_work_and_review()):
+        with patch("coord.dashboard.server.read_board", return_value=self._board_with_work_and_review()):
             r = client.post("/api/pipeline/action", json={
                 "assignment_id": "work001",
                 "action": "record-review-verdict",
@@ -713,7 +716,7 @@ class TestPipelineActionRecordReviewVerdict:
     def test_exception_returns_500(self) -> None:
         client = _client()
         with (
-            patch("coord.dashboard.server.load_board", return_value=self._board_with_work_and_review()),
+            patch("coord.dashboard.server.read_board", return_value=self._board_with_work_and_review()),
             patch("coord.notify._persist_review_findings", side_effect=RuntimeError("db locked")),
         ):
             r = client.post("/api/pipeline/action", json={
@@ -752,7 +755,7 @@ class TestPipelineReviewFindings:
     def test_review_verdict_and_body_in_pipeline_response(self) -> None:
         client = _client()
         with (
-            patch("coord.dashboard.server.load_board", return_value=self._board_with_review()),
+            patch("coord.dashboard.server.read_board", return_value=self._board_with_review()),
             patch("coord.merge_queue.load_queue", return_value=[]),
             patch(
                 "coord.state.load_assignment_review_findings",
@@ -780,7 +783,7 @@ class TestPipelineReviewFindings:
         board = Board(active=[], completed=[work])
         client = _client()
         with (
-            patch("coord.dashboard.server.load_board", return_value=board),
+            patch("coord.dashboard.server.read_board", return_value=board),
             patch("coord.merge_queue.load_queue", return_value=[]),
             patch("coord.state.load_assignment_review_findings") as mock_lrf,
         ):
@@ -1190,8 +1193,8 @@ class TestUnstickAction:
         client = _client()
         board = self._board_with_running()
         with (
-            patch("coord.dashboard.server.load_board", return_value=board),
-            patch("coord.dashboard.server.save_board"),
+            patch("coord.dashboard.server.read_board", return_value=board),
+            patch("coord.dashboard.server.write_board"),
             patch("coord.dashboard.server.httpx.post", side_effect=Exception("unreachable")),
         ):
             r = client.post("/api/pipeline/action", json={
@@ -1213,8 +1216,8 @@ class TestUnstickAction:
         mock_response = MagicMock()
         mock_response.status_code = 200
         with (
-            patch("coord.dashboard.server.load_board", return_value=board),
-            patch("coord.dashboard.server.save_board"),
+            patch("coord.dashboard.server.read_board", return_value=board),
+            patch("coord.dashboard.server.write_board"),
             patch("coord.dashboard.server.httpx.post", return_value=mock_response),
         ):
             r = client.post("/api/pipeline/action", json={
@@ -1228,7 +1231,7 @@ class TestUnstickAction:
 
     def test_unstick_unknown_assignment_returns_404(self) -> None:
         client = _client()
-        with patch("coord.dashboard.server.load_board", return_value=Board()):
+        with patch("coord.dashboard.server.read_board", return_value=Board()):
             r = client.post("/api/pipeline/action", json={
                 "assignment_id": "doesnotexist",
                 "action": "unstick",
@@ -1261,7 +1264,7 @@ class TestSPAServing:
         board = Board(round_number=99)
         with patch("coord.dashboard.server.WEBAPP_DIST", dist):
             client = TestClient(build_app(_config()))
-            with patch("coord.dashboard.server.load_board", return_value=board):
+            with patch("coord.dashboard.server.read_board", return_value=board):
                 r = client.get("/api/board")
         assert r.status_code == 200
         assert r.json()["round_number"] == 99
