@@ -113,16 +113,27 @@ impl CoordApp {
                 if is_fix_cap_preflight_label(&result.label, &p.work_aid) {
                     self.pending_fix_cap_preflight = None;
                     if result.exit_code == 0 {
-                        // `after_preflight = true`: this IS the follow-through
-                        // from the preflight that just completed — skip the
-                        // gate (see `launch_interactive_session_on_machine_inner`)
-                        // so a clean, non-forced pass doesn't preflight forever.
+                        // This IS the follow-through from the preflight that
+                        // just completed — pass `Some(FixPreflightTarget)` so
+                        // `launch_interactive_session_on_machine_inner` (1)
+                        // skips the cap-preflight gate (it just ran) and (2)
+                        // resolves the repo/issue/work_aid from the PINNED
+                        // target below rather than whatever is currently
+                        // selected in the UI — otherwise an operator who
+                        // navigates away while the preflight runs gets the
+                        // launch silently misdirected to (or dropped for) the
+                        // wrong issue (#863 review fix).
                         self.launch_interactive_session_on_machine_inner(
                             InteractiveLaunchMode::Fix,
                             p.machine,
                             None,
                             p.force,
-                            true,
+                            Some(FixPreflightTarget {
+                                coord_repo: p.coord_repo,
+                                repo_slug: p.repo_slug,
+                                issue_num: p.issue_num,
+                                work_aid: p.work_aid,
+                            }),
                         );
                     } else if result.stderr.contains("max_review_iterations") {
                         let max_iterations = parse_max_review_iterations(&result.stderr);

@@ -1598,6 +1598,186 @@
         );
     }
 
+    // ── #863 review fix: pin the preflighted target, don't re-derive it ──────
+
+    /// Build a pipeline app with TWO issues (42 and 43), each with its own
+    /// test-FAILED work assignment on repo "api" — enough to simulate an
+    /// operator navigating from the preflighted issue (42) to a different one
+    /// (43) while a Fix cap preflight for 42 is still in flight.
+    fn make_two_issue_fix_cap_preflight_app() -> CoordApp {
+        let failed_42 = Assignment {
+            branch: Some("issue-42-fix".to_string()),
+            test_state: Some("failed".to_string()),
+            ..make_assignment_typed("done", 42, "api", Some("work"))
+        };
+        let failed_43 = Assignment {
+            branch: Some("issue-43-fix".to_string()),
+            test_state: Some("failed".to_string()),
+            ..make_assignment_typed("done", 43, "api", Some("work"))
+        };
+        let data = BoardData {
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            machines: vec![Machine {
+                name: "m1".to_string(),
+                host: String::new(),
+                reachable: true,
+                active_count: 0,
+                repos: vec!["api".to_string()],
+                version: None,
+                worktree_bytes: 0,
+            }],
+            assignments: vec![failed_42, failed_43],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        app.pipeline_issues = vec![
+            PipelineIssue {
+                number: 42,
+                title: "Add cool thing".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string()],
+                is_closed: false,
+            },
+            PipelineIssue {
+                number: 43,
+                title: "Add another thing".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string()],
+                is_closed: false,
+            },
+        ];
+        // `selected_issue_repo_and_key()` reads the Board selection while on
+        // the Board view (#675 BUG 5) — these tests drive the Pipeline
+        // selection (`pipeline_sel`), so the view must actually be Pipeline
+        // for the "unpinned falls back to the live selection" sanity checks
+        // to resolve anything at all.
+        app.active_view = SidebarView::Pipeline;
+        app
+    }
+
+    /// The review's core finding: the follow-through launch after a
+    /// successful cap preflight must resolve the repo/issue from the PINNED
+    /// `FixPreflightTarget`, not from whatever is currently selected in the
+    /// UI. Simulates the operator navigating from issue 42 (the preflighted
+    /// issue) to issue 43 before the preflight resolves.
+    #[test]
+    fn resolve_launch_repo_and_key_prefers_pinned_target_over_current_selection() {
+        let mut app = make_two_issue_fix_cap_preflight_app();
+        // Operator has navigated to issue 43 by the time the preflight for
+        // issue 42 completes.
+        app.pipeline_sel = Some(1);
+
+        let pinned = FixPreflightTarget {
+            coord_repo: "api".to_string(),
+            repo_slug: "acme/api".to_string(),
+            issue_num: 42,
+            work_aid: "id-42-done".to_string(),
+        };
+        let (repo, (slug, num)) = app
+            .resolve_launch_repo_and_key(Some(&pinned))
+            .expect("pinned target must resolve");
+        assert_eq!(repo, "api", "must use the PINNED repo, not issue 43's");
+        assert_eq!(slug, "acme/api");
+        assert_eq!(num, 42, "must target the PREFLIGHTED issue 42, not the currently-selected 43");
+
+        // Sanity: with no pin, it DOES fall back to the live selection (43) —
+        // confirms the test fixture actually distinguishes the two issues.
+        let (repo, (_, num)) = app
+            .resolve_launch_repo_and_key(None)
+            .expect("live selection must resolve");
+        assert_eq!(repo, "api");
+        assert_eq!(num, 43, "unpinned resolution must follow the live selection");
+    }
+
+    /// Same as above, for the work_aid the Fix launch's command line carries.
+    /// Before this fix, `InteractiveLaunchMode::Fix`'s work_aid was ALWAYS
+    /// re-derived from `selected_test_failed_work_aid()` / `selected_request_
+    /// changes_review_aid()` — i.e. issue 43's work item — even on the
+    /// preflight follow-through, which would silently apply the preflighted
+    /// issue's outcome (including a confirmed `--force`) to the wrong work.
+    #[test]
+    fn resolve_fix_work_aid_prefers_pinned_target_over_current_selection() {
+        let mut app = make_two_issue_fix_cap_preflight_app();
+        app.pipeline_sel = Some(1); // issue 43 selected
+
+        let pinned = FixPreflightTarget {
+            coord_repo: "api".to_string(),
+            repo_slug: "acme/api".to_string(),
+            issue_num: 42,
+            work_aid: "id-42-done".to_string(),
+        };
+        assert_eq!(
+            app.resolve_fix_work_aid(Some(&pinned)),
+            Some("id-42-done".to_string()),
+            "must use the PINNED work_aid, not issue 43's"
+        );
+
+        // Sanity: unpinned resolution follows the live selection (issue 43).
+        assert_eq!(
+            app.resolve_fix_work_aid(None),
+            Some("id-43-done".to_string()),
+            "unpinned resolution must follow the live selection"
+        );
+    }
+
+    /// #863 review fix (secondary finding): a second Fix cap preflight must
+    /// NOT be dispatched — and must NOT overwrite `pending_fix_cap_preflight`
+    /// — while one is already in flight. Without this guard, the FIRST
+    /// preflight's eventual result would fail to match the (overwritten)
+    /// pending target and get silently dropped: no launch, no force-confirm,
+    /// for an issue the operator is still waiting on.
+    #[test]
+    fn dispatch_fix_cap_preflight_refuses_second_dispatch_while_one_in_flight() {
+        let mut app = make_two_issue_fix_cap_preflight_app();
+
+        app.dispatch_fix_cap_preflight(
+            "api".to_string(),
+            "acme/api".to_string(),
+            42,
+            "m1".to_string(),
+            "id-42-done".to_string(),
+            false,
+        );
+        assert_eq!(app.command_runner.spawned_calls.len(), 1);
+        assert_eq!(
+            app.pending_fix_cap_preflight.as_ref().map(|p| p.issue_num),
+            Some(42)
+        );
+
+        // Operator navigates to issue 43 and clicks Fix again before the
+        // first preflight's subprocess has returned.
+        app.dispatch_fix_cap_preflight(
+            "api".to_string(),
+            "acme/api".to_string(),
+            43,
+            "m1".to_string(),
+            "id-43-done".to_string(),
+            false,
+        );
+
+        assert_eq!(
+            app.command_runner.spawned_calls.len(),
+            1,
+            "the second preflight must NOT be dispatched while the first is in flight"
+        );
+        assert_eq!(
+            app.pending_fix_cap_preflight.as_ref().map(|p| p.issue_num),
+            Some(42),
+            "the in-flight preflight's target must NOT be overwritten"
+        );
+        assert!(
+            app.toasts.iter().any(|t| t.0.title.contains("already running")),
+            "operator must be told why the second Fix click did nothing, got toasts: {:?}",
+            app.toasts.iter().map(|t| &t.0.title).collect::<Vec<_>>(),
+        );
+    }
+
     /// #863 TuiDriver black-box: once the force-confirm prompt is up, the
     /// operator must see WHY (the cap number) via the SAME render path
     /// `find`/`click` use in every other TuiDriver test.  (The dialog's
