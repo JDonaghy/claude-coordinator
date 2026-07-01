@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import shutil
 import socket
 import subprocess
 from pathlib import Path
@@ -100,15 +102,51 @@ def _validate_plan(data: object) -> dict:
     }
 
 
+def resolve_claude_bin() -> str:
+    """Resolve an absolute path to the ``claude`` binary (#859).
+
+    ``_call_claude`` used to shell out to bare ``"claude"``, which relies on
+    the invoking process's ``$PATH`` containing ``~/.local/bin`` (where the
+    binary is typically installed). That holds for an interactive shell but
+    not for ``coord-serve``, which runs under ``systemd --user`` with the
+    default (empty ``Environment=``) PATH — so daemon-side plan generation
+    (a cache miss on ``coord test-plan``, routed to the daemon by #851)
+    failed with ``FileNotFoundError``. Same lesson as the #424/#425 PTY
+    escape hatch: cross-machine/service invocation must use an absolute
+    path, not a bare command name.
+
+    Resolution order:
+      1. ``$CLAUDE_BIN`` — explicit override for non-standard installs.
+      2. ``shutil.which("claude")`` — PATH lookup; works whenever the
+         caller's environment is sane (e.g. interactive shells).
+      3. ``~/.local/bin/claude`` — the standard install location, used
+         verbatim as a last-resort fallback even if it doesn't exist, so a
+         resulting ``FileNotFoundError`` still names the path that was
+         expected (easier to diagnose than a bare ``'claude'``).
+
+    Returns:
+        Absolute path (str) to use as argv[0] for the ``claude`` subprocess.
+    """
+    override = os.environ.get("CLAUDE_BIN")
+    if override:
+        return override
+    found = shutil.which("claude")
+    if found:
+        return found
+    return str(Path.home() / ".local" / "bin" / "claude")
+
+
 def _call_claude(system: str, user: str, *, model: str = "haiku") -> str:
     """Invoke ``claude -p`` and return the text result.
 
     Mirrors the pattern in ``coord.brain.call_claude`` — no Anthropic SDK.
     The ``--output-format json`` flag gives a structured envelope; we extract
-    the ``result`` field.
+    the ``result`` field. The binary is resolved to an absolute path (see
+    :func:`resolve_claude_bin`) so this works under ``coord-serve``'s
+    restricted-PATH ``systemd --user`` environment, not just interactively.
     """
     cmd = [
-        "claude", "-p",
+        resolve_claude_bin(), "-p",
         "--system-prompt", system,
         "--output-format", "json",
     ]
