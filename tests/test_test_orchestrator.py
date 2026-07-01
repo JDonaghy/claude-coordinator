@@ -114,6 +114,58 @@ class TestValidatePlan:
             assert result["steps"][0]["kind"] == kind
 
 
+# ── resolve_claude_bin / _call_claude binary resolution (#859) ───────────────
+
+class TestResolveClaudeBin:
+    """coord-serve's systemd --user PATH lacks ~/.local/bin (#859) — bare
+    'claude' fails on daemon-side plan generation. resolve_claude_bin() must
+    resolve an absolute path instead."""
+
+    def test_env_override_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CLAUDE_BIN", "/opt/custom/claude")
+        with patch("shutil.which", return_value="/should/not/be/used/claude"):
+            from coord.test_orchestrator import resolve_claude_bin
+            assert resolve_claude_bin() == "/opt/custom/claude"
+
+    def test_path_lookup_used_when_no_override(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("CLAUDE_BIN", raising=False)
+        with patch("shutil.which", return_value="/usr/local/bin/claude") as mock_which:
+            from coord.test_orchestrator import resolve_claude_bin
+            assert resolve_claude_bin() == "/usr/local/bin/claude"
+        mock_which.assert_called_once_with("claude")
+
+    def test_falls_back_to_local_bin_when_not_on_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("CLAUDE_BIN", raising=False)
+        with patch("shutil.which", return_value=None):
+            from coord.test_orchestrator import resolve_claude_bin
+            result = resolve_claude_bin()
+        assert result == str(Path.home() / ".local" / "bin" / "claude")
+
+
+class TestCallClaudeUsesResolvedBinary:
+    """_call_claude must invoke the resolved absolute path, not bare 'claude'."""
+
+    def test_subprocess_argv0_is_resolved_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from coord.test_orchestrator import _call_claude
+
+        monkeypatch.setenv("CLAUDE_BIN", "/home/svc/.local/bin/claude")
+        fake_result = MagicMock(
+            returncode=0, stdout='{"result": "ok"}', stderr=""
+        )
+        with patch("subprocess.run", return_value=fake_result) as mock_run:
+            result = _call_claude("sys", "user")
+
+        cmd = mock_run.call_args[0][0]
+        assert cmd[0] == "/home/svc/.local/bin/claude"
+        assert result == "ok"
+
+
 # ── _build_user_prompt / manifest-merging ────────────────────────────────────
 
 class TestBuildUserPrompt:

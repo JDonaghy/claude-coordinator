@@ -1581,6 +1581,80 @@ def test_test_plan_routes_to_daemon_when_service_set(coord_db, tmp_path, monkeyp
     assert "DAEMON TEST-PLAN OUTPUT" in out.output
 
 
+def test_test_plan_generation_on_daemon_uses_resolved_claude_path(
+    file_db: Path, valid_config_path: Path, rw_db, monkeypatch
+):
+    """#859: on a cache miss, daemon-side plan generation must invoke the
+    resolved ABSOLUTE `claude` path, not bare 'claude' — coord-serve runs
+    under systemd --user with a PATH that lacks ~/.local/bin (where the
+    binary actually lives), so a bare-name subprocess call fails there even
+    though it works from an interactive shell.
+
+    Full round-trip: a thin client's `coord test-plan` (board_service set)
+    POSTs to /test-plan; `post_record` is routed into the real Starlette app
+    via TestClient (in-process, no live HTTP) so `test_plan_cmd.callback` runs
+    for real against `rw_db` and calls the real (unmocked) `generate_plan` →
+    `_call_claude`. Only the network/gh/subprocess leaves are stubbed:
+    artifact manifest, PR diff, issue body (mirrors TestGeneratePlan's
+    mocking) — and `shutil.which`/`subprocess.run` inside `_call_claude`,
+    which is exactly what's under test.
+    """
+    import json
+    from unittest.mock import MagicMock
+
+    from click.testing import CliRunner
+
+    from coord import client as cc
+    from coord import test_orchestrator
+    from coord.cli import main
+
+    _seed_running_assignment(rw_db, aid="work9")
+
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    daemon_client = TestClient(app)
+
+    monkeypatch.setattr(
+        cc, "resolve_board_service", lambda *a, **k: cc.ServiceConfig("http://d:7435")
+    )
+    # Route the thin-client POST into the real daemon endpoint in-process
+    # instead of over a live HTTP socket.
+    monkeypatch.setattr(
+        cc, "post_record",
+        lambda svc, path, payload, **kw: daemon_client.post(path, json=payload).json(),
+    )
+
+    # generate_plan's non-claude side calls (gh/network) — stub them out so
+    # the only real subprocess left is `_call_claude`'s `claude -p` call.
+    monkeypatch.setattr(test_orchestrator, "_fetch_artifact_manifest", lambda *a, **k: None)
+    monkeypatch.setattr(test_orchestrator, "_get_pr_diff", lambda *a, **k: "")
+    monkeypatch.setattr(test_orchestrator, "_get_issue_body", lambda *a, **k: "")
+
+    monkeypatch.delenv("CLAUDE_BIN", raising=False)
+    monkeypatch.setattr(test_orchestrator.shutil, "which", lambda name: None)  # not on PATH
+
+    captured_cmd: list = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001, ANN003
+        captured_cmd.append(cmd)
+        result = MagicMock()
+        result.returncode = 0
+        result.stdout = json.dumps({"result": json.dumps({"steps": [], "blockers": []})})
+        result.stderr = ""
+        return result
+
+    monkeypatch.setattr(test_orchestrator.subprocess, "run", fake_run)
+
+    out = CliRunner().invoke(
+        main, ["test-plan", "work9", "--config", str(valid_config_path)]
+    )
+    assert out.exit_code == 0, out.output
+    assert len(captured_cmd) == 1, "expected exactly one claude -p subprocess call"
+    resolved = captured_cmd[0][0]
+    assert resolved != "claude", "must not shell out to bare 'claude' (#859)"
+    assert resolved == str(Path.home() / ".local" / "bin" / "claude")
+    assert '"steps": []' in out.output
+
+
 def test_log_falls_back_to_daemon_board_machine_name(coord_db, tmp_path, monkeypatch):
     # #851: `coord log` on a thin client (or any machine that isn't the
     # dispatcher) has no local dispatched-ledger record for a valid remote
