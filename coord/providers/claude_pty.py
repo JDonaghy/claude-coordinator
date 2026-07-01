@@ -36,6 +36,7 @@ the import cycle latent, matching the pattern in
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -78,6 +79,83 @@ BRACKETED_PASTE_END = b"\x1b[201~"
 # ~0.85s after first output, while the TUI is still drawing; pasting then is
 # silently dropped).
 BRACKETED_PASTE_ENABLE = b"\x1b[?2004h"
+
+# ── #865: readiness-anchor + paste verification primitives ───────────────────
+#
+# Root cause of #865: both injection paths (the tmux path in
+# ``coord.interactive`` and the PTY-relay paths in ``coord.interactive`` /
+# ``coord.agent``) used render QUIESCENCE as their only proxy for "the input
+# box is ready", then pasted once and never checked whether the text actually
+# landed.  Claude Code's TUI paints async startup content (promo banners,
+# MCP/auth notices, update notices) over several seconds — quiescence alone
+# cannot tell "static banner mid-startup" from "input box settled", and a
+# late repaint arriving right around the paste can silently discard it.
+#
+# The fix has two parts, both anchored on primitives defined ONCE here so the
+# three call-sites (tmux capture-pane text, the interactive PTY relay's
+# in-memory screen buffer, and the agent's PTY log tail) can't drift out of
+# sync the way the pre-#865 "twin implementations" did:
+#
+# 1. ``INPUT_BOX_MARKER`` — the rendered left border of the TUI's input box
+#    (``"❯ Try ..."`` in the #865 capture).  Callers require this to be
+#    present (in addition to quiescence) before treating the screen as
+#    "ready" — so we don't paste into a still-loading/blank frame that
+#    merely *looks* stable.  If the marker never appears (older CLI, unusual
+#    render), callers still fall back to their existing timeout/cap so a
+#    mismatch degrades to the pre-#865 behaviour rather than hanging.
+#
+# 2. ``briefing_fingerprint`` / ``fingerprint_in_text`` / ``fingerprint_in_bytes``
+#    — after pasting, re-observe the screen and confirm a snippet of the
+#    briefing actually rendered.  Whitespace is collapsed on both sides
+#    because the terminal re-wraps pasted text at arbitrary column widths,
+#    so an exact match against the original briefing would spuriously fail.
+#    Callers retry the paste (bounded, with backoff) on a miss and log a
+#    hard failure if every attempt misses — never silent.
+INPUT_BOX_MARKER = "❯"
+INPUT_BOX_MARKER_BYTES = INPUT_BOX_MARKER.encode("utf-8")
+
+_WS_RE_STR = re.compile(r"\s+")
+_WS_RE_BYTES = re.compile(rb"\s+")
+
+
+def briefing_fingerprint(briefing: str, length: int = 40) -> str:
+    """Return a whitespace-normalized snippet of *briefing* for paste verification.
+
+    Collapsing runs of whitespace to a single space and taking a short prefix
+    makes the check robust to the terminal re-wrapping the pasted text across
+    lines, while still being specific enough that it won't spuriously match
+    unrelated screen content (banner text, help hints, etc.).
+    """
+    return _WS_RE_STR.sub(" ", briefing).strip()[:length]
+
+
+def fingerprint_in_text(text: str, fingerprint: str) -> bool:
+    """True when *fingerprint* (see :func:`briefing_fingerprint`) appears in *text*.
+
+    Used against tmux's ``capture-pane -p`` output, which is already
+    fully-rendered plain text (no ANSI escapes to worry about).  An empty
+    fingerprint (e.g. a briefing shorter than nothing) trivially matches —
+    there's nothing to verify.
+    """
+    if not fingerprint:
+        return True
+    return fingerprint in _WS_RE_STR.sub(" ", text)
+
+
+def fingerprint_in_bytes(raw: bytes, fingerprint: str) -> bool:
+    """Byte-oriented twin of :func:`fingerprint_in_text` for the PTY paths.
+
+    The PTY log/screen buffer contains raw TTY bytes — ANSI escapes
+    interleaved with the rendered text — so this is a best-effort heuristic
+    rather than the exact match ``fingerprint_in_text`` gets from tmux's
+    pre-rendered ``capture-pane`` output.  A redraw that splits the pasted
+    text across escape sequences can still produce a false negative, which
+    just triggers a (harmless, bounded) retry.
+    """
+    if not fingerprint:
+        return True
+    normalized = _WS_RE_BYTES.sub(b" ", raw)
+    return fingerprint.encode("utf-8") in normalized
 
 
 class ClaudePtyProvider(Provider):

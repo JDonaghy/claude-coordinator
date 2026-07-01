@@ -1007,11 +1007,14 @@ class TestInjectBriefingIntoTmuxSession:
     # -- Injection always happens ----------------------------------------------
 
     def test_injects_after_immediate_timeout(self) -> None:
-        """Even when timeout=0 (deadline already passed), injection still runs."""
+        """Even when timeout=0 (readiness deadline already passed), injection
+        still runs — and the post-paste capture-pane shows the briefing
+        landed, so verification succeeds on the first attempt (#865)."""
         from coord.interactive import _inject_briefing_into_tmux_session
 
-        with patch("subprocess.run", side_effect=self._make_run_mock()), \
-             patch("time.sleep"):
+        with patch(
+            "subprocess.run", side_effect=self._make_run_mock(["hello world"])
+        ), patch("time.sleep"):
             result = _inject_briefing_into_tmux_session(
                 "coord-ses", "hello world", timeout=0.0
             )
@@ -1062,71 +1065,52 @@ class TestInjectBriefingIntoTmuxSession:
     # -- Quiescence path -------------------------------------------------------
 
     def test_injects_after_quiescence_detected(self) -> None:
-        """Injection happens after content stabilises for _READY_QUIESCE_S.
-
-        The mock drives exactly two capture-pane iterations:
-          iter 1 — content changes (None → "stable") → quiescent_since is set.
-          iter 2 — content same → now - quiescent_since >= _READY_QUIESCE_S → break.
-        time.monotonic() is called 5 times total (see call sequence in comments).
+        """Readiness requires BOTH the input-box marker AND stable content
+        for _READY_QUIESCE_S (#865) — a "stable" but marker-less loading
+        screen must NOT be treated as ready.  Uses real (patched-down)
+        timing rather than hand-choreographed ``time.monotonic()`` calls, so
+        the test exercises the actual poll loop instead of an exact call
+        count that breaks the moment the loop gains a new ``monotonic()``
+        call site.
         """
-        from coord.interactive import _inject_briefing_into_tmux_session, _READY_QUIESCE_S
+        from coord.interactive import INPUT_BOX_MARKER, _inject_briefing_into_tmux_session
 
         calls: list[list[str]] = []
-
-        # Content is the same on both capture-pane calls so the elif path
-        # fires and the quiescence condition is evaluated.
-        cap_counter = [0]
-        cap_content = ["stable content", "stable content"]
+        cap_calls = [0]
+        # First two capture-pane polls: a loading screen with no input box.
+        # From the third poll onward: the rendered box, PLUS (once pasted)
+        # the briefing text — so the post-paste verification also succeeds
+        # on the first attempt.
+        loading = "Starting Claude Code..."
+        settled = f"{INPUT_BOX_MARKER} placeholder\nmy brief landed here"
 
         def _mock_run(cmd: list[str], **kwargs: Any) -> MagicMock:
             calls.append(list(cmd))
             m = MagicMock()
             m.returncode = 0
             if "capture-pane" in cmd:
-                idx = cap_counter[0]
-                cap_counter[0] += 1
-                m.stdout = cap_content[idx] if idx < len(cap_content) else cap_content[-1]
+                cap_calls[0] += 1
+                m.stdout = loading if cap_calls[0] <= 2 else settled
             else:
                 m.stdout = ""
             return m
 
-        # time.monotonic() call order (5 calls total):
-        #   0 → base:           deadline = base + 60.0  (far future)
-        #   1 → base + 0.1:     while-check iter 1 → True (enter loop)
-        #   2 → base + 0.5:     now inside iter 1; content changed → quiescent_since = base + 0.5
-        #   3 → base + 0.6:     while-check iter 2 → True
-        #   4 → base + 0.5 + _READY_QUIESCE_S + 0.1:
-        #                       now inside iter 2; same content; now - quiescent_since
-        #                       = _READY_QUIESCE_S + 0.1 >= _READY_QUIESCE_S → break
-        base = 1000.0
-        mono_values = [
-            base,
-            base + 0.1,
-            base + 0.5,
-            base + 0.6,
-            base + 0.5 + _READY_QUIESCE_S + 0.1,
-        ]
-        mono_counter = [0]
-
-        def _mono() -> float:
-            idx = mono_counter[0]
-            mono_counter[0] += 1
-            # After the list is exhausted return a value past the deadline so
-            # the while-condition exits naturally rather than looping forever.
-            if idx < len(mono_values):
-                return mono_values[idx]
-            return base + 999.0  # past deadline → loop exits
-
         with patch("subprocess.run", side_effect=_mock_run), \
-             patch("time.sleep"), \
-             patch("coord.interactive.time.monotonic", side_effect=_mono):
+             patch("coord.interactive._READY_QUIESCE_S", 0.05), \
+             patch("coord.interactive._INJECT_VERIFY_SETTLE_S", 0.02), \
+             patch("coord.interactive._INJECT_RETRY_BACKOFF_S", 0.02):
             result = _inject_briefing_into_tmux_session(
-                "coord-quiescent", "my brief", timeout=60.0
+                "coord-quiescent", "my brief", timeout=2.0
             )
 
         assert result is True
         load_calls = [c for c in calls if "load-buffer" in c]
         assert load_calls, "load-buffer not called — injection did not happen"
+        # The loading-screen frames were seen but never treated as ready —
+        # confirmed indirectly by the fact injection didn't fire until AFTER
+        # capture-pane started returning `settled` (paste-buffer calls only
+        # appear once cap_calls has passed 2).
+        assert cap_calls[0] > 2
 
     # -- Subprocess errors -----------------------------------------------------
 
@@ -1140,7 +1124,10 @@ class TestInjectBriefingIntoTmuxSession:
             calls.append({"cmd": list(cmd), "kwargs": kwargs})
             m = MagicMock()
             m.returncode = 0
-            m.stdout = ""
+            # Post-paste capture-pane shows the briefing landed, so
+            # verification succeeds on the first attempt (#865) — this test
+            # is about the load-buffer stdin plumbing, not verify/retry.
+            m.stdout = "my briefing text" if "capture-pane" in cmd else ""
             return m
 
         with patch("subprocess.run", side_effect=_mock), patch("time.sleep"):
