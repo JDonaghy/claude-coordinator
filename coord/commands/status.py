@@ -535,8 +535,8 @@ def diagnose(
     stage: str | None,
     reset: bool,
     dry_run: bool,
-    orphan_worktrees: bool,
     config_path: Path,
+    orphan_worktrees: bool = False,
 ) -> None:
     """Per-stage doctor — diagnose, best-effort recover, optional reset."""
     # ── #618: --orphan-worktrees fleet sweep ─────────────────────────────────

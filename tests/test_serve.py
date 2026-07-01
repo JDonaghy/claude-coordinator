@@ -1326,6 +1326,43 @@ def test_serve_diagnose_runs_callback_and_captures_output(
     assert os.environ.get("COORD_DIAGNOSE_ON_DAEMON") is None  # restored after
 
 
+def test_serve_diagnose_real_callback_no_orphan_worktrees_crash(
+    file_db: Path, valid_config_path: Path, rw_db, monkeypatch
+):
+    # Regression: POST /diagnose used to raise
+    #   TypeError: diagnose() missing 1 required positional argument: 'orphan_worktrees'
+    # because serve_app.post_diagnose called diagnose_cmd.callback(...) without
+    # passing the orphan_worktrees kwarg.  This test drives the REAL callback
+    # (no monkeypatching of .callback) and should FAIL without the serve_app fix.
+    from coord import client as cc
+    from coord import state as coord_state
+    from coord.diagnose import DiagnoseResult
+    from coord.models import Board
+
+    # Route to local path (COORD_DIAGNOSE_ON_DAEMON guard takes over inside the
+    # endpoint, but resolve_board_service must return None so the callback doesn't
+    # try to route again before the guard is set).
+    monkeypatch.setattr(cc, "resolve_board_service", lambda *a, **k: None)
+    monkeypatch.setattr(coord_state, "build_board", lambda: Board())
+    monkeypatch.setattr(
+        "coord.diagnose.diagnose_stage",
+        lambda *a, **k: DiagnoseResult(
+            repo_name="api", issue_number=42, stage="work", recovered=False
+        ),
+    )
+
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post("/diagnose", json={"repo": "api", "issue": 42})
+
+    assert resp.status_code == 200
+    out = resp.json()
+    assert out["exit_code"] == 0, f"expected exit_code=0, got: {out}"
+    assert out["error"] is None, f"expected no error, got: {out['error']}"
+    assert "missing" not in (out["error"] or "")
+    assert "positional argument" not in (out["error"] or "")
+
+
 def test_serve_diagnose_relays_nonzero_exit(
     file_db: Path, valid_config_path: Path, rw_db, monkeypatch
 ):
