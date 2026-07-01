@@ -123,6 +123,33 @@ _PTY_RESULT_LINE_MARKER = b"# pty: worker exited"
 _PTY_READY_QUIESCE_S = 0.8
 _PTY_READY_QUIESCE_CAP_S = 8.0
 
+# #865: requiring INPUT_BOX_MARKER_BYTES is a STRONGER signal than bare
+# quiescence, but making it a hard requirement for the fast quiescence exit
+# would regress the case where the render never emits a recognisable marker
+# at all (an older CLI, an unusual terminal, or — as caught by the test
+# suite — a worker that exits before drawing anything): without this
+# fallback that case spins for the FULL _PTY_READY_QUIESCE_CAP_S instead of
+# exiting once the (marker-less) screen has simply gone quiet.  So: exit on
+# quiescence alone after the longer _PTY_READY_QUIESCE_NO_MARKER_S window if
+# the marker still hasn't shown up by then; exit sooner, after the shorter
+# _PTY_READY_QUIESCE_S, once it has.  The overall cap remains the ultimate
+# backstop either way.
+_PTY_READY_QUIESCE_NO_MARKER_S = 1.6
+
+# #865: the pre-#865 pre-fill was fire-and-forget — a single ``os.write`` with
+# no verification that the briefing actually landed, which a mid-startup
+# repaint (promo banner, MCP/auth notice) could silently discard.  After
+# pasting we re-read the log tail (the pump thread is already writing PTY
+# master output there) and check for a fingerprint of the briefing, retrying
+# up to _PTY_INJECT_MAX_ATTEMPTS times with a short backoff.  Mirrors the
+# tmux-path constants in ``coord.interactive`` (``_INJECT_MAX_ATTEMPTS`` /
+# ``_INJECT_VERIFY_SETTLE_S`` / ``_INJECT_RETRY_BACKOFF_S``) — kept as a
+# separate copy here rather than a shared import to dodge the
+# coord.agent <-> coord.interactive import cycle both modules already avoid.
+_PTY_INJECT_MAX_ATTEMPTS = 3
+_PTY_INJECT_VERIFY_SETTLE_S = 0.5
+_PTY_INJECT_RETRY_BACKOFF_S = 0.4
+
 # First-output (TTFT) watchdog default and the distinct exit code used when it
 # fires, so `_reap` records the assignment as FAILED (any non-zero exit) and the
 # `concurrency.auto_reassign` path re-dispatches it. See #299 and the upstream
@@ -2828,6 +2855,9 @@ class AgentServer:
         # pre-fill is a nuisance rather than a correctness problem.
         from coord.providers.claude_pty import (  # noqa: PLC0415
             BRACKETED_PASTE_ENABLE,
+            INPUT_BOX_MARKER_BYTES,
+            briefing_fingerprint,
+            fingerprint_in_bytes,
         )
 
         initial_input = provider.initial_input(spec)
@@ -2842,33 +2872,85 @@ class AgentServer:
                 except OSError:
                     pass
                 time.sleep(0.05)
-            # (2) wait for the init render to go quiet before pasting.
+            # (2) wait for the *input box* to render AND the init render to
+            # go quiet before pasting (#865).  Bare quiescence let an async
+            # startup banner ("Fable 5 is back", MCP-auth notices) that goes
+            # briefly static mid-paint pass for "ready" — requiring
+            # INPUT_BOX_MARKER_BYTES too means we only call it ready once
+            # the actual prompt box has been drawn.  If the marker never
+            # appears (older CLI, unusual render) the cap below still
+            # fires, so this degrades to the pre-#865 behaviour rather than
+            # hanging.
             quiet_cap = time.monotonic() + _PTY_READY_QUIESCE_CAP_S
             last_size = -1
             last_change = time.monotonic()
             while time.monotonic() < quiet_cap:
                 try:
-                    size = os.path.getsize(log_path)
+                    with open(log_path, "rb") as _rf:
+                        _tail = _rf.read()
                 except OSError:
-                    size = last_size
+                    _tail = b""
+                size = len(_tail)
+                marker_seen = INPUT_BOX_MARKER_BYTES in _tail
                 if size != last_size:
                     last_size = size
                     last_change = time.monotonic()
-                elif time.monotonic() - last_change >= _PTY_READY_QUIESCE_S:
-                    break
+                else:
+                    quiet_for = time.monotonic() - last_change
+                    threshold = (
+                        _PTY_READY_QUIESCE_S
+                        if marker_seen
+                        else _PTY_READY_QUIESCE_NO_MARKER_S
+                    )
+                    if quiet_for >= threshold:
+                        break
                 time.sleep(0.05)
-            try:
-                # (3) PRE-FILL ONLY.  The bracketed-paste block populates the
-                # TUI's input box; the operator presses Enter to submit.  #437
-                # explicitly does NOT write a trailing carriage return — that
-                # is the structural change that makes this path human-attended
-                # rather than agentic.  No content-based completion detection
-                # follows; no scraper inspects the TTY for sentinels; the
-                # session terminates when the human exits ``claude``.
-                os.write(master_fd, initial_input)
-            except OSError as e:
+
+            # (3) PRE-FILL, THEN VERIFY — retry on a miss (#865: fire-and-
+            # forget with no verification at all was the root defect that
+            # let the ~30% drop-rate through).  Each attempt writes the
+            # bracketed-paste block (populates the TUI's input box; the
+            # operator presses Enter to submit — #437 explicitly does NOT
+            # write a trailing carriage return, the structural change that
+            # makes this path human-attended rather than agentic), then
+            # re-reads the log tail the pump thread is already writing and
+            # checks for a fingerprint of the briefing.  No content-based
+            # completion detection follows; no scraper inspects the TTY for
+            # sentinels; the session terminates when the human exits
+            # ``claude``.
+            fingerprint = briefing_fingerprint(spec.briefing)
+            landed = False
+            write_failed = False
+            for _attempt in range(1, _PTY_INJECT_MAX_ATTEMPTS + 1):
                 try:
-                    log_fh.write(f"\n# pty: failed to pre-fill briefing: {e}\n")
+                    os.write(master_fd, initial_input)
+                except OSError as e:
+                    write_failed = True
+                    try:
+                        log_fh.write(f"\n# pty: failed to pre-fill briefing: {e}\n")
+                        log_fh.flush()
+                    except OSError:
+                        pass
+                    break
+                time.sleep(_PTY_INJECT_VERIFY_SETTLE_S)
+                try:
+                    with open(log_path, "rb") as _rf:
+                        _tail = _rf.read()
+                except OSError:
+                    _tail = b""
+                if fingerprint_in_bytes(_tail, fingerprint):
+                    landed = True
+                    break
+                if _attempt < _PTY_INJECT_MAX_ATTEMPTS:
+                    time.sleep(_PTY_INJECT_RETRY_BACKOFF_S)
+
+            if not landed and not write_failed and fingerprint:
+                try:
+                    log_fh.write(
+                        f"\n# pty: briefing injection unverified after "
+                        f"{_PTY_INJECT_MAX_ATTEMPTS} attempt(s) — the "
+                        f"briefing may not have landed in the input box\n"
+                    )
                     log_fh.flush()
                 except OSError:
                     pass

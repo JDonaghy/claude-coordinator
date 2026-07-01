@@ -717,3 +717,126 @@ def test_pty_assign_returns_immediately_without_blocking_on_readiness(
     # Wait for the worker to actually finish before tearing down.
     server.wait_for(record.id, timeout=15.0)
     server.shutdown()
+
+
+# ── #865: banner-interrupted startup + paste-verify-retry (black-box) ────────
+
+# Mock ``claude`` mimicking the #865 live capture: emits the bracketed-paste
+# enable DECSET and the rendered input box (INPUT_BOX_MARKER) immediately,
+# then — after the box is already up — an ASYNC banner/notification line
+# arrives a few hundred ms later (the "Fable 5 is back" / MCP-auth-notice
+# behaviour described in #865).  ``tty.setraw`` disables the pty's kernel
+# line-echo so the only bytes that reach the log are ones this script
+# explicitly writes — matching a real TUI, which renders everything itself
+# rather than relying on line-discipline echo.
+#
+# The script then reads the pre-fill off stdin TWICE: the first receipt is
+# deliberately DISCARDED (never echoed) to simulate a paste that lands
+# mid-repaint and gets silently dropped — the pre-#865 failure mode. Only
+# the second receipt is echoed back (``got=...``). This proves the paste
+# was VERIFIED as missing and RETRIED — the core #865 fix — rather than the
+# briefing simply vanishing.
+_BANNER_INTERRUPT_PTY_MOCK = (
+    "import sys, os, select, time, tty\n"
+    "tty.setraw(0)\n"
+    "sys.stdout.write('\\x1b[?2004h')\n"
+    "sys.stdout.write('\\u276f placeholder\\n')\n"  # INPUT_BOX_MARKER rendered
+    "sys.stdout.flush()\n"
+    "time.sleep(0.3)\n"
+    # Async startup content arriving AFTER the input box already rendered —
+    # the #865 scenario.  This changes the log's size, so a purely
+    # size-based quiescence check (pre- and post-#865) correctly keeps
+    # waiting past it rather than pasting into the mid-repaint window.
+    "sys.stdout.write('late banner notice\\n')\n"
+    "sys.stdout.flush()\n"
+    # tlen is hardcoded (NOT computed from the literal briefing text) so the
+    # briefing's fingerprint ("ECHO_ME") never appears anywhere in this
+    # script's OWN source — which is itself logged verbatim in the
+    # assignment log's ``argv=...`` header line.  If it appeared there, the
+    # production fingerprint check would find a false match against the
+    # header and report "landed" before any real paste happened, defeating
+    # the whole point of this fixture.  19 = len(ESC[200~) + len('ECHO_ME')
+    # + len(ESC[201~) = 6 + 7 + 6.
+    "tlen = 19\n"
+    "def _read_chunk(deadline):\n"
+    "    buf = b''\n"
+    "    while len(buf) < tlen and time.monotonic() < deadline:\n"
+    "        r, _, _ = select.select([0], [], [], 0.05)\n"
+    "        if r:\n"
+    "            chunk = os.read(0, tlen - len(buf))\n"
+    "            if not chunk:\n"
+    "                break\n"
+    "            buf += chunk\n"
+    "    return buf\n"
+    "first = _read_chunk(time.monotonic() + 4.0)\n"
+    "sys.stdout.write('DISCARDED first_len=' + str(len(first)) + '\\n')\n"
+    "sys.stdout.flush()\n"
+    "second = _read_chunk(time.monotonic() + 4.0)\n"
+    "sys.stdout.write('got=' + second.decode('utf-8', errors='replace') + '\\n')\n"
+    "sys.stdout.flush()\n"
+)
+
+
+class _BannerInterruptPtyProvider(ClaudePtyProvider):
+    """Mock ``claude`` that renders the input box, THEN an async banner
+    arrives, THEN silently drops the first pre-fill attempt before finally
+    accepting the second (see :data:`_BANNER_INTERRUPT_PTY_MOCK`)."""
+
+    def build_command(
+        self,
+        spec: AssignmentSpec,
+        *,
+        resolved_model=None,
+        system_prompt=None,
+        allowed_tools=None,
+        permission_mode="acceptEdits",
+    ) -> list[str]:
+        return [sys.executable, "-c", _BANNER_INTERRUPT_PTY_MOCK]
+
+
+def test_pty_spawn_retries_after_banner_interrupted_dropped_paste(
+    tmp_path: Path,
+) -> None:
+    """#865 black-box fixture: a delayed startup banner arrives after the
+    input box renders, and the FIRST pre-fill attempt is silently dropped —
+    the briefing must still end up verified in the input box via retry.
+
+    This is the acceptance-criterion fixture from #865: "a fixture that
+    feeds a delayed/banner-interrupted startup render ... and asserts the
+    briefing still ends up in the input box (and that a paste-miss triggers
+    a retry)."  Uses a REAL pty + REAL subprocess (no mocked ``os.write`` /
+    ``subprocess.run``) — genuinely black-box against the agent's spawn path.
+    """
+    repo = _init_repo(tmp_path / "repo")
+    server = AgentServer(
+        machine_name="test",
+        capabilities=["python"],
+        repos=["myrepo"],
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: ["/bin/sh", "-c", "echo unused"],
+        repo_paths={"myrepo": str(repo)},
+        providers={"claude-pty": _BannerInterruptPtyProvider()},
+    )
+    spec = _make_spec(
+        repo_name="myrepo",
+        repo_path=str(repo),
+        type="plan",
+        provider="claude-pty",
+        briefing="ECHO_ME",
+    )
+    record = server.assign(spec)
+    final = server.wait_for(record.id, timeout=20.0)
+    log = Path(final.log_path).read_text(errors="replace")
+
+    # The banner arrived and was captured (proves the pump ran through the
+    # async-content window rather than pasting blind before it).
+    assert "late banner notice" in log, f"banner line missing from log: {log!r}"
+    # The first pre-fill attempt was received by the mock and discarded —
+    # proves a real write reached the child before the eventual success.
+    assert "DISCARDED" in log, f"first (dropped) attempt never arrived: {log!r}"
+    # And verification caught the miss and retried: the SECOND attempt was
+    # echoed back containing the briefing body.
+    assert any("got=" in ln and "ECHO_ME" in ln for ln in log.splitlines()), (
+        f"briefing never landed after retry: {log!r}"
+    )
+    server.shutdown()

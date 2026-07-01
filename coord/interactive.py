@@ -13,10 +13,15 @@ the operator's local TTY via one of two strategies:
 * The parent relays bytes between the operator's TTY and the master fd
   (raw-mode stdin → master, master → stdout), so the human drives the
   session as if they had typed ``claude`` themselves.
-* Once the TUI emits the bracketed-paste-enable DECSET (``ESC[?2004h``)
-  AND its initial render has gone quiet, the briefing is PRE-FILLED into
-  the input box as a single bracketed paste — NO trailing carriage
-  return.  The operator presses Enter to submit.
+* Once the TUI emits the bracketed-paste-enable DECSET (``ESC[?2004h``),
+  the rendered input box (:data:`~coord.providers.claude_pty.INPUT_BOX_MARKER`)
+  has appeared, AND the render has gone quiet, the briefing is PRE-FILLED
+  into the input box as a single bracketed paste — NO trailing carriage
+  return.  The operator presses Enter to submit.  The paste is then
+  **verified** (re-observing the master output for a fingerprint of the
+  briefing) and **retried** on a miss (#865: a mistimed paste — e.g. one
+  that races an async startup banner like "Fable 5 is back" — used to be
+  silently dropped with no way to tell).  See :class:`_PrefillState`.
 * Window-size changes (SIGWINCH) are forwarded to the child via
   ``TIOCSWINSZ`` so the TUI re-flows correctly when the operator
   resizes their terminal.
@@ -27,8 +32,9 @@ provided — #487)**
 * A named tmux session ``coord-<assignment_id>`` is created (or reused).
 * ``claude`` runs directly inside the tmux session; tmux provides the pty.
 * The briefing is injected via :func:`_inject_briefing_into_tmux_session`:
-  a quiescence-based poll on the pane output followed by
-  ``tmux paste-buffer -p`` (bracketed-paste mode).
+  a marker+quiescence-anchored poll on the pane output, then
+  ``tmux paste-buffer -p`` (bracketed-paste mode), then a re-``capture-pane``
+  verification with retry on a miss — same #865 rationale as the PTY path.
 * The operator's terminal ATTACHES to the tmux session
   (``tmux attach-session -t coord-<aid>``); if the TUI crashes the
   attachment disconnects but **the tmux session and claude keep running**.
@@ -93,6 +99,11 @@ from coord.providers.claude_pty import (
     BRACKETED_PASTE_ENABLE,
     BRACKETED_PASTE_END,
     BRACKETED_PASTE_START,
+    INPUT_BOX_MARKER,
+    INPUT_BOX_MARKER_BYTES,
+    briefing_fingerprint,
+    fingerprint_in_bytes,
+    fingerprint_in_text,
 )
 
 __all__ = [
@@ -363,21 +374,37 @@ def _inject_briefing_into_tmux_session(
     timeout: float = 12.0,
     host: TmuxHost = TmuxHost(None),
 ) -> bool:
-    """Wait for the tmux pane to stabilise then inject *briefing* via bracketed paste.
+    """Wait for the tmux pane to stabilise, inject *briefing*, then VERIFY it landed.
 
-    The injection strategy mirrors the PTY-relay path:
+    #865 fix: quiescence alone can't tell "static startup banner" from "input
+    box settled" — Claude Code's TUI paints async startup content (promo
+    banners, MCP/auth notices) over several seconds, and a paste that lands
+    mid-repaint used to be silently dropped.  The injection is now two
+    phases:
 
-    1. Poll ``tmux capture-pane -p`` every 50 ms.
-    2. Once the pane has been non-empty AND stable for
-       :data:`_READY_QUIESCE_S` seconds (or the overall *timeout* lapses),
-       load the briefing text into a tmux named buffer (``coord-brief``)
-       via **stdin** (``tmux load-buffer -b coord-brief -``) and invoke
-       ``tmux paste-buffer -p``.
-    3. The ``-p`` flag makes tmux send the content wrapped in bracketed-paste
-       markers (``ESC[200~`` … ``ESC[201~``) **if** the target application
-       has requested bracketed-paste mode.  Since ``claude``'s TUI always
-       enables bracketed paste, this is equivalent to the PTY relay's
-       manual bracketed-paste block.
+    1. **Readiness wait** — poll ``tmux capture-pane -p`` every 50 ms until
+       the pane both contains :data:`~coord.providers.claude_pty.INPUT_BOX_MARKER`
+       (the rendered input box, not just any static content) AND has been
+       unchanged for :data:`_READY_QUIESCE_S` seconds, or *timeout* lapses
+       (degraded fallback: proceed anyway rather than hang forever on an
+       unrecognised render).
+    2. **Paste + verify + retry** — load the briefing into a tmux named
+       buffer (``coord-brief``) via stdin and ``paste-buffer -p`` (bracketed
+       paste), then re-capture the pane and check whether a fingerprint of
+       the briefing (see :func:`~coord.providers.claude_pty.briefing_fingerprint`)
+       actually rendered.  Retries up to :data:`_INJECT_MAX_ATTEMPTS` times
+       with a short backoff between attempts.  If the pane can't be
+       captured at all (tmux/session gone), verification is impossible and
+       the single paste already issued is treated as best-effort success —
+       there's nothing more to learn by retrying blind.  If every
+       observable attempt misses, a hard failure is logged (never silent)
+       and ``False`` is returned.
+
+    The ``-p`` flag makes tmux send the content wrapped in bracketed-paste
+    markers (``ESC[200~`` … ``ESC[201~``) **if** the target application has
+    requested bracketed-paste mode.  Since ``claude``'s TUI always enables
+    bracketed paste, this is equivalent to the PTY relay's manual
+    bracketed-paste block.
 
     The stdin-based ``load-buffer -`` approach avoids creating a local
     temporary file, which is important for the remote-host path (#486b):
@@ -386,47 +413,38 @@ def _inject_briefing_into_tmux_session(
     Args:
         session_name: The tmux session to inject into.
         briefing: Text to pre-fill in the TUI input box.
-        timeout: Quiescence-wait deadline in seconds.
+        timeout: Readiness-wait deadline in seconds.  The paste+verify+retry
+            phase spends additional (bounded) time beyond this.
         host: Target host.  Defaults to ``TmuxHost(None)`` (local).
 
     Returns:
-        ``True`` when the briefing was injected, ``False`` on timeout
-        or subprocess error.
+        ``True`` when the briefing was injected (verified, or verification
+        was impossible and the paste was issued).  ``False`` when every
+        verifiable attempt confirmed the briefing did NOT land.
     """
     if not briefing.strip():
         return True  # nothing to inject — trivially OK
 
-    try:
-        deadline = time.monotonic() + timeout
-        prev_content: str | None = None
-        quiescent_since: float | None = None
+    fingerprint = briefing_fingerprint(briefing)
 
-        while time.monotonic() < deadline:
-            time.sleep(0.05)
-            try:
-                cap = subprocess.run(
-                    host.cmd(["capture-pane", "-p", "-t", session_name]),
-                    capture_output=True,
-                    text=True,
-                    timeout=2.0,
-                )
-            except (subprocess.SubprocessError, OSError):
-                break
-            if cap.returncode != 0:
-                break  # session gone
+    def _capture() -> str | None:
+        try:
+            cap = subprocess.run(
+                host.cmd(["capture-pane", "-p", "-t", session_name]),
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+            )
+        except (subprocess.SubprocessError, OSError):
+            return None
+        if cap.returncode != 0:
+            return None
+        return cap.stdout
 
-            content = cap.stdout
-            now = time.monotonic()
-            if content != prev_content:
-                prev_content = content
-                quiescent_since = now if content.strip() else None
-            elif content.strip() and quiescent_since is not None:
-                if now - quiescent_since >= _READY_QUIESCE_S:
-                    break  # stable and non-empty — inject
-
-        # Load briefing into a named tmux buffer via stdin.
-        # Using "-" as the source tells tmux to read from stdin, which
-        # works for both local and remote hosts without temporary files.
+    def _paste_once() -> None:
+        # Load briefing into a named tmux buffer via stdin.  Using "-" as
+        # the source tells tmux to read from stdin, which works for both
+        # local and remote hosts without temporary files.
         subprocess.run(
             host.cmd(["load-buffer", "-b", "coord-brief", "-"]),
             input=briefing.rstrip("\n"),
@@ -440,7 +458,63 @@ def _inject_briefing_into_tmux_session(
             capture_output=True,
             timeout=5.0,
         )
-        return True
+
+    try:
+        # ── Phase 1: wait for the input box to render AND settle ───────────
+        deadline = time.monotonic() + timeout
+        prev_content: str | None = None
+        quiescent_since: float | None = None
+
+        while time.monotonic() < deadline:
+            time.sleep(0.05)
+            content = _capture()
+            if content is None:
+                break  # session/tmux gone — degrade to a blind paste below
+
+            now = time.monotonic()
+            stable = bool(content.strip())
+            if content != prev_content:
+                prev_content = content
+                quiescent_since = now if stable else None
+            elif stable and quiescent_since is not None:
+                # A recognised input box needs less settle time to trust —
+                # we've seen the actual prompt render, not just SOME static
+                # content.  When the marker never shows (older CLI, unusual
+                # render, or a session that died before drawing anything),
+                # fall back to a longer quiescence window rather than
+                # spinning for the full ``timeout`` (#865).
+                quiet_for = now - quiescent_since
+                threshold = (
+                    _READY_QUIESCE_S
+                    if INPUT_BOX_MARKER in content
+                    else _READY_QUIESCE_NO_MARKER_S
+                )
+                if quiet_for >= threshold:
+                    break  # settled — inject
+
+        # ── Phase 2: paste, verify, retry on a miss (#865) ─────────────────
+        for attempt in range(1, _INJECT_MAX_ATTEMPTS + 1):
+            _paste_once()
+            time.sleep(_INJECT_VERIFY_SETTLE_S)
+            content = _capture()
+            if content is None:
+                # Can't observe the pane — nothing more to learn from a
+                # retry.  The paste itself was issued; treat as best-effort
+                # success (matches pre-#865 behaviour when tmux is broken).
+                return True
+            if fingerprint_in_text(content, fingerprint):
+                return True
+            if attempt < _INJECT_MAX_ATTEMPTS:
+                time.sleep(_INJECT_RETRY_BACKOFF_S)
+
+        logging.error(
+            "briefing injection unverified after %d attempt(s) for tmux "
+            "session %r — the briefing may not have landed in the input "
+            "box; the operator should check and paste manually",
+            _INJECT_MAX_ATTEMPTS,
+            session_name,
+        )
+        return False
     except (subprocess.SubprocessError, OSError):
         return False
 
@@ -624,6 +698,156 @@ def _launch_via_tmux(
 _READY_QUIESCE_S = 0.8
 _READY_QUIESCE_CAP_S = 8.0
 
+# #865: requiring INPUT_BOX_MARKER is a STRONGER readiness signal than bare
+# quiescence (it means we've actually seen the rendered prompt, not just
+# some static content — a promo banner mid-paint, say), but making it a hard
+# requirement for the fast quiescence exit would regress the case where the
+# render never emits a recognisable marker at all (older CLI, unusual
+# terminal, or a session that exits before drawing anything — caught by the
+# test suite).  So: exit fast (after _READY_QUIESCE_S) once the marker has
+# been seen; fall back to this longer window when it hasn't, rather than
+# spinning all the way to the outer cap/timeout.
+_READY_QUIESCE_NO_MARKER_S = 1.6
+
+# #865: paste-verify-retry constants shared by the tmux path
+# (:func:`_inject_briefing_into_tmux_session`) and the PTY relay path
+# (:func:`_launch_via_pty`'s prefill state machine).  A miss re-pastes after
+# a short backoff rather than silently giving up — this is the core #865
+# fix, since fire-and-forget (no verification at all) was the root defect.
+_INJECT_MAX_ATTEMPTS = 3
+_INJECT_VERIFY_SETTLE_S = 0.5
+_INJECT_RETRY_BACKOFF_S = 0.4
+
+#: Cap on the in-memory copy of recent master-fd output the PTY relay keeps
+#: for readiness/verification (#865).  ~32KB comfortably holds a full TUI
+#: frame plus ANSI escapes; older bytes are dropped so a long-lived session
+#: doesn't grow this unbounded.
+_PREFILL_SCREEN_BUF_CAP = 32768
+
+
+@dataclass
+class _PrefillState:
+    """Pure state for the PTY relay's pre-fill-then-verify state machine (#865).
+
+    Deliberately free of any I/O — :func:`_prefill_on_master_data` folds
+    observed master-fd bytes in, :func:`_prefill_step` decides (given the
+    current time) whether :func:`_launch_via_pty` should write
+    ``paste_block`` to the master fd right now.  Splitting the decision out
+    as pure functions means the readiness+verify+retry logic can be unit
+    tested without a real pty, and keeps the relay's ``select()`` loop
+    (which must stay non-blocking — it's also servicing the operator's
+    keystrokes and the child's live output) free of any ``time.sleep()``.
+
+    Attributes:
+        fingerprint: The whitespace-normalized briefing snippet (see
+            :func:`~coord.providers.claude_pty.briefing_fingerprint`) used to
+            confirm a paste landed.
+        started: ``time.monotonic()`` when the relay loop began — anchors
+            the overall degraded-fallback cap.
+        last_master_activity: ``time.monotonic()`` of the most recent
+            master-fd read — anchors the pre-paste quiescence check.
+        done: ``True`` once the state machine has either verified success or
+            exhausted its retry budget — the caller stops driving it.
+        seen_enable: Whether the bracketed-paste-enable DECSET has been
+            observed in the master output yet.
+        screen_buf: Rolling tail of recent master-fd bytes (capped at
+            :data:`_PREFILL_SCREEN_BUF_CAP`), used both to look for
+            :data:`~coord.providers.claude_pty.INPUT_BOX_MARKER_BYTES`
+            (readiness) and the fingerprint (post-paste verification).
+        paste_attempts: How many times the paste has been written so far.
+        next_paste_at: ``time.monotonic()`` deadline for the next paste
+            attempt when a retry is pending; ``None`` otherwise.
+        verify_deadline: ``time.monotonic()`` deadline to check for the
+            fingerprint after the most recent paste; ``None`` when not
+            currently waiting on a verification window.
+    """
+
+    fingerprint: str
+    started: float
+    last_master_activity: float
+    done: bool = False
+    seen_enable: bool = False
+    screen_buf: bytearray = field(default_factory=bytearray)
+    paste_attempts: int = 0
+    next_paste_at: float | None = None
+    verify_deadline: float | None = None
+
+
+def _prefill_on_master_data(state: _PrefillState, data: bytes, now: float) -> None:
+    """Fold newly-observed master-fd *data* into *state*.
+
+    Call this for every chunk read from the master fd, BEFORE the next
+    :func:`_prefill_step` call, while ``state.done`` is still ``False``.
+    """
+    if state.done:
+        return
+    state.screen_buf.extend(data)
+    overflow = len(state.screen_buf) - _PREFILL_SCREEN_BUF_CAP
+    if overflow > 0:
+        del state.screen_buf[:overflow]
+    if not state.seen_enable and BRACKETED_PASTE_ENABLE in data:
+        state.seen_enable = True
+    state.last_master_activity = now
+
+
+def _prefill_step(state: _PrefillState, now: float) -> bool:
+    """Advance the pre-fill state machine one tick.
+
+    Returns ``True`` exactly when the caller should write the bracketed-paste
+    block to the master fd right now (once for the initial attempt, again
+    for each retry).  Mutates *state* in place; check ``state.done`` after
+    calling to know whether the machine has finished (verified success, or
+    exhausted its retry budget — see :data:`_INJECT_MAX_ATTEMPTS`).
+    """
+    if state.done:
+        return False
+
+    if state.verify_deadline is not None:
+        if now < state.verify_deadline:
+            return False
+        # Verification window elapsed — did the fingerprint land?
+        if fingerprint_in_bytes(bytes(state.screen_buf), state.fingerprint):
+            state.done = True
+        elif state.paste_attempts >= _INJECT_MAX_ATTEMPTS:
+            state.done = True
+            logging.error(
+                "briefing pre-fill unverified after %d attempt(s) in the "
+                "PTY relay session — the briefing may not have landed in "
+                "the input box; the operator should check and paste "
+                "manually",
+                state.paste_attempts,
+            )
+        else:
+            state.next_paste_at = now + _INJECT_RETRY_BACKOFF_S
+        state.verify_deadline = None
+        return False
+
+    if state.next_paste_at is not None:
+        if now < state.next_paste_at:
+            return False
+        state.next_paste_at = None
+        state.paste_attempts += 1
+        state.verify_deadline = now + _INJECT_VERIFY_SETTLE_S
+        return True
+
+    # No attempt in flight yet — wait for bracketed-paste-enable AND render
+    # quiescence.  A recognised input box (INPUT_BOX_MARKER) needs only the
+    # short _READY_QUIESCE_S settle window; without it (older CLI, unusual
+    # render, or a session that never draws anything — see the two-tier
+    # rationale on _READY_QUIESCE_NO_MARKER_S above) fall back to the longer
+    # window instead of spinning all the way to the overall cap (degraded
+    # fallback — paste anyway rather than hang forever).
+    quiet_for = now - state.last_master_activity
+    marker_seen = INPUT_BOX_MARKER_BYTES in bytes(state.screen_buf)
+    threshold = _READY_QUIESCE_S if marker_seen else _READY_QUIESCE_NO_MARKER_S
+    ready_quiet = state.seen_enable and quiet_for >= threshold
+    ready_cap = now - state.started >= _READY_QUIESCE_CAP_S
+    if ready_quiet or ready_cap:
+        state.paste_attempts += 1
+        state.verify_deadline = now + _INJECT_VERIFY_SETTLE_S
+        return True
+    return False
+
 
 def launch_human_attended_interactive(
     argv: Sequence[str],
@@ -790,10 +1014,16 @@ def _launch_via_pty(
             + BRACKETED_PASTE_END
         )
 
-    seen_enable = False
     prefilled = not bool(paste_block)
     started = time.monotonic()
-    last_master_activity = started
+    # #865: pure paste/verify/retry state machine — see _PrefillState.  Only
+    # constructed when there's actually a briefing to pre-fill; when
+    # ``prefilled`` starts ``True`` (empty briefing) it's never touched.
+    prefill_state = _PrefillState(
+        fingerprint=briefing_fingerprint(briefing) if paste_block else "",
+        started=started,
+        last_master_activity=started,
+    )
     # Capture the raw wait-status from the WNOHANG poll so that if the
     # child is already reaped when we reach the post-loop waitpid we can
     # still extract the correct exit code (see ChildProcessError handler
@@ -830,25 +1060,18 @@ def _launch_via_pty(
                 except OSError:
                     break
                 if not prefilled:
-                    if not seen_enable and BRACKETED_PASTE_ENABLE in data:
-                        seen_enable = True
-                    last_master_activity = time.monotonic()
+                    _prefill_on_master_data(prefill_state, data, time.monotonic())
 
             if not prefilled:
-                now = time.monotonic()
-                # Pre-fill once: bracketed-paste-enable seen AND render
-                # quiescent for _READY_QUIESCE_S, OR the overall cap
-                # has elapsed (degraded fallback — paste anyway).
-                ready_quiet = (
-                    seen_enable and now - last_master_activity >= _READY_QUIESCE_S
-                )
-                ready_cap = now - started >= _READY_QUIESCE_CAP_S
-                if ready_quiet or ready_cap:
+                # #865: readiness-anchored paste, verified and retried by
+                # _prefill_step — a mistimed/lost paste is no longer
+                # fire-and-forget.
+                if _prefill_step(prefill_state, time.monotonic()):
                     try:
                         os.write(master_fd, paste_block)
                     except OSError:
                         pass
-                    prefilled = True
+                prefilled = prefill_state.done
 
             # Poll child status without blocking.
             try:
