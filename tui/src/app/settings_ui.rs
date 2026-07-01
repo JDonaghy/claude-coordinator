@@ -679,6 +679,12 @@ impl CoordApp {
                         // can diagnose connection issues without grepping
                         // agent journalctl. Capped to one line in the panel.
                         sse.lines.push(format!("[sse error] {}", err_msg));
+                        // #852: keep `lines` and `line_times` the same length.
+                        // Every other push site pairs them; missing the pair
+                        // here desynced the two vecs, and the incremental
+                        // log-cache render then sliced `line_times[old_count..]`
+                        // out of range and crashed the whole TUI.
+                        sse.line_times.push(Instant::now());
                         // Connection failure. Update the failure window.
                         sse.fail_count += 1;
                         match sse.first_fail_at {

@@ -8604,6 +8604,104 @@
         app.watch_focused = Some(aid);
     }
 
+    /// #852 (root cause): an SSE stream error must keep `lines` and
+    /// `line_times` the same length.  The error arm used to push the
+    /// `[sse error]` line to `lines` only, desyncing the two vectors — which
+    /// later made the incremental log-cache render slice `line_times` out of
+    /// range and crash the whole TUI.
+    #[test]
+    fn drain_sse_watch_error_keeps_lines_and_times_in_lockstep() {
+        let mut app = make_app_default();
+        let (state, tx) = make_sse_state_pair();
+        install_watch_ctx(&mut app, state);
+        // Empty host so the post-error reconnect path does not spawn a real
+        // SSE watch thread during the test.
+        app.watch_pool.get_mut(TEST_AID).unwrap().sse.host.clear();
+
+        tx.send(SseWatchMsg::Lines {
+            last_id: 1,
+            text: "line one\n".to_string(),
+        })
+        .unwrap();
+        app.drain_sse_watch();
+        tx.send(SseWatchMsg::Error("connection reset".to_string()))
+            .unwrap();
+        app.drain_sse_watch();
+
+        let sse = &app.watch_pool[TEST_AID].sse;
+        assert!(
+            sse.lines.iter().any(|l| l.contains("[sse error]")),
+            "the stream error should be surfaced as a log line: {:?}",
+            sse.lines
+        );
+        assert_eq!(
+            sse.lines.len(),
+            sse.line_times.len(),
+            "#852: lines and line_times must stay the same length after an \
+             SSE error (lines={:?}, line_times.len()={})",
+            sse.lines,
+            sse.line_times.len()
+        );
+    }
+
+    /// #852 (render defense): the log renderer must never index-panic on a
+    /// `lines`/`line_times` length mismatch.  Reproduces the exact crash —
+    /// cached `line_count=1`, `lines.len()=2`, `line_times.len()=0`, so the
+    /// `CanExtend` path slices `line_times[1..]` on a length-0 vec.  Pre-fix
+    /// this panicked ("range start index 1 out of range for slice of length
+    /// 0") on the unguarded render path and took down the TUI.
+    #[test]
+    fn pipeline_log_list_survives_lines_line_times_desync() {
+        let assignments = vec![{
+            let mut a = make_assignment_typed("running", 42, "api", Some("work"));
+            a.id = TEST_AID.to_string();
+            a
+        }];
+        let mut app = make_app_with_assignments(assignments);
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 42,
+            title: "Test issue".to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: false,
+        }];
+        app.rebuild_pipeline_sidebar(None);
+        app.pipeline_sel = Some(0);
+
+        let (sse, _tx) = make_sse_state_pair();
+        install_watch_ctx(&mut app, sse);
+
+        // Seed a desynced state: one real assistant line, but NO line_times
+        // (mirrors the pre-fix `[sse error]` push that skipped line_times).
+        {
+            let sse = &mut app.watch_pool.get_mut(TEST_AID).unwrap().sse;
+            sse.lines.push(
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]}}"#
+                    .to_string(),
+            );
+            // line_times intentionally left empty.
+        }
+        // First call primes the cache (FullBuild, line_count = 1).
+        let _ = app.pipeline_log_list();
+
+        // Grow `lines` again with still-empty `line_times` → CanExtend(1) will
+        // slice line_times[1..] on a length-0 vec.
+        {
+            let sse = &mut app.watch_pool.get_mut(TEST_AID).unwrap().sse;
+            sse.lines.push("[sse error] connection reset".to_string());
+        }
+
+        // Must render cleanly instead of panicking.
+        let view = app.pipeline_log_list();
+        assert!(
+            !view.items.is_empty(),
+            "log list should still render items despite the lines/line_times desync"
+        );
+    }
+
     #[test]
     fn drain_sse_watch_accumulates_lines() {
         let mut app = make_app_default();
