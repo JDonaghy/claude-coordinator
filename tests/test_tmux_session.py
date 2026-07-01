@@ -476,3 +476,86 @@ class TestLaunchTmuxPathSelection:
             )
 
         assert not wrote_echo, "no echo should happen for whitespace-only briefing"
+
+
+# ── _launch_via_tmux — unverified injection is surfaced to the operator (#865) ──
+
+
+class TestLaunchViaTmuxUnverifiedInjectionSurfaced:
+    """Review follow-up on #865: the tmux path used to discard the bool
+    return value of ``_inject_briefing_into_tmux_session`` — a hard failure
+    (verify+retry exhausted) only produced a ``logging.error`` call, which
+    (no ``logging.basicConfig`` anywhere in the repo) is invisible before
+    the very next statement switches the terminal to the tmux alt-screen.
+    ``_launch_via_tmux`` must now print a visible warning to the operator's
+    own terminal and require an explicit acknowledgment BEFORE attaching.
+    """
+
+    def _mock_create_ok(self) -> Any:
+        def _mock_run(cmd: list, **kw: Any) -> MagicMock:
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = ""
+            return m
+
+        return _mock_run
+
+    def test_warns_and_waits_for_ack_when_injection_unverified(self) -> None:
+        from coord.interactive import _launch_via_tmux
+
+        with patch("subprocess.run", side_effect=self._mock_create_ok()), \
+             patch("coord.interactive.tmux_session_alive", return_value=False), \
+             patch(
+                 "coord.interactive._inject_briefing_into_tmux_session",
+                 return_value=False,
+             ), \
+             patch("builtins.print") as mock_print, \
+             patch("builtins.input", return_value="") as mock_input:
+            _launch_via_tmux(["claude"], "briefing text", "coord-unverified")
+
+        assert mock_input.called, (
+            "operator should be required to acknowledge before attach when "
+            "injection could not be verified"
+        )
+        printed = " ".join(
+            str(call.args[0]) if call.args else "" for call in mock_print.call_args_list
+        )
+        assert "briefing injection could not be verified" in printed
+
+    def test_no_warning_or_ack_when_injection_verified(self) -> None:
+        from coord.interactive import _launch_via_tmux
+
+        with patch("subprocess.run", side_effect=self._mock_create_ok()), \
+             patch("coord.interactive.tmux_session_alive", return_value=False), \
+             patch(
+                 "coord.interactive._inject_briefing_into_tmux_session",
+                 return_value=True,
+             ), \
+             patch("builtins.print") as mock_print, \
+             patch("builtins.input") as mock_input:
+            _launch_via_tmux(["claude"], "briefing text", "coord-verified")
+
+        assert not mock_input.called, (
+            "no acknowledgment should be required when injection was verified"
+        )
+        assert not mock_print.called, (
+            "no warning should be printed when injection was verified"
+        )
+
+    def test_no_warning_for_empty_briefing(self) -> None:
+        """Empty briefing skips injection entirely — nothing to warn about."""
+        from coord.interactive import _launch_via_tmux
+
+        with patch("subprocess.run", side_effect=self._mock_create_ok()), \
+             patch("coord.interactive.tmux_session_alive", return_value=False), \
+             patch(
+                 "coord.interactive._inject_briefing_into_tmux_session",
+                 return_value=False,
+             ) as mock_inject, \
+             patch("builtins.print") as mock_print, \
+             patch("builtins.input") as mock_input:
+            _launch_via_tmux(["claude"], "   ", "coord-empty-brief")
+
+        assert not mock_inject.called
+        assert not mock_input.called
+        assert not mock_print.called
