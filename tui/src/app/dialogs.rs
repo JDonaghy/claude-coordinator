@@ -1321,6 +1321,52 @@ impl CoordApp {
             });
         }
 
+        // ── #863: Fix dispatch hit the iteration cap → force-past-cap confirm
+        if let Some(ref p) = self.pending_fix_force_confirm {
+            // #722: live-session gate, same discipline as the other Fix confirms.
+            if let Some(d) = self.live_session_blocking_dialog(p.issue_num, &p.coord_repo) {
+                return Some(d);
+            }
+            let cap_text = p
+                .max_iterations
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "configured".to_string());
+            return Some(Dialog {
+                table: None,
+                id: WidgetId::new("dialog:fix-force-cap"),
+                title: StyledText::plain("Iteration cap reached"),
+                body: vec![
+                    StyledText::plain(format!(
+                        "The iteration cap ({}) has been reached for {} #{} — \
+                         `pipeline.max_review_iterations` is blocking another fix round.",
+                        cap_text, p.coord_repo, p.issue_num,
+                    )),
+                    StyledText::plain(
+                        "Force another fix round anyway? (--force, #862's override)".to_string(),
+                    ),
+                ],
+                buttons: vec![
+                    DialogButton {
+                        id: WidgetId::new("force-fix"),
+                        label: "⏎  Force fix".into(),
+                        is_default: true,
+                        is_cancel: false,
+                        tint: None,
+                    },
+                    DialogButton {
+                        id: WidgetId::new("cancel"),
+                        label: "Esc  Not now".into(),
+                        is_default: false,
+                        is_cancel: true,
+                        tint: None,
+                    },
+                ],
+                severity: Some(DialogSeverity::Question),
+                vertical_buttons: false,
+                input: None,
+            });
+        }
+
         // ── Leg 3c (#517, #306): review APPROVED → start merge agent confirm
         if let Some(ref p) = self.pending_merge {
             // #722: live-session gate (same as pending_auto_review above).
@@ -1828,6 +1874,14 @@ impl CoordApp {
             if !blocked {
                 self.pending_merge = None;
             }
+        } else if self.pending_fix_force_confirm.is_some() {
+            // #722: blocking-dialog guard, same discipline as the other Fix confirms.
+            let blocked = self.pending_fix_force_confirm.as_ref().is_some_and(|p| {
+                self.issue_has_live_session_for_repo(p.issue_num, &p.coord_repo)
+            });
+            if !blocked {
+                self.pending_fix_force_confirm = None;
+            }
         } else if self.pending_repo_picker.is_some() {
             self.pending_repo_picker = None;
         } else if self.pending_refinement_close_prompt.is_some() {
@@ -1963,7 +2017,7 @@ impl CoordApp {
                         if let Some(entry) = picker.machines.get(idx) {
                             let mode = picker.mode;
                             let machine = entry.name.clone();
-                            self.launch_interactive_session_on_machine(mode, machine, None);
+                            self.launch_interactive_session_on_machine(mode, machine, None, false);
                         }
                     }
                 }
@@ -2015,6 +2069,30 @@ impl CoordApp {
                 }
             } else {
                 self.pending_merge = None;
+            }
+            *self.dialog_layout.borrow_mut() = None;
+            return;
+        }
+
+        // ── #863: iteration cap reached → force-past-cap confirm ─────────
+        if self.pending_fix_force_confirm.is_some() {
+            if id == "force-fix" {
+                self.confirm_fix_force_past_cap();
+            } else if id == "close" {
+                // "close" = blocking dialog dismiss (#722) — preserve the offer.
+                if let Some(ref p) = self.pending_fix_force_confirm {
+                    let n = p.issue_num;
+                    self.push_toast(
+                        "Reattach first",
+                        &format!(
+                            "Close the live session for #{n} first; \
+                             the force-fix offer will re-appear automatically.",
+                        ),
+                        ToastSeverity::Warning,
+                    );
+                }
+            } else {
+                self.pending_fix_force_confirm = None;
             }
             *self.dialog_layout.borrow_mut() = None;
             return;

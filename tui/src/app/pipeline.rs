@@ -169,6 +169,48 @@ pub(crate) struct PendingMerge {
     pub(crate) issue_num: u64,
 }
 
+/// #863: an in-flight headless preflight (`coord assign --interactive
+/// --fix-of <aid> [--force] <machine> <repo> <issue> --dry-run`) checking
+/// whether `pipeline.max_review_iterations` blocks a Fix dispatch, BEFORE the
+/// human-attended terminal opens.  `_dispatch_fix_of`
+/// (coord/commands/dispatch_workers.py) runs the same cap check and returns
+/// cleanly on `--dry-run` without ever touching a TTY, so this preflight is a
+/// safe, side-effect-free probe dispatched via `CommandRunner` — completely
+/// separate from the real (embedded-PTY) Fix launch it gates.
+///
+/// Matched against the completed `CommandResult` by `work_aid` in
+/// `run_periodic_work`.  On a clean exit the real launch proceeds (forced or
+/// not, per `force`); on a cap refusal (`max_review_iterations` in stderr)
+/// `pending_fix_force_confirm` is raised instead.
+#[derive(Clone)]
+pub(crate) struct PendingFixCapPreflight {
+    pub(crate) coord_repo: String,
+    pub(crate) repo_slug: String,
+    pub(crate) issue_num: u64,
+    pub(crate) machine: String,
+    pub(crate) work_aid: String,
+    /// Whether THIS preflight already carries `--force` (the operator's
+    /// confirmed retry) — echoed back to the real launch on success so the
+    /// embedded terminal's command line also gets `--force`.
+    pub(crate) force: bool,
+}
+
+/// #863: the iteration cap was hit — awaiting the operator's one-key confirm
+/// to re-dispatch the SAME Fix with `--force` (#862's override).  Raised by
+/// the `PendingFixCapPreflight` completion handler; consumed by
+/// `confirm_fix_force_past_cap`.
+pub(crate) struct PendingFixForceConfirm {
+    pub(crate) coord_repo: String,
+    pub(crate) repo_slug: String,
+    pub(crate) issue_num: u64,
+    pub(crate) machine: String,
+    pub(crate) work_aid: String,
+    /// The configured cap (`pipeline.max_review_iterations`), parsed from the
+    /// preflight's stderr, for the confirm prompt text.  `None` if the
+    /// stderr format ever drifts — the prompt falls back to generic wording.
+    pub(crate) max_iterations: Option<u32>,
+}
+
 /// Width of one arrow connector between stages, in TUI cells. Mirrors the
 /// constant used by quadraui's `tui_pipeline_view_layout` so host
 /// hit-testing matches the painted geometry.

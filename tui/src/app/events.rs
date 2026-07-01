@@ -341,6 +341,45 @@ impl CoordApp {
             }
         }
 
+        // ── #863: iteration cap reached → force-past-cap confirm ─────────
+        // Own Enter (→ re-dispatch the same Fix with --force) and Esc/n (dismiss).
+        if self.pending_fix_force_confirm.is_some() {
+            if let UiEvent::KeyPressed { key, .. } = &event {
+                match key {
+                    Key::Named(NamedKey::Enter) => {
+                        self.confirm_fix_force_past_cap();
+                        return Reaction::Redraw;
+                    }
+                    Key::Named(NamedKey::Escape) | Key::Char('n') | Key::Char('N') => {
+                        // #722: preserve the offer when the blocking dialog is showing.
+                        if let Some(ref p) = self.pending_fix_force_confirm {
+                            if self.issue_has_live_session_for_repo(p.issue_num, &p.coord_repo) {
+                                let n = p.issue_num;
+                                self.push_toast(
+                                    "Reattach first",
+                                    &format!(
+                                        "Close the live session for #{n} first; \
+                                         the force-fix offer will re-appear automatically.",
+                                    ),
+                                    ToastSeverity::Warning,
+                                );
+                                return Reaction::Redraw;
+                            }
+                        }
+                        self.pending_fix_force_confirm = None;
+                        self.push_toast(
+                            "Not forcing",
+                            "Resolve manually, or bump pipeline.max_review_iterations \
+                             in coordinator.yml.",
+                            ToastSeverity::Info,
+                        );
+                        return Reaction::Redraw;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         // ── #440/#675: Pipeline/Board detail Terminal tab focus arbitration ──
         // PROTOCOL (mirrors the standalone Terminal pane):
         //   - When `active_view == Pipeline && pipeline_detail_tab == Terminal`
@@ -835,7 +874,7 @@ impl CoordApp {
                                 let mode = picker.mode;
                                 let machine = picker.machines[digit].name.clone();
                                 self.pending_machine_picker = None;
-                                self.launch_interactive_session_on_machine(mode, machine, None);
+                                self.launch_interactive_session_on_machine(mode, machine, None, false);
                                 return Reaction::Redraw;
                             }
                         }

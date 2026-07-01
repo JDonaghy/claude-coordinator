@@ -415,6 +415,7 @@ impl CoordApp {
             || self.pending_test_fix.is_some()
             || self.pending_merge.is_some()
             || self.pending_test_mode_choice.is_some()
+            || self.pending_fix_force_confirm.is_some()
     }
 
     /// True when the Pipeline detail Terminal tab is showing a LIVE (not
@@ -1403,7 +1404,7 @@ impl CoordApp {
             InteractiveLaunchMode::Troubleshoot | InteractiveLaunchMode::Chat
         ) {
             let machine = self.data.local_machine.clone();
-            self.launch_interactive_session_on_machine(mode, machine, None);
+            self.launch_interactive_session_on_machine(mode, machine, None, false);
             return;
         }
 
@@ -1466,7 +1467,7 @@ impl CoordApp {
                 Instant::now(),
             ));
             let machine = self.data.local_machine.clone();
-            self.launch_interactive_session_on_machine(mode, machine, None);
+            self.launch_interactive_session_on_machine(mode, machine, None, false);
             return;
         }
 
@@ -1490,7 +1491,7 @@ impl CoordApp {
             .first()
             .map(|m| m.name.clone())
             .unwrap_or_else(|| self.data.local_machine.clone());
-        self.launch_interactive_session_on_machine(mode, machine, None);
+        self.launch_interactive_session_on_machine(mode, machine, None, false);
     }
 
     /// Reattach to the live interactive session for the selected issue,
@@ -1695,7 +1696,7 @@ impl CoordApp {
         // `reattach_aid` (Some) short-circuits the type-gated lookup and runs
         // `coord reattach`.
         let machine = self.data.local_machine.clone();
-        self.launch_interactive_session_on_machine(InteractiveLaunchMode::Work, machine, Some(aid));
+        self.launch_interactive_session_on_machine(InteractiveLaunchMode::Work, machine, Some(aid), false);
     }
 
     // ── Leg 3c / A3 (#517, #581): test-verdict routing ─────────────────────
@@ -1996,6 +1997,27 @@ impl CoordApp {
         mode: InteractiveLaunchMode,
         machine: String,
         reattach_aid: Option<String>,
+        force: bool,
+    ) {
+        self.launch_interactive_session_on_machine_inner(mode, machine, reattach_aid, force, false)
+    }
+
+    /// #863: `launch_interactive_session_on_machine`'s actual body, plus
+    /// `after_preflight` — true ONLY when this call is the follow-through from
+    /// the `dispatch_fix_cap_preflight` completion handler in
+    /// `run_periodic_work`.  That handler must skip the cap-preflight gate
+    /// below (it just ran the preflight); every other caller goes through the
+    /// public wrapper above with `after_preflight = false` so a FRESH Fix
+    /// dispatch always gets gated.  Without this distinction, a clean
+    /// (non-forced) preflight success would re-enter the gate on the
+    /// follow-through call and preflight forever.
+    pub(crate) fn launch_interactive_session_on_machine_inner(
+        &mut self,
+        mode: InteractiveLaunchMode,
+        machine: String,
+        reattach_aid: Option<String>,
+        force: bool,
+        after_preflight: bool,
     ) {
         let Some((repo, issue_key)) = self.selected_issue_repo_and_key() else {
             self.pipeline_status = Some((
@@ -2118,6 +2140,29 @@ impl CoordApp {
         let maybe_live_session =
             reattach_aid.or_else(|| self.reattachable_session_aid(issue_num, &repo, mode));
 
+        // #863: before opening a FRESH (non-reattach) Fix session, headlessly
+        // preflight `coord assign --fix-of --dry-run` via `CommandRunner` so a
+        // `pipeline.max_review_iterations` cap refusal (#862) surfaces as an
+        // in-TUI "force another fix round?" confirm instead of a dead
+        // terminal the operator has to retype with `--force` by hand.
+        // `after_preflight` is true on the follow-through call from the
+        // preflight's OWN completion handler (whether or not the operator
+        // ended up forcing it) — skip the gate then, or a clean preflight
+        // success would re-enter it forever.
+        if mode == InteractiveLaunchMode::Fix && maybe_live_session.is_none() && !after_preflight {
+            if let Some(aid) = work_aid.clone() {
+                self.dispatch_fix_cap_preflight(
+                    repo.clone(),
+                    issue_key.0.clone(),
+                    issue_num,
+                    machine.clone(),
+                    aid,
+                    false,
+                );
+                return;
+            }
+        }
+
         match quadraui::terminal_engine::TerminalSession::spawn(
             cols.max(20),
             rows.max(5),
@@ -2175,6 +2220,25 @@ impl CoordApp {
                         &machine,
                         &repo,
                         issue_num,
+                    )
+                } else if mode == InteractiveLaunchMode::Fix && force {
+                    // #863: the operator confirmed past `pipeline.max_review_iterations`
+                    // (#862) — append `--force` to the SAME `--fix-of` command line so
+                    // the backend dispatches iteration N+1 anyway instead of the cap's
+                    // usual `sys.exit(2)`.  Deliberately NOT routed through the shared
+                    // `build_interactive_launch_cmd` (its signature is exercised by
+                    // ~15 pure-function tests for every OTHER mode) — this mirrors its
+                    // Fix arm exactly, plus `--force`.
+                    let cfg = match cfg_path.as_deref() {
+                        Some(p) if !p.is_empty() => format!("--config {} ", shell_quote_arg(p)),
+                        _ => String::new(),
+                    };
+                    let aid = shell_quote_arg(work_aid.as_deref().unwrap_or(""));
+                    let m = shell_quote_arg(&machine);
+                    let r = shell_quote_arg(&repo);
+                    format!(
+                        "coord assign {}--interactive --fix-of {} --force {} {} {}\r",
+                        cfg, aid, m, r, issue_num,
                     )
                 } else {
                     // Fresh launch path.  Re-pressing the launch key while a
@@ -2313,6 +2377,69 @@ impl CoordApp {
                 self.detail_terminal_spawn_errors.insert(issue_key, e.to_string());
             }
         }
+    }
+
+    /// #863: headlessly dispatch `coord assign --interactive --fix-of <aid>
+    /// [--force] <machine> <repo> <issue> --dry-run` via `CommandRunner` and
+    /// record `pending_fix_cap_preflight` so the `run_periodic_work`
+    /// completion handler can route on the result.
+    ///
+    /// This is a probe, not the real dispatch: `_dispatch_fix_of`
+    /// (coord/commands/dispatch_workers.py) runs the iteration-cap check
+    /// BEFORE its `--dry-run` early-return, and never touches a TTY on that
+    /// path, so it's safe to run as an ordinary background subprocess (no
+    /// embedded PTY needed) purely to see whether the cap blocks it.
+    pub(crate) fn dispatch_fix_cap_preflight(
+        &mut self,
+        coord_repo: String,
+        repo_slug: String,
+        issue_num: u64,
+        machine: String,
+        work_aid: String,
+        force: bool,
+    ) {
+        let issue_str = issue_num.to_string();
+        let mut argv: Vec<String> = vec![
+            "assign".to_string(),
+            "--interactive".to_string(),
+            "--fix-of".to_string(),
+            work_aid.clone(),
+        ];
+        if force {
+            argv.push("--force".to_string());
+        }
+        argv.push(machine.clone());
+        argv.push(coord_repo.clone());
+        argv.push(issue_str);
+        argv.push("--dry-run".to_string());
+        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        self.command_runner.spawn_queued(&argv_refs);
+        self.pending_fix_cap_preflight = Some(PendingFixCapPreflight {
+            coord_repo,
+            repo_slug,
+            issue_num,
+            machine,
+            work_aid,
+            force,
+        });
+    }
+
+    /// #863: the operator confirmed the "Iteration cap (N) reached — force
+    /// another fix round?" prompt raised by the preflight completion handler.
+    /// Re-runs the SAME preflight with `--force` appended; on a clean exit the
+    /// completion handler proceeds straight into the real (forced) launch.
+    pub(crate) fn confirm_fix_force_past_cap(&mut self) {
+        let Some(p) = self.pending_fix_force_confirm.take() else {
+            return;
+        };
+        self.dispatch_fix_cap_preflight(
+            p.coord_repo,
+            p.repo_slug,
+            p.issue_num,
+            p.machine,
+            p.work_aid,
+            true,
+        );
     }
 
     /// Render the Pipeline detail Terminal tab for the selected issue (#440).
@@ -2481,6 +2608,19 @@ pub(crate) fn interactive_plan_briefing(issue_num: u64) -> String {
         "Plan-then-implement for issue #{n} in this session. First read it with `gh issue view {n}`, then propose a concise implementation plan and ask me to confirm it. Once I approve, implement the plan here in this same session — do not stop after planning.",
         n = issue_num,
     )
+}
+
+/// #863: extract the configured cap (`N`) from the `_dispatch_fix_of`
+/// cap-refusal stderr line —
+/// `"error: max_review_iterations (N) reached for work …"` — for the
+/// force-confirm prompt.  Returns `None` if the format ever drifts; the
+/// prompt falls back to generic wording in that case.
+pub(crate) fn parse_max_review_iterations(stderr: &str) -> Option<u32> {
+    let marker = "max_review_iterations (";
+    let idx = stderr.find(marker)?;
+    let rest = &stderr[idx + marker.len()..];
+    let end = rest.find(')')?;
+    rest[..end].trim().parse().ok()
 }
 
 /// Build the local launcher line that auto-runs when the user picks a

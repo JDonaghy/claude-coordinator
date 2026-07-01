@@ -74,11 +74,25 @@ impl CoordApp {
             // the newer work_id and the stale result would otherwise be
             // silently dropped (no toast, no dialog).  Check the match first,
             // suppress only when handled.
+            //
+            // #863: same idea for the Fix-dispatch cap preflight — a
+            // `max_review_iterations` refusal is EXPECTED (not a bug) and gets
+            // its own force-confirm prompt below, so the generic red toast
+            // would be redundant/alarming noise for that one specific case.
+            // Any OTHER preflight failure (aid not found, etc.) still gets the
+            // normal toast — the operator needs to know Fix silently did
+            // nothing.
+            let suppress_for_fix_cap = self
+                .pending_fix_cap_preflight
+                .as_ref()
+                .is_some_and(|p| is_fix_cap_preflight_label(&result.label, &p.work_aid))
+                && result.stderr.contains("max_review_iterations");
             if result.exit_code != 0
                 && !should_suppress_command_failed_toast(
                     &result.label,
                     self.pending_artifact_pull.as_ref(),
                 )
+                && !suppress_for_fix_cap
             {
                 let reason = first_meaningful_stderr_line(&result.stderr)
                     .unwrap_or_else(|| format!("exit {} — no stderr captured", result.exit_code));
@@ -87,6 +101,41 @@ impl CoordApp {
                     &format!("{}\n{}", result.label, reason),
                     ToastSeverity::Error,
                 );
+            }
+            // #863: Fix-dispatch cap preflight completed.  A clean exit means
+            // the cap doesn't block this dispatch (or `--force` already
+            // overrode it) — proceed straight into the real human-attended
+            // launch.  A `max_review_iterations` refusal raises the one-key
+            // force-past-cap confirm instead of leaving the operator at a
+            // dead end.  Any other failure already got the generic toast
+            // above; nothing further to do.
+            if let Some(p) = self.pending_fix_cap_preflight.clone() {
+                if is_fix_cap_preflight_label(&result.label, &p.work_aid) {
+                    self.pending_fix_cap_preflight = None;
+                    if result.exit_code == 0 {
+                        // `after_preflight = true`: this IS the follow-through
+                        // from the preflight that just completed — skip the
+                        // gate (see `launch_interactive_session_on_machine_inner`)
+                        // so a clean, non-forced pass doesn't preflight forever.
+                        self.launch_interactive_session_on_machine_inner(
+                            InteractiveLaunchMode::Fix,
+                            p.machine,
+                            None,
+                            p.force,
+                            true,
+                        );
+                    } else if result.stderr.contains("max_review_iterations") {
+                        let max_iterations = parse_max_review_iterations(&result.stderr);
+                        self.pending_fix_force_confirm = Some(PendingFixForceConfirm {
+                            coord_repo: p.coord_repo,
+                            repo_slug: p.repo_slug,
+                            issue_num: p.issue_num,
+                            machine: p.machine,
+                            work_aid: p.work_aid,
+                            max_iterations,
+                        });
+                    }
+                }
             }
             // Per-stage doctor: surface `coord diagnose`'s findings/actions and,
             // when it couldn't recover, point at the non-destructive Reset.  The
