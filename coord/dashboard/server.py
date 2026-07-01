@@ -15,6 +15,7 @@ from starlette.responses import FileResponse, HTMLResponse, JSONResponse, Stream
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
+from coord import __version__
 from coord.config import Config
 from coord.dispatch import AGENT_PORT
 from coord.events import (
@@ -25,7 +26,10 @@ from coord.events import (
     build_events_route,
 )
 from coord.board_service import read_board, write_board
+from coord.models import Assignment
 from coord.network import check_all, fetch_status
+from coord.openapi import build_spec, dataclass_schema, openapi_and_docs_routes
+from coord.pipeline import PipelineView
 from coord.state import load_proposals
 
 DASHBOARD_DIR = Path(__file__).parent
@@ -181,6 +185,218 @@ async def _poll_once(
             del orphaned_since[aid]
 
     return possibly_stuck
+
+
+def _openapi_spec() -> dict:
+    """#757: the dashboard's OpenAPI 3 document.
+
+    ``GET /api/board`` and ``GET /api/pipeline`` are fully specified via
+    :func:`coord.openapi.dataclass_schema` over ``coord.models.Assignment`` /
+    ``coord.pipeline.PipelineView`` — the same dataclasses #750's TS codegen
+    (``scripts/codegen.py``) already introspects, so this spec and the
+    generated TS types describe the identical wire shape. The action-style
+    ``POST /api/pipeline/action`` endpoint documents its ``action`` enum but
+    leaves the response loosely typed since each action returns a distinct
+    ad-hoc shape.
+    """
+    components: dict = {}
+    assignment_ref = dataclass_schema(Assignment, components)
+    pipeline_view_ref = dataclass_schema(PipelineView, components)
+    board_response = {
+        "type": "object",
+        "properties": {
+            "round_number": {"type": "integer"},
+            "active": {"type": "array", "items": assignment_ref},
+            "completed": {"type": "array", "items": assignment_ref},
+        },
+    }
+    ok_response = {"type": "object", "properties": {"ok": {"type": "boolean"}}}
+    paths = {
+        "/": {
+            "get": {
+                "summary": "Dashboard SPA (or legacy single-file UI) index page",
+                "responses": {"200": {"description": "text/html"}},
+            }
+        },
+        "/api/board": {
+            "get": {
+                "summary": "Recent board state: active assignments + last 20 completed",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {"application/json": {"schema": board_response}},
+                    }
+                },
+            }
+        },
+        "/api/machines": {
+            "get": {
+                "summary": "Machine reachability + live agent /status per machine",
+                "responses": {"200": {"description": "OK"}},
+            }
+        },
+        "/api/proposals": {
+            "get": {
+                "summary": "Pending brain proposals awaiting approve/reject",
+                "responses": {"200": {"description": "OK"}},
+            }
+        },
+        "/api/approve": {
+            "post": {
+                "summary": "Dispatch one or more proposals by id",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "ids": {"type": "array", "items": {"type": "integer"}},
+                                    "briefings": {"type": "object"},
+                                },
+                                "required": ["ids"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {"description": "OK"},
+                    "400": {"description": "ids must be a non-empty list"},
+                    "404": {"description": "No matching proposals"},
+                },
+            }
+        },
+        "/api/reject": {
+            "post": {
+                "summary": "Discard one or more proposals by id",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "ids": {"type": "array", "items": {"type": "integer"}},
+                                },
+                                "required": ["ids"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {"description": "OK"},
+                    "400": {"description": "ids must be a non-empty list"},
+                },
+            }
+        },
+        "/api/diff/{id}": {
+            "get": {
+                "summary": "PR/branch diff for an assignment (gh pr diff, falls back to compare)",
+                "parameters": [_dashboard_path_param("id", "assignment id")],
+                "responses": {
+                    "200": {"description": "OK"},
+                    "404": {"description": "Assignment/branch/repo not found"},
+                    "500": {"description": "gh lookup failed"},
+                },
+            }
+        },
+        "/api/chat": {
+            "post": {
+                "summary": "Stream a chat reply about current board state (SSE)",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {"message": {"type": "string"}},
+                                "required": ["message"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {"description": "text/event-stream"},
+                    "400": {"description": "message required / unsupported provider"},
+                },
+            }
+        },
+        "/api/pipeline": {
+            "get": {
+                "summary": "PipelineView for every type='work' assignment",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {
+                            "application/json": {
+                                "schema": {"type": "array", "items": pipeline_view_ref}
+                            }
+                        },
+                    }
+                },
+            }
+        },
+        "/api/pipeline/action": {
+            "post": {
+                "summary": "Advance an assignment through a pipeline gate",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "assignment_id": {"type": "string"},
+                                    "action": {
+                                        "type": "string",
+                                        "enum": [
+                                            "dispatch_review", "dispatch_smoke", "enqueue",
+                                            "merge", "post_findings", "unstick",
+                                            "test-verdict", "record-review-verdict",
+                                            "retry", "dispatch_fix",
+                                        ],
+                                    },
+                                },
+                                "required": ["assignment_id", "action"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {"application/json": {"schema": ok_response}},
+                    },
+                    "400": {"description": "Missing/unknown field"},
+                    "404": {"description": "Assignment not found"},
+                    "501": {"description": "Action not yet implemented"},
+                },
+            }
+        },
+        "/events": {
+            "get": {
+                "summary": "Server-sent-event stream of board/assignment events",
+                "responses": {"200": {"description": "text/event-stream"}},
+            }
+        },
+    }
+    return build_spec(
+        title="coord dashboard",
+        version=__version__,
+        description="Phone-accessible coordination dashboard (React webapp + legacy single-file UI).",
+        paths=paths,
+        components=components,
+    )
+
+
+def _dashboard_path_param(name: str, description: str = "") -> dict:
+    return {
+        "name": name,
+        "in": "path",
+        "required": True,
+        "schema": {"type": "string"},
+        "description": description,
+    }
 
 
 def build_app(config: Config) -> Starlette:
@@ -778,6 +994,8 @@ def build_app(config: Config) -> Starlette:
         Route("/api/pipeline/action", api_pipeline_action, methods=["POST"]),
         build_events_route(event_source),
     ]
+    # #757: served OpenAPI 3 spec + Swagger UI docs page.
+    routes.extend(openapi_and_docs_routes(_openapi_spec()))
 
     # ── Static file serving for the built React webapp ─────────────────────
     # Only activated when `coord/dashboard/webapp/dist/` exists (i.e. after
@@ -807,6 +1025,10 @@ def build_app(config: Config) -> Starlette:
             # SPA fallback — let the React router handle the path.
             return HTMLResponse((WEBAPP_DIST / "index.html").read_text())
 
-        routes.append(Route("/{path:path}", _spa_catch_all, methods=["GET"]))
+        # Not part of the JSON API contract (client-side-router fallback) —
+        # excluded from the OpenAPI route inventory via include_in_schema.
+        routes.append(
+            Route("/{path:path}", _spa_catch_all, methods=["GET"], include_in_schema=False)
+        )
 
     return Starlette(routes=routes, lifespan=_lifespan)

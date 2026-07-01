@@ -17,8 +17,9 @@ from starlette.responses import JSONResponse, PlainTextResponse, Response, Strea
 from starlette.routing import Route
 
 from coord import __version__
-from coord.agent import RUNNING, PENDING, AgentServer, AssignmentSpec
+from coord.agent import RUNNING, PENDING, AgentAssignment, AgentServer, AssignmentSpec
 from coord.events import stream_assignment_log
+from coord.openapi import build_spec, dataclass_schema, openapi_and_docs_routes
 
 
 def _installed_version() -> str | None:
@@ -97,6 +98,198 @@ def _detect_install_mode() -> tuple[bool, str | None]:
         return False, None
     except Exception:
         return False, None
+
+
+def _path_param(name: str, description: str = "") -> dict:
+    return {
+        "name": name,
+        "in": "path",
+        "required": True,
+        "schema": {"type": "string"},
+        "description": description,
+    }
+
+
+def _openapi_spec() -> dict:
+    """#757: the agent's OpenAPI 3 document.
+
+    ``POST /assign`` is fully specified (request = ``AssignmentSpec``,
+    response = ``AgentAssignment``, both introspected via
+    :func:`coord.openapi.dataclass_schema`); the remaining routes carry a
+    summary/description and path-param shapes but a loosely-typed body, since
+    they return small ad-hoc dicts rather than a dataclass.
+    """
+    components: dict = {}
+    assign_request = dataclass_schema(AssignmentSpec, components)
+    assign_response = dataclass_schema(AgentAssignment, components)
+    paths = {
+        "/health": {
+            "get": {
+                "summary": "Agent health + version",
+                "responses": {"200": {"description": "OK"}},
+            }
+        },
+        "/status": {
+            "get": {
+                "summary": "List this agent's assignments (active + completed)",
+                "responses": {"200": {"description": "OK"}},
+            }
+        },
+        "/repos": {
+            "get": {
+                "summary": "Repos this agent can dispatch work into",
+                "responses": {"200": {"description": "OK"}},
+            }
+        },
+        "/assign": {
+            "post": {
+                "summary": "Dispatch a new assignment (spawns `claude -p`)",
+                "requestBody": {
+                    "required": True,
+                    "content": {"application/json": {"schema": assign_request}},
+                },
+                "responses": {
+                    "202": {
+                        "description": "Accepted",
+                        "content": {"application/json": {"schema": assign_response}},
+                    },
+                    "400": {"description": "Bad assignment payload"},
+                },
+            }
+        },
+        "/cancel/{id}": {
+            "post": {
+                "summary": "Cancel a running/pending assignment",
+                "parameters": [_path_param("id", "assignment id")],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {"application/json": {"schema": assign_response}},
+                    },
+                    "404": {"description": "Unknown assignment"},
+                },
+            }
+        },
+        "/inject/{id}": {
+            "post": {
+                "summary": "Inject a new user message into a running worker's session",
+                "parameters": [_path_param("id", "assignment id")],
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {"text": {"type": "string"}},
+                                "required": ["text"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "202": {"description": "Delivered"},
+                    "404": {"description": "Unknown assignment"},
+                    "409": {"description": "Worker not running"},
+                    "410": {"description": "Worker stdin already closed"},
+                },
+            }
+        },
+        "/logs/{id}": {
+            "get": {
+                "summary": "Read (a tail of) the worker's log file",
+                "parameters": [
+                    _path_param("id", "assignment id"),
+                    {
+                        "name": "since",
+                        "in": "query",
+                        "required": False,
+                        "schema": {"type": "integer"},
+                        "description": "byte offset to read from",
+                    },
+                ],
+                "responses": {
+                    "200": {"description": "OK"},
+                    "404": {"description": "Unknown assignment or no log file"},
+                },
+            }
+        },
+        "/stream/{id}": {
+            "get": {
+                "summary": "Server-sent-event stream of the worker's log",
+                "parameters": [_path_param("id", "assignment id")],
+                "responses": {"200": {"description": "text/event-stream"}},
+            }
+        },
+        "/update": {
+            "post": {
+                "summary": "Upgrade the installed package and restart the agent process",
+                "responses": {"202": {"description": "Updating"}},
+            }
+        },
+        "/restart": {
+            "post": {
+                "summary": "Gracefully restart the agent process",
+                "requestBody": {
+                    "required": False,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {"cancel_timeout": {"type": "number"}},
+                            }
+                        }
+                    },
+                },
+                "responses": {"202": {"description": "Restarting"}},
+            }
+        },
+        "/worktree-clean": {
+            "post": {
+                "summary": "Remove stale git worktrees managed by this agent",
+                "requestBody": {
+                    "required": False,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {"recent_secs": {"type": "number"}},
+                            }
+                        }
+                    },
+                },
+                "responses": {"200": {"description": "OK"}},
+            }
+        },
+        "/artifact/{repo}/{branch}": {
+            "get": {
+                "summary": "Manifest of stashed build artifacts for a (repo, branch) pair",
+                "parameters": [
+                    _path_param("repo", "repo name"),
+                    _path_param("branch", "sanitized branch name"),
+                ],
+                "responses": {
+                    "200": {"description": "OK"},
+                    "404": {"description": "No artifacts for this repo/branch"},
+                },
+            }
+        },
+        "/metrics": {
+            "get": {
+                "summary": "CPU + memory snapshot for the agent machine",
+                "responses": {
+                    "200": {"description": "OK"},
+                    "503": {"description": "psutil not installed"},
+                },
+            }
+        },
+    }
+    return build_spec(
+        title="coord agent",
+        version=__version__,
+        description="Per-machine agent server: spawns and tracks `claude -p` workers.",
+        paths=paths,
+        components=components,
+    )
 
 
 def build_app(
@@ -536,4 +729,6 @@ def build_app(
         # #207: CPU + memory snapshot for TUI sparklines
         Route("/metrics", metrics, methods=["GET"]),
     ]
+    # #757: served OpenAPI 3 spec + Swagger UI docs page.
+    routes.extend(openapi_and_docs_routes(_openapi_spec()))
     return Starlette(routes=routes)

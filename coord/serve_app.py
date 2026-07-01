@@ -31,6 +31,7 @@ servers, which have no auth). Per-user auth is #282 / team-mode territory.
 from __future__ import annotations
 
 import os
+import sqlite3
 from dataclasses import asdict, fields
 from pathlib import Path
 
@@ -42,8 +43,11 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route
 
+from coord import __version__
 from coord.config import Config
-from coord.dao import SCHEMA_VERSION, CoordStore
+from coord.dao import _DROP_COLUMNS, _JSON_COLUMNS, SCHEMA_VERSION, CoordStore
+from coord.db import _ensure_schema
+from coord.openapi import build_spec, dataclass_schema, openapi_and_docs_routes, sqlite_table_schema
 
 # Default port for the coordination daemon (agent=7433, dashboard=7434).
 SERVE_PORT = 7435
@@ -276,6 +280,574 @@ def _auto_drain_tick(config: Config) -> "list":
     mq.save_queue(merged)
 
     return events
+
+
+def _board_response_schema(components: dict) -> dict:
+    """#757: the `GET /board` response schema, built straight from the live
+    (migrated) SQLite DDL — not a dataclass. Per
+    ``scripts/gen_board_fixture.py``: "the wire schema *is* the SQLite DDL",
+    so this introspects the exact same schema + JSON/dropped-column tables
+    (``coord.dao._JSON_COLUMNS`` / ``_DROP_COLUMNS``) that
+    ``SqliteStore.board_projection()`` uses, rather than hand-duplicating the
+    column list here where it could drift.
+    """
+    from coord.merge_queue import PlannedMerge, StagingItem  # noqa: PLC0415
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        _ensure_schema(conn)
+        for table, key in (
+            ("assignments", "BoardAssignment"),
+            ("machines", "BoardMachine"),
+            ("merge_queue", "BoardMergeQueueEntry"),
+            ("proposals", "BoardProposal"),
+            ("issues", "BoardIssue"),
+        ):
+            components[key] = sqlite_table_schema(
+                conn,
+                table,
+                drop=frozenset(_DROP_COLUMNS.get(table, ())),
+                json_columns=frozenset(_JSON_COLUMNS.get(table, ())),
+            )
+    finally:
+        conn.close()
+
+    planned_merge_ref = dataclass_schema(PlannedMerge, components)
+    staging_item_ref = dataclass_schema(StagingItem, components)
+
+    def _list_of(key: str) -> dict:
+        return {"type": "array", "items": {"$ref": f"#/components/schemas/{key}"}}
+
+    return {
+        "type": "object",
+        "properties": {
+            "schema_version": {"type": "integer"},
+            "round_number": {"type": "integer"},
+            "assignments": _list_of("BoardAssignment"),
+            "machines": _list_of("BoardMachine"),
+            "merge_queue": _list_of("BoardMergeQueueEntry"),
+            "proposals": _list_of("BoardProposal"),
+            "issues": _list_of("BoardIssue"),
+            "plans": {
+                "type": "object",
+                "description": "assignment_id -> parsed structured plan",
+                "additionalProperties": {"type": "object"},
+            },
+            "notifications": {"type": "array", "items": {"type": "object"}},
+            "board_meta": {"type": "object", "additionalProperties": {"type": "string"}},
+            "merge_plan": {
+                "type": "array",
+                "description": "#776: server-side, gate-annotated merge plan",
+                "items": planned_merge_ref,
+            },
+            "merge_staging": {
+                "type": "array",
+                "description": "#778: approved/done work not yet in the merge queue",
+                "items": staging_item_ref,
+            },
+        },
+        "required": [
+            "schema_version", "round_number", "assignments", "machines",
+            "merge_queue", "proposals", "issues",
+        ],
+    }
+
+
+def _openapi_spec() -> dict:
+    """#757: the daemon's OpenAPI 3 document.
+
+    ``GET /board`` is fully specified (see :func:`_board_response_schema`);
+    the write endpoints document their required JSON fields (mirroring each
+    handler's own ``KeyError``/``TypeError`` validation) but keep the body
+    loosely typed beyond that, since most bodies are hand-assembled dicts
+    rather than a single dataclass round-trip.
+    """
+    components: dict = {}
+    board_schema = _board_response_schema(components)
+    result_body = {"type": "object", "description": "issue_store.ResultRecord fields"}
+    completion_body = {"type": "object", "description": "issue_store.CompletionRecord fields"}
+    ok_response = {"type": "object", "properties": {"ok": {"type": "boolean"}}}
+    cli_output_response = {
+        "type": "object",
+        "properties": {
+            "output": {"type": "string"},
+            "exit_code": {"type": "integer"},
+            "error": {"type": "string", "nullable": True},
+        },
+    }
+    paths = {
+        "/healthz": {
+            "get": {
+                "summary": "Liveness probe (never auth-gated, no DB access)",
+                "responses": {"200": {"description": "OK"}},
+            }
+        },
+        "/board": {
+            "get": {
+                "summary": "The full board projection (CoordStore.board_projection)",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {"application/json": {"schema": board_schema}},
+                    },
+                    "503": {"description": "Board read failed"},
+                },
+            },
+            "post": {
+                "summary": "#749: whole-board upsert (backs board_service.write_board)",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "assignments": {
+                                        "type": "array",
+                                        "items": {"$ref": "#/components/schemas/BoardAssignment"},
+                                    },
+                                    "round_number": {"type": "integer"},
+                                },
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {"application/json": {"schema": ok_response}},
+                    },
+                    "400": {"description": "Bad board payload"},
+                    "503": {"description": "Board write failed"},
+                },
+            },
+        },
+        "/config": {
+            "get": {
+                "summary": "Raw coordinator.yml bytes the daemon owns",
+                "responses": {
+                    "200": {"description": "OK (application/x-yaml)"},
+                    "404": {"description": "No config file on the daemon host"},
+                },
+            }
+        },
+        "/result": {
+            "post": {
+                "summary": "Record an interactive-session result (#590)",
+                "requestBody": {
+                    "required": True,
+                    "content": {"application/json": {"schema": result_body}},
+                },
+                "responses": {"200": {"description": "OK"}, "400": {"description": "Bad record"}},
+            }
+        },
+        "/completion": {
+            "post": {
+                "summary": "Record a git-floor backstop completion (#590)",
+                "requestBody": {
+                    "required": True,
+                    "content": {"application/json": {"schema": completion_body}},
+                },
+                "responses": {"200": {"description": "OK"}},
+            }
+        },
+        "/dispatched-work": {
+            "post": {
+                "summary": "Record a thin client's work dispatch (#590 Phase 2)",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "assignment_id": {"type": "string"},
+                                    "proposal": {"type": "object"},
+                                    "repo_github": {"type": "string"},
+                                    "provider_name": {"type": "string", "nullable": True},
+                                },
+                                "required": ["assignment_id", "repo_github"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {"application/json": {"schema": ok_response}},
+                    },
+                    "400": {"description": "Bad dispatch"},
+                },
+            }
+        },
+        "/dispatched": {
+            "post": {
+                "summary": "Record a thin client's review/fix/rework/merge dispatch (#590 Phase 2)",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "assignment": {"$ref": "#/components/schemas/BoardAssignment"},
+                                    "repo_github": {"type": "string"},
+                                },
+                                "required": ["repo_github"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {"application/json": {"schema": ok_response}},
+                    },
+                    "400": {"description": "Bad dispatch"},
+                },
+            }
+        },
+        "/test-verdict": {
+            "post": {
+                "summary": "Record a Test-gate verdict (#590 Phase 2)",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "assignment_id": {"type": "string"},
+                                    "test_state": {"type": "string"},
+                                    "test_reason": {"type": "string", "nullable": True},
+                                    "smoke_test": {"type": "string", "nullable": True},
+                                    "smoke_test_reason": {"type": "string", "nullable": True},
+                                },
+                                "required": ["assignment_id", "test_state"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {"application/json": {"schema": ok_response}},
+                    },
+                    "400": {"description": "Missing field"},
+                },
+            }
+        },
+        "/assignment-usage": {
+            "post": {
+                "summary": "Route cost/token/is_interactive/smoke_tests writes (#665/#749)",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "assignment_id": {"type": "string"},
+                                    "cost_usd": {"type": "number", "nullable": True},
+                                    "input_tokens": {"type": "integer"},
+                                    "output_tokens": {"type": "integer"},
+                                    "cache_creation_tokens": {"type": "integer"},
+                                    "cache_read_tokens": {"type": "integer"},
+                                    "is_interactive": {"type": "boolean"},
+                                    "smoke_tests": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                        "nullable": True,
+                                    },
+                                },
+                                "required": ["assignment_id"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {"application/json": {"schema": ok_response}},
+                    },
+                    "400": {"description": "Missing assignment_id"},
+                },
+            }
+        },
+        "/issue-labels": {
+            "post": {
+                "summary": "Update one issue's cached labels (#601)",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "repo_name": {"type": "string"},
+                                    "issue_number": {"type": "integer"},
+                                    "labels": {"type": "array", "items": {"type": "string"}},
+                                },
+                                "required": ["repo_name", "issue_number"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {"description": "OK"},
+                    "400": {"description": "Missing field"},
+                },
+            }
+        },
+        "/issues-sync": {
+            "post": {
+                "summary": "Upsert a repo's open issues into the shared issue cache (#601)",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "repo_name": {"type": "string"},
+                                    "issues": {"type": "array", "items": {"type": "object"}},
+                                },
+                                "required": ["repo_name"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {"application/json": {"schema": ok_response}},
+                    },
+                    "400": {"description": "Missing field"},
+                },
+            }
+        },
+        "/issue-edit": {
+            "post": {
+                "summary": "Edit an issue's title/body through the tracker seam",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "repo_name": {"type": "string"},
+                                    "issue_number": {"type": "integer"},
+                                    "title": {"type": "string", "nullable": True},
+                                    "body": {"type": "string", "nullable": True},
+                                    "repo_github": {"type": "string", "nullable": True},
+                                },
+                                "required": ["repo_name", "issue_number"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {"description": "OK"},
+                    "400": {"description": "Missing field"},
+                },
+            }
+        },
+        "/issue-context": {
+            "get": {
+                "summary": "#603: read an issue's raw context entries (oldest-first)",
+                "parameters": [
+                    {
+                        "name": "repo_name", "in": "query", "required": True,
+                        "schema": {"type": "string"},
+                    },
+                    {
+                        "name": "issue_number", "in": "query", "required": True,
+                        "schema": {"type": "integer"},
+                    },
+                ],
+                "responses": {
+                    "200": {"description": "OK"},
+                    "400": {"description": "Missing repo_name/issue_number"},
+                },
+            },
+            "post": {
+                "summary": "#603: add / pin / clear / replace a per-issue context entry",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "action": {
+                                        "type": "string",
+                                        "enum": ["add", "pin", "clear", "replace"],
+                                    },
+                                    "repo_name": {"type": "string"},
+                                    "issue_number": {"type": "integer"},
+                                    "body": {"type": "string"},
+                                    "pinned": {"type": "boolean"},
+                                    "source": {"type": "string", "nullable": True},
+                                    "entry_id": {"type": "integer"},
+                                    "entries": {"type": "array", "items": {"type": "object"}},
+                                },
+                                "required": ["action", "repo_name", "issue_number"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {"description": "OK"},
+                    "400": {"description": "Missing field / unknown action"},
+                },
+            },
+        },
+        "/merge": {
+            "post": {
+                "summary": "Run `coord merge` against the canonical DB (#584)",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "dry_run": {"type": "boolean"},
+                                    "order": {"type": "array", "items": {"type": "string"}, "nullable": True},
+                                    "repo_filter": {"type": "string", "nullable": True},
+                                    "method": {"type": "string"},
+                                    "force_merge": {"type": "boolean"},
+                                    "skip_smoke": {"type": "boolean"},
+                                    "drop": {"type": "string", "nullable": True},
+                                    "only": {"type": "string", "nullable": True},
+                                },
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {"application/json": {"schema": cli_output_response}},
+                    },
+                },
+            }
+        },
+        "/reconcile-merges": {
+            "post": {
+                "summary": "Run `coord reconcile-merges` against the canonical DB (#584)",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "dry_run": {"type": "boolean"},
+                                    "repo": {"type": "string", "nullable": True},
+                                },
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {"application/json": {"schema": cli_output_response}},
+                    },
+                },
+            }
+        },
+        "/diagnose": {
+            "post": {
+                "summary": "Run `coord diagnose` against the canonical DB + fleet (#diagnose)",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "repo": {"type": "string"},
+                                    "issue": {"type": "integer"},
+                                    "stage": {"type": "string", "nullable": True},
+                                    "reset": {"type": "boolean"},
+                                    "dry_run": {"type": "boolean"},
+                                },
+                                "required": ["issue"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {"application/json": {"schema": cli_output_response}},
+                    },
+                },
+            }
+        },
+        "/test-plan": {
+            "post": {
+                "summary": "Run `coord test-plan` against the canonical DB (#851)",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "assignment_id": {"type": "string"},
+                                    "refresh": {"type": "boolean"},
+                                    "model": {"type": "string"},
+                                },
+                                "required": ["assignment_id"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {"application/json": {"schema": cli_output_response}},
+                    },
+                },
+            }
+        },
+        "/housekeeping": {
+            "post": {
+                "summary": "Archive stale terminal board rows (#762)",
+                "requestBody": {
+                    "required": False,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {"dry_run": {"type": "boolean"}},
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {"description": "OK"},
+                    "503": {"description": "Housekeeping failed"},
+                },
+            }
+        },
+    }
+    return build_spec(
+        title="coord serve",
+        version=__version__,
+        description=(
+            "Portable control-center daemon: fronts the coordinator board over "
+            "Tailscale so a thin client needs no local coord.db/coordinator.yml. "
+            "Every endpoint except /healthz requires `Authorization: Bearer "
+            "<token>` when the daemon is configured with one."
+        ),
+        paths=paths,
+        components=components,
+    )
 
 
 def build_app(store: CoordStore, config: Config, *, token: str | None = None) -> Starlette:
@@ -1127,6 +1699,10 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/test-plan", post_test_plan, methods=["POST"]),
         Route("/housekeeping", post_housekeeping, methods=["POST"]),
     ]
+    # #757: served OpenAPI 3 spec + Swagger UI docs page. Not exempted from
+    # the bearer-auth middleware below (only /healthz is) — "behind the
+    # daemon's bearer auth where applicable" per the issue.
+    routes.extend(openapi_and_docs_routes(_openapi_spec()))
     # #762: gzip the /board projection (markdown-heavy JSON compresses ~9×), so a
     # large payload can't overrun the TUI's fetch timeout on a slow link.  Gzip is
     # outermost so it compresses every response (incl. auth rejections); ureq on
