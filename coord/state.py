@@ -24,11 +24,14 @@ from pathlib import Path
 _log = logging.getLogger(__name__)
 
 from coord._board_mapping import (
+    assemble_board as _assemble_board,
     decode_smoke_tests as _decode_smoke_tests,
     infer_review_state as _infer_review_state_core,
     json_loads as _json_loads,
     row_to_assignment as _row_to_assignment,
 )
+from coord.board_service import resolve as _board_service_resolve
+from coord.board_service import route_write as _route_write
 from coord.db import get_connection
 from coord.models import Assignment, Board, Proposal, SplitChunk, SplitProposal
 
@@ -400,9 +403,10 @@ def _row_to_dispatched_dict(row: object) -> dict:
 
 
 def _board_service():  # -> ServiceConfig | None
-    from coord.client import resolve_board_service  # noqa: PLC0415
-
-    return resolve_board_service()
+    # #749: delegates to coord.board_service.resolve() rather than importing
+    # coord.client directly — coord.state's outward coupling now goes through
+    # the one board_service facade.
+    return _board_service_resolve()
 
 
 def _thin_client_local_board_guard(fn_name: str) -> None:
@@ -477,19 +481,17 @@ def record_dispatched(
 ) -> None:
     """Record a newly dispatched assignment — routes to the daemon when set."""
     svc = _board_service()
-    if svc is not None:
-        from coord.client import post_record  # noqa: PLC0415
-
-        post_record(
-            svc,
-            "/dispatched-work",
-            {
-                "assignment_id": assignment_id,
-                "proposal": asdict(proposal),
-                "repo_github": repo_github,
-                "provider_name": provider_name,
-            },
-        )
+    resp = _route_write(
+        svc,
+        "/dispatched-work",
+        {
+            "assignment_id": assignment_id,
+            "proposal": asdict(proposal),
+            "repo_github": repo_github,
+            "provider_name": provider_name,
+        },
+    )
+    if resp is not None:
         return
     _record_dispatched_local(
         assignment_id=assignment_id,
@@ -562,14 +564,10 @@ def record_dispatched_assignment(
 ) -> None:
     """Record a dispatched assignment — routes to the daemon when set."""
     svc = _board_service()
-    if svc is not None:
-        from coord.client import post_record  # noqa: PLC0415
-
-        post_record(
-            svc,
-            "/dispatched",
-            {"assignment": asdict(assignment), "repo_github": repo_github},
-        )
+    resp = _route_write(
+        svc, "/dispatched", {"assignment": asdict(assignment), "repo_github": repo_github}
+    )
+    if resp is not None:
         return
     _record_dispatched_assignment_local(assignment=assignment, repo_github=repo_github)
 
@@ -645,20 +643,18 @@ def record_test_verdict(
     without rewriting the whole board.
     """
     svc = _board_service()
-    if svc is not None:
-        from coord.client import post_record  # noqa: PLC0415
-
-        post_record(
-            svc,
-            "/test-verdict",
-            {
-                "assignment_id": assignment_id,
-                "test_state": test_state,
-                "test_reason": test_reason,
-                "smoke_test": smoke_test,
-                "smoke_test_reason": smoke_test_reason,
-            },
-        )
+    resp = _route_write(
+        svc,
+        "/test-verdict",
+        {
+            "assignment_id": assignment_id,
+            "test_state": test_state,
+            "test_reason": test_reason,
+            "smoke_test": smoke_test,
+            "smoke_test_reason": smoke_test_reason,
+        },
+    )
+    if resp is not None:
         return
     _record_test_verdict_local(
         assignment_id=assignment_id,
@@ -900,6 +896,27 @@ def load_assignment_review_findings(
 def update_assignment_smoke_tests(
     assignment_id: str, smoke_tests: list[str],
 ) -> None:
+    """#252: persist the worker's parsed SMOKE_TESTS list on the row — routes
+    to the daemon when ``board_service`` is set (#749), else writes locally.
+
+    Previously unrouted: on a thin client this silently wrote to a local DB
+    that isn't the canonical one, so `coord notify` / `coord approve-plan`
+    never actually recorded the SMOKE_TESTS block and the TUI never saw it.
+    """
+    if not assignment_id:
+        return
+    svc = _board_service()
+    resp = _route_write(
+        svc, "/assignment-usage", {"assignment_id": assignment_id, "smoke_tests": smoke_tests}
+    )
+    if resp is not None:
+        return
+    _update_assignment_smoke_tests_local(assignment_id, smoke_tests)
+
+
+def _update_assignment_smoke_tests_local(
+    assignment_id: str, smoke_tests: list[str],
+) -> None:
     """#252: persist the worker's parsed SMOKE_TESTS list on the row.
 
     ``smoke_tests=[]`` (the explicit "no tests — change is internal"
@@ -949,10 +966,10 @@ def update_assignment_cost(assignment_id: str, cost_usd: float) -> None:
     if not assignment_id:
         return
     svc = _board_service()
-    if svc is not None:
-        from coord.client import post_record  # noqa: PLC0415
-
-        post_record(svc, "/assignment-usage", {"assignment_id": assignment_id, "cost_usd": cost_usd})
+    resp = _route_write(
+        svc, "/assignment-usage", {"assignment_id": assignment_id, "cost_usd": cost_usd}
+    )
+    if resp is not None:
         return
     _update_assignment_cost_local(assignment_id, cost_usd)
 
@@ -1036,20 +1053,18 @@ def update_assignment_tokens(
     if total <= 0:
         return
     svc = _board_service()
-    if svc is not None:
-        from coord.client import post_record  # noqa: PLC0415
-
-        post_record(
-            svc,
-            "/assignment-usage",
-            {
-                "assignment_id": assignment_id,
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "cache_creation_tokens": cache_creation_tokens,
-                "cache_read_tokens": cache_read_tokens,
-            },
-        )
+    resp = _route_write(
+        svc,
+        "/assignment-usage",
+        {
+            "assignment_id": assignment_id,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_creation_tokens": cache_creation_tokens,
+            "cache_read_tokens": cache_read_tokens,
+        },
+    )
+    if resp is not None:
         return
     _update_assignment_tokens_local(
         assignment_id,
@@ -1106,14 +1121,10 @@ def mark_assignment_interactive(assignment_id: str) -> None:
     if not assignment_id:
         return
     svc = _board_service()
-    if svc is not None:
-        from coord.client import post_record  # noqa: PLC0415
-
-        post_record(
-            svc,
-            "/assignment-usage",
-            {"assignment_id": assignment_id, "is_interactive": True},
-        )
+    resp = _route_write(
+        svc, "/assignment-usage", {"assignment_id": assignment_id, "is_interactive": True}
+    )
+    if resp is not None:
         return
     _mark_assignment_interactive_local(assignment_id)
 
@@ -1355,22 +1366,12 @@ def _query_board(conn: sqlite3.Connection) -> Board:
     }
 
     rows = conn.execute("SELECT * FROM assignments").fetchall()
-    active: list[Assignment] = []
-    completed: list[Assignment] = []
-    for row in rows:
-        a = _row_to_assignment(row)
-        # Attach plan data if present
-        if a.assignment_id and a.assignment_id in plans_by_id:
-            a.plan = plans_by_id[a.assignment_id]
-        if a.status in ("running", "pending"):
-            active.append(a)
-        else:
-            completed.append(a)
     round_number_row = conn.execute(
         "SELECT value FROM board_meta WHERE key = 'round_number'"
     ).fetchone()
     round_number = int(round_number_row["value"]) if round_number_row else 0
-    return Board(active=active, completed=completed, round_number=round_number)
+    # #749: shared row→Board assembly core — see coord._board_mapping.assemble_board.
+    return _assemble_board(rows, plans_by_id, round_number)
 
 
 def build_board() -> Board:
@@ -1412,14 +1413,12 @@ def update_issue_labels(repo_name: str, issue_number: int, labels: list[str]) ->
     table and the TUI Pipeline (which reads it) wouldn't reflect the move.
     """
     svc = _board_service()
-    if svc is not None:
-        from coord.client import post_record  # noqa: PLC0415
-
-        resp = post_record(
-            svc,
-            "/issue-labels",
-            {"repo_name": repo_name, "issue_number": issue_number, "labels": labels},
-        )
+    resp = _route_write(
+        svc,
+        "/issue-labels",
+        {"repo_name": repo_name, "issue_number": issue_number, "labels": labels},
+    )
+    if resp is not None:
         return bool(resp.get("updated"))
     return _update_issue_labels_local(repo_name, issue_number, labels)
 
@@ -1492,20 +1491,18 @@ def edit_issue_content(
     Returns True when something was written, False on a no-op (no fields given).
     """
     svc = _board_service()
-    if svc is not None:
-        from coord.client import post_record  # noqa: PLC0415
-
-        resp = post_record(
-            svc,
-            "/issue-edit",
-            {
-                "repo_name": repo_name,
-                "issue_number": issue_number,
-                "title": title,
-                "body": body,
-                "repo_github": repo_github,
-            },
-        )
+    resp = _route_write(
+        svc,
+        "/issue-edit",
+        {
+            "repo_name": repo_name,
+            "issue_number": issue_number,
+            "title": title,
+            "body": body,
+            "repo_github": repo_github,
+        },
+    )
+    if resp is not None:
         return bool(resp.get("updated"))
     return _edit_issue_content_local(
         repo_name, issue_number, title=title, body=body, repo_github=repo_github
@@ -1559,10 +1556,8 @@ def upsert_open_issues(repo_name: str, issues: list[dict]) -> None:
     issue cache the TUI reads never updates.
     """
     svc = _board_service()
-    if svc is not None:
-        from coord.client import post_record  # noqa: PLC0415
-
-        post_record(svc, "/issues-sync", {"repo_name": repo_name, "issues": issues})
+    resp = _route_write(svc, "/issues-sync", {"repo_name": repo_name, "issues": issues})
+    if resp is not None:
         return
     _upsert_open_issues_local(repo_name, issues)
 
@@ -1665,21 +1660,19 @@ def add_issue_context_entry(
     if not body:
         return None
     svc = _board_service()
-    if svc is not None:
-        from coord.client import post_record  # noqa: PLC0415
-
-        resp = post_record(
-            svc,
-            "/issue-context",
-            {
-                "action": "add",
-                "repo_name": repo_name,
-                "issue_number": issue_number,
-                "body": body,
-                "pinned": pinned,
-                "source": source,
-            },
-        )
+    resp = _route_write(
+        svc,
+        "/issue-context",
+        {
+            "action": "add",
+            "repo_name": repo_name,
+            "issue_number": issue_number,
+            "body": body,
+            "pinned": pinned,
+            "source": source,
+        },
+    )
+    if resp is not None:
         return resp.get("entry_id")
     return _add_issue_context_entry_local(
         repo_name, issue_number, body, pinned=pinned, source=source
@@ -1711,20 +1704,18 @@ def set_issue_context_pin(
     """Pin/unpin one entry — routes to the daemon when set.  Returns whether a
     row was updated."""
     svc = _board_service()
-    if svc is not None:
-        from coord.client import post_record  # noqa: PLC0415
-
-        resp = post_record(
-            svc,
-            "/issue-context",
-            {
-                "action": "pin",
-                "repo_name": repo_name,
-                "issue_number": issue_number,
-                "entry_id": entry_id,
-                "pinned": pinned,
-            },
-        )
+    resp = _route_write(
+        svc,
+        "/issue-context",
+        {
+            "action": "pin",
+            "repo_name": repo_name,
+            "issue_number": issue_number,
+            "entry_id": entry_id,
+            "pinned": pinned,
+        },
+    )
+    if resp is not None:
         return bool(resp.get("updated"))
     return _set_issue_context_pin_local(repo_name, issue_number, entry_id, pinned)
 
@@ -1746,18 +1737,16 @@ def clear_issue_context(repo_name: str, issue_number: int) -> int:
     """Delete all context entries for an issue — routes to the daemon when set.
     Returns the number of rows removed (0 when routed)."""
     svc = _board_service()
-    if svc is not None:
-        from coord.client import post_record  # noqa: PLC0415
-
-        resp = post_record(
-            svc,
-            "/issue-context",
-            {
-                "action": "clear",
-                "repo_name": repo_name,
-                "issue_number": issue_number,
-            },
-        )
+    resp = _route_write(
+        svc,
+        "/issue-context",
+        {
+            "action": "clear",
+            "repo_name": repo_name,
+            "issue_number": issue_number,
+        },
+    )
+    if resp is not None:
         return int(resp.get("deleted") or 0)
     return _clear_issue_context_local(repo_name, issue_number)
 
@@ -1779,19 +1768,17 @@ def replace_issue_context(
     context curate`) — routes to the daemon when set.  *entries* is an ordered
     list of ``{body, pinned?, source?}`` dicts."""
     svc = _board_service()
-    if svc is not None:
-        from coord.client import post_record  # noqa: PLC0415
-
-        post_record(
-            svc,
-            "/issue-context",
-            {
-                "action": "replace",
-                "repo_name": repo_name,
-                "issue_number": issue_number,
-                "entries": entries,
-            },
-        )
+    resp = _route_write(
+        svc,
+        "/issue-context",
+        {
+            "action": "replace",
+            "repo_name": repo_name,
+            "issue_number": issue_number,
+            "entries": entries,
+        },
+    )
+    if resp is not None:
         return
     _replace_issue_context_local(repo_name, issue_number, entries)
 

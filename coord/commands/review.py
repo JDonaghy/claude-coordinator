@@ -457,12 +457,11 @@ def fix_briefing_cmd(aid: str, config_path: Path) -> None:
     from types import SimpleNamespace
 
     from coord.auto_loop import _build_fix_briefing, _load_review_findings
-    from coord.client import fetch_remote_board, resolve_board_service
-    from coord.state import COORD_DIR as _CTX_COORD_DIR, build_board, issue_context_block
+    from coord.board_service import read_board
+    from coord.state import COORD_DIR as _CTX_COORD_DIR, issue_context_block
 
     cfg = _load_config(config_path)
-    svc = resolve_board_service()
-    board = fetch_remote_board(svc) if svc is not None else build_board()
+    board = read_board()
     target = board.find_by_id(aid)
     if target is None:
         click.echo(f"error: no assignment {aid} on the board.", err=True)

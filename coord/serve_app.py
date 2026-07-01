@@ -470,11 +470,45 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             )
         return JSONResponse({"ok": True})
 
+    async def post_board(request: Request) -> Response:
+        # #749: generic whole-board upsert endpoint backing
+        # coord.board_service.write_board() for the commands that still
+        # read-modify-write the full board locally (assign/approve/stop/retry/
+        # resume/bounce/done/pr/…, the dashboard, and auto_loop). save_board()
+        # is upsert-only (never deletes rows), so applying a client's full
+        # in-memory board here is a safe, non-lossy drop-in for what today
+        # runs directly against the local DB.
+        from coord import state  # noqa: PLC0415
+        from coord.models import Assignment, Board  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        try:
+            assignments = [
+                Assignment(**_kwargs(Assignment, d))
+                for d in body.get("assignments", [])
+            ]
+            board = Board(
+                active=[],
+                completed=assignments,
+                round_number=int(body.get("round_number") or 0),
+            )
+            state.save_board(board)
+        except (TypeError, KeyError) as e:
+            return JSONResponse({"error": f"bad board payload: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "board write failed", "detail": str(e)}, status_code=503
+            )
+        return JSONResponse({"ok": True})
+
     async def post_assignment_usage(request: Request) -> Response:
-        # #665: route cost/token/is_interactive writes through the daemon.
-        # Body: {assignment_id, cost_usd?, input_tokens?, output_tokens?,
-        #        cache_creation_tokens?, cache_read_tokens?, is_interactive?}
-        # One round-trip covers all three update helpers; the daemon calls the
+        # #665/#749: route cost/token/is_interactive/smoke_tests writes through
+        # the daemon.  Body: {assignment_id, cost_usd?, input_tokens?,
+        #        output_tokens?, cache_creation_tokens?, cache_read_tokens?,
+        #        is_interactive?, smoke_tests?}
+        # One round-trip covers all four update helpers; the daemon calls the
         # _local forms directly so it never recurses back out over HTTP.
         from coord import state  # noqa: PLC0415
 
@@ -500,6 +534,8 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 )
             if body.get("is_interactive"):
                 state._mark_assignment_interactive_local(aid)
+            if "smoke_tests" in body and body["smoke_tests"] is not None:
+                state._update_assignment_smoke_tests_local(aid, body["smoke_tests"])
         except Exception as e:  # noqa: BLE001
             return JSONResponse(
                 {"error": "assignment-usage write failed", "detail": str(e)},
@@ -1031,6 +1067,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/dispatched-work", post_dispatched_work, methods=["POST"]),
         Route("/dispatched", post_dispatched, methods=["POST"]),
         Route("/test-verdict", post_test_verdict, methods=["POST"]),
+        Route("/board", post_board, methods=["POST"]),
         Route("/assignment-usage", post_assignment_usage, methods=["POST"]),
         Route("/issue-labels", post_issue_labels, methods=["POST"]),
         Route("/issues-sync", post_issues_sync, methods=["POST"]),

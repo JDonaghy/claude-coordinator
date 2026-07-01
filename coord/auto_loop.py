@@ -51,7 +51,8 @@ from coord.review import (
     parse_review_from_agent,
     parse_review_from_log,
 )
-from coord.state import load_board, record_dispatched_assignment, save_board
+from coord.board_service import read_board, write_board
+from coord.state import record_dispatched_assignment
 
 log = logging.getLogger(__name__)
 
@@ -781,10 +782,10 @@ def run_for_fix_transition(
     if not config.pipeline.auto_loop:
         return [LoopAction(kind="disabled", assignment_id=assignment_id)]
 
-    board = load_board()
-    if board is None:
-        log.debug("auto_loop: no board — skipping fix completion %s", assignment_id)
-        return []
+    # #749: read_board()/write_board() route through the daemon when
+    # board_service is configured — previously this always hit the local DB
+    # directly regardless of thin-client status.
+    board = read_board()
 
     fix = board.find_by_id(assignment_id)
     if fix is None:
@@ -823,7 +824,7 @@ def run_for_fix_transition(
             assignment_id, fix.issue_number,
         )
         fix.review_state = "done"
-        save_board(board)
+        write_board(board)
         return [LoopAction(
             kind="terminal_skip",
             assignment_id=assignment_id,
@@ -846,7 +847,7 @@ def run_for_fix_transition(
         # and save the board so the state survives a coordinator restart.
         _post_max_iterations_notice(fix, config)
         fix.review_state = "cap_hit"
-        save_board(board)
+        write_board(board)
         return [LoopAction(
             kind="iteration_cap_hit",
             assignment_id=assignment_id,
@@ -868,7 +869,7 @@ def run_for_fix_transition(
         return []
 
     fix.review_state = "dispatched"
-    save_board(board)
+    write_board(board)
 
     log.info(
         "auto_loop: dispatched re-review %s for fix worker %s (iteration %d/%d)",
@@ -916,10 +917,9 @@ def run_for_review_transition(
     if record.get("type") != "review":
         return []
 
-    board = load_board()
-    if board is None:
-        log.debug("auto_loop: no board — skipping review %s", assignment_id)
-        return []
+    # #749: read_board() routes through the daemon when board_service is
+    # configured, instead of always hitting the local DB directly.
+    board = read_board()
 
     review = board.find_by_id(assignment_id)
     if review is None:
@@ -958,6 +958,6 @@ def run_for_review_transition(
     # silently can't merge), or the work was found terminal (#522).
     _persist_kinds = ("fix_dispatched", "approved", "approved_with_nits", "terminal_skip")
     if any(a.kind in _persist_kinds for a in actions):
-        save_board(board)
+        write_board(board)
 
     return actions

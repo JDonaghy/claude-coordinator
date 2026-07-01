@@ -408,7 +408,7 @@ class TestPipelineAPI:
         )
         client = _dashboard_client()
         with (
-            patch("coord.dashboard.server.load_board", return_value=board),
+            patch("coord.dashboard.server.read_board", return_value=board),
             patch("coord.merge_queue.load_queue", return_value=[]),
         ):
             r = client.get("/api/pipeline")
@@ -444,7 +444,7 @@ class TestPipelineAPI:
         )
         client = _dashboard_client()
         with (
-            patch("coord.dashboard.server.load_board", return_value=board),
+            patch("coord.dashboard.server.read_board", return_value=board),
             patch("coord.merge_queue.load_queue", return_value=[]),
         ):
             r = client.get("/api/pipeline")
@@ -458,8 +458,7 @@ class TestPipelineAPI:
     def test_get_pipeline_empty_board(self) -> None:
         client = _dashboard_client()
         with (
-            patch("coord.dashboard.server.load_board", return_value=None),
-            patch("coord.dashboard.server.build_board", return_value=Board()),
+            patch("coord.dashboard.server.read_board", return_value=Board()),
             patch("coord.merge_queue.load_queue", return_value=[]),
         ):
             r = client.get("/api/pipeline")
@@ -476,7 +475,7 @@ class TestPipelineAPI:
         ])
         client = _dashboard_client()
         with (
-            patch("coord.dashboard.server.load_board", return_value=board),
+            patch("coord.dashboard.server.read_board", return_value=board),
             patch("coord.merge_queue.load_queue", return_value=[]),
         ):
             r = client.get("/api/pipeline")
@@ -501,8 +500,7 @@ class TestPipelineActionAPI:
     def test_unknown_assignment_returns_404(self) -> None:
         client = _dashboard_client()
         with (
-            patch("coord.dashboard.server.load_board", return_value=Board()),
-            patch("coord.dashboard.server.build_board", return_value=Board()),
+            patch("coord.dashboard.server.read_board", return_value=Board()),
         ):
             r = client.post(
                 "/api/pipeline/action",
@@ -529,7 +527,7 @@ class TestPipelineActionAPI:
         ])
         client = _dashboard_client()
         with (
-            patch("coord.dashboard.server.load_board", return_value=board),
+            patch("coord.dashboard.server.read_board", return_value=board),
         ):
             r = client.post(
                 "/api/pipeline/action",
@@ -547,7 +545,7 @@ class TestPipelineActionAPI:
         board = Board(completed=[a])
         client = _dashboard_client()
         with (
-            patch("coord.dashboard.server.load_board", return_value=board),
+            patch("coord.dashboard.server.read_board", return_value=board),
             patch("coord.merge_queue.load_queue", return_value=[]),
             patch("coord.merge_queue.save_queue") as mock_save,
         ):
@@ -567,7 +565,7 @@ class TestPipelineActionAPI:
         )
         board = Board(completed=[a])
         client = _dashboard_client()
-        with patch("coord.dashboard.server.load_board", return_value=board):
+        with patch("coord.dashboard.server.read_board", return_value=board):
             r = client.post(
                 "/api/pipeline/action",
                 json={"assignment_id": "a1", "action": "retry"},
@@ -584,7 +582,7 @@ class TestPipelineActionAPI:
         board = Board(completed=[a])
         client = _dashboard_client()
         with (
-            patch("coord.dashboard.server.load_board", return_value=board),
+            patch("coord.dashboard.server.read_board", return_value=board),
             patch("coord.merge_queue.load_queue", return_value=[]),
         ):
             r = client.post(
@@ -608,8 +606,8 @@ class TestPipelineActionAPI:
         )
         client = _dashboard_client()
         with (
-            patch("coord.dashboard.server.load_board", return_value=board),
-            patch("coord.dashboard.server.save_board"),
+            patch("coord.dashboard.server.read_board", return_value=board),
+            patch("coord.dashboard.server.write_board"),
             patch("coord.review.dispatch_review", return_value=mock_review),
         ):
             r = client.post(
@@ -638,8 +636,8 @@ class TestPipelineActionAPI:
         )
         client = _dashboard_client()
         with (
-            patch("coord.dashboard.server.load_board", return_value=board),
-            patch("coord.dashboard.server.save_board"),
+            patch("coord.dashboard.server.read_board", return_value=board),
+            patch("coord.dashboard.server.write_board"),
             patch("coord.review.dispatch_headless_fix", return_value=mock_fix) as mock_dhf,
         ):
             r = client.post(
@@ -673,8 +671,8 @@ class TestPipelineActionAPI:
         )
         client = _dashboard_client()
         with (
-            patch("coord.dashboard.server.load_board", return_value=board),
-            patch("coord.dashboard.server.save_board"),
+            patch("coord.dashboard.server.read_board", return_value=board),
+            patch("coord.dashboard.server.write_board"),
             patch("coord.review.dispatch_headless_fix", return_value=mock_fix) as mock_dhf,
         ):
             r = client.post(
@@ -698,7 +696,7 @@ class TestPipelineActionAPI:
         )
         board = Board(completed=[a])
         client = _dashboard_client()
-        with patch("coord.dashboard.server.load_board", return_value=board):
+        with patch("coord.dashboard.server.read_board", return_value=board):
             r = client.post(
                 "/api/pipeline/action",
                 json={"assignment_id": "w1", "action": "dispatch_fix",
@@ -715,7 +713,7 @@ class TestPipelineActionAPI:
         )
         board = Board(completed=[a])
         client = _dashboard_client()
-        with patch("coord.dashboard.server.load_board", return_value=board):
+        with patch("coord.dashboard.server.read_board", return_value=board):
             r = client.post(
                 "/api/pipeline/action",
                 json={"assignment_id": "w1", "action": "dispatch_fix"},
@@ -739,8 +737,8 @@ class TestPipelineActionAPI:
             branch="issue-1-t",
         )
         with (
-            patch("coord.dashboard.server.load_board", return_value=board),
-            patch("coord.dashboard.server.save_board"),
+            patch("coord.dashboard.server.read_board", return_value=board),
+            patch("coord.dashboard.server.write_board"),
             patch("coord.review.dispatch_headless_fix", return_value=mock_fix),
         ):
             r = client.post(

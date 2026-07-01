@@ -124,8 +124,9 @@ def _dispatch_followup(
     throwaway worktree name (sometimes a stale/wrong capture), and the
     work it spawns must start a FRESH branch derived from the issue.
     """
+    from coord.board_service import read_board, write_board
     from coord.dispatch import dispatch, post_briefing, compute_do_not_touch
-    from coord.state import build_board, record_dispatched, save_board, load_dispatched
+    from coord.state import record_dispatched, load_dispatched
     from coord.models import Proposal
 
     repo = cfg.repo(original.repo_name)
@@ -169,8 +170,8 @@ def _dispatch_followup(
     post_briefing(proposal, cfg, assignment_id=assignment_id, do_not_touch=do_not_touch)
 
     # Update board
-    board = build_board()
-    save_board(board)
+    board = read_board()
+    write_board(board)
 
     return assignment_id
 
@@ -249,10 +250,10 @@ def _plan_dict_to_text(plan_dict: dict) -> str:
 
 
 def pr(assignment_id: str, config_path: Path, no_review: bool) -> None:
-    from coord.state import build_board, load_board, save_board
+    from coord.board_service import read_board, write_board
 
     cfg = _load_config(config_path)
-    board = load_board() or build_board()
+    board = read_board()
 
     assignment = board.find_by_id(assignment_id)
     if assignment is None:
@@ -306,10 +307,10 @@ def pr(assignment_id: str, config_path: Path, no_review: bool) -> None:
     if not no_review and cfg.reviews.enabled:
         from coord.review import dispatch_review
 
-        fresh_board = load_board() or build_board()
+        fresh_board = read_board()
         review = dispatch_review(assignment, fresh_board, cfg)
         if review is not None:
-            save_board(fresh_board)
+            write_board(fresh_board)
             click.echo(f"Review dispatched (assignment {review.assignment_id})")
             click.echo(f"  reviewer: {review.machine_name}")
         else:
@@ -321,10 +322,11 @@ def pr(assignment_id: str, config_path: Path, no_review: bool) -> None:
 @_CONFIG_OPTION
 @click.option("--guidance", default="", help="Additional guidance for the fix-up worker.")
 def fix(assignment_id: str, config_path: Path, guidance: str) -> None:
-    from coord.state import build_board, load_board, COORD_DIR
+    from coord.board_service import read_board
+    from coord.state import COORD_DIR
 
     cfg = _load_config(config_path)
-    board = load_board() or build_board()
+    board = read_board()
 
     assignment = board.find_by_id(assignment_id)
     if assignment is None:
@@ -408,10 +410,10 @@ def fix(assignment_id: str, config_path: Path, guidance: str) -> None:
 @click.argument("assignment_id")
 @_CONFIG_OPTION
 def approve_plan(assignment_id: str, config_path: Path) -> None:
-    from coord.state import build_board, load_board, save_board
+    from coord.board_service import read_board
 
     cfg = _load_config(config_path)
-    board = load_board() or build_board()
+    board = read_board()
 
     assignment = board.find_by_id(assignment_id)
     if assignment is None:
@@ -520,10 +522,10 @@ def approve_plan(assignment_id: str, config_path: Path) -> None:
 
 
 def reject_plan(assignment_id: str, config_path: Path, guidance: str) -> None:
-    from coord.state import build_board, load_board, save_board
+    from coord.board_service import read_board
 
     cfg = _load_config(config_path)
-    board = load_board() or build_board()
+    board = read_board()
 
     assignment = board.find_by_id(assignment_id)
     if assignment is None:
@@ -610,10 +612,10 @@ def reject_plan(assignment_id: str, config_path: Path, guidance: str) -> None:
 @_CONFIG_OPTION
 @click.option("--guidance", required=True, help="Guidance for the continuation worker.")
 def resume_stuck(assignment_id: str, config_path: Path, guidance: str) -> None:
-    from coord.state import build_board, load_board
+    from coord.board_service import read_board
 
     cfg = _load_config(config_path)
-    board = load_board() or build_board()
+    board = read_board()
 
     assignment = board.find_by_id(assignment_id)
     if assignment is None:

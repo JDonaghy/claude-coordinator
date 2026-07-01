@@ -24,8 +24,9 @@ from coord.events import (
     EventSource,
     build_events_route,
 )
+from coord.board_service import read_board, write_board
 from coord.network import check_all, fetch_status
-from coord.state import build_board, load_board, load_proposals, save_board
+from coord.state import load_proposals
 
 DASHBOARD_DIR = Path(__file__).parent
 # Built React webapp lives here after `npm run build` inside coord/dashboard/webapp/.
@@ -79,7 +80,7 @@ async def _poll_once(
     standing up a full HTTP server.
     """
     if board is None:
-        board = load_board() or build_board()
+        board = read_board()
     if now is None:
         now = time.time()
 
@@ -225,7 +226,7 @@ def build_app(config: Config) -> Starlette:
         return HTMLResponse(html)
 
     async def api_board(request: Request) -> JSONResponse:
-        board = load_board() or build_board()
+        board = read_board()
         from dataclasses import asdict
         return JSONResponse({
             "round_number": board.round_number,
@@ -264,7 +265,7 @@ def build_app(config: Config) -> Starlette:
         from coord.dispatch import dispatch, post_briefing, compute_do_not_touch
         from coord.state import (
             clear_proposals, load_dispatched, load_proposals as load_p,
-            record_dispatched, save_board as save_b, build_board as build_b,
+            record_dispatched,
         )
 
         try:
@@ -291,7 +292,7 @@ def build_app(config: Config) -> Starlette:
         from coord.claim import claim_message, find_work_claim
 
         in_flight = load_dispatched()
-        board_for_claim = build_b()
+        board_for_claim = read_board()
         results = []
         for p in selected:
             repo = config.repo(p.repo_name)
@@ -326,9 +327,9 @@ def build_app(config: Config) -> Starlette:
                 results.append({"id": p.id, "ok": False, "error": str(e)})
 
         clear_proposals()
-        board = build_b()
+        board = read_board()
         board.round_number += 1
-        save_b(board)
+        write_board(board)
         return JSONResponse({"results": results})
 
     async def api_chat(request: Request) -> StreamingResponse:
@@ -341,7 +342,7 @@ def build_app(config: Config) -> Starlette:
         if not message:
             return JSONResponse({"error": "message required"}, status_code=400)
 
-        board = load_board() or build_board()
+        board = read_board()
         from dataclasses import asdict
         board_context = json.dumps({
             "round_number": board.round_number,
@@ -415,7 +416,7 @@ def build_app(config: Config) -> Starlette:
 
     async def api_diff(request: Request) -> JSONResponse:
         assignment_id = request.path_params["id"]
-        board = load_board() or build_board()
+        board = read_board()
         assignment = board.find_by_id(assignment_id)
         if assignment is None:
             return JSONResponse({"error": "assignment not found"}, status_code=404)
@@ -454,7 +455,7 @@ def build_app(config: Config) -> Starlette:
         from coord.merge_queue import load_queue
         from coord.state import load_assignment_review_findings
 
-        board = load_board() or build_board()
+        board = read_board()
         mq_items = load_queue()
 
         # Build a lookup of review assignment id per work assignment_id so we can
@@ -508,7 +509,7 @@ def build_app(config: Config) -> Starlette:
                 {"error": "assignment_id and action are required"}, status_code=400
             )
 
-        board = load_board() or build_board()
+        board = read_board()
         assignment = board.find_by_id(assignment_id)
         if assignment is None:
             return JSONResponse({"error": "assignment not found"}, status_code=404)
@@ -521,7 +522,7 @@ def build_app(config: Config) -> Starlette:
             except Exception as exc:
                 return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
             if result:
-                save_board(board)
+                write_board(board)
                 return JSONResponse({
                     "ok": True,
                     "machine_name": result.machine_name,
@@ -540,7 +541,7 @@ def build_app(config: Config) -> Starlette:
             except Exception as exc:
                 return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
             if result:
-                save_board(board)
+                write_board(board)
                 return JSONResponse({
                     "ok": True,
                     "machine_name": result.machine_name,
@@ -636,7 +637,7 @@ def build_app(config: Config) -> Starlette:
                     pass
             # Mark failed in the board regardless of agent response.
             board.mark_failed_by_id(assignment_id, finished_at=time.time())
-            save_board(board)
+            write_board(board)
             return JSONResponse({"ok": True, "cancelled_on_agent": cancelled_on_agent})
 
         elif action == "test-verdict":
@@ -744,7 +745,7 @@ def build_app(config: Config) -> Starlette:
             except Exception as exc:
                 return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
             if result:
-                save_board(board)
+                write_board(board)
                 return JSONResponse({
                     "ok": True,
                     "machine_name": result.machine_name,

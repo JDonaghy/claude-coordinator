@@ -783,11 +783,11 @@ def _run_troubleshoot_or_chat(
         tmux_session_name as _tmux_name,
     )
 
+    from coord.board_service import read_board as _read_board_ts  # noqa: PLC0415
+    from coord.board_service import write_board as _write_board_ts  # noqa: PLC0415
     from coord.models import Assignment as _AssignmentTs  # noqa: PLC0415
     from coord.state import (  # noqa: PLC0415
-        build_board as _build_board_ts,
         record_dispatched_assignment as _record_ts,
-        save_board as _save_board_ts,
     )
     from coord.agent import AssignmentSpec as _AssignmentSpecTs  # noqa: PLC0415
 
@@ -975,7 +975,10 @@ def _run_troubleshoot_or_chat(
         provider_name="claude-pty",
     )
     _record_ts(assignment=ts_assignment, repo_github=repo_cfg.github)
-    _save_board_ts(_build_board_ts())
+    # #749: previously unconditional local build_board/save_board — this
+    # function (unlike the --x-of variants) never had thin-client awareness,
+    # so it silently wrote board_meta to a non-canonical local DB.
+    _write_board_ts(_read_board_ts())
     os.environ["COORD_ASSIGNMENT_ID"] = assignment_id
 
     started_at = _time.time()
@@ -2654,14 +2657,11 @@ def _dispatch_interactive_work(
     # interactive sessions on the same issue and both push competing
     # branches.  --force bypasses the check (mirrors the
     # claude -p path below).
+    from coord.board_service import read_board, write_board  # noqa: PLC0415
     from coord.claim import claim_message, find_work_claim  # noqa: PLC0415
-    from coord.state import (  # noqa: PLC0415
-        build_board,
-        record_dispatched,
-        save_board,
-    )
+    from coord.state import record_dispatched  # noqa: PLC0415
 
-    board_check = build_board()
+    board_check = read_board()
     if not force:
         claim = find_work_claim(issue, repo, repo_cfg.github, board_check)
         if claim is not None:
@@ -2805,9 +2805,11 @@ def _dispatch_interactive_work(
 
         # Update board metadata (round_number / board_initialized).
         # `record_dispatched` already wrote the assignment row, so the
-        # build_board → save_board round-trip is a no-op for the
-        # assignments table; the useful side-effect is board_meta.
-        save_board(build_board())
+        # read_board → write_board round-trip is a no-op for the
+        # assignments table; the useful side-effect is board_meta — and
+        # write_board() now actually reaches the daemon on a thin client
+        # instead of silently touching a local DB that isn't canonical (#749).
+        write_board(read_board())
 
         started_at = _time.time()
         # #487: pass assignment_id so the tmux path names the session
@@ -2974,7 +2976,7 @@ def _dispatch_interactive_work(
         )
         effective_briefing = _issue_ctx + report_reminder + briefing + _ctx_write_hint
 
-        save_board(build_board())
+        write_board(read_board())
 
         # Echo briefing to the LOCAL terminal before connecting to the
         # remote session, so the operator can read it before pressing
@@ -3252,13 +3254,9 @@ def _dispatch_headless(
     run the claim + dependency-freshness checks, POST to the agent server,
     and record + post the briefing.
     """
+    from coord.board_service import read_board, write_board  # noqa: PLC0415
     from coord.dispatch import dispatch, post_briefing  # noqa: PLC0415
-    from coord.state import (  # noqa: PLC0415
-        build_board,
-        load_dispatched,
-        record_dispatched,
-        save_board,
-    )
+    from coord.state import load_dispatched, record_dispatched  # noqa: PLC0415
 
 
     # Build a Proposal inline
@@ -3312,7 +3310,7 @@ def _dispatch_headless(
     # Claim check
     from coord.claim import claim_message, find_work_claim
 
-    board = build_board()
+    board = read_board()
     if not force:
         claim = find_work_claim(issue, repo, repo_cfg.github, board)
         if claim is not None:
@@ -3408,8 +3406,8 @@ def _dispatch_headless(
         click.echo(f"  briefing post failed: {e}", err=True)
 
     # Update board
-    board = build_board()
-    save_board(board)
+    board = read_board()
+    write_board(board)
 
     # Mark session start on first dispatch of the session
     from coord.state import load_session, write_session_start

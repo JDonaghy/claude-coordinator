@@ -437,20 +437,16 @@ def _restore_default_branch_after_test(cfg, assignment) -> None:
 
 
 def test(assignment_id: str, config_path: Path, verdict: str | None, reason: str, output_file: str | None) -> None:
-    from coord.client import resolve_board_service
-    from coord.state import build_board, load_board, record_test_verdict, save_board
+    from coord.board_service import read_board, resolve
+    from coord.state import record_test_verdict, save_board
 
     cfg = _load_config(config_path)
     # #590 Phase 2: a thin client reads the board from the daemon (its local DB
     # is empty) so the assignment resolves; the verdict is then recorded back
-    # through the daemon. Unset ⇒ unchanged local board + save_board.
-    svc = resolve_board_service()
-    if svc is not None:
-        from coord.client import fetch_remote_board
-
-        board = fetch_remote_board(svc)
-    else:
-        board = load_board() or build_board()
+    # through the daemon via the lighter single-row record_test_verdict (not a
+    # full write_board()). Unset ⇒ unchanged local board + save_board.
+    svc = resolve()
+    board = read_board()
 
     assignment = board.find_by_id(assignment_id)
     if assignment is None:

@@ -447,6 +447,70 @@ def test_serve_dispatched_work_records_row(
     assert row["status"] == "running" and row["provider_name"] == "claude"
 
 
+def test_serve_post_board_upserts_full_board(
+    file_db: Path, valid_config_path: Path, rw_db
+):
+    """#749: POST /board — the generic whole-board upsert endpoint backing
+    coord.board_service.write_board() for the client paths that still
+    read-modify-write the full board (assign/approve/stop/retry/…)."""
+    from coord.client import serialize_board
+    from coord.models import Assignment, Board
+
+    board = Board(
+        round_number=4,
+        completed=[
+            Assignment(
+                machine_name="precision", repo_name="api", issue_number=21,
+                issue_title="thin-client board write", assignment_id="wb1",
+                status="done", branch="issue-21-x",
+            ),
+        ],
+    )
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post("/board", json=serialize_board(board))
+    assert resp.status_code == 200 and resp.json()["ok"] is True
+
+    row = rw_db.execute(
+        "SELECT status, branch FROM assignments WHERE assignment_id='wb1'"
+    ).fetchone()
+    assert row["status"] == "done" and row["branch"] == "issue-21-x"
+    meta = rw_db.execute(
+        "SELECT value FROM board_meta WHERE key='round_number'"
+    ).fetchone()
+    assert meta["value"] == "4"
+
+
+def test_post_board_routes_to_daemon_when_service_set(coord_db, monkeypatch):
+    """coord.client.post_board POSTs the serialized board to /board."""
+    from coord import client as cc
+    from coord.models import Assignment, Board
+
+    captured: dict = {}
+    monkeypatch.setattr(
+        cc, "post_record",
+        lambda svc, path, payload, **kw: captured.update(path=path, payload=payload)
+        or {"ok": True},
+    )
+    board = Board(
+        round_number=6,
+        completed=[
+            Assignment(
+                machine_name="m", repo_name="api", issue_number=1,
+                issue_title="t", assignment_id="wb2", status="done",
+            ),
+        ],
+    )
+    cc.post_board(cc.ServiceConfig("http://d:7435"), board)
+    assert captured["path"] == "/board"
+    assert captured["payload"]["round_number"] == 6
+    assert captured["payload"]["assignments"][0]["assignment_id"] == "wb2"
+    # Routed → nothing written to the local DB.
+    assert coord_db.execute(
+        "SELECT COUNT(*) c FROM assignments WHERE assignment_id='wb2'"
+    ).fetchone()["c"] == 0
+
+
 def test_serve_test_verdict_records(file_db: Path, valid_config_path: Path, rw_db):
     _seed_running_assignment(rw_db, aid="work77")
     app = build_app(SqliteStore(file_db), load_config(valid_config_path))
@@ -748,6 +812,42 @@ def test_serve_assignment_usage_combined(file_db, valid_config_path, rw_db):
     assert row["cost_usd"] == 0.10
     assert row["input_tokens"] == 50
     assert row["is_interactive"] == 1
+
+
+def test_serve_assignment_usage_records_smoke_tests(file_db, valid_config_path, rw_db):
+    """#749: POST /assignment-usage also routes the SMOKE_TESTS block —
+    coord.state.update_assignment_smoke_tests was previously unrouted, so a
+    thin client's `coord notify`/`coord approve-plan` never recorded it."""
+    _seed_running_assignment(rw_db, aid="du05")
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post(
+            "/assignment-usage",
+            json={"assignment_id": "du05", "smoke_tests": ["click the button"]},
+        )
+    assert resp.status_code == 200
+    row = rw_db.execute(
+        "SELECT smoke_tests FROM assignments WHERE assignment_id='du05'"
+    ).fetchone()
+    assert row["smoke_tests"] == '["click the button"]'
+
+
+def test_update_assignment_smoke_tests_routes_when_service_set(coord_db, monkeypatch):
+    from coord import client as cc
+    from coord import state
+
+    monkeypatch.setattr(
+        cc, "resolve_board_service", lambda *a, **k: cc.ServiceConfig("http://d:7435")
+    )
+    captured: dict = {}
+    monkeypatch.setattr(
+        cc, "post_record",
+        lambda svc, path, payload, **kw: captured.update(path=path, payload=payload)
+        or {"ok": True},
+    )
+    state.update_assignment_smoke_tests("aid1", ["run the tests"])
+    assert captured["path"] == "/assignment-usage"
+    assert captured["payload"]["smoke_tests"] == ["run the tests"]
 
 
 def test_serve_assignment_usage_missing_id(file_db, valid_config_path):

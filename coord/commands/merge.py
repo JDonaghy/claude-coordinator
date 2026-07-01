@@ -4,7 +4,6 @@ coord/cli.py (#747)."""
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
@@ -97,12 +96,10 @@ def verify_merge(
     can run even when the board lookup returns nothing.
     """
     from coord.agent import verify_merge_branch  # noqa: PLC0415
-    from coord.client import fetch_remote_board, resolve_board_service  # noqa: PLC0415
-    from coord.state import build_board  # noqa: PLC0415
+    from coord.board_service import read_board  # noqa: PLC0415
 
     cfg = _load_config(config_path)
-    svc = resolve_board_service()
-    board = fetch_remote_board(svc) if svc is not None else build_board()
+    board = read_board()
     work = board.find_by_id(work_aid)
     if work is None:
         if repo_opt and issue_number_opt is not None:
@@ -170,10 +167,11 @@ def bounce(review_assignment_id: str, config_path: Path) -> None:
     button.
     """
     from coord.auto_loop import process_review_completion
-    from coord.state import COORD_DIR, build_board, load_board, save_board
+    from coord.board_service import read_board, write_board
+    from coord.state import COORD_DIR
 
     cfg = _load_config(config_path)
-    board = load_board() or build_board()
+    board = read_board()
 
     review = board.find_by_id(review_assignment_id)
     if review is None:
@@ -221,7 +219,7 @@ def bounce(review_assignment_id: str, config_path: Path) -> None:
     # row doesn't get re-evaluated, and treat it as a clean (not failed) exit.
     terminal = any(a.kind == "terminal_skip" for a in actions)
     if dispatched or terminal:
-        save_board(board)
+        write_board(board)
 
     for a in actions:
         click.echo(f"{a.kind}: {a.detail}")
@@ -266,10 +264,10 @@ def reconcile_merges(repo_name: str | None, dry_run: bool, config_path: Path) ->
     # client this would sweep an empty local board and silently do nothing.
     # Route the whole operation to the daemon (mirrors `coord merge`).
     # COORD_RECONCILE_ON_DAEMON guards the daemon against re-routing to itself.
-    from coord.client import resolve_board_service  # noqa: PLC0415
+    from coord.board_service import daemon_reroute_target  # noqa: PLC0415
 
-    _svc = resolve_board_service()
-    if _svc is not None and not os.environ.get("COORD_RECONCILE_ON_DAEMON"):
+    _svc = daemon_reroute_target("COORD_RECONCILE_ON_DAEMON")
+    if _svc is not None:
         _reconcile_via_daemon(_svc, {"repo": repo_name, "dry_run": dry_run})
         return
 
@@ -599,10 +597,10 @@ def merge(
     # operation to the daemon — it runs the merge where the DB + gh live and
     # returns its output.  COORD_MERGE_ON_DAEMON guards the daemon against
     # re-routing to itself (it calls this same command with the env var set).
-    from coord.client import resolve_board_service  # noqa: PLC0415
+    from coord.board_service import daemon_reroute_target  # noqa: PLC0415
 
-    _merge_svc = resolve_board_service()
-    if _merge_svc is not None and not os.environ.get("COORD_MERGE_ON_DAEMON"):
+    _merge_svc = daemon_reroute_target("COORD_MERGE_ON_DAEMON")
+    if _merge_svc is not None:
         # #779-fix: --plan must never reach /merge on an older daemon — it has
         # no show_plan handler and falls through to a live merge cycle (side
         # effects).  Route through /board instead; merge_plan has been in the
