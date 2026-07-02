@@ -1033,9 +1033,10 @@ def chat_continue(
 
     # #316: preserve the chat type so the agent server uses the right system
     # prompt and tool restrictions on continuation.  The known chat types are
-    # "refinement", "test-chat", and "new-issue-chat"; anything else falls
-    # back to "refinement" (the original behaviour before type-preservation).
-    _CHAT_TYPES = {"refinement", "test-chat", "new-issue-chat"}
+    # "refinement", "test-chat", "new-issue-chat", and "milestone-chat"
+    # (#770); anything else falls back to "refinement" (the original
+    # behaviour before type-preservation).
+    _CHAT_TYPES = {"refinement", "test-chat", "new-issue-chat", "milestone-chat"}
     prior_type: str = prior.type if prior.type in _CHAT_TYPES else "refinement"
 
     # #315: if the DB doesn't have the session_id yet, fetch it directly

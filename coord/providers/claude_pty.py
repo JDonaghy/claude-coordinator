@@ -408,6 +408,8 @@ class ClaudePtyProvider(Provider):
         # Deferred import — keeps the cycle latent.
         from coord.agent import (  # noqa: PLC0415
             DEFAULT_WORKER_BINARY,
+            MILESTONE_CHAT_DENY_COMMANDS,
+            MILESTONE_CHAT_SYSTEM_PROMPT,
             NEW_ISSUE_CHAT_DENY_COMMANDS,
             NEW_ISSUE_CHAT_SYSTEM_PROMPT,
             REFINEMENT_SYSTEM_PROMPT,
@@ -451,6 +453,10 @@ class ClaudePtyProvider(Provider):
                         "covered them yet).\n\n"
                         + spec.new_issue_guidance
                     )
+                _at = "Read,Bash"
+            elif spec.type == "milestone-chat":
+                _sp = spec.system_prompt if spec.system_prompt else MILESTONE_CHAT_SYSTEM_PROMPT
+                _sp += build_deny_prompt(MILESTONE_CHAT_DENY_COMMANDS)
                 _at = "Read,Bash"
             else:
                 _sp = spec.system_prompt if spec.system_prompt else WORKER_SYSTEM_PROMPT

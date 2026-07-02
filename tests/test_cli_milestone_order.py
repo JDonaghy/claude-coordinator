@@ -181,3 +181,203 @@ class TestMilestoneOrderCmd:
             )
         assert result.exit_code == 1
         assert "cycle" in result.output
+
+
+# ── `coord milestone write-order` (#770 Phase 2 write path) ────────────────
+
+
+class TestMilestoneWriteOrderCmd:
+    def test_writes_valid_block_via_stdin(self, config_file: Path) -> None:
+        tracking_body = "Milestone plan.\n\n## Refs\nsome refs\n"
+
+        def get_issue(repo, number):
+            return {
+                "number": 100, "title": "tracking", "body": tracking_body,
+                "state": "OPEN", "milestone": {"number": 9, "title": "M"},
+            }
+
+        open_issues = [
+            {"number": 762, "milestone": {"number": 9}},
+            {"number": 763, "milestone": {"number": 9}},
+        ]
+        new_block = "- [ ] #762  {group: A}\n- [ ] #763  {after: #762}\n"
+        with patch("coord.github_ops.get_issue", side_effect=get_issue), \
+             patch("coord.github_ops.get_open_issues", return_value=open_issues), \
+             patch("coord.github_ops.update_issue_body") as mock_update:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "write-order", "api", "100", "--config", str(config_file)],
+                input=new_block,
+            )
+        assert result.exit_code == 0, result.output
+        assert "wrote `## Work order` block (2 node(s))" in result.output
+        mock_update.assert_called_once()
+        call_repo, call_issue, call_body = mock_update.call_args[0]
+        assert call_repo == "acme/api"
+        assert call_issue == 100
+        assert "Milestone plan." in call_body
+        assert "## Refs\nsome refs" in call_body
+        assert "#762" in call_body and "#763" in call_body
+
+    def test_writes_from_file_option(self, config_file: Path, tmp_path: Path) -> None:
+        block_file = tmp_path / "order.txt"
+        block_file.write_text("- [ ] #762\n")
+
+        def get_issue(repo, number):
+            return {
+                "number": 100, "title": "tracking", "body": "",
+                "state": "OPEN", "milestone": {"number": 9, "title": "M"},
+            }
+
+        open_issues = [{"number": 762, "milestone": {"number": 9}}]
+        with patch("coord.github_ops.get_issue", side_effect=get_issue), \
+             patch("coord.github_ops.get_open_issues", return_value=open_issues), \
+             patch("coord.github_ops.update_issue_body") as mock_update:
+            result = CliRunner().invoke(
+                main,
+                [
+                    "milestone", "write-order", "api", "100",
+                    "--file", str(block_file), "--config", str(config_file),
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        mock_update.assert_called_once()
+
+    def test_idempotent_rewrite_is_a_noop(self, config_file: Path) -> None:
+        tracking_body = "## Work order\n- [ ] #762  {group: A}\n"
+
+        def get_issue(repo, number):
+            return {
+                "number": 100, "title": "tracking", "body": tracking_body,
+                "state": "OPEN", "milestone": {"number": 9, "title": "M"},
+            }
+
+        open_issues = [{"number": 762, "milestone": {"number": 9}}]
+        with patch("coord.github_ops.get_issue", side_effect=get_issue), \
+             patch("coord.github_ops.get_open_issues", return_value=open_issues), \
+             patch("coord.github_ops.update_issue_body") as mock_update:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "write-order", "api", "100", "--config", str(config_file)],
+                input="- [ ] #762  {group: A}\n",
+            )
+        assert result.exit_code == 0, result.output
+        assert "unchanged (idempotent no-op)" in result.output
+        mock_update.assert_not_called()
+
+    def test_refuses_to_write_a_cycle(self, config_file: Path) -> None:
+        def get_issue(repo, number):
+            return {
+                "number": 100, "title": "tracking", "body": "",
+                "state": "OPEN", "milestone": {"number": 9, "title": "M"},
+            }
+
+        with patch("coord.github_ops.get_issue", side_effect=get_issue), \
+             patch("coord.github_ops.update_issue_body") as mock_update:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "write-order", "api", "100", "--config", str(config_file)],
+                input="- [ ] #1 {after: #2}\n- [ ] #2 {after: #1}\n",
+            )
+        assert result.exit_code == 1
+        assert "cycle" in result.output
+        mock_update.assert_not_called()
+
+    def test_refuses_foreign_issue(self, config_file: Path) -> None:
+        def get_issue(repo, number):
+            if number == 100:
+                return {
+                    "number": 100, "title": "tracking", "body": "",
+                    "state": "OPEN", "milestone": {"number": 9, "title": "M"},
+                }
+            return {
+                "number": number, "title": "x", "body": "",
+                "state": "OPEN", "milestone": {"number": 42, "title": "Other"},
+            }
+
+        with patch("coord.github_ops.get_issue", side_effect=get_issue), \
+             patch("coord.github_ops.get_open_issues", return_value=[]), \
+             patch("coord.github_ops.update_issue_body") as mock_update:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "write-order", "api", "100", "--config", str(config_file)],
+                input="- [ ] #999\n",
+            )
+        assert result.exit_code == 1
+        assert "not an issue under this milestone" in result.output
+        mock_update.assert_not_called()
+
+    def test_refuses_empty_block(self, config_file: Path) -> None:
+        with patch("coord.github_ops.update_issue_body") as mock_update:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "write-order", "api", "100", "--config", str(config_file)],
+                input="",
+            )
+        assert result.exit_code == 2
+        assert "no work-order content" in result.output
+        mock_update.assert_not_called()
+
+    def test_tracking_issue_without_milestone_errors(self, config_file: Path) -> None:
+        def get_issue_no_milestone(repo, number):
+            return {"number": number, "title": "t", "body": "", "state": "OPEN", "milestone": None}
+
+        with patch("coord.github_ops.get_issue", side_effect=get_issue_no_milestone), \
+             patch("coord.github_ops.update_issue_body") as mock_update:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "write-order", "api", "100", "--config", str(config_file)],
+                input="- [ ] #1\n",
+            )
+        assert result.exit_code == 1
+        assert "no milestone" in result.output
+        mock_update.assert_not_called()
+
+    def test_unknown_repo_errors(self, config_file: Path) -> None:
+        result = CliRunner().invoke(
+            main,
+            ["milestone", "write-order", "nope", "100", "--config", str(config_file)],
+            input="- [ ] #1\n",
+        )
+        assert result.exit_code == 2
+        assert "unknown repo" in result.output
+
+
+# ── `coord milestone chat` (#770 Phase 2 dispatch) ──────────────────────────
+
+
+class TestMilestoneChatCmd:
+    def test_dispatches_and_prints_assignment_id(self, config_file: Path) -> None:
+        with patch(
+            "coord.milestone_chat.dispatch_milestone_chat",
+            return_value=("asg123", "laptop"),
+        ) as mock_dispatch:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "chat", "api", "100", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        assert result.output.strip().splitlines()[-1] == "asg123"
+        mock_dispatch.assert_called_once_with(
+            "api", 100, mock_dispatch.call_args[0][2], machine_override=None
+        )
+
+    def test_dispatch_failure_reports_error(self, config_file: Path) -> None:
+        with patch(
+            "coord.milestone_chat.dispatch_milestone_chat",
+            side_effect=RuntimeError("no machine claims repo 'api'"),
+        ):
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "chat", "api", "100", "--config", str(config_file)],
+            )
+        assert result.exit_code == 1
+        assert "no machine claims repo" in result.output
+
+    def test_unknown_repo_errors(self, config_file: Path) -> None:
+        result = CliRunner().invoke(
+            main,
+            ["milestone", "chat", "nope", "100", "--config", str(config_file)],
+        )
+        assert result.exit_code == 2
+        assert "unknown repo" in result.output

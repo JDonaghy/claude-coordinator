@@ -230,6 +230,42 @@ class TestChatContinueTypePreservation:
         assert payload["resume_session_id"] == "ses-nic-1"
 
     @patch("coord.dispatch.httpx.post")
+    def test_milestone_chat_type_round_trips(
+        self, mock_post, coord_db, simple_config
+    ) -> None:
+        """chat-continue sends type='milestone-chat' when prior assignment
+        has that type (#770) — a wrong fallback to 'refinement' would give
+        the continuation turn the wrong system prompt/tool restrictions."""
+        from coord.db import get_connection
+
+        conn = get_connection()
+        _insert_assignment(
+            conn,
+            assignment_id="mc-old-1",
+            claude_session_id="ses-mc-1",
+            type="milestone-chat",
+            issue_number=100,
+            issue_title="Milestone tracker",
+        )
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "mc-new-1"}
+        mock_resp.raise_for_status = MagicMock()
+        mock_post.return_value = mock_resp
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            ["chat-continue", "--config", str(simple_config), "mc-old-1", "yes, write it"],
+        )
+        assert result.exit_code == 0, result.output
+
+        mock_post.assert_called_once()
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["type"] == "milestone-chat"
+        assert payload["resume_session_id"] == "ses-mc-1"
+
+    @patch("coord.dispatch.httpx.post")
     def test_refinement_type_still_round_trips(
         self, mock_post, coord_db, simple_config
     ) -> None:

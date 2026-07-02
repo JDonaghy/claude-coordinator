@@ -126,6 +126,12 @@ def test_parity_new_issue_chat_with_guidance() -> None:
     _parity(spec)
 
 
+def test_parity_milestone_chat_type() -> None:
+    """Milestone-chat assignment (#770)."""
+    spec = _make_spec(type="milestone-chat")
+    _parity(spec)
+
+
 def test_parity_with_resume_session_id() -> None:
     """Work assignment with resume_session_id (chat-continue dispatch)."""
     spec = _make_spec(type="work", resume_session_id="abc123session")
