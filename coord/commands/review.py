@@ -14,7 +14,9 @@ import click
 from coord.commands._common import _CONFIG_OPTION, _load_config
 
 
-def _collect_review_body_via_editor(*, assignment_id: str, summary: str) -> str | None:
+def _collect_review_body_via_editor(
+    *, assignment_id: str, summary: str, pre_body: str | None = None
+) -> str | None:
     """Open ``$EDITOR`` for the operator to enter the full review findings (#617).
 
     Last-resort body capture for :func:`_prompt_and_relay_review_verdict` when
@@ -23,6 +25,10 @@ def _collect_review_body_via_editor(*, assignment_id: str, summary: str) -> str 
     never be recorded bodyless — the write seam refuses it and the fix worker
     would be dispatched with nothing to fix (#607) — so this collects the body
     the operator just wrote in the review session.
+
+    When *pre_body* is provided it is used as the initial seed, so the operator
+    edits or confirms already-recovered findings rather than typing from scratch
+    (#877 editor-blank fix).
 
     Returns the entered body (template comment lines stripped) or ``None`` when
     empty / no editor available, so the caller can refuse + print the manual
@@ -37,7 +43,10 @@ def _collect_review_body_via_editor(*, assignment_id: str, summary: str) -> str 
         "# iteration on this issue.\n"
         "# Lines starting with '#' are ignored. Save an empty file to cancel.\n"
     )
-    seed = (f"{summary.strip()}\n" if summary.strip() else "") + template
+    if pre_body and pre_body.strip():
+        seed = pre_body.strip() + "\n" + template
+    else:
+        seed = (f"{summary.strip()}\n" if summary.strip() else "") + template
     try:
         edited = click.edit(seed)
     except Exception:  # noqa: BLE001 — no editor / editor failed → treat as cancel
@@ -58,8 +67,10 @@ def _prompt_and_relay_review_verdict(
     issue_number: int,
     machine_name: str,
     verdict_cmd_hint: str,
+    started_at: float | None = None,
+    ssh_target: str | None = None,
 ) -> bool:
-    """Prompt the operator for a review verdict on exit and relay it (#486d).
+    """Prompt the operator for a review verdict on exit and relay it (#486d / #877).
 
     Backstop used by BOTH interactive-review exit paths when the reviewer left
     without running `coord report-result` (local or remote — since #590 a
@@ -71,51 +82,163 @@ def _prompt_and_relay_review_verdict(
     TTY) and relay through the same `issue_store` seam `coord report-result`
     uses — which itself routes to the daemon when `board_service` is set.
 
-    No-op that prints the manual hint when stdin isn't a TTY (tests/headless).
+    **#877 board-content gate (primary)**: before prompting, read the assignment
+    from the local DB for ``review_verdict`` + ``review_findings``.  When both
+    are present the editor is NOT opened — the already-captured body is used
+    directly and the prompt defaults to the captured verdict (not ``[s]``).
+    This handles the status=failed-with-valid-verdict inconsistency where the
+    board already captured the findings (e.g. via ``notify`` or a previous
+    partial attempt) but ``already_recorded`` was False when ``finalize`` ran.
+
+    **#877 remote-transcript backstop (secondary)**: when the board is empty and
+    ``ssh_target`` is set, the remote transcript-floor is re-run against the
+    session's own host before any editor is opened.  Findings recovered here
+    also seed the editor so it is never blank.
+
+    *started_at*: session start timestamp (epoch).  Passed to the transcript-
+    floor so only transcripts active during this session are considered.  When
+    ``None``, the local scan is skipped and the remote scan uses a permissive
+    ``cutoff=0`` (bounded solely by the issue-number gate).
+
+    *ssh_target*: SSH hostname of the machine where the review session ran.
+    ``None`` for local sessions; set to ``machine.host`` for remote reviews.
+
+    No-op that prints the manual hint when stdin isn't a TTY AND no pre-
+    captured data is available (tests / headless invocations where no prior
+    recording happened).
     Returns True when a verdict was recorded.
     """
+    # ── Step 1: board-content gate (#877) ───────────────────────────────────
+    # Check the local DB first (cheapest) for already-captured verdict+findings.
+    # This is intentionally BEFORE the TTY check so headless callers also benefit
+    # (auto-relay the captured data without prompting).
+    _pre_verdict: str | None = None
+    _pre_body: str | None = None
+    try:
+        from coord.state import load_assignment_review_findings  # noqa: PLC0415
+
+        _cached = load_assignment_review_findings(assignment_id)
+        if _cached is not None:
+            _pre_verdict, _pre_body = _cached
+    except Exception:  # noqa: BLE001 — DB unavailable → fall through
+        pass
+
+    # ── Step 2: remote transcript-floor (#877) ──────────────────────────────
+    # When board is empty and ssh_target is known, re-run the transcript-floor
+    # against the session's own host.  Reuses the same floor that
+    # finalize_interactive_exit already attempted — a 2nd pass here catches the
+    # flush-race / timing window where the JSONL wasn't fully written yet when
+    # finalize ran.  started_at=None falls through to cutoff=0 (all transcripts
+    # in the remote listing) — still bounded by the issue-number gate.
+    if _pre_verdict is None and ssh_target:
+        try:
+            from coord.interactive import (  # noqa: PLC0415
+                _review_findings_from_transcript,
+            )
+
+            _tf = _review_findings_from_transcript(
+                issue_number, started_at, ssh_target=ssh_target
+            )
+            if _tf is not None:
+                _pre_verdict = _tf.verdict
+                _pre_body = _tf.body
+        except Exception:  # noqa: BLE001 — ssh unavailable → fall through
+            pass
+
+    # ── Surface pre-captured findings ───────────────────────────────────────
+    if _pre_verdict is not None:
+        click.echo(f"\n  Captured review verdict: {_pre_verdict!r}")
+        if _pre_body:
+            _preview = _pre_body[:300].rstrip()
+            if len(_pre_body) > 300:
+                _preview += f"\n  … ({len(_pre_body)} chars total)"
+            click.echo(f"  Findings preview: {_preview}\n")
+
+    # ── Non-TTY path ─────────────────────────────────────────────────────────
     if not sys.stdin.isatty():
-        click.echo(f"  no verdict reported — record it with:\n{verdict_cmd_hint}")
-        return False
-    ans = click.prompt(
-        "  Review verdict — [a]pprove / [r]equest-changes / [s]kip",
-        type=click.Choice(["a", "r", "s"], case_sensitive=False),
-        default="s",
-        show_choices=True,
-    )
-    verdict = {"a": "approve", "r": "request-changes"}.get(ans.lower())
-    if verdict is None:
-        click.echo(f"  skipped — record the verdict later with:\n{verdict_cmd_hint}")
-        return False
-    summary = click.prompt(
-        "  one-line summary (optional, Enter to skip)", default="", show_default=False
-    )
-    # #617: a request-changes verdict MUST carry the full findings body — the
-    # one-line summary is what the fix worker is briefed with and what the #603
-    # context store records, so recording request-changes bodyless silently
-    # strands the next iteration (#607).  The write seam refuses it, so collect
-    # the body here ($EDITOR) and never relay request-changes without it.
-    # Approve needs no body.
-    findings_body: str | None = None
-    if verdict == "request-changes":
-        click.echo(
-            "  request-changes needs your full findings — opening an editor "
-            "(every blocking item, file:line)…"
-        )
-        findings_body = _collect_review_body_via_editor(
-            assignment_id=assignment_id, summary=summary
-        )
-        if not findings_body:
+        if _pre_verdict is None:
+            click.echo(f"  no verdict reported — record it with:\n{verdict_cmd_hint}")
+            return False
+        # Headless + pre-captured: auto-relay (no prompt, no editor).
+        # Applies to CI / daemon scenarios where both verdict AND body are
+        # already in the board — no human input needed.
+        if _pre_verdict == "request-changes" and not _pre_body:
             click.echo(
-                "  verdict NOT recorded: request-changes requires the findings "
-                "body — recording it without one would strand the fix worker "
-                "(#607). Record it when ready with:\n"
-                f"    coord report-result --assignment {assignment_id} "
-                "--status done --verdict request-changes "
-                f"--body-file /tmp/review-{assignment_id}.md",
-                err=True,
+                "  headless: captured verdict is request-changes but findings body "
+                f"is missing — record manually with:\n{verdict_cmd_hint}"
             )
             return False
+        verdict: str = _pre_verdict
+        summary: str = ""
+        findings_body: str | None = _pre_body
+    else:
+        # ── TTY prompt ──────────────────────────────────────────────────────
+        # Default to the captured verdict when we have one (never [s]kip).
+        _default = {"approve": "a", "request-changes": "r"}.get(_pre_verdict or "", "s")
+        ans = click.prompt(
+            "  Review verdict — [a]pprove / [r]equest-changes / [s]kip",
+            type=click.Choice(["a", "r", "s"], case_sensitive=False),
+            default=_default,
+            show_choices=True,
+        )
+        verdict = {"a": "approve", "r": "request-changes"}.get(ans.lower(), "")
+        if not verdict:
+            click.echo(f"  skipped — record the verdict later with:\n{verdict_cmd_hint}")
+            return False
+        summary = click.prompt(
+            "  one-line summary (optional, Enter to skip)", default="", show_default=False
+        )
+
+        # ── Findings body for request-changes ───────────────────────────────
+        # #617: request-changes MUST carry the full findings body.
+        # #877: when the board/transcript already has the body, use it directly
+        # (no blank editor).  When missing, open the editor — seeded with
+        # whatever partial body we recovered, or blank as a last resort (with a
+        # hint pointing the operator at the session host / transcript path).
+        findings_body = None
+        if verdict == "request-changes":
+            if _pre_body:
+                # Pre-captured body — use it directly; editor not opened (#877).
+                findings_body = _pre_body
+                click.echo(
+                    f"  Using {len(findings_body)}-char findings body from "
+                    "board/transcript (editor not opened)."
+                )
+            else:
+                # No pre-captured body — open editor.
+                if ssh_target:
+                    click.echo(
+                        f"  Findings not recovered from {ssh_target!r}. "
+                        "Opening editor — enter the full review (every blocking "
+                        "item, file:line)."
+                    )
+                    click.echo(
+                        f"  To fetch the transcript manually: "
+                        f"ssh {ssh_target} "
+                        r"'find $HOME/.claude/projects -name \"*.jsonl\" "
+                        r"| sort -rn | head -10'"
+                    )
+                else:
+                    click.echo(
+                        "  request-changes needs your full findings — opening an "
+                        "editor (every blocking item, file:line)…"
+                    )
+                findings_body = _collect_review_body_via_editor(
+                    assignment_id=assignment_id, summary=summary
+                )
+                if not findings_body:
+                    click.echo(
+                        "  verdict NOT recorded: request-changes requires the findings "
+                        "body — recording it without one would strand the fix worker "
+                        "(#607). Record it when ready with:\n"
+                        f"    coord report-result --assignment {assignment_id} "
+                        "--status done --verdict request-changes "
+                        f"--body-file /tmp/review-{assignment_id}.md",
+                        err=True,
+                    )
+                    return False
+
+    # ── Relay through issue_store seam ──────────────────────────────────────
     try:
         from coord import issue_store  # noqa: PLC0415
 
