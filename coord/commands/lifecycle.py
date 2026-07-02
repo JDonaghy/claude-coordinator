@@ -78,6 +78,34 @@ def housekeeping(dry_run: bool) -> None:
 @click.command(help="Poll agents and post completion/failure comments on GitHub.")
 @_CONFIG_OPTION
 def notify(config_path: Path) -> None:
+    # #906: `coord notify` reads dispatched assignments and writes back
+    # mark_notified/save_plan/update_claude_session_id — all local-DB
+    # operations that are empty/no-op on a thin client.  Route the whole
+    # command to the daemon so it runs against the canonical DB + real agent
+    # fleet.  COORD_NOTIFY_ON_DAEMON guards the daemon against re-routing to
+    # itself (same pattern as coord merge / reconcile-merges / diagnose /
+    # housekeeping).
+    from coord.board_service import daemon_reroute_target  # noqa: PLC0415
+
+    _svc = daemon_reroute_target("COORD_NOTIFY_ON_DAEMON")
+    if _svc is not None:
+        from coord.client import post_record  # noqa: PLC0415
+
+        try:
+            resp = post_record(_svc, "/notify", {}, timeout=180.0)
+        except Exception as exc:  # noqa: BLE001
+            click.echo(f"error: notify via daemon failed: {exc}", err=True)
+            sys.exit(1)
+        output = resp.get("output") or ""
+        if output:
+            click.echo(output, nl=False)
+        if resp.get("error"):
+            click.echo(f"error: {resp['error']}", err=True)
+        code = resp.get("exit_code") or 0
+        if code:
+            sys.exit(int(code))
+        return
+
     from coord.board_service import read_board, write_board
     from coord.hooks import is_round_complete, run_hooks
     from coord.notify import run as run_notify

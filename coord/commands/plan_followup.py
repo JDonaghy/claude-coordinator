@@ -126,7 +126,7 @@ def _dispatch_followup(
     """
     from coord.board_service import read_board, write_board
     from coord.dispatch import dispatch, post_briefing, compute_do_not_touch
-    from coord.state import record_dispatched, load_dispatched
+    from coord.state import record_dispatched
     from coord.models import Proposal
 
     repo = cfg.repo(original.repo_name)
@@ -165,12 +165,24 @@ def _dispatch_followup(
         provider_name=response.get("_provider_name"),
     )
 
-    in_flight = load_dispatched()
+    # #906: use read_board() to build the peer-conflict in-flight list instead
+    # of load_dispatched() — the latter reads the local DB which is empty on a
+    # thin client.  read_board() routes to the daemon's /board when configured,
+    # so we get the canonical active assignment list for do-not-touch detection.
+    # This also consolidates the board read we needed anyway for write_board().
+    board = read_board()
+    in_flight = [
+        {
+            "machine_name": a.machine_name,
+            "repo_name": a.repo_name,
+            "files_likely": a.files_allowed,
+        }
+        for a in board.active
+        if a.assignment_id != assignment_id  # exclude just-dispatched
+    ]
     do_not_touch = compute_do_not_touch(proposal, peers=[], in_flight=in_flight)
     post_briefing(proposal, cfg, assignment_id=assignment_id, do_not_touch=do_not_touch)
 
-    # Update board
-    board = read_board()
     write_board(board)
 
     return assignment_id

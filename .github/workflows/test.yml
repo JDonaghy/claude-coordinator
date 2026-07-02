@@ -20,6 +20,30 @@ jobs:
       - run: pip install -e ".[dev]"
       - run: pytest
 
+  # #906: run the test suite in thin-client mode with COORD_STRICT_LOCAL_BOARD=1
+  # so any board touch reachable from a thin-client path raises RuntimeError
+  # instead of silently no-oping against an empty local DB.  This job catches
+  # regressions that only manifest on a thin client (where the daemon holds the
+  # canonical DB but the CLI/notify runs on a laptop without a local copy).
+  thin-client-strict:
+    runs-on: ubuntu-latest
+    env:
+      COORD_STRICT_LOCAL_BOARD: "1"
+      # Simulate a thin-client: point board-service at a non-existent URL so
+      # resolve_board_service() returns a non-None svc and the guard fires.
+      # Tests that monkeypatch board-service themselves will override this.
+      COORD_SERVICE_URL: "http://localhost:19999"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      # Run only the audit + thin-client-specific tests to avoid hammering
+      # the daemon-guarded paths in the full suite (which legitimately hit
+      # local board state on the daemon host).
+      - run: pytest tests/test_thin_client_board_audit.py tests/test_state_review_findings_daemon.py -v
+
   e2e:
     runs-on: ubuntu-latest
     defaults:

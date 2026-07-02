@@ -124,7 +124,6 @@ def approve(
     from coord.network import classify_error, fetch_repos
     from coord.state import (
         clear_proposals,
-        load_dispatched,
         load_proposals,
         record_dispatched,
     )
@@ -156,7 +155,13 @@ def approve(
             for reason in blocked[p.repo_name]:
                 click.echo(f"    - {reason}", err=True)
 
-    in_flight = load_dispatched()
+    # #906: derive in_flight from board.active instead of load_dispatched() so
+    # a thin client (empty local DB) still sees peer assignments that are
+    # running on other machines (the daemon board tracks them all).
+    in_flight = [
+        {"machine_name": a.machine_name, "repo_name": a.repo_name, "files_likely": a.files_allowed}
+        for a in board.active
+    ]
 
     # ── Claim pre-check ──────────────────────────────────────────────
     # Refuse any proposal whose issue is already being worked on (board
@@ -981,35 +986,49 @@ def chat_continue(
     Does NOT post a GitHub briefing comment (chat turns are developer-side
     conversation, not issue activity).
     """
-    from coord.db import get_connection
+    from coord.board_service import read_board  # noqa: PLC0415
     from coord.dispatch import dispatch
     from coord.models import Proposal
     from coord.state import record_dispatched
 
     cfg = _load_config(config_path)
 
-    conn = get_connection()
-    row = conn.execute(
-        "SELECT assignment_id, machine_name, repo_name, issue_number, issue_title, "
-        "claude_session_id, type FROM assignments WHERE assignment_id=?",
-        (prior_assignment_id,),
-    ).fetchone()
-    if row is None:
+    # #906: use read_board() so a thin client with an empty local DB still
+    # finds the prior assignment on the daemon's canonical board.  The
+    # Assignment model carries all fields we need; claude_session_id is handled
+    # separately below (it is not projected into the board payload).
+    board = read_board()
+    prior = board.find_by_id(prior_assignment_id)
+    if prior is None:
         click.echo(
             f"error: assignment {prior_assignment_id!r} not found in DB", err=True
         )
         sys.exit(1)
 
-    # column may not exist on very old DBs that haven't migrated yet
-    try:
-        claude_session_id = row["claude_session_id"]
-    except (IndexError, KeyError):
-        claude_session_id = None
+    # claude_session_id is not projected into the board payload.  On a daemon
+    # host (no board_service configured), read it directly from the local DB.
+    # On a thin client, svc is not None so we skip the DB and rely solely on
+    # the #315 agent-/status fallback below.
+    from coord.client import resolve_board_service as _resolve_svc  # noqa: PLC0415
 
-    machine_name = row["machine_name"]
-    repo_name = row["repo_name"]
-    issue_number = row["issue_number"]
-    issue_title = row["issue_title"]
+    claude_session_id = None
+    if _resolve_svc() is None:
+        try:
+            from coord.db import get_connection as _get_conn  # noqa: PLC0415
+
+            _row = _get_conn().execute(
+                "SELECT claude_session_id FROM assignments WHERE assignment_id = ?",
+                (prior_assignment_id,),
+            ).fetchone()
+            if _row:
+                claude_session_id = _row[0]
+        except Exception:  # noqa: BLE001
+            pass
+
+    machine_name = prior.machine_name
+    repo_name = prior.repo_name
+    issue_number = prior.issue_number
+    issue_title = prior.issue_title
     message_text = " ".join(text).strip()
 
     # #316: preserve the chat type so the agent server uses the right system
@@ -1017,12 +1036,7 @@ def chat_continue(
     # "refinement", "test-chat", and "new-issue-chat"; anything else falls
     # back to "refinement" (the original behaviour before type-preservation).
     _CHAT_TYPES = {"refinement", "test-chat", "new-issue-chat"}
-    try:
-        prior_type: str = row["type"] or "refinement"
-    except (IndexError, KeyError):
-        prior_type = "refinement"
-    if prior_type not in _CHAT_TYPES:
-        prior_type = "refinement"
+    prior_type: str = prior.type if prior.type in _CHAT_TYPES else "refinement"
 
     # #315: if the DB doesn't have the session_id yet, fetch it directly
     # from the agent's /status endpoint.  The notify cycle (typically every

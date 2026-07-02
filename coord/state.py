@@ -361,7 +361,16 @@ def load_dispatched() -> list[dict]:
     Only returns rows that were explicitly dispatched (``dispatched_at IS NOT
     NULL``).  Assignments inserted solely via :func:`save_board` (e.g. created
     directly in tests without going through the dispatch path) are excluded.
+
+    **Thin-client note (#906):** reads the local DB directly.  On a thin client
+    this will be empty/stale.  Callers that need the canonical list on a thin
+    client should use ``board_service.read_board()`` and build the dispatch-dict
+    format from the board's active assignments instead (see
+    ``coord.commands.plan_followup._dispatch_followup`` for the board-based
+    migration).  The guard fires on thin clients so the offending caller is
+    identifiable.
     """
+    _thin_client_local_board_guard("load_dispatched")
     conn = get_connection()
     rows = conn.execute(
         "SELECT * FROM assignments WHERE dispatched_at IS NOT NULL ORDER BY dispatched_at"
@@ -734,7 +743,15 @@ def mark_notified(
 
     Also updates the assignments table so that build_board() reflects the new
     status without needing a separate save_board() call.
+
+    **Thin-client note (#906):** this function writes the local DB directly.
+    On a thin client the canonical writes happen on the daemon via the
+    ``COORD_NOTIFY_ON_DAEMON`` whole-command reroute (see
+    ``coord.commands.lifecycle.notify``).  The guard fires when a thin-client
+    caller bypasses the reroute — surfacing the issue without breaking the
+    call.
     """
+    _thin_client_local_board_guard("mark_notified")
     from coord.comments import EVENT_COMPLETION, EVENT_PLAN
 
     conn = get_connection()
@@ -1014,9 +1031,44 @@ def update_assignment_claude_session_id(
     nothing when the row doesn't exist or the ID is empty.  COALESCE-based
     UPDATE so the first writer wins (two concurrent notifies can't clobber
     a valid value with NULL).
+
+    **Daemon-aware (#906):** routes to ``POST /assignment-session-id`` when a
+    ``board_service`` is configured so the session ID lands on the shared DB.
+    Fails-OPEN on HTTP error — a missed session-ID just means the next
+    ``chat-continue`` will fall back to fetching it from the agent's
+    ``/status`` endpoint (the #315 fallback already handles this).
     """
     if not assignment_id or not claude_session_id:
         return
+    svc = _board_service()
+    try:
+        resp = _route_write(
+            svc,
+            "/assignment-session-id",
+            {"assignment_id": assignment_id, "claude_session_id": claude_session_id},
+        )
+    except Exception as _e:  # noqa: BLE001
+        import httpx as _httpx  # noqa: PLC0415
+        if isinstance(_e, _httpx.HTTPError):
+            _log.warning(
+                "#906: update_assignment_claude_session_id: daemon write failed "
+                "(deploy-lag?), falling back to local: %s", _e
+            )
+            resp = None
+        else:
+            raise
+    if resp is not None:
+        return
+    _update_assignment_claude_session_id_local(assignment_id, claude_session_id)
+
+
+def _update_assignment_claude_session_id_local(
+    assignment_id: str, claude_session_id: str
+) -> None:
+    """Local-DB write for :func:`update_assignment_claude_session_id`.
+
+    Called directly by the daemon endpoint so it never re-routes back over HTTP.
+    """
     conn = get_connection()
     conn.execute(
         "UPDATE assignments SET claude_session_id=? WHERE assignment_id=? "
@@ -1252,9 +1304,45 @@ def get_test_plan(assignment_id: str) -> dict | None:
 
     Returns ``None`` when the row doesn't exist, the column is NULL
     (plan not yet generated), or the stored JSON is malformed.
+
+    **Daemon-aware (#906):** routes to ``GET /assignment-test-plan`` when a
+    ``board_service`` is configured so a thin client (e.g. running
+    ``--smoke-of`` for a local checkout but with the canonical DB on the
+    daemon) reads the real cached plan rather than returning None from an
+    empty local DB.  Fails-OPEN on error (returns None and lets the smoke
+    briefing fall back to "no plan found").
     """
     if not assignment_id:
         return None
+    svc = _board_service()
+    if svc is not None:
+        try:
+            from coord.client import post_record  # noqa: PLC0415
+
+            resp = post_record(
+                svc, "/assignment-test-plan", {"assignment_id": assignment_id}
+            )
+            raw = resp.get("test_plan")
+            if not raw:
+                return None
+            try:
+                value = json.loads(raw) if isinstance(raw, str) else raw
+            except (json.JSONDecodeError, TypeError):
+                return None
+            return value if isinstance(value, dict) else None
+        except Exception:  # noqa: BLE001 — fail-open; smoke briefing handles None
+            _log.warning(
+                "#906: get_test_plan: daemon read failed for %s, using local",
+                assignment_id,
+            )
+    return _get_test_plan_local(assignment_id)
+
+
+def _get_test_plan_local(assignment_id: str) -> dict | None:
+    """Local-DB read for :func:`get_test_plan`.
+
+    Called directly by the daemon endpoint so it never re-routes back over HTTP.
+    """
     conn = get_connection()
     row = conn.execute(
         "SELECT test_plan FROM assignments WHERE assignment_id=?",
@@ -1287,9 +1375,43 @@ def set_assignment_failure_reason(assignment_id: str, reason: str) -> None:
 
     Silently no-ops when the column is missing (pre-migration DB) or when
     the row doesn't exist.
+
+    **Daemon-aware (#906):** routes to ``POST /assignment-failure-reason`` when
+    a ``board_service`` is configured so the terminal mark lands on the shared
+    DB rather than the thin client's empty local one.  Fails-OPEN on HTTP error
+    — the row was already written by ``record_dispatched_assignment`` via its
+    own daemon route, so a missed failure-reason is recoverable (the assignment
+    stays ``running`` until the next reconcile sweep).
     """
     if not assignment_id:
         return
+    svc = _board_service()
+    try:
+        resp = _route_write(
+            svc,
+            "/assignment-failure-reason",
+            {"assignment_id": assignment_id, "reason": reason},
+        )
+    except Exception as _e:  # noqa: BLE001
+        import httpx as _httpx  # noqa: PLC0415
+        if isinstance(_e, _httpx.HTTPError):
+            _log.warning(
+                "#906: set_assignment_failure_reason: daemon write failed "
+                "(deploy-lag?), falling back to local: %s", _e
+            )
+            resp = None
+        else:
+            raise
+    if resp is not None:
+        return
+    _set_assignment_failure_reason_local(assignment_id, reason)
+
+
+def _set_assignment_failure_reason_local(assignment_id: str, reason: str) -> None:
+    """Local-DB write for :func:`set_assignment_failure_reason`.
+
+    Called directly by the daemon endpoint so it never re-routes back over HTTP.
+    """
     conn = get_connection()
     now = time.time()
     try:
@@ -1418,7 +1540,19 @@ def _load_done_reviews_needing_post_local(repo_name: str | None = None) -> list[
 # ── Plan persistence ────────────────────────────────────────────────────────────
 
 def save_plan(assignment_id: str, plan_dict: dict) -> None:
-    """Persist a parsed WorkerPlan for *assignment_id*."""
+    """Persist a parsed WorkerPlan for *assignment_id*.
+
+    **Thin-client note (#906):** this function writes the local ``plans``
+    table directly.  It is called from two paths:
+    - ``coord.notify.post_transition`` — covered by the ``COORD_NOTIFY_ON_DAEMON``
+      whole-command reroute; on a thin client ``coord notify`` runs the whole
+      function on the daemon, so this local write is correct.
+    - ``coord.reconcile._capture_plan_best_effort`` — only reached from the
+      daemon's passive tick loop (``serve_app._passive_tick``); always local.
+
+    The guard fires if a caller bypasses both reroutes.
+    """
+    _thin_client_local_board_guard("save_plan")
     conn = get_connection()
     conn.execute(
         "INSERT OR REPLACE INTO plans (assignment_id, plan_data) VALUES (?, ?)",
@@ -1759,7 +1893,14 @@ def get_issue_test_mode(repo_name: str, issue_number: int) -> str | None:
     Always reads the local SQLite DB directly — does not call GitHub.  The cache
     is kept current by ``github_ops.set_test_mode_label``, so the value is fresh
     whenever the TUI has dispatched a headless session after #685.
+
+    **Thin-client note (#906):** this function reads the local DB.  Its one
+    caller (``coord.reconcile.reconcile_completed_assignments``) only runs inside
+    the daemon's passive tick loop — so on a real deployment the local DB IS
+    canonical and the guard is a no-op.  The guard fires only if a future
+    refactor adds a thin-client code path to this function.
     """
+    _thin_client_local_board_guard("get_issue_test_mode")
     conn = get_connection()
     row = conn.execute(
         "SELECT labels FROM issues WHERE repo_name = ? AND number = ?",

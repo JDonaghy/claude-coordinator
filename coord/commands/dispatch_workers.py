@@ -3282,7 +3282,7 @@ def _dispatch_headless(
     """
     from coord.board_service import read_board, write_board  # noqa: PLC0415
     from coord.dispatch import dispatch, post_briefing  # noqa: PLC0415
-    from coord.state import load_dispatched, record_dispatched  # noqa: PLC0415
+    from coord.state import record_dispatched  # noqa: PLC0415
 
 
     # Build a Proposal inline
@@ -3420,19 +3420,27 @@ def _dispatch_headless(
         provider_name=response.get("_provider_name"),
     )
 
+    # Update board (read now so the briefing can see the full in-flight picture).
+    board = read_board()
+
     # Post briefing to GitHub
-    in_flight = load_dispatched()
     try:
         from coord.dispatch import compute_do_not_touch
 
+        # #906: use board.active instead of load_dispatched() so a thin client
+        # (empty local DB) still sees peer assignments running on other machines.
+        # Exclude the just-dispatched assignment to avoid it listing itself.
+        in_flight = [
+            {"machine_name": a.machine_name, "repo_name": a.repo_name, "files_likely": a.files_allowed}
+            for a in board.active
+            if a.assignment_id != assignment_id
+        ]
         do_not_touch = compute_do_not_touch(proposal, peers=[], in_flight=in_flight)
         post_briefing(proposal, cfg, assignment_id=assignment_id, do_not_touch=do_not_touch)
         click.echo("  briefing posted to GitHub")
     except Exception as e:
         click.echo(f"  briefing post failed: {e}", err=True)
 
-    # Update board
-    board = read_board()
     write_board(board)
 
     # Mark session start on first dispatch of the session
