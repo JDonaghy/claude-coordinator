@@ -1,8 +1,12 @@
-"""`coord milestone` — Phase 0 of #767 (milestone-driven workflow).
+"""`coord milestone` — Phase 0 (`order`) + Phase 1 (`dispatch`) of #767
+(milestone-driven workflow).
 
-Thin CLI glue around ``coord/milestone_order.py``: fetches the tracking
-issue + milestone membership + issue terminal state from GitHub, then hands
-that data to the pure parser/DAG/frontier functions and prints the result.
+Thin CLI glue around ``coord/milestone_order.py`` (the pure DAG/frontier
+parser) and ``coord/milestone_dispatch.py`` (Phase 1's machine-picking +
+dispatch): fetches the tracking issue + milestone membership + issue
+terminal state from GitHub via ``coord.milestone_dispatch.
+fetch_milestone_context`` (shared by both subcommands so they see identical
+inputs), then hands that data to the pure functions and prints the result.
 """
 
 from __future__ import annotations
@@ -13,17 +17,20 @@ from pathlib import Path
 import click
 
 from coord.commands._common import _CONFIG_OPTION, _load_config
-from coord.milestone_order import (
-    WorkOrderError,
-    parse_work_order,
-    ready_frontier,
-    validate_milestone_membership,
+from coord.milestone_dispatch import (
+    DispatchOutcome,
+    MachinePick,
+    MilestoneDispatchError,
+    dispatch_entry,
+    fetch_milestone_context,
+    is_milestone_complete,
+    plan_dispatch,
 )
 
 
 @click.group("milestone")
 def milestone_group() -> None:
-    """Milestone work-order operations (#767 Phase 0)."""
+    """Milestone work-order operations (#767)."""
 
 
 @milestone_group.command(
@@ -45,77 +52,34 @@ def milestone_order_cmd(repo: str, tracking_issue: int, config_path: Path) -> No
         click.echo(f"error: unknown repo {repo!r}", err=True)
         sys.exit(2)
 
-    from coord import board_service, github_ops
+    from coord import board_service
 
     try:
-        issue_data = github_ops.get_issue(repo_entry.github, tracking_issue)
-    except RuntimeError as e:
-        click.echo(f"error: could not fetch #{tracking_issue}: {e}", err=True)
-        sys.exit(1)
-
-    milestone = issue_data.get("milestone") or {}
-    milestone_number = milestone.get("number")
-    if milestone_number is None:
-        click.echo(f"error: #{tracking_issue} has no milestone", err=True)
-        sys.exit(1)
-
-    body = issue_data.get("body") or ""
-    try:
-        work_order = parse_work_order(body)
-    except WorkOrderError as e:
+        ctx = fetch_milestone_context(repo_entry, tracking_issue)
+    except MilestoneDispatchError as e:
         click.echo(f"error: {e}", err=True)
         sys.exit(1)
 
-    if not work_order.nodes:
+    if not ctx.work_order.nodes:
         click.echo(f"#{tracking_issue}: no `## Work order` block found")
         return
 
-    # Membership + terminal state. Issues currently open under the milestone
-    # come free from one `get_open_issues` call; anything a node references
-    # that isn't in that set gets an individual lookup (closed, or foreign).
-    open_issues = github_ops.get_open_issues(repo_entry.github)
-    milestone_issue_numbers = {
-        i["number"]
-        for i in open_issues
-        if (i.get("milestone") or {}).get("number") == milestone_number
-    }
-    terminal_issues: set[int] = set()
-    for node in work_order.nodes:
-        if node.issue_number in milestone_issue_numbers:
-            continue
-        try:
-            node_data = github_ops.get_issue(repo_entry.github, node.issue_number)
-        except RuntimeError as e:
-            click.echo(
-                f"error: could not fetch #{node.issue_number}: {e}", err=True
-            )
-            sys.exit(1)
-        node_milestone_number = (node_data.get("milestone") or {}).get("number")
-        if node_milestone_number == milestone_number:
-            milestone_issue_numbers.add(node.issue_number)
-        if node_data.get("state", "").upper() == "CLOSED":
-            terminal_issues.add(node.issue_number)
-
-    try:
-        validate_milestone_membership(work_order, milestone_issue_numbers)
-    except WorkOrderError as e:
-        click.echo(f"error: {e}", err=True)
-        sys.exit(1)
-
     board = board_service.read_board()
+    from coord.milestone_order import ready_frontier
+
     frontier = ready_frontier(
-        work_order,
+        ctx.work_order,
         board,
         repo_name=repo_entry.name,
         repo_github=repo_entry.github,
-        terminal_issues=terminal_issues,
+        terminal_issues=set(ctx.terminal_issues),
     )
 
     click.echo(
-        f"Work order for #{tracking_issue} (milestone #{milestone_number}):"
+        f"Work order for #{tracking_issue} (milestone #{ctx.milestone_number}):"
     )
-    for node in work_order.nodes:
-        state = "done" if node.issue_number in terminal_issues else "open"
+    for node in ctx.work_order.nodes:
+        state = "done" if node.issue_number in ctx.terminal_issues else "open"
         bits = [f"[{state}]"]
         if node.group:
             bits.append(f"group:{node.group}")
@@ -137,3 +101,162 @@ def milestone_order_cmd(repo: str, tracking_issue: int, config_path: Path) -> No
         click.echo("Blocked:")
         for b in frontier.blocked:
             click.echo(f"  #{b.issue_number}: {b.reason}")
+
+
+def _echo_pick(pick: MachinePick) -> None:
+    suffix = f"  (group {pick.entry.group})" if pick.entry.group else ""
+    click.echo(f"  #{pick.entry.issue_number} -> {pick.machine.name}{suffix}")
+
+
+def _echo_outcome(outcome: DispatchOutcome) -> None:
+    if outcome.ok:
+        click.echo(
+            f"  #{outcome.issue_number} -> {outcome.machine_name} "
+            f"(dispatched, assignment {outcome.assignment_id})"
+        )
+    else:
+        click.echo(
+            f"  #{outcome.issue_number}: dispatch failed: {outcome.error}", err=True
+        )
+
+
+@milestone_group.command(
+    "dispatch",
+    help=(
+        "Promote a milestone into the pipeline: dispatch its ready frontier "
+        "in parallel (up to idle/capable machines), then keep draining it as "
+        "declared-order dependencies complete. REPO is the local repo name "
+        "from coordinator.yml; TRACKING_ISSUE is the GH issue number of the "
+        "tracking issue (its body holds the `## Work order` block). This is "
+        "the single explicit approval for the whole declared work order — "
+        "it does not expand scope beyond what `## Work order` lists."
+    ),
+)
+@click.argument("repo")
+@click.argument("tracking_issue", type=int)
+@click.option(
+    "--dry-run", is_flag=True,
+    help="Show what would dispatch now vs. what's waiting (and on what), without dispatching.",
+)
+@click.option(
+    "--next", "next_", is_flag=True,
+    help=(
+        "Single-pick mode: show up to 3 ready-frontier items and dispatch "
+        "only the one you choose. Lighter-weight than draining the whole "
+        "milestone — does not register for daemon auto-drain."
+    ),
+)
+@_CONFIG_OPTION
+def milestone_dispatch_cmd(
+    repo: str, tracking_issue: int, dry_run: bool, next_: bool, config_path: Path
+) -> None:
+    cfg = _load_config(config_path)
+    repo_entry = cfg.repo(repo)
+    if repo_entry is None:
+        click.echo(f"error: unknown repo {repo!r}", err=True)
+        sys.exit(2)
+
+    from coord import board_service
+
+    try:
+        ctx = fetch_milestone_context(repo_entry, tracking_issue)
+    except MilestoneDispatchError as e:
+        click.echo(f"error: {e}", err=True)
+        sys.exit(1)
+
+    if not ctx.work_order.nodes:
+        click.echo(f"#{tracking_issue}: no `## Work order` block found")
+        return
+
+    board = board_service.read_board()
+    plan = plan_dispatch(ctx.work_order, board, cfg, repo_entry, ctx.terminal_issues)
+
+    click.echo(
+        f"Work order for #{tracking_issue} (milestone #{ctx.milestone_number}):"
+    )
+
+    if next_:
+        if not plan.to_dispatch:
+            click.echo("No ready frontier item can dispatch right now.")
+            if plan.skipped:
+                click.echo("Ready but no idle machine:")
+                for s in plan.skipped:
+                    click.echo(f"  #{s.entry.issue_number}: {s.reason}")
+            if plan.waiting:
+                click.echo("Waiting:")
+                for b in plan.waiting:
+                    click.echo(f"  #{b.issue_number}: {b.reason}")
+            return
+
+        choices = plan.to_dispatch[:3]
+        click.echo("Ready frontier — pick one to dispatch:")
+        for i, pick in enumerate(choices, 1):
+            suffix = f"  (group {pick.entry.group})" if pick.entry.group else ""
+            click.echo(f"  {i}. #{pick.entry.issue_number} -> {pick.machine.name}{suffix}")
+
+        if dry_run:
+            click.echo("(dry run — not dispatched)")
+            return
+
+        idx = click.prompt(
+            "Pick one", type=click.IntRange(1, len(choices)), default=1
+        )
+        chosen = choices[idx - 1]
+        outcome = dispatch_entry(chosen, repo_entry, cfg, board, tracking_issue=tracking_issue)
+        _echo_outcome(outcome)
+        if not outcome.ok:
+            sys.exit(1)
+        return
+
+    # Bulk mode: dispatch the entire current ready frontier.
+    click.echo("Will dispatch now:")
+    if plan.to_dispatch:
+        for pick in plan.to_dispatch:
+            _echo_pick(pick)
+    else:
+        click.echo("  (none)")
+
+    if plan.skipped:
+        click.echo()
+        click.echo("Ready but no idle machine:")
+        for s in plan.skipped:
+            click.echo(f"  #{s.entry.issue_number}: {s.reason}")
+
+    if plan.waiting:
+        click.echo()
+        click.echo("Waiting:")
+        for b in plan.waiting:
+            click.echo(f"  #{b.issue_number}: {b.reason}")
+
+    if dry_run:
+        click.echo()
+        click.echo("(dry run — not dispatched)")
+        return
+
+    if not plan.to_dispatch:
+        click.echo()
+        click.echo("Nothing to dispatch right now.")
+        return
+
+    click.echo()
+    failures = 0
+    for pick in plan.to_dispatch:
+        outcome = dispatch_entry(pick, repo_entry, cfg, board, tracking_issue=tracking_issue)
+        _echo_outcome(outcome)
+        if not outcome.ok:
+            failures += 1
+
+    if not is_milestone_complete(ctx):
+        from coord.state import register_milestone_drain
+
+        register_milestone_drain(repo_name=repo_entry.name, tracking_issue=tracking_issue)
+        click.echo()
+        click.echo(
+            f"Milestone #{tracking_issue} registered for daemon auto-drain "
+            "(requires `milestone.auto_dispatch: true` in coordinator.yml + a "
+            "daemon restart to activate; `coord milestone dispatch` still "
+            "works as a manual re-drain either way)."
+        )
+
+    if failures:
+        sys.exit(1)

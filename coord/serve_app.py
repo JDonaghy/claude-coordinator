@@ -282,6 +282,101 @@ def _auto_drain_tick(config: Config) -> "list":
     return events
 
 
+def _milestone_drain_tick(config: Config) -> list:
+    """Re-drain every actively-registered milestone — #769 Phase 1 auto-dispatch.
+
+    Called by ``_tick_loop`` when ``milestone.auto_dispatch: true`` is set in
+    ``coordinator.yml`` (default-off). For each ``(repo_name, tracking_issue)``
+    registered via a non-dry-run ``coord milestone dispatch`` (``coord.state.
+    register_milestone_drain``), re-fetches the tracking issue, recomputes the
+    ready frontier (:func:`coord.milestone_dispatch.plan_dispatch`), and
+    dispatches any newly-unblocked entries — the same mechanism a manual
+    ``coord milestone dispatch`` uses, so a fix that lands and merges for one
+    cohort member automatically unblocks and dispatches the next one. Once a
+    milestone's whole work order reaches a terminal state it's deregistered.
+
+    A single shared :class:`~coord.models.Board` snapshot is used across all
+    registered milestones in one tick (loaded once via ``build_board()``) and
+    updated in place by ``dispatch_entry`` as each dispatch lands, so two
+    milestones competing for the same idle machine in one tick don't
+    double-book it.
+
+    Gate policy mirrors the manual CLI path exactly — same claim recheck,
+    same ``can_work_on``/idle/paused machine filter (#688's "never route
+    coord-self to a machine whose ``repos:`` list excludes it" falls out of
+    that filter for free). A per-milestone fetch/dispatch error must not
+    silence the other registered milestones — caught and logged per entry.
+
+    Extracted as a module-level function so tests can call it directly
+    without wiring up the async ``_tick_loop`` infrastructure (mirrors
+    ``_auto_drain_tick``'s doc comment above).
+    """
+    import logging  # noqa: PLC0415
+
+    from coord import milestone_dispatch as md  # noqa: PLC0415
+    from coord.state import (  # noqa: PLC0415
+        build_board,
+        deregister_milestone_drain,
+        list_milestone_drains,
+    )
+
+    log = logging.getLogger("coord.serve")
+
+    drains = list_milestone_drains()
+    if not drains:
+        return []
+
+    board = build_board()
+    outcomes: list = []
+    for entry in drains:
+        repo_name = entry.get("repo_name")
+        tracking_issue = entry.get("tracking_issue")
+        repo_cfg = config.repo(repo_name) if repo_name else None
+        if repo_cfg is None or tracking_issue is None:
+            log.warning(
+                "milestone-drain: dropping malformed/unknown-repo entry %r", entry
+            )
+            deregister_milestone_drain(
+                repo_name=repo_name or "", tracking_issue=tracking_issue or 0
+            )
+            continue
+
+        try:
+            ctx = md.fetch_milestone_context(repo_cfg, tracking_issue)
+        except md.MilestoneDispatchError as e:
+            log.warning(
+                "milestone-drain: %s #%d fetch failed: %s", repo_name, tracking_issue, e
+            )
+            continue
+
+        plan = md.plan_dispatch(ctx.work_order, board, config, repo_cfg, ctx.terminal_issues)
+        for pick in plan.to_dispatch:
+            outcome = md.dispatch_entry(
+                pick, repo_cfg, config, board, tracking_issue=tracking_issue
+            )
+            outcomes.append(outcome)
+            if outcome.ok:
+                log.info(
+                    "milestone-drain: %s #%d → %s (assignment %s)",
+                    repo_name, outcome.issue_number, outcome.machine_name,
+                    outcome.assignment_id,
+                )
+            else:
+                log.warning(
+                    "milestone-drain: %s #%d dispatch failed: %s",
+                    repo_name, outcome.issue_number, outcome.error,
+                )
+
+        if md.is_milestone_complete(ctx):
+            log.info(
+                "milestone-drain: %s #%d work order complete — deregistering",
+                repo_name, tracking_issue,
+            )
+            deregister_milestone_drain(repo_name=repo_name, tracking_issue=tracking_issue)
+
+    return outcomes
+
+
 def _board_response_schema(components: dict) -> dict:
     """#757: the `GET /board` response schema, built straight from the live
     (migrated) SQLite DDL — not a dataclass. Per
@@ -501,6 +596,36 @@ def _openapi_spec() -> dict:
                         "content": {"application/json": {"schema": ok_response}},
                     },
                     "400": {"description": "Bad dispatch"},
+                },
+            }
+        },
+        "/milestone-drain": {
+            "post": {
+                "summary": (
+                    "Register a thin client's `coord milestone dispatch` for "
+                    "daemon auto-drain (#769 Phase 1)"
+                ),
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "repo_name": {"type": "string"},
+                                    "tracking_issue": {"type": "integer"},
+                                },
+                                "required": ["repo_name", "tracking_issue"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {"application/json": {"schema": ok_response}},
+                    },
+                    "400": {"description": "Bad milestone-drain"},
                 },
             }
         },
@@ -1103,6 +1228,28 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         except Exception as e:  # noqa: BLE001
             return JSONResponse(
                 {"error": "dispatch write failed", "detail": str(e)}, status_code=503
+            )
+        return JSONResponse({"ok": True})
+
+    async def post_milestone_drain(request: Request) -> Response:
+        # #769 Phase 1: register a thin client's `coord milestone dispatch`
+        # for daemon auto-drain on the shared DB. Mirrors post_dispatched_work.
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        try:
+            state._register_milestone_drain_local(
+                repo_name=body["repo_name"],
+                tracking_issue=int(body["tracking_issue"]),
+            )
+        except (TypeError, KeyError, ValueError) as e:
+            return JSONResponse({"error": f"bad milestone-drain: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "milestone-drain write failed", "detail": str(e)},
+                status_code=503,
             )
         return JSONResponse({"ok": True})
 
@@ -1768,6 +1915,35 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                             )
                     except Exception:  # noqa: BLE001
                         log.warning("auto-drain tick failed", exc_info=True)
+                # Step 3b: #769 Phase 1 — re-drain actively-registered milestones'
+                # ready frontier as declared-order dependencies complete.
+                # Runs AFTER reconcile (Step 1) so a freshly-terminal dependency
+                # is visible.  Default-off (milestone.auto_dispatch: false) — no
+                # behaviour change for users who haven't opted in; `coord
+                # milestone dispatch` still works as a one-shot manual drain
+                # either way.  Independent try/except so a milestone-drain
+                # failure never silences the other tick steps.
+                if config.milestone.auto_dispatch:
+                    try:
+                        drain_outcomes = await run_in_threadpool(
+                            _milestone_drain_tick, config
+                        )
+                        for outcome in drain_outcomes:
+                            if outcome.ok:
+                                log.info(
+                                    "milestone-drain: #%d → %s (assignment %s)",
+                                    outcome.issue_number,
+                                    outcome.machine_name,
+                                    outcome.assignment_id,
+                                )
+                            else:
+                                log.warning(
+                                    "milestone-drain: #%d dispatch failed: %s",
+                                    outcome.issue_number,
+                                    outcome.error,
+                                )
+                    except Exception:  # noqa: BLE001
+                        log.warning("milestone-drain tick failed", exc_info=True)
                 # Step 4: #762 archival sweep on a slow cadence (default hourly).
                 # Independent try/except — a sweep failure must never crash the
                 # daemon or silence the reconcile/enqueue steps above.
@@ -1846,6 +2022,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/result", post_result, methods=["POST"]),
         Route("/completion", post_completion, methods=["POST"]),
         Route("/dispatched-work", post_dispatched_work, methods=["POST"]),
+        Route("/milestone-drain", post_milestone_drain, methods=["POST"]),
         Route("/dispatched", post_dispatched, methods=["POST"]),
         Route("/test-verdict", post_test_verdict, methods=["POST"]),
         Route("/board", post_board, methods=["POST"]),
