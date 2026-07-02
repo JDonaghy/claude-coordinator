@@ -468,6 +468,54 @@ def pick_reviewer_machine(
     )
 
 
+def _ranked_reviewer_candidates(
+    worker_machine_name: str,
+    repo_name: str,
+    board: Board,
+    config: Config,
+) -> list[tuple[Machine, bool]]:
+    """Return **all** candidate reviewer machines in priority order.
+
+    Each element is ``(machine, same_as_worker)``.  Priority mirrors
+    ``pick_reviewer_machine``:
+
+    1. Different from the worker, currently **idle** — best independence, no
+       queue delay.
+    2. Different from the worker, currently **busy** — independence preserved;
+       the review will queue on that agent.
+    3. **Same** machine as the worker — last resort; fresh session but no
+       hardware separation.
+
+    Returns an empty list when no configured machine handles *repo_name*.
+    Used by ``dispatch_review`` to iterate candidates instead of committing to
+    a single pick, so a rejected agent (e.g. a 400 from config drift) can
+    fall through to the next rather than silently failing (#904).
+    """
+    from coord.machine_pause import paused_set  # noqa: PLC0415
+
+    paused = paused_set()
+    candidates = [
+        m for m in config.machines
+        if m.can_work_on(repo_name) and m.name not in paused
+    ]
+    if not candidates:
+        return []
+
+    busy = {a.machine_name for a in board.active if a.status in ("pending", "running")}
+
+    result: list[tuple[Machine, bool]] = []
+    for m in candidates:
+        if m.name != worker_machine_name and m.name not in busy:
+            result.append((m, False))   # different + idle
+    for m in candidates:
+        if m.name != worker_machine_name and m.name in busy:
+            result.append((m, False))   # different + busy (will queue)
+    for m in candidates:
+        if m.name == worker_machine_name:
+            result.append((m, True))    # same machine — last resort
+    return result
+
+
 # ── Briefing construction ───────────────────────────────────────────────────
 
 def _read_repo_claude_md(repo_path: Path) -> str | None:
@@ -719,6 +767,37 @@ def _find_or_open_pr(
         return None
 
 
+def _fetch_agent_advertised_repos(
+    host: str,
+    port: int = AGENT_PORT,
+    *,
+    timeout: float = 2.0,
+) -> list[str] | None:
+    """Query an agent's ``/health`` endpoint and return the repos it handles.
+
+    Returns a list of repo names (strings) when the agent is reachable and
+    returns well-formed JSON; returns ``None`` on *any* failure so callers
+    can **fail-open** — never exclude a machine solely because its health probe
+    hiccuped or timed out.
+
+    The short *timeout* (default 2 s) is intentional: this is a preventative
+    pre-filter, not a blocking gate.  If the agent is slow to respond, skip
+    the filter and rely on the fall-through loop in ``dispatch_review`` to
+    surface a definitive rejection.
+    """
+    url = f"http://{host}:{port}/health"
+    try:
+        resp = httpx.get(url, timeout=timeout)
+        if resp.status_code == 200:
+            data = resp.json()
+            repos = data.get("repos")
+            if isinstance(repos, list):
+                return [str(r) for r in repos]
+    except Exception:  # noqa: BLE001 — fail-open: any network or parse error
+        pass
+    return None
+
+
 def dispatch_review(
     completed: Assignment,
     board: Board,
@@ -732,12 +811,18 @@ def dispatch_review(
     terminal_cache: dict | None = None,
     remote_branch_checker=None,
     branch_sha_fetcher=None,
+    health_checker=None,
 ) -> Assignment | None:
     """Open a PR for `completed` and dispatch a review assignment.
 
     Returns the new review Assignment, or None if review couldn't be dispatched
     (no machine handles the repo, no branch on the completed assignment, etc.).
     The caller is responsible for persisting the board.
+
+    *health_checker* is an optional ``(host: str) -> list[str] | None`` callable
+    that returns the repo names a given agent advertises, or ``None`` to
+    fail-open.  When not provided, ``_fetch_agent_advertised_repos`` is called
+    directly.  Inject a stub in tests to avoid real network probes.
     """
     if not config.reviews.enabled or not config.reviews.auto_dispatch:
         return None
@@ -817,19 +902,23 @@ def dispatch_review(
         issue_title=completed.issue_title,
     )
 
-    choice = pick_reviewer_machine(
+    # #904 (fix #1): build a ranked list of ALL eligible reviewer machines so
+    # we can fall through to the next if one rejects the dispatch.  This
+    # replaces the previous single-pick → silent-return-None path that could
+    # park a work row at the merge gate forever when config drift caused a
+    # "does not handle repo" 400 from the first (and only tried) machine.
+    candidates = _ranked_reviewer_candidates(
         completed.machine_name, completed.repo_name, board, config
     )
-    if choice is None:
+    if not candidates:
         return None
 
-    # #586: if the reviewer would run on a different machine, the branch must
-    # exist on the remote so that machine can fetch it.  If the original worker
-    # never pushed, route the review back to the worker's own machine (which
-    # already has the branch locally).  If even that fallback is unavailable,
-    # mark the work row with a visible stall state and return None — this
-    # surfaces an actionable error instead of a silent 2-second crash.
-    if not choice.same_as_worker and completed.branch:
+    # #586: if the branch isn't on the remote, only the original worker machine
+    # has it locally — any cross-machine reviewer would crash on git-fetch.
+    # Narrow the candidate list to just that machine; if it's unavailable too,
+    # stall visibly with "branch_not_on_remote".
+    any_cross_machine = any(not same for _, same in candidates)
+    if any_cross_machine and completed.branch:
         _check_remote = remote_branch_checker or github_ops.branch_exists_on_remote
         if not _check_remote(repo.github, completed.branch):
             log.warning(
@@ -837,28 +926,21 @@ def dispatch_review(
                 "to original worker machine %s to avoid cross-machine fetch failure",
                 completed.branch, completed.assignment_id, completed.machine_name,
             )
+            from coord.machine_pause import paused_set  # noqa: PLC0415
+            paused = paused_set()
             worker_machine = next(
                 (m for m in config.machines if m.name == completed.machine_name),
                 None,
             )
-            from coord.machine_pause import paused_set  # noqa: PLC0415
-            paused = paused_set()
             if (
                 worker_machine is not None
                 and worker_machine.can_work_on(completed.repo_name)
                 and worker_machine.name not in paused
             ):
-                choice = ReviewerChoice(
-                    machine=worker_machine,
-                    same_as_worker=True,
-                    rationale=(
-                        f"branch {completed.branch!r} not on remote — "
-                        f"routed back to {completed.machine_name}"
-                    ),
-                )
+                # Restrict to just the worker machine — it has the branch locally.
+                candidates = [(worker_machine, True)]
             else:
-                # Original machine also unavailable — stall visibly rather than
-                # dispatching to a machine that cannot check out the branch.
+                # Original machine also unavailable — stall visibly.
                 log.error(
                     "[review] branch %r not on remote for %s and original machine "
                     "%s is unavailable (paused or not configured) — "
@@ -868,89 +950,22 @@ def dispatch_review(
                 completed.review_state = "branch_not_on_remote"
                 return None
 
-    repo_path = choice.machine.repo_path(completed.repo_name)
-    if repo_path is None:
-        return None
-    claude_md = claude_md_reader(Path(repo_path).expanduser())
+    # Compute the parts that are constant across all candidate machines.
 
-    # #612: compute the merge-base (three-dot) diff ourselves and embed it in
-    # the briefing so the reviewer has nothing to compute (a stale-base diff
-    # would surface already-merged commits as spurious deletions). Best-effort:
-    # on failure diff_text is None and the briefing keeps its fallback
-    # three-dot diff instructions.
+    # #612: merge-base diff — embedded verbatim so the reviewer reviews exactly
+    # the branch's own changes (a stale-base diff sweeps in already-merged
+    # commits as spurious deletions, #546).  Best-effort: None keeps the
+    # fallback three-dot git-diff instructions in the briefing.
     diff_text = github_ops.pr_diff(repo.github, pr["number"]) if pr else None
 
     fetch_body = issue_body_fetcher or _fetch_issue_body
-    briefing = build_review_briefing(
-        pr_number=pr["number"] if pr else None,
-        pr_url=pr["url"] if pr else None,
-        repo_github=repo.github,
-        repo_name=repo.name,
-        issue_number=completed.issue_number,
-        issue_title=completed.issue_title,
-        issue_body=fetch_body(repo.github, completed.issue_number),
-        branch=completed.branch,
-        worker_machine=completed.machine_name,
-        same_as_worker=choice.same_as_worker,
-        reviews_cfg=config.reviews,
-        repo_claude_md=claude_md,
-        default_branch=repo.default_branch,
-        # #476: a fix worker carries review_iteration > 0; its re-review is
-        # scoped to the fix delta rather than re-reviewing the whole PR.
-        review_iteration=getattr(completed, "review_iteration", 0) or 0,
-        diff_text=diff_text,
-    )
+    issue_body = fetch_body(repo.github, completed.issue_number)
 
-    # #603: prepend the per-issue context digest so the reviewer also knows the
-    # cross-repo deps / prior-attempt findings.  The interactive review path
-    # prefixes it at its own call site, so build_review_briefing stays pure.
-    from coord.state import issue_context_block  # noqa: PLC0415
-
-    briefing = issue_context_block(completed.repo_name, completed.issue_number) + briefing
-
-    # Pin the reviewer's model.  Without this the payload omits `model`
-    # and the agent lets `claude -p` pick its CLI default, which became
-    # Opus 4.8 in claude-code 2.1.x — silently making every review the
-    # most expensive model available.  Use the configured default
-    # (typically sonnet) and resolve through models.versions so the wire
-    # carries an exact id when one is pinned.
+    # Pin the reviewer's model to avoid the agent defaulting to Opus (#911).
     review_model_alias = config.models.default
     review_model_wire = config.models.resolve(review_model_alias)
 
-    payload = {
-        "repo_name": completed.repo_name,
-        "repo_path": repo_path,
-        "issue_number": completed.issue_number,
-        "issue_title": f"[review] {completed.issue_title}",
-        "briefing": briefing,
-        "files_allowed": [],
-        "files_forbidden": [],
-        "pull_repos": [],
-        "type": "review",
-        "model": review_model_wire,
-        "system_prompt": REVIEWER_SYSTEM_PROMPT,
-        "review_target": str(pr["number"]) if pr else completed.branch,
-        # #255: review checkout uses the PR branch, but the agent's worktree
-        # setup still consults `branch` as the integration base when no PR
-        # branch exists locally yet.  Match the work-dispatch path.
-        "branch": repo.default_branch or "main",
-    }
-
-    url = f"http://{choice.machine.host}:{AGENT_PORT}/assign"
-    client = http_client or httpx
-    try:
-        resp = client.post(url, json=payload, timeout=15)
-        resp.raise_for_status()
-        agent_response = resp.json()
-    except (httpx.HTTPError, httpx.TimeoutException):
-        return None
-
-    # #821: capture branch HEAD SHA for commit-bound approval check.
-    # If the branch moves after this review runs (new commits pushed),
-    # has_approved_review will detect the staleness via branch_head_sha ≠
-    # review_head_sha and block the merge until a fresh review is done.
-    # Best-effort: None means "SHA unavailable"; the staleness check is skipped
-    # (backward-compatible with pre-821 rows and air-gapped setups).
+    # #821: capture branch HEAD SHA once; staleness detected post-review.
     _get_sha = branch_sha_fetcher or github_ops.get_branch_sha
     review_head_sha: str | None = None
     try:
@@ -958,34 +973,166 @@ def dispatch_review(
     except Exception:  # noqa: BLE001 — fail-safe: missing SHA is not blocking
         pass
 
-    review_assignment = Assignment(
-        machine_name=choice.machine.name,
-        repo_name=completed.repo_name,
-        issue_number=completed.issue_number,
-        issue_title=f"[review] {completed.issue_title}",
-        files_allowed=[],
-        files_forbidden=[],
-        briefing=briefing,
-        assignment_id=agent_response.get("id") or uuid.uuid4().hex[:12],
-        status="running",
-        branch=completed.branch,
-        pr_url=pr.get("url") if pr else None,
-        dispatched_at=now if now is not None else time.time(),
-        type="review",
-        review_target=str(pr["number"]) if pr else completed.branch,
-        review_of_assignment_id=completed.assignment_id,
-        model=review_model_alias,
-        review_head_sha=review_head_sha,
-    )
-    board.active.append(review_assignment)
+    # #603: per-issue context digest (cross-repo deps / prior findings).
+    from coord.state import issue_context_block  # noqa: PLC0415
+    context_prefix = issue_context_block(completed.repo_name, completed.issue_number)
 
-    from coord.state import record_dispatched_assignment
-    record_dispatched_assignment(
-        assignment=review_assignment,
-        repo_github=repo.github,
-    )
+    client = http_client or httpx
 
-    return review_assignment
+    # Iterate candidates in priority order.  On agent rejection (4xx from a
+    # misconfigured agent, health-check filter on a drifted config, etc.) we
+    # log a warning and try the next candidate instead of giving up silently.
+    # Only definitive rejections (4xx responses or health-check exclusions) set
+    # had_rejection=True; transient network failures leave the row as "pending"
+    # so the next reconcile/notify pass retries automatically.
+    had_rejection = False
+    for machine, same_as_worker in candidates:
+        # Fix #2 (PREVENTATIVE): pre-filter against the agent's /health
+        # ``repos`` list so a drifted local config can't pick a machine that
+        # will 400.  Fail-open: None means "probe failed, include anyway".
+        _hc = health_checker if health_checker is not None else _fetch_agent_advertised_repos
+        advertised = _hc(machine.host)
+        if advertised is not None and completed.repo_name not in advertised:
+            log.warning(
+                "[review] skipping candidate %s: /health advertises repos %r "
+                "but repo %r is not listed — possible config drift",
+                machine.name, advertised, completed.repo_name,
+            )
+            had_rejection = True
+            continue
+
+        repo_path = machine.repo_path(completed.repo_name)
+        if repo_path is None:
+            log.warning(
+                "[review] skipping candidate %s: no repo_path for %r",
+                machine.name, completed.repo_name,
+            )
+            continue
+
+        claude_md = claude_md_reader(Path(repo_path).expanduser())
+
+        # #476 / #612: briefing is rebuilt per candidate because same_as_worker
+        # (warning note in the briefing) and claude_md path can differ between
+        # machines.
+        briefing = context_prefix + build_review_briefing(
+            pr_number=pr["number"] if pr else None,
+            pr_url=pr["url"] if pr else None,
+            repo_github=repo.github,
+            repo_name=repo.name,
+            issue_number=completed.issue_number,
+            issue_title=completed.issue_title,
+            issue_body=issue_body,
+            branch=completed.branch,
+            worker_machine=completed.machine_name,
+            same_as_worker=same_as_worker,
+            reviews_cfg=config.reviews,
+            repo_claude_md=claude_md,
+            default_branch=repo.default_branch,
+            # #476: a fix worker carries review_iteration > 0; its re-review is
+            # scoped to the fix delta rather than re-reviewing the whole PR.
+            review_iteration=getattr(completed, "review_iteration", 0) or 0,
+            diff_text=diff_text,
+        )
+
+        payload = {
+            "repo_name": completed.repo_name,
+            "repo_path": repo_path,
+            "issue_number": completed.issue_number,
+            "issue_title": f"[review] {completed.issue_title}",
+            "briefing": briefing,
+            "files_allowed": [],
+            "files_forbidden": [],
+            "pull_repos": [],
+            "type": "review",
+            "model": review_model_wire,
+            "system_prompt": REVIEWER_SYSTEM_PROMPT,
+            "review_target": str(pr["number"]) if pr else completed.branch,
+            # #255: review checkout uses the PR branch, but the agent's worktree
+            # setup still consults `branch` as the integration base when no PR
+            # branch exists locally yet.  Match the work-dispatch path.
+            "branch": repo.default_branch or "main",
+        }
+
+        url = f"http://{machine.host}:{AGENT_PORT}/assign"
+        try:
+            resp = client.post(url, json=payload, timeout=15)
+            resp.raise_for_status()
+            agent_response = resp.json()
+        except httpx.HTTPStatusError as exc:
+            # Fix #1 (PRIMARY): the agent definitively rejected the dispatch
+            # (e.g. 400 "does not handle repo 'x'").  Try the next candidate
+            # instead of silently returning None and leaving review_state as
+            # 'pending' (#904).
+            log.warning(
+                "[review] agent %s rejected dispatch with HTTP %d — "
+                "trying next reviewer candidate",
+                machine.name, exc.response.status_code,
+            )
+            had_rejection = True
+            continue
+        except (httpx.HTTPError, httpx.TimeoutException) as exc:
+            # Transient network failure — try next candidate, and if all
+            # fail transiently, leave review_state unchanged so the next
+            # reconcile/notify pass retries automatically.
+            log.warning(
+                "[review] agent %s unreachable (%s) — trying next reviewer candidate",
+                machine.name, exc,
+            )
+            continue
+
+        # Dispatch accepted — record the review assignment and return.
+        review_assignment = Assignment(
+            machine_name=machine.name,
+            repo_name=completed.repo_name,
+            issue_number=completed.issue_number,
+            issue_title=f"[review] {completed.issue_title}",
+            files_allowed=[],
+            files_forbidden=[],
+            briefing=briefing,
+            assignment_id=agent_response.get("id") or uuid.uuid4().hex[:12],
+            status="running",
+            branch=completed.branch,
+            pr_url=pr.get("url") if pr else None,
+            dispatched_at=now if now is not None else time.time(),
+            type="review",
+            review_target=str(pr["number"]) if pr else completed.branch,
+            review_of_assignment_id=completed.assignment_id,
+            model=review_model_alias,
+            review_head_sha=review_head_sha,
+        )
+        board.active.append(review_assignment)
+
+        from coord.state import record_dispatched_assignment  # noqa: PLC0415
+        record_dispatched_assignment(
+            assignment=review_assignment,
+            repo_github=repo.github,
+        )
+
+        return review_assignment
+
+    # All candidates exhausted.  Distinguish definitive rejection (config
+    # drift, drifted agent config) from transient network failures.
+    if had_rejection:
+        # At least one agent definitively rejected the repo — stall visibly
+        # with a named state so `coord status` can surface an actionable error
+        # and the pending-review loop stops silently retrying (#904).
+        log.error(
+            "[review] all reviewer candidates rejected dispatch for %s "
+            "(repo=%r, branch=%r) — setting review_state='no_eligible_reviewer'. "
+            "Check that every agent's repos list includes %r.",
+            completed.assignment_id, completed.repo_name, completed.branch,
+            completed.repo_name,
+        )
+        completed.review_state = "no_eligible_reviewer"
+    else:
+        # Only transient failures — leave review_state unchanged so the next
+        # reconcile/notify pass retries automatically.
+        log.warning(
+            "[review] all reviewer candidates unreachable for %s "
+            "(repo=%r) — will retry on next reconcile/notify pass",
+            completed.assignment_id, completed.repo_name,
+        )
+    return None
 
 
 def dispatch_pending_reviews(board, config, *, test_gate_active: bool = False, now=None):
