@@ -50,6 +50,17 @@ jobs:
         with:
           workspaces: tui
 
+      # A few tui integration tests (commands::tests) spawn the real `coord`
+      # CLI (e.g. `coord --version`) via Command::new("coord") and assert it
+      # succeeds, so the Python package must be installed and on PATH inside
+      # this otherwise Rust-only job.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install coord CLI (tui integration tests spawn it)
+        run: pip install -e .
+
       - name: cargo test (tui)
         working-directory: tui
         run: cargo test
