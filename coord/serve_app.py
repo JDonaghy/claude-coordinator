@@ -891,9 +891,16 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             return JSONResponse(
                 {"error": "board read failed", "detail": str(e)}, status_code=503
             )
-        # #776: inject server-side merge plan (ordered, gate-annotated) so thin
-        # clients get status + reason without re-implementing gate logic.
-        # Computed after the projection so a plan failure never 503 the board.
+        # #776/#778/#550: inject server-side merge plan (ordered, gate-annotated),
+        # staging section, and per-issue stage/gate projection so thin clients get
+        # status + reason without re-implementing gate logic. All three are derived
+        # from the same board snapshot + CI store, built once here and shared below
+        # so a concurrent DB write can't split them across two snapshots and
+        # `list_checks_for_pr` (a real `gh` round trip) isn't paid twice per
+        # request. Computed after the projection so a plan failure never 503s the
+        # board.
+        _board = None
+        _ci = None
         try:
             from coord import merge_queue as _mq  # noqa: PLC0415
             from coord.ci_store import build_ci_store as _build_ci_store  # noqa: PLC0415
@@ -924,26 +931,25 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             projection["merge_staging"] = []
         # #550: server-computed per-issue stage/gate projection — generalizes
         # the #776/#778 pattern to coord-tui's `pipeline.rs` stage-status
-        # functions.  Fail-open: an error returns an empty list rather than
-        # 503ing the board.
+        # functions.  Reuses the `_board`/`_ci` snapshot built above; only
+        # falls back to a fresh `build_board()` if that block above failed
+        # before reaching it (e.g. a DB error), so the common case never
+        # double-builds the board or double-fetches CI checks.  Fail-open:
+        # an error returns an empty list rather than 503ing the board.
         try:
             from coord import stage_projection as _sp  # noqa: PLC0415
-            from coord.ci_store import build_ci_store as _build_ci_store2  # noqa: PLC0415
             from coord.merge_queue import load_queue as _load_queue  # noqa: PLC0415
-            from coord.state import build_board as _build_board2  # noqa: PLC0415
 
-            _sp_board = _build_board2()
-            try:
-                _sp_ci = _build_ci_store2(config.ci_store.type)
-            except Exception:  # noqa: BLE001
-                _sp_ci = None
+            if _board is None:
+                from coord.state import build_board as _build_board2  # noqa: PLC0415
+                _board = _build_board2()
             projection["issue_stage_projection"] = _sp.compute_board_stage_projection(
                 issues=projection.get("issues", []),
-                assignments=list(_sp_board.active) + list(_sp_board.completed),
+                assignments=list(_board.active) + list(_board.completed),
                 merge_queue_items=_load_queue(),
                 default_gates=list(config.pipeline.default_gates),
                 require_plan=bool(config.dispatch.require_plan),
-                ci_store=_sp_ci,
+                ci_store=_ci,
             )
         except Exception:  # noqa: BLE001 — projection failure must not blank the board
             projection["issue_stage_projection"] = []
