@@ -561,6 +561,60 @@ def _openapi_spec() -> dict:
                 },
             }
         },
+        "/review-findings": {
+            "post": {
+                "summary": "Persist parsed review verdict+body on a review assignment (#905)",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "assignment_id": {"type": "string"},
+                                    "verdict": {"type": "string"},
+                                    "body": {"type": "string"},
+                                },
+                                "required": ["assignment_id", "verdict", "body"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {"application/json": {"schema": ok_response}},
+                    },
+                    "400": {"description": "Missing field"},
+                },
+            }
+        },
+        "/review-posted": {
+            "post": {
+                "summary": "Mark a review assignment's findings as posted (sets review_posted_at) (#905)",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "assignment_id": {"type": "string"},
+                                },
+                                "required": ["assignment_id"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {"application/json": {"schema": ok_response}},
+                    },
+                    "400": {"description": "Missing assignment_id"},
+                },
+            }
+        },
         "/assignment-usage": {
             "post": {
                 "summary": "Route cost/token/is_interactive/smoke_tests writes (#665/#749)",
@@ -1147,6 +1201,48 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         except Exception as e:  # noqa: BLE001
             return JSONResponse(
                 {"error": "test-verdict write failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"ok": True})
+
+    async def post_review_findings(request: Request) -> Response:
+        # #905: persist parsed review verdict+body on the daemon's DB so
+        # post_orphaned_review_findings on a thin client reaches the shared DB.
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        try:
+            state._update_assignment_review_findings_local(
+                body["assignment_id"],
+                verdict=body["verdict"],
+                body=body["body"],
+            )
+        except KeyError as e:
+            return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "review-findings write failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"ok": True})
+
+    async def post_review_posted(request: Request) -> Response:
+        # #905: mark a review assignment as posted (sets review_posted_at) on the
+        # daemon's DB so thin-client notify runs correctly.
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        try:
+            state._mark_review_posted_local(body["assignment_id"])
+        except KeyError as e:
+            return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "review-posted write failed", "detail": str(e)},
                 status_code=503,
             )
         return JSONResponse({"ok": True})
@@ -1848,6 +1944,8 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/dispatched-work", post_dispatched_work, methods=["POST"]),
         Route("/dispatched", post_dispatched, methods=["POST"]),
         Route("/test-verdict", post_test_verdict, methods=["POST"]),
+        Route("/review-findings", post_review_findings, methods=["POST"]),
+        Route("/review-posted", post_review_posted, methods=["POST"]),
         Route("/board", post_board, methods=["POST"]),
         Route("/assignment-usage", post_assignment_usage, methods=["POST"]),
         Route("/issue-labels", post_issue_labels, methods=["POST"]),
