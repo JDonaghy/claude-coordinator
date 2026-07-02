@@ -202,6 +202,49 @@ def remove_issue_label(repo: str, issue_number: int, label: str) -> None:
     _gh("issue", "edit", str(issue_number), "--repo", repo, "--remove-label", label)
 
 
+def change_issue_labels(
+    repo: str,
+    issue_number: int,
+    *,
+    add: set[str],
+    remove: set[str],
+) -> tuple[list[str], bool]:
+    """Atomically add and/or remove arbitrary labels on an issue (#802).
+
+    Fetches the current label set first, computes the minimal delta, and
+    runs a single ``gh issue edit`` call only when something actually
+    changes — tolerates already-present ``add`` labels and already-absent
+    ``remove`` labels (idempotent, matches ``_apply_label_change``'s
+    pre-#802 behavior).
+
+    Returns ``(new_labels, changed)`` where ``new_labels`` is the final
+    label list (sorted) and ``changed`` is ``True`` when any labels were
+    added or removed. Raises ``RuntimeError`` on ``gh`` failure.
+    """
+    view_raw = _gh(
+        "issue", "view", str(issue_number), "--repo", repo, "--json", "labels",
+    )
+    current: set[str] = {
+        lbl.get("name", "")
+        for lbl in json.loads(view_raw).get("labels", [])
+    }
+
+    to_add = add - current
+    to_remove = remove & current
+    changed = bool(to_add or to_remove)
+
+    if changed:
+        args = ["issue", "edit", str(issue_number), "--repo", repo]
+        for lbl in sorted(to_add):
+            args.extend(["--add-label", lbl])
+        for lbl in sorted(to_remove):
+            args.extend(["--remove-label", lbl])
+        _gh(*args)
+
+    new_labels = sorted((current - to_remove) | to_add)
+    return new_labels, changed
+
+
 _TEST_MODE_LABELS = ("test-mode:smoke", "test-mode:auto")
 
 
