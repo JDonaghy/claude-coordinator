@@ -19,10 +19,14 @@ on:
     branches: [main]
     paths:
       - 'tui/**'
+      # Self-trigger so edits to this workflow are exercised by their own PR.
+      - '.github/workflows/cargo-test.yml'
   pull_request:
     branches: [main]
     paths:
       - 'tui/**'
+      # Self-trigger so edits to this workflow are exercised by their own PR.
+      - '.github/workflows/cargo-test.yml'
 
 jobs:
   cargo-test:
