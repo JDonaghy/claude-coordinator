@@ -1,4 +1,5 @@
-"""Milestone work-order representation — Phase 0 of #767.
+"""Milestone work-order representation — Phase 0 of #767 (+ the render/replace
+write-side helpers Phase 2, #770, uses to persist a chat-proposed order).
 
 A milestone's **tracking issue** (the decision-log convention established by
 #645) carries a ``## Work order`` annotated checklist describing which of
@@ -14,7 +15,12 @@ edges::
 This module turns that block into a DAG (:func:`parse_work_order`) and
 computes the **ready frontier** — the subset of nodes eligible to dispatch
 right now given the current board state and which issues have already
-reached a merged/terminal state (:func:`ready_frontier`).
+reached a merged/terminal state (:func:`ready_frontier`). It also renders a
+:class:`WorkOrder` back into checklist text and splices it into a tracking
+issue's body (:func:`render_work_order` / :func:`replace_work_order_section`)
+— the write-side counterpart the #770 milestone-chat session (and its
+``coord milestone write-order`` CLI command) uses to persist an
+operator-confirmed order idempotently, never duplicating the section.
 
 Deliberately **pure / board-driven** (per #768's acceptance criteria): every
 function here takes plain data (a body string, a :class:`~coord.models.Board`,
@@ -51,6 +57,8 @@ __all__ = [
     "WorkOrderNode",
     "WorkOrder",
     "parse_work_order",
+    "render_work_order",
+    "replace_work_order_section",
     "validate_milestone_membership",
     "FrontierEntry",
     "BlockedNode",
@@ -210,6 +218,70 @@ def _parse_after_list(issue_number: int, value: str) -> list[int]:
             )
         items.append(int(m.group(1)))
     return items
+
+
+def render_work_order(work_order: WorkOrder) -> str:
+    """Render *work_order* back into checklist lines (no `## Work order` heading).
+
+    Inverse of the checklist half of :func:`parse_work_order` — round-trips
+    through it: ``parse_work_order(f"## Work order\\n{render_work_order(wo)}")
+    == wo``. Used by :func:`replace_work_order_section` and by
+    ``coord milestone write-order`` (#770) to persist a chat-proposed order.
+    """
+    lines: list[str] = []
+    for n in work_order.nodes:
+        box = "x" if n.checked else " "
+        bits: list[str] = []
+        if n.group:
+            bits.append(f"group: {n.group}")
+        if n.after:
+            bits.append("after: " + ",".join(f"#{d}" for d in n.after))
+        annotation = f"  {{{', '.join(bits)}}}" if bits else ""
+        lines.append(f"- [{box}] #{n.issue_number}{annotation}")
+    return "\n".join(lines)
+
+
+def replace_work_order_section(body: str, new_block: str) -> str:
+    """Idempotently insert/replace the `## Work order` section of *body*.
+
+    ``new_block`` is checklist text only (e.g. :func:`render_work_order`'s
+    output) — no heading line. Mirrors :func:`parse_work_order`'s own
+    section-boundary rule so a round-trip through both functions agrees on
+    where the block starts and ends: if *body* already has a `## Work
+    order` heading, everything from the line after it up to the next
+    markdown heading (or EOF) is replaced in place, and everything else in
+    *body* is preserved verbatim — re-running with the same *new_block* is a
+    no-op, and re-running with a revised one updates rather than
+    duplicates. If *body* has no such heading, `## Work order\\n` +
+    *new_block* is appended at the end (blank-line separated).
+    """
+    lines = body.splitlines()
+    start = None
+    for i, line in enumerate(lines):
+        if _HEADING_RE.match(line.strip()):
+            start = i + 1
+            break
+
+    new_block_lines = new_block.strip("\n").splitlines() if new_block.strip() else []
+
+    if start is None:
+        prefix = body.rstrip("\n")
+        sep = "\n\n" if prefix else ""
+        rendered = "\n".join(["## Work order", *new_block_lines])
+        return f"{prefix}{sep}{rendered}\n"
+
+    end = len(lines)
+    for i in range(start, len(lines)):
+        if lines[i].strip().startswith("#"):
+            end = i
+            break
+
+    tail = lines[end:]
+    if new_block_lines and tail and tail[0].strip():
+        tail = ["", *tail]
+
+    new_lines = lines[:start] + new_block_lines + tail
+    return "\n".join(new_lines).rstrip("\n") + "\n"
 
 
 def _check_cycles(nodes: list[WorkOrderNode]) -> None:

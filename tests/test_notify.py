@@ -1108,3 +1108,45 @@ class TestDispatchBoardPendingReviewsNoSmokeGate:
             "_dispatch_board_pending_reviews must call dispatch_review even "
             "when test_state='failed' (#465)"
         )
+
+
+class TestMilestoneChatNotifySuppression:
+    """#770: milestone-chat completion must NOT post a GitHub comment.
+
+    Each conversational turn dispatches a new `-p` invocation against the
+    SAME tracking issue (real issue number, unlike refinement's board-chat
+    sentinel) — a generic "assignment completed" comment on every turn
+    would spam the live planning document. Mirrors refinement's existing
+    suppression (#315)."""
+
+    def test_milestone_chat_completion_skips_post_completion(self) -> None:
+        from coord.notify import post_transition, Transition, EVENT_COMPLETION
+
+        transition = Transition(
+            assignment_id="mc-1",
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=100,
+            event=EVENT_COMPLETION,
+            exit_code=0,
+        )
+        record = {"repo_github": "acme/api", "type": "milestone-chat"}
+        entry = {
+            "started_at": 1000.0,
+            "finished_at": 1010.0,
+            "branch": None,
+            "log_path": None,
+        }
+        with (
+            patch("coord.notify.post_completion") as mock_post_completion,
+            patch("coord.notify.mark_notified") as mock_mark_notified,
+            patch("coord.notify._capture_cost"),
+            patch("coord.notify._capture_smoke_tests"),
+            patch("coord.notify._capture_claude_session_id"),
+        ):
+            post_transition(transition, record, entry)
+
+        mock_post_completion.assert_not_called()
+        mock_mark_notified.assert_called_once_with(
+            "mc-1", EVENT_COMPLETION, branch=None
+        )

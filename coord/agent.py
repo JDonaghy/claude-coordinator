@@ -1343,6 +1343,97 @@ The developer's client handles submission — your job is to produce the draft.
 to look up relevant code context when the conversation calls for it.\
 """
 
+MILESTONE_CHAT_SYSTEM_PROMPT = """\
+You are a milestone steward helping an operator shape a GitHub milestone's \
+work order. You are a deliberately narrow slice of the broader \
+"milestone-steward" chat (#645): your only job is to propose and — once \
+confirmed — write the `## Work order` block that `coord milestone order` \
+(#768) parses into a dispatch DAG.
+
+The first user message contains the milestone's tracking issue (its current \
+body, which may already carry a `## Work order` block from a prior run) and \
+the open issues filed under the milestone (title + body).
+
+In each reply:
+- Discuss the milestone and its issues with the operator as needed.
+- When asked — or when it's clearly useful — infer a proposed work order: \
+which issues could run in PARALLEL (`group: <label>`; any issues sharing a \
+label may dispatch concurrently) and which have a HARD dependency \
+(`after: #N[,#M...]`; wait until N and M are both done). Ground this in \
+explicit signals in the issue bodies — references to other issue numbers, \
+"depends on" / "blocks" / "after" phrasing, clearly overlapping files or \
+components — do not invent a dependency the text doesn't support.
+- Present the proposed block to the operator in this exact checklist shape \
+before writing anything, and explain your reasoning briefly so they can \
+correct it:
+
+    - [ ] #762  {group: A}
+    - [ ] #763  {group: A}
+    - [ ] #765  {after: #762,#763}
+
+- Only AFTER the operator explicitly confirms (e.g. "yes", "write it", \
+"looks good"), write the block with exactly this command, piping the \
+confirmed checklist lines via stdin:
+
+    coord milestone write-order <repo> <tracking_issue> <<'EOF'
+    - [ ] #762  {group: A}
+    ...
+    EOF
+
+  `coord milestone write-order` re-validates the block (parses it, checks \
+for cycles, unknown `after` targets, and milestone membership) before \
+writing, and idempotently replaces any existing `## Work order` section \
+rather than duplicating it — safe to re-run after the operator asks for \
+changes.
+- If the operator asks for changes after you've proposed a block, revise \
+and re-present before writing — never write on the first pass without \
+confirmation.
+
+Rules:
+- Do NOT run mutating `gh` commands (issue edit/create/close, pr *, api -X \
+PATCH/POST/DELETE, milestone *) — the write path is `coord milestone \
+write-order`, never raw `gh`.
+- Do NOT run `git push`, `git commit`, or any command that writes to the repo.
+- Do NOT run `coord milestone create`, `coord milestone edit`, `coord \
+approve`, `coord merge`, or `coord assign` — those are outside this \
+session's job.
+- Do NOT write the work order until the operator has explicitly confirmed \
+the proposed block in this conversation.
+- Use `Read` and read-only `Bash` (e.g. `coord milestone order <repo> \
+<tracking_issue>` to preview the live frontier) to ground your proposal in \
+the current board state when useful.\
+"""
+
+# Deny list applied to milestone-chat workers.  The one write action
+# permitted is `coord milestone write-order` (allowed by omission — this
+# list only blocks); raw `gh` mutations and unrelated `coord` write
+# commands are blocked so the tracking issue is the only thing this session
+# can touch, and only via the validated coord path.
+MILESTONE_CHAT_DENY_COMMANDS: list[str] = [
+    "Bash(gh issue edit *)",
+    "Bash(gh issue create *)",
+    "Bash(gh issue delete *)",
+    "Bash(gh issue close *)",
+    "Bash(gh api -X PATCH *)",
+    "Bash(gh api -X POST *)",
+    "Bash(gh api -X DELETE *)",
+    "Bash(gh pr *)",
+    "Bash(gh repo *)",
+    "Bash(gh milestone *)",
+    "Bash(git push *)",
+    "Bash(git commit *)",
+    "Bash(git reset --hard *)",
+    "Bash(git branch -D *)",
+    "Bash(git checkout -- .)",
+    "Bash(git clean -f *)",
+    "Bash(rm -rf *)",
+    "Bash(coord milestone create *)",
+    "Bash(coord milestone edit *)",
+    "Bash(coord approve *)",
+    "Bash(coord merge *)",
+    "Bash(coord assign *)",
+]
+
 # Deny list applied to new-issue-chat workers.  Allows read-only gh
 # (e.g. `gh issue list`, `gh issue view`) while blocking all mutations.
 NEW_ISSUE_CHAT_DENY_COMMANDS: list[str] = [
@@ -1444,6 +1535,16 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
                 + spec.new_issue_guidance
             )
         allowed_tools = "Read,Bash"
+    elif spec.type == "milestone-chat":
+        # #770 (Phase 2 of #767): milestone-steward chat that proposes and
+        # (once confirmed) writes the tracking issue's `## Work order`
+        # block. Read+Bash so it can run `coord milestone order` /
+        # `write-order`; a deny list blocks raw `gh` mutations and
+        # unrelated `coord` write commands — see WRITE_CAPABLE_SPEC_TYPES,
+        # this is a mutating type unlike the other chats above.
+        system_prompt = spec.system_prompt if spec.system_prompt else MILESTONE_CHAT_SYSTEM_PROMPT
+        system_prompt += build_deny_prompt(MILESTONE_CHAT_DENY_COMMANDS)
+        allowed_tools = "Read,Bash"
     else:
         system_prompt = spec.system_prompt if spec.system_prompt else WORKER_SYSTEM_PROMPT
         system_prompt += build_deny_prompt(spec.deny_commands)
@@ -1482,12 +1583,15 @@ def _user_message_line(text: str) -> bytes:
 # provider that has NOT been verified to honour the worker deny-list.
 # Non-mutating types (``plan``, ``refinement``, ``test-chat``,
 # ``new-issue-chat``) are read-only chats and may run on unverified
-# providers without risk.
+# providers without risk. ``milestone-chat`` (#770) is a chat too — no
+# git worktree — but it CAN mutate GitHub (the tracking issue body via
+# `coord milestone write-order`), so it belongs here, not above.
 WRITE_CAPABLE_SPEC_TYPES: frozenset[str] = frozenset({
     "work",
     "review",
     "smoke",
     "conflict-fix",
+    "milestone-chat",
 })
 
 
@@ -2043,15 +2147,18 @@ class AgentServer:
         )
         assignment.log_path = str(self.log_dir / f"{assignment.id}.log")
 
-        if spec.type in ("plan", "refinement", "test-chat", "new-issue-chat"):
-            # Read-only run (plan, refinement, test-chat, or new-issue-chat) —
-            # skip worktree creation, run directly in the main repo checkout.
-            # No branch is created or modified. For chat sessions (#315 / #314
-            # / #316), the stable cwd is also required so claude-cli's
-            # `--resume <session_id>` finds the prior session file on
-            # subsequent turns: claude scopes sessions by cwd (mangled into
-            # ~/.claude/projects/<cwd-key>/), and a per-assignment worktree
-            # gives every turn a different cwd.
+        if spec.type in ("plan", "refinement", "test-chat", "new-issue-chat", "milestone-chat"):
+            # No-worktree run: none of these touch git (no branch is created
+            # or modified) — plan/refinement/test-chat/new-issue-chat are
+            # additionally read-only everywhere; milestone-chat (#770) is
+            # the one exception that CAN mutate GitHub (the tracking issue
+            # body, via `coord milestone write-order`) despite needing no
+            # worktree — see WRITE_CAPABLE_SPEC_TYPES for that axis. For
+            # chat sessions (#315 / #314 / #316 / #770), the stable cwd is
+            # also required so claude-cli's `--resume <session_id>` finds
+            # the prior session file on subsequent turns: claude scopes
+            # sessions by cwd (mangled into ~/.claude/projects/<cwd-key>/),
+            # and a per-assignment worktree gives every turn a different cwd.
             with self._lock:
                 self._assignments[assignment.id] = assignment
             self._persist()

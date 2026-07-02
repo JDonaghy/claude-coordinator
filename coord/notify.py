@@ -685,11 +685,20 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
         log_path=entry.get("log_path"),
     )
     assignment_type = record.get("type", "work")
-    if transition.event == EVENT_COMPLETION and assignment_type == "refinement":
+    if transition.event == EVENT_COMPLETION and assignment_type in (
+        "refinement",
+        "milestone-chat",
+    ):
         # #315: refinement chat turns are developer-side conversation — do NOT
         # post completion comments to GitHub.  Each turn would spam the issue
         # with identical "assignment completed" noise.  We still capture cost,
         # smoke tests, and session ID above; just skip the GitHub post.
+        # #770: milestone-chat is dispatched AGAINST the tracking issue
+        # itself (unlike refinement's target issue, this one is the live
+        # planning document a human reads) — a generic completion comment on
+        # every conversational turn would be even noisier here. The
+        # meaningful GitHub-visible effect is the tracking issue's body
+        # update via `coord milestone write-order`, not a completion comment.
         mark_notified(
             transition.assignment_id,
             transition.event,
