@@ -30,10 +30,16 @@ def get_open_issues(repo: str) -> list[dict]:
 
 
 def get_issue(repo: str, issue_number: int) -> dict:
-    """Fetch a single issue by number. Returns {number, title, body, state, ...}."""
+    """Fetch a single issue by number.
+
+    Returns ``{number, title, body, state, milestone, ...}``. ``milestone``
+    is ``None`` when the issue has none, else ``{"number": ..., "title":
+    ...}`` — used by ``coord milestone order`` (#768) to resolve a tracking
+    issue's milestone and validate node membership without a second call.
+    """
     raw = _gh(
         "issue", "view", str(issue_number), "--repo", repo,
-        "--json", "number,title,body,state",
+        "--json", "number,title,body,state,milestone",
     )
     return json.loads(raw)
 

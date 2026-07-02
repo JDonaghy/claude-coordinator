@@ -105,6 +105,7 @@ from coord.commands.issues import (
     untrack,
 )
 from coord.commands.lifecycle import done, housekeeping, notify, resume, serve, web
+from coord.commands.milestone import milestone_group
 from coord.commands.plan_followup import (
     _dispatch_followup,  # noqa: F401 — re-exported for tests
     approve_plan,
@@ -241,6 +242,7 @@ main.add_command(housekeeping)
 main.add_command(diagnose)
 main.add_command(issue_group)
 main.add_command(context_group)
+main.add_command(milestone_group)
 main.add_command(fix_briefing_cmd)
 main.add_command(track)
 main.add_command(untrack)
