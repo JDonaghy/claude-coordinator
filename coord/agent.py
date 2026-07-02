@@ -2858,6 +2858,7 @@ class AgentServer:
             INPUT_BOX_MARKER_BYTES,
             briefing_fingerprint,
             fingerprint_in_bytes,
+            paste_landed_bytes,
         )
 
         initial_input = provider.initial_input(spec)
@@ -2906,22 +2907,36 @@ class AgentServer:
                         break
                 time.sleep(0.05)
 
-            # (3) PRE-FILL, THEN VERIFY — retry on a miss (#865: fire-and-
-            # forget with no verification at all was the root defect that
-            # let the ~30% drop-rate through).  Each attempt writes the
+            # (3) PRE-FILL, THEN VERIFY — retry on a miss (#865 / #896).
+            # #865 root defect: fire-and-forget with no verification at all
+            # let the ~30% drop-rate through.  #896 root defect: the bare
+            # fingerprint check gave false negatives when Claude Code
+            # collapsed a large paste into a chip ("❯ [Pasted text #1 +NNN
+            # lines]") or scrolled the input box to the tail (fingerprint
+            # from the start not visible).  Each attempt writes the
             # bracketed-paste block (populates the TUI's input box; the
             # operator presses Enter to submit — #437 explicitly does NOT
             # write a trailing carriage return, the structural change that
             # makes this path human-attended rather than agentic), then
-            # re-reads the log tail the pump thread is already writing and
-            # checks for a fingerprint of the briefing.  No content-based
-            # completion detection follows; no scraper inspects the TTY for
-            # sentinels; the session terminates when the human exits
-            # ``claude``.
+            # re-reads the log tail and checks via the broadened
+            # ``paste_landed_bytes`` predicate.  On a miss, Escape + Ctrl-U
+            # are written first to clear any stacked chips before retrying.
+            # No content-based completion detection follows; no scraper
+            # inspects the TTY for sentinels; the session terminates when
+            # the human exits ``claude``.
             fingerprint = briefing_fingerprint(spec.briefing)
             landed = False
             write_failed = False
             for _attempt in range(1, _PTY_INJECT_MAX_ATTEMPTS + 1):
+                if _attempt > 1:
+                    # Idempotent retry (#896): clear the input box before
+                    # re-pasting so stacked chips don't accumulate if a
+                    # false-negative slips through.
+                    try:
+                        os.write(master_fd, b"\x1b\x15")  # Escape + Ctrl-U
+                    except OSError:
+                        pass
+                    time.sleep(0.05)
                 try:
                     os.write(master_fd, initial_input)
                 except OSError as e:
@@ -2938,7 +2953,7 @@ class AgentServer:
                         _tail = _rf.read()
                 except OSError:
                     _tail = b""
-                if fingerprint_in_bytes(_tail, fingerprint):
+                if paste_landed_bytes(_tail, fingerprint):
                     landed = True
                     break
                 if _attempt < _PTY_INJECT_MAX_ATTEMPTS:

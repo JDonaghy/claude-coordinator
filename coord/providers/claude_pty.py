@@ -117,6 +117,29 @@ INPUT_BOX_MARKER_BYTES = INPUT_BOX_MARKER.encode("utf-8")
 _WS_RE_STR = re.compile(r"\s+")
 _WS_RE_BYTES = re.compile(rb"\s+")
 
+# ── #896: paste-chip / box-changed detection ──────────────────────────────────
+#
+# Root cause of #896: ``fingerprint_in_text`` / ``fingerprint_in_bytes`` both
+# check only for the *literal* first-40-chars of the briefing in the captured
+# pane/bytes.  Two scenarios produce false negatives even though the paste
+# landed:
+#
+# 1. Claude Code **collapses** a large/multi-line paste into a placeholder
+#    chip ("❯ [Pasted text #1 +NNN lines]") — the literal briefing text never
+#    appears in ``capture-pane -p`` or the PTY log.
+#
+# 2. The input box is bounded-height and scrolls to show the **tail** of the
+#    pasted text (cursor at end of content), so the fingerprint — taken from
+#    the START — has scrolled out of the visible/captured region.
+#
+# ``_PASTE_CHIP_RE`` / ``_PASTE_CHIP_BYTES_RE`` detect the collapsed chip.
+# ``paste_landed`` / ``paste_landed_bytes`` are the broadened predicates used
+# in place of the bare ``fingerprint_in_*`` checks in ``coord.interactive``
+# and ``coord.agent``.  They are defined here — once — so all three call-sites
+# stay in sync.
+_PASTE_CHIP_RE = re.compile(r"\[Pasted text|\+\s*\d+\s*lines\]")
+_PASTE_CHIP_BYTES_RE = re.compile(rb"\[Pasted text|\+\s*\d+\s*lines\]")
+
 
 def briefing_fingerprint(briefing: str, length: int = 40) -> str:
     """Return a whitespace-normalized snippet of *briefing* for paste verification.
@@ -156,6 +179,123 @@ def fingerprint_in_bytes(raw: bytes, fingerprint: str) -> bool:
         return True
     normalized = _WS_RE_BYTES.sub(b" ", raw)
     return fingerprint.encode("utf-8") in normalized
+
+
+def paste_landed(
+    pane_text: str,
+    *,
+    fingerprint: str,
+    baseline: str | None = None,
+) -> bool:
+    """True when a paste of the briefing (identified by *fingerprint*) has landed.
+
+    Broadened over the bare :func:`fingerprint_in_text` check (#896) to
+    handle the two scenarios where ``fingerprint_in_text`` gives false
+    negatives even though the paste actually arrived:
+
+    * **Paste-chip**: Claude Code collapses a large/multi-line paste into a
+      placeholder chip (``❯ [Pasted text #1 +NNN lines]``) — the literal
+      briefing text never appears in ``capture-pane -p``.
+    * **Scrolled tail**: the input box is bounded-height and renders the
+      **tail** of the pasted text (cursor at end), so the fingerprint —
+      taken from the *start* — has scrolled out of the visible region.
+
+    The chip and box-changed checks are deliberately scoped to the
+    **input-box region** (characters at or after the ``❯`` INPUT_BOX_MARKER)
+    so that async startup banners mutating the top of the pane do NOT count
+    as evidence of a paste — this was the #865 trap.
+
+    Args:
+        pane_text: The current ``tmux capture-pane -p`` output (plain text,
+            no ANSI escapes).
+        fingerprint: The whitespace-normalised briefing snippet returned by
+            :func:`briefing_fingerprint`.
+        baseline: The pane text captured *before* the paste was sent.
+            When provided, a non-empty input-box region that differs from the
+            corresponding region in *baseline* is treated as evidence that the
+            paste arrived (box went from empty placeholder to holding content).
+
+    Returns:
+        ``True`` when any of the following holds:
+
+        * :func:`fingerprint_in_text` matches (fast path, no scoping needed).
+        * :data:`_PASTE_CHIP_RE` matches somewhere in the input-box region.
+        * The input-box region is non-empty and differs from the same region
+          in *baseline* (box changed after the paste).
+    """
+    if not fingerprint:
+        return True  # nothing to verify
+
+    # Fast path: literal fingerprint visible anywhere in the pane.
+    if fingerprint_in_text(pane_text, fingerprint):
+        return True
+
+    # Locate the input-box region so the broader checks don't count async
+    # startup banners at the top of the pane.
+    marker_idx = pane_text.find(INPUT_BOX_MARKER)
+    if marker_idx == -1:
+        # No input box visible — can't safely scope the chip/changed checks,
+        # so fall back to "not yet landed" and let the caller retry/time out.
+        return False
+
+    region = pane_text[marker_idx:]
+
+    # Paste-chip: Claude Code collapses large pastes to a chip.
+    if _PASTE_CHIP_RE.search(region):
+        return True
+
+    # Box-changed from the pre-paste baseline: the input-box region is
+    # non-empty and differs from what it looked like before the paste.
+    if baseline is not None:
+        baseline_marker_idx = baseline.find(INPUT_BOX_MARKER)
+        if baseline_marker_idx != -1:
+            baseline_region = baseline[baseline_marker_idx:]
+            if region.strip() and region != baseline_region:
+                return True
+
+    return False
+
+
+def paste_landed_bytes(raw: bytes, fingerprint: str) -> bool:
+    """Byte-oriented twin of :func:`paste_landed` for the PTY relay paths.
+
+    The PTY log/screen buffer contains raw TTY bytes (ANSI escapes
+    interleaved with rendered text), so this is more heuristic than
+    :func:`paste_landed`.  Checks in priority order:
+
+    1. :func:`fingerprint_in_bytes` — literal fingerprint present (fast path).
+    2. :data:`_PASTE_CHIP_BYTES_RE` after :data:`INPUT_BOX_MARKER_BYTES` —
+       Claude Code collapsed the large paste to a chip.
+
+    The baseline / box-changed check is omitted here: the PTY log is an
+    append-only stream of all terminal output rather than a snapshot of the
+    current screen, so "the log grew" is too coarse a signal (the log always
+    grows as ``claude`` runs).
+
+    Args:
+        raw:  The raw PTY log bytes (may contain ANSI escape sequences).
+        fingerprint:  The whitespace-normalised briefing snippet returned by
+            :func:`briefing_fingerprint`.
+
+    Returns:
+        ``True`` when the fingerprint or paste-chip marker is found.
+    """
+    if not fingerprint:
+        return True
+
+    # Fast path
+    if fingerprint_in_bytes(raw, fingerprint):
+        return True
+
+    # Paste-chip scoped to after the input-box marker (reduces false positives
+    # from any "[Pasted text" that might appear in the system prompt or header).
+    marker_idx = raw.find(INPUT_BOX_MARKER_BYTES)
+    if marker_idx != -1:
+        region = raw[marker_idx:]
+        if _PASTE_CHIP_BYTES_RE.search(region):
+            return True
+
+    return False
 
 
 class ClaudePtyProvider(Provider):

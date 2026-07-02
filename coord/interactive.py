@@ -104,6 +104,7 @@ from coord.providers.claude_pty import (
     briefing_fingerprint,
     fingerprint_in_bytes,
     fingerprint_in_text,
+    paste_landed,
 )
 
 __all__ = [
@@ -492,8 +493,31 @@ def _inject_briefing_into_tmux_session(
                 if quiet_for >= threshold:
                     break  # settled — inject
 
-        # ── Phase 2: paste, verify, retry on a miss (#865) ─────────────────
+        # ── Phase 2: paste, verify, retry on a miss (#865 / #896) ─────────
+        # Capture a baseline snapshot of the input-box region BEFORE the
+        # first paste so ``paste_landed`` can detect "box changed from
+        # empty placeholder" even when the paste-chip hides the literal
+        # fingerprint (#896).
+        baseline = _capture()
+
         for attempt in range(1, _INJECT_MAX_ATTEMPTS + 1):
+            if attempt > 1:
+                # Idempotent retry (#896): clear any stacked paste chips
+                # before re-pasting so a false-negative on a successfully-
+                # landed paste doesn't stack duplicate chips.
+                subprocess.run(
+                    host.cmd(["send-keys", "-t", session_name, "Escape"]),
+                    capture_output=True,
+                    timeout=2.0,
+                    check=False,
+                )
+                time.sleep(0.05)
+                subprocess.run(
+                    host.cmd(["send-keys", "-t", session_name, "C-u"]),
+                    capture_output=True,
+                    timeout=2.0,
+                    check=False,
+                )
             _paste_once()
             time.sleep(_INJECT_VERIFY_SETTLE_S)
             content = _capture()
@@ -502,7 +526,7 @@ def _inject_briefing_into_tmux_session(
                 # retry.  The paste itself was issued; treat as best-effort
                 # success (matches pre-#865 behaviour when tmux is broken).
                 return True
-            if fingerprint_in_text(content, fingerprint):
+            if paste_landed(content, fingerprint=fingerprint, baseline=baseline):
                 return True
             if attempt < _INJECT_MAX_ATTEMPTS:
                 time.sleep(_INJECT_RETRY_BACKOFF_S)
