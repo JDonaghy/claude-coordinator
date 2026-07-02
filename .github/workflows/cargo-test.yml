@@ -9,9 +9,10 @@ name: Rust tests
 # Path-dep note: tui/Cargo.toml has
 #   quadraui = { path = "../../quadraui/quadraui", ... }
 # which mirrors the local dev layout ~/src/claude-coordinator/ (sibling of
-# ~/src/quadraui/).  On CI we replicate that layout by checking out quadraui
-# at `path: ../quadraui` (one level above $GITHUB_WORKSPACE), so the relative
-# path from tui/ resolves to the same place.
+# ~/src/quadraui/).  On CI we replicate that layout by cloning quadraui to
+# ../quadraui (relative to $GITHUB_WORKSPACE) via `git clone` — a plain shell
+# step can write outside the workspace, unlike actions/checkout@v4 which
+# enforces a workspace-relative path restriction.
 
 on:
   push:
@@ -29,15 +30,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Check out quadraui as a sibling directory to match the local path dep.
-      # tui/Cargo.toml: quadraui = { path = "../../quadraui/quadraui" }
-      # From tui/ that resolves to ../quadraui/quadraui relative to the repo root,
-      # i.e. the sibling checkout at path: ../quadraui.
+      # Reproduce the sibling-directory layout that tui/Cargo.toml expects:
+      #   quadraui = { path = "../../quadraui/quadraui" }
+      # From tui/ that resolves to $GITHUB_WORKSPACE/../quadraui/quadraui.
+      #
+      # actions/checkout@v4 refuses any `path:` outside $GITHUB_WORKSPACE, so we
+      # use a plain `git clone` instead — shell steps are not subject to that
+      # restriction and can write to the parent directory freely.
       - name: Check out quadraui (sibling path dep)
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ github.repository_owner }}/quadraui
-          path: ../quadraui
+        run: git clone https://github.com/${{ github.repository_owner }}/quadraui ../quadraui
 
       - uses: dtolnay/rust-toolchain@stable
 
