@@ -2101,6 +2101,92 @@ def test_board_merge_plan_does_not_503_on_plan_error(
     assert body["merge_plan"] == []
 
 
+# ── #550: issue_stage_projection in /board payload ────────────────────────────
+
+
+def test_board_payload_has_issue_stage_projection_key(
+    file_db: Path, valid_config_path: Path
+) -> None:
+    """/board always includes an 'issue_stage_projection' key (may be empty)."""
+    from coord.config import load as load_config
+    from coord.dao import SqliteStore
+    from coord.serve_app import build_app
+
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(file_db), cfg)
+    with TestClient(app) as cli:
+        board = cli.get("/board").json()
+    assert "issue_stage_projection" in board
+    assert isinstance(board["issue_stage_projection"], list)
+
+
+def test_board_issue_stage_projection_contains_correct_fields(
+    rw_db, valid_config_path: Path, tmp_path: Path
+) -> None:
+    """/board issue_stage_projection carries computed stage badges + has_approved_review.
+
+    Seeds a done work assignment with an approved review — mirrors the shape
+    coord-tui's pipeline.rs stage functions currently derive independently.
+    """
+    from coord.config import load as load_config
+    from coord.dao import SqliteStore
+    from coord.serve_app import build_app
+
+    rw_db.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')")
+    rw_db.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('round_number', '1')")
+    rw_db.execute(
+        "INSERT INTO assignments "
+        "(assignment_id, machine_name, repo_name, issue_number, issue_title, "
+        " status, type, test_state, dispatched_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        ("w1", "laptop", "api", 1, "An issue", "done", "work", "passed", 1.0),
+    )
+    rw_db.execute(
+        "INSERT INTO assignments "
+        "(assignment_id, machine_name, repo_name, issue_number, issue_title, "
+        " status, type, review_of_assignment_id, review_verdict, dispatched_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        ("rev1", "server", "api", 1, "An issue", "done", "review", "w1", "approve", 2.0),
+    )
+    rw_db.commit()
+
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(tmp_path / "rw.db"), cfg)
+    with TestClient(app) as cli:
+        board = cli.get("/board").json()
+
+    proj = {(e["repo_name"], e["issue_number"]): e for e in board["issue_stage_projection"]}
+    assert ("api", 1) in proj
+    entry = proj[("api", 1)]
+    assert entry["has_approved_review"] is True
+    assert entry["stages"]["work"] == "done"
+    assert entry["stages"]["test"] == "done"
+    assert entry["stages"]["review"] == "done"
+
+
+def test_board_issue_stage_projection_does_not_503_on_error(
+    file_db: Path, valid_config_path: Path, monkeypatch
+) -> None:
+    """/board returns 200 even when the projection raises — falls back to []."""
+    from coord import stage_projection as sp
+    from coord.config import load as load_config
+    from coord.dao import SqliteStore
+    from coord.serve_app import build_app
+
+    monkeypatch.setattr(
+        sp,
+        "compute_board_stage_projection",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(file_db), cfg)
+    with TestClient(app) as cli:
+        resp = cli.get("/board")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["issue_stage_projection"] == []
+
+
 # ── #781: _auto_drain_tick ────────────────────────────────────────────────────
 
 

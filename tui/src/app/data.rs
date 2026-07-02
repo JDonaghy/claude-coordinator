@@ -1273,6 +1273,10 @@ pub(crate) fn load_data() -> BoardData {
         pipeline_require_plan,
         merge_staging,
         pipeline_models,
+        // #550: local SQLite path has no daemon to compute the server-side
+        // stage projection; `pipeline.rs`'s local functions it mirrors
+        // remain authoritative on this path. Pass empty here.
+        Vec::new(),
     )
 }
 
@@ -1303,6 +1307,7 @@ pub(crate) fn assemble_board_data(
     pipeline_require_plan: bool,
     merge_staging: Vec<StagingEntry>,
     pipeline_models: Option<PipelineModels>,
+    issue_stage_projection: Vec<IssueStageProjection>,
 ) -> BoardData {
     // ── Machine reachability probes + health fetches ──────────────────────
     // Probe using the Tailscale host (fixes #121: machine name ≠ Tailscale hostname).
@@ -1413,6 +1418,7 @@ pub(crate) fn assemble_board_data(
         plans,
         merge_staging,
         pipeline_models,
+        issue_stage_projection,
     }
 }
 
@@ -1676,6 +1682,9 @@ pub(crate) fn load_data_remote(url: &str, token: Option<&str>) -> BoardData {
         pipeline_require_plan,
         merge_staging,
         pipeline_models,
+        // #550: prefer the server-computed stage projection; empty when the
+        // daemon predates #550 (`pipeline.rs`'s local functions fall back).
+        payload.issue_stage_projection,
     )
 }
 

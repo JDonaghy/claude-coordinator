@@ -3695,6 +3695,111 @@
         );
     }
 
+    // ── #550: server-computed issue_stage_projection consumption ───────────
+
+    fn projection_issue() -> PipelineIssue {
+        PipelineIssue {
+            number: 900,
+            title: "x".to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: false,
+        }
+    }
+
+    #[test]
+    fn stage_status_for_prefers_server_projection_over_local() {
+        // No local assignments at all — a purely local computation would
+        // return Pending. The server projection says Done; that must win.
+        let issue = projection_issue();
+        let mut app = make_app_default();
+        app.data.issue_stage_projection = vec![IssueStageProjection {
+            repo_name: "api".to_string(),
+            issue_number: 900,
+            issue_title: "x".to_string(),
+            stages: std::collections::HashMap::from([("review".to_string(), "done".to_string())]),
+            has_approved_review: true,
+        }];
+        assert_eq!(app.stage_status_for(&issue, "review"), StageStatus::Done);
+    }
+
+    #[test]
+    fn stage_status_for_falls_back_to_local_when_no_server_entry() {
+        // Empty issue_stage_projection (default, local-SQLite-mode, or a
+        // daemon older than #550) — must reproduce the pre-#550 local result.
+        let issue = projection_issue();
+        let mut app = make_app_default();
+        let mut a = make_assignment_typed("done", 900, "api", Some("review"));
+        a.review_verdict = Some("approve".to_string());
+        a.dispatched_at = Some(100.0);
+        app.data.assignments = vec![a];
+        assert!(app.data.issue_stage_projection.is_empty());
+        assert_eq!(app.stage_status_for(&issue, "review"), StageStatus::Done);
+    }
+
+    #[test]
+    fn merge_stage_status_for_prefers_server_projection() {
+        let issue = projection_issue();
+        let mut app = make_app_default();
+        app.data.issue_stage_projection = vec![IssueStageProjection {
+            repo_name: "api".to_string(),
+            issue_number: 900,
+            issue_title: "x".to_string(),
+            stages: std::collections::HashMap::from([("merge".to_string(), "failed".to_string())]),
+            has_approved_review: false,
+        }];
+        assert_eq!(app.merge_stage_status_for(&issue), StageStatus::Failed);
+    }
+
+    #[test]
+    fn merge_stage_status_for_active_conflict_fix_overlay_wins_over_server() {
+        // #241: a running conflict-fix worker is TUI-session-local knowledge
+        // that must win even when the server says the merge stage is Done.
+        let issue = projection_issue();
+        let mut app = make_app_default();
+        app.data.assignments = vec![make_assignment_typed(
+            "running",
+            900,
+            "api",
+            Some("conflict-fix"),
+        )];
+        app.data.issue_stage_projection = vec![IssueStageProjection {
+            repo_name: "api".to_string(),
+            issue_number: 900,
+            issue_title: "x".to_string(),
+            stages: std::collections::HashMap::from([("merge".to_string(), "done".to_string())]),
+            has_approved_review: true,
+        }];
+        assert_eq!(app.merge_stage_status_for(&issue), StageStatus::Active);
+    }
+
+    #[test]
+    fn issue_has_any_approved_review_prefers_server_projection() {
+        // No local review assignment at all — a purely local computation
+        // would return false. The server projection says true; that must win.
+        let issue = projection_issue();
+        let mut app = make_app_default();
+        app.data.issue_stage_projection = vec![IssueStageProjection {
+            repo_name: "api".to_string(),
+            issue_number: 900,
+            issue_title: "x".to_string(),
+            stages: std::collections::HashMap::new(),
+            has_approved_review: true,
+        }];
+        assert!(app.issue_has_any_approved_review(&issue, None));
+    }
+
+    #[test]
+    fn issue_has_any_approved_review_falls_back_to_local_when_no_server_entry() {
+        let issue = projection_issue();
+        let app = make_app_default();
+        assert!(app.data.issue_stage_projection.is_empty());
+        assert!(!app.issue_has_any_approved_review(&issue, None));
+    }
+
     #[test]
     fn rebuild_pipeline_sidebar_lifecycle_refinement_only_is_new_not_in_progress() {
         let mut app = make_pipeline_app();

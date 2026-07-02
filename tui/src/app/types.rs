@@ -395,6 +395,12 @@ pub(crate) struct BoardPayload {
     /// running (the local SQLite path computes its own in `load_data`).
     #[serde(default)]
     pub(crate) merge_staging: Vec<StagingEntry>,
+    /// #550: server-computed per-issue stage/gate projection.  Empty when
+    /// the daemon predates #550 — the client-local `pipeline.rs` functions
+    /// this mirrors remain the fallback in that case (and always for the
+    /// local-SQLite-mode read path, which has no daemon to ask).
+    #[serde(default)]
+    pub(crate) issue_stage_projection: Vec<IssueStageProjection>,
 }
 
 /// #584: serde deserializer for `Assignment::test_plan` on the remote
@@ -680,6 +686,35 @@ pub(crate) struct PlannedMergeEntry {
     #[allow(dead_code)]
     #[serde(default)]
     pub(crate) milestone: Option<String>,
+}
+
+/// One entry in the server-side per-issue stage/gate projection (#550).
+///
+/// Deserialized from the `issue_stage_projection` key of the `/board`
+/// payload, computed by `coord.stage_projection.compute_board_stage_projection`
+/// and injected by `serve_app.py` — generalizes the #776/#778 pattern to
+/// coord-tui's `pipeline.rs` stage-status functions (`stage_status_for`,
+/// `merge_stage_status_for`, `test_stage_status_for`,
+/// `issue_has_any_approved_review`).
+///
+/// `stages` maps a stage name (e.g. "work", "review", "test", "merge") to a
+/// lowercase status string (`"pending"|"active"|"done"|"failed"|"stale"|"skipped"`)
+/// — kept as a plain string on the wire (not `quadraui::StageStatus` directly)
+/// so this crate isn't coupled to that enum's serde representation; see
+/// [`parse_stage_status`] in `pipeline.rs` for the mapping.
+///
+/// Deliberately excludes TUI-session-local overlays (an optimistic
+/// "merge just dispatched" flag, a locally-spawned test-build subprocess,
+/// the TUI's own CI-check poll cache) — those are applied client-side on top
+/// of this projection; see `pipeline.rs` for where each is layered back in.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub(crate) struct IssueStageProjection {
+    pub(crate) repo_name: String,
+    pub(crate) issue_number: u64,
+    #[allow(dead_code)]
+    pub(crate) issue_title: String,
+    pub(crate) stages: std::collections::HashMap<String, String>,
+    pub(crate) has_approved_review: bool,
 }
 
 /// CI check status for one PR, fetched in the background via `gh pr checks`.
@@ -1000,6 +1035,11 @@ pub(crate) struct BoardData {
     /// implementation (sonnet default, [haiku,sonnet,opus] ladder, escalation
     /// enabled) which matches the coordinator.yml defaults.
     pub(crate) pipeline_models: Option<PipelineModels>,
+    /// #550: server-computed per-issue stage/gate projection from `/board`.
+    /// Empty on the local-SQLite-mode read path (no daemon to compute it) and
+    /// on daemons older than #550 — `pipeline.rs`'s stage functions fall back
+    /// to local computation in both cases.
+    pub(crate) issue_stage_projection: Vec<IssueStageProjection>,
 }
 
 /// Parsed plan data, mirroring `coord.plan_parser.WorkerPlan.to_dict()`.
