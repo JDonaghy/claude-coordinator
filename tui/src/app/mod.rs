@@ -2329,6 +2329,16 @@ pub struct CoordApp {
     /// shell) or Shift is held (force-override). Cleared on the matching
     /// mouse-release. `pty_pressed_buttons` is NOT set for these drags.
     terminal_host_sel_dragging: bool,
+    /// #790: `true` while the terminal pane is in keyboard-toggled "copy
+    /// mode" (F9).  Shift+drag is intercepted by an outer tmux before
+    /// coord-tui ever sees it, so a mouse modifier can't reliably trigger a
+    /// host selection; copy mode is the tmux-proof alternative.  While it is
+    /// on, mouse events are NOT forwarded to the embedded PTY — a plain
+    /// left-drag begins a host-side selection (via `terminal_should_host_select`)
+    /// that Ctrl+C copies.  Only meaningful in the copy-capable terminal
+    /// contexts (`terminal_copy_mode_available`); auto-cleared when the view
+    /// changes out from under it.
+    terminal_copy_mode: bool,
 
     // ── #207: Machine metrics sparklines ─────────────────────────────────
     /// Rolling ring-buffer of CPU + memory samples per machine, keyed by
@@ -2766,6 +2776,8 @@ impl CoordApp {
             pty_pressed_buttons: 0,
             // #464: host-side terminal selection drag state.
             terminal_host_sel_dragging: false,
+            // #790: F9 keyboard-toggled terminal copy mode.
+            terminal_copy_mode: false,
             // #207: machine metrics sparklines.
             machine_metrics: std::collections::HashMap::new(),
             pending_metrics: Vec::new(),

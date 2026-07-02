@@ -390,8 +390,20 @@ impl ShellApp for CoordApp {
                 //     exists (spawn happens on the next `tick`).
                 let cell_w = backend.char_width().max(1.0);
                 let cell_h = lh.max(1.0);
-                let cols = (m.width / cell_w).floor().max(1.0) as u16;
-                let rows = (m.height / cell_h).floor().max(1.0) as u16;
+                // #790: reserve a 1-row hint strip at the bottom advertising
+                // F9 copy mode (and its in-mode controls).  The terminal
+                // content — and thus the PTY resize — uses the shrunken rect.
+                let hint_h = cell_h.min(m.height);
+                let term_rect =
+                    Rect::new(m.x, m.y, m.width, (m.height - hint_h).max(0.0));
+                let hint_rect = Rect::new(
+                    m.x,
+                    m.y + term_rect.height,
+                    m.width,
+                    m.height - term_rect.height,
+                );
+                let cols = (term_rect.width / cell_w).floor().max(1.0) as u16;
+                let rows = (term_rect.height / cell_h).floor().max(1.0) as u16;
                 self.terminal_pending_dims.set(Some((cols, rows)));
 
                 if let Some(ref sess) = self.terminal_session {
@@ -402,7 +414,7 @@ impl ShellApp for CoordApp {
                         None
                     };
                     let snapshot = sess.to_terminal(WidgetId::new("coord-terminal:0"), sb);
-                    backend.draw_terminal(m, &snapshot);
+                    backend.draw_terminal(term_rect, &snapshot);
                 } else {
                     // No session yet — show a one-line placeholder.  The
                     // first `tick` after this render will spawn it.
@@ -421,7 +433,7 @@ impl ShellApp for CoordApp {
                         },
                     );
                     backend.draw_list(
-                        m,
+                        term_rect,
                         &ListView {
                             id: WidgetId::new("terminal-placeholder"),
                             title: None,
@@ -436,6 +448,9 @@ impl ShellApp for CoordApp {
                         },
                     );
                 }
+                // #790: paint the hint strip last so it sits below the
+                // terminal content.
+                backend.draw_list(hint_rect, &self.terminal_copy_hint_list());
             }
             // #638: Kanban view — render the Board widget into the full main rect.
             SidebarView::Kanban => {
@@ -1323,6 +1338,37 @@ pub(crate) fn issue_body_list(
 // ─── Pipeline display methods ─────────────────────────────────────────────────
 
 impl CoordApp {
+
+    /// #790: one-line copy-mode hint strip painted at the bottom of the
+    /// terminal pane.  Advertises the F9 keyboard toggle — Shift+drag is
+    /// intercepted by an outer tmux, so a key is the only tmux-proof way to
+    /// select-and-copy pane text — and, while copy mode is active, the
+    /// in-mode controls.
+    pub(crate) fn terminal_copy_hint_list(&self) -> ListView {
+        let (msg, color) = if self.terminal_copy_mode {
+            (
+                "  ● COPY MODE — drag to select · Ctrl+C copy · Esc/F9 exit".to_string(),
+                Color::rgb(240, 200, 90),
+            )
+        } else {
+            (
+                "  F9 copy-mode: drag-select text out of the pane (tmux-safe)".to_string(),
+                Color::rgb(130, 130, 130),
+            )
+        };
+        ListView {
+            id: WidgetId::new("terminal-copy-hint"),
+            title: None,
+            items: vec![activity_item(&msg, color)],
+            selected_idx: 0,
+            scroll_offset: 0,
+            has_focus: false,
+            bordered: false,
+            h_scroll: 0,
+            max_content_width: None,
+            show_v_scrollbar: false,
+        }
+    }
 
     /// Pipeline panel detail-side: list-style fallback when no PipelineView
     /// can be drawn yet (no issue selected / still loading).

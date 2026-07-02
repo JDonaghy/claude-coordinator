@@ -2528,14 +2528,33 @@ impl CoordApp {
     pub(crate) fn render_detail_terminal_tab(&self, backend: &mut dyn Backend, rect: Rect) {
         let lh = backend.line_height().max(1.0);
         let cell_w = backend.char_width().max(1.0);
-        let cols = (rect.width / cell_w).floor().max(1.0) as u16;
-        let rows = (rect.height / lh).floor().max(1.0) as u16;
+        // #790: reserve a 1-row copy-mode hint strip at the bottom, but only
+        // in the Pipeline Terminal tab where host selection is wired.  The
+        // Board Terminal tab is Chat-scoped (#675) with no selection path, so
+        // it keeps the full height and shows no hint.
+        let show_hint = self.terminal_copy_mode_available();
+        let hint_h = if show_hint { lh.min(rect.height) } else { 0.0 };
+        let term_rect = Rect::new(rect.x, rect.y, rect.width, (rect.height - hint_h).max(0.0));
+        let cols = (term_rect.width / cell_w).floor().max(1.0) as u16;
+        let rows = (term_rect.height / lh).floor().max(1.0) as u16;
         self.detail_terminal_pending_dims.set(Some((cols, rows)));
+        // Closure to paint the hint after the terminal content (if reserved).
+        let paint_hint = |app: &Self, backend: &mut dyn Backend| {
+            if show_hint {
+                let hint_rect = Rect::new(
+                    rect.x,
+                    rect.y + term_rect.height,
+                    rect.width,
+                    rect.height - term_rect.height,
+                );
+                backend.draw_list(hint_rect, &app.terminal_copy_hint_list());
+            }
+        };
 
         let Some(issue_key) = self.selected_issue_key() else {
             // No issue selected — show a neutral placeholder.
             backend.draw_list(
-                rect,
+                term_rect,
                 &ListView {
                     id: WidgetId::new("detail-terminal-no-issue"),
                     title: None,
@@ -2552,6 +2571,7 @@ impl CoordApp {
                     show_v_scrollbar: false,
                 },
             );
+            paint_hint(self, backend);
             return;
         };
 
@@ -2566,7 +2586,7 @@ impl CoordApp {
                 WidgetId::new(format!("detail-terminal:{}:{}", issue_key.0, issue_key.1)),
                 sb,
             );
-            backend.draw_terminal(rect, &snapshot);
+            backend.draw_terminal(term_rect, &snapshot);
         } else {
             // Session pending or spawn error.
             let (msg, color) = match self.detail_terminal_spawn_errors.get(&issue_key) {
@@ -2580,7 +2600,7 @@ impl CoordApp {
                 ),
             };
             backend.draw_list(
-                rect,
+                term_rect,
                 &ListView {
                     id: WidgetId::new("detail-terminal-placeholder"),
                     title: None,
@@ -2595,6 +2615,7 @@ impl CoordApp {
                 },
             );
         }
+        paint_hint(self, backend);
     }
 }
 
