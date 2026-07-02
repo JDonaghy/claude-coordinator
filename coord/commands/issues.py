@@ -194,13 +194,19 @@ def issue_label_cmd(
     if not add_labels and not remove_labels:
         click.echo("error: provide --add and/or --remove", err=True)
         sys.exit(2)
-    from coord.state import apply_issue_labels  # noqa: PLC0415
+    from coord.state import apply_issue_labels, get_cached_issue_labels  # noqa: PLC0415
 
     cfg = _load_config(config_path)
     repo_entry = cfg.repo(repo)
     slug = repo_entry.github if repo_entry else repo
+
+    # Snapshot the pre-change cache so the echoed message reflects the actual
+    # delta, not just the requested --add/--remove sets (a requested label
+    # that was already present/absent is a no-op for it specifically, even
+    # when other labels in the same call do change something).
+    old_labels = get_cached_issue_labels(repo, issue)
     try:
-        _new_labels, changed = apply_issue_labels(
+        new_labels, changed = apply_issue_labels(
             repo, issue,
             add=set(add_labels),
             remove=set(remove_labels),
@@ -210,11 +216,24 @@ def issue_label_cmd(
         click.echo(f"error: issue label failed: {e}", err=True)
         sys.exit(1)
     if changed:
+        if old_labels is not None:
+            actually_added = sorted(set(add_labels) & (set(new_labels) - set(old_labels)))
+            actually_removed = sorted(set(remove_labels) & (set(old_labels) - set(new_labels)))
+        else:
+            # No prior cache snapshot to diff against (issue not yet synced
+            # locally) — fall back to the requested sets.
+            actually_added = sorted(add_labels)
+            actually_removed = sorted(remove_labels)
         parts: list[str] = []
-        if add_labels:
-            parts.append(f"+{{{', '.join(sorted(add_labels))}}}")
-        if remove_labels:
-            parts.append(f"-{{{', '.join(sorted(remove_labels))}}}")
+        if actually_added:
+            parts.append(f"+{{{', '.join(actually_added)}}}")
+        if actually_removed:
+            parts.append(f"-{{{', '.join(actually_removed)}}}")
+        if not parts:
+            # Stale local cache made the diff a no-op even though the seam
+            # reported a real change upstream — fall back to the full
+            # resulting label set rather than echoing a blank delta.
+            parts.append(f"(now: {{{', '.join(sorted(new_labels))}}})")
         click.echo(f"#{issue} ({slug}) labels updated: {' '.join(parts)}")
     else:
         click.echo(f"#{issue} ({slug}) labels unchanged (no delta)")

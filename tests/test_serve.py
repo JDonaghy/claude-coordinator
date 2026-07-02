@@ -986,6 +986,91 @@ def test_serve_issue_edit_writes_backend_and_cache(
     assert row["title"] == "new title" and row["body"] == "new body"
 
 
+def test_serve_issue_label_writes_backend_and_cache(
+    file_db: Path, valid_config_path: Path, rw_db, monkeypatch
+):
+    """#802 daemon route: POST /issue-label runs the gh write on the daemon
+    and mirrors the resulting label set into the local ``issues`` cache —
+    the seam counterpart of test_serve_issue_edit_writes_backend_and_cache."""
+    import json
+
+    calls: list = []
+    monkeypatch.setattr(
+        "coord.github_ops.change_issue_labels",
+        lambda repo, num, *, add, remove: (
+            calls.append((repo, num, add, remove)) or (["bug", "existing"], True)
+        ),
+    )
+    rw_db.execute(
+        "INSERT INTO issues (repo_name, number, title, body, state, labels, synced_at) "
+        "VALUES (?,?,?,?,?,?,?)",
+        ("api", 7, "an issue", "", "open", '["existing"]', 1.0),
+    )
+    rw_db.commit()
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post(
+            "/issue-label",
+            json={
+                "repo_name": "api",
+                "issue_number": 7,
+                "add": ["bug"],
+                "remove": [],
+                "repo_github": "owner/api",
+            },
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["labels"] == ["bug", "existing"] and body["changed"] is True
+    assert calls == [("owner/api", 7, {"bug"}, set())]
+    # Cache mirrors the new label set so the TUI reflects it without a full sync.
+    row = rw_db.execute(
+        "SELECT labels FROM issues WHERE repo_name='api' AND number=7"
+    ).fetchone()
+    assert json.loads(row["labels"]) == ["bug", "existing"]
+
+
+def test_serve_issue_create_writes_backend_and_cache(
+    file_db: Path, valid_config_path: Path, rw_db, monkeypatch
+):
+    """#802 daemon route: POST /issue-create runs the gh create on the daemon
+    and inserts the new issue into the local ``issues`` cache — the seam
+    counterpart of test_serve_issue_edit_writes_backend_and_cache."""
+    import json
+
+    calls: list = []
+    monkeypatch.setattr(
+        "coord.github_ops.create_issue",
+        lambda repo, title, body, *, labels=None: (
+            calls.append((repo, title, body, labels))
+            or {"number": 99, "url": "https://github.com/owner/api/issues/99"}
+        ),
+    )
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post(
+            "/issue-create",
+            json={
+                "repo_name": "api",
+                "title": "new issue",
+                "body": "issue body",
+                "labels": ["bug"],
+                "repo_github": "owner/api",
+            },
+        )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body == {"number": 99, "url": "https://github.com/owner/api/issues/99"}
+    assert calls == [("owner/api", "new issue", "issue body", ["bug"])]
+    # Cache gains the new issue row so the TUI reflects it without a full sync.
+    row = rw_db.execute(
+        "SELECT title, body, labels FROM issues WHERE repo_name='api' AND number=99"
+    ).fetchone()
+    assert row is not None
+    assert row["title"] == "new issue" and row["body"] == "issue body"
+    assert json.loads(row["labels"]) == ["bug"]
+
+
 def test_edit_issue_content_routes_when_service_set(coord_db, monkeypatch):
     from coord import client as cc
     from coord import state
