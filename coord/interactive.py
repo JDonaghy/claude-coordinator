@@ -1288,15 +1288,35 @@ def _current_branch(wt_path: Path) -> str | None:
     return branch
 
 
-def _assignment_already_recorded(assignment_id: str) -> bool:
-    """Did ``coord report-result`` already write a terminal state for
-    this assignment?  We check the assignments row's ``status`` column.
-    The backstop runs after the human session exits, so if the agent
-    invoked ``coord report-result`` before exiting we must NOT clobber
-    that decision with the git-floor's heuristic verdict.
+def _assignment_status(assignment_id: str) -> str | None:
+    """Read an assignment's ``status`` — daemon-aware (#883).
+
+    On a thin client the canonical status lives on the daemon (a reviewer's
+    ``coord report-result`` routes there via ``issue_store``), so a local-only
+    read sees a stale ``running`` and misses the terminal write — the sibling of
+    the #877 ``load_assignment_review_findings`` bug.  Prefer the daemon board
+    (``GET /board`` filtered by ``assignment_id``) when ``board_service`` is set;
+    fall back to the local DB when unset (daemon host, where the local DB IS
+    canonical) or the fetch fails.  Returns ``None`` when the row is absent.
     """
-    if not assignment_id:
-        return False
+    try:
+        from coord.board_service import resolve as _resolve_svc  # noqa: PLC0415
+
+        svc = _resolve_svc()
+    except Exception:  # noqa: BLE001
+        svc = None
+    if svc is not None:
+        try:
+            from coord.client import fetch_board_payload  # noqa: PLC0415
+
+            payload = fetch_board_payload(svc)
+            for a in payload.get("assignments", []):
+                if a.get("assignment_id") == assignment_id:
+                    return a.get("status")
+            # Daemon is canonical: assignment absent ⇒ no terminal write yet.
+            return None
+        except Exception:  # noqa: BLE001 — daemon unreachable → local fallback
+            pass
     try:
         from coord.state import get_connection  # noqa: PLC0415
 
@@ -1306,10 +1326,27 @@ def _assignment_already_recorded(assignment_id: str) -> bool:
             (assignment_id,),
         ).fetchone()
     except Exception:  # noqa: BLE001
-        return False
+        return None
     if row is None:
+        return None
+    return row["status"] if hasattr(row, "keys") else row[0]
+
+
+def _assignment_already_recorded(assignment_id: str) -> bool:
+    """Did ``coord report-result`` already write a terminal state for
+    this assignment?  We check the assignments row's ``status`` column.
+    The backstop runs after the human session exits, so if the agent
+    invoked ``coord report-result`` before exiting we must NOT clobber
+    that decision with the git-floor's heuristic verdict.
+
+    #883: the status read is daemon-aware (see :func:`_assignment_status`) — on
+    a thin client the reviewer's terminal write lands on the daemon, not the
+    local DB, so a local-only read made this fire the backstop on every
+    interactive review even after a clean ``report-result``.
+    """
+    if not assignment_id:
         return False
-    status = row["status"] if hasattr(row, "keys") else row[0]
+    status = _assignment_status(assignment_id)
     # Anything that's not 'running'/'pending' means a terminal write
     # already landed (done/advisory/failed/cancelled).  Respect it.
     return status not in (None, "", "running", "pending")
