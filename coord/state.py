@@ -772,7 +772,7 @@ def update_assignment_review_findings(
     verdict: str,
     body: str,
 ) -> None:
-    """#bounce: persist a parsed `ReviewFindings` on the assignment row.
+    """#bounce / #905: persist a parsed `ReviewFindings` on the assignment row.
 
     Stored as JSON ({"verdict": ..., "body": ...}) so the future read
     path can recover both fields with one column.  Callers that only
@@ -782,9 +782,34 @@ def update_assignment_review_findings(
 
     Idempotent: silently no-ops when the row doesn't exist (matches the
     other `update_assignment_*` helpers).
+
+    **Daemon-aware (#905):** routes to ``POST /review-findings`` when a
+    ``board_service`` is configured so the verdict lands on the shared DB
+    rather than the thin client's empty local one.
     """
     if not assignment_id:
         return
+    svc = _board_service()
+    resp = _route_write(
+        svc,
+        "/review-findings",
+        {"assignment_id": assignment_id, "verdict": verdict, "body": body},
+    )
+    if resp is not None:
+        return
+    _update_assignment_review_findings_local(assignment_id, verdict=verdict, body=body)
+
+
+def _update_assignment_review_findings_local(
+    assignment_id: str,
+    *,
+    verdict: str,
+    body: str,
+) -> None:
+    """Local-DB write for :func:`update_assignment_review_findings`.
+
+    Called directly by the daemon endpoint so it never re-routes back over HTTP.
+    """
     payload = json.dumps({"verdict": verdict, "body": body})
     conn = get_connection()
     conn.execute(
@@ -1285,6 +1310,22 @@ def mark_review_posted(assignment_id: str) -> None:
     Sets ``review_posted_at`` on the assignment row.  Idempotent — calling
     it again after it's already set is harmless (the timestamp won't change
     because the UPDATE only fires when the row exists).
+
+    **Daemon-aware (#905):** routes to ``POST /review-posted`` when a
+    ``board_service`` is configured so the timestamp lands on the shared DB
+    rather than the thin client's empty local one.
+    """
+    svc = _board_service()
+    resp = _route_write(svc, "/review-posted", {"assignment_id": assignment_id})
+    if resp is not None:
+        return
+    _mark_review_posted_local(assignment_id)
+
+
+def _mark_review_posted_local(assignment_id: str) -> None:
+    """Local-DB write for :func:`mark_review_posted`.
+
+    Called directly by the daemon endpoint so it never re-routes back over HTTP.
     """
     conn = get_connection()
     conn.execute(
@@ -1307,6 +1348,55 @@ def load_done_reviews_needing_post(repo_name: str | None = None) -> list[dict]:
     Returns dicts in the same format as :func:`load_dispatched` (keyed by
     ``assignment_id``, ``machine_name``, ``repo_github``, ``issue_number``,
     ``review_target``, etc.).
+
+    **Daemon-aware (#905):** when a ``board_service`` is configured the local
+    SQLite is empty/stale — the canonical assignments live on the daemon.
+    Reads them from the ``GET /board`` payload so a thin client running
+    ``coord notify`` or ``coord post-pending-reviews`` finds the real
+    candidates instead of an empty list and therefore captures the verdict.
+    Falls back to local on daemon-host (no board_service) or fetch failure.
+    """
+    svc = _board_service()
+    if svc is not None:
+        try:
+            from coord.client import fetch_board_payload  # noqa: PLC0415
+
+            payload = fetch_board_payload(svc)
+            results: list[dict] = []
+            for a in payload.get("assignments", []):
+                if (
+                    a.get("type") == "review"
+                    and a.get("status") == "done"
+                    and not a.get("review_posted_at")
+                    and (repo_name is None or a.get("repo_name") == repo_name)
+                ):
+                    results.append({
+                        "assignment_id": a.get("assignment_id"),
+                        "machine_name": a.get("machine_name", ""),
+                        "repo_name": a.get("repo_name", ""),
+                        "repo_github": a.get("repo_github"),
+                        "issue_number": a.get("issue_number", 0),
+                        "issue_title": a.get("issue_title", ""),
+                        "files_likely": a.get("files_allowed") or [],
+                        "briefing": a.get("briefing") or "",
+                        "model": a.get("model"),
+                        "type": a.get("type", "review"),
+                        "required_gates": a.get("required_gates") or [],
+                        "dispatched_at": a.get("dispatched_at"),
+                        "review_of_assignment_id": a.get("review_of_assignment_id"),
+                        "review_target": a.get("review_target"),
+                        "status": a.get("status"),
+                    })
+            return results
+        except Exception:  # noqa: BLE001 — daemon unreachable → local fallback
+            pass
+    return _load_done_reviews_needing_post_local(repo_name=repo_name)
+
+
+def _load_done_reviews_needing_post_local(repo_name: str | None = None) -> list[dict]:
+    """Local-DB read for :func:`load_done_reviews_needing_post`.
+
+    Used on the daemon host (local DB is canonical) or as the offline fallback.
     """
     conn = get_connection()
     if repo_name:
