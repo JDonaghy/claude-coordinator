@@ -861,10 +861,44 @@ def clear_issue_context_by_source(
     return cur.rowcount
 
 
+def _parse_review_findings_blob(raw: object) -> tuple[str, str] | None:
+    """Parse a stored ``review_findings`` blob into ``(verdict, body)``.
+
+    Shared by the daemon and local reads so both hand callers the same shape.
+    Accepts a JSON string (local DB column) or an already-decoded dict (daemon
+    ``/board`` payload).  Returns ``None`` when empty, unparseable, or missing a
+    string ``verdict``/``body``.
+    """
+    if not raw:
+        return None
+    if isinstance(raw, (str, bytes)):
+        try:
+            payload = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return None
+    else:
+        payload = raw
+    verdict = payload.get("verdict") if isinstance(payload, dict) else None
+    body = payload.get("body") if isinstance(payload, dict) else None
+    if not isinstance(verdict, str) or not isinstance(body, str):
+        return None
+    return (verdict, body)
+
+
 def load_assignment_review_findings(
     assignment_id: str,
 ) -> tuple[str, str] | None:
-    """#bounce: read back a cached `(verdict, body)` for an assignment.
+    """#bounce / #877: read back a cached `(verdict, body)` for an assignment.
+
+    **Daemon-aware (#877):** when a ``board_service`` is configured (thin-client
+    mode) the canonical ``review_findings`` live on the daemon, NOT in this
+    host's local DB — which is empty/stale there.  A local-only read therefore
+    silently misses daemon-captured findings, the exact #547 failure that made
+    the verdict-relay backstop open a blank editor despite the body already
+    being on the board.  So prefer the daemon board (``GET /board`` filtered by
+    ``assignment_id``) and fall back to the local DB only when no
+    ``board_service`` is set (daemon host, where the local DB IS canonical) or
+    the fetch fails.
 
     Returns `None` when the row doesn't exist or the column is NULL
     (notify hasn't parsed this review yet) — callers fall back to
@@ -872,6 +906,27 @@ def load_assignment_review_findings(
     """
     if not assignment_id:
         return None
+    svc = _board_service()
+    if svc is not None:
+        try:
+            from coord.client import fetch_board_payload  # noqa: PLC0415
+
+            payload = fetch_board_payload(svc)
+            for a in payload.get("assignments", []):
+                if a.get("assignment_id") == assignment_id:
+                    return _parse_review_findings_blob(a.get("review_findings"))
+            # Daemon is canonical: assignment absent ⇒ genuinely no findings yet.
+            return None
+        except Exception:  # noqa: BLE001 — daemon unreachable → local fallback
+            pass
+    return _load_assignment_review_findings_local(assignment_id)
+
+
+def _load_assignment_review_findings_local(
+    assignment_id: str,
+) -> tuple[str, str] | None:
+    """Local-DB read for :func:`load_assignment_review_findings` — used on the
+    daemon host (local DB is canonical) or as the offline fallback."""
     conn = get_connection()
     row = conn.execute(
         "SELECT review_findings FROM assignments WHERE assignment_id=?",
@@ -880,17 +935,7 @@ def load_assignment_review_findings(
     if row is None:
         return None
     raw = row["review_findings"] if hasattr(row, "keys") else row[0]
-    if not raw:
-        return None
-    try:
-        payload = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        return None
-    verdict = payload.get("verdict") if isinstance(payload, dict) else None
-    body = payload.get("body") if isinstance(payload, dict) else None
-    if not isinstance(verdict, str) or not isinstance(body, str):
-        return None
-    return (verdict, body)
+    return _parse_review_findings_blob(raw)
 
 
 def update_assignment_smoke_tests(
