@@ -652,6 +652,110 @@ def _openapi_spec() -> dict:
                 },
             }
         },
+        "/assignment-session-id": {
+            "post": {
+                "summary": "Persist a worker's claude session ID on the assignment row (#906)",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "assignment_id": {"type": "string"},
+                                    "claude_session_id": {"type": "string"},
+                                },
+                                "required": ["assignment_id", "claude_session_id"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {"application/json": {"schema": ok_response}},
+                    },
+                    "400": {"description": "Missing field"},
+                },
+            }
+        },
+        "/assignment-failure-reason": {
+            "post": {
+                "summary": "Mark assignment failed with a reason string (#906)",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "assignment_id": {"type": "string"},
+                                    "reason": {"type": "string"},
+                                },
+                                "required": ["assignment_id", "reason"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {"application/json": {"schema": ok_response}},
+                    },
+                    "400": {"description": "Missing field"},
+                },
+            }
+        },
+        "/assignment-test-plan": {
+            "post": {
+                "summary": "Read the cached smoke-test plan for an assignment (#906)",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "assignment_id": {"type": "string"},
+                                },
+                                "required": ["assignment_id"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK — test_plan is the JSON string or null",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "test_plan": {"nullable": True},
+                                    },
+                                }
+                            }
+                        },
+                    },
+                    "400": {"description": "Missing assignment_id"},
+                },
+            }
+        },
+        "/notify": {
+            "post": {
+                "summary": "Run `coord notify` against the canonical DB + agent fleet (#906)",
+                "requestBody": {
+                    "required": False,
+                    "content": {"application/json": {"schema": {"type": "object"}}},
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {"application/json": {"schema": cli_output_response}},
+                    },
+                },
+            }
+        },
         "/issue-labels": {
             "post": {
                 "summary": "Update one issue's cached labels (#601)",
@@ -1320,6 +1424,110 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             )
         return JSONResponse({"ok": True})
 
+    async def post_assignment_session_id(request: Request) -> Response:
+        # #906: persist a worker's claude session ID on the daemon's DB so that
+        # thin-client chat-continue calls can read it back.  Mirrors the
+        # _local form called directly on the daemon host.
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        try:
+            state._update_assignment_claude_session_id_local(
+                body["assignment_id"], body["claude_session_id"]
+            )
+        except KeyError as e:
+            return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "assignment-session-id write failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"ok": True})
+
+    async def post_assignment_failure_reason(request: Request) -> Response:
+        # #906: mark an assignment failed with a reason on the daemon's DB so a
+        # thin-client interactive launch failure (e.g. worktree-add) reaches the
+        # shared DB and the TUI shows the red-box reason.
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        try:
+            state._set_assignment_failure_reason_local(
+                body["assignment_id"], body["reason"]
+            )
+        except KeyError as e:
+            return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "assignment-failure-reason write failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"ok": True})
+
+    async def post_assignment_test_plan(request: Request) -> Response:
+        # #906: read the cached smoke-test plan from the daemon's DB for a thin
+        # client running --smoke-of against a local checkout.  Returns
+        # {"test_plan": <raw JSON string or null>}.
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        aid = body.get("assignment_id")
+        if not aid:
+            return JSONResponse({"error": "missing assignment_id"}, status_code=400)
+        try:
+            plan = state._get_test_plan_local(aid)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "assignment-test-plan read failed", "detail": str(e)},
+                status_code=503,
+            )
+        import json as _json  # noqa: PLC0415
+
+        return JSONResponse({"test_plan": _json.dumps(plan) if plan is not None else None})
+
+    async def post_notify(request: Request) -> Response:
+        # #906: run `coord notify` on the canonical DB + agent fleet so a thin
+        # client's `coord notify` reaches the real assignments/notifications rather
+        # than the empty local DB.  Mirrors post_merge/post_reconcile_merges.
+        # COORD_NOTIFY_ON_DAEMON guards the daemon against re-routing to itself.
+        from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
+
+        def _run() -> dict:
+            import contextlib  # noqa: PLC0415
+            import io  # noqa: PLC0415
+            import os  # noqa: PLC0415
+
+            from coord.cli import notify as notify_cmd  # noqa: PLC0415
+
+            buf = io.StringIO()
+            code = 0
+            err = None
+            prev = os.environ.get("COORD_NOTIFY_ON_DAEMON")
+            os.environ["COORD_NOTIFY_ON_DAEMON"] = "1"
+            try:
+                with contextlib.redirect_stdout(buf):
+                    notify_cmd.callback(config_path=config.path)
+            except SystemExit as e:
+                code = e.code if isinstance(e.code, int) else (1 if e.code else 0)
+            except Exception as e:  # noqa: BLE001
+                err = str(e)
+                code = 1
+            finally:
+                if prev is None:
+                    os.environ.pop("COORD_NOTIFY_ON_DAEMON", None)
+                else:
+                    os.environ["COORD_NOTIFY_ON_DAEMON"] = prev
+            return {"output": buf.getvalue(), "exit_code": code, "error": err}
+
+        result = await run_in_threadpool(_run)
+        return JSONResponse(result)
+
     async def post_issue_labels(request: Request) -> Response:
         # #601: update one issue's cached labels (coord ready/backlog/refine/track).
         from coord import state  # noqa: PLC0415
@@ -1948,6 +2156,10 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/review-posted", post_review_posted, methods=["POST"]),
         Route("/board", post_board, methods=["POST"]),
         Route("/assignment-usage", post_assignment_usage, methods=["POST"]),
+        Route("/assignment-session-id", post_assignment_session_id, methods=["POST"]),
+        Route("/assignment-failure-reason", post_assignment_failure_reason, methods=["POST"]),
+        Route("/assignment-test-plan", post_assignment_test_plan, methods=["POST"]),
+        Route("/notify", post_notify, methods=["POST"]),
         Route("/issue-labels", post_issue_labels, methods=["POST"]),
         Route("/issue-label", post_issue_label, methods=["POST"]),
         Route("/issue-create", post_issue_create, methods=["POST"]),
