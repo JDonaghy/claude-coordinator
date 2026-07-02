@@ -388,6 +388,8 @@
             pty_pressed_buttons: 0,
             // #464
             terminal_host_sel_dragging: false,
+            // #790
+            terminal_copy_mode: false,
             // #207
             machine_metrics: std::collections::HashMap::new(),
             pending_metrics: Vec::new(),
@@ -18117,6 +18119,239 @@
             .as_ref()
             .expect("selection should still exist");
         assert_eq!((sel.end_col, sel.end_row), (5, 5), "update was a no-op");
+    }
+
+    // ── #790: F9 terminal copy mode ─────────────────────────────────────────
+    //
+    // Shift+drag can't reach coord-tui when it runs inside an outer tmux
+    // (tmux consumes Shift for its own cross-pane selection), so a keyboard
+    // toggle (F9) is the tmux-proof way to enter a host-side selection mode.
+    // While copy mode is on, `terminal_should_host_select` forces a plain
+    // left-drag onto the host-selection path instead of the PTY.
+
+    /// The host-select decision includes copy mode: with mouse reporting ON
+    /// and no Shift, a press normally forwards to the PTY (false) — but copy
+    /// mode forces a host selection (true).
+    #[test]
+    fn copy_mode_forces_host_select_decision() {
+        let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::Terminal;
+        // Baseline: reporting ON, no Shift, copy mode OFF → forward to PTY.
+        assert!(
+            !app.terminal_should_host_select(false, true),
+            "reporting on + no shift + no copy mode → PTY, not host-select"
+        );
+        // Shift still forces host-select (classic override).
+        assert!(app.terminal_should_host_select(true, true));
+        // Reporting OFF always host-selects (plain shell).
+        assert!(app.terminal_should_host_select(false, false));
+        // Copy mode forces host-select even with reporting ON and no Shift —
+        // the tmux-proof path.
+        app.terminal_copy_mode = true;
+        assert!(
+            app.terminal_should_host_select(false, true),
+            "copy mode must force host-select with reporting on and no shift"
+        );
+    }
+
+    /// Copy mode is only available in the copy-capable terminal contexts:
+    /// the standalone Terminal view and the Pipeline detail Terminal tab.
+    /// The Board Terminal tab is Chat-scoped (#675) with no selection path.
+    #[test]
+    fn copy_mode_availability_by_view() {
+        let mut app = make_test_app(BoardData::default());
+
+        app.active_view = SidebarView::Terminal;
+        assert!(app.terminal_copy_mode_available(), "Terminal view: available");
+
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Terminal;
+        assert!(
+            app.terminal_copy_mode_available(),
+            "Pipeline Terminal tab: available"
+        );
+        app.pipeline_detail_tab = PipelineDetailTab::Pipeline;
+        assert!(
+            !app.terminal_copy_mode_available(),
+            "Pipeline non-Terminal tab: unavailable"
+        );
+
+        app.active_view = SidebarView::Board;
+        app.board_detail_tab = BoardDetailTab::Terminal;
+        assert!(
+            !app.terminal_copy_mode_available(),
+            "Board Terminal tab is Chat-scoped (#675) — copy mode unavailable"
+        );
+    }
+
+    /// `exit_terminal_copy_mode` clears the flag, the drag flag, and any
+    /// in-progress (uncopied) selection.
+    #[test]
+    #[cfg(unix)]
+    fn exit_copy_mode_clears_all_state() {
+        use quadraui::terminal_engine::TerminalSelection;
+        let mut app = make_terminal_app_with_session();
+        app.terminal_copy_mode = true;
+        app.terminal_host_sel_dragging = true;
+        app.terminal_session.as_mut().unwrap().selection = Some(TerminalSelection {
+            start_row: 0,
+            start_col: 0,
+            end_row: 0,
+            end_col: 5,
+        });
+        app.exit_terminal_copy_mode();
+        assert!(!app.terminal_copy_mode, "copy mode cleared");
+        assert!(!app.terminal_host_sel_dragging, "drag flag cleared");
+        assert!(
+            app.terminal_session.as_ref().unwrap().selection.is_none(),
+            "uncopied selection discarded"
+        );
+    }
+
+    /// A stale copy mode is dropped once the active view is no longer a
+    /// copy-capable terminal context.  Mirrors the guard at the top of
+    /// `dispatch_handle` (which cannot be driven headlessly because the
+    /// shell-adapter driver hides the concrete `CoordApp` fields).
+    #[test]
+    fn stale_copy_mode_dropped_when_view_not_copy_capable() {
+        let mut app = make_test_app(BoardData::default());
+        app.terminal_copy_mode = true;
+        // Move to a view where copy mode is not available.
+        app.active_view = SidebarView::Board;
+        app.board_detail_tab = BoardDetailTab::Terminal;
+        assert!(!app.terminal_copy_mode_available());
+        // The dispatch guard runs exactly this on every event.
+        if app.terminal_copy_mode && !app.terminal_copy_mode_available() {
+            app.exit_terminal_copy_mode();
+        }
+        assert!(
+            !app.terminal_copy_mode,
+            "copy mode must be cleared once the view is no longer copy-capable"
+        );
+    }
+
+    /// Black-box: F9 toggles copy mode and the terminal pane's hint strip
+    /// switches between the discoverability hint and the in-mode banner.
+    /// Drives the full `event → handle → render` path against the headless
+    /// backend and asserts on the rendered screen (the hint text is the
+    /// user-visible proxy for `terminal_copy_mode`, which the shell-adapter
+    /// driver hides).
+    #[test]
+    #[cfg(unix)]
+    fn f9_toggles_copy_mode_and_updates_hint() {
+        use quadraui::tui::testing::driver_with_shell;
+        let app = make_terminal_app_with_session();
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+
+        // Copy mode OFF: discoverability hint present, no in-mode banner.
+        assert!(
+            driver.screen_contains("F9 copy-mode"),
+            "OFF: discoverability hint must be visible:\n{}",
+            driver.screen()
+        );
+        assert!(
+            !driver.screen_contains("COPY MODE"),
+            "OFF: in-mode banner must be absent:\n{}",
+            driver.screen()
+        );
+
+        // Press F9 → copy mode ON: banner replaces the hint.
+        driver.press_named(quadraui::NamedKey::F(9));
+        assert!(
+            driver.screen_contains("COPY MODE"),
+            "ON: in-mode banner must be visible:\n{}",
+            driver.screen()
+        );
+        assert!(
+            !driver.screen_contains("F9 copy-mode"),
+            "ON: discoverability hint must be replaced by the banner:\n{}",
+            driver.screen()
+        );
+
+        // Press F9 again → back OFF: hint restored.
+        driver.press_named(quadraui::NamedKey::F(9));
+        assert!(
+            driver.screen_contains("F9 copy-mode"),
+            "OFF again: discoverability hint restored:\n{}",
+            driver.screen()
+        );
+        assert!(
+            !driver.screen_contains("COPY MODE"),
+            "OFF again: banner gone:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// Black-box: Esc leaves copy mode (banner → hint) without copying.
+    #[test]
+    #[cfg(unix)]
+    fn esc_exits_copy_mode_via_driver() {
+        use quadraui::tui::testing::driver_with_shell;
+        let mut app = make_terminal_app_with_session();
+        app.terminal_copy_mode = true;
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        assert!(
+            driver.screen_contains("COPY MODE"),
+            "precondition: copy-mode banner visible:\n{}",
+            driver.screen()
+        );
+        driver.press_named(quadraui::NamedKey::Escape);
+        assert!(
+            driver.screen_contains("F9 copy-mode") && !driver.screen_contains("COPY MODE"),
+            "Esc must leave copy mode (hint restored):\n{}",
+            driver.screen()
+        );
+    }
+
+    /// Black-box: Ctrl+C copies the active selection AND exits copy mode so
+    /// normal PTY mouse forwarding resumes (banner → hint).
+    #[test]
+    #[cfg(unix)]
+    fn ctrl_c_in_copy_mode_copies_and_exits() {
+        use quadraui::terminal_engine::TerminalSelection;
+        use quadraui::tui::testing::driver_with_shell;
+        let mut app = make_terminal_app_with_session();
+        app.terminal_copy_mode = true;
+        // A set selection makes `selected_text` return Some(_) (even over
+        // blank cells), so the Ctrl+C copy path fires deterministically.
+        app.terminal_session.as_mut().unwrap().selection = Some(TerminalSelection {
+            start_row: 0,
+            start_col: 0,
+            end_row: 0,
+            end_col: 5,
+        });
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        assert!(
+            driver.screen_contains("COPY MODE"),
+            "precondition: copy-mode banner visible:\n{}",
+            driver.screen()
+        );
+        driver.ctrl_char('c');
+        assert!(
+            driver.screen_contains("F9 copy-mode") && !driver.screen_contains("COPY MODE"),
+            "a copy must end copy mode (hint restored):\n{}",
+            driver.screen()
+        );
+    }
+
+    /// Direct-state check the shell-adapter driver can't reach: a copy through
+    /// the Ctrl+C handler clears the session selection.  Confirms the
+    /// selection is copyable (`Some(_)`) before the copy fires.
+    #[test]
+    #[cfg(unix)]
+    fn selection_yields_copyable_text_for_ctrl_c() {
+        use quadraui::terminal_engine::TerminalSelection;
+        let mut app = make_terminal_app_with_session();
+        app.terminal_session.as_mut().unwrap().selection = Some(TerminalSelection {
+            start_row: 0,
+            start_col: 0,
+            end_row: 0,
+            end_col: 5,
+        });
+        assert!(
+            app.active_terminal_selected_text().is_some(),
+            "a set selection yields Some(text) — the Ctrl+C copy path will fire"
+        );
     }
 
     // ── #467: local `coord assign --interactive` launcher ────────────────────

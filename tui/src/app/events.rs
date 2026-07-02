@@ -47,6 +47,14 @@ impl CoordApp {
         // ── Expire stale toasts ─────────────────────────────────────────
         needs_redraw |= self.run_periodic_work();
 
+        // ── #790: drop a stale terminal copy mode ───────────────────────
+        // Copy mode (F9) is only meaningful in a copy-capable terminal
+        // context.  If the view changed out from under it, clear the flag so
+        // a lingering toggle can't silently swallow the next drag.
+        if self.terminal_copy_mode && !self.terminal_copy_mode_available() {
+            self.exit_terminal_copy_mode();
+        }
+
         // ── #464: Ctrl-C copies active terminal host-selection ──────────
         // Fires for BOTH terminal views (standalone Terminal and
         // Pipeline/Terminal tab) regardless of whether PTY-passthrough is
@@ -63,10 +71,47 @@ impl CoordApp {
                 if let Some(text) = self.active_terminal_selected_text() {
                     backend.services().clipboard().write_text(&text);
                     self.clear_active_terminal_selection();
+                    // #790: a successful copy ends copy mode (F9) — the gesture
+                    // is complete, so restore normal PTY mouse forwarding.
+                    self.terminal_copy_mode = false;
+                    self.terminal_host_sel_dragging = false;
                     // Platform contract (#464): emit TextCopied so copy-confirmation
                     // UI and future listeners observe terminal copies, matching the
                     // quadraui built-in text-selection copy path (tui/run.rs:258).
                     let _ = self.handle(UiEvent::TextCopied(text), backend, ctx);
+                    return Reaction::Redraw;
+                }
+            }
+        }
+
+        // ── #790: F9 toggles terminal copy mode (keyboard, tmux-proof) ──
+        // Shift+drag can't reach coord-tui when it runs inside an outer tmux
+        // (tmux consumes Shift for its own cross-pane selection), so a
+        // key-driven toggle is the only reliable trigger.  Caught BEFORE the
+        // terminal-focus PTY-forward blocks below so F9/Esc are not swallowed
+        // by a focused PTY.  Scoped to the copy-capable contexts (standalone
+        // Terminal view + Pipeline detail Terminal tab).
+        if self.terminal_copy_mode_available() {
+            if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
+                if matches!(key, Key::Named(NamedKey::F(9)))
+                    && !modifiers.ctrl
+                    && !modifiers.alt
+                    && !modifiers.shift
+                {
+                    if self.terminal_copy_mode {
+                        self.exit_terminal_copy_mode();
+                    } else {
+                        self.terminal_copy_mode = true;
+                    }
+                    return Reaction::Redraw;
+                }
+                // Esc leaves copy mode (discarding the selection) without
+                // copying — only owned here while copy mode is actually on so
+                // Esc keeps its normal meaning otherwise.
+                if self.terminal_copy_mode
+                    && matches!(key, Key::Named(NamedKey::Escape))
+                {
+                    self.exit_terminal_copy_mode();
                     return Reaction::Redraw;
                 }
             }
@@ -3110,7 +3155,11 @@ impl CoordApp {
                             _ => false,
                         }
                     };
-                    let force_host_sel = modifiers.shift || !reporting_on;
+                    // #790: copy mode (F9) also forces host selection so a
+                    // plain drag selects text instead of reaching the PTY —
+                    // the tmux-proof path when Shift is eaten by an outer tmux.
+                    let force_host_sel =
+                        self.terminal_should_host_select(modifiers.shift, reporting_on);
                     if force_host_sel {
                         if let Some((col, row)) = cr {
                             self.terminal_host_sel_begin(col, row);
@@ -4241,6 +4290,38 @@ impl CoordApp {
                 sess.selection = None;
             }
         }
+    }
+
+    /// #790: decide whether a left mouse-press in the terminal pane should
+    /// begin a host-side text selection instead of being forwarded to the
+    /// embedded PTY.  True when:
+    ///   - `shift` is held (the classic terminal override — but an OUTER tmux
+    ///     consumes Shift before coord-tui sees it, which is exactly why copy
+    ///     mode exists), OR
+    ///   - mouse reporting is OFF (a plain shell won't consume the click), OR
+    ///   - copy mode is active (the F9 toggle — keyboard-driven and therefore
+    ///     immune to the outer-tmux Shift interception).
+    pub(crate) fn terminal_should_host_select(&self, shift: bool, reporting_on: bool) -> bool {
+        shift || !reporting_on || self.terminal_copy_mode
+    }
+
+    /// #790: whether the active view is one where host-side terminal selection
+    /// (and therefore F9 copy mode) is wired.  Mirrors the arms of
+    /// [`active_terminal_session_mut`]: the standalone Terminal view and the
+    /// Pipeline detail Terminal tab.  The Board Terminal tab is Chat-scoped
+    /// (#675) and has no host-selection path, so copy mode is unavailable there.
+    pub(crate) fn terminal_copy_mode_available(&self) -> bool {
+        matches!(self.active_view, SidebarView::Terminal)
+            || (self.active_view == SidebarView::Pipeline
+                && self.pipeline_detail_tab == PipelineDetailTab::Terminal)
+    }
+
+    /// #790: leave terminal copy mode — clear the flag, drop any in-progress
+    /// drag, and discard the (uncopied) host selection.  Idempotent.
+    pub(crate) fn exit_terminal_copy_mode(&mut self) {
+        self.terminal_copy_mode = false;
+        self.terminal_host_sel_dragging = false;
+        self.clear_active_terminal_selection();
     }
 
     /// Scroll wheel in the sidebar.
