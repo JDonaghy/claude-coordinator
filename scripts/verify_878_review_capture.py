@@ -108,7 +108,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from coord.client import ServiceConfig, fetch_board_payload, resolve_board_service  # noqa: E402
+from coord.client import fetch_board_payload, resolve_board_service  # noqa: E402
 from coord.state import _parse_review_findings_blob  # noqa: E402
 
 EXPECTED_VERDICT = "request-changes"
@@ -133,21 +133,17 @@ def verify(
 
     Returns ``(passed, one_line_report)``.
     """
-    svc = (
-        ServiceConfig(url=service_url.rstrip("/"), token=service_token)
-        if service_url
-        else resolve_board_service()
-    )
+    svc = resolve_board_service(flag_url=service_url, flag_token=service_token)
     if svc is None:
         return False, (
-            "FAIL: no daemon service configured — pass --service-url, set "
+            "ERROR: no daemon service configured — pass --service-url, set "
             "COORD_SERVICE_URL, or configure ~/.coord/client.toml"
         )
 
     try:
         payload = fetch_board_payload(svc)
     except Exception as e:  # noqa: BLE001 — surface a clean failure line
-        return False, f"FAIL: could not reach board daemon at {svc.url}: {e}"
+        return False, f"ERROR: could not reach board daemon at {svc.url}: {e}"
 
     row = _find_assignment(payload, assignment_id)
     if row is None:
@@ -253,7 +249,11 @@ def main() -> int:
         min_body_chars=args.min_body_chars,
     )
     print(line)
-    return 0 if passed else 1
+    if passed:
+        return 0
+    if line.startswith("ERROR:"):
+        return 2
+    return 1
 
 
 if __name__ == "__main__":
