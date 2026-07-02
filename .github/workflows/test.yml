@@ -42,7 +42,30 @@ jobs:
       # Run only the audit + thin-client-specific tests to avoid hammering
       # the daemon-guarded paths in the full suite (which legitimately hit
       # local board state on the daemon host).
-      - run: pytest tests/test_thin_client_board_audit.py tests/test_state_review_findings_daemon.py -v
+      #
+      # #906: added test_thin_client_daemon_routing_906.py (daemon-routing +
+      # fail-open coverage for the new endpoints/functions) and test_smoke.py
+      # (reconcile()'s thin-client get_issue_test_mode regression) so this job
+      # actually exercises COORD_STRICT_LOCAL_BOARD against the new #906
+      # functions, not just the original build_board/save_board/load_board
+      # triad.
+      #
+      # NOT added: test_state.py / test_review_verdict_relay.py. Both contain
+      # tests that assert the *warn* (non-strict) behavior of the local-board
+      # guard while simulating a thin client — under this job's ambient
+      # COORD_STRICT_LOCAL_BOARD=1 those calls raise instead of warn and the
+      # assertions fail, because the guard reads the env var directly rather
+      # than a value those tests control. That's a pre-existing test-isolation
+      # gap (COORD_STRICT_LOCAL_BOARD leaks in as ambient env instead of each
+      # "warns" test forcing it unset), not something introduced by #906 —
+      # tracked as a follow-up rather than fixed here to keep this PR's scope
+      # to the review findings.
+      - run: |
+          pytest tests/test_thin_client_board_audit.py \
+                 tests/test_state_review_findings_daemon.py \
+                 tests/test_thin_client_daemon_routing_906.py \
+                 tests/test_smoke.py \
+                 -v
 
   e2e:
     runs-on: ubuntu-latest

@@ -555,3 +555,111 @@ def test_reconcile_dispatches_auto_smoke_for_auto_mode_issue(
         assert mock_dispatch.called, (
             "Expected dispatch_smoke to be called for test-mode:auto issue"
         )
+
+
+def test_reconcile_thin_client_respects_smoke_mode_via_daemon(
+    gtk_and_server_config: Config, coord_db, monkeypatch
+) -> None:
+    """#906 regression: reconcile() runs from the thin-client-reachable `coord
+    resume` (not just the daemon tick loop, as an earlier #906 allowlist
+    comment incorrectly assumed). On a thin client the local `issues` table
+    is an empty stub, so ``get_issue_test_mode`` must route to the daemon's
+    ``/issue-test-mode`` endpoint rather than reading the local (empty) table
+    and silently falling through to auto-dispatching a headless smoke test
+    for an issue explicitly labeled ``test-mode:smoke``.
+    """
+    import coord.client as cc
+    from unittest.mock import patch as _patch
+    from coord.reconcile import reconcile
+    from coord.state import save_board
+
+    # Local `issues` table is EMPTY — mirrors the thin-client reality that
+    # triggered the #906 bug (a local read would return None here even though
+    # the issue really has test-mode:smoke on the daemon/GitHub).
+    assert coord_db.execute("SELECT COUNT(*) FROM issues").fetchone()[0] == 0
+
+    # Seed the board locally first (as-if state.py's autouse fixture wrote it
+    # before board_service was configured) so this setup step itself doesn't
+    # trip the thin-client local-board guard.
+    completed_work = _completed(machine="server")
+    board = Board(active=[completed_work])
+    save_board(board)
+
+    class _FakeSvc:
+        url = "http://daemon:7435"
+        token = "t"
+
+    monkeypatch.setattr(cc, "resolve_board_service", lambda *a, **k: _FakeSvc())
+
+    daemon_calls: list[tuple[str, dict]] = []
+
+    def _fake_post_record(svc, path, payload, **kw):
+        daemon_calls.append((path, payload))
+        return {"test_mode": "smoke"}
+
+    monkeypatch.setattr(cc, "post_record", _fake_post_record)
+
+    def _fake_agent(_host: str, _port: int = 7433, **kw):
+        return {
+            "completed": [
+                {"id": "abc123", "status": "done", "branch": "issue-287-fix"}
+            ]
+        }
+
+    with _patch("coord.reconcile._query_agent", side_effect=_fake_agent):
+        reconcile(board, gtk_and_server_config)
+
+    # The daemon endpoint was consulted for this exact issue.
+    assert ("/issue-test-mode", {"repo_name": "api", "issue_number": 287}) in daemon_calls
+
+    # No smoke assignment must have been auto-dispatched.
+    smoke_assignments = [a for a in board.active if a.type == "smoke"]
+    assert smoke_assignments == [], (
+        "Expected no auto-smoke dispatch for test-mode:smoke issue even though "
+        "the local `issues` table is empty (daemon has the real label) — "
+        f"got {smoke_assignments}"
+    )
+
+    # The local issues table was never populated — proves no local fallback read.
+    assert coord_db.execute("SELECT COUNT(*) FROM issues").fetchone()[0] == 0
+
+
+def test_reconcile_thin_client_falls_back_to_local_on_daemon_error(
+    gtk_and_server_config: Config, coord_db, monkeypatch
+) -> None:
+    """If the daemon read for test-mode fails, get_issue_test_mode fails open to
+    the (empty) local DB — matching pre-#906 "no label" behaviour rather than
+    raising and breaking the whole reconcile pass."""
+    import coord.client as cc
+    from unittest.mock import patch as _patch
+    from coord.reconcile import reconcile
+    from coord.state import save_board
+
+    completed_work = _completed(machine="server")
+    board = Board(active=[completed_work])
+    save_board(board)
+
+    class _FakeSvc:
+        url = "http://daemon:7435"
+        token = "t"
+
+    monkeypatch.setattr(cc, "resolve_board_service", lambda *a, **k: _FakeSvc())
+    monkeypatch.setattr(
+        cc,
+        "post_record",
+        lambda svc, path, payload, **kw: (_ for _ in ()).throw(RuntimeError("daemon down")),
+    )
+
+    def _fake_agent(_host: str, _port: int = 7433, **kw):
+        return {
+            "completed": [
+                {"id": "abc123", "status": "done", "branch": "issue-287-fix"}
+            ]
+        }
+
+    with _patch("coord.reconcile._query_agent", side_effect=_fake_agent), \
+         _patch("coord.smoke.dispatch_smoke", return_value=None) as mock_dispatch:
+        reconcile(board, gtk_and_server_config)
+
+    # Falls open to "no label" behaviour → respects auto_queue=True → dispatches.
+    assert mock_dispatch.called

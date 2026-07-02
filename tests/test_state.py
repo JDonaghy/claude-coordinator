@@ -649,6 +649,115 @@ class TestThinClientLocalBoardGuard:
         # Must not raise — the guard is inactive on the daemon host.
         save_board(board)
 
+    # ── #906: mark_notified / save_plan / load_dispatched ──────────────────────
+    # The #906 review flagged these three guard extensions (added alongside
+    # the original build_board/save_board/load_board triad above) as having
+    # NO dedicated warn/raise/no-op coverage of their own — only the static
+    # AST audit (test_thin_client_board_audit.py) exercised them. These close
+    # that gap with the same triad shape used above.
+
+    def test_mark_notified_warns_on_thin_client(self, coord_db, monkeypatch) -> None:
+        from coord.state import mark_notified
+
+        self._set_thin_client(monkeypatch)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            mark_notified("no-such-id", "completion")
+
+        guard_warns = [w for w in caught if "#615" in str(w.message)]
+        assert guard_warns, "mark_notified on thin client must emit a #615 UserWarning"
+        assert "mark_notified" in str(guard_warns[0].message)
+
+    def test_mark_notified_raises_in_strict_mode(self, coord_db, monkeypatch) -> None:
+        from coord.state import mark_notified
+
+        self._set_thin_client(monkeypatch)
+        monkeypatch.setenv("COORD_STRICT_LOCAL_BOARD", "1")
+
+        with pytest.raises(RuntimeError, match="#615"):
+            mark_notified("no-such-id", "completion")
+
+    def test_mark_notified_no_warning_on_daemon_host(self, coord_db, monkeypatch) -> None:
+        from coord.state import mark_notified
+
+        self._set_daemon_host(monkeypatch)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            mark_notified("no-such-id", "completion")
+
+        guard_warns = [w for w in caught if "#615" in str(w.message)]
+        assert not guard_warns, "mark_notified on daemon host must NOT emit a #615 warning"
+
+    def test_save_plan_warns_on_thin_client(self, coord_db, monkeypatch) -> None:
+        from coord.state import save_plan
+
+        self._set_thin_client(monkeypatch)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            save_plan("no-such-id", {"steps": [], "blockers": []})
+
+        guard_warns = [w for w in caught if "#615" in str(w.message)]
+        assert guard_warns, "save_plan on thin client must emit a #615 UserWarning"
+        assert "save_plan" in str(guard_warns[0].message)
+
+    def test_save_plan_raises_in_strict_mode(self, coord_db, monkeypatch) -> None:
+        from coord.state import save_plan
+
+        self._set_thin_client(monkeypatch)
+        monkeypatch.setenv("COORD_STRICT_LOCAL_BOARD", "1")
+
+        with pytest.raises(RuntimeError, match="#615"):
+            save_plan("no-such-id", {"steps": [], "blockers": []})
+
+    def test_save_plan_no_warning_on_daemon_host(self, coord_db, monkeypatch) -> None:
+        from coord.state import save_plan
+
+        self._set_daemon_host(monkeypatch)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            save_plan("no-such-id", {"steps": [], "blockers": []})
+
+        guard_warns = [w for w in caught if "#615" in str(w.message)]
+        assert not guard_warns, "save_plan on daemon host must NOT emit a #615 warning"
+
+    def test_load_dispatched_warns_on_thin_client(self, coord_db, monkeypatch) -> None:
+        from coord.state import load_dispatched
+
+        self._set_thin_client(monkeypatch)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            load_dispatched()
+
+        guard_warns = [w for w in caught if "#615" in str(w.message)]
+        assert guard_warns, "load_dispatched on thin client must emit a #615 UserWarning"
+        assert "load_dispatched" in str(guard_warns[0].message)
+
+    def test_load_dispatched_raises_in_strict_mode(self, coord_db, monkeypatch) -> None:
+        from coord.state import load_dispatched
+
+        self._set_thin_client(monkeypatch)
+        monkeypatch.setenv("COORD_STRICT_LOCAL_BOARD", "1")
+
+        with pytest.raises(RuntimeError, match="#615"):
+            load_dispatched()
+
+    def test_load_dispatched_no_warning_on_daemon_host(self, coord_db, monkeypatch) -> None:
+        from coord.state import load_dispatched
+
+        self._set_daemon_host(monkeypatch)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            load_dispatched()
+
+        guard_warns = [w for w in caught if "#615" in str(w.message)]
+        assert not guard_warns, "load_dispatched on daemon host must NOT emit a #615 warning"
+
 
 class TestSetAssignmentFailureReason:
     """#618: set_assignment_failure_reason() persists launch-failure info on the row."""

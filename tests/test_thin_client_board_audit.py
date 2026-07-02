@@ -20,7 +20,12 @@ every *reachable* call site to route through ``coord.board_service`` /
 * ``BOARD_LOCAL_FUNCS`` now includes *every* non-routed board reader/writer in
   ``coord.state``: the original three (``build_board`` / ``save_board`` /
   ``load_board``) plus the newly-guarded helpers (``mark_notified``,
-  ``save_plan``, ``load_dispatched``, ``get_issue_test_mode``).
+  ``save_plan``, ``load_dispatched``). ``get_issue_test_mode`` itself is now
+  daemon-routed (mirrors ``get_test_plan``: routes to ``POST
+  /issue-test-mode`` when ``board_service`` is configured, falls back to the
+  private ``_get_issue_test_mode_local`` otherwise) after a review caught it
+  being reachable from a thin client via ``coord resume`` -> ``reconcile()``
+  — so it's no longer tracked as an unrouted local function here.
 * The **second test** (``test_no_unallowlisted_board_calls_in_core_modules``)
   scans the wider set of core modules beyond ``coord/commands/`` for the same
   ``BOARD_LOCAL_FUNCS`` *plus* raw ``get_connection()`` calls — the one
@@ -44,11 +49,13 @@ COORD_DIR = REPO_ROOT / "coord"
 BOARD_FUNCS_ORIGINAL = {"build_board", "save_board", "load_board"}
 
 # ── #906 additions: non-routed board readers/writers added to state.py guards ─
+# NOTE: get_issue_test_mode is NOT here — it's daemon-routed (like
+# get_test_plan), not merely guarded, after the #906 review found it
+# reachable from a thin client via `coord resume` -> reconcile().
 BOARD_FUNCS_EXTENDED = {
     "mark_notified",       # local notifications + assignments write; guarded
     "save_plan",           # local plans write; guarded
     "load_dispatched",     # local assignments read; guarded
-    "get_issue_test_mode", # local issues read; guarded
 }
 
 # All board-local function names tracked by both tests.
@@ -193,7 +200,7 @@ def test_no_unallowlisted_direct_board_calls_in_commands() -> None:
         "daemon first (mirror `coord merge`'s daemon_reroute_target() / "
         "board_service.route_write() pattern, #615/#906) — do not call "
         "coord.state.build_board/save_board/load_board/mark_notified/save_plan/"
-        "load_dispatched/get_issue_test_mode unconditionally from a CLI command. "
+        "load_dispatched unconditionally from a CLI command. "
         "If it's already safely guarded (e.g. behind an `if svc is None:` / "
         "`if not is_remote():` check, or only reached after a daemon-routing "
         "early-return), add it to COMMANDS_ALLOWLIST with a one-line reason.\n"
@@ -260,8 +267,10 @@ EXTENDED_ALLOWLIST: dict[str, set[tuple[str, str]]] = {
         ("reconcile_completed_assignments", "build_board"),
         # save_plan in _capture_plan_best_effort: daemon tick only.
         ("_capture_plan_best_effort", "save_plan"),
-        # get_issue_test_mode in reconcile: daemon tick only.
-        ("reconcile", "get_issue_test_mode"),
+        # NOTE: reconcile() calls get_issue_test_mode(), but that function is
+        # now daemon-routed itself (not in BOARD_LOCAL_FUNCS) after the #906
+        # review found reconcile() runs from the thin-client-reachable
+        # `coord resume`, not just the daemon tick — so no entry is needed here.
     },
     # coord/merge_queue.py — board-local and DB calls; merge queue is a
     # separate concern (its own table); all callers are daemon-side or behind

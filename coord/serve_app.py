@@ -756,6 +756,42 @@ def _openapi_spec() -> dict:
                 },
             }
         },
+        "/issue-test-mode": {
+            "post": {
+                "summary": "Read the cached test-mode label for an issue (#906)",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "repo_name": {"type": "string"},
+                                    "issue_number": {"type": "integer"},
+                                },
+                                "required": ["repo_name", "issue_number"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK — test_mode is \"auto\", \"smoke\", or null",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "test_mode": {"nullable": True},
+                                    },
+                                }
+                            }
+                        },
+                    },
+                    "400": {"description": "Missing repo_name or issue_number"},
+                },
+            }
+        },
         "/issue-labels": {
             "post": {
                 "summary": "Update one issue's cached labels (#601)",
@@ -1528,6 +1564,31 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         result = await run_in_threadpool(_run)
         return JSONResponse(result)
 
+    async def post_issue_test_mode(request: Request) -> Response:
+        # #906: read the cached test-mode label (test-mode:auto/test-mode:smoke)
+        # for an issue from the daemon's canonical `issues` table, so a thin
+        # client's `coord resume` -> reconcile() smoke-auto-queue gate sees the
+        # real per-issue policy instead of None from an empty local DB.
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        repo_name = body.get("repo_name")
+        issue_number = body.get("issue_number")
+        if not repo_name or issue_number is None:
+            return JSONResponse(
+                {"error": "missing repo_name or issue_number"}, status_code=400
+            )
+        try:
+            test_mode = state._get_issue_test_mode_local(repo_name, int(issue_number))
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "issue-test-mode read failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"test_mode": test_mode})
+
     async def post_issue_labels(request: Request) -> Response:
         # #601: update one issue's cached labels (coord ready/backlog/refine/track).
         from coord import state  # noqa: PLC0415
@@ -2160,6 +2221,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/assignment-failure-reason", post_assignment_failure_reason, methods=["POST"]),
         Route("/assignment-test-plan", post_assignment_test_plan, methods=["POST"]),
         Route("/notify", post_notify, methods=["POST"]),
+        Route("/issue-test-mode", post_issue_test_mode, methods=["POST"]),
         Route("/issue-labels", post_issue_labels, methods=["POST"]),
         Route("/issue-label", post_issue_label, methods=["POST"]),
         Route("/issue-create", post_issue_create, methods=["POST"]),
