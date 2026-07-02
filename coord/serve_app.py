@@ -345,6 +345,30 @@ def _board_response_schema(components: dict) -> dict:
                 "description": "#778: approved/done work not yet in the merge queue",
                 "items": staging_item_ref,
             },
+            "issue_stage_projection": {
+                "type": "array",
+                "description": (
+                    "#550: server-computed per-issue stage/gate badges "
+                    "(work/review/smoke/test/merge status, has_approved_review) — "
+                    "generalizes the #776/#778 pattern so coord-tui's "
+                    "pipeline.rs stops re-deriving this from raw rows"
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "repo_name": {"type": "string"},
+                        "issue_number": {"type": "integer"},
+                        "issue_title": {"type": "string"},
+                        "stages": {
+                            "type": "object",
+                            "description": "stage name -> pending|active|done|failed|stale|skipped",
+                            "additionalProperties": {"type": "string"},
+                        },
+                        "has_approved_review": {"type": "boolean"},
+                    },
+                    "required": ["repo_name", "issue_number", "stages", "has_approved_review"],
+                },
+            },
         },
         "required": [
             "schema_version", "round_number", "assignments", "machines",
@@ -898,6 +922,31 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         except Exception:  # noqa: BLE001 — plan failure must not blank the board
             projection["merge_plan"] = []
             projection["merge_staging"] = []
+        # #550: server-computed per-issue stage/gate projection — generalizes
+        # the #776/#778 pattern to coord-tui's `pipeline.rs` stage-status
+        # functions.  Fail-open: an error returns an empty list rather than
+        # 503ing the board.
+        try:
+            from coord import stage_projection as _sp  # noqa: PLC0415
+            from coord.ci_store import build_ci_store as _build_ci_store2  # noqa: PLC0415
+            from coord.merge_queue import load_queue as _load_queue  # noqa: PLC0415
+            from coord.state import build_board as _build_board2  # noqa: PLC0415
+
+            _sp_board = _build_board2()
+            try:
+                _sp_ci = _build_ci_store2(config.ci_store.type)
+            except Exception:  # noqa: BLE001
+                _sp_ci = None
+            projection["issue_stage_projection"] = _sp.compute_board_stage_projection(
+                issues=projection.get("issues", []),
+                assignments=list(_sp_board.active) + list(_sp_board.completed),
+                merge_queue_items=_load_queue(),
+                default_gates=list(config.pipeline.default_gates),
+                require_plan=bool(config.dispatch.require_plan),
+                ci_store=_sp_ci,
+            )
+        except Exception:  # noqa: BLE001 — projection failure must not blank the board
+            projection["issue_stage_projection"] = []
         return JSONResponse(projection)
 
     async def serve_config(request: Request) -> Response:  # noqa: ARG001

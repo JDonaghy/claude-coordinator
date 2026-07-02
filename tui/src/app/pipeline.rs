@@ -304,6 +304,24 @@ pub(crate) fn ci_stale_secs(cached: Option<&CiCheckSummary>, merge_eligible: boo
     }
 }
 
+/// #550: map a lowercase status string from the server-computed
+/// `issue_stage_projection` (`coord.stage_projection`, see
+/// `PENDING`/`ACTIVE`/`DONE`/`FAILED`/`STALE`/`SKIPPED`) onto
+/// `quadraui::StageStatus`.  Kept as a plain string on the wire (rather than
+/// deserializing directly into the enum) so this crate isn't coupled to
+/// quadraui's serde representation. Unknown/missing values map to `Pending`
+/// — the same "never ran yet" default the local computation uses.
+pub(crate) fn parse_stage_status(s: &str) -> StageStatus {
+    match s {
+        "active" => StageStatus::Active,
+        "done" => StageStatus::Done,
+        "failed" => StageStatus::Failed,
+        "stale" => StageStatus::Stale,
+        "skipped" => StageStatus::Skipped,
+        _ => StageStatus::Pending,
+    }
+}
+
 // ─── Pipeline impl CoordApp ─────────────────────────────────────────────────
 
 impl CoordApp {
@@ -2498,6 +2516,22 @@ impl CoordApp {
         }
     }
 
+    /// #550: look up *stage*'s status for *issue* in the server-computed
+    /// `issue_stage_projection` (from `/board`, see `coord.stage_projection`),
+    /// when present.  Returns `None` when the daemon predates #550, the
+    /// local-SQLite read path is in use (no daemon at all), or the issue has
+    /// no `coord_repo` mapping — all cases where the caller should fall back
+    /// to local computation.
+    pub(crate) fn server_stage_status(&self, issue: &PipelineIssue, stage: &str) -> Option<StageStatus> {
+        let repo = issue.coord_repo.as_deref()?;
+        let entry = self
+            .data
+            .issue_stage_projection
+            .iter()
+            .find(|p| p.repo_name == repo && p.issue_number == issue.number)?;
+        entry.stages.get(stage).map(|s| parse_stage_status(s))
+    }
+
     /// Resolve the per-stage status of an issue from existing assignments.
     ///
     /// "work" is the first stage and matches assignments with
@@ -2512,6 +2546,21 @@ impl CoordApp {
         if stage == "test" {
             return self.test_stage_status_for(issue);
         }
+        // #550: prefer the server-computed projection when present — falls
+        // back to the local computation below on the local-SQLite read path
+        // (no daemon) or against a daemon older than #550.
+        if let Some(s) = self.server_stage_status(issue, stage) {
+            return s;
+        }
+        self.stage_status_for_local(issue, stage)
+    }
+
+    /// Local fallback for [`stage_status_for`] — the generic (non merge/test)
+    /// stage computation `pipeline.rs` used exclusively before #550.  Kept as
+    /// the authoritative path for local-SQLite-mode coord-tui (no `coord
+    /// serve` daemon to compute the server-side projection) and as a safety
+    /// net against older daemons.
+    pub(crate) fn stage_status_for_local(&self, issue: &PipelineIssue, stage: &str) -> StageStatus {
         let matching = self.assignments_for_stage(issue, stage);
         if matching.iter().any(|a| a.status == "running") {
             return StageStatus::Active;
@@ -2656,6 +2705,20 @@ impl CoordApp {
                 return StageStatus::Active;
             }
         }
+        // #550: prefer the server-computed projection when present — falls
+        // back to the local computation below on the local-SQLite read path
+        // (no daemon) or against a daemon older than #550.
+        if let Some(s) = self.server_stage_status(issue, "merge") {
+            return s;
+        }
+        self.merge_stage_status_for_local(issue)
+    }
+
+    /// Local fallback for [`merge_stage_status_for`] — the raw
+    /// `merge_queue`-derived computation `pipeline.rs` used exclusively
+    /// before #550. Kept as the authoritative path for local-SQLite-mode
+    /// coord-tui and as a safety net against older daemons.
+    pub(crate) fn merge_stage_status_for_local(&self, issue: &PipelineIssue) -> StageStatus {
         let entry = self
             .data
             .merge_queue
@@ -2769,10 +2832,19 @@ impl CoordApp {
         });
         // #235: Phase 1 build in flight beats any prior verdict — the user
         // pressed `B` to re-test, so the old verdict is no longer current.
+        // TUI-session-local (a locally-spawned subprocess); no server
+        // equivalent, so this overlay is always applied before consulting
+        // the server-computed projection below.
         if let Some(a) = latest.as_ref() {
             if self.test_build_in_flight(&a.id) {
                 return StageStatus::Active;
             }
+        }
+        // #550: prefer the server-computed projection when present — falls
+        // back to the local computation below on the local-SQLite read path
+        // (no daemon) or against a daemon older than #550.
+        if let Some(s) = self.server_stage_status(issue, "test") {
+            return s;
         }
         // #585: a manual/interactive smoke session in flight keeps the Test box
         // blue (Active) — even over a prior `passed` verdict — so the operator
@@ -2813,6 +2885,12 @@ impl CoordApp {
     /// `stage_status_for` (which would special-case "test" too). Used by
     /// `test_stage_status_for` to decide whether Test is actionable yet.
     pub(crate) fn stage_status_for_internal_work(&self, issue: &PipelineIssue) -> StageStatus {
+        // #550: prefer the server-computed projection when present — falls
+        // back to the local computation below on the local-SQLite read path
+        // (no daemon) or against a daemon older than #550.
+        if let Some(s) = self.server_stage_status(issue, "work") {
+            return s;
+        }
         let matching = self.assignments_for_stage(issue, "work");
         if matching.iter().any(|a| a.status == "running") {
             return StageStatus::Active;
@@ -4717,6 +4795,37 @@ impl CoordApp {
     /// DB).  Pass `None` when no queue entry is involved (the no-queue path
     /// in `pipeline_merge_state`).
     pub(crate) fn issue_has_any_approved_review(
+        &self,
+        issue: &PipelineIssue,
+        seed_work_id: Option<&str>,
+    ) -> bool {
+        // #550: prefer the server-computed flag when present. Safe to trust
+        // unconditionally (dropping `seed_work_id`): `self.data.merge_queue`
+        // and `self.data.issue_stage_projection` are always parsed from the
+        // SAME `/board` fetch (remote mode), so the entry the server used to
+        // seed its computation is the identical one Rust would independently
+        // find by `(repo_name, issue_number)` — including the no-queue-entry
+        // case, where both sides seed with `None`. Empty/absent on the
+        // local-SQLite read path (no daemon), where the local computation
+        // below remains authoritative.
+        if let Some(repo) = issue.coord_repo.as_deref() {
+            if let Some(entry) = self
+                .data
+                .issue_stage_projection
+                .iter()
+                .find(|p| p.repo_name == repo && p.issue_number == issue.number)
+            {
+                return entry.has_approved_review;
+            }
+        }
+        self.issue_has_any_approved_review_local(issue, seed_work_id)
+    }
+
+    /// Local fallback for [`issue_has_any_approved_review`] — the
+    /// assignment-scanning computation `pipeline.rs` used exclusively before
+    /// #550. Kept as the authoritative path for local-SQLite-mode coord-tui
+    /// and as a safety net against older daemons.
+    pub(crate) fn issue_has_any_approved_review_local(
         &self,
         issue: &PipelineIssue,
         seed_work_id: Option<&str>,
