@@ -425,6 +425,50 @@ class _FakeHTTPClient:
         return _FakeHTTPResponse(self._payload)
 
 
+class _BadRequestResponse:
+    """Simulates an agent 400 'does not handle repo' response (#904)."""
+
+    def raise_for_status(self) -> None:
+        import httpx
+        raise httpx.HTTPStatusError(
+            "400 Bad Request",
+            request=httpx.Request("POST", "http://test/assign"),
+            response=httpx.Response(
+                400,
+                text='{"error": "this agent does not handle repo"}',
+            ),
+        )
+
+    def json(self) -> dict:
+        return {"error": "this agent does not handle repo"}
+
+
+class _FallThroughClient:
+    """HTTP client that rejects one URL with 400, succeeds for all others (#904)."""
+
+    def __init__(self, reject_fragment: str, success_payload: dict) -> None:
+        self._reject_fragment = reject_fragment
+        self._success_payload = success_payload
+        self.calls: list[str] = []
+
+    def post(self, url: str, *, json: dict, timeout: float):
+        self.calls.append(url)
+        if self._reject_fragment in url:
+            return _BadRequestResponse()
+        return _FakeHTTPResponse(self._success_payload)
+
+
+class _AllRejectingClient:
+    """HTTP client that always returns 400 (#904 exhaustion test)."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def post(self, url: str, *, json: dict, timeout: float):
+        self.calls.append(url)
+        return _BadRequestResponse()
+
+
 def test_dispatch_review_skipped_when_disabled(two_machine_config: Config) -> None:
     cfg = replace(two_machine_config, reviews=ReviewsConfig(enabled=False))
     board = Board()
@@ -1658,3 +1702,128 @@ def test_dispatch_review_passes_through_normally_when_branch_on_remote(
 
     assert result is not None
     assert result.machine_name == "server"  # different from worker (laptop)
+
+
+# ── #904: fall-through loop + health-check pre-filter ───────────────────────
+
+
+def test_dispatch_review_skips_machine_not_advertising_repo_in_health(
+    two_machine_config: Config,
+) -> None:
+    """Fix #2 (PREVENTATIVE, #904): a candidate whose /health does not list the
+    target repo is skipped before any POST attempt.
+
+    When ``server`` (the preferred different-machine candidate) advertises an
+    empty repo list, ``dispatch_review`` should skip it and fall through to
+    ``laptop`` (the worker's own machine) rather than dispatching a guaranteed-
+    400 POST."""
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    client = _FakeHTTPClient({"id": "health-filter-1"})
+
+    def _health(host: str) -> list[str] | None:
+        # server is drifted: /health omits "api" from its repos list.
+        if "server" in host:
+            return []           # reachable but "api" is absent
+        return ["api"]          # laptop advertises "api" correctly
+
+    result = dispatch_review(
+        completed, board, two_machine_config,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {"number": 7, "url": "u", "existed": True},
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+        remote_branch_checker=lambda repo, branch: True,
+        health_checker=_health,
+    )
+
+    assert result is not None
+    # server was filtered by health check; dispatch fell through to laptop.
+    assert result.machine_name == "laptop"
+    assert result.assignment_id == "health-filter-1"
+    # Only ONE POST — to laptop; server was excluded before any network call.
+    assert len(client.calls) == 1
+    url, _ = client.calls[0]
+    assert "laptop.tail" in url
+    assert "server.tail" not in url
+
+
+def test_dispatch_review_falls_through_to_second_candidate_on_400(
+    two_machine_config: Config,
+) -> None:
+    """Fix #1 (PRIMARY, #904): when the first reviewer candidate returns a 400
+    'does not handle repo' response, ``dispatch_review`` retries with the next
+    candidate instead of silently returning None and leaving review_state as
+    'pending'.
+
+    ``http_client=`` is the existing injection seam; the test stubs it so
+    ``server.tail`` 400s and ``laptop.tail`` succeeds."""
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+
+    client = _FallThroughClient(
+        reject_fragment="server.tail",
+        success_payload={"id": "fallthrough-review-1"},
+    )
+
+    result = dispatch_review(
+        completed, board, two_machine_config,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {"number": 5, "url": "u", "existed": True},
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+        remote_branch_checker=lambda repo, branch: True,
+        # Bypass health pre-filter so only the POST rejection drives fall-through.
+        health_checker=lambda host: None,
+    )
+
+    assert result is not None
+    assert result.machine_name == "laptop"
+    assert result.assignment_id == "fallthrough-review-1"
+    # Two POST calls — first to server (rejected), then to laptop (accepted).
+    assert len(client.calls) == 2
+    assert any("server.tail" in url for url in client.calls), (
+        "expected a POST to server.tail (the first, rejected candidate)"
+    )
+    assert any("laptop.tail" in url for url in client.calls), (
+        "expected a POST to laptop.tail (the fall-through candidate)"
+    )
+    # Review assignment is on the board.
+    assert result in board.active
+    assert result.review_of_assignment_id == completed.assignment_id
+
+
+def test_dispatch_review_sets_stall_state_when_all_candidates_rejected(
+    two_machine_config: Config,
+) -> None:
+    """Fix #1 + exhaustion (#904): when ALL reviewer candidates 400, the work
+    row's ``review_state`` is set to ``'no_eligible_reviewer'`` (NOT left as
+    ``'pending'``), so the pending-review loop stops silently retrying and
+    ``coord status`` can surface an actionable error.
+
+    Returns None (same contract as before) but the stall state is now visible."""
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    client = _AllRejectingClient()
+
+    result = dispatch_review(
+        completed, board, two_machine_config,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {"number": 3, "url": "u", "existed": True},
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+        remote_branch_checker=lambda repo, branch: True,
+        # Bypass health pre-filter so the POST 400 is the signal.
+        health_checker=lambda host: None,
+    )
+
+    assert result is None
+    assert board.active == []
+    # Stall state set — NOT left as None/pending.
+    assert completed.review_state == "no_eligible_reviewer", (
+        f"expected 'no_eligible_reviewer', got {completed.review_state!r}"
+    )
+    # Both candidates were tried — not just the first.
+    assert len(client.calls) == 2, (
+        f"expected 2 POST attempts (one per candidate), got {len(client.calls)}"
+    )
