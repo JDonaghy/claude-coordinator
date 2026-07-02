@@ -1487,6 +1487,155 @@ def _update_issue_labels_local(
     return cursor.rowcount > 0
 
 
+def apply_issue_labels(
+    repo_name: str,
+    issue_number: int,
+    *,
+    add: set[str],
+    remove: set[str],
+    repo_github: str | None = None,
+) -> tuple[list[str], bool]:
+    """Add and/or remove arbitrary labels on an issue through the seam (#802).
+
+    Routes to the daemon (``POST /issue-label``) when ``board_service`` is
+    set, else writes locally. Returns ``(new_labels, changed)`` where
+    ``changed`` is ``True`` when at least one label was added or removed.
+
+    Tolerates already-present ``add`` labels and already-absent ``remove``
+    labels (idempotent — no error raised). Updates the local ``issues``
+    cache so the TUI reflects the change without waiting for ``coord sync``.
+    """
+    svc = _board_service()
+    resp = _route_write(
+        svc,
+        "/issue-label",
+        {
+            "repo_name": repo_name,
+            "issue_number": issue_number,
+            "add": sorted(add),
+            "remove": sorted(remove),
+            "repo_github": repo_github,
+        },
+    )
+    if resp is not None:
+        return resp.get("labels", []), bool(resp.get("changed"))
+    return _apply_issue_labels_local(
+        repo_name, issue_number,
+        add=add, remove=remove,
+        repo_github=repo_github,
+    )
+
+
+def _apply_issue_labels_local(
+    repo_name: str,
+    issue_number: int,
+    *,
+    add: set[str],
+    remove: set[str],
+    repo_github: str | None = None,
+) -> tuple[list[str], bool]:
+    """Backend adapter: write the label change to GitHub then mirror the new
+    label set into the local ``issues`` cache.
+
+    Returns ``(new_labels, changed)``; callers that need no-op detection use
+    ``changed``. This is the seam endpoint the daemon calls directly — it
+    never recurses back out over HTTP.
+    """
+    from coord import github_ops  # noqa: PLC0415
+
+    slug = repo_github or repo_name
+    new_labels, changed = github_ops.change_issue_labels(
+        slug, issue_number, add=add, remove=remove
+    )
+    _update_issue_labels_local(repo_name, issue_number, new_labels)
+    return new_labels, changed
+
+
+def create_issue(
+    repo_name: str,
+    title: str,
+    body: str,
+    *,
+    labels: list[str] | None = None,
+    repo_github: str | None = None,
+) -> dict:
+    """Create a new GitHub issue through the issue-tracker seam (#802).
+
+    Routes to the daemon (``POST /issue-create``) when ``board_service`` is
+    set, else creates locally. Returns a dict with ``number`` and ``url``.
+    Also inserts the new issue into the local ``issues`` cache so the TUI
+    reflects it on the next refresh without waiting for ``coord sync``.
+    """
+    svc = _board_service()
+    resp = _route_write(
+        svc,
+        "/issue-create",
+        {
+            "repo_name": repo_name,
+            "title": title,
+            "body": body,
+            "labels": labels or [],
+            "repo_github": repo_github,
+        },
+    )
+    if resp is not None:
+        return resp
+    return _create_issue_local(
+        repo_name, title, body, labels=labels, repo_github=repo_github
+    )
+
+
+def _create_issue_local(
+    repo_name: str,
+    title: str,
+    body: str,
+    *,
+    labels: list[str] | None = None,
+    repo_github: str | None = None,
+) -> dict:
+    """Backend adapter: create the issue on GitHub then insert it into the
+    local ``issues`` cache so the TUI sees it immediately.
+
+    Returns ``{"number": N, "url": "..."}``. This is the seam endpoint the
+    daemon calls directly — it never recurses back out over HTTP.
+    """
+    from coord import github_ops  # noqa: PLC0415
+
+    slug = repo_github or repo_name
+    result = github_ops.create_issue(slug, title, body, labels=labels or [])
+
+    # Mirror the new issue into the local cache (best-effort: the GitHub write
+    # above is authoritative; a failure here just means the next sync fills it).
+    conn = get_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO issues
+                (repo_name, number, title, body, state, labels, synced_at,
+                 milestone_number, milestone_title)
+            VALUES (?, ?, ?, ?, 'open', ?, ?, NULL, NULL)
+            ON CONFLICT (repo_name, number) DO UPDATE SET
+                title     = excluded.title,
+                body      = excluded.body,
+                state     = 'open',
+                labels    = excluded.labels,
+                synced_at = excluded.synced_at
+            """,
+            (
+                repo_name,
+                result["number"],
+                title,
+                body,
+                json.dumps(sorted(labels or [])),
+                time.time(),
+            ),
+        )
+        conn.commit()
+    except Exception:  # noqa: BLE001
+        pass  # cache insert is best-effort
+    return result
+
+
 def get_issue_test_mode(repo_name: str, issue_number: int) -> str | None:
     """Return the test-mode policy for an issue from the local issues cache.
 
