@@ -666,15 +666,37 @@ impl CoordApp {
         idxs
     }
 
-    /// Whether a live `coord-<id>` tmux session currently exists for `issue`
-    /// (local OR remote, via `live_tmux_sessions`).  Matched precisely by
-    /// coord-local repo + issue number so a same-number session in another
-    /// repo doesn't false-positive (#480).  A session counts as live whether
-    /// or not a human is attached — it's running in tmux either way.
+    /// Whether a live claude session currently exists for `issue` — either an
+    /// interactive `coord-<id>` tmux session (local OR remote, via
+    /// `live_tmux_sessions`) or a headless `claude -p` worker whose DB
+    /// assignment still shows `status="running"` (#897).
+    ///
+    /// The tmux check is matched precisely by coord-local repo + issue number
+    /// so a same-number session in another repo doesn't false-positive (#480).
+    /// A session counts as live whether or not a human is attached.
+    ///
+    /// The running-assignment check covers ALL assignment types (work / review /
+    /// smoke / conflict-fix) — any active worker makes the issue Live.
     pub(crate) fn issue_session_is_live(&self, issue: &PipelineIssue) -> bool {
+        // Interactive path: a coord-<id> tmux session exists.
         let repo = Self::pipeline_repo_key(issue);
-        self.live_tmux_sessions.iter().any(|s| {
+        let has_tmux_session = self.live_tmux_sessions.iter().any(|s| {
             s.issue_number == Some(issue.number) && s.repo_name.as_deref() == Some(repo)
+        });
+        if has_tmux_session {
+            return true;
+        }
+        // Headless path (#897): a `claude -p` worker (is_interactive=false)
+        // has no tmux session but is actively running.  Any assignment with
+        // status="running" — across all types — marks the issue as Live.
+        self.data.assignments.iter().any(|a| {
+            a.issue_number == issue.number
+                && issue
+                    .coord_repo
+                    .as_deref()
+                    .map(|r| r == a.repo)
+                    .unwrap_or(true)
+                && a.status == "running"
         })
     }
 
