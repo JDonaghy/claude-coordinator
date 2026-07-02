@@ -3558,12 +3558,14 @@
     #[test]
     fn pipeline_active_by_liveness_splits_on_live_session() {
         let mut app = make_pipeline_app();
-        // #42 → in-progress (a running work assignment).
+        // Use a `done` work assignment: the issue is still "in-progress" (any
+        // work assignment suffices for pipeline_lifecycle_section), but there is
+        // no *running* assignment and no tmux session — it must be Idle.
         app.data
             .assignments
-            .push(make_assignment_typed("running", 42, "api", Some("work")));
+            .push(make_assignment_typed("done", 42, "api", Some("work")));
 
-        // No live session → the one Active issue is Idle.
+        // No live session, no running assignment → Idle.
         let groups = app.pipeline_active_by_liveness();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].0, "idle");
@@ -3583,7 +3585,9 @@
         assert_eq!(groups[0].0, "live");
 
         // Cross-repo guard (#480): a same-number session in another repo must
-        // NOT mark api#42 live.
+        // NOT mark api#42 live.  The work assignment is "done" (not running),
+        // so the only liveness signal would be the tmux session — and it's in
+        // the wrong repo, so the result must be Idle.
         app.live_tmux_sessions = vec![LiveTmuxSession {
             assignment_id: "y".to_string(),
             issue_number: Some(42),
@@ -3618,6 +3622,72 @@
             .selected_pipeline_index()
             .expect("Active selection resolves through the nested path");
         assert_eq!(app.pipeline_issues[idx].number, 42);
+    }
+
+    // ── #897: headless running assignments → Live ─────────────────────────────
+
+    #[test]
+    fn headless_running_work_classifies_as_live() {
+        // #897: a headless (is_interactive=false) `claude -p` work assignment
+        // with status="running" must place the issue in the Live group even
+        // though no tmux session exists.  Previously it fell through to Idle
+        // because `issue_session_is_live` only checked `live_tmux_sessions`.
+        let mut app = make_pipeline_app();
+        let mut a = make_assignment_typed("running", 42, "api", Some("work"));
+        a.is_interactive = false;
+        app.data.assignments.push(a);
+
+        // Confirm no tmux session is present — the assignment is the only signal.
+        assert!(app.live_tmux_sessions.is_empty());
+        let groups = app.pipeline_active_by_liveness();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].0, "live",
+            "headless running work assignment must render under Live, not Idle"
+        );
+        assert_eq!(groups[0].1.len(), 1);
+    }
+
+    #[test]
+    fn headless_running_review_classifies_as_live() {
+        // #897: the running-assignment check is type-agnostic — a running
+        // review (non-work type) must also mark the issue as Live.
+        let mut app = make_pipeline_app();
+        // A done work assignment puts issue #42 in-progress (pipeline_lifecycle_section).
+        app.data
+            .assignments
+            .push(make_assignment_typed("done", 42, "api", Some("work")));
+        // A running review assignment (headless, no tmux) is the liveness signal.
+        let mut review = make_assignment_typed("running", 42, "api", Some("review"));
+        review.is_interactive = false;
+        app.data.assignments.push(review);
+
+        assert!(app.live_tmux_sessions.is_empty());
+        let groups = app.pipeline_active_by_liveness();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].0, "live",
+            "running review assignment (non-work type) must render under Live"
+        );
+    }
+
+    #[test]
+    fn in_progress_no_running_assignment_stays_idle() {
+        // An in-progress issue whose work assignment is done (not running)
+        // and has no live tmux session must remain in Idle — we must not
+        // false-positive on completed work.
+        let mut app = make_pipeline_app();
+        app.data
+            .assignments
+            .push(make_assignment_typed("done", 42, "api", Some("work")));
+
+        assert!(app.live_tmux_sessions.is_empty());
+        let groups = app.pipeline_active_by_liveness();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].0, "idle",
+            "issue with only a done assignment and no tmux session must stay Idle"
+        );
     }
 
     #[test]
