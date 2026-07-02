@@ -2968,6 +2968,18 @@ impl CoordApp {
                         //   can extend → parse only new lines, append (O(new)).
                         //   full build → parse all lines from scratch (O(total)).
                         let line_count = sse.lines.len();
+                        // #899: the incremental cache-extend branch below slices
+                        // `sse.line_times[old_count..]` with indices derived
+                        // from `sse.lines.len()`. If a producer ever desyncs the
+                        // two parallel vectors (lines ahead of line_times), that
+                        // slice panics ("range start index N out of range").
+                        // When they're not in lockstep, fall through to the
+                        // bounds-safe FullBuild path (parse_sse_log_more reads
+                        // times via `.get(i)`, so a length mismatch there is
+                        // harmless). Producer-side this should never fire — the
+                        // #899 fix keeps line_times in lockstep — but rendering
+                        // must never panic on malformed state.
+                        let times_synced = sse.line_times.len() == line_count;
                         // Determine the cache status in a scoped borrow so we
                         // can take `borrow_mut` below without a conflict.
                         enum CacheStatus { ExactHit, CanExtend(usize), FullBuild }
@@ -2975,7 +2987,9 @@ impl CoordApp {
                             let cache = self.log_items_cache.borrow();
                             match cache.as_ref() {
                                 Some(c)
-                                    if c.assignment_id == a.id && c.wrap_width == wrap_width =>
+                                    if times_synced
+                                        && c.assignment_id == a.id
+                                        && c.wrap_width == wrap_width =>
                                 {
                                     if c.line_count == line_count {
                                         CacheStatus::ExactHit
