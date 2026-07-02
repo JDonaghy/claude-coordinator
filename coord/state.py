@@ -1725,6 +1725,84 @@ def edit_issue_content(
     )
 
 
+def write_milestone(
+    repo_name: str,
+    *,
+    number: int | None = None,
+    title: str | None = None,
+    description: str | None = None,
+    due_on: str | None = None,
+    repo_github: str | None = None,
+) -> dict:
+    """Create or edit a GitHub milestone through the milestone-tracker seam
+    (#645, mirrors ``edit_issue_content``).
+
+    Routes to the daemon (``POST /milestone-edit``) when ``board_service`` is
+    set, else writes locally. ``number=None`` **creates** a new milestone;
+    ``number=<int>`` **edits** an existing one — the same shape as
+    ``coord milestone create``/``coord milestone edit``. Returns the
+    milestone's JSON dict (``number``, ``title``, ``description``,
+    ``due_on``, ...) from the tracker backend.
+    """
+    svc = _board_service()
+    resp = _route_write(
+        svc,
+        "/milestone-edit",
+        {
+            "repo_name": repo_name,
+            "number": number,
+            "title": title,
+            "description": description,
+            "due_on": due_on,
+            "repo_github": repo_github,
+        },
+    )
+    if resp is not None:
+        return resp
+    return _write_milestone_local(
+        repo_name,
+        number=number,
+        title=title,
+        description=description,
+        due_on=due_on,
+        repo_github=repo_github,
+    )
+
+
+def _write_milestone_local(
+    repo_name: str,
+    *,
+    number: int | None = None,
+    title: str | None = None,
+    description: str | None = None,
+    due_on: str | None = None,
+    repo_github: str | None = None,
+) -> dict:
+    """Backend adapter (GitHub today): create or edit a milestone via
+    ``github_ops``.
+
+    Unlike ``_edit_issue_content_local`` there is no local cache row to
+    mirror — per #645's store decision, milestones stay GitHub-native and
+    the DB remains a read-cache of ``issues.milestone_number/title`` only
+    (no new write tables). Raises ``ValueError`` when creating without a
+    title (mirrors the CLI's own required-field validation, so a daemon
+    thin-client call that skips the CLI still fails loudly instead of
+    silently calling ``gh api`` with a blank title).
+    """
+    from coord import github_ops  # noqa: PLC0415
+
+    slug = repo_github or repo_name
+    if number is None:
+        if not (title or "").strip():
+            raise ValueError("creating a milestone requires a title")
+        return github_ops.create_milestone(
+            slug, title, description=description, due_on=due_on
+        )
+    return github_ops.edit_milestone(
+        slug, number, title=title, description=description, due_on=due_on
+    )
+
+
 def _edit_issue_content_local(
     repo_name: str,
     issue_number: int,

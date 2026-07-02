@@ -677,6 +677,38 @@ def _openapi_spec() -> dict:
                 },
             }
         },
+        "/milestone-edit": {
+            "post": {
+                "summary": "Create or edit a GitHub milestone through the tracker seam (#645)",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "repo_name": {"type": "string"},
+                                    "number": {
+                                        "type": "integer",
+                                        "nullable": True,
+                                        "description": "Omit/null to create a new milestone; set to edit an existing one.",
+                                    },
+                                    "title": {"type": "string", "nullable": True},
+                                    "description": {"type": "string", "nullable": True},
+                                    "due_on": {"type": "string", "nullable": True},
+                                    "repo_github": {"type": "string", "nullable": True},
+                                },
+                                "required": ["repo_name"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {"description": "OK — the milestone's JSON dict"},
+                    "400": {"description": "Missing field / invalid create (no title)"},
+                },
+            }
+        },
         "/issue-label": {
             "post": {
                 "summary": "Add/remove arbitrary labels on an issue through the tracker seam (#802)",
@@ -1285,6 +1317,36 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             )
         return JSONResponse({"updated": bool(updated)})
 
+    async def post_milestone_edit(request: Request) -> Response:
+        # #645: create/edit a GitHub milestone through the tracker seam (the
+        # backend write — GitHub via gh today — runs HERE on the daemon, not
+        # the client, mirroring /issue-edit). number=None creates a new
+        # milestone; number=<int> edits an existing one.
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        try:
+            result = state._write_milestone_local(
+                body["repo_name"],
+                number=body.get("number"),
+                title=body.get("title"),
+                description=body.get("description"),
+                due_on=body.get("due_on"),
+                repo_github=body.get("repo_github"),
+            )
+        except KeyError as e:
+            return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        except ValueError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "milestone-edit write failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse(result)
+
     async def post_issue_label(request: Request) -> Response:
         # #802: generic add/remove of arbitrary labels through the seam.
         # The actual gh call runs HERE on the daemon so the tracker stays
@@ -1855,6 +1917,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/issue-create", post_issue_create, methods=["POST"]),
         Route("/issues-sync", post_issues_sync, methods=["POST"]),
         Route("/issue-edit", post_issue_edit, methods=["POST"]),
+        Route("/milestone-edit", post_milestone_edit, methods=["POST"]),
         Route("/issue-context", get_issue_context, methods=["GET"]),
         Route("/issue-context", post_issue_context, methods=["POST"]),
         Route("/merge", post_merge, methods=["POST"]),

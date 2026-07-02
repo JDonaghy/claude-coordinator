@@ -47,6 +47,7 @@ from coord.models import Board
 
 
 __all__ = [
+    "TRACKING_ISSUE_LABEL",
     "WorkOrderError",
     "WorkOrderNode",
     "WorkOrder",
@@ -57,6 +58,17 @@ __all__ = [
     "Frontier",
     "ready_frontier",
 ]
+
+# #645 task 5: the tracking-issue convention. A milestone's tracking issue —
+# the issue whose body carries the `## Work order` block above and whose
+# comment stream is the milestone's decision log — is identified by this
+# label, assigned to the milestone itself. This repo has used ``"epic"`` for
+# that role in practice since before #645 codified it (see #767/#884); a
+# future `--milestone-chat` session (#645 task 2) reads/writes the tracking
+# issue found via ``label:epic milestone:<title>``, and can create one
+# (`coord issue create --label epic --milestone ...`) when a milestone
+# doesn't have one yet.
+TRACKING_ISSUE_LABEL = "epic"
 
 
 class WorkOrderError(ValueError):
