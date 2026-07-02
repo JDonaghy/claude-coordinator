@@ -1883,24 +1883,54 @@ def _create_issue_local(
 
 
 def get_issue_test_mode(repo_name: str, issue_number: int) -> str | None:
-    """Return the test-mode policy for an issue from the local issues cache.
+    """Return the test-mode policy for an issue from the issues cache.
 
     Reads the ``test-mode:smoke`` / ``test-mode:auto`` label from the ``issues``
     table row.  Returns ``"smoke"``, ``"auto"``, or ``None`` (no label set — the
     caller should treat ``None`` as *old behaviour*, i.e. respect
     ``smoke_tests.auto_queue`` from the config).
 
-    Always reads the local SQLite DB directly — does not call GitHub.  The cache
-    is kept current by ``github_ops.set_test_mode_label``, so the value is fresh
-    whenever the TUI has dispatched a headless session after #685.
+    Does not call GitHub directly.  The cache is kept current by
+    ``github_ops.set_test_mode_label``, so the value is fresh whenever the TUI
+    has dispatched a headless session after #685.
 
-    **Thin-client note (#906):** this function reads the local DB.  Its one
-    caller (``coord.reconcile.reconcile_completed_assignments``) only runs inside
-    the daemon's passive tick loop — so on a real deployment the local DB IS
-    canonical and the guard is a no-op.  The guard fires only if a future
-    refactor adds a thin-client code path to this function.
+    **Daemon-aware (#906):** routes to ``POST /issue-test-mode`` when a
+    ``board_service`` is configured.  This function's caller,
+    ``coord.reconcile.reconcile()`` (not the similarly-named, genuinely
+    daemon-tick-only ``reconcile_completed_assignments()`` — an earlier
+    version of this docstring conflated the two), is reached unconditionally
+    from the thin-client-reachable ``coord resume`` command
+    (``coord/commands/lifecycle.py``). Without daemon routing, a thin client's
+    empty local ``issues`` table would return ``None`` here and silently
+    auto-dispatch a headless smoke test for an issue explicitly labeled
+    ``test-mode:smoke``. Fails-OPEN on error (returns ``None``, same as "no
+    label set" — matches pre-#906 local-DB-miss behaviour).
     """
-    _thin_client_local_board_guard("get_issue_test_mode")
+    svc = _board_service()
+    if svc is not None:
+        try:
+            from coord.client import post_record  # noqa: PLC0415
+
+            resp = post_record(
+                svc,
+                "/issue-test-mode",
+                {"repo_name": repo_name, "issue_number": issue_number},
+            )
+            value = resp.get("test_mode")
+            return value if value in ("auto", "smoke") else None
+        except Exception:  # noqa: BLE001 — fail-open; caller respects auto_queue
+            _log.warning(
+                "#906: get_issue_test_mode: daemon read failed for %s#%s, using local",
+                repo_name, issue_number,
+            )
+    return _get_issue_test_mode_local(repo_name, issue_number)
+
+
+def _get_issue_test_mode_local(repo_name: str, issue_number: int) -> str | None:
+    """Local-DB read for :func:`get_issue_test_mode`.
+
+    Called directly by the daemon endpoint so it never re-routes back over HTTP.
+    """
     conn = get_connection()
     row = conn.execute(
         "SELECT labels FROM issues WHERE repo_name = ? AND number = ?",
