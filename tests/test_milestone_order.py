@@ -18,6 +18,8 @@ from coord.milestone_order import (
     WorkOrderNode,
     parse_work_order,
     ready_frontier,
+    render_work_order,
+    replace_work_order_section,
     validate_milestone_membership,
 )
 from coord.models import Assignment, Board
@@ -265,3 +267,86 @@ class TestReadyFrontier:
             branch_lookup=lambda repo, n: [],
         )
         assert frontier == Frontier(ready=(), blocked=())
+
+
+# ── render_work_order / replace_work_order_section (#770 Phase 2 write path) ─
+
+
+class TestRenderWorkOrder:
+    def test_round_trips_through_parse(self) -> None:
+        wo = parse_work_order(SAMPLE_BODY)
+        rendered = render_work_order(wo)
+        reparsed = parse_work_order("## Work order\n" + rendered)
+        assert reparsed == wo
+
+    def test_renders_group_and_after_annotations(self) -> None:
+        wo = WorkOrder(nodes=(
+            WorkOrderNode(1, group="A"),
+            WorkOrderNode(2, after=(1,)),
+            WorkOrderNode(3),
+        ))
+        rendered = render_work_order(wo)
+        assert rendered == (
+            "- [ ] #1  {group: A}\n"
+            "- [ ] #2  {after: #1}\n"
+            "- [ ] #3"
+        )
+
+    def test_renders_checked_box(self) -> None:
+        wo = WorkOrder(nodes=(WorkOrderNode(1, checked=True),))
+        assert render_work_order(wo) == "- [x] #1"
+
+    def test_empty_work_order_renders_empty_string(self) -> None:
+        assert render_work_order(WorkOrder()) == ""
+
+
+class TestReplaceWorkOrderSection:
+    def test_replaces_existing_section_in_place(self) -> None:
+        body = (
+            "Intro.\n\n"
+            "## Work order\n"
+            "- [ ] #1\n\n"
+            "## Refs\n"
+            "other stuff\n"
+        )
+        new_body = replace_work_order_section(body, "- [ ] #1  {group: A}\n- [ ] #2  {after: #1}")
+        assert "## Refs\nother stuff" in new_body
+        assert "Intro." in new_body
+        wo = parse_work_order(new_body)
+        assert wo.issue_numbers == (1, 2)
+        assert wo.node(2).after == (1,)
+        # Old single-line block is gone, not duplicated alongside the new one.
+        assert new_body.count("## Work order") == 1
+
+    def test_appends_section_when_absent(self) -> None:
+        body = "Just prose, no work order yet.\n"
+        new_body = replace_work_order_section(body, "- [ ] #1")
+        assert "Just prose, no work order yet." in new_body
+        wo = parse_work_order(new_body)
+        assert wo.issue_numbers == (1,)
+
+    def test_appends_section_to_empty_body(self) -> None:
+        new_body = replace_work_order_section("", "- [ ] #1")
+        wo = parse_work_order(new_body)
+        assert wo.issue_numbers == (1,)
+
+    def test_is_idempotent(self) -> None:
+        body = "## Work order\n- [ ] #1  {group: A}\n"
+        once = replace_work_order_section(body, "- [ ] #1  {group: A}")
+        twice = replace_work_order_section(once, "- [ ] #1  {group: A}")
+        assert once == twice
+
+    def test_round_trip_with_render_work_order(self) -> None:
+        """render → replace → parse recovers the same WorkOrder (the shape
+        `coord milestone write-order` actually exercises)."""
+        wo = parse_work_order(SAMPLE_BODY)
+        tracking_body = "Milestone plan.\n\n## Work order\n(stale)\n"
+        new_body = replace_work_order_section(tracking_body, render_work_order(wo))
+        assert parse_work_order(new_body) == wo
+        assert "Milestone plan." in new_body
+
+    def test_preserves_content_after_next_heading_of_any_level(self) -> None:
+        body = "## Work order\n- [ ] #1\n\n### Sub-heading\nkept\n"
+        new_body = replace_work_order_section(body, "- [ ] #1\n- [ ] #2")
+        assert "### Sub-heading\nkept" in new_body
+        assert parse_work_order(new_body).issue_numbers == (1, 2)
