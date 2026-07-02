@@ -338,6 +338,12 @@ def _dispatch_review_of(
                     issue_number=issue,
                     machine_name=machine,
                     verdict_cmd_hint=_verdict_cmd,
+                    started_at=started_at,
+                    # Local review — session ran on THIS machine; no ssh needed.
+                    # The transcript-floor already scanned the local projects dir
+                    # in finalize_interactive_exit; ssh_target=None skips the
+                    # remote SSH path while still checking the board (#877).
+                    ssh_target=None,
                 ):
                     click.echo(
                         "  review session ended with no verdict reported "
@@ -475,6 +481,14 @@ def _dispatch_review_of(
                 issue_number=issue,
                 machine_name=machine,
                 verdict_cmd_hint=_verdict_cmd,
+                started_at=started_at,
+                # #877: remote review — session ran on machine_obj.host, so the
+                # transcript lives THERE.  Pass the ssh_target so the board-
+                # content gate can re-run the remote transcript-floor here
+                # (a 2nd attempt; the first ran in finalize_interactive_exit via
+                # its own ssh_target).  Catches any timing window where the
+                # JSONL wasn't fully flushed when finalize ran.
+                ssh_target=machine_obj.host,
             )
     except Exception as exc:  # noqa: BLE001 — best-effort backstop
         click.echo(
