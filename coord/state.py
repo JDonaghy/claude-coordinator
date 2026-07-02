@@ -1487,6 +1487,28 @@ def _update_issue_labels_local(
     return cursor.rowcount > 0
 
 
+def get_cached_issue_labels(repo_name: str, issue_number: int) -> list[str] | None:
+    """Return the local cache's label list for an issue, or ``None`` if the
+    issue isn't cached (or its ``labels`` column can't be parsed).
+
+    Read-only lookup against the local ``issues`` table — never calls GitHub.
+    Used to compute an accurate before/after delta for CLI echo messages
+    (e.g. ``coord issue label``'s "labels updated: +{...} -{...}" summary),
+    since ``apply_issue_labels`` only returns the post-change label set.
+    """
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT labels FROM issues WHERE repo_name = ? AND number = ?",
+        (repo_name, issue_number),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        return json.loads(row["labels"] or "[]")
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
 def apply_issue_labels(
     repo_name: str,
     issue_number: int,
@@ -1604,35 +1626,35 @@ def _create_issue_local(
     slug = repo_github or repo_name
     result = github_ops.create_issue(slug, title, body, labels=labels or [])
 
-    # Mirror the new issue into the local cache (best-effort: the GitHub write
-    # above is authoritative; a failure here just means the next sync fills it).
+    # Mirror the new issue into the local cache (best-effort in intent — the
+    # GitHub write above is authoritative and a missing row just gets filled
+    # on the next sync — but left unguarded, matching the sibling
+    # _edit_issue_content_local's cache write: a real typo/schema-drift bug
+    # in this hand-written SQL should surface, not vanish behind a bare except).
     conn = get_connection()
-    try:
-        conn.execute(
-            """
-            INSERT INTO issues
-                (repo_name, number, title, body, state, labels, synced_at,
-                 milestone_number, milestone_title)
-            VALUES (?, ?, ?, ?, 'open', ?, ?, NULL, NULL)
-            ON CONFLICT (repo_name, number) DO UPDATE SET
-                title     = excluded.title,
-                body      = excluded.body,
-                state     = 'open',
-                labels    = excluded.labels,
-                synced_at = excluded.synced_at
-            """,
-            (
-                repo_name,
-                result["number"],
-                title,
-                body,
-                json.dumps(sorted(labels or [])),
-                time.time(),
-            ),
-        )
-        conn.commit()
-    except Exception:  # noqa: BLE001
-        pass  # cache insert is best-effort
+    conn.execute(
+        """
+        INSERT INTO issues
+            (repo_name, number, title, body, state, labels, synced_at,
+             milestone_number, milestone_title)
+        VALUES (?, ?, ?, ?, 'open', ?, ?, NULL, NULL)
+        ON CONFLICT (repo_name, number) DO UPDATE SET
+            title     = excluded.title,
+            body      = excluded.body,
+            state     = 'open',
+            labels    = excluded.labels,
+            synced_at = excluded.synced_at
+        """,
+        (
+            repo_name,
+            result["number"],
+            title,
+            body,
+            json.dumps(sorted(labels or [])),
+            time.time(),
+        ),
+    )
+    conn.commit()
     return result
 
 
