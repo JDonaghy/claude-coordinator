@@ -102,9 +102,8 @@ from coord.providers.claude_pty import (
     INPUT_BOX_MARKER,
     INPUT_BOX_MARKER_BYTES,
     briefing_fingerprint,
-    fingerprint_in_bytes,
-    fingerprint_in_text,
     paste_landed,
+    paste_landed_bytes,
 )
 
 __all__ = [
@@ -852,8 +851,12 @@ def _prefill_step(state: _PrefillState, now: float) -> bool:
     if state.verify_deadline is not None:
         if now < state.verify_deadline:
             return False
-        # Verification window elapsed — did the fingerprint land?
-        if fingerprint_in_bytes(bytes(state.screen_buf), state.fingerprint):
+        # Verification window elapsed — did the paste land?  Broadened
+        # (#896 review follow-up) from the bare fingerprint check to
+        # ``paste_landed_bytes`` so a collapsed paste-chip or a scrolled-tail
+        # input box also counts as evidence — this is the third of the three
+        # call-sites documented above; it was missed in the first #896 pass.
+        if paste_landed_bytes(bytes(state.screen_buf), state.fingerprint):
             state.done = True
         elif state.paste_attempts >= _INJECT_MAX_ATTEMPTS:
             state.done = True
@@ -1112,9 +1115,21 @@ def _launch_via_pty(
             if not prefilled:
                 # #865: readiness-anchored paste, verified and retried by
                 # _prefill_step — a mistimed/lost paste is no longer
-                # fire-and-forget.
+                # fire-and-forget.  ``_prefill_step`` is deliberately I/O-free
+                # (see _PrefillState's docstring), so it can't send the
+                # clear-before-retry keys itself; instead it increments
+                # ``paste_attempts`` before returning True, and a value > 1
+                # here means this write is a retry (the initial attempt is
+                # always 1) — the same signal ``_paste_once``'s caller and
+                # agent.py's PTY relay use their own attempt counters for.
                 if _prefill_step(prefill_state, time.monotonic()):
                     try:
+                        if prefill_state.paste_attempts > 1:
+                            # Idempotent retry (#896): clear any stacked
+                            # paste chip before re-pasting so a false-
+                            # negative on a successfully-landed paste
+                            # doesn't stack duplicate chips.
+                            os.write(master_fd, b"\x1b\x15")  # Escape + Ctrl-U
                         os.write(master_fd, paste_block)
                     except OSError:
                         pass

@@ -137,8 +137,25 @@ _WS_RE_BYTES = re.compile(rb"\s+")
 # in place of the bare ``fingerprint_in_*`` checks in ``coord.interactive``
 # and ``coord.agent``.  They are defined here — once — so all three call-sites
 # stay in sync.
-_PASTE_CHIP_RE = re.compile(r"\[Pasted text|\+\s*\d+\s*lines\]")
-_PASTE_CHIP_BYTES_RE = re.compile(rb"\[Pasted text|\+\s*\d+\s*lines\]")
+#
+# LIVE-VERIFIED (#896 review follow-up): the inferred chip wording above was
+# confirmed against a real render rather than left as a guess.  Launched
+# interactive ``claude`` v2.1.198 in a scratch tmux session, pasted a 58-line
+# buffer via ``tmux load-buffer`` + ``paste-buffer -p``, and captured the
+# collapsed input box with ``tmux capture-pane -p``. Literal rendered line:
+#
+#     ❯ [Pasted text #1 +58 lines]
+#
+# — confirming the ``[Pasted text #N +NNN lines]`` form (with a trailing
+# "paste again to expand" hint on the line below, not matched here). The
+# pattern below requires both fragments to co-occur as a single chip
+# (``[^\]]*`` bridges the "#1 " counter between them) rather than matching
+# either fragment independently — narrower than the original OR-of-two-
+# alternatives version, so unrelated "+N lines]" text elsewhere in the
+# input-box region (e.g. briefing prose describing a diff) can't false-
+# positive.
+_PASTE_CHIP_RE = re.compile(r"\[Pasted text[^\]]*\+\s*\d+\s*lines\]")
+_PASTE_CHIP_BYTES_RE = re.compile(rb"\[Pasted text[^\]]*\+\s*\d+\s*lines\]")
 
 
 def briefing_fingerprint(briefing: str, length: int = 40) -> str:

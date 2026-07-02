@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 
 import pytest
@@ -36,8 +37,11 @@ from coord.interactive import (
     _prefill_step,
 )
 from coord.providers.claude_pty import (
+    BRACKETED_PASTE_END,
     BRACKETED_PASTE_ENABLE,
+    BRACKETED_PASTE_START,
     INPUT_BOX_MARKER,
+    INPUT_BOX_MARKER_BYTES,
     briefing_fingerprint,
 )
 
@@ -112,6 +116,25 @@ def test_verified_success_stops_the_machine() -> None:
     assert _prefill_step(state, now=5.01) is False
     assert state.done is True
     assert state.paste_attempts == 1  # no retry needed
+
+
+def test_verified_success_via_paste_chip_not_just_literal_fingerprint() -> None:
+    """#896 review follow-up: ``_prefill_step`` (the third of the three #896
+    call-sites — tmux and the agent.py PTY relay were fixed first, this one
+    was missed) must use the broadened ``paste_landed_bytes`` predicate, not
+    the bare literal-fingerprint check.  A large briefing that Claude Code
+    collapses into a paste-chip (``[Pasted text #1 +NNN lines]``) never
+    renders its literal fingerprint text at all — only ``paste_landed_bytes``
+    (chip-aware) reports this as landed; the old ``fingerprint_in_bytes``
+    would spin through all retries and give up (the exact #896 bug)."""
+    state = _state(fingerprint=briefing_fingerprint("x" * 200), started=0.0)
+    state.verify_deadline = 5.0
+    state.paste_attempts = 1
+    chip = INPUT_BOX_MARKER_BYTES + b" [Pasted text #1 +58 lines]\r\n"
+    _prefill_on_master_data(state, chip, now=4.9)
+    assert _prefill_step(state, now=5.01) is False
+    assert state.done is True
+    assert state.paste_attempts == 1  # verified on the first attempt, no retry
 
 
 def test_verification_miss_schedules_a_retry() -> None:
@@ -309,3 +332,96 @@ def test_launch_via_pty_lands_briefing_after_banner_interrupt(
     assert b"got=" in captured and b"ECHO_ME" in captured, (
         f"briefing never landed in the (real) relay loop: {captured!r}"
     )
+
+
+# Mock ``claude`` for the retry-clears-input-box fixture below: renders the
+# input box but never echoes anything that would let ``paste_landed_bytes``
+# verify a landed paste, so the relay is forced through every one of
+# ``_INJECT_MAX_ATTEMPTS`` — deterministic, no timing race on when/whether
+# the fingerprint happens to show up in the child's own output.  It just
+# accumulates every byte it reads on stdin (across all 3 attempts) and dumps
+# the lot back as hex once it's read enough (or a generous deadline elapses).
+_RETRY_CHILD_SCRIPT = (
+    "import sys, os, select, time, tty\n"
+    "tty.setraw(0)\n"
+    "sys.stdout.write('\\x1b[?2004h')\n"
+    f"sys.stdout.write('{INPUT_BOX_MARKER} placeholder\\n')\n"
+    "sys.stdout.flush()\n"
+    "wanted = 64\n"
+    "buf = b''\n"
+    "deadline = time.monotonic() + 8.0\n"
+    "while len(buf) < wanted and time.monotonic() < deadline:\n"
+    "    r, _, _ = select.select([0], [], [], 0.05)\n"
+    "    if r:\n"
+    "        chunk = os.read(0, wanted - len(buf))\n"
+    "        if not chunk:\n"
+    "            break\n"
+    "        buf += chunk\n"
+    # Stay alive (don't exit yet) so the parent relay's WNOHANG child-exit
+    # check doesn't race ahead of the 3rd verify_deadline / give-up log —
+    # exiting immediately after the 3rd paste lands would let the relay
+    # observe the exit and break out of its loop before ever re-driving
+    # _prefill_step past that final verify window.
+    "time.sleep(1.5)\n"
+    "sys.stdout.write('got=' + buf.hex() + '\\n')\n"
+    "sys.stdout.flush()\n"
+)
+
+
+def test_launch_via_pty_clears_input_box_before_retry_paste(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#896 review follow-up: on a retry (the previous paste didn't verify),
+    the PTY relay must clear the input box (Escape + Ctrl-U) before
+    re-pasting — otherwise a false-negative on an already-landed paste
+    stacks duplicate paste chips.  This mirrors the idempotent-retry fix
+    already applied to the tmux path (``_paste_once`` in this module) and
+    the remote PTY relay (``coord.agent``'s ``_spawn_pty``); this end-to-end
+    fixture (real ``pty.fork()``, real child process, no mocking of
+    ``_prefill_step``) proves it's wired into ``_launch_via_pty`` too.
+
+    The mock child never echoes anything ``paste_landed_bytes`` would
+    recognise, so all ``_INJECT_MAX_ATTEMPTS`` (3) fire deterministically —
+    the test asserts the child received: paste, clear, paste, clear, paste.
+    """
+    briefing = "RETRY_ME"
+    paste_block = BRACKETED_PASTE_START + briefing.encode("utf-8") + BRACKETED_PASTE_END
+    clear_bytes = b"\x1b\x15"  # Escape + Ctrl-U
+    expected = paste_block + clear_bytes + paste_block + clear_bytes + paste_block
+
+    out_r, out_w = os.pipe()
+    in_r, in_w = os.pipe()
+    try:
+        monkeypatch.setattr(sys, "stdout", _PipedStdout(out_w))
+        monkeypatch.setattr(sys, "stdin", _PipedStdin(in_r))
+
+        with caplog.at_level(logging.ERROR):
+            rc = _launch_via_pty([sys.executable, "-c", _RETRY_CHILD_SCRIPT], briefing)
+
+        os.close(out_w)
+        out_w = -1
+        captured = _drain_pipe(out_r)
+    finally:
+        if out_w != -1:
+            try:
+                os.close(out_w)
+            except OSError:
+                pass
+        for fd in (out_r, in_r, in_w):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    assert rc == 0, f"child exited non-zero; captured={captured!r}"
+    match = re.search(rb"got=([0-9a-f]*)\n", captured)
+    assert match is not None, f"child never dumped what it received: {captured!r}"
+    received = bytes.fromhex(match.group(1).decode())
+    assert received == expected, (
+        f"expected paste/clear/paste/clear/paste, got {received!r}"
+    )
+    assert any(
+        "unverified after 3 attempt" in r.message and "PTY relay" in r.message
+        for r in caplog.records
+    ), f"expected the exhausted-retries hard-failure log, got: {[r.message for r in caplog.records]}"

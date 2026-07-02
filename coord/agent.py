@@ -2857,7 +2857,6 @@ class AgentServer:
             BRACKETED_PASTE_ENABLE,
             INPUT_BOX_MARKER_BYTES,
             briefing_fingerprint,
-            fingerprint_in_bytes,
             paste_landed_bytes,
         )
 
