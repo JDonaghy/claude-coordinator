@@ -867,4 +867,96 @@ def reconcile_board_merges(
             + (" [dry-run]" if dry_run else "")
         )
 
+    # (e) #894 — settle sibling ghost rows for terminal issues.
+    #
+    # The #609 sweep (b) only processes type='work' status='done' rows, so it
+    # misses two classes of lingering ghost rows for already-merged/closed issues:
+    #
+    #   * type=review/smoke/conflict-fix rows whose status='done' but
+    #     review_state='pending' — the interactive-completion path
+    #     (issue_store._update_local_state) sets review_state='pending' on ALL
+    #     completed assignments so reconcile picks them up like claude -p workers.
+    #     When the parent issue closes before that handoff fires, these rows
+    #     surface as "awaiting review" in coord status / the TUI forever.
+    #
+    #   * status='advisory' rows (any type) — the #609 candidates filter requires
+    #     status='done', so advisory rows are never reached.  They linger in the
+    #     TUI's advisory view after the issue is terminal.
+    #
+    # This sweep is conservative and fail-open:
+    #   - Only acts when work_is_terminal(...) is confirmed true.
+    #   - Uses the terminal_cache populated by sweep (b) to avoid extra GH calls;
+    #     falls back to a fresh check (still fail-open) for ghost rows whose issue
+    #     wasn't processed in sweep (b) (e.g. work already merged in a prior run).
+    #   - Respects the repo/issue filter so --repo/--issue scopes apply.
+    #   - Terminality is keyed on issue_is_closed OR pr_is_merged — NOT branch
+    #     ancestry, so rebase/squash merges with new SHAs are correctly handled.
+
+    # Build a (repo_name, issue_number) → branch lookup from all work rows so
+    # that sibling rows lacking a branch can still pass a branch to work_is_terminal
+    # (enabling the pr_is_merged fast-path in addition to issue_is_closed).
+    work_branch_for: dict[tuple[str, int], str | None] = {}
+    for _a in board.active + board.completed:
+        if _a.type == "work" and _a.issue_number is not None:
+            key = (_a.repo_name, _a.issue_number)
+            # Prefer a non-None branch; first seen wins (done rows come before
+            # merged rows in board.completed, but any non-None branch is fine).
+            if key not in work_branch_for or work_branch_for[key] is None:
+                work_branch_for[key] = _a.branch
+
+    # Identify ghost sibling rows subject to this sweep.
+    ghost_candidates = [
+        a
+        for a in board.active + board.completed
+        if (
+            (
+                a.type in ("review", "smoke", "conflict-fix")
+                and a.status == "done"
+                and a.review_state == "pending"
+            )
+            or a.status == "advisory"
+        )
+        and (repo is None or a.repo_name == repo)
+        and (issue is None or a.issue_number == issue)
+    ]
+
+    for a in ghost_candidates:
+        repo_cfg = config.repo(a.repo_name)
+        if repo_cfg is None:
+            actions.append(
+                f"skip settle {a.assignment_id} "
+                f"({a.repo_name} #{a.issue_number}): repo not in config"
+            )
+            continue
+
+        # Resolve the best available branch for the terminality probe.  The
+        # sibling row itself may carry a branch; fall back to the work row's
+        # branch so the pr_is_merged check fires even when the sibling has none.
+        branch = a.branch or work_branch_for.get((a.repo_name, a.issue_number))
+
+        if not github_ops.work_is_terminal(
+            repo_cfg.github, a.issue_number, branch, cache=terminal_cache
+        ):
+            continue  # Issue still live — leave this row alone.
+
+        if a.status == "advisory":
+            actions.append(
+                f"settle advisory {a.assignment_id} "
+                f"({a.repo_name} #{a.issue_number})"
+                + (" [dry-run]" if dry_run else "")
+            )
+            if not dry_run:
+                a.status = "merged"
+                state.mark_advisory_settled(a.assignment_id or "")
+        else:
+            # type=review/smoke/conflict-fix, status=done, review_state=pending
+            actions.append(
+                f"settle sibling {a.assignment_id} "
+                f"({a.repo_name} #{a.issue_number}, type={a.type})"
+                + (" [dry-run]" if dry_run else "")
+            )
+            if not dry_run:
+                a.review_state = "done"
+                state.mark_sibling_review_done(a.assignment_id or "")
+
     return actions

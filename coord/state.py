@@ -1152,6 +1152,53 @@ def mark_assignment_merged(assignment_id: str) -> None:
     conn.commit()
 
 
+def mark_sibling_review_done(assignment_id: str) -> None:
+    """#894: clear the review_state='pending' ghost on a done sibling row.
+
+    When a merged+closed issue has a lingering review/smoke/conflict-fix
+    assignment that completed (status='done') but whose review_state was left
+    at 'pending' by the interactive-completion path (issue_store sets
+    review_state='pending' so reconcile picks it up like a claude -p worker),
+    flip review_state → 'done' so it no longer surfaces as "awaiting review".
+
+    Idempotent: only transitions rows that still carry review_state='pending'
+    and status='done'.  Silently no-ops for other states.
+    """
+    if not assignment_id:
+        return
+    conn = get_connection()
+    conn.execute(
+        "UPDATE assignments SET review_state='done' WHERE assignment_id=? "
+        "AND type IN ('review','smoke','conflict-fix') "
+        "AND status='done' AND review_state='pending'",
+        (assignment_id,),
+    )
+    conn.commit()
+
+
+def mark_advisory_settled(assignment_id: str) -> None:
+    """#894: flip an advisory row to 'merged' when its issue is terminal.
+
+    Advisory assignments (status='advisory') for a merged+closed issue are
+    never touched by the existing #609 sweep (which only looks at
+    status='done' work rows), so they linger in the board's advisory view
+    forever.  This settles them by flipping status → 'merged', consistent with
+    how a done work row is settled by mark_assignment_merged.
+
+    Idempotent: only transitions rows still carrying status='advisory'.
+    Silently no-ops when the row doesn't exist or is already settled.
+    """
+    if not assignment_id:
+        return
+    conn = get_connection()
+    conn.execute(
+        "UPDATE assignments SET status='merged' WHERE assignment_id=? "
+        "AND status='advisory'",
+        (assignment_id,),
+    )
+    conn.commit()
+
+
 def update_assignment_tokens(
     assignment_id: str,
     *,

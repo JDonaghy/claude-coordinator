@@ -1,4 +1,4 @@
-"""Tests for reconcile_board_merges: branch backfill (#611) + record merged (#609) + close stale PRs (#721) + prune stale queue (#732)."""
+"""Tests for reconcile_board_merges: branch backfill (#611) + record merged (#609) + close stale PRs (#721) + prune stale queue (#732) + settle sibling ghosts (#894)."""
 
 from __future__ import annotations
 
@@ -47,6 +47,9 @@ def _patch_probes(
     Also stubs ``list_open_prs`` to return an empty list so the stale-PR
     sweep (#721) does not fire for tests that only care about the earlier
     reconcile sweeps (branch backfill, record-merged).
+
+    Now also stubs ``mark_sibling_review_done`` and ``mark_advisory_settled``
+    (#894) so sweep (e) never touches the DB in these tests.
     """
     from coord import github_ops, state
 
@@ -69,6 +72,15 @@ def _patch_probes(
     monkeypatch.setattr(
         state, "mark_assignment_merged",
         lambda aid: writes.append(("merged", aid)),
+    )
+    # #894: stub sibling-settling functions so sweep (e) never touches the DB.
+    monkeypatch.setattr(
+        state, "mark_sibling_review_done",
+        lambda aid: writes.append(("sibling_review_done", aid)),
+    )
+    monkeypatch.setattr(
+        state, "mark_advisory_settled",
+        lambda aid: writes.append(("advisory_settled", aid)),
     )
     return writes
 
@@ -447,3 +459,214 @@ def test_reconcile_prune_dry_run_does_not_remove_entry(
 
     assert any("dry-stale" in s and "dry-run" in s for s in actions)
     assert len(mq.load_queue()) == 1  # still there
+
+
+# ── #894 settle sibling ghost rows ────────────────────────────────────────────
+
+
+def _ghost_sibling(
+    *,
+    assignment_id: str,
+    issue_number: int = 42,
+    sibling_type: str = "review",
+    status: str = "done",
+    review_state: str | None = "pending",
+    branch: str | None = None,
+) -> Assignment:
+    """Build a completed sibling assignment (review/smoke/conflict-fix/advisory)."""
+    return Assignment(
+        machine_name="laptop",
+        repo_name="api",
+        issue_number=issue_number,
+        issue_title="t",
+        status=status,
+        assignment_id=assignment_id,
+        branch=branch,
+        type=sibling_type,
+        review_state=review_state,
+    )
+
+
+def test_settles_review_sibling_when_issue_terminal(monkeypatch, config) -> None:
+    """A type=review done+review_state=pending row must be settled when work_is_terminal."""
+    work = _done_work(assignment_id="work-1", issue_number=42, branch="issue-42-fix")
+    review = _ghost_sibling(assignment_id="rev-1", sibling_type="review", review_state="pending")
+    board = Board(completed=[work, review])
+    writes = _patch_probes(monkeypatch, terminal=True)
+
+    actions = reconcile_board_merges(board, config)
+
+    # work row: flipped to merged
+    assert work.status == "merged"
+    assert ("merged", "work-1") in writes
+    # review sibling: review_state cleared
+    assert review.review_state == "done"
+    assert ("sibling_review_done", "rev-1") in writes
+    assert any("settle sibling" in s and "rev-1" in s for s in actions)
+
+
+def test_settles_smoke_sibling_when_issue_terminal(monkeypatch, config) -> None:
+    """A type=smoke done+review_state=pending row must be settled when work_is_terminal."""
+    work = _done_work(assignment_id="work-2", issue_number=42, branch="issue-42-fix")
+    smoke = _ghost_sibling(assignment_id="smk-1", sibling_type="smoke", review_state="pending")
+    board = Board(completed=[work, smoke])
+    writes = _patch_probes(monkeypatch, terminal=True)
+
+    actions = reconcile_board_merges(board, config)
+
+    assert smoke.review_state == "done"
+    assert ("sibling_review_done", "smk-1") in writes
+    assert any("settle sibling" in s and "smk-1" in s for s in actions)
+
+
+def test_settles_advisory_row_when_issue_terminal(monkeypatch, config) -> None:
+    """A status=advisory row must be flipped to merged when work_is_terminal."""
+    work = _done_work(assignment_id="work-3", issue_number=42, branch="issue-42-fix")
+    advisory = _ghost_sibling(
+        assignment_id="adv-1", sibling_type="work",
+        status="advisory", review_state=None,
+    )
+    board = Board(completed=[work, advisory])
+    writes = _patch_probes(monkeypatch, terminal=True)
+
+    actions = reconcile_board_merges(board, config)
+
+    assert advisory.status == "merged"
+    assert ("advisory_settled", "adv-1") in writes
+    assert any("settle advisory" in s and "adv-1" in s for s in actions)
+
+
+def test_settles_all_ghost_types_in_one_pass(monkeypatch, config) -> None:
+    """All three ghost-row types — review, smoke, advisory — are settled together.
+
+    Acceptance criterion: a merged+closed issue with leftover type=review/smoke/
+    advisory rows → after reconcile_board_merges, NONE remain non-terminal.
+    """
+    work = _done_work(assignment_id="w0", issue_number=42, branch="issue-42-fix")
+    review = _ghost_sibling(assignment_id="rv0", sibling_type="review", review_state="pending")
+    smoke = _ghost_sibling(assignment_id="sk0", sibling_type="smoke", review_state="pending")
+    conflict_fix = _ghost_sibling(
+        assignment_id="cf0", sibling_type="conflict-fix", review_state="pending"
+    )
+    advisory = _ghost_sibling(
+        assignment_id="ad0", sibling_type="work", status="advisory", review_state=None,
+    )
+    board = Board(completed=[work, review, smoke, conflict_fix, advisory])
+    writes = _patch_probes(monkeypatch, terminal=True)
+
+    reconcile_board_merges(board, config)
+
+    # All ghost rows settled — none remain non-terminal.
+    assert review.review_state == "done", "review sibling must have review_state='done'"
+    assert smoke.review_state == "done", "smoke sibling must have review_state='done'"
+    assert conflict_fix.review_state == "done", "conflict-fix sibling must be settled"
+    assert advisory.status == "merged", "advisory row must be flipped to 'merged'"
+    # Work row also settled.
+    assert work.status == "merged"
+
+
+def test_ghost_rows_not_settled_when_issue_not_terminal(monkeypatch, config) -> None:
+    """Ghost rows for a still-open/unmerged issue must be left untouched.
+
+    Acceptance criterion: a still-open/unmerged issue's rows are left untouched.
+    """
+    work = _done_work(assignment_id="w-live", issue_number=7, branch="issue-7-fix")
+    review = _ghost_sibling(
+        assignment_id="rv-live", sibling_type="review",
+        issue_number=7, review_state="pending",
+    )
+    advisory = _ghost_sibling(
+        assignment_id="ad-live", sibling_type="work",
+        issue_number=7, status="advisory", review_state=None,
+    )
+    board = Board(completed=[work, review, advisory])
+    writes = _patch_probes(monkeypatch, terminal=False)  # issue NOT terminal
+
+    reconcile_board_merges(board, config)
+
+    assert work.status == "done"            # work untouched
+    assert review.review_state == "pending" # sibling untouched
+    assert advisory.status == "advisory"    # advisory untouched
+    assert not any("settle" in s for s in [])
+    assert ("sibling_review_done", "rv-live") not in writes
+    assert ("advisory_settled", "ad-live") not in writes
+
+
+def test_sibling_settle_dry_run_makes_no_writes(monkeypatch, config) -> None:
+    """dry_run=True describes what would settle without mutating anything."""
+    work = _done_work(assignment_id="w-dry", issue_number=42, branch="issue-42-fix")
+    review = _ghost_sibling(assignment_id="rv-dry", sibling_type="review", review_state="pending")
+    advisory = _ghost_sibling(
+        assignment_id="ad-dry", sibling_type="work", status="advisory", review_state=None,
+    )
+    board = Board(completed=[work, review, advisory])
+    writes = _patch_probes(monkeypatch, terminal=True)
+
+    actions = reconcile_board_merges(board, config, dry_run=True)
+
+    # No in-memory mutations.
+    assert review.review_state == "pending"
+    assert advisory.status == "advisory"
+    assert work.status == "done"
+    # No state writes.
+    assert ("sibling_review_done", "rv-dry") not in writes
+    assert ("advisory_settled", "ad-dry") not in writes
+    # Actions describe what WOULD happen.
+    assert any("settle sibling" in s and "[dry-run]" in s for s in actions)
+    assert any("settle advisory" in s and "[dry-run]" in s for s in actions)
+
+
+def test_sibling_settle_respects_issue_filter(monkeypatch, config) -> None:
+    """The --issue filter scopes sibling settling to the targeted issue."""
+    # Issue 42: terminal, has ghost review sibling.
+    work42 = _done_work(assignment_id="w42", issue_number=42, branch="issue-42-fix")
+    review42 = _ghost_sibling(assignment_id="rv42", sibling_type="review", issue_number=42)
+    # Issue 7: also terminal, has ghost review sibling — but outside the filter.
+    work7 = _done_work(assignment_id="w7", issue_number=7, branch="issue-7-fix")
+    review7 = _ghost_sibling(assignment_id="rv7", sibling_type="review", issue_number=7)
+    board = Board(completed=[work42, review42, work7, review7])
+    writes = _patch_probes(monkeypatch, terminal=True)
+
+    reconcile_board_merges(board, config, issue=42)
+
+    # Issue 42 ghost settled; issue 7 ghost untouched.
+    assert review42.review_state == "done"
+    assert ("sibling_review_done", "rv42") in writes
+    assert review7.review_state == "pending"
+    assert ("sibling_review_done", "rv7") not in writes
+
+
+def test_sibling_already_merged_branch_used_for_terminality(monkeypatch, config) -> None:
+    """When the sibling row has no branch, the work row's branch is used for
+    the work_is_terminal probe so the pr_is_merged fast-path can fire."""
+    # Work row has a branch; sibling has none.
+    work = _done_work(assignment_id="w-nb", issue_number=42, branch="issue-42-fix")
+    # Sibling row has no branch — relies on work row's branch for the probe.
+    review = _ghost_sibling(
+        assignment_id="rv-nb", sibling_type="review",
+        review_state="pending", branch=None,
+    )
+    board = Board(completed=[work, review])
+
+    probed_branches: list[str | None] = []
+
+    from coord import github_ops, state  # noqa: PLC0415
+
+    def _track_terminal(repo, issue, branch, cache=None):
+        probed_branches.append(branch)
+        return True  # always terminal for this test
+
+    monkeypatch.setattr(github_ops, "work_is_terminal", _track_terminal)
+    monkeypatch.setattr(github_ops, "list_remote_branch_names", lambda repo: set())
+    monkeypatch.setattr(github_ops, "list_open_prs", lambda repo: [])
+    monkeypatch.setattr(state, "update_assignment_branch", lambda *a: None)
+    monkeypatch.setattr(state, "mark_assignment_merged", lambda *a: None)
+    monkeypatch.setattr(state, "mark_sibling_review_done", lambda *a: None)
+    monkeypatch.setattr(state, "mark_advisory_settled", lambda *a: None)
+
+    reconcile_board_merges(board, config)
+
+    # The sweep should have used the work row's branch for the sibling probe.
+    assert "issue-42-fix" in probed_branches, (
+        f"Expected 'issue-42-fix' in probed branches; got {probed_branches}"
+    )
