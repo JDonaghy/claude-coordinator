@@ -2499,3 +2499,206 @@ def test_auto_drain_error_isolation(
     after = mq.load_queue()
     assert len(after) == 1
     assert after[0].state == "pending"
+
+
+# ── #769 Phase 1: _milestone_drain_tick ──────────────────────────────────────
+
+
+def _make_milestone_config(tmp_path: "Path", *, auto_dispatch: bool = True) -> "Path":
+    """Write a coordinator.yml with milestone.auto_dispatch set and two
+    machines capable of repo "api", and return its path."""
+    content = (
+        "repos:\n"
+        "  - name: api\n"
+        "    github: acme/api\n"
+        "\n"
+        "machines:\n"
+        "  - name: laptop\n"
+        "    host: laptop.tailnet\n"
+        "    repos: [api]\n"
+        "    repo_paths:\n"
+        "      api: /tmp/api\n"
+        "  - name: server\n"
+        "    host: server.tailnet\n"
+        "    repos: [api]\n"
+        "    repo_paths:\n"
+        "      api: /tmp/api\n"
+        "\n"
+        f"milestone:\n"
+        f"  auto_dispatch: {'true' if auto_dispatch else 'false'}\n"
+    )
+    p = tmp_path / "coord-milestone.yml"
+    p.write_text(content)
+    return p
+
+
+_MILESTONE_TRACKING_BODY = """\
+## Work order
+- [ ] #762  {group: A}
+- [ ] #765  {after: #762}
+"""
+
+
+def test_milestone_auto_dispatch_config_default_off(valid_config_path: "Path") -> None:
+    """#769: milestone.auto_dispatch defaults to False when the milestone:
+    block is absent."""
+    cfg = load_config(valid_config_path)
+    assert cfg.milestone.auto_dispatch is False
+
+
+def test_milestone_drain_tick_noop_when_no_registrations(
+    tmp_path: "Path", rw_db
+) -> None:
+    from coord.serve_app import _milestone_drain_tick
+
+    cfg = load_config(_make_milestone_config(tmp_path))
+    assert _milestone_drain_tick(cfg) == []
+
+
+def test_milestone_drain_tick_dispatches_and_deregisters_when_complete(
+    tmp_path: "Path", rw_db, monkeypatch
+) -> None:
+    """#769 acceptance criteria wiring: a registered milestone whose only
+    remaining node is now ready gets dispatched and, once nothing is left
+    un-terminal, deregistered by the tick."""
+    from coord import state
+    from coord.serve_app import _milestone_drain_tick
+
+    state.register_milestone_drain(repo_name="api", tracking_issue=100)
+
+    def get_issue(repo, number):
+        if number == 100:
+            return {
+                "number": 100, "title": "tracking", "body": "## Work order\n- [ ] #762\n",
+                "state": "OPEN", "milestone": {"number": 9},
+            }
+        return {"number": 762, "title": "the work", "body": "", "state": "OPEN",
+                "milestone": {"number": 9}, "labels": []}
+
+    monkeypatch.setattr("coord.github_ops.get_issue", get_issue)
+    monkeypatch.setattr("coord.github_ops.get_open_issues", lambda repo: [
+        {"number": 762, "milestone": {"number": 9}}
+    ])
+    monkeypatch.setattr("coord.dispatch.dispatch", lambda proposal, config, **kw: {"id": "drain-1"})
+    monkeypatch.setattr("coord.github_ops.post_issue_comment", lambda *a, **kw: None)
+    monkeypatch.setattr("coord.github_ops.check_branch_exists", lambda *a, **kw: False)
+
+    cfg = load_config(_make_milestone_config(tmp_path))
+    outcomes = _milestone_drain_tick(cfg)
+
+    assert len(outcomes) == 1
+    assert outcomes[0].ok is True
+    assert outcomes[0].assignment_id == "drain-1"
+
+    records = state.load_dispatched()
+    assert len(records) == 1
+    assert records[0]["issue_number"] == 762
+
+    # #762 is still OPEN on GitHub in this fixture (dispatching doesn't close
+    # it), so the milestone context still shows it un-terminal -> the drain
+    # registration is intentionally left in place for the next tick, exactly
+    # like a manual `coord milestone dispatch` re-run would.
+    assert state.list_milestone_drains() == [{"repo_name": "api", "tracking_issue": 100}]
+
+
+def test_milestone_drain_tick_deregisters_fully_terminal_milestone(
+    tmp_path: "Path", rw_db, monkeypatch
+) -> None:
+    """Once every node in the work order is terminal, the tick deregisters
+    the milestone — nothing left to keep re-checking."""
+    from coord import state
+    from coord.serve_app import _milestone_drain_tick
+
+    state.register_milestone_drain(repo_name="api", tracking_issue=100)
+
+    def get_issue(repo, number):
+        if number == 100:
+            return {
+                "number": 100, "title": "tracking", "body": "## Work order\n- [ ] #762\n",
+                "state": "OPEN", "milestone": {"number": 9},
+            }
+        return {"number": 762, "title": "the work", "body": "", "state": "CLOSED",
+                "milestone": {"number": 9}, "labels": []}
+
+    monkeypatch.setattr("coord.github_ops.get_issue", get_issue)
+    monkeypatch.setattr("coord.github_ops.get_open_issues", lambda repo: [])
+
+    cfg = load_config(_make_milestone_config(tmp_path))
+    outcomes = _milestone_drain_tick(cfg)
+
+    assert outcomes == []  # nothing ready — #762 already terminal
+    assert state.list_milestone_drains() == []
+
+
+def test_milestone_drain_tick_fetch_error_does_not_deregister(
+    tmp_path: "Path", rw_db, monkeypatch
+) -> None:
+    """A transient GitHub fetch error must not silently drop the milestone
+    from the registry — it should be retried on the next tick."""
+    from coord import state
+    from coord.serve_app import _milestone_drain_tick
+
+    state.register_milestone_drain(repo_name="api", tracking_issue=100)
+    monkeypatch.setattr(
+        "coord.github_ops.get_issue",
+        lambda repo, number: (_ for _ in ()).throw(RuntimeError("rate limited")),
+    )
+
+    cfg = load_config(_make_milestone_config(tmp_path))
+    outcomes = _milestone_drain_tick(cfg)
+
+    assert outcomes == []
+    assert state.list_milestone_drains() == [{"repo_name": "api", "tracking_issue": 100}]
+
+
+def test_serve_milestone_drain_registers_row(
+    file_db: Path, valid_config_path: Path, rw_db
+):
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post(
+            "/milestone-drain",
+            json={"repo_name": "api", "tracking_issue": 100},
+        )
+    assert resp.status_code == 200
+    from coord import state
+
+    assert state.list_milestone_drains() == [{"repo_name": "api", "tracking_issue": 100}]
+
+
+def test_register_milestone_drain_routes_when_service_set(coord_db, monkeypatch):
+    from coord import client as cc
+    from coord import state
+
+    monkeypatch.setattr(
+        cc, "resolve_board_service", lambda *a, **k: cc.ServiceConfig("http://d:7435")
+    )
+    captured: dict = {}
+    monkeypatch.setattr(
+        cc, "post_record",
+        lambda svc, path, payload, **kw: captured.update(path=path, payload=payload) or {"ok": True},
+    )
+    state.register_milestone_drain(repo_name="api", tracking_issue=100)
+    assert captured["path"] == "/milestone-drain"
+    assert captured["payload"] == {"repo_name": "api", "tracking_issue": 100}
+    # Routed → no local row created.
+    assert state.list_milestone_drains() == []
+
+
+def test_register_milestone_drain_unset_writes_local(coord_db, monkeypatch):
+    from coord import state
+
+    state.register_milestone_drain(repo_name="api", tracking_issue=100)
+    assert state.list_milestone_drains() == [{"repo_name": "api", "tracking_issue": 100}]
+    # Idempotent re-registration.
+    state.register_milestone_drain(repo_name="api", tracking_issue=100)
+    assert state.list_milestone_drains() == [{"repo_name": "api", "tracking_issue": 100}]
+
+
+def test_deregister_milestone_drain_removes_only_matching_entry(coord_db):
+    from coord import state
+
+    state.register_milestone_drain(repo_name="api", tracking_issue=100)
+    state.register_milestone_drain(repo_name="web", tracking_issue=200)
+    state.deregister_milestone_drain(repo_name="api", tracking_issue=100)
+    assert state.list_milestone_drains() == [{"repo_name": "web", "tracking_issue": 200}]

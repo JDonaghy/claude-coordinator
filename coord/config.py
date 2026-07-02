@@ -330,6 +330,33 @@ class MergeConfig:
 
 
 @dataclass
+class MilestoneConfig:
+    """Milestone-driven-workflow configuration (#767 / #769 Phase 1).
+
+    ``auto_dispatch`` enables the daemon's tick loop to keep draining a
+    milestone's declared work order after ``coord milestone dispatch``
+    registers it: as issues reach a merged/terminal state, the newly-
+    unblocked ready frontier is recomputed and dispatched automatically —
+    no further human approval per issue, since the *declared* work order
+    (the `## Work order` block) was the one-time approval unit.
+    **Default-off** — with no ``milestone:`` block in ``coordinator.yml``
+    the daemon never auto-dispatches and existing behaviour is unchanged;
+    `coord milestone dispatch` still works as a one-shot manual drain.
+
+    When enabled, :func:`coord.serve_app._milestone_drain_tick` runs on
+    each daemon tick (after the reconcile step) for every milestone
+    registered via a non-dry-run `coord milestone dispatch` call, and
+    deregisters a milestone once its whole work order reaches a terminal
+    state.
+
+    Editing this wiring requires a **daemon restart** to take effect — the
+    tick loop's closures are captured at ``coord serve`` startup time.
+    """
+
+    auto_dispatch: bool = False
+
+
+@dataclass
 class CiStoreConfig:
     """Backend selection for CI check visibility (#240).
 
@@ -417,6 +444,7 @@ class Config:
     dispatch: DispatchConfig = field(default_factory=DispatchConfig)
     ci_store: CiStoreConfig = field(default_factory=CiStoreConfig)
     merge: MergeConfig = field(default_factory=MergeConfig)
+    milestone: MilestoneConfig = field(default_factory=MilestoneConfig)
     providers: ProvidersConfig = field(default_factory=ProvidersConfig)
     path: Path | None = None
 
@@ -462,6 +490,7 @@ def load(path: str | Path | None = None) -> Config:
     dispatch = _parse_dispatch(raw.get("dispatch"))
     ci_store = _parse_ci_store(raw.get("ci_store"))
     merge = _parse_merge(raw.get("merge"))
+    milestone = _parse_milestone(raw.get("milestone"))
     providers = _parse_providers(raw.get("providers"))
 
     return Config(
@@ -476,6 +505,7 @@ def load(path: str | Path | None = None) -> Config:
         dispatch=dispatch,
         ci_store=ci_store,
         merge=merge,
+        milestone=milestone,
         providers=providers,
         path=p,
     )
@@ -1002,6 +1032,28 @@ def _parse_merge(raw: Any) -> MergeConfig:
         if not isinstance(value, int) or value < 0:
             raise ConfigError("merge.max_per_tick must be a non-negative integer")
         cfg.max_per_tick = value
+    return cfg
+
+
+def _parse_milestone(raw: Any) -> MilestoneConfig:
+    """Parse the optional ``milestone:`` block from coordinator.yml.
+
+    An absent block returns ``MilestoneConfig()`` — ``auto_dispatch=False`` —
+    preserving existing behaviour: the daemon never auto-drains a milestone's
+    work order; `coord milestone dispatch` still dispatches the ready
+    frontier once per invocation.
+    """
+    if raw is None:
+        return MilestoneConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'milestone' must be a mapping")
+
+    cfg = MilestoneConfig()
+    if "auto_dispatch" in raw:
+        value = raw["auto_dispatch"]
+        if not isinstance(value, bool):
+            raise ConfigError("milestone.auto_dispatch must be a boolean")
+        cfg.auto_dispatch = value
     return cfg
 
 

@@ -1704,6 +1704,89 @@ def build_board() -> Board:
     return board
 
 
+def register_milestone_drain(*, repo_name: str, tracking_issue: int) -> None:
+    """Register a milestone for daemon auto-drain — routes to the daemon when set.
+
+    Called once, by a non-dry-run bulk ``coord milestone dispatch`` (#769
+    Phase 1) — the single explicit approval that lets the daemon's tick loop
+    (``coord.serve_app._milestone_drain_tick``, opt-in via
+    ``coordinator.yml`` ``milestone.auto_dispatch``) keep recomputing and
+    dispatching this milestone's ready frontier as declared-order
+    dependencies complete, with no further per-issue approval. Idempotent —
+    registering an already-registered ``(repo_name, tracking_issue)`` pair is
+    a no-op.
+    """
+    svc = _board_service()
+    resp = _route_write(
+        svc, "/milestone-drain",
+        {"repo_name": repo_name, "tracking_issue": tracking_issue},
+    )
+    if resp is not None:
+        return
+    _register_milestone_drain_local(repo_name=repo_name, tracking_issue=tracking_issue)
+
+
+def _register_milestone_drain_local(*, repo_name: str, tracking_issue: int) -> None:
+    conn = get_connection()
+    with conn:
+        drains = _load_milestone_drains_raw(conn)
+        key = (repo_name, tracking_issue)
+        if not any(
+            (d.get("repo_name"), d.get("tracking_issue")) == key for d in drains
+        ):
+            drains.append({"repo_name": repo_name, "tracking_issue": tracking_issue})
+            conn.execute(
+                "INSERT OR REPLACE INTO board_meta (key, value) VALUES "
+                "('milestone_drains', ?)",
+                (json.dumps(drains),),
+            )
+
+
+def list_milestone_drains() -> list[dict]:
+    """List milestones currently registered for daemon auto-drain.
+
+    Local-DB only (no thin-client routing) — the only caller is the daemon's
+    own tick loop, which always runs against the canonical DB directly.
+    """
+    conn = get_connection()
+    return _load_milestone_drains_raw(conn)
+
+
+def _load_milestone_drains_raw(conn: sqlite3.Connection) -> list[dict]:
+    row = conn.execute(
+        "SELECT value FROM board_meta WHERE key = 'milestone_drains'"
+    ).fetchone()
+    if row is None:
+        return []
+    try:
+        data = json.loads(row["value"])
+    except (TypeError, ValueError):
+        return []
+    return data if isinstance(data, list) else []
+
+
+def deregister_milestone_drain(*, repo_name: str, tracking_issue: int) -> None:
+    """Remove a milestone from the active-drain registry.
+
+    Local-DB only — called by the daemon's tick loop once a milestone's
+    whole work order reaches a terminal state (:func:`coord.
+    milestone_dispatch.is_milestone_complete`).
+    """
+    conn = get_connection()
+    with conn:
+        drains = _load_milestone_drains_raw(conn)
+        key = (repo_name, tracking_issue)
+        remaining = [
+            d for d in drains
+            if (d.get("repo_name"), d.get("tracking_issue")) != key
+        ]
+        conn.execute(
+            "INSERT OR REPLACE INTO board_meta (key, value) VALUES "
+            "('milestone_drains', ?)",
+            (json.dumps(remaining),),
+        )
+
+
 def _infer_review_state(board: Board, conn: sqlite3.Connection) -> None:
     """Set review_state on completed work assignments from their linked reviews.
 
