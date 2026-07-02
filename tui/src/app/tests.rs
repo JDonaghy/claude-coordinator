@@ -9143,6 +9143,34 @@
     }
 
     #[test]
+    fn drain_sse_watch_error_keeps_lines_and_times_in_lockstep() {
+        // #899 regression: the SSE-error arm surfaces a "[sse error]" line in
+        // `sse.lines`. It MUST push a matching `sse.line_times` entry — the
+        // render cache-extend path (render.rs) derives slice indices from
+        // `lines.len()` and applies them to `line_times`, so any desync panics
+        // ("range start index N out of range for slice of length 0"). Before
+        // the fix this arm pushed to `lines` only, leaving line_times empty.
+        let mut app = make_app_default();
+        let (state, tx) = make_sse_state_pair();
+        install_watch_ctx(&mut app, state);
+
+        tx.send(SseWatchMsg::Error("connection refused".to_string()))
+            .unwrap();
+        app.drain_sse_watch();
+
+        let sse = &app.watch_pool[TEST_AID].sse;
+        assert!(
+            !sse.lines.is_empty(),
+            "the [sse error] line should be surfaced in the log"
+        );
+        assert_eq!(
+            sse.lines.len(),
+            sse.line_times.len(),
+            "lines/line_times must stay in lockstep after an SSE error (#899)"
+        );
+    }
+
+    #[test]
     fn drain_sse_watch_stops_after_three_errors() {
         let mut app = make_app_default();
         let (state, _tx) = make_sse_state_pair(); // tx unused; rx gets replaced below
