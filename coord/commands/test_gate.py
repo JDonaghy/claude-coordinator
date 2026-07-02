@@ -1,12 +1,15 @@
 """Test-gate commands: `test` (pull/record verdict), `test-plan`,
 `set-test-mode`. Extracted from coord/cli.py (#747).
 
-Note: `test_cmd` (the original ``@main.command("test", ...)`` "queue a
-smoke test" command) is dead code in the pre-#747 cli.py too — the later
+#615: the original ``@main.command("test", ...)`` "queue a smoke test"
+command (`test_cmd`) was dead code even in the pre-#747 cli.py — the
 `test` function below registers the same Click command name "test" and
-wins (last registration in main.commands wins). Preserved here exactly as
-found: cli.py registers test_cmd then test, in that order, so the shadow
-is unchanged. Not fixed in this PR — pure refactor, no functional change.
+always won (last registration in main.commands wins), so `test_cmd` could
+never run. It also called `build_board()`/`load_board()`/`save_board()`
+unconditionally, unlike every reachable board-mutating command, which are
+now daemon-routed (see the #615 audit note via `coord context show
+claude-coordinator 615`). Removed rather than migrated, since routing
+dead code would be pure ceremony.
 """
 
 from __future__ import annotations
@@ -161,65 +164,6 @@ def _maybe_reconcile_branch(
     _ = original_error
     _ = config
     return real_branch
-
-
-@click.command("test", help="Queue a smoke test for a completed assignment.")
-@click.argument("assignment_id")
-@_CONFIG_OPTION
-def test_cmd(assignment_id: str, config_path: Path) -> None:
-    from coord.smoke import dispatch_smoke
-    from coord.state import build_board, load_board, save_board
-
-    cfg = _load_config(config_path)
-    board = load_board() or build_board()
-
-    assignment = board.find_by_id(assignment_id)
-    if assignment is None:
-        click.echo(f"error: assignment {assignment_id!r} not found in board", err=True)
-        sys.exit(1)
-    if assignment.status != "done":
-        click.echo(
-            f"error: assignment {assignment_id} is {assignment.status!r}, "
-            "smoke can only run on done work assignments",
-            err=True,
-        )
-        sys.exit(1)
-    if assignment.type != "work":
-        click.echo(
-            f"error: assignment {assignment_id} is type {assignment.type!r}; "
-            "only 'work' assignments get smoke tests",
-            err=True,
-        )
-        sys.exit(1)
-
-    from coord.claim import has_active_followup
-
-    if has_active_followup(
-        board, of_assignment_id=assignment_id, assignment_type="smoke"
-    ):
-        click.echo(
-            f"error: a smoke test for assignment {assignment_id} is already "
-            "running. Use `coord status` to see it.",
-            err=True,
-        )
-        sys.exit(1)
-
-    cfg.smoke_tests.auto_queue = True
-    smoke = dispatch_smoke(assignment, board, cfg)
-    if smoke is None:
-        click.echo(
-            "No smoke test was queued. Possible reasons: no matching "
-            "capability_rules, no capable machine, or HTTP failure reaching "
-            "the agent.",
-            err=True,
-        )
-        sys.exit(1)
-
-    save_board(board)
-    click.echo(
-        f"Smoke test {smoke.assignment_id} queued on {smoke.machine_name} "
-        f"for branch {smoke.branch}"
-    )
 
 
 @click.command(

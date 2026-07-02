@@ -86,7 +86,6 @@ from coord.commands.test_gate import (
     _get_assignment_branch_head,  # noqa: F401 — re-exported for tests
     set_test_mode,
     test,
-    test_cmd,
     test_plan_cmd,
 )
 from coord.commands.chat import (
@@ -208,12 +207,7 @@ def main() -> None:
 
 
 # Registration order below matches the historical decoration order in the
-# pre-#747 cli.py exactly. This matters for one pair: test_cmd ("queue a
-# smoke test", registered first) and test ("pull/record verdict", registered
-# second) both claim the Click command name "test" — the later add_command
-# wins, same as the later @main.command(...) decorator used to win. See
-# coord/commands/test_gate.py's module docstring for the (pre-existing, not
-# fixed here) detail.
+# pre-#747 cli.py exactly.
 main.add_command(version)
 main.add_command(config_cmd)
 main.add_command(init)
@@ -230,7 +224,6 @@ main.add_command(stop)
 main.add_command(report_result)
 main.add_command(verify_merge)
 main.add_command(set_review_findings)
-main.add_command(test_cmd)
 main.add_command(retry)
 main.add_command(pull_artifact)
 main.add_command(bounce)
@@ -257,7 +250,7 @@ main.add_command(notify)
 main.add_command(post_pending_reviews)
 main.add_command(merge)
 main.add_command(resume)
-main.add_command(test)  # wins over test_cmd's "test" registration above
+main.add_command(test)
 main.add_command(test_plan_cmd)
 main.add_command(split)
 main.add_command(done)
