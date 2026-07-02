@@ -75,6 +75,57 @@ def edit_issue(
         )
 
 
+def create_milestone(
+    repo: str,
+    title: str,
+    *,
+    description: str | None = None,
+    due_on: str | None = None,
+) -> dict:
+    """Create a GitHub milestone via ``gh api POST .../milestones`` (#645 seam).
+
+    The GitHub backend of the milestone-tracker seam
+    (``coord.state.write_milestone``) — GitLab / bare-DB adapters slot in
+    alongside this later, same as ``edit_issue``. ``due_on`` is an ISO 8601
+    timestamp (e.g. ``"2026-08-01T00:00:00Z"``) per the GitHub API; this
+    layer does not validate the format, it just forwards it. Returns the
+    created milestone's JSON (``number``, ``title``, ``description``,
+    ``due_on``, ``html_url``, ...).
+    """
+    args = ["api", f"repos/{repo}/milestones", "-f", f"title={title}"]
+    if description is not None:
+        args += ["-f", f"description={description}"]
+    if due_on is not None:
+        args += ["-f", f"due_on={due_on}"]
+    raw = _gh(*args)
+    return json.loads(raw)
+
+
+def edit_milestone(
+    repo: str,
+    number: int,
+    *,
+    title: str | None = None,
+    description: str | None = None,
+    due_on: str | None = None,
+) -> dict:
+    """Edit a GitHub milestone's title/description/due date via
+    ``gh api -X PATCH .../milestones/{number}`` (#645 seam, mirrors
+    ``edit_issue``). A no-op (all three fields ``None``) returns ``{}``
+    without shelling out. Returns the updated milestone's JSON."""
+    if title is None and description is None and due_on is None:
+        return {}
+    args = ["api", "-X", "PATCH", f"repos/{repo}/milestones/{number}"]
+    if title is not None:
+        args += ["-f", f"title={title}"]
+    if description is not None:
+        args += ["-f", f"description={description}"]
+    if due_on is not None:
+        args += ["-f", f"due_on={due_on}"]
+    raw = _gh(*args)
+    return json.loads(raw)
+
+
 def close_issue(repo: str, issue_number: int, *, comment: str | None = None) -> None:
     """Close a GitHub issue, optionally posting *comment* first.
 

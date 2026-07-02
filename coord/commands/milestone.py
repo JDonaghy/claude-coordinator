@@ -30,7 +30,115 @@ from coord.milestone_dispatch import (
 
 @click.group("milestone")
 def milestone_group() -> None:
-    """Milestone work-order operations (#767)."""
+    """Milestone work-order operations (#767 Phase 0) + the milestone write
+    seam (#645)."""
+
+
+@milestone_group.command(
+    "create",
+    help=(
+        "Create a GitHub milestone through the backend-agnostic tracker seam. "
+        "REPO is the local repo name from coordinator.yml. Prints the new "
+        "milestone number on success. Routes through the daemon seam so "
+        "agents (notably the milestone-chat session) never call `gh` "
+        "directly."
+    ),
+)
+@click.argument("repo")
+@click.option("--title", required=True, help="Milestone title.")
+@click.option("--description", default=None, help="Milestone description (markdown).")
+@click.option(
+    "--due-on",
+    default=None,
+    help="Due date, ISO 8601 (e.g. 2026-08-01T00:00:00Z).",
+)
+@_CONFIG_OPTION
+def milestone_create_cmd(
+    repo: str,
+    title: str,
+    description: str | None,
+    due_on: str | None,
+    config_path: Path,
+) -> None:
+    cfg = _load_config(config_path)
+    repo_entry = cfg.repo(repo)
+    if repo_entry is None:
+        click.echo(f"error: unknown repo {repo!r}", err=True)
+        sys.exit(2)
+
+    from coord.state import write_milestone
+
+    try:
+        result = write_milestone(
+            repo,
+            title=title,
+            description=description,
+            due_on=due_on,
+            repo_github=repo_entry.github,
+        )
+    except Exception as e:  # noqa: BLE001
+        click.echo(f"error: milestone create failed: {e}", err=True)
+        sys.exit(1)
+    click.echo(
+        f"milestone #{result.get('number')} created ({repo_entry.github}): "
+        f"{result.get('title')}"
+    )
+
+
+@milestone_group.command(
+    "edit",
+    help=(
+        "Edit a GitHub milestone's title/description/due date. REPO is the "
+        "local repo name from coordinator.yml; NUMBER is the GH milestone "
+        "number. Provide at least one of --title/--description/--due-on. "
+        "Routes through the backend-agnostic tracker seam."
+    ),
+)
+@click.argument("repo")
+@click.argument("number", type=int)
+@click.option("--title", default=None, help="New milestone title.")
+@click.option("--description", default=None, help="New milestone description (markdown).")
+@click.option(
+    "--due-on",
+    default=None,
+    help="New due date, ISO 8601 (e.g. 2026-08-01T00:00:00Z).",
+)
+@_CONFIG_OPTION
+def milestone_edit_cmd(
+    repo: str,
+    number: int,
+    title: str | None,
+    description: str | None,
+    due_on: str | None,
+    config_path: Path,
+) -> None:
+    cfg = _load_config(config_path)
+    repo_entry = cfg.repo(repo)
+    if repo_entry is None:
+        click.echo(f"error: unknown repo {repo!r}", err=True)
+        sys.exit(2)
+    if title is None and description is None and due_on is None:
+        click.echo(
+            "error: provide --title and/or --description and/or --due-on",
+            err=True,
+        )
+        sys.exit(2)
+
+    from coord.state import write_milestone
+
+    try:
+        write_milestone(
+            repo,
+            number=number,
+            title=title,
+            description=description,
+            due_on=due_on,
+            repo_github=repo_entry.github,
+        )
+    except Exception as e:  # noqa: BLE001
+        click.echo(f"error: milestone edit failed: {e}", err=True)
+        sys.exit(1)
+    click.echo(f"milestone #{number} updated ({repo_entry.github})")
 
 
 @milestone_group.command(
