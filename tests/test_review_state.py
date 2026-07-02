@@ -818,6 +818,38 @@ class TestStatusReviewStateDisplay:
         assert "[⚠ iteration cap hit" in output
         assert "Cap hit task" in output
 
+    def test_status_shows_no_eligible_reviewer_blocker(
+        self, config_file: Path, cli_coord_dir: Path
+    ) -> None:
+        """#904: review_state='no_eligible_reviewer' (set when every reviewer
+        candidate definitively rejects the dispatch) shows the dedicated
+        '⚠ No reviewer available' block AND the matching tag in the completed
+        work listing — mirroring the branch_not_on_remote surfacing so the
+        stall is operator-visible instead of only a log.error() line."""
+        board = Board(
+            completed=[
+                Assignment(
+                    machine_name="laptop",
+                    repo_name="api",
+                    issue_number=904,
+                    issue_title="No reviewer task",
+                    assignment_id="w-noreviewer",
+                    status="done",
+                    type="work",
+                    review_state="no_eligible_reviewer",
+                    finished_at=6.0,
+                )
+            ]
+        )
+        save_board(board)
+
+        with patch("coord.network.check_all", return_value=[]):
+            output = self._run_status(config_file)
+
+        assert "⚠ No reviewer available" in output
+        assert "[⚠ no reviewer available" in output
+        assert "No reviewer task" in output
+
     def test_status_only_shows_work_type_assignments(
         self, config_file: Path, cli_coord_dir: Path
     ) -> None:

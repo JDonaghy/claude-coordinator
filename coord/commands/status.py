@@ -302,6 +302,29 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
                 f" then re-run 'coord notify' to retry review dispatch."
             )
 
+    # #904: no-eligible-reviewer blockers — every configured candidate machine
+    # definitively rejected the review dispatch (drifted coordinator.yml vs.
+    # an agent's actual `/health` repos list, most commonly). Mirrors the
+    # branch-not-on-remote block above so this stall is operator-visible
+    # instead of only a log.error() line.
+    no_eligible_reviewer = [
+        a for a in board.completed
+        if a.type == "work" and a.review_state == "no_eligible_reviewer"
+    ]
+    if no_eligible_reviewer:
+        click.echo("")
+        click.echo("⚠ No reviewer available (review blocked — all candidates rejected):")
+        for a in no_eligible_reviewer:
+            click.echo(
+                f"  #{a.issue_number}: {a.issue_title} ({a.repo_name})"
+                f"  [no eligible reviewer]"
+            )
+            click.echo(
+                "    Every configured machine for this repo rejected the dispatch."
+                " Check that each agent's /health 'repos' list matches coordinator.yml,"
+                " then re-run 'coord notify' to retry review dispatch."
+            )
+
     # Show completed work assignments with review lifecycle state.
     _REVIEW_STATE_TAGS = {
         "pending": "[awaiting review]",
@@ -309,6 +332,7 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
         "done": "[review done]",
         "cap_hit": "[⚠ iteration cap hit — manual action required]",
         "branch_not_on_remote": "[⚠ branch not on remote — push required]",
+        "no_eligible_reviewer": "[⚠ no reviewer available — check agent /health vs coordinator.yml]",
     }
     work_completed = [a for a in board.completed if a.type == "work"]
     if work_completed:

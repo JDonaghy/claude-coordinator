@@ -1063,12 +1063,28 @@ def dispatch_review(
             # (e.g. 400 "does not handle repo 'x'").  Try the next candidate
             # instead of silently returning None and leaving review_state as
             # 'pending' (#904).
-            log.warning(
-                "[review] agent %s rejected dispatch with HTTP %d — "
-                "trying next reviewer candidate",
-                machine.name, exc.response.status_code,
-            )
-            had_rejection = True
+            #
+            # #904 (fix #2): only a 4xx is a *definitive* rejection — it means
+            # the agent looked at the request and refused it (bad repo, bad
+            # payload, etc.), which is a config-drift signal.  A 5xx means the
+            # agent's own handler blew up (mid-restart, disk full, unhandled
+            # exception) and says nothing about whether this agent/repo pairing
+            # is valid — treat it like the transient network branch below so
+            # the row stays "pending" and retries next pass instead of
+            # permanently stalling as "no_eligible_reviewer".
+            if exc.response.is_client_error:
+                log.warning(
+                    "[review] agent %s rejected dispatch with HTTP %d — "
+                    "trying next reviewer candidate",
+                    machine.name, exc.response.status_code,
+                )
+                had_rejection = True
+            else:
+                log.warning(
+                    "[review] agent %s returned server error HTTP %d (transient) — "
+                    "trying next reviewer candidate",
+                    machine.name, exc.response.status_code,
+                )
             continue
         except (httpx.HTTPError, httpx.TimeoutException) as exc:
             # Transient network failure — try next candidate, and if all

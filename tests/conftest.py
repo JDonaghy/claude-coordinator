@@ -36,6 +36,23 @@ def _no_board_service(monkeypatch, tmp_path):
     monkeypatch.setattr(_cc, "CLIENT_TOML", tmp_path / "absent-client.toml")
 
 
+@pytest.fixture(autouse=True)
+def _no_agent_health_probe(monkeypatch):
+    """#904: default the reviewer /health pre-filter to fail-open (``None``)
+    so tests that don't pass ``health_checker=`` to ``dispatch_review``
+    (nearly all of them) never make a real ``httpx.get(".../health")`` call.
+    Previously this fell through to the real ``_fetch_agent_advertised_repos``,
+    which resolved fast locally (NXDOMAIN) but made the suite's default
+    behavior depend on network/DNS timing rather than being fully hermetic.
+    Tests exercising the health-filter itself pass an explicit
+    ``health_checker=`` to ``dispatch_review``, which takes priority over this
+    default and is unaffected by this stub.
+    """
+    monkeypatch.setattr(
+        "coord.review._fetch_agent_advertised_repos", lambda *a, **k: None
+    )
+
+
 def output_and_stderr(result) -> str:
     """CLI text across click versions: newer click separates stderr; older
     mixes it into .output and raises on .stderr access."""
