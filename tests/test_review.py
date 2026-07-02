@@ -469,6 +469,33 @@ class _AllRejectingClient:
         return _BadRequestResponse()
 
 
+class _ServerErrorResponse:
+    """Simulates a transient agent 500 (mid-restart, unhandled exception, #904
+    fix #2) — NOT a definitive "this agent doesn't handle this repo" rejection."""
+
+    def raise_for_status(self) -> None:
+        import httpx
+        raise httpx.HTTPStatusError(
+            "500 Internal Server Error",
+            request=httpx.Request("POST", "http://test/assign"),
+            response=httpx.Response(500, text='{"error": "internal error"}'),
+        )
+
+    def json(self) -> dict:
+        return {"error": "internal error"}
+
+
+class _AllServerErrorClient:
+    """HTTP client that always returns 500 (#904 fix #2 transient-5xx test)."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def post(self, url: str, *, json: dict, timeout: float):
+        self.calls.append(url)
+        return _ServerErrorResponse()
+
+
 def test_dispatch_review_skipped_when_disabled(two_machine_config: Config) -> None:
     cfg = replace(two_machine_config, reviews=ReviewsConfig(enabled=False))
     board = Board()
@@ -1824,6 +1851,43 @@ def test_dispatch_review_sets_stall_state_when_all_candidates_rejected(
         f"expected 'no_eligible_reviewer', got {completed.review_state!r}"
     )
     # Both candidates were tried — not just the first.
+    assert len(client.calls) == 2, (
+        f"expected 2 POST attempts (one per candidate), got {len(client.calls)}"
+    )
+
+
+def test_dispatch_review_leaves_pending_when_all_candidates_5xx(
+    two_machine_config: Config,
+) -> None:
+    """Fix #2 (#904): a 5xx from every candidate is a TRANSIENT failure (agent
+    mid-restart, unhandled exception, etc.) — it says nothing about whether
+    this agent/repo pairing is valid, unlike a 4xx.  ``dispatch_review`` must
+    NOT set ``review_state='no_eligible_reviewer'`` in this case; the row
+    should stay eligible (``review_state`` untouched / still pending) so the
+    next reconcile/notify pass retries automatically, exactly like the
+    existing network-unreachable branch."""
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    client = _AllServerErrorClient()
+
+    result = dispatch_review(
+        completed, board, two_machine_config,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {"number": 3, "url": "u", "existed": True},
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+        remote_branch_checker=lambda repo, branch: True,
+        health_checker=lambda host: None,
+    )
+
+    assert result is None
+    assert board.active == []
+    # NOT 'no_eligible_reviewer' — a 5xx is transient, not a definitive
+    # rejection, so the caller (dispatch_pending_reviews) must retry it.
+    assert completed.review_state != "no_eligible_reviewer", (
+        f"5xx must not be treated as a definitive rejection, got "
+        f"review_state={completed.review_state!r}"
+    )
     assert len(client.calls) == 2, (
         f"expected 2 POST attempts (one per candidate), got {len(client.calls)}"
     )
