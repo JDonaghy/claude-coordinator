@@ -641,6 +641,15 @@ pub(crate) struct MergeQueueEntry {
     /// milestone or the issue row is absent from `open_issues`.
     #[serde(default)]
     pub(crate) milestone_title: Option<String>,
+    /// Unix timestamp of the last merge attempt (`coord/merge_queue.py` sets
+    /// this immediately before calling `gh pr merge`, and leaves it untouched
+    /// on success) — for a `state == "merged"` entry this IS the merge time.
+    /// #913: the Pipeline Done section's recency window + sort use this (via
+    /// `issue_done_at`) instead of the work assignment's `finished_at`, so a
+    /// freshly-merged item lands in Done immediately rather than being keyed
+    /// off however long ago the work itself finished.
+    #[serde(default)]
+    pub(crate) last_attempt: Option<f64>,
 }
 
 /// One entry in the server-side merge plan from #776.

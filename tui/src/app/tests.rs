@@ -2974,6 +2974,7 @@
             error: None,
             branch: None,
             milestone_title: None,
+            last_attempt: None,
         });
         seed_open_issue_records(&mut app, "repo-a", &[7]);
         let cache = app.board_issues_cache.clone();
@@ -3946,6 +3947,7 @@
             error: None,
             branch: None,
             milestone_title: None,
+            last_attempt: None,
         });
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
         assert_eq!(section, "done");
@@ -4045,6 +4047,7 @@
             error: None,
             branch: None,
             milestone_title: None,
+            last_attempt: None,
         });
 
         // Real state takes over — the merge_queue entry exists, so the
@@ -4101,6 +4104,7 @@
                 error: None,
                 branch: None,
                 milestone_title: None,
+                last_attempt: None,
             }],
             ..BoardData::default()
         };
@@ -6000,6 +6004,7 @@
             error: None,
             branch: None,
             milestone_title: None,
+            last_attempt: None,
         });
         assert!(app.merge_blocked_on_review_for_selected_issue());
     }
@@ -6020,6 +6025,7 @@
             error: None,
             branch: None,
             milestone_title: None,
+            last_attempt: None,
         });
         // An approved review on the board unblocks the merge.
         let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
@@ -6045,6 +6051,7 @@
             error: None,
             branch: None,
             milestone_title: None,
+            last_attempt: None,
         });
         let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
         review.review_of_assignment_id = Some("w42".to_string());
@@ -6071,6 +6078,7 @@
             error: None,
             branch: None,
             milestone_title: None,
+            last_attempt: None,
         });
         assert!(!app.merge_blocked_on_review_for_selected_issue());
     }
@@ -6108,6 +6116,7 @@
             error: None,
             branch: None,
             milestone_title: None,
+            last_attempt: None,
         });
         let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
         review.review_of_assignment_id = Some("w42".to_string());
@@ -6138,6 +6147,7 @@
             error: None,
             branch: None,
             milestone_title: None,
+            last_attempt: None,
         });
         let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
         review.review_of_assignment_id = Some("w42".to_string());
@@ -6179,6 +6189,7 @@
             error: None,
             branch: None,
             milestone_title: None,
+            last_attempt: None,
         });
         // Work assignment carries review_verdict='approve' directly — no
         // separate review assignment is present (the self-approval case).
@@ -6214,6 +6225,7 @@
             error: None,
             branch: None,
             milestone_title: None,
+            last_attempt: None,
         });
         assert_eq!(
             app.pipeline_merge_state(),
@@ -6240,6 +6252,7 @@
             error: None,
             branch: None,
             milestone_title: None,
+            last_attempt: None,
         });
         let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
         review.review_of_assignment_id = Some("w42".to_string());
@@ -6310,6 +6323,7 @@
             error: None,
             branch: None,
             milestone_title: None,
+            last_attempt: None,
         });
         let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
         review.review_of_assignment_id = Some("w42".to_string());
@@ -6360,6 +6374,7 @@
             error: None,
             branch: None,
             milestone_title: None,
+            last_attempt: None,
         });
 
         // Original work (done, request-changes review).
@@ -6456,6 +6471,7 @@
             error: None,
             branch: None,
             milestone_title: None,
+            last_attempt: None,
         });
 
         let mut orig_work = _stage_assignment("orig-work", "work", 100.0, "done");
@@ -6503,6 +6519,7 @@
             error: None,
             branch: None,
             milestone_title: None,
+            last_attempt: None,
         });
 
         // Bounce scenario: original request-changes, fix approved.
@@ -6561,6 +6578,7 @@
             error: None,
             branch: None,
             milestone_title: None,
+            last_attempt: None,
         });
         let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
         review.review_of_assignment_id = Some("w42".to_string());
@@ -7291,6 +7309,7 @@
             error: None,
             branch: None,
             milestone_title: None,
+            last_attempt: None,
         });
         let issue = &app.pipeline_issues[0];
         // Lifecycle section must say "done" (open-but-merged path).
@@ -7317,6 +7336,7 @@
             error: None,
             branch: None,
             milestone_title: None,
+            last_attempt: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.pipeline_lifecycle_section(issue), "done");
@@ -7848,6 +7868,7 @@
             error: None,
             branch: None,
             milestone_title: None,
+            last_attempt: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "merge"), StageStatus::Done);
@@ -7868,6 +7889,7 @@
             error: None,
             branch: None,
             milestone_title: None,
+            last_attempt: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "merge"), StageStatus::Active);
@@ -7891,6 +7913,7 @@
             error: None,
             branch: None,
             milestone_title: None,
+            last_attempt: None,
         });
 
         // Failing CI → Failed.
@@ -7992,6 +8015,7 @@
             error: None,
             branch: None,
             milestone_title: None,
+            last_attempt: None,
         }
     }
 
@@ -8379,6 +8403,7 @@
             error: None,
             branch: None,
             milestone_title: None,
+            last_attempt: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         for stage in &view.stages {
@@ -9911,6 +9936,7 @@
             error: None,
             branch: None,
             milestone_title: None,
+            last_attempt: None,
         });
         // Seed the cache directly — bypasses the gh subprocess.
         app.fetched_prs_cache.borrow_mut().insert(
@@ -9984,6 +10010,7 @@
             error: None,
             branch: None,
             milestone_title: None,
+            last_attempt: None,
         });
         // Seed the cache with a fully populated PR including review.
         app.fetched_prs_cache.borrow_mut().insert(
@@ -10060,6 +10087,7 @@
             error: None,
             branch: None,
             milestone_title: None,
+            last_attempt: None,
         });
         app.fetched_prs_cache.borrow_mut().insert(
             ("acme/api".to_string(), 244),
@@ -10121,6 +10149,7 @@
             error: None,
             branch: None,
             milestone_title: None,
+            last_attempt: None,
         });
         // Pre-populate `pending_pr_fetches` so `pr_info_for_issue`
         // doesn't actually shell out to gh during the test.  An empty
@@ -10742,6 +10771,7 @@
                 error: None,
                 branch: None,
                 milestone_title: None,
+                last_attempt: None,
             }],
             ..BoardData::default()
         });
@@ -12186,6 +12216,7 @@
             error: None,
             branch: None,
             milestone_title: None,
+            last_attempt: None,
         });
 
         let toasts_before = app.toasts.len();
@@ -12466,6 +12497,7 @@
             error: None,
             branch: None,
             milestone_title: None,
+            last_attempt: None,
         });
         let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
         review.issue_number = 42;
@@ -12617,6 +12649,7 @@
             error: Some("CI check failed: build".to_string()),
             branch: None,
             milestone_title: None,
+            last_attempt: None,
         });
         let briefing = app.troubleshoot_briefing("api", 42);
         assert!(
@@ -12852,6 +12885,7 @@
             error: None,
             branch: None,
             milestone_title: None,
+            last_attempt: None,
         });
         // Query the helper directly rather than via rebuild so we don't trip
         // the "same issue — skip auto-focus" guard.
@@ -12953,6 +12987,7 @@
             error: None,
             branch: None,
             milestone_title: None,
+            last_attempt: None,
         });
         // #738: last per-issue stage is now "review" (merge removed).
         let stages = app.pipeline_stage_names_for_issue(&app.pipeline_issues[0]);
@@ -18748,6 +18783,7 @@
             error: None,
             branch: None,
             milestone_title: None,
+            last_attempt: None,
         }
     }
 
@@ -20109,6 +20145,7 @@
             error: None,
             branch: None,
             milestone_title: None,
+            last_attempt: None,
         }
     }
 
@@ -20124,6 +20161,7 @@
             error: Some(error.to_string()),
             branch: None,
             milestone_title: None,
+            last_attempt: None,
         }
     }
 
@@ -21070,6 +21108,7 @@
             error: None,
             branch: Some(branch.clone()), // same branch as the fix
             milestone_title: None,
+            last_attempt: None,
         };
 
         let gates = vec!["review".to_string(), "test".to_string(), "merge".to_string()];
@@ -21249,6 +21288,179 @@
         assert_eq!(app.pipeline_issues[windowed[0]].number, 20, "newest first");
         assert_eq!(app.pipeline_issues[windowed[1]].number, 30, "middle");
         assert_eq!(app.pipeline_issues[windowed[2]].number, 10, "oldest last");
+    }
+
+    #[test]
+    fn done_windowed_uses_merge_time_not_work_finish_time() {
+        // #913: the concrete #769 case — work finished hours ago (outside
+        // the default H2 window) but the merge landed seconds ago. The Done
+        // section must key off the merge_queue entry's `last_attempt`
+        // (merge time), not the work assignment's `finished_at`, so the
+        // item shows up immediately instead of only after widening the
+        // window. A second, older-merged issue proves the sort follows
+        // merge time too: it "finished" work more recently than #769 but
+        // merged earlier, so it must sort *below* #769.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+
+        let mut app = make_test_app(BoardData {
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            assignments: vec![
+                // Work for #769 finished 5h ago — well outside the H2 window
+                // on `finished_at` alone.
+                finished_assignment_ago("a-769", 769, "api", 5.0 * 3600.0),
+                // #20's work finished more recently than #769's, but it
+                // merged earlier — ordering must follow the merge, not this.
+                finished_assignment_ago("a-20", 20, "api", 1.0 * 3600.0),
+            ],
+            merge_queue: vec![
+                MergeQueueEntry {
+                    assignment_id: "a-769".to_string(),
+                    issue_number: Some(769),
+                    state: "merged".to_string(),
+                    pr_number: Some(910),
+                    pr_url: None,
+                    repo_github: "acme/api".to_string(),
+                    target_branch: None,
+                    error: None,
+                    branch: None,
+                    milestone_title: None,
+                    last_attempt: Some(now - 30.0), // merged 30s ago
+                },
+                MergeQueueEntry {
+                    assignment_id: "a-20".to_string(),
+                    issue_number: Some(20),
+                    state: "merged".to_string(),
+                    pr_number: Some(21),
+                    pr_url: None,
+                    repo_github: "acme/api".to_string(),
+                    target_branch: None,
+                    error: None,
+                    branch: None,
+                    milestone_title: None,
+                    last_attempt: Some(now - 20.0 * 60.0), // merged 20m ago
+                },
+            ],
+            ..BoardData::default()
+        });
+        // Still open on GitHub (the brain hasn't synced the close yet) —
+        // Done classification must come from the merge_queue entry, not
+        // `is_closed`, mirroring the live #769 scenario.
+        let mut issue_769 = closed_issue(769, "acme/api", "api");
+        issue_769.is_closed = false;
+        let mut issue_20 = closed_issue(20, "acme/api", "api");
+        issue_20.is_closed = false;
+        app.pipeline_issues = vec![issue_769, issue_20];
+        app.done_window = DoneWindow::H2;
+        app.rebuild_pipeline_sidebar(None);
+
+        let windowed = app.pipeline_done_windowed();
+        assert_eq!(
+            windowed.len(),
+            2,
+            "both merged-recently issues show at the default H2 window \
+             despite work having finished hours ago"
+        );
+        assert_eq!(
+            app.pipeline_issues[windowed[0]].number, 769,
+            "most-recently-merged (#769, merged 30s ago) sorts first"
+        );
+        assert_eq!(
+            app.pipeline_issues[windowed[1]].number, 20,
+            "older merge (#20, merged 20m ago) sorts second"
+        );
+    }
+
+    #[test]
+    fn done_windowed_excludes_recently_worked_but_unmerged_item() {
+        // Companion to the above: an item worked on recently but NOT yet
+        // merged must not appear in Done, even though its `finished_at` is
+        // fresh — only a closed issue or a merged queue entry makes Done.
+        let mut app = make_test_app(BoardData {
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            assignments: vec![
+                finished_assignment_ago("a-30", 30, "api", 60.0), // 1 min ago
+            ],
+            ..BoardData::default()
+        });
+        let mut issue_30 = closed_issue(30, "acme/api", "api");
+        issue_30.is_closed = false; // still open, not merged
+        app.pipeline_issues = vec![issue_30];
+        app.done_window = DoneWindow::H2;
+        app.rebuild_pipeline_sidebar(None);
+
+        let windowed = app.pipeline_done_windowed();
+        assert!(
+            windowed.is_empty(),
+            "recently-worked-but-unmerged issue must not appear in Done"
+        );
+    }
+
+    #[test]
+    fn done_section_renders_freshly_merged_issue_despite_stale_work_finish_time() {
+        // #913 acceptance (rendered, not just internal state): a TuiDriver
+        // check that a freshly-merged issue whose work finished outside the
+        // default window still shows up in the *rendered* Done section.
+        use quadraui::tui::testing::driver_with_shell;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let mut app = make_test_app(BoardData {
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            assignments: vec![
+                finished_assignment_ago("a-769", 769, "api", 5.0 * 3600.0), // 5h ago
+            ],
+            merge_queue: vec![MergeQueueEntry {
+                assignment_id: "a-769".to_string(),
+                issue_number: Some(769),
+                state: "merged".to_string(),
+                pr_number: Some(910),
+                pr_url: None,
+                repo_github: "acme/api".to_string(),
+                target_branch: None,
+                error: None,
+                branch: None,
+                milestone_title: None,
+                last_attempt: Some(now - 30.0), // merged 30s ago
+            }],
+            ..BoardData::default()
+        });
+        let mut issue_769 = closed_issue(769, "acme/api", "api");
+        issue_769.is_closed = false; // GitHub close not yet synced, as in the live #769 case
+        app.pipeline_issues = vec![issue_769];
+        app.done_window = DoneWindow::H2;
+        app.rebuild_pipeline_sidebar(None);
+        // #815: Done starts collapsed by default; expand it so #769 is visible.
+        {
+            let search_offset = 1usize; // section 0 = FILTER widget
+            if let Some(done_idx) = app
+                .pipeline_state_section_names
+                .iter()
+                .position(|&k| k == "done")
+            {
+                app.pipeline_sidebar.set_collapsed(done_idx + search_offset, false);
+            }
+        }
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        driver.press(quadraui::Key::Char('3')); // switch to Pipeline view
+        let screen = driver.screen();
+
+        assert!(
+            screen.contains("Done") && screen.contains("last 2h"),
+            "Done header shows the default window\n{}",
+            screen,
+        );
+        assert!(
+            screen.contains("#769"),
+            "freshly-merged issue #769 renders in Done despite work having \
+             finished 5h ago (only the merge, 30s ago, is inside the window)\n{}",
+            screen,
+        );
     }
 
     #[test]

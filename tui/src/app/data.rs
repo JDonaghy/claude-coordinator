@@ -1119,7 +1119,7 @@ pub(crate) fn load_data() -> BoardData {
     let merge_queue: Vec<MergeQueueEntry> = {
         let stmt = conn.prepare(
             "SELECT mq.assignment_id, a.issue_number, mq.state, mq.pr_number, mq.pr_url, \
-             mq.repo_github, mq.target_branch, mq.error, a.branch \
+             mq.repo_github, mq.target_branch, mq.error, a.branch, mq.last_attempt \
              FROM merge_queue mq \
              LEFT JOIN assignments a ON mq.assignment_id = a.assignment_id",
         );
@@ -1141,6 +1141,8 @@ pub(crate) fn load_data() -> BoardData {
                         // milestone_title is filled in by the client-side join
                         // in assemble_board_data after open_issues are loaded.
                         milestone_title: None,
+                        // #913: merge time — see field doc on MergeQueueEntry.
+                        last_attempt: row.get::<_, Option<f64>>(9)?,
                     })
                 })
                 .map(|rows| rows.filter_map(|r| r.ok()).collect())
