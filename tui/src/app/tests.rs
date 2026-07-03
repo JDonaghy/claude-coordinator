@@ -450,6 +450,25 @@
         make_test_app(BoardData::default())
     }
 
+    /// §3 (#782): numeric view-switch keys (1-7) were removed from the real
+    /// key-dispatch path — views are discovered via the activity bar only.
+    /// TuiDriver tests that need to land on a specific view before exercising
+    /// something else must click its activity-bar icon instead of pressing a
+    /// digit. Panics with the rendered screen when the icon glyph can't be
+    /// found, so a layout/label regression fails loudly at the right call site.
+    fn click_activity_icon<A: quadraui::AppLogic>(
+        driver: &mut quadraui::tui::testing::TuiDriver<A>,
+        icon: &str,
+    ) {
+        let (x, y) = driver.find(icon).unwrap_or_else(|| {
+            panic!(
+                "#782: activity-bar icon {icon:?} not found:\n{}",
+                driver.screen()
+            )
+        });
+        driver.click(x, y);
+    }
+
     fn make_app_with_assignments(assignments: Vec<Assignment>) -> CoordApp {
         let mut app = make_test_app(BoardData {
             assignments,
@@ -20526,25 +20545,27 @@
 
     // ── TuiDriver black-box: Merge Queue panel ────────────────────────────────
 
-    /// #737 black-box (TuiDriver): pressing key '7' must switch to the Merge
-    /// Queue view and render the panel header.
+    /// #737 black-box (TuiDriver): clicking the Merge Queue activity-bar icon
+    /// (≣) must switch to the Merge Queue view and render the panel header.
+    /// §3 (#782): numeric key '7' no longer switches views — this exercises
+    /// the discoverable activity-bar route instead.
     #[test]
-    fn tuidriver_merge_queue_view_activated_by_key_7() {
+    fn tuidriver_merge_queue_view_activated_by_panel_click() {
         use quadraui::tui::testing::driver_with_shell;
 
         // Start on the default Board view — do NOT pre-set active_view.
-        // The test verifies that the '7' key binding actually routes to MergeQueue.
+        // The test verifies that clicking the icon actually routes to MergeQueue.
         let app = make_test_app(BoardData {
             merge_queue: vec![mq_entry_for_state("aid-1", 10, "pending", Some(5))],
             ..BoardData::default()
         });
-        // app.active_view is Board (the default) — press '7' to switch.
+        // app.active_view is Board (the default) — click the icon to switch.
         let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
-        driver.press(Key::Char('7'));
+        click_activity_icon(&mut driver, "≣");
 
         assert!(
             driver.screen_contains("MERGE QUEUE") || driver.screen_contains("Merge Queue"),
-            "pressing '7' must activate MergeQueue and render its panel:\n{}",
+            "clicking '≣' must activate MergeQueue and render its panel:\n{}",
             driver.screen()
         );
     }
@@ -21673,7 +21694,7 @@
         }
 
         let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
-        driver.press(quadraui::Key::Char('3')); // switch to Pipeline view
+        click_activity_icon(&mut driver, "▶"); // switch to Pipeline view
         let screen = driver.screen();
 
         assert!(
@@ -21726,7 +21747,7 @@
 
         let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
         // Switch to Pipeline view.
-        driver.press(quadraui::Key::Char('3'));
+        click_activity_icon(&mut driver, "▶");
         let screen = driver.screen();
 
         // Done section header must show the window label.
@@ -21821,7 +21842,7 @@
 
         let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
         // Switch to Pipeline (key 3), Done section should be active already.
-        driver.press(quadraui::Key::Char('3'));
+        click_activity_icon(&mut driver, "▶");
 
         // Header starts with "last 2h".
         let s0 = driver.screen();
@@ -21925,7 +21946,7 @@
 
         let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
         // Switch to Pipeline view.
-        driver.press(quadraui::Key::Char('3'));
+        click_activity_icon(&mut driver, "▶");
 
         // The Done section header should show "last 2h" initially.
         let s0 = driver.screen();
@@ -22134,7 +22155,7 @@
         );
 
         // Switch to Pipeline view.
-        driver.press(quadraui::Key::Char('3'));
+        click_activity_icon(&mut driver, "▶");
         // Navigate to the Log tab (h cycles left; l/Right cycles right).
         // Tabs: Pipeline → Issue → Stages → Log → ...
         // Three presses of 'l' (right) from Pipeline tab → Log tab.
@@ -22716,12 +22737,13 @@
     // must stay green through every app.rs decomposition step so a structural
     // move cannot silently break a surface.
 
-    /// #741 core smoke: pressing '6' must switch to the Kanban view and
-    /// render all three column headers (Backlog / In Flight / Completed).
-    /// The default Board view does not paint these labels, so their presence
-    /// after the key-press is the signal that the view switch occurred.
+    /// #741 core smoke: clicking the Kanban activity-bar icon (▦) must switch
+    /// to the Kanban view and render all three column headers (Backlog / In
+    /// Flight / Completed). The default Board view does not paint these
+    /// labels, so their presence after the click is the signal that the view
+    /// switch occurred. §3 (#782): numeric key '6' no longer switches views.
     #[test]
-    fn tuidriver_kanban_view_activated_by_key_6() {
+    fn tuidriver_kanban_view_activated_by_panel_click() {
         use quadraui::tui::testing::driver_with_shell;
 
         // Seed an app with one running issue so the Kanban model is non-empty.
@@ -22737,23 +22759,23 @@
             driver.screen()
         );
 
-        // Press '6' → switch to Kanban.
-        driver.press(quadraui::Key::Char('6'));
+        // Click '▦' → switch to Kanban.
+        click_activity_icon(&mut driver, "▦");
 
         let screen = driver.screen();
         assert!(
             screen.contains("Backlog"),
-            "#741: 'Backlog' column header must appear after key '6':\n{}",
+            "#741: 'Backlog' column header must appear after clicking '▦':\n{}",
             screen
         );
         assert!(
             screen.contains("In Flight"),
-            "#741: 'In Flight' column header must appear after key '6':\n{}",
+            "#741: 'In Flight' column header must appear after clicking '▦':\n{}",
             screen
         );
         assert!(
             screen.contains("Completed"),
-            "#741: 'Completed' column header must appear after key '6':\n{}",
+            "#741: 'Completed' column header must appear after clicking '▦':\n{}",
             screen
         );
     }
@@ -22769,13 +22791,13 @@
         let app = make_app_with_assignments(assignments);
 
         let mut driver = driver_with_shell(app, CoordApp::shell_config(), 160, 40);
-        driver.press(quadraui::Key::Char('6')); // switch to Kanban
+        click_activity_icon(&mut driver, "▦"); // switch to Kanban
 
         let screen = driver.screen();
         // The card title is "Issue 99" (set by make_assignment_typed).
         assert!(
             screen.contains("Issue 99") || screen.contains("#99"),
-            "#741: issue must appear in Kanban after pressing '6':\n{}",
+            "#741: issue must appear in Kanban after clicking '▦':\n{}",
             screen
         );
         // The issue is running → it must be in the In Flight column, not Backlog.
@@ -22789,40 +22811,44 @@
         );
     }
 
-    /// #741 core smoke: pressing '1' from Merge Queue must return to the
-    /// Board view.  Guards the numeric shortcut routing block against
-    /// regressions that would break the per-view key assignments.
+    /// #741 core smoke: clicking the Board icon (B) from Merge Queue must
+    /// return to the Board view. Guards the activity-bar panel routing
+    /// against regressions that would break per-view switching. §3 (#782):
+    /// this used to be driven by numeric keys ('7' then '1'); those no
+    /// longer switch views, so the test now drives the same round-trip via
+    /// activity-bar clicks.
     #[test]
-    fn tuidriver_key_1_returns_to_board_from_merge_queue() {
+    fn tuidriver_panel_click_returns_to_board_from_merge_queue() {
         use quadraui::tui::testing::driver_with_shell;
 
         let app = make_test_app(BoardData::default());
         let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
 
         // Switch away from Board first.
-        driver.press(quadraui::Key::Char('7')); // → Merge Queue
-        let after_7 = driver.screen();
+        click_activity_icon(&mut driver, "≣"); // → Merge Queue
+        let after_mq = driver.screen();
         assert!(
-            after_7.contains("MERGE QUEUE") || after_7.contains("Merge Queue"),
-            "#741: sanity — screen should show Merge Queue after '7':\n{}",
-            after_7
+            after_mq.contains("MERGE QUEUE") || after_mq.contains("Merge Queue"),
+            "#741: sanity — screen should show Merge Queue after clicking '≣':\n{}",
+            after_mq
         );
 
-        // Press '1' → back to Board.
-        driver.press(quadraui::Key::Char('1'));
-        let after_1 = driver.screen();
+        // Click 'B' → back to Board.
+        click_activity_icon(&mut driver, "B");
+        let after_board = driver.screen();
         assert!(
-            !after_1.contains("MERGE QUEUE"),
-            "#741: MERGE QUEUE must NOT be shown after pressing '1':\n{}",
-            after_1
+            !after_board.contains("MERGE QUEUE"),
+            "#741: MERGE QUEUE must NOT be shown after clicking 'B':\n{}",
+            after_board
         );
     }
 
-    /// #741 core smoke: pressing '3' from the default Board view must
-    /// switch to the Pipeline panel.  A structural move of the key handler
-    /// that forgets to update `active_view` would regress this.
+    /// #741 core smoke: clicking the Pipeline icon (▶) from the default
+    /// Board view must switch to the Pipeline panel. A structural move of
+    /// the panel-click handler that forgets to update `active_view` would
+    /// regress this. §3 (#782): numeric key '3' no longer switches views.
     #[test]
-    fn tuidriver_key_3_switches_to_pipeline() {
+    fn tuidriver_panel_click_switches_to_pipeline() {
         use quadraui::tui::testing::driver_with_shell;
 
         // Use the pipeline fixture so the Pipeline sidebar has content.
@@ -22832,23 +22858,23 @@
 
         let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
 
-        // Before pressing '3' the MergeQueue banner must be absent.
-        driver.press(quadraui::Key::Char('3'));
+        // Click '▶' → switch to Pipeline.
+        click_activity_icon(&mut driver, "▶");
 
-        // After '3' the Pipeline-specific "New" section or stage strip
+        // After the click the Pipeline-specific "New" section or stage strip
         // should be visible; at minimum the Merge Queue label is not the
         // active heading.
         let screen = driver.screen();
         assert!(
             !screen.contains("MERGE QUEUE"),
-            "#741: Merge Queue must NOT show after pressing '3':\n{}",
+            "#741: Merge Queue must NOT show after clicking '▶':\n{}",
             screen
         );
         // The pipeline sidebar section label "New" appears when there are
         // tracked issues with status:ready — make_pipeline_app() provides these.
         assert!(
             screen.contains("New") || screen.contains("Pipeline"),
-            "#741: Pipeline panel must render after key '3':\n{}",
+            "#741: Pipeline panel must render after clicking '▶':\n{}",
             screen
         );
     }
