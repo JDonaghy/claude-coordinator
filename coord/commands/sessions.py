@@ -1246,6 +1246,46 @@ def reattach(assignment_id: str, config_path: Path) -> None:
                                 "--verdict approve|request-changes"
                             ),
                         )
+                    elif (
+                        assignment_type_val == "smoke"
+                        and review_of_assignment_id_val
+                    ):
+                        # #923 (review round 1): mirror the review-verdict relay
+                        # above for the REMOTE branch — a thin-client `coord
+                        # reattach` to a smoke session dispatched on a different
+                        # machine is a supported path (ssh-reattach is not
+                        # local-only even though --smoke-of dispatch is), so
+                        # this branch must also carry the test-verdict backstop
+                        # or the exact #923 bug (silent verdict loss, grey Test
+                        # box, blocked merge gate) reproduces here.
+                        _tv_cmd_remote = (
+                            f"    coord test --passed "
+                            f"{review_of_assignment_id_val}   # all good\n"
+                            f"    coord test --fail "
+                            f"{review_of_assignment_id_val} --reason "
+                            '"<story>"   # broken'
+                        )
+                        try:
+                            if not _prompt_and_relay_test_verdict(
+                                work_assignment_id=review_of_assignment_id_val,
+                                smoke_assignment_id=assignment_id,
+                                repo_name=repo_name_val,
+                                repo_github=repo_github_val,
+                                issue_number=int(issue_number_val),  # type: ignore[arg-type]
+                                machine_name=machine_name_val or "unknown",
+                                verdict_cmd_hint=_tv_cmd_remote,
+                            ):
+                                click.echo(
+                                    "  smoke session ended with no test "
+                                    "verdict recorded — the merge gate stays "
+                                    "blocked until a verdict is reported."
+                                )
+                        except Exception as _tv_exc:  # noqa: BLE001
+                            click.echo(
+                                "  warning: test-verdict backstop failed: "
+                                f"{_tv_exc}",
+                                err=True,
+                            )
                     elif assignment_type_val is not None:
                         click.echo(
                             "  note: no branch recorded for this remote session "

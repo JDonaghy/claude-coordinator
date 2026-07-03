@@ -305,6 +305,14 @@ def _prompt_and_relay_test_verdict(
 
     Returns True when a verdict was successfully recorded.
     """
+    # Context label for the log lines below — identifies which repo/issue/
+    # machine/smoke-session this backstop is acting on (#923 review nit: these
+    # params were previously accepted but never read).
+    _ctx = (
+        f"{repo_name} ({repo_github}) issue #{issue_number} on {machine_name} "
+        f"[smoke={smoke_assignment_id}]"
+    )
+
     # ── Idempotency gate ──────────────────────────────────────────────────────
     # Read the WORK row (not the smoke session) from the board.  If it already
     # has test_state set the agent self-reported — do nothing.
@@ -315,8 +323,8 @@ def _prompt_and_relay_test_verdict(
         _work = _board.find_by_id(work_assignment_id)
         if _work is not None and (_work.test_state or "").strip():
             click.echo(
-                f"  test verdict already recorded: {_work.test_state!r} "
-                "(agent used `coord test` — no operator prompt needed)"
+                f"  test verdict already recorded: {_work.test_state!r} for "
+                f"{_ctx} (agent used `coord test` — no operator prompt needed)"
             )
             return True
     except Exception:  # noqa: BLE001 — board unavailable → fall through to prompt
@@ -325,7 +333,8 @@ def _prompt_and_relay_test_verdict(
     # ── Non-TTY path ──────────────────────────────────────────────────────────
     if not sys.stdin.isatty():
         click.echo(
-            f"  no test verdict recorded — record it with:\n{verdict_cmd_hint}"
+            f"  no test verdict recorded for {_ctx} — record it with:\n"
+            f"{verdict_cmd_hint}"
         )
         return False
 
@@ -366,12 +375,13 @@ def _prompt_and_relay_test_verdict(
         )
         click.echo(
             f"  test verdict '{test_state}' recorded for work assignment "
-            f"{work_assignment_id}."
+            f"{work_assignment_id} ({_ctx})."
         )
         return True
     except Exception as exc:  # noqa: BLE001 — best-effort; fall back to the hint
         click.echo(
-            f"  warning: failed to record test verdict: {exc}\n{verdict_cmd_hint}",
+            f"  warning: failed to record test verdict for {_ctx}: {exc}\n"
+            f"{verdict_cmd_hint}",
             err=True,
         )
         return False
