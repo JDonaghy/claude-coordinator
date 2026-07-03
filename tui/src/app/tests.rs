@@ -432,6 +432,8 @@
             // #737
             merge_queue_sel: 0,
             merge_queue_scroll: 0,
+            // #771
+            milestone_dag_sel: 0,
             // #217: use the default dark palette for test helpers.
             active_theme: crate::settings::Theme::Dark.to_quadraui_theme(),
             // #728: default 2h window for tests (can be overridden per test).
@@ -22701,5 +22703,155 @@
             !screen.trim().is_empty(),
             "#741: Pipeline Summary tab must produce a non-empty screen:\n{}",
             screen
+        );
+    }
+
+    // ── #771: Milestone DAG view (Phase 3 of #767) ───────────────────────────
+
+    /// Build a minimal `OpenIssue` for the milestone-DAG fixtures below.
+    fn make_open_issue(
+        repo: &str,
+        number: u64,
+        title: &str,
+        body: &str,
+        labels: &[&str],
+        state: &str,
+        milestone_number: Option<i64>,
+        milestone_title: Option<&str>,
+    ) -> OpenIssue {
+        OpenIssue {
+            repo_name: repo.to_string(),
+            number,
+            title: title.to_string(),
+            body: body.to_string(),
+            labels: labels.iter().map(|s| s.to_string()).collect(),
+            state: state.to_string(),
+            milestone_number,
+            milestone_title: milestone_title.map(|s| s.to_string()),
+        }
+    }
+
+    /// Seeds a milestone with an "epic"-labelled tracking issue carrying a
+    /// `## Work order` block that covers all four node states: #762 is
+    /// closed (done), #763 has a running assignment (in-flight), #765
+    /// waits on both (blocked), and #766 has no dependents (ready).
+    fn make_milestone_dag_app() -> CoordApp {
+        let tracking_body = "\
+Milestone tracking issue.
+
+## Work order
+- [ ] #762  {group: A}
+- [ ] #763  {group: A}
+- [ ] #765  {after: #762,#763}
+- [ ] #766
+";
+        let open_issues = vec![
+            make_open_issue(
+                "coord-repo",
+                100,
+                "Epic tracking issue",
+                tracking_body,
+                &["epic", "coord"],
+                "open",
+                Some(5),
+                Some("v0.5"),
+            ),
+            make_open_issue(
+                "coord-repo", 762, "Foundation piece", "", &[], "closed", Some(5), Some("v0.5"),
+            ),
+            make_open_issue(
+                "coord-repo", 763, "Parallel piece", "", &[], "open", Some(5), Some("v0.5"),
+            ),
+            make_open_issue(
+                "coord-repo", 765, "Depends on both", "", &[], "open", Some(5), Some("v0.5"),
+            ),
+            make_open_issue(
+                "coord-repo", 766, "Independent, ready", "", &[], "open", Some(5), Some("v0.5"),
+            ),
+        ];
+        let assignments = vec![make_assignment_typed(
+            "running",
+            763,
+            "coord-repo",
+            Some("work"),
+        )];
+        make_test_app(BoardData {
+            open_issues,
+            assignments,
+            ..Default::default()
+        })
+    }
+
+    /// Acceptance criterion (#771): pressing `8` renders the Milestone DAG
+    /// view with the right per-node state — done / in-flight / blocked /
+    /// ready — and the milestone header exposes "Dispatch milestone".
+    #[test]
+    fn tuidriver_milestone_dag_shows_node_states_and_dispatch_action() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_milestone_dag_app();
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 160, 40);
+
+        driver.press(quadraui::Key::Char('8')); // → Milestone DAG view
+        let screen = driver.screen();
+
+        assert!(
+            screen.contains("v0.5") && screen.contains("#100"),
+            "#771: milestone header (title + tracking issue) must render:\n{}",
+            screen
+        );
+        assert!(
+            screen.contains("Dispatch milestone"),
+            "#771: milestone header must expose a 'Dispatch milestone' action:\n{}",
+            screen
+        );
+        assert!(
+            screen.contains("#762") && screen.contains("done"),
+            "#771: closed dependency #762 must show as done:\n{}",
+            screen
+        );
+        assert!(
+            screen.contains("#763") && screen.contains("in-flight"),
+            "#771: #763 has a running assignment and must show as in-flight:\n{}",
+            screen
+        );
+        assert!(
+            screen.contains("#765") && screen.contains("blocked") && screen.contains("#763"),
+            "#771: #765 must show blocked, naming the still-unmet #763 dependency:\n{}",
+            screen
+        );
+        assert!(
+            screen.contains("#766") && screen.contains("ready"),
+            "#771: #766 has no unmet deps and must show as ready:\n{}",
+            screen
+        );
+    }
+
+    /// #771: "Dispatch milestone" spawns `coord milestone dispatch <repo>
+    /// <tracking_issue>` — the already-shipped #769 Phase 1 CLI — through
+    /// the same `CommandRunner` every other TUI action uses.
+    #[test]
+    fn milestone_dag_dispatch_action_spawns_milestone_dispatch_command() {
+        let mut app = make_milestone_dag_app();
+        app.active_view = SidebarView::MilestoneDag;
+        app.command_runner = crate::commands::CommandRunner::new_for_test();
+
+        let target = app.milestone_dag_selected().map(|v| ContextMenuTarget::MilestoneHeader {
+            repo_name: v.repo_name.clone(),
+            tracking_issue: v.tracking_issue,
+            milestone_title: v.milestone_title.clone(),
+        });
+        let target = target.expect("#771: fixture must have a selectable milestone");
+        assert!(app.dispatch_milestone_action(&target));
+
+        assert_eq!(
+            app.command_runner.spawned_calls,
+            vec![vec![
+                "milestone".to_string(),
+                "dispatch".to_string(),
+                "coord-repo".to_string(),
+                "100".to_string(),
+            ]],
+            "#771: Dispatch milestone must spawn `coord milestone dispatch <repo> <tracking_issue>`",
         );
     }

@@ -1639,6 +1639,52 @@ impl CoordApp {
                         self.active_view = SidebarView::MergeQueue;
                         needs_redraw = true;
                     }
+                    // #771: 8 → Milestone DAG panel.
+                    Key::Char('8') => {
+                        self.active_view = SidebarView::MilestoneDag;
+                        needs_redraw = true;
+                    }
+
+                    // ── Milestone DAG keyboard nav (#771) ────────────────
+                    Key::Char('j') | Key::Named(NamedKey::Down)
+                        if self.active_view == SidebarView::MilestoneDag =>
+                    {
+                        let n = self.milestone_dag_views().len();
+                        if n > 0 {
+                            self.milestone_dag_sel =
+                                (self.milestone_dag_sel + 1).min(n.saturating_sub(1));
+                        }
+                        needs_redraw = true;
+                    }
+                    Key::Char('k') | Key::Named(NamedKey::Up)
+                        if self.active_view == SidebarView::MilestoneDag =>
+                    {
+                        self.milestone_dag_sel = self.milestone_dag_sel.saturating_sub(1);
+                        needs_redraw = true;
+                    }
+                    // "Dispatch milestone" — promote the selected milestone's
+                    // declared work order into the pipeline (#767 Phase 1).
+                    Key::Char('d')
+                        if self.active_view == SidebarView::MilestoneDag =>
+                    {
+                        let target = self.milestone_dag_selected().map(|v| {
+                            ContextMenuTarget::MilestoneHeader {
+                                repo_name: v.repo_name.clone(),
+                                tracking_issue: v.tracking_issue,
+                                milestone_title: v.milestone_title.clone(),
+                            }
+                        });
+                        if let Some(target) = target {
+                            self.dispatch_milestone_action(&target);
+                        } else {
+                            self.push_toast(
+                                "Dispatch milestone",
+                                "No milestone selected — no work-order block found.",
+                                ToastSeverity::Info,
+                            );
+                        }
+                        needs_redraw = true;
+                    }
 
                     // ── Merge Queue keyboard nav (#737) ──────────────────
                     Key::Char('j') | Key::Named(NamedKey::Down)
@@ -2094,6 +2140,8 @@ impl CoordApp {
                             SidebarView::Kanban => {}
                             // #737: MergeQueue j/k handled by the earlier guarded arm.
                             SidebarView::MergeQueue => {}
+                            // #771: MilestoneDag j/k handled by the earlier guarded arm.
+                            SidebarView::MilestoneDag => {}
                         }
                         needs_redraw = true;
                     }
@@ -2137,6 +2185,8 @@ impl CoordApp {
                             SidebarView::Kanban => {}
                             // #737: MergeQueue k handled by the earlier guarded arm.
                             SidebarView::MergeQueue => {}
+                            // #771: MilestoneDag k handled by the earlier guarded arm.
+                            SidebarView::MilestoneDag => {}
                         }
                         needs_redraw = true;
                     }
@@ -2367,6 +2417,10 @@ impl CoordApp {
                                 self.merge_queue_sel = 0;
                                 self.fix_merge_queue_scroll(content_visible_rows(list_b, lh));
                             }
+                            // #771: MilestoneDag — Home jumps to first milestone.
+                            SidebarView::MilestoneDag => {
+                                self.milestone_dag_sel = 0;
+                            }
                         }
                         needs_redraw = true;
                     }
@@ -2420,6 +2474,13 @@ impl CoordApp {
                                     self.merge_queue_sel = n - 1;
                                 }
                                 self.fix_merge_queue_scroll(content_visible_rows(list_b, lh));
+                            }
+                            // #771: MilestoneDag — End jumps to last milestone.
+                            SidebarView::MilestoneDag => {
+                                let n = self.milestone_dag_views().len();
+                                if n > 0 {
+                                    self.milestone_dag_sel = n - 1;
+                                }
                             }
                         }
                         needs_redraw = true;
@@ -3801,6 +3862,9 @@ impl CoordApp {
             SidebarView::Kanban => false,
             // #737: Merge Queue sidebar is a placeholder; clicks are inert.
             SidebarView::MergeQueue => false,
+            // #771: Milestone DAG sidebar is a placeholder; the milestone
+            // list + DAG both live in the main panel (`mouse_main_click`).
+            SidebarView::MilestoneDag => false,
         }
     }
 
@@ -4370,6 +4434,8 @@ impl CoordApp {
             SidebarView::Kanban => false,
             // #737: Merge Queue sidebar is a placeholder — no sidebar scroll.
             SidebarView::MergeQueue => false,
+            // #771: Milestone DAG sidebar is a placeholder — no sidebar scroll.
+            SidebarView::MilestoneDag => false,
         }
     }
 
@@ -4631,6 +4697,8 @@ impl CoordApp {
             SidebarView::Kanban => true,
             // #737: Merge Queue panel — j/k handles navigation; wheel is no-op for now.
             SidebarView::MergeQueue => true,
+            // #771: Milestone DAG panel — j/k handles navigation; wheel is no-op for now.
+            SidebarView::MilestoneDag => true,
         }
     }
 }

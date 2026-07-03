@@ -599,6 +599,14 @@ impl CoordApp {
                     is_paused: self.paused_machines.contains(&m.name),
                 }
             }),
+            // #771: milestone header — carries what "Dispatch milestone" needs.
+            SidebarView::MilestoneDag => self.milestone_dag_selected().map(|v| {
+                ContextMenuTarget::MilestoneHeader {
+                    repo_name: v.repo_name.clone(),
+                    tracking_issue: v.tracking_issue,
+                    milestone_title: v.milestone_title.clone(),
+                }
+            }),
             _ => None,
         }
     }
@@ -625,6 +633,15 @@ impl CoordApp {
             ContextMenuTarget::MachineRow { name, is_paused } => {
                 self.context_menu_items_for_machine_row(name, *is_paused)
             }
+            ContextMenuTarget::MilestoneHeader {
+                repo_name,
+                tracking_issue,
+                milestone_title,
+            } => self.context_menu_items_for_milestone_header(
+                repo_name,
+                *tracking_issue,
+                milestone_title,
+            ),
         };
         if items.is_empty() {
             return false;
@@ -4599,6 +4616,7 @@ impl CoordApp {
                         issue_number.unwrap_or(0)
                     }
                     ContextMenuTarget::MachineRow { .. } => 0,
+                    ContextMenuTarget::MilestoneHeader { tracking_issue, .. } => *tracking_issue,
                 };
                 self.push_toast(
                     "Copy",
@@ -4926,6 +4944,9 @@ impl CoordApp {
                 }
                 true
             }
+            // #771: promote a milestone's whole declared work order into the
+            // pipeline — `coord milestone dispatch <repo> <tracking_issue>`.
+            "dispatch-milestone" => self.dispatch_milestone_action(target),
             // #685: open the test-mode choice dialog (SetOnly — no dispatch).
             "set-test-mode" => {
                 let result = self.arm_set_test_mode_for_selected();
