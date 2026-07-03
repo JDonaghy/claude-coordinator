@@ -464,6 +464,38 @@ def _board_response_schema(components: dict) -> dict:
                     "required": ["repo_name", "issue_number", "stages", "has_approved_review"],
                 },
             },
+            "milestone_work_orders": {
+                "type": "array",
+                "description": (
+                    "#795 Phase 3b: server-computed per-milestone work-order "
+                    "rank + ready/blocked frontier so coord-tui can display "
+                    "work-order rank, next-up, and blocked-on badges on Pipeline "
+                    "milestone cards without re-implementing the DAG logic in Rust."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "repo_name": {"type": "string"},
+                        "tracking_issue": {"type": "integer"},
+                        "milestone_title": {"type": "string"},
+                        "nodes": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "issue_number": {"type": "integer"},
+                                    "rank": {"type": "integer", "description": "0-indexed position in the work order"},
+                                    "ready": {"type": "boolean"},
+                                    "next_up": {"type": "boolean", "description": "true when on the ready frontier (ready + not claimed)"},
+                                    "blocked_on": {"type": "array", "items": {"type": "integer"}},
+                                },
+                                "required": ["issue_number", "rank", "ready", "next_up", "blocked_on"],
+                            },
+                        },
+                    },
+                    "required": ["repo_name", "tracking_issue", "nodes"],
+                },
+            },
         },
         "required": [
             "schema_version", "round_number", "assignments", "machines",
@@ -1358,6 +1390,117 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             )
         except Exception:  # noqa: BLE001 — projection failure must not blank the board
             projection["issue_stage_projection"] = []
+        # #795 Phase 3b: per-milestone work-order rank + ready frontier.
+        # Parsed from each tracking issue's (label="epic") `## Work order`
+        # block using coord.milestone_order (Phase 0); the TUI renders rank,
+        # next-up, and blocked-on badges on Pipeline milestone cards without
+        # re-implementing the DAG logic in Rust.  Fail-open: any per-milestone
+        # error produces an empty node list, not a 503.
+        try:
+            from coord.milestone_order import (  # noqa: PLC0415
+                TRACKING_ISSUE_LABEL as _TRACKING_LABEL,
+                parse_work_order as _parse_wo,
+                ready_frontier as _ready_frontier,
+            )
+
+            if _board is None:
+                try:
+                    from coord.state import build_board as _build_board3  # noqa: PLC0415
+                    _board = _build_board3()
+                except Exception:  # noqa: BLE001 — e.g. thread-safety on test in-memory DB
+                    from coord.models import Board as _Board  # noqa: PLC0415
+                    _board = _Board()  # fallback: empty board → no claim blocking
+
+            # Build an open-issue-number set per repo for terminal detection.
+            # Issues absent from this set (missing entirely or state='closed')
+            # are treated as terminal — mirrors the Rust DAG view's semantics.
+            _open_by_repo: dict[str, set[int]] = {}
+            for _oi in projection.get("issues", []):
+                if _oi.get("state") == "open":
+                    _rn = _oi.get("repo_name", "")
+                    if _rn:
+                        _open_by_repo.setdefault(_rn, set()).add(_oi["number"])
+
+            _milestone_work_orders: list[dict] = []
+            for _ti in projection.get("issues", []):
+                # Only process tracking issues (carry the "epic" label).
+                _labels = _ti.get("labels") or []
+                if _TRACKING_LABEL not in _labels:
+                    continue
+                _repo_name = _ti.get("repo_name", "")
+                if not _repo_name:
+                    continue
+                _body = _ti.get("body") or ""
+                try:
+                    _wo = _parse_wo(_body)
+                except Exception:  # noqa: BLE001 — bad work order: skip this tracking issue
+                    continue
+                if not _wo.nodes:
+                    continue
+
+                # terminal = in work order but NOT currently open for this repo.
+                _open_nums = _open_by_repo.get(_repo_name, set())
+                _terminal: set[int] = {
+                    n.issue_number for n in _wo.nodes
+                    if n.issue_number not in _open_nums
+                }
+
+                # Resolve coord-local repo → GitHub slug from config.
+                _repo_cfg = config.repo(_repo_name)
+                _repo_github = _repo_cfg.github if _repo_cfg is not None else _repo_name
+
+                # Compute frontier: board-only claim check (no remote branch
+                # lookup) to keep the /board endpoint fast.
+                try:
+                    _frontier = _ready_frontier(
+                        _wo,
+                        _board,
+                        repo_name=_repo_name,
+                        repo_github=_repo_github,
+                        terminal_issues=_terminal,
+                        branch_lookup=lambda _r, _i: [],  # skip slow gh call
+                    )
+                except Exception:  # noqa: BLE001
+                    # Fallback: mark nodes ready iff all after-deps are terminal.
+                    from coord.milestone_order import FrontierEntry as _FE, Frontier as _Fr  # noqa: PLC0415
+                    _ready_list = [
+                        _FE(n.issue_number, n.group)
+                        for n in _wo.nodes
+                        if n.issue_number not in _terminal
+                        and all(d in _terminal for d in n.after)
+                    ]
+                    _frontier = _Fr(ready=tuple(_ready_list), blocked=())
+
+                _ready_nums = {fe.issue_number for fe in _frontier.ready}
+
+                _nodes = []
+                for _rank, _node in enumerate(_wo.nodes):
+                    if _node.issue_number in _terminal:
+                        continue  # done — skip from projection
+                    _is_ready = _node.issue_number in _ready_nums
+                    _blocked_on = (
+                        [d for d in _node.after if d not in _terminal]
+                        if not _is_ready else []
+                    )
+                    _nodes.append({
+                        "issue_number": _node.issue_number,
+                        "rank": _rank,
+                        "ready": _is_ready,
+                        "next_up": _is_ready,  # ready + unclaimed = next-up
+                        "blocked_on": _blocked_on,
+                    })
+
+                if _nodes:
+                    _milestone_work_orders.append({
+                        "repo_name": _repo_name,
+                        "tracking_issue": _ti["number"],
+                        "milestone_title": _ti.get("milestone_title") or "",
+                        "nodes": _nodes,
+                    })
+
+            projection["milestone_work_orders"] = _milestone_work_orders
+        except Exception:  # noqa: BLE001 — work-order failure must not blank the board
+            projection["milestone_work_orders"] = []
         return JSONResponse(projection)
 
     async def serve_config(request: Request) -> Response:  # noqa: ARG001

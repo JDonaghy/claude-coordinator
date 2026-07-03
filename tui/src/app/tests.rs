@@ -24119,3 +24119,238 @@ Milestone tracking issue.
             screen
         );
     }
+
+    // ── #795 Phase 3b: milestone work-order badges in Pipeline cards ──────────
+
+    /// Build a `BoardData` seeded with one milestone work order carrying three
+    /// nodes — #101 and #102 ready/next-up (rank 0 and 1), #103 blocked on both
+    /// (rank 2).  Used by the deserialization and TuiDriver tests below.
+    fn make_work_order_board_data() -> BoardData {
+        BoardData {
+            open_issues: vec![
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 101,
+                    title: "Issue A1".to_string(),
+                    body: String::new(),
+                    state: "open".to_string(),
+                    labels: vec!["coord".to_string()],
+                    milestone_number: Some(1),
+                    milestone_title: Some("v1.0".to_string()),
+                },
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 102,
+                    title: "Issue A2".to_string(),
+                    body: String::new(),
+                    state: "open".to_string(),
+                    labels: vec!["coord".to_string()],
+                    milestone_number: Some(1),
+                    milestone_title: Some("v1.0".to_string()),
+                },
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 103,
+                    title: "Issue B1".to_string(),
+                    body: String::new(),
+                    state: "open".to_string(),
+                    labels: vec!["coord".to_string()],
+                    milestone_number: Some(1),
+                    milestone_title: Some("v1.0".to_string()),
+                },
+            ],
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            milestone_work_orders: vec![MilestoneWorkOrder {
+                repo_name: "api".to_string(),
+                tracking_issue: 500,
+                milestone_title: "v1.0".to_string(),
+                nodes: vec![
+                    MilestoneWorkOrderNode {
+                        issue_number: 101,
+                        rank: 0,
+                        ready: true,
+                        next_up: true,
+                        blocked_on: vec![],
+                    },
+                    MilestoneWorkOrderNode {
+                        issue_number: 102,
+                        rank: 1,
+                        ready: true,
+                        next_up: true,
+                        blocked_on: vec![],
+                    },
+                    MilestoneWorkOrderNode {
+                        issue_number: 103,
+                        rank: 2,
+                        ready: false,
+                        next_up: false,
+                        blocked_on: vec![101, 102],
+                    },
+                ],
+            }],
+            ..BoardData::default()
+        }
+    }
+
+    /// #795: `BoardPayload` with `milestone_work_orders` deserializes cleanly.
+    ///
+    /// Validates the wire shape against a hand-crafted JSON blob (the real
+    /// `/board` JSON shape, not a hand-built Rust fixture).  This is the
+    /// #632-class guard: a serde-mismatched field would blank the whole board;
+    /// catching it here means the type is validated before it ships.
+    #[test]
+    fn board_payload_milestone_work_orders_deserializes() {
+        let json = r#"{
+            "assignments": [],
+            "machines": [],
+            "milestone_work_orders": [
+                {
+                    "repo_name": "api",
+                    "tracking_issue": 500,
+                    "milestone_title": "v1.0",
+                    "nodes": [
+                        {"issue_number": 101, "rank": 0, "ready": true, "next_up": true, "blocked_on": []},
+                        {"issue_number": 102, "rank": 1, "ready": true, "next_up": true, "blocked_on": []},
+                        {"issue_number": 103, "rank": 2, "ready": false, "next_up": false, "blocked_on": [101, 102]}
+                    ]
+                }
+            ]
+        }"#;
+        let payload: BoardPayload = serde_json::from_str(json)
+            .expect("milestone_work_orders JSON must deserialize into BoardPayload");
+
+        assert_eq!(payload.milestone_work_orders.len(), 1);
+        let mwo = &payload.milestone_work_orders[0];
+        assert_eq!(mwo.repo_name, "api");
+        assert_eq!(mwo.nodes.len(), 3);
+
+        let n101 = &mwo.nodes[0];
+        assert_eq!(n101.issue_number, 101);
+        assert_eq!(n101.rank, 0);
+        assert!(n101.ready, "#101 should be ready");
+        assert!(n101.next_up, "#101 should be next_up");
+        assert!(n101.blocked_on.is_empty());
+
+        let n103 = &mwo.nodes[2];
+        assert_eq!(n103.issue_number, 103);
+        assert_eq!(n103.rank, 2);
+        assert!(!n103.ready, "#103 should be blocked");
+        assert!(!n103.next_up, "#103 should not be next_up");
+        assert_eq!(n103.blocked_on, vec![101, 102]);
+    }
+
+    /// #795: `BoardPayload` without `milestone_work_orders` (pre-#795 daemon)
+    /// deserializes cleanly — the `#[serde(default)]` must kick in.
+    #[test]
+    fn board_payload_milestone_work_orders_absent_defaults_to_empty() {
+        let json = r#"{"assignments": [], "machines": []}"#;
+        let payload: BoardPayload = serde_json::from_str(json)
+            .expect("payload missing milestone_work_orders must deserialize via default");
+        assert!(payload.milestone_work_orders.is_empty(),
+            "absent milestone_work_orders must default to empty vec");
+    }
+
+    /// #795 TuiDriver black-box: Pipeline milestone cards show work-order badges.
+    ///
+    /// Seeds a `BoardData` with three issues under milestone "v1.0" and a
+    /// `MilestoneWorkOrder` with rank/ready/blocked_on data.  Drives the full
+    /// `event → handle → render` path through `TuiDriver` and asserts:
+    /// - ready/next-up issues display the "↑W{rank}" badge text
+    /// - blocked issues display the "⊘W{rank}←#{blocker}" badge text
+    ///
+    /// Uses `find()` to locate targets, never hardcoded coordinates.
+    #[test]
+    fn tuidriver_pipeline_milestone_cards_show_work_order_badges() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let data = make_work_order_board_data();
+        let mut app = make_test_app(data);
+
+        // Populate pipeline_issues for our three work-order issues.
+        app.pipeline_issues = vec![
+            PipelineIssue {
+                number: 101,
+                title: "Issue A1".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string()],
+                is_closed: false,
+            },
+            PipelineIssue {
+                number: 102,
+                title: "Issue A2".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string()],
+                is_closed: false,
+            },
+            PipelineIssue {
+                number: 103,
+                title: "Issue B1".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string()],
+                is_closed: false,
+            },
+        ];
+
+        // Pre-expand the milestone section so issue cards are visible without
+        // a click.  Key format: (lifecycle, repo_key, milestone_key) where
+        // milestone_key is the number as a string (see `pipeline_milestones_for_issues`).
+        app.pipeline_milestone_expanded.insert(
+            ("new".to_string(), "api".to_string(), "1".to_string()),
+            true,
+        );
+        // Also ensure the repo section is expanded (defaults to true but be explicit).
+        app.pipeline_lifecycle_expanded.insert(
+            ("new".to_string(), "api".to_string()),
+            true,
+        );
+
+        app.active_view = SidebarView::Pipeline;
+        app.rebuild_board_sidebar();
+        app.rebuild_pipeline_sidebar(None);
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 50);
+        let screen = driver.screen();
+
+        // #101 is ready + next_up, rank 0 → span text "↑W1" (1-indexed)
+        assert!(
+            screen.contains("↑W1"),
+            "#101 must show '↑W1' (ready + next_up, rank 0→1):\n{screen}",
+        );
+        // #102 is ready + next_up, rank 1 → "↑W2"
+        assert!(
+            screen.contains("↑W2"),
+            "#102 must show '↑W2' (ready + next_up, rank 1→2):\n{screen}",
+        );
+        // #103 is blocked (rank 2, first blocker #101) → "⊘W3←#101"
+        assert!(
+            screen.contains("⊘W3←#101"),
+            "#103 must show '⊘W3←#101' (blocked rank 2→3, first dep #101):\n{screen}",
+        );
+    }
+
+    /// #795: `work_order_node_for` finds the correct node by (repo, issue_number).
+    #[test]
+    fn work_order_node_for_returns_correct_node() {
+        let app = make_test_app(make_work_order_board_data());
+        let node = app.work_order_node_for("api", 103).expect("#103 must be found");
+        assert_eq!(node.rank, 2);
+        assert!(!node.ready);
+        assert_eq!(node.blocked_on, vec![101, 102]);
+    }
+
+    /// #795: `work_order_node_for` returns `None` for an unknown repo/issue.
+    #[test]
+    fn work_order_node_for_unknown_repo_returns_none() {
+        let app = make_test_app(make_work_order_board_data());
+        assert!(app.work_order_node_for("other-repo", 101).is_none());
+        assert!(app.work_order_node_for("api", 9999).is_none());
+    }

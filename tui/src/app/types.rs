@@ -436,6 +436,11 @@ pub(crate) struct BoardPayload {
     /// local-SQLite-mode read path, which has no daemon to ask).
     #[serde(default)]
     pub(crate) issue_stage_projection: Vec<IssueStageProjection>,
+    /// #795 Phase 3b: per-milestone work-order rank + ready frontier.  Empty
+    /// when the daemon predates #795.  The TUI renders rank, next-up, and
+    /// blocked-on badges on Pipeline milestone cards using this projection.
+    #[serde(default)]
+    pub(crate) milestone_work_orders: Vec<MilestoneWorkOrder>,
 }
 
 /// #584: serde deserializer for `Assignment::test_plan` on the remote
@@ -770,6 +775,54 @@ pub(crate) struct IssueStageProjection {
     pub(crate) has_approved_review: bool,
 }
 
+/// One node in a milestone work order from the `/board` payload (#795 Phase 3b).
+///
+/// Deserialized from the `milestone_work_orders[*].nodes[*]` key of the
+/// `/board` payload, computed by `coord/serve_app.py` from the tracking
+/// issue's `## Work order` block via `coord.milestone_order`. The TUI uses
+/// this to render work-order rank, next-up, and blocked-on badges on Pipeline
+/// milestone cards without re-implementing the DAG logic in Rust.
+///
+/// `rank` is 0-indexed position in the declared work order. `ready` is `true`
+/// when all `after:` dependencies are terminal. `next_up` refines `ready`
+/// further: the issue is ready AND not already claimed by an active assignment.
+/// `blocked_on` carries the still-unmet dependency issue numbers when `ready`
+/// is `false`.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub(crate) struct MilestoneWorkOrderNode {
+    pub(crate) issue_number: u64,
+    /// 0-indexed position in the `## Work order` list (display as rank+1).
+    pub(crate) rank: u32,
+    pub(crate) ready: bool,
+    /// `true` when `ready` AND not claimed — the dispatcher's next candidates.
+    pub(crate) next_up: bool,
+    #[serde(default)]
+    pub(crate) blocked_on: Vec<u64>,
+}
+
+/// One milestone's work-order data from the `/board` payload (#795 Phase 3b).
+///
+/// Deserialized from `milestone_work_orders[*]` in the `/board` payload. The
+/// TUI looks up `(repo_name, issue_number)` across all `MilestoneWorkOrder`
+/// entries to augment Pipeline milestone card rows with rank and frontier state.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub(crate) struct MilestoneWorkOrder {
+    pub(crate) repo_name: String,
+    /// Tracking issue number (the "epic"-labelled issue carrying the
+    /// `## Work order` block).  Kept for future surfacing (e.g. a
+    /// "jump to tracking issue" action) and round-trip parity with the
+    /// server payload; not rendered in the #795 Phase 3b UI.
+    #[allow(dead_code)]
+    pub(crate) tracking_issue: u64,
+    /// Milestone title from the tracking issue's GitHub milestone field.
+    /// Kept for future display; not shown in the #795 Phase 3b card badges.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub(crate) milestone_title: String,
+    #[serde(default)]
+    pub(crate) nodes: Vec<MilestoneWorkOrderNode>,
+}
+
 /// CI check status for one PR, fetched in the background via `gh pr checks`.
 ///
 /// Populated from `fetch_ci_checks_summary` and stored on `CoordApp` keyed by
@@ -1093,6 +1146,11 @@ pub(crate) struct BoardData {
     /// on daemons older than #550 — `pipeline.rs`'s stage functions fall back
     /// to local computation in both cases.
     pub(crate) issue_stage_projection: Vec<IssueStageProjection>,
+    /// #795 Phase 3b: per-milestone work-order rank + ready frontier from
+    /// `/board`.  Empty on the local-SQLite-mode read path and daemons older
+    /// than #795.  The Pipeline view renders rank/next-up/blocked-on badges
+    /// on milestone cards using this projection.
+    pub(crate) milestone_work_orders: Vec<MilestoneWorkOrder>,
 }
 
 /// Parsed plan data, mirroring `coord.plan_parser.WorkerPlan.to_dict()`.
