@@ -571,8 +571,8 @@ def diagnose(
     stage: str | None,
     reset: bool,
     dry_run: bool,
-    output_json: bool,
     config_path: Path,
+    output_json: bool = False,
     orphan_worktrees: bool = False,
 ) -> None:
     """Per-stage doctor — diagnose, best-effort recover, optional reset."""

@@ -82,13 +82,15 @@ pub struct CommandRunner {
     /// `no_spawn = true` so tests can assert on what commands would have run.
     #[cfg(test)]
     pub(crate) spawned_calls: Vec<Vec<String>>,
-    /// FIFO queue of `(exit_code, stderr)` overrides for the NEXT `do_spawn`
-    /// calls in `no_spawn` mode — lets a test simulate a failing command
-    /// (e.g. a `max_review_iterations` cap refusal) instead of the default
-    /// zero-exit success.  Popped one-per-spawn; once empty, `do_spawn` falls
-    /// back to the default success result.  See [`Self::push_canned_result`].
+    /// FIFO queue of `(exit_code, stdout, stderr)` overrides for the NEXT
+    /// `do_spawn` calls in `no_spawn` mode — lets a test simulate a failing
+    /// command (e.g. a `max_review_iterations` cap refusal) or canned stdout
+    /// (e.g. a `coord diagnose --json` response) instead of the default
+    /// zero-exit success with empty output.  Popped one-per-spawn; once
+    /// empty, `do_spawn` falls back to the default success result.  See
+    /// [`Self::push_canned_result`] / [`Self::push_canned_result_with_stdout`].
     #[cfg(test)]
-    canned_results: VecDeque<(i32, String)>,
+    canned_results: VecDeque<(i32, String, String)>,
 }
 
 /// Search for `coordinator.yml` in three places, in order:
@@ -185,7 +187,25 @@ impl CommandRunner {
     /// real `coord` subprocess.  Only meaningful after [`Self::new_for_test`].
     #[cfg(test)]
     pub(crate) fn push_canned_result(&mut self, exit_code: i32, stderr: &str) {
-        self.canned_results.push_back((exit_code, stderr.to_string()));
+        self.canned_results
+            .push_back((exit_code, String::new(), stderr.to_string()));
+    }
+
+    /// Queue a `(exit_code, stdout, stderr)` override for the NEXT `no_spawn`
+    /// command dispatched — lets a test drive the REAL spawn → poll →
+    /// stdout-parse pipeline (e.g. `coord diagnose --json --dry-run`'s
+    /// `DIAGNOSE_JSON:` line, or a legacy pre-#935 daemon's response with no
+    /// such line) without a real `coord` subprocess. Only meaningful after
+    /// [`Self::new_for_test`].
+    #[cfg(test)]
+    pub(crate) fn push_canned_result_with_stdout(
+        &mut self,
+        exit_code: i32,
+        stdout: &str,
+        stderr: &str,
+    ) {
+        self.canned_results
+            .push_back((exit_code, stdout.to_string(), stderr.to_string()));
     }
 
     /// Internal: unconditionally start `coord <argv>` in a background thread
@@ -207,25 +227,26 @@ impl CommandRunner {
         if self.no_spawn {
             #[cfg(test)]
             self.spawned_calls.push(argv.clone());
-            // #863: consume a queued (exit_code, stderr) override if the test
-            // pushed one via `push_canned_result`; otherwise the usual
-            // zero-exit success (unconditional call in non-test builds since
-            // `no_spawn` can only be true via `new_for_test`, which is itself
-            // `#[cfg(test)]`).
+            // #863/#935: consume a queued (exit_code, stdout, stderr)
+            // override if the test pushed one via `push_canned_result` /
+            // `push_canned_result_with_stdout`; otherwise the usual
+            // zero-exit success with empty output (unconditional call in
+            // non-test builds since `no_spawn` can only be true via
+            // `new_for_test`, which is itself `#[cfg(test)]`).
             #[cfg(test)]
-            let (exit_code, stderr) = self
+            let (exit_code, stdout, stderr) = self
                 .canned_results
                 .pop_front()
-                .unwrap_or((0, String::new()));
+                .unwrap_or((0, String::new(), String::new()));
             #[cfg(not(test))]
-            let (exit_code, stderr) = (0, String::new());
+            let (exit_code, stdout, stderr) = (0, String::new(), String::new());
             let (tx, rx) = mpsc::channel();
             let _ = tx.send(CommandResult {
                 label: label.clone(),
                 exit_code,
                 duration: Duration::default(),
                 stderr,
-                stdout: String::new(),
+                stdout,
             });
             self.state = CommandState::Running {
                 label,

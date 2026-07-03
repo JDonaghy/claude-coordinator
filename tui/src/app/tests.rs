@@ -23117,6 +23117,7 @@ Milestone tracking issue.
             actions_taken: vec![],
             needs_reset: false,
             has_phantom_session: has_phantom,
+            legacy: false,
         });
         app
     }
@@ -23303,5 +23304,142 @@ Milestone tracking issue.
         assert!(
             !action_ids.contains(&"diagnose-reset"),
             "old 'diagnose-reset' item must not appear in context menu: {action_ids:?}"
+        );
+    }
+
+    // ── #935 fix-review follow-up: real spawn → parse → dialog pipeline ─────
+    //
+    // Every test above builds `PendingDiagnoseDialog` directly via a fixture,
+    // never exercising `dispatch_diagnose_for_selected_pipeline_row`'s argv
+    // construction, `CommandRunner::poll()`, or the `DIAGNOSE_JSON:`/legacy
+    // -text parsing branches in `run_periodic_work`. That gap is exactly what
+    // let the manual-smoke failure ship: the dialog never opened against a
+    // real (or version-skewed) `coord diagnose` response. These tests drive
+    // the REAL pipeline end-to-end via `push_canned_result_with_stdout` (no
+    // real `coord` subprocess).
+
+    /// Helper: an app with a single selected Pipeline-view row for
+    /// repo "api" issue 42 — enough for `selected_issue_repo_and_key()` /
+    /// `dispatch_diagnose_for_selected_pipeline_row` to resolve a target.
+    fn make_app_with_selected_pipeline_row() -> CoordApp {
+        let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 42,
+            title: "Fix the widget".to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec![],
+            all_labels: vec![],
+            is_closed: false,
+        }];
+        app.pipeline_sel = Some(0);
+        app
+    }
+
+    /// End-to-end happy path: a `coord diagnose --json --dry-run` response
+    /// WITH a `DIAGNOSE_JSON:` line must flow through the real
+    /// dispatch → spawn → poll → parse pipeline into a non-legacy
+    /// `pending_diagnose_dialog`.
+    #[test]
+    fn diagnose_real_spawn_with_json_line_populates_dialog() {
+        let mut app = make_app_with_selected_pipeline_row();
+        let stdout = concat!(
+            "diagnose api #42 — stage=work [dry-run]\n",
+            "  · phantom work row running with no live session\n",
+            "DIAGNOSE_JSON:{\"repo_name\":\"api\",\"issue_number\":42,\"stage\":\"work\",",
+            "\"findings\":[\"phantom work row running with no live session\"],",
+            "\"actions_taken\":[],\"recovered\":true,\"needs_reset\":false,",
+            "\"branch_preserved\":true,\"reset_performed\":false}\n",
+            "DIAGNOSE_RESULT: stage=work recovered=true needs_reset=false ",
+            "reset_performed=false actions=0\n",
+        );
+        // Must be queued BEFORE dispatch — `new_for_test()`'s no_spawn path
+        // resolves synchronously at spawn time.
+        app.command_runner
+            .push_canned_result_with_stdout(0, stdout, "");
+
+        let dispatched = app.dispatch_diagnose_for_selected_pipeline_row(false, true, true);
+        assert!(dispatched, "dispatch must succeed with a selected pipeline row");
+
+        // Drain the (already-resolved) canned result — real poll() + parse.
+        app.run_periodic_work();
+
+        let dlg = app
+            .pending_diagnose_dialog
+            .as_ref()
+            .expect("a well-formed DIAGNOSE_JSON line must populate pending_diagnose_dialog");
+        assert_eq!(dlg.repo, "api");
+        assert_eq!(dlg.issue_number, 42);
+        assert_eq!(dlg.stage, "work");
+        assert!(!dlg.legacy, "a well-formed DIAGNOSE_JSON line must NOT be flagged legacy");
+        assert_eq!(
+            dlg.findings,
+            vec!["phantom work row running with no live session".to_string()],
+        );
+    }
+
+    /// End-to-end degraded path: a legacy (pre-#935) daemon's response — no
+    /// `DIAGNOSE_JSON:` line, but the always-emitted `·`/`✓` lines and
+    /// `DIAGNOSE_RESULT:` trailer — must still open `pending_diagnose_dialog`
+    /// (flagged `legacy: true`) instead of leaving the operator with a bare
+    /// toast and nothing they can act on. This is the exact scenario the
+    /// #935 fix review flagged as blocking: a version-skewed daemon must not
+    /// regress to "blind fire-and-toast".
+    #[test]
+    fn diagnose_real_spawn_without_json_line_falls_back_to_legacy_dialog() {
+        let mut app = make_app_with_selected_pipeline_row();
+        let stdout = concat!(
+            "diagnose api #42 — stage=work [dry-run]\n",
+            "  · phantom work row running with no live session\n",
+            "  ✓ would clear the stale claim\n",
+            "DIAGNOSE_RESULT: stage=work recovered=true needs_reset=false ",
+            "reset_performed=false actions=1\n",
+        );
+        app.command_runner
+            .push_canned_result_with_stdout(0, stdout, "");
+
+        let dispatched = app.dispatch_diagnose_for_selected_pipeline_row(false, true, true);
+        assert!(dispatched, "dispatch must succeed with a selected pipeline row");
+
+        app.run_periodic_work();
+
+        {
+            let dlg = app.pending_diagnose_dialog.as_ref().expect(
+                "a missing DIAGNOSE_JSON line must still open a degraded dialog, not \
+                 just a toast — this is the exact regression the #935 fix review \
+                 flagged (version-skewed daemon -> blind toast, dialog never opens)",
+            );
+            assert_eq!(dlg.repo, "api");
+            assert_eq!(dlg.issue_number, 42);
+            assert_eq!(dlg.stage, "work");
+            assert!(dlg.legacy, "must be flagged legacy when parsed from text output");
+            assert_eq!(
+                dlg.findings,
+                vec!["phantom work row running with no live session".to_string()],
+            );
+            assert_eq!(
+                dlg.actions_taken,
+                vec!["would clear the stale claim".to_string()],
+            );
+            assert!(!dlg.needs_reset);
+        }
+
+        // Render it — the dialog must actually appear (not just a toast), and
+        // note that it's a best-effort parse so the operator understands why
+        // the daemon needs upgrading.
+        use quadraui::tui::testing::driver_with_shell;
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        assert!(
+            driver.screen_contains("Diagnose:"),
+            "legacy-fallback dialog must render just like the JSON path:\n{}",
+            driver.screen(),
+        );
+        assert!(
+            driver.screen_contains("predates #935")
+                || driver.screen_contains("best-effort"),
+            "dialog body should note the degraded/legacy source:\n{}",
+            driver.screen(),
         );
     }

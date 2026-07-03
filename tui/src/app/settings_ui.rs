@@ -7,6 +7,25 @@ use super::*;
 
 // ─── Shared periodic work (called from both handle() and tick()) ─────────────
 
+/// Extract `(repo, issue_number)` from a `CommandResult::label` of the shape
+/// `"coord diagnose <repo> <issue> [--stage <stage>] [--reset] [--dry-run]
+/// [--json]"` (see `dispatch_diagnose_for_selected_pipeline_row`). Used to
+/// build the #935 degraded-fallback dialog when a version-skewed daemon's
+/// response has no `DIAGNOSE_JSON:` line — the positional repo/issue are
+/// still in the label even though the JSON body never arrived.
+fn parse_diagnose_label_repo_issue(label: &str) -> Option<(String, u64)> {
+    let mut it = label.split_whitespace();
+    if it.next()? != "coord" {
+        return None;
+    }
+    if it.next()? != "diagnose" {
+        return None;
+    }
+    let repo = it.next()?.to_string();
+    let issue_number: u64 = it.next()?.parse().ok()?;
+    Some((repo, issue_number))
+}
+
 impl CoordApp {
     /// Time-based housekeeping that must run regardless of whether a UI
     /// event arrived: toast pruning, data auto-refresh, background command
@@ -224,6 +243,7 @@ impl CoordApp {
                                 actions_taken,
                                 needs_reset,
                                 has_phantom_session,
+                                legacy: false,
                             });
                         } else {
                             // JSON parse failed — fall back to plain toast.
@@ -234,12 +254,68 @@ impl CoordApp {
                             );
                         }
                     } else {
-                        // No DIAGNOSE_JSON line — fall back to trailer-only toast.
-                        self.push_toast(
-                            "Diagnose",
-                            "No DIAGNOSE_JSON line in output — daemon may be pre-#935.",
-                            ToastSeverity::Warning,
-                        );
+                        // No DIAGNOSE_JSON line — the daemon predates #935's
+                        // JSON support (or relayed a malformed response). The
+                        // human-readable findings (`·`), actions (`✓`), and
+                        // the `DIAGNOSE_RESULT:` trailer are ALWAYS emitted
+                        // regardless of --json, so best-effort parse those
+                        // into the SAME options dialog rather than leaving
+                        // the operator with a bare toast and no way to act
+                        // (the exact "blind fire-and-toast" UX #935 set out
+                        // to eliminate).
+                        if let Some((repo, issue_number)) =
+                            parse_diagnose_label_repo_issue(&result.label)
+                        {
+                            let trailer = out
+                                .lines()
+                                .rev()
+                                .find(|l| l.starts_with("DIAGNOSE_RESULT:"));
+                            let needs_reset = trailer
+                                .map(|l| l.contains("needs_reset=true"))
+                                .unwrap_or(false);
+                            let stage = trailer
+                                .and_then(|l| {
+                                    l.split_whitespace()
+                                        .find(|tok| tok.starts_with("stage="))
+                                })
+                                .and_then(|tok| tok.strip_prefix("stage="))
+                                .unwrap_or("work")
+                                .to_string();
+                            let findings: Vec<String> = out
+                                .lines()
+                                .filter(|l| l.trim_start().starts_with('·'))
+                                .map(|l| l.trim_start().trim_start_matches('·').trim().to_string())
+                                .collect();
+                            let actions_taken: Vec<String> = out
+                                .lines()
+                                .filter(|l| l.trim_start().starts_with('✓'))
+                                .map(|l| l.trim_start().trim_start_matches('✓').trim().to_string())
+                                .collect();
+                            let has_phantom_session = self.live_tmux_sessions.iter().any(|s| {
+                                s.assignment_id.starts_with("pending-")
+                                    && s.issue_number == Some(issue_number)
+                                    && s.repo_name.as_deref() == Some(&repo)
+                            });
+                            self.pending_diagnose_dialog = Some(PendingDiagnoseDialog {
+                                repo,
+                                issue_number,
+                                stage,
+                                findings,
+                                actions_taken,
+                                needs_reset,
+                                has_phantom_session,
+                                legacy: true,
+                            });
+                        } else {
+                            // argv shape unrecognized — truly nothing to show.
+                            self.push_toast(
+                                "Diagnose",
+                                "No DIAGNOSE_JSON line in output — daemon may be \
+                                 pre-#935, and the fallback output could not be \
+                                 parsed either.",
+                                ToastSeverity::Warning,
+                            );
+                        }
                     }
                 } else {
                     // Full recover / reset / legacy pass: existing toast behaviour.

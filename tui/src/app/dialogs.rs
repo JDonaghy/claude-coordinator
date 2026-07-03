@@ -1031,6 +1031,14 @@ impl CoordApp {
             } else {
                 "No issues found — stage appears healthy.".to_string()
             };
+            let body_text = if dlg.legacy {
+                format!(
+                    "{body_text}\n\n(daemon predates #935 JSON support — best-effort \
+                     parsed from legacy text output)"
+                )
+            } else {
+                body_text
+            };
 
             let mut buttons: Vec<DialogButton> = Vec::new();
             // "Recover" — run the full (non-dry-run) diagnose.
