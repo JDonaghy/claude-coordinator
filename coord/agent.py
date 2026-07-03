@@ -1822,6 +1822,78 @@ class AgentServer:
     # pattern in practice.
     _SAFE_PATH_COMPONENT = re.compile(r"^[a-zA-Z0-9._-]+$")
 
+    def _find_live_worktree(self, repo: str, branch: str) -> Path | None:
+        """Locate a live git worktree of *repo* still checked out to *branch* (#914).
+
+        Reads ``git worktree list --porcelain`` on the repo's main checkout
+        (``self.repo_paths[repo]``) — the authoritative source for which
+        worktrees belong to this repo and what branch each has checked out —
+        rather than guessing from directory names under
+        ``state_dir/worktrees/``. *branch* is compared in its sanitized form
+        (matching the manifest endpoint's path component), so
+        ``refs/heads/issue-914-foo`` and the already-sanitized ``branch``
+        argument line up regardless of slashes.
+
+        Returns the worktree path, or ``None`` when the repo is unknown to
+        this agent, git fails, or no worktree matches.
+        """
+        repo_path_str = self.repo_paths.get(repo)
+        if not repo_path_str:
+            return None
+        try:
+            output = _git(Path(repo_path_str), "worktree", "list", "--porcelain")
+        except (_GitError, FileNotFoundError, OSError):
+            return None
+
+        current_path: Path | None = None
+        for line in output.splitlines():
+            if line.startswith("worktree "):
+                current_path = Path(line[len("worktree "):])
+            elif line.startswith("branch ") and current_path is not None:
+                ref = line[len("branch "):]
+                name = ref.removeprefix("refs/heads/")
+                if _sanitize_branch(name) == branch:
+                    return current_path
+        return None
+
+    def artifact_absence_reason(self, repo: str, branch: str) -> str:
+        """Ground-truth explanation for why a stash is missing (#914).
+
+        Called by the manifest 404 path once :meth:`artifact_manifest` has
+        already tried (and failed) to lazily stash from a live worktree.
+        Distinguishes "built but never stashed" — a live worktree for
+        *branch* still exists on this host, so the interactive session's
+        finalize/``coord report-result`` simply never ran (crash, tmux
+        killed, ``coord done`` skipped) — from genuinely absent, so
+        ``coord pull-artifact`` stops blaming GC / glob mismatches / missing
+        config when none of those is the real cause.
+        """
+        if (
+            not self._SAFE_PATH_COMPONENT.match(repo)
+            or not self._SAFE_PATH_COMPONENT.match(branch)
+        ):
+            return "invalid repo/branch name"
+        wt = self._find_live_worktree(repo, branch)
+        if wt is not None and wt.exists():
+            if not self.artifact_paths.get(repo):
+                return (
+                    f"a live worktree for branch {branch!r} exists on this host "
+                    f"({wt}), but repo {repo!r} has no artifact_paths configured "
+                    "— there is nothing to stash."
+                )
+            return (
+                f"a live worktree for branch {branch!r} exists on this host "
+                f"({wt}), but the build did not produce any files matching "
+                "artifact_paths — the session likely wasn't finalized (crash, "
+                "tmux killed, or `coord done` never ran), and re-running the "
+                "build or checking the artifact_paths globs may help."
+            )
+        return (
+            f"no stash and no live worktree for branch {branch!r} on this host — "
+            "the branch was likely already merged and its worktree pruned, or "
+            "nothing was ever built here."
+        )
+
     def artifact_manifest(self, repo: str, branch: str) -> dict | None:
         """Return the artifact manifest for a stash, or ``None`` if missing.
 
@@ -1834,6 +1906,14 @@ class AgentServer:
         The agent server is Tailscale-only, not internet-facing, but rejecting
         malformed params is cheap and prevents any node from probing the
         artifacts directory structure.
+
+        Lazy stash-on-pull safety net (#914): when the stash is empty, a
+        missed interactive finalize (the session ended without a clean
+        ``coord done`` — crash, tmux killed directly, or finalize skipped)
+        can still leave the built worktree sitting on disk. Before reporting
+        absence, look for a live worktree still checked out to *branch* and
+        stash it now, so `coord pull-artifact` self-heals instead of 404ing
+        with a misleading "GC'd / glob mismatch / not configured" guess.
         """
         if (
             not self._SAFE_PATH_COMPONENT.match(repo)
@@ -1842,7 +1922,21 @@ class AgentServer:
             return None
         stash_dir = self.state_dir / "artifacts" / repo / branch
         if not stash_dir.exists():
-            return None
+            patterns = self.artifact_paths.get(repo, [])
+            wt = self._find_live_worktree(repo, branch) if patterns else None
+            if wt is not None and wt.exists():
+                stash_artifacts_for_branch(
+                    worktree_path=wt,
+                    branch=branch,
+                    repo_name=repo,
+                    patterns=patterns,
+                    state_dir=self.state_dir,
+                    assignment_id=wt.name,
+                )
+                if stash_dir.exists():
+                    self._artifact_bytes_cache = None
+            if not stash_dir.exists():
+                return None
 
         files = []
         for f in sorted(stash_dir.iterdir()):

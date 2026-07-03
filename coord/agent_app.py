@@ -587,13 +587,18 @@ def build_app(
             }
 
         Returns 404 when no stash exists for the given (repo, branch) pair.
+        The 404 body's ``error`` field carries the agent's ground-truth
+        reason (#914) — e.g. a live worktree exists but was never stashed,
+        vs. genuinely nothing was ever built here — rather than a generic
+        message, since only this host can tell the difference.
         """
         repo = request.path_params["repo"]
         branch = request.path_params["branch"]
         manifest = server.artifact_manifest(repo, branch)
         if manifest is None:
+            reason = server.artifact_absence_reason(repo, branch)
             return JSONResponse(
-                {"error": f"no artifacts for repo={repo!r} branch={branch!r}"},
+                {"error": f"no artifacts for repo={repo!r} branch={branch!r}: {reason}"},
                 status_code=404,
             )
         return JSONResponse(manifest)
