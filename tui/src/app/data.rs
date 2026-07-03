@@ -1779,6 +1779,13 @@ pub(crate) struct LiveTmuxSession {
     /// (#491).  `false` while the pane is still running or status is unknown
     /// (sessions that pre-date the `pane_dead` field default to `false`).
     pub(crate) pane_dead: bool,
+    /// #935 (Part A): number of discovery sweeps this optimistic `"pending-"`
+    /// entry has survived without being covered by a real session.  Only used
+    /// on entries whose `assignment_id` starts with `"pending-"`; always 0 on
+    /// real discovery entries.  When the count exceeds the budget (2 sweeps),
+    /// `poll_remote_sessions` drops the entry so a phantom "Live" badge cannot
+    /// linger forever when a session never actually started.
+    pub(crate) pending_sweep_count: u8,
 }
 
 /// Fetch live `coord-*` tmux sessions by running `coord sessions --json`.
@@ -1840,6 +1847,7 @@ pub(crate) fn parse_sessions_json(text: &str) -> Vec<LiveTmuxSession> {
                 issue_title,
                 machine,
                 pane_dead,
+                pending_sweep_count: 0,
             })
         })
         .collect()

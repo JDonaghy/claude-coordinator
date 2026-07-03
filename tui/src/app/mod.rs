@@ -740,6 +740,30 @@ pub(crate) struct MachinePickEntry {
     is_local: bool,
 }
 
+/// #935 Part B: pending "Diagnose & fix stage…" results dialog.
+///
+/// Populated from the `DIAGNOSE_JSON:` output of a `coord diagnose --json
+/// --dry-run` command.  `build_prompt_dialog()` renders it as an option dialog;
+/// `fire_dialog_button()` dispatches the chosen action.
+#[derive(Clone)]
+struct PendingDiagnoseDialog {
+    /// Coord-local repo name (e.g. "api").
+    repo: String,
+    /// GitHub issue number.
+    issue_number: u64,
+    /// Resolved stage (e.g. "work", "review").
+    stage: String,
+    /// Human-readable findings from the dry-run pass.
+    findings: Vec<String>,
+    /// Actions the full recovery run WOULD take (from the dry-run result).
+    actions_taken: Vec<String>,
+    /// True when the dry-run says a manual reset is still needed.
+    needs_reset: bool,
+    /// True when ≥1 `live_tmux_sessions` entry is a `"pending-"` entry for
+    /// this (repo, issue) — i.e. a phantom live session may be present.
+    has_phantom_session: bool,
+}
+
 /// #316 Phase B: state for the file-issue finaliser modal.
 /// Shown when the user confirms filing a new issue drafted by a new-issue-chat.
 ///
@@ -2191,6 +2215,10 @@ pub struct CoordApp {
     /// Review/Fix launch.  Intercepts numeric keys (1, 2, …) to pick the
     /// target machine, or Esc to cancel.  Cleared when a machine is chosen.
     pending_machine_picker: Option<PendingMachinePicker>,
+    /// #935 Part B: parsed results from a `coord diagnose --json --dry-run`
+    /// run, waiting for the user to choose Recover / Reset / Clear phantom /
+    /// Dismiss in `build_prompt_dialog`.
+    pending_diagnose_dialog: Option<PendingDiagnoseDialog>,
     /// Force-quit confirmation.  Set when Esc/q is pressed while an
     /// interactive session is live in the Terminal tab — instead of silently
     /// swallowing the keypress (a dead end), we show a dialog so the operator
@@ -2749,6 +2777,7 @@ impl CoordApp {
             pending_board_chat: None,
             pending_repo_picker: None,
             pending_machine_picker: None,
+            pending_diagnose_dialog: None,
             pending_quit_confirm: false,
             quit_requested: false,
             file_issue_modal: None,

@@ -506,18 +506,14 @@ impl CoordApp {
                             .with_shortcut("f"),
                     );
                 }
-                // Per-stage doctor: diagnose + best-effort recover + reconcile
-                // this issue's board rows (phantom 'running', dropped review
-                // findings, stale sessions, merged-but-grey).  When it can't
-                // recover, the result toast says so and "Reset stage" clears it
-                // — non-destructively (the branch + commits are kept).
+                // #935 Part B: unified per-stage doctor — dry-run-diagnoses
+                // first, then shows a results dialog with option buttons
+                // (Recover / Reset stage / Clear phantom live session / Dismiss).
+                // Replaces the two separate "Diagnose & fix stage" and
+                // "Reset stage" items that required knowing which to pick.
                 items.push(ContextMenuItem::action(
-                    "diagnose-stage",
-                    "Diagnose & fix stage",
-                ));
-                items.push(ContextMenuItem::action(
-                    "diagnose-reset",
-                    "Reset stage (keeps branch + commits)",
+                    "diagnose-fix-stage",
+                    "Diagnose & fix stage…",
                 ));
                 // #266: Drop an In-progress *idle* item back to Backlog (strips
                 // `status:ready`).  Disabled when (a) a live session is attached
@@ -1001,6 +997,86 @@ impl CoordApp {
                 body: vec![StyledText::plain(
                     "Choose the repo to file the new issue in:",
                 )],
+                buttons,
+                severity: Some(DialogSeverity::Question),
+                vertical_buttons: true,
+                input: None,
+            });
+        }
+
+        // ── #935 Part B: Diagnose & fix stage results dialog ────────────
+        if let Some(ref dlg) = self.pending_diagnose_dialog {
+            let repo = dlg.repo.clone();
+            let issue_number = dlg.issue_number;
+            let stage = dlg.stage.clone();
+            let needs_reset = dlg.needs_reset;
+            let has_phantom = dlg.has_phantom_session;
+
+            // Body: prefer actions (dry-run reports what would be done) over
+            // findings; fall back to findings if no actions; empty → healthy.
+            let body_text = if !dlg.actions_taken.is_empty() {
+                dlg.actions_taken
+                    .iter()
+                    .take(6)
+                    .map(|a| format!("✓ {a}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else if !dlg.findings.is_empty() {
+                dlg.findings
+                    .iter()
+                    .take(6)
+                    .map(|f| format!("· {f}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                "No issues found — stage appears healthy.".to_string()
+            };
+
+            let mut buttons: Vec<DialogButton> = Vec::new();
+            // "Recover" — run the full (non-dry-run) diagnose.
+            // Always offered; it's safe to retry if already healthy.
+            buttons.push(DialogButton {
+                id: WidgetId::new("diagnose-stage"),
+                label: "R  Recover (diagnose & fix)".into(),
+                is_default: !needs_reset,
+                is_cancel: false,
+                tint: None,
+            });
+            // "Reset stage" — diagnose --reset; always available as a
+            // non-destructive escape hatch (keeps the branch).
+            buttons.push(DialogButton {
+                id: WidgetId::new("diagnose-reset"),
+                label: "X  Reset stage (keeps branch + commits)".into(),
+                is_default: needs_reset,
+                is_cancel: false,
+                tint: Some(Color::rgb(200, 130, 50)),
+            });
+            // "Clear phantom live session" — only meaningful when there is
+            // actually a pending- entry for this issue.
+            if has_phantom {
+                buttons.push(DialogButton {
+                    id: WidgetId::new("diagnose-clear-phantom"),
+                    label: "C  Clear phantom live session".into(),
+                    is_default: false,
+                    is_cancel: false,
+                    tint: Some(Color::rgb(150, 100, 200)),
+                });
+            }
+            buttons.push(DialogButton {
+                id: WidgetId::new("cancel"),
+                label: "Esc  Dismiss".into(),
+                is_default: false,
+                is_cancel: true,
+                tint: None,
+            });
+
+            return Some(Dialog {
+                table: None,
+                id: WidgetId::new("dialog:diagnose-fix-stage"),
+                title: StyledText::plain(format!(
+                    "Diagnose: {repo} #{issue_number} — {stage}"
+                )),
+                body: vec![StyledText::plain(body_text)],
                 buttons,
                 severity: Some(DialogSeverity::Question),
                 vertical_buttons: true,
@@ -2110,6 +2186,56 @@ impl CoordApp {
                 }
             } else {
                 self.pending_fix_force_confirm = None;
+            }
+            *self.dialog_layout.borrow_mut() = None;
+            return;
+        }
+
+        // ── #935 Part B: Diagnose & fix stage dialog ─────────────────────
+        if self.pending_diagnose_dialog.is_some() {
+            // Route the button id to the appropriate action.  The action
+            // dispatch also clears pending_diagnose_dialog where needed.
+            match id {
+                "diagnose-stage" | "diagnose-reset" | "diagnose-clear-phantom" => {
+                    // These are real action IDs: dispatch to
+                    // dispatch_context_menu_action which handles them (including
+                    // the phantom-clear path which takes the dialog from self).
+                    // We can't call dispatch_context_menu_action directly here
+                    // (borrow conflict), so inline the relevant logic:
+                    if id == "diagnose-stage" {
+                        self.dispatch_diagnose_for_selected_pipeline_row(false, false, false);
+                        self.pending_diagnose_dialog = None;
+                    } else if id == "diagnose-reset" {
+                        self.dispatch_diagnose_for_selected_pipeline_row(true, false, false);
+                        self.pending_diagnose_dialog = None;
+                    } else {
+                        // diagnose-clear-phantom
+                        if let Some(dlg) = self.pending_diagnose_dialog.take() {
+                            let repo = dlg.repo.clone();
+                            let issue_number = dlg.issue_number;
+                            let before = self.live_tmux_sessions.len();
+                            self.live_tmux_sessions.retain(|s| {
+                                !(s.assignment_id.starts_with("pending-")
+                                    && s.issue_number == Some(issue_number)
+                                    && s.repo_name.as_deref() == Some(&repo))
+                            });
+                            let removed = before - self.live_tmux_sessions.len();
+                            self.push_toast(
+                                "Phantom session cleared",
+                                &format!(
+                                    "#{issue_number}: removed {removed} phantom live-session \
+                                     entr{}. The card will move to Idle on the next refresh.",
+                                    if removed == 1 { "y" } else { "ies" },
+                                ),
+                                ToastSeverity::Info,
+                            );
+                        }
+                    }
+                }
+                _ => {
+                    // "cancel" or anything else → dismiss without action.
+                    self.pending_diagnose_dialog = None;
+                }
             }
             *self.dialog_layout.borrow_mut() = None;
             return;
@@ -4553,7 +4679,12 @@ impl CoordApp {
         }
     }
 
-    pub(crate) fn dispatch_diagnose_for_selected_pipeline_row(&mut self, reset: bool) -> bool {
+    pub(crate) fn dispatch_diagnose_for_selected_pipeline_row(
+        &mut self,
+        reset: bool,
+        dry_run: bool,
+        output_json: bool,
+    ) -> bool {
         let (repo, key) = match self.selected_issue_repo_and_key() {
             Some(v) => v,
             None => {
@@ -4575,11 +4706,19 @@ impl CoordApp {
         if reset {
             argv.push("--reset".into());
         }
+        if dry_run {
+            argv.push("--dry-run".into());
+        }
+        if output_json {
+            argv.push("--json".into());
+        }
         let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
         use crate::commands::SpawnQueuedOutcome;
         let outcome = self.command_runner.spawn_queued(&argv_refs);
         let verb = if reset {
             "Reset stage"
+        } else if dry_run {
+            "Diagnose stage"
         } else {
             "Diagnose & fix stage"
         };
@@ -4817,17 +4956,50 @@ impl CoordApp {
                 );
                 true
             }
-            // Per-stage doctor (diagnose + best-effort recover + reconcile this
-            // issue's board).  `coord diagnose` routes through the daemon, so it
-            // operates on the canonical board even from a thin client.
-            "diagnose-stage" => {
-                self.dispatch_diagnose_for_selected_pipeline_row(false);
+            // #935 Part B: unified per-stage doctor — dry-run-diagnoses first,
+            // then opens a results dialog with option buttons.
+            "diagnose-fix-stage" => {
+                self.dispatch_diagnose_for_selected_pipeline_row(false, true, true);
                 true
             }
-            // Non-destructive reset of the stage — clears the stage's
-            // rows/claim/worktree + stops a live session, KEEPING the branch.
+            // Internal action IDs used by the diagnose dialog buttons:
+            // Recover = full diagnose (no reset, no dry-run).
+            "diagnose-stage" => {
+                self.dispatch_diagnose_for_selected_pipeline_row(false, false, false);
+                self.pending_diagnose_dialog = None;
+                true
+            }
+            // Reset stage = diagnose --reset.
             "diagnose-reset" => {
-                self.dispatch_diagnose_for_selected_pipeline_row(true);
+                self.dispatch_diagnose_for_selected_pipeline_row(true, false, false);
+                self.pending_diagnose_dialog = None;
+                true
+            }
+            // Clear phantom live session — purges stale "pending-" live_tmux_sessions
+            // entries for the selected issue without running any coord command.
+            "diagnose-clear-phantom" => {
+                if let Some(dlg) = self.pending_diagnose_dialog.take() {
+                    let repo = dlg.repo.clone();
+                    let issue_number = dlg.issue_number;
+                    let before = self.live_tmux_sessions.len();
+                    self.live_tmux_sessions.retain(|s| {
+                        !(s.assignment_id.starts_with("pending-")
+                            && s.issue_number == Some(issue_number)
+                            && s.repo_name.as_deref() == Some(&repo))
+                    });
+                    let removed = before - self.live_tmux_sessions.len();
+                    self.push_toast(
+                        "Phantom session cleared",
+                        &format!(
+                            "#{}: removed {} phantom live-session entr{}. \
+                             The card will move to Idle on the next refresh.",
+                            issue_number,
+                            removed,
+                            if removed == 1 { "y" } else { "ies" },
+                        ),
+                        ToastSeverity::Info,
+                    );
+                }
                 true
             }
             // Leg 3c / A3 (#517, #581): human-attended testing agent launcher.
