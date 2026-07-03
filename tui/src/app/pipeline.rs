@@ -679,17 +679,14 @@ impl CoordApp {
     /// smoke / conflict-fix) — any active worker makes the issue Live.
     pub(crate) fn issue_session_is_live(&self, issue: &PipelineIssue) -> bool {
         // Interactive path: a coord-<id> tmux session exists.
+        //
+        // #935 Part A: a "pending-" optimistic entry only counts as live while
+        // either (a) it is within the sweep budget (newly launched, session not
+        // yet discoverable) OR (b) a running assignment independently confirms
+        // the work is active.  A phantom pending- that exhausted its budget
+        // without a real session appearing no longer makes the card "Live".
         let repo = Self::pipeline_repo_key(issue);
-        let has_tmux_session = self.live_tmux_sessions.iter().any(|s| {
-            s.issue_number == Some(issue.number) && s.repo_name.as_deref() == Some(repo)
-        });
-        if has_tmux_session {
-            return true;
-        }
-        // Headless path (#897): a `claude -p` worker (is_interactive=false)
-        // has no tmux session but is actively running.  Any assignment with
-        // status="running" — across all types — marks the issue as Live.
-        self.data.assignments.iter().any(|a| {
+        let has_running_assignment = self.data.assignments.iter().any(|a| {
             a.issue_number == issue.number
                 && issue
                     .coord_repo
@@ -697,7 +694,28 @@ impl CoordApp {
                     .map(|r| r == a.repo)
                     .unwrap_or(true)
                 && a.status == "running"
-        })
+        });
+
+        let has_tmux_session = self.live_tmux_sessions.iter().any(|s| {
+            if s.issue_number != Some(issue.number) || s.repo_name.as_deref() != Some(repo) {
+                return false;
+            }
+            if s.assignment_id.starts_with("pending-") {
+                // Pending entry: live only while under budget OR assignment
+                // confirms it (the headless-path guard from #897).
+                s.pending_sweep_count <= Self::PENDING_SESSION_SWEEP_BUDGET
+                    || has_running_assignment
+            } else {
+                true // real session from discovery always counts
+            }
+        });
+        if has_tmux_session {
+            return true;
+        }
+        // Headless path (#897): a `claude -p` worker (is_interactive=false)
+        // has no tmux session but is actively running.  Any assignment with
+        // status="running" — across all types — marks the issue as Live.
+        has_running_assignment
     }
 
     /// Split the in-progress ("Active") issues into two ordered groups by
@@ -5237,6 +5255,13 @@ impl CoordApp {
     /// completes it REPLACES the local-only startup snapshot so the reattach
     /// detection in `launch_interactive_session_for_selected_issue` can target
     /// sessions running on remote fleet machines.  Returns true on update.
+    /// Maximum number of discovery sweeps an optimistic `"pending-"` entry may
+    /// survive without being covered by a real session before it is evicted.
+    /// Two sweeps ≈ 2× the remote-session poll interval (typically ~10 s each),
+    /// so a genuinely-starting session has plenty of time to appear while a
+    /// never-actually-started phantom is dropped within ~20 s. (#935 Part A)
+    pub(crate) const PENDING_SESSION_SWEEP_BUDGET: u8 = 2;
+
     pub(crate) fn poll_remote_sessions(&mut self) -> bool {
         let Some(rx) = self.pending_remote_sessions.as_ref() else {
             return false;
@@ -5250,6 +5275,12 @@ impl CoordApp {
                 // whose (repo_name, issue_number) pair is NOT already covered
                 // by the real discovery result; drop it once the real session
                 // appears (to avoid stale phantom entries accumulating).
+                //
+                // #935 Part A: increment the sweep counter each time a pending
+                // entry survives uncovered.  Once it exceeds
+                // `PENDING_SESSION_SWEEP_BUDGET` the entry is evicted so that
+                // a phantom "pending-" that never becomes a real session doesn't
+                // keep the Pipeline card pinned to "Live" indefinitely.
                 let covered: std::collections::HashSet<(Option<String>, Option<u64>)> = sessions
                     .iter()
                     .map(|s| (s.repo_name.clone(), s.issue_number))
@@ -5257,9 +5288,19 @@ impl CoordApp {
                 let surviving_pending: Vec<LiveTmuxSession> = self
                     .live_tmux_sessions
                     .drain(..)
-                    .filter(|s| {
-                        s.assignment_id.starts_with("pending-")
-                            && !covered.contains(&(s.repo_name.clone(), s.issue_number))
+                    .filter_map(|mut s| {
+                        if !s.assignment_id.starts_with("pending-") {
+                            return None; // real entries are replaced by discovery
+                        }
+                        if covered.contains(&(s.repo_name.clone(), s.issue_number)) {
+                            return None; // real session appeared → drop optimistic
+                        }
+                        s.pending_sweep_count =
+                            s.pending_sweep_count.saturating_add(1);
+                        if s.pending_sweep_count > Self::PENDING_SESSION_SWEEP_BUDGET {
+                            return None; // budget exhausted → evict phantom
+                        }
+                        Some(s)
                     })
                     .collect();
                 self.live_tmux_sessions = surviving_pending;

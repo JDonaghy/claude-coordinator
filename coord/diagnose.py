@@ -77,6 +77,14 @@ class DiagnoseResult:
     # Whether a reset was actually performed this run.
     reset_performed: bool = False
 
+    def to_json_dict(self) -> dict:
+        """Return a JSON-serialisable dict of all DiagnoseResult fields.
+        Used by ``coord diagnose --json`` and the daemon ``post_diagnose``
+        handler (#935 Part C) so the TUI can parse findings/actions without
+        scraping the human-readable output lines."""
+        import dataclasses  # noqa: PLC0415 — lazy to avoid circular import risk
+        return dataclasses.asdict(self)
+
     def summary_line(self) -> str:
         """The machine-readable trailer the TUI greps for (mirrors the
         ``coord:`` marker convention)."""

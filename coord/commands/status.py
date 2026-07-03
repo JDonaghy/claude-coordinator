@@ -544,6 +544,16 @@ def _diagnose_via_daemon(svc, params: dict) -> None:
 
 @click.option("--dry-run", is_flag=True, help="Report findings without writing.")
 @click.option(
+    "--json",
+    "output_json",
+    is_flag=True,
+    help=(
+        "#935: emit the DiagnoseResult as a JSON object on stdout (in addition to "
+        "the human-readable lines and the DIAGNOSE_RESULT trailer).  The JSON block "
+        "is printed BEFORE the trailer so callers can parse it without grepping."
+    ),
+)
+@click.option(
     "--orphan-worktrees",
     is_flag=True,
     help=(
@@ -561,6 +571,7 @@ def diagnose(
     stage: str | None,
     reset: bool,
     dry_run: bool,
+    output_json: bool,
     config_path: Path,
     orphan_worktrees: bool = False,
 ) -> None:
@@ -592,6 +603,7 @@ def diagnose(
                 "stage": stage,
                 "reset": reset,
                 "dry_run": dry_run,
+                "output_json": output_json,
             },
         )
         return
@@ -621,6 +633,11 @@ def diagnose(
     if res.needs_reset and not reset:
         click.echo("  ⚠ still wedged — re-run with --reset to clear the stage "
                    "(keeps the branch + commits).")
+    # #935 Part C: emit JSON dict before the trailer when --json is requested.
+    # The daemon handler also passes output_json through so remote calls relay it.
+    if output_json:
+        import json  # noqa: PLC0415
+        click.echo("DIAGNOSE_JSON:" + json.dumps(res.to_json_dict()))
     click.echo(res.summary_line())
 
 

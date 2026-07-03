@@ -160,47 +160,125 @@ impl CoordApp {
                     }
                 }
             }
-            // Per-stage doctor: surface `coord diagnose`'s findings/actions and,
-            // when it couldn't recover, point at the non-destructive Reset.  The
-            // findings ride on stdout (captured since this feature); the trailing
-            // DIAGNOSE_RESULT line tells us whether a reset is still needed.
+            // Per-stage doctor: surface `coord diagnose`'s findings/actions.
+            //
+            // #935 Part B: when the label includes "--json" AND "--dry-run"
+            // (the two-phase "Diagnose & fix stage…" dry-run pass), parse
+            // the DIAGNOSE_JSON line and open an option dialog instead of a
+            // plain toast.  For all other diagnose completions (the full
+            // recover pass, the --reset pass, or old-style calls that don't
+            // carry --json) keep the existing toast behaviour.
             if result.label.contains("diagnose ") && result.exit_code == 0 {
                 let out = result.stdout.trim();
-                let needs_reset = out
-                    .lines()
-                    .rev()
-                    .find(|l| l.starts_with("DIAGNOSE_RESULT:"))
-                    .map(|l| l.contains("needs_reset=true"))
-                    .unwrap_or(false);
-                let is_reset = result.label.contains("--reset");
-                // Prefer the action (✓) lines; fall back to the findings (·).
-                let actions: Vec<&str> = out
-                    .lines()
-                    .filter(|l| l.trim_start().starts_with('✓'))
-                    .collect();
-                let mut body = if !actions.is_empty() {
-                    actions.join("\n")
+                let is_dry_run_json = result.label.contains("--json")
+                    && result.label.contains("--dry-run");
+                if is_dry_run_json {
+                    // Parse the DIAGNOSE_JSON line to populate the dialog.
+                    let json_line = out
+                        .lines()
+                        .find(|l| l.starts_with("DIAGNOSE_JSON:"))
+                        .and_then(|l| l.strip_prefix("DIAGNOSE_JSON:"));
+                    if let Some(json_str) = json_line {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+                            let repo = v.get("repo_name")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let issue_number = v.get("issue_number")
+                                .and_then(|x| x.as_u64())
+                                .unwrap_or(0);
+                            let stage = v.get("stage")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("work")
+                                .to_string();
+                            let findings: Vec<String> = v.get("findings")
+                                .and_then(|x| x.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|e| e.as_str().map(|s| s.to_string()))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            let actions_taken: Vec<String> = v.get("actions_taken")
+                                .and_then(|x| x.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|e| e.as_str().map(|s| s.to_string()))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            let needs_reset = v.get("needs_reset")
+                                .and_then(|x| x.as_bool())
+                                .unwrap_or(false);
+                            // Check for a phantom pending- entry for this issue.
+                            let has_phantom_session = self.live_tmux_sessions.iter().any(|s| {
+                                s.assignment_id.starts_with("pending-")
+                                    && s.issue_number == Some(issue_number)
+                                    && s.repo_name.as_deref() == Some(&repo)
+                            });
+                            self.pending_diagnose_dialog = Some(PendingDiagnoseDialog {
+                                repo,
+                                issue_number,
+                                stage,
+                                findings,
+                                actions_taken,
+                                needs_reset,
+                                has_phantom_session,
+                            });
+                        } else {
+                            // JSON parse failed — fall back to plain toast.
+                            self.push_toast(
+                                "Diagnose",
+                                "Could not parse DIAGNOSE_JSON — see log for details.",
+                                ToastSeverity::Warning,
+                            );
+                        }
+                    } else {
+                        // No DIAGNOSE_JSON line — fall back to trailer-only toast.
+                        self.push_toast(
+                            "Diagnose",
+                            "No DIAGNOSE_JSON line in output — daemon may be pre-#935.",
+                            ToastSeverity::Warning,
+                        );
+                    }
                 } else {
-                    out.lines()
-                        .filter(|l| l.trim_start().starts_with('·'))
-                        .take(6)
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                };
-                if body.is_empty() {
-                    body = "no changes needed".to_string();
+                    // Full recover / reset / legacy pass: existing toast behaviour.
+                    let needs_reset = out
+                        .lines()
+                        .rev()
+                        .find(|l| l.starts_with("DIAGNOSE_RESULT:"))
+                        .map(|l| l.contains("needs_reset=true"))
+                        .unwrap_or(false);
+                    let is_reset = result.label.contains("--reset");
+                    // Prefer the action (✓) lines; fall back to the findings (·).
+                    let actions: Vec<&str> = out
+                        .lines()
+                        .filter(|l| l.trim_start().starts_with('✓'))
+                        .collect();
+                    let mut body = if !actions.is_empty() {
+                        actions.join("\n")
+                    } else {
+                        out.lines()
+                            .filter(|l| l.trim_start().starts_with('·'))
+                            .take(6)
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    };
+                    if body.is_empty() {
+                        body = "no changes needed".to_string();
+                    }
+                    let (title, sev) = if is_reset {
+                        ("Stage reset (branch kept)", ToastSeverity::Info)
+                    } else if needs_reset {
+                        body.push_str(
+                            "\n\nUse 'Reset stage (keeps branch + commits)' to clear it.",
+                        );
+                        ("Diagnose — still wedged", ToastSeverity::Warning)
+                    } else {
+                        ("Diagnose & fix stage", ToastSeverity::Info)
+                    };
+                    self.push_toast(title, &body, sev);
                 }
-                let (title, sev) = if is_reset {
-                    ("Stage reset (branch kept)", ToastSeverity::Info)
-                } else if needs_reset {
-                    body.push_str(
-                        "\n\n→ right-click → \"Reset stage (keeps branch + commits)\" to clear it.",
-                    );
-                    ("Diagnose — still wedged", ToastSeverity::Warning)
-                } else {
-                    ("Diagnose & fix stage", ToastSeverity::Info)
-                };
-                self.push_toast(title, &body, sev);
                 self.refresh();
             }
             // #264: chain the queued `coord ready` after `coord stop`

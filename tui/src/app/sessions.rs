@@ -2321,6 +2321,7 @@ impl CoordApp {
                         issue_title: None,
                         machine: None,
                         pane_dead: false,
+                        pending_sweep_count: 0,
                     });
                 }
 

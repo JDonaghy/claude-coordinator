@@ -936,3 +936,167 @@ def test_maybe_fix_base_checkout_lock_no_base_holder(monkeypatch, config) -> Non
         f"no findings expected when holder is None; got {res.findings}"
     )
     assert not res.actions_taken, res.actions_taken
+
+
+# ── #935 Part C: DiagnoseResult.to_json_dict + coord diagnose --json ─────────
+
+
+def test_diagnose_result_to_json_dict_roundtrips_all_fields() -> None:
+    """``to_json_dict`` must serialise all dataclass fields correctly."""
+    import json
+    from coord.diagnose import DiagnoseResult
+
+    res = DiagnoseResult(
+        repo_name="api",
+        issue_number=42,
+        stage="work",
+        findings=["phantom running"],
+        actions_taken=["finalized work assignment"],
+        recovered=True,
+        needs_reset=False,
+        branch_preserved=True,
+        reset_performed=False,
+    )
+    d = res.to_json_dict()
+
+    # Verify JSON-serialisable (no TypeError on dump).
+    serialised = json.dumps(d)
+    roundtripped = json.loads(serialised)
+
+    assert roundtripped["repo_name"] == "api"
+    assert roundtripped["issue_number"] == 42
+    assert roundtripped["stage"] == "work"
+    assert roundtripped["findings"] == ["phantom running"]
+    assert roundtripped["actions_taken"] == ["finalized work assignment"]
+    assert roundtripped["recovered"] is True
+    assert roundtripped["needs_reset"] is False
+    assert roundtripped["branch_preserved"] is True
+    assert roundtripped["reset_performed"] is False
+
+
+def test_diagnose_result_to_json_dict_empty_lists() -> None:
+    """Works with default empty lists (no findings or actions)."""
+    import json
+    from coord.diagnose import DiagnoseResult
+
+    res = DiagnoseResult(repo_name="myrepo", issue_number=7, stage="review")
+    d = res.to_json_dict()
+    assert d["findings"] == []
+    assert d["actions_taken"] == []
+    # JSON-serialisable
+    json.dumps(d)
+
+
+def test_diagnose_json_flag_emits_json_line(monkeypatch) -> None:
+    """``coord diagnose --json`` must print a ``DIAGNOSE_JSON:`` line containing
+    a JSON-encoded DiagnoseResult before the ``DIAGNOSE_RESULT:`` trailer."""
+    import json
+    from click.testing import CliRunner
+    from coord.commands.status import diagnose as diagnose_cmd
+
+    # Stub out the heavy lifting so no DB / git is needed.
+    monkeypatch.setattr("coord.board_service.daemon_reroute_target", lambda _: None)
+
+    def _fake_build_board():
+        from coord.models import Board
+        return Board()
+
+    monkeypatch.setattr("coord.commands.status.sys.exit", lambda c: None)
+
+    from coord import diagnose as diag_mod
+
+    # Stub out everything that touches the filesystem.
+    monkeypatch.setattr(diag_mod, "_session_state", lambda a, c: "dead")
+    monkeypatch.setattr(diag_mod, "_finalize_dead", lambda a, c: "advisory")
+    monkeypatch.setattr(diag_mod, "_kill_session", lambda a, c: True)
+    monkeypatch.setattr(diag_mod, "_recover_review_findings", lambda a, c: None)
+    monkeypatch.setattr(diag_mod, "_reconcile_issue_merges",
+                        lambda b, c, r, i, *, dry_run: [])
+
+    # Provide a minimal config so _load_config doesn't error.
+    from coord.config import Config
+    from coord.models import Board, Repo, Machine
+
+    cfg = Config(
+        repos=[Repo(name="api", github="acme/api", default_branch="main")],
+        machines=[Machine(name="precision", host="p.tail", repos=["api"])],
+    )
+    monkeypatch.setattr("coord.commands.status._load_config", lambda p: cfg)
+
+    # build_board is also a local import; patch at its canonical site.
+    import coord.state as state_mod  # noqa: PLC0415
+    monkeypatch.setattr(state_mod, "build_board", lambda: Board())
+
+    # Patch the diagnose_stage + current_stage so we don't need a real board.
+    # These are imported locally inside the diagnose() function, so patch at
+    # their definition site in coord.diagnose.
+    from coord.diagnose import DiagnoseResult
+    fake_result = DiagnoseResult(
+        repo_name="api",
+        issue_number=99,
+        stage="work",
+        findings=["phantom work running"],
+        actions_taken=["finalized it"],
+        recovered=True,
+        needs_reset=False,
+    )
+    monkeypatch.setattr(diag_mod, "diagnose_stage",
+                        lambda *a, **kw: fake_result)
+    monkeypatch.setattr(diag_mod, "current_stage",
+                        lambda *a: "work")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        diagnose_cmd,
+        ["api", "99", "--json", "--dry-run"],
+        catch_exceptions=False,
+    )
+
+    output = result.output
+    assert result.exit_code == 0, f"command failed:\n{output}"
+
+    # Must contain a DIAGNOSE_JSON line
+    json_lines = [l for l in output.splitlines() if l.startswith("DIAGNOSE_JSON:")]
+    assert json_lines, f"DIAGNOSE_JSON line missing in output:\n{output}"
+
+    payload = json.loads(json_lines[0][len("DIAGNOSE_JSON:"):])
+    assert payload["repo_name"] == "api"
+    assert payload["issue_number"] == 99
+    assert payload["stage"] == "work"
+    assert payload["recovered"] is True
+    assert payload["findings"] == ["phantom work running"]
+    assert payload["actions_taken"] == ["finalized it"]
+
+    # DIAGNOSE_RESULT trailer must also still be present.
+    trailer_lines = [l for l in output.splitlines() if l.startswith("DIAGNOSE_RESULT:")]
+    assert trailer_lines, f"DIAGNOSE_RESULT trailer missing in output:\n{output}"
+
+
+def test_diagnose_without_json_flag_no_json_line(monkeypatch) -> None:
+    """Without ``--json``, no ``DIAGNOSE_JSON:`` line must appear."""
+    from click.testing import CliRunner
+    from coord.commands.status import diagnose as diagnose_cmd
+    from coord.config import Config
+    from coord.diagnose import DiagnoseResult
+    from coord.models import Board, Repo, Machine
+    import coord.diagnose as diag_mod  # noqa: PLC0415
+    import coord.state as state_mod  # noqa: PLC0415
+
+    monkeypatch.setattr("coord.board_service.daemon_reroute_target", lambda _: None)
+
+    cfg = Config(
+        repos=[Repo(name="api", github="acme/api", default_branch="main")],
+        machines=[Machine(name="precision", host="p.tail", repos=["api"])],
+    )
+    fake_result = DiagnoseResult(repo_name="api", issue_number=99, stage="work")
+    monkeypatch.setattr("coord.commands.status._load_config", lambda p: cfg)
+    monkeypatch.setattr(diag_mod, "diagnose_stage", lambda *a, **kw: fake_result)
+    monkeypatch.setattr(diag_mod, "current_stage", lambda *a: "work")
+    monkeypatch.setattr(state_mod, "build_board", lambda: Board())
+
+    runner = CliRunner()
+    result = runner.invoke(diagnose_cmd, ["api", "99", "--dry-run"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert "DIAGNOSE_JSON:" not in result.output
+    assert "DIAGNOSE_RESULT:" in result.output
