@@ -1752,6 +1752,31 @@ class AgentServer:
                     return current_path
         return None
 
+    @staticmethod
+    def _stash_has_content(stash_dir: Path) -> bool:
+        """True when *stash_dir* holds at least one real (non-dotfile) file.
+
+        ``stash_artifacts_for_branch`` calls ``mkdir(parents=True,
+        exist_ok=True)`` unconditionally, before it knows whether any file
+        actually matched a glob pattern (#914 review) — so a bare
+        ``stash_dir.exists()`` is true even for a stash that copied zero
+        files. Checking for real content instead of mere directory
+        existence keeps ``artifact_manifest`` from treating an empty,
+        just-created directory as "stash present" (which would return a
+        misleading 200 with an empty file list) and keeps the lazy-stash
+        retry from self-poisoning: as long as no real content lands, later
+        calls keep re-attempting the stash instead of short-circuiting on
+        the empty directory forever (until the 3-day GC evicts it).
+        """
+        if not stash_dir.exists():
+            return False
+        try:
+            return any(
+                f.is_file() and not f.name.startswith(".") for f in stash_dir.iterdir()
+            )
+        except OSError:
+            return False
+
     def artifact_absence_reason(self, repo: str, branch: str) -> str:
         """Ground-truth explanation for why a stash is missing (#914).
 
@@ -1817,11 +1842,11 @@ class AgentServer:
         ):
             return None
         stash_dir = self.state_dir / "artifacts" / repo / branch
-        if not stash_dir.exists():
+        if not self._stash_has_content(stash_dir):
             patterns = self.artifact_paths.get(repo, [])
             wt = self._find_live_worktree(repo, branch) if patterns else None
             if wt is not None and wt.exists():
-                stash_artifacts_for_branch(
+                copied = stash_artifacts_for_branch(
                     worktree_path=wt,
                     branch=branch,
                     repo_name=repo,
@@ -1829,9 +1854,9 @@ class AgentServer:
                     state_dir=self.state_dir,
                     assignment_id=wt.name,
                 )
-                if stash_dir.exists():
+                if copied > 0:
                     self._artifact_bytes_cache = None
-            if not stash_dir.exists():
+            if not self._stash_has_content(stash_dir):
                 return None
 
         files = []

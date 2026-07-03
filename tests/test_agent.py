@@ -1225,6 +1225,46 @@ def test_artifact_manifest_lazy_stashes_from_live_worktree(tmp_path: Path) -> No
     assert (stash_dir / "mybinary").exists()
 
 
+def test_artifact_manifest_none_when_worktree_present_but_no_files_match(
+    tmp_path: Path,
+) -> None:
+    """artifact_manifest() returns None (→ 404), not an empty-but-200
+    manifest, when a live worktree exists and artifact_paths is configured
+    but nothing on disk matches the glob yet (#914 review regression case).
+
+    stash_artifacts_for_branch's mkdir(parents=True, exist_ok=True) is
+    unconditional, so a naive `stash_dir.exists()` success check would
+    treat the freshly-created empty directory as "stashed" and both return
+    a misleading 200 with zero files AND permanently block future retries
+    for this branch. This asserts the fix: no content → None, and the
+    empty directory doesn't poison a subsequent successful stash attempt.
+    """
+    rp = _init_repo(tmp_path / "repo")
+    server = _server(
+        tmp_path, repo_path=rp, artifact_paths={"api": ["target/debug/mybinary"]}
+    )
+
+    wt_path = tmp_path / "state" / "worktrees" / "asgn-nomatch"
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "issue-914-nomatch", str(wt_path)],
+        cwd=str(rp),
+        check=True,
+        capture_output=True,
+    )
+    # No target/debug/mybinary in the worktree — the glob matches nothing.
+
+    assert server.artifact_manifest("api", "issue-914-nomatch") is None
+
+    # A later, successful build must still self-heal (no self-poisoning).
+    (wt_path / "target" / "debug").mkdir(parents=True)
+    (wt_path / "target" / "debug" / "mybinary").write_bytes(b"\x7fELF" + b"\x00" * 200)
+
+    manifest = server.artifact_manifest("api", "issue-914-nomatch")
+    assert manifest is not None
+    assert [f["name"] for f in manifest["files"]] == ["mybinary"]
+
+
 # ── stash_artifacts_for_branch standalone function (#562) ─────────────────────
 
 
