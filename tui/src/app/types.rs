@@ -112,6 +112,12 @@ pub(crate) enum SidebarView {
     /// #737: Merge Queue panel — global view of all in-flight PR merges,
     /// grouped by milestone.  Key `7` switches to this view.
     MergeQueue,
+    /// #771 (Phase 3 of #767): milestone work-order DAG/lane view — renders
+    /// a milestone's `## Work order` block (parsed client-side from the
+    /// already-synced tracking-issue body, see `app/milestone_dag.rs`) as
+    /// cohort rows with done/in-flight/blocked/ready state per node, plus a
+    /// "Dispatch milestone" action on the milestone header. Key `8`.
+    MilestoneDag,
 }
 
 impl SidebarView {
@@ -124,6 +130,7 @@ impl SidebarView {
             SidebarView::Terminal => "Terminal",
             SidebarView::Kanban => "Kanban",
             SidebarView::MergeQueue => "Merge Queue",
+            SidebarView::MilestoneDag => "Milestones",
         }
     }
 }
@@ -478,6 +485,15 @@ pub(crate) enum ContextMenuTarget {
     /// menu (`Pause` / `Resume`) — the user can steer agents away from a
     /// machine without editing coordinator.yml or shelling out.
     MachineRow { name: String, is_paused: bool },
+    /// #771: right-click (or the keyboard shortcut) on the Milestone DAG
+    /// view's milestone header. Carries what `coord milestone dispatch`
+    /// needs — the coord-local repo name and the tracking-issue number —
+    /// so the menu's "Dispatch milestone" item can spawn it directly.
+    MilestoneHeader {
+        repo_name: String,
+        tracking_issue: u64,
+        milestone_title: String,
+    },
 }
 
 /// #262: lifecycle bucket for a Pipeline sidebar row at right-click

@@ -88,6 +88,10 @@ impl ShellApp for CoordApp {
                 SidebarView::MergeQueue => {
                     backend.draw_list(sidebar_rect, &self.merge_queue_sidebar());
                 }
+                // #771: Milestone DAG sidebar — milestone-with-work-order list.
+                SidebarView::MilestoneDag => {
+                    backend.draw_list(sidebar_rect, &self.milestone_dag_sidebar());
+                }
             }
         }
 
@@ -460,6 +464,11 @@ impl ShellApp for CoordApp {
             // #737: Merge Queue panel — render the entry list in the main area.
             SidebarView::MergeQueue => {
                 self.render_merge_queue_panel(backend, m, lh);
+            }
+            // #771: Milestone DAG panel — cohort rows + state badges for the
+            // selected milestone's work order.
+            SidebarView::MilestoneDag => {
+                self.render_milestone_dag_panel(backend, m, lh);
             }
         }
 

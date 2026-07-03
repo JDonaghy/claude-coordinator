@@ -83,6 +83,7 @@ pub(crate) mod terminal;
 pub(crate) mod sessions;
 pub(crate) mod events;
 pub(crate) mod pipeline;
+pub(crate) mod milestone_dag;
 #[allow(unused_imports)]
 use self::types::*;
 #[allow(unused_imports)]
@@ -2455,6 +2456,12 @@ pub struct CoordApp {
     /// updates `selected_idx` and `scroll_offset` for the next frame."
     merge_queue_scroll: usize,
 
+    // ── #771: Milestone DAG panel (Phase 3 of #767) ──────────────────────────
+    /// Selected milestone index (0-based) into `milestone_dag_views()`'s
+    /// return order.  Clamped to bounds on navigation, same pattern as
+    /// `merge_queue_sel`.
+    milestone_dag_sel: usize,
+
     // ── #541: global Telescope-style issue fuzzy finder ──────────────────────
     /// Active state of the issue fuzzy-finder overlay.  `None` when the
     /// overlay is closed.  Opened with Ctrl+P from any non-PTY view; closed
@@ -2823,6 +2830,8 @@ impl CoordApp {
             // #737: Merge Queue panel — selection and scroll start at the top.
             merge_queue_sel: 0,
             merge_queue_scroll: 0,
+            // #771: Milestone DAG panel — selection starts at the top.
+            milestone_dag_sel: 0,
             // #217: resolved theme palette — computed from settings + optional
             // ~/.coord/theme.toml override file.
             active_theme: {
@@ -6029,7 +6038,7 @@ impl CoordApp {
             // know about the activity-bar key shortcuts.
             StatusBarSegment {
                 text: format!(
-                    " {}  [1=Board 2=Machines 3=Pipeline 4=Settings 5=Terminal 6=Kanban 7=MQ] ",
+                    " {}  [1=Board 2=Machines 3=Pipeline 4=Settings 5=Terminal 6=Kanban 7=MQ 8=Milestones] ",
                     view_label
                 ),
                 fg: Color::rgb(200, 220, 255),
