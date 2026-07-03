@@ -2258,14 +2258,28 @@ def _upsert_open_issues_local(repo_name: str, issues: list[dict]) -> None:
     issues are upserted with ``state='open'``.  This means issues closed on
     GitHub since the last sync will disappear from the Pending group on the
     next ``coord plan``.
+
+    #771 review: the close-marking UPDATE below also stamps ``synced_at`` for
+    rows that are transitioning ``open -> closed`` on *this* sync. Without
+    that, a row's ``synced_at`` stayed frozen at whenever it was last synced
+    while still open (the upsert below only refreshes ``synced_at`` for
+    issues present in the current fetch, i.e. still-open ones) — so the
+    7-day prune below effectively measured "days since last confirmed open,"
+    not "days since closed," silently shrinking (sometimes to ~zero) the
+    grace period consumers (e.g. the TUI's milestone DAG view) rely on to
+    still find a just-closed issue in this cache. Already-closed rows are
+    excluded from this stamp (``WHERE state = 'open'`` — the pre-flip state)
+    so their clock keeps counting from when *they* closed, and the prune
+    below still reclaims them on schedule.
     """
     conn = get_connection()
     now = time.time()
-    # Mark all current open issues for this repo as closed; the upsert below
-    # will reopen those still present in the fetched list.
+    # Mark all current open issues for this repo as closed (stamping
+    # synced_at = now for exactly the rows flipping state right now); the
+    # upsert below will reopen those still present in the fetched list.
     conn.execute(
-        "UPDATE issues SET state = 'closed' WHERE repo_name = ?",
-        (repo_name,),
+        "UPDATE issues SET state = 'closed', synced_at = ? WHERE repo_name = ? AND state = 'open'",
+        (now, repo_name),
     )
     # Prune closed issues synced more than 7 days ago to keep the DB lean.
     conn.execute(
