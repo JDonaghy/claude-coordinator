@@ -161,5 +161,20 @@ Adopted in two steps to de-risk the big rewire:
 
 ## Issue map
 
-<!-- ISSUE-MAP -->
-Populated when the epics are filed (see below).
+**Phase 1 — Observability** (milestone: TUI: Polish & Observability)
+- #925 — per-stage run-count badges (`×N`)
+- #926 — in-progress / active-stage indicator
+- #927 — Summary tab recovers from a transient fetch failure without a TUI restart
+
+**Phase 2 — Merge = driven / bounce-capable** (epic #915, milestone: Merge Queue v2)
+- #928 — hide the merge queue; make Merge an explicit driven box
+- #916 — re-gate the delta after a non-trivial rebase (keystone) · #917 — route to the resolver on
+  conflict · #918 — stale-approval detection · #919 — verify PR-mergeable + branch-fresh ·
+  #920 — sequence high-overlap siblings · #923 — interactive Test-verdict backstop *(shipped)*
+
+**Phases 3–4 — Two-tier milestone pipeline** (epic #929)
+- #930 — (A) pre-work architecture gate + black-box contract
+- #931 — independent feature-level acceptance test authoring (`type=test-author`)
+- #932 — acceptance run stage + Gate-C full-suite gate
+- #933 — (B) post-milestone architecture review (built-to-spec)
+- #934 — (D) `develop` + feature-branch-per-milestone git model *(Phase 4, last)*
