@@ -182,6 +182,146 @@ def test_resolve_board_service_unset_returns_none(tmp_path: Path, monkeypatch):
     assert coord_client.resolve_board_service() is None
 
 
+# ── #795 Phase 3b: milestone_work_orders in /board payload ───────────────────
+
+_WORK_ORDER_BODY = """\
+Tracking issue for the milestone.
+
+## Work order
+- [ ] #101  {group: A}
+- [ ] #102  {group: A}
+- [ ] #103  {after: #101,#102}
+
+## Notes
+Not part of the work order.
+"""
+
+
+def _make_work_order_db(path: Path) -> None:
+    """Seed a DB with:
+    - a tracking issue (label="epic") carrying a ## Work order block
+    - two open milestone issues (#101, #102) and one open (#103) blocked on them
+    - a machine so build_board() doesn't crash
+    """
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    _ensure_schema(conn)
+    conn.execute("INSERT INTO machines (name, host, capabilities, repos) VALUES (?,?,?,?)",
+                 ("laptop", "laptop.tailnet", '["python"]', '["api"]'))
+    # Tracking issue: epic label, no milestone of its own (doesn't need one)
+    conn.execute(
+        "INSERT INTO issues (repo_name, number, title, body, state, labels, synced_at) "
+        "VALUES (?, ?, ?, ?, 'open', ?, 0)",
+        ("api", 500, "Milestone tracking", _WORK_ORDER_BODY, '["epic", "coord"]'),
+    )
+    # Open work issues referenced in the work order
+    for num, title in [(101, "Issue A1"), (102, "Issue A2"), (103, "Issue B1")]:
+        conn.execute(
+            "INSERT INTO issues (repo_name, number, title, body, state, labels, synced_at) "
+            "VALUES (?, ?, ?, '', 'open', '[]', 0)",
+            ("api", num, title),
+        )
+    conn.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')")
+    conn.commit()
+    conn.close()
+
+
+@pytest.fixture
+def work_order_db(tmp_path: Path) -> Path:
+    p = tmp_path / "coord.db"
+    _make_work_order_db(p)
+    return p
+
+
+def test_milestone_work_orders_in_board_payload(work_order_db: Path, valid_config_path: Path):
+    """#795: /board payload carries milestone_work_orders for each tracking issue.
+
+    Verifies rank, ready/blocked, next_up, and blocked_on for a seeded
+    ## Work order block.  #101 and #102 are ready (no deps); #103 is blocked
+    on both.
+    """
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(work_order_db), cfg)
+    with TestClient(app) as cli:
+        board = cli.get("/board").json()
+
+    assert "milestone_work_orders" in board, "milestone_work_orders key missing from /board"
+    mwos = board["milestone_work_orders"]
+    assert len(mwos) == 1, f"expected 1 milestone work order, got {len(mwos)}: {mwos}"
+
+    mwo = mwos[0]
+    assert mwo["repo_name"] == "api"
+    assert mwo["tracking_issue"] == 500
+
+    nodes_by_num = {n["issue_number"]: n for n in mwo["nodes"]}
+    assert set(nodes_by_num) == {101, 102, 103}, f"unexpected node set: {set(nodes_by_num)}"
+
+    # #101 and #102 are at ranks 0 and 1 (group A, no deps) → ready + next_up
+    n101 = nodes_by_num[101]
+    assert n101["rank"] == 0
+    assert n101["ready"] is True
+    assert n101["next_up"] is True
+    assert n101["blocked_on"] == []
+
+    n102 = nodes_by_num[102]
+    assert n102["rank"] == 1
+    assert n102["ready"] is True
+    assert n102["next_up"] is True
+    assert n102["blocked_on"] == []
+
+    # #103 is at rank 2, blocked on #101 and #102 (both still open)
+    n103 = nodes_by_num[103]
+    assert n103["rank"] == 2
+    assert n103["ready"] is False
+    assert n103["next_up"] is False
+    assert set(n103["blocked_on"]) == {101, 102}, f"unexpected blocked_on: {n103['blocked_on']}"
+
+
+def test_milestone_work_orders_terminal_issue_excluded(work_order_db: Path, valid_config_path: Path):
+    """#795: a work-order node whose issue is closed/absent is excluded from nodes.
+
+    Close #101 and #102 in the DB — they become terminal, so #103's blocked_on
+    is empty and it becomes ready/next_up.  Closed nodes are dropped from the
+    payload (they're done, not a frontier item).
+    """
+    # Re-open the DB and mark #101, #102 closed.
+    conn = sqlite3.connect(str(work_order_db))
+    conn.execute("UPDATE issues SET state='closed' WHERE repo_name='api' AND number IN (101, 102)")
+    conn.commit()
+    conn.close()
+
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(work_order_db), cfg)
+    with TestClient(app) as cli:
+        board = cli.get("/board").json()
+
+    mwos = board["milestone_work_orders"]
+    assert len(mwos) == 1
+    nodes_by_num = {n["issue_number"]: n for n in mwos[0]["nodes"]}
+
+    # #101 and #102 are closed → terminal → excluded from the payload
+    assert 101 not in nodes_by_num, "#101 is closed/terminal — must not appear in nodes"
+    assert 102 not in nodes_by_num, "#102 is closed/terminal — must not appear in nodes"
+
+    # #103's deps are all terminal → it's now ready
+    assert 103 in nodes_by_num, "#103 must appear as a node"
+    n103 = nodes_by_num[103]
+    assert n103["ready"] is True
+    assert n103["next_up"] is True
+    assert n103["blocked_on"] == []
+
+
+def test_milestone_work_orders_empty_when_no_tracking_issue(file_db: Path, valid_config_path: Path):
+    """#795: fail-open — no epic-labelled issue means milestone_work_orders is []."""
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(file_db), cfg)
+    with TestClient(app) as cli:
+        board = cli.get("/board").json()
+    assert board.get("milestone_work_orders") == [], (
+        "milestone_work_orders must be [] when no tracking issue is present"
+    )
+
+
 # ── Write path (#590): daemon endpoints ──────────────────────────────────────
 
 

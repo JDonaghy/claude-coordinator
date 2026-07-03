@@ -1279,6 +1279,9 @@ pub(crate) fn load_data() -> BoardData {
         // stage projection; `pipeline.rs`'s local functions it mirrors
         // remain authoritative on this path. Pass empty here.
         Vec::new(),
+        // #795: local SQLite path has no daemon to compute the work-order
+        // frontier. Pass empty; Pipeline cards show no rank/frontier badges.
+        Vec::new(),
     )
 }
 
@@ -1310,6 +1313,7 @@ pub(crate) fn assemble_board_data(
     merge_staging: Vec<StagingEntry>,
     pipeline_models: Option<PipelineModels>,
     issue_stage_projection: Vec<IssueStageProjection>,
+    milestone_work_orders: Vec<MilestoneWorkOrder>,
 ) -> BoardData {
     // ── Machine reachability probes + health fetches ──────────────────────
     // Probe using the Tailscale host (fixes #121: machine name ≠ Tailscale hostname).
@@ -1421,6 +1425,7 @@ pub(crate) fn assemble_board_data(
         merge_staging,
         pipeline_models,
         issue_stage_projection,
+        milestone_work_orders,
     }
 }
 
@@ -1687,6 +1692,9 @@ pub(crate) fn load_data_remote(url: &str, token: Option<&str>) -> BoardData {
         // #550: prefer the server-computed stage projection; empty when the
         // daemon predates #550 (`pipeline.rs`'s local functions fall back).
         payload.issue_stage_projection,
+        // #795: server-computed work-order rank + frontier; empty when the
+        // daemon predates #795.
+        payload.milestone_work_orders,
     )
 }
 

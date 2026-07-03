@@ -935,6 +935,26 @@ impl CoordApp {
         Some((num, oi.milestone_title.clone().unwrap_or_default()))
     }
 
+    /// #795 Phase 3b: look up the server-computed work-order node for
+    /// `(repo_name, issue_number)` from `self.data.milestone_work_orders`.
+    ///
+    /// Returns `None` when the daemon predates #795 (empty list) or this issue
+    /// isn't part of any tracked work order.  Callers augment Pipeline
+    /// milestone card rows with the rank/next_up/blocked_on badges only when
+    /// `Some(_)` is returned.
+    pub(crate) fn work_order_node_for(
+        &self,
+        repo_name: &str,
+        issue_number: u64,
+    ) -> Option<&MilestoneWorkOrderNode> {
+        self.data.milestone_work_orders.iter().find_map(|mwo| {
+            if mwo.repo_name != repo_name {
+                return None;
+            }
+            mwo.nodes.iter().find(|n| n.issue_number == issue_number)
+        })
+    }
+
     /// #668: Group a slice of `pipeline_issues` indices by milestone.
     ///
     /// Looks up milestone data via `pipeline_issue_milestone`.  Issues
@@ -2284,6 +2304,12 @@ impl CoordApp {
                                     let has_live_stream = self.watch_pool.values().any(|ctx| {
                                         ctx.state.issue_number == issue.number && !ctx.sse.done
                                     });
+                                    // #795: look up server-computed work-order
+                                    // node; only present when the daemon is
+                                    // v#795+ and this issue is in a work order.
+                                    let wo_node = issue.coord_repo.as_ref().and_then(|rn| {
+                                        self.work_order_node_for(rn, issue.number)
+                                    });
                                     let mut spans = vec![
                                         StyledSpan::with_fg(
                                             format!("#{:<5}", issue.number),
@@ -2299,6 +2325,36 @@ impl CoordApp {
                                             " ▶".to_string(),
                                             Color::rgb(60, 200, 80),
                                         ));
+                                    }
+                                    // #795: append work-order state badges
+                                    // after any live-stream indicator.
+                                    if let Some(node) = wo_node {
+                                        if node.next_up {
+                                            // Ready + unclaimed → dispatcher's
+                                            // next candidate for this milestone.
+                                            spans.push(StyledSpan::with_fg(
+                                                format!(" ↑W{}", node.rank + 1),
+                                                Color::rgb(80, 200, 120), // green
+                                            ));
+                                        } else if node.ready {
+                                            // Ready but claimed (in-flight on
+                                            // another machine) — dim indicator.
+                                            spans.push(StyledSpan::with_fg(
+                                                format!(" W{}", node.rank + 1),
+                                                Color::rgb(120, 160, 120), // dim green
+                                            ));
+                                        } else {
+                                            // Blocked: show rank + first blocker.
+                                            let blocker = node
+                                                .blocked_on
+                                                .first()
+                                                .map(|b| format!("#{b}"))
+                                                .unwrap_or_default();
+                                            spans.push(StyledSpan::with_fg(
+                                                format!(" ⊘W{}←{blocker}", node.rank + 1),
+                                                Color::rgb(200, 100, 80), // muted red
+                                            ));
+                                        }
                                     }
                                     rows.push(TreeRow {
                                         path: vec![ri as u16, mi as u16, ii as u16],
