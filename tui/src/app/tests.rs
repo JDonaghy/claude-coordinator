@@ -385,6 +385,7 @@
             detail_terminal_spawn_errors: std::collections::HashMap::new(),
             detail_terminal_focused: false,
             ctrl_w_pending: false,
+            focused_region: FocusedRegion::default(),
             detail_terminal_pending_dims: std::cell::Cell::new(None),
             // #454
             pty_pressed_buttons: 0,
@@ -23603,4 +23604,201 @@ Milestone tracking issue.
             super::parse_diagnose_label_stage("coord diagnose api 42 --dry-run --json"),
             None,
         );
+    }
+
+
+    // ── §1/#782: Kanban + Merge Queue activity-bar panel buttons ───────────────
+
+    /// §1 (#782): The Kanban panel icon (▦) must appear in the activity bar.
+    /// Clicking it must switch the active view to Kanban (Backlog / In Flight /
+    /// Completed columns become visible).
+    #[test]
+    fn tuidriver_kanban_panel_button_click_switches_view() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let assignments = vec![make_assignment_typed("running", 10, "repo-a", Some("work"))];
+        let app = make_app_with_assignments(assignments);
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 160, 40);
+
+        // Board is the default; Kanban column headers must NOT be visible yet.
+        assert!(
+            !driver.screen_contains("In Flight"),
+            "#782: 'In Flight' must NOT be visible on the default Board view:\n{}",
+            driver.screen()
+        );
+
+        // Find the Kanban icon in the activity bar and click it.
+        let (x, y) = driver.find("▦").unwrap_or_else(|| {
+            panic!(
+                "#782: Kanban icon '▦' not found in the activity bar:\n{}",
+                driver.screen()
+            )
+        });
+        driver.click(x, y);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Backlog") || screen.contains("In Flight") || screen.contains("KANBAN"),
+            "#782: clicking '▦' must activate the Kanban view:\n{}",
+            screen
+        );
+    }
+
+    /// §1 (#782): The Merge Queue panel icon (≣) must appear in the activity bar.
+    /// Clicking it must switch the active view to Merge Queue (the panel title
+    /// or queue entries become visible).
+    #[test]
+    fn tuidriver_mergequeue_panel_button_click_switches_view() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_test_app(BoardData {
+            merge_queue: vec![mq_entry_for_state("aid-99", 99, "pending", Some(77))],
+            ..BoardData::default()
+        });
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 160, 40);
+
+        // Default Board view — Merge Queue panel title must not be visible.
+        assert!(
+            !driver.screen_contains("MERGE QUEUE"),
+            "#782: 'MERGE QUEUE' must not render on the initial Board view:\n{}",
+            driver.screen()
+        );
+
+        // Find the Merge Queue icon (≣) and click it.
+        let (x, y) = driver.find("≣").unwrap_or_else(|| {
+            panic!(
+                "#782: Merge Queue icon '≣' not found in the activity bar:\n{}",
+                driver.screen()
+            )
+        });
+        driver.click(x, y);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("MERGE QUEUE") || screen.contains("Merge Queue"),
+            "#782: clicking '≣' must activate the Merge Queue view:\n{}",
+            screen
+        );
+    }
+
+    /// §2 (#782): Settings must be reachable via the activity bar (⚙ icon).
+    /// Clicking the Settings icon must switch to the Settings view.
+    #[test]
+    fn tuidriver_settings_panel_accessible_via_activity_bar() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_test_app(BoardData::default());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 160, 40);
+
+        // Find the Settings gear icon and click it.
+        let (x, y) = driver.find("⚙").unwrap_or_else(|| {
+            panic!(
+                "#782: Settings icon '⚙' not found in the activity bar:\n{}",
+                driver.screen()
+            )
+        });
+        driver.click(x, y);
+
+        // Settings view must render (theme selector or a settings field visible).
+        let screen = driver.screen();
+        assert!(
+            screen.contains("SETTINGS") || screen.contains("Theme") || screen.contains("Settings"),
+            "#782: clicking '⚙' must activate the Settings view:\n{}",
+            screen
+        );
+    }
+
+    // ── §4/#782: Ctrl-W focus cycler visible indicator ────────────────────────
+
+    /// §4 (#782): Ctrl-W Right must cycle focused_region Sidebar → Main (or
+    /// Detail when a PTY is present) and produce a visible `[Main]` / `[Detail]`
+    /// / `[Sidebar]` indicator in the status bar.
+    #[test]
+    fn tuidriver_ctrl_w_right_cycles_focus_indicator() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_test_app(BoardData::default());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 160, 40);
+
+        // Initial state: Sidebar focused — status bar must show [Sidebar].
+        let screen = driver.screen();
+        assert!(
+            screen.contains("[Sidebar]"),
+            "#782: initial screen must show '[Sidebar]' focus indicator:\n{}",
+            screen
+        );
+
+        // Ctrl-W then Right → advances to Main (no PTY in Board view).
+        driver.ctrl_char('w');
+        driver.press_named(quadraui::NamedKey::Right);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("[Main]"),
+            "#782: after Ctrl-W Right from Board view, indicator must show '[Main]':\n{}",
+            screen
+        );
+
+        // A second Ctrl-W Right → Detail.
+        driver.ctrl_char('w');
+        driver.press_named(quadraui::NamedKey::Right);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("[Detail]"),
+            "#782: after second Ctrl-W Right, indicator must show '[Detail]':\n{}",
+            screen
+        );
+
+        // Third Ctrl-W Right → wraps back to Sidebar.
+        driver.ctrl_char('w');
+        driver.press_named(quadraui::NamedKey::Right);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("[Sidebar]"),
+            "#782: Ctrl-W Right wraps from Detail back to Sidebar:\n{}",
+            screen
+        );
+    }
+
+    /// §4 (#782): Ctrl-W Left must cycle focus in the reverse direction
+    /// (Sidebar → Detail → Main → Sidebar) and update the status-bar indicator.
+    #[test]
+    fn tuidriver_ctrl_w_left_cycles_focus_indicator_in_reverse() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_test_app(BoardData::default());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 160, 40);
+
+        // Starts at Sidebar; Ctrl-W Left wraps around to Main (Board view has
+        // no Detail PTY, so leftmost wrap lands on Main).
+        driver.ctrl_char('w');
+        driver.press_named(quadraui::NamedKey::Left);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("[Main]") || screen.contains("[Detail]"),
+            "#782: Ctrl-W Left from Sidebar must wrap to Main or Detail:\n{}",
+            screen
+        );
+
+        // Another Ctrl-W Left → Sidebar.
+        driver.ctrl_char('w');
+        driver.press_named(quadraui::NamedKey::Left);
+
+        let screen = driver.screen();
+        // From Main, Left → Sidebar.
+        if !screen.contains("[Sidebar]") {
+            // If we landed on Detail on the first Left, another Left → Main,
+            // one more → Sidebar. Handle the Detail case.
+            driver.ctrl_char('w');
+            driver.press_named(quadraui::NamedKey::Left);
+            let screen2 = driver.screen();
+            assert!(
+                screen2.contains("[Sidebar]"),
+                "#782: Ctrl-W Left must eventually return to Sidebar:\n{}",
+                screen2
+            );
+        }
     }
