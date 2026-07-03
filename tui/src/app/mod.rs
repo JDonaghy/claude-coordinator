@@ -16,7 +16,7 @@
 //! │  │ ▶ Done (3)                   │                                  │
 //! │  │                              │                                  │
 //! ├──┴──────────────────────────────┴──────────────────────────────────┤
-//! │ coord-tui  Board  ↻ 3s  1=Board 2=Machines 3=Pipeline  j/k  q     │
+//! │ coord-tui  Board  [Sidebar]  ↻ 3s  click activity bar to switch  q  │
 //! └────────────────────────────────────────────────────────────────────┘
 //!  ↑ activity bar    ↑ sidebar (35 cols)    ↑ main content
 //! ```
@@ -6100,17 +6100,24 @@ impl CoordApp {
             },
             // §3 (#782): numeric key hints removed — views are now discovered
             // via the activity bar panel buttons.  §4: show the focused pane
-            // region so Ctrl-W navigation is visible.
-            StatusBarSegment {
-                text: format!(
-                    " {}  [{}] ",
-                    view_label,
-                    self.focused_region.label()
-                ),
-                fg: Color::rgb(200, 220, 255),
-                bg: Color::rgb(40, 60, 90),
-                bold: false,
-                action_id: None,
+            // region so Ctrl-W navigation is visible. The segment switches to
+            // a bright, high-contrast highlight whenever focus has moved off
+            // the Sidebar (the default) so the change is unmistakable at a
+            // glance rather than a subtle text-only diff (#782 review finding B).
+            {
+                let (focus_fg, focus_bg, focus_bold) =
+                    if self.focused_region == FocusedRegion::Sidebar {
+                        (Color::rgb(200, 220, 255), Color::rgb(40, 60, 90), false)
+                    } else {
+                        (Color::rgb(20, 20, 20), Color::rgb(255, 200, 60), true)
+                    };
+                StatusBarSegment {
+                    text: format!(" {}  [{}] ", view_label, self.focused_region.label()),
+                    fg: focus_fg,
+                    bg: focus_bg,
+                    bold: focus_bold,
+                    action_id: None,
+                }
             },
             StatusBarSegment {
                 text: refresh_text,

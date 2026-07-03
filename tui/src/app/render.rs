@@ -423,8 +423,10 @@ impl ShellApp for CoordApp {
                     // No session yet — show a one-line placeholder.  The
                     // first `tick` after this render will spawn it.
                     let msg = match &self.terminal_spawn_error {
+                        // §3 (#782): numeric keys no longer switch views —
+                        // point at the activity bar instead.
                         Some(err) => format!(
-                            "  ⚠ Terminal session error: {}  (press 1/2/3/4 to switch views)",
+                            "  ⚠ Terminal session error: {}  (click the activity bar to switch views)",
                             err
                         ),
                         None => "  Starting shell session…".to_string(),

@@ -1603,47 +1603,18 @@ impl CoordApp {
                     }
                     Key::Char('q') | Key::Named(NamedKey::Escape) => return Reaction::Exit,
 
-                    // ── Switch sidebar views ─────────────────────────────
-                    Key::Char('1') => {
-                        self.active_view = SidebarView::Board;
-                        needs_redraw = true;
-                    }
-                    Key::Char('2') => {
-                        self.active_view = SidebarView::Machines;
-                        needs_redraw = true;
-                    }
-                    Key::Char('3') => {
-                        self.active_view = SidebarView::Pipeline;
-                        self.maybe_kick_pipeline_loader();
-                        needs_redraw = true;
-                    }
-                    Key::Char('4') => {
-                        self.active_view = SidebarView::Settings;
-                        needs_redraw = true;
-                    }
-                    // #424: 5 → Terminal pane; entering defaults to
-                    // PTY-focused so the user can type immediately
-                    // (F12 releases focus back to the TUI chrome).
-                    Key::Char('5') => {
-                        self.active_view = SidebarView::Terminal;
-                        self.terminal_focused = true;
-                        needs_redraw = true;
-                    }
-                    // #638: 6 → Kanban view.
-                    Key::Char('6') => {
-                        self.active_view = SidebarView::Kanban;
-                        needs_redraw = true;
-                    }
-                    // #737: 7 → Merge Queue panel.
-                    Key::Char('7') => {
-                        self.active_view = SidebarView::MergeQueue;
-                        needs_redraw = true;
-                    }
-                    // #771: 8 → Milestone DAG panel.
-                    Key::Char('8') => {
-                        self.active_view = SidebarView::MilestoneDag;
-                        needs_redraw = true;
-                    }
+                    // §3 (#782): numeric keys 1-7 used to switch sidebar views
+                    // directly (Board/Machines/Pipeline/Settings/Terminal/
+                    // Kanban/MergeQueue). Removed — views are now discovered
+                    // and switched exclusively via the activity-bar panel
+                    // buttons (click, or Ctrl-W focus-cycle + activity-bar
+                    // selection) so the digits are free for other bindings
+                    // and don't silently fire mid-typing (e.g. commit
+                    // messages, search filters). This also covers the #771
+                    // "8 → Milestone DAG" switch key that landed on main
+                    // after this branch diverged — dropped for the same
+                    // reason; the DAG view is reached via its activity-bar
+                    // icon like every other panel.
 
                     // ── Milestone DAG keyboard nav (#771) ────────────────
                     Key::Char('j') | Key::Named(NamedKey::Down)
