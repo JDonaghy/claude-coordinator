@@ -34,6 +34,14 @@ and stays, a direct operator↔own-machine tmux/ssh stream.
      authz (RBAC: customer / engineer / admin + row-level ownership).
    - **Does NOT own:** git working-tree ops, `claude -p`, the interactive PTY.
    - Shape: API-over-SQL coordination service. The holder of the **coordination token** for the forge.
+   - **Agent-facing surface (MCP) is a generated view of this API, not a new component.** The daemon's
+     OpenAPI 3 spec (`coord/openapi.py`, #757 — introspected from the dataclasses + SQLite DDL, so it can't
+     drift) is the machine-readable contract for both the TS/Rust client codegen (#750) **and** an eventual
+     **MCP server** exposing `board`/`assign`/`merge`/`report_result` as tools to external Claude/agent
+     clients. This is the end-state #478 anticipated and #590 folded in: MCP is the *agent-facing form* of
+     the write path, slotting into the `IssueStore`/daemon seam (`coord/issue_store.py:92` —
+     "backend can be swapped to MCP without changing the call sites") — not a parallel service. Build it
+     when external agents need to drive the Cloud API; until then it stays parked behind the seam.
 2. **Postgres** — the store. Local on dellserver first → Azure PG Flexible Server later.
 3. **Fleet Runner** *(evolved `coord agent`, flipped push→pull)*.
    - **Owns:** lease/claim authorized work; worktree setup; run `claude -p` (headless) **and** launch/manage
