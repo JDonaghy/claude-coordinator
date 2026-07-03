@@ -562,27 +562,39 @@ impl ShellApp for CoordApp {
     }
 
     /// Sync `active_view` when the shell switches panels via activity bar click.
+    ///
+    /// §2 (#782): Settings lives in `with_bottom_items`, so clicking it
+    /// fires `AppShellEvent::BottomItemClicked { id }` rather than
+    /// `PanelChanged`.  Both variants are handled here.
     fn on_shell_event(&mut self, event: &AppShellEvent) {
-        if let AppShellEvent::PanelChanged { panel_id } = event {
-            self.active_view = match panel_id.as_str() {
-                "panel:board" => SidebarView::Board,
-                "panel:machines" => SidebarView::Machines,
-                "panel:pipeline" => {
-                    self.maybe_kick_pipeline_loader();
-                    SidebarView::Pipeline
-                }
-                "panel:settings" => SidebarView::Settings,
-                "panel:terminal" => {
-                    // #424: entering the Terminal view defaults to
-                    // PTY-focused so the user can start typing
-                    // immediately.  F12 releases focus back to the TUI
-                    // chrome (1/2/3/4/5 view switching).
-                    self.terminal_focused = true;
-                    SidebarView::Terminal
-                }
-                _ => return,
-            };
-        }
+        // §3 (#782): any activity-bar navigation resets keyboard focus back
+        // to Sidebar so Ctrl-W h/l starts from a known state.
+        let panel_id_str = match event {
+            AppShellEvent::PanelChanged { panel_id } => panel_id.as_str(),
+            AppShellEvent::BottomItemClicked { id } => id.as_str(),
+            _ => return,
+        };
+        self.focused_region = FocusedRegion::Sidebar;
+        self.active_view = match panel_id_str {
+            "panel:board" => SidebarView::Board,
+            "panel:machines" => SidebarView::Machines,
+            "panel:pipeline" => {
+                self.maybe_kick_pipeline_loader();
+                SidebarView::Pipeline
+            }
+            "panel:settings" => SidebarView::Settings,
+            "panel:terminal" => {
+                // #424: entering the Terminal view defaults to
+                // PTY-focused so the user can start typing
+                // immediately.  F12 releases focus back to the TUI chrome.
+                self.terminal_focused = true;
+                SidebarView::Terminal
+            }
+            // §1 (#782): Kanban + Merge Queue activity-bar panels.
+            "panel:kanban" => SidebarView::Kanban,
+            "panel:mergequeue" => SidebarView::MergeQueue,
+            _ => return,
+        };
     }
 
     /// Periodic callback driven by the quadraui runner (~60Hz on TUI).

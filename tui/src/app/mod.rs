@@ -2356,6 +2356,11 @@ pub struct CoordApp {
     /// panel, `l`/`Right` → content/PTY, `Ctrl-W` → literal to the PTY).
     /// A keyboard-only slice of the #578 focus model (no mouse focus).
     ctrl_w_pending: bool,
+    /// #782: which of the three pane regions (Sidebar / Main / Detail) has
+    /// keyboard focus.  Cycled by `Ctrl-W Left` / `Ctrl-W Right`.
+    /// When a PTY-backed terminal is shown, this also controls the
+    /// `terminal_focused` / `detail_terminal_focused` flags.
+    focused_region: FocusedRegion,
     /// Pending `(cols, rows)` for per-issue terminal resize, stashed by
     /// `render_detail_terminal_tab` (`&self`) and applied by `tick`
     /// (`&mut self`).
@@ -2823,6 +2828,7 @@ impl CoordApp {
             detail_terminal_spawn_errors: std::collections::HashMap::new(),
             detail_terminal_focused: false,
             ctrl_w_pending: false,
+            focused_region: FocusedRegion::default(),
             detail_terminal_pending_dims: std::cell::Cell::new(None),
             // #454: tracks Press → Release for PTY mouse-reporting drags.
             pty_pressed_buttons: 0,
@@ -2936,6 +2942,15 @@ impl CoordApp {
     /// The status bar is enabled so `render_content()` can draw into
     /// `layout.status_bar_bounds`.
     pub fn shell_config() -> ShellConfig {
+        // §2 (#782): Settings is pinned to the bottom of the activity bar via
+        // `with_bottom_items` so it is visually separated from the primary views.
+        let settings_panel = PanelDefinition {
+            id: WidgetId::new("panel:settings"),
+            // ⚙ gear icon for settings.
+            icon: "⚙".into(),
+            tooltip: "Settings".into(),
+            title: "SETTINGS".into(),
+        };
         let mut config = ShellConfig::new(
             "coord-tui",
             vec![
@@ -2958,13 +2973,6 @@ impl CoordApp {
                     tooltip: "Pipeline".into(),
                     title: "PIPELINE".into(),
                 },
-                PanelDefinition {
-                    id: WidgetId::new("panel:settings"),
-                    // ⚙ gear icon for settings.
-                    icon: "⚙".into(),
-                    tooltip: "Settings".into(),
-                    title: "SETTINGS".into(),
-                },
                 // #424: embedded terminal pane (PTY-backed shell via
                 // quadraui::terminal_engine::TerminalSession).
                 PanelDefinition {
@@ -2974,13 +2982,27 @@ impl CoordApp {
                     tooltip: "Terminal".into(),
                     title: "TERMINAL".into(),
                 },
+                // §1 (#782): Kanban view — three-column board display.
+                PanelDefinition {
+                    id: WidgetId::new("panel:kanban"),
+                    // ▦ box-grid icon for a kanban board.
+                    icon: "▦".into(),
+                    tooltip: "Kanban".into(),
+                    title: "KANBAN".into(),
+                },
+                // §1 (#782): Merge Queue panel — global PR merge pipeline.
+                PanelDefinition {
+                    id: WidgetId::new("panel:mergequeue"),
+                    // ≣ horizontal-lines icon for a queue.
+                    icon: "≣".into(),
+                    tooltip: "Merge Queue".into(),
+                    title: "MERGE QUEUE".into(),
+                },
             ],
         )
-        .with_status_bar();
-        // Bottom COMMANDS panel removed — it carved sidebar height in half
-        // and made the lower sidebar rows fall outside sidebar_content_bounds
-        // when many issues were shown. Toasts cover completion notifications;
-        // running-command status can move to the status bar in a follow-up.
+        .with_status_bar()
+        // §2 (#782): Settings pinned to the bottom of the activity bar.
+        .with_bottom_items(vec![settings_panel]);
         config.default_sidebar_width = 35.0;
         config.min_sidebar_width = 20.0;
         config.max_sidebar_width = 55.0;
@@ -6076,15 +6098,14 @@ impl CoordApp {
                 bold: true,
                 action_id: None,
             },
-            // #201: surface the view-switch keys in the active view label so
-            // new users discover that 1/2/3 swaps Board/Machines/Pipeline.
-            // Without this hint, the Pipeline panel's [Go]/[Retry] buttons
-            // (now wired to mouse clicks) are unreachable for users who don't
-            // know about the activity-bar key shortcuts.
+            // §3 (#782): numeric key hints removed — views are now discovered
+            // via the activity bar panel buttons.  §4: show the focused pane
+            // region so Ctrl-W navigation is visible.
             StatusBarSegment {
                 text: format!(
-                    " {}  [1=Board 2=Machines 3=Pipeline 4=Settings 5=Terminal 6=Kanban 7=MQ 8=Milestones] ",
-                    view_label
+                    " {}  [{}] ",
+                    view_label,
+                    self.focused_region.label()
                 ),
                 fg: Color::rgb(200, 220, 255),
                 bg: Color::rgb(40, 60, 90),
@@ -6203,7 +6224,7 @@ impl CoordApp {
             if self.terminal_focused {
                 " PTY focused — F12 / Ctrl-W h = release  (typed keys go to the shell) ".to_string()
             } else {
-                " PTY released — F12 / Ctrl-W l = focus  ·  1–5 switch view  ·  q=quit ".to_string()
+                " PTY released — F12 / Ctrl-W l = focus  ·  click activity bar to switch view  ·  q=quit ".to_string()
             }
         } else if self.active_view == SidebarView::Pipeline
             && self.pipeline_detail_tab == PipelineDetailTab::Terminal

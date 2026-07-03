@@ -287,12 +287,24 @@ impl CoordApp {
     ///                                   terminal so bare `j`/`k` drive the
     ///                                   sidebar again.  Works from the terminal
     ///                                   or any tab.
-    ///   `Ctrl-W l` / `Ctrl-W Right`  → focus the content pane (and the PTY when
-    ///                                   the active tab/view is a Terminal).
+    ///   `Ctrl-W l` / `Ctrl-W Right`  → cycle focus forward: Sidebar → Main → Detail → Sidebar.
+    ///                                   When a PTY is visible in the target pane, also toggles
+    ///                                   `terminal_focused` / `detail_terminal_focused`.
+    ///   `Ctrl-W h` / `Ctrl-W Left`   → cycle focus backward: Sidebar → Detail → Main → Sidebar.
     ///   `Ctrl-W Ctrl-W`              → forward a literal `Ctrl-W` to the focused
     ///                                   PTY, so an inner app's own window key
     ///                                   (e.g. vim) is still reachable.
     /// Any other key after the prefix cancels the leader (swallowed, no action).
+    ///
+    /// §4 (#782): `focused_region` tracks Sidebar / Main / Detail across all views.
+    /// The existing terminal blur/focus behaviour is preserved as a side-effect of
+    /// the region change: moving to Sidebar blurs PTYs; moving to Main focuses the
+    /// standalone terminal PTY; moving to Detail focuses the per-issue detail PTY.
+    ///
+    /// When a PTY view is active (standalone Terminal, Pipeline Terminal tab),
+    /// the cycle can skip the "Main" step and jump directly to "Detail" so that
+    /// a single `Ctrl-W l` from the sidebar focuses the PTY — matching the old
+    /// two-region (Sidebar ↔ content) behaviour that existed before this refactor.
     pub(crate) fn handle_ctrl_w_leader(
         &mut self,
         key: &Key,
@@ -304,26 +316,19 @@ impl CoordApp {
         if self.ctrl_w_pending {
             self.ctrl_w_pending = false;
             match key {
-                // → side panel: blur whichever embedded terminal is focused.
-                // No explicit sidebar-focus flag exists; releasing the PTY is
-                // what restores bare-key navigation to the sidebar.
+                // → cycle focus LEFT (backward).
                 Key::Char('h') | Key::Named(NamedKey::Left)
                     if !modifiers.ctrl && !modifiers.alt =>
                 {
-                    self.terminal_focused = false;
-                    self.detail_terminal_focused = false;
+                    self.focused_region = self.next_region_left();
+                    self.apply_pty_focus_for_region();
                 }
-                // → content pane: focus the embedded terminal when one is shown.
+                // → cycle focus RIGHT (forward).
                 Key::Char('l') | Key::Named(NamedKey::Right)
                     if !modifiers.ctrl && !modifiers.alt =>
                 {
-                    if self.active_view == SidebarView::Terminal {
-                        self.terminal_focused = true;
-                    } else if self.active_view == SidebarView::Pipeline
-                        && self.pipeline_detail_tab == PipelineDetailTab::Terminal
-                    {
-                        self.detail_terminal_focused = true;
-                    }
+                    self.focused_region = self.next_region_right();
+                    self.apply_pty_focus_for_region();
                 }
                 // `Ctrl-W Ctrl-W` → literal `Ctrl-W` to the focused PTY.
                 Key::Char('w') | Key::Char('W') if modifiers.ctrl => {
@@ -352,6 +357,119 @@ impl CoordApp {
         }
 
         None
+    }
+
+    // ─── §4 (#782): focus-region helpers ─────────────────────────────────────
+
+    /// Derive the "effective" focused region from the PTY focus flags.
+    ///
+    /// PTY focus flags (`terminal_focused`, `detail_terminal_focused`) may be
+    /// set by code paths outside the Ctrl-W handler (e.g. F12, entering the
+    /// Terminal view via the activity bar).  Reading them here ensures the
+    /// cycle always starts from the correct position even when `focused_region`
+    /// hasn't been synchronised yet.
+    fn effective_focused_region(&self) -> FocusedRegion {
+        if self.detail_terminal_focused {
+            FocusedRegion::Detail
+        } else if self.terminal_focused && self.active_view == SidebarView::Terminal {
+            FocusedRegion::Main
+        } else {
+            self.focused_region
+        }
+    }
+
+    /// True when the active view has a PTY in the Detail region.
+    fn has_detail_pty(&self) -> bool {
+        self.active_view == SidebarView::Pipeline
+            && self.pipeline_detail_tab == PipelineDetailTab::Terminal
+    }
+
+    /// True when the active view has a PTY in the Main region.
+    fn has_main_pty(&self) -> bool {
+        self.active_view == SidebarView::Terminal
+    }
+
+    /// Compute the next region when cycling RIGHT (Sidebar → Main → Detail → Sidebar).
+    ///
+    /// When a Detail PTY is present, skip Main and jump directly from Sidebar to
+    /// Detail so a single Ctrl-W l focuses the PTY (preserving the pre-§4 UX).
+    fn next_region_right(&self) -> FocusedRegion {
+        match self.effective_focused_region() {
+            FocusedRegion::Sidebar => {
+                if self.has_detail_pty() {
+                    FocusedRegion::Detail
+                } else {
+                    FocusedRegion::Main
+                }
+            }
+            FocusedRegion::Main => FocusedRegion::Detail,
+            FocusedRegion::Detail => FocusedRegion::Sidebar,
+        }
+    }
+
+    /// Compute the next region when cycling LEFT (Sidebar → Detail → Main → Sidebar).
+    ///
+    /// When a Detail PTY is present, skip Main in the backward direction too so
+    /// focus returns from Detail directly to Sidebar (mirrors `next_region_right`).
+    fn next_region_left(&self) -> FocusedRegion {
+        match self.effective_focused_region() {
+            FocusedRegion::Detail => {
+                if self.has_detail_pty() {
+                    FocusedRegion::Sidebar
+                } else {
+                    FocusedRegion::Main
+                }
+            }
+            FocusedRegion::Main => FocusedRegion::Sidebar,
+            FocusedRegion::Sidebar => {
+                // Wrap: land on the rightmost region that has content.
+                if self.has_detail_pty() {
+                    FocusedRegion::Detail
+                } else if self.has_main_pty() {
+                    FocusedRegion::Main
+                } else {
+                    FocusedRegion::Main
+                }
+            }
+        }
+    }
+
+    /// §4 (#782): Update `terminal_focused` / `detail_terminal_focused` to
+    /// match the new `focused_region`.
+    ///
+    /// Called after every `focused_region` change caused by a `Ctrl-W`
+    /// chord so that PTY-passthrough behaviour stays in sync with the
+    /// region model:
+    /// - Sidebar  → blur all PTYs (bare-key nav drives the sidebar list).
+    /// - Main     → focus the standalone Terminal PTY when it is the
+    ///              active view; blur detail PTY.
+    /// - Detail   → focus the Pipeline detail Terminal PTY when that tab
+    ///              is open; blur the standalone PTY.
+    fn apply_pty_focus_for_region(&mut self) {
+        match self.focused_region {
+            FocusedRegion::Sidebar => {
+                self.terminal_focused = false;
+                self.detail_terminal_focused = false;
+            }
+            FocusedRegion::Main => {
+                self.detail_terminal_focused = false;
+                if self.active_view == SidebarView::Terminal {
+                    self.terminal_focused = true;
+                } else {
+                    self.terminal_focused = false;
+                }
+            }
+            FocusedRegion::Detail => {
+                self.terminal_focused = false;
+                if self.active_view == SidebarView::Pipeline
+                    && self.pipeline_detail_tab == PipelineDetailTab::Terminal
+                {
+                    self.detail_terminal_focused = true;
+                } else {
+                    self.detail_terminal_focused = false;
+                }
+            }
+        }
     }
 
     pub(crate) fn forward_key_to_pty(&mut self, key: &Key, mods: &quadraui::Modifiers) -> bool {

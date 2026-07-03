@@ -90,6 +90,34 @@ pub(crate) enum BoardDetailTab {
     Terminal,
 }
 
+/// #782: which pane currently has keyboard focus.
+///
+/// `Sidebar` is the default (activity-bar + list panel).
+/// `Main` is the primary content area (main panel / detail panel).
+/// `Detail` is the secondary pane visible when a detail sub-pane or PTY
+/// occupies the right/bottom portion of the content area.
+///
+/// Used by the Ctrl-W focus cycler; the visible indicator is rendered in the
+/// status bar.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub(crate) enum FocusedRegion {
+    #[default]
+    Sidebar,
+    Main,
+    Detail,
+}
+
+impl FocusedRegion {
+    /// Short label shown in the status-bar focus indicator.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            FocusedRegion::Sidebar => "Sidebar",
+            FocusedRegion::Main => "Main",
+            FocusedRegion::Detail => "Detail",
+        }
+    }
+}
+
 /// The selectable top-level views shown in the left sidebar.
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 pub(crate) enum SidebarView {
