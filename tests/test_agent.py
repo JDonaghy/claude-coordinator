@@ -1121,6 +1121,110 @@ def test_artifact_manifest_returns_file_list(tmp_path: Path) -> None:
     assert manifest["total_bytes"] == manifest["files"][0]["size"]
 
 
+# ── #914: _find_live_worktree + artifact_absence_reason ────────────────────────
+
+
+def test_find_live_worktree_matches_by_current_branch(tmp_path: Path) -> None:
+    """_find_live_worktree locates a real `git worktree add` checkout by
+    its current (sanitized) branch name, independent of directory naming."""
+    rp = _init_repo(tmp_path / "repo")
+    server = _server(tmp_path, repo_path=rp)
+
+    wt_path = tmp_path / "state" / "worktrees" / "asgn-xyz"
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "issue-99-fix", str(wt_path)],
+        cwd=str(rp),
+        check=True,
+        capture_output=True,
+    )
+
+    found = server._find_live_worktree("api", "issue-99-fix")
+    assert found == wt_path
+
+
+def test_find_live_worktree_returns_none_for_unknown_repo(tmp_path: Path) -> None:
+    """No repo_paths entry for the requested repo → no crash, just None."""
+    server = _server(tmp_path)
+    assert server._find_live_worktree("no-such-repo", "issue-1-x") is None
+
+
+def test_find_live_worktree_returns_none_when_branch_not_checked_out(
+    tmp_path: Path,
+) -> None:
+    """A configured repo with no worktree on the requested branch → None."""
+    server = _server(tmp_path)
+    assert server._find_live_worktree("api", "issue-404-nonexistent") is None
+
+
+def test_artifact_absence_reason_worktree_present_no_patterns(
+    tmp_path: Path,
+) -> None:
+    """Reason names 'no artifact_paths configured' when a live worktree
+    exists but the repo isn't configured to stash anything."""
+    rp = _init_repo(tmp_path / "repo")
+    server = _server(tmp_path, repo_path=rp)  # no artifact_paths kwarg
+
+    wt_path = tmp_path / "state" / "worktrees" / "asgn-noconf"
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "issue-1-noconf", str(wt_path)],
+        cwd=str(rp),
+        check=True,
+        capture_output=True,
+    )
+
+    reason = server.artifact_absence_reason("api", "issue-1-noconf")
+    assert "no artifact_paths configured" in reason
+
+
+def test_artifact_absence_reason_genuinely_absent(tmp_path: Path) -> None:
+    """Reason correctly reports 'genuinely absent' when no worktree matches."""
+    server = _server(tmp_path, artifact_paths={"api": ["target/debug/foo"]})
+    reason = server.artifact_absence_reason("api", "issue-1-never-existed")
+    assert "already merged" in reason or "nothing was ever built" in reason
+
+
+def test_artifact_absence_reason_rejects_bad_path_components(
+    tmp_path: Path,
+) -> None:
+    """repo/branch names outside the safe path-component charset get the
+    same guard as artifact_manifest, not a crash from a bad path lookup."""
+    server = _server(tmp_path)
+    assert server.artifact_absence_reason("a/b", "issue-1-x") == "invalid repo/branch name"
+    assert server.artifact_absence_reason("api", "a/b") == "invalid repo/branch name"
+
+
+def test_artifact_manifest_lazy_stashes_from_live_worktree(tmp_path: Path) -> None:
+    """artifact_manifest() self-heals: a live worktree still on the requested
+    branch gets stashed on demand when the persistent stash is empty (#914),
+    mirroring the vimcode #552 'missed finalize' scenario end-to-end."""
+    rp = _init_repo(tmp_path / "repo")
+    server = _server(
+        tmp_path, repo_path=rp, artifact_paths={"api": ["target/debug/mybinary"]}
+    )
+
+    wt_path = tmp_path / "state" / "worktrees" / "asgn-552"
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "issue-552-fix", str(wt_path)],
+        cwd=str(rp),
+        check=True,
+        capture_output=True,
+    )
+    (wt_path / "target" / "debug").mkdir(parents=True)
+    (wt_path / "target" / "debug" / "mybinary").write_bytes(b"\x7fELF" + b"\x00" * 200)
+
+    stash_dir = server.state_dir / "artifacts" / "api" / "issue-552-fix"
+    assert not stash_dir.exists()
+
+    manifest = server.artifact_manifest("api", "issue-552-fix")
+    assert manifest is not None
+    assert [f["name"] for f in manifest["files"]] == ["mybinary"]
+    assert manifest["built_by_assignment_id"] == "asgn-552"
+    assert (stash_dir / "mybinary").exists()
+
+
 # ── stash_artifacts_for_branch standalone function (#562) ─────────────────────
 
 

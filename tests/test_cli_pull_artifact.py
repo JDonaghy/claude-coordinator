@@ -107,6 +107,40 @@ def test_pull_artifact_404_from_agent(tmp_path: Path, coord_db) -> None:
            "not found" in output.lower() or "stash" in output.lower()
 
 
+def test_pull_artifact_404_echoes_agent_reason(tmp_path: Path, coord_db) -> None:
+    """#914: the 404 message must surface the agent's actual reason (from the
+    manifest endpoint's JSON body) instead of always printing the generic
+    GC/glob-mismatch/no-config guesses — those are frequently all wrong."""
+    cfg = _write_config(tmp_path)
+    _insert_assignment(coord_db)
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 404
+    mock_resp.text = "not found"
+    mock_resp.json.return_value = {
+        "error": "no artifacts for repo='myrepo' branch='issue-1-my-feature': "
+        "a live worktree for branch 'issue-1-my-feature' exists on this host "
+        "(/home/agent/.coord/worktrees/asgn-abc123), but the build did not "
+        "produce any files matching artifact_paths — the session likely "
+        "wasn't finalized (crash, tmux killed, or `coord done` never ran)"
+    }
+
+    runner = CliRunner()
+    with patch("httpx.get", return_value=mock_resp):
+        result = runner.invoke(
+            main,
+            ["pull-artifact", "asgn-abc123", "--config", str(cfg)],
+        )
+
+    assert result.exit_code != 0
+    output = result.output
+    assert "wasn't finalized" in output
+    assert "live worktree" in output
+    # The old three-guess message must NOT appear once the agent supplied a
+    # real reason — it would misdirect back to GC/glob/config guesses.
+    assert "Possible causes: stash has been GC'd" not in output
+
+
 def test_pull_artifact_thin_client_resolves_from_daemon(
     tmp_path: Path, coord_db, monkeypatch
 ) -> None:

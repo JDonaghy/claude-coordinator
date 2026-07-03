@@ -376,12 +376,25 @@ def pull_artifact(assignment_id: str, dest_path: Path | None, config_path: Path)
         sys.exit(1)
 
     if resp.status_code == 404:
+        # #914: the agent host knows the ground truth (it just tried a lazy
+        # stash-on-pull before giving up) — echo its actual reason instead of
+        # guessing among GC / glob mismatch / missing config, which are
+        # frequently all wrong (e.g. the real cause is a missed interactive
+        # finalize with the built worktree still sitting on disk).
+        reason: str | None = None
+        try:
+            reason = resp.json().get("error")
+        except Exception:  # noqa: BLE001 — malformed/non-JSON body, fall back below
+            reason = None
+        detail = reason or (
+            "Possible causes: stash has been GC'd (default TTL 3 days), "
+            "the build did not match any artifact_paths globs, "
+            "or artifact_paths is not configured for this repo."
+        )
         click.echo(
             f"error: no artifacts found for assignment {assignment_id!r} "
             f"(repo={repo_name!r}, branch={sanitized!r}) on {machine.name}.\n"
-            "Possible causes: stash has been GC'd (default TTL 3 days), "
-            "the build did not match any artifact_paths globs, "
-            "or artifact_paths is not configured for this repo.",
+            f"{detail}",
             err=True,
         )
         sys.exit(1)

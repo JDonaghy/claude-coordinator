@@ -29,6 +29,7 @@ def _client(
     argv: list[str] | None = None,
     repo_paths: dict[str, str] | None = None,
     repo_path: Path | None = None,
+    artifact_paths: dict[str, list[str]] | None = None,
 ) -> tuple[TestClient, AgentServer]:
     rp = repo_path or _init_repo(tmp_path / "repo")
     server = AgentServer(
@@ -38,6 +39,7 @@ def _client(
         state_dir=tmp_path / "state",
         worker_command=lambda spec: argv or ["/bin/sh", "-c", "echo ok"],
         repo_paths=repo_paths if repo_paths is not None else {"api": str(rp)},
+        artifact_paths=artifact_paths,
     )
     app = build_app(server)
     return TestClient(app), server
@@ -464,6 +466,91 @@ def test_artifact_manifest_rejects_path_traversal(tmp_path: Path) -> None:
     # Also verify that a valid pair returns None when the stash is genuinely absent.
     manifest = server.artifact_manifest("myrepo", "issue-1-branch")
     assert manifest is None
+
+
+# ── #914: lazy stash-on-pull + accurate 404 reason ────────────────────────────
+
+
+def test_artifact_manifest_lazy_stash_from_live_worktree(tmp_path: Path) -> None:
+    """A missed finalize (no stash) with the worktree still on disk self-heals.
+
+    Simulates the vimcode #552 scenario: the build succeeded and the branch
+    was pushed, but the interactive session ended without a clean `coord
+    done`, so nothing ever called stash_artifacts_for_branch. GET
+    /artifact/<repo>/<branch> should find the live git worktree still
+    checked out to that branch and stash on demand instead of 404ing.
+    """
+    client, server = _client(
+        tmp_path, artifact_paths={"api": ["target/debug/mybinary"]}
+    )
+    repo_path = tmp_path / "repo"
+
+    wt_path = tmp_path / "state" / "worktrees" / "asgn-914"
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "issue-552-fix", str(wt_path)],
+        cwd=str(repo_path),
+        check=True,
+        capture_output=True,
+    )
+    (wt_path / "target" / "debug").mkdir(parents=True)
+    (wt_path / "target" / "debug" / "mybinary").write_bytes(b"\x7fELF" + b"\x00" * 200)
+
+    # No stash exists yet.
+    stash_dir = server.state_dir / "artifacts" / "api" / "issue-552-fix"
+    assert not stash_dir.exists()
+
+    r = client.get("/artifact/api/issue-552-fix")
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body["files"]) == 1
+    assert body["files"][0]["name"] == "mybinary"
+    assert body["built_by_assignment_id"] == "asgn-914"
+    # The lazy stash actually persisted the file for next time.
+    assert (stash_dir / "mybinary").exists()
+
+
+def test_artifact_manifest_404_reason_worktree_present_no_config(
+    tmp_path: Path,
+) -> None:
+    """404 reason names the real cause when a live worktree exists but the
+    repo has no artifact_paths configured — not a GC/glob-mismatch guess."""
+    client, server = _client(tmp_path)  # no artifact_paths configured
+    repo_path = tmp_path / "repo"
+
+    wt_path = tmp_path / "state" / "worktrees" / "asgn-noconfig"
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "issue-1-noconfig", str(wt_path)],
+        cwd=str(repo_path),
+        check=True,
+        capture_output=True,
+    )
+
+    r = client.get("/artifact/api/issue-1-noconfig")
+    assert r.status_code == 404
+    error = r.json()["error"]
+    assert "no artifact_paths configured" in error
+    assert "GC" not in error
+
+    reason = server.artifact_absence_reason("api", "issue-1-noconfig")
+    assert "no artifact_paths configured" in reason
+
+
+def test_artifact_manifest_404_reason_genuinely_absent(tmp_path: Path) -> None:
+    """404 reason correctly reports 'genuinely absent' when no worktree
+    matches at all — distinct from the worktree-present-but-unstashed case."""
+    client, server = _client(
+        tmp_path, artifact_paths={"api": ["target/debug/mybinary"]}
+    )
+
+    r = client.get("/artifact/api/issue-1-never-built")
+    assert r.status_code == 404
+    error = r.json()["error"]
+    assert "already merged" in error or "nothing was ever built" in error
+
+    reason = server.artifact_absence_reason("api", "issue-1-never-built")
+    assert "already merged" in reason or "nothing was ever built" in reason
 
 
 # ─── #207: /metrics endpoint ─────────────────────────────────────────────────
