@@ -735,14 +735,37 @@ impl CoordApp {
 
     // ── #728: Done-section windowing helpers ─────────────────────────────────
 
-    /// Compute the "done-at" timestamp for an issue: the **max** `finished_at`
-    /// across all assignments for that issue (by issue number + coord-repo).
+    /// Compute the "done-at" timestamp for an issue: the moment it actually
+    /// *entered* Done, for the Done section's recency window + sort (#913).
     ///
-    /// Returns `None` when no assignment has a `finished_at` (e.g. the issue
-    /// was closed on GitHub with no coord pipeline rows, or rows predate the
-    /// column).  Such issues are excluded from the windowed view and only
-    /// appear when `done_window == All`.
+    /// Preferred source: a `state == "merged"` `merge_queue` entry's
+    /// `last_attempt` — `coord/merge_queue.py` sets that field immediately
+    /// before the merge attempt and never touches it again on success, so
+    /// for a merged entry it IS the merge time. A `passed`/`skipped` smoke
+    /// test can sit for hours or days before review + merge actually lands
+    /// it, so keying off work-completion time hides freshly-merged items
+    /// behind a stale-looking timestamp — see #913.
+    ///
+    /// Falls back to the **max** `finished_at` across all assignments for
+    /// the issue (by issue number + coord-repo) when no merged queue entry
+    /// exists — e.g. the merge_queue row was pruned after reconcile flipped
+    /// the assignment to `status == "merged"`, or the issue was closed on
+    /// GitHub with no coord-driven merge at all.
+    ///
+    /// Returns `None` when neither source has a timestamp (e.g. rows predate
+    /// the relevant column). Such issues are excluded from the windowed view
+    /// and only appear when `done_window == All`.
     pub(crate) fn issue_done_at(&self, issue: &PipelineIssue) -> Option<f64> {
+        if let Some(merged_at) = self
+            .data
+            .merge_queue
+            .iter()
+            .find(|m| m.issue_number == Some(issue.number) && m.repo_github == issue.repo_slug)
+            .filter(|m| m.state == "merged")
+            .and_then(|m| m.last_attempt)
+        {
+            return Some(merged_at);
+        }
         let local_repo = issue.coord_repo.as_deref();
         self.data
             .assignments
