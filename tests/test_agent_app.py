@@ -510,6 +510,58 @@ def test_artifact_manifest_lazy_stash_from_live_worktree(tmp_path: Path) -> None
     assert (stash_dir / "mybinary").exists()
 
 
+def test_artifact_manifest_404_when_worktree_present_but_no_files_match(
+    tmp_path: Path,
+) -> None:
+    """A live worktree exists and artifact_paths is configured, but the build
+    hasn't produced anything matching the globs yet (build still running,
+    build failed, or a wrong glob) — this must 404 with the informative
+    "did not produce any files matching artifact_paths" reason, not a 200
+    with an empty file list (#914 review: stash_artifacts_for_branch's
+    unconditional mkdir must not be mistaken for stash success).
+
+    Also asserts the lazy-stash retry doesn't self-poison: once a real
+    build produces the matching file, a later request for the same
+    repo/branch succeeds instead of staying stuck on the empty directory.
+    """
+    client, server = _client(
+        tmp_path, artifact_paths={"api": ["target/debug/mybinary"]}
+    )
+    repo_path = tmp_path / "repo"
+
+    wt_path = tmp_path / "state" / "worktrees" / "asgn-nomatch"
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "issue-914-nomatch", str(wt_path)],
+        cwd=str(repo_path),
+        check=True,
+        capture_output=True,
+    )
+    # No target/debug/mybinary in the worktree — the glob matches nothing.
+
+    r = client.get("/artifact/api/issue-914-nomatch")
+    assert r.status_code == 404
+    error = r.json()["error"]
+    assert "did not produce any files matching artifact_paths" in error
+
+    # The lazy-stash attempt must not have poisoned the stash dir with an
+    # empty directory that blocks all future retries.
+    stash_dir = server.state_dir / "artifacts" / "api" / "issue-914-nomatch"
+    assert not any(
+        f.is_file() and not f.name.startswith(".") for f in stash_dir.iterdir()
+    ) if stash_dir.exists() else True
+
+    # Now the "build" actually lands the file — a later poll must self-heal
+    # instead of staying stuck on the earlier empty attempt.
+    (wt_path / "target" / "debug").mkdir(parents=True)
+    (wt_path / "target" / "debug" / "mybinary").write_bytes(b"\x7fELF" + b"\x00" * 200)
+
+    r2 = client.get("/artifact/api/issue-914-nomatch")
+    assert r2.status_code == 200
+    body = r2.json()
+    assert [f["name"] for f in body["files"]] == ["mybinary"]
+
+
 def test_artifact_manifest_404_reason_worktree_present_no_config(
     tmp_path: Path,
 ) -> None:
