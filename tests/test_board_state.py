@@ -743,6 +743,72 @@ def test_upsert_open_issues_marks_removed_issues_closed(coord_db) -> None:
     assert rows[1]["state"] == "open"
 
 
+def test_upsert_open_issues_stamps_synced_at_when_issue_closes(coord_db) -> None:
+    """#771 review: the retention clock for a closed issue must start at
+    close-detection time, not freeze at whenever it was last confirmed open.
+
+    Previously the close-marking UPDATE didn't touch ``synced_at``, so an
+    issue that had gone e.g. 6 days without a resync-worthy change (no title/
+    label/milestone edit) inherited that stale timestamp the moment it
+    closed — leaving only ~1 of the intended 7 days of grace before the
+    local-cache prune below deletes it, instead of a full 7 days from
+    closure.
+    """
+    import time
+
+    from coord.db import get_connection
+    from coord.state import upsert_open_issues
+
+    conn = get_connection()
+    old_ts = time.time() - 6 * 86400  # last confirmed open 6 days ago
+    conn.execute(
+        "INSERT INTO issues (repo_name, number, title, body, state, labels, synced_at) "
+        "VALUES ('repo', 42, 'Old', '', 'open', '[]', ?)",
+        (old_ts,),
+    )
+    conn.commit()
+
+    # Next sync: #42 is no longer in the fetched open list → transitions closed.
+    upsert_open_issues("repo", [])
+
+    row = get_connection().execute(
+        "SELECT state, synced_at FROM issues WHERE repo_name='repo' AND number=42"
+    ).fetchone()
+    assert row["state"] == "closed"
+    assert row["synced_at"] > old_ts + 86400, (
+        "synced_at must be refreshed to ~now on the open->closed transition, "
+        "not left at the stale last-confirmed-open timestamp"
+    )
+
+
+def test_upsert_open_issues_does_not_reset_synced_at_for_already_closed(coord_db) -> None:
+    """The close-time stamp only applies to the open->closed transition —
+    an already-closed row's clock must keep counting from when *it* closed,
+    so the 7-day prune still reclaims it on schedule instead of the clock
+    resetting on every subsequent sync that finds it still absent."""
+    import time
+
+    from coord.db import get_connection
+    from coord.state import upsert_open_issues
+
+    conn = get_connection()
+    old_ts = time.time() - 8 * 86400  # closed 8 days ago — already past the window
+    conn.execute(
+        "INSERT INTO issues (repo_name, number, title, body, state, labels, synced_at) "
+        "VALUES ('repo', 43, 'Old', '', 'closed', '[]', ?)",
+        (old_ts,),
+    )
+    conn.commit()
+
+    # #43 stays absent from the open list on this sync too.
+    upsert_open_issues("repo", [])
+
+    row = get_connection().execute(
+        "SELECT synced_at FROM issues WHERE repo_name='repo' AND number=43"
+    ).fetchone()
+    assert row is None, "an already-closed row past the 7-day window must still be pruned"
+
+
 def test_upsert_open_issues_updates_title_on_resync(coord_db) -> None:
     from coord.state import upsert_open_issues
     from coord.db import get_connection

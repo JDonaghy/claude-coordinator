@@ -96,9 +96,21 @@ impl CoordApp {
             {
                 let reason = first_meaningful_stderr_line(&result.stderr)
                     .unwrap_or_else(|| format!("exit {} — no stderr captured", result.exit_code));
+                // #771 review: the TUI toast body is a single un-wrapped row
+                // (quadraui's `tui/toast.rs` paints title + body as one line
+                // each, ~40 cols wide, no wrapping — the embedded `\n` this
+                // used to join `label`/`reason` with was never a real line
+                // break). A long label (e.g. "coord milestone dispatch
+                // claude-coordinator 767") ate the whole row and silently
+                // swallowed the actual failure reason — exactly the
+                // "unreadable toast" the operator hit. Put the actionable
+                // `reason` FIRST so it survives truncation; the full label
+                // is already visible in the status bar for several seconds
+                // after completion (`command_runner.message`, set below),
+                // so demoting it here loses nothing.
                 self.push_toast(
                     "Command failed",
-                    &format!("{}\n{}", result.label, reason),
+                    &format!("{}  ({})", reason, result.label),
                     ToastSeverity::Error,
                 );
             }

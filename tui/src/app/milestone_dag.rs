@@ -44,10 +44,6 @@ pub(crate) enum NodeState {
     /// Not done, not in flight, all `after` dependencies are `Done` — part
     /// of the ready frontier `coord milestone dispatch` would pick up now.
     Ready,
-    /// The issue number isn't present in the synced open-issues cache (e.g.
-    /// closed long enough ago to have aged out). Shown as `?` rather than
-    /// guessed at, since we can't tell done vs. some other state.
-    Unknown,
 }
 
 /// A work-order node plus its computed display state and issue title.
@@ -239,6 +235,18 @@ pub(crate) fn milestone_tracking_issue<'a>(
 /// `state`/assignments for done/in-flight, `after`-edges vs. the terminal
 /// (closed) set for blocked/ready. Terminal is scoped to `repo_name` so two
 /// repos can't cross-pollinate issue numbers.
+///
+/// **A work-order issue absent from the local open-issues cache counts as
+/// terminal (done), not unknown** (#771 review finding). `coord/state.py`'s
+/// `_upsert_open_issues_local` only ever prunes a row for being *closed* and
+/// stale (`synced_at` older than 7 days) — a still-open issue is refreshed on
+/// every sync and never ages out. So "missing entirely" is strong evidence of
+/// "closed a while back," not genuine ambiguity; treating it as `Unknown`
+/// (the previous behavior) made the "done" badge effectively never render for
+/// realistic milestones (issues closed more than ~a week ago, whose
+/// `synced_at` froze at their last *open* sync, had already aged out) and
+/// made dependent nodes show as incorrectly `Blocked` on a dependency that
+/// was actually done.
 pub(crate) fn build_dag_nodes(
     work_order: &[WorkOrderNode],
     repo_name: &str,
@@ -248,9 +256,13 @@ pub(crate) fn build_dag_nodes(
     let terminal: std::collections::HashSet<u64> = work_order
         .iter()
         .filter(|n| {
-            open_issues.iter().any(|oi| {
-                oi.repo_name == repo_name && oi.number == n.issue_number && oi.state == "closed"
-            })
+            match open_issues
+                .iter()
+                .find(|oi| oi.repo_name == repo_name && oi.number == n.issue_number)
+            {
+                Some(oi) => oi.state == "closed",
+                None => true, // aged out of the sync cache ⇒ presumed closed/done.
+            }
         })
         .map(|n| n.issue_number)
         .collect();
@@ -263,8 +275,6 @@ pub(crate) fn build_dag_nodes(
                 .find(|oi| oi.repo_name == repo_name && oi.number == n.issue_number);
             let state = if terminal.contains(&n.issue_number) {
                 NodeState::Done
-            } else if found.is_none() {
-                NodeState::Unknown
             } else if assignments
                 .iter()
                 .any(|a| a.repo == repo_name && a.issue_number == n.issue_number && a.status == "running")
@@ -362,7 +372,6 @@ fn milestone_node_badge(state: &NodeState, theme: &quadraui::Theme) -> (&'static
         NodeState::InFlight => ("in-flight", theme.link_fg),
         NodeState::Ready => ("ready", theme.accent_fg),
         NodeState::Blocked(_) => ("blocked", theme.badge_request_changes),
-        NodeState::Unknown => ("?", theme.muted_fg),
     }
 }
 
@@ -700,11 +709,36 @@ Not part of the block.
         assert_eq!(nodes[3].state, NodeState::Ready);
     }
 
+    /// #771 review finding 1: an issue absent from the local open-issues
+    /// cache entirely (the effective outcome once a closed issue ages out of
+    /// `coord/state.py`'s 7-day prune) must be presumed `Done`, not shown as
+    /// an unhelpful `Unknown`/`?` — the local cache only ever drops rows for
+    /// being closed-and-stale, never for a still-open issue.
     #[test]
-    fn build_dag_nodes_unknown_when_issue_not_synced() {
+    fn build_dag_nodes_presumes_done_when_issue_not_synced() {
         let work_order = vec![WorkOrderNode { issue_number: 99, group: None, after: vec![] }];
         let nodes = build_dag_nodes(&work_order, "repo", &[], &[]);
-        assert_eq!(nodes[0].state, NodeState::Unknown);
+        assert_eq!(nodes[0].state, NodeState::Done);
+        // Title falls back to the bare issue number when nothing is cached.
+        assert_eq!(nodes[0].title, "#99");
+    }
+
+    /// #771 review finding 2: a dependency that has aged out of the cache
+    /// (missing entirely, same as above) must clear the `after` edge rather
+    /// than leaving the dependent node incorrectly `Blocked` on something
+    /// that's actually done.
+    #[test]
+    fn build_dag_nodes_ready_when_dependency_aged_out_of_cache() {
+        let work_order = vec![
+            WorkOrderNode { issue_number: 765, group: None, after: vec![] },
+            WorkOrderNode { issue_number: 766, group: None, after: vec![765] },
+        ];
+        // #765 is NOT present in open_issues — simulating a real closed
+        // issue that's aged out of the 7-day-stale-closed prune.
+        let open_issues = vec![issue("repo", 766, "Independent, ready", "open", &[])];
+        let nodes = build_dag_nodes(&work_order, "repo", &open_issues, &[]);
+        assert_eq!(nodes[0].state, NodeState::Done);
+        assert_eq!(nodes[1].state, NodeState::Ready);
     }
 
     #[test]
