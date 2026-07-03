@@ -385,9 +385,10 @@ def _resolve_milestone_membership(
 
     Open issues under the milestone come free from one ``get_open_issues``
     call; any work-order node not in that set gets an individual
-    ``get_issue`` lookup (closed, or foreign) to classify it. Shared by
-    ``coord milestone order`` and ``coord milestone write-order`` so both
-    commands agree on membership/terminal-state resolution.
+    ``get_issue`` lookup (closed, or foreign) to classify it. Used by
+    ``coord milestone write-order`` to validate proposed work-order content
+    before writing it (``coord milestone order``/``dispatch`` resolve
+    membership via ``milestone_dispatch.fetch_milestone_context`` instead).
     """
     from coord import github_ops
 
