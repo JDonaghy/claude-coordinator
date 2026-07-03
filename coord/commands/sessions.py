@@ -17,7 +17,10 @@ import httpx
 
 from coord.commands._common import AGENT_PORT, _CONFIG_OPTION, _load_config
 
-from coord.commands.review import _prompt_and_relay_review_verdict
+from coord.commands.review import (
+    _prompt_and_relay_review_verdict,
+    _prompt_and_relay_test_verdict,
+)
 
 
 @click.command(help="View claude -p output for a specific assignment.")
@@ -971,6 +974,10 @@ def reattach(assignment_id: str, config_path: Path) -> None:
     # worktree's commits back to origin.
     assignment_type_val: str | None = None
     branch_val: str | None = None
+    # #923: for smoke sessions, the WORK assignment id (smoke_of) is stored
+    # as review_of_assignment_id on the smoke row — needed for the test-
+    # verdict backstop so we can check and record test_state on the WORK row.
+    review_of_assignment_id_val: str | None = None
 
     # #601: resolve the assignment metadata that finalize_interactive_exit needs
     # (repo/issue/machine/type/branch). On a thin client the local DB is retired,
@@ -1002,13 +1009,16 @@ def reattach(assignment_id: str, config_path: Path) -> None:
             assignment_type_val = row.get("type")
             _br = row.get("branch")
             branch_val = str(_br) if _br else None
+            # #923: review_of_assignment_id = smoke_of (the work being tested)
+            _roi = row.get("review_of_assignment_id")
+            review_of_assignment_id_val = str(_roi) if _roi else None
     else:
         try:
             from coord.state import get_connection as _gc  # noqa: PLC0415
             conn = _gc()
             row = conn.execute(
                 "SELECT issue_number, repo_name, repo_github, machine_name, "
-                "type, branch "
+                "type, branch, review_of_assignment_id "
                 "FROM assignments WHERE assignment_id=?",
                 (assignment_id,),
             ).fetchone()
@@ -1024,6 +1034,9 @@ def reattach(assignment_id: str, config_path: Path) -> None:
                 assignment_type_val = str(_at) if _at is not None else None
                 _br = _col(row, "branch", 5)
                 branch_val = str(_br) if _br else None
+                # #923: review_of_assignment_id = smoke_of (the work being tested)
+                _roi = _col(row, "review_of_assignment_id", 6)
+                review_of_assignment_id_val = str(_roi) if _roi else None
         except Exception:  # noqa: BLE001
             pass
 
@@ -1271,6 +1284,40 @@ def reattach(assignment_id: str, config_path: Path) -> None:
                 if not finalize_result.push_ok:
                     click.echo(
                         f"  warning: git push failed: {finalize_result.push_error}",
+                        err=True,
+                    )
+            # #923: Test-verdict backstop for smoke sessions.  The smoke
+            # session's own report-result (above) records the session row,
+            # but the WORK row's test_state is what unlocks the merge gate.
+            # If the agent didn't run `coord test`, prompt the operator here.
+            if (
+                assignment_type_val == "smoke"
+                and review_of_assignment_id_val
+            ):
+                _tv_cmd = (
+                    f"    coord test --passed {review_of_assignment_id_val}"
+                    "   # all good\n"
+                    f"    coord test --fail {review_of_assignment_id_val}"
+                    " --reason \"<story>\"   # broken"
+                )
+                try:
+                    if not _prompt_and_relay_test_verdict(
+                        work_assignment_id=review_of_assignment_id_val,
+                        smoke_assignment_id=assignment_id,
+                        repo_name=repo_name_val,
+                        repo_github=repo_github_val,
+                        issue_number=int(issue_number_val),  # type: ignore[arg-type]
+                        machine_name=machine_name_val or "unknown",
+                        verdict_cmd_hint=_tv_cmd,
+                    ):
+                        click.echo(
+                            "  smoke session ended with no test verdict "
+                            "recorded — the merge gate stays blocked until "
+                            "a verdict is reported."
+                        )
+                except Exception as _tv_exc:  # noqa: BLE001
+                    click.echo(
+                        f"  warning: test-verdict backstop failed: {_tv_exc}",
                         err=True,
                     )
         except Exception as exc:  # noqa: BLE001
