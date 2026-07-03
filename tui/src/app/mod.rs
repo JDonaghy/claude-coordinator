@@ -762,6 +762,14 @@ struct PendingDiagnoseDialog {
     /// True when ≥1 `live_tmux_sessions` entry is a `"pending-"` entry for
     /// this (repo, issue) — i.e. a phantom live session may be present.
     has_phantom_session: bool,
+    /// True when this dialog was built from a best-effort parse of the
+    /// legacy human-readable `coord diagnose` output (findings `·` lines,
+    /// actions `✓` lines, and the `DIAGNOSE_RESULT:` trailer) because the
+    /// daemon's response had no `DIAGNOSE_JSON:` line — i.e. a version-skewed
+    /// (pre-#935) daemon on the other end. The dialog still opens so the
+    /// operator gets Recover/Reset/Clear-phantom options instead of a bare
+    /// toast; the body notes the degraded source (#935 follow-up).
+    legacy: bool,
 }
 
 /// #316 Phase B: state for the file-issue finaliser modal.
