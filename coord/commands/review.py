@@ -270,6 +270,113 @@ def _prompt_and_relay_review_verdict(
         return False
 
 
+def _prompt_and_relay_test_verdict(
+    *,
+    work_assignment_id: str,
+    smoke_assignment_id: str,
+    repo_name: str,
+    repo_github: str,
+    issue_number: int,
+    machine_name: str,
+    verdict_cmd_hint: str,
+) -> bool:
+    """Prompt the operator for a Test-gate verdict on exit and relay it (#923).
+
+    Backstop for interactive SMOKE-OF sessions that exit without the agent
+    running ``coord test --passed|--fail|--skipped``.  Without it the test
+    verdict is silently lost, the Test box greys, and the merge gate blocks
+    with no error message.
+
+    **Idempotent**: reads ``work_assignment_id`` from the board first; when
+    ``test_state`` is already set (the agent DID run ``coord test``), this
+    function prints a confirmation and returns True immediately — no
+    double-prompt.
+
+    Mirrors :func:`_prompt_and_relay_review_verdict` (which handles the REVIEW
+    stage).  Same contract for headless callers: no-op + hint when stdin is
+    not a TTY.
+
+    *work_assignment_id*: the WORK assignment being tested (passed as
+    ``smoke_of`` at dispatch time).  The test verdict is ALWAYS recorded on
+    the work row, not the smoke session row.
+
+    *smoke_assignment_id*: the smoke session assignment id (used for log
+    messages only).
+
+    Returns True when a verdict was successfully recorded.
+    """
+    # ── Idempotency gate ──────────────────────────────────────────────────────
+    # Read the WORK row (not the smoke session) from the board.  If it already
+    # has test_state set the agent self-reported — do nothing.
+    try:
+        from coord.board_service import read_board as _read_board_tv  # noqa: PLC0415
+
+        _board = _read_board_tv()
+        _work = _board.find_by_id(work_assignment_id)
+        if _work is not None and (_work.test_state or "").strip():
+            click.echo(
+                f"  test verdict already recorded: {_work.test_state!r} "
+                "(agent used `coord test` — no operator prompt needed)"
+            )
+            return True
+    except Exception:  # noqa: BLE001 — board unavailable → fall through to prompt
+        pass
+
+    # ── Non-TTY path ──────────────────────────────────────────────────────────
+    if not sys.stdin.isatty():
+        click.echo(
+            f"  no test verdict recorded — record it with:\n{verdict_cmd_hint}"
+        )
+        return False
+
+    # ── TTY prompt ────────────────────────────────────────────────────────────
+    ans = click.prompt(
+        "  Test verdict — [p]assed / [f]ailed / [s]kip",
+        type=click.Choice(["p", "f", "s"], case_sensitive=False),
+        default="s",
+        show_choices=True,
+    )
+    if ans.lower() == "s":
+        click.echo(
+            f"  skipped — record the test verdict later with:\n{verdict_cmd_hint}"
+        )
+        return False
+
+    test_state = {"p": "passed", "f": "failed"}[ans.lower()]
+    reason: str = ""
+    if test_state == "failed":
+        reason = click.prompt(
+            "  failure reason (what was checked, expected vs actual, repro "
+            "steps, suspected files — this IS the fix worker's brief)",
+            default="",
+            show_default=False,
+        ).strip()
+
+    # ── Relay via daemon-routed record_test_verdict ────────────────────────────
+    try:
+        from coord.state import record_test_verdict as _record_tv  # noqa: PLC0415
+
+        _record_tv(
+            assignment_id=work_assignment_id,
+            test_state=test_state,
+            test_reason=reason if reason else None,
+            # Mirror to legacy smoke_test columns (pipeline.py reads both).
+            smoke_test="pass" if test_state == "passed" else "fail",
+            smoke_test_reason=reason if test_state == "failed" and reason else None,
+        )
+        click.echo(
+            f"  test verdict '{test_state}' recorded for work assignment "
+            f"{work_assignment_id}."
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001 — best-effort; fall back to the hint
+        click.echo(
+            f"  warning: failed to record test verdict: {exc}\n{verdict_cmd_hint}",
+            err=True,
+        )
+        return False
+
+
 @click.command(
     "report-result",
     help=(

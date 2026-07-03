@@ -17,7 +17,10 @@ from coord import github_ops
 from coord.config import Config
 
 
-from coord.commands.review import _prompt_and_relay_review_verdict
+from coord.commands.review import (
+    _prompt_and_relay_review_verdict,
+    _prompt_and_relay_test_verdict,
+)
 
 
 def _dispatch_review_of(
@@ -762,6 +765,34 @@ def _dispatch_smoke_of(
     except Exception as exc:  # noqa: BLE001 — best-effort backstop
         click.echo(
             f"  warning: backstop failed to record smoke exit: {exc}",
+            err=True,
+        )
+
+    # #923: Test-verdict backstop — if the agent exited without running
+    # `coord test --passed|--fail|--skipped`, prompt the operator here (we
+    # are on a TTY) and relay via the daemon-routed record_test_verdict.
+    # Idempotent: no-op when the WORK row already has test_state set.
+    _test_verdict_cmd = (
+        f"    coord test --passed {smoke_of}   # all good\n"
+        f"    coord test --fail {smoke_of} --reason \"<story>\"   # broken"
+    )
+    try:
+        if not _prompt_and_relay_test_verdict(
+            work_assignment_id=smoke_of,
+            smoke_assignment_id=assignment_id,
+            repo_name=repo,
+            repo_github=repo_cfg.github,
+            issue_number=issue,
+            machine_name=machine,
+            verdict_cmd_hint=_test_verdict_cmd,
+        ):
+            click.echo(
+                "  smoke session ended with no test verdict recorded "
+                "— the merge gate stays blocked until a verdict is reported."
+            )
+    except Exception as exc:  # noqa: BLE001 — best-effort backstop
+        click.echo(
+            f"  warning: test-verdict backstop failed: {exc}",
             err=True,
         )
     return

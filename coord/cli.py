@@ -78,6 +78,7 @@ from coord.commands.merge import (
 )
 from coord.commands.review import (
     _prompt_and_relay_review_verdict,  # noqa: F401 — re-exported for tests
+    _prompt_and_relay_test_verdict,  # noqa: F401 — re-exported for tests
     fix_briefing_cmd,
     report_result,
     set_review_findings,
