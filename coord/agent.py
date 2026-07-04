@@ -695,6 +695,48 @@ _STASH_SKIP_SUFFIXES: frozenset[str] = frozenset(
 # hash-suffixed copy; when ONLY the hash-suffixed form exists we keep it.
 _BUILD_HASH_SUFFIX_RE = re.compile(r"^(.+)-[0-9a-f]{16}$")
 
+# Warn (but do not block) when a single branch's stash exceeds this size —
+# a signal that artifact_paths is too broad for the repo (#940: 72
+# unstripped debug example binaries at ~103MB each ballooned a single
+# quadraui stash to 7.2GB, even though the #436 junk filter was working
+# correctly — the glob itself was just too wide).
+_STASH_WARN_BYTES = 1 * 1024**3  # 1 GB
+
+
+def _strip_debug_symbols(path: Path) -> bool:
+    """Best-effort strip of debug symbols from a stashed binary (#940).
+
+    Runs ``strip -S`` (strip the debug-symbol table only) on *path* in
+    place. ``-S`` is supported by both GNU binutils and macOS/LLVM strip
+    — a bare ``strip`` with no flags behaves differently across those two,
+    so ``-S`` is the portable choice. A Rust debug binary commonly shrinks
+    5-10x with no functional change: only DWARF debug info is removed, not
+    the binary's code or its dynamic symbol table, so a stripped example
+    still runs identically for smoke testing.
+
+    Silently no-ops if the ``strip`` binary isn't on ``PATH``, or if the
+    file isn't something ``strip`` understands (a script, a non-binary
+    asset an artifact_paths glob happened to match, an already-stripped
+    binary) — a failed strip just leaves the original copy intact rather
+    than losing the artifact.
+
+    Returns True if strip ran and exited successfully, False otherwise
+    (caller does not need to branch on this today, but it keeps the
+    function testable in isolation).
+    """
+    strip_bin = shutil.which("strip")
+    if strip_bin is None:
+        return False
+    try:
+        result = subprocess.run(
+            [strip_bin, "-S", str(path)],
+            capture_output=True,
+            timeout=30,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
 
 def stash_artifacts_for_branch(
     worktree_path: Path,
@@ -717,10 +759,14 @@ def stash_artifacts_for_branch(
     Build-intermediate suffixes (.d, .o, .rlib, .rmeta, .rcgu) and files
     smaller than 100 bytes are skipped.  Cargo hash-stamped duplicates
     (``<name>-<16 hex>``) are de-duplicated when the canonical sibling also
-    matches.
+    matches.  Each copy is passed through :func:`_strip_debug_symbols`
+    (#940) to shrink debug binaries before they hit the stash.
 
     A ``.assignment_id`` marker is written when *assignment_id* is provided so
-    the manifest endpoint can surface which build produced the stash.
+    the manifest endpoint can surface which build produced the stash.  When
+    the stash directory's total size exceeds ``_STASH_WARN_BYTES`` after
+    this run, a warning line is appended to *log_path* (#940) — a signal
+    that ``artifact_paths`` for this repo is too broad.
 
     Returns the number of files copied (0 for a no-op).
     """
@@ -785,7 +831,8 @@ def stash_artifacts_for_branch(
             shutil.copy2(src, dst)
             copied += 1
         except (OSError, shutil.Error):
-            pass
+            continue
+        _strip_debug_symbols(dst)
 
     # Touch the stash directory so its mtime reflects this stash run.
     # mkdir(exist_ok=True) is a no-op when the directory already exists, so
@@ -809,6 +856,24 @@ def stash_artifacts_for_branch(
             log_path,
             f"# stash: {copied} artifact(s) → {stash_dir}\n",
         )
+        try:
+            total_bytes = sum(
+                f.stat().st_size
+                for f in stash_dir.iterdir()
+                if f.is_file() and not f.name.startswith(".")
+            )
+        except OSError:
+            total_bytes = 0
+        if total_bytes > _STASH_WARN_BYTES:
+            _append_log_line(
+                log_path,
+                f"# stash WARNING: {stash_dir} is "
+                f"{total_bytes / (1024**3):.1f} GB "
+                f"(> {_STASH_WARN_BYTES / (1024**3):.0f} GB) — "
+                f"consider narrowing artifact_paths for {repo_name!r} to "
+                "the example(s) actually under test, or pull selectively "
+                "with `coord pull-artifact --only <glob>` (#940).\n",
+            )
 
     return copied
 

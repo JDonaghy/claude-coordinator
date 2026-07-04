@@ -43,6 +43,10 @@ Rules:
 - Prefer pulling pre-built artifacts (kind: "pull") over local rebuilds when \
 the artifact manifest shows matching binaries.  For a "pull" step include both \
 "cmd" (the pull/copy command) and "label" (what is being pulled).
+- When the manifest lists many files but the diff only concerns one or two \
+example binaries, scope the pull with `coord pull-artifact <assignment_id> \
+--only <name>` (repeatable, glob-matched) instead of pulling the whole \
+stash — stashes can be dozens of ~100MB debug binaries (#940).
 - For kind "run": include "cmd" with the exact shell command to run.
 - For kind "verify": include "check" with a one-line concrete, observable \
 assertion ("text glyphs visible inside GTK cells", not "looks correct").  \

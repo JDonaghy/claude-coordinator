@@ -369,3 +369,163 @@ def test_pull_artifact_branch_fallback_when_db_null(tmp_path: Path, coord_db) ->
     url = captured_url[0]
     # Should derive branch as issue-99-do-the-thing (slugified)
     assert "/artifact/myrepo/issue-99-do-the-thing" in url
+
+
+# ── --only scoping (#940) ────────────────────────────────────────────────────
+
+
+def _multi_file_manifest() -> dict:
+    return {
+        "files": [
+            {"name": "tui_submenu", "size": 103_000_000, "mtime": 1700000000.0},
+            {"name": "tui_shell", "size": 103_000_000, "mtime": 1700000000.0},
+            {"name": "gtk_treeview", "size": 103_000_000, "mtime": 1700000000.0},
+        ],
+        "total_bytes": 309_000_000,
+        "built_by_assignment_id": "asgn-abc123",
+    }
+
+
+def test_pull_artifact_only_filters_rsync_includes(tmp_path: Path, coord_db) -> None:
+    """--only turns the rsync transfer into an allowlist of matching names."""
+    cfg = _write_config(tmp_path)
+    _insert_assignment(coord_db)
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = _multi_file_manifest()
+
+    mock_proc = MagicMock()
+    mock_proc.returncode = 0
+
+    runner = CliRunner()
+    with patch("httpx.get", return_value=mock_resp), \
+         patch("subprocess.run", return_value=mock_proc) as mock_run:
+        result = runner.invoke(
+            main,
+            [
+                "pull-artifact", "asgn-abc123",
+                "--into", str(tmp_path / "out"),
+                "--only", "tui_submenu",
+                "--config", str(cfg),
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    # Only the matched file should be listed as found.
+    assert "tui_submenu" in result.output
+    assert "tui_shell" not in result.output
+    assert "gtk_treeview" not in result.output
+    assert "Found 1 artifact" in result.output
+
+    rsync_cmd = mock_run.call_args[0][0]
+    assert "--include=tui_submenu" in rsync_cmd
+    # The include must come before the trailing catch-all exclude — rsync
+    # filter rules are first-match-wins, so the reverse order would drop
+    # everything.
+    exclude_star_idx = rsync_cmd.index("--exclude=*")
+    include_idx = rsync_cmd.index("--include=tui_submenu")
+    assert include_idx < exclude_star_idx
+
+
+def test_pull_artifact_only_glob_matches_multiple(tmp_path: Path, coord_db) -> None:
+    """--only accepts a glob and can match more than one file."""
+    cfg = _write_config(tmp_path)
+    _insert_assignment(coord_db)
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = _multi_file_manifest()
+
+    mock_proc = MagicMock()
+    mock_proc.returncode = 0
+
+    runner = CliRunner()
+    with patch("httpx.get", return_value=mock_resp), \
+         patch("subprocess.run", return_value=mock_proc):
+        result = runner.invoke(
+            main,
+            [
+                "pull-artifact", "asgn-abc123",
+                "--into", str(tmp_path / "out"),
+                "--only", "tui_*",
+                "--config", str(cfg),
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "tui_submenu" in result.output
+    assert "tui_shell" in result.output
+    assert "gtk_treeview" not in result.output
+    assert "Found 2 artifact" in result.output
+
+
+def test_pull_artifact_only_no_match_errors(tmp_path: Path, coord_db) -> None:
+    """--only matching nothing in the stash is a clear error, not a silent empty pull."""
+    cfg = _write_config(tmp_path)
+    _insert_assignment(coord_db)
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = _multi_file_manifest()
+
+    runner = CliRunner()
+    with patch("httpx.get", return_value=mock_resp), \
+         patch("subprocess.run") as mock_run:
+        result = runner.invoke(
+            main,
+            [
+                "pull-artifact", "asgn-abc123",
+                "--into", str(tmp_path / "out"),
+                "--only", "nonexistent_binary",
+                "--config", str(cfg),
+            ],
+        )
+
+    assert result.exit_code != 0
+    assert "no files" in result.output.lower() or "error" in result.output.lower()
+    # Available files should be surfaced to help the user pick a real name.
+    assert "tui_submenu" in result.output
+    mock_run.assert_not_called()
+
+
+def test_pull_artifact_only_filters_local_copy(tmp_path: Path, coord_db) -> None:
+    """--only also scopes the local-machine (no-ssh) copy path."""
+    from coord.agent import _sanitize_branch
+
+    cfg = _write_config(tmp_path)
+    _insert_assignment(coord_db)
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = _multi_file_manifest()
+
+    # Simulate the agent's local stash under a patched HOME.
+    home = tmp_path / "home"
+    src = home / ".coord" / "artifacts" / "myrepo" / _sanitize_branch("issue-42-my-feature")
+    src.mkdir(parents=True)
+    (src / "tui_submenu").write_bytes(b"A" * 20)
+    (src / "tui_shell").write_bytes(b"B" * 20)
+    (src / "gtk_treeview").write_bytes(b"C" * 20)
+
+    dest = tmp_path / "out"
+    runner = CliRunner()
+    with patch("httpx.get", return_value=mock_resp), \
+         patch("socket.gethostname", return_value="builder"), \
+         patch("pathlib.Path.home", return_value=home), \
+         patch("subprocess.run") as mock_run:
+        result = runner.invoke(
+            main,
+            [
+                "pull-artifact", "asgn-abc123",
+                "--into", str(dest),
+                "--only", "tui_submenu",
+                "--config", str(cfg),
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    mock_run.assert_not_called()
+    assert (dest / "tui_submenu").exists()
+    assert not (dest / "tui_shell").exists()
+    assert not (dest / "gtk_treeview").exists()
