@@ -536,6 +536,38 @@ class TestPipelineActionAPI:
         assert r.status_code == 400
 
     def test_enqueue_action_calls_enqueue(self) -> None:
+        """#946: the dashboard 'enqueue' action is gated like the other two
+        enqueue paths — an approved review must exist before it succeeds."""
+        a = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=1, issue_title="t",
+            assignment_id="a1", status="done", type="work",
+            branch="feat/x",
+        )
+        rev = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=1, issue_title="[review] t",
+            assignment_id="rev-1", status="done", type="review",
+            review_of_assignment_id="a1", review_verdict="approve",
+        )
+        board = Board(completed=[a, rev])
+        client = _dashboard_client()
+        with (
+            patch("coord.dashboard.server.read_board", return_value=board),
+            patch("coord.merge_queue.load_queue", return_value=[]),
+            patch("coord.merge_queue.save_queue") as mock_save,
+        ):
+            r = client.post(
+                "/api/pipeline/action",
+                json={"assignment_id": "a1", "action": "enqueue"},
+            )
+        assert r.status_code == 200
+        assert r.json()["ok"] is True
+        mock_save.assert_called_once()
+
+    def test_enqueue_action_rejects_when_gate_not_satisfied(self) -> None:
+        """#946: without an approved review (or force), enqueue must be
+        refused — this is the dashboard's third, previously-ungated path."""
         a = Assignment(
             machine_name="laptop", repo_name="api",
             issue_number=1, issue_title="t",
@@ -552,6 +584,30 @@ class TestPipelineActionAPI:
             r = client.post(
                 "/api/pipeline/action",
                 json={"assignment_id": "a1", "action": "enqueue"},
+            )
+        assert r.status_code == 200
+        assert r.json()["ok"] is False
+        mock_save.assert_not_called()
+
+    def test_enqueue_action_force_bypasses_gate(self) -> None:
+        """#946: force=True is the explicit escape hatch, mirroring
+        --force-merge, for enqueuing work that hasn't passed its gates."""
+        a = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=1, issue_title="t",
+            assignment_id="a1", status="done", type="work",
+            branch="feat/x",
+        )
+        board = Board(completed=[a])
+        client = _dashboard_client()
+        with (
+            patch("coord.dashboard.server.read_board", return_value=board),
+            patch("coord.merge_queue.load_queue", return_value=[]),
+            patch("coord.merge_queue.save_queue") as mock_save,
+        ):
+            r = client.post(
+                "/api/pipeline/action",
+                json={"assignment_id": "a1", "action": "enqueue", "force": True},
             )
         assert r.status_code == 200
         assert r.json()["ok"] is True
