@@ -26,7 +26,103 @@ fn parse_diagnose_label_repo_issue(label: &str) -> Option<(String, u64)> {
     Some((repo, issue_number))
 }
 
+/// Extract the `--stage <name>` value from a `coord diagnose …` label, if any.
+/// Used to preserve the operator's focused-stage target when we retry a
+/// `--json`-rejected dry-run without `--json` (#935).
+pub(crate) fn parse_diagnose_label_stage(label: &str) -> Option<String> {
+    let mut it = label.split_whitespace();
+    while let Some(tok) = it.next() {
+        if tok == "--stage" {
+            return it.next().map(|s| s.to_string());
+        }
+    }
+    None
+}
+
+/// True when a `coord` command failed specifically because it does not
+/// recognise the `--json` option — i.e. a version-skewed CLI/daemon that
+/// predates #935. Click emits `Error: No such option '--json'.` (exit 2) on
+/// stderr with no stdout. We match on the option name so an unrelated failure
+/// that merely mentions "json" doesn't trigger the no-`--json` retry.
+pub(crate) fn diagnose_json_flag_unsupported(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    s.contains("no such option") && s.contains("--json")
+}
+
 impl CoordApp {
+    /// #935: Best-effort-parse a *legacy* `coord diagnose` text response
+    /// (findings `·` lines, actions `✓` lines, `DIAGNOSE_RESULT:` trailer) into
+    /// the per-stage options dialog. Used when the daemon/CLI predates #935's
+    /// `--json` support — either it ran but emitted no `DIAGNOSE_JSON:` line, or
+    /// it rejected `--json` outright and we retried the dry-run without it.
+    /// Returns true if a dialog was opened. The dialog is flagged `legacy: true`
+    /// so the body notes the degraded source.
+    fn open_legacy_diagnose_dialog(&mut self, label: &str, stdout: &str) -> bool {
+        let Some((repo, issue_number)) = parse_diagnose_label_repo_issue(label) else {
+            return false;
+        };
+        let out = stdout.trim();
+        let trailer = out.lines().rev().find(|l| l.starts_with("DIAGNOSE_RESULT:"));
+        let needs_reset = trailer
+            .map(|l| l.contains("needs_reset=true"))
+            .unwrap_or(false);
+        let stage = trailer
+            .and_then(|l| l.split_whitespace().find(|tok| tok.starts_with("stage=")))
+            .and_then(|tok| tok.strip_prefix("stage="))
+            .unwrap_or("work")
+            .to_string();
+        let findings: Vec<String> = out
+            .lines()
+            .filter(|l| l.trim_start().starts_with('·'))
+            .map(|l| l.trim_start().trim_start_matches('·').trim().to_string())
+            .collect();
+        let actions_taken: Vec<String> = out
+            .lines()
+            .filter(|l| l.trim_start().starts_with('✓'))
+            .map(|l| l.trim_start().trim_start_matches('✓').trim().to_string())
+            .collect();
+        let has_phantom_session = self.live_tmux_sessions.iter().any(|s| {
+            s.assignment_id.starts_with("pending-")
+                && s.issue_number == Some(issue_number)
+                && s.repo_name.as_deref() == Some(&repo)
+        });
+        self.pending_diagnose_dialog = Some(PendingDiagnoseDialog {
+            repo,
+            issue_number,
+            stage,
+            findings,
+            actions_taken,
+            needs_reset,
+            has_phantom_session,
+            legacy: true,
+        });
+        true
+    }
+
+    /// #935: Open a *minimal* degraded diagnose dialog with no findings. Used
+    /// when even the no-`--json` retry couldn't produce parseable output (e.g.
+    /// a CLI old enough to also reject `--dry-run`, or one that failed for some
+    /// other reason). The operator still gets the Recover / Reset / Clear-phantom
+    /// / Dismiss options rather than a dead-end toast — the acceptance bar for
+    /// #935 is "a dialog, not a bare toast" even in the worst-case skew.
+    fn open_minimal_legacy_diagnose_dialog(&mut self, repo: &str, issue_number: u64) {
+        let has_phantom_session = self.live_tmux_sessions.iter().any(|s| {
+            s.assignment_id.starts_with("pending-")
+                && s.issue_number == Some(issue_number)
+                && s.repo_name.as_deref() == Some(&repo)
+        });
+        self.pending_diagnose_dialog = Some(PendingDiagnoseDialog {
+            repo: repo.to_string(),
+            issue_number,
+            stage: "work".to_string(),
+            findings: Vec::new(),
+            actions_taken: Vec::new(),
+            needs_reset: false,
+            has_phantom_session,
+            legacy: true,
+        });
+    }
+
     /// Time-based housekeeping that must run regardless of whether a UI
     /// event arrived: toast pruning, data auto-refresh, background command
     /// runner draining, pipeline loader polling, and auto-notify when
@@ -106,12 +202,38 @@ impl CoordApp {
                 .as_ref()
                 .is_some_and(|p| is_fix_cap_preflight_label(&result.label, &p.work_aid))
                 && result.stderr.contains("max_review_iterations");
+            // #935: a version-skewed `coord` that predates the `--json` diagnose
+            // flag rejects the "Diagnose & fix stage…" dry-run
+            // (`diagnose <repo> <issue> --dry-run --json`) with a Click usage
+            // error (exit 2, "No such option '--json'", no stdout). That is an
+            // EXPECTED skew, not a bug: we transparently retry without `--json`
+            // and open the legacy options dialog below, so the generic red toast
+            // would be misleading noise. Suppress it for this one case.
+            let diagnose_json_rejected = result.exit_code != 0
+                && result.label.contains("diagnose ")
+                && result.label.contains("--json")
+                && diagnose_json_flag_unsupported(&result.stderr);
+            // #935: completion of the no-`--json` retry we dispatched for the
+            // case above. Whether it succeeded or failed, its result is surfaced
+            // as a dialog (legacy parse, or a minimal degraded dialog) rather
+            // than a toast — so suppress the generic failure toast here too.
+            let is_diagnose_legacy_retry = self
+                .pending_diagnose_legacy_retry
+                .as_ref()
+                .is_some_and(|(repo, issue)| {
+                    result.label.contains("diagnose ")
+                        && !result.label.contains("--json")
+                        && parse_diagnose_label_repo_issue(&result.label)
+                            == Some((repo.clone(), *issue))
+                });
             if result.exit_code != 0
                 && !should_suppress_command_failed_toast(
                     &result.label,
                     self.pending_artifact_pull.as_ref(),
                 )
                 && !suppress_for_fix_cap
+                && !diagnose_json_rejected
+                && !is_diagnose_legacy_retry
             {
                 let reason = first_meaningful_stderr_line(&result.stderr)
                     .unwrap_or_else(|| format!("exit {} — no stderr captured", result.exit_code));
@@ -179,6 +301,58 @@ impl CoordApp {
                     }
                 }
             }
+            // #935: The operator's `coord` CLI/daemon rejected the `--json`
+            // diagnose flag (it predates #935). Transparently retry the SAME
+            // dry-run WITHOUT `--json` — the retry succeeds against the old CLI
+            // and emits the legacy `·`/`✓`/DIAGNOSE_RESULT: text we parse into
+            // the options dialog on its completion (handled just below). This
+            // keeps the per-stage doctor usable on a version-skewed fleet
+            // instead of dead-ending at a "Command failed" toast (the exact
+            // smoke-test failure this fixes).
+            if diagnose_json_rejected {
+                if let Some((repo, issue_number)) =
+                    parse_diagnose_label_repo_issue(&result.label)
+                {
+                    let mut argv: Vec<String> =
+                        vec!["diagnose".into(), repo.clone(), issue_number.to_string()];
+                    if let Some(stage) = parse_diagnose_label_stage(&result.label) {
+                        argv.push("--stage".into());
+                        argv.push(stage);
+                    }
+                    argv.push("--dry-run".into());
+                    let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+                    self.command_runner.spawn_queued(&argv_refs);
+                    self.pending_diagnose_legacy_retry = Some((repo, issue_number));
+                } else {
+                    // argv shape unrecognized — can't retry, but still avoid a
+                    // dead-end: tell the operator their CLI is too old for the
+                    // per-stage doctor's JSON path.
+                    self.push_toast(
+                        "Diagnose",
+                        "This coord CLI predates #935 (no --json). Upgrade the \
+                         daemon/CLI to use 'Diagnose & fix stage'.",
+                        ToastSeverity::Warning,
+                    );
+                }
+            }
+            // #935: completion of the no-`--json` retry dispatched above. Route
+            // it into the legacy options dialog (best-effort text parse). If the
+            // retry ALSO failed or produced nothing parseable (e.g. a CLI old
+            // enough to also reject `--dry-run`), still open a minimal degraded
+            // dialog so the operator gets Recover/Reset/Clear-phantom/Dismiss —
+            // never a bare toast.
+            else if is_diagnose_legacy_retry {
+                if let Some((repo, issue_number)) =
+                    self.pending_diagnose_legacy_retry.take()
+                {
+                    let opened = result.exit_code == 0
+                        && self.open_legacy_diagnose_dialog(&result.label, &result.stdout);
+                    if !opened {
+                        self.open_minimal_legacy_diagnose_dialog(&repo, issue_number);
+                    }
+                    self.refresh();
+                }
+            }
             // Per-stage doctor: surface `coord diagnose`'s findings/actions.
             //
             // #935 Part B: when the label includes "--json" AND "--dry-run"
@@ -187,7 +361,7 @@ impl CoordApp {
             // plain toast.  For all other diagnose completions (the full
             // recover pass, the --reset pass, or old-style calls that don't
             // carry --json) keep the existing toast behaviour.
-            if result.label.contains("diagnose ") && result.exit_code == 0 {
+            else if result.label.contains("diagnose ") && result.exit_code == 0 {
                 let out = result.stdout.trim();
                 let is_dry_run_json = result.label.contains("--json")
                     && result.label.contains("--dry-run");
@@ -263,50 +437,7 @@ impl CoordApp {
                         // the operator with a bare toast and no way to act
                         // (the exact "blind fire-and-toast" UX #935 set out
                         // to eliminate).
-                        if let Some((repo, issue_number)) =
-                            parse_diagnose_label_repo_issue(&result.label)
-                        {
-                            let trailer = out
-                                .lines()
-                                .rev()
-                                .find(|l| l.starts_with("DIAGNOSE_RESULT:"));
-                            let needs_reset = trailer
-                                .map(|l| l.contains("needs_reset=true"))
-                                .unwrap_or(false);
-                            let stage = trailer
-                                .and_then(|l| {
-                                    l.split_whitespace()
-                                        .find(|tok| tok.starts_with("stage="))
-                                })
-                                .and_then(|tok| tok.strip_prefix("stage="))
-                                .unwrap_or("work")
-                                .to_string();
-                            let findings: Vec<String> = out
-                                .lines()
-                                .filter(|l| l.trim_start().starts_with('·'))
-                                .map(|l| l.trim_start().trim_start_matches('·').trim().to_string())
-                                .collect();
-                            let actions_taken: Vec<String> = out
-                                .lines()
-                                .filter(|l| l.trim_start().starts_with('✓'))
-                                .map(|l| l.trim_start().trim_start_matches('✓').trim().to_string())
-                                .collect();
-                            let has_phantom_session = self.live_tmux_sessions.iter().any(|s| {
-                                s.assignment_id.starts_with("pending-")
-                                    && s.issue_number == Some(issue_number)
-                                    && s.repo_name.as_deref() == Some(&repo)
-                            });
-                            self.pending_diagnose_dialog = Some(PendingDiagnoseDialog {
-                                repo,
-                                issue_number,
-                                stage,
-                                findings,
-                                actions_taken,
-                                needs_reset,
-                                has_phantom_session,
-                                legacy: true,
-                            });
-                        } else {
+                        if !self.open_legacy_diagnose_dialog(&result.label, out) {
                             // argv shape unrecognized — truly nothing to show.
                             self.push_toast(
                                 "Diagnose",

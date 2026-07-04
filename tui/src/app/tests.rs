@@ -357,6 +357,7 @@
             pending_repo_picker: None,
             pending_machine_picker: None,
             pending_diagnose_dialog: None,
+            pending_diagnose_legacy_retry: None,
             pending_quit_confirm: false,
             quit_requested: false,
             file_issue_modal: None,
@@ -23441,5 +23442,165 @@ Milestone tracking issue.
                 || driver.screen_contains("best-effort"),
             "dialog body should note the degraded/legacy source:\n{}",
             driver.screen(),
+        );
+    }
+
+    /// The REAL smoke-test failure (#935 iter 3): the operator's installed
+    /// `coord` predates #935, so it doesn't register the `--json` diagnose
+    /// flag at all. The dry-run dispatch (`diagnose <repo> <issue> --dry-run
+    /// --json`) is rejected by Click BEFORE any diagnose logic runs — exit 2,
+    /// stderr `Error: No such option '--json'.`, NO stdout. Previously the
+    /// legacy-fallback block required `exit_code == 0`, so it was never reached
+    /// and the operator got a bare "Command failed" toast with no dialog.
+    ///
+    /// The fix must transparently retry the dry-run WITHOUT `--json` and open
+    /// the legacy options dialog from that retry's output — never a bare toast.
+    #[test]
+    fn diagnose_json_flag_rejection_retries_without_json_and_opens_legacy_dialog() {
+        let mut app = make_app_with_selected_pipeline_row();
+        // 1st spawn (`--json`): Click rejects the unknown flag. Exit 2, no stdout.
+        app.command_runner
+            .push_canned_result_with_stdout(2, "", "Error: No such option '--json'.");
+        // 2nd spawn (the auto-retry WITHOUT `--json`): old CLI runs fine and
+        // emits the always-present legacy `·`/`✓`/DIAGNOSE_RESULT: text.
+        let legacy_stdout = concat!(
+            "diagnose api #42 — stage=work [dry-run]\n",
+            "  · phantom work row running with no live session\n",
+            "  ✓ would clear the stale claim\n",
+            "DIAGNOSE_RESULT: stage=work recovered=true needs_reset=false ",
+            "reset_performed=false actions=1\n",
+        );
+        app.command_runner
+            .push_canned_result_with_stdout(0, legacy_stdout, "");
+
+        let dispatched = app.dispatch_diagnose_for_selected_pipeline_row(false, true, true);
+        assert!(dispatched, "dispatch must succeed with a selected pipeline row");
+
+        // Poll #1: drains the exit-2 `--json` rejection, dispatches the retry.
+        app.run_periodic_work();
+        assert!(
+            app.pending_diagnose_legacy_retry.is_some(),
+            "a --json rejection must schedule a no-json retry, not dead-end",
+        );
+        assert!(
+            app.pending_diagnose_dialog.is_none(),
+            "dialog must wait for the retry's output, not open prematurely",
+        );
+        assert!(
+            !app.toasts.iter().any(|t| t.0.title == "Command failed"),
+            "the --json rejection is EXPECTED skew — no red 'Command failed' toast:\n{:?}",
+            app.toasts.iter().map(|t| &t.0.title).collect::<Vec<_>>(),
+        );
+
+        // Poll #2: drains the retry's legacy output, opens the options dialog.
+        app.run_periodic_work();
+        let dlg = app.pending_diagnose_dialog.as_ref().expect(
+            "the no-json retry's legacy output must open the options dialog — NOT a \
+             bare toast (this is the exact smoke-test failure #935 iter 3 flagged: \
+             an old CLI rejecting --json left the operator with a dead-end toast)",
+        );
+        assert_eq!(dlg.repo, "api");
+        assert_eq!(dlg.issue_number, 42);
+        assert_eq!(dlg.stage, "work");
+        assert!(dlg.legacy, "retry-sourced dialog must be flagged legacy");
+        assert_eq!(
+            dlg.findings,
+            vec!["phantom work row running with no live session".to_string()],
+        );
+        assert_eq!(dlg.actions_taken, vec!["would clear the stale claim".to_string()]);
+        assert!(
+            app.pending_diagnose_legacy_retry.is_none(),
+            "retry state must be cleared once consumed",
+        );
+        assert!(
+            !app.toasts.iter().any(|t| t.0.title == "Command failed"),
+            "no 'Command failed' toast for the retry either",
+        );
+    }
+
+    /// Worst-case skew: the operator's CLI is old enough to reject `--json`
+    /// AND the no-json retry ALSO fails (e.g. it lacks `--dry-run` too, or
+    /// errors for another reason). Even then the operator must get a dialog
+    /// (Recover / Reset / Dismiss) — a minimal degraded one — not a bare toast.
+    #[test]
+    fn diagnose_json_rejection_retry_also_fails_opens_minimal_dialog() {
+        let mut app = make_app_with_selected_pipeline_row();
+        app.command_runner
+            .push_canned_result_with_stdout(2, "", "Error: No such option '--json'.");
+        // Retry also rejected — nothing parseable comes back.
+        app.command_runner
+            .push_canned_result_with_stdout(2, "", "Error: No such option '--dry-run'.");
+
+        assert!(app.dispatch_diagnose_for_selected_pipeline_row(false, true, true));
+        app.run_periodic_work(); // rejection → retry
+        app.run_periodic_work(); // retry fails → minimal dialog
+
+        let dlg = app.pending_diagnose_dialog.as_ref().expect(
+            "even when the retry fails, a minimal degraded dialog must open so the \
+             operator can act — never a dead-end toast",
+        );
+        assert_eq!(dlg.repo, "api");
+        assert_eq!(dlg.issue_number, 42);
+        assert!(dlg.legacy);
+        assert!(dlg.findings.is_empty(), "no findings could be gathered");
+        assert!(
+            app.pending_diagnose_legacy_retry.is_none(),
+            "retry state cleared even on the failure path",
+        );
+        assert!(
+            !app.toasts.iter().any(|t| t.0.title == "Command failed"),
+            "no 'Command failed' toast on either the rejection or the failed retry",
+        );
+
+        // The dialog must actually render with actionable buttons.
+        use quadraui::tui::testing::driver_with_shell;
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        assert!(
+            driver.screen_contains("Diagnose:"),
+            "minimal degraded dialog must render:\n{}",
+            driver.screen(),
+        );
+        assert!(
+            driver.screen_contains("Recover"),
+            "minimal dialog must still offer the Recover action:\n{}",
+            driver.screen(),
+        );
+    }
+
+    /// Unit-level guard for the stderr classifier: it must fire only for the
+    /// specific "unknown --json option" Click usage error, not for any failure
+    /// that merely mentions json.
+    #[test]
+    fn diagnose_json_flag_unsupported_matches_only_the_click_usage_error() {
+        assert!(super::diagnose_json_flag_unsupported(
+            "Error: No such option '--json'."
+        ));
+        assert!(super::diagnose_json_flag_unsupported(
+            "error: no such option '--json'\nUsage: coord diagnose ..."
+        ));
+        // An unrelated failure that happens to mention json must NOT trigger
+        // the retry — e.g. a daemon error while emitting JSON.
+        assert!(!super::diagnose_json_flag_unsupported(
+            "Error: failed to serialize json payload"
+        ));
+        assert!(!super::diagnose_json_flag_unsupported(
+            "Error: No such option '--reset'."
+        ));
+        assert!(!super::diagnose_json_flag_unsupported(""));
+    }
+
+    /// `parse_diagnose_label_stage` must recover the `--stage <name>` target so
+    /// the no-json retry preserves the operator's focused-stage selection.
+    #[test]
+    fn parse_diagnose_label_stage_extracts_focused_stage() {
+        assert_eq!(
+            super::parse_diagnose_label_stage(
+                "coord diagnose api 42 --stage review --dry-run --json"
+            ),
+            Some("review".to_string()),
+        );
+        assert_eq!(
+            super::parse_diagnose_label_stage("coord diagnose api 42 --dry-run --json"),
+            None,
         );
     }

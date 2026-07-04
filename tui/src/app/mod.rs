@@ -2227,6 +2227,13 @@ pub struct CoordApp {
     /// run, waiting for the user to choose Recover / Reset / Clear phantom /
     /// Dismiss in `build_prompt_dialog`.
     pending_diagnose_dialog: Option<PendingDiagnoseDialog>,
+    /// #935: `(repo, issue)` awaiting the no-`--json` retry we dispatched
+    /// because a version-skewed `coord` CLI/daemon rejected the `--json`
+    /// diagnose flag (Click "No such option '--json'", exit 2, no stdout).
+    /// The retry runs the SAME dry-run without `--json`; its completion is
+    /// routed into the legacy options dialog (best-effort text parse) instead
+    /// of a bare "Command failed" toast.
+    pending_diagnose_legacy_retry: Option<(String, u64)>,
     /// Force-quit confirmation.  Set when Esc/q is pressed while an
     /// interactive session is live in the Terminal tab — instead of silently
     /// swallowing the keypress (a dead end), we show a dialog so the operator
@@ -2786,6 +2793,7 @@ impl CoordApp {
             pending_repo_picker: None,
             pending_machine_picker: None,
             pending_diagnose_dialog: None,
+            pending_diagnose_legacy_retry: None,
             pending_quit_confirm: false,
             quit_requested: false,
             file_issue_modal: None,
