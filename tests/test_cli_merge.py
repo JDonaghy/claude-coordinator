@@ -265,6 +265,7 @@ class TestMergeCommand:
             machine_name="laptop", repo_name="api", issue_number=241,
             issue_title="#241", assignment_id="w241", type="work",
             status="done", branch="issue-241-still-open",
+            test_state="passed",  # smoke gate satisfied (#465) — see #946
         )
         save_board(Board(active=[], completed=[work]))
 
@@ -699,6 +700,106 @@ class TestMergeAutoEnqueue:
         assert result.exit_code == 0, result.output
         assert "auto-enqueued" in result.output
         assert "#526" in result.output
+
+    # ── #946: auto-enqueue must be gated on review + test, same as the
+    # daemon's enqueue_approved_work.  Prior to the fix, this loop had no
+    # gate at all — untested/unreviewed work (#782/#795) reached the queue.
+
+    def test_auto_enqueue_refused_on_failed_test(
+        self, config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        """A failed test verdict (and no review) must block auto-enqueue."""
+        from coord.models import Assignment, Board
+        from coord.state import save_board
+
+        work = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=782,
+            issue_title="#782", assignment_id="w782", type="work",
+            status="done", branch="issue-782-fix", test_state="failed",
+        )
+        save_board(Board(active=[], completed=[work]))
+
+        with patch(
+            "coord.github_ops.list_remote_branch_names",
+            return_value={"main", "issue-782-fix"},
+        ):
+            result = CliRunner().invoke(
+                main, ["merge", "--dry-run", "--config", str(config_file)],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "auto-enqueued" not in result.output
+        assert not any(e.issue_number == 782 for e in mq.load_queue())
+
+    def test_auto_enqueue_refused_with_no_verdict_and_no_review(
+        self, config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        """No test verdict at all + reviews required + no review → refused.
+
+        Reviews are enabled for this test (unlike the module-level
+        ``config_file`` fixture, which disables them) so both gates are live.
+        """
+        from coord.models import Assignment, Board
+        from coord.state import save_board
+
+        config_file.write_text(CONFIG_YAML.replace(
+            "reviews:\n  enabled: false\n", ""
+        ))
+
+        work = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=795,
+            issue_title="#795", assignment_id="w795", type="work",
+            status="done", branch="issue-795-fix",
+        )
+        save_board(Board(active=[], completed=[work]))
+
+        with patch(
+            "coord.github_ops.list_remote_branch_names",
+            return_value={"main", "issue-795-fix"},
+        ):
+            result = CliRunner().invoke(
+                main, ["merge", "--dry-run", "--config", str(config_file)],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "auto-enqueued" not in result.output
+        assert not any(e.issue_number == 795 for e in mq.load_queue())
+
+    def test_auto_enqueue_allowed_with_passed_test_and_approved_review(
+        self, config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        """Passed test + an approved review on the board → IS enqueued."""
+        from coord.models import Assignment, Board
+        from coord.state import save_board
+
+        config_file.write_text(CONFIG_YAML.replace(
+            "reviews:\n  enabled: false\n", ""
+        ))
+
+        work = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=947,
+            issue_title="#947", assignment_id="w947", type="work",
+            status="done", branch="issue-947-fix", test_state="passed",
+        )
+        review = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=947,
+            issue_title="#947 review", assignment_id="r947", type="review",
+            status="done", branch="issue-947-fix",
+            review_of_assignment_id="w947", review_verdict="approve",
+        )
+        save_board(Board(active=[], completed=[work, review]))
+
+        with patch(
+            "coord.github_ops.list_remote_branch_names",
+            return_value={"main", "issue-947-fix"},
+        ):
+            result = CliRunner().invoke(
+                main, ["merge", "--dry-run", "--config", str(config_file)],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "auto-enqueued" in result.output
+        assert any(e.issue_number == 947 for e in mq.load_queue())
 
 
 class TestStatusMergeQueue:

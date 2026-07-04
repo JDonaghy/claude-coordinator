@@ -732,6 +732,95 @@ class TestReviewGate:
         assert items[0].state == PENDING  # dry-run: state untouched
 
 
+class TestPassesMergeGates:
+    """#946: passes_merge_gates() is the shared predicate composing the
+    review + smoke gates, used by every enqueue path (enqueue_approved_work,
+    the `coord merge` auto-enqueue loop, and enqueue()) so none of them can
+    drift out of sync with the others."""
+
+    @staticmethod
+    def _config(*, reviews_enabled: bool = True, gates: list[str] | None = None):
+        from dataclasses import dataclass, field as dc_field
+
+        @dataclass
+        class _Reviews:
+            enabled: bool = True
+
+        @dataclass
+        class _Pipeline:
+            default_gates: list[str] | None = None
+
+        @dataclass
+        class _Cfg:
+            reviews: _Reviews = dc_field(default_factory=_Reviews)
+            pipeline: _Pipeline = dc_field(default_factory=_Pipeline)
+
+        cfg = _Cfg()
+        cfg.reviews.enabled = reviews_enabled
+        cfg.pipeline.default_gates = gates if gates is not None else ["test", "review", "merge"]
+        return cfg
+
+    @staticmethod
+    def _board(active=None, completed=None):
+        from coord.models import Board
+        return Board(active=list(active or []), completed=list(completed or []))
+
+    @staticmethod
+    def _work(aid: str = "w1", *, test_state: str | None = None) -> Assignment:
+        return Assignment(
+            machine_name="m1",
+            repo_name="api",
+            issue_number=1,
+            issue_title="t",
+            assignment_id=aid,
+            type="work",
+            status="done",
+            branch=f"worker/{aid}",
+            test_state=test_state,
+        )
+
+    @staticmethod
+    def _review(of_aid: str, *, verdict: str | None = "approve") -> Assignment:
+        return Assignment(
+            machine_name="m2",
+            repo_name="api",
+            issue_number=1,
+            issue_title="t",
+            assignment_id=f"rev-{of_aid}",
+            type="review",
+            status="done",
+            review_of_assignment_id=of_aid,
+            review_verdict=verdict,
+        )
+
+    def test_refused_on_failed_test_and_no_review(self) -> None:
+        """#782 repro: failed test, no review → gate refuses."""
+        cfg = self._config()
+        work = self._work("w1", test_state="failed")
+        board = self._board(completed=[work])
+        assert mq.passes_merge_gates(work, cfg, board) is False
+
+    def test_refused_on_no_verdict_and_no_review(self) -> None:
+        """#795 repro: no test verdict at all, no review → gate refuses."""
+        cfg = self._config()
+        work = self._work("w1", test_state=None)
+        board = self._board(completed=[work])
+        assert mq.passes_merge_gates(work, cfg, board) is False
+
+    def test_passes_with_passed_test_and_approved_review(self) -> None:
+        cfg = self._config()
+        work = self._work("w1", test_state="passed")
+        review = self._review("w1", verdict="approve")
+        board = self._board(completed=[work, review])
+        assert mq.passes_merge_gates(work, cfg, board) is True
+
+    def test_passes_when_gates_disabled(self) -> None:
+        cfg = self._config(reviews_enabled=False, gates=["merge"])
+        work = self._work("w1", test_state=None)
+        board = self._board(completed=[work])
+        assert mq.passes_merge_gates(work, cfg, board) is True
+
+
 class TestSmokeGate:
     """#465: process() must refuse to merge when interactive smoke is required
     and no passing/skipped verdict is recorded on the work assignment.

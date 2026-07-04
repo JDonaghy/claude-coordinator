@@ -167,6 +167,29 @@ def requires_smoke(entry: "QueuedMerge", config) -> bool:
     return "test" in (pipeline.default_gates or [])
 
 
+def passes_merge_gates(a, config, board) -> bool:
+    """True when *a* (a work ``Assignment`` or ``QueuedMerge`` entry) has
+    satisfied every gate required before it may enter the merge queue.
+
+    Shared predicate (#946) so untested/unreviewed work can never enter the
+    queue through *any* enqueue path — previously each of the three enqueue
+    call sites (the daemon's :func:`enqueue_approved_work`, the ``coord
+    merge`` auto-enqueue loop, and the raw :func:`enqueue` helper) re-derived
+    this logic and drifted: only the daemon path actually gated, so
+    untested/unreviewed work could sneak into the queue via ``coord merge``.
+
+    Duck-typed on ``entry.assignment_id`` / ``entry.branch`` (both
+    ``Assignment`` and ``QueuedMerge`` have them), matching
+    :func:`requires_review` / :func:`has_approved_review` / :func:`requires_smoke`
+    / :func:`has_smoke_verdict`, which this composes.
+    """
+    if requires_review(a, config) and not has_approved_review(a, board):
+        return False
+    if requires_smoke(a, config) and not has_smoke_verdict(a, board):
+        return False
+    return True
+
+
 def has_smoke_verdict(entry: "QueuedMerge", board) -> bool:
     """True when the smoke requirement for *entry* is satisfied.
 
@@ -319,10 +342,19 @@ def enqueue(
     assignment: Assignment,
     repo_github: str,
     target_branch: str,
+    config=None,
+    board=None,
 ) -> QueuedMerge | None:
     """Add a completed assignment to the queue if it isn't already there.
 
-    Returns the new entry, or None if it was already queued or has no branch.
+    Returns the new entry, or None if it was already queued, has no branch,
+    or (#946) *config* was supplied and ``passes_merge_gates`` rejects it —
+    i.e. review/smoke are required but not yet satisfied.  ``config`` (and
+    ``board``) are optional and default to ``None`` for backward
+    compatibility with existing callers (notably tests that seed the queue
+    directly); passing ``None`` skips the gate check entirely rather than
+    failing closed, since without a config there's no way to know which
+    gates apply.
 
     Dedup is by ``(repo_github, branch)`` — the queue's natural key is the
     branch we'd merge, not the assignment_id.  Multiple work assignments
@@ -331,6 +363,8 @@ def enqueue(
     duplicate rows. (#274)
     """
     if not assignment.branch:
+        return None
+    if config is not None and not passes_merge_gates(assignment, config, board):
         return None
     items = load_queue()
     if any(
@@ -446,15 +480,11 @@ def enqueue_approved_work(config, board=None) -> list[str]:
         if any(x.assignment_id == aid for x in existing_queue):
             continue
 
-        # Gate 1: review.  Only block when the gate is configured AND no
-        # approved review is on the board.  Pass when reviews are disabled —
-        # using bare `has_approved_review` would always return False (no review
-        # assignments) and silently block every enqueue in a no-review config.
-        if requires_review(a, config) and not has_approved_review(a, board):
-            continue
-
-        # Gate 2: smoke.  Same semantics — only block when the gate is enabled.
-        if requires_smoke(a, config) and not has_smoke_verdict(a, board):
+        # Gates 1+2: review + smoke, via the shared predicate (#946) so this
+        # path stays in lockstep with the `coord merge` auto-enqueue loop and
+        # the raw `enqueue()` helper.  Only blocks when a gate is configured
+        # AND not satisfied — passes_merge_gates itself no-ops a disabled gate.
+        if not passes_merge_gates(a, config, board):
             continue
 
         # Gate 3: not already terminal on GitHub (merged / closed).  Fail OPEN
