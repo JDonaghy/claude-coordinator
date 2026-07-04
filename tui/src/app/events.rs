@@ -28,6 +28,65 @@ impl CoordApp {
             .map(|(action, _)| action.as_str())
     }
 
+    /// §4 (#782): scroll the currently-focused **content** pane by one line.
+    ///
+    /// Invoked for a bare `j`/`k`/`Up`/`Down` while `focused_region` is `Main`
+    /// or `Detail` — i.e. the operator has moved focus off the sidebar with
+    /// `Ctrl-W`.  Before this existed the focus indicator was *cosmetic only*:
+    /// the status bar reported `[Main]`/`[Detail]` but keys still drove the
+    /// sidebar tree, because the default Board/Pipeline tabs have no dedicated
+    /// j/k scroll arm and fell through to the generic sidebar-nav arm (#782
+    /// review: "focus has no functional effect on keyboard routing").
+    ///
+    /// Mutates the exact scroll-offset field the active view's content pane
+    /// reads in `render_content`, so the movement is visible:
+    /// - **Board** → `detail_scroll` (assignment summary / issue body list).
+    /// - **Machines** → `machine_detail_scroll`.
+    /// - **Pipeline** default stage view / Stages tab → `pipeline_stage_content_scroll`
+    ///   (the field `pipeline_tab_body_list` renders with); every other
+    ///   Pipeline tab → `pipeline_detail_scroll`.
+    ///
+    /// Returns `true` when a field was updated (every list+detail view); the
+    /// caller then requests a redraw.  Views without a scrollable content pane
+    /// (Terminal, Kanban, Merge Queue, Settings) return `false`.
+    pub(crate) fn scroll_focused_content(&mut self, down: bool) -> bool {
+        fn step(v: usize, down: bool) -> usize {
+            if down {
+                v.saturating_add(1)
+            } else {
+                v.saturating_sub(1)
+            }
+        }
+        match self.active_view {
+            SidebarView::Board => {
+                self.detail_scroll = step(self.detail_scroll, down);
+                true
+            }
+            SidebarView::Machines => {
+                self.machine_detail_scroll = step(self.machine_detail_scroll, down);
+                true
+            }
+            SidebarView::Pipeline => {
+                match self.pipeline_detail_tab {
+                    // The default stage-view tab and the Stages tab both render
+                    // `pipeline_tab_body_list`, whose scroll_offset is
+                    // `pipeline_stage_content_scroll`.
+                    PipelineDetailTab::Pipeline | PipelineDetailTab::Stages => {
+                        self.pipeline_stage_content_scroll =
+                            step(self.pipeline_stage_content_scroll, down);
+                    }
+                    // Issue / Log / Summary / Refinement / Terminal bodies read
+                    // `pipeline_detail_scroll`.
+                    _ => {
+                        self.pipeline_detail_scroll = step(self.pipeline_detail_scroll, down);
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Route a UI event to the appropriate handler. Called by []
     /// in render.rs — the body is extracted here so the ShellApp impl stays thin
     /// and tests can call dispatch_handle directly without going through the trait.
@@ -1856,16 +1915,22 @@ impl CoordApp {
                     }
 
                     // ── j/k — scroll Issue tab body ───────────────────────
+                    // §4 (#782): only when focus is off the sidebar (Main/Detail).
+                    // In Sidebar focus these fall through to the generic arm so
+                    // j/k drives the issue list, keeping the Ctrl-W focus model
+                    // consistent across every tab.
                     Key::Char('j') | Key::Named(NamedKey::Down)
                         if self.active_view == SidebarView::Pipeline
-                            && self.pipeline_detail_tab == PipelineDetailTab::Issue =>
+                            && self.pipeline_detail_tab == PipelineDetailTab::Issue
+                            && self.focused_region != FocusedRegion::Sidebar =>
                     {
                         self.pipeline_detail_scroll = self.pipeline_detail_scroll.saturating_add(1);
                         needs_redraw = true;
                     }
                     Key::Char('k') | Key::Named(NamedKey::Up)
                         if self.active_view == SidebarView::Pipeline
-                            && self.pipeline_detail_tab == PipelineDetailTab::Issue =>
+                            && self.pipeline_detail_tab == PipelineDetailTab::Issue
+                            && self.focused_region != FocusedRegion::Sidebar =>
                     {
                         self.pipeline_detail_scroll = self.pipeline_detail_scroll.saturating_sub(1);
                         needs_redraw = true;
@@ -1876,7 +1941,8 @@ impl CoordApp {
                     // rendered content (plans + log tails overflow easily).
                     Key::Char('j') | Key::Named(NamedKey::Down)
                         if self.active_view == SidebarView::Pipeline
-                            && self.pipeline_detail_tab == PipelineDetailTab::Stages =>
+                            && self.pipeline_detail_tab == PipelineDetailTab::Stages
+                            && self.focused_region != FocusedRegion::Sidebar =>
                     {
                         self.pipeline_stage_content_scroll =
                             self.pipeline_stage_content_scroll.saturating_add(1);
@@ -1884,7 +1950,8 @@ impl CoordApp {
                     }
                     Key::Char('k') | Key::Named(NamedKey::Up)
                         if self.active_view == SidebarView::Pipeline
-                            && self.pipeline_detail_tab == PipelineDetailTab::Stages =>
+                            && self.pipeline_detail_tab == PipelineDetailTab::Stages
+                            && self.focused_region != FocusedRegion::Sidebar =>
                     {
                         self.pipeline_stage_content_scroll =
                             self.pipeline_stage_content_scroll.saturating_sub(1);
@@ -1895,7 +1962,8 @@ impl CoordApp {
                     // Up breaks sticky; Down re-sticks when reaching the bottom.
                     Key::Char('j') | Key::Named(NamedKey::Down)
                         if self.active_view == SidebarView::Pipeline
-                            && self.pipeline_detail_tab == PipelineDetailTab::Log =>
+                            && self.pipeline_detail_tab == PipelineDetailTab::Log
+                            && self.focused_region != FocusedRegion::Sidebar =>
                     {
                         let items = self.pipeline_log_list().items.len();
                         let visible = self.last_main_visible_rows.get().max(1);
@@ -1908,7 +1976,8 @@ impl CoordApp {
                     }
                     Key::Char('k') | Key::Named(NamedKey::Up)
                         if self.active_view == SidebarView::Pipeline
-                            && self.pipeline_detail_tab == PipelineDetailTab::Log =>
+                            && self.pipeline_detail_tab == PipelineDetailTab::Log
+                            && self.focused_region != FocusedRegion::Sidebar =>
                     {
                         let items = self.pipeline_log_list().items.len();
                         let visible = self.last_main_visible_rows.get().max(1);
@@ -1982,7 +2051,8 @@ impl CoordApp {
                     // ── j/k — scroll Summary tab ──────────────────────────
                     Key::Char('j') | Key::Named(NamedKey::Down)
                         if self.active_view == SidebarView::Pipeline
-                            && self.pipeline_detail_tab == PipelineDetailTab::Summary =>
+                            && self.pipeline_detail_tab == PipelineDetailTab::Summary
+                            && self.focused_region != FocusedRegion::Sidebar =>
                     {
                         let items = self.pipeline_summary_list().items.len();
                         let visible = self.last_main_visible_rows.get().max(1);
@@ -1993,7 +2063,8 @@ impl CoordApp {
                     }
                     Key::Char('k') | Key::Named(NamedKey::Up)
                         if self.active_view == SidebarView::Pipeline
-                            && self.pipeline_detail_tab == PipelineDetailTab::Summary =>
+                            && self.pipeline_detail_tab == PipelineDetailTab::Summary
+                            && self.focused_region != FocusedRegion::Sidebar =>
                     {
                         self.pipeline_detail_scroll =
                             self.pipeline_detail_scroll.saturating_sub(1);
@@ -2070,6 +2141,17 @@ impl CoordApp {
                     }
 
                     // ── Down / j ─────────────────────────────────────────
+                    // §4 (#782): when focus is on Main/Detail (moved off the
+                    // sidebar with Ctrl-W), j/Down scrolls the content pane
+                    // instead of moving the sidebar selection — this is what
+                    // makes the focus indicator functional rather than cosmetic.
+                    // Sidebar focus keeps the original list-navigation below.
+                    Key::Char('j') | Key::Named(NamedKey::Down)
+                        if self.focused_region != FocusedRegion::Sidebar
+                            && self.scroll_focused_content(true) =>
+                    {
+                        needs_redraw = true;
+                    }
                     Key::Char('j') | Key::Named(NamedKey::Down) => {
                         match self.active_view {
                             SidebarView::Board => {
@@ -2118,6 +2200,15 @@ impl CoordApp {
                     }
 
                     // ── Up / k ───────────────────────────────────────────
+                    // §4 (#782): mirror of the Down/j arm — Main/Detail focus
+                    // scrolls the content pane up; Sidebar focus navigates the
+                    // list below.
+                    Key::Char('k') | Key::Named(NamedKey::Up)
+                        if self.focused_region != FocusedRegion::Sidebar
+                            && self.scroll_focused_content(false) =>
+                    {
+                        needs_redraw = true;
+                    }
                     Key::Char('k') | Key::Named(NamedKey::Up) => {
                         match self.active_view {
                             SidebarView::Board => {
