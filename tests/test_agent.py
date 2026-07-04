@@ -1157,6 +1157,44 @@ def test_find_live_worktree_returns_none_when_branch_not_checked_out(
     assert server._find_live_worktree("api", "issue-404-nonexistent") is None
 
 
+def test_find_live_worktree_expands_tilde_repo_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#939: repo_paths entries configured with a literal ``~`` (as in
+    coordinator.yml on hosts that keep repos under the home directory) must
+    resolve the same way every other repo_paths consumer in this module
+    does (see the ``.expanduser()`` calls elsewhere in agent.py). Before the
+    fix, ``_find_live_worktree`` passed the raw ``~``-prefixed string straight
+    to ``git``, which cannot resolve ``~`` itself, so a live worktree was
+    silently reported as missing.
+    """
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    rp = _init_repo(fake_home / "repo")
+    server = AgentServer(
+        machine_name="test",
+        capabilities=["python"],
+        repos=["api"],
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: ["/bin/sh", "-c", "echo worker-output"],
+        repo_paths={"api": "~/repo"},
+    )
+
+    wt_path = tmp_path / "state" / "worktrees" / "asgn-xyz"
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "issue-939-fix", str(wt_path)],
+        cwd=str(rp),
+        check=True,
+        capture_output=True,
+    )
+
+    found = server._find_live_worktree("api", "issue-939-fix")
+    assert found == wt_path
+
+
 def test_artifact_absence_reason_worktree_present_no_patterns(
     tmp_path: Path,
 ) -> None:

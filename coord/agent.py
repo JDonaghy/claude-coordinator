@@ -1841,7 +1841,7 @@ class AgentServer:
         if not repo_path_str:
             return None
         try:
-            output = _git(Path(repo_path_str), "worktree", "list", "--porcelain")
+            output = _git(Path(repo_path_str).expanduser(), "worktree", "list", "--porcelain")
         except (_GitError, FileNotFoundError, OSError):
             return None
 
