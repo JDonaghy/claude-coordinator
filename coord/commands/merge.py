@@ -825,6 +825,14 @@ def merge(
                 cache=terminal_cache,
             ):
                 continue
+            # #946: review + smoke gates, via the shared predicate — this
+            # loop was the primary ungated enqueue path (#782/#795 reached
+            # the merge queue with a failed test / no review at all).  Mirrors
+            # the gate already enforced by the daemon's
+            # `enqueue_approved_work` so `coord merge` and the passive tick
+            # agree on what's allowed to queue.
+            if not mq.passes_merge_gates(a, cfg, board):
+                continue
             # #736 / #292: use refresh_entry_assignment (not bare enqueue) so
             # an existing PENDING entry is re-keyed to the latest fix assignment
             # when the original assignment_id no longer matches.  Dedup by
