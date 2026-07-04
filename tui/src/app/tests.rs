@@ -17343,6 +17343,209 @@
         assert!(app.detail_terminal_focused, "an unrecognized key leaves focus unchanged");
     }
 
+    // ── §4 (#782 fix-iter-3): focus-region actually routes keyboard nav ──────
+    // The fix-iter-2 smoke test FAILED because the Ctrl-W focus indicator was
+    // *cosmetic only*: j/k/Up/Down always navigated the sidebar tree no matter
+    // which region the status bar reported as focused.  These tests lock in the
+    // fix — when focus is off the sidebar (Main/Detail), bare j/k scroll the
+    // content pane instead of moving the sidebar selection.
+
+    #[test]
+    fn scroll_focused_content_board_scrolls_detail_offset() {
+        let mut app = make_app_default();
+        app.active_view = SidebarView::Board;
+        app.detail_scroll = 0;
+        assert!(
+            app.scroll_focused_content(true),
+            "Board exposes a scrollable content pane"
+        );
+        assert_eq!(app.detail_scroll, 1, "j scrolls the board detail down one row");
+        assert!(app.scroll_focused_content(false));
+        assert_eq!(app.detail_scroll, 0, "k scrolls back up one row");
+        // Saturating: never underflows below the top.
+        assert!(app.scroll_focused_content(false));
+        assert_eq!(app.detail_scroll, 0, "k at the top is a saturating no-op");
+    }
+
+    #[test]
+    fn scroll_focused_content_machines_scrolls_machine_detail() {
+        let mut app = make_app_default();
+        app.active_view = SidebarView::Machines;
+        app.machine_detail_scroll = 5;
+        assert!(app.scroll_focused_content(true));
+        assert_eq!(app.machine_detail_scroll, 6);
+        assert!(app.scroll_focused_content(false));
+        assert_eq!(app.machine_detail_scroll, 5);
+    }
+
+    #[test]
+    fn scroll_focused_content_pipeline_default_tab_scrolls_stage_body() {
+        // The default Pipeline (stage-view) tab renders `pipeline_tab_body_list`,
+        // whose scroll_offset is `pipeline_stage_content_scroll` — NOT the
+        // issue-body offset.  Scroll the field the visible list actually reads.
+        let mut app = make_app_default();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Pipeline;
+        app.pipeline_stage_content_scroll = 0;
+        app.pipeline_detail_scroll = 0;
+        assert!(app.scroll_focused_content(true));
+        assert_eq!(
+            app.pipeline_stage_content_scroll, 1,
+            "the stage-view body scrolls"
+        );
+        assert_eq!(
+            app.pipeline_detail_scroll, 0,
+            "the issue-body offset is left untouched"
+        );
+    }
+
+    #[test]
+    fn scroll_focused_content_pipeline_issue_tab_scrolls_detail() {
+        let mut app = make_app_default();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Issue;
+        app.pipeline_detail_scroll = 0;
+        assert!(app.scroll_focused_content(true));
+        assert_eq!(app.pipeline_detail_scroll, 1);
+    }
+
+    #[test]
+    fn scroll_focused_content_noop_on_paneless_views() {
+        // Terminal / Kanban / Merge Queue / Settings have no scrollable content
+        // pane the region-nav owns, so the helper reports "not handled" (false)
+        // and the caller falls through to that view's own dispatch.
+        for view in [
+            SidebarView::Terminal,
+            SidebarView::Kanban,
+            SidebarView::MergeQueue,
+            SidebarView::Settings,
+        ] {
+            let mut app = make_app_default();
+            app.active_view = view;
+            assert!(
+                !app.scroll_focused_content(true),
+                "{view:?} has no region-scrollable content pane"
+            );
+        }
+    }
+
+    #[test]
+    fn scroll_focused_content_leaves_board_selection_untouched() {
+        // The heart of the fix: scrolling the content pane must NOT move the
+        // sidebar selection.  Before the fix a `j` in Main/Detail focus fell
+        // through to the sidebar-nav arm and yanked the selection.
+        let assignments = vec![
+            make_assignment_typed("running", 10, "repo-a", Some("work")),
+            make_assignment_typed("done", 20, "repo-a", Some("work")),
+        ];
+        let mut app = make_app_with_assignments(assignments);
+        app.select_issue("repo-a", 10);
+        let before = app.board_selected_issue();
+        app.scroll_focused_content(true);
+        app.scroll_focused_content(true);
+        assert_eq!(
+            app.board_selected_issue(),
+            before,
+            "content scroll must not move the sidebar selection"
+        );
+    }
+
+    /// Black-box: with focus moved to Main via a real `Ctrl-W l`, bare `j`/`k`
+    /// must scroll the content pane and NOT navigate the sidebar.  Drives the
+    /// full event → ShellAdapter → dispatch → render path.  The selected
+    /// issue's assignment machine name renders only in the detail panel (never
+    /// in the sidebar), so it is a clean on-screen proxy for "which issue is
+    /// selected".
+    #[test]
+    fn tuidriver_main_focus_j_does_not_navigate_sidebar() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut a10 = make_assignment_typed("running", 10, "repo-a", Some("work"));
+        a10.machine = "machalpha".to_string();
+        let mut a20 = make_assignment_typed("running", 20, "repo-a", Some("work"));
+        a20.machine = "machbeta".to_string();
+        let mut app = make_app_with_assignments(vec![a10, a20]);
+        app.select_issue("repo-a", 10);
+        app.rebuild_board_sidebar();
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        assert!(
+            driver.screen_contains("machalpha"),
+            "sanity: issue #10's detail (machine machalpha) must be shown:\n{}",
+            driver.screen()
+        );
+
+        // Ctrl-W l → move focus off the sidebar into Main.
+        driver.ctrl_char('w');
+        driver.press(Key::Char('l'));
+        assert!(
+            driver.screen_contains("[Main]"),
+            "Ctrl-W l must move focus to Main:\n{}",
+            driver.screen()
+        );
+
+        // In Main focus, j/k scroll content and must NOT move the selection.
+        driver.type_char('j');
+        driver.type_char('j');
+        driver.type_char('k');
+        driver.type_char('k');
+        assert!(
+            driver.screen_contains("machalpha"),
+            "j/k in Main focus must leave the selection on #10:\n{}",
+            driver.screen()
+        );
+        assert!(
+            !driver.screen_contains("machbeta"),
+            "j in Main focus must NOT navigate the sidebar to #20 \
+             (the fix-iter-2 bug):\n{}",
+            driver.screen()
+        );
+    }
+
+    /// Black-box: a real `Ctrl-W l` chord cycles the status-bar focus indicator
+    /// Sidebar → Main → Detail → Sidebar through the full dispatch path (not the
+    /// direct `handle_ctrl_w_leader` unit path the other tests use).
+    #[test]
+    fn tuidriver_ctrl_w_cycles_focus_indicator_end_to_end() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_app_with_assignments(vec![make_assignment_typed(
+            "running",
+            10,
+            "repo-a",
+            Some("work"),
+        )]);
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        assert!(
+            driver.screen_contains("[Sidebar]"),
+            "focus starts on the sidebar:\n{}",
+            driver.screen()
+        );
+
+        let cycle_right = |driver: &mut quadraui::tui::testing::TuiDriver<_>| {
+            driver.ctrl_char('w');
+            driver.press(Key::Char('l'));
+        };
+        cycle_right(&mut driver);
+        assert!(
+            driver.screen_contains("[Main]"),
+            "Ctrl-W l → Main:\n{}",
+            driver.screen()
+        );
+        cycle_right(&mut driver);
+        assert!(
+            driver.screen_contains("[Detail]"),
+            "Ctrl-W l → Detail:\n{}",
+            driver.screen()
+        );
+        cycle_right(&mut driver);
+        assert!(
+            driver.screen_contains("[Sidebar]"),
+            "Ctrl-W l wraps back → Sidebar:\n{}",
+            driver.screen()
+        );
+    }
+
     /// Integration test: actually spawn /bin/sh for a per-issue terminal,
     /// write a command + Enter via `forward_key_to_detail_terminal`, and
     /// confirm the screen text shows the expected output.  Mirrors the
