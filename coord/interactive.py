@@ -2727,12 +2727,17 @@ def reap_stale_interactive_sessions(
             commits = _commits_ahead(wt_path, base_branch)
         terminal_status = "advisory" if commits == 0 else "failed"
 
-        # 1a. (Dead-pane only) Push commits before removing the worktree so
-        #     that any work the operator produced survives.  Best-effort: a push
-        #     failure does NOT abort the reap — the worktree is still removed
-        #     and the DB still updated.  Skipped for the all-dead-session case
-        #     (where the session is already gone) and when there are no commits.
-        if _dead_pane_kill_needed and wt_path.exists() and commits:
+        # 1a. Push commits before removing the worktree so that any work the
+        #     operator produced survives.  Best-effort: a push failure does NOT
+        #     abort the reap — the worktree is still removed and the DB still
+        #     updated.  #949: this now runs for the session-gone case too, not
+        #     just dead-pane.  The old "already gone → operator must have
+        #     finalized (and pushed)" assumption is false — a crashed/killed
+        #     session that vanished can hold unpushed commits, and since the
+        #     reaper *deletes* the worktree next, skipping the push loses that
+        #     work permanently.  Non-force `git push -u origin HEAD`
+        #     fast-forwards real work and safely no-ops on a diverged branch.
+        if wt_path.exists() and commits:
             try:
                 subprocess.run(
                     ["git", "push", "-u", "origin", "HEAD"],
