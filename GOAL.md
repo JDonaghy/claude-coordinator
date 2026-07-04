@@ -3,7 +3,11 @@
 > **The living, cross-repo / cross-machine objective for the coordinator and every agent it dispatches.**
 > This is *meta-level*: above any single issue, repo, or session (and broader than Claude's own per-session goal feature). Both humans and agents may edit it as priorities evolve — keep it short, current, and re-date the Status line. `coordinator.yml` is the source of truth for *topology*; **this file is the source of truth for *intent*.**
 >
-> _Last updated: 2026-06-25_
+> _Last updated: 2026-07-04_ — near-term direction is the two-tier **Pipeline v2**
+> ([`docs/PIPELINE_V2.md`](docs/PIPELINE_V2.md)) and the **oracle loop**
+> ([`docs/ORACLE_LOOP.md`](docs/ORACLE_LOOP.md)): tighten the Work↔Test cycle into a warm in-session
+> loop against an independent, sealed acceptance oracle, to drive user-acceptance pass-rate toward
+> the >90% bar without the cold-start token bleed.
 
 ## 🎯 North star
 
@@ -62,7 +66,7 @@ the critical path** (demoted to Horizon).
     - **Start merge (interactive)** → `coord assign --interactive --merge-of <work_aid>`: a merge agent that worktrees the branch, fetches + **rebases onto the default branch (#306 proactive rebase)**, resolves mechanical conflicts (semantic with the operator), runs tests, `git push --force-with-lease`, then hands back to the operator to merge (Go / `coord merge`).
     - All on `main`; coord suite 2062 + tui 599 pass; coord-tui rebuilt + installed.
 - 📋 **Next, in order:** local interactive lifecycle (Work→Review→Test→Merge) is now complete end-to-end; **leg 4 cont. is remote Test/Merge over SSH (Track B)**. The merge agent supersedes #306's reactive-only conflict-fix with a proactive interactive rebase; #277/#567 (conflict-fix orphan branch, NULL-branch verdict gate) remain open backend hygiene. A1 follow-ups to fold in: the briefing emits both the `REVIEW_VERDICT` block and the report-result reminder; `coord report-result` needs a `--body-file` for full review bodies (see `project_a1_interactive_review`).
-- 🧭 **Open design Q — where do automated tests gate?** CI is pytest-only, so Rust repos (tui/quadraui/vimcode) still have no automated gate; they need an explicit `cargo build && cargo test` gate (extend CI, or a pre-merge verify step).
+- ✅ **Resolved — where do automated tests gate?** The old open question (CI is pytest-only, so Rust repos had no automated gate) is answered by the **oracle loop** ([`docs/ORACLE_LOOP.md`](docs/ORACLE_LOOP.md), 2026-07-04): acceptance runs above **pluggable framework drivers** (`tui-tuidriver` for Rust/TUI via quadraui's `TuiDriver`, Playwright for web/Electron), routed to a capability-matched machine via `smoke_tests.capability_rules` — so each repo gets a real acceptance+test gate regardless of what CI covers. The worker iterates against a sealed, independently-authored oracle **in-session**, then the coordinator re-runs it externally as the trust gate.
 
 ## Near-term priority — Tech Debt sweep (2026-06-25)
 

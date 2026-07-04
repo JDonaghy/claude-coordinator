@@ -45,6 +45,15 @@ What the user should run / look at locally to confirm the change works in practi
 
 If the change can't be smoke-tested without infrastructure (e.g. depends on a not-yet-configured remote), say so explicitly. That's a `coord test --skipped` candidate.
 
+### Acceptance contract (oracle-loop milestones)
+
+For an issue inside an **oracle-loop milestone** ([`ORACLE_LOOP.md`](ORACLE_LOOP.md)), the black-box
+acceptance tests are **authored independently** (`type=test-author`), not by the worker — so **do
+not** ask the worker to write them. Instead, point the issue at its slice of the milestone's
+`tests/acceptance/ms-NN/contract.md`, and phrase the acceptance criteria as the **contract surface**
+the worker must make green (CLI names, key screen text, API field shapes). The worker still writes
+its own unit/internal tests and must not edit `tests/acceptance/**`.
+
 ### Out of scope
 
 What this issue intentionally does NOT cover. Link to follow-up issues if the boundary is "Phase A vs Phase B".

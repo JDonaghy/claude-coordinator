@@ -3,6 +3,14 @@
 > **Status:** design, agreed 2026-07-03. Supersedes the flat `Work → Test → Review → Merge`
 > model in [`ARCHITECTURE.md`](ARCHITECTURE.md) once the phases below land. This doc is the
 > north star the epics point at; it is not yet fully built. Issue map is at the bottom.
+>
+> **Refined 2026-07-04 by [`ORACLE_LOOP.md`](ORACLE_LOOP.md):** acceptance testing becomes a
+> *tight, in-session* loop (the worker iterates against a **sealed, runnable-not-editable** oracle in
+> its own warm session, then the coordinator re-runs it externally as a trust gate), Gate A becomes
+> **mock-first** with an **amendable, versioned contract** (which is what keeps this iterative, not
+> waterfall), and the runner sits above **pluggable framework drivers** (TUI/web/native). Where this
+> doc and ORACLE_LOOP.md differ on *how acceptance works* or *how Gate A runs*, **ORACLE_LOOP.md
+> wins**; the merge-bounce, observability, and git-model parts below are unchanged.
 
 ## Why
 
@@ -66,7 +74,7 @@ MILESTONE  feature/ms-NN ──────────────────�
 |---|---|---|
 | **Work** | Worker implements; writes **unit / internal** tests only — **not** the acceptance tests. | commits pushed |
 | **Test** | The repo's normal automated suite (`cargo test` / `pytest`), incl. the worker's unit tests. | suite green + a recorded verdict (#923 backstop) |
-| **Acceptance** | The **independent, feature-level** black-box suite — a *separate target/dir*, run per issue as it grows (partial-green expected until the feature completes). | its slice green |
+| **Acceptance** | The **independent, feature-level** black-box suite (a *separate target/dir*). The worker iterates against it **sealed & in-session** during Work (ORACLE_LOOP.md); the coordinator re-runs it externally against the pushed SHA as the trust gate. Partial-green expected until the feature completes. | its slice green (externally verified) |
 | **Review** | Adversarial code review, zero shared context (unchanged). | approved / bounce → Fix |
 | **Merge** | **Explicit, driven, bounce-capable** box (see below). The merge queue still sequences underneath but is **hidden** — Merge is a first-class stage the operator drives. | rebased-delta re-gated + CI green → merged into `feature/ms-NN` |
 
@@ -74,12 +82,18 @@ MILESTONE  feature/ms-NN ──────────────────�
 
 | Gate | What it is |
 |---|---|
-| **A — Arch gate** | Before any issue work: a design review that (1) pins the **black-box contract** and (2) has an independent agent author the acceptance suite **red** against that contract. |
+| **A — Arch gate** | Before any issue work: **mock-first** (ORACLE_LOOP.md) — an independent agent renders a **viewable mock** in the target medium; the operator reacts to *that* (UX discovery against a cheap artifact, not a text spec); the approved mock + an **amendable, versioned `contract.md`** pin the black-box surface; a second independent agent authors the acceptance suite **red** against the contract. |
 | **B — Arch review** | After the issues land: an independent review that the milestone was **implemented to the Gate-A spec** (not just that each issue passed). |
 | **C — Full acceptance suite** | The whole accumulated acceptance suite must be **green** — catches the integration gaps *between* issues that per-issue runs miss. |
 | **D — Ship** | Merge `feature/ms-NN → develop`, gated on B + C. |
 
 ## Independent acceptance testing — the details
+
+> **See [`ORACLE_LOOP.md`](ORACLE_LOOP.md) for the built shape** — the sealed `coord acceptance`
+> runner, the in-session worker loop, the external trust gate, framework drivers, and the stall
+> protocol. The independence + separate-target facts below are unchanged; the key refinement is that
+> the same suite runs **twice** (in-session for speed, externally for trust) and is delivered to the
+> worker **read-only / run-only** so it can iterate against it without gaming it.
 
 **When authored:** at the **Gate-A arch gate**, from the spec, by an independent `test-author`
 agent — *before* the work, so tests can't be rationalized to match what was built. Extended
@@ -148,16 +162,17 @@ Adopted in two steps to de-risk the big rewire:
    git-model change, immediate daily relief. *Start here.*
 2. **Merge = driven / bounce-capable** — epic #915 (the merge stage becomes a router that rebases,
    resolves, re-gates, and bounces) + the interactive verdict backstop #923.
-3. **Independent acceptance testing** — feature-level authoring + a separate acceptance run stage +
-   the Gate-C full-suite gate.
+3. **Independent acceptance testing (the oracle loop)** — the sealed `coord acceptance` runner + one
+   framework driver (`tui-tuidriver`), the in-session worker loop + external trust gate, mock-first
+   Gate A, and the Gate-C full-suite gate. Detailed build slice in [`ORACLE_LOOP.md`](ORACLE_LOOP.md).
 4. **Milestone tier + git model** — arch gates A/B, then `develop` + feature-branch-per-milestone.
 
 ## Non-goals / open questions
 
 - **Not** per-issue independent test authoring (too expensive) — feature-level only.
 - Auto-drain / autonomous merge stays **off** until trust is regained (unchanged).
-- Open: how the Gate-A contract is stored and versioned (issue-body section? a checked-in
-  `milestone-NN.contract.md`?). Decided during Phase 3/4.
+- ~~Open: how the Gate-A contract is stored and versioned.~~ **Settled** in ORACLE_LOOP.md: a
+  checked-in `tests/acceptance/ms-NN/contract.md` alongside the mock fixtures, amendable in place.
 
 ## Issue map
 

@@ -132,6 +132,14 @@ The most coordinated path through the system is the review/fix/re-review loop. I
 
 If any single link is broken — most often `coord notify` not running — the whole loop stalls. The TUI helps spot this because completed assignments without comments are visible in the pipeline view, but the fix is always "run `coord notify`."
 
+> **Evolving (2026-07-04):** this describes the flat, stage-serial loop that runs *today*. Two
+> redesigns are landing on top of it: **[`PIPELINE_V2.md`](PIPELINE_V2.md)** nests this issue loop
+> inside a milestone tier (Gate A/B/C/D) and makes Merge a driven, bounce-capable box; and
+> **[`ORACLE_LOOP.md`](ORACLE_LOOP.md)** collapses the expensive cold-start Test/Fix cycle above into
+> a **tight in-session loop** — the worker iterates against a sealed, independently-authored
+> acceptance oracle in its own warm session, and the coordinator re-runs it externally as the trust
+> gate. Until those ship, the loop here is authoritative.
+
 ## When a merge isn't happening
 
 A story that won't merge — the TUI "Go" does nothing, `coord merge` skips it, the box stays grey/pending — almost always traces to one of these gates. Check in order:
