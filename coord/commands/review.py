@@ -603,6 +603,36 @@ def report_result(
         )
         sys.exit(2)
 
+    # #949: push the worktree's commits BEFORE recording 'done' so completed
+    # interactive work is never stranded.  report-result is the "done" path for
+    # interactive fix/merge/work sessions; when a session declares done here
+    # (rather than through finalize_interactive_exit, which is bypassed on a
+    # detached/reattached tmux), nothing else pushes: the stale-session reaper
+    # skips the already-'done' row, and the worker itself may have been told not
+    # to push (e.g. a repo CLAUDE.md).  Without this, the commit sits unpushed in
+    # ~/.coord/worktrees/<aid> and the next test/review agent tests stale code —
+    # the confirmed root cause of #407 and #782.  Best-effort, non-force: it
+    # fast-forwards real work and safely no-ops on a diverged/rebased branch (the
+    # merge agent owns force-pushes).  Review sessions have no worktree, so the
+    # .exists() guard skips them.
+    if status == "done":
+        from coord.interactive import _git_push  # noqa: PLC0415
+        from coord.state import COORD_DIR  # noqa: PLC0415
+
+        _wt = COORD_DIR / "worktrees" / assignment_id
+        if _wt.exists():
+            _pushed, _perr = _git_push(_wt)
+            if _pushed:
+                click.echo(f"  pushed {branch or 'HEAD'} to origin (#949)")
+            else:
+                click.echo(
+                    f"  ⚠ WARNING: could not push commits for {assignment_id} "
+                    f"to origin: {_perr}\n"
+                    f"    work is committed but UNPUSHED in {_wt}\n"
+                    f"    push manually:  git -C {_wt} push origin HEAD",
+                    err=True,
+                )
+
     record_obj = issue_store.ResultRecord(
         assignment_id=assignment_id,
         machine_name=machine_name,
