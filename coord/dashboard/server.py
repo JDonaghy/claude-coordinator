@@ -772,10 +772,36 @@ def build_app(config: Config) -> Starlette:
             repo = config.repo(assignment.repo_name)
             if repo is None:
                 return JSONResponse({"error": "unknown repo"}, status_code=404)
-            from coord.merge_queue import enqueue
+            from coord import merge_queue as mq
+
+            # #946: this was the third (dashboard-only) enqueue path left
+            # ungated after the daemon (`enqueue_approved_work`) and `coord
+            # merge`'s auto-enqueue loop were fixed to use the shared
+            # `passes_merge_gates` predicate. Gate here too — untested /
+            # unreviewed work must never enter the merge queue through any
+            # path. `force: true` in the request body is the explicit
+            # escape hatch, mirroring `--force-merge` at merge time.
+            force = bool(body.get("force"))
+            if not force and not mq.passes_merge_gates(assignment, config, board):
+                return JSONResponse({
+                    "ok": False,
+                    "error": (
+                        "assignment has not passed the required review/smoke "
+                        "gates — pass force: true to enqueue anyway"
+                    ),
+                })
 
             try:
-                entry = enqueue(assignment, repo.github, repo.default_branch)
+                if force:
+                    # Bypass the gate entirely — don't pass config/board, or
+                    # enqueue()'s own (unconditional) gate check would still
+                    # reject it despite the explicit override above.
+                    entry = mq.enqueue(assignment, repo.github, repo.default_branch)
+                else:
+                    entry = mq.enqueue(
+                        assignment, repo.github, repo.default_branch,
+                        config=config, board=board,
+                    )
             except Exception as exc:
                 return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
             if entry is None:
