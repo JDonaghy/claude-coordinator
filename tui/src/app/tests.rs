@@ -17263,6 +17263,72 @@
         assert!(!app.ctrl_w_pending);
     }
 
+    /// #782 fix-iter-2 regression guard: a plain list+detail view (Board) must
+    /// expose all three regions so BOTH Ctrl-W directions reach Detail.  The
+    /// prior smoke failure was that Ctrl-W Left only alternated Sidebar ↔ Main.
+    #[test]
+    fn ctrl_w_left_cycles_all_three_regions_on_board() {
+        let mut app = make_app_default();
+        app.active_view = SidebarView::Board;
+        app.focused_region = FocusedRegion::Sidebar;
+
+        let press_left = |app: &mut CoordApp| {
+            app.handle_ctrl_w_leader(&Key::Char('w'), &ctrl());
+            app.handle_ctrl_w_leader(&Key::Named(NamedKey::Left), &quadraui::Modifiers::default());
+        };
+
+        // Reverse cycle: Sidebar → Detail → Main → Sidebar.
+        press_left(&mut app);
+        assert_eq!(app.focused_region, FocusedRegion::Detail, "Left wraps to Detail");
+        press_left(&mut app);
+        assert_eq!(app.focused_region, FocusedRegion::Main, "Detail → Main");
+        press_left(&mut app);
+        assert_eq!(app.focused_region, FocusedRegion::Sidebar, "Main → Sidebar");
+    }
+
+    /// #782: the forward cycle on a list+detail view visits every region too
+    /// (Sidebar → Main → Detail → Sidebar).
+    #[test]
+    fn ctrl_w_right_cycles_all_three_regions_on_board() {
+        let mut app = make_app_default();
+        app.active_view = SidebarView::Board;
+        app.focused_region = FocusedRegion::Sidebar;
+
+        let press_right = |app: &mut CoordApp| {
+            app.handle_ctrl_w_leader(&Key::Char('w'), &ctrl());
+            app.handle_ctrl_w_leader(&Key::Char('l'), &quadraui::Modifiers::default());
+        };
+
+        press_right(&mut app);
+        assert_eq!(app.focused_region, FocusedRegion::Main, "Sidebar → Main");
+        press_right(&mut app);
+        assert_eq!(app.focused_region, FocusedRegion::Detail, "Main → Detail");
+        press_right(&mut app);
+        assert_eq!(app.focused_region, FocusedRegion::Sidebar, "Detail wraps to Sidebar");
+    }
+
+    /// #782: the standalone Terminal view is a two-region cycle (Sidebar ↔ Main,
+    /// the PTY) — Detail is never entered because that view has no detail pane.
+    #[test]
+    fn ctrl_w_terminal_view_is_two_region_cycle() {
+        let mut app = make_app_default();
+        app.active_view = SidebarView::Terminal;
+        app.focused_region = FocusedRegion::Sidebar;
+        app.terminal_focused = false;
+
+        app.handle_ctrl_w_leader(&Key::Char('w'), &ctrl());
+        app.handle_ctrl_w_leader(&Key::Char('l'), &quadraui::Modifiers::default());
+        assert_eq!(app.focused_region, FocusedRegion::Main, "Sidebar → Main (PTY)");
+
+        app.handle_ctrl_w_leader(&Key::Char('w'), &ctrl());
+        app.handle_ctrl_w_leader(&Key::Char('l'), &quadraui::Modifiers::default());
+        assert_eq!(
+            app.focused_region,
+            FocusedRegion::Sidebar,
+            "Main wraps straight back to Sidebar; Detail is skipped"
+        );
+    }
+
     #[test]
     fn unrecognized_follow_up_cancels_the_leader() {
         let mut app = make_app_default();
@@ -23790,6 +23856,13 @@ Milestone tracking issue.
 
     /// §4 (#782): Ctrl-W Left must cycle focus in the reverse direction
     /// (Sidebar → Detail → Main → Sidebar) and update the status-bar indicator.
+    ///
+    /// Regression guard for the fix-iteration-2 smoke failure: the Board view
+    /// exposes all three regions, so a *single* Ctrl-W Left from the Sidebar
+    /// must land on `[Detail]` (the reverse-cycle wrap), NOT `[Main]`.  The old
+    /// two-region logic only ever alternated Sidebar ↔ Main and never reached
+    /// Detail — this test now asserts the exact reverse order so that failure
+    /// can't recur silently.
     #[test]
     fn tuidriver_ctrl_w_left_cycles_focus_indicator_in_reverse() {
         use quadraui::tui::testing::driver_with_shell;
@@ -23797,34 +23870,33 @@ Milestone tracking issue.
         let app = make_test_app(BoardData::default());
         let mut driver = driver_with_shell(app, CoordApp::shell_config(), 160, 40);
 
-        // Starts at Sidebar; Ctrl-W Left wraps around to Main (Board view has
-        // no Detail PTY, so leftmost wrap lands on Main).
+        // Starts at Sidebar; Ctrl-W Left wraps to the rightmost region → Detail.
         driver.ctrl_char('w');
         driver.press_named(quadraui::NamedKey::Left);
-
         let screen = driver.screen();
         assert!(
-            screen.contains("[Main]") || screen.contains("[Detail]"),
-            "#782: Ctrl-W Left from Sidebar must wrap to Main or Detail:\n{}",
+            screen.contains("[Detail]"),
+            "#782: first Ctrl-W Left from Sidebar must reach '[Detail]' (reverse wrap):\n{}",
             screen
         );
 
-        // Another Ctrl-W Left → Sidebar.
+        // Second Ctrl-W Left → Main.
         driver.ctrl_char('w');
         driver.press_named(quadraui::NamedKey::Left);
-
         let screen = driver.screen();
-        // From Main, Left → Sidebar.
-        if !screen.contains("[Sidebar]") {
-            // If we landed on Detail on the first Left, another Left → Main,
-            // one more → Sidebar. Handle the Detail case.
-            driver.ctrl_char('w');
-            driver.press_named(quadraui::NamedKey::Left);
-            let screen2 = driver.screen();
-            assert!(
-                screen2.contains("[Sidebar]"),
-                "#782: Ctrl-W Left must eventually return to Sidebar:\n{}",
-                screen2
-            );
-        }
+        assert!(
+            screen.contains("[Main]"),
+            "#782: second Ctrl-W Left must move Detail → Main:\n{}",
+            screen
+        );
+
+        // Third Ctrl-W Left → back to Sidebar.
+        driver.ctrl_char('w');
+        driver.press_named(quadraui::NamedKey::Left);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("[Sidebar]"),
+            "#782: third Ctrl-W Left must return Main → Sidebar:\n{}",
+            screen
+        );
     }

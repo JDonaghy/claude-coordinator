@@ -389,49 +389,67 @@ impl CoordApp {
         self.active_view == SidebarView::Terminal
     }
 
-    /// Compute the next region when cycling RIGHT (Sidebar → Main → Detail → Sidebar).
+    /// The ordered set of focus regions the current view actually exposes.
     ///
-    /// When a Detail PTY is present, skip Main and jump directly from Sidebar to
-    /// Detail so a single Ctrl-W l focuses the PTY (preserving the pre-§4 UX).
-    fn next_region_right(&self) -> FocusedRegion {
-        match self.effective_focused_region() {
-            FocusedRegion::Sidebar => {
-                if self.has_detail_pty() {
-                    FocusedRegion::Detail
-                } else {
-                    FocusedRegion::Main
-                }
-            }
-            FocusedRegion::Main => FocusedRegion::Detail,
-            FocusedRegion::Detail => FocusedRegion::Sidebar,
+    /// The Ctrl-W cycler walks this list, so a view only ever stops on regions
+    /// that exist.  Three cases:
+    /// - **Pipeline detail Terminal tab** — the PTY lives in the Detail region
+    ///   and there is no separately focusable Main content, so the cycle is
+    ///   `Sidebar ↔ Detail`.  A single `Ctrl-W l` from the sidebar lands on the
+    ///   PTY, preserving the pre-§4 two-region UX (and the `ctrl_w_l_focuses_
+    ///   detail_terminal_content` test).
+    /// - **Standalone Terminal view** — the PTY *is* the Main region and there
+    ///   is no Detail pane, so the cycle is `Sidebar ↔ Main`.
+    /// - **Every other view** (Board, Pipeline non-terminal tabs, Machines,
+    ///   Settings, Kanban, Merge Queue) — a full list-plus-detail layout, so all
+    ///   three regions `Sidebar → Main → Detail` participate.  This is what makes
+    ///   `Ctrl-W h`/`l` reach `Detail` on the Board and Pipeline views (#782
+    ///   review finding: the old logic only ever toggled Sidebar ↔ Main there).
+    fn available_regions(&self) -> Vec<FocusedRegion> {
+        if self.has_detail_pty() {
+            vec![FocusedRegion::Sidebar, FocusedRegion::Detail]
+        } else if self.has_main_pty() {
+            vec![FocusedRegion::Sidebar, FocusedRegion::Main]
+        } else {
+            vec![
+                FocusedRegion::Sidebar,
+                FocusedRegion::Main,
+                FocusedRegion::Detail,
+            ]
         }
     }
 
-    /// Compute the next region when cycling LEFT (Sidebar → Detail → Main → Sidebar).
+    /// Step through [`available_regions`] from the current position.
     ///
-    /// When a Detail PTY is present, skip Main in the backward direction too so
-    /// focus returns from Detail directly to Sidebar (mirrors `next_region_right`).
+    /// `forward` cycles Sidebar → Main → Detail → Sidebar; `!forward` reverses
+    /// it (Sidebar → Detail → Main → Sidebar).  Both directions visit every
+    /// region the view exposes, so the two-way cycle is symmetric.
+    fn cycle_region(&self, forward: bool) -> FocusedRegion {
+        let regions = self.available_regions();
+        let len = regions.len();
+        // `effective_focused_region` may report a region the current view no
+        // longer exposes (e.g. a stale Detail flag); fall back to the first
+        // region so the cycle always has a valid anchor.
+        let idx = regions
+            .iter()
+            .position(|&r| r == self.effective_focused_region())
+            .unwrap_or(0);
+        let next = if forward {
+            (idx + 1) % len
+        } else {
+            (idx + len - 1) % len
+        };
+        regions[next]
+    }
+
+    /// Compute the next region when cycling RIGHT (Sidebar → Main → Detail → Sidebar).
+    fn next_region_right(&self) -> FocusedRegion {
+        self.cycle_region(true)
+    }
+
+    /// Compute the next region when cycling LEFT (Sidebar → Detail → Main → Sidebar).
     fn next_region_left(&self) -> FocusedRegion {
-        match self.effective_focused_region() {
-            FocusedRegion::Detail => {
-                if self.has_detail_pty() {
-                    FocusedRegion::Sidebar
-                } else {
-                    FocusedRegion::Main
-                }
-            }
-            FocusedRegion::Main => FocusedRegion::Sidebar,
-            FocusedRegion::Sidebar => {
-                // Wrap: land on the rightmost region that has content.
-                if self.has_detail_pty() {
-                    FocusedRegion::Detail
-                } else if self.has_main_pty() {
-                    FocusedRegion::Main
-                } else {
-                    FocusedRegion::Main
-                }
-            }
-        }
+        self.cycle_region(false)
     }
 
     /// §4 (#782): Update `terminal_focused` / `detail_terminal_focused` to
