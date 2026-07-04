@@ -239,6 +239,38 @@ session (needs a human keystroke) — which is exactly where the human belongs a
 "zero-touch" Test/Work mode; interactive is the low-touch supervised variant. #686's per-issue
 test-mode policy chooses between them.
 
+## Dispatch order (milestone #25)
+
+The slices resolve to one dependency DAG, encoded as the `## Work order` block in the milestone's
+**epic tracking issue #947** (machine-readable by `coord milestone order` / `coord milestone
+dispatch`, #768/#769 — `coord milestone dispatch` drains this frontier in order):
+
+```
+#944 ─┬─► #932 ─┐
+      │         ├─► #945 ─┬─► #931
+      └─► #846 ─┘         └─► #930
+```
+
+| Step | Issue | After | Runtime |
+|---|---|---|---|
+| 1 | **#944** runner + `tui-tuidriver` + sealing v1 + the `oracle_loop` milestone marker | — | coord-live |
+| 2 | **#932** in-session run + external trust gate (Acceptance box) + Gate C | #944 | coord-live |
+| 2 | **#846** stall protocol (`coord acceptance stall`) + churn detector | #944 | coord-live |
+| 3 | **#945** worker briefing-contract injection | #944, #846 | **needs release** |
+| ▶ | **Dogfood checkpoint** — hand-write a `contract.md` + one red acceptance slice for a small coord-tui issue, run *one* issue through the loop before automating authoring/Gate A | | |
+| 4 | **#931** independent sealed authoring (`type=test-author`) | #945, #932 | **needs release** |
+| 4 | **#930** mock-first Gate A + amendable contract | #945, #932 | **needs release** |
+
+#932 ∥ #846 run concurrently (both only need #944); #931 ∥ #930 run concurrently after the plumbing.
+The DAG **gates #931/#930 behind #945 + #932** so authoring + mock automation only begin once the loop
+is dogfoodable — the checkpoint is enforced, not just advisory. **"needs release"** = touches
+`agent.py` / worker prompts, so it reaches agents only after a PyPI release + `coord agent update`;
+#944/#932/#846 are live from the editable install immediately.
+
+**Standalone:** this milestone runs on the *current* flat pipeline — it does **not** depend on
+Pipeline v2's Observability (#925–927) or Merge-bounce (#915) phases. Only **Gate C** rides along
+(in #932); Gate B/D + the `develop` git model (#933/#934) stay deferred.
+
 ## Open questions
 
 - Contract storage: settled here as checked-in `tests/acceptance/ms-NN/contract.md` (closes the
