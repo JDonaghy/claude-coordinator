@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import os
 import shutil
 import socket
@@ -299,10 +300,27 @@ def _log_remote(machine, assignment_id: str, follow: bool, *, raw: bool = False)
         "path; pulling the same branch twice overwrites the same location)."
     ),
 )
+@click.option(
+    "--only",
+    "only_patterns",
+    multiple=True,
+    default=(),
+    help=(
+        "Fetch only files whose name matches this glob (fnmatch-style, e.g. "
+        "'tui_submenu' or 'gtk_*').  Repeatable — a file matching ANY given "
+        "pattern is pulled.  Use this to scope a pull to the one or two "
+        "binaries actually under test instead of the whole stash (#940)."
+    ),
+)
 
 
 @_CONFIG_OPTION
-def pull_artifact(assignment_id: str, dest_path: Path | None, config_path: Path) -> None:
+def pull_artifact(
+    assignment_id: str,
+    dest_path: Path | None,
+    only_patterns: tuple[str, ...],
+    config_path: Path,
+) -> None:
     """Rsync build artifacts from the agent machine that ran ASSIGNMENT_ID."""
     from coord.agent import _sanitize_branch, _slugify
     from coord.client import resolve_board_service
@@ -419,7 +437,27 @@ def pull_artifact(assignment_id: str, dest_path: Path | None, config_path: Path)
         )
         sys.exit(1)
 
-    total_bytes = manifest.get("total_bytes", 0)
+    # #940: scope to just the requested file(s) when --only is given — a
+    # stash can hold dozens of ~100MB debug binaries (e.g. every `tui_*`/
+    # `gtk_*`/`msv_*` example in quadraui) when a tester only needs one or
+    # two of them.
+    if only_patterns:
+        matched = [
+            f
+            for f in files
+            if any(fnmatch.fnmatch(f["name"], pat) for pat in only_patterns)
+        ]
+        if not matched:
+            available = ", ".join(f["name"] for f in files)
+            click.echo(
+                f"error: no files in the stash for {assignment_id!r} match "
+                f"--only {list(only_patterns)!r}.\nAvailable: {available}",
+                err=True,
+            )
+            sys.exit(1)
+        files = matched
+
+    total_bytes = sum(f["size"] for f in files)
     built_by = manifest.get("built_by_assignment_id") or assignment_id
     click.echo(
         f"Found {len(files)} artifact(s) ({total_bytes:,} bytes) "
@@ -450,12 +488,19 @@ def pull_artifact(assignment_id: str, dest_path: Path | None, config_path: Path)
     )
     if is_local:
         src_dir = Path.home() / ".coord" / "artifacts" / repo_name / sanitized
+        # Nothing to copy when the destination IS the stash directory
+        # (default `--into`) — the (possibly --only-filtered) files
+        # already live there regardless of filtering.
         if src_dir.resolve() == dest_path.resolve():
             click.echo(f"\nArtifacts already local at: {dest_path}")
             return
         click.echo(f"\nCopying local artifacts {src_dir}/ → {dest_path}/")
         for item in src_dir.iterdir():
             if item.name == ".assignment_id":
+                continue
+            if only_patterns and not any(
+                fnmatch.fnmatch(item.name, pat) for pat in only_patterns
+            ):
                 continue
             target = dest_path / item.name
             if item.is_dir():
@@ -479,9 +524,15 @@ def pull_artifact(assignment_id: str, dest_path: Path | None, config_path: Path)
         # Tailscale, where the network is already authenticated).
         "-e", "ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new",
         "--exclude=.assignment_id",
-        remote,
-        str(dest_path) + "/",
     ]
+    # #940: when --only is given, turn the transfer into an allowlist —
+    # rsync filter rules are first-match-wins, so each --include must be
+    # listed before the trailing --exclude=* that drops everything else
+    # (including files that simply don't match any requested pattern).
+    if only_patterns:
+        cmd += [f"--include={pat}" for pat in only_patterns]
+        cmd += ["--exclude=*"]
+    cmd += [remote, str(dest_path) + "/"]
     click.echo(f"\nRsyncing {remote} → {dest_path}/")
     # start_new_session + stdin=DEVNULL: belt-and-braces so no descendant
     # (ssh) can claim the controlling terminal even if BatchMode is somehow

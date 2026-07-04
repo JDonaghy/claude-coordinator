@@ -1379,6 +1379,157 @@ def test_agent_stash_artifacts_delegates_to_standalone(tmp_path: Path) -> None:
     assert (stash_dir / ".assignment_id").read_text() == "asgn-abc123"
 
 
+# ── Debug-symbol stripping + oversize warning (#940) ─────────────────────────
+
+
+def test_strip_debug_symbols_runs_strip_when_available(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_strip_debug_symbols shells out to `strip -S <file>` when on PATH."""
+    from coord import agent as agent_mod
+
+    calls: list[list[str]] = []
+
+    def fake_which(name: str) -> str | None:
+        return "/usr/bin/strip" if name == "strip" else None
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, returncode=0)
+
+    monkeypatch.setattr(agent_mod.shutil, "which", fake_which)
+    monkeypatch.setattr(agent_mod.subprocess, "run", fake_run)
+
+    target = tmp_path / "mybinary"
+    target.write_bytes(b"\x7fELF" + b"\x00" * 200)
+
+    assert agent_mod._strip_debug_symbols(target) is True
+    assert calls == [["/usr/bin/strip", "-S", str(target)]]
+
+
+def test_strip_debug_symbols_noop_when_strip_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No `strip` on PATH: skip silently, never shell out."""
+    from coord import agent as agent_mod
+
+    monkeypatch.setattr(agent_mod.shutil, "which", lambda name: None)
+
+    def fail_if_called(cmd, **kwargs):
+        raise AssertionError("subprocess.run should not be called when strip is missing")
+
+    monkeypatch.setattr(agent_mod.subprocess, "run", fail_if_called)
+
+    target = tmp_path / "mybinary"
+    target.write_bytes(b"\x7fELF" + b"\x00" * 200)
+
+    assert agent_mod._strip_debug_symbols(target) is False
+
+
+def test_strip_debug_symbols_returns_false_on_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed/erroring strip is swallowed — the original copy is kept."""
+    from coord import agent as agent_mod
+
+    monkeypatch.setattr(agent_mod.shutil, "which", lambda name: "/usr/bin/strip")
+
+    def raising_run(cmd, **kwargs):
+        raise OSError("boom")
+
+    monkeypatch.setattr(agent_mod.subprocess, "run", raising_run)
+
+    target = tmp_path / "mybinary"
+    target.write_bytes(b"\x7fELF" + b"\x00" * 200)
+
+    assert agent_mod._strip_debug_symbols(target) is False
+    assert target.exists(), "file must survive a failed strip attempt"
+
+
+def test_stash_artifacts_for_branch_strips_each_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every copied file is passed through _strip_debug_symbols (#940)."""
+    from coord import agent as agent_mod
+
+    stripped: list[Path] = []
+    monkeypatch.setattr(
+        agent_mod, "_strip_debug_symbols", lambda p: stripped.append(p) or True
+    )
+
+    wt = tmp_path / "worktree"
+    (wt / "target" / "debug").mkdir(parents=True)
+    (wt / "target" / "debug" / "tui_a").write_bytes(b"\x7fELF" + b"\x00" * 200)
+    (wt / "target" / "debug" / "tui_b").write_bytes(b"\x7fELF" + b"\x00" * 200)
+
+    state_dir = tmp_path / "state"
+    count = agent_mod.stash_artifacts_for_branch(
+        worktree_path=wt,
+        branch="issue-940-strip",
+        repo_name="quadraui",
+        patterns=["target/debug/tui_*"],
+        state_dir=state_dir,
+    )
+
+    assert count == 2
+    stash_dir = state_dir / "artifacts" / "quadraui" / "issue-940-strip"
+    assert sorted(p.name for p in stripped) == ["tui_a", "tui_b"]
+    assert all(p.parent == stash_dir for p in stripped), "must strip the STASHED copy, not the source"
+
+
+def test_stash_artifacts_for_branch_logs_oversize_warning(tmp_path: Path) -> None:
+    """A stash over _STASH_WARN_BYTES appends a WARNING line to the log (#940)."""
+    from coord import agent as agent_mod
+
+    wt = tmp_path / "worktree"
+    (wt / "target" / "debug").mkdir(parents=True)
+    (wt / "target" / "debug" / "bigbin").write_bytes(b"\x00" * 500)
+
+    log_path = tmp_path / "assignment.log"
+    log_path.write_text("")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(agent_mod, "_STASH_WARN_BYTES", 100)  # force the warning path
+        count = agent_mod.stash_artifacts_for_branch(
+            worktree_path=wt,
+            branch="issue-940-warn",
+            repo_name="quadraui",
+            patterns=["target/debug/bigbin"],
+            state_dir=tmp_path / "state",
+            log_path=str(log_path),
+        )
+
+    assert count == 1
+    log_text = log_path.read_text()
+    assert "# stash WARNING" in log_text
+    assert "quadraui" in log_text
+    assert "--only" in log_text  # points the reader at the escape hatch
+
+
+def test_stash_artifacts_for_branch_no_warning_under_threshold(tmp_path: Path) -> None:
+    """A small stash produces no WARNING line."""
+    from coord import agent as agent_mod
+
+    wt = tmp_path / "worktree"
+    (wt / "target" / "debug").mkdir(parents=True)
+    (wt / "target" / "debug" / "smallbin").write_bytes(b"\x00" * 500)
+
+    log_path = tmp_path / "assignment.log"
+    log_path.write_text("")
+
+    count = agent_mod.stash_artifacts_for_branch(
+        worktree_path=wt,
+        branch="issue-940-nowarn",
+        repo_name="quadraui",
+        patterns=["target/debug/smallbin"],
+        state_dir=tmp_path / "state",
+        log_path=str(log_path),
+    )
+
+    assert count == 1
+    assert "WARNING" not in log_path.read_text()
+
+
 def test_sanitize_branch_replaces_slashes(tmp_path: Path) -> None:
     """_sanitize_branch should replace slashes with dashes."""
     from coord.agent import _sanitize_branch
