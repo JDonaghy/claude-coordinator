@@ -122,12 +122,37 @@ def dispatch(
     # them first.  Only `work` (chat/refinement/conflict-fix carry no issue
     # context); the interactive and auto-loop fix/review paths inject at their
     # own sites, so this is the single -p work chokepoint (no double injection).
+    #
+    # #945 (docs/ORACLE_LOOP.md "The worker briefing contract"): right after
+    # the #603 digest, prepend the oracle-loop contract when this repo has an
+    # acceptance driver configured (the oracle-loop proxy — #944 never landed
+    # a milestone-level flag, so "driver configured for this repo" is the
+    # signal, mirroring the tests/acceptance/ auto-seal above) AND this issue
+    # already has an authored slice (oracle_loop_contract_block returns ""
+    # otherwise, e.g. before Gate A/#931 has run for it).
     briefing_text = proposal.briefing
     if proposal.type == "work" and proposal.issue_number:
+        from pathlib import Path  # noqa: PLC0415
+
         from coord.state import issue_context_block  # noqa: PLC0415
 
+        oracle_contract = ""
+        if config.acceptance.driver_for(proposal.repo_name) is not None:
+            from coord.acceptance import (  # noqa: PLC0415
+                ACCEPTANCE_DIRNAME,
+                oracle_loop_contract_block,
+            )
+
+            oracle_contract = oracle_loop_contract_block(
+                Path(repo_path) / ACCEPTANCE_DIRNAME,
+                proposal.repo_name,
+                proposal.issue_number,
+            )
+
         briefing_text = (
-            issue_context_block(proposal.repo_name, proposal.issue_number) + briefing_text
+            issue_context_block(proposal.repo_name, proposal.issue_number)
+            + oracle_contract
+            + briefing_text
         )
 
     url = f"http://{machine.host}:{AGENT_PORT}/assign"
