@@ -5318,13 +5318,28 @@ fn assignment_status_badge(a: &Assignment) -> (String, Color) {
     }
 }
 
+/// #876: `review_findings` is stored server-side as a JSON envelope
+/// `{"verdict": ..., "body": ...}` (see `coord/state.py`
+/// `_update_assignment_review_findings_local` / `_parse_review_findings_blob`).
+/// Extract just the prose `body` for display; mirrors the Python helper so
+/// the TUI never renders the raw JSON blob to the operator.
+pub(crate) fn extract_review_findings_body(raw: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let body = value.get("body")?.as_str()?;
+    if body.trim().is_empty() {
+        None
+    } else {
+        Some(body.to_string())
+    }
+}
+
 /// #876: Extract the most informative reason string from an assignment.
 ///
 /// Priority:
 ///   1. `test_reason` — recorded by the operator when marking a test failed
 ///   2. `review_findings` — the review body for review assignments
 ///   3. `failure_reason` — short launch-failure explanation
-fn board_assignment_reason(a: &Assignment) -> String {
+pub(crate) fn board_assignment_reason(a: &Assignment) -> String {
     if let Some(r) = a.test_reason.as_deref() {
         if !r.trim().is_empty() {
             return r.to_string();
@@ -5332,7 +5347,11 @@ fn board_assignment_reason(a: &Assignment) -> String {
     }
     if let Some(r) = a.review_findings.as_deref() {
         if !r.trim().is_empty() {
-            return r.to_string();
+            // `review_findings` is a JSON envelope, not plain prose — parse
+            // out the `body` field. Fall back to the raw string only if it
+            // doesn't parse as the expected envelope (defensive; shouldn't
+            // happen with server-written data).
+            return extract_review_findings_body(r).unwrap_or_else(|| r.to_string());
         }
     }
     if let Some(r) = a.failure_reason.as_deref() {

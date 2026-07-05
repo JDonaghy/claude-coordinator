@@ -933,6 +933,58 @@
     }
 
     #[test]
+    fn extract_review_findings_body_parses_json_envelope() {
+        // Well-formed envelope → just the body, verdict discarded.
+        assert_eq!(
+            extract_review_findings_body(r#"{"verdict":"approve","body":"Looks good — ship it."}"#),
+            Some("Looks good — ship it.".to_string()),
+        );
+        // Blank body → None (nothing useful to show).
+        assert_eq!(
+            extract_review_findings_body(r#"{"verdict":"approve","body":"   "}"#),
+            None,
+        );
+        // Not JSON at all → None (caller falls back to the raw string).
+        assert_eq!(extract_review_findings_body("not json"), None);
+        // JSON but missing a body field → None.
+        assert_eq!(extract_review_findings_body(r#"{"verdict":"approve"}"#), None);
+    }
+
+    #[test]
+    fn board_assignment_reason_extracts_review_body_not_raw_json() {
+        // #876 regression: the Summary tab must show the parsed review prose,
+        // never the raw `{"verdict": ..., "body": ...}` envelope string.
+        let mut review = make_assignment_typed("done", 20, "repo-a", Some("review"));
+        review.review_findings = Some(
+            r##"{"verdict": "approve", "body": "# Review: #932 Pipeline v2 — looks correct."}"##
+                .to_string(),
+        );
+        assert_eq!(
+            board_assignment_reason(&review),
+            "# Review: #932 Pipeline v2 — looks correct.",
+        );
+
+        // test_reason still takes priority over review_findings when both present.
+        let mut both = make_assignment_typed("done", 21, "repo-a", Some("review"));
+        both.test_reason = Some("assertion failed on line 42".to_string());
+        both.review_findings =
+            Some(r#"{"verdict":"approve","body":"should not be shown"}"#.to_string());
+        assert_eq!(
+            board_assignment_reason(&both),
+            "assertion failed on line 42",
+        );
+
+        // failure_reason is the last resort when neither is present.
+        let mut fail = make_assignment_typed("failed", 22, "repo-a", Some("work"));
+        fail.failure_reason = Some("machine unreachable".to_string());
+        assert_eq!(board_assignment_reason(&fail), "machine unreachable");
+
+        // Nothing set at all → empty string.
+        let empty = make_assignment_typed("done", 23, "repo-a", Some("work"));
+        assert_eq!(board_assignment_reason(&empty), "");
+    }
+
+    #[test]
     fn detect_review_verdict_approve_notifies_without_rework() {
         let mut app = make_app_with_assignments(vec![
             done_work_with_branch(10, "repo-a"),
