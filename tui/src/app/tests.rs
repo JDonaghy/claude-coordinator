@@ -24122,9 +24122,13 @@ Milestone tracking issue.
 
     // ── #795 Phase 3b: milestone work-order badges in Pipeline cards ──────────
 
-    /// Build a `BoardData` seeded with one milestone work order carrying three
-    /// nodes — #101 and #102 ready/next-up (rank 0 and 1), #103 blocked on both
-    /// (rank 2).  Used by the deserialization and TuiDriver tests below.
+    /// Build a `BoardData` seeded with one milestone work order carrying four
+    /// nodes — #101 and #102 ready/next-up (rank 0 and 1), #103 blocked on
+    /// both (rank 2), and #104 ready-but-claimed (rank 3: deps met, but an
+    /// active assignment elsewhere means it isn't the dispatcher's next
+    /// candidate — #795 review's claimed-node case, `ready: true, next_up:
+    /// false, blocked_on: []`).  Used by the deserialization and TuiDriver
+    /// tests below.
     fn make_work_order_board_data() -> BoardData {
         BoardData {
             open_issues: vec![
@@ -24152,6 +24156,16 @@ Milestone tracking issue.
                     repo_name: "api".to_string(),
                     number: 103,
                     title: "Issue B1".to_string(),
+                    body: String::new(),
+                    state: "open".to_string(),
+                    labels: vec!["coord".to_string()],
+                    milestone_number: Some(1),
+                    milestone_title: Some("v1.0".to_string()),
+                },
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 104,
+                    title: "Issue C1".to_string(),
                     body: String::new(),
                     state: "open".to_string(),
                     labels: vec!["coord".to_string()],
@@ -24186,6 +24200,13 @@ Milestone tracking issue.
                         next_up: false,
                         blocked_on: vec![101, 102],
                     },
+                    MilestoneWorkOrderNode {
+                        issue_number: 104,
+                        rank: 3,
+                        ready: true,
+                        next_up: false,
+                        blocked_on: vec![],
+                    },
                 ],
             }],
             ..BoardData::default()
@@ -24211,7 +24232,8 @@ Milestone tracking issue.
                     "nodes": [
                         {"issue_number": 101, "rank": 0, "ready": true, "next_up": true, "blocked_on": []},
                         {"issue_number": 102, "rank": 1, "ready": true, "next_up": true, "blocked_on": []},
-                        {"issue_number": 103, "rank": 2, "ready": false, "next_up": false, "blocked_on": [101, 102]}
+                        {"issue_number": 103, "rank": 2, "ready": false, "next_up": false, "blocked_on": [101, 102]},
+                        {"issue_number": 104, "rank": 3, "ready": true, "next_up": false, "blocked_on": []}
                     ]
                 }
             ]
@@ -24222,7 +24244,7 @@ Milestone tracking issue.
         assert_eq!(payload.milestone_work_orders.len(), 1);
         let mwo = &payload.milestone_work_orders[0];
         assert_eq!(mwo.repo_name, "api");
-        assert_eq!(mwo.nodes.len(), 3);
+        assert_eq!(mwo.nodes.len(), 4);
 
         let n101 = &mwo.nodes[0];
         assert_eq!(n101.issue_number, 101);
@@ -24237,6 +24259,17 @@ Milestone tracking issue.
         assert!(!n103.ready, "#103 should be blocked");
         assert!(!n103.next_up, "#103 should not be next_up");
         assert_eq!(n103.blocked_on, vec![101, 102]);
+
+        // #795 review: a claimed node — deps met (`ready`) but not the
+        // dispatcher's next candidate (`!next_up`) because it's already
+        // spoken for. `blocked_on` is empty; this must NOT be confused with
+        // the fully-blocked #103 case above.
+        let n104 = &mwo.nodes[3];
+        assert_eq!(n104.issue_number, 104);
+        assert_eq!(n104.rank, 3);
+        assert!(n104.ready, "#104 (claimed) should still be ready — deps are met");
+        assert!(!n104.next_up, "#104 (claimed) should not be next_up");
+        assert!(n104.blocked_on.is_empty(), "#104 (claimed) has no unmet deps");
     }
 
     /// #795: `BoardPayload` without `milestone_work_orders` (pre-#795 daemon)
@@ -24252,11 +24285,16 @@ Milestone tracking issue.
 
     /// #795 TuiDriver black-box: Pipeline milestone cards show work-order badges.
     ///
-    /// Seeds a `BoardData` with three issues under milestone "v1.0" and a
-    /// `MilestoneWorkOrder` with rank/ready/blocked_on data.  Drives the full
-    /// `event → handle → render` path through `TuiDriver` and asserts:
+    /// Seeds a `BoardData` with four issues under milestone "v1.0" and a
+    /// `MilestoneWorkOrder` with rank/ready/next_up/blocked_on data.  Drives
+    /// the full `event → handle → render` path through `TuiDriver` and
+    /// asserts:
     /// - ready/next-up issues display the "↑W{rank}" badge text
     /// - blocked issues display the "⊘W{rank}←#{blocker}" badge text
+    /// - a ready-but-claimed issue (deps met, but already claimed by an
+    ///   active assignment elsewhere — #795 review) displays the plain
+    ///   dim "W{rank}" badge, with NEITHER the next-up arrow NOR a dangling
+    ///   blocked-arrow-with-no-blocker
     ///
     /// Uses `find()` to locate targets, never hardcoded coordinates.
     #[test]
@@ -24266,7 +24304,7 @@ Milestone tracking issue.
         let data = make_work_order_board_data();
         let mut app = make_test_app(data);
 
-        // Populate pipeline_issues for our three work-order issues.
+        // Populate pipeline_issues for our four work-order issues.
         app.pipeline_issues = vec![
             PipelineIssue {
                 number: 101,
@@ -24291,6 +24329,16 @@ Milestone tracking issue.
             PipelineIssue {
                 number: 103,
                 title: "Issue B1".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string()],
+                is_closed: false,
+            },
+            PipelineIssue {
+                number: 104,
+                title: "Issue C1".to_string(),
                 body: String::new(),
                 repo_slug: "acme/api".to_string(),
                 coord_repo: Some("api".to_string()),
@@ -24334,6 +24382,22 @@ Milestone tracking issue.
         assert!(
             screen.contains("⊘W3←#101"),
             "#103 must show '⊘W3←#101' (blocked rank 2→3, first dep #101):\n{screen}",
+        );
+        // #104 is ready but claimed (rank 3, next_up=false, blocked_on=[])
+        // → plain dim "W4", no next-up arrow and no dangling blocked-arrow
+        // (the #795 review bug: this case used to fall through to the
+        // blocked branch with an empty blocker, rendering "⊘W4←").
+        assert!(
+            screen.contains(" W4"),
+            "#104 must show ' W4' (ready-but-claimed, rank 3→4):\n{screen}",
+        );
+        assert!(
+            !screen.contains("↑W4"),
+            "#104 (claimed) must NOT show the next-up arrow:\n{screen}",
+        );
+        assert!(
+            !screen.contains("⊘W4"),
+            "#104 (claimed) must NOT show a dangling blocked-arrow:\n{screen}",
         );
     }
 
