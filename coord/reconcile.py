@@ -756,12 +756,23 @@ def reconcile_board_merges(
         branch is backfilled via :func:`state.update_assignment_branch`.  More
         than one candidate (or none) is left untouched and logged.
 
-    (b) #609 record out-of-band merges — work merged directly on GitHub, or a
-        ``merge_queue`` row that drained without flipping the board, is never
-        recorded as ``status='merged'`` so the TUI shows a grey merge box
-        forever.  When :func:`github_ops.work_is_terminal` reports the branch
-        merged (PR merged OR issue closed, fail-open), the row is flipped via
-        :func:`state.mark_assignment_merged`.
+    (b) #609/#951 record out-of-band merges — work merged directly on GitHub,
+        or a ``merge_queue`` row that drained without flipping the board, is
+        never recorded as ``status='merged'`` so the TUI shows a grey merge
+        box forever.  When :func:`github_ops.work_is_terminal` reports the
+        issue closed OR the PR merged (fail-open), the row is flipped via
+        :func:`state.mark_assignment_merged`.  ``work_is_terminal``'s
+        issue-closed check needs **no branch**, so this still fires even when
+        sweep (a)'s backfill couldn't resolve one (#951) — an unresolved
+        branch must not block the issue-closed fast path.  Because every
+        finished work assignment defaults to ``review_state='pending'``
+        (reconcile's own Pass 1 sets it unconditionally so the review-dispatch
+        loop can pick it up), flipping ``status`` alone leaves that ghost
+        behind — the row keeps surfacing as "[awaiting review]" forever even
+        though it's merged.  So this sweep also clears a lingering
+        ``review_state='pending'`` via :func:`state.mark_work_review_settled`
+        (#951), mirroring how sweep (e) below settles the sibling
+        review/smoke/conflict-fix rows.
 
     Both sweeps are **conservative**: they never act when uncertain and append a
     skip reason instead.  *repo* filters to a single local repo name.  When
@@ -823,31 +834,37 @@ def reconcile_board_merges(
                     f"({a.repo_name} #{a.issue_number}): "
                     f"{len(matches)} ambiguous branch candidates {matches}"
                 )
-                continue
+                # #951: do NOT bail out here — a.branch is still None, but the
+                # issue-closed fast path below needs no branch, so give it a
+                # chance instead of stranding the row forever.
             else:
                 actions.append(
                     f"skip backfill {a.assignment_id} "
                     f"({a.repo_name} #{a.issue_number}): "
                     f"no remote branch matching {prefix}*"
                 )
-                continue
+                # #951: same — fall through rather than `continue`.
 
-        # (b) #609 — flip done work whose branch is merged on GitHub.
-        if not a.branch:
-            # Still no branch even after the backfill attempt — can't determine
-            # merge state without one, so leave it for the next sweep.
-            continue
+        # (b) #609/#951 — flip done work whose branch is merged on GitHub, OR
+        # whose issue is closed even when no branch could be resolved above
+        # (work_is_terminal's issue-closed check needs no branch).
         if github_ops.work_is_terminal(
             repo_cfg.github, a.issue_number, a.branch, cache=terminal_cache
         ):
             actions.append(
                 f"mark merged {a.assignment_id} "
-                f"({a.repo_name} #{a.issue_number}, {a.branch})"
+                f"({a.repo_name} #{a.issue_number}, {a.branch or 'no branch'})"
                 + (" [dry-run]" if dry_run else "")
             )
             if not dry_run:
                 a.status = "merged"
                 state.mark_assignment_merged(a.assignment_id or "")
+                # #951: mark_assignment_merged only flips status — clear a
+                # lingering review_state='pending' ghost too, or the row keeps
+                # showing "[awaiting review]" forever despite being merged.
+                if a.review_state == "pending":
+                    a.review_state = "done"
+                    state.mark_work_review_settled(a.assignment_id or "")
 
     # (c) #721 — close open PRs whose work has already landed.
     actions.extend(close_stale_prs(config, repo=repo, issue=issue, dry_run=dry_run))
