@@ -144,7 +144,7 @@ def dispatch(
             )
 
             oracle_contract = oracle_loop_contract_block(
-                Path(repo_path) / ACCEPTANCE_DIRNAME,
+                Path(repo_path).expanduser() / ACCEPTANCE_DIRNAME,
                 proposal.repo_name,
                 proposal.issue_number,
             )
