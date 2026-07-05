@@ -289,6 +289,48 @@ class TestDispatch:
         assert briefing.rstrip().endswith("Fix the auth module")  # original briefing last
 
     @patch("coord.dispatch.httpx.post")
+    def test_payload_oracle_loop_contract_with_tilde_repo_path(
+        self, mock_post: MagicMock, proposal: Proposal, tmp_path, coord_db,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """#945 review follow-up: repo_paths entries configured with a
+        literal ``~`` (the README's canonical ``repo_paths: { my-project:
+        ~/src/my-project }`` example) must resolve the same way the sibling
+        ``.expanduser()`` call three lines above does. Before the fix,
+        ``Path(repo_path) / ACCEPTANCE_DIRNAME`` left the ``~`` unexpanded,
+        ``.exists()`` was always False, and the contract block silently
+        never appeared for any repo configured the documented way."""
+        from coord.config import AcceptanceConfig, AcceptanceDriverConfig
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        monkeypatch.setenv("HOME", str(fake_home))
+
+        repo_dir = fake_home / "src" / "api"
+        acceptance_dir = repo_dir / "tests" / "acceptance" / "ms01"
+        acceptance_dir.mkdir(parents=True)
+        (acceptance_dir / "manifest.yml").write_text("tests:\n  ms01::a: 10\n")
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": "~/src/api"},
+            )],
+            acceptance=AcceptanceConfig(drivers={
+                "api": AcceptanceDriverConfig(kind="tui-tuidriver", run="cargo test"),
+            }),
+        )
+        dispatch(proposal, cfg)
+        briefing = mock_post.call_args.kwargs["json"]["briefing"]
+        assert "## 🔒 Oracle-loop acceptance contract" in briefing
+        assert "tests/acceptance/ms01/contract.md" in briefing
+
+    @patch("coord.dispatch.httpx.post")
     def test_payload_no_oracle_loop_contract_without_driver(
         self, mock_post: MagicMock, config: Config, proposal: Proposal, coord_db,
     ) -> None:
