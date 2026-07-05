@@ -812,11 +812,8 @@ impl CoordApp {
             needs_redraw = true;
         }
 
-        // #558: Drain completed `gh issue view --json comments` fetches for
-        // the Pipeline Summary tab.
-        if self.poll_pending_comments_fetches() {
-            needs_redraw = true;
-        }
+        // #876: poll_pending_comments_fetches removed — Summary tab now
+        // sources from in-memory board assignments.
 
         // #336: Poll the in-flight artifact manifest fetch and populate cache.
         if let Some((key, rx)) = &self.artifact_fetch_rx {

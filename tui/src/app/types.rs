@@ -292,6 +292,20 @@ pub(crate) struct Assignment {
     pub(crate) acceptance_total: Option<i64>,
     #[serde(default)]
     pub(crate) acceptance_passed: Option<i64>,
+    /// #876: test failure reason entered by the operator via `coord test --fail`
+    /// (written by `record_test_verdict`).  `None` for assignments without a
+    /// failed test or for pre-#876 rows.
+    #[serde(default)]
+    pub(crate) test_reason: Option<String>,
+    /// Internal review-state machine value: "pending" | "done" etc.
+    /// `None` for non-review assignments and for pre-#876 rows.
+    #[serde(default)]
+    pub(crate) review_state: Option<String>,
+    /// URL to the pull request for this work assignment (populated when the
+    /// worker pushes a branch and the coordinator records it).
+    /// `None` when no PR URL is known.
+    #[serde(default)]
+    pub(crate) pr_url: Option<String>,
 }
 
 /// Deserialize a boolean the daemon may send as a SQLite-style integer (0/1)

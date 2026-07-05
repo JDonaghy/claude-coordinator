@@ -632,6 +632,9 @@ mod pure_tests {
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         }
     }
 
