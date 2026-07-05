@@ -253,7 +253,13 @@ class TestReconcileBoardWriteHelpers:
     reconcile-merges sweep."""
 
     def _insert_done_work(
-        self, *, assignment_id: str, branch: str | None, status: str = "done"
+        self,
+        *,
+        assignment_id: str,
+        branch: str | None,
+        status: str = "done",
+        review_state: str | None = None,
+        assignment_type: str = "work",
     ) -> None:
         from coord.db import get_connection
         from coord.models import Assignment
@@ -267,7 +273,7 @@ class TestReconcileBoardWriteHelpers:
             assignment_id=assignment_id,
             status=status,
             branch=branch,
-            type="work",
+            type=assignment_type,
             dispatched_at=0.0,
         )
         record_dispatched_assignment(
@@ -280,6 +286,11 @@ class TestReconcileBoardWriteHelpers:
             "UPDATE assignments SET status=? WHERE assignment_id=?",
             (status, assignment_id),
         )
+        if review_state is not None:
+            conn.execute(
+                "UPDATE assignments SET review_state=? WHERE assignment_id=?",
+                (review_state, assignment_id),
+            )
         conn.commit()
 
     def test_update_assignment_branch_backfills_when_empty(self, coord_db) -> None:
@@ -346,6 +357,68 @@ class TestReconcileBoardWriteHelpers:
         from coord.state import mark_assignment_merged
 
         mark_assignment_merged("")  # must not raise
+
+    def test_mark_work_review_settled_clears_pending(self, coord_db) -> None:
+        """#951: a type=work row's review_state='pending' ghost flips to 'done'."""
+        from coord.db import get_connection
+        from coord.state import mark_work_review_settled
+
+        self._insert_done_work(
+            assignment_id="wrs1",
+            branch="issue-42-fix",
+            status="merged",
+            review_state="pending",
+        )
+        mark_work_review_settled("wrs1")
+
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT review_state FROM assignments WHERE assignment_id=?", ("wrs1",)
+        ).fetchone()
+        assert row[0] == "done"
+
+    def test_mark_work_review_settled_only_acts_on_pending(self, coord_db) -> None:
+        from coord.db import get_connection
+        from coord.state import mark_work_review_settled
+
+        self._insert_done_work(
+            assignment_id="wrs2",
+            branch="issue-42-fix",
+            status="merged",
+            review_state="dispatched",
+        )
+        mark_work_review_settled("wrs2")
+
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT review_state FROM assignments WHERE assignment_id=?", ("wrs2",)
+        ).fetchone()
+        assert row[0] == "dispatched"
+
+    def test_mark_work_review_settled_ignores_non_work_type(self, coord_db) -> None:
+        """Only type='work' rows are in scope — siblings are settled elsewhere (#894)."""
+        from coord.db import get_connection
+        from coord.state import mark_work_review_settled
+
+        self._insert_done_work(
+            assignment_id="wrs3",
+            branch="issue-42-fix",
+            status="done",
+            review_state="pending",
+            assignment_type="review",
+        )
+        mark_work_review_settled("wrs3")
+
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT review_state FROM assignments WHERE assignment_id=?", ("wrs3",)
+        ).fetchone()
+        assert row[0] == "pending"
+
+    def test_mark_work_review_settled_noop_on_empty_id(self, coord_db) -> None:
+        from coord.state import mark_work_review_settled
+
+        mark_work_review_settled("")  # must not raise
 
 
 class TestRecordDispatchedBranch:

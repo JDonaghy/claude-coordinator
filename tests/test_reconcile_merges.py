@@ -82,6 +82,12 @@ def _patch_probes(
         state, "mark_advisory_settled",
         lambda aid: writes.append(("advisory_settled", aid)),
     )
+    # #951: stub the type=work review_state settle so sweep (b) never touches
+    # the DB in these tests.
+    monkeypatch.setattr(
+        state, "mark_work_review_settled",
+        lambda aid: writes.append(("work_review_settled", aid)),
+    )
     return writes
 
 
@@ -170,6 +176,77 @@ def test_backfill_then_mark_merged_in_one_sweep(monkeypatch, config) -> None:
     assert a.status == "merged"
     assert ("branch", "abc") in writes
     assert ("merged", "abc") in writes
+
+
+# ── #951 settle type=work review-stage ghost rows ──────────────────────────
+#
+# `mark_assignment_merged` (#609, sweep b above) only flips `status`, it never
+# touches `review_state`. Every finished work assignment defaults to
+# `review_state='pending'` (reconcile Pass 1 sets it unconditionally), so that
+# ghost survives the status flip to 'merged' and the row keeps surfacing as
+# "[awaiting review]" in `coord status` / the TUI forever — the display tag
+# (coord/commands/status.py) is keyed on review_state independent of status.
+# These rows also fell outside sweep (e) #894's sibling settle, which
+# explicitly excludes type='work'. See issue #951.
+
+
+def test_settles_work_review_state_when_terminal(monkeypatch, config) -> None:
+    """A type=work done+review_state=pending row for a closed/merged issue
+    must be settled: status flips to merged AND the review_state='pending'
+    ghost clears, so it stops surfacing as "[awaiting review]" (#951)."""
+    a = _done_work(issue_number=42, branch="issue-42-fix")
+    a.review_state = "pending"
+    board = Board(completed=[a])
+    writes = _patch_probes(monkeypatch, terminal=True)
+
+    actions = reconcile_board_merges(board, config)
+
+    assert a.status == "merged"
+    assert a.review_state == "done"
+    assert ("merged", "abc") in writes
+    assert ("work_review_settled", "abc") in writes
+    assert any("mark merged" in s for s in actions)
+
+
+def test_settles_work_review_state_without_branch_when_issue_closed(
+    monkeypatch, config
+) -> None:
+    """#951: the issue-closed fast path must not require a resolvable branch.
+
+    A done+pending work row whose branch could not be backfilled (no
+    matching remote branch at all) still must settle when work_is_terminal
+    is confirmed — e.g. via issue_is_closed, which needs no branch. Before
+    the fix, the backfill's `continue` on a failed match stranded the row
+    before sweep (b) ever ran the terminality check.
+    """
+    a = _done_work(issue_number=42, branch=None)
+    a.review_state = "pending"
+    board = Board(completed=[a])
+    writes = _patch_probes(monkeypatch, remote_branches=set(), terminal=True)
+
+    actions = reconcile_board_merges(board, config)
+
+    assert a.branch is None  # never resolved — the fast path needs none
+    assert a.status == "merged"
+    assert a.review_state == "done"
+    assert ("merged", "abc") in writes
+    assert ("work_review_settled", "abc") in writes
+    assert any("mark merged" in s for s in actions)
+
+
+def test_work_review_state_left_untouched_when_issue_open(monkeypatch, config) -> None:
+    """Fail-open: a still-OPEN issue's done+pending work row must be left alone."""
+    a = _done_work(issue_number=42, branch="issue-42-fix")
+    a.review_state = "pending"
+    board = Board(completed=[a])
+    writes = _patch_probes(monkeypatch, terminal=False)
+
+    actions = reconcile_board_merges(board, config)
+
+    assert a.status == "done"
+    assert a.review_state == "pending"
+    assert writes == []
+    assert not any("mark merged" in s for s in actions)
 
 
 # ── dry_run + filters ──────────────────────────────────────────────────────

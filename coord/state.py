@@ -1152,6 +1152,35 @@ def mark_assignment_merged(assignment_id: str) -> None:
     conn.commit()
 
 
+def mark_work_review_settled(assignment_id: str) -> None:
+    """#951: clear a lingering ``review_state='pending'`` ghost on a work row
+    whose issue is already terminal (closed or PR merged).
+
+    ``mark_assignment_merged`` (#609) flips a done work row's ``status`` to
+    ``'merged'`` but never touches ``review_state``.  Every finished work
+    assignment defaults to ``review_state='pending'`` (set unconditionally so
+    the review-dispatch loop can pick it up), so that ghost survives the
+    status flip and the row keeps surfacing as "[awaiting review]" in
+    ``coord status`` / the TUI forever — the display tag is keyed on
+    ``review_state`` independent of ``status``. Sweep (e) (#894) already
+    settles this ghost for sibling ``review``/``smoke``/``conflict-fix`` rows
+    via :func:`mark_sibling_review_done`; this is the ``type='work'`` mirror,
+    which fell between both sweeps (#951).
+
+    Idempotent: only transitions rows that still carry
+    ``review_state='pending'``.  Silently no-ops when the row doesn't exist.
+    """
+    if not assignment_id:
+        return
+    conn = get_connection()
+    conn.execute(
+        "UPDATE assignments SET review_state='done' WHERE assignment_id=? "
+        "AND type='work' AND review_state='pending'",
+        (assignment_id,),
+    )
+    conn.commit()
+
+
 def mark_sibling_review_done(assignment_id: str) -> None:
     """#894: clear the review_state='pending' ghost on a done sibling row.
 
