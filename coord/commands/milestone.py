@@ -232,7 +232,11 @@ def milestone_assign_cmd(
         click.echo(f"error: milestone assign failed: {e}", err=True)
         sys.exit(1)
 
-    ms_label = f"{milestone_title!r} (#{milestone_number})" if milestone_title else f"#{milestone_number}"
+    ms_label = (
+        f"{milestone_title!r} (#{milestone_number})"
+        if milestone_title
+        else f"#{milestone_number}"
+    )
     click.echo(f"#{issue} ({repo_entry.github}) assigned to milestone {ms_label}")
 
 

@@ -605,8 +605,8 @@ def get_repo_milestones(repo: str, *, state: str = "open") -> list[dict]:
     """
     raw = _gh(
         "api", "--paginate",
-        f"repos/{repo}/milestones",
-        "--jq", ".[].{number: .number, title: .title}",
+        f"repos/{repo}/milestones?state={state}",
+        "--jq", ".[] | {number: .number, title: .title}",
     )
     # --jq emits one JSON object per line when applied to an array.
     results = []
