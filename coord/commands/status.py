@@ -255,8 +255,13 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
                 tag = f"[{e.state}]"
                 line = f"    {tag:11s} #{e.issue_number} ({e.branch} → {e.target_branch}) {pr} size={size}"
                 click.echo(line)
-                if e.error:
-                    click.echo(f"      error: {e.error}")
+                # #420: recompute the review/smoke gate error live rather than
+                # echoing the stored string verbatim — it's only refreshed on
+                # a real merge attempt, so an approval/verdict that landed
+                # since then would otherwise show as stale as "blocked".
+                live_error = mq.display_error(e, board, cfg)
+                if live_error:
+                    click.echo(f"      error: {live_error}")
 
     # Auto-loop iteration-cap blockers: assignments where the review→fix loop
     # exhausted all allowed iterations without receiving an approval.  These
