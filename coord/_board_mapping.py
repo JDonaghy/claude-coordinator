@@ -118,6 +118,9 @@ def row_to_assignment(row: object) -> Assignment:
         acceptance_state=d.get("acceptance_state"),
         acceptance_reason=d.get("acceptance_reason"),
         acceptance_sha=d.get("acceptance_sha"),
+        # #932: per-test counts; None for rows predating this column.
+        acceptance_total=d.get("acceptance_total"),
+        acceptance_passed=d.get("acceptance_passed"),
     )
 
 

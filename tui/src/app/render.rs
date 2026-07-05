@@ -1803,6 +1803,9 @@ impl CoordApp {
                 // to anchor against; without one there's nothing to
                 // test or build.
                 self.append_test_guidance_rows(&mut items, issue);
+                // #932: the Acceptance box's own guidance, reported
+                // separately from Test.
+                self.append_acceptance_guidance_rows(&mut items, issue);
             }
         }
         ListView {
@@ -1892,6 +1895,7 @@ impl CoordApp {
                 }
             }
             self.append_test_guidance_rows(&mut items, issue);
+            self.append_acceptance_guidance_rows(&mut items, issue);
         }
 
         // ── Focused-stage content ─────────────────────────────────────
@@ -2368,6 +2372,68 @@ impl CoordApp {
             test_label,
             Some(Color::rgb(160, 160, 180)),
         ));
+    }
+
+    /// #932: append an "Acceptance" guidance block — verdict, per-test
+    /// progress ("3/7"), failing-test summary, and the SHA it was recorded
+    /// against — when this issue's Acceptance box has ever been recorded.
+    /// Reported and gated SEPARATELY from the Test block above: silent
+    /// (no rows at all) for issues outside an oracle-loop milestone, since
+    /// `acceptance_stage_status_for` reads Skipped as "no signal", not
+    /// "in play".
+    pub(crate) fn append_acceptance_guidance_rows(&self, items: &mut Vec<ListItem>, issue: &PipelineIssue) {
+        let status = self.acceptance_stage_status_for(issue);
+        if status == StageStatus::Skipped {
+            return;
+        }
+
+        items.push(kv_item("", "", None));
+        let (label, color) = match status {
+            StageStatus::Done => ("passed", Color::rgb(120, 200, 120)),
+            StageStatus::Failed => ("failed", Color::rgb(220, 100, 100)),
+            _ => ("pending", Color::rgb(160, 160, 180)),
+        };
+        let progress = self
+            .acceptance_progress_for(issue)
+            .map(|(passed, total)| format!(" ({passed}/{total} green)"))
+            .unwrap_or_default();
+        items.push(kv_item(
+            "Acceptance",
+            &format!("{label}{progress}"),
+            Some(color),
+        ));
+
+        let work = self.assignments_for_stage(issue, "work");
+        let latest = work
+            .iter()
+            .filter(|a| {
+                a.acceptance_state
+                    .as_deref()
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false)
+            })
+            .max_by(|a, b| {
+                a.dispatched_at
+                    .partial_cmp(&b.dispatched_at)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        if let Some(a) = latest {
+            if let Some(sha) = &a.acceptance_sha {
+                items.push(kv_item(
+                    "  SHA",
+                    &sha.chars().take(12).collect::<String>(),
+                    Some(Color::rgb(160, 160, 180)),
+                ));
+            }
+            if status == StageStatus::Failed {
+                if let Some(reason) = &a.acceptance_reason {
+                    for (i, line) in reason.lines().take(5).enumerate() {
+                        let label = if i == 0 { "  Failing" } else { "" };
+                        items.push(kv_item(label, line, Some(Color::rgb(220, 140, 140))));
+                    }
+                }
+            }
+        }
     }
 
     /// Detail list for the Stages tab. One section per stage in the

@@ -1,9 +1,11 @@
 {
   "assignments": [
     {
+      "acceptance_passed": null,
       "acceptance_reason": null,
       "acceptance_sha": null,
       "acceptance_state": null,
+      "acceptance_total": null,
       "assignment_id": "work-748b",
       "branch": "issue-749-followup",
       "cache_creation_tokens": 0,
@@ -49,9 +51,11 @@
       "unreachable_count": 0
     },
     {
+      "acceptance_passed": null,
       "acceptance_reason": null,
       "acceptance_sha": null,
       "acceptance_state": null,
+      "acceptance_total": null,
       "assignment_id": "rev-748a",
       "branch": null,
       "cache_creation_tokens": 0,
@@ -97,9 +101,11 @@
       "unreachable_count": 0
     },
     {
+      "acceptance_passed": null,
       "acceptance_reason": null,
       "acceptance_sha": null,
       "acceptance_state": null,
+      "acceptance_total": null,
       "assignment_id": "work-748a",
       "branch": "issue-748-fixture",
       "cache_creation_tokens": 0,

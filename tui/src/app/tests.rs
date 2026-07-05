@@ -626,6 +626,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         }
     }
 
@@ -1891,6 +1896,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         };
         BoardData {
             assignments: vec![work],
@@ -2283,6 +2293,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         }
     }
 
@@ -3577,6 +3592,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         });
         // Has assignment → in-progress, even though status:ready label is set.
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
@@ -3938,6 +3958,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         });
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
         assert_eq!(section, "new");
@@ -4013,6 +4038,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         });
         // is_closed wins over has-assignment.
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
@@ -4207,6 +4237,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         });
 
         // With no queue entry but a merged work assignment, Merge stage → Done.
@@ -5031,6 +5066,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         }
     }
 
@@ -5390,6 +5430,88 @@
             .assignments
             .push(_work_assignment("w2", 300.0, "done", None));
         assert_eq!(app.pipeline_selected_work_id(), Some("w2".to_string()));
+    }
+
+    // ── #932/#944: Acceptance box (reported/gated separately from Test) ────
+
+    fn _work_assignment_with_acceptance(
+        id: &str,
+        dispatched_at: f64,
+        acceptance_state: Option<&str>,
+        acceptance_passed: Option<i64>,
+        acceptance_total: Option<i64>,
+    ) -> Assignment {
+        let mut a = _stage_assignment(id, "work", dispatched_at, "done");
+        a.acceptance_state = acceptance_state.map(String::from);
+        a.acceptance_passed = acceptance_passed;
+        a.acceptance_total = acceptance_total;
+        a
+    }
+
+    #[test]
+    fn acceptance_stage_no_verdict_yet_is_skipped_not_pending() {
+        // Unlike Test, an issue with no acceptance suite authored yet reads
+        // Skipped — it isn't a gate every issue must clear.
+        let mut app = make_pipeline_app_with_test_gate();
+        app.data
+            .assignments
+            .push(_work_assignment_with_acceptance("w1", 100.0, None, None, None));
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.acceptance_stage_status_for(issue), StageStatus::Skipped);
+        assert_eq!(app.acceptance_progress_for(issue), None);
+    }
+
+    #[test]
+    fn acceptance_stage_passed_verdict_is_done() {
+        let mut app = make_pipeline_app_with_test_gate();
+        app.data.assignments.push(_work_assignment_with_acceptance(
+            "w1",
+            100.0,
+            Some("passed"),
+            Some(5),
+            Some(5),
+        ));
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.acceptance_stage_status_for(issue), StageStatus::Done);
+        assert_eq!(app.acceptance_progress_for(issue), Some((5, 5)));
+    }
+
+    #[test]
+    fn acceptance_stage_failed_verdict_is_failed_with_partial_progress() {
+        // The issue's illustrative "3/7 acceptance green" example: a failed
+        // (sub-100%) verdict is still reported with its fractional progress.
+        let mut app = make_pipeline_app_with_test_gate();
+        app.data.assignments.push(_work_assignment_with_acceptance(
+            "w1",
+            100.0,
+            Some("failed"),
+            Some(3),
+            Some(7),
+        ));
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.acceptance_stage_status_for(issue), StageStatus::Failed);
+        assert_eq!(app.acceptance_progress_for(issue), Some((3, 7)));
+    }
+
+    #[test]
+    fn acceptance_stage_latest_by_dispatch_wins() {
+        let mut app = make_pipeline_app_with_test_gate();
+        app.data.assignments.push(_work_assignment_with_acceptance(
+            "w1",
+            100.0,
+            Some("failed"),
+            Some(3),
+            Some(7),
+        ));
+        app.data.assignments.push(_work_assignment_with_acceptance(
+            "fix1",
+            200.0,
+            Some("passed"),
+            Some(7),
+            Some(7),
+        ));
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.acceptance_stage_status_for(issue), StageStatus::Done);
     }
 
     // ── #236: Test → Review / Work-bounce handoffs ─────────────────────────
@@ -6917,6 +7039,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         });
         let issue = &app.pipeline_issues[0];
         assert!(app.issue_has_any_assignment(issue));
@@ -6964,6 +7091,11 @@
                 is_interactive: false,
                 failure_reason: None,
                 review_iteration: 0,
+                acceptance_state: None,
+                acceptance_reason: None,
+                acceptance_sha: None,
+                acceptance_total: None,
+                acceptance_passed: None,
             });
         }
         let issue = &app.pipeline_issues[0];
@@ -7005,6 +7137,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         });
         // Same issue number but different repo — should be excluded.
         app.data.assignments.push(Assignment {
@@ -7035,6 +7172,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         });
         let issue = &app.pipeline_issues[0];  // coord_repo = Some("api")
         let total = app.issue_total_cost(issue).expect("should have cost");
@@ -7076,6 +7218,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         });
         // Interactive session — cost_usd is None (Max subscription).
         app.data.assignments.push(Assignment {
@@ -7106,6 +7253,11 @@
             is_interactive: true,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         });
         let issue = &app.pipeline_issues[0];
         let total = app.issue_total_cost(issue).expect("should have cost from auto assignment");
@@ -7152,6 +7304,11 @@
                 is_interactive: false,
                 failure_reason: None,
                 review_iteration: 0,
+                acceptance_state: None,
+                acceptance_reason: None,
+                acceptance_sha: None,
+                acceptance_total: None,
+                acceptance_passed: None,
             });
         }
         let issue = &app.pipeline_issues[0];
@@ -7192,6 +7349,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         });
         // Same issue number, different repo — should be excluded.
         app.data.assignments.push(Assignment {
@@ -7222,6 +7384,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         });
         let issue = &app.pipeline_issues[0];  // coord_repo = Some("api")
         assert_eq!(app.issue_total_tokens(issue), 1200, "expected 1000+200=1200 for api repo only");
@@ -7271,6 +7438,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -7320,6 +7492,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.derive_current_stage(issue), "done");
@@ -7455,6 +7632,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         // Work stage ran → Done.
@@ -7549,6 +7731,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         });
         let list = app.pipeline_stages_list();
         let text: String = list
@@ -7598,6 +7785,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Active);
@@ -7634,6 +7826,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -7675,6 +7872,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         });
         // Newer successful retry.
         app.data.assignments.push(Assignment {
@@ -7705,6 +7907,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -7743,6 +7950,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         });
         let issue = &app.pipeline_issues[0];
         // issue.coord_repo == "api", assignment.repo == "different-repo" →
@@ -7810,6 +8022,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].label, "Work");
@@ -7857,6 +8074,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         });
         app.data.assignments.push(Assignment {
             id: "r1".to_string(),
@@ -7886,6 +8108,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         // Both stages done, no Merge stage remaining.
@@ -8092,6 +8319,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         }
     }
 
@@ -8433,6 +8665,11 @@
                 is_interactive: false,
                 failure_reason: None,
                 review_iteration: 0,
+                acceptance_state: None,
+                acceptance_reason: None,
+                acceptance_sha: None,
+                acceptance_total: None,
+                acceptance_passed: None,
             });
         }
         app.data.merge_queue.push(MergeQueueEntry {
@@ -8487,6 +8724,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].status, StageStatus::Failed);
@@ -8532,6 +8774,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         for stage in &view.stages {
@@ -8620,6 +8867,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "plan"), StageStatus::Done);
@@ -8664,6 +8916,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         });
         let issue = &app.pipeline_issues[0].clone();
         let id = app.find_done_plan_assignment_id(issue, "api");
@@ -8702,6 +8959,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         });
         let issue = &app.pipeline_issues[0].clone();
         assert_eq!(app.find_done_plan_assignment_id(issue, "api"), None);
@@ -8740,6 +9002,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         });
         let list = app.pipeline_stages_list();
         let text_blob: String = list
@@ -13628,6 +13895,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         }];
 
         let result = parse_session_summaries_from_comments(&comments, &assignments);
@@ -13749,6 +14021,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         };
         let result = parse_session_summaries_from_comments(&comments, &[fix_assignment]);
         assert_eq!(result.len(), 1);
@@ -14111,6 +14388,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         };
         let mut app = make_test_app(BoardData {
             assignments: vec![work_assignment],
@@ -21593,6 +21875,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         };
 
         // Review for the fix — approved.
@@ -21624,6 +21911,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         };
 
         // The merge queue has the ORIGINAL work (different aid, same branch).
@@ -21693,6 +21985,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         });
 
         let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);

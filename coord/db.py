@@ -320,6 +320,10 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         "ALTER TABLE assignments ADD COLUMN acceptance_state TEXT",
         "ALTER TABLE assignments ADD COLUMN acceptance_reason TEXT",
         "ALTER TABLE assignments ADD COLUMN acceptance_sha TEXT",
+        # #932: per-test counts alongside acceptance_state, so the Acceptance
+        # box can render "3/7 acceptance green" instead of a bare verdict.
+        "ALTER TABLE assignments ADD COLUMN acceptance_total INTEGER",
+        "ALTER TABLE assignments ADD COLUMN acceptance_passed INTEGER",
     ]
     for sql in migrations:
         try:

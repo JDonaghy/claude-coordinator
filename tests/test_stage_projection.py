@@ -184,6 +184,60 @@ def test_test_stage_no_work_closed_issue_is_skipped():
     assert sp.test_stage_status_for([], is_closed=True, require_plan=False) == sp.SKIPPED
 
 
+# ── acceptance_stage_status_for / acceptance_progress_for (#932) ────────────
+
+
+def test_acceptance_stage_no_verdict_yet_is_skipped_not_pending():
+    """Unlike Test, an issue with no acceptance suite authored yet (no
+    `acceptance record` has ever run) reads SKIPPED — it isn't a gate every
+    issue must clear, only oracle-loop milestones' issues."""
+    a = [_work(status="done")]
+    assert sp.acceptance_stage_status_for(a) == sp.SKIPPED
+    assert sp.acceptance_progress_for(a) is None
+
+
+def test_acceptance_stage_passed_verdict_is_done():
+    a = [_work(status="done", acceptance_state="passed")]
+    assert sp.acceptance_stage_status_for(a) == sp.DONE
+
+
+def test_acceptance_stage_failed_verdict_is_failed():
+    a = [_work(status="done", acceptance_state="failed")]
+    assert sp.acceptance_stage_status_for(a) == sp.FAILED
+
+
+def test_acceptance_stage_latest_by_dispatch_wins():
+    a = [
+        _work(status="done", acceptance_state="failed", dispatched_at=1.0),
+        _work(status="done", acceptance_state="passed", dispatched_at=2.0, assignment_id="fix1"),
+    ]
+    assert sp.acceptance_stage_status_for(a) == sp.DONE
+
+
+def test_acceptance_progress_reports_partial_green():
+    """The illustrative example from the issue: '3/7 acceptance green' is
+    reporting, not a fail verdict — the box itself is DONE only when this
+    issue's own scoped slice is fully green (build_verdict's `green`), the
+    fractional count is separate context surfaced alongside it."""
+    a = [_work(status="done", acceptance_state="failed", acceptance_total=7, acceptance_passed=3)]
+    assert sp.acceptance_progress_for(a) == {"passed": 3, "total": 7}
+    assert sp.acceptance_stage_status_for(a) == sp.FAILED
+
+
+def test_acceptance_progress_none_when_counts_predate_932():
+    a = [_work(status="done", acceptance_state="passed")]
+    assert sp.acceptance_progress_for(a) is None
+
+
+def test_compute_issue_projection_includes_acceptance_box():
+    a = [_work(status="done", acceptance_state="passed", acceptance_total=5, acceptance_passed=5)]
+    out = sp.compute_issue_projection(
+        a, None, is_closed=False, require_plan=False, default_gates=["test", "review", "merge"],
+    )
+    assert out["stages"]["acceptance"] == sp.DONE
+    assert out["acceptance_progress"] == {"passed": 5, "total": 5}
+
+
 # ── issue_has_any_approved_review ───────────────────────────────────────────
 
 

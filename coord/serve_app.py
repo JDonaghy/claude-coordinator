@@ -732,6 +732,8 @@ def _openapi_spec() -> dict:
                                     "acceptance_state": {"type": "string"},
                                     "acceptance_reason": {"type": "string", "nullable": True},
                                     "acceptance_sha": {"type": "string", "nullable": True},
+                                    "acceptance_total": {"type": "integer", "nullable": True},
+                                    "acceptance_passed": {"type": "integer", "nullable": True},
                                 },
                                 "required": ["assignment_id", "acceptance_state"],
                             }
@@ -1767,6 +1769,8 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 acceptance_state=body["acceptance_state"],
                 acceptance_reason=body.get("acceptance_reason"),
                 acceptance_sha=body.get("acceptance_sha"),
+                acceptance_total=body.get("acceptance_total"),
+                acceptance_passed=body.get("acceptance_passed"),
             )
         except KeyError as e:
             return JSONResponse({"error": f"missing field: {e}"}, status_code=400)

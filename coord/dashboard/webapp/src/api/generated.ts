@@ -126,4 +126,6 @@ export interface Assignment {
   acceptance_state: string | null
   acceptance_reason: string | null
   acceptance_sha: string | null
+  acceptance_total: number | null
+  acceptance_passed: number | null
 }

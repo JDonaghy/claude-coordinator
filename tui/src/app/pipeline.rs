@@ -3000,6 +3000,76 @@ impl CoordApp {
         }
     }
 
+    /// #932/#944: the Acceptance box's status — reported and gated
+    /// SEPARATELY from Test (docs/ORACLE_LOOP.md), so this reads
+    /// `Assignment.acceptance_state` off the work assignment row directly
+    /// rather than going through `test_stage_status_for`'s Work-gating
+    /// dance: `coord acceptance record` stamps the verdict whenever the
+    /// external re-run happens, independent of whether the human Test gate
+    /// has run yet.
+    ///
+    /// Distinct from Test in one more way: an issue with no acceptance
+    /// suite authored yet (no manifest slice, so `acceptance record` was
+    /// never run against it) has no signal at all — Skipped rather than
+    /// Pending, since the Acceptance box only applies to oracle-loop
+    /// milestones, not every issue on the board.
+    pub(crate) fn acceptance_stage_status_for(&self, issue: &PipelineIssue) -> StageStatus {
+        // #550: prefer the server-computed projection when present — falls
+        // back to the local computation below on the local-SQLite read path
+        // (no daemon) or against a daemon older than #550.
+        if let Some(s) = self.server_stage_status(issue, "acceptance") {
+            return s;
+        }
+        self.acceptance_stage_status_for_local(issue)
+    }
+
+    /// Local fallback for [`acceptance_stage_status_for`] — authoritative
+    /// for local-SQLite-mode coord-tui (no `coord serve` daemon) and a
+    /// safety net against older daemons that predate #932's projection.
+    pub(crate) fn acceptance_stage_status_for_local(&self, issue: &PipelineIssue) -> StageStatus {
+        let work = self.assignments_for_stage(issue, "work");
+        let latest = work
+            .iter()
+            .filter(|a| {
+                a.acceptance_state
+                    .as_deref()
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false)
+            })
+            .max_by(|a, b| {
+                a.dispatched_at
+                    .partial_cmp(&b.dispatched_at)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        match latest.and_then(|a| a.acceptance_state.as_deref()) {
+            Some("passed") => StageStatus::Done,
+            Some("failed") => StageStatus::Failed,
+            _ => StageStatus::Skipped,
+        }
+    }
+
+    /// The Acceptance box's per-test progress (e.g. "3/7") from the latest
+    /// recorded verdict, or `None` when no verdict exists yet or it
+    /// predates #932's per-test counts. Reporting only — the Acceptance
+    /// box's colour comes from [`acceptance_stage_status_for`], not this.
+    pub(crate) fn acceptance_progress_for(&self, issue: &PipelineIssue) -> Option<(i64, i64)> {
+        let work = self.assignments_for_stage(issue, "work");
+        let latest = work
+            .iter()
+            .filter(|a| {
+                a.acceptance_state
+                    .as_deref()
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false)
+            })
+            .max_by(|a, b| {
+                a.dispatched_at
+                    .partial_cmp(&b.dispatched_at)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })?;
+        Some((latest.acceptance_passed?, latest.acceptance_total?))
+    }
+
     /// Compute the Work stage status without going through the dispatch in
     /// `stage_status_for` (which would special-case "test" too). Used by
     /// `test_stage_status_for` to decide whether Test is actionable yet.

@@ -11,6 +11,7 @@ inputs), then hands that data to the pure functions and prints the result.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -559,3 +560,116 @@ def milestone_chat_cmd(
     # eventually — #771/#645) can capture it with a "last non-empty line"
     # parse, matching refine-chat / new-issue-chat.
     click.echo(assignment_id)
+
+
+@milestone_group.command(
+    "gate-c",
+    help=(
+        "Gate C (docs/ORACLE_LOOP.md, #932): the milestone's FULL "
+        "accumulated acceptance suite must be green before it ships — "
+        "catches the integration gaps *between* issues that per-issue "
+        "acceptance runs miss. Runs the repo's acceptance driver once "
+        "against the current checkout (`--path`, default: the repo's "
+        "configured local checkout) and reports pass/fail with a "
+        "non-zero exit on red, alongside a per-issue rollup of the "
+        "milestone's own Acceptance box state (e.g. \"3/7 acceptance "
+        "green\") for visibility. This is a manual check the operator "
+        "runs before treating a milestone as done — no `feature/ms-NN "
+        "→ develop` ship-path automation exists yet (#933/#934), so "
+        "nothing here mutates git state or blocks anything automatically."
+    ),
+)
+@click.argument("repo")
+@click.argument("tracking_issue", type=int)
+@click.option(
+    "--path", "path_opt", type=click.Path(file_okay=False), default=None,
+    help="Repo checkout to run the driver in (default: repo_paths in coordinator.yml).",
+)
+@_CONFIG_OPTION
+def milestone_gate_c_cmd(
+    repo: str, tracking_issue: int, path_opt: str | None, config_path: Path
+) -> None:
+    from coord.acceptance import build_verdict
+    from coord.acceptance_drivers import DriverError, run_driver
+
+    cfg = _load_config(config_path)
+    repo_entry = cfg.repo(repo)
+    if repo_entry is None:
+        click.echo(f"error: unknown repo {repo!r}", err=True)
+        sys.exit(2)
+
+    driver_cfg = cfg.acceptance.driver_for(repo)
+    if driver_cfg is None:
+        click.echo(
+            f"error: no acceptance driver configured for repo {repo!r} "
+            "(add it under acceptance.drivers in coordinator.yml)",
+            err=True,
+        )
+        sys.exit(1)
+
+    if path_opt is not None:
+        repo_dir = Path(path_opt).expanduser()
+    else:
+        from coord.test_orchestrator import find_local_repo_path
+
+        found = find_local_repo_path(repo, cfg)
+        if found is None:
+            click.echo(
+                f"error: no local repo checkout found for {repo!r} "
+                "(repo_paths in coordinator.yml) — pass --path",
+                err=True,
+            )
+            sys.exit(1)
+        repo_dir = found
+
+    try:
+        ctx = fetch_milestone_context(repo_entry, tracking_issue)
+    except MilestoneDispatchError as e:
+        click.echo(f"error: {e}", err=True)
+        sys.exit(1)
+
+    click.echo(
+        f"Gate C for #{tracking_issue} (milestone #{ctx.milestone_number}) "
+        f"— running the full accumulated acceptance suite in {repo_dir}..."
+    )
+    try:
+        result = run_driver(driver_cfg.kind, driver_cfg.run, cwd=str(repo_dir))
+    except DriverError as e:
+        click.echo(f"error: {e}", err=True)
+        sys.exit(1)
+
+    if not result.tests and result.exit_code != 0:
+        click.echo(result.raw_output, err=True)
+
+    verdict = build_verdict(result.tests, scope="all")
+    click.echo(json.dumps(verdict, indent=2))
+
+    # Per-issue rollup: how many of the milestone's own issues already have
+    # a passed Acceptance box, for visibility alongside the full-suite
+    # verdict (docs/ORACLE_LOOP.md's "3/7 acceptance green" example is a
+    # per-milestone-member reading, not this full-suite one).
+    if ctx.work_order.nodes:
+        from coord import board_service
+        from coord.diagnose import stage_assignments
+
+        board = board_service.read_board()
+        passed = 0
+        with_signal = 0
+        for node in ctx.work_order.nodes:
+            work = stage_assignments(board, repo, node.issue_number, "work")
+            with_state = [a for a in work if (a.acceptance_state or "") != ""]
+            if not with_state:
+                continue
+            with_signal += 1
+            if with_state[0].acceptance_state == "passed":
+                passed += 1
+        click.echo(
+            f"\nMilestone Acceptance boxes: {passed}/{with_signal} passed "
+            f"({len(ctx.work_order.nodes)} issue(s) total, "
+            f"{len(ctx.work_order.nodes) - with_signal} with no verdict yet)"
+        )
+
+    if verdict["total"] == 0 or not verdict["green"]:
+        click.echo(f"\nGate C RED for #{tracking_issue} — milestone is not ready to ship.")
+        sys.exit(1)
+    click.echo(f"\nGate C GREEN for #{tracking_issue}.")
