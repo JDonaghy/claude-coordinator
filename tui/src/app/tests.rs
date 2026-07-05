@@ -16729,6 +16729,20 @@
     }
 
     #[test]
+    fn shell_config_advertises_milestones_panel() {
+        // #771/#782: the Milestone DAG view has no keyboard shortcut (#782
+        // removed all numeric view-switch keys), so the activity-bar button
+        // is its ONLY entry point. If this panel definition or the
+        // on_shell_event("panel:milestones") wire ever gets dropped, the
+        // whole view becomes unreachable with no test failure elsewhere.
+        let cfg = CoordApp::shell_config();
+        assert!(
+            cfg.panels.iter().any(|p| p.id.as_str() == "panel:milestones"),
+            "shell_config must include the Milestones panel for #771/#782",
+        );
+    }
+
+    #[test]
     fn panel_toolbar_terminal_has_no_toolbar() {
         // The Terminal pane is pure pass-through — no coord verbs apply,
         // so it should not show a per-panel toolbar (which would steal
@@ -23301,9 +23315,11 @@ Milestone tracking issue.
         })
     }
 
-    /// Acceptance criterion (#771): pressing `8` renders the Milestone DAG
-    /// view with the right per-node state — done / in-flight / blocked /
-    /// ready — and the milestone header exposes "Dispatch milestone".
+    /// Acceptance criterion (#771): clicking the Milestones activity-bar icon
+    /// (◆ — #782 dropped the numeric '8' shortcut in favor of activity-bar
+    /// discovery, see `shell_config()`) renders the Milestone DAG view with
+    /// the right per-node state — done / in-flight / blocked / ready — and
+    /// the milestone header exposes "Dispatch milestone".
     #[test]
     fn tuidriver_milestone_dag_shows_node_states_and_dispatch_action() {
         use quadraui::tui::testing::driver_with_shell;
@@ -23311,7 +23327,7 @@ Milestone tracking issue.
         let app = make_milestone_dag_app();
         let mut driver = driver_with_shell(app, CoordApp::shell_config(), 160, 40);
 
-        driver.press(quadraui::Key::Char('8')); // → Milestone DAG view
+        click_activity_icon(&mut driver, "◆"); // → Milestone DAG view
         let screen = driver.screen();
 
         assert!(

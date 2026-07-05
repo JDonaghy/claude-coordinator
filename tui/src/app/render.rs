@@ -595,6 +595,9 @@ impl ShellApp for CoordApp {
             // §1 (#782): Kanban + Merge Queue activity-bar panels.
             "panel:kanban" => SidebarView::Kanban,
             "panel:mergequeue" => SidebarView::MergeQueue,
+            // #771/#782: Milestone DAG — see shell_config() for why this
+            // button exists (replaces the numeric '8' key dropped by #782).
+            "panel:milestones" => SidebarView::MilestoneDag,
             _ => return,
         };
     }

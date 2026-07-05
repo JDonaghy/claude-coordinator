@@ -2998,6 +2998,18 @@ impl CoordApp {
                     tooltip: "Merge Queue".into(),
                     title: "MERGE QUEUE".into(),
                 },
+                // #771/#782: Milestone DAG panel. #771 landed on main after
+                // this branch diverged with only a numeric-key ('8') entry
+                // point; #782 drops all numeric view-switch keys, so this
+                // activity-bar button is the only way in — added here to
+                // keep the view reachable post-merge.
+                PanelDefinition {
+                    id: WidgetId::new("panel:milestones"),
+                    // ◆ diamond — conventional milestone marker.
+                    icon: "◆".into(),
+                    tooltip: "Milestones".into(),
+                    title: "MILESTONES".into(),
+                },
             ],
         )
         .with_status_bar()
