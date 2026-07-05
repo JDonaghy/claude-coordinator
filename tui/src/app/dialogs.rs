@@ -277,40 +277,10 @@ impl CoordApp {
 
         let mut items: Vec<ListItem> = Vec::new();
 
-        // --- Status strip ---
-        let stage_names = self.pipeline_stage_names_for_issue(issue);
-        let mut strip_spans: Vec<StyledSpan> = vec![StyledSpan::with_fg("  ", muted)];
-        for (i, stage) in stage_names.iter().enumerate() {
-            if i > 0 {
-                strip_spans.push(StyledSpan::with_fg("  ", dim));
-            }
-            let status = self.stage_status_for(issue, stage);
-            let (sym, sym_color) = board_stage_symbol(&status);
-            let label = match stage.as_str() {
-                "work" => "Work",
-                "test" => "Test",
-                "review" => "Review",
-                "merge" => "Merge",
-                "plan" => "Plan",
-                other => other,
-            };
-            strip_spans.push(StyledSpan::with_fg(format!("{} ", label), muted));
-            strip_spans.push(StyledSpan::with_fg(sym, sym_color));
-        }
-        items.push(ListItem {
-            text: StyledText { spans: strip_spans },
-            icon: None,
-            detail: None,
-            decoration: Decoration::Normal,
-        });
-
-        // Separator after the strip.
-        items.push(ListItem {
-            text: StyledText { spans: vec![StyledSpan::with_fg(" ", dim)] },
-            icon: None,
-            detail: None,
-            decoration: Decoration::Normal,
-        });
+        // #818: The inline status strip is removed from the Summary tab body.
+        // The universal pinned stage strip (rendered via `build_pipeline_widget`
+        // + `pipeline_detail_pv_rect_strip`) now sits above every non-Overview
+        // tab, so duplicating it here would show the strip twice.
 
         // --- Per-assignment entries ---
         for a in &assignments {
@@ -3267,13 +3237,12 @@ impl CoordApp {
         )));
         chat.set_transcript(Vec::new());
         self.inject_chat = Some(chat);
-        // #264: route the user straight into the Refinement tab on the
-        // Pipeline view so the chat is visible immediately.  Also switch
-        // pipeline_sel to the refinement issue if it's in the loaded
-        // list — without this, the bind succeeds but the user has to hunt
-        // for the row before the tab shows the chat.
+        // #264/#818: route the user to the Pipeline view.  The Refinement
+        // tab was removed in #818, so we land on Overview instead.  The
+        // refinement chat backend continues to run; its output appears in
+        // the log (coord assign --interactive launched by the board CTA).
         self.active_view = SidebarView::Pipeline;
-        self.pipeline_detail_tab = PipelineDetailTab::Refinement;
+        self.pipeline_detail_tab = PipelineDetailTab::Overview;
         if let Some(idx) = self
             .pipeline_issues
             .iter()
@@ -3628,9 +3597,9 @@ impl CoordApp {
         )));
         chat.set_transcript(Vec::new());
         self.inject_chat = Some(chat);
-        // Switch to the Refinement tab (the chat tab) on the Pipeline view.
+        // #818: Refinement tab removed; land on Overview instead.
         self.active_view = SidebarView::Pipeline;
-        self.pipeline_detail_tab = PipelineDetailTab::Refinement;
+        self.pipeline_detail_tab = PipelineDetailTab::Overview;
         if let Some(idx) = self
             .pipeline_issues
             .iter()
@@ -5275,18 +5244,6 @@ impl CoordApp {
                 false
             }
         }
-    }
-}
-
-/// #876: Status symbol + colour for a pipeline gate from a `StageStatus`.
-fn board_stage_symbol(status: &StageStatus) -> (String, Color) {
-    match status {
-        StageStatus::Done => ("✓".to_string(), Color::rgb(120, 200, 120)),
-        StageStatus::Failed => ("✗".to_string(), Color::rgb(220, 70, 70)),
-        StageStatus::Active => ("⟳".to_string(), Color::rgb(100, 180, 220)),
-        StageStatus::Skipped => ("↷".to_string(), Color::rgb(100, 100, 100)),
-        StageStatus::Stale => ("~".to_string(), Color::rgb(200, 150, 70)),
-        StageStatus::Pending => ("—".to_string(), Color::rgb(80, 80, 80)),
     }
 }
 

@@ -2751,7 +2751,7 @@
     fn mouse_click_on_pipeline_stage_body_focuses() {
         let mut app = make_pipeline_app();
         app.active_view = SidebarView::Pipeline;
-        app.pipeline_detail_tab = PipelineDetailTab::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Overview;
         app.pipeline_sel = Some(0);
 
         // Use a large content rect so the layout produces well-separated stages.
@@ -2802,7 +2802,7 @@
     fn mouse_click_on_pipeline_action_bar_dispatches() {
         let mut app = make_pipeline_app();
         app.active_view = SidebarView::Pipeline;
-        app.pipeline_detail_tab = PipelineDetailTab::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Overview;
         app.pipeline_sel = Some(0);
 
         // Sanity: with no assignments, Work owns the [Go] action.
@@ -7786,87 +7786,6 @@
         );
     }
 
-    #[test]
-    fn pipeline_stages_list_closed_no_pipeline_shows_message() {
-        // Closed issue with no assignment rows → Stages tab shows message, no stage rows.
-        let mut app = make_pipeline_app();
-        app.pipeline_issues[0].is_closed = true;
-        let list = app.pipeline_stages_list();
-        let text: String = list
-            .items
-            .iter()
-            .flat_map(|i| i.text.spans.iter().map(|s| s.text.as_str()))
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(
-            text.contains("Closed without coord pipeline"),
-            "expected closed-without-pipeline message, got: {text:?}"
-        );
-        // No stage headers (Work / Review / Merge) should appear.
-        assert!(
-            !text.contains("Work"),
-            "Work stage row should be suppressed"
-        );
-    }
-
-    #[test]
-    fn pipeline_stages_list_closed_with_assignments_shows_stages() {
-        // Closed issue that went through coord → Stages tab still shows stages.
-        let mut app = make_pipeline_app();
-        app.pipeline_issues[0].is_closed = true;
-        app.data.assignments.push(Assignment {
-            id: "w1".to_string(),
-            repo: "api".to_string(),
-            issue_number: 42,
-            issue_title: "Add cool thing".to_string(),
-            machine: "m1".to_string(),
-            status: "done".to_string(),
-            branch: None,
-            model: None,
-            dispatched_at: Some(1.0),
-            finished_at: Some(2.0),
-            exit_code: Some(0),
-            assignment_type: Some("work".to_string()),
-            test_state: None,
-            review_verdict: None,
-            review_of_assignment_id: None,
-            cost_usd: None,
-            smoke_tests: None,
-            review_findings: None,
-            test_plan: None,
-            test_plan_branch_head: None,
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_creation_tokens: 0,
-            cache_read_tokens: 0,
-            is_interactive: false,
-            failure_reason: None,
-            review_iteration: 0,
-            acceptance_state: None,
-            acceptance_reason: None,
-            acceptance_sha: None,
-            acceptance_total: None,
-            acceptance_passed: None,
-            test_reason: None,
-            review_state: None,
-            pr_url: None,
-        });
-        let list = app.pipeline_stages_list();
-        let text: String = list
-            .items
-            .iter()
-            .flat_map(|i| i.text.spans.iter().map(|s| s.text.as_str()))
-            .collect::<Vec<_>>()
-            .join(" ");
-        // Stage headers must appear.
-        assert!(text.contains("Work"), "Work header missing");
-        assert!(text.contains("Review"), "Review header missing");
-        // No "closed without coord pipeline" message when there are assignments.
-        assert!(
-            !text.contains("Closed without coord pipeline"),
-            "should not show closed-no-pipeline message when assignments exist"
-        );
-    }
 
     #[test]
     fn stage_status_for_running_work_marks_active() {
@@ -9126,69 +9045,6 @@
         });
         let issue = &app.pipeline_issues[0].clone();
         assert_eq!(app.find_done_plan_assignment_id(issue, "api"), None);
-    }
-
-    /// Stages tab list includes one row per stage and detail rows for
-    /// assignments that exist.
-    #[test]
-    fn pipeline_stages_list_renders_stage_headers_and_details() {
-        let mut app = make_pipeline_app();
-        app.data.assignments.push(Assignment {
-            id: "abcdef1234567890".to_string(),
-            repo: "api".to_string(),
-            issue_number: 42,
-            issue_title: "Add cool thing".to_string(),
-            machine: "m1".to_string(),
-            status: "done".to_string(),
-            branch: Some("issue-42-cool".to_string()),
-            model: Some("sonnet".to_string()),
-            dispatched_at: Some(1.0),
-            finished_at: Some(2.0),
-            exit_code: Some(0),
-            assignment_type: Some("work".to_string()),
-            test_state: None,
-            review_verdict: None,
-            review_of_assignment_id: None,
-            cost_usd: None,
-            smoke_tests: None,
-            review_findings: None,
-            test_plan: None,
-            test_plan_branch_head: None,
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_creation_tokens: 0,
-            cache_read_tokens: 0,
-            is_interactive: false,
-            failure_reason: None,
-            review_iteration: 0,
-            acceptance_state: None,
-            acceptance_reason: None,
-            acceptance_sha: None,
-            acceptance_total: None,
-            acceptance_passed: None,
-            test_reason: None,
-            review_state: None,
-            pr_url: None,
-        });
-        let list = app.pipeline_stages_list();
-        let text_blob: String = list
-            .items
-            .iter()
-            .flat_map(|it| it.text.spans.iter().map(|s| s.text.as_str()))
-            .collect::<Vec<&str>>()
-            .join("|");
-        // Headers for every stage are present.
-        // #738: Merge is no longer a per-issue stage — only Work and Review.
-        assert!(text_blob.contains("Work"), "Work header missing");
-        assert!(text_blob.contains("Review"), "Review header missing");
-        assert!(!text_blob.contains("Merge"), "#738: Merge must NOT appear in per-issue pipeline");
-        // Assignment short id appears.
-        assert!(text_blob.contains("abcdef12"), "short id missing");
-        // Branch + model render.
-        assert!(text_blob.contains("issue-42-cool"), "branch missing");
-        assert!(text_blob.contains("sonnet"), "model missing");
-        // Empty-detail rows for stages with no assignments.
-        assert!(text_blob.contains("(not started)"));
     }
 
     /// capitalize() upper-cases the first ASCII character only.
@@ -14354,6 +14210,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
             pr_url: None,
         };
 
@@ -14397,6 +14258,185 @@
             driver.screen_contains("cargo test failed"),
             "Summary tab must show test_reason from board layer:\n{}",
             driver.screen(),
+        );
+    }
+
+    // ── #818: TuiDriver black-box — detail-tab redesign ───────────────────────
+
+    /// #818: The tab bar must show "Overview" (not "Pipeline"), and must NOT
+    /// contain "Stages" or "Refinement" tabs.
+    #[test]
+    fn tab_bar_shows_overview_not_pipeline_stages_refinement() {
+        let app = make_pipeline_app();
+        let bar = app.pipeline_detail_tab_bar();
+        let labels: Vec<&str> = bar.tabs.iter().map(|t| t.label.trim()).collect();
+        assert!(
+            labels.contains(&"Overview"),
+            "#818: tab bar must contain 'Overview', got: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"Pipeline"),
+            "#818: 'Pipeline' label must be gone, got: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"Stages"),
+            "#818: 'Stages' tab must be removed, got: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"Refinement"),
+            "#818: 'Refinement' tab must be removed, got: {labels:?}"
+        );
+        assert_eq!(
+            labels.len(),
+            5,
+            "#818: exactly 5 tabs expected (Overview/Issue/Log/Summary/Terminal), got: {labels:?}"
+        );
+    }
+
+    /// #818: Universal pinned stage strip appears at the top of the Summary
+    /// tab when a pipeline issue with assignments is selected.
+    #[test]
+    fn universal_strip_visible_on_summary_tab_with_pipeline_issue() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let work = Assignment {
+            id: "strip-test-work".to_string(),
+            repo: "api".to_string(),
+            issue_number: 42,
+            issue_title: "Strip test issue".to_string(),
+            machine: "m1".to_string(),
+            status: "done".to_string(),
+            branch: Some("issue-42-strip".to_string()),
+            model: Some("sonnet".to_string()),
+            dispatched_at: Some(1_000_000.0),
+            finished_at: Some(1_001_200.0),
+            exit_code: Some(0),
+            assignment_type: Some("work".to_string()),
+            test_state: None,
+            test_reason: None,
+            review_verdict: None,
+            review_state: None,
+            review_of_assignment_id: None,
+            cost_usd: None,
+            smoke_tests: None,
+            review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            is_interactive: false,
+            failure_reason: None,
+            review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
+            pr_url: None,
+        };
+
+        let data = BoardData {
+            pipeline_default_gates: vec!["review".to_string(), "merge".to_string()],
+            pipeline_tracked_labels: vec!["coord".to_string()],
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            assignments: vec![work],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 42,
+            title: "Strip test issue".to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string(), "status:ready".to_string()],
+            is_closed: false,
+        }];
+        app.rebuild_pipeline_sidebar(None);
+        app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
+        // Go to Summary tab (non-Overview).
+        app.pipeline_detail_tab = PipelineDetailTab::Summary;
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+
+        // The pinned stage strip renders stage boxes (Work / Review) above
+        // the summary body. The TUI renders them as box-drawn stage labels.
+        assert!(
+            driver.screen_contains("Work"),
+            "#818: stage strip must show Work stage on Summary tab:\n{}",
+            driver.screen(),
+        );
+        // Summary session entries must also be visible below the strip:
+        // the machine name "m1" appears in the session header row.
+        assert!(
+            driver.screen_contains("m1"),
+            "#818: summary session entry (machine) must appear below the strip:\n{}",
+            driver.screen(),
+        );
+    }
+
+    /// #818: Universal strip is ABSENT when no pipeline entry is selected.
+    #[test]
+    fn universal_strip_absent_without_pipeline_entry() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_app_default();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Summary;
+        // No pipeline issues / no selection → strip widget returns None.
+        app.pipeline_issues = vec![];
+        app.pipeline_sel = None;
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+
+        // With no pipeline entry the placeholder is shown; the stage strip
+        // must not appear (no Work / Review boxes rendered by the widget).
+        let screen = driver.screen();
+        // The pipeline placeholder message appears (various forms).
+        assert!(
+            screen.contains("No issues found")
+                || screen.contains("No issue selected")
+                || screen.contains("No pipeline"),
+            "#818: placeholder must appear when no pipeline entry selected:\n{screen}"
+        );
+    }
+
+    /// #818: On the Overview tab, clicking a stage box focuses that stage and
+    /// reveals its detail content in the body list below the boxes.
+    #[test]
+    fn overview_tab_click_stage_box_reveals_stage_detail() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        // Use make_pipeline_app which has issue #42 with work/review gates.
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Overview;
+        app.pipeline_sel = Some(0); // issue #42
+        app.pipeline_focused_stage = None; // no stage focused initially
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+
+        // The Overview tab shows the stage boxes. Locate "Work" on screen and
+        // click it — driver.find("Work") returns (col, row).
+        // After click, "Stage content: Work" should appear in the body list.
+        let pos = driver.find("Work");
+        assert!(
+            pos.is_some(),
+            "#818: 'Work' stage box must be visible on Overview tab:\n{}",
+            driver.screen()
+        );
+        if let Some((col, row)) = pos {
+            driver.click(col, row);
+        }
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Stage content"),
+            "#818: clicking a stage box on Overview must reveal stage detail:\n{screen}"
         );
     }
 
@@ -17308,58 +17348,69 @@
     }
 
     #[test]
-    fn detail_terminal_tab_is_seventh_in_pipeline_tab_bar() {
-        // Order: Pipeline / Issue / Stages / Log / Summary / Refinement / Terminal.
-        // Index 6 (0-based) → Terminal.  (#558 added Summary at index 4.)
+    fn detail_terminal_tab_is_fifth_in_pipeline_tab_bar() {
+        // #818 order: Overview / Issue / Log / Summary / Terminal (5 tabs).
+        // Index 4 (0-based) → Terminal.
         let app = make_app_default();
         let bar = app.pipeline_detail_tab_bar();
-        assert!(
-            bar.tabs.len() >= 7,
-            "expected at least 7 pipeline detail tabs"
+        assert_eq!(
+            bar.tabs.len(),
+            5,
+            "expected exactly 5 pipeline detail tabs (#818)"
+        );
+        assert_eq!(
+            bar.tabs[0].label.trim(),
+            "Overview",
+            "tab index 0 must be Overview (#818)"
+        );
+        assert_eq!(
+            bar.tabs[3].label.trim(),
+            "Summary",
+            "tab index 3 must be Summary"
         );
         assert_eq!(
             bar.tabs[4].label.trim(),
-            "Summary",
-            "tab index 4 must be Summary"
-        );
-        assert_eq!(
-            bar.tabs[6].label.trim(),
             "Terminal",
-            "tab index 6 must be Terminal"
+            "tab index 4 must be Terminal"
         );
     }
 
     #[test]
-    fn pipeline_detail_tab_cycles_through_terminal_forward() {
-        // l (Right) from Refinement should land on Terminal.
+    fn pipeline_detail_tab_cycles_forward() {
+        // l (Right) from Summary should land on Terminal; from Terminal wraps to Overview.
         let mut app = make_app_default();
-        app.pipeline_detail_tab = PipelineDetailTab::Refinement;
-        // Advance one step.
+        // Summary → Terminal
+        app.pipeline_detail_tab = PipelineDetailTab::Summary;
         app.pipeline_detail_tab = match app.pipeline_detail_tab {
-            PipelineDetailTab::Pipeline => PipelineDetailTab::Issue,
-            PipelineDetailTab::Issue => PipelineDetailTab::Stages,
-            PipelineDetailTab::Stages => PipelineDetailTab::Log,
+            PipelineDetailTab::Overview => PipelineDetailTab::Issue,
+            PipelineDetailTab::Issue => PipelineDetailTab::Log,
             PipelineDetailTab::Log => PipelineDetailTab::Summary,
-            PipelineDetailTab::Summary => PipelineDetailTab::Refinement,
-            PipelineDetailTab::Refinement => PipelineDetailTab::Terminal,
-            PipelineDetailTab::Terminal => PipelineDetailTab::Pipeline,
+            PipelineDetailTab::Summary => PipelineDetailTab::Terminal,
+            PipelineDetailTab::Terminal => PipelineDetailTab::Overview,
         };
         assert_eq!(app.pipeline_detail_tab, PipelineDetailTab::Terminal);
+        // Terminal → Overview (wrap-around)
+        app.pipeline_detail_tab = match app.pipeline_detail_tab {
+            PipelineDetailTab::Overview => PipelineDetailTab::Issue,
+            PipelineDetailTab::Issue => PipelineDetailTab::Log,
+            PipelineDetailTab::Log => PipelineDetailTab::Summary,
+            PipelineDetailTab::Summary => PipelineDetailTab::Terminal,
+            PipelineDetailTab::Terminal => PipelineDetailTab::Overview,
+        };
+        assert_eq!(app.pipeline_detail_tab, PipelineDetailTab::Overview);
     }
 
     #[test]
-    fn pipeline_detail_tab_cycles_through_terminal_backward() {
-        // h (Left) from Pipeline should land on Terminal (wrap-around).
+    fn pipeline_detail_tab_cycles_backward() {
+        // h (Left) from Overview should land on Terminal (wrap-around).
         let mut app = make_app_default();
-        app.pipeline_detail_tab = PipelineDetailTab::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Overview;
         app.pipeline_detail_tab = match app.pipeline_detail_tab {
-            PipelineDetailTab::Pipeline => PipelineDetailTab::Terminal,
-            PipelineDetailTab::Issue => PipelineDetailTab::Pipeline,
-            PipelineDetailTab::Stages => PipelineDetailTab::Issue,
-            PipelineDetailTab::Log => PipelineDetailTab::Stages,
+            PipelineDetailTab::Overview => PipelineDetailTab::Terminal,
+            PipelineDetailTab::Issue => PipelineDetailTab::Overview,
+            PipelineDetailTab::Log => PipelineDetailTab::Issue,
             PipelineDetailTab::Summary => PipelineDetailTab::Log,
-            PipelineDetailTab::Refinement => PipelineDetailTab::Summary,
-            PipelineDetailTab::Terminal => PipelineDetailTab::Refinement,
+            PipelineDetailTab::Terminal => PipelineDetailTab::Summary,
         };
         assert_eq!(app.pipeline_detail_tab, PipelineDetailTab::Terminal);
     }
@@ -17939,7 +17990,7 @@
         // issue-body offset.  Scroll the field the visible list actually reads.
         let mut app = make_app_default();
         app.active_view = SidebarView::Pipeline;
-        app.pipeline_detail_tab = PipelineDetailTab::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Overview;
         app.pipeline_stage_content_scroll = 0;
         app.pipeline_detail_scroll = 0;
         assert!(app.scroll_focused_content(true));
@@ -19270,7 +19321,7 @@
             app.terminal_copy_mode_available(),
             "Pipeline Terminal tab: available"
         );
-        app.pipeline_detail_tab = PipelineDetailTab::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Overview;
         assert!(
             !app.terminal_copy_mode_available(),
             "Pipeline non-Terminal tab: unavailable"
@@ -23004,9 +23055,8 @@
         // Switch to Pipeline view.
         click_activity_icon(&mut driver, "▶");
         // Navigate to the Log tab (h cycles left; l/Right cycles right).
-        // Tabs: Pipeline → Issue → Stages → Log → ...
-        // Three presses of 'l' (right) from Pipeline tab → Log tab.
-        driver.press(quadraui::Key::Char('l'));
+        // #818 tab order: Overview → Issue → Log → ...
+        // Two presses of 'l' (right) from Overview tab → Log tab.
         driver.press(quadraui::Key::Char('l'));
         driver.press(quadraui::Key::Char('l'));
 

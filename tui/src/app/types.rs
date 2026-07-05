@@ -36,37 +36,28 @@ pub(crate) struct TestStepJob {
 }
 
 /// The tabs shown in the Pipeline view detail panel.
+///
+/// #818: Redesigned tab set — Stages and Refinement removed; Pipeline renamed
+/// to Overview.  A universal read-only stage strip is pinned at the top of
+/// every non-Overview tab when a pipeline entry exists.
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 pub(crate) enum PipelineDetailTab {
-    /// Horizontal stage view + repo/labels/gates meta.
+    /// Overview: horizontal stage boxes (click a box to expand that stage's
+    /// detail inline), repo/labels/gates meta, and focused-stage content.
+    /// Actions (Go / dispatch) are only available here.
     #[default]
-    Pipeline,
+    Overview,
     /// Full issue body text (scrollable with j/k).
     Issue,
-    /// Per-stage detail: assignment id, machine, status, timing,
-    /// exit code (or merge-queue state for the merge stage).
-    Stages,
-    /// Live worker log — same content as the watch overlay but inline
-    /// so the pipeline stage boxes remain visible above.
+    /// Live worker log — same content as the watch overlay but inline.
     Log,
     /// #558: session-history summary for the selected issue.  Lists every
-    /// work/review/fix session (newest-first) with type, machine,
-    /// status/verdict, and summary text.  Data is fetched from GitHub
-    /// issue comments on demand and cached per-issue.
+    /// work/review/fix session (oldest → newest) with type, machine,
+    /// status/verdict, and summary text.  Sourced from the in-memory board.
     Summary,
-    /// #264: refinement chat for the selected issue.  Empty placeholder
-    /// when no `type="refinement"` assignment is active for the row; an
-    /// embedded `ChatController` when one is — so the user can flip back
-    /// to Issue / Stages / Log while the chat keeps streaming in the
-    /// background.
-    Refinement,
     /// #440: per-issue interactive shell for the detail view.  Each active
     /// issue gets its own `TerminalSession`; only the selected issue's
     /// terminal is visible while others keep running in the background.
-    /// Focus arbitration mirrors the standalone Terminal pane: F12 toggles
-    /// PTY focus (detail_terminal_focused); F12-released keys drive normal
-    /// TUI navigation.  The #437 human-attended launcher will dock into
-    /// this tab in a follow-up — this PR hosts a generic shell only.
     Terminal,
 }
 
@@ -246,8 +237,10 @@ pub(crate) struct Assignment {
     #[serde(default)]
     pub(crate) output_tokens: i64,
     #[serde(default)]
+    #[allow(dead_code)] // populated from DB / SSE; not yet read in TUI render (#818 removed the Stages tab that displayed them)
     pub(crate) cache_creation_tokens: i64,
     #[serde(default)]
+    #[allow(dead_code)] // see above
     pub(crate) cache_read_tokens: i64,
     /// #546: true when the assignment ran as a human-attended interactive session
     /// (Max / Pro subscription).  Set by `finalize_interactive_exit`; prevents
