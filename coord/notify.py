@@ -250,6 +250,55 @@ def post_stuck(detection: StuckDetection, record: dict) -> None:
     mark_notified(_stuck_notified_key(detection.assignment_id), EVENT_STUCK)
 
 
+def _capture_completion_summary(transition: Transition, entry: dict) -> None:
+    """#874: parse the worker's ### Summary block and persist it on the row.
+
+    Tries the local log first, then falls back to the agent's /logs/<id>
+    endpoint for remote-agent assignments.  Silent on failure — a worker
+    that emits no summary leaves the field NULL without error.
+    """
+    from coord.progress import (  # noqa: PLC0415
+        parse_completion_summary_from_agent,
+        parse_completion_summary_from_log,
+    )
+    from coord.state import update_assignment_completion_summary  # noqa: PLC0415
+
+    prose: str | None = None
+    log_path = entry.get("log_path")
+    if log_path:
+        try:
+            prose = parse_completion_summary_from_log(Path(log_path))
+        except Exception as exc:  # noqa: BLE001
+            log.debug(
+                "_capture_completion_summary: failed to parse local log for %s: %s",
+                transition.assignment_id, exc,
+            )
+
+    if prose is None:
+        # Local log unavailable (remote-agent assignment) — fetch via the
+        # agent's /logs/<id> endpoint.  Same fallback used by smoke tests.
+        host = _agent_host(transition.machine_name)
+        if host:
+            try:
+                prose = parse_completion_summary_from_agent(host, transition.assignment_id)
+            except Exception as exc:  # noqa: BLE001
+                log.debug(
+                    "_capture_completion_summary: failed to fetch from agent %s for %s: %s",
+                    host, transition.assignment_id, exc,
+                )
+
+    if prose is None:
+        # No ### Summary block anywhere — leave completion_summary NULL.
+        return
+    try:
+        update_assignment_completion_summary(transition.assignment_id, prose)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "_capture_completion_summary: failed to persist summary for %s: %s",
+            transition.assignment_id, exc,
+        )
+
+
 def _capture_smoke_tests(transition: Transition, entry: dict) -> None:
     """#252: parse the worker's SMOKE_TESTS block and persist it on the row.
 
@@ -672,6 +721,9 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
     # moment so the TUI can render it under the Test stage.  Same
     # best-effort discipline — failure is silent.
     _capture_smoke_tests(transition, entry)
+    # #874: capture the worker's ### Summary prose block at the same moment
+    # so the board has a durable, queryable summary field.  Best-effort.
+    _capture_completion_summary(transition, entry)
     # #315: persist the worker's claude session ID so chat-continue can
     # pass --resume to the next worker.  Best-effort; silent on failure.
     _capture_claude_session_id(transition, entry)

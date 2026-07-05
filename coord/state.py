@@ -1108,6 +1108,44 @@ def _update_assignment_smoke_tests_local(
     conn.commit()
 
 
+def update_assignment_completion_summary(
+    assignment_id: str, summary: str,
+) -> None:
+    """#874: persist the worker's ### Summary prose on the assignment row.
+
+    Routes to the daemon via ``/assignment-usage`` when a ``board_service``
+    is set, so the field lands on the shared DB.  Falls back to a local
+    write.  Best-effort — callers catch exceptions; this helper does not
+    raise on a missing row.
+    """
+    if not assignment_id or not summary:
+        return
+    svc = _board_service()
+    resp = _route_write(
+        svc, "/assignment-usage", {"assignment_id": assignment_id, "completion_summary": summary}
+    )
+    if resp is not None:
+        return
+    _update_assignment_completion_summary_local(assignment_id, summary)
+
+
+def _update_assignment_completion_summary_local(
+    assignment_id: str, summary: str,
+) -> None:
+    """Local-DB write for :func:`update_assignment_completion_summary`.
+
+    Called directly by the daemon endpoint so it never re-routes back over HTTP.
+    """
+    if not assignment_id or not summary:
+        return
+    conn = get_connection()
+    conn.execute(
+        "UPDATE assignments SET completion_summary=? WHERE assignment_id=?",
+        (summary, assignment_id),
+    )
+    conn.commit()
+
+
 def update_assignment_claude_session_id(
     assignment_id: str, claude_session_id: str
 ) -> None:

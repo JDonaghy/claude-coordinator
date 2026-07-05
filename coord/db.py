@@ -324,6 +324,10 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # box can render "3/7 acceptance green" instead of a bare verdict.
         "ALTER TABLE assignments ADD COLUMN acceptance_total INTEGER",
         "ALTER TABLE assignments ADD COLUMN acceptance_passed INTEGER",
+        # #874: persist the worker's ### Summary prose block so the TUI's
+        # Summary tab has a durable, board-sourced field.  NULL when the
+        # worker emitted no summary (best-effort; never blocks completion).
+        "ALTER TABLE assignments ADD COLUMN completion_summary TEXT",
     ]
     for sql in migrations:
         try:

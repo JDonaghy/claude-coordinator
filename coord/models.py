@@ -263,6 +263,11 @@ class Assignment:
     # feature completes (docs/ORACLE_LOOP.md). None for rows predating #932.
     acceptance_total: int | None = None
     acceptance_passed: int | None = None
+    # #874: prose summary extracted from the worker's "### Summary" block
+    # and persisted at completion time.  NULL when the worker emitted no
+    # summary.  A durable, board-sourced complement to the ephemeral GitHub
+    # comment (which already contained the same text).
+    completion_summary: str | None = None
 
 
 @dataclass

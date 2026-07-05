@@ -1963,6 +1963,8 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 state._mark_assignment_interactive_local(aid)
             if "smoke_tests" in body and body["smoke_tests"] is not None:
                 state._update_assignment_smoke_tests_local(aid, body["smoke_tests"])
+            if "completion_summary" in body and body["completion_summary"]:
+                state._update_assignment_completion_summary_local(aid, body["completion_summary"])
         except Exception as e:  # noqa: BLE001
             return JSONResponse(
                 {"error": "assignment-usage write failed", "detail": str(e)},
