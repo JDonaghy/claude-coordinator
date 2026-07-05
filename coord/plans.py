@@ -1,0 +1,346 @@
+"""Pure aggregation for ``coord plans`` — the data backbone for the TUI
+"Plans" panel (#975).
+
+Every public function here is **pure / board-driven**: all inputs are plain
+Python values (milestone dicts, issue bodies, a :class:`~coord.models.Board`,
+sets of open/terminal issue numbers). No GitHub calls, no subprocess, no I/O.
+That keeps the stats cheap to unit-test with seeded fixtures.
+
+The CLI command (``coord/commands/plans.py``) fetches the raw inputs from
+GitHub and calls :func:`aggregate_plan` for each milestone in each configured
+repo.
+
+Design decisions (#974):
+- **tracking issue = "epic"-labelled issue under the milestone**.  This is the
+  same convention established in :mod:`coord.milestone_order`
+  (``TRACKING_ISSUE_LABEL = "epic"``).  An open milestone with no such issue is
+  reported with ``has_work_order = False`` and a ``"no_work_order"``
+  ``needs_you`` signal.
+- **Work order scope only**.  ``done``/``total`` counts count work-order
+  nodes, not all issues under the milestone (the work order is the declared
+  scope of automated dispatch).
+- **No remote branch check during aggregation**.  The ``branch_lookup``
+  parameter to :func:`~coord.milestone_order.ready_frontier` defaults to
+  ``lambda *_: []`` here — a background aggregate over many milestones should
+  not spawn N ``gh`` calls for branch checks.  ``in_flight`` is derived purely
+  from the board's active assignments.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+from coord.milestone_order import (
+    TRACKING_ISSUE_LABEL,
+    WorkOrder,
+    parse_work_order,
+    ready_frontier,
+)
+from coord.models import Board
+
+
+__all__ = [
+    "TRACKING_ISSUE_LABEL",
+    "PlanEntry",
+    "find_tracking_issue",
+    "aggregate_plan",
+    "aggregate_repo_plans",
+]
+
+
+# ── Data model ───────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class PlanEntry:
+    """Aggregated stats for one GitHub milestone in one repo.
+
+    All counts are scoped to the ``## Work order`` block of the milestone's
+    tracking epic.  When there is no work order the counts are all 0 and
+    ``needs_you`` contains ``"no_work_order"``.
+
+    Attributes:
+        repo:              coord-local repo name (``coordinator.yml`` key).
+        title:             Milestone title on GitHub.
+        milestone_number:  GitHub milestone number.
+        tracking_issue:    GitHub issue number of the epic/tracking issue, or
+                           ``None`` when none exists under this milestone.
+        has_work_order:    ``True`` iff the tracking body carries a parsed
+                           ``## Work order`` block with ≥1 node.
+        ready_frontier:    Number of work-order nodes ready to dispatch now
+                           (dependencies met, unclaimed, not terminal).
+        blocked:           Number of nodes blocked by unmet dependencies or a
+                           conflict (i.e. *not* claimed by an active assignment).
+        in_flight:         Number of nodes that are claimed by an active board
+                           assignment or a remote ``issue-N-*`` branch.
+        done:              Number of terminal (closed) work-order nodes.
+        total:             Total number of nodes in the work order.
+        needs_you:         Ordered list of attention signals.  Possible values:
+
+                           ``"no_work_order"``
+                               Open milestone with no parseable work order.
+                           ``"ready_waiting"``
+                               ≥1 ready-frontier entry exists to dispatch.
+                           ``"stalled"``
+                               Open, has a work order, but nothing is ready *or*
+                               in-flight and the milestone is not done.
+    """
+
+    repo: str
+    title: str
+    milestone_number: int
+    tracking_issue: int | None
+    has_work_order: bool
+    ready_frontier: int
+    blocked: int
+    in_flight: int
+    done: int
+    total: int
+    needs_you: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        """Serialise to a plain dict suitable for ``json.dumps``."""
+        return {
+            "repo": self.repo,
+            "title": self.title,
+            "milestone_number": self.milestone_number,
+            "tracking_issue": self.tracking_issue,
+            "has_work_order": self.has_work_order,
+            "ready_frontier": self.ready_frontier,
+            "blocked": self.blocked,
+            "in_flight": self.in_flight,
+            "done": self.done,
+            "total": self.total,
+            "needs_you": list(self.needs_you),
+        }
+
+
+# ── Pure helpers ─────────────────────────────────────────────────────────────
+
+
+def find_tracking_issue(
+    milestone_number: int,
+    open_issues: list[dict],
+) -> dict | None:
+    """Return the first open issue under *milestone_number* labelled ``"epic"``.
+
+    ``open_issues`` is the raw list returned by
+    :func:`coord.github_ops.get_open_issues` — each item has at least
+    ``"number"``, ``"labels"`` (list of ``{"name": ...}`` dicts), and
+    ``"milestone"`` (``None`` or ``{"number": ...}``).
+
+    Returns ``None`` when no epic is found for this milestone.  The caller
+    decides how to report a missing tracking issue.
+    """
+    for issue in open_issues:
+        ms = issue.get("milestone") or {}
+        if ms.get("number") != milestone_number:
+            continue
+        labels = [lbl.get("name", "") for lbl in (issue.get("labels") or [])]
+        if TRACKING_ISSUE_LABEL in labels:
+            return issue
+    return None
+
+
+def aggregate_plan(
+    *,
+    milestone_title: str,
+    milestone_number: int,
+    repo_name: str,
+    repo_github: str,
+    tracking_issue_number: int | None,
+    tracking_body: str | None,
+    board: Board,
+    open_issue_numbers: set[int],
+) -> PlanEntry:
+    """Compute a :class:`PlanEntry` for one milestone.
+
+    Parameters
+    ----------
+    milestone_title:
+        GitHub milestone title.
+    milestone_number:
+        GitHub milestone number.
+    repo_name:
+        coord-local repo name.
+    repo_github:
+        GitHub slug (``owner/repo``).
+    tracking_issue_number:
+        Issue number of the epic/tracking issue, or ``None``.
+    tracking_body:
+        Body text of the tracking issue, or ``None`` when there is no
+        tracking issue.  An empty string is treated the same as ``None``
+        (no work order).
+    board:
+        Current board state, used to find active assignments for in-flight
+        detection.
+    open_issue_numbers:
+        Set of GitHub issue numbers that are currently *open* under this
+        milestone.  Any work-order node **not** in this set is assumed
+        terminal (closed).
+
+    Returns
+    -------
+    PlanEntry
+        Aggregated stats.  When ``tracking_body`` is ``None`` / empty, or the
+        body has no ``## Work order`` block, ``has_work_order`` is ``False``
+        and all counts are 0.
+    """
+    _no_work_order = PlanEntry(
+        repo=repo_name,
+        title=milestone_title,
+        milestone_number=milestone_number,
+        tracking_issue=tracking_issue_number,
+        has_work_order=False,
+        ready_frontier=0,
+        blocked=0,
+        in_flight=0,
+        done=0,
+        total=0,
+        needs_you=["no_work_order"],
+    )
+
+    if not tracking_body:
+        return _no_work_order
+
+    try:
+        work_order: WorkOrder = parse_work_order(tracking_body)
+    except Exception:  # noqa: BLE001 — malformed work order; treat as absent
+        return _no_work_order
+
+    if not work_order.nodes:
+        return _no_work_order
+
+    # Terminal = declared in the work order but not currently open.
+    terminal_issues: set[int] = {
+        n.issue_number
+        for n in work_order.nodes
+        if n.issue_number not in open_issue_numbers
+    }
+
+    total = len(work_order.nodes)
+    done = len(terminal_issues)
+
+    frontier = ready_frontier(
+        work_order,
+        board,
+        repo_name=repo_name,
+        repo_github=repo_github,
+        terminal_issues=terminal_issues,
+        # No remote branch check here: a bulk aggregate must not spawn N gh
+        # calls for branch lookups.  In-flight is derived from the board only.
+        branch_lookup=lambda *_: [],
+    )
+
+    ready_count = len(frontier.ready)
+    in_flight_count = sum(1 for b in frontier.blocked if b.claim is not None)
+    blocked_count = sum(1 for b in frontier.blocked if b.claim is None)
+
+    needs_you: list[str] = []
+    if ready_count > 0:
+        needs_you.append("ready_waiting")
+    elif done < total and in_flight_count == 0:
+        needs_you.append("stalled")
+
+    return PlanEntry(
+        repo=repo_name,
+        title=milestone_title,
+        milestone_number=milestone_number,
+        tracking_issue=tracking_issue_number,
+        has_work_order=True,
+        ready_frontier=ready_count,
+        blocked=blocked_count,
+        in_flight=in_flight_count,
+        done=done,
+        total=total,
+        needs_you=needs_you,
+    )
+
+
+def aggregate_repo_plans(
+    *,
+    repo_name: str,
+    repo_github: str,
+    milestones: list[dict],
+    open_issues: list[dict],
+    board: Board,
+    issue_body_fetcher: "Callable[[int], str | None] | None" = None,
+) -> list[PlanEntry]:
+    """Aggregate plans for all milestones in one repo.
+
+    Parameters
+    ----------
+    repo_name:
+        coord-local repo name.
+    repo_github:
+        GitHub slug (``owner/repo``).
+    milestones:
+        List of milestone dicts (``{number, title, ...}``), as returned by
+        :func:`coord.github_ops.get_repo_milestones`.
+    open_issues:
+        List of all open issue dicts for the repo, as returned by
+        :func:`coord.github_ops.get_open_issues`.
+    board:
+        Current board state.
+    issue_body_fetcher:
+        Optional callable ``(issue_number: int) -> str | None`` that fetches
+        the body of a *single* issue by number.  Required only when the
+        tracking epic's body is not already in ``open_issues`` (it always
+        should be for an open epic, but the hook lets callers supply a
+        pre-fetched body map for testing).  When ``None``, body is read from
+        the matching entry in ``open_issues`` only.
+
+    Returns
+    -------
+    list[PlanEntry]
+        One entry per milestone, in the same order as *milestones*.
+    """
+    from typing import Callable  # noqa: PLC0415 — keep import cheap
+
+    # Build a quick index: issue_number → body from the open_issues snapshot.
+    body_index: dict[int, str] = {
+        i["number"]: (i.get("body") or "")
+        for i in open_issues
+    }
+
+    # Build open-issue-numbers per milestone.
+    open_by_milestone: dict[int, set[int]] = {}
+    for issue in open_issues:
+        ms = issue.get("milestone") or {}
+        ms_num = ms.get("number")
+        if ms_num is not None:
+            open_by_milestone.setdefault(ms_num, set()).add(issue["number"])
+
+    entries: list[PlanEntry] = []
+    for ms in milestones:
+        ms_num: int = ms["number"]
+        ms_title: str = ms.get("title", f"Milestone #{ms_num}")
+
+        tracking = find_tracking_issue(ms_num, open_issues)
+        tracking_number: int | None = tracking["number"] if tracking is not None else None
+
+        if tracking_number is not None:
+            body: str | None = body_index.get(tracking_number)
+            # Call the fetcher when the body is absent or empty — an empty
+            # string from the snapshot means the issue was returned without
+            # body text, so we fall back to a direct fetch if available.
+            if not body and issue_body_fetcher is not None:
+                body = issue_body_fetcher(tracking_number)
+        else:
+            body = None
+
+        open_nums = open_by_milestone.get(ms_num, set())
+
+        entry = aggregate_plan(
+            milestone_title=ms_title,
+            milestone_number=ms_num,
+            repo_name=repo_name,
+            repo_github=repo_github,
+            tracking_issue_number=tracking_number,
+            tracking_body=body,
+            board=board,
+            open_issue_numbers=open_nums,
+        )
+        entries.append(entry)
+
+    return entries
