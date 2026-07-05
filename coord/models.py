@@ -257,6 +257,12 @@ class Assignment:
     # future gate detect staleness (new commits since the last record) the
     # same way review_head_sha detects a stale review approval.
     acceptance_sha: str | None = None
+    # #932: per-test counts from the same verdict, so the Acceptance box can
+    # read as partial progress ("3/7 acceptance green") rather than a bare
+    # pass/fail — a growing suite is expected to be sub-100% until the
+    # feature completes (docs/ORACLE_LOOP.md). None for rows predating #932.
+    acceptance_total: int | None = None
+    acceptance_passed: int | None = None
 
 
 @dataclass

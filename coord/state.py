@@ -643,13 +643,17 @@ def record_acceptance_verdict(
     acceptance_state: str,
     acceptance_reason: str | None = None,
     acceptance_sha: str | None = None,
+    acceptance_total: int | None = None,
+    acceptance_passed: int | None = None,
 ) -> None:
     """Record an Acceptance-gate verdict on one assignment (#944, the oracle
     loop's external trust gate) — routes to the daemon when set.
 
     The single-row analogue of ``record_test_verdict``, called by ``coord
     acceptance record --issue N --sha <sha>`` after re-running the sealed
-    suite externally against the pushed SHA.
+    suite externally against the pushed SHA. ``acceptance_total`` /
+    ``acceptance_passed`` (#932) are the per-test counts backing the
+    Acceptance box's partial-green display (e.g. "3/7").
     """
     svc = _board_service()
     resp = _route_write(
@@ -660,6 +664,8 @@ def record_acceptance_verdict(
             "acceptance_state": acceptance_state,
             "acceptance_reason": acceptance_reason,
             "acceptance_sha": acceptance_sha,
+            "acceptance_total": acceptance_total,
+            "acceptance_passed": acceptance_passed,
         },
     )
     if resp is not None:
@@ -669,6 +675,8 @@ def record_acceptance_verdict(
         acceptance_state=acceptance_state,
         acceptance_reason=acceptance_reason,
         acceptance_sha=acceptance_sha,
+        acceptance_total=acceptance_total,
+        acceptance_passed=acceptance_passed,
     )
 
 
@@ -678,13 +686,23 @@ def _record_acceptance_verdict_local(
     acceptance_state: str,
     acceptance_reason: str | None = None,
     acceptance_sha: str | None = None,
+    acceptance_total: int | None = None,
+    acceptance_passed: int | None = None,
 ) -> None:
-    """UPDATE the assignment's acceptance_state/acceptance_reason/acceptance_sha."""
+    """UPDATE the assignment's acceptance_state/acceptance_reason/acceptance_sha
+    (+ #932's acceptance_total/acceptance_passed counts)."""
     conn = get_connection()
     conn.execute(
         "UPDATE assignments SET acceptance_state=?, acceptance_reason=?, "
-        "acceptance_sha=? WHERE assignment_id=?",
-        (acceptance_state, acceptance_reason, acceptance_sha, assignment_id),
+        "acceptance_sha=?, acceptance_total=?, acceptance_passed=? WHERE assignment_id=?",
+        (
+            acceptance_state,
+            acceptance_reason,
+            acceptance_sha,
+            acceptance_total,
+            acceptance_passed,
+            assignment_id,
+        ),
     )
     conn.commit()
 

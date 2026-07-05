@@ -1003,7 +1003,9 @@ pub(crate) fn load_data() -> BoardData {
              COALESCE(input_tokens, 0), COALESCE(output_tokens, 0), \
              COALESCE(cache_creation_tokens, 0), COALESCE(cache_read_tokens, 0), \
              COALESCE(is_interactive, 0), failure_reason, \
-             COALESCE(review_iteration, 0) \
+             COALESCE(review_iteration, 0), \
+             acceptance_state, acceptance_reason, acceptance_sha, \
+             acceptance_total, acceptance_passed \
              FROM assignments ORDER BY dispatched_at DESC",
         ) {
             Ok(s) => s,
@@ -1060,6 +1062,13 @@ pub(crate) fn load_data() -> BoardData {
                 // #803: fix-round counter for model escalation on the interactive
                 // --fix-of path.  COALESCE handles the pre-migration NULL case.
                 review_iteration: row.get::<_, i64>(26)?,
+                // #932/#944: the Acceptance-gate verdict, reported/gated
+                // separately from test_state.
+                acceptance_state: row.get::<_, Option<String>>(27)?,
+                acceptance_reason: row.get::<_, Option<String>>(28)?,
+                acceptance_sha: row.get::<_, Option<String>>(29)?,
+                acceptance_total: row.get::<_, Option<i64>>(30)?,
+                acceptance_passed: row.get::<_, Option<i64>>(31)?,
             })
         }) {
             Ok(r) => r,

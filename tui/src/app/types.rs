@@ -270,6 +270,28 @@ pub(crate) struct Assignment {
     /// [`fix_model_for_iteration`]: `next_iteration = review_iteration + 1`.
     #[serde(default)]
     pub(crate) review_iteration: i64,
+    /// #932/#944: the Acceptance-gate verdict (oracle loop,
+    /// docs/ORACLE_LOOP.md) for type="work" assignments, stamped by `coord
+    /// acceptance record --issue N --sha <sha>` — the coordinator's
+    /// external re-run of the sealed suite against the pushed SHA.
+    /// None | "passed" | "failed". Reported and gated SEPARATELY from
+    /// `test_state` — its own box, its own verdict.
+    #[serde(default)]
+    pub(crate) acceptance_state: Option<String>,
+    /// Short failing-test summary when `acceptance_state == "failed"`.
+    #[serde(default)]
+    pub(crate) acceptance_reason: Option<String>,
+    /// SHA the last `acceptance record` verdict was recorded against.
+    #[serde(default)]
+    pub(crate) acceptance_sha: Option<String>,
+    /// #932: per-test counts from the same verdict, so the Acceptance box
+    /// can read as partial progress ("3/7 acceptance green") rather than a
+    /// bare pass/fail — a growing suite is expected to be sub-100% until
+    /// the feature completes. `None` for rows predating this column.
+    #[serde(default)]
+    pub(crate) acceptance_total: Option<i64>,
+    #[serde(default)]
+    pub(crate) acceptance_passed: Option<i64>,
 }
 
 /// Deserialize a boolean the daemon may send as a SQLite-style integer (0/1)

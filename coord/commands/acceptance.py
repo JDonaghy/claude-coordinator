@@ -314,6 +314,10 @@ def _acceptance_record_local(
         acceptance_state=acceptance_state,
         acceptance_reason=reason,
         acceptance_sha=sha,
+        # #932: per-test counts so the Acceptance box can show partial
+        # progress ("3/7 acceptance green") instead of a bare verdict.
+        acceptance_total=verdict["total"],
+        acceptance_passed=verdict["passed"],
     )
 
     click.echo(json.dumps(verdict, indent=2))

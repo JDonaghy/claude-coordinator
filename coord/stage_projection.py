@@ -57,6 +57,9 @@ class _AssignmentLike(Protocol):
     test_state: str | None
     repo_name: str
     issue_number: int
+    acceptance_state: str | None
+    acceptance_total: int | None
+    acceptance_passed: int | None
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -208,6 +211,52 @@ def test_stage_status_for(
     if verdict == "failed":
         return FAILED
     return PENDING
+
+
+def acceptance_stage_status_for(assignments_for_issue: list) -> str:
+    """The Acceptance box's status (#932/#944) — reported and gated
+    *separately* from the Test box (docs/ORACLE_LOOP.md), so this mirrors
+    ``test_stage_status_for``'s shape but keys off
+    ``Assignment.acceptance_state`` rather than a dedicated assignment
+    type: ``coord acceptance record`` stamps the verdict directly onto the
+    work assignment row (see ``coord/commands/acceptance.py``), it never
+    spawns a separate ``type="acceptance"`` assignment.
+
+    Distinct from Test in one more way: an issue with no acceptance suite
+    authored yet (no manifest slice, so ``acceptance record`` was never run
+    against it) has no signal at all — SKIPPED rather than PENDING, since
+    the Acceptance box only applies to oracle-loop milestones, not every
+    issue on the board.
+    """
+    work = [a for a in assignments_for_issue if (a.type or "work") == "work"]
+    with_state = [a for a in work if (a.acceptance_state or "") != ""]
+    if not with_state:
+        return SKIPPED
+    latest = _latest_by_dispatch(with_state)
+    state = latest.acceptance_state
+    if state == "passed":
+        return DONE
+    if state == "failed":
+        return FAILED
+    return PENDING
+
+
+def acceptance_progress_for(assignments_for_issue: list) -> dict[str, int] | None:
+    """``{"passed": p, "total": t}`` from the latest recorded acceptance
+    verdict for this issue, or ``None`` when no verdict exists yet or it
+    predates #932's per-test counts. Backs the Acceptance box's
+    partial-green display (e.g. "3/7 acceptance green") — a growing suite
+    is *expected* to read sub-100% until the feature completes
+    (docs/ORACLE_LOOP.md), so this is reporting, not a pass/fail gate.
+    """
+    work = [a for a in assignments_for_issue if (a.type or "work") == "work"]
+    with_state = [a for a in work if (a.acceptance_state or "") != ""]
+    if not with_state:
+        return None
+    latest = _latest_by_dispatch(with_state)
+    if latest.acceptance_total is None or latest.acceptance_passed is None:
+        return None
+    return {"passed": latest.acceptance_passed, "total": latest.acceptance_total}
 
 
 def merge_stage_status_for(
@@ -386,8 +435,14 @@ def compute_issue_projection(
     stages["merge"] = merge_stage_status_for(
         assignments_for_issue, merge_entry, is_closed=is_closed, ci_store=ci_store
     )
+    # #932: the Acceptance box, computed unconditionally like "merge" above
+    # (own box, own verdict — reported separately from the Test stage) and
+    # excluded from the per-issue stage-strip ordering that `default_gates`
+    # drives, since it only applies to oracle-loop milestones.
+    stages["acceptance"] = acceptance_stage_status_for(assignments_for_issue)
     return {
         "stages": stages,
+        "acceptance_progress": acceptance_progress_for(assignments_for_issue),
         "has_approved_review": issue_has_any_approved_review(
             assignments_for_issue,
             seed_work_id=merge_entry.assignment_id if merge_entry is not None else None,

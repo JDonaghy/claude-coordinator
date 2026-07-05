@@ -627,6 +627,11 @@ mod pure_tests {
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
         }
     }
 
