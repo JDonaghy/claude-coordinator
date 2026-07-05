@@ -121,6 +121,8 @@ def row_to_assignment(row: object) -> Assignment:
         # #932: per-test counts; None for rows predating this column.
         acceptance_total=d.get("acceptance_total"),
         acceptance_passed=d.get("acceptance_passed"),
+        # #874: worker ### Summary prose; None when the worker emitted no block.
+        completion_summary=d.get("completion_summary"),
     )
 
 

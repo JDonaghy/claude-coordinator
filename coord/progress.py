@@ -251,6 +251,131 @@ def parse_smoke_tests_from_agent(
     return _extract_smoke_tests_from_text(text)
 
 
+# #874: workers emit a "### Summary" markdown heading before finishing.
+# The block extends to the next "###" heading or to end-of-text.  We
+# pick the LAST occurrence (workers may recap after final fixes).
+#
+# NOTE: use [ \t]* (horizontal whitespace only) in the prefix — NOT \s* —
+# so the blank line after the heading is NOT consumed by the prefix match.
+# With re.DOTALL, \s* would greedily eat the blank \n, shifting the
+# captured group to start at the *next* ### heading's content instead.
+_SUMMARY_BLOCK_RE = re.compile(
+    r"###[ \t]+Summary[ \t]*\n(.*?)(?=\n###[ \t]|\Z)",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _extract_completion_summary_from_text(text: str) -> str | None:
+    """#874: pull the ### Summary block out of *text*.
+
+    Returns:
+      * ``None`` — no "### Summary" heading found.
+      * ``str``  — the prose text immediately under the heading, stripped
+        of leading/trailing whitespace.  Empty string is folded to None
+        (an empty heading is treated as absent).
+
+    Picks the LAST block in the text in case the worker re-emitted the
+    section after further edits.
+    """
+    matches = list(_SUMMARY_BLOCK_RE.finditer(text))
+    if not matches:
+        return None
+    prose = matches[-1].group(1).strip()
+    return prose if prose else None
+
+
+def parse_completion_summary_from_log(
+    log_path: str | Path, tail_bytes: int = 65_536,
+) -> str | None:
+    """#874: read the tail of *log_path* and extract any ### Summary block.
+
+    Handles both stream-json logs (decodes assistant text events first)
+    and legacy plain-text logs.  Returns the same two-state result as
+    :func:`_extract_completion_summary_from_text`.
+    """
+    p = Path(log_path)
+    if not p.exists():
+        return None
+
+    from coord.worker_events import is_stream_json  # noqa: PLC0415
+
+    if is_stream_json(p):
+        from coord.worker_events import _assistant_text, parse_event  # noqa: PLC0415
+        texts: list[str] = []
+        try:
+            with open(p, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    event = parse_event(line.rstrip("\n"))
+                    if event is None or event.type != "assistant":
+                        continue
+                    t = _assistant_text(event)
+                    if t:
+                        texts.append(t)
+        except OSError:
+            return None
+        return _extract_completion_summary_from_text("\n".join(texts))
+
+    try:
+        size = p.stat().st_size
+        with open(p, encoding="utf-8", errors="replace") as f:
+            if size > tail_bytes:
+                f.seek(size - tail_bytes)
+                f.readline()  # skip partial line
+            text = f.read()
+    except OSError:
+        return None
+    return _extract_completion_summary_from_text(text)
+
+
+def parse_completion_summary_from_agent(
+    host: str,
+    assignment_id: str,
+    port: int = 7433,
+    timeout: float = 15.0,
+) -> str | None:
+    """#874: fetch a worker's log via the agent's ``/logs/<id>`` endpoint
+    and extract the ### Summary block.
+
+    Use this instead of :func:`parse_completion_summary_from_log` when the
+    worker ran on a remote agent and the log isn't on the coordinator's local
+    filesystem.  Mirrors :func:`parse_smoke_tests_from_agent`.
+    """
+    import httpx  # noqa: PLC0415
+
+    url = f"http://{host}:{port}/logs/{assignment_id}"
+    try:
+        resp = httpx.get(url, timeout=timeout)
+        resp.raise_for_status()
+        text = resp.text
+    except (httpx.HTTPError, httpx.TimeoutException):
+        return None
+    if not text:
+        return None
+
+    # Detect stream-json the same way is_stream_json() does for files.
+    stream_json = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        stream_json = stripped.startswith("{")
+        break
+
+    if stream_json:
+        from coord.worker_events import _assistant_text, parse_event  # noqa: PLC0415
+        decoded: list[str] = []
+        for line in text.splitlines():
+            event = parse_event(line.rstrip("\n"))
+            if event is None or event.type != "assistant":
+                continue
+            t = _assistant_text(event)
+            if t:
+                decoded.append(t)
+        return _extract_completion_summary_from_text("\n".join(decoded))
+
+    return _extract_completion_summary_from_text(text)
+
+
 def _detect_warnings(progress: WorkerProgress, all_updates: list[str]) -> None:
     if progress.stuck:
         progress.warnings.append("worker is STUCK and waiting for guidance")
