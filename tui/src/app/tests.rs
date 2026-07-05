@@ -14370,6 +14370,21 @@
             "#818: stage strip must show Work stage on Summary tab:\n{}",
             driver.screen(),
         );
+        // #818 fix-iteration-1 regression guard: the strip must render the
+        // *boxed* style — status icon inside a bordered box — not collapse
+        // to a flat single-line row. The status icon (✓ for the completed
+        // Work stage here) only appears once the box has enough interior
+        // rows (`quadraui::tui::pipeline_view::draw_pipeline_view` needs
+        // box height >= 3 to place the icon row); a too-short strip rect
+        // (the original #818 bug) draws only the top/bottom border with no
+        // icon or label, so the corner glyph alone does NOT catch this —
+        // the icon glyph does.
+        assert!(
+            driver.screen_contains("✓"),
+            "#818: stage strip must render the boxed style (status icon), \
+             not a flat line:\n{}",
+            driver.screen(),
+        );
         // Summary session entries must also be visible below the strip:
         // the machine name "m1" appears in the session header row.
         assert!(
