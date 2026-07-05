@@ -166,8 +166,16 @@ class AcceptanceDriverConfig:
     verdicts to stdout. ``mock`` is a glob (relative to the acceptance dir)
     for the viewable mock/assertion fixtures — informational today, consumed
     by the future mock-author (#930). ``capability`` is the machine
-    capability required to run this driver, routed the same way
-    ``smoke_tests.capability_rules`` routes smoke tests.
+    capability required to run this driver, intended to be routed the same
+    way ``smoke_tests.capability_rules`` routes smoke tests.
+
+    NOTE (#944 review): parsed and validated here, but not yet *consulted* —
+    ``coord acceptance record``'s daemon-routed run (#944) always executes on
+    whatever host ``resolve_board_service()`` points at, with no capability
+    check. Wiring ``record`` through ``capability_rules``-style routing (the
+    way ``coord test``'s ``pick_smoke_machine``/``match_rules`` route smoke
+    runs to capable hardware) is left to #932, which owns dispatching the
+    run stage.
     """
 
     kind: str = ""

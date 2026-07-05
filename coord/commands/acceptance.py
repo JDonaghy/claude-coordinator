@@ -278,7 +278,15 @@ def _acceptance_record_local(
         _remove_acceptance_worktree(repo_dir, wt_path)
         sys.exit(1)
 
-    verdict = _scoped_verdict(result.tests, wt_path / ACCEPTANCE_DIRNAME, issue_number)
+    # #944 review: _scoped_verdict exits(1) internally for a manifest that
+    # hasn't been authored yet / has no slice for this issue — a
+    # configuration error, not a real (kept-for-inspection) test failure, so
+    # the throwaway worktree must still be cleaned up on the way out.
+    try:
+        verdict = _scoped_verdict(result.tests, wt_path / ACCEPTANCE_DIRNAME, issue_number)
+    except SystemExit:
+        _remove_acceptance_worktree(repo_dir, wt_path)
+        raise
 
     from coord.board_service import read_board  # noqa: PLC0415
     from coord.diagnose import stage_assignments  # noqa: PLC0415
@@ -291,6 +299,9 @@ def _acceptance_record_local(
             "cannot record verdict",
             err=True,
         )
+        # Same rationale: a lookup error, not a failing-verdict "kept for
+        # inspection" case — don't leak the worktree.
+        _remove_acceptance_worktree(repo_dir, wt_path)
         sys.exit(1)
     assignment_id = work_rows[0].assignment_id
 
