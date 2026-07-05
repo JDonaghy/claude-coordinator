@@ -238,3 +238,41 @@ Note: requires agents >= 0.3.0 for `--force` to work.
   - The parent issue's body should say plainly **"Status: parent/tracking issue"** and
     list the remaining open sub-issues, so anyone who lands on it — human or agent —
     doesn't mistake it for actionable work.
+
+  **Every epic holds the plan AND a machine-readable work order — add this as a matter of
+  course.** The tracking issue is the single home for both the *intent* and the *dispatch
+  DAG*, so it can be read, chatted with, and drained by tooling. Whenever you create an epic
+  or carve a milestone, the tracking issue must carry, by default:
+
+  1. **The overall plan** — why the epic exists, how it decomposes into sub-issues, the
+     consumer/dependency structure, and the key decisions. Prose in the body.
+  2. **A `## Work order` block** — the dispatch DAG as checklist lines and NOTHING else under
+     that heading: `- [ ] #NNN  {group: A}` for concurrent roots, `- [ ] #NNN  {after: #X,#Y}`
+     for hard deps. Keep any ASCII DAG / step table in a SEPARATE section (e.g.
+     `## Dispatch plan`) — `coord milestone write-order` idempotently **replaces the entire
+     `## Work order` section**, so anything parked under that heading is destroyed on the next
+     rewrite (this is why #947 keeps its DAG in `docs/ORACLE_LOOP.md`).
+  3. **Runtime notes** per node: coord-live (editable install → immediate) vs. needs-release
+     (touches `agent.py`/worker prompts → PyPI + `coord agent update`) vs. coord-tui (local
+     `cargo build` + copy binary, no PyPI).
+
+  Use the milestone seam (#767/#770) — **never raw `gh` for the work order**:
+
+  ```
+  coord milestone write-order <repo> <issue> --file lines.txt  # validate (cycles, unknown
+        # after-targets, milestone membership) + idempotently splice the ## Work order block
+  coord milestone order    <repo> <issue>   # parse + print the ready frontier / blocked set
+  coord milestone dispatch <repo> <issue>   # promote the ready frontier into the pipeline
+  coord milestone chat     <repo> <issue>   # dispatch a milestone-steward chat: an agent seeded
+        # with the epic body + open sub-issues that discusses next steps and (only on your
+        # confirmation) writes the ## Work order via write-order. THIS is "chat in the epic".
+  ```
+
+  - **Cross-milestone `after:` edges are rejected** by the validator. A hard dep on an issue
+    in another milestone (e.g. #973's #972 needs #952, which lives in milestone #26) goes in
+    the step table / runtime notes as a prose prereq — NOT as a machine edge.
+  - To refine next steps *inside* an epic, dispatch `coord milestone chat` rather than editing
+    the body by hand — the steward proposes/updates the work order through the validated write
+    path and keeps the plan and the DAG in sync.
+  - Canonical examples: **#947** (oracle-loop, milestone #25) and **#973** (fleet session
+    substrate, milestone #28 — DAG/table in the epic's `## Dispatch plan` section).
