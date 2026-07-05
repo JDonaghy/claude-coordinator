@@ -13,6 +13,8 @@ from coord.acceptance import (
     dump_manifest_error_hint,
     failure_summary,
     load_manifest,
+    ms_dir_for_issue,
+    oracle_loop_contract_block,
 )
 # Aliased on import: pytest treats any module-level `test_*` name as a
 # collectible test function, and `test_ids_for_issue` takes required
@@ -132,3 +134,57 @@ class TestFailureSummary:
 def test_dump_manifest_error_hint_mentions_authoring_issue(tmp_path: Path) -> None:
     hint = dump_manifest_error_hint(tmp_path / "tests" / "acceptance")
     assert "not been authored" in hint
+
+
+class TestMsDirForIssue:
+    def test_missing_dir_returns_none(self, tmp_path: Path) -> None:
+        assert ms_dir_for_issue(tmp_path / "tests" / "acceptance", 945) is None
+
+    def test_finds_owning_dir(self, tmp_path: Path) -> None:
+        root = tmp_path / "tests" / "acceptance"
+        (root / "ms01").mkdir(parents=True)
+        (root / "ms02").mkdir(parents=True)
+        (root / "ms01" / "manifest.yml").write_text("tests:\n  ms01::a: 944\n")
+        (root / "ms02" / "manifest.yml").write_text("tests:\n  ms02::b: 945\n")
+        assert ms_dir_for_issue(root, 945) == "ms02"
+        assert ms_dir_for_issue(root, 944) == "ms01"
+
+    def test_issue_not_in_any_manifest_returns_none(self, tmp_path: Path) -> None:
+        root = tmp_path / "tests" / "acceptance"
+        (root / "ms01").mkdir(parents=True)
+        (root / "ms01" / "manifest.yml").write_text("tests:\n  ms01::a: 944\n")
+        assert ms_dir_for_issue(root, 999) is None
+
+    def test_malformed_manifest_propagates(self, tmp_path: Path) -> None:
+        root = tmp_path / "tests" / "acceptance"
+        (root / "ms01").mkdir(parents=True)
+        (root / "ms01" / "manifest.yml").write_text("tests: [not, a, mapping\n")
+        with pytest.raises(ManifestError):
+            ms_dir_for_issue(root, 945)
+
+
+class TestOracleLoopContractBlock:
+    def test_empty_when_issue_not_authored(self, tmp_path: Path) -> None:
+        root = tmp_path / "tests" / "acceptance"
+        assert oracle_loop_contract_block(root, "api", 945) == ""
+
+    def test_empty_on_malformed_manifest(self, tmp_path: Path) -> None:
+        # Fail-soft (#603-style): a manifest read hiccup must never blow up
+        # the dispatch hot path — it degrades to "no block" instead.
+        root = tmp_path / "tests" / "acceptance"
+        (root / "ms01").mkdir(parents=True)
+        (root / "ms01" / "manifest.yml").write_text("tests: [not, a, mapping\n")
+        assert oracle_loop_contract_block(root, "api", 945) == ""
+
+    def test_block_names_contract_path_and_run_command(self, tmp_path: Path) -> None:
+        root = tmp_path / "tests" / "acceptance"
+        (root / "ms25").mkdir(parents=True)
+        (root / "ms25" / "manifest.yml").write_text("tests:\n  ms25::a: 945\n")
+        block = oracle_loop_contract_block(root, "api", 945)
+        assert block.startswith("## 🔒 Oracle-loop acceptance contract")
+        assert "tests/acceptance/ms25/contract.md" in block
+        assert "coord acceptance run --repo api --issue 945" in block
+        assert "tests/acceptance/**" in block
+        assert "STUCK:" in block
+        # #846 not implemented yet — must not tell the worker to run it.
+        assert "coord acceptance stall" not in block

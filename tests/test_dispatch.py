@@ -254,6 +254,78 @@ class TestDispatch:
         payload = mock_post.call_args.kwargs["json"]
         assert payload["files_forbidden"].count("tests/acceptance/") == 1
 
+    @patch("coord.dispatch.httpx.post")
+    def test_payload_prepends_oracle_loop_contract_when_slice_authored(
+        self, mock_post: MagicMock, proposal: Proposal, tmp_path, coord_db,
+    ) -> None:
+        """#945: a repo with an acceptance driver configured AND an authored
+        manifest slice for this issue gets the oracle-loop contract block
+        prepended (after the #603 digest, before the original briefing)."""
+        from coord.config import AcceptanceConfig, AcceptanceDriverConfig
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        acceptance_dir = tmp_path / "tests" / "acceptance" / "ms01"
+        acceptance_dir.mkdir(parents=True)
+        (acceptance_dir / "manifest.yml").write_text("tests:\n  ms01::a: 10\n")
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": str(tmp_path)},
+            )],
+            acceptance=AcceptanceConfig(drivers={
+                "api": AcceptanceDriverConfig(kind="tui-tuidriver", run="cargo test"),
+            }),
+        )
+        dispatch(proposal, cfg)
+        briefing = mock_post.call_args.kwargs["json"]["briefing"]
+        assert "## 🔒 Oracle-loop acceptance contract" in briefing
+        assert "tests/acceptance/ms01/contract.md" in briefing
+        assert "coord acceptance run --repo api --issue 10" in briefing
+        assert briefing.rstrip().endswith("Fix the auth module")  # original briefing last
+
+    @patch("coord.dispatch.httpx.post")
+    def test_payload_no_oracle_loop_contract_without_driver(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal, coord_db,
+    ) -> None:
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+        dispatch(proposal, config)
+        briefing = mock_post.call_args.kwargs["json"]["briefing"]
+        assert "Oracle-loop acceptance contract" not in briefing
+
+    @patch("coord.dispatch.httpx.post")
+    def test_payload_no_oracle_loop_contract_when_issue_not_authored(
+        self, mock_post: MagicMock, proposal: Proposal, tmp_path, coord_db,
+    ) -> None:
+        """Driver configured, but no manifest covers this issue yet (Gate
+        A/#931 hasn't authored its slice) — no block, no crash."""
+        from coord.config import AcceptanceConfig, AcceptanceDriverConfig
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": str(tmp_path)},
+            )],
+            acceptance=AcceptanceConfig(drivers={
+                "api": AcceptanceDriverConfig(kind="tui-tuidriver", run="cargo test"),
+            }),
+        )
+        dispatch(proposal, cfg)
+        briefing = mock_post.call_args.kwargs["json"]["briefing"]
+        assert "Oracle-loop acceptance contract" not in briefing
+        assert briefing == "Fix the auth module"
+
     def test_unknown_machine_raises(self, config: Config) -> None:
         bad = Proposal(
             id=1, machine_name="ghost", repo_name="api",
