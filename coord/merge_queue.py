@@ -239,6 +239,54 @@ def has_smoke_verdict(entry: "QueuedMerge", board) -> bool:
     )
 
 
+# Stored error strings that only reflect the gate state *at the moment a
+# merge attempt ran* (`process()`) — nothing clears them when the approval or
+# verdict they're waiting on lands outside of a merge attempt (a normal
+# interactive review, no `coord merge`/auto-loop tick in between). See #420.
+_STALE_GATE_ERRORS = frozenset({
+    "review required but not approved",
+    "review required but board unavailable to confirm approval",
+    "smoke test required but no verdict recorded",
+    "smoke test required but board unavailable to confirm verdict",
+})
+
+
+def display_error(entry: "QueuedMerge", board, config) -> str | None:
+    """Return the error to show for *entry* in a read-only display (``coord
+    status``, dashboards) — recomputing the review/smoke gates live instead
+    of trusting the stored ``entry.error`` string verbatim.
+
+    #420: ``entry.error`` is only refreshed by :func:`process` (a real merge
+    attempt) or ``refresh_entry_assignment``. When a review approves — or a
+    smoke verdict is recorded — through the normal path (no ``coord merge``
+    run, no auto-loop tick in between), nothing clears the stored string, so
+    a mergeable entry can keep showing e.g. "review required but not
+    approved" indefinitely. Left unchecked this invites operators to bounce
+    already-approved work back for another round (the #410 real-world case).
+
+    Only the two gate messages known to go stale this way are recomputed
+    here, and recomputation is pure board/config lookups — no I/O. Every
+    other stored error (merge conflicts, CI check results) reflects the
+    outcome of the *last actual attempt* and is left untouched; re-checking
+    CI on every ``coord status`` would mean a live ``gh`` call per queue
+    entry just to render a status line.
+    """
+    if entry.error not in _STALE_GATE_ERRORS:
+        return entry.error
+    if board is None or config is None:
+        # Can't recompute without both — fall back to the stored string.
+        return entry.error
+    if entry.error.startswith("review"):
+        if requires_review(entry, config) and not has_approved_review(entry, board):
+            return entry.error
+        return None
+    if entry.error.startswith("smoke"):
+        if requires_smoke(entry, config) and not has_smoke_verdict(entry, board):
+            return entry.error
+        return None
+    return entry.error  # pragma: no cover — unreachable, kept for safety
+
+
 @dataclass
 class QueuedMerge:
     assignment_id: str

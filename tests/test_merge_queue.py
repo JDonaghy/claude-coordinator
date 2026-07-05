@@ -2199,3 +2199,120 @@ class TestStagingItems:
         cfg = self._config()
         items = mq.staging_items(Board(active=[], completed=[]), cfg)
         assert items == []
+
+
+# ── #420: display_error — recompute stale gate errors live ──────────────────
+
+class TestDisplayError:
+    """`coord status`'s merge-queue section must not echo a stored
+    ``entry.error`` verbatim when it was a review/smoke gate message — that
+    string is only refreshed by a real merge attempt (`process()`), so an
+    approval or verdict recorded afterward (the normal interactive path, no
+    `coord merge`/auto-loop tick in between) would otherwise keep showing as
+    "blocked" forever, inviting an operator to redundantly bounce already-
+    approved work (the #410 real-world case).
+    """
+
+    @staticmethod
+    def _config(*, review_enabled: bool = True, gates: list[str] | None = None):
+        from dataclasses import dataclass, field as dc_field
+        @dataclass
+        class _Reviews:
+            enabled: bool = True
+        @dataclass
+        class _Pipeline:
+            default_gates: list[str] | None = None
+        @dataclass
+        class _Cfg:
+            reviews: _Reviews = dc_field(default_factory=_Reviews)
+            pipeline: _Pipeline = dc_field(default_factory=_Pipeline)
+        cfg = _Cfg()
+        cfg.reviews.enabled = review_enabled
+        cfg.pipeline.default_gates = gates if gates is not None else ["review", "test", "merge"]
+        return cfg
+
+    @staticmethod
+    def _board(active=None, completed=None):
+        from coord.models import Board
+        return Board(active=list(active or []), completed=list(completed or []))
+
+    @staticmethod
+    def _work(aid: str = "w1", *, test_state: str | None = None) -> Assignment:
+        return Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id=aid, type="work", status="done", branch=f"worker/{aid}",
+            test_state=test_state,
+        )
+
+    @staticmethod
+    def _review(of_aid: str, *, verdict: str | None = "approve") -> Assignment:
+        return Assignment(
+            machine_name="m2", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id=f"rev-{of_aid}", type="review", status="done",
+            review_of_assignment_id=of_aid, review_verdict=verdict,
+        )
+
+    def test_clears_stale_review_error_once_approved(self) -> None:
+        """The #410 case: entry.error was stamped before the approval landed;
+        a later read must not keep showing "review required but not approved"."""
+        cfg = self._config()
+        entry = _q("w1")
+        entry.error = "review required but not approved"
+        board = self._board(completed=[
+            self._work("w1"), self._review("w1", verdict="approve"),
+        ])
+        assert mq.display_error(entry, board, cfg) is None
+
+    def test_keeps_review_error_when_still_unapproved(self) -> None:
+        cfg = self._config()
+        entry = _q("w1")
+        entry.error = "review required but not approved"
+        board = self._board(completed=[self._work("w1")])
+        assert mq.display_error(entry, board, cfg) == "review required but not approved"
+
+    def test_keeps_review_error_when_request_changes(self) -> None:
+        cfg = self._config()
+        entry = _q("w1")
+        entry.error = "review required but not approved"
+        board = self._board(completed=[
+            self._work("w1"), self._review("w1", verdict="request-changes"),
+        ])
+        assert mq.display_error(entry, board, cfg) == "review required but not approved"
+
+    def test_clears_stale_smoke_error_once_verdict_recorded(self) -> None:
+        cfg = self._config(review_enabled=False, gates=["test", "merge"])
+        entry = _q("w1")
+        entry.error = "smoke test required but no verdict recorded"
+        board = self._board(completed=[self._work("w1", test_state="passed")])
+        assert mq.display_error(entry, board, cfg) is None
+
+    def test_keeps_smoke_error_when_no_verdict_yet(self) -> None:
+        cfg = self._config(review_enabled=False, gates=["test", "merge"])
+        entry = _q("w1")
+        entry.error = "smoke test required but no verdict recorded"
+        board = self._board(completed=[self._work("w1")])
+        assert mq.display_error(entry, board, cfg) == "smoke test required but no verdict recorded"
+
+    def test_other_errors_pass_through_unchanged(self) -> None:
+        """Conflict/CI errors reflect the outcome of the last real attempt —
+        they must not be recomputed just because board/config are available."""
+        cfg = self._config()
+        entry = _q("w1")
+        entry.error = "checks failed: build (failure)"
+        board = self._board(completed=[
+            self._work("w1"), self._review("w1", verdict="approve"),
+        ])
+        assert mq.display_error(entry, board, cfg) == "checks failed: build (failure)"
+
+    def test_none_error_stays_none(self) -> None:
+        cfg = self._config()
+        entry = _q("w1")
+        board = self._board()
+        assert mq.display_error(entry, board, cfg) is None
+
+    def test_falls_back_to_stored_error_without_board_or_config(self) -> None:
+        """Can't safely recompute without both board and config — keep the
+        stored string rather than silently dropping a real block."""
+        entry = _q("w1")
+        entry.error = "review required but not approved"
+        assert mq.display_error(entry, None, None) == "review required but not approved"
