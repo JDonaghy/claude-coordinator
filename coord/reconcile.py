@@ -772,7 +772,12 @@ def reconcile_board_merges(
         though it's merged.  So this sweep also clears a lingering
         ``review_state='pending'`` via :func:`state.mark_work_review_settled`
         (#951), mirroring how sweep (e) below settles the sibling
-        review/smoke/conflict-fix rows.
+        review/smoke/conflict-fix rows. This only reaches rows still carrying
+        ``status='done'`` — a row whose ``status`` already flipped to
+        ``'merged'`` in a *prior* reconcile run permanently drops out of this
+        sweep's candidate list, so sweep (e) below also matches
+        ``type='work' status='merged' review_state='pending'`` to catch those
+        (#951 round 2).
 
     Both sweeps are **conservative**: they never act when uncertain and append a
     skip reason instead.  *repo* filters to a single local repo name.  When
@@ -884,10 +889,10 @@ def reconcile_board_merges(
             + (" [dry-run]" if dry_run else "")
         )
 
-    # (e) #894 — settle sibling ghost rows for terminal issues.
+    # (e) #894/#951 — settle sibling ghost rows for terminal issues.
     #
     # The #609 sweep (b) only processes type='work' status='done' rows, so it
-    # misses two classes of lingering ghost rows for already-merged/closed issues:
+    # misses three classes of lingering ghost rows for already-merged/closed issues:
     #
     #   * type=review/smoke/conflict-fix rows whose status='done' but
     #     review_state='pending' — the interactive-completion path
@@ -899,6 +904,19 @@ def reconcile_board_merges(
     #   * status='advisory' rows (any type) — the #609 candidates filter requires
     #     status='done', so advisory rows are never reached.  They linger in the
     #     TUI's advisory view after the issue is terminal.
+    #
+    #   * type='work' rows whose status is ALREADY 'merged' but review_state is
+    #     still 'pending' (#951) — once `mark_assignment_merged` (#609) flips a
+    #     row's status to 'merged' (in this run's sweep (b) above, or in a prior
+    #     reconcile run), it permanently drops out of sweep (b)'s
+    #     status=='done' candidates list on every future pass, so a
+    #     review_state='pending' ghost left on it (from #609 predating the
+    #     review_state clear added above, or any other stale write) is never
+    #     revisited. `state.mark_work_review_settled` already handles
+    #     status='merged' rows fine (no status gate) — the gap was purely that
+    #     reconcile() never called it for a row outside sweep (b)'s candidate
+    #     set. This class fixes that: it directly matches the bug report's
+    #     scenario of already-merged+closed issues stuck "awaiting review".
     #
     # This sweep is conservative and fail-open:
     #   - Only acts when work_is_terminal(...) is confirmed true.
@@ -932,6 +950,11 @@ def reconcile_board_merges(
                 and a.review_state == "pending"
             )
             or a.status == "advisory"
+            or (
+                a.type == "work"
+                and a.status == "merged"
+                and a.review_state == "pending"
+            )
         )
         and (repo is None or a.repo_name == repo)
         and (issue is None or a.issue_number == issue)
@@ -965,6 +988,20 @@ def reconcile_board_merges(
             if not dry_run:
                 a.status = "merged"
                 state.mark_advisory_settled(a.assignment_id or "")
+        elif a.type == "work":
+            # #951: type=work, status=merged, review_state=pending — a row
+            # that already fell out of sweep (b)'s status=='done' candidates
+            # in a prior run (or earlier in this run) but still carries a
+            # review_state ghost. status is already 'merged', so only the
+            # review_state needs settling.
+            actions.append(
+                f"settle work review_state {a.assignment_id} "
+                f"({a.repo_name} #{a.issue_number})"
+                + (" [dry-run]" if dry_run else "")
+            )
+            if not dry_run:
+                a.review_state = "done"
+                state.mark_work_review_settled(a.assignment_id or "")
         else:
             # type=review/smoke/conflict-fix, status=done, review_state=pending
             actions.append(
