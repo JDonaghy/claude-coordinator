@@ -123,4 +123,7 @@ export interface Assignment {
   cache_creation_tokens: number
   cache_read_tokens: number
   failure_reason: string | null
+  acceptance_state: string | null
+  acceptance_reason: string | null
+  acceptance_sha: string | null
 }

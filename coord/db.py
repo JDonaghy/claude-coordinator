@@ -309,6 +309,17 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # treats the approval as stale (new commits since the review → re-review
         # required).  NULL for rows predating this feature.
         "ALTER TABLE assignments ADD COLUMN review_head_sha TEXT",
+        # #944: the Acceptance-gate verdict (oracle loop, docs/ORACLE_LOOP.md)
+        # — set by `coord acceptance record --issue N --sha <sha>`, the
+        # coordinator's external re-run of the sealed suite against the
+        # pushed SHA. NULL until a record has run. acceptance_reason carries
+        # a short failing-test summary (mirrors test_reason); acceptance_sha
+        # is the exact commit the verdict was recorded against, so staleness
+        # (new commits since the last record) is detectable the same way
+        # review_head_sha detects a stale review approval.
+        "ALTER TABLE assignments ADD COLUMN acceptance_state TEXT",
+        "ALTER TABLE assignments ADD COLUMN acceptance_reason TEXT",
+        "ALTER TABLE assignments ADD COLUMN acceptance_sha TEXT",
     ]
     for sql in migrations:
         try:

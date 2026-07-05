@@ -536,6 +536,32 @@ def _read_repo_claude_md(repo_path: Path) -> str | None:
         return None
 
 
+def _diff_touched_sealed_paths(diff_text: str, sealed_paths: list[str]) -> list[str]:
+    """Return the sealed path prefixes actually touched by *diff_text*.
+
+    Scans unified-diff file-header lines (``diff --git a/X b/Y``, ``---
+    a/X``, ``+++ b/X``) for a path that starts with one of *sealed_paths* —
+    cheap, dependency-free tamper detection (#944 sealing v1) ahead of a real
+    diff parser. Pure function, easy to test.
+    """
+    touched: set[str] = set()
+    for line in diff_text.splitlines():
+        candidates: list[str] = []
+        if line.startswith("diff --git "):
+            for part in line.split()[1:]:
+                if part.startswith("a/") or part.startswith("b/"):
+                    candidates.append(part[2:])
+        elif line.startswith("--- a/"):
+            candidates.append(line[len("--- a/"):])
+        elif line.startswith("+++ b/"):
+            candidates.append(line[len("+++ b/"):])
+        for c in candidates:
+            for sealed in sealed_paths:
+                if c.startswith(sealed):
+                    touched.add(sealed)
+    return sorted(touched)
+
+
 def build_review_briefing(
     *,
     pr_number: int | None,
@@ -553,6 +579,7 @@ def build_review_briefing(
     default_branch: str = "main",
     review_iteration: int = 0,
     diff_text: str | None = None,
+    sealed_paths: list[str] | None = None,
 ) -> str:
     """Assemble the reviewer's prompt. Pure function — easy to test.
 
@@ -569,6 +596,14 @@ def build_review_briefing(
     surface code merged to the default branch *after* the branch was cut as
     spurious deletions and flag it as a regression (#546). When *diff_text* is
     None the existing three-dot ``git diff`` fallback instructions stand.
+
+    *sealed_paths* (#944, docs/ORACLE_LOOP.md sealing v1) lists path prefixes
+    the worker must never touch — today just ``tests/acceptance/`` for repos
+    with an oracle-loop acceptance driver configured. When non-empty a
+    reviewer instruction is always appended; if *diff_text* is also given and
+    actually touches one of the paths, a blocking "TAMPER DETECTED" banner is
+    prepended instead of a soft reminder — this is the "reviewer flags any
+    diff that touches tests/acceptance/**" tamper-detection policy.
     """
 
     lines: list[str] = []
@@ -643,6 +678,31 @@ def build_review_briefing(
         lines.append("```diff")
         lines.append(diff_text.strip())
         lines.append("```")
+
+    if sealed_paths:
+        touched = _diff_touched_sealed_paths(diff_text, sealed_paths) if diff_text else []
+        lines.append("")
+        if touched:
+            lines.append("## \U0001f6a8 SEALED ORACLE TAMPER DETECTED")
+            lines.append("")
+            lines.append(
+                "The diff modifies a path SEALED by this repo's acceptance "
+                "oracle (docs/ORACLE_LOOP.md sealing v1): "
+                + ", ".join(f"`{p}`" for p in touched)
+                + ". The suite under these paths is authored independently — "
+                "workers may only RUN it (`coord acceptance run`), never read "
+                "or edit it. **request-changes is mandatory here**, regardless "
+                "of anything else in this diff."
+            )
+        else:
+            lines.append("## Sealed paths (do not touch)")
+            lines.append("")
+            lines.append(
+                "This repo's acceptance oracle is sealed by policy: "
+                + ", ".join(f"`{p}`" for p in sealed_paths)
+                + ". If the diff modifies any of them, **request-changes** — "
+                "this is a hard rule, not a suggestion (docs/ORACLE_LOOP.md)."
+            )
 
     lines.append("")
     lines.append("## What to do")
@@ -977,6 +1037,13 @@ def dispatch_review(
     from coord.state import issue_context_block  # noqa: PLC0415
     context_prefix = issue_context_block(completed.repo_name, completed.issue_number)
 
+    # #944 sealing v1: flag tests/acceptance/ as sealed when this repo has an
+    # oracle-loop acceptance driver configured — the reviewer must reject any
+    # diff that touches it (docs/ORACLE_LOOP.md).
+    sealed_paths: list[str] = []
+    if config.acceptance.driver_for(completed.repo_name) is not None:
+        sealed_paths.append("tests/acceptance/")
+
     client = http_client or httpx
 
     # Iterate candidates in priority order.  On agent rejection (4xx from a
@@ -1032,6 +1099,7 @@ def dispatch_review(
             # scoped to the fix delta rather than re-reviewing the whole PR.
             review_iteration=getattr(completed, "review_iteration", 0) or 0,
             diff_text=diff_text,
+            sealed_paths=sealed_paths,
         )
 
         payload = {

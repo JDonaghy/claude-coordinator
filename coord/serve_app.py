@@ -718,6 +718,66 @@ def _openapi_spec() -> dict:
                 },
             }
         },
+        "/acceptance-verdict": {
+            "post": {
+                "summary": "Record an Acceptance-gate verdict (#944, oracle loop)",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "assignment_id": {"type": "string"},
+                                    "acceptance_state": {"type": "string"},
+                                    "acceptance_reason": {"type": "string", "nullable": True},
+                                    "acceptance_sha": {"type": "string", "nullable": True},
+                                },
+                                "required": ["assignment_id", "acceptance_state"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {"application/json": {"schema": ok_response}},
+                    },
+                    "400": {"description": "Missing field"},
+                },
+            }
+        },
+        "/acceptance-record": {
+            "post": {
+                "summary": (
+                    "Run `coord acceptance record` on the daemon host: "
+                    "re-run the sealed suite against a pushed SHA and write "
+                    "the verdict to the board (#944, oracle loop trust gate)"
+                ),
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "repo": {"type": "string"},
+                                    "issue": {"type": "integer"},
+                                    "sha": {"type": "string"},
+                                },
+                                "required": ["repo", "issue", "sha"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK — CLI output relayed verbatim",
+                        "content": {"application/json": {"schema": ok_response}},
+                    },
+                },
+            }
+        },
         "/review-findings": {
             "post": {
                 "summary": "Persist parsed review verdict+body on a review assignment (#905)",
@@ -1693,6 +1753,76 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             )
         return JSONResponse({"ok": True})
 
+    async def post_acceptance_verdict(request: Request) -> Response:
+        # #944: record an Acceptance-gate verdict (oracle loop) on the shared
+        # DB. Mirrors post_test_verdict.
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        try:
+            state._record_acceptance_verdict_local(
+                assignment_id=body["assignment_id"],
+                acceptance_state=body["acceptance_state"],
+                acceptance_reason=body.get("acceptance_reason"),
+                acceptance_sha=body.get("acceptance_sha"),
+            )
+        except KeyError as e:
+            return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "acceptance-verdict write failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"ok": True})
+
+    async def post_acceptance_record(request: Request) -> Response:
+        # #944: the canonical board + the repo checkouts live on THIS host, so
+        # a thin client's `coord acceptance record` (the external trust-gate
+        # re-run) routes the whole command here. Run it in a threadpool (it
+        # shells out to git + the driver's test command). Mirrors post_diagnose.
+        from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+
+        def _run() -> dict:
+            import contextlib  # noqa: PLC0415
+            import io  # noqa: PLC0415
+            import os  # noqa: PLC0415
+
+            from coord.commands.acceptance import acceptance_record  # noqa: PLC0415
+
+            buf = io.StringIO()
+            code = 0
+            err = None
+            prev = os.environ.get("COORD_ACCEPTANCE_ON_DAEMON")
+            os.environ["COORD_ACCEPTANCE_ON_DAEMON"] = "1"  # guard against re-routing
+            try:
+                with contextlib.redirect_stdout(buf):
+                    acceptance_record.callback(
+                        repo=body.get("repo"),
+                        issue_number=int(body.get("issue")),
+                        sha=body.get("sha"),
+                        config_path=config.path,
+                    )
+            except SystemExit as e:  # click commands sys.exit() on some paths
+                code = e.code if isinstance(e.code, int) else (1 if e.code else 0)
+            except Exception as e:  # noqa: BLE001
+                err = str(e)
+                code = 1
+            finally:
+                if prev is None:
+                    os.environ.pop("COORD_ACCEPTANCE_ON_DAEMON", None)
+                else:
+                    os.environ["COORD_ACCEPTANCE_ON_DAEMON"] = prev
+            return {"output": buf.getvalue(), "exit_code": code, "error": err}
+
+        result = await run_in_threadpool(_run)
+        return JSONResponse(result)
+
     async def post_review_findings(request: Request) -> Response:
         # #905: persist parsed review verdict+body on the daemon's DB so
         # post_orphaned_review_findings on a thin client reaches the shared DB.
@@ -2622,6 +2752,8 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/milestone-drain", post_milestone_drain, methods=["POST"]),
         Route("/dispatched", post_dispatched, methods=["POST"]),
         Route("/test-verdict", post_test_verdict, methods=["POST"]),
+        Route("/acceptance-verdict", post_acceptance_verdict, methods=["POST"]),
+        Route("/acceptance-record", post_acceptance_record, methods=["POST"]),
         Route("/review-findings", post_review_findings, methods=["POST"]),
         Route("/review-posted", post_review_posted, methods=["POST"]),
         Route("/board", post_board, methods=["POST"]),
