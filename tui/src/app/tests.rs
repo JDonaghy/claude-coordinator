@@ -14354,6 +14354,11 @@
             is_interactive: false,
             failure_reason: None,
             review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
             pr_url: None,
         };
 
@@ -21364,6 +21369,108 @@
         let label = app.merge_queue_entry_label(&entry);
         // Long errors get truncated to 57 chars + "…)"
         assert!(label.contains('…'), "label must truncate long errors: {}", label);
+    }
+
+    // ── #420: merge_queue_entry_display_error live-recompute ─────────────────
+    //
+    // Mirrors coord/merge_queue.py::display_error's Python test coverage —
+    // the Rust-side legacy render path (no merge_plan from the daemon) must
+    // not keep showing "review required but not approved" / "smoke test
+    // required but no verdict recorded" once the underlying gate is actually
+    // satisfied. entry.error itself is only refreshed by a real merge
+    // attempt, so the panel must recompute live instead of trusting it.
+
+    fn pipeline_issue_stub(number: u64, repo_slug: &str, coord_repo: &str) -> PipelineIssue {
+        PipelineIssue {
+            number,
+            title: format!("Issue {}", number),
+            body: String::new(),
+            repo_slug: repo_slug.to_string(),
+            coord_repo: Some(coord_repo.to_string()),
+            matched_labels: vec![],
+            all_labels: vec![],
+            is_closed: false,
+        }
+    }
+
+    fn mq_entry_full(assignment_id: &str, issue_num: u64, repo_github: &str, error: &str) -> MergeQueueEntry {
+        MergeQueueEntry {
+            assignment_id: assignment_id.to_string(),
+            issue_number: Some(issue_num),
+            state: "pending".to_string(),
+            pr_number: Some(42),
+            pr_url: Some("https://github.com/acme/api/pull/42".to_string()),
+            repo_github: repo_github.to_string(),
+            target_branch: Some("main".to_string()),
+            error: Some(error.to_string()),
+            branch: None,
+            milestone_title: None,
+            last_attempt: None,
+        }
+    }
+
+    #[test]
+    fn display_error_clears_stale_review_error_once_approved() {
+        let work = make_assignment_typed("done", 56, "api", Some("work"));
+        let mut review = make_assignment_typed("done", 56, "api", Some("review"));
+        review.review_of_assignment_id = Some(work.id.clone());
+        review.review_verdict = Some("approve".to_string());
+        let mut app = make_app_with_assignments(vec![work.clone(), review]);
+        app.pipeline_issues = vec![pipeline_issue_stub(56, "acme/api", "api")];
+        let entry = mq_entry_full(&work.id, 56, "acme/api", "review required but not approved");
+
+        assert_eq!(app.merge_queue_entry_display_error(&entry), None);
+        let label = app.merge_queue_entry_label(&entry);
+        assert!(
+            !label.contains("review required"),
+            "label must not show stale review error once approved: {}", label
+        );
+    }
+
+    #[test]
+    fn display_error_keeps_review_error_when_still_unapproved() {
+        let work = make_assignment_typed("done", 57, "api", Some("work"));
+        let mut app = make_app_with_assignments(vec![work.clone()]);
+        app.pipeline_issues = vec![pipeline_issue_stub(57, "acme/api", "api")];
+        let entry = mq_entry_full(&work.id, 57, "acme/api", "review required but not approved");
+
+        assert_eq!(
+            app.merge_queue_entry_display_error(&entry).as_deref(),
+            Some("review required but not approved")
+        );
+        let label = app.merge_queue_entry_label(&entry);
+        assert!(
+            label.contains("review required but not approved"),
+            "label must still show the error while unapproved: {}", label
+        );
+    }
+
+    #[test]
+    fn display_error_clears_stale_smoke_error_once_test_passed() {
+        let mut work = make_assignment_typed("done", 58, "api", Some("work"));
+        work.test_state = Some("passed".to_string());
+        let work_id = work.id.clone();
+        let mut app = make_app_with_assignments(vec![work]);
+        app.pipeline_issues = vec![pipeline_issue_stub(58, "acme/api", "api")];
+        let entry = mq_entry_full(&work_id, 58, "acme/api", "smoke test required but no verdict recorded");
+
+        assert_eq!(app.merge_queue_entry_display_error(&entry), None);
+        let label = app.merge_queue_entry_label(&entry);
+        assert!(
+            !label.contains("smoke test required"),
+            "label must not show stale smoke error once test passed: {}", label
+        );
+    }
+
+    #[test]
+    fn display_error_leaves_non_stale_errors_untouched() {
+        let app = make_app_default();
+        let entry = mq_entry_full("aid-1", 10, "owner/repo", "checks failed: build (failure)");
+        assert_eq!(
+            app.merge_queue_entry_display_error(&entry).as_deref(),
+            Some("checks failed: build (failure)"),
+            "non-gate errors (conflicts, CI) must pass through unchanged"
+        );
     }
 
     // ── TuiDriver black-box: Merge Queue panel ────────────────────────────────

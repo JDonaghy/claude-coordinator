@@ -1068,6 +1068,64 @@ impl CoordApp {
         self.data.merge_plan.get(self.merge_queue_sel.min(n - 1))
     }
 
+    /// Recompute a merge-queue entry's displayed error live instead of
+    /// trusting the stored `entry.error` string verbatim (#420).
+    ///
+    /// `entry.error` is only refreshed by a real merge attempt (`coord
+    /// merge` / `process()`) or `refresh_entry_assignment` — nothing clears
+    /// it when a review approves or a smoke verdict lands through the
+    /// normal interactive path (no intervening merge attempt). Left
+    /// unchecked, a mergeable entry keeps showing e.g. "review required but
+    /// not approved" indefinitely, inviting the operator to bounce
+    /// already-approved work back for another round (the #410 case).
+    ///
+    /// Mirrors `coord/merge_queue.py::display_error`: only the gate
+    /// messages known to go stale this way are recomputed here, using the
+    /// same live gate checks the rest of the Pipeline view already uses
+    /// (`issue_has_any_approved_review`, `test_stage_status_for`). Every
+    /// other stored error (merge conflicts, CI results) reflects the
+    /// outcome of the *last actual attempt* and is returned unchanged. This
+    /// is the legacy (non-`merge_plan`) render path's counterpart — the
+    /// `merge_plan` path already gets a live `reason` from the server's
+    /// `coord.merge_queue.plan()`.
+    pub(crate) fn merge_queue_entry_display_error(
+        &self,
+        entry: &MergeQueueEntry,
+    ) -> Option<String> {
+        let err = entry.error.as_deref().filter(|e| !e.is_empty())?;
+        let is_stale_review = matches!(
+            err,
+            "review required but not approved"
+                | "review required but board unavailable to confirm approval"
+        );
+        let is_stale_smoke = matches!(
+            err,
+            "smoke test required but no verdict recorded"
+                | "smoke test required but board unavailable to confirm verdict"
+        );
+        if !is_stale_review && !is_stale_smoke {
+            return Some(err.to_string());
+        }
+        // Can't recompute without knowing which issue this entry is for —
+        // fall back to the stored string.
+        let Some(issue) = self.pipeline_issues.iter().find(|i| {
+            entry.issue_number == Some(i.number) && i.repo_slug == entry.repo_github
+        }) else {
+            return Some(err.to_string());
+        };
+        if is_stale_review {
+            if self.issue_has_any_approved_review(issue, Some(&entry.assignment_id)) {
+                return None;
+            }
+            return Some(err.to_string());
+        }
+        // is_stale_smoke
+        if self.test_stage_status_for(issue) == StageStatus::Done {
+            return None;
+        }
+        Some(err.to_string())
+    }
+
     /// Format a single merge-queue entry as a terse list label.
     ///
     /// Template: `[<STATE>] #<PR>  <issue_title>  (<error-reason>)`
@@ -1104,9 +1162,11 @@ impl CoordApp {
             })
             .map(|oi| format!("  {}", oi.title))
             .unwrap_or_default();
-        // Gate / conflict reason — the last error string from coord merge.
-        let reason = entry
-            .error
+        // Gate / conflict reason — the last error string from coord merge,
+        // recomputed live (#420) so an approval/verdict that landed outside
+        // a merge attempt doesn't leave a stale "not approved" message.
+        let reason = self
+            .merge_queue_entry_display_error(entry)
             .as_deref()
             .filter(|e| !e.is_empty())
             .map(|e| {
