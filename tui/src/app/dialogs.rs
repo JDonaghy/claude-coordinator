@@ -209,51 +209,12 @@ impl CoordApp {
         changed
     }
 
-    /// #558: Drain completed `gh issue view --json comments` fetches into the
-    /// in-memory cache.  Returns `true` when at least one fetch resolved —
-    /// caller should redraw so the Summary tab picks up the new entries.
-    pub(crate) fn poll_pending_comments_fetches(&self) -> bool {
-        use std::sync::mpsc::TryRecvError;
-        let mut changed = false;
-        // Receive each ready message exactly once.  `try_recv` consumes the
-        // message, so we must capture the payload here rather than re-receiving
-        // in a second pass (that would always see `Disconnected` and silently
-        // drop the result, leaving the Summary tab stuck on "Fetching…").
-        let mut done: Vec<(String, u64)> = Vec::new();
-        let mut resolved: Vec<((String, u64), serde_json::Value)> = Vec::new();
-        {
-            let pending = self.pending_comments_fetches.borrow();
-            for (key, rx) in pending.iter() {
-                match rx.try_recv() {
-                    Ok(Ok(comments_json)) => {
-                        resolved.push((key.clone(), comments_json));
-                        done.push(key.clone());
-                    }
-                    Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
-                        // Fetch failed — drop the receiver; next render retries.
-                        done.push(key.clone());
-                    }
-                    Err(TryRecvError::Empty) => {}
-                }
-            }
-        }
-        for key in &done {
-            self.pending_comments_fetches.borrow_mut().remove(key);
-        }
-        for (key, comments_json) in resolved {
-            let summaries =
-                parse_session_summaries_from_comments(&comments_json, &self.data.assignments);
-            self.fetched_comments_cache.borrow_mut().insert(key, summaries);
-            changed = true;
-        }
-        changed
-    }
-
-    /// #558: Build the Summary tab ListView for the selected Pipeline issue.
+    /// #876: Build the Pipeline Summary tab `ListView` for the selected issue
+    /// directly from in-memory board assignments — no GitHub shellout.
     ///
-    /// Kicks off a `spawn_comments_fetch` when the cache is empty (lazy fetch);
-    /// shows a "fetching…" placeholder while the fetch is in flight, or an
-    /// empty-state message when no coord comments exist.
+    /// Sources: `test_state`, `test_reason`, `review_verdict`, `review_findings`,
+    /// `failure_reason`, cost, tokens, timing, machine/model, `is_interactive`.
+    /// Gracefully omits fields absent from older daemon rows.
     pub(crate) fn pipeline_summary_list(&self) -> ListView {
         let issue = self
             .pipeline_sel
@@ -261,33 +222,199 @@ impl CoordApp {
         let Some(issue) = issue else {
             return plain_list("pipeline-summary", "  (no issue selected)", 0);
         };
-        let key = (issue.repo_slug.clone(), issue.number);
+        self.build_board_summary_list_view(issue, self.pipeline_detail_scroll)
+    }
 
-        // Check the cache first.
-        if let Some(summaries) = self.fetched_comments_cache.borrow().get(&key).cloned() {
-            return build_summary_list_view(summaries, self.pipeline_detail_scroll);
-        }
+    /// #876: Build the Pipeline Summary tab `ListView` directly from board-layer
+    /// assignments.  Replaces the old `spawn_comments_fetch` / GitHub shellout
+    /// path so `test_reason`, `review_findings`, and other verdict data from the
+    /// board are always visible — even when they were never posted as issue
+    /// comments.
+    ///
+    /// Layout:
+    ///   1. Status strip:  Work ✓  Test ✗  Review —  Merge —
+    ///   2. Per-assignment entries (oldest → newest, matching stage order):
+    ///      ● <type>  <machine>  <status/verdict>  <duration>  <cost>  <model>
+    ///         <reason text (test_reason / review_findings / failure_reason)>
+    pub(crate) fn build_board_summary_list_view(
+        &self,
+        issue: &PipelineIssue,
+        scroll_offset: usize,
+    ) -> ListView {
+        let dim = Color::rgb(80, 80, 80);
+        let muted = Color::rgb(160, 160, 160);
+        let machine_color = Color::rgb(130, 170, 210);
+        let model_color = Color::rgb(100, 160, 100);
+        let cost_color = Color::rgb(180, 160, 100);
+        let duration_color = Color::rgb(110, 110, 130);
+        let reason_color = Color::rgb(210, 210, 210);
+        let pr_color = Color::rgb(100, 150, 200);
 
-        // If a fetch is already in flight, show loading state.
-        if self.pending_comments_fetches.borrow().contains_key(&key) {
+        // --- collect assignments for this issue (oldest → newest) ---
+        let local_repo = issue.coord_repo.as_deref();
+        let mut assignments: Vec<&Assignment> = self
+            .data
+            .assignments
+            .iter()
+            .filter(|a| a.issue_number == issue.number)
+            .filter(|a| local_repo.map_or(true, |r| a.repo == r))
+            .collect();
+
+        // Sort oldest-first so entries read Work → Fix → Review chronologically.
+        assignments.sort_by(|a, b| {
+            a.dispatched_at
+                .partial_cmp(&b.dispatched_at)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        if assignments.is_empty() {
             return plain_list(
                 "pipeline-summary",
-                "  Fetching session history…",
-                self.pipeline_detail_scroll,
+                "  No board sessions for this issue yet.",
+                scroll_offset,
             );
         }
 
-        // Kick off a new fetch.
-        let rx = spawn_comments_fetch(issue.repo_slug.clone(), issue.number);
-        self.pending_comments_fetches
-            .borrow_mut()
-            .insert(key, rx);
+        let mut items: Vec<ListItem> = Vec::new();
 
-        plain_list(
-            "pipeline-summary",
-            "  Fetching session history…",
-            self.pipeline_detail_scroll,
-        )
+        // --- Status strip ---
+        let stage_names = self.pipeline_stage_names_for_issue(issue);
+        let mut strip_spans: Vec<StyledSpan> = vec![StyledSpan::with_fg("  ", muted)];
+        for (i, stage) in stage_names.iter().enumerate() {
+            if i > 0 {
+                strip_spans.push(StyledSpan::with_fg("  ", dim));
+            }
+            let status = self.stage_status_for(issue, stage);
+            let (sym, sym_color) = board_stage_symbol(&status);
+            let label = match stage.as_str() {
+                "work" => "Work",
+                "test" => "Test",
+                "review" => "Review",
+                "merge" => "Merge",
+                "plan" => "Plan",
+                other => other,
+            };
+            strip_spans.push(StyledSpan::with_fg(format!("{} ", label), muted));
+            strip_spans.push(StyledSpan::with_fg(sym, sym_color));
+        }
+        items.push(ListItem {
+            text: StyledText { spans: strip_spans },
+            icon: None,
+            detail: None,
+            decoration: Decoration::Normal,
+        });
+
+        // Separator after the strip.
+        items.push(ListItem {
+            text: StyledText { spans: vec![StyledSpan::with_fg(" ", dim)] },
+            icon: None,
+            detail: None,
+            decoration: Decoration::Normal,
+        });
+
+        // --- Per-assignment entries ---
+        for a in &assignments {
+            // Skip scoping sessions (refinement, chat, new-issue-chat) that are
+            // not pipeline execution.
+            let atype = a.assignment_type.as_deref().unwrap_or("work");
+            if matches!(atype, "refinement" | "new-issue-chat" | "chat" | "test-chat") {
+                continue;
+            }
+
+            let type_label = session_type_label(atype);
+            let (badge_text, badge_color) = assignment_status_badge(a);
+
+            // Duration: finished_at - dispatched_at.
+            let dur_str = match (a.dispatched_at, a.finished_at) {
+                (Some(s), Some(e)) if e > s => fmt_dur((e - s) as u64),
+                _ => String::new(),
+            };
+
+            // Cost.
+            let cost_str = if a.is_interactive {
+                "Max".to_string()
+            } else {
+                a.cost_usd
+                    .map(|c| format!("${:.2}", c))
+                    .unwrap_or_default()
+            };
+
+            // Header row: ● <type>  <machine>  <badge>  [duration]  [cost]  [model]
+            let mut spans: Vec<StyledSpan> = vec![
+                StyledSpan::with_fg("● ", muted),
+                StyledSpan::with_fg(format!("{:<10}", type_label), muted),
+                StyledSpan::with_fg(format!("  {:<14}", &a.machine), machine_color),
+                StyledSpan::with_fg(format!("  {}", badge_text), badge_color),
+            ];
+            if !dur_str.is_empty() {
+                spans.push(StyledSpan::with_fg(format!("  {}", dur_str), duration_color));
+            }
+            if !cost_str.is_empty() {
+                spans.push(StyledSpan::with_fg(format!("  {}", cost_str), cost_color));
+            }
+            if let Some(m) = a.model.as_deref() {
+                spans.push(StyledSpan::with_fg(format!("  {}", m), model_color));
+            }
+            items.push(ListItem {
+                text: StyledText { spans },
+                icon: None,
+                detail: None,
+                decoration: Decoration::Normal,
+            });
+
+            // Reason inline: test_reason for failed tests; review_findings for
+            // reviews; failure_reason for hard-failed assignments.
+            let reason = board_assignment_reason(a);
+            if !reason.is_empty() {
+                for line in reason.lines().take(8) {
+                    let s: String = line.chars().take(200).collect();
+                    if s.trim().is_empty() {
+                        continue;
+                    }
+                    items.push(ListItem {
+                        text: StyledText {
+                            spans: vec![StyledSpan::with_fg(format!("   {}", s), reason_color)],
+                        },
+                        icon: None,
+                        detail: None,
+                        decoration: Decoration::Normal,
+                    });
+                }
+            }
+
+            // PR URL.
+            if let Some(ref url) = a.pr_url {
+                items.push(ListItem {
+                    text: StyledText {
+                        spans: vec![StyledSpan::with_fg(format!("   {}", url), pr_color)],
+                    },
+                    icon: None,
+                    detail: None,
+                    decoration: Decoration::Normal,
+                });
+            }
+
+            // Blank separator between sessions.
+            items.push(ListItem {
+                text: StyledText { spans: vec![StyledSpan::with_fg(" ", dim)] },
+                icon: None,
+                detail: None,
+                decoration: Decoration::Normal,
+            });
+        }
+
+        ListView {
+            id: WidgetId::new("pipeline-summary"),
+            title: None,
+            items,
+            selected_idx: 0,
+            scroll_offset,
+            has_focus: false,
+            bordered: true,
+            h_scroll: 0,
+            max_content_width: None,
+            show_v_scrollbar: false,
+        }
     }
 
     pub(crate) fn pipeline_row_lifecycle(&self, issue: &PipelineIssue) -> PipelineRowLifecycle {
@@ -5149,6 +5276,71 @@ impl CoordApp {
             }
         }
     }
+}
+
+/// #876: Status symbol + colour for a pipeline gate from a `StageStatus`.
+fn board_stage_symbol(status: &StageStatus) -> (String, Color) {
+    match status {
+        StageStatus::Done => ("✓".to_string(), Color::rgb(120, 200, 120)),
+        StageStatus::Failed => ("✗".to_string(), Color::rgb(220, 70, 70)),
+        StageStatus::Active => ("⟳".to_string(), Color::rgb(100, 180, 220)),
+        StageStatus::Skipped => ("↷".to_string(), Color::rgb(100, 100, 100)),
+        StageStatus::Stale => ("~".to_string(), Color::rgb(200, 150, 70)),
+        StageStatus::Pending => ("—".to_string(), Color::rgb(80, 80, 80)),
+    }
+}
+
+/// #876: Derive a coloured status/verdict badge text from an assignment row.
+fn assignment_status_badge(a: &Assignment) -> (String, Color) {
+    let atype = a.assignment_type.as_deref().unwrap_or("work");
+    // Review: verdict is the primary signal.
+    if atype == "review" || atype == "re-review" {
+        return match a.review_verdict.as_deref() {
+            Some("approve") => ("approve ✓".to_string(), Color::rgb(120, 200, 120)),
+            Some("request-changes") => {
+                ("request-changes ✗".to_string(), Color::rgb(220, 100, 100))
+            }
+            _ if a.status == "running" => ("reviewing…".to_string(), Color::rgb(100, 180, 220)),
+            _ => ("done".to_string(), Color::rgb(120, 120, 120)),
+        };
+    }
+    // Work / fix / smoke: status + test_state overlay.
+    match a.status.as_str() {
+        "running" => ("running…".to_string(), Color::rgb(100, 180, 220)),
+        "done" => match a.test_state.as_deref() {
+            Some("failed") => ("done · Test ✗".to_string(), Color::rgb(220, 70, 70)),
+            Some("passed") => ("done · Test ✓".to_string(), Color::rgb(120, 200, 120)),
+            Some("skipped") => ("done · Test ↷".to_string(), Color::rgb(150, 150, 150)),
+            _ => ("done".to_string(), Color::rgb(120, 120, 120)),
+        },
+        "failed" => ("failed".to_string(), Color::rgb(220, 70, 70)),
+        other => (other.to_string(), Color::rgb(200, 200, 70)),
+    }
+}
+
+/// #876: Extract the most informative reason string from an assignment.
+///
+/// Priority:
+///   1. `test_reason` — recorded by the operator when marking a test failed
+///   2. `review_findings` — the review body for review assignments
+///   3. `failure_reason` — short launch-failure explanation
+fn board_assignment_reason(a: &Assignment) -> String {
+    if let Some(r) = a.test_reason.as_deref() {
+        if !r.trim().is_empty() {
+            return r.to_string();
+        }
+    }
+    if let Some(r) = a.review_findings.as_deref() {
+        if !r.trim().is_empty() {
+            return r.to_string();
+        }
+    }
+    if let Some(r) = a.failure_reason.as_deref() {
+        if !r.trim().is_empty() {
+            return r.to_string();
+        }
+    }
+    String::new()
 }
 
 /// #269: Hit-test a click against a TUI tab bar's labels.  Walks the

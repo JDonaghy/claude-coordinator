@@ -1082,6 +1082,7 @@ fn plain_list(id: &str, msg: &str, scroll_offset: usize) -> ListView {
 /// Each session renders as:
 ///   ● <type>  <machine>  <status/verdict (coloured)>
 ///      "<summary text wrapped>"
+#[cfg(test)]
 fn build_summary_list_view(summaries: Vec<SessionSummary>, scroll_offset: usize) -> ListView {
     if summaries.is_empty() {
         return plain_list(
@@ -1934,21 +1935,8 @@ pub struct CoordApp {
     /// of truth for invalidation.
     fetched_issues_cache:
         std::cell::RefCell<std::collections::HashMap<(String, u64), FetchedIssue>>,
-    /// #558: In-flight `gh issue view --json comments` fetches for the Pipeline
-    /// Summary tab.  Keyed by `(repo_slug, issue_number)`.  The receiver yields
-    /// the raw `comments` JSON array value, or an error string.
-    pending_comments_fetches: std::cell::RefCell<
-        std::collections::HashMap<
-            (String, u64),
-            std::sync::mpsc::Receiver<Result<serde_json::Value, String>>,
-        >,
-    >,
-    /// #558: In-memory cache of parsed session-summary entries for the Pipeline
-    /// Summary tab.  Keyed by `(repo_slug, issue_number)`.  Populated by
-    /// `poll_pending_comments_fetches`; entries survive until the TUI restarts
-    /// (no TTL — the user can switch away and back without a re-fetch).
-    fetched_comments_cache:
-        std::cell::RefCell<std::collections::HashMap<(String, u64), Vec<SessionSummary>>>,
+    // #876: removed pending_comments_fetches and fetched_comments_cache —
+    // the Summary tab now sources directly from in-memory board assignments.
     /// Pending purge confirmation state.  `Some((assignments, issues))` means
     /// we are waiting for the user to confirm; `None` means not pending.
     ///
@@ -2743,8 +2731,7 @@ impl CoordApp {
             pending_log_fetches: std::cell::RefCell::new(std::collections::HashMap::new()),
             pending_issue_fetches: std::cell::RefCell::new(std::collections::HashMap::new()),
             fetched_issues_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
-            pending_comments_fetches: std::cell::RefCell::new(std::collections::HashMap::new()),
-            fetched_comments_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            // #876: pending_comments_fetches and fetched_comments_cache removed.
             pending_purge: None,
             pending_test_fail: None,
             pending_report_fix: None,

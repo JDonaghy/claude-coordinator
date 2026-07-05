@@ -302,8 +302,7 @@
             pending_log_fetches: std::cell::RefCell::new(std::collections::HashMap::new()),
             pending_issue_fetches: std::cell::RefCell::new(std::collections::HashMap::new()),
             fetched_issues_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
-            pending_comments_fetches: std::cell::RefCell::new(std::collections::HashMap::new()),
-            fetched_comments_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            // #876: pending_comments_fetches and fetched_comments_cache removed.
             pending_purge: None,
             pending_test_fail: None,
             pending_report_fix: None,
@@ -631,6 +630,9 @@
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         }
     }
 
@@ -1901,6 +1903,9 @@
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         };
         BoardData {
             assignments: vec![work],
@@ -2298,6 +2303,9 @@
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         }
     }
 
@@ -3597,6 +3605,9 @@
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         });
         // Has assignment → in-progress, even though status:ready label is set.
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
@@ -3963,6 +3974,9 @@
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         });
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
         assert_eq!(section, "new");
@@ -4043,6 +4057,9 @@
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         });
         // is_closed wins over has-assignment.
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
@@ -4242,6 +4259,9 @@
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         });
 
         // With no queue entry but a merged work assignment, Merge stage → Done.
@@ -5071,6 +5091,9 @@
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         }
     }
 
@@ -7044,6 +7067,9 @@
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         });
         let issue = &app.pipeline_issues[0];
         assert!(app.issue_has_any_assignment(issue));
@@ -7096,6 +7122,9 @@
                 acceptance_sha: None,
                 acceptance_total: None,
                 acceptance_passed: None,
+                test_reason: None,
+                review_state: None,
+                pr_url: None,
             });
         }
         let issue = &app.pipeline_issues[0];
@@ -7142,6 +7171,9 @@
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         });
         // Same issue number but different repo — should be excluded.
         app.data.assignments.push(Assignment {
@@ -7177,6 +7209,9 @@
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         });
         let issue = &app.pipeline_issues[0];  // coord_repo = Some("api")
         let total = app.issue_total_cost(issue).expect("should have cost");
@@ -7223,6 +7258,9 @@
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         });
         // Interactive session — cost_usd is None (Max subscription).
         app.data.assignments.push(Assignment {
@@ -7258,6 +7296,9 @@
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         });
         let issue = &app.pipeline_issues[0];
         let total = app.issue_total_cost(issue).expect("should have cost from auto assignment");
@@ -7309,6 +7350,9 @@
                 acceptance_sha: None,
                 acceptance_total: None,
                 acceptance_passed: None,
+                test_reason: None,
+                review_state: None,
+                pr_url: None,
             });
         }
         let issue = &app.pipeline_issues[0];
@@ -7354,6 +7398,9 @@
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         });
         // Same issue number, different repo — should be excluded.
         app.data.assignments.push(Assignment {
@@ -7389,6 +7436,9 @@
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         });
         let issue = &app.pipeline_issues[0];  // coord_repo = Some("api")
         assert_eq!(app.issue_total_tokens(issue), 1200, "expected 1000+200=1200 for api repo only");
@@ -7443,6 +7493,9 @@
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -7497,6 +7550,9 @@
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.derive_current_stage(issue), "done");
@@ -7637,6 +7693,9 @@
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         // Work stage ran → Done.
@@ -7736,6 +7795,9 @@
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         });
         let list = app.pipeline_stages_list();
         let text: String = list
@@ -7790,6 +7852,9 @@
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Active);
@@ -7831,6 +7896,9 @@
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -7877,6 +7945,9 @@
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         });
         // Newer successful retry.
         app.data.assignments.push(Assignment {
@@ -7912,6 +7983,9 @@
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -7955,6 +8029,9 @@
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         });
         let issue = &app.pipeline_issues[0];
         // issue.coord_repo == "api", assignment.repo == "different-repo" →
@@ -8027,6 +8104,9 @@
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].label, "Work");
@@ -8079,6 +8159,9 @@
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         });
         app.data.assignments.push(Assignment {
             id: "r1".to_string(),
@@ -8113,6 +8196,9 @@
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         // Both stages done, no Merge stage remaining.
@@ -8324,6 +8410,9 @@
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         }
     }
 
@@ -8670,6 +8759,9 @@
                 acceptance_sha: None,
                 acceptance_total: None,
                 acceptance_passed: None,
+                test_reason: None,
+                review_state: None,
+                pr_url: None,
             });
         }
         app.data.merge_queue.push(MergeQueueEntry {
@@ -8729,6 +8821,9 @@
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].status, StageStatus::Failed);
@@ -8779,6 +8874,9 @@
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         for stage in &view.stages {
@@ -8872,6 +8970,9 @@
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "plan"), StageStatus::Done);
@@ -8921,6 +9022,9 @@
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         });
         let issue = &app.pipeline_issues[0].clone();
         let id = app.find_done_plan_assignment_id(issue, "api");
@@ -8964,6 +9068,9 @@
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         });
         let issue = &app.pipeline_issues[0].clone();
         assert_eq!(app.find_done_plan_assignment_id(issue, "api"), None);
@@ -9007,6 +9114,9 @@
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         });
         let list = app.pipeline_stages_list();
         let text_blob: String = list
@@ -13900,6 +14010,9 @@
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         }];
 
         let result = parse_session_summaries_from_comments(&comments, &assignments);
@@ -14026,6 +14139,9 @@
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         };
         let result = parse_session_summaries_from_comments(&comments, &[fix_assignment]);
         assert_eq!(result.len(), 1);
@@ -14142,6 +14258,93 @@
             badge_span.fg,
             Some(Color::rgb(220, 100, 100)),
             "request-changes badge must be red"
+        );
+    }
+
+    // ── #876: TuiDriver black-box — Summary tab sources from board layer ─────────
+
+    /// #876: The Summary tab must show the Test FAILED verdict AND the
+    /// `test_reason` text, sourced from the in-memory board (not GitHub
+    /// comments).  This is the exact regression from #865: test_reason
+    /// is board-only and was never visible before this fix.
+    #[test]
+    fn summary_tab_shows_test_failed_verdict_and_reason_from_board() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        // Build a work assignment: done, test=failed, reason set.
+        let work = Assignment {
+            id: "w-42-fail".to_string(),
+            repo: "api".to_string(),
+            issue_number: 42,
+            issue_title: "Add cool thing".to_string(),
+            machine: "dellserver".to_string(),
+            status: "done".to_string(),
+            branch: Some("issue-42-work".to_string()),
+            model: Some("sonnet".to_string()),
+            dispatched_at: Some(1_000_000.0),
+            finished_at: Some(1_001_200.0),
+            exit_code: Some(0),
+            assignment_type: Some("work".to_string()),
+            test_state: Some("failed".to_string()),
+            test_reason: Some("cargo test failed: 3 test failures".to_string()),
+            review_verdict: None,
+            review_state: None,
+            review_of_assignment_id: None,
+            cost_usd: Some(0.42),
+            smoke_tests: None,
+            review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            is_interactive: false,
+            failure_reason: None,
+            review_iteration: 0,
+            pr_url: None,
+        };
+
+        let data = BoardData {
+            pipeline_default_gates: vec![
+                "test".to_string(),
+                "review".to_string(),
+                "merge".to_string(),
+            ],
+            pipeline_tracked_labels: vec!["coord".to_string()],
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            assignments: vec![work],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 42,
+            title: "Add cool thing".to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string(), "status:ready".to_string()],
+            is_closed: false,
+        }];
+        app.rebuild_pipeline_sidebar(None);
+        app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Summary;
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+
+        // The Summary tab must render the FAILED verdict badge.
+        assert!(
+            driver.screen_contains("Test ✗"),
+            "Summary tab must show test=failed badge:\n{}",
+            driver.screen(),
+        );
+        // The test_reason text must be visible — this is the #865 regression.
+        assert!(
+            driver.screen_contains("cargo test failed"),
+            "Summary tab must show test_reason from board layer:\n{}",
+            driver.screen(),
         );
     }
 
@@ -14393,6 +14596,9 @@
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         };
         let mut app = make_test_app(BoardData {
             assignments: vec![work_assignment],
@@ -21880,6 +22086,9 @@
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         };
 
         // Review for the fix — approved.
@@ -21916,6 +22125,9 @@
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         };
 
         // The merge queue has the ORIGINAL work (different aid, same branch).
@@ -21990,6 +22202,9 @@
             acceptance_sha: None,
             acceptance_total: None,
             acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
         });
 
         let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);

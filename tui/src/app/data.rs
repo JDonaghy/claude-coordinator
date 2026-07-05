@@ -1005,7 +1005,8 @@ pub(crate) fn load_data() -> BoardData {
              COALESCE(is_interactive, 0), failure_reason, \
              COALESCE(review_iteration, 0), \
              acceptance_state, acceptance_reason, acceptance_sha, \
-             acceptance_total, acceptance_passed \
+             acceptance_total, acceptance_passed, \
+             test_reason, review_state, pr_url \
              FROM assignments ORDER BY dispatched_at DESC",
         ) {
             Ok(s) => s,
@@ -1069,6 +1070,12 @@ pub(crate) fn load_data() -> BoardData {
                 acceptance_sha: row.get::<_, Option<String>>(29)?,
                 acceptance_total: row.get::<_, Option<i64>>(30)?,
                 acceptance_passed: row.get::<_, Option<i64>>(31)?,
+                // #876: board-sourced summary fields.  These columns may not
+                // exist in pre-migration DBs, so we use unwrap_or(None) so an
+                // older DB doesn't blank the board.
+                test_reason: row.get::<_, Option<String>>(32).unwrap_or(None),
+                review_state: row.get::<_, Option<String>>(33).unwrap_or(None),
+                pr_url: row.get::<_, Option<String>>(34).unwrap_or(None),
             })
         }) {
             Ok(r) => r,
