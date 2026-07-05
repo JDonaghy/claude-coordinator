@@ -485,9 +485,9 @@ def _board_response_schema(components: dict) -> dict:
                                 "properties": {
                                     "issue_number": {"type": "integer"},
                                     "rank": {"type": "integer", "description": "0-indexed position in the work order"},
-                                    "ready": {"type": "boolean"},
-                                    "next_up": {"type": "boolean", "description": "true when on the ready frontier (ready + not claimed)"},
-                                    "blocked_on": {"type": "array", "items": {"type": "integer"}},
+                                    "ready": {"type": "boolean", "description": "true when all `after` dependencies are terminal, regardless of claim state"},
+                                    "next_up": {"type": "boolean", "description": "true when on the ready frontier: ready AND not already claimed/conflict-blocked — the dispatcher's next candidate"},
+                                    "blocked_on": {"type": "array", "items": {"type": "integer"}, "description": "unmet dependency issue numbers; empty when ready (including 'ready but claimed')"},
                                 },
                                 "required": ["issue_number", "rank", "ready", "next_up", "blocked_on"],
                             },
@@ -1472,21 +1472,47 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                     _frontier = _Fr(ready=tuple(_ready_list), blocked=())
 
                 _ready_nums = {fe.issue_number for fe in _frontier.ready}
+                _blocked_by_num = {bn.issue_number: bn for bn in _frontier.blocked}
 
                 _nodes = []
                 for _rank, _node in enumerate(_wo.nodes):
                     if _node.issue_number in _terminal:
                         continue  # done — skip from projection
-                    _is_ready = _node.issue_number in _ready_nums
-                    _blocked_on = (
-                        [d for d in _node.after if d not in _terminal]
-                        if not _is_ready else []
-                    )
+                    _is_next_up = _node.issue_number in _ready_nums
+                    _bn = _blocked_by_num.get(_node.issue_number)
+                    if _is_next_up:
+                        # In frontier.ready: deps met, unclaimed, uncontested
+                        # — the dispatcher's next candidate for this milestone.
+                        _is_ready = True
+                        _blocked_on: list[int] = []
+                    elif _bn is not None and not _bn.waiting_on_deps:
+                        # In frontier.blocked, but NOT for unmet deps — an
+                        # active claim (assignment/branch elsewhere) or a
+                        # conflict-checker hit. Deps ARE satisfied, so this
+                        # is "ready" in the dependency sense, just not the
+                        # next thing to dispatch (#795 review: previously
+                        # this fell through to the "waiting on deps" branch
+                        # below with an empty `_node.after` remainder,
+                        # producing a dangling blocked_on with nothing to
+                        # point at — distinguish it instead of reporting a
+                        # phantom dependency).
+                        _is_ready = True
+                        _blocked_on = []
+                    elif _bn is not None:
+                        # In frontier.blocked, waiting on unmet deps.
+                        _is_ready = False
+                        _blocked_on = list(_bn.waiting_on_deps)
+                    else:
+                        # `ready_frontier` raised and we fell back to
+                        # unmet-deps-only (see except-block above) — no
+                        # claim/conflict info is available in the fallback.
+                        _blocked_on = [d for d in _node.after if d not in _terminal]
+                        _is_ready = not _blocked_on
                     _nodes.append({
                         "issue_number": _node.issue_number,
                         "rank": _rank,
                         "ready": _is_ready,
-                        "next_up": _is_ready,  # ready + unclaimed = next-up
+                        "next_up": _is_next_up,  # ready + unclaimed = next-up
                         "blocked_on": _blocked_on,
                     })
 

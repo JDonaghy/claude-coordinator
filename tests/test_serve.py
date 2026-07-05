@@ -311,6 +311,71 @@ def test_milestone_work_orders_terminal_issue_excluded(work_order_db: Path, vali
     assert n103["blocked_on"] == []
 
 
+def test_milestone_work_orders_claimed_node_ready_but_not_next_up(
+    tmp_path: Path, valid_config_path: Path,
+):
+    """#795 review: a node whose deps are all terminal but which is actively
+    CLAIMED (an in-flight assignment elsewhere) must report `ready=True` /
+    `next_up=False` with an EMPTY `blocked_on` — not fall through to the
+    "waiting on deps" branch, which previously produced a dangling
+    `blocked_on` with nothing left in it (`ready_frontier` excludes claimed
+    nodes from `ready` for a claim reason, not an unmet-dep reason, and the
+    old code recomputed `blocked_on` purely from `node.after`).
+
+    `build_board()` (used by the `/board` handler for claim detection via
+    `find_work_claim`) reads through `coord.state.get_connection()` — the
+    thread-bound `:memory:` conn the autouse `coord_db` fixture installs,
+    which TestClient's worker thread can't touch (see the `rw_db` fixture's
+    docstring above). So the claim has to be seeded into a file-backed,
+    `check_same_thread=False` override of that same global connection —
+    the on-disk `work_order_db` fixture alone (which only backs
+    `SqliteStore.board_projection()`) wouldn't be visible to `build_board()`.
+    """
+    db_path = tmp_path / "coord.db"
+    _make_work_order_db(db_path)
+
+    from coord import db as _db
+
+    conn = sqlite3.connect(str(db_path), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+        "repo_github, issue_number, issue_title, status, type) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        ("work102", "laptop", "api", "acme/api", 102, "Issue A2", "running", "work"),
+    )
+    conn.commit()
+    _db.override_connection(conn)
+
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(db_path), cfg)
+    with TestClient(app) as cli:
+        board = cli.get("/board").json()
+
+    mwos = board["milestone_work_orders"]
+    assert len(mwos) == 1
+    nodes_by_num = {n["issue_number"]: n for n in mwos[0]["nodes"]}
+
+    # #102 has no unmet deps but IS claimed → ready (deps satisfied) yet not
+    # next_up (already spoken for); blocked_on must be empty, not a dangling
+    # reference to a phantom dependency.
+    n102 = nodes_by_num[102]
+    assert n102["ready"] is True, "claimed node with met deps should be ready"
+    assert n102["next_up"] is False, "claimed node must not be next_up"
+    assert n102["blocked_on"] == [], "claimed node has no unmet deps to report"
+
+    # #101 is unaffected — still ready + next_up (no claim on it).
+    n101 = nodes_by_num[101]
+    assert n101["ready"] is True
+    assert n101["next_up"] is True
+
+    # #103 is still genuinely blocked on both (#102 is claimed, not terminal).
+    n103 = nodes_by_num[103]
+    assert n103["ready"] is False
+    assert n103["next_up"] is False
+    assert set(n103["blocked_on"]) == {101, 102}
+
+
 def test_milestone_work_orders_empty_when_no_tracking_issue(file_db: Path, valid_config_path: Path):
     """#795: fail-open — no epic-labelled issue means milestone_work_orders is []."""
     cfg = load_config(valid_config_path)
