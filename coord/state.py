@@ -2348,6 +2348,77 @@ def _edit_issue_content_local(
     return True
 
 
+def assign_issue_milestone(
+    repo_name: str,
+    issue_number: int,
+    milestone_number: int,
+    *,
+    milestone_title: str | None = None,
+    repo_github: str | None = None,
+) -> None:
+    """Assign *milestone_number* to *issue_number* through the issue-tracker seam.
+
+    Routes to the daemon (``POST /issue-milestone``) when ``board_service`` is
+    set, else writes locally. Also updates the local ``issues`` cache
+    ``milestone_number`` / ``milestone_title`` columns so the TUI reflects the
+    change on its next refresh without waiting for ``coord sync``.
+
+    The caller is responsible for resolving *milestone_title* when only a number
+    is given (``coord milestone assign`` does this before calling here so the
+    cache can be fully populated).
+    """
+    svc = _board_service()
+    resp = _route_write(
+        svc,
+        "/issue-milestone",
+        {
+            "repo_name": repo_name,
+            "issue_number": issue_number,
+            "milestone_number": milestone_number,
+            "milestone_title": milestone_title,
+            "repo_github": repo_github,
+        },
+    )
+    if resp is not None:
+        return
+    _assign_issue_milestone_local(
+        repo_name, issue_number, milestone_number,
+        milestone_title=milestone_title, repo_github=repo_github,
+    )
+
+
+def _assign_issue_milestone_local(
+    repo_name: str,
+    issue_number: int,
+    milestone_number: int,
+    *,
+    milestone_title: str | None = None,
+    repo_github: str | None = None,
+) -> None:
+    """Backend adapter (GitHub today): assign the milestone via ``github_ops``,
+    then mirror the updated ``milestone_number`` / ``milestone_title`` into the
+    local ``issues`` cache so the TUI reflects the change on its next refresh
+    without waiting for ``coord sync``.
+
+    The daemon endpoint (``POST /issue-milestone``) calls this function directly —
+    it never recurses back out over HTTP.
+    """
+    from coord import github_ops  # noqa: PLC0415
+
+    slug = repo_github or repo_name
+    github_ops.assign_issue_milestone(slug, issue_number, milestone_number)
+
+    # Mirror into the cache (best-effort in intent — the tracker write above is
+    # authoritative; a missing cache row just gets filled on the next sync).
+    conn = get_connection()
+    conn.execute(
+        "UPDATE issues SET milestone_number = ?, milestone_title = ?"
+        " WHERE repo_name = ? AND number = ?",
+        (milestone_number, milestone_title, repo_name, issue_number),
+    )
+    conn.commit()
+
+
 def upsert_open_issues(repo_name: str, issues: list[dict]) -> None:
     """Persist open issues for a repo into the issues table — routes to the
     daemon when ``board_service`` is set (#601), else writes the local DB.

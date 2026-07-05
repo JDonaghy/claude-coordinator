@@ -595,6 +595,56 @@ def update_issue_body(repo: str, issue_number: int, body: str) -> None:
     )
 
 
+def get_repo_milestones(repo: str, *, state: str = "open") -> list[dict]:
+    """Return milestones for *repo* (open ones by default).
+
+    Each item has at least ``number`` and ``title`` keys, matching the
+    shape returned by the GitHub milestones REST endpoint. Used to resolve a
+    milestone title → number (``coord milestone assign``) without a separate
+    call.
+    """
+    raw = _gh(
+        "api", "--paginate",
+        f"repos/{repo}/milestones",
+        "--jq", ".[].{number: .number, title: .title}",
+    )
+    # --jq emits one JSON object per line when applied to an array.
+    results = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if line:
+            results.append(json.loads(line))
+    return results
+
+
+def get_milestone(repo: str, milestone_number: int) -> dict:
+    """Fetch a single milestone by number; returns ``{number, title, ...}``.
+
+    Used to resolve a milestone number → title so the local issues cache
+    ``milestone_title`` column can be populated without listing all milestones.
+    Raises RuntimeError (propagated from ``_gh``) when the milestone does not
+    exist.
+    """
+    raw = _gh("api", f"repos/{repo}/milestones/{milestone_number}")
+    return json.loads(raw)
+
+
+def assign_issue_milestone(
+    repo: str, issue_number: int, milestone_number: int
+) -> None:
+    """Assign *milestone_number* to *issue_number* on *repo* via the GitHub API.
+
+    Uses ``gh api -X PATCH`` with ``-F milestone=<int>`` (capital -F so the
+    value is sent as a JSON integer, as GitHub's REST API requires). Raises
+    RuntimeError on any ``gh`` failure.
+    """
+    _gh(
+        "api", "-X", "PATCH",
+        f"repos/{repo}/issues/{issue_number}",
+        "-F", f"milestone={milestone_number}",
+    )
+
+
 def close_pr(repo: str, number: int, *, comment: str | None = None) -> None:
     """Close an open PR, optionally posting a comment first.
 

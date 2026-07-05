@@ -150,6 +150,93 @@ def milestone_edit_cmd(
 
 
 @milestone_group.command(
+    "assign",
+    help=(
+        "Assign an existing issue to a milestone. REPO is the local repo name "
+        "from coordinator.yml; ISSUE is the GH issue number; MILESTONE is the "
+        "milestone number (e.g. `5`) or title (e.g. `v1.0`). Titles are "
+        "resolved to their number by fetching open milestones from GitHub.\n\n"
+        "Routes through the daemon seam (``POST /issue-milestone``) so the "
+        "write is always traceable and the local issues cache "
+        "``milestone_number``/``milestone_title`` columns are updated "
+        "immediately (no need to wait for ``coord sync``)."
+    ),
+)
+@click.argument("repo")
+@click.argument("issue", type=int)
+@click.argument("milestone")
+@_CONFIG_OPTION
+def milestone_assign_cmd(
+    repo: str,
+    issue: int,
+    milestone: str,
+    config_path: Path,
+) -> None:
+    cfg = _load_config(config_path)
+    repo_entry = cfg.repo(repo)
+    if repo_entry is None:
+        click.echo(f"error: unknown repo {repo!r}", err=True)
+        sys.exit(2)
+
+    from coord import github_ops  # noqa: PLC0415
+    from coord.state import assign_issue_milestone  # noqa: PLC0415
+
+    # Resolve milestone argument: numeric → number, string → title lookup.
+    milestone_number: int
+    milestone_title: str | None
+
+    try:
+        milestone_number = int(milestone)
+        # Resolve the title from the number so the cache can store it.
+        try:
+            ms_data = github_ops.get_milestone(repo_entry.github, milestone_number)
+            milestone_title = ms_data.get("title")
+        except RuntimeError as e:
+            click.echo(
+                f"error: could not fetch milestone #{milestone_number}: {e}", err=True
+            )
+            sys.exit(1)
+    except ValueError:
+        # Treat the argument as a title and resolve to a number.
+        try:
+            all_ms = github_ops.get_repo_milestones(repo_entry.github)
+        except RuntimeError as e:
+            click.echo(f"error: could not list milestones: {e}", err=True)
+            sys.exit(1)
+        matches = [m for m in all_ms if m.get("title") == milestone]
+        if not matches:
+            click.echo(
+                f"error: no open milestone with title {milestone!r} in {repo_entry.github}",
+                err=True,
+            )
+            sys.exit(1)
+        if len(matches) > 1:
+            click.echo(
+                f"error: multiple open milestones match {milestone!r} — "
+                "use the milestone number instead",
+                err=True,
+            )
+            sys.exit(1)
+        milestone_number = matches[0]["number"]
+        milestone_title = matches[0].get("title")
+
+    try:
+        assign_issue_milestone(
+            repo,
+            issue,
+            milestone_number,
+            milestone_title=milestone_title,
+            repo_github=repo_entry.github,
+        )
+    except Exception as e:  # noqa: BLE001
+        click.echo(f"error: milestone assign failed: {e}", err=True)
+        sys.exit(1)
+
+    ms_label = f"{milestone_title!r} (#{milestone_number})" if milestone_title else f"#{milestone_number}"
+    click.echo(f"#{issue} ({repo_entry.github}) assigned to milestone {ms_label}")
+
+
+@milestone_group.command(
     "order",
     help=(
         "Parse the `## Work order` block from a milestone tracking issue and "
