@@ -216,3 +216,25 @@ The branch conflicts with something that merged after the worker finished. Dispa
 coord assign <machine> <repo> <issue> --force --briefing "Rebase branch <branch> onto main. git fetch origin, git checkout <branch>, git rebase origin/main, resolve conflicts, git push --force-with-lease. Do not change any logic."
 ```
 Note: requires agents >= 0.3.0 for `--force` to work.
+
+
+### 7. Epic / Parent-Issue Hygiene
+
+  When an issue is split into sub-issues (e.g. `coord split`, or a manual A/B/C/D...
+  breakdown), the parent becomes an **epic** — a tracking issue, not a dispatchable
+  one. `coord` has no distinct "epic" issue type: a Pipeline card is dispatchable
+  purely from having both the `coord` + `status:ready` labels, regardless of whether
+  the issue body has any diffable scope left. Leaving the parent `status:ready` risks
+  a Work session getting dispatched against an issue with nothing left to build.
+
+  - Once a parent's own actionable scope is fully delegated to sub-issues, pull it out
+    of "live": `coord backlog <repo> <issue>`. This keeps it `coord`-tracked and
+    visible on the board, but drops it to the Backlog column — no `[Go]` button, can't
+    be auto-dispatched by `coord plan`.
+  - Prefer a dedicated milestone for a tightly-coupled parent + sub-issue family over
+    lumping it into a large umbrella milestone — keeps milestone size a meaningful
+    progress signal (see #448 → milestone "GTK ShellApp Event Dispatch", carved out of
+    the ballooning "Platform-Neutral" milestone).
+  - The parent issue's body should say plainly **"Status: parent/tracking issue"** and
+    list the remaining open sub-issues, so anyone who lands on it — human or agent —
+    doesn't mistake it for actionable work.
