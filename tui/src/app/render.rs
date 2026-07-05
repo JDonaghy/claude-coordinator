@@ -1261,14 +1261,24 @@ pub(crate) fn pipeline_detail_pv_rect(main: Rect, lh: f32) -> Rect {
 }
 
 /// #818: Compact variant of [`pipeline_detail_pv_rect`] used for the
-/// universal pinned stage strip shown on every non-Overview tab.  Only
-/// reserves 3 rows (icon + label) so most of the content rect remains for
-/// the tab's own content.
+/// universal pinned stage strip shown on every non-Overview tab.
+///
+/// The TUI `PipelineView` rasteriser (`quadraui::tui::pipeline_view`)
+/// reserves 1 row above the boxes for the keyboard-focus caret, then draws
+/// a bordered box needing at least 4 rows itself (top border / status icon
+/// / label / bottom border) to show the checkmark-or-dot status icon and
+/// stage label inside the border — anything shorter collapses the box to
+/// just its two border rows stacked with no content, which reads as a
+/// flat line instead of a box. 5 rows (1 caret + 4 box) is the minimum
+/// that reproduces the same boxed look as the full-size widget on the
+/// Overview tab, just without room for the two-line label or the action
+/// row. Found via #818 fix-iteration-1 smoke: the previous 3-row strip
+/// rendered as a flat bar because the box had no room for its interior.
 pub(crate) fn pipeline_detail_pv_rect_strip(main: Rect, lh: f32) -> Rect {
     if lh <= 0.0 {
         return Rect::new(main.x, main.y, main.width, 0.0);
     }
-    let want_rows = 3.0_f32;
+    let want_rows = 5.0_f32;
     let max_h = (main.height * 0.40).max(lh);
     let h = (want_rows * lh).min(max_h);
     Rect::new(main.x, main.y, main.width, h)
