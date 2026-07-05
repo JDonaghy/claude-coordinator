@@ -206,8 +206,29 @@ impl ShellApp for CoordApp {
                         backend.tab_bar_layout(tab_rect, &tab_bar).correct_scroll_offset;
                     backend.draw_tab_bar(tab_rect, &tab_bar, None);
 
+                    // #818: helper — draw the compact read-only stage strip
+                    // pinned at the top of every non-Overview tab.  Returns
+                    // the rect below the strip for the tab's own content.
+                    let content_below_strip = |app: &Self,
+                                               backend: &mut dyn Backend,
+                                               cr: Rect|
+                     -> Rect {
+                        let Some(pv) = app.build_pipeline_widget() else {
+                            return cr;
+                        };
+                        let strip_rect = pipeline_detail_pv_rect_strip(cr, lh);
+                        let render_view = pipeline_view_for_render(&pv);
+                        backend.draw_pipeline_view(strip_rect, &render_view);
+                        Rect::new(
+                            cr.x,
+                            cr.y + strip_rect.height,
+                            cr.width,
+                            (cr.height - strip_rect.height).max(0.0),
+                        )
+                    };
+
                     match self.pipeline_detail_tab {
-                        PipelineDetailTab::Pipeline => {
+                        PipelineDetailTab::Overview => {
                             // #303: button bar above the stage row when a
                             // stage is dispatchable.  Eats `bar_h` from the
                             // top of `content_rect`; the stage row and meta
@@ -254,31 +275,32 @@ impl ShellApp for CoordApp {
                             backend.draw_list(meta_rect, &self.pipeline_tab_body_list());
                         }
                         PipelineDetailTab::Issue => {
+                            // #818: pinned stage strip above the issue body.
+                            let body_rect = content_below_strip(self, backend, content_rect);
                             // #669: stash content width so pipeline_issue_body_list can
                             // word-wrap long lines to the viewport.
-                            self.last_issue_panel_cols.set(content_rect.width as usize);
-                            backend.draw_list(content_rect, &self.pipeline_issue_body_list());
-                        }
-                        PipelineDetailTab::Stages => {
-                            backend.draw_list(content_rect, &self.pipeline_stages_list());
+                            self.last_issue_panel_cols.set(body_rect.width as usize);
+                            backend.draw_list(body_rect, &self.pipeline_issue_body_list());
                         }
                         PipelineDetailTab::Log => {
+                            // #818: pinned stage strip above the log.
+                            let log_rect = content_below_strip(self, backend, content_rect);
                             // #399: reserve 1 column on the right for the
                             // vertical scrollbar.  This keeps the list content
                             // out from under the thumb glyph.  For GTK/macOS
                             // backends, `width` is in pixels and 1 px is below
                             // the thumb minimum so the scrollbar is a no-op —
                             // those backends use native scrolling.
-                            let sb_col_w = if content_rect.width >= 2.0 {
+                            let sb_col_w = if log_rect.width >= 2.0 {
                                 1.0_f32
                             } else {
                                 0.0_f32
                             };
                             let list_rect = Rect::new(
-                                content_rect.x,
-                                content_rect.y,
-                                (content_rect.width - sb_col_w).max(1.0),
-                                content_rect.height,
+                                log_rect.x,
+                                log_rect.y,
+                                (log_rect.width - sb_col_w).max(1.0),
+                                log_rect.height,
                             );
                             // #385: stash panel width so pipeline_log_list can
                             // word-wrap assistant prose to the viewport.
@@ -288,13 +310,13 @@ impl ShellApp for CoordApp {
                             // #399: draw the vertical scrollbar at the right edge.
                             if sb_col_w > 0.0 {
                                 let total = log_list.items.len();
-                                let visible = (content_rect.height as usize).max(1);
+                                let visible = (log_rect.height as usize).max(1);
                                 if total > visible {
                                     let sb_track = Rect::new(
-                                        content_rect.x + list_rect.width,
-                                        content_rect.y,
+                                        log_rect.x + list_rect.width,
+                                        log_rect.y,
                                         sb_col_w,
-                                        content_rect.height,
+                                        log_rect.height,
                                     );
                                     let vsb = Scrollbar::vertical(
                                         "pipeline-log-vsb",
@@ -328,57 +350,23 @@ impl ShellApp for CoordApp {
                             });
                         }
                         PipelineDetailTab::Summary => {
-                            // #558: session-history summary — kick the async
-                            // fetch if needed (pipeline_summary_list handles
-                            // that) then paint the list.
+                            // #818: pinned stage strip above the summary.
+                            let summary_body = content_below_strip(self, backend, content_rect);
+                            // #558/#876: session-history summary sourced from
+                            // the in-memory board.
                             let summary_list = self.pipeline_summary_list();
-                            backend.draw_list(content_rect, &summary_list);
-                        }
-                        PipelineDetailTab::Refinement => {
-                            // #264: refinement chat lives in its own tab so
-                            // the user can flip back to Issue / Stages / Log
-                            // while the chat keeps streaming in the
-                            // background.  Render the chat whenever it's
-                            // open — its status strip already names the
-                            // repo + issue, and Backlog rows the user
-                            // refines aren't in `pipeline_issues` (they
-                            // lack the `coord` label), so a per-pipeline-
-                            // sel match would never fire for those.
-                            if self.chat_is_refinement() {
-                                // Paint an opaque backing first so the chat's
-                                // empty transcript zone doesn't bleed
-                                // through.
-                                backend.draw_list(
-                                    content_rect,
-                                    &ListView {
-                                        id: WidgetId::new("refinement-tab-bg"),
-                                        title: None,
-                                        items: Vec::new(),
-                                        selected_idx: 0,
-                                        scroll_offset: 0,
-                                        has_focus: false,
-                                        bordered: true,
-                                        h_scroll: 0,
-                                        max_content_width: None,
-                                        show_v_scrollbar: false,
-                                    },
-                                );
-                                if let Some(ref chat) = self.inject_chat {
-                                    chat.render(backend, content_rect);
-                                }
-                            } else {
-                                backend.draw_list(
-                                    content_rect,
-                                    &self.refinement_tab_placeholder_list(),
-                                );
-                            }
+                            backend.draw_list(summary_body, &summary_list);
                         }
                         PipelineDetailTab::Terminal => {
+                            // #818: pinned stage strip above the terminal.
+                            // The PTY is resized to the reduced rect so the
+                            // strip doesn't overdraw it.
+                            let term_rect = content_below_strip(self, backend, content_rect);
                             // #440: per-issue interactive shell.  Stashes
                             // dims, reads the session snapshot, paints the
                             // PTY surface.  Spawn / resize / poll happen in
                             // `drive_detail_terminals` on every tick.
-                            self.render_detail_terminal_tab(backend, content_rect);
+                            self.render_detail_terminal_tab(backend, term_rect);
                         }
                     }
                 }
@@ -1260,7 +1248,7 @@ pub(crate) fn pipeline_action_bar_height(has_button: bool, lh: f32) -> f32 {
 
 /// Carve out the rect used by the PipelineView primitive at the top of the
 /// Pipeline detail pane.  Reserves 6 rows by default (icon row + label row
-/// + action row + 1 row of padding/border), clamped to ≤ 50 % of the
+/// + action row + 1 row of padding/border), clamped to ≤ 55 % of the
 /// available height so the issue summary below remains visible.
 pub(crate) fn pipeline_detail_pv_rect(main: Rect, lh: f32) -> Rect {
     if lh <= 0.0 {
@@ -1268,6 +1256,20 @@ pub(crate) fn pipeline_detail_pv_rect(main: Rect, lh: f32) -> Rect {
     }
     let want_rows = 6.0_f32;
     let max_h = (main.height * 0.55).max(lh);
+    let h = (want_rows * lh).min(max_h);
+    Rect::new(main.x, main.y, main.width, h)
+}
+
+/// #818: Compact variant of [`pipeline_detail_pv_rect`] used for the
+/// universal pinned stage strip shown on every non-Overview tab.  Only
+/// reserves 3 rows (icon + label) so most of the content rect remains for
+/// the tab's own content.
+pub(crate) fn pipeline_detail_pv_rect_strip(main: Rect, lh: f32) -> Rect {
+    if lh <= 0.0 {
+        return Rect::new(main.x, main.y, main.width, 0.0);
+    }
+    let want_rows = 3.0_f32;
+    let max_h = (main.height * 0.40).max(lh);
     let h = (want_rows * lh).min(max_h);
     Rect::new(main.x, main.y, main.width, h)
 }
@@ -1652,12 +1654,14 @@ impl CoordApp {
     }
 
     pub(crate) fn pipeline_detail_tab_bar(&self) -> TabBar {
+        // #818: redesigned tab set — Pipeline renamed to Overview; Stages and
+        // Refinement removed.  Order: Overview / Issue / Log / Summary / Terminal.
         TabBar {
             id: WidgetId::new("pipeline-detail-tabs"),
             tabs: vec![
                 TabItem {
-                    label: " Pipeline ".to_string(),
-                    is_active: self.pipeline_detail_tab == PipelineDetailTab::Pipeline,
+                    label: " Overview ".to_string(),
+                    is_active: self.pipeline_detail_tab == PipelineDetailTab::Overview,
                     is_dirty: false,
                     is_preview: false,
                     is_closable: false,
@@ -1665,13 +1669,6 @@ impl CoordApp {
                 TabItem {
                     label: " Issue ".to_string(),
                     is_active: self.pipeline_detail_tab == PipelineDetailTab::Issue,
-                    is_dirty: false,
-                    is_preview: false,
-                    is_closable: false,
-                },
-                TabItem {
-                    label: " Stages ".to_string(),
-                    is_active: self.pipeline_detail_tab == PipelineDetailTab::Stages,
                     is_dirty: false,
                     is_preview: false,
                     is_closable: false,
@@ -1687,20 +1684,6 @@ impl CoordApp {
                 TabItem {
                     label: " Summary ".to_string(),
                     is_active: self.pipeline_detail_tab == PipelineDetailTab::Summary,
-                    is_dirty: false,
-                    is_preview: false,
-                    is_closable: false,
-                },
-                TabItem {
-                    // #264: an indicator dot when a refinement worker is
-                    // actively talking on this issue makes the tab
-                    // discoverable without forcing the user back onto it.
-                    label: if self.has_active_refinement_for_selected_issue() {
-                        " Refinement ● ".to_string()
-                    } else {
-                        " Refinement ".to_string()
-                    },
-                    is_active: self.pipeline_detail_tab == PipelineDetailTab::Refinement,
                     is_dirty: false,
                     is_preview: false,
                     is_closable: false,
@@ -3282,331 +3265,5 @@ impl CoordApp {
             .lines()
             .filter(|l| json_str(l, "type").as_deref() == Some("assistant"))
             .count()
-    }
-
-    pub(crate) fn pipeline_stages_list(&self) -> ListView {
-        let mut items: Vec<ListItem> = Vec::new();
-        let issue = self
-            .pipeline_sel
-            .and_then(|i| self.pipeline_issues.get(i))
-            .cloned();
-        let Some(issue) = issue else {
-            items.push(kv_item(
-                "",
-                "(no issue selected)",
-                Some(Color::rgb(140, 140, 140)),
-            ));
-            return ListView {
-                id: WidgetId::new("pipeline-stages"),
-                title: None,
-                items,
-                selected_idx: 0,
-                scroll_offset: 0,
-                has_focus: false,
-                bordered: false,
-                h_scroll: 0,
-                max_content_width: None,
-                show_v_scrollbar: false,
-            };
-        };
-
-        // Closed issue with no assignment rows → no stage rows to show.
-        if issue.is_closed && !self.issue_has_any_assignment(&issue) {
-            items.push(kv_item(
-                "",
-                "  Closed without coord pipeline — no stages tracked.",
-                Some(Color::rgb(120, 180, 120)),
-            ));
-            return ListView {
-                id: WidgetId::new("pipeline-stages"),
-                title: None,
-                items,
-                selected_idx: 0,
-                scroll_offset: 0,
-                has_focus: false,
-                bordered: false,
-                h_scroll: 0,
-                max_content_width: None,
-                show_v_scrollbar: false,
-            };
-        }
-
-        let stage_names = self.pipeline_stage_names_for_issue(&issue);
-        for name in &stage_names {
-            let status = self.stage_status_for(&issue, name);
-            let (icon, color) = match status {
-                StageStatus::Done => ("✓", Color::rgb(120, 200, 120)),
-                StageStatus::Active => ("~", Color::rgb(220, 180, 100)),
-                StageStatus::Failed => ("✗", Color::rgb(220, 70, 70)),
-                StageStatus::Skipped => ("─", Color::rgb(140, 140, 140)),
-                StageStatus::Pending => ("·", Color::rgb(140, 140, 140)),
-                StageStatus::Stale => ("↻", Color::rgb(140, 140, 140)),
-            };
-            let header = format!(" {} {}", icon, capitalize(name));
-            items.push(ListItem {
-                text: StyledText {
-                    spans: vec![StyledSpan::with_fg(header, color)],
-                },
-                icon: None,
-                detail: None,
-                decoration: Decoration::Normal,
-            });
-
-            self.append_assignment_stage_rows(&mut items, &issue, name);
-            items.push(kv_item("", "", None));
-        }
-
-        // #stage-content: per-stage content panel.  When a stage is
-        // focused ([/] keys, or a click on the stage box on the Pipeline
-        // tab), render its associated output at the bottom of the list.
-        // Plan → planner agent output; Work → worker log tail;
-        // Test → build output; Review → cached review findings.
-        if let Some(focused_idx) = self
-            .pipeline_focused_stage
-            .filter(|&i| i < stage_names.len())
-        {
-            let name = &stage_names[focused_idx];
-            items.push(kv_item("", "", None));
-            items.push(kv_item(
-                "",
-                &format!(" ── Stage content: {} ──", capitalize(name)),
-                Some(Color::rgb(220, 220, 230)),
-            ));
-            items.push(kv_item(
-                "",
-                "   ([/] previous · [/] next stage)",
-                Some(Color::rgb(140, 140, 160)),
-            ));
-            items.push(kv_item("", "", None));
-            let content_rows = self.stage_content_for(&issue, name);
-            if content_rows.is_empty() {
-                items.push(kv_item(
-                    "",
-                    "   (no content available for this stage yet)",
-                    Some(Color::rgb(140, 140, 160)),
-                ));
-            } else {
-                items.extend(content_rows);
-            }
-        } else {
-            // No stage focused — auto-focus should handle this, but
-            // show a hint for issues with no stages or no content yet.
-            items.push(kv_item(
-                "",
-                " Tip: press [ / ] to view each stage's output here.",
-                Some(Color::rgb(140, 140, 160)),
-            ));
-        }
-        ListView {
-            id: WidgetId::new("pipeline-stages"),
-            title: None,
-            items,
-            selected_idx: 0,
-            // Stage content (esp. a rendered plan) can overflow the panel.
-            // Honour the scroll offset driven by the scroll wheel / keys.
-            scroll_offset: self.pipeline_stage_content_scroll,
-            has_focus: false,
-            bordered: false,
-            h_scroll: 0,
-            max_content_width: None,
-            show_v_scrollbar: false,
-        }
-    }
-
-    /// Push detail rows for a non-merge stage's matching assignments
-    /// (most-recent first). Falls back to a single "(not started)" row.
-    pub(crate) fn append_assignment_stage_rows(
-        &self,
-        items: &mut Vec<ListItem>,
-        issue: &PipelineIssue,
-        stage: &str,
-    ) {
-        let local_repo = issue.coord_repo.as_deref();
-        let plan_gate_on = self.data.pipeline_require_plan;
-        let has_plan_for_issue = self.issue_has_plan_assignment(issue);
-        let matching: Vec<&Assignment> = self
-            .data
-            .assignments
-            .iter()
-            .filter(|a| a.issue_number == issue.number)
-            .filter(|a| match local_repo {
-                Some(r) => a.repo == r,
-                None => true,
-            })
-            .filter(|a| {
-                let t = a.assignment_type.as_deref().unwrap_or("work");
-                // Legacy fold: plan-typed assignments count as Work only
-                // when this issue's strip has no Plan stage (no plan
-                // gate globally AND no plan-typed assignment exists).
-                if stage == "work" && !plan_gate_on && !has_plan_for_issue {
-                    t == "work" || t == "plan"
-                } else {
-                    t == stage
-                }
-            })
-            .collect();
-
-        if matching.is_empty() {
-            items.push(kv_item(
-                "",
-                "    (not started)",
-                Some(Color::rgb(140, 140, 140)),
-            ));
-            return;
-        }
-        for a in matching.iter() {
-            let id_short: String = a.id.chars().take(8).collect();
-            items.push(kv_item(
-                "Assignment",
-                &id_short,
-                Some(Color::rgb(160, 200, 220)),
-            ));
-            items.push(kv_item(
-                "Machine",
-                &a.machine,
-                Some(Color::rgb(210, 210, 210)),
-            ));
-            let status_color = match a.status.as_str() {
-                "running" => Color::rgb(220, 180, 100),
-                "done" => Color::rgb(120, 200, 120),
-                "failed" => Color::rgb(220, 70, 70),
-                _ => Color::rgb(180, 180, 180),
-            };
-            items.push(kv_item("Status", &a.status, Some(status_color)));
-            // #618: when an interactive session fails at launch (e.g. branch
-            // already checked out) no log file is produced.  Surface the
-            // reason string recorded at failure time so the operator can see
-            // WHY the box is red without having to run `coord diagnose`.
-            if a.status == "failed" {
-                if let Some(reason) = &a.failure_reason {
-                    items.push(kv_item(
-                        "Failure",
-                        reason,
-                        Some(Color::rgb(220, 100, 100)),
-                    ));
-                }
-            }
-            if let Some(branch) = &a.branch {
-                items.push(kv_item("Branch", branch, Some(Color::rgb(200, 200, 200))));
-            }
-            if let Some(model) = &a.model {
-                items.push(kv_item("Model", model, Some(Color::rgb(180, 180, 180))));
-            }
-            if let Some(t) = a.dispatched_at {
-                items.push(kv_item(
-                    "Dispatched",
-                    &format_unix_time(t),
-                    Some(Color::rgb(180, 180, 180)),
-                ));
-            }
-            if let Some(t) = a.finished_at {
-                items.push(kv_item(
-                    "Finished",
-                    &format_unix_time(t),
-                    Some(Color::rgb(180, 180, 180)),
-                ));
-            }
-            if let Some(ec) = a.exit_code {
-                let ec_color = if ec == 0 {
-                    Color::rgb(120, 200, 120)
-                } else {
-                    Color::rgb(220, 70, 70)
-                };
-                items.push(kv_item("Exit code", &ec.to_string(), Some(ec_color)));
-            }
-            // #208/#546: surface captured worker cost + token counts so the
-            // user can spot unusually expensive runs without leaving the TUI.
-            // Token counts come from the same stream-json parse as cost_usd.
-            // Interactive (Max subscription) workers have cost_usd=None and
-            // token counts of 0 — we show "Max (subscription)" for those.
-            let tok_total = a.input_tokens + a.output_tokens
-                + a.cache_creation_tokens + a.cache_read_tokens;
-            let has_tokens = tok_total > 0;
-            if let Some(cost) = a.cost_usd {
-                let tok_suffix = if has_tokens {
-                    // Show input·output with a cache note when cache was used.
-                    let cache = a.cache_creation_tokens + a.cache_read_tokens;
-                    if cache > 0 {
-                        format!(
-                            "  ({}in · {}out · {}cache)",
-                            fmt_tokens(a.input_tokens),
-                            fmt_tokens(a.output_tokens),
-                            fmt_tokens(cache),
-                        )
-                    } else {
-                        format!(
-                            "  ({}in · {}out)",
-                            fmt_tokens(a.input_tokens),
-                            fmt_tokens(a.output_tokens),
-                        )
-                    }
-                } else {
-                    String::new()
-                };
-                items.push(kv_item(
-                    "Cost",
-                    &format!("{}{}", format_cost_usd(cost), tok_suffix),
-                    Some(Color::rgb(180, 180, 180)),
-                ));
-            } else if a.is_interactive {
-                // Confirmed interactive (Max) session — show billing model.
-                // Gate on is_interactive so pre-#208 automated rows (which also have
-                // cost_usd=NULL + zero tokens) are not mis-labelled "Max (subscription)".
-                // Include token breakdown when the transcript scan succeeded (#546).
-                let tok_suffix = if has_tokens {
-                    let cache = a.cache_creation_tokens + a.cache_read_tokens;
-                    if cache > 0 {
-                        format!(
-                            "  ({}in · {}out · {}cache)",
-                            fmt_tokens(a.input_tokens),
-                            fmt_tokens(a.output_tokens),
-                            fmt_tokens(cache),
-                        )
-                    } else {
-                        format!(
-                            "  ({}in · {}out)",
-                            fmt_tokens(a.input_tokens),
-                            fmt_tokens(a.output_tokens),
-                        )
-                    }
-                } else {
-                    String::new()
-                };
-                items.push(kv_item(
-                    "Cost",
-                    &format!("Max (subscription){}", tok_suffix),
-                    Some(Color::rgb(140, 140, 160)),
-                ));
-            } else if has_tokens {
-                // Tokens available but cost_usd not yet persisted (uncommon).
-                items.push(kv_item(
-                    "Tokens",
-                    &format!("{}tok", fmt_tokens(tok_total)),
-                    Some(Color::rgb(180, 180, 180)),
-                ));
-            }
-            // #272-followup: surface the local DB's review_verdict on
-            // review-typed assignments so the user can see WHY a
-            // merge is blocked without leaving the TUI.  Earlier
-            // session feedback: "I cant access the review text and
-            // tell if it passed or failed".
-            if a.assignment_type.as_deref() == Some("review") {
-                if let Some(verdict) = a.review_verdict.as_deref() {
-                    let (label, color) = match verdict {
-                        "approve" => ("✓ approved", Color::rgb(120, 200, 120)),
-                        "request-changes" => ("✗ changes requested", Color::rgb(220, 100, 100)),
-                        other => (other, Color::rgb(220, 180, 100)),
-                    };
-                    items.push(kv_item("Verdict", label, Some(color)));
-                } else {
-                    items.push(kv_item(
-                        "Verdict",
-                        "(pending — not parsed yet)",
-                        Some(Color::rgb(160, 160, 180)),
-                    ));
-                }
-            }
-            items.push(kv_item("", "", None));
-        }
     }
 }

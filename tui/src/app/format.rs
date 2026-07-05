@@ -37,6 +37,8 @@ pub(crate) fn capitalize(s: &str) -> String {
 /// Format a unix timestamp as a relative "Xs/m/h ago" string using
 /// the existing `fmt_dur` helper.  Falls back to "-" when the
 /// timestamp is in the future or the system clock can't be read.
+/// (#818: previously used by the Stages tab detail rows; retained for future use.)
+#[allow(dead_code)]
 pub(crate) fn format_unix_time(ts: f64) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)

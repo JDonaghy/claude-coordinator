@@ -68,14 +68,13 @@ impl CoordApp {
             }
             SidebarView::Pipeline => {
                 match self.pipeline_detail_tab {
-                    // The default stage-view tab and the Stages tab both render
-                    // `pipeline_tab_body_list`, whose scroll_offset is
-                    // `pipeline_stage_content_scroll`.
-                    PipelineDetailTab::Pipeline | PipelineDetailTab::Stages => {
+                    // #818: Overview renders `pipeline_tab_body_list`, whose
+                    // scroll_offset is `pipeline_stage_content_scroll`.
+                    PipelineDetailTab::Overview => {
                         self.pipeline_stage_content_scroll =
                             step(self.pipeline_stage_content_scroll, down);
                     }
-                    // Issue / Log / Summary / Refinement / Terminal bodies read
+                    // Issue / Log / Summary / Terminal bodies read
                     // `pipeline_detail_scroll`.
                     _ => {
                         self.pipeline_detail_scroll = step(self.pipeline_detail_scroll, down);
@@ -743,20 +742,22 @@ impl CoordApp {
         //     keeps the original modal behaviour: chat captures ALL events
         //     until closed.  This matches its short-burst usage.
         //   - **Refinement** (#264, opened via Refine with chat) routes
-        //     events to the chat only when the user is actively on the
-        //     Refinement tab — otherwise the user can navigate Issue /
-        //     Stages / Log freely while the chat keeps streaming in the
-        //     background.
+        //     events to the chat only when the user is actively in a chat
+        //     context (Board > Chat tab or worker-guidance modal).
+        //     #818: the Pipeline Refinement tab is removed; refinement chats
+        //     are no longer routed here.
         if self.inject_chat.is_some() {
             let chat_is_refinement = self.chat_is_refinement();
             let chat_is_board = self.chat_is_board_chat();
             // Three routing modes:
             //   - **Worker-guidance**: modal — captures ALL events.
-            //   - **Refinement** (#264): routed only on Pipeline > Refinement tab.
+            //   - **Refinement** (#264/#818): Refinement tab removed; the
+            //     refinement chat is no longer shown inline in the Pipeline
+            //     view so events are not routed to it.
             //   - **Board chat** (#316): routed only on Board > Chat tab.
             let route_to_chat = if chat_is_refinement {
-                self.active_view == SidebarView::Pipeline
-                    && self.pipeline_detail_tab == PipelineDetailTab::Refinement
+                // #818: Refinement tab removed — no longer route events.
+                false
             } else if chat_is_board {
                 self.active_view == SidebarView::Board
                     && self.board_detail_tab == BoardDetailTab::Chat
@@ -1936,12 +1937,12 @@ impl CoordApp {
                         needs_redraw = true;
                     }
 
-                    // ── j/k — scroll Stages tab content (plan / log) ──────
+                    // ── j/k — scroll Overview tab stage body ──────────────
                     // `[`/`]` switch the focused stage; j/k scroll the
                     // rendered content (plans + log tails overflow easily).
                     Key::Char('j') | Key::Named(NamedKey::Down)
                         if self.active_view == SidebarView::Pipeline
-                            && self.pipeline_detail_tab == PipelineDetailTab::Stages
+                            && self.pipeline_detail_tab == PipelineDetailTab::Overview
                             && self.focused_region != FocusedRegion::Sidebar =>
                     {
                         self.pipeline_stage_content_scroll =
@@ -1950,7 +1951,7 @@ impl CoordApp {
                     }
                     Key::Char('k') | Key::Named(NamedKey::Up)
                         if self.active_view == SidebarView::Pipeline
-                            && self.pipeline_detail_tab == PipelineDetailTab::Stages
+                            && self.pipeline_detail_tab == PipelineDetailTab::Overview
                             && self.focused_region != FocusedRegion::Sidebar =>
                     {
                         self.pipeline_stage_content_scroll =
@@ -2253,42 +2254,37 @@ impl CoordApp {
                         needs_redraw = true;
                     }
 
-                    // ── [ / ] — cycle focused stage (Pipeline + Stages tabs) ─
+                    // ── [ / ] — cycle focused stage (Overview tab) ────────
                     // Sets `pipeline_focused_stage`, which the rasteriser
                     // draws with an accent border on the stage boxes and
                     // selects which stage's content the scrollable panel shows.
-                    // Available on both the Pipeline tab (stage-content panel
-                    // below the boxes) and the Stages tab.
+                    // #818: available on the Overview tab only (Stages tab removed).
                     Key::Char('[')
                         if self.active_view == SidebarView::Pipeline
-                            && (self.pipeline_detail_tab == PipelineDetailTab::Stages
-                                || self.pipeline_detail_tab == PipelineDetailTab::Pipeline) =>
+                            && self.pipeline_detail_tab == PipelineDetailTab::Overview =>
                     {
                         self.focus_prev_pipeline_stage();
                         needs_redraw = true;
                     }
                     Key::Char(']')
                         if self.active_view == SidebarView::Pipeline
-                            && (self.pipeline_detail_tab == PipelineDetailTab::Stages
-                                || self.pipeline_detail_tab == PipelineDetailTab::Pipeline) =>
+                            && self.pipeline_detail_tab == PipelineDetailTab::Overview =>
                     {
                         self.focus_next_pipeline_stage();
                         needs_redraw = true;
                     }
 
                     // ── h/l — cycle Pipeline detail tabs ─────────────────
-                    // Order: Pipeline → Issue → Stages → Log → Summary → Refinement → Terminal → Pipeline …
+                    // #818 order: Overview → Issue → Log → Summary → Terminal → Overview …
                     Key::Char('h') | Key::Named(NamedKey::Left)
                         if self.active_view == SidebarView::Pipeline =>
                     {
                         let next = match self.pipeline_detail_tab {
-                            PipelineDetailTab::Pipeline => PipelineDetailTab::Terminal,
-                            PipelineDetailTab::Issue => PipelineDetailTab::Pipeline,
-                            PipelineDetailTab::Stages => PipelineDetailTab::Issue,
-                            PipelineDetailTab::Log => PipelineDetailTab::Stages,
+                            PipelineDetailTab::Overview => PipelineDetailTab::Terminal,
+                            PipelineDetailTab::Issue => PipelineDetailTab::Overview,
+                            PipelineDetailTab::Log => PipelineDetailTab::Issue,
                             PipelineDetailTab::Summary => PipelineDetailTab::Log,
-                            PipelineDetailTab::Refinement => PipelineDetailTab::Summary,
-                            PipelineDetailTab::Terminal => PipelineDetailTab::Refinement,
+                            PipelineDetailTab::Terminal => PipelineDetailTab::Summary,
                         };
                         // Release PTY focus whenever the user navigates away
                         // from the Terminal tab.
@@ -2319,13 +2315,11 @@ impl CoordApp {
                         if self.active_view == SidebarView::Pipeline =>
                     {
                         let next = match self.pipeline_detail_tab {
-                            PipelineDetailTab::Pipeline => PipelineDetailTab::Issue,
-                            PipelineDetailTab::Issue => PipelineDetailTab::Stages,
-                            PipelineDetailTab::Stages => PipelineDetailTab::Log,
+                            PipelineDetailTab::Overview => PipelineDetailTab::Issue,
+                            PipelineDetailTab::Issue => PipelineDetailTab::Log,
                             PipelineDetailTab::Log => PipelineDetailTab::Summary,
-                            PipelineDetailTab::Summary => PipelineDetailTab::Refinement,
-                            PipelineDetailTab::Refinement => PipelineDetailTab::Terminal,
-                            PipelineDetailTab::Terminal => PipelineDetailTab::Pipeline,
+                            PipelineDetailTab::Summary => PipelineDetailTab::Terminal,
+                            PipelineDetailTab::Terminal => PipelineDetailTab::Overview,
                         };
                         // Release PTY focus whenever the user navigates away
                         // from the Terminal tab.
@@ -2548,17 +2542,9 @@ impl CoordApp {
                         needs_redraw = true;
                     }
 
-                    // ── Enter — Stages tab: switch to Log tab to view the
-                    //              worker log inline.  Log tab: Go fires
-                    //              the active stage.  Other tabs: Go fires.
+                    // ── Enter — Pipeline: Go fires the active stage.
                     Key::Named(NamedKey::Enter) if self.active_view == SidebarView::Pipeline => {
-                        if self.pipeline_detail_tab == PipelineDetailTab::Stages {
-                            self.pipeline_detail_tab = PipelineDetailTab::Log;
-                            self.pipeline_detail_scroll = usize::MAX;
-                            self.ensure_log_tab_sse();
-                        } else {
-                            self.dispatch_pipeline_active_go();
-                        }
+                        self.dispatch_pipeline_active_go();
                         needs_redraw = true;
                     }
 
@@ -3511,7 +3497,7 @@ impl CoordApp {
                     // main_b.y + tab_h — compute bar_rect the same way
                     // the render path does and feed it to `toolbar_layout`.
                     if self.active_view == SidebarView::Pipeline
-                        && self.pipeline_detail_tab == PipelineDetailTab::Pipeline
+                        && self.pipeline_detail_tab == PipelineDetailTab::Overview
                     {
                         if let Some(action_toolbar) = self.pipeline_action_bar_toolbar() {
                             let main_b = ctx.main_bounds();
@@ -4076,13 +4062,12 @@ impl CoordApp {
                 if let Some(idx) =
                     hit_tab_index_from_labels(&labels, main_b.x, pos.x, tab_scroll)
                 {
+                    // #818: Overview / Issue / Log / Summary / Terminal (5 tabs).
                     let new_tab = match idx {
-                        0 => PipelineDetailTab::Pipeline,
+                        0 => PipelineDetailTab::Overview,
                         1 => PipelineDetailTab::Issue,
-                        2 => PipelineDetailTab::Stages,
-                        3 => PipelineDetailTab::Log,
-                        4 => PipelineDetailTab::Summary,
-                        5 => PipelineDetailTab::Refinement,
+                        2 => PipelineDetailTab::Log,
+                        3 => PipelineDetailTab::Summary,
                         _ => PipelineDetailTab::Terminal,
                     };
                     if new_tab != self.pipeline_detail_tab {
@@ -4108,7 +4093,7 @@ impl CoordApp {
             // is rendered into the content area (main_b minus tab row), so
             // we must hit-test against that rect — not main_b directly, or
             // the y-coordinates are off by tab_h.
-            if self.pipeline_detail_tab == PipelineDetailTab::Pipeline {
+            if self.pipeline_detail_tab == PipelineDetailTab::Overview {
                 if let Some(view) = self.build_pipeline_widget() {
                     let content_rect = Rect::new(
                         main_b.x,
@@ -4577,9 +4562,8 @@ impl CoordApp {
                 true
             }
             SidebarView::Pipeline => {
-                // Issue tab body and Stages tab content (rendered plan, log
-                // tails) can both overflow the panel.  The Pipeline tab is a
-                // fixed-size widget — scroll there is consumed but inert.
+                // Issue tab body and Overview tab body can both overflow the
+                // panel.
                 match self.pipeline_detail_tab {
                     PipelineDetailTab::Issue => {
                         let items = self.pipeline_issue_body_list().items.len();
@@ -4592,20 +4576,9 @@ impl CoordApp {
                                 (self.pipeline_detail_scroll + 1).min(max);
                         }
                     }
-                    PipelineDetailTab::Stages => {
-                        let items = self.pipeline_stages_list().items.len();
-                        let max = items.saturating_sub(visible.saturating_sub(1));
-                        if delta.y > 0.0 {
-                            self.pipeline_stage_content_scroll =
-                                self.pipeline_stage_content_scroll.saturating_sub(1);
-                        } else if delta.y < 0.0 {
-                            self.pipeline_stage_content_scroll =
-                                (self.pipeline_stage_content_scroll + 1).min(max);
-                        }
-                    }
-                    PipelineDetailTab::Pipeline => {
-                        // The body list (meta + stage content) is now
-                        // scrollable on the Pipeline tab.
+                    PipelineDetailTab::Overview => {
+                        // #818: The body list (meta + stage content) scrolls on
+                        // the Overview tab.
                         let items = self.pipeline_tab_body_list().items.len();
                         let max = items.saturating_sub(visible.saturating_sub(1));
                         if delta.y > 0.0 {
@@ -4645,13 +4618,6 @@ impl CoordApp {
                             self.pipeline_detail_scroll =
                                 (self.pipeline_detail_scroll + 1).min(max);
                         }
-                    }
-                    PipelineDetailTab::Refinement => {
-                        // #264: ChatController owns its own scroll inside
-                        // the embedded transcript when the chat is bound
-                        // to this issue; the parent panel-scroll path is
-                        // a no-op so wheel events here don't fight with
-                        // the chat's internal scrollbar.
                     }
                     PipelineDetailTab::Terminal => {
                         // #454: Forward scroll to the PTY when the child has
