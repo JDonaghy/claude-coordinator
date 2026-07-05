@@ -299,6 +299,9 @@ pub(crate) struct Assignment {
     pub(crate) test_reason: Option<String>,
     /// Internal review-state machine value: "pending" | "done" etc.
     /// `None` for non-review assignments and for pre-#876 rows.
+    /// Deserialized from the board for future display; not yet read in
+    /// production rendering paths.
+    #[allow(dead_code)]
     #[serde(default)]
     pub(crate) review_state: Option<String>,
     /// URL to the pull request for this work assignment (populated when the
@@ -1013,6 +1016,10 @@ pub(crate) struct CoordReviewHeader {
 
 /// #558: One session entry shown in the Pipeline Summary tab.
 /// Represents a single work/review/fix/plan session from GitHub comments.
+/// #876: Used only in unit tests (the live Summary tab now sources from the
+/// board layer via `build_board_summary_list_view`); the struct and its
+/// helpers are compiled exclusively in test mode.
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct SessionSummary {
     /// The coord assignment id (from the `assignment=` marker token), or empty.

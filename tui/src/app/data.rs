@@ -589,6 +589,11 @@ pub(crate) fn parse_coord_review_header(body: &str) -> Option<CoordReviewHeader>
 ///
 /// `assignments` is passed so we can promote the `assignment_type` from the
 /// local DB (the comment marker only carries the id, not the type).
+///
+/// #876: The live Summary tab now uses `build_board_summary_list_view` instead
+/// (board-layer data, no GH shellout).  This function is kept for unit tests
+/// that verify the comment-parsing logic in isolation.
+#[cfg(test)]
 pub(crate) fn parse_session_summaries_from_comments(
     comments_json: &serde_json::Value,
     assignments: &[Assignment],
@@ -668,6 +673,8 @@ pub(crate) fn parse_session_summaries_from_comments(
 
 /// Parse a `<!-- coord:event=... -->` comment into a `SessionSummary`.
 /// Returns `None` when the comment doesn't carry a recognised coord event.
+/// #876: test-only (called exclusively from `parse_session_summaries_from_comments`).
+#[cfg(test)]
 pub(crate) fn parse_coord_event_comment(
     body: &str,
     assignments: &[Assignment],
@@ -732,6 +739,8 @@ pub(crate) fn parse_coord_event_comment(
 
 /// Extract the prose from a `### Summary` block in a completion comment.
 /// Returns the trimmed block text (may be multi-line), or empty string.
+/// #876: test-only helper.
+#[cfg(test)]
 pub(crate) fn extract_completion_summary(body: &str) -> String {
     // Find "### Summary" heading and collect text until the next heading or end.
     let lower = body.to_ascii_lowercase();
@@ -751,6 +760,8 @@ pub(crate) fn extract_completion_summary(body: &str) -> String {
 /// Extract a one-line prose summary from a review comment body.
 /// Skips the `<!-- coord:review ... -->` header line and returns the first
 /// non-empty content line.
+/// #876: test-only helper.
+#[cfg(test)]
 pub(crate) fn extract_review_summary(body: &str) -> String {
     // Find "REVIEW_BODY:" marker if present (the structured review format).
     let lower = body.to_ascii_lowercase();
@@ -2150,45 +2161,6 @@ pub(crate) fn spawn_pr_fetch(
     rx
 }
 
-/// #558: Fetch GitHub issue comments asynchronously via `gh issue view --json
-/// comments`.  Returns a channel that yields the raw `comments` JSON array on
-/// success or an error string on failure.  The caller (poll loop in tick)
-/// passes the JSON through `parse_session_summaries_from_comments` to build
-/// the Summary tab entries.
-pub(crate) fn spawn_comments_fetch(
-    repo_slug: String,
-    issue_number: u64,
-) -> std::sync::mpsc::Receiver<Result<serde_json::Value, String>> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let output = std::process::Command::new("gh")
-            .args([
-                "issue",
-                "view",
-                &issue_number.to_string(),
-                "--repo",
-                &repo_slug,
-                "--json",
-                "comments",
-            ])
-            .output();
-        let result = match output {
-            Ok(o) if o.status.success() => {
-                match serde_json::from_slice::<serde_json::Value>(&o.stdout) {
-                    Ok(v) => {
-                        // Return the `comments` array (or null → empty array).
-                        Ok(v.get("comments").cloned().unwrap_or(serde_json::Value::Array(Vec::new())))
-                    }
-                    Err(e) => Err(format!("gh json parse failed: {}", e)),
-                }
-            }
-            Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
-            Err(e) => Err(format!("could not run gh: {}", e)),
-        };
-        let _ = tx.send(result);
-    });
-    rx
-}
 
 /// Upsert a freshly-fetched issue into the local `issues` table. Mirrors the
 /// `upsert_open_issues` Python helper but for a single row, using the same
