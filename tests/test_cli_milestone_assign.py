@@ -12,7 +12,9 @@ Coverage targets (mirroring test_milestone_seam.py / test_cli_issue_create_label
 
 from __future__ import annotations
 
+import inspect
 import json
+import re
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -115,8 +117,47 @@ class TestGithubOpsGetRepoMilestones:
             {"number": 4, "title": "v2.0"},
         ]
         args = mock_run.call_args[0][0]
-        assert "repos/acme/api/milestones" in " ".join(args)
+        assert "repos/acme/api/milestones?state=open" in " ".join(args)
         assert "--jq" in args
+        # Assert the exact filter string (not just presence of "--jq") so a
+        # future edit that reintroduces invalid jq syntax is caught here even
+        # without a live jq engine.
+        jq_index = args.index("--jq")
+        assert args[jq_index + 1] == ".[] | {number: .number, title: .title}"
+
+    def test_jq_filter_is_valid_jq_syntax(self) -> None:
+        """Regression test for the #967 review finding: `.[].{...}` (no pipe)
+        is invalid jq syntax and made the title-lookup path fail end to end.
+        Run the *actual* filter through a real jq engine to catch this class
+        of bug even though the rest of this test class mocks subprocess.run.
+        """
+        jq = pytest.importorskip("jq")
+        from coord import github_ops
+
+        source = inspect.getsource(github_ops.get_repo_milestones)
+        match = re.search(r'"--jq",\s*"([^"]+)"', source)
+        assert match, "could not find --jq filter string in get_repo_milestones"
+        filter_str = match.group(1)
+
+        sample = [
+            {"number": 3, "title": "v1.0", "state": "open"},
+            {"number": 4, "title": "v2.0", "state": "open"},
+        ]
+        result = jq.compile(filter_str).input_value(sample).all()
+        assert result == [
+            {"number": 3, "title": "v1.0"},
+            {"number": 4, "title": "v2.0"},
+        ]
+
+    def test_forwards_state_query_param(self) -> None:
+        fake_result = MagicMock(returncode=0, stdout="", stderr="")
+        with patch("subprocess.run", return_value=fake_result) as mock_run:
+            from coord import github_ops
+
+            github_ops.get_repo_milestones("acme/api", state="all")
+
+        args = mock_run.call_args[0][0]
+        assert "repos/acme/api/milestones?state=all" in " ".join(args)
 
     def test_empty_repo_returns_empty_list(self) -> None:
         fake_result = MagicMock(returncode=0, stdout="", stderr="")
