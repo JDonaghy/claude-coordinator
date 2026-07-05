@@ -246,6 +246,17 @@ class Assignment:
     # the TUI explain the red box without any log file being present.
     # None for assignments that launched successfully.
     failure_reason: str | None = None
+    # #944: Acceptance-gate verdict (oracle loop, docs/ORACLE_LOOP.md) for
+    # type="work" assignments. None | "passed" | "failed" — set by `coord
+    # acceptance record --issue N --sha <sha>`, the coordinator's external
+    # re-run of the sealed suite against the pushed SHA (the trust gate a
+    # headless worker's in-session "green" claim can't fake).
+    acceptance_state: str | None = None
+    acceptance_reason: str | None = None
+    # SHA the last `acceptance record` verdict was recorded against — lets a
+    # future gate detect staleness (new commits since the last record) the
+    # same way review_head_sha detects a stale review approval.
+    acceptance_sha: str | None = None
 
 
 @dataclass

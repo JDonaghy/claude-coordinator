@@ -77,6 +77,15 @@ def dispatch(
     if repo is not None and repo.coordinator_only_files:
         files_forbidden = list(repo.coordinator_only_files)
 
+    # #944 sealing v1 (docs/ORACLE_LOOP.md): the acceptance oracle is
+    # read-only/run-only for the worker — it's authored by an independent
+    # test-author, not the worker under test. Auto-forbid it for any repo
+    # with an acceptance driver configured, so sealing doesn't depend on an
+    # operator remembering to also list it under coordinator_only_files.
+    if config.acceptance.driver_for(proposal.repo_name) is not None:
+        if "tests/acceptance/" not in files_forbidden:
+            files_forbidden.append("tests/acceptance/")
+
     # Resolve model: proposal override → config default → None (let claude pick).
     # The board/DB stores the alias for legibility; only the wire payload is
     # translated to an exact model id via models.versions (when configured).

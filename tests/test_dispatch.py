@@ -166,6 +166,94 @@ class TestDispatch:
         payload = mock_post.call_args.kwargs["json"]
         assert "target_branch" not in payload
 
+    @patch("coord.dispatch.httpx.post")
+    def test_payload_carries_coordinator_only_files(
+        self, mock_post: MagicMock, proposal: Proposal,
+    ) -> None:
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        cfg = Config(
+            repos=[Repo(
+                name="api", github="acme/api",
+                coordinator_only_files=["README.md", "CHANGELOG.md"],
+            )],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+            )],
+        )
+        dispatch(proposal, cfg)
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["files_forbidden"] == ["README.md", "CHANGELOG.md"]
+
+    @patch("coord.dispatch.httpx.post")
+    def test_payload_auto_seals_acceptance_dir_when_driver_configured(
+        self, mock_post: MagicMock, proposal: Proposal,
+    ) -> None:
+        """#944 sealing v1: a repo with an oracle-loop acceptance driver gets
+        tests/acceptance/ auto-forbidden even without listing it under
+        coordinator_only_files — sealing shouldn't depend on remembering to
+        configure both."""
+        from coord.config import AcceptanceConfig, AcceptanceDriverConfig
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+            )],
+            acceptance=AcceptanceConfig(drivers={
+                "api": AcceptanceDriverConfig(kind="tui-tuidriver", run="cargo test"),
+            }),
+        )
+        dispatch(proposal, cfg)
+        payload = mock_post.call_args.kwargs["json"]
+        assert "tests/acceptance/" in payload["files_forbidden"]
+
+    @patch("coord.dispatch.httpx.post")
+    def test_payload_no_acceptance_seal_without_driver(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal,
+    ) -> None:
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+        dispatch(proposal, config)
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["files_forbidden"] == []
+
+    @patch("coord.dispatch.httpx.post")
+    def test_payload_acceptance_seal_dedupes_with_coordinator_only_files(
+        self, mock_post: MagicMock, proposal: Proposal,
+    ) -> None:
+        from coord.config import AcceptanceConfig, AcceptanceDriverConfig
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        cfg = Config(
+            repos=[Repo(
+                name="api", github="acme/api",
+                coordinator_only_files=["tests/acceptance/"],
+            )],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+            )],
+            acceptance=AcceptanceConfig(drivers={
+                "api": AcceptanceDriverConfig(kind="tui-tuidriver", run="cargo test"),
+            }),
+        )
+        dispatch(proposal, cfg)
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["files_forbidden"].count("tests/acceptance/") == 1
+
     def test_unknown_machine_raises(self, config: Config) -> None:
         bad = Proposal(
             id=1, machine_name="ghost", repo_name="api",

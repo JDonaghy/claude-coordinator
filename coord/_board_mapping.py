@@ -113,6 +113,11 @@ def row_to_assignment(row: object) -> Assignment:
         cache_read_tokens=int(d.get("cache_read_tokens") or 0),
         # #618: short launch-failure reason; None for successfully-launched rows.
         failure_reason=d.get("failure_reason"),
+        # #944: Acceptance-gate verdict; None for rows predating the oracle loop
+        # or work that hasn't reached an `acceptance record` yet.
+        acceptance_state=d.get("acceptance_state"),
+        acceptance_reason=d.get("acceptance_reason"),
+        acceptance_sha=d.get("acceptance_sha"),
     )
 
 

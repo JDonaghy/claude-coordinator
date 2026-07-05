@@ -377,6 +377,75 @@ def test_briefing_no_diff_text_keeps_three_dot_fallback() -> None:
     assert "git diff origin/main...origin/my-branch" in briefing
 
 
+def test_briefing_no_sealed_paths_by_default() -> None:
+    briefing = build_review_briefing(
+        pr_number=42, pr_url=None, repo_github="acme/api", repo_name="api",
+        issue_number=7, issue_title="X", issue_body="",
+        branch="my-branch", worker_machine="laptop", same_as_worker=False,
+        reviews_cfg=ReviewsConfig(enabled=True), repo_claude_md=None,
+    )
+    assert "SEALED" not in briefing
+    assert "Sealed paths" not in briefing
+
+
+def test_briefing_sealed_paths_reminder_when_diff_untouched() -> None:
+    """#944 sealing v1: when a repo has an acceptance driver, the reviewer
+    always gets told the oracle is sealed — even if this diff doesn't touch
+    it — so REQUEST-changes is the default reflex, not something it has to
+    infer from the checklist alone."""
+    diff = (
+        "diff --git a/src/foo.py b/src/foo.py\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+added_line = 1\n"
+    )
+    briefing = build_review_briefing(
+        pr_number=42, pr_url=None, repo_github="acme/coord-tui", repo_name="coord-tui",
+        issue_number=944, issue_title="X", issue_body="",
+        branch="my-branch", worker_machine="laptop", same_as_worker=False,
+        reviews_cfg=ReviewsConfig(enabled=True), repo_claude_md=None,
+        diff_text=diff,
+        sealed_paths=["tests/acceptance/"],
+    )
+    assert "## Sealed paths (do not touch)" in briefing
+    assert "tests/acceptance/" in briefing
+    assert "TAMPER DETECTED" not in briefing
+
+
+def test_briefing_flags_tamper_when_diff_touches_sealed_path() -> None:
+    diff = (
+        "diff --git a/tests/acceptance/ms01/foo.rs b/tests/acceptance/ms01/foo.rs\n"
+        "--- a/tests/acceptance/ms01/foo.rs\n"
+        "+++ b/tests/acceptance/ms01/foo.rs\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+cheated = True\n"
+    )
+    briefing = build_review_briefing(
+        pr_number=42, pr_url=None, repo_github="acme/coord-tui", repo_name="coord-tui",
+        issue_number=944, issue_title="X", issue_body="",
+        branch="my-branch", worker_machine="laptop", same_as_worker=False,
+        reviews_cfg=ReviewsConfig(enabled=True), repo_claude_md=None,
+        diff_text=diff,
+        sealed_paths=["tests/acceptance/"],
+    )
+    assert "SEALED ORACLE TAMPER DETECTED" in briefing
+    assert "tests/acceptance/" in briefing
+    assert "request-changes is mandatory" in briefing
+
+
+def test_diff_touched_sealed_paths_matches_diff_git_header() -> None:
+    from coord.review import _diff_touched_sealed_paths
+
+    diff = "diff --git a/tests/acceptance/ms01/foo.rs b/tests/acceptance/ms01/foo.rs\n"
+    assert _diff_touched_sealed_paths(diff, ["tests/acceptance/"]) == ["tests/acceptance/"]
+
+
+def test_diff_touched_sealed_paths_no_match() -> None:
+    from coord.review import _diff_touched_sealed_paths
+
+    diff = "diff --git a/src/foo.py b/src/foo.py\n"
+    assert _diff_touched_sealed_paths(diff, ["tests/acceptance/"]) == []
+
+
 def test_pr_diff_truncates_at_max_chars(monkeypatch) -> None:
     """#612: github_ops.pr_diff caps a huge diff and appends a truncation note."""
     from coord import github_ops
@@ -644,6 +713,42 @@ def test_dispatch_review_sends_to_different_machine_and_appends_to_board(
     assert payload["review_target"] == "42"
     assert payload["repo_path"] == "/srv/api"  # reviewer's local path
     assert "# Project rules" in payload["briefing"]
+
+
+def test_dispatch_review_flags_sealed_acceptance_dir_when_driver_configured(
+    two_machine_config: Config,
+) -> None:
+    """#944 sealing v1: dispatch_review must thread sealed_paths through to
+    the briefing for any repo with an oracle-loop acceptance driver."""
+    from coord.config import AcceptanceConfig, AcceptanceDriverConfig
+    from dataclasses import replace as _replace
+
+    cfg = _replace(
+        two_machine_config,
+        acceptance=AcceptanceConfig(drivers={
+            "api": AcceptanceDriverConfig(kind="tui-tuidriver", run="cargo test"),
+        }),
+    )
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    client = _FakeHTTPClient({"id": "review-id-1"})
+
+    dispatch_review(
+        completed, board, cfg,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {
+            "number": 42, "url": "https://github.com/acme/api/pull/42", "existed": True,
+        },
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+        now=123.0,
+        remote_branch_checker=lambda repo, branch: True,
+    )
+
+    assert len(client.calls) == 1
+    _, payload = client.calls[0]
+    assert "Sealed paths (do not touch)" in payload["briefing"]
+    assert "tests/acceptance/" in payload["briefing"]
 
 
 def test_dispatch_review_captures_branch_sha(

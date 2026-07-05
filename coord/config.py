@@ -154,6 +154,39 @@ class SmokeTestsConfig:
 
 
 @dataclass
+class AcceptanceDriverConfig:
+    """One entry under ``acceptance.drivers.<repo_name>`` in coordinator.yml
+    (#944, docs/ORACLE_LOOP.md).
+
+    ``kind`` selects the framework-specific adapter that knows how to launch,
+    drive, and parse a repo's sealed acceptance suite (only ``tui-tuidriver``
+    is implemented; other kinds are declared here but rejected at run time by
+    :mod:`coord.acceptance_drivers` until their issues land). ``run`` is the
+    shell command that executes the suite and must print structured (JSON)
+    verdicts to stdout. ``mock`` is a glob (relative to the acceptance dir)
+    for the viewable mock/assertion fixtures — informational today, consumed
+    by the future mock-author (#930). ``capability`` is the machine
+    capability required to run this driver, routed the same way
+    ``smoke_tests.capability_rules`` routes smoke tests.
+    """
+
+    kind: str = ""
+    run: str = ""
+    mock: str = ""
+    capability: str = ""
+
+
+@dataclass
+class AcceptanceConfig:
+    """``acceptance.drivers`` — repo name -> :class:`AcceptanceDriverConfig`."""
+
+    drivers: dict[str, AcceptanceDriverConfig] = field(default_factory=dict)
+
+    def driver_for(self, repo_name: str) -> AcceptanceDriverConfig | None:
+        return self.drivers.get(repo_name)
+
+
+@dataclass
 class ModelsConfig:
     """Model tier selection and escalation ladder for workers.
 
@@ -439,6 +472,7 @@ class Config:
     reviews: ReviewsConfig = field(default_factory=ReviewsConfig)
     concurrency: ConcurrencyConfig = field(default_factory=ConcurrencyConfig)
     smoke_tests: SmokeTestsConfig = field(default_factory=SmokeTestsConfig)
+    acceptance: AcceptanceConfig = field(default_factory=AcceptanceConfig)
     models: ModelsConfig = field(default_factory=ModelsConfig)
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
     dispatch: DispatchConfig = field(default_factory=DispatchConfig)
@@ -485,6 +519,7 @@ def load(path: str | Path | None = None) -> Config:
     reviews = _parse_reviews(raw.get("reviews"), {r.name for r in repos})
     concurrency = _parse_concurrency(raw.get("concurrency"))
     smoke_tests = _parse_smoke_tests(raw.get("smoke_tests"))
+    acceptance = _parse_acceptance(raw.get("acceptance"))
     models = _parse_models(raw.get("models"))
     pipeline = _parse_pipeline(raw.get("pipeline"))
     dispatch = _parse_dispatch(raw.get("dispatch"))
@@ -500,6 +535,7 @@ def load(path: str | Path | None = None) -> Config:
         reviews=reviews,
         concurrency=concurrency,
         smoke_tests=smoke_tests,
+        acceptance=acceptance,
         models=models,
         pipeline=pipeline,
         dispatch=dispatch,
@@ -873,6 +909,55 @@ def _parse_smoke_tests(raw: Any) -> SmokeTestsConfig:
         rules.append(SmokeRule(files=files, requires=requires))
     cfg.capability_rules = rules
     return cfg
+
+
+def _parse_acceptance(raw: Any) -> AcceptanceConfig:
+    """Parse the ``acceptance:`` block (#944, docs/ORACLE_LOOP.md).
+
+    ``acceptance.drivers`` maps a local repo name (as declared under
+    ``repos:``) to its driver config. Absent entirely -> no repo has a sealed
+    acceptance suite, and ``coord acceptance run/record`` refuses with a
+    clear error rather than guessing a default.
+    """
+    if raw is None:
+        return AcceptanceConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'acceptance' must be a mapping")
+
+    drivers_raw = raw.get("drivers", {}) or {}
+    if not isinstance(drivers_raw, dict):
+        raise ConfigError(
+            "acceptance.drivers must be a mapping of repo name -> driver config"
+        )
+
+    drivers: dict[str, AcceptanceDriverConfig] = {}
+    for repo_name, entry in drivers_raw.items():
+        if not isinstance(entry, dict):
+            raise ConfigError(f"acceptance.drivers[{repo_name!r}] must be a mapping")
+
+        kind = entry.get("kind")
+        if not kind or not isinstance(kind, str):
+            raise ConfigError(f"acceptance.drivers[{repo_name!r}].kind is required")
+
+        run = entry.get("run")
+        if not run or not isinstance(run, str):
+            raise ConfigError(f"acceptance.drivers[{repo_name!r}].run is required")
+
+        mock = entry.get("mock", "") or ""
+        if not isinstance(mock, str):
+            raise ConfigError(f"acceptance.drivers[{repo_name!r}].mock must be a string")
+
+        capability = entry.get("capability", "") or ""
+        if not isinstance(capability, str):
+            raise ConfigError(
+                f"acceptance.drivers[{repo_name!r}].capability must be a string"
+            )
+
+        drivers[repo_name] = AcceptanceDriverConfig(
+            kind=kind, run=run, mock=mock, capability=capability,
+        )
+
+    return AcceptanceConfig(drivers=drivers)
 
 
 def _parse_models(raw: Any) -> ModelsConfig:

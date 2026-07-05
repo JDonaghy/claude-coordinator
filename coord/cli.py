@@ -28,6 +28,8 @@ import httpx  # noqa: F401
 
 from coord import __version__
 
+from coord.commands.acceptance import acceptance_group
+
 # Re-exported for back-compat: some tests do `from coord.cli import
 # _save_config_snapshot` / `_load_config` / etc. directly.
 from coord.commands._common import (  # noqa: F401
@@ -271,3 +273,4 @@ main.add_command(approve_plan)
 main.add_command(reject_plan)
 main.add_command(resume_stuck)
 main.add_command(install_skills)
+main.add_command(acceptance_group)

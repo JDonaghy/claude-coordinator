@@ -637,6 +637,75 @@ def _record_dispatched_assignment_local(
     conn.commit()
 
 
+def record_acceptance_verdict(
+    *,
+    assignment_id: str,
+    acceptance_state: str,
+    acceptance_reason: str | None = None,
+    acceptance_sha: str | None = None,
+) -> None:
+    """Record an Acceptance-gate verdict on one assignment (#944, the oracle
+    loop's external trust gate) — routes to the daemon when set.
+
+    The single-row analogue of ``record_test_verdict``, called by ``coord
+    acceptance record --issue N --sha <sha>`` after re-running the sealed
+    suite externally against the pushed SHA.
+    """
+    svc = _board_service()
+    resp = _route_write(
+        svc,
+        "/acceptance-verdict",
+        {
+            "assignment_id": assignment_id,
+            "acceptance_state": acceptance_state,
+            "acceptance_reason": acceptance_reason,
+            "acceptance_sha": acceptance_sha,
+        },
+    )
+    if resp is not None:
+        return
+    _record_acceptance_verdict_local(
+        assignment_id=assignment_id,
+        acceptance_state=acceptance_state,
+        acceptance_reason=acceptance_reason,
+        acceptance_sha=acceptance_sha,
+    )
+
+
+def _record_acceptance_verdict_local(
+    *,
+    assignment_id: str,
+    acceptance_state: str,
+    acceptance_reason: str | None = None,
+    acceptance_sha: str | None = None,
+) -> None:
+    """UPDATE the assignment's acceptance_state/acceptance_reason/acceptance_sha."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE assignments SET acceptance_state=?, acceptance_reason=?, "
+        "acceptance_sha=? WHERE assignment_id=?",
+        (acceptance_state, acceptance_reason, acceptance_sha, assignment_id),
+    )
+    conn.commit()
+
+    # #603: a failed external acceptance re-run is durable context for EVERY
+    # future agent on the issue — mirrors the test-failure note below. Local
+    # writer (we're already daemon-side on a thin client), so use the
+    # _local variant to avoid re-routing.
+    if acceptance_state == "failed" and (acceptance_reason or "").strip():
+        row = conn.execute(
+            "SELECT repo_name, issue_number FROM assignments WHERE assignment_id=?",
+            (assignment_id,),
+        ).fetchone()
+        if row is not None:
+            _add_issue_context_entry_local(
+                row["repo_name"],
+                row["issue_number"],
+                f"Acceptance FAILED @ {acceptance_sha or '?'}: {acceptance_reason.strip()}",
+                source="test",
+            )
+
+
 def record_test_verdict(
     *,
     assignment_id: str,

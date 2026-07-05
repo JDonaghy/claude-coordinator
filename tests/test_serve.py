@@ -737,6 +737,39 @@ def test_serve_test_verdict_records(file_db: Path, valid_config_path: Path, rw_d
     assert row["test_reason"] == "scroll broke"
 
 
+def test_serve_acceptance_verdict_records(file_db: Path, valid_config_path: Path, rw_db):
+    # #944: /acceptance-verdict mirrors /test-verdict for the oracle loop's
+    # Acceptance-gate verdict.
+    _seed_running_assignment(rw_db, aid="work78")
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post(
+            "/acceptance-verdict",
+            json={
+                "assignment_id": "work78", "acceptance_state": "failed",
+                "acceptance_reason": "ms01::a: expected A got B",
+                "acceptance_sha": "deadbeef",
+            },
+        )
+    assert resp.status_code == 200
+    row = rw_db.execute(
+        "SELECT acceptance_state, acceptance_reason, acceptance_sha "
+        "FROM assignments WHERE assignment_id='work78'"
+    ).fetchone()
+    assert row["acceptance_state"] == "failed"
+    assert row["acceptance_reason"] == "ms01::a: expected A got B"
+    assert row["acceptance_sha"] == "deadbeef"
+
+
+def test_serve_acceptance_verdict_missing_field_400(
+    file_db: Path, valid_config_path: Path, rw_db,
+):
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post("/acceptance-verdict", json={"assignment_id": "work78"})
+    assert resp.status_code == 400
+
+
 def test_record_dispatched_assignment_routes_when_service_set(coord_db, monkeypatch):
     from coord import client as cc
     from coord import state
@@ -782,6 +815,26 @@ def test_record_test_verdict_routes_when_service_set(coord_db, monkeypatch):
     )
     assert captured["path"] == "/test-verdict"
     assert captured["payload"]["test_state"] == "passed"
+
+
+def test_record_acceptance_verdict_routes_when_service_set(coord_db, monkeypatch):
+    from coord import client as cc
+    from coord import state
+
+    monkeypatch.setattr(
+        cc, "resolve_board_service", lambda *a, **k: cc.ServiceConfig("http://d:7435")
+    )
+    captured: dict = {}
+    monkeypatch.setattr(
+        cc, "post_record",
+        lambda svc, path, payload, **kw: captured.update(path=path, payload=payload) or {"ok": True},
+    )
+    state.record_acceptance_verdict(
+        assignment_id="aaa", acceptance_state="passed", acceptance_sha="deadbeef",
+    )
+    assert captured["path"] == "/acceptance-verdict"
+    assert captured["payload"]["acceptance_state"] == "passed"
+    assert captured["payload"]["acceptance_sha"] == "deadbeef"
 
 
 def test_record_dispatched_assignment_unset_writes_local(coord_db, monkeypatch):
@@ -1798,6 +1851,81 @@ def test_diagnose_routes_to_daemon_when_service_set(coord_db, monkeypatch):
     assert captured["payload"]["stage"] == "review"
     assert captured["payload"]["reset"] is True
     assert "DAEMON DIAGNOSE OUTPUT" in out.output
+
+
+def test_serve_acceptance_record_runs_callback_and_captures_output(
+    file_db: Path, valid_config_path: Path, rw_db, monkeypatch
+):
+    # #944: POST /acceptance-record runs `coord acceptance record` on the
+    # daemon with the recursion guard set, and relays the captured CLI
+    # output + exit code. Mirrors test_serve_diagnose_runs_callback_and_captures_output.
+    import os
+    import click
+    from coord.commands.acceptance import acceptance_record
+
+    def fake_callback(**kwargs):
+        assert os.environ.get("COORD_ACCEPTANCE_ON_DAEMON") == "1"  # guard set
+        click.echo(
+            f"recorded repo={kwargs['repo']} issue={kwargs['issue_number']} "
+            f"sha={kwargs['sha']}"
+        )
+
+    monkeypatch.setattr(acceptance_record, "callback", fake_callback)
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post(
+            "/acceptance-record",
+            json={"repo": "api", "issue": 944, "sha": "deadbeef"},
+        )
+    assert resp.status_code == 200
+    out = resp.json()
+    assert out["exit_code"] == 0 and out["error"] is None
+    assert "recorded repo=api issue=944 sha=deadbeef" in out["output"]
+    assert os.environ.get("COORD_ACCEPTANCE_ON_DAEMON") is None  # restored after
+
+
+def test_serve_acceptance_record_relays_nonzero_exit(
+    file_db: Path, valid_config_path: Path, rw_db, monkeypatch
+):
+    import sys
+    from coord.commands.acceptance import acceptance_record
+
+    monkeypatch.setattr(acceptance_record, "callback", lambda **k: sys.exit(1))
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post(
+            "/acceptance-record",
+            json={"repo": "api", "issue": 944, "sha": "deadbeef"},
+        )
+    assert resp.json()["exit_code"] == 1
+
+
+def test_acceptance_record_routes_to_daemon_when_service_set(coord_db, monkeypatch):
+    # `coord acceptance record` on a thin client POSTs to /acceptance-record
+    # and relays the output, instead of trying to run against an empty local
+    # board / missing repo checkout.
+    from coord import client as cc
+    from click.testing import CliRunner
+    from coord.cli import main
+
+    monkeypatch.setattr(
+        cc, "resolve_board_service", lambda *a, **k: cc.ServiceConfig("http://d:7435")
+    )
+    captured: dict = {}
+    monkeypatch.setattr(
+        cc, "post_record",
+        lambda svc, path, payload, **kw: captured.update(path=path, payload=payload)
+        or {"output": "DAEMON ACCEPTANCE RECORD OUTPUT\n", "exit_code": 0},
+    )
+    out = CliRunner().invoke(main, [
+        "acceptance", "record", "--repo", "api", "--issue", "944", "--sha", "deadbeef",
+    ])
+    assert out.exit_code == 0, out.output
+    assert captured["path"] == "/acceptance-record"
+    assert captured["payload"]["repo"] == "api"
+    assert captured["payload"]["issue"] == 944
+    assert captured["payload"]["sha"] == "deadbeef"
+    assert "DAEMON ACCEPTANCE RECORD OUTPUT" in out.output
 
 
 def test_serve_test_plan_runs_callback_and_captures_output(
