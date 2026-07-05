@@ -249,6 +249,33 @@ def test_work_review_state_left_untouched_when_issue_open(monkeypatch, config) -
     assert not any("mark merged" in s for s in actions)
 
 
+def test_settles_work_review_state_when_already_merged(monkeypatch, config) -> None:
+    """#951 (review round 2): a row that is ALREADY `status='merged'` with a
+    lingering `review_state='pending'` ghost — the actual state of the bug
+    report's cited examples (quadraui #406/407/409/411,
+    claude-coordinator #782/795/946, vimcode #552) — must also settle.
+
+    Once `mark_assignment_merged` flips `status` to 'merged' (in this run's
+    sweep (b), or in a prior reconcile run), the row permanently drops out of
+    sweep (b)'s `status=='done'` candidates list, so the review_state ghost is
+    only reachable via sweep (e)'s ghost_candidates.
+    """
+    a = _done_work(issue_number=42, branch="issue-42-fix", status="merged")
+    a.review_state = "pending"
+    board = Board(completed=[a])
+    writes = _patch_probes(monkeypatch, terminal=True)
+
+    actions = reconcile_board_merges(board, config)
+
+    assert a.status == "merged"
+    assert a.review_state == "done"
+    # sweep (b) never touches this row (status is already 'merged', not
+    # 'done'), so no additional "merged" write — only the ghost settle.
+    assert ("merged", "abc") not in writes
+    assert ("work_review_settled", "abc") in writes
+    assert any("settle work review_state" in s for s in actions)
+
+
 # ── dry_run + filters ──────────────────────────────────────────────────────
 
 
