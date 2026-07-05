@@ -314,3 +314,31 @@ class TestAcceptanceRecord:
         ])
         assert result.exit_code == 1
         assert "no work assignment found" in result.output
+
+        # #944 review: this is a lookup error (no `work` assignment for the
+        # repo/issue), not a real failing-verdict "kept for inspection" case
+        # — the throwaway worktree must not be left behind.
+        wt_path = tmp_path / "acceptance-worktrees" / "coord-tui-944"
+        assert not wt_path.exists(), "worktree leaked on no-work-assignment error path"
+
+    def test_record_manifest_missing_cleans_up_worktree(
+        self, tmp_path: Path, coord_db,
+    ) -> None:
+        # No manifest committed at all — `_scoped_verdict` exit(1)s inside
+        # `dump_manifest_error_hint` before a work-assignment lookup ever
+        # happens; that path must clean up the worktree too (#944 review).
+        repo_dir = tmp_path / "repo"
+        sha = _init_git_repo(repo_dir, manifest=None)
+
+        blob = json.dumps({"tests": [{"id": "ms01::a", "status": "pass"}]})
+        config_path = _write_config(tmp_path, repo_path=str(repo_dir), run_cmd=f"echo '{blob}'")
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "record", "--repo", "coord-tui", "--issue", "944",
+            "--sha", sha, "--config", str(config_path),
+        ])
+        assert result.exit_code == 1
+        assert "not been authored" in result.output
+
+        wt_path = tmp_path / "acceptance-worktrees" / "coord-tui-944"
+        assert not wt_path.exists(), "worktree leaked on manifest-missing error path"
