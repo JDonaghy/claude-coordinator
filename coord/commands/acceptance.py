@@ -187,6 +187,65 @@ def _acceptance_record_via_daemon(svc, params: dict) -> None:
         sys.exit(int(code))
 
 
+@acceptance_group.command(
+    "author",
+    help=(
+        "Dispatch an independent `type=\"test-author\"` session (#931, "
+        "docs/ORACLE_LOOP.md) that authors — or, with --issue, extends — the "
+        "sealed feature-level acceptance suite for a milestone from its "
+        "Gate-A contract. TRACKING_ISSUE is the milestone's tracking issue "
+        "number (same argument `coord milestone order`/`gate-c` take); the "
+        "milestone number is resolved from it. Requires "
+        "`tests/acceptance/ms-NN/contract.md` to already exist in the repo "
+        "(hand-authored, or produced by the mock-author, #930) — the "
+        "test-author reads it from its own checkout, it is not dispatched "
+        "with the contract text embedded."
+    ),
+)
+@click.argument("repo")
+@click.argument("tracking_issue", type=int)
+@click.option(
+    "--issue", "issue_number", type=int, default=None,
+    help=(
+        "Scope to one issue's just-in-time slice instead of the whole "
+        "milestone (must be a member of TRACKING_ISSUE's work order)."
+    ),
+)
+@click.option(
+    "--machine", "machine_override", default=None,
+    help="Force a specific machine instead of auto-picking one.",
+)
+@_CONFIG_OPTION
+def acceptance_author(
+    repo: str,
+    tracking_issue: int,
+    issue_number: int | None,
+    machine_override: str | None,
+    config_path: Path,
+) -> None:
+    """Dispatch the independent test-author for REPO's milestone."""
+    from coord.test_author import dispatch_test_author
+
+    cfg = _load_config(config_path)
+    try:
+        assignment_id, machine_name = dispatch_test_author(
+            repo,
+            tracking_issue,
+            cfg,
+            issue_number=issue_number,
+            machine_override=machine_override,
+        )
+    except RuntimeError as e:
+        click.echo(f"error: {e}", err=True)
+        sys.exit(1)
+
+    scope = f"issue #{issue_number} slice" if issue_number is not None else "full milestone"
+    click.echo(
+        f"Dispatched test-author {assignment_id} to {machine_name} for "
+        f"{repo} (tracking issue #{tracking_issue}, {scope})."
+    )
+
+
 @acceptance_group.command("record")
 @click.option("--repo", required=True, help="Local repo name (coordinator.yml repos[].name).")
 @click.option("--issue", "issue_number", type=int, required=True, help="Issue number.")
