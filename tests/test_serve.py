@@ -490,6 +490,83 @@ def test_plan_roster_empty_when_no_milestones(file_db: Path, valid_config_path: 
     )
 
 
+def _make_finished_milestone_db(path: Path) -> None:
+    """Seed a milestone (#7, "Wrapped up") whose tracking epic AND every
+    work-order child are closed, but the milestone itself is still open on
+    GitHub — the exact scenario #974's ``closed_tracking_issues`` plumbing
+    exists to handle ("someone tidied up the epic before remembering to
+    close the milestone"). Zero *open* issues remain under this milestone,
+    so it must be discovered via the closed epic's own milestone_number, not
+    via any open-issue branch.
+    """
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    _ensure_schema(conn)
+    conn.execute(
+        "INSERT INTO machines (name, host, capabilities, repos) VALUES (?,?,?,?)",
+        ("laptop", "laptop.tailnet", '["python"]', '["api"]'),
+    )
+    _finished_work_order_body = """\
+Tracking issue for the milestone.
+
+## Work order
+- [ ] #104  {group: A}
+- [ ] #105  {group: A}
+"""
+    conn.execute(
+        "INSERT INTO issues (repo_name, number, title, body, state, labels, "
+        "milestone_number, milestone_title, synced_at) "
+        "VALUES (?, ?, ?, ?, 'closed', ?, ?, ?, 0)",
+        ("api", 700, "Wrapped up epic", _finished_work_order_body, '["epic", "coord"]', 7, "Wrapped up"),
+    )
+    for num, title in [(104, "Node D"), (105, "Node E")]:
+        conn.execute(
+            "INSERT INTO issues (repo_name, number, title, body, state, labels, "
+            "milestone_number, milestone_title, synced_at) "
+            "VALUES (?, ?, ?, '', 'closed', '[]', ?, ?, 0)",
+            ("api", num, title, 7, "Wrapped up"),
+        )
+    conn.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')")
+    conn.commit()
+    conn.close()
+
+
+@pytest.fixture
+def finished_milestone_db(tmp_path: Path) -> Path:
+    p = tmp_path / "coord.db"
+    _make_finished_milestone_db(p)
+    return p
+
+
+def test_plan_roster_surfaces_milestone_with_only_closed_issues(
+    finished_milestone_db: Path, valid_config_path: Path
+):
+    """#975 fix: a milestone whose tracking epic *and* every work-order child
+    are closed — but which is still open on GitHub — must still surface in
+    plan_roster as a finished plan (done == total), not silently vanish.
+
+    Before the fix, ``_repo_milestones`` was only seeded from open issues, so
+    with zero open issues left under the milestone the outer aggregation
+    loop never visited it at all.
+    """
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(finished_milestone_db), cfg)
+    with TestClient(app) as cli:
+        board = cli.get("/board").json()
+
+    roster = board["plan_roster"]
+    entries_by_ms = {e["milestone_number"]: e for e in roster}
+    assert 7 in entries_by_ms, (
+        f"finished milestone #7 missing from plan_roster entirely: {entries_by_ms}"
+    )
+    wrapped_up = entries_by_ms[7]
+    assert wrapped_up["tracking_issue"] == 700
+    assert wrapped_up["has_work_order"] is True
+    assert wrapped_up["total"] == 2
+    assert wrapped_up["done"] == 2
+    assert wrapped_up["needs_you"] == []
+
+
 # ── Write path (#590): daemon endpoints ──────────────────────────────────────
 
 
