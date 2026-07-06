@@ -2756,7 +2756,7 @@ def _dispatch_interactive_work(
             )
             sys.exit(1)
 
-    from coord.agent import AssignmentSpec, narrow_artifact_paths as _narrow_ap_work  # noqa: PLC0415
+    from coord.agent import AssignmentSpec  # noqa: PLC0415
     from coord.models import Proposal  # noqa: PLC0415
 
     resolved_model = model if model else cfg.models.default
@@ -2924,10 +2924,13 @@ def _dispatch_interactive_work(
         # whether the agent typed `coord report-result` first.  The
         # finalizer respects an existing report (it checks the DB row's
         # status before clobbering).
-        # #982: no pre-existing smoke_tests for a fresh interactive work
-        # session (none available before the worker runs), so fall back to
-        # the full repo-wide glob via narrow_artifact_paths(_, None).
-        _aps_work = _narrow_ap_work(list(repo_cfg.artifact_paths), None)
+        # #982: a fresh interactive work session has no pre-existing
+        # smoke_tests to narrow against (none are available until the
+        # worker's own session finishes, and that session runs in a live
+        # tmux/TTY pane rather than a log file this code can parse), so
+        # this always stashes the full repo-wide glob — narrowing happens
+        # centrally in AgentServer._stash_artifacts for the headless Work
+        # path instead.
         try:
             finalize_result = finalize_interactive_exit(
                 assignment_id=assignment_id,
@@ -2941,7 +2944,7 @@ def _dispatch_interactive_work(
                 started_at=started_at,
                 log_path=None,
                 repo_path=repo_path,
-                artifact_paths=_aps_work,
+                artifact_paths=repo_cfg.artifact_paths,
                 branch=_interactive_branch,
             )
             if finalize_result.already_recorded:
@@ -3273,9 +3276,9 @@ def _dispatch_interactive_work(
         # fire), and clean up the remote worktree.  Mirrors the remote-FIX
         # path; the only difference is the branch is the fresh feature
         # branch this work session created, not an existing one.
-        # #982: no pre-existing smoke_tests for a fresh interactive work
-        # session, so fall back to the full repo-wide glob.
-        _aps_work_remote = _narrow_ap_work(list(repo_cfg.artifact_paths), None)
+        # #982: same as the local finalize above — no pre-existing
+        # smoke_tests for a fresh interactive work session, so this always
+        # stashes the full repo-wide glob.
         try:
             _fr = finalize_remote_interactive_exit(
                 assignment_id=assignment_id,
@@ -3290,7 +3293,7 @@ def _dispatch_interactive_work(
                 base_branch=repo_default_branch,
                 exit_code=exit_code,
                 started_at=started_at,
-                artifact_paths=_aps_work_remote,
+                artifact_paths=repo_cfg.artifact_paths,
             )
             if _fr.already_recorded:
                 click.echo(

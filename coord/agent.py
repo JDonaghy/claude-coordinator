@@ -764,10 +764,21 @@ def narrow_artifact_paths(
     used, so common prose words like "run", "it", "see" are silently
     discarded when they don't fit the glob pattern.
 
-    #982: used at the six interactive-dispatch backstop sites in
-    :mod:`coord.commands.dispatch_workers` so the stash captures 1–2
-    relevant example binaries instead of every file matching a broad glob
-    (e.g. ``tui_*`` matching ~72 Cargo debug examples).
+    #982: called centrally from :meth:`AgentServer._stash_artifacts` for
+    every headless ``coord assign`` Work dispatch — the dominant case, since
+    the worker's own ``SMOKE_TESTS:`` block is only available in its log
+    *after* the session ends, right when ``_stash_artifacts`` runs.  Also
+    called at four interactive-dispatch backstop sites in
+    :mod:`coord.commands.dispatch_workers` (``--fix-of`` and ``--rework-of``,
+    local + remote), which narrow using the *original* work assignment's
+    already-captured ``smoke_tests``.  A fresh ``--interactive`` work
+    session has no such backstop — no smoke tests exist before that session
+    runs, and its output isn't captured to a log this code can parse — so
+    it always stashes the full glob and relies on this function's
+    centralized call for any later narrowing.  Either way the effect is the
+    same: the stash captures 1-2 relevant example binaries instead of every
+    file matching a broad glob (e.g. ``tui_*`` matching ~72 Cargo debug
+    examples).
     """
     if not smoke_tests or not artifact_paths:
         return list(artifact_paths)
@@ -849,6 +860,12 @@ def stash_artifacts_for_branch(
     matches.  Each copy is passed through :func:`_strip_debug_symbols`
     (#940) to shrink debug binaries before they hit the stash.
 
+    #982: any file already present in the stash directory that does *not*
+    match this run's *patterns* is removed (dotfile markers excepted) — a
+    re-stash with a narrower pattern set (e.g. after
+    :func:`narrow_artifact_paths` scopes down to the example(s) actually
+    under test) shrinks an existing stash instead of only ever growing it.
+
     A ``.assignment_id`` marker is written when *assignment_id* is provided so
     the manifest endpoint can surface which build produced the stash.  When
     the stash directory's total size exceeds ``_STASH_WARN_BYTES`` after
@@ -892,6 +909,10 @@ def stash_artifacts_for_branch(
         if _BUILD_HASH_SUFFIX_RE.match(src.stem) is None
     }
 
+    # Names this run intends to keep in the stash — used below (#982) to
+    # prune anything left over from a prior, broader stash of this branch.
+    kept_names: set[str] = set()
+
     for src in candidates:
         # Skip build-intermediate files (.d, .o, .rlib, .rmeta, .rcgu).
         if src.suffix in _STASH_SKIP_SUFFIXES:
@@ -913,6 +934,7 @@ def stash_artifacts_for_branch(
             canonical_name = m.group(1) + src.suffix
             if canonical_name in canonical_names:
                 continue
+        kept_names.add(src.name)
         dst = stash_dir / src.name
         try:
             shutil.copy2(src, dst)
@@ -920,6 +942,29 @@ def stash_artifacts_for_branch(
         except (OSError, shutil.Error):
             continue
         _strip_debug_symbols(dst)
+
+    # #982: prune stash files that no longer match the current pattern set.
+    # A narrowed re-stash (e.g. a fix-of/rework-of session that only names
+    # 1-2 examples in its smoke tests) is otherwise purely additive — it
+    # copies the named files on top of whatever an earlier, broader stash
+    # (e.g. the first headless Work dispatch, before narrowing) already
+    # left behind, so the stash never actually shrinks.  Anything already
+    # in the stash directory that isn't among this run's kept names is
+    # stale for the *current* pattern set and gets removed.  Marker files
+    # (dotfiles, e.g. ``.assignment_id``) are left alone.
+    try:
+        for existing in stash_dir.iterdir():
+            if existing.name.startswith("."):
+                continue
+            if not existing.is_file():
+                continue
+            if existing.name not in kept_names:
+                try:
+                    existing.unlink()
+                except OSError:
+                    pass
+    except OSError:
+        pass
 
     # Touch the stash directory so its mtime reflects this stash run.
     # mkdir(exist_ok=True) is a no-op when the directory already exists, so
@@ -1892,6 +1937,19 @@ class AgentServer:
         Delegates to the module-level :func:`stash_artifacts_for_branch`
         (#562) so the same logic is reachable from the interactive finalize
         path without importing the full AgentServer graph.
+
+        #982: this is the one call site reached by a normal headless
+        ``coord assign`` Work dispatch — ``_dispatch_headless`` sends the
+        repo's full ``artifact_paths`` glob unmodified in the ``/assign``
+        payload, and that glob can't be narrowed any earlier because the
+        worker doesn't emit its ``SMOKE_TESTS:`` block until the very end of
+        its own session.  By the time this method runs (the DONE
+        transition, after the subprocess has exited) that block is already
+        in ``assignment.log_path`` on this same host, so narrow the resolved
+        pattern list against it before stashing.  This is what actually
+        shrinks the *first* stash for a repo like quadraui, where a broad
+        ``target/debug/examples/tui_*`` glob matched ~72 example binaries
+        (issue-406/issue-411, 7.2 GB / 5.2 GB stashes).
         """
         if assignment.status != DONE:
             return
@@ -1904,6 +1962,13 @@ class AgentServer:
         branch = assignment.branch or assignment.spec.branch
         if not branch:
             return
+
+        smoke_tests: list[str] | None = None
+        if assignment.log_path:
+            from coord.progress import parse_smoke_tests_from_log  # noqa: PLC0415
+
+            smoke_tests = parse_smoke_tests_from_log(assignment.log_path)
+        patterns = narrow_artifact_paths(patterns, smoke_tests)
 
         copied = stash_artifacts_for_branch(
             worktree_path=Path(assignment.worktree_path),
