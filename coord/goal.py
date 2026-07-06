@@ -28,7 +28,12 @@ _LAST_UPDATED_RE = re.compile(r"_Last updated:\s*(\d{4}-\d{2}-\d{2})_")
 
 # The "## \U0001F3AF North star" heading (or a plain "## North star" fallback)
 # — matched case-insensitively so an emoji-less rewrite still resolves.
-_NORTH_STAR_HEADING_RE = re.compile(r"^#{1,6}[^\n]*north star[^\n]*$", re.IGNORECASE | re.MULTILINE)
+# Restricted to heading levels 2-6: GOAL.md's own H1 title
+# ("# Current Goal — North Star") also contains the words "north star", and a
+# level-1-inclusive match would bind here instead of the intended `## North
+# star` section below it (#978 review) — the first bold text after the H1
+# would then be the blockquote's framing sentence, not the real headline.
+_NORTH_STAR_HEADING_RE = re.compile(r"^#{2,6}[^\n]*north star[^\n]*$", re.IGNORECASE | re.MULTILINE)
 
 _BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
 _H1_RE = re.compile(r"^#\s+(.+)$", re.MULTILINE)
