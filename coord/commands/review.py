@@ -137,7 +137,7 @@ def _prompt_and_relay_review_verdict(
             )
 
             _tf = _review_findings_from_transcript(
-                issue_number, started_at, ssh_target=ssh_target
+                issue_number, started_at, assignment_id=assignment_id, ssh_target=ssh_target
             )
             if _tf is not None:
                 _pre_verdict = _tf.verdict

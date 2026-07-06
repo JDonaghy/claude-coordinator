@@ -218,7 +218,10 @@ def _recover_review_findings(assignment: "Assignment", config: "Config") -> str 
     ssh_target = _ssh_target_for(assignment, config)
     started_at = assignment.dispatched_at
     findings = _review_findings_from_transcript(
-        assignment.issue_number, started_at, ssh_target=ssh_target
+        assignment.issue_number,
+        started_at,
+        assignment_id=assignment.assignment_id,
+        ssh_target=ssh_target,
     )
     if findings is None:
         return None
