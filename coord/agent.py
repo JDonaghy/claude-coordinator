@@ -1631,6 +1631,71 @@ MILESTONE_CHAT_DENY_COMMANDS: list[str] = [
     "Bash(coord assign *)",
 ]
 
+MOCK_AUTHOR_SYSTEM_PROMPT = """\
+You are an independent mock-author agent for Gate A of a milestone \
+(#930, docs/ORACLE_LOOP.md) — the pre-work architecture gate. You have \
+ZERO context from whichever workers will later implement this milestone's \
+issues; that independence is the whole point, mirroring the adversarial \
+code reviewer.
+
+The first user message names the milestone (tracking issue + open issues \
+filed under it) and the exact `tests/acceptance/ms-NN/` directory + mock \
+format (e.g. `.screen` text grids for a TUI driver, a self-contained \
+`.html` wireframe for web/Electron) declared for this repo.
+
+Your job, and ONLY your job:
+1. Read the milestone's tracking issue and open issues to understand what's \
+being built.
+2. Render a VIEWABLE MOCK of the milestone's user-facing surface in the \
+declared medium, under `tests/acceptance/ms-NN/mocks/` — something the \
+operator can look at and react to, not a text description.
+3. Write `tests/acceptance/ms-NN/contract.md` pinning the exact black-box \
+surface the mock implies: CLI command names, key screen text, API field \
+shapes — whatever the milestone's workers and the independent test-author \
+must agree on without a shared session.
+
+Rules:
+- Do NOT touch any file outside `tests/acceptance/ms-NN/`. You are not \
+implementing the milestone — you are pinning its contract. If the \
+milestone's own issue bodies are unclear or contradictory, say so in the \
+contract's notes rather than silently resolving it yourself.
+- Do NOT run gh commands. The coordinator owns all GitHub interactions.
+- You are already on a feature branch. Commit your work to this branch. \
+Push with `git push origin HEAD`. NEVER commit or push to the repo's \
+default branch directly. Do NOT open a PR — the coordinator handles that.
+- If `contract.md` already exists (you are AMENDING an existing Gate A, not \
+authoring one from scratch), read it first and edit it in place — do not \
+start over or duplicate sections.
+
+Before declaring done, re-read `contract.md` once and check it names \
+concrete, checkable surface (exact command names / screen strings / field \
+names) rather than vague prose — that is what makes it a contract and not \
+a spec.
+
+#252: before exiting, emit a SMOKE_TESTS block telling the human what to \
+manually verify in the rendered mock.
+
+  SMOKE_TESTS:
+  - [scenario] — [how to trigger] — [what to look for]
+  END_SMOKE_TESTS
+"""
+
+# Deny list applied to mock-author workers.  Unlike milestone-chat this type
+# DOES commit/push (it's authoring real files under tests/acceptance/), so
+# git commit/push stay allowed; gh and destructive git/coord commands don't.
+MOCK_AUTHOR_DENY_COMMANDS: list[str] = [
+    "Bash(gh *)",
+    "Bash(git push --force*)",
+    "Bash(git reset --hard *)",
+    "Bash(git branch -D *)",
+    "Bash(git checkout -- .)",
+    "Bash(git clean -f *)",
+    "Bash(rm -rf *)",
+    "Bash(coord approve *)",
+    "Bash(coord merge *)",
+    "Bash(coord assign *)",
+]
+
 # Deny list applied to new-issue-chat workers.  Allows read-only gh
 # (e.g. `gh issue list`, `gh issue view`) while blocking all mutations.
 NEW_ISSUE_CHAT_DENY_COMMANDS: list[str] = [
@@ -1742,6 +1807,17 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
         system_prompt = spec.system_prompt if spec.system_prompt else MILESTONE_CHAT_SYSTEM_PROMPT
         system_prompt += build_deny_prompt(MILESTONE_CHAT_DENY_COMMANDS)
         allowed_tools = "Read,Bash"
+    elif spec.type == "mock-author":
+        # #930 (docs/ORACLE_LOOP.md, Gate A): an independent mock-author
+        # agent renders a viewable mock + writes `contract.md` under
+        # `tests/acceptance/ms-NN/` — the one type allowed to write there
+        # (dispatch.py exempts it from the acceptance-dir auto-forbid).
+        # Needs Edit/Write (create the mock/contract files) + Bash (commit,
+        # push) like a normal worker, but with its own scoped system prompt
+        # and deny list instead of the generic WORKER_SYSTEM_PROMPT.
+        system_prompt = spec.system_prompt if spec.system_prompt else MOCK_AUTHOR_SYSTEM_PROMPT
+        system_prompt += build_deny_prompt(MOCK_AUTHOR_DENY_COMMANDS)
+        allowed_tools = "Read,Edit,Write,Bash"
     else:
         system_prompt = spec.system_prompt if spec.system_prompt else WORKER_SYSTEM_PROMPT
         system_prompt += build_deny_prompt(spec.deny_commands)
@@ -1783,16 +1859,19 @@ def _user_message_line(text: str) -> bytes:
 # providers without risk. ``milestone-chat`` (#770) is a chat too — no
 # git worktree — but it CAN mutate GitHub (the tracking issue body via
 # `coord milestone write-order`), so it belongs here, not above.
-# ``test-author`` (#931, docs/ORACLE_LOOP.md) writes the sealed acceptance
-# suite under ``tests/acceptance/`` and pushes a branch — a real git
-# worktree + a push, same mutation shape as ``work``/``smoke``/
-# ``conflict-fix``, so it must be gated the same way.
+# ``mock-author`` (#930) gets a real worktree + branch and commits/pushes
+# files, same mutation risk as ``work``. ``test-author`` (#931,
+# docs/ORACLE_LOOP.md) writes the sealed acceptance suite under
+# ``tests/acceptance/`` and pushes a branch — a real git worktree + a
+# push, same mutation shape as ``work``/``smoke``/``conflict-fix``, so it
+# must be gated the same way.
 WRITE_CAPABLE_SPEC_TYPES: frozenset[str] = frozenset({
     "work",
     "review",
     "smoke",
     "conflict-fix",
     "milestone-chat",
+    "mock-author",
     "test-author",
 })
 

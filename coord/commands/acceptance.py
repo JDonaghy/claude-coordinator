@@ -1,7 +1,7 @@
 """``coord acceptance`` — the framework-agnostic oracle-loop runner (#944,
 docs/ORACLE_LOOP.md).
 
-Two subcommands:
+Subcommands:
 
 - ``coord acceptance run --repo R (--issue N | --all)`` — run the repo's
   declared driver **in-session** (the worker's own warm loop) and print a
@@ -12,6 +12,11 @@ Two subcommands:
   Acceptance box). Routes the whole command through the daemon (mirrors
   ``coord merge`` / ``coord diagnose`` — the no-local-DB rule), never a bare
   ``save_board``.
+- ``coord acceptance mock <repo> <tracking_issue>`` — Gate A (#930): dispatch
+  an independent mock-author that renders a viewable mock + writes
+  ``tests/acceptance/ms-NN/contract.md``.
+  ``coord.milestone_dispatch.gate_a_status`` blocks the milestone's issue
+  dispatch until that contract exists.
 """
 
 from __future__ import annotations
@@ -387,3 +392,51 @@ def _acceptance_record_local(
     else:
         click.echo(f"  worktree kept for inspection: {wt_path}")
         sys.exit(1)
+
+
+@acceptance_group.command(
+    "mock",
+    help=(
+        "Gate A (#930, docs/ORACLE_LOOP.md): dispatch an independent "
+        "mock-author agent that renders a viewable mock of the milestone's "
+        "user-facing surface and writes tests/acceptance/ms-NN/contract.md "
+        "— the black-box contract the milestone's workers and the "
+        "independent test-author (#931) implement/test to. REPO is the "
+        "local repo name from coordinator.yml; TRACKING_ISSUE is the GH "
+        "issue number of the milestone's tracking issue (must carry a "
+        "milestone). `coord milestone dispatch` refuses this milestone's "
+        "issues until the contract this produces exists."
+    ),
+)
+@click.argument("repo")
+@click.argument("tracking_issue", type=int)
+@click.option(
+    "--machine",
+    default=None,
+    help="Override machine selection (default: first idle machine that lists the repo).",
+)
+@_CONFIG_OPTION
+def acceptance_mock_cmd(
+    repo: str, tracking_issue: int, machine: str | None, config_path: Path
+) -> None:
+    cfg = _load_config(config_path)
+    repo_entry = cfg.repo(repo)
+    if repo_entry is None:
+        click.echo(f"error: unknown repo {repo!r}", err=True)
+        sys.exit(2)
+
+    from coord.mock_author import dispatch_acceptance_mock
+
+    try:
+        assignment_id, picked_machine = dispatch_acceptance_mock(
+            repo,
+            tracking_issue,
+            cfg,
+            machine_override=machine,
+        )
+    except RuntimeError as exc:
+        click.echo(f"error: {exc}", err=True)
+        sys.exit(1)
+
+    click.echo(f"Dispatched mock-author for #{tracking_issue} -> {picked_machine}")
+    click.echo(assignment_id)

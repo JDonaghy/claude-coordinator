@@ -426,3 +426,73 @@ class TestAcceptanceAuthor:
         ])
         assert result.exit_code == 1
         assert "no acceptance driver configured" in result.output
+
+
+class TestAcceptanceMock:
+    """#930 (Gate A): `coord acceptance mock <repo> <tracking_issue>`
+    dispatches the mock-author. Mocks `coord.github_ops`, `coord.
+    board_service.read_board`, and `coord.dispatch.dispatch_with_retry` so
+    the test drives the real Click command end to end without a live `gh`
+    call or HTTP POST to an agent."""
+
+    def test_dispatches_mock_author_and_prints_assignment_id(
+        self, tmp_path: Path,
+    ) -> None:
+        from unittest.mock import patch
+
+        from coord.models import Board
+
+        config_path = _write_config(
+            tmp_path, repo_path=str(tmp_path / "repo"), run_cmd="echo {}",
+        )
+        issue_data = {
+            "number": 100, "title": "Milestone tracker", "body": "",
+            "milestone": {"number": 9, "title": "Q3"},
+        }
+        with patch("coord.github_ops.get_issue", return_value=issue_data), \
+             patch("coord.github_ops.get_open_issues", return_value=[]), \
+             patch("coord.board_service.read_board", return_value=Board()), \
+             patch(
+                 "coord.dispatch.dispatch_with_retry",
+                 return_value={"id": "mock-asg-1"},
+             ) as disp, \
+             patch("coord.dispatch.post_briefing"), \
+             patch("coord.state.record_dispatched") as mock_record:
+            result = CliRunner().invoke(main, [
+                "acceptance", "mock", "coord-tui", "100", "--config", str(config_path),
+            ])
+
+        assert result.exit_code == 0, result.output
+        assert "laptop" in result.output
+        assert "mock-asg-1" in result.output
+        disp.assert_called_once()
+        proposal = disp.call_args[0][0]
+        assert proposal.type == "mock-author"
+        assert proposal.target_branch == "ms-9-gate-a"
+        mock_record.assert_called_once()
+
+    def test_unknown_repo_errors(self, tmp_path: Path) -> None:
+        config_path = _write_config(
+            tmp_path, repo_path=str(tmp_path / "repo"), run_cmd="echo {}",
+        )
+        result = CliRunner().invoke(main, [
+            "acceptance", "mock", "nope", "100", "--config", str(config_path),
+        ])
+        assert result.exit_code == 2
+        assert "unknown repo" in result.output
+
+    def test_no_milestone_errors(self, tmp_path: Path) -> None:
+        from unittest.mock import patch
+
+        config_path = _write_config(
+            tmp_path, repo_path=str(tmp_path / "repo"), run_cmd="echo {}",
+        )
+        with patch(
+            "coord.github_ops.get_issue",
+            return_value={"number": 100, "title": "t", "body": "", "milestone": None},
+        ):
+            result = CliRunner().invoke(main, [
+                "acceptance", "mock", "coord-tui", "100", "--config", str(config_path),
+            ])
+        assert result.exit_code == 1
+        assert "no milestone" in result.output

@@ -27,6 +27,24 @@ import yaml
 ACCEPTANCE_DIRNAME = "tests/acceptance"
 
 
+def ms_dirname(milestone_number: int) -> str:
+    """The ``ms-NN`` directory name for *milestone_number* (docs/ORACLE_LOOP.md
+    "Layout"). Single source of truth for the naming convention so Gate A
+    (#930, ``coord acceptance mock``) and the manifest reader agree."""
+    return f"ms-{milestone_number}"
+
+
+def gate_a_contract_path(milestone_number: int) -> str:
+    """Repo-relative path to *milestone_number*'s Gate A contract
+    (docs/ORACLE_LOOP.md "Layout": ``tests/acceptance/ms-NN/contract.md``).
+
+    Used both by ``coord acceptance mock`` (#930, what it writes) and
+    ``coord.milestone_dispatch.gate_a_status`` (what it checks for before
+    letting the milestone's issues dispatch).
+    """
+    return f"{ACCEPTANCE_DIRNAME}/{ms_dirname(milestone_number)}/contract.md"
+
+
 class ManifestError(Exception):
     """Raised when a manifest file exists but is malformed."""
 

@@ -132,6 +132,12 @@ def test_parity_milestone_chat_type() -> None:
     _parity(spec)
 
 
+def test_parity_mock_author_type() -> None:
+    """Mock-author assignment (#930, Gate A)."""
+    spec = _make_spec(type="mock-author")
+    _parity(spec)
+
+
 def test_parity_with_resume_session_id() -> None:
     """Work assignment with resume_session_id (chat-continue dispatch)."""
     spec = _make_spec(type="work", resume_session_id="abc123session")
