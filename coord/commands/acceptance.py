@@ -30,6 +30,7 @@ import click
 
 from coord.acceptance import (
     ACCEPTANCE_DIRNAME,
+    acceptance_capability_gap,
     build_verdict,
     dump_manifest_error_hint,
     failure_summary,
@@ -62,6 +63,27 @@ def _resolve_driver(cfg, repo: str):
         )
         sys.exit(1)
     return driver_cfg
+
+
+def _check_local_capability(driver_cfg, repo: str, cfg) -> None:
+    """Fail loudly (#966) when this host is about to run *repo*'s acceptance
+    driver but lacks the capability it declares, and some other configured
+    machine has it. There's no remote-exec plumbing yet to actually route
+    the run there — see :func:`coord.acceptance.acceptance_capability_gap` —
+    so the best available behavior is a clear, actionable error instead of
+    silently executing on hardware that may not support the driver.
+    """
+    gap = acceptance_capability_gap(driver_cfg.capability, repo, cfg)
+    if gap is None:
+        return
+    click.echo(
+        f"error: this host lacks the {driver_cfg.capability!r} capability "
+        f"required by {repo!r}'s acceptance driver ({driver_cfg.kind}); "
+        f"{gap.name!r} has it. Capability-matched remote routing isn't "
+        "implemented yet (#966) — run this command on that machine directly.",
+        err=True,
+    )
+    sys.exit(1)
 
 
 def _scoped_verdict(tests: list[dict], acceptance_root: Path, issue_number: int) -> dict:
@@ -121,6 +143,7 @@ def acceptance_run(
 
     cfg = _load_config(config_path)
     driver_cfg = _resolve_driver(cfg, repo)
+    _check_local_capability(driver_cfg, repo, cfg)
     cwd = Path(path_opt).expanduser() if path_opt else Path.cwd()
 
     try:
@@ -297,6 +320,7 @@ def _acceptance_record_local(
 
     cfg = _load_config(config_path)
     driver_cfg = _resolve_driver(cfg, repo)
+    _check_local_capability(driver_cfg, repo, cfg)
 
     repo_dir = find_local_repo_path(repo, cfg)
     if repo_dir is None or not repo_dir.exists():

@@ -344,6 +344,92 @@ class TestAcceptanceRecord:
         assert not wt_path.exists(), "worktree leaked on manifest-missing error path"
 
 
+class TestAcceptanceCapabilityRouting:
+    """#966: `coord acceptance run --all` / `record` fail loudly instead of
+    silently executing when this host lacks a capability the driver
+    declares and another configured machine has it — no remote-exec
+    plumbing to actually route there yet, so a clear error is the best
+    available behavior."""
+
+    CONFIG_YAML = """\
+repos:
+  - name: coord-tui
+    github: acme/coord-tui
+machines:
+  - name: here
+    host: here.tail
+    repos: [coord-tui]
+    repo_paths:
+      coord-tui: {repo_path}
+  - name: capable
+    host: capable.tail
+    repos: [coord-tui]
+    capabilities: [browser]
+acceptance:
+  drivers:
+    coord-tui:
+      kind: tui-tuidriver
+      run: {run_cmd}
+      capability: browser
+"""
+
+    def _config(self, tmp_path: Path, *, repo_path: str, run_cmd: str) -> Path:
+        p = tmp_path / "coordinator.yml"
+        p.write_text(self.CONFIG_YAML.format(repo_path=repo_path, run_cmd=json.dumps(run_cmd)))
+        return p
+
+    def test_run_all_fails_when_local_host_lacks_capability(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        monkeypatch.setattr("socket.gethostname", lambda: "here")
+        cwd = tmp_path / "repo"
+        cwd.mkdir()
+        config_path = self._config(tmp_path, repo_path=str(cwd), run_cmd="echo '{}'")
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "run", "--repo", "coord-tui", "--all",
+            "--path", str(cwd), "--config", str(config_path),
+        ])
+        assert result.exit_code == 1
+        assert "lacks the 'browser' capability" in result.output
+        assert "'capable'" in result.output
+        assert "#966" in result.output
+
+    def test_run_all_proceeds_when_local_host_has_capability(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        monkeypatch.setattr("socket.gethostname", lambda: "capable")
+        cwd = tmp_path / "repo"
+        cwd.mkdir()
+        # "capable" has no repo_paths entry, but --path is passed explicitly
+        # so find_local_repo_path is never consulted for this command.
+        config_path = self._config(tmp_path, repo_path=str(cwd), run_cmd="echo '{\"tests\": []}'")
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "run", "--repo", "coord-tui", "--all",
+            "--path", str(cwd), "--config", str(config_path),
+        ])
+        # No capability gap → falls through to the ordinary "0 tests" exit.
+        assert "lacks the" not in result.output
+        assert result.exit_code == 1  # total == 0 → non-green, unrelated to #966
+
+    def test_record_fails_when_local_host_lacks_capability(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        monkeypatch.setattr("socket.gethostname", lambda: "here")
+        config_path = self._config(
+            tmp_path, repo_path=str(tmp_path / "repo"), run_cmd="echo '{}'",
+        )
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "record", "--repo", "coord-tui", "--issue", "944",
+            "--sha", "deadbeef", "--config", str(config_path),
+        ])
+        assert result.exit_code == 1
+        assert "lacks the 'browser' capability" in result.output
+        assert "'capable'" in result.output
+
+
 class TestAcceptanceAuthor:
     """`coord acceptance author` (#931) — thin CLI glue over
     `coord.test_author.dispatch_test_author`. The dispatch logic itself

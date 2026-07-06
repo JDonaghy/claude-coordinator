@@ -19,12 +19,16 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
+from coord.config import Config
+from coord.models import Machine, Repo
 from coord.test_orchestrator import (
     PLAN_SYSTEM_PROMPT,
     _build_user_prompt,
     _strip_fences,
     _validate_plan,
+    find_local_repo_path,
     generate_plan,
+    local_machine,
 )
 
 
@@ -490,3 +494,50 @@ class TestSchemaMigration:
         cursor = conn.execute("PRAGMA table_info(assignments)")
         columns = {row["name"] for row in cursor}
         assert "test_plan" in columns
+
+
+class TestLocalMachine:
+    """#966: `local_machine` extracted out of `find_local_repo_path`'s
+    hostname-matching so callers needing the `Machine` object (e.g. an
+    acceptance-driver capability check) don't re-derive the match."""
+
+    @staticmethod
+    def _config() -> Config:
+        return Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[
+                Machine(
+                    name="laptop", host="laptop.tail.ts.net", capabilities=["rust"],
+                    repos=["api"], repo_paths={"api": "/home/laptop/api"},
+                ),
+                Machine(
+                    name="server", host="server.tail.ts.net", capabilities=["gtk"],
+                    repos=["api"], repo_paths={"api": "/home/server/api"},
+                ),
+            ],
+        )
+
+    def test_matches_by_machine_name(self, monkeypatch) -> None:
+        monkeypatch.setattr("socket.gethostname", lambda: "laptop")
+        cfg = self._config()
+        machine = local_machine(cfg)
+        assert machine is not None
+        assert machine.name == "laptop"
+
+    def test_matches_by_host_prefix(self, monkeypatch) -> None:
+        monkeypatch.setattr("socket.gethostname", lambda: "server.tail.ts.net")
+        cfg = self._config()
+        machine = local_machine(cfg)
+        assert machine is not None
+        assert machine.name == "server"
+
+    def test_no_match_returns_none(self, monkeypatch) -> None:
+        monkeypatch.setattr("socket.gethostname", lambda: "nowhere")
+        assert local_machine(self._config()) is None
+
+    def test_find_local_repo_path_still_prefers_matching_machine(self, monkeypatch) -> None:
+        # Regression: local_machine() extraction must not change
+        # find_local_repo_path's existing preference behavior.
+        monkeypatch.setattr("socket.gethostname", lambda: "server")
+        cfg = self._config()
+        assert find_local_repo_path("api", cfg) == Path("/home/server/api")

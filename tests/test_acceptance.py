@@ -9,6 +9,7 @@ import pytest
 
 from coord.acceptance import (
     ManifestError,
+    acceptance_capability_gap,
     build_verdict,
     dump_manifest_error_hint,
     failure_summary,
@@ -20,6 +21,8 @@ from coord.acceptance import (
 # collectible test function, and `test_ids_for_issue` takes required
 # positional args — importing it under its real name breaks collection.
 from coord.acceptance import test_ids_for_issue as ids_for_issue
+from coord.config import Config
+from coord.models import Machine, Repo
 
 
 class TestLoadManifest:
@@ -188,3 +191,70 @@ class TestOracleLoopContractBlock:
         assert "STUCK:" in block
         # #846 not implemented yet — must not tell the worker to run it.
         assert "coord acceptance stall" not in block
+
+
+class TestAcceptanceCapabilityGap:
+    """#966: cheap detection mirroring `coord.smoke.pick_smoke_machine`'s
+    candidate filter — no remote-exec plumbing, just "is this the wrong
+    host?" so callers can fail loudly instead of running on hardware that
+    can't actually support the driver."""
+
+    @staticmethod
+    def _config(*, here_caps: list[str], other_caps: list[str]) -> Config:
+        return Config(
+            repos=[Repo(name="webapp", github="acme/webapp")],
+            machines=[
+                Machine(
+                    name="here", host="here.tail", capabilities=here_caps,
+                    repos=["webapp"],
+                ),
+                Machine(
+                    name="other", host="other.tail", capabilities=other_caps,
+                    repos=["webapp"],
+                ),
+            ],
+        )
+
+    def test_no_capability_required_is_never_a_gap(self, monkeypatch) -> None:
+        monkeypatch.setattr("socket.gethostname", lambda: "here")
+        cfg = self._config(here_caps=[], other_caps=["browser"])
+        assert acceptance_capability_gap("", "webapp", cfg) is None
+
+    def test_local_host_already_has_capability_no_gap(self, monkeypatch) -> None:
+        monkeypatch.setattr("socket.gethostname", lambda: "here")
+        cfg = self._config(here_caps=["browser"], other_caps=[])
+        assert acceptance_capability_gap("browser", "webapp", cfg) is None
+
+    def test_local_host_missing_capability_returns_other_machine(self, monkeypatch) -> None:
+        monkeypatch.setattr("socket.gethostname", lambda: "here")
+        cfg = self._config(here_caps=[], other_caps=["browser"])
+        gap = acceptance_capability_gap("browser", "webapp", cfg)
+        assert gap is not None
+        assert gap.name == "other"
+
+    def test_no_other_machine_has_it_either_no_gap(self, monkeypatch) -> None:
+        # Nothing to route to — failing wouldn't be actionable.
+        monkeypatch.setattr("socket.gethostname", lambda: "here")
+        cfg = self._config(here_caps=[], other_caps=[])
+        assert acceptance_capability_gap("browser", "webapp", cfg) is None
+
+    def test_unrecognized_host_gets_benefit_of_the_doubt(self, monkeypatch) -> None:
+        # This process's hostname doesn't match any configured machine —
+        # could be a dev box outside the fleet with everything installed.
+        monkeypatch.setattr("socket.gethostname", lambda: "nowhere")
+        cfg = self._config(here_caps=[], other_caps=["browser"])
+        assert acceptance_capability_gap("browser", "webapp", cfg) is None
+
+    def test_other_machine_without_repo_access_is_not_a_candidate(self, monkeypatch) -> None:
+        monkeypatch.setattr("socket.gethostname", lambda: "here")
+        cfg = Config(
+            repos=[Repo(name="webapp", github="acme/webapp")],
+            machines=[
+                Machine(name="here", host="here.tail", capabilities=[], repos=["webapp"]),
+                Machine(
+                    name="other", host="other.tail", capabilities=["browser"],
+                    repos=["some-other-repo"],
+                ),
+            ],
+        )
+        assert acceptance_capability_gap("browser", "webapp", cfg) is None

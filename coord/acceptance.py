@@ -24,6 +24,9 @@ from typing import Any
 
 import yaml
 
+from coord.config import Config
+from coord.models import Machine
+
 ACCEPTANCE_DIRNAME = "tests/acceptance"
 
 
@@ -231,3 +234,50 @@ def dump_manifest_error_hint(acceptance_root: Path) -> str:
         "suite has not been authored yet for this repo (see docs/ORACLE_LOOP.md "
         "/ #931)."
     )
+
+
+def acceptance_capability_gap(
+    capability: str, repo_name: str, config: Config,
+) -> Machine | None:
+    """Detect a capability-matched-routing gap for an acceptance driver run
+    (#966, deferred from #932/#944).
+
+    ``coord acceptance run --all`` (Gate C) and ``coord acceptance record``
+    always execute the driver's ``run`` command on whatever host invoked
+    them — there is no remote-exec plumbing to actually route the run
+    elsewhere yet (that's the "new plumbing, not a copy-paste" part #966
+    defers until a driver with a real capability mismatch exists). What this
+    function *can* do cheaply — mirroring ``coord.smoke.pick_smoke_machine``'s
+    candidate filter, minus the async/busy-machine bits that don't apply to
+    a synchronous command — is detect when it's about to run on the *wrong*
+    hardware, so the caller can fail loudly instead of silently.
+
+    Returns the first other configured machine that has *repo_name* and
+    *capability*, when:
+    - *capability* is set (drivers without one, e.g. today's only real
+      driver's implicit local-only assumption, are never gapped), AND
+    - this host is a recognized machine in ``coordinator.yml`` that does
+      NOT have *capability* (an unrecognized host is given the benefit of
+      the doubt — it might be a dev machine outside the fleet that happens
+      to have everything installed), AND
+    - some other configured machine actually has it (nothing to route to
+      otherwise, so failing wouldn't be actionable).
+
+    Returns ``None`` in every other case — i.e. "no known gap, proceed."
+    """
+    if not capability:
+        return None
+
+    from coord.test_orchestrator import local_machine  # noqa: PLC0415 — avoid import cycle
+
+    here = local_machine(config)
+    if here is None or capability in here.capabilities:
+        return None
+
+    candidates = [
+        m for m in config.machines
+        if m.can_work_on(repo_name) and capability in m.capabilities
+    ]
+    if not candidates:
+        return None
+    return candidates[0]
