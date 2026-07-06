@@ -464,6 +464,37 @@ def _board_response_schema(components: dict) -> dict:
                     "required": ["repo_name", "issue_number", "stages", "has_approved_review"],
                 },
             },
+            "plan_roster": {
+                "type": "array",
+                "description": (
+                    "#975: milestone plan-roster — one entry per milestone/epic "
+                    "with ready / blocked / in-flight / done counts and a "
+                    "`needs_you` list of attention signals. Computed server-side "
+                    "by reusing coord.plans.aggregate_repo_plans over the same "
+                    "board + issues snapshot; the coord-tui \"Plans\" panel "
+                    "deserialises this and renders one row per plan."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "repo": {"type": "string"},
+                        "title": {"type": "string"},
+                        "milestone_number": {"type": "integer"},
+                        "tracking_issue": {"type": ["integer", "null"]},
+                        "has_work_order": {"type": "boolean"},
+                        "ready_frontier": {"type": "integer"},
+                        "blocked": {"type": "integer"},
+                        "in_flight": {"type": "integer"},
+                        "done": {"type": "integer"},
+                        "total": {"type": "integer"},
+                        "needs_you": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": [
+                        "repo", "title", "milestone_number", "has_work_order",
+                        "ready_frontier", "blocked", "in_flight", "done", "total", "needs_you",
+                    ],
+                },
+            },
             "milestone_work_orders": {
                 "type": "array",
                 "description": (
@@ -1617,6 +1648,93 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             projection["milestone_work_orders"] = _milestone_work_orders
         except Exception:  # noqa: BLE001 — work-order failure must not blank the board
             projection["milestone_work_orders"] = []
+        # #975: milestone plan-roster — reuse coord.plans.aggregate_repo_plans
+        # server-side so the Plans TUI panel gets one row per milestone/epic
+        # (ready / blocked / in-flight / done counts, needs_you attention
+        # signals) without shelling out from the client. Sourced from the same
+        # projection["issues"] + build_board() snapshot as milestone_work_orders
+        # above — no extra `gh` round trip. Fail-open: any error produces an
+        # empty list rather than 503ing the board.
+        try:
+            from coord.plans import aggregate_repo_plans as _aggregate_repo_plans  # noqa: PLC0415
+
+            if _board is None:
+                try:
+                    from coord.state import build_board as _build_board4  # noqa: PLC0415
+                    _board = _build_board4()
+                except Exception:  # noqa: BLE001 — e.g. thread-safety on test in-memory DB
+                    from coord.models import Board as _Board2  # noqa: PLC0415
+                    _board = _Board2()
+
+            # Group issues by coord-local repo, converting the DAO wire shape
+            # (labels: list[str], flat milestone_number/title) to the dict
+            # shape coord.plans expects (labels: [{"name": ...}], nested
+            # milestone). Only open issues participate — closed epics are
+            # collected separately below so a milestone whose tracking epic
+            # was closed still resolves via #974's closed_tracking_issues arg.
+            _repo_open_issues: dict[str, list[dict]] = {}
+            _repo_closed_epics: dict[str, list[dict]] = {}
+            _repo_milestones: dict[str, dict[int, dict]] = {}
+            for _oi in projection.get("issues", []):
+                _rn = _oi.get("repo_name", "")
+                if not _rn:
+                    continue
+                _label_names = _oi.get("labels") or []
+                _adapted = {
+                    "number": _oi.get("number"),
+                    "title": _oi.get("title", ""),
+                    "body": _oi.get("body") or "",
+                    "state": _oi.get("state"),
+                    "labels": [{"name": name} for name in _label_names],
+                    "milestone": (
+                        {
+                            "number": _oi.get("milestone_number"),
+                            "title": _oi.get("milestone_title") or "",
+                        }
+                        if _oi.get("milestone_number") is not None
+                        else None
+                    ),
+                }
+                if _oi.get("state") == "open":
+                    _repo_open_issues.setdefault(_rn, []).append(_adapted)
+                    _ms_num = _oi.get("milestone_number")
+                    if _ms_num is not None:
+                        _repo_milestones.setdefault(_rn, {}).setdefault(
+                            _ms_num,
+                            {
+                                "number": _ms_num,
+                                "title": _oi.get("milestone_title") or f"Milestone #{_ms_num}",
+                            },
+                        )
+                elif "epic" in _label_names:
+                    # A closed epic — feed into closed_tracking_issues so
+                    # milestones whose tracking issue was tidied up still
+                    # resolve (mirrors coord/plans.py's #974 fix).
+                    _repo_closed_epics.setdefault(_rn, []).append(_adapted)
+
+            _plan_roster: list[dict] = []
+            for _repo_name, _milestones_by_num in _repo_milestones.items():
+                _repo_cfg2 = config.repo(_repo_name)
+                _repo_gh = _repo_cfg2.github if _repo_cfg2 is not None else _repo_name
+                _milestones_list = [
+                    _milestones_by_num[_k] for _k in sorted(_milestones_by_num.keys())
+                ]
+                try:
+                    _entries = _aggregate_repo_plans(
+                        repo_name=_repo_name,
+                        repo_github=_repo_gh,
+                        milestones=_milestones_list,
+                        open_issues=_repo_open_issues.get(_repo_name, []),
+                        board=_board,
+                        closed_tracking_issues=_repo_closed_epics.get(_repo_name, []),
+                    )
+                except Exception:  # noqa: BLE001 — per-repo fail-open
+                    continue
+                for _entry in _entries:
+                    _plan_roster.append(_entry.to_dict())
+            projection["plan_roster"] = _plan_roster
+        except Exception:  # noqa: BLE001 — plan-roster failure must not blank the board
+            projection["plan_roster"] = []
         return JSONResponse(projection)
 
     async def serve_config(request: Request) -> Response:  # noqa: ARG001

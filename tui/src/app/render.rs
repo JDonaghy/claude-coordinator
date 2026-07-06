@@ -92,6 +92,10 @@ impl ShellApp for CoordApp {
                 SidebarView::MilestoneDag => {
                     backend.draw_list(sidebar_rect, &self.milestone_dag_sidebar());
                 }
+                // #975: Plans sidebar — plan-count + attention hint.
+                SidebarView::Plans => {
+                    backend.draw_list(sidebar_rect, &self.plans_sidebar());
+                }
             }
         }
 
@@ -460,6 +464,10 @@ impl ShellApp for CoordApp {
             SidebarView::MilestoneDag => {
                 self.render_milestone_dag_panel(backend, m, lh);
             }
+            // #975: Plans panel — one row per milestone/epic with counts.
+            SidebarView::Plans => {
+                self.render_plans_panel(backend, m, lh);
+            }
         }
 
         // ── Inject chat overlay — renders over the main panel ───────────
@@ -583,9 +591,13 @@ impl ShellApp for CoordApp {
             // §1 (#782): Kanban + Merge Queue activity-bar panels.
             "panel:kanban" => SidebarView::Kanban,
             "panel:mergequeue" => SidebarView::MergeQueue,
-            // #771/#782: Milestone DAG — see shell_config() for why this
-            // button exists (replaces the numeric '8' key dropped by #782).
-            "panel:milestones" => SidebarView::MilestoneDag,
+            // #975: Plans panel — the ActivityBar item now labelled "Plans"
+            // (see shell_config()).  Legacy `panel:milestones` id still
+            // routes here so users who had the old button pinned land on
+            // the new Plans panel (which subsumes MilestoneDag's roster
+            // view); the MilestoneDag view itself remains accessible as a
+            // future drill-down but no longer has its own top-level entry.
+            "panel:plans" | "panel:milestones" => SidebarView::Plans,
             _ => return,
         };
     }

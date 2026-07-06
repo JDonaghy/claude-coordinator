@@ -137,6 +137,15 @@ pub(crate) enum SidebarView {
     /// cohort rows with done/in-flight/blocked/ready state per node, plus a
     /// "Dispatch milestone" action on the milestone header. Key `8`.
     MilestoneDag,
+    /// #975: Plans panel — the first-class ActivityBar view onto the plan
+    /// roster.  Elevates/subsumes the older `MilestoneDag` "Milestones" view:
+    /// one row per milestone/epic with ready / blocked / in-flight / done
+    /// counts, sourced from `BoardData::plan_roster` (server-computed by
+    /// `coord/serve_app.py` via `coord.plans.aggregate_repo_plans`).  Read-only
+    /// in this slice — health chips (#976), fast capture (#977), and the
+    /// GOAL.md header (#978) come later.  Selecting a row opens that plan's
+    /// tracking epic in the browser via `gh issue view --web`.
+    Plans,
 }
 
 impl SidebarView {
@@ -150,6 +159,7 @@ impl SidebarView {
             SidebarView::Kanban => "Kanban",
             SidebarView::MergeQueue => "Merge Queue",
             SidebarView::MilestoneDag => "Milestones",
+            SidebarView::Plans => "Plans",
         }
     }
 }
@@ -473,6 +483,14 @@ pub(crate) struct BoardPayload {
     /// blocked-on badges on Pipeline milestone cards using this projection.
     #[serde(default)]
     pub(crate) milestone_work_orders: Vec<MilestoneWorkOrder>,
+    /// #975: milestone plan-roster — one entry per milestone/epic with
+    /// ready / blocked / in-flight / done counts + attention signals,
+    /// computed server-side by `coord.plans.aggregate_repo_plans`.  Empty on
+    /// the local-SQLite-mode read path (no daemon to compute it) and on
+    /// daemons older than #975 — the Plans panel renders "No plans yet" in
+    /// that case.
+    #[serde(default)]
+    pub(crate) plan_roster: Vec<PlanRosterEntry>,
 }
 
 /// #584: serde deserializer for `Assignment::test_plan` on the remote
@@ -861,6 +879,66 @@ pub(crate) struct MilestoneWorkOrder {
     pub(crate) nodes: Vec<MilestoneWorkOrderNode>,
 }
 
+/// One row in the milestone plan-roster from the `/board` payload (#975).
+///
+/// Deserialized from the top-level `plan_roster[*]` list, computed
+/// server-side by `coord/serve_app.py` via
+/// `coord.plans.aggregate_repo_plans` — one entry per milestone/epic across
+/// all configured repos.  The coord-tui "Plans" panel renders one row per
+/// entry with ready / blocked / in-flight / done counts and a `needs_you`
+/// attention list.
+///
+/// **Serde note (#632).** Every field here must match the JSON type emitted
+/// by `PlanEntry.to_dict()` in `coord/plans.py`.  Counts are integers,
+/// `has_work_order` is a bool (Python bool → JSON true/false, so no
+/// `de_bool_from_int_or_bool` needed), `tracking_issue` can be null.  A
+/// mistyped field would fail the whole `BoardPayload` parse and blank the
+/// board on load.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub(crate) struct PlanRosterEntry {
+    /// Coord-local repo name (matches `coordinator.yml`).
+    pub(crate) repo: String,
+    /// Milestone title, e.g. `"Substrate"`.
+    pub(crate) title: String,
+    /// GitHub milestone number.
+    pub(crate) milestone_number: i64,
+    /// Tracking-epic issue number, or `None` when the milestone has no
+    /// `"epic"`-labelled issue.  When present, selecting the row opens this
+    /// issue in the browser via `gh issue view --web`.
+    #[serde(default)]
+    pub(crate) tracking_issue: Option<u64>,
+    /// True iff the tracking epic body carries a parseable `## Work order`
+    /// block with ≥1 node.  False for milestones surfaced in the roster
+    /// purely because member issues reference them (no epic yet) — those
+    /// get `needs_you: ["no_work_order"]` and zero counts.
+    #[serde(default)]
+    pub(crate) has_work_order: bool,
+    /// Work-order nodes on the ready frontier (dependencies met, unclaimed,
+    /// not terminal) — the dispatcher's next candidates.
+    #[serde(default)]
+    pub(crate) ready_frontier: u32,
+    /// Work-order nodes blocked by unmet dependencies or a conflict.
+    #[serde(default)]
+    pub(crate) blocked: u32,
+    /// Work-order nodes currently claimed by an active board assignment or
+    /// a remote `issue-N-*` branch.
+    #[serde(default)]
+    pub(crate) in_flight: u32,
+    /// Work-order nodes that have reached a terminal (closed) state.
+    #[serde(default)]
+    pub(crate) done: u32,
+    /// Total work-order nodes declared under this milestone.
+    #[serde(default)]
+    pub(crate) total: u32,
+    /// Ordered attention signals — currently one of:
+    ///   * `"no_work_order"` — open milestone with no parseable work order
+    ///   * `"ready_waiting"` — ≥1 ready-frontier entry exists to dispatch
+    ///   * `"stalled"` — open with a work order but nothing ready or in flight
+    /// #976 will paint these as health chips on each row.
+    #[serde(default)]
+    pub(crate) needs_you: Vec<String>,
+}
+
 /// CI check status for one PR, fetched in the background via `gh pr checks`.
 ///
 /// Populated from `fetch_ci_checks_summary` and stored on `CoordApp` keyed by
@@ -1193,6 +1271,11 @@ pub(crate) struct BoardData {
     /// than #795.  The Pipeline view renders rank/next-up/blocked-on badges
     /// on milestone cards using this projection.
     pub(crate) milestone_work_orders: Vec<MilestoneWorkOrder>,
+    /// #975: milestone plan-roster — one entry per milestone/epic, sourced
+    /// from `/board`'s `plan_roster` field.  Empty on the local-SQLite-mode
+    /// read path and daemons older than #975.  The Plans panel renders one
+    /// row per entry.
+    pub(crate) plan_roster: Vec<PlanRosterEntry>,
 }
 
 /// Parsed plan data, mirroring `coord.plan_parser.WorkerPlan.to_dict()`.

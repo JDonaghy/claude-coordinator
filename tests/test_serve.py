@@ -387,6 +387,109 @@ def test_milestone_work_orders_empty_when_no_tracking_issue(file_db: Path, valid
     )
 
 
+# ── #975: plan_roster in /board payload ──────────────────────────────────────
+
+def _make_plan_roster_db(path: Path) -> None:
+    """Seed a DB with two milestones so the plan_roster aggregation has something
+    to compute over:
+
+    - milestone #5 ("Substrate"): tracking epic #500 with a ## Work order,
+      three open children (#101, #102, #103) — #103 is blocked on the other two
+    - milestone #6 ("Follow-up"): no tracking epic yet — should surface with
+      `has_work_order=False` and `needs_you=["no_work_order"]`
+    """
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    _ensure_schema(conn)
+    conn.execute(
+        "INSERT INTO machines (name, host, capabilities, repos) VALUES (?,?,?,?)",
+        ("laptop", "laptop.tailnet", '["python"]', '["api"]'),
+    )
+    # Tracking epic for milestone #5 — the plan-roster aggregation reads its
+    # body to find the ## Work order block.  It IS a member of milestone #5
+    # (so aggregate_repo_plans can match it back to the milestone entry).
+    conn.execute(
+        "INSERT INTO issues (repo_name, number, title, body, state, labels, "
+        "milestone_number, milestone_title, synced_at) "
+        "VALUES (?, ?, ?, ?, 'open', ?, ?, ?, 0)",
+        ("api", 500, "Substrate epic", _WORK_ORDER_BODY, '["epic", "coord"]', 5, "Substrate"),
+    )
+    for num, title in [(101, "Node A"), (102, "Node B"), (103, "Node C")]:
+        conn.execute(
+            "INSERT INTO issues (repo_name, number, title, body, state, labels, "
+            "milestone_number, milestone_title, synced_at) "
+            "VALUES (?, ?, ?, '', 'open', '[]', ?, ?, 0)",
+            ("api", num, title, 5, "Substrate"),
+        )
+    # A second milestone that never got a tracking epic.  Only surface it if
+    # aggregate_repo_plans sees a member issue — put one open issue under it.
+    conn.execute(
+        "INSERT INTO issues (repo_name, number, title, body, state, labels, "
+        "milestone_number, milestone_title, synced_at) "
+        "VALUES (?, ?, ?, '', 'open', '[]', ?, ?, 0)",
+        ("api", 200, "Bare follow-up issue", 6, "Follow-up"),
+    )
+    conn.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')")
+    conn.commit()
+    conn.close()
+
+
+@pytest.fixture
+def plan_roster_db(tmp_path: Path) -> Path:
+    p = tmp_path / "coord.db"
+    _make_plan_roster_db(p)
+    return p
+
+
+def test_plan_roster_in_board_payload(plan_roster_db: Path, valid_config_path: Path):
+    """#975: /board payload carries a `plan_roster` field — one entry per
+    milestone/epic, with ready / blocked / in-flight / done counts sourced
+    from `coord.plans.aggregate_repo_plans`.  The TUI "Plans" panel reads
+    this to render one row per plan.
+    """
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(plan_roster_db), cfg)
+    with TestClient(app) as cli:
+        board = cli.get("/board").json()
+
+    assert "plan_roster" in board, "plan_roster key missing from /board"
+    roster = board["plan_roster"]
+    # Two milestones seeded (#5 with epic, #6 without) — both must surface.
+    entries_by_ms = {e["milestone_number"]: e for e in roster}
+    assert set(entries_by_ms) == {5, 6}, f"unexpected milestones: {set(entries_by_ms)}"
+
+    substrate = entries_by_ms[5]
+    assert substrate["repo"] == "api"
+    assert substrate["title"] == "Substrate"
+    assert substrate["tracking_issue"] == 500
+    assert substrate["has_work_order"] is True
+    # Two ready-frontier nodes (#101 + #102, no unmet deps); #103 blocked on both.
+    assert substrate["ready_frontier"] == 2
+    assert substrate["blocked"] == 1
+    assert substrate["in_flight"] == 0
+    assert substrate["done"] == 0
+    assert substrate["total"] == 3
+    assert "ready_waiting" in substrate["needs_you"], (
+        f"ready_waiting attention signal missing: {substrate['needs_you']}"
+    )
+
+    followup = entries_by_ms[6]
+    assert followup["has_work_order"] is False
+    assert followup["needs_you"] == ["no_work_order"]
+    assert followup["total"] == 0
+
+
+def test_plan_roster_empty_when_no_milestones(file_db: Path, valid_config_path: Path):
+    """#975: fail-open — no milestone-tagged issues means plan_roster is []."""
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(file_db), cfg)
+    with TestClient(app) as cli:
+        board = cli.get("/board").json()
+    assert board.get("plan_roster") == [], (
+        f"plan_roster must be [] when no milestones exist, got {board.get('plan_roster')!r}"
+    )
+
+
 # ── Write path (#590): daemon endpoints ──────────────────────────────────────
 
 

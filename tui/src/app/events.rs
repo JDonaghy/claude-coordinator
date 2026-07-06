@@ -1693,6 +1693,33 @@ impl CoordApp {
                         self.milestone_dag_sel = self.milestone_dag_sel.saturating_sub(1);
                         needs_redraw = true;
                     }
+
+                    // ── Plans panel keyboard nav (#975) ──────────────────
+                    Key::Char('j') | Key::Named(NamedKey::Down)
+                        if self.active_view == SidebarView::Plans =>
+                    {
+                        let n = self.plans_entries().len();
+                        if n > 0 {
+                            self.plans_sel = (self.plans_sel + 1).min(n.saturating_sub(1));
+                        }
+                        needs_redraw = true;
+                    }
+                    Key::Char('k') | Key::Named(NamedKey::Up)
+                        if self.active_view == SidebarView::Plans =>
+                    {
+                        self.plans_sel = self.plans_sel.saturating_sub(1);
+                        needs_redraw = true;
+                    }
+                    // Enter — open the tracking epic of the selected plan in
+                    // the browser via `gh issue view --web`.  A no-op with a
+                    // toast when the plan has no epic yet (#977 / #978 cover
+                    // the create-epic workflow).
+                    Key::Named(NamedKey::Enter)
+                        if self.active_view == SidebarView::Plans =>
+                    {
+                        self.open_selected_plan_tracking_epic();
+                        needs_redraw = true;
+                    }
                     // "Dispatch milestone" — promote the selected milestone's
                     // declared work order into the pipeline (#767 Phase 1).
                     Key::Char('d')
@@ -2196,6 +2223,8 @@ impl CoordApp {
                             SidebarView::MergeQueue => {}
                             // #771: MilestoneDag j/k handled by the earlier guarded arm.
                             SidebarView::MilestoneDag => {}
+                            // #975: Plans j/k handled by the earlier guarded arm.
+                            SidebarView::Plans => {}
                         }
                         needs_redraw = true;
                     }
@@ -2250,6 +2279,8 @@ impl CoordApp {
                             SidebarView::MergeQueue => {}
                             // #771: MilestoneDag k handled by the earlier guarded arm.
                             SidebarView::MilestoneDag => {}
+                            // #975: Plans k handled by the earlier guarded arm.
+                            SidebarView::Plans => {}
                         }
                         needs_redraw = true;
                     }
@@ -2477,6 +2508,10 @@ impl CoordApp {
                             SidebarView::MilestoneDag => {
                                 self.milestone_dag_sel = 0;
                             }
+                            // #975: Plans — Home jumps to first plan.
+                            SidebarView::Plans => {
+                                self.plans_sel = 0;
+                            }
                         }
                         needs_redraw = true;
                     }
@@ -2536,6 +2571,13 @@ impl CoordApp {
                                 let n = self.milestone_dag_views().len();
                                 if n > 0 {
                                     self.milestone_dag_sel = n - 1;
+                                }
+                            }
+                            // #975: Plans — End jumps to last plan.
+                            SidebarView::Plans => {
+                                let n = self.plans_entries().len();
+                                if n > 0 {
+                                    self.plans_sel = n - 1;
                                 }
                             }
                         }
@@ -3913,6 +3955,9 @@ impl CoordApp {
             // #771: Milestone DAG sidebar is a placeholder; the milestone
             // list + DAG both live in the main panel (`mouse_main_click`).
             SidebarView::MilestoneDag => false,
+            // #975: Plans sidebar is a placeholder; the plan-roster list lives
+            // in the main panel (`mouse_main_click`).
+            SidebarView::Plans => false,
         }
     }
 
@@ -4483,6 +4528,8 @@ impl CoordApp {
             SidebarView::MergeQueue => false,
             // #771: Milestone DAG sidebar is a placeholder — no sidebar scroll.
             SidebarView::MilestoneDag => false,
+            // #975: Plans sidebar is a placeholder — no sidebar scroll.
+            SidebarView::Plans => false,
         }
     }
 
@@ -4727,6 +4774,8 @@ impl CoordApp {
             SidebarView::MergeQueue => true,
             // #771: Milestone DAG panel — j/k handles navigation; wheel is no-op for now.
             SidebarView::MilestoneDag => true,
+            // #975: Plans panel — j/k handles navigation; wheel is no-op for now.
+            SidebarView::Plans => true,
         }
     }
 }
