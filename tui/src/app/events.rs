@@ -4229,7 +4229,9 @@ impl CoordApp {
     ///
     /// The coordinate translation mirrors the render path: for the standalone
     /// terminal, `main_b` is the full main content rect (no toolbar).  For the
-    /// detail terminal, `main_b.y + lh*1.4` is the content-area top edge.
+    /// detail terminal, [`Self::pipeline_terminal_content_y`] (tab bar height
+    /// plus the `#818` pinned stage strip, when shown — `#995`) is the
+    /// content-area top edge.
     pub(crate) fn terminal_mouse_event(
         &mut self,
         kind: TerminalMouseKind,
@@ -4256,11 +4258,14 @@ impl CoordApp {
             SidebarView::Pipeline
                 if self.pipeline_detail_tab == PipelineDetailTab::Terminal =>
             {
-                // Content area starts below the tab bar. `#464`: use the
-                // rounded helper so the hit-test origin lines up with the
-                // render origin in the TUI backend (where `q_rect_to_ratatui`
-                // rounds the fractional `lh * 1.4` to a whole cell).
-                let content_y = main_b.y + detail_tab_bar_height(lh);
+                // Content area starts below the tab bar and the #818 pinned
+                // stage strip. `#995`: route through the shared
+                // `pipeline_terminal_content_y` helper so the hit-test
+                // origin lines up with the render origin (tab bar +
+                // stage-strip height) in the TUI backend (where
+                // `q_rect_to_ratatui` rounds the fractional `lh * 1.4` to a
+                // whole cell).
+                let content_y = self.pipeline_terminal_content_y(main_b, lh);
                 if let Some((col, row)) =
                     terminal_pixel_to_cell(pos, main_b, content_y, char_w, lh)
                 {
@@ -4313,8 +4318,10 @@ impl CoordApp {
             SidebarView::Pipeline
                 if self.pipeline_detail_tab == PipelineDetailTab::Terminal =>
             {
-                // `#464`: rounded helper for parity with the render path.
-                let content_y = main_b.y + detail_tab_bar_height(lh);
+                // `#995`: shared helper includes both the tab bar and the
+                // #818 pinned stage strip so this stays in parity with the
+                // render path.
+                let content_y = self.pipeline_terminal_content_y(main_b, lh);
                 let (col, row) =
                     terminal_pixel_to_cell_clamped(pos, main_b, content_y, char_w, lh);
                 if let Some(issue_key) = self.selected_issue_key() {
@@ -4354,8 +4361,10 @@ impl CoordApp {
             SidebarView::Pipeline
                 if self.pipeline_detail_tab == PipelineDetailTab::Terminal =>
             {
-                // `#464`: rounded helper for parity with the render path.
-                let content_y = main_b.y + detail_tab_bar_height(lh);
+                // `#995`: shared helper includes both the tab bar and the
+                // #818 pinned stage strip so this stays in parity with the
+                // render path.
+                let content_y = self.pipeline_terminal_content_y(main_b, lh);
                 terminal_pixel_to_cell(pos, main_b, content_y, char_w, lh)
             }
             _ => None,

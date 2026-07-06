@@ -18669,6 +18669,116 @@
         assert!(!result);
     }
 
+    // ── #995: pinned stage-strip (#818) origin parity ─────────────────────
+
+    #[test]
+    fn pipeline_stage_strip_height_zero_without_pipeline_widget() {
+        // `make_test_app(BoardData::default())` has no pipeline issues, so
+        // `build_pipeline_widget()` is `None` and `content_below_strip`
+        // (render.rs) draws no strip at all — the hit-test must agree.
+        let app = make_test_app(BoardData::default());
+        let content_rect = Rect::new(0.0, 0.0, 200.0, 99.0);
+        assert_eq!(app.pipeline_stage_strip_height(content_rect, 16.0), 0.0);
+    }
+
+    #[test]
+    fn pipeline_stage_strip_height_matches_render_rect_when_widget_present() {
+        // With real pipeline data selected, the strip height must be
+        // computed by the exact same `pipeline_detail_pv_rect_strip` the
+        // render path calls, so the two can never drift again (#995).
+        let app = make_pipeline_app();
+        assert!(app.build_pipeline_widget().is_some(), "fixture must have a pipeline widget");
+        let content_rect = Rect::new(0.0, 0.0, 200.0, 99.0);
+        let lh = 16.0_f32;
+        assert_eq!(
+            app.pipeline_stage_strip_height(content_rect, lh),
+            pipeline_detail_pv_rect_strip(content_rect, lh).height
+        );
+        assert!(
+            app.pipeline_stage_strip_height(content_rect, lh) > 0.0,
+            "strip must have nonzero height when a pipeline widget is present"
+        );
+    }
+
+    #[test]
+    fn pipeline_terminal_content_y_is_tab_bar_only_without_pipeline_widget() {
+        // No pipeline data selected → no strip drawn → content_y is just
+        // the tab bar height, matching pre-#818 behavior.
+        let app = make_test_app(BoardData::default());
+        let main_b = Rect::new(0.0, 0.0, 200.0, 100.0);
+        let lh = 16.0_f32;
+        assert_eq!(
+            app.pipeline_terminal_content_y(main_b, lh),
+            main_b.y + detail_tab_bar_height(lh)
+        );
+    }
+
+    #[test]
+    fn pipeline_terminal_content_y_includes_strip_when_widget_present() {
+        // #995 regression: content_y must include the #818 stage-strip
+        // height on top of the tab bar, or hit-testing lands `strip_h`
+        // rows below every click.
+        let app = make_pipeline_app();
+        let main_b = Rect::new(0.0, 0.0, 200.0, 100.0);
+        let lh = 16.0_f32;
+        let tab_h = detail_tab_bar_height(lh);
+        let content_rect = Rect::new(
+            main_b.x,
+            main_b.y + tab_h,
+            main_b.width,
+            (main_b.height - tab_h).max(0.0),
+        );
+        let strip_h = pipeline_detail_pv_rect_strip(content_rect, lh).height;
+        assert!(strip_h > 0.0, "fixture must produce a nonzero strip");
+        assert_eq!(app.pipeline_terminal_content_y(main_b, lh), main_b.y + tab_h + strip_h);
+    }
+
+    /// `#995` reproducer (TUI integer-cell case, mirroring the `#464` parity
+    /// tests above): with a pipeline widget present, the visual top-left
+    /// content cell of the Pipeline/Terminal tab — now BELOW the stage
+    /// strip — must map to `(col=0, row=0)`. Before the fix, `content_y`
+    /// omitted the strip height, so this pixel row hit-tested to a row
+    /// `strip_h` cells too high (or, for a click at the true row 0 top of
+    /// the PTY, resolved to a negative row and was rejected).
+    #[test]
+    fn tpc_tui_pipeline_terminal_tab_top_left_cell_accounts_for_strip() {
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Terminal;
+        assert!(app.build_pipeline_widget().is_some());
+
+        let lh = 1.0_f32; // TUI: one row per line height
+        let char_w = 1.0_f32;
+        let main_b = Rect::new(0.0, 0.0, 80.0, 24.0);
+        let content_y = app.pipeline_terminal_content_y(main_b, lh);
+
+        let cell = app.active_terminal_pixel_to_cell(
+            Point::new(0.0, content_y),
+            main_b,
+            lh,
+            char_w,
+        );
+        assert_eq!(
+            cell,
+            Some((0, 0)),
+            "top-left of the content area (below tab bar + stage strip) \
+             must map to (col=0, row=0)"
+        );
+
+        // One row above the true content origin (i.e. still inside the
+        // strip) must NOT hit-test into the PTY grid.
+        let in_strip = app.active_terminal_pixel_to_cell(
+            Point::new(0.0, content_y - 1.0),
+            main_b,
+            lh,
+            char_w,
+        );
+        assert_eq!(
+            in_strip, None,
+            "a click still inside the stage strip must not reach the PTY"
+        );
+    }
+
     #[test]
     fn terminal_mouse_event_non_terminal_view_returns_false() {
         // Board view has no PTY — the _ arm must return false immediately.
