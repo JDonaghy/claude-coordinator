@@ -129,7 +129,7 @@ class TestFindTrackingIssue:
 # ── aggregate_plan — needs_you signals ───────────────────────────────────────
 
 
-class TestAggregateplanSignals:
+class TestAggregatePlanSignals:
     def test_no_tracking_issue_gives_no_work_order(self) -> None:
         entry = aggregate_plan(
             milestone_title="v1",
@@ -202,115 +202,6 @@ class TestAggregateplanSignals:
         assert entry.blocked == 1  # #12 still waiting on deps
         assert "ready_waiting" not in entry.needs_you
         assert "stalled" not in entry.needs_you
-
-    def test_stalled_when_no_ready_and_no_in_flight(self) -> None:
-        """Work order exists but nothing is ready or in-flight (e.g. all blocked
-        and nobody working on them). Actually this can't happen naturally with the
-        sample — let's construct a scenario where the work order is present but
-        everything is claimed as dep-blocked and no claim exists."""
-        # Use a body where #10 depends on a closed issue #99 (done) so it's ready,
-        # then close it, leaving #11 waiting on #10.
-        body = "## Work order\n- [ ] #10 {after: #11}\n- [ ] #11 {after: #10}\n"
-        # Actually a cycle — let's use a simpler stalled scenario:
-        # Single open issue with no work order progress possible because it has
-        # a dep on something closed but itself open and unclaimed.
-        body = "## Work order\n- [ ] #20\n"
-        # #20 is open, unclaimed → it's ready, not stalled.
-        # For stalled: we need ready==0 and in_flight==0 and done < total.
-        # This happens when ALL work-order nodes that aren't done are blocked by deps.
-        stall_body = (
-            "## Work order\n"
-            "- [ ] #30\n"          # blocked on #31
-            "- [ ] #31 {after: #30}\n"  # blocked on #30
-        )
-        # ^ This would be a cycle and raise WorkOrderError.
-        # Instead: two nodes, one blocked on the other, neither open in open_issue_numbers.
-        # → both terminal → done == total → no signal.
-        #
-        # Real stalled case: one node open, one node blocked on it — nothing
-        # except a blocked node. That is impossible since the single open node
-        # would be ready.
-        #
-        # Stalled actually requires: open node, claimed (so blocked), dep-blocked
-        # node remaining — but claim shows in_flight. Let's use a narrower
-        # scenario: single open node #50 blocked because something it depends on
-        # (#49) is ALSO still open but not in the work order... wait, that would
-        # be a validation error.
-        #
-        # The simplest stalled scenario: work order has one node #50 which is
-        # NOT in open_issue_numbers (so it appears closed/terminal) AND there's
-        # another node #51 that depends on #50. But #51 IS open. The #50 terminal
-        # unblocks... wait. Let me think.
-        #
-        # Actually a stalled case:
-        # - #60 and #61 both open, #61 depends on #60.
-        # - #60 is claimed (in_flight) → not ready.
-        # - #61 is dep-blocked on #60 → not ready.
-        # → ready==0, in_flight==1 → NOT stalled (in_flight > 0).
-        #
-        # True stalled: work order has multiple dep levels, top-level all claimed,
-        # or all blocked by a conflict. But since in_flight > 0, it's not stalled.
-        #
-        # The issue spec says stalled = "open, no in-flight, none ready".
-        # This can happen when a work order has ONE node, it's blocked by a dep,
-        # but the dep is in terminal_issues (so the node should be ready).
-        # Actually no.
-        #
-        # Stalled = everything in the frontier.blocked has waiting_on_deps AND
-        # none have claims, AND ready==0. This only happens if we have:
-        # - Node A depending on node B (which is in the work order)
-        # - Node B is also open and not terminal
-        # - Node B has no deps of its own → B should be ready.
-        # So this scenario is impossible with a valid work order — unless B has
-        # claims but branch_lookup returns nothing (since we pass lambda *_: [])
-        # and the board has no active assignment for B.
-        #
-        # Let me construct a stalled scenario differently:
-        # Two parallel nodes #70 and #71, BOTH conflict-checked.
-        # conflict_checker is not wired in aggregate_plan, so we can't test that.
-        #
-        # The only realistic stalled scenario in our pure-fn world is:
-        # - Work order has nodes A, B
-        # - A depends on B (B must finish first)
-        # - B is open but claimed on the board → B is in_flight → NOT stalled
-        # OR
-        # - No nodes are ready, no in_flight, some are waiting_on_deps
-        # → only possible if all non-done nodes have waiting_on_deps
-        # AND none of their deps are done (so deps are also non-done)
-        # AND none of those deps are ready...
-        # That's a situation where EVERY node has at least one non-done dep.
-        # That would be a cycle → WorkOrderError. So stalled is actually hard to hit
-        # without conflict_checker.
-        #
-        # ACTUALLY: the simplest stalled case:
-        # all nodes in the work order are closed (terminal) → done==total → no signal.
-        # OR:
-        # The work order is valid, and one node is ready... so stalled can't happen
-        # without conflict_checker or branch claims.
-        #
-        # But wait — what if the only remaining open node has all deps closed
-        # PLUS a branch claim but we pass branch_lookup=lambda: [] so no branch claim?
-        # Then it's ready.
-        #
-        # Real stall: the entire ready frontier is 0 because all non-terminal nodes
-        # are blocked by active board assignments... but that means in_flight > 0.
-        #
-        # Conclusion: the "stalled" signal requires conflict_checker which we don't
-        # pass in aggregate_plan. It CAN'T happen in our current pure model without
-        # it. Let me add a simpler test that verifies the stalled logic branch
-        # IS reachable with a synthetic board scenario.
-        #
-        # Actually it IS reachable: if the work order has node #80 which is open
-        # and its dep #79 is also open (not terminal) → #80 is dep-blocked, #79 is
-        # ready. So #80 is stalled and #79 is ready → signal is "ready_waiting".
-        #
-        # True stalled needs all nodes: closed OR (open + dep-blocked with no
-        # ready non-blocked nodes AND no in-flight). Only a cycle achieves that,
-        # but cycles raise WorkOrderError.
-        #
-        # The stalled test therefore needs conflict_checker. But aggregate_plan
-        # doesn't expose one. Let me test it by patching ready_frontier instead.
-        pass
 
     def test_stalled_when_all_blocked_by_conflict(self, monkeypatch) -> None:
         """Stalled signal fires when nothing is ready or in-flight but work remains."""
@@ -495,6 +386,49 @@ class TestAggregateRepoPlans:
         assert fetcher_calls == [50]
         assert entries[0].has_work_order is True
 
+    def test_closed_epic_still_found_via_closed_tracking_issues(self) -> None:
+        """A milestone whose tracking epic was closed (but the milestone
+        stayed open) still resolves its work order when the closed epic is
+        supplied via ``closed_tracking_issues`` — #974 review finding #1."""
+        milestones = [_ms(6, "v6")]
+        # No open epic under milestone 6 — only plain work-order-node issues.
+        open_issues = [
+            _issue(10, milestone_number=6),
+            _issue(11, milestone_number=6),
+            _issue(12, milestone_number=6),
+        ]
+        closed_epics = [
+            _issue(60, milestone_number=6, labels=["epic"], body=WORK_ORDER_BODY),
+        ]
+        entries = aggregate_repo_plans(
+            repo_name="api",
+            repo_github="acme/api",
+            milestones=milestones,
+            open_issues=open_issues,
+            board=Board(),
+            closed_tracking_issues=closed_epics,
+        )
+        assert len(entries) == 1
+        assert entries[0].tracking_issue == 60
+        assert entries[0].has_work_order is True
+        # #10 and #11 open and unclaimed → ready.
+        assert entries[0].ready_frontier == 2
+
+    def test_without_closed_tracking_issues_reports_no_work_order(self) -> None:
+        """Baseline: omitting ``closed_tracking_issues`` (the default) keeps
+        the open-only behaviour — a closed-only epic is not found."""
+        milestones = [_ms(7, "v7")]
+        open_issues = [_issue(10, milestone_number=7)]
+        entries = aggregate_repo_plans(
+            repo_name="api",
+            repo_github="acme/api",
+            milestones=milestones,
+            open_issues=open_issues,
+            board=Board(),
+        )
+        assert entries[0].has_work_order is False
+        assert "no_work_order" in entries[0].needs_you
+
 
 # ── CLI integration ───────────────────────────────────────────────────────────
 
@@ -511,6 +445,7 @@ class TestPlansCli:
         with (
             patch("coord.github_ops.get_repo_milestones", return_value=milestones),
             patch("coord.github_ops.get_open_issues", return_value=open_issues),
+            patch("coord.github_ops.get_closed_epics", return_value=[]),
         ):
             result = CliRunner().invoke(
                 main, ["plans", "--json", "--config", str(config_file)]
@@ -532,6 +467,7 @@ class TestPlansCli:
         with (
             patch("coord.github_ops.get_repo_milestones", return_value=milestones),
             patch("coord.github_ops.get_open_issues", return_value=open_issues),
+            patch("coord.github_ops.get_closed_epics", return_value=[]),
         ):
             result = CliRunner().invoke(
                 main, ["plans", "--json", "--config", str(config_file)]
@@ -553,6 +489,7 @@ class TestPlansCli:
         with (
             patch("coord.github_ops.get_repo_milestones", return_value=[]),
             patch("coord.github_ops.get_open_issues", return_value=[]),
+            patch("coord.github_ops.get_closed_epics", return_value=[]),
         ):
             result = CliRunner().invoke(
                 main, ["plans", "--config", str(config_file)]
@@ -571,6 +508,7 @@ class TestPlansCli:
         with (
             patch("coord.github_ops.get_repo_milestones", return_value=milestones),
             patch("coord.github_ops.get_open_issues", return_value=open_issues),
+            patch("coord.github_ops.get_closed_epics", return_value=[]),
         ):
             result = CliRunner().invoke(
                 main, ["plans", "--config", str(config_file)]
@@ -589,6 +527,7 @@ class TestPlansCli:
                 "coord.github_ops.get_repo_milestones", return_value=milestones
             ) as mock_ms,
             patch("coord.github_ops.get_open_issues", return_value=open_issues),
+            patch("coord.github_ops.get_closed_epics", return_value=[]),
         ):
             result = CliRunner().invoke(
                 main, ["plans", "--repo", "api", "--json", "--config", str(config_file)]
@@ -621,6 +560,65 @@ class TestPlansCli:
         json_start = output.index("[")
         data = json.loads(output[json_start:])
         assert data == []
+
+    def test_closed_epic_resolves_milestone_end_to_end(self, config_file: Path) -> None:
+        """#974 review finding #1: a closed tracking epic (from
+        ``get_closed_epics``) is still used to resolve the milestone's work
+        order, end-to-end through the CLI command."""
+        milestones = [{"number": 8, "title": "v8"}]
+        open_issues = [
+            _issue(10, milestone_number=8),
+            _issue(11, milestone_number=8),
+            _issue(12, milestone_number=8),
+        ]
+        closed_epics = [
+            _issue(80, milestone_number=8, labels=["epic"], body=WORK_ORDER_BODY),
+        ]
+        with (
+            patch("coord.github_ops.get_repo_milestones", return_value=milestones),
+            patch("coord.github_ops.get_open_issues", return_value=open_issues),
+            patch("coord.github_ops.get_closed_epics", return_value=closed_epics),
+        ):
+            result = CliRunner().invoke(
+                main, ["plans", "--json", "--config", str(config_file)]
+            )
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert len(data) == 1
+        assert data[0]["tracking_issue"] == 80
+        assert data[0]["has_work_order"] is True
+        assert "no_work_order" not in data[0]["needs_you"]
+
+    def test_closed_epics_fetch_error_falls_back_to_open_only(
+        self, config_file: Path
+    ) -> None:
+        """A failure fetching closed epics degrades to open-only lookup
+        (with a warning) instead of failing the whole command."""
+        milestones = [{"number": 9, "title": "v9"}]
+        open_issues = [
+            _issue(90, milestone_number=9, labels=["epic"], body=WORK_ORDER_BODY),
+            _issue(10, milestone_number=9),
+            _issue(11, milestone_number=9),
+            _issue(12, milestone_number=9),
+        ]
+        with (
+            patch("coord.github_ops.get_repo_milestones", return_value=milestones),
+            patch("coord.github_ops.get_open_issues", return_value=open_issues),
+            patch(
+                "coord.github_ops.get_closed_epics",
+                side_effect=RuntimeError("network down"),
+            ),
+        ):
+            result = CliRunner().invoke(
+                main, ["plans", "--json", "--config", str(config_file)]
+            )
+        assert result.exit_code == 0, result.output
+        assert "warning" in result.output.lower()
+        json_start = result.output.index("[")
+        data = json.loads(result.output[json_start:])
+        assert len(data) == 1
+        assert data[0]["tracking_issue"] == 90
+        assert data[0]["has_work_order"] is True
 
     def test_to_dict_round_trips_all_fields(self) -> None:
         entry = PlanEntry(

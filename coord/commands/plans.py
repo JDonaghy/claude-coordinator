@@ -2,9 +2,10 @@
 
 Fetches every open GitHub milestone across all configured repos (or a single
 repo when ``--repo`` is given), finds each milestone's tracking epic (the
-``"epic"``-labelled issue), parses its ``## Work order`` block, and emits a
-JSON array (``--json``) or a human-readable table of plan stats + attention
-signals.
+``"epic"``-labelled issue — open *or* closed, so a milestone left open after
+its epic was tidied up still resolves correctly, #974), parses its
+``## Work order`` block, and emits a JSON array (``--json``) or a
+human-readable table of plan stats + attention signals.
 
 This command is **read-only**: it never writes issues, comments, or the board.
 The JSON output is the data backbone consumed by the TUI "Plans" panel (#975).
@@ -97,12 +98,26 @@ def plans_cmd(repo: str | None, json_out: bool, config_path: Path) -> None:
             errors.append(f"warning: could not fetch issues for {repo_entry.github}: {e}")
             continue
 
+        # #974 fix: a milestone can stay open after its tracking epic has
+        # been closed (e.g. work finished, epic tidied up before the
+        # milestone). Fetch closed epics too so that state is still detected
+        # instead of misreported as "no_work_order". Fail-open: a lookup
+        # error here just falls back to open-only tracking-issue detection.
+        try:
+            closed_epics = github_ops.get_closed_epics(repo_entry.github)
+        except RuntimeError as e:
+            errors.append(
+                f"warning: could not fetch closed epics for {repo_entry.github}: {e}"
+            )
+            closed_epics = []
+
         entries = aggregate_repo_plans(
             repo_name=repo_entry.name,
             repo_github=repo_entry.github,
             milestones=milestones,
             open_issues=open_issues,
             board=board,
+            closed_tracking_issues=closed_epics,
         )
         all_entries.extend(entries)
 

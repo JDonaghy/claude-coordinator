@@ -29,6 +29,25 @@ def get_open_issues(repo: str) -> list[dict]:
     return json.loads(raw)
 
 
+def get_closed_epics(repo: str, *, label: str = "epic") -> list[dict]:
+    """Return closed issues in *repo* carrying *label* (default ``"epic"``).
+
+    Used by ``coord plans`` (#974) so a milestone's tracking epic is still
+    found once it has been closed while the milestone itself stays open
+    (e.g. all work-order nodes finished and someone tidied up the epic
+    before remembering to close the milestone) — see
+    :func:`coord.plans.find_tracking_issue`. A small, label-filtered,
+    closed-only lookup rather than a full ``--state all`` issue fetch, since
+    only closed *epics* are of interest here.
+    """
+    raw = _gh(
+        "issue", "list", "--repo", repo, "--state", "closed", "--label", label,
+        "--json", "number,title,labels,milestone,body,assignees",
+        "--limit", "500",
+    )
+    return json.loads(raw)
+
+
 def get_issue(repo: str, issue_number: int) -> dict:
     """Fetch a single issue by number.
 
