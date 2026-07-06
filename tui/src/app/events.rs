@@ -4689,7 +4689,11 @@ impl CoordApp {
                         //
                         // `#464`: rounded helper for parity with the render
                         // path so the click-to-cell mapping is exact in TUI.
-                        let content_y = main_b.y + detail_tab_bar_height(lh);
+                        //
+                        // `#995`: route through `pipeline_terminal_content_y`
+                        // like the other three Pipeline/Terminal call sites
+                        // so the stage-strip height isn't dropped here too.
+                        let content_y = self.pipeline_terminal_content_y(main_b, lh);
                         if delta.y != 0.0 {
                             if let Some((col, row)) =
                                 terminal_pixel_to_cell(pos, main_b, content_y, char_w, lh)

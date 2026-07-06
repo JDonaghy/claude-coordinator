@@ -19091,6 +19091,116 @@
         }
     }
 
+    /// `#995` regression (4th call site): the Pipeline/Terminal wheel-forward
+    /// arm of `mouse_main_scroll` must account for the #818 stage-strip
+    /// height the same way `terminal_mouse_event` / `terminal_force_release`
+    /// / `active_terminal_pixel_to_cell` do. Mirrors
+    /// `tpc_tui_pipeline_terminal_tab_top_left_cell_accounts_for_strip`
+    /// but drives the wheel path instead of a click, using a real spawned
+    /// session so the local-scrollback fallback is observable.
+    ///
+    /// Before the fix, `content_y` omitted the strip height, so a wheel
+    /// event positioned one pixel above the true content origin (still
+    /// inside the strip) would incorrectly resolve to a valid PTY cell and
+    /// engage the local-scrollback fallback (mouse reporting is off for
+    /// plain `/bin/sh`). After the fix, that position must be rejected
+    /// (`terminal_pixel_to_cell` returns `None`) and `scroll_offset` must
+    /// stay unchanged; a wheel event at the true content origin (row 0,
+    /// below the strip) must still engage the fallback as before.
+    #[test]
+    #[cfg(unix)]
+    fn mouse_main_scroll_pipeline_terminal_strip_boundary_matches_render() {
+        use std::time::{Duration, Instant};
+
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Terminal;
+        assert!(app.build_pipeline_widget().is_some(), "fixture must have a pipeline widget");
+
+        // Spawn a real session so forward_mouse can be invoked; key it by
+        // the fixture's selected issue (acme/api#42 — see make_pipeline_app).
+        let cwd = std::env::temp_dir();
+        let mut sess = quadraui::terminal_engine::TerminalSession::spawn(
+            80, 24, "/bin/sh", &cwd, 1000,
+        )
+        .expect("spawn /bin/sh");
+        for _ in 0..10 {
+            sess.write_input(b"echo seed\r");
+        }
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(3) {
+            sess.poll();
+            if sess.history_len() >= 5 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(sess.history_len() >= 5, "need history to scroll into");
+        assert!(
+            !sess.mouse_reporting_enabled(),
+            "plain /bin/sh shouldn't enable mouse reporting",
+        );
+        let issue_key = ("acme/api".to_string(), 42u64);
+        assert_eq!(
+            app.selected_issue_key(),
+            Some(issue_key.clone()),
+            "fixture's pipeline selection must resolve to acme/api#42"
+        );
+        app.detail_terminal_sessions.insert(issue_key.clone(), sess);
+
+        let main_b = Rect::new(0.0, 0.0, 200.0, 100.0);
+        let lh = 16.0_f32;
+        let char_w = 8.0_f32;
+        let content_y = app.pipeline_terminal_content_y(main_b, lh);
+        let strip_h = content_y - (main_b.y + detail_tab_bar_height(lh));
+        assert!(strip_h >= lh, "fixture strip must be at least one row tall");
+
+        // A wheel event one pixel above the true content origin (still
+        // inside the strip) must be rejected entirely: no forward, no
+        // local-scrollback fallback, `scroll_offset` unchanged.
+        let before_in_strip = app.detail_terminal_sessions[&issue_key].scroll_offset();
+        let consumed = app.mouse_main_scroll(
+            ScrollDelta::new(0.0, 1.0),
+            Point::new(50.0, content_y - 1.0),
+            main_b,
+            lh,
+            char_w,
+        );
+        assert!(consumed, "Pipeline view always reports the wheel as consumed");
+        let after_in_strip = app.detail_terminal_sessions[&issue_key].scroll_offset();
+        assert_eq!(
+            after_in_strip, before_in_strip,
+            "a wheel event still inside the stage strip must not reach the PTY \
+             or the local-scrollback fallback"
+        );
+
+        // A wheel event at the true content origin (row 0, below the
+        // strip) must still engage the local-scrollback fallback (mouse
+        // reporting is off), same as pre-#818 behavior.
+        let before_content = app.detail_terminal_sessions[&issue_key].scroll_offset();
+        let consumed = app.mouse_main_scroll(
+            ScrollDelta::new(0.0, 1.0),
+            Point::new(50.0, content_y),
+            main_b,
+            lh,
+            char_w,
+        );
+        assert!(consumed);
+        let after_content = app.detail_terminal_sessions[&issue_key].scroll_offset();
+        assert_eq!(
+            after_content.saturating_sub(before_content),
+            3,
+            "wheel-up notch at the true content origin should scroll local \
+             history by 3 rows when forward_mouse returns false"
+        );
+
+        // Tidy up.
+        app.detail_terminal_sessions
+            .get_mut(&issue_key)
+            .unwrap()
+            .write_input(b"exit\r");
+    }
+
     // ── #468: paste-forward tests ─────────────────────────────────────────
 
     /// With no session, forward_paste_to_pty must return false (not panic).

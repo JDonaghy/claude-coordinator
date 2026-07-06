@@ -183,10 +183,11 @@ impl CoordApp {
     ///
     /// `main_b` is the full main-content rect passed to the terminal
     /// mouse-event / hit-test helpers (same rect the render path calls
-    /// `m`). All three Pipeline/Terminal call sites in this module
+    /// `m`). All four Pipeline/Terminal call sites in `events.rs`
     /// (`terminal_mouse_event`, `terminal_force_release`,
-    /// `active_terminal_pixel_to_cell`) route through this one function
-    /// so they can't independently drift from the render origin again.
+    /// `active_terminal_pixel_to_cell`, and the `mouse_main_scroll`
+    /// wheel-forwarding arm) route through this one function so they
+    /// can't independently drift from the render origin again.
     pub(crate) fn pipeline_terminal_content_y(&self, main_b: Rect, lh: f32) -> f32 {
         let tab_h = detail_tab_bar_height(lh);
         let content_rect = Rect::new(
