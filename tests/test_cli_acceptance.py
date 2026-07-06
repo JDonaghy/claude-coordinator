@@ -342,3 +342,87 @@ class TestAcceptanceRecord:
 
         wt_path = tmp_path / "acceptance-worktrees" / "coord-tui-944"
         assert not wt_path.exists(), "worktree leaked on manifest-missing error path"
+
+
+class TestAcceptanceAuthor:
+    """`coord acceptance author` (#931) — thin CLI glue over
+    `coord.test_author.dispatch_test_author`. The dispatch logic itself
+    (machine picking, briefing content, error surfaces) is unit-tested in
+    tests/test_test_author.py; these just check the CLI wiring: arguments
+    reach the function correctly and its outcomes map to the right exit
+    code/output."""
+
+    def _config_no_driver(self, tmp_path: Path) -> Path:
+        p = tmp_path / "coordinator.yml"
+        p.write_text(
+            "repos:\n"
+            "  - name: coord-tui\n"
+            "    github: acme/coord-tui\n"
+            "machines:\n"
+            "  - name: laptop\n"
+            "    host: laptop.tail\n"
+            "    repos: [coord-tui]\n"
+            "    repo_paths:\n"
+            "      coord-tui: /tmp/repo\n"
+        )
+        return p
+
+    def test_happy_path_reports_dispatch(self, tmp_path: Path, monkeypatch) -> None:
+        config_path = self._config_no_driver(tmp_path)
+        calls = {}
+
+        def fake_dispatch(repo, tracking_issue, cfg, *, issue_number=None, machine_override=None):
+            calls.update(
+                repo=repo, tracking_issue=tracking_issue,
+                issue_number=issue_number, machine_override=machine_override,
+            )
+            return ("aid-42", "laptop")
+
+        monkeypatch.setattr("coord.test_author.dispatch_test_author", fake_dispatch)
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "author", "coord-tui", "947", "--config", str(config_path),
+        ])
+        assert result.exit_code == 0, result.output
+        assert "aid-42" in result.output
+        assert "laptop" in result.output
+        assert "full milestone" in result.output
+        assert calls == {
+            "repo": "coord-tui", "tracking_issue": 947,
+            "issue_number": None, "machine_override": None,
+        }
+
+    def test_issue_scope_and_machine_override_forwarded(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        config_path = self._config_no_driver(tmp_path)
+        calls = {}
+
+        def fake_dispatch(repo, tracking_issue, cfg, *, issue_number=None, machine_override=None):
+            calls.update(issue_number=issue_number, machine_override=machine_override)
+            return ("aid-7", "dellserver")
+
+        monkeypatch.setattr("coord.test_author.dispatch_test_author", fake_dispatch)
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "author", "coord-tui", "947",
+            "--issue", "101", "--machine", "dellserver",
+            "--config", str(config_path),
+        ])
+        assert result.exit_code == 0, result.output
+        assert "issue #101 slice" in result.output
+        assert calls == {"issue_number": 101, "machine_override": "dellserver"}
+
+    def test_dispatch_error_surfaces_nonzero_exit(self, tmp_path: Path, monkeypatch) -> None:
+        config_path = self._config_no_driver(tmp_path)
+
+        def fake_dispatch(*a, **kw):
+            raise RuntimeError("no acceptance driver configured for repo 'coord-tui'")
+
+        monkeypatch.setattr("coord.test_author.dispatch_test_author", fake_dispatch)
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "author", "coord-tui", "947", "--config", str(config_path),
+        ])
+        assert result.exit_code == 1
+        assert "no acceptance driver configured" in result.output

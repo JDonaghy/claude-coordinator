@@ -1783,12 +1783,17 @@ def _user_message_line(text: str) -> bytes:
 # providers without risk. ``milestone-chat`` (#770) is a chat too — no
 # git worktree — but it CAN mutate GitHub (the tracking issue body via
 # `coord milestone write-order`), so it belongs here, not above.
+# ``test-author`` (#931, docs/ORACLE_LOOP.md) writes the sealed acceptance
+# suite under ``tests/acceptance/`` and pushes a branch — a real git
+# worktree + a push, same mutation shape as ``work``/``smoke``/
+# ``conflict-fix``, so it must be gated the same way.
 WRITE_CAPABLE_SPEC_TYPES: frozenset[str] = frozenset({
     "work",
     "review",
     "smoke",
     "conflict-fix",
     "milestone-chat",
+    "test-author",
 })
 
 
