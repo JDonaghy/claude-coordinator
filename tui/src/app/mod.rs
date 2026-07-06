@@ -6149,6 +6149,25 @@ impl CoordApp {
                 });
             }
         }
+        // #976: persistent "N plans need you" attention badge. quadraui's
+        // `PanelDefinition` (the ◆ activity-bar icon behind the Plans view)
+        // has no badge/count slot in this vendored version, so the
+        // ActivityBar-level "you're reminded without opening it" signal
+        // lives here instead — always visible regardless of `active_view`,
+        // same as the live-session badge below. Uses the same
+        // `plans_needing_attention_count` the Plans sidebar hint reads
+        // (`plans.rs`) so the two numbers never drift apart.
+        let plans_attn = self.plans_needing_attention_count();
+        if plans_attn > 0 {
+            let (noun, verb) = if plans_attn == 1 { ("plan", "needs") } else { ("plans", "need") };
+            left.push(StatusBarSegment {
+                text: format!(" ◆ {} {} {} you ", plans_attn, noun, verb),
+                fg: Color::rgb(255, 210, 100),
+                bg: Color::rgb(70, 45, 10),
+                bold: true,
+                action_id: None,
+            });
+        }
         // #628: persistent indicator for live interactive sessions. Detached
         // sessions create no board `running` row, so they were invisible —
         // they only showed in the one-time #487 startup toast and then piled

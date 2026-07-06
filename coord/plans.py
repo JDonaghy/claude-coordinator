@@ -99,6 +99,14 @@ class PlanEntry:
                            ``"stalled"``
                                Open, has a work order, but nothing is ready *or*
                                in-flight and the milestone is not done.
+                           ``"chat_pending"``
+                               A ``type="milestone-chat"`` assignment is
+                               currently active (running/pending) against the
+                               tracking issue (#976) — an operator opened
+                               ``coord milestone chat`` and hasn't finalized
+                               it yet.  Orthogonal to the other three signals:
+                               it can appear alongside any of them (or alone
+                               on an otherwise "done" milestone).
     """
 
     repo: str
@@ -161,6 +169,35 @@ def find_tracking_issue(
     return None
 
 
+def _has_pending_chat(
+    board: Board,
+    repo_name: str,
+    tracking_issue_number: int | None,
+) -> bool:
+    """True iff an active ``type="milestone-chat"`` assignment targets
+    *tracking_issue_number* in *repo_name* (#976).
+
+    ``coord milestone chat <repo> <tracking_issue>``
+    (:func:`coord.milestone_chat.dispatch_milestone_chat`) records the
+    session as a normal :class:`~coord.models.Assignment` with
+    ``issue_number=tracking_issue_number`` — the same board state every
+    other claim check reads, so this needs no new plumbing.  Mirrors the
+    ``a.status == "failed"`` skip in :func:`coord.claim.find_work_claim`: a
+    failed chat dispatch never actually opened, so it isn't "pending."
+    ``None`` tracking issue (no epic yet) can't have a chat dispatched
+    against it — always ``False``.
+    """
+    if tracking_issue_number is None:
+        return False
+    return any(
+        a.type == "milestone-chat"
+        and a.repo_name == repo_name
+        and a.issue_number == tracking_issue_number
+        and a.status != "failed"
+        for a in board.active
+    )
+
+
 def aggregate_plan(
     *,
     milestone_title: str,
@@ -205,6 +242,11 @@ def aggregate_plan(
         body has no ``## Work order`` block, ``has_work_order`` is ``False``
         and all counts are 0.
     """
+    chat_pending = _has_pending_chat(board, repo_name, tracking_issue_number)
+
+    _no_work_order_signals = ["no_work_order"]
+    if chat_pending:
+        _no_work_order_signals.append("chat_pending")
     _no_work_order = PlanEntry(
         repo=repo_name,
         title=milestone_title,
@@ -216,7 +258,7 @@ def aggregate_plan(
         in_flight=0,
         done=0,
         total=0,
-        needs_you=["no_work_order"],
+        needs_you=_no_work_order_signals,
     )
 
     if not tracking_body:
@@ -260,6 +302,8 @@ def aggregate_plan(
         needs_you.append("ready_waiting")
     elif done < total and in_flight_count == 0:
         needs_you.append("stalled")
+    if chat_pending:
+        needs_you.append("chat_pending")
 
     return PlanEntry(
         repo=repo_name,
