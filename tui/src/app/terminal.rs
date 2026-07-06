@@ -156,6 +156,48 @@ impl CoordApp {
         self.pty_panic_dialog = Some(msg);
     }
 
+    /// #995: height of the pinned stage strip ("universal stage strip",
+    /// #818) drawn above the content on every non-Overview Pipeline detail
+    /// tab, given the post-tab-bar content rect `content_rect`.
+    ///
+    /// Returns `0.0` when [`Self::build_pipeline_widget`] has nothing to
+    /// draw (no pipeline data for the selected issue) — the render path's
+    /// `content_below_strip` closure (`render.rs`) skips the strip
+    /// entirely in that case, so hit-testing must agree.
+    ///
+    /// This is the single source of truth for "how tall is the strip" so
+    /// the render path and [`Self::pipeline_terminal_content_y`] below
+    /// can never drift apart the way they did in #995 (the strip term
+    /// was simply missing from the hit-test math).
+    pub(crate) fn pipeline_stage_strip_height(&self, content_rect: Rect, lh: f32) -> f32 {
+        if self.build_pipeline_widget().is_none() {
+            return 0.0;
+        }
+        pipeline_detail_pv_rect_strip(content_rect, lh).height
+    }
+
+    /// #995: Y origin (in the same units as `main_b`) where PTY row 0
+    /// starts for the Pipeline / Terminal detail tab — tab bar height
+    /// plus the pinned stage strip height, mirroring the render path's
+    /// `tab_rect` then `content_below_strip` layout in `render.rs`.
+    ///
+    /// `main_b` is the full main-content rect passed to the terminal
+    /// mouse-event / hit-test helpers (same rect the render path calls
+    /// `m`). All three Pipeline/Terminal call sites in this module
+    /// (`terminal_mouse_event`, `terminal_force_release`,
+    /// `active_terminal_pixel_to_cell`) route through this one function
+    /// so they can't independently drift from the render origin again.
+    pub(crate) fn pipeline_terminal_content_y(&self, main_b: Rect, lh: f32) -> f32 {
+        let tab_h = detail_tab_bar_height(lh);
+        let content_rect = Rect::new(
+            main_b.x,
+            main_b.y + tab_h,
+            main_b.width,
+            (main_b.height - tab_h).max(0.0),
+        );
+        main_b.y + tab_h + self.pipeline_stage_strip_height(content_rect, lh)
+    }
+
     /// Per-tick maintenance for the embedded terminal pane (#424).
     ///
     /// Performs three things in order, each idempotent:
