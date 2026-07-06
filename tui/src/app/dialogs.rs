@@ -1287,6 +1287,47 @@ impl CoordApp {
             });
         }
 
+        // ── #977 Plan-capture title input ─────────────────────────────────
+        if let Some(ref buf) = self.pending_plan_capture {
+            let repo = self
+                .plans_selected()
+                .map(|e| e.repo)
+                .or_else(|| self.data.pipeline_repos.first().map(|(n, _)| n.clone()))
+                .unwrap_or_else(|| "?".to_string());
+            return Some(Dialog {
+                table: None,
+                id: WidgetId::new("dialog:plan-capture"),
+                title: StyledText::plain("New plan (capture)"),
+                body: vec![StyledText::plain(format!(
+                    "Enter a short plan title — captured immediately as {repo}, \
+                     no work order yet:"
+                ))],
+                buttons: vec![
+                    DialogButton {
+                        id: WidgetId::new("submit"),
+                        label: "Submit".into(),
+                        is_default: true,
+                        is_cancel: false,
+                        tint: None,
+                    },
+                    DialogButton {
+                        id: WidgetId::new("cancel"),
+                        label: "Cancel".into(),
+                        is_default: false,
+                        is_cancel: true,
+                        tint: None,
+                    },
+                ],
+                severity: None,
+                vertical_buttons: false,
+                input: Some(DialogInput::TextInput(DialogTextInput {
+                    value: buf.clone(),
+                    placeholder: "plan title…".into(),
+                    cursor: Some(buf.len()),
+                })),
+            });
+        }
+
         // ── Test-failure reason input ────────────────────────────────────
         if let Some((_, ref buf)) = self.pending_test_fail {
             return Some(Dialog {
@@ -2474,6 +2515,21 @@ impl CoordApp {
                 }
                 _ => {
                     self.pending_report_fix = None;
+                }
+            }
+            *self.dialog_layout.borrow_mut() = None;
+            return;
+        }
+
+        // ── #977 Plan-capture ────────────────────────────────────────────
+        if self.pending_plan_capture.is_some() {
+            match id {
+                "submit" => {
+                    let title = self.pending_plan_capture.take().unwrap_or_default();
+                    self.capture_plan_stub(title);
+                }
+                _ => {
+                    self.pending_plan_capture = None;
                 }
             }
             *self.dialog_layout.borrow_mut() = None;

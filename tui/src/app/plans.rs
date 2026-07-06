@@ -316,6 +316,60 @@ impl CoordApp {
         );
         true
     }
+
+    /// Submit handler for the #977 "fast plan capture" prompt (`c` in the
+    /// Plans panel). Fires `coord milestone capture <repo> --title <title>`
+    /// through the command runner — the CLI seam composes `write_milestone`
+    /// + `create_issue` + `assign_issue_milestone` server-side so the new
+    /// milestone/issue pair shows up in `plan_roster` (flagged
+    /// `no_work_order`) on the next board refresh, no `coord sync` needed.
+    ///
+    /// Target repo: the repo of the currently-selected plan-roster row, or
+    /// (when the roster is empty) the first configured repo. Toasts + noops
+    /// when no repo is configured at all, or when the trimmed title is
+    /// empty.
+    pub(crate) fn capture_plan_stub(&mut self, title: String) {
+        let title = title.trim().to_string();
+        if title.is_empty() {
+            self.push_toast(
+                "Capture plan",
+                "Plan title can't be empty — nothing captured.",
+                ToastSeverity::Info,
+            );
+            return;
+        }
+        let Some(repo) = self
+            .plans_selected()
+            .map(|e| e.repo)
+            .or_else(|| self.data.pipeline_repos.first().map(|(n, _)| n.clone()))
+        else {
+            self.push_toast(
+                "Capture plan",
+                "No repo configured — nothing to capture into.",
+                ToastSeverity::Info,
+            );
+            return;
+        };
+        let args = ["milestone", "capture", repo.as_str(), "--title", title.as_str()];
+        use crate::commands::SpawnQueuedOutcome;
+        match self.command_runner.spawn_queued(&args) {
+            SpawnQueuedOutcome::Deduped => {}
+            SpawnQueuedOutcome::Queued => {
+                self.push_toast(
+                    "Plan capture queued",
+                    &format!("\"{title}\" ({repo}) — will capture after current command."),
+                    ToastSeverity::Info,
+                );
+            }
+            SpawnQueuedOutcome::Started => {
+                self.push_toast(
+                    "Plan captured",
+                    &format!("\"{title}\" ({repo}) — dispatching `coord milestone capture`…"),
+                    ToastSeverity::Info,
+                );
+            }
+        }
+    }
 }
 
 // ─── Pure-function unit tests ─────────────────────────────────────────────────

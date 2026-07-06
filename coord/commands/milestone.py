@@ -241,6 +241,90 @@ def milestone_assign_cmd(
     click.echo(f"#{issue} ({repo_entry.github}) assigned to milestone {ms_label}")
 
 
+_DEFAULT_CAPTURE_BODY = (
+    "Captured via coord-tui fast plan capture — no work order yet. "
+    "Promote to a full epic with `coord milestone chat`."
+)
+
+
+@milestone_group.command(
+    "capture",
+    help=(
+        "Fast-capture a lightweight plan stub (#977): creates a new milestone "
+        "titled TEXT, a plain issue (no `epic` label) under it, and assigns "
+        "the issue to the milestone — all through the existing write seams "
+        "(`coord milestone create` + `coord issue create` + `coord milestone "
+        "assign` composed in one step). REPO is the local repo name from "
+        "coordinator.yml. Appears immediately in the `coord plans` / TUI "
+        "Plans-panel roster flagged `no_work_order`, ready to be promoted to "
+        "a full epic later via `coord milestone chat`."
+    ),
+)
+@click.argument("repo")
+@click.option(
+    "--title",
+    required=True,
+    help="Plan title (used for both the milestone and the issue).",
+)
+@click.option(
+    "--body",
+    default=None,
+    help="Issue body (markdown). Defaults to a short note pointing at `coord milestone chat`.",
+)
+@_CONFIG_OPTION
+def milestone_capture_cmd(
+    repo: str,
+    title: str,
+    body: str | None,
+    config_path: Path,
+) -> None:
+    cfg = _load_config(config_path)
+    repo_entry = cfg.repo(repo)
+    if repo_entry is None:
+        click.echo(f"error: unknown repo {repo!r}", err=True)
+        sys.exit(2)
+    slug = repo_entry.github
+
+    from coord.state import assign_issue_milestone, create_issue, write_milestone  # noqa: PLC0415
+
+    try:
+        ms = write_milestone(repo, title=title, repo_github=slug)
+    except Exception as e:  # noqa: BLE001
+        click.echo(f"error: plan capture failed creating milestone: {e}", err=True)
+        sys.exit(1)
+
+    try:
+        issue = create_issue(repo, title, body or _DEFAULT_CAPTURE_BODY, repo_github=slug)
+    except Exception as e:  # noqa: BLE001
+        click.echo(
+            f"error: plan capture failed creating issue (milestone #{ms.get('number')} "
+            f"was already created): {e}",
+            err=True,
+        )
+        sys.exit(1)
+
+    try:
+        assign_issue_milestone(
+            repo,
+            issue["number"],
+            ms["number"],
+            milestone_title=title,
+            repo_github=slug,
+        )
+    except Exception as e:  # noqa: BLE001
+        click.echo(
+            f"error: plan capture failed assigning issue #{issue.get('number')} to "
+            f"milestone #{ms.get('number')}: {e}",
+            err=True,
+        )
+        sys.exit(1)
+
+    click.echo(
+        f"plan captured: milestone #{ms['number']} ({slug}) — issue #{issue['number']} "
+        "— no work order yet. Promote via `coord milestone chat`."
+    )
+
+
 @milestone_group.command(
     "order",
     help=(

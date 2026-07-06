@@ -1134,6 +1134,36 @@ impl CoordApp {
             }
         }
 
+        // ── #977 Pending "fast plan capture" title input: intercept all keys ─
+        // `c` in the Plans panel opens this buffer. Enter dispatches `coord
+        // milestone capture <repo> --title <buf>` via `capture_plan_stub`.
+        // Esc cancels without creating anything.
+        if self.pending_plan_capture.is_some() {
+            if let UiEvent::KeyPressed { key, .. } = &event {
+                match key {
+                    Key::Named(NamedKey::Enter) => {
+                        let title = self.pending_plan_capture.take().unwrap_or_default();
+                        self.capture_plan_stub(title);
+                    }
+                    Key::Named(NamedKey::Escape) => {
+                        self.pending_plan_capture = None;
+                    }
+                    Key::Named(NamedKey::Backspace) => {
+                        if let Some(ref mut buf) = self.pending_plan_capture {
+                            buf.pop();
+                        }
+                    }
+                    Key::Char(ch) => {
+                        if let Some(ref mut buf) = self.pending_plan_capture {
+                            buf.push(*ch);
+                        }
+                    }
+                    _ => {}
+                }
+                return Reaction::Redraw;
+            }
+        }
+
         // ── Pending restart confirmation: intercept ALL key presses ──────────
         // While a restart is pending, 'y'/'Y' fires the restart; every other
         // key cancels.  We return early so normal key dispatch never fires.
@@ -1718,6 +1748,17 @@ impl CoordApp {
                         if self.active_view == SidebarView::Plans =>
                     {
                         self.open_selected_plan_tracking_epic();
+                        needs_redraw = true;
+                    }
+                    // "Capture a plan" (#977) — one-key fast-jot: pops the
+                    // plan-title prompt. `c` is free in this view (the only
+                    // other bare 'c' binding is Ctrl+C copy-selection, gated
+                    // on modifiers.ctrl; 'n' is taken globally by `notify`).
+                    Key::Char('c')
+                        if self.active_view == SidebarView::Plans
+                            && self.pending_plan_capture.is_none() =>
+                    {
+                        self.pending_plan_capture = Some(String::new());
                         needs_redraw = true;
                     }
                     // "Dispatch milestone" — promote the selected milestone's
