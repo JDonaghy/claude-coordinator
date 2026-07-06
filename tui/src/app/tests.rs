@@ -5869,6 +5869,29 @@
     }
 
     #[test]
+    fn status_bar_hints_advertise_plan_capture_keybind() {
+        // #977 review: pressing `c` in the Plans panel silently opened the
+        // capture prompt with no visible hint anywhere the operator could
+        // find it. The status-bar hint strip must name it for this view —
+        // matching how Machines/MergeQueue/Pipeline already advertise their
+        // own bindings — instead of falling through to the generic default.
+        let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::Plans;
+        let right_text = app
+            .status_bar()
+            .right_segments
+            .iter()
+            .map(|s| s.text.clone())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            right_text.contains("c=capture plan"),
+            "expected the Plans panel hint to advertise `c=capture plan`, got: {}",
+            right_text,
+        );
+    }
+
+    #[test]
     fn live_session_count_for_machine_joins_sessions_to_assignments() {
         // #628 pt.2: the Machines tab counts live interactive sessions by
         // joining each session to its assignment's machine — independent of the
