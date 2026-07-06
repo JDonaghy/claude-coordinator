@@ -25301,6 +25301,11 @@ Milestone tracking issue.
             pipeline_default_gates: vec!["review".to_string(), "merge".to_string()],
             pipeline_tracked_labels: vec!["coord".to_string()],
             pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            // #976: a real daemon serving this roster always stamps the
+            // capability flag alongside it — mirror that here for realism,
+            // though it's a no-op for these tests since the roster is
+            // non-empty (the flag only gates the empty-state message).
+            plan_roster_supported: true,
             plan_roster: vec![
                 PlanRosterEntry {
                     repo: "api".to_string(),
@@ -25463,20 +25468,50 @@ Milestone tracking issue.
         );
     }
 
-    /// Plans panel with an empty `plan_roster` renders the "No plans yet"
-    /// placeholder rather than an empty box (fail-open on daemons that
-    /// predate #975, or on the local-SQLite-mode read path).
+    /// Plans panel with an empty `plan_roster` AND `plan_roster_supported:
+    /// true` (a #975+ daemon that genuinely found zero milestones) renders
+    /// the "No plans yet" placeholder — the true-empty case.
     #[test]
-    fn plans_panel_empty_state() {
+    fn plans_panel_empty_state_when_daemon_supports_plan_roster() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_test_app(BoardData {
+            plan_roster_supported: true,
+            ..BoardData::default()
+        });
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "◆");
+        assert!(
+            driver.screen_contains("No plans yet"),
+            "#975: genuinely empty plan_roster (daemon supports it) must render \
+             the placeholder:\n{}",
+            driver.screen(),
+        );
+    }
+
+    /// #976: Plans panel with an empty `plan_roster` and
+    /// `plan_roster_supported: false` — either no daemon connected
+    /// (`BoardData::default()`, the local-SQLite-mode read path) or one that
+    /// predates #975 — must render a DIFFERENT message than the genuinely-
+    /// empty case above. Silently showing "No plans yet" for both was the
+    /// #976 review finding: a stale daemon read as "zero milestones" instead
+    /// of "not receiving plan data."
+    #[test]
+    fn plans_panel_shows_unsupported_message_when_daemon_predates_plan_roster() {
         use quadraui::tui::testing::driver_with_shell;
 
         let app = make_test_app(BoardData::default());
         let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
         click_activity_icon(&mut driver, "◆");
+        let screen = driver.screen();
         assert!(
-            driver.screen_contains("No plans yet"),
-            "#975: empty plan_roster must render the placeholder:\n{}",
-            driver.screen(),
+            screen.contains("Plans unavailable"),
+            "#976: unsupported-daemon empty state must NOT read as \
+             'No plans yet' — it must say plan data isn't being received:\n{screen}",
+        );
+        assert!(
+            !screen.contains("No plans yet"),
+            "#976: the two empty states must be visibly distinct:\n{screen}",
         );
     }
 

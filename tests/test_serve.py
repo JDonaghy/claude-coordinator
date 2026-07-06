@@ -532,6 +532,30 @@ def test_plan_roster_empty_when_no_milestones(file_db: Path, valid_config_path: 
     assert board.get("plan_roster") == [], (
         f"plan_roster must be [] when no milestones exist, got {board.get('plan_roster')!r}"
     )
+    # #976: `plan_roster_supported` must still be True here — a genuinely
+    # empty roster (no milestones) is a different state from "daemon
+    # predates plan_roster" and the TUI needs to tell them apart. Only the
+    # absence of the field (pre-#975 daemons never set it) should read as
+    # unsupported.
+    assert board.get("plan_roster_supported") is True, (
+        "plan_roster_supported must be True whenever this daemon computes "
+        f"plan_roster at all, even when the roster itself is empty; got "
+        f"{board.get('plan_roster_supported')!r}"
+    )
+
+
+def test_plan_roster_supported_flag_true_with_populated_roster(
+    plan_roster_db: Path, valid_config_path: Path
+):
+    """#976: the capability flag accompanies a non-empty roster too — it's
+    an "I compute this" signal, independent of whether there's data this
+    tick."""
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(plan_roster_db), cfg)
+    with TestClient(app) as cli:
+        board = cli.get("/board").json()
+    assert board.get("plan_roster_supported") is True
+    assert len(board["plan_roster"]) > 0
 
 
 def _make_finished_milestone_db(path: Path) -> None:
