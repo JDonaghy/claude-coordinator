@@ -436,6 +436,8 @@
             merge_queue_scroll: 0,
             // #771
             milestone_dag_sel: 0,
+            // #975
+            plans_sel: 0,
             // #217: use the default dark palette for test helpers.
             active_theme: crate::settings::Theme::Dark.to_quadraui_theme(),
             // #728: default 2h window for tests (can be overridden per test).
@@ -17447,16 +17449,20 @@
     }
 
     #[test]
-    fn shell_config_advertises_milestones_panel() {
-        // #771/#782: the Milestone DAG view has no keyboard shortcut (#782
-        // removed all numeric view-switch keys), so the activity-bar button
-        // is its ONLY entry point. If this panel definition or the
-        // on_shell_event("panel:milestones") wire ever gets dropped, the
-        // whole view becomes unreachable with no test failure elsewhere.
+    fn shell_config_advertises_plans_panel() {
+        // #975 (was #771/#782): the Plans panel is the first-class ActivityBar
+        // view onto the plan roster; it subsumes the older MilestoneDag
+        // "Milestones" entry.  No keyboard shortcut exists (#782 removed all
+        // numeric view-switch keys), so the activity-bar button is the ONLY
+        // entry point — if this panel definition or the on_shell_event route
+        // ever gets dropped, the whole view becomes unreachable with no test
+        // failure elsewhere.  The legacy `panel:milestones` id is still
+        // recognised by `on_shell_event` for back-compat but no longer needs
+        // its own activity-bar entry.
         let cfg = CoordApp::shell_config();
         assert!(
-            cfg.panels.iter().any(|p| p.id.as_str() == "panel:milestones"),
-            "shell_config must include the Milestones panel for #771/#782",
+            cfg.panels.iter().any(|p| p.id.as_str() == "panel:plans"),
+            "shell_config must include the Plans panel for #975",
         );
     }
 
@@ -24169,19 +24175,23 @@ Milestone tracking issue.
         })
     }
 
-    /// Acceptance criterion (#771): clicking the Milestones activity-bar icon
-    /// (◆ — #782 dropped the numeric '8' shortcut in favor of activity-bar
-    /// discovery, see `shell_config()`) renders the Milestone DAG view with
-    /// the right per-node state — done / in-flight / blocked / ready — and
-    /// the milestone header exposes "Dispatch milestone".
+    /// Acceptance criterion (#771): the Milestone DAG view renders per-node
+    /// state — done / in-flight / blocked / ready — and the milestone header
+    /// exposes "Dispatch milestone".
+    ///
+    /// #975 followup: the ◆ activity-bar icon now routes to the Plans panel
+    /// (which elevates/subsumes the older Milestones DAG view).  The DAG
+    /// rendering itself remains — it's the drill-down target reserved for a
+    /// future Plans-detail seam (#976+) — so we drive the DAG view here by
+    /// setting `active_view` directly rather than via the activity bar.
     #[test]
     fn tuidriver_milestone_dag_shows_node_states_and_dispatch_action() {
         use quadraui::tui::testing::driver_with_shell;
 
-        let app = make_milestone_dag_app();
-        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 160, 40);
+        let mut app = make_milestone_dag_app();
+        app.active_view = SidebarView::MilestoneDag;
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 160, 40);
 
-        click_activity_icon(&mut driver, "◆"); // → Milestone DAG view
         let screen = driver.screen();
 
         assert!(
@@ -25272,4 +25282,200 @@ Milestone tracking issue.
         let app = make_test_app(make_work_order_board_data());
         assert!(app.work_order_node_for("other-repo", 101).is_none());
         assert!(app.work_order_node_for("api", 9999).is_none());
+    }
+
+    // ── #975: Plans panel — TuiDriver black-box tests ────────────────────
+
+    /// Seed a `BoardData` snapshot with two plan-roster entries so the
+    /// Plans-panel tests below have something realistic to render + navigate.
+    ///
+    /// Layout:
+    ///   - `api` #5 "Substrate"   — tracking epic #500, ready=2/blocked=1
+    ///   - `api` #6 "Follow-up"   — no epic (`no_work_order`)
+    ///
+    /// Pipeline repo map is set so `open_selected_plan_tracking_epic` can
+    /// resolve `api → acme/api` (though we don't shell out to `gh` under
+    /// test — the `#[cfg(test)]` branch in `plans.rs` skips the spawn).
+    fn make_plan_roster_board_data() -> BoardData {
+        BoardData {
+            pipeline_default_gates: vec!["review".to_string(), "merge".to_string()],
+            pipeline_tracked_labels: vec!["coord".to_string()],
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            plan_roster: vec![
+                PlanRosterEntry {
+                    repo: "api".to_string(),
+                    title: "Substrate".to_string(),
+                    milestone_number: 5,
+                    tracking_issue: Some(500),
+                    has_work_order: true,
+                    ready_frontier: 2,
+                    blocked: 1,
+                    in_flight: 0,
+                    done: 0,
+                    total: 3,
+                    needs_you: vec!["ready_waiting".to_string()],
+                },
+                PlanRosterEntry {
+                    repo: "api".to_string(),
+                    title: "Follow-up".to_string(),
+                    milestone_number: 6,
+                    tracking_issue: None,
+                    has_work_order: false,
+                    ready_frontier: 0,
+                    blocked: 0,
+                    in_flight: 0,
+                    done: 0,
+                    total: 0,
+                    needs_you: vec!["no_work_order".to_string()],
+                },
+            ],
+            ..BoardData::default()
+        }
+    }
+
+    /// The Plans activity-bar icon (◆) must be present in the shell config
+    /// so users can reach the panel with a mouse click.
+    #[test]
+    fn shell_config_registers_plans_activity_bar_entry() {
+        let config = CoordApp::shell_config();
+        // The activity bar entries live on `config.panels` — the config API is
+        // opaque here, so drive discovery through the driver's screen instead.
+        // Just build a driver and verify the icon glyph is on screen.
+        use quadraui::tui::testing::driver_with_shell;
+        let app = make_test_app(BoardData::default());
+        let driver = driver_with_shell(app, config, 120, 40);
+        assert!(
+            driver.screen_contains("◆"),
+            "#975: Plans activity-bar icon ◆ must be visible:\n{}",
+            driver.screen(),
+        );
+    }
+
+    /// Clicking the Plans (◆) activity-bar icon switches to the Plans view
+    /// and lists every plan-roster entry with its counts and attention
+    /// signals.  Uses the same `click_activity_icon` helper as the other
+    /// activity-bar tests.
+    #[test]
+    fn plans_panel_lists_plans_from_board_data() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_test_app(make_plan_roster_board_data());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+
+        // Land on the Plans view via the activity-bar diamond glyph.
+        click_activity_icon(&mut driver, "◆");
+
+        // Sidebar header identifies the panel.
+        assert!(
+            driver.screen_contains("PLANS"),
+            "#975: Plans panel sidebar must render its title:\n{}",
+            driver.screen(),
+        );
+        // Substrate row: milestone title, epic reference, counts, attention.
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Substrate"),
+            "#975: Plans row for milestone 'Substrate' must render:\n{screen}",
+        );
+        assert!(
+            screen.contains("epic:#500"),
+            "#975: Plans row must show tracking epic #500 for Substrate:\n{screen}",
+        );
+        assert!(
+            screen.contains("ready=2"),
+            "#975: Plans row must show ready-frontier count:\n{screen}",
+        );
+        assert!(
+            screen.contains("blocked=1"),
+            "#975: Plans row must show blocked count:\n{screen}",
+        );
+        assert!(
+            screen.contains("done=0/3"),
+            "#975: Plans row must show done/total counts:\n{screen}",
+        );
+        assert!(
+            screen.contains("ready_waiting"),
+            "#975: Plans row must surface the `ready_waiting` attention signal:\n{screen}",
+        );
+
+        // Follow-up milestone (no epic yet): renders with `no work order`
+        // + `no_work_order` attention signal.
+        assert!(
+            screen.contains("Follow-up"),
+            "#975: Plans row for milestone 'Follow-up' must render:\n{screen}",
+        );
+        assert!(
+            screen.contains("no work order"),
+            "#975: milestone without epic must render 'no work order':\n{screen}",
+        );
+        assert!(
+            screen.contains("no_work_order"),
+            "#975: milestone without epic must surface `no_work_order` signal:\n{screen}",
+        );
+    }
+
+    /// After landing on Plans, pressing Enter on the selected row opens the
+    /// tracking epic (visible as an "Opening plan" toast in-test — the real
+    /// `gh` spawn is `#[cfg(not(test))]`-gated to keep the sandbox hermetic).
+    /// Pressing j once first moves selection to the second row (Follow-up),
+    /// which has no epic — that path must surface a "No tracking epic yet"
+    /// toast rather than opening a bogus URL.
+    #[test]
+    fn plans_panel_enter_opens_tracking_epic() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_test_app(make_plan_roster_board_data());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "◆");
+
+        // Row 0 (Substrate) is selected by default → Enter opens epic #500.
+        driver.press_named(quadraui::NamedKey::Enter);
+        assert!(
+            driver.screen_contains("Opening plan"),
+            "#975: Enter on a plan with an epic must fire the 'Opening plan' toast:\n{}",
+            driver.screen(),
+        );
+        assert!(
+            driver.screen_contains("#500"),
+            "#975: the 'Opening plan' toast must name the tracking epic (#500):\n{}",
+            driver.screen(),
+        );
+    }
+
+    /// j on the Plans panel advances the selection; Enter on a row without a
+    /// tracking epic must NOT open anything — instead a "No tracking epic
+    /// yet" toast points users at `coord milestone chat`.
+    #[test]
+    fn plans_panel_enter_on_row_without_epic_surfaces_toast() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_test_app(make_plan_roster_board_data());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "◆");
+
+        // Advance selection to row 1 (Follow-up, no epic).
+        driver.press(quadraui::Key::Char('j'));
+        driver.press_named(quadraui::NamedKey::Enter);
+        assert!(
+            driver.screen_contains("No tracking epic yet"),
+            "#975: Enter on a plan without an epic must surface guidance:\n{}",
+            driver.screen(),
+        );
+    }
+
+    /// Plans panel with an empty `plan_roster` renders the "No plans yet"
+    /// placeholder rather than an empty box (fail-open on daemons that
+    /// predate #975, or on the local-SQLite-mode read path).
+    #[test]
+    fn plans_panel_empty_state() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_test_app(BoardData::default());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "◆");
+        assert!(
+            driver.screen_contains("No plans yet"),
+            "#975: empty plan_roster must render the placeholder:\n{}",
+            driver.screen(),
+        );
     }

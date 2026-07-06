@@ -239,7 +239,8 @@ impl CoordApp {
             | SidebarView::Terminal
             | SidebarView::Kanban
             | SidebarView::MergeQueue
-            | SidebarView::MilestoneDag => return None,
+            | SidebarView::MilestoneDag
+            | SidebarView::Plans => return None,
         };
 
         Some(Toolbar {

@@ -84,6 +84,7 @@ pub(crate) mod sessions;
 pub(crate) mod events;
 pub(crate) mod pipeline;
 pub(crate) mod milestone_dag;
+pub(crate) mod plans;
 #[allow(unused_imports)]
 use self::types::*;
 #[allow(unused_imports)]
@@ -2498,6 +2499,12 @@ pub struct CoordApp {
     /// `merge_queue_sel`.
     milestone_dag_sel: usize,
 
+    // ── #975: Plans ActivityBar panel ────────────────────────────────────────
+    /// Selected plan-roster index (0-based) into `plans_entries()`'s return
+    /// order.  Clamped to bounds on navigation, same pattern as
+    /// `milestone_dag_sel`.
+    plans_sel: usize,
+
     // ── #541: global Telescope-style issue fuzzy finder ──────────────────────
     /// Active state of the issue fuzzy-finder overlay.  `None` when the
     /// overlay is closed.  Opened with Ctrl+P from any non-PTY view; closed
@@ -2870,6 +2877,8 @@ impl CoordApp {
             merge_queue_scroll: 0,
             // #771: Milestone DAG panel — selection starts at the top.
             milestone_dag_sel: 0,
+            // #975: Plans panel — selection starts at the top.
+            plans_sel: 0,
             // #217: resolved theme palette — computed from settings + optional
             // ~/.coord/theme.toml override file.
             active_theme: {
@@ -2985,17 +2994,19 @@ impl CoordApp {
                     tooltip: "Merge Queue".into(),
                     title: "MERGE QUEUE".into(),
                 },
-                // #771/#782: Milestone DAG panel. #771 landed on main after
-                // this branch diverged with only a numeric-key ('8') entry
-                // point; #782 drops all numeric view-switch keys, so this
-                // activity-bar button is the only way in — added here to
-                // keep the view reachable post-merge.
+                // #975: Plans panel — elevates/subsumes the older #771
+                // "Milestones" DAG view.  One row per milestone/epic with
+                // ready / blocked / in-flight / done counts, sourced from
+                // the server-computed `plan_roster` on `/board`.  The old
+                // `panel:milestones` id is still recognised in
+                // `on_shell_event` for backward-compat with users who had
+                // it pinned, but the button surfaces as "Plans" now.
                 PanelDefinition {
-                    id: WidgetId::new("panel:milestones"),
-                    // ◆ diamond — conventional milestone marker.
+                    id: WidgetId::new("panel:plans"),
+                    // ◆ diamond — conventional plan/milestone marker.
                     icon: "◆".into(),
-                    tooltip: "Milestones".into(),
-                    title: "MILESTONES".into(),
+                    tooltip: "Plans".into(),
+                    title: "PLANS".into(),
                 },
             ],
         )

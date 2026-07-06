@@ -1309,6 +1309,9 @@ pub(crate) fn load_data() -> BoardData {
         // #795: local SQLite path has no daemon to compute the work-order
         // frontier. Pass empty; Pipeline cards show no rank/frontier badges.
         Vec::new(),
+        // #975: local SQLite path has no daemon to compute the plan roster.
+        // Pass empty; the Plans panel renders a "no plans yet" placeholder.
+        Vec::new(),
     )
 }
 
@@ -1341,6 +1344,7 @@ pub(crate) fn assemble_board_data(
     pipeline_models: Option<PipelineModels>,
     issue_stage_projection: Vec<IssueStageProjection>,
     milestone_work_orders: Vec<MilestoneWorkOrder>,
+    plan_roster: Vec<PlanRosterEntry>,
 ) -> BoardData {
     // ── Machine reachability probes + health fetches ──────────────────────
     // Probe using the Tailscale host (fixes #121: machine name ≠ Tailscale hostname).
@@ -1453,6 +1457,7 @@ pub(crate) fn assemble_board_data(
         pipeline_models,
         issue_stage_projection,
         milestone_work_orders,
+        plan_roster,
     }
 }
 
@@ -1722,6 +1727,9 @@ pub(crate) fn load_data_remote(url: &str, token: Option<&str>) -> BoardData {
         // #795: server-computed work-order rank + frontier; empty when the
         // daemon predates #795.
         payload.milestone_work_orders,
+        // #975: server-computed plan roster; empty when the daemon predates
+        // #975 (the Plans panel shows a placeholder in that case).
+        payload.plan_roster,
     )
 }
 
