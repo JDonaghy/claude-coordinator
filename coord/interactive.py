@@ -1487,11 +1487,33 @@ def _transcript_names_issue(body: str, issue_number: int) -> bool:
     return re.search(rf"(?:#|issue-){issue_number}(?!\d)", body) is not None
 
 
+def _transcript_names_assignment(body: str, assignment_id: str) -> bool:
+    """True when a transcript carries this exact *assignment_id* (#989).
+
+    The interactive review briefing embeds the assignment id verbatim in its
+    very first prompt — ``[Coordinator review assignment <id>]`` and
+    ``coord report-result --assignment <id>`` (``_dispatch_review_of`` in
+    ``coord/commands/dispatch_workers.py``) — so only the transcript of the
+    session THIS assignment id was actually dispatched to can ever contain
+    it. Unlike an issue number (a small integer that sibling issues under the
+    same epic routinely cross-reference in prose/docs — the #989 incident:
+    #930's transcript legitimately contained the substring ``issue-931``
+    even though the session ran entirely for #930), a freshly generated
+    ``uuid4().hex[:12]`` cannot plausibly appear in an unrelated session's
+    transcript by coincidence. This is the primary discriminator between two
+    concurrent review sessions that both happen to name the same issue;
+    ``_transcript_names_issue`` is kept as an additional (much weaker) check
+    on top of it.
+    """
+    return bool(assignment_id) and assignment_id in body
+
+
 def _fetch_remote_review_findings(
     issue_number: int,
     cutoff: float,
     ssh_target: str,
     *,
+    assignment_id: str,
     timeout: float = 30.0,
 ):
     """Remote twin of the transcript-floor: parse the review block from the
@@ -1504,9 +1526,13 @@ def _fetch_remote_review_findings(
     left (the #607 incident).  This lists the remote host's recent transcripts
     over ssh (newest-first, active at/after *cutoff*), streams each candidate
     back, and parses it with the same :func:`coord.review.parse_review_from_log`
-    used locally.  Returns the first ``ReviewFindings`` that BOTH parses as a
-    review AND names this issue (``issue-<N>``), or ``None`` (ssh failure / no
-    match) so the caller falls through to the operator-prompt backstop.
+    used locally.  Returns the first ``ReviewFindings`` that parses as a
+    review AND names this issue (``issue-<N>``) AND carries this exact
+    *assignment_id* (#989 — the issue-number check alone is not sufficient:
+    sibling issues under the same epic legitimately cross-reference each
+    other's numbers, so a DIFFERENT assignment's transcript can satisfy it),
+    or ``None`` (ssh failure / no match) so the caller falls through to the
+    operator-prompt backstop.
 
     The ``cutoff`` filter already bounds the candidate set to the session
     window — no additional per-scan cap is applied (#619: the original
@@ -1581,7 +1607,14 @@ def _fetch_remote_review_findings(
         # reviewer describes the code, not the issue number, so the body often
         # never says "#362" (real #362 miss, 2026-06-18) — but the review
         # BRIEFING seeds the issue/branch (`issue-<N>`), so the transcript does.
-        if findings is not None and _transcript_names_issue(cat.stdout, issue_number):
+        # #989: the issue-number check ALONE is not sufficient — also require
+        # this exact assignment_id, since a sibling issue's own review session
+        # can legitimately name this issue number in prose.
+        if (
+            findings is not None
+            and _transcript_names_issue(cat.stdout, issue_number)
+            and _transcript_names_assignment(cat.stdout, assignment_id)
+        ):
             return findings
     return None
 
@@ -1675,6 +1708,7 @@ def _review_findings_from_transcript(
     issue_number: int,
     started_at: float | None,
     *,
+    assignment_id: str,
     projects_dir: Path | None = None,
     ssh_target: str | None = None,
 ):
@@ -1694,14 +1728,23 @@ def _review_findings_from_transcript(
     parsed ``ReviewFindings`` or ``None`` — independent of the agent running any
     command.
 
-    Robustness: only a transcript that BOTH parses as a review AND names this
-    issue (``issue-<N>``, the format the review briefing produces) is trusted —
-    newest-first, so the just-exited session wins.  There is deliberately NO
-    "guess the only review in the window" fallback: that could mis-attribute an
-    unrelated/concurrent review (and record its verdict against the wrong
-    assignment id).  Self-gating — a work session's transcript carries no
-    ``REVIEW_VERDICT`` block, so this returns ``None`` and the caller falls
-    through to the git-floor.
+    Robustness: only a transcript that parses as a review AND names this issue
+    (``issue-<N>``, the format the review briefing produces) AND carries this
+    exact *assignment_id* is trusted — newest-first, so the just-exited session
+    wins. The issue-number check alone is NOT sufficient (#989): #930 and #931
+    were sibling issues under the same epic that cross-referenced each other's
+    numbers throughout their bodies/docs, so #930's own (legitimately dead-
+    unrelated) review transcript satisfied the ``issue-931`` substring check
+    and got recorded as #931's verdict, on BOTH of #931's review assignment
+    slots. ``assignment_id`` is a fresh ``uuid4().hex[:12]`` embedded verbatim
+    in the review briefing's first prompt (``_dispatch_review_of``) — it
+    cannot plausibly appear in a different assignment's transcript, so
+    requiring it closes that cross-issue (and cross-assignment) attribution
+    hole. There is deliberately NO "guess the only review in the window"
+    fallback: that could mis-attribute an unrelated/concurrent review (and
+    record its verdict against the wrong assignment id). Self-gating — a work
+    session's transcript carries no ``REVIEW_VERDICT`` block, so this returns
+    ``None`` and the caller falls through to the git-floor.
     """
     from coord.review import parse_review_from_log  # noqa: PLC0415
 
@@ -1717,14 +1760,18 @@ def _review_findings_from_transcript(
     # projects dir is blind to it (the #607 silent-drop).  Scan the session's
     # own host over ssh instead.
     if ssh_target is not None:
-        result = _fetch_remote_review_findings(issue_number, cutoff, ssh_target)
+        result = _fetch_remote_review_findings(
+            issue_number, cutoff, ssh_target, assignment_id=assignment_id
+        )
         if result is None:
             # One settle-and-retry: covers a transcript-flush blip where the
             # JSONL hasn't been fully flushed to disk at the instant we read it
             # (#619).  2 s is long enough for a local flush but short enough
             # to avoid annoying the operator on the fast path.
             time.sleep(2.0)
-            result = _fetch_remote_review_findings(issue_number, cutoff, ssh_target)
+            result = _fetch_remote_review_findings(
+                issue_number, cutoff, ssh_target, assignment_id=assignment_id
+            )
         return result
     base = projects_dir if projects_dir is not None else (Path.home() / ".claude" / "projects")
     if not base.is_dir():
@@ -1750,7 +1797,12 @@ def _review_findings_from_transcript(
             raw = p.read_text(encoding="utf-8", errors="replace")
         except OSError:
             raw = findings.body
-        if _transcript_names_issue(raw, issue_number):
+        # #989: require BOTH the issue-number reference AND this exact
+        # assignment_id — a sibling issue's transcript can satisfy the former
+        # alone (cross-referenced issue numbers in shared epic prose/docs).
+        if _transcript_names_issue(raw, issue_number) and _transcript_names_assignment(
+            raw, assignment_id
+        ):
             return findings
     return None
 
@@ -1921,7 +1973,7 @@ def finalize_interactive_exit(
     # less advisory).  Self-gating: a work session's transcript has no review
     # block, so this is a no-op there and the git-floor below still handles it.
     _tf = _review_findings_from_transcript(
-        issue_number, started_at, ssh_target=ssh_target
+        issue_number, started_at, assignment_id=assignment_id, ssh_target=ssh_target
     )
     if _tf is not None:
         try:
