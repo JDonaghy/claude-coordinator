@@ -1249,6 +1249,194 @@ def test_stash_artifacts_no_spec_override_uses_repo_wide_glob(
     )
 
 
+def test_stash_artifacts_narrows_using_worker_own_smoke_tests_log(
+    tmp_path: Path,
+) -> None:
+    """#982: _stash_artifacts must narrow the repo-wide glob using the
+    worker's OWN just-completed SMOKE_TESTS block, parsed from
+    assignment.log_path — this is the headless Work dispatch path
+    (_dispatch_headless sends the full glob unmodified; narrowing has to
+    happen here, since smoke tests don't exist until the worker's session
+    ends). Regression test for the review finding that no call site
+    actually narrowed the path that produces the reported bloat."""
+    from coord.agent import DONE, AgentAssignment, AgentServer, AssignmentSpec
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True)
+    wt_path = state_dir / "worktrees" / "asgn-982-headless"
+    examples_dir = wt_path / "target" / "debug" / "examples"
+    examples_dir.mkdir(parents=True)
+
+    payload = b"\x7fELF" + b"\x00" * 200
+    for name in ["tui_submenu", "tui_scrollbar", "tui_colors"]:
+        (examples_dir / name).write_bytes(payload)
+
+    log_dir = state_dir / "logs"
+    log_dir.mkdir(parents=True)
+    log_path = log_dir / "asgn-982-headless.log"
+    log_path.write_text(
+        "worker output...\n"
+        "SMOKE_TESTS:\n"
+        "- submenu opens — run tui_submenu — submenu renders\n"
+        "END_SMOKE_TESTS\n"
+    )
+
+    server = AgentServer(
+        machine_name="test",
+        repos=["quadraui"],
+        state_dir=state_dir,
+        worker_command=lambda spec: ["/bin/sh", "-c", "echo ok"],
+        repo_paths={"quadraui": str(tmp_path / "repo")},
+        artifact_paths={"quadraui": ["target/debug/examples/tui_*"]},
+    )
+
+    # Mimics _dispatch_headless: the /assign payload carries the repo's
+    # full, unmodified glob as spec.artifact_paths — nothing narrows it
+    # before dispatch.
+    spec = AssignmentSpec(
+        repo_name="quadraui",
+        repo_path=str(tmp_path / "repo"),
+        issue_number=982,
+        issue_title="headless narrow",
+        briefing="b",
+        branch="main",
+        artifact_paths=["target/debug/examples/tui_*"],
+    )
+    a = AgentAssignment(
+        id="asgn-982-headless",
+        spec=spec,
+        status=DONE,
+        branch="issue-982-headless-narrow",
+    )
+    a.worktree_path = str(wt_path)
+    a.log_path = str(log_path)
+
+    server._stash_artifacts(a)
+
+    stash_dir = (
+        state_dir / "artifacts" / "quadraui" / "issue-982-headless-narrow"
+    )
+    stashed = {p.name for p in stash_dir.iterdir() if not p.name.startswith(".")}
+    assert stashed == {"tui_submenu"}, (
+        f"headless dispatch should narrow to the smoke-tested binary "
+        f"named in the worker's own log; got {stashed!r}"
+    )
+
+
+def test_stash_artifacts_no_log_path_falls_back_to_full_glob(
+    tmp_path: Path,
+) -> None:
+    """#982: with no log_path recorded on the assignment, narrowing is
+    skipped entirely (nothing to parse) and the full glob is stashed —
+    same behavior as before this fix, just guarding against AttributeError
+    or a crash when log_path is unset."""
+    from coord.agent import DONE, AgentAssignment, AgentServer, AssignmentSpec
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True)
+    wt_path = state_dir / "worktrees" / "asgn-982-nolog"
+    examples_dir = wt_path / "target" / "debug" / "examples"
+    examples_dir.mkdir(parents=True)
+
+    payload = b"\x7fELF" + b"\x00" * 200
+    for name in ["tui_submenu", "tui_scrollbar"]:
+        (examples_dir / name).write_bytes(payload)
+
+    server = AgentServer(
+        machine_name="test",
+        repos=["quadraui"],
+        state_dir=state_dir,
+        worker_command=lambda spec: ["/bin/sh", "-c", "echo ok"],
+        repo_paths={"quadraui": str(tmp_path / "repo")},
+        artifact_paths={"quadraui": ["target/debug/examples/tui_*"]},
+    )
+
+    spec = AssignmentSpec(
+        repo_name="quadraui",
+        repo_path=str(tmp_path / "repo"),
+        issue_number=982,
+        issue_title="no log path",
+        briefing="b",
+        branch="main",
+        artifact_paths=["target/debug/examples/tui_*"],
+    )
+    a = AgentAssignment(
+        id="asgn-982-nolog",
+        spec=spec,
+        status=DONE,
+        branch="issue-982-nolog",
+    )
+    a.worktree_path = str(wt_path)
+    assert a.log_path is None
+
+    server._stash_artifacts(a)
+
+    stash_dir = state_dir / "artifacts" / "quadraui" / "issue-982-nolog"
+    stashed = {p.name for p in stash_dir.iterdir() if not p.name.startswith(".")}
+    assert stashed == {"tui_submenu", "tui_scrollbar"}
+
+
+def test_stash_artifacts_for_branch_prunes_stale_files_on_narrowed_restash(
+    tmp_path: Path,
+) -> None:
+    """#982: a re-stash with a narrower pattern set must shrink an existing
+    oversized stash, not just avoid growing it. First stash with the full
+    glob (simulating the unnarrowed first headless Work dispatch), then
+    re-stash the same branch with only one file named — the other files
+    left over from the first stash must be pruned."""
+    from coord.agent import stash_artifacts_for_branch
+
+    state_dir = tmp_path / "state"
+    wt_path = tmp_path / "worktree"
+    examples_dir = wt_path / "target" / "debug" / "examples"
+    examples_dir.mkdir(parents=True)
+
+    payload = b"\x7fELF" + b"\x00" * 200
+    for name in ["tui_submenu", "tui_scrollbar", "tui_colors"]:
+        (examples_dir / name).write_bytes(payload)
+
+    # First stash: broad glob, all three files land in the stash.
+    count1 = stash_artifacts_for_branch(
+        worktree_path=wt_path,
+        branch="issue-982-prune",
+        repo_name="quadraui",
+        patterns=["target/debug/examples/tui_*"],
+        state_dir=state_dir,
+        assignment_id="asgn-1",
+    )
+    assert count1 == 3
+
+    stash_dir = state_dir / "artifacts" / "quadraui" / "issue-982-prune"
+    assert {p.name for p in stash_dir.iterdir() if not p.name.startswith(".")} == {
+        "tui_submenu",
+        "tui_scrollbar",
+        "tui_colors",
+    }
+
+    # Re-stash the same branch, narrowed to a single named binary (as if a
+    # later fix-of/rework-of session narrowed against smoke tests). The
+    # stale tui_scrollbar / tui_colors copies must be pruned, not just left
+    # in place alongside the freshly re-copied tui_submenu.
+    count2 = stash_artifacts_for_branch(
+        worktree_path=wt_path,
+        branch="issue-982-prune",
+        repo_name="quadraui",
+        patterns=["target/debug/examples/tui_submenu"],
+        state_dir=state_dir,
+        assignment_id="asgn-2",
+    )
+    assert count2 == 1
+
+    stashed_after = {
+        p.name for p in stash_dir.iterdir() if not p.name.startswith(".")
+    }
+    assert stashed_after == {"tui_submenu"}, (
+        f"narrowed re-stash should prune stale files; got {stashed_after!r}"
+    )
+    # The assignment_id marker (a dotfile) must survive the prune.
+    assert (stash_dir / ".assignment_id").read_text() == "asgn-2"
+
+
 def test_gc_artifacts_removes_old_directories(tmp_path: Path) -> None:
     """_gc_artifacts should remove stash dirs older than ttl_days."""
     import os
