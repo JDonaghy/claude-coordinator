@@ -1709,8 +1709,24 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 elif "epic" in _label_names:
                     # A closed epic — feed into closed_tracking_issues so
                     # milestones whose tracking issue was tidied up still
-                    # resolve (mirrors coord/plans.py's #974 fix).
+                    # resolve (mirrors coord/plans.py's #974 fix). Also seed
+                    # _repo_milestones from the epic's own milestone_number:
+                    # if every issue under a milestone (epic included) is now
+                    # closed, no *open* issue would otherwise register the
+                    # milestone, and the outer aggregation loop below would
+                    # never visit it at all — silently dropping a
+                    # finished-but-still-open-on-GitHub milestone from the
+                    # roster instead of surfacing it as done.
                     _repo_closed_epics.setdefault(_rn, []).append(_adapted)
+                    _ms_num = _oi.get("milestone_number")
+                    if _ms_num is not None:
+                        _repo_milestones.setdefault(_rn, {}).setdefault(
+                            _ms_num,
+                            {
+                                "number": _ms_num,
+                                "title": _oi.get("milestone_title") or f"Milestone #{_ms_num}",
+                            },
+                        )
 
             _plan_roster: list[dict] = []
             for _repo_name, _milestones_by_num in _repo_milestones.items():
