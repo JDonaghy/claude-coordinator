@@ -16,7 +16,7 @@ from typing import Iterable, Protocol
 
 from coord.ci_store import CiStore, NoOpCi, failed_checks, in_flight_checks, summarize
 from coord.db import get_connection
-from coord.models import Assignment
+from coord.models import WORK_LIKE_TYPES, Assignment
 from coord.state import COORD_DIR
 
 # Legacy path constant — kept for backward compat with monkeypatch calls in tests.
@@ -120,7 +120,7 @@ def has_approved_review(entry: "QueuedMerge", board) -> bool:
     if entry.assignment_id:
         branch_work_ids.add(entry.assignment_id)
     for a in pool:
-        if getattr(a, "type", None) != "work":
+        if getattr(a, "type", None) not in WORK_LIKE_TYPES:
             continue
         aid = getattr(a, "assignment_id", None)
         branch = getattr(a, "branch", None)
@@ -215,7 +215,7 @@ def has_smoke_verdict(entry: "QueuedMerge", board) -> bool:
     if entry.assignment_id:
         branch_work_ids.add(entry.assignment_id)
     for a in pool:
-        if getattr(a, "type", None) != "work":
+        if getattr(a, "type", None) not in WORK_LIKE_TYPES:
             continue
         aid = getattr(a, "assignment_id", None)
         branch = getattr(a, "branch", None)
@@ -226,7 +226,7 @@ def has_smoke_verdict(entry: "QueuedMerge", board) -> bool:
     branch_work = [
         a for a in pool
         if getattr(a, "assignment_id", None) in branch_work_ids
-        and getattr(a, "type", None) == "work"
+        and getattr(a, "type", None) in WORK_LIKE_TYPES
     ]
     # Fail open: no work assignment found → can't block without evidence.
     if not branch_work:
@@ -451,8 +451,9 @@ def enqueue(
 def enqueue_approved_work(config, board=None) -> list[str]:
     """Enqueue / re-key merge-queue entries for all approved + tested done work.
 
-    Scans ``board.completed`` for done ``type=work`` assignments and, for each
-    that satisfies ALL three conditions:
+    Scans ``board.completed`` for done assignments whose ``type`` is in
+    :data:`coord.models.WORK_LIKE_TYPES` (``"work"`` or ``"mock-author"``,
+    #930) and, for each that satisfies ALL three conditions:
 
     1. Review gate OK — ``requires_review(a, config)`` is False, **or** an
        approved review exists on the board (``has_approved_review``).
@@ -501,7 +502,7 @@ def enqueue_approved_work(config, board=None) -> list[str]:
     }
 
     for a in completed:
-        if getattr(a, "type", None) != "work":
+        if getattr(a, "type", None) not in WORK_LIKE_TYPES:
             continue
         if getattr(a, "status", None) != "done":
             continue
@@ -898,7 +899,7 @@ def _work_has_approved_review_a(a, board) -> bool:
     if aid:
         branch_work_ids.add(aid)
     for x in pool:
-        if getattr(x, "type", None) != "work":
+        if getattr(x, "type", None) not in WORK_LIKE_TYPES:
             continue
         x_aid = getattr(x, "assignment_id", None)
         if x_aid and branch and getattr(x, "branch", None) == branch:
@@ -920,8 +921,10 @@ def _work_has_approved_review_a(a, board) -> bool:
 def staging_items(board, config) -> list[StagingItem]:
     """Return work assignments that are done+approved but not yet in the queue.
 
-    Scans ``board.completed`` for ``type=work, status=done`` assignments and
-    returns one :class:`StagingItem` per candidate that has an approved review
+    Scans ``board.completed`` for ``status=done`` assignments whose ``type``
+    is in :data:`coord.models.WORK_LIKE_TYPES` (``"work"`` or
+    ``"mock-author"``, #930) and returns one :class:`StagingItem` per
+    candidate that has an approved review
     (or doesn't need one) but hasn't yet been admitted to the merge queue.
     Each item is classified:
 
@@ -960,7 +963,7 @@ def staging_items(board, config) -> list[StagingItem]:
     completed = list(getattr(board, "completed", []) or [])
 
     for a in completed:
-        if getattr(a, "type", None) != "work":
+        if getattr(a, "type", None) not in WORK_LIKE_TYPES:
             continue
         if getattr(a, "status", None) != "done":
             continue

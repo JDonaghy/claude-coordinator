@@ -142,6 +142,22 @@ class Machine:
         return self.repo_paths.get(repo_name)
 
 
+# #930 review fix: assignment ``type`` values that should flow through the
+# normal Work → Test → Review → Merge pipeline like any other "work" — i.e.
+# their completion is eligible for `coord.review.dispatch_review` /
+# `dispatch_pending_reviews` and for the merge-queue auto-enqueue
+# (`coord.merge_queue.enqueue_approved_work`, `coord.commands.merge`'s
+# auto-enqueue scan). "work" is the default worker type; "mock-author"
+# (#930, Gate A) commits `tests/acceptance/ms-NN/contract.md` and its own
+# docstring/system-prompt promise it dispatches through the *same* pipeline
+# as any other branch — so every completion-side filter that only matched
+# ``type == "work"`` must also match this set, or a mock-author branch can
+# never actually reach a review or the merge queue. Keep this set — not a
+# bare string check — as the single source of truth so a future work-like
+# type only needs to be added here.
+WORK_LIKE_TYPES: frozenset[str] = frozenset({"work", "mock-author"})
+
+
 @dataclass
 class Assignment:
     machine_name: str

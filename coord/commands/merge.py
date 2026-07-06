@@ -11,6 +11,7 @@ import click
 
 
 from coord.commands._common import _CONFIG_OPTION, _load_config
+from coord.models import WORK_LIKE_TYPES
 
 
 def _machine_for_assignment(board, assignment_id: str | None) -> str | None:
@@ -783,7 +784,7 @@ def merge(
     terminal_cache: dict = {}
     if board is not None:
         for a in board.completed:
-            if a.type != "work" or a.status != "done":
+            if a.type not in WORK_LIKE_TYPES or a.status != "done":
                 continue
             if not a.branch or not a.assignment_id:
                 continue
@@ -858,7 +859,7 @@ def merge(
         # there's no completed work to merge" — the latter is the common
         # case before #242 was fixed and was the silent-fail symptom.
         if board is not None and any(
-            a.type == "work" and a.status == "done" and a.branch
+            a.type in WORK_LIKE_TYPES and a.status == "done" and a.branch
             for a in board.completed
             if (not repo_filter or a.repo_name == repo_filter)
         ):

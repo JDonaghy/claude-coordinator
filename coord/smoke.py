@@ -42,7 +42,7 @@ import httpx
 from coord import github_ops
 from coord.config import Config, SmokeRule, SmokeTestsConfig
 from coord.dispatch import AGENT_PORT
-from coord.models import Assignment, Board, Machine
+from coord.models import WORK_LIKE_TYPES, Assignment, Board, Machine
 
 
 SMOKE_SYSTEM_PROMPT = """\
@@ -266,7 +266,8 @@ def dispatch_smoke(
     diff_lookup: DiffLookup = _fetch_touched_files,
     now: float | None = None,
 ) -> Assignment | None:
-    """Queue a smoke test for a completed work assignment.
+    """Queue a smoke test for a completed work-like assignment (#930: also
+    ``type="mock-author"`` — see :data:`coord.models.WORK_LIKE_TYPES`).
 
     Returns the new smoke `Assignment`, or None when no smoke is needed
     (no rules matched, no capable machine, smoke disabled, etc.). The
@@ -275,7 +276,7 @@ def dispatch_smoke(
     smoke_cfg = getattr(config, "smoke_tests", SmokeTestsConfig())
     if not smoke_cfg.auto_queue:
         return None
-    if completed.type != "work":
+    if completed.type not in WORK_LIKE_TYPES:
         return None
     if completed.status != "done":
         return None

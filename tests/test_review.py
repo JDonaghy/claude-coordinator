@@ -621,6 +621,44 @@ def test_dispatch_review_skipped_for_review_type(two_machine_config: Config) -> 
     assert result is None
 
 
+def test_dispatch_review_dispatches_for_mock_author_type(
+    two_machine_config: Config,
+) -> None:
+    """#930 fix: a completed ``type="mock-author"`` (Gate A) assignment must
+    be eligible for review dispatch, not just ``type="work"`` — otherwise a
+    Gate A branch can never reach a review through any `coord` command
+    (`coord pr`, `coord notify`, the daemon tick), contradicting the type's
+    own docstring/system-prompt promise that it flows through the same
+    Work -> Test -> Review -> Merge pipeline as ordinary work."""
+    board = Board()
+    completed = replace(
+        _completed_assignment(),
+        type="mock-author",
+        assignment_id="ma-1",
+        branch="ms-5-gate-a",
+    )
+    client = _FakeHTTPClient({"id": "review-id-ma"})
+
+    result = dispatch_review(
+        completed, board, two_machine_config,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {
+            "number": 43,
+            "url": "https://github.com/acme/api/pull/43",
+            "existed": True,
+        },
+        claude_md_reader=lambda p: "# Project rules\n",
+        issue_body_fetcher=lambda repo, num: "issue body text",
+        now=123.0,
+        remote_branch_checker=lambda repo, branch: True,
+    )
+
+    assert result is not None
+    assert result.type == "review"
+    assert result.review_of_assignment_id == "ma-1"
+    assert board.active == [result]
+
+
 def test_dispatch_review_skipped_when_work_terminal(
     two_machine_config: Config, monkeypatch
 ) -> None:
@@ -1540,6 +1578,35 @@ def test_flood_guard_dispatches_all_below_cap(fake_dispatch) -> None:
     assert len(out) == 3
     assert len(fake_dispatch) == 3
     assert all(c.review_state == "dispatched" for c in board.completed)
+
+
+def test_dispatch_pending_reviews_includes_mock_author(fake_dispatch) -> None:
+    """#930 fix: the bulk/auto dispatch path (`coord notify`, `reconcile()`)
+    must pick up a completed `type="mock-author"` (Gate A) row the same as
+    ordinary work — previously the ``eligible`` filter hard-required
+    ``type == "work"`` so a Gate A branch could never get an automatic
+    review."""
+    mock_author = Assignment(
+        machine_name="laptop",
+        repo_name="api",
+        issue_number=930,
+        issue_title="Gate A mock",
+        assignment_id="ma-2",
+        status="done",
+        branch="ms-5-gate-a",
+        type="mock-author",
+        review_state=None,
+        dispatched_at=0.0,
+        finished_at=1.0,
+    )
+    board = Board(completed=[mock_author])
+    cfg = _flood_config(max_auto_dispatch_per_pass=5, flood_threshold=12)
+
+    out = dispatch_pending_reviews(board, cfg)
+
+    assert len(out) == 1
+    assert fake_dispatch == ["ma-2"]
+    assert mock_author.review_state == "dispatched"
 
 
 def test_dispatch_pending_reviews_skips_interactive_work(fake_dispatch) -> None:
