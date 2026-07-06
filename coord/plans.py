@@ -16,6 +16,18 @@ Design decisions (#974):
   (``TRACKING_ISSUE_LABEL = "epic"``).  An open milestone with no such issue is
   reported with ``has_work_order = False`` and a ``"no_work_order"``
   ``needs_you`` signal.
+- **Tracking-epic lookup considers closed epics too.**  A milestone can stay
+  open on GitHub after its tracking epic has been closed (e.g. all
+  work-order nodes finished and someone tidied up the epic before
+  remembering to close the milestone).  Reporting that as ``"no_work_order"``
+  would be backwards — it would read as "nobody wrote a work order yet" when
+  the real state is "this plan is done."  So :func:`aggregate_repo_plans`
+  accepts an optional ``closed_tracking_issues`` list (closed, ``"epic"``-
+  labelled issues, e.g. from :func:`coord.github_ops.get_closed_epics`) and
+  merges it with ``open_issues`` before searching for the tracking issue —
+  mirroring the open+closed scan :func:`coord.serve_app` already does for the
+  same "find the epic" operation (the #795 Phase 3b per-milestone work-order
+  projection).
 - **Work order scope only**.  ``done``/``total`` counts count work-order
   nodes, not all issues under the milestone (the work order is the declared
   scope of automated dispatch).
@@ -65,6 +77,9 @@ class PlanEntry:
         milestone_number:  GitHub milestone number.
         tracking_issue:    GitHub issue number of the epic/tracking issue, or
                            ``None`` when none exists under this milestone.
+                           May be a closed issue when the caller supplies
+                           ``closed_tracking_issues`` to
+                           :func:`aggregate_repo_plans`.
         has_work_order:    ``True`` iff the tracking body carries a parsed
                            ``## Work order`` block with ≥1 node.
         ready_frontier:    Number of work-order nodes ready to dispatch now
@@ -120,19 +135,23 @@ class PlanEntry:
 
 def find_tracking_issue(
     milestone_number: int,
-    open_issues: list[dict],
+    issues: list[dict],
 ) -> dict | None:
-    """Return the first open issue under *milestone_number* labelled ``"epic"``.
+    """Return the first issue under *milestone_number* labelled ``"epic"``.
 
-    ``open_issues`` is the raw list returned by
-    :func:`coord.github_ops.get_open_issues` — each item has at least
-    ``"number"``, ``"labels"`` (list of ``{"name": ...}`` dicts), and
-    ``"milestone"`` (``None`` or ``{"number": ...}``).
+    ``issues`` is a raw issue-dict list — each item has at least ``"number"``,
+    ``"labels"`` (list of ``{"name": ...}`` dicts), and ``"milestone"``
+    (``None`` or ``{"number": ...}``), matching the shape returned by
+    :func:`coord.github_ops.get_open_issues` / :func:`~coord.github_ops.get_closed_epics`.
+    This function does not care about issue state — callers that want a
+    closed epic to still count as the tracking issue (see
+    :func:`aggregate_repo_plans`) pass a list that already includes closed
+    epics alongside the open issues.
 
     Returns ``None`` when no epic is found for this milestone.  The caller
     decides how to report a missing tracking issue.
     """
-    for issue in open_issues:
+    for issue in issues:
         ms = issue.get("milestone") or {}
         if ms.get("number") != milestone_number:
             continue
@@ -264,6 +283,7 @@ def aggregate_repo_plans(
     milestones: list[dict],
     open_issues: list[dict],
     board: Board,
+    closed_tracking_issues: list[dict] | None = None,
     issue_body_fetcher: "Callable[[int], str | None] | None" = None,
 ) -> list[PlanEntry]:
     """Aggregate plans for all milestones in one repo.
@@ -282,13 +302,21 @@ def aggregate_repo_plans(
         :func:`coord.github_ops.get_open_issues`.
     board:
         Current board state.
+    closed_tracking_issues:
+        Optional list of *closed* ``"epic"``-labelled issue dicts (e.g. from
+        :func:`coord.github_ops.get_closed_epics`), merged with
+        ``open_issues`` when searching for each milestone's tracking issue.
+        Without this, a milestone whose tracking epic was closed while the
+        milestone stayed open would be reported as ``"no_work_order"``
+        instead of reflecting its (likely done) work order. ``None``/``[]``
+        preserves the open-only lookup.
     issue_body_fetcher:
         Optional callable ``(issue_number: int) -> str | None`` that fetches
         the body of a *single* issue by number.  Required only when the
-        tracking epic's body is not already in ``open_issues`` (it always
-        should be for an open epic, but the hook lets callers supply a
-        pre-fetched body map for testing).  When ``None``, body is read from
-        the matching entry in ``open_issues`` only.
+        tracking epic's body is not already in ``open_issues`` /
+        ``closed_tracking_issues`` (it always should be, but the hook lets
+        callers supply a pre-fetched body map for testing).  When ``None``,
+        body is read from the matching entry in those snapshots only.
 
     Returns
     -------
@@ -297,10 +325,18 @@ def aggregate_repo_plans(
     """
     from typing import Callable  # noqa: PLC0415 — keep import cheap
 
-    # Build a quick index: issue_number → body from the open_issues snapshot.
+    closed_tracking_issues = closed_tracking_issues or []
+
+    # Candidates for tracking-issue lookup: open issues + any closed epics
+    # supplied by the caller. Deliberately kept separate from open-issue-only
+    # terminal detection below (a closed epic isn't a work-order node).
+    tracking_candidates: list[dict] = open_issues + closed_tracking_issues
+
+    # Build a quick index: issue_number → body from the open + closed-epic
+    # snapshots.
     body_index: dict[int, str] = {
         i["number"]: (i.get("body") or "")
-        for i in open_issues
+        for i in tracking_candidates
     }
 
     # Build open-issue-numbers per milestone.
@@ -316,7 +352,7 @@ def aggregate_repo_plans(
         ms_num: int = ms["number"]
         ms_title: str = ms.get("title", f"Milestone #{ms_num}")
 
-        tracking = find_tracking_issue(ms_num, open_issues)
+        tracking = find_tracking_issue(ms_num, tracking_candidates)
         tracking_number: int | None = tracking["number"] if tracking is not None else None
 
         if tracking_number is not None:
