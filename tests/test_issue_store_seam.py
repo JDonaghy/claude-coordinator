@@ -480,6 +480,91 @@ class TestPostResult:
         ).fetchone()
         assert row["review_verdict"] == "approve"
 
+    # ── #990: verdict write must not silently no-op ─────────────────────────
+    #
+    # These exercise `_persist_review_verdict` directly (rather than going
+    # through the full `post_result` pipeline) so a blanket `get_connection`
+    # failure only affects the verdict write under test, not the unrelated
+    # `_update_local_state` / notification writes that happen earlier in
+    # `_post_result_local`.
+
+    @staticmethod
+    def _verdict_record(assignment_id: str, verdict: str = "approve") -> "issue_store.ResultRecord":
+        return issue_store.ResultRecord(
+            assignment_id=assignment_id,
+            machine_name="laptop",
+            repo_name="api",
+            repo_github="acme/api",
+            issue_number=7,
+            status="done",
+            verdict=verdict,  # type: ignore[arg-type]
+            summary="LGTM",
+        )
+
+    def test_verdict_write_retries_transient_failure_then_succeeds(self) -> None:
+        """A transient failure on the FIRST attempt (simulating SQLite lock
+        contention on the shared daemon DB) must be absorbed by the retry —
+        the verdict still lands durably and no exception escapes."""
+        import sqlite3
+
+        _seed_running_assignment("aid-flaky", assignment_type="review")
+        real_get_connection = state_mod.get_connection
+        calls = {"n": 0}
+
+        def flaky_get_connection():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return real_get_connection()
+
+        with patch("time.sleep"), \
+             patch("coord.state.get_connection", side_effect=flaky_get_connection):
+            issue_store._persist_review_verdict(self._verdict_record("aid-flaky"))
+        assert calls["n"] >= 2, "expected at least one retry after the flaky first call"
+        row = state_mod.get_connection().execute(
+            "SELECT review_verdict FROM assignments WHERE assignment_id=?",
+            ("aid-flaky",),
+        ).fetchone()
+        assert row["review_verdict"] == "approve"
+
+    def test_verdict_write_raises_after_exhausting_retries(self) -> None:
+        """#990 core regression: if the write never lands (persistent lock
+        contention), the seam MUST raise instead of silently reporting
+        success — the merge gate reads `review_verdict` directly, so a
+        swallowed failure here would leave it silently stale while the CLI
+        and the GitHub comment both claim the verdict was recorded."""
+        import sqlite3
+
+        _seed_running_assignment("aid-stuck", assignment_type="review")
+
+        def always_locked():
+            raise sqlite3.OperationalError("database is locked")
+
+        with patch("time.sleep"), \
+             patch("coord.state.get_connection", side_effect=always_locked):
+            with pytest.raises(RuntimeError, match="review_verdict"):
+                issue_store._persist_review_verdict(self._verdict_record("aid-stuck"))
+        row = state_mod.get_connection().execute(
+            "SELECT review_verdict FROM assignments WHERE assignment_id=?",
+            ("aid-stuck",),
+        ).fetchone()
+        assert row["review_verdict"] is None, (
+            "the DB must NOT show the verdict when the write never durably landed"
+        )
+
+    def test_verdict_write_raises_on_readback_mismatch(self) -> None:
+        """Even when the UPDATE call itself raises nothing, a stale readback
+        (the write silently no-op'd, e.g. matched zero rows) must still be
+        treated as a failure — this is the "verify-after-write" half of the
+        #990 fix, distinct from an exception being raised."""
+        _seed_running_assignment("aid-mismatch", assignment_type="review")
+
+        with patch("time.sleep"), patch.object(
+            issue_store, "_read_review_verdict_local", return_value="request-changes",
+        ):
+            with pytest.raises(RuntimeError, match="readback mismatch"):
+                issue_store._persist_review_verdict(self._verdict_record("aid-mismatch"))
+
     def test_findings_body_persisted_and_posted(self) -> None:
         """`--body-file` path: the full findings are persisted on the row (as
         the {verdict, body} JSON the fix worker's DB-cache reads) AND embedded
@@ -772,6 +857,35 @@ class TestReportResultCli:
         assert row["review_verdict"] == "request-changes"
         # The body is persisted (not silently discarded).
         assert row["review_findings"] and "foo.rs:10" in row["review_findings"]
+
+    def test_verdict_persist_failure_exits_nonzero(self, config_file: Path) -> None:
+        """#990: if the verdict write can't be durably confirmed (retries
+        exhausted in `_persist_review_verdict`), the CLI must exit non-zero
+        and print a clear error — never print "result recorded" while the
+        merge-gate-critical review_verdict column never actually landed."""
+        _seed_running_assignment("cli-verdict-fail", assignment_type="review")
+
+        with patch("coord.github_ops.post_issue_comment"), patch(
+            "coord.issue_store._persist_review_verdict",
+            side_effect=RuntimeError(
+                "failed to durably persist review_verdict='approve' for "
+                "assignment 'cli-verdict-fail' after 4 attempts (#990): boom"
+            ),
+        ):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "report-result",
+                    "--assignment", "cli-verdict-fail",
+                    "--status", "done",
+                    "--verdict", "approve",
+                    "--summary", "LGTM",
+                    "--config", str(config_file),
+                ],
+            )
+        assert result.exit_code != 0
+        assert "result recorded" not in result.output
+        assert "review_verdict" in result.output
 
     def test_request_changes_without_body_is_rejected(self, config_file: Path) -> None:
         """#580: recording request-changes with only a one-line --summary (no
