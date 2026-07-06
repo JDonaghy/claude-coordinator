@@ -325,6 +325,19 @@ def post_result(record: ResultRecord) -> StoreOutcome:
             except Exception:  # noqa: BLE001
                 detail = str(exc)
             raise ValueError(detail) from exc
+        if exc.response.status_code == 503:
+            # #990: the daemon's _post_result_local raises RuntimeError when a
+            # review verdict can't be durably persisted (retries exhausted /
+            # readback mismatch); serve_app.py serialises that as HTTP 503
+            # {"error": "result write failed", "detail": "..."}. Convert back
+            # to RuntimeError so the CLI's `except RuntimeError` shows a clean
+            # message instead of a raw HTTPStatusError traceback.
+            try:
+                payload = exc.response.json()
+                detail = payload.get("detail") or payload.get("error") or str(exc)
+            except Exception:  # noqa: BLE001
+                detail = str(exc)
+            raise RuntimeError(detail) from exc
         raise
 
 
@@ -417,6 +430,83 @@ def _assignment_type_local(assignment_id: str) -> str | None:
     if row is None:
         return None
     return row["type"] if hasattr(row, "keys") else row[0]
+
+
+def _read_review_verdict_local(assignment_id: str) -> str | None:
+    """Read back the persisted ``review_verdict`` column, or ``None`` if the
+    row is absent. Used by :func:`_persist_review_verdict` to verify a write
+    actually landed rather than trusting a bare ``commit()`` call."""
+    from coord.state import get_connection  # noqa: PLC0415
+
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT review_verdict FROM assignments WHERE assignment_id = ?",
+        (assignment_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return row["review_verdict"] if hasattr(row, "keys") else row[0]
+
+
+def _persist_review_verdict(record: ResultRecord) -> None:
+    """Durably record ``record.verdict`` on the assignment row.
+
+    #990: this used to be a bare ``UPDATE ... ; except Exception: pass`` —
+    a transient SQLite lock (the daemon DB is concurrently written by other
+    ticks/agents) could make the write silently no-op while the caller
+    (``coord report-result``) still reported success and posted a GitHub
+    comment showing the verdict. The merge gate (``has_approved_review`` in
+    ``coord.merge_queue``) reads exactly this column, so a swallowed failure
+    here quietly undermines the merge gate's trustworthiness.
+
+    Retries a few times with backoff to absorb transient contention, then
+    reads the column back and compares it to what we intended to write —
+    catches both a raised exception AND a write that silently no-ops
+    (e.g. a stale connection, or a commit that didn't persist). Raises
+    ``RuntimeError`` if it still can't confirm the write landed; callers
+    MUST NOT swallow this — let it propagate so the CLI exits non-zero and
+    the operator knows to retry, instead of trusting a false success.
+    """
+    attempts = 4
+    delay = 0.15
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            if record.findings_body and record.findings_body.strip():
+                from coord.state import update_assignment_review_findings  # noqa: PLC0415
+
+                update_assignment_review_findings(
+                    record.assignment_id,
+                    verdict=record.verdict,
+                    body=record.findings_body.strip(),
+                )
+            else:
+                from coord.state import get_connection  # noqa: PLC0415
+
+                conn = get_connection()
+                conn.execute(
+                    "UPDATE assignments SET review_verdict=? WHERE assignment_id=?",
+                    (record.verdict, record.assignment_id),
+                )
+                conn.commit()
+            actual = _read_review_verdict_local(record.assignment_id)
+            if actual == record.verdict:
+                return
+            last_exc = RuntimeError(
+                f"review_verdict readback mismatch for assignment "
+                f"{record.assignment_id!r}: wrote {record.verdict!r}, read back "
+                f"{actual!r} (attempt {attempt}/{attempts})"
+            )
+        except Exception as exc:  # noqa: BLE001 — retried below; re-raised after
+            last_exc = exc
+        if attempt < attempts:
+            time.sleep(delay)
+            delay *= 2
+    raise RuntimeError(
+        f"failed to durably persist review_verdict={record.verdict!r} for "
+        f"assignment {record.assignment_id!r} after {attempts} attempts "
+        f"(#990): {last_exc}"
+    ) from last_exc
 
 
 def _post_result_local(record: ResultRecord) -> StoreOutcome:
@@ -596,24 +686,7 @@ def _post_result_local(record: ResultRecord) -> StoreOutcome:
     # the same JSON column the claude -p path uses, so the fix worker's DB-cache
     # lookup (load_assignment_review_findings) hits on this machine.
     if record.verdict is not None:
-        try:
-            if record.findings_body and record.findings_body.strip():
-                from coord.state import update_assignment_review_findings  # noqa: PLC0415
-                update_assignment_review_findings(
-                    record.assignment_id,
-                    verdict=record.verdict,
-                    body=record.findings_body.strip(),
-                )
-            else:
-                from coord.state import get_connection  # noqa: PLC0415
-                conn = get_connection()
-                conn.execute(
-                    "UPDATE assignments SET review_verdict=? WHERE assignment_id=?",
-                    (record.verdict, record.assignment_id),
-                )
-                conn.commit()
-        except Exception:  # noqa: BLE001 — best-effort
-            pass
+        _persist_review_verdict(record)
     # #603: a request-changes verdict is durable context for EVERY future agent
     # on the issue — record a short note in the per-issue digest (local writer;
     # daemon-side on a thin client, so use the _local variant).

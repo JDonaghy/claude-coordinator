@@ -650,6 +650,14 @@ def report_result(
     except ValueError as exc:
         click.echo(f"error: {exc}", err=True)
         sys.exit(2)
+    except RuntimeError as exc:
+        # #990: the verdict write couldn't be durably confirmed (retries
+        # exhausted, or a readback mismatch) — surface this loudly instead of
+        # reporting success while the merge-gate-critical review_verdict
+        # column never actually landed. Re-running the identical command is
+        # the recovery path.
+        click.echo(f"error: {exc}", err=True)
+        sys.exit(1)
 
     click.echo(
         f"result recorded: status={outcome.status} event={outcome.event} "

@@ -227,20 +227,36 @@ def _recover_review_findings(assignment: "Assignment", config: "Config") -> str 
     if findings is None:
         return None
     repo_cfg = next((r for r in config.repos if r.name == assignment.repo_name), None)
-    issue_store.post_result(
-        issue_store.ResultRecord(
-            assignment_id=assignment_id,
-            machine_name=assignment.machine_name or "unknown",
-            repo_name=assignment.repo_name,
-            repo_github=(repo_cfg.github if repo_cfg else assignment.repo_name),
-            issue_number=assignment.issue_number,
-            status="done",
-            verdict=findings.verdict,  # type: ignore[arg-type]
-            summary="Findings recovered from the session transcript by coord diagnose.",
-            findings_body=findings.body,
-            branch=None,
+    try:
+        issue_store.post_result(
+            issue_store.ResultRecord(
+                assignment_id=assignment_id,
+                machine_name=assignment.machine_name or "unknown",
+                repo_name=assignment.repo_name,
+                repo_github=(repo_cfg.github if repo_cfg else assignment.repo_name),
+                issue_number=assignment.issue_number,
+                status="done",
+                verdict=findings.verdict,  # type: ignore[arg-type]
+                summary="Findings recovered from the session transcript by coord diagnose.",
+                findings_body=findings.body,
+                branch=None,
+            )
         )
-    )
+    except RuntimeError as exc:
+        # #990: the verdict was recovered from the transcript but couldn't be
+        # durably persisted (retries exhausted / readback mismatch). Surface
+        # this instead of letting it crash `coord diagnose` — the caller
+        # treats a ``None`` return as "not recoverable" and reports
+        # "re-review needed", which is the safe outcome here too since the
+        # write did not actually land.
+        import click  # noqa: PLC0415
+
+        click.echo(
+            f"  ⚠ recovered verdict {findings.verdict!r} from transcript for "
+            f"{assignment.assignment_id} but failed to persist it: {exc}",
+            err=True,
+        )
+        return None
     return findings.verdict
 
 

@@ -293,10 +293,15 @@ EXTENDED_ALLOWLIST: dict[str, set[tuple[str, str]]] = {
     # The seam routes through /result and /completion endpoints on thin clients
     # (#590); the _local suffix functions are only reached on the daemon.
     "issue_store.py": {
-        ("_post_result_local", "get_connection"),
         ("_update_local_state", "get_connection"),
         ("_assignment_type_local", "get_connection"),
         ("_record_notification", "get_connection"),
+        # #990: the verdict write was factored out of _post_result_local into
+        # these two named helpers (retry + readback-verify so a silent no-op
+        # under SQLite lock contention can't masquerade as success) — same
+        # local-DB-only seam, no new daemon-bypass.
+        ("_read_review_verdict_local", "get_connection"),
+        ("_persist_review_verdict", "get_connection"),
     },
     # coord/interactive.py — raw get_connection calls for session/assignment
     # management (reading status, marking stale rows terminal).  These are
