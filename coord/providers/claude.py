@@ -88,6 +88,8 @@ class ClaudeProvider(Provider):
             DEFAULT_WORKER_BINARY,
             MILESTONE_CHAT_DENY_COMMANDS,
             MILESTONE_CHAT_SYSTEM_PROMPT,
+            MOCK_AUTHOR_DENY_COMMANDS,
+            MOCK_AUTHOR_SYSTEM_PROMPT,
             NEW_ISSUE_CHAT_DENY_COMMANDS,
             NEW_ISSUE_CHAT_SYSTEM_PROMPT,
             REFINEMENT_SYSTEM_PROMPT,
@@ -135,6 +137,10 @@ class ClaudeProvider(Provider):
                 _sp = spec.system_prompt if spec.system_prompt else MILESTONE_CHAT_SYSTEM_PROMPT
                 _sp += build_deny_prompt(MILESTONE_CHAT_DENY_COMMANDS)
                 _at = "Read,Bash"
+            elif spec.type == "mock-author":
+                _sp = spec.system_prompt if spec.system_prompt else MOCK_AUTHOR_SYSTEM_PROMPT
+                _sp += build_deny_prompt(MOCK_AUTHOR_DENY_COMMANDS)
+                _at = "Read,Edit,Write,Bash"
             else:
                 _sp = spec.system_prompt if spec.system_prompt else WORKER_SYSTEM_PROMPT
                 _sp += build_deny_prompt(spec.deny_commands)

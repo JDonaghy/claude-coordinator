@@ -349,6 +349,16 @@ def _milestone_drain_tick(config: Config) -> list:
             )
             continue
 
+        # Gate A (#930, docs/ORACLE_LOOP.md): don't drain a milestone whose
+        # black-box contract doesn't exist yet — skip this tick and retry
+        # later (not deregistered) once `coord acceptance mock` lands one.
+        block_reason = md.gate_a_status(repo_cfg, config, ctx.milestone_number)
+        if block_reason:
+            log.warning(
+                "milestone-drain: %s #%d gated: %s", repo_name, tracking_issue, block_reason
+            )
+            continue
+
         plan = md.plan_dispatch(ctx.work_order, board, config, repo_cfg, ctx.terminal_issues)
         for pick in plan.to_dispatch:
             outcome = md.dispatch_entry(

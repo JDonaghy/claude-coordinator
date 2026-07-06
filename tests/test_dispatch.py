@@ -217,6 +217,36 @@ class TestDispatch:
         assert "tests/acceptance/" in payload["files_forbidden"]
 
     @patch("coord.dispatch.httpx.post")
+    def test_payload_mock_author_exempt_from_acceptance_seal(
+        self, mock_post: MagicMock, proposal: Proposal,
+    ) -> None:
+        """#930: `type="mock-author"` is the one type whose entire job is
+        writing under tests/acceptance/ms-NN/ (Gate A) — it must NOT get the
+        #944 auto-forbid, even though the repo has a driver configured."""
+        from dataclasses import replace
+
+        from coord.config import AcceptanceConfig, AcceptanceDriverConfig
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+            )],
+            acceptance=AcceptanceConfig(drivers={
+                "api": AcceptanceDriverConfig(kind="tui-tuidriver", run="cargo test"),
+            }),
+        )
+        mock_author_proposal = replace(proposal, type="mock-author")
+        dispatch(mock_author_proposal, cfg)
+        payload = mock_post.call_args.kwargs["json"]
+        assert "tests/acceptance/" not in payload["files_forbidden"]
+
+    @patch("coord.dispatch.httpx.post")
     def test_payload_no_acceptance_seal_without_driver(
         self, mock_post: MagicMock, config: Config, proposal: Proposal,
     ) -> None:

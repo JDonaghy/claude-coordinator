@@ -22,6 +22,7 @@ from coord.milestone_dispatch import (
     MilestoneDispatchError,
     dispatch_entry,
     fetch_milestone_context,
+    gate_a_status,
     is_milestone_complete,
     pick_machine,
     plan_dispatch,
@@ -183,6 +184,67 @@ class TestIsMilestoneComplete:
             terminal_issues=frozenset({762, 763, 765}),
         )
         assert is_milestone_complete(ctx) is True
+
+
+# ── gate_a_status (#930, docs/ORACLE_LOOP.md Gate A) ─────────────────────────
+
+
+class TestGateAStatus:
+    def _cfg(self, *, with_driver: bool) -> Config:
+        from coord.config import AcceptanceConfig, AcceptanceDriverConfig
+
+        drivers = {}
+        if with_driver:
+            drivers["api"] = AcceptanceDriverConfig(kind="tui-tuidriver", run="cargo test")
+        return Config(
+            repos=[Repo(name="api", github="acme/api", default_branch="main")],
+            machines=[_machine("laptop", ["api"])],
+            acceptance=AcceptanceConfig(drivers=drivers),
+        )
+
+    def test_none_when_no_acceptance_driver_configured(self) -> None:
+        cfg = self._cfg(with_driver=False)
+        repo = cfg.repo("api")
+        assert gate_a_status(repo, cfg, 9, file_exists=lambda *a: False) is None
+
+    def test_blocked_when_contract_missing(self) -> None:
+        cfg = self._cfg(with_driver=True)
+        repo = cfg.repo("api")
+        reason = gate_a_status(repo, cfg, 9, file_exists=lambda *a: False)
+        assert reason is not None
+        assert "tests/acceptance/ms-9/contract.md" in reason
+        assert "coord acceptance mock api" in reason
+
+    def test_none_when_contract_exists(self) -> None:
+        cfg = self._cfg(with_driver=True)
+        repo = cfg.repo("api")
+        assert gate_a_status(repo, cfg, 9, file_exists=lambda *a: True) is None
+
+    def test_file_exists_called_with_expected_args(self) -> None:
+        cfg = self._cfg(with_driver=True)
+        repo = cfg.repo("api")
+        calls: list[tuple] = []
+
+        def _check(repo_github: str, path: str, branch: str) -> bool:
+            calls.append((repo_github, path, branch))
+            return True
+
+        gate_a_status(repo, cfg, 9, file_exists=_check)
+        assert calls == [("acme/api", "tests/acceptance/ms-9/contract.md", "main")]
+
+    def test_default_file_exists_treats_runtime_error_as_missing(self) -> None:
+        cfg = self._cfg(with_driver=True)
+        repo = cfg.repo("api")
+        with patch("coord.github_ops.get_repo_file", side_effect=RuntimeError("404")):
+            reason = gate_a_status(repo, cfg, 9)
+        assert reason is not None
+
+    def test_default_file_exists_true_when_no_error(self) -> None:
+        cfg = self._cfg(with_driver=True)
+        repo = cfg.repo("api")
+        with patch("coord.github_ops.get_repo_file", return_value="contract body"):
+            reason = gate_a_status(repo, cfg, 9)
+        assert reason is None
 
 
 # ── fetch_milestone_context ──────────────────────────────────────────────────

@@ -24,6 +24,7 @@ from coord.milestone_dispatch import (
     MilestoneDispatchError,
     dispatch_entry,
     fetch_milestone_context,
+    gate_a_status,
     is_milestone_complete,
     plan_dispatch,
 )
@@ -369,6 +370,15 @@ def milestone_dispatch_cmd(
         ctx = fetch_milestone_context(repo_entry, tracking_issue)
     except MilestoneDispatchError as e:
         click.echo(f"error: {e}", err=True)
+        sys.exit(1)
+
+    # Gate A (#930, docs/ORACLE_LOOP.md): refuse to dispatch any of this
+    # milestone's issues until its black-box contract exists. Checked before
+    # everything else — including `--dry-run`/`--next` — so the gate is
+    # never silently bypassable.
+    block_reason = gate_a_status(repo_entry, cfg, ctx.milestone_number)
+    if block_reason:
+        click.echo(f"error: {block_reason}", err=True)
         sys.exit(1)
 
     if not ctx.work_order.nodes:

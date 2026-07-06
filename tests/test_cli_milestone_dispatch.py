@@ -44,6 +44,23 @@ machines:
 """
 
 
+CONFIG_YAML_WITH_ACCEPTANCE_DRIVER = CONFIG_YAML + """\
+acceptance:
+  drivers:
+    api:
+      kind: tui-tuidriver
+      run: "cargo test"
+      mock: "*.screen"
+"""
+
+
+@pytest.fixture
+def config_file_with_gate_a(tmp_path: Path) -> Path:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(CONFIG_YAML_WITH_ACCEPTANCE_DRIVER)
+    return p
+
+
 @pytest.fixture
 def config_file(tmp_path: Path) -> Path:
     p = tmp_path / "coordinator.yml"
@@ -257,3 +274,90 @@ class TestMilestoneDispatchNext:
         disp.assert_not_called()
         assert "#762" in result.output
         assert "#763" in result.output
+
+
+class TestMilestoneDispatchGateA:
+    """#930 (docs/ORACLE_LOOP.md, Gate A) — the issue's specified black-box
+    scenario: a milestone with no contract refuses issue dispatch; with a
+    contract, allows it. Only applies to repos with an acceptance driver
+    configured; ``config_file`` (no driver) is exercised everywhere above
+    and is unaffected by this gate."""
+
+    def test_no_contract_refuses_dispatch(self, config_file_with_gate_a: Path) -> None:
+        open_issues = [
+            {"number": 762, "milestone": {"number": 9}},
+            {"number": 763, "milestone": {"number": 9}},
+            {"number": 765, "milestone": {"number": 9}},
+        ]
+        with patch("coord.github_ops.get_issue", side_effect=_get_issue), \
+             patch("coord.github_ops.get_open_issues", return_value=open_issues), \
+             patch("coord.github_ops.get_repo_file", side_effect=RuntimeError("404")), \
+             patch("coord.board_service.read_board", return_value=Board()), \
+             patch("coord.dispatch.dispatch") as disp:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "dispatch", "api", "100", "--config",
+                 str(config_file_with_gate_a)],
+            )
+        assert result.exit_code == 1, result.output
+        assert "Gate A not satisfied" in result.output
+        assert "tests/acceptance/ms-9/contract.md" in result.output
+        assert "coord acceptance mock api" in result.output
+        disp.assert_not_called()
+
+    def test_no_contract_refuses_even_under_dry_run_and_next(
+        self, config_file_with_gate_a: Path,
+    ) -> None:
+        open_issues = [
+            {"number": 762, "milestone": {"number": 9}},
+            {"number": 763, "milestone": {"number": 9}},
+            {"number": 765, "milestone": {"number": 9}},
+        ]
+        with patch("coord.github_ops.get_issue", side_effect=_get_issue), \
+             patch("coord.github_ops.get_open_issues", return_value=open_issues), \
+             patch("coord.github_ops.get_repo_file", side_effect=RuntimeError("404")), \
+             patch("coord.dispatch.dispatch") as disp:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "dispatch", "api", "100", "--config",
+                 str(config_file_with_gate_a), "--dry-run", "--next"],
+            )
+        assert result.exit_code == 1, result.output
+        assert "Gate A not satisfied" in result.output
+        disp.assert_not_called()
+
+    def test_contract_present_allows_dispatch(self, config_file_with_gate_a: Path) -> None:
+        open_issues = [
+            {"number": 762, "milestone": {"number": 9}},
+            {"number": 763, "milestone": {"number": 9}},
+            {"number": 765, "milestone": {"number": 9}},
+        ]
+        with patch("coord.github_ops.get_issue", side_effect=_get_issue), \
+             patch("coord.github_ops.get_open_issues", return_value=open_issues), \
+             patch("coord.github_ops.get_repo_file", return_value="# Contract\n"), \
+             patch("coord.board_service.read_board", return_value=Board()), \
+             patch("coord.dispatch.dispatch") as disp:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "dispatch", "api", "100", "--config",
+                 str(config_file_with_gate_a), "--dry-run"],
+            )
+        assert result.exit_code == 0, result.output
+        assert "Gate A" not in result.output
+        will_dispatch = result.output.split("Will dispatch now:")[1].split("Waiting:")[0]
+        assert "#762" in will_dispatch
+        assert "#763" in will_dispatch
+
+    def test_repo_without_acceptance_driver_is_unaffected(self, config_file: Path) -> None:
+        """No `acceptance.drivers` entry for this repo -> Gate A is a no-op,
+        exactly as before #930."""
+        with patch("coord.github_ops.get_issue", side_effect=_get_issue), \
+             patch("coord.github_ops.get_open_issues", return_value=[]), \
+             patch("coord.github_ops.get_repo_file") as get_file:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "dispatch", "api", "100", "--config", str(config_file),
+                 "--dry-run"],
+            )
+        get_file.assert_not_called()
+        assert "Gate A" not in result.output

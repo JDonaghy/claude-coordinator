@@ -82,7 +82,13 @@ def dispatch(
     # test-author, not the worker under test. Auto-forbid it for any repo
     # with an acceptance driver configured, so sealing doesn't depend on an
     # operator remembering to also list it under coordinator_only_files.
-    if config.acceptance.driver_for(proposal.repo_name) is not None:
+    # #930: exempt `mock-author` — the one type whose entire job IS writing
+    # under tests/acceptance/ms-NN/ (Gate A). A future `test-author` (#931)
+    # gets the same exemption when it lands.
+    if (
+        proposal.type != "mock-author"
+        and config.acceptance.driver_for(proposal.repo_name) is not None
+    ):
         if "tests/acceptance/" not in files_forbidden:
             files_forbidden.append("tests/acceptance/")
 

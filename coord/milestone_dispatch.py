@@ -29,7 +29,7 @@ Three call sites share this module:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import httpx
 
@@ -51,6 +51,8 @@ __all__ = [
     "MilestoneDispatchError",
     "MilestoneContext",
     "fetch_milestone_context",
+    "GateAFileExists",
+    "gate_a_status",
     "pick_machine",
     "MachinePick",
     "NoMachineAvailable",
@@ -162,6 +164,55 @@ def is_milestone_complete(ctx: MilestoneContext) -> bool:
     """Whether every node in the work order has reached a terminal state."""
     return all(
         n.issue_number in ctx.terminal_issues for n in ctx.work_order.nodes
+    )
+
+
+# (repo_github, path, branch) -> True if the file exists at that ref.
+# Injected so tests never hit `gh` — mirrors ``coord.claim``'s BranchLookup.
+GateAFileExists = Callable[[str, str, str], bool]
+
+
+def _default_gate_a_file_exists(repo_github: str, path: str, branch: str) -> bool:
+    from coord import github_ops  # noqa: PLC0415
+
+    try:
+        github_ops.get_repo_file(repo_github, path, branch=branch)
+        return True
+    except RuntimeError:
+        return False
+
+
+def gate_a_status(
+    repo_cfg: Repo,
+    config: "Config",
+    milestone_number: int,
+    *,
+    file_exists: GateAFileExists | None = None,
+) -> str | None:
+    """Gate A (docs/ORACLE_LOOP.md, #930): a milestone's issues may not
+    dispatch until its black-box contract exists.
+
+    Returns ``None`` when dispatch may proceed — either the repo has no
+    ``acceptance.drivers`` entry configured (Gate A is an oracle-loop
+    concept; repos outside that model dispatch exactly as before #930), or
+    the contract file already exists on the repo's default branch. Returns a
+    human-readable block reason otherwise, naming the missing path and the
+    command that produces it.
+    """
+    if config.acceptance.driver_for(repo_cfg.name) is None:
+        return None
+
+    from coord.acceptance import gate_a_contract_path  # noqa: PLC0415
+
+    path = gate_a_contract_path(milestone_number)
+    check = file_exists or _default_gate_a_file_exists
+    if check(repo_cfg.github, path, repo_cfg.default_branch):
+        return None
+    return (
+        f"Gate A not satisfied: {path!r} does not exist yet on "
+        f"{repo_cfg.default_branch!r}. Run `coord acceptance mock {repo_cfg.name} "
+        "<tracking_issue>` (docs/ORACLE_LOOP.md) to render the mock + write "
+        "the contract before dispatching this milestone's issues."
     )
 
 
