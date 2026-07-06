@@ -30,6 +30,18 @@
 //! (`plans_needing_attention_count` below, read from `status_bar()` in
 //! `mod.rs`), mirroring the existing `live_tmux_sessions` badge pattern —
 //! visible from any view, satisfying "remind me without opening it."
+//!
+//! **Empty state is not one message (#976 fix-up).** A manual smoke test
+//! against a real daemon reported "0 plans" with no indication anything was
+//! wrong; the daemon turned out to be running a pre-#975 build that never
+//! sends `plan_roster` at all — indistinguishable, from the empty Vec alone,
+//! from a board with genuinely zero milestones. `render_plans_panel` now
+//! branches on `BoardData::plan_roster_supported` (mirrors
+//! `BoardPayload::plan_roster_supported`, stamped by `serve_app.py`'s
+//! `board()` handler whenever it computes a roster at all, empty or not) to
+//! show one of two distinct messages: "No plans yet" for a true-empty
+//! roster, or a "Plans unavailable" pointer to upgrade/connect a daemon
+//! otherwise.
 #[allow(unused_imports)]
 use super::*;
 
@@ -135,14 +147,24 @@ impl CoordApp {
     pub(crate) fn render_plans_panel(&self, backend: &mut dyn Backend, rect: Rect, _lh: f32) {
         let entries = self.plans_entries();
         if entries.is_empty() {
-            backend.draw_list(
-                rect,
-                &plain_list(
-                    "plans-empty",
-                    "  No plans yet.  Milestones with a `## Work order` block will appear here.",
-                    0,
-                ),
-            );
+            // #976: an empty roster is ambiguous on its own — it means either
+            // "genuinely zero milestones" (rare but real) or "not currently
+            // receiving plan-roster data at all" (no daemon connected, or a
+            // daemon older than #975 that never computes it). Silently
+            // showing the same "no plans yet" placeholder in the second case
+            // is exactly the review finding this fixes: a stale/pre-#975
+            // daemon rendered indistinguishable from a genuinely empty board.
+            // `plan_roster_supported` (from `BoardPayload`/`BoardData`, see
+            // types.rs) is the authoritative signal — trust it over guessing
+            // from the empty Vec.
+            let message = if self.data.plan_roster_supported {
+                "  No plans yet.  Milestones with a `## Work order` block will appear here."
+            } else {
+                "  Plans unavailable — not receiving plan-roster data. Requires a \
+                 `coord serve` daemon that supports it (v0.4.64+); connect via \
+                 ~/.coord/client.toml, or upgrade + restart the daemon if already connected."
+            };
+            backend.draw_list(rect, &plain_list("plans-empty", message, 0));
             return;
         }
         let sel = self.plans_sel.min(entries.len() - 1);

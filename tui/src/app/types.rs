@@ -491,6 +491,17 @@ pub(crate) struct BoardPayload {
     /// that case.
     #[serde(default)]
     pub(crate) plan_roster: Vec<PlanRosterEntry>,
+    /// #976: capability flag — true whenever the daemon computes
+    /// `plan_roster` at all (see `serve_app.py`'s `board()` handler), even
+    /// if the roster came back empty this tick due to a per-repo
+    /// aggregation error. Absent (→ `false` via `#[serde(default)]`) on
+    /// daemons older than #975, which never emit `plan_roster`/this flag at
+    /// all. Lets the Plans panel tell "genuinely zero milestones" apart
+    /// from "connected to a daemon too old to compute a roster" instead of
+    /// rendering an identical, silent "0 plans" for both (the #976 review
+    /// finding: a stale/pre-#975 daemon produced exactly this ambiguity).
+    #[serde(default)]
+    pub(crate) plan_roster_supported: bool,
 }
 
 /// #584: serde deserializer for `Assignment::test_plan` on the remote
@@ -1276,6 +1287,14 @@ pub(crate) struct BoardData {
     /// read path and daemons older than #975.  The Plans panel renders one
     /// row per entry.
     pub(crate) plan_roster: Vec<PlanRosterEntry>,
+    /// #976: mirrors `BoardPayload::plan_roster_supported` — `true` only
+    /// when the connected daemon actually computes `plan_roster` (any
+    /// #975+ daemon, whether or not it found milestones this tick). `false`
+    /// on the local-SQLite-mode read path (no daemon at all) and on daemons
+    /// older than #975 (no such field on the wire). The Plans panel uses
+    /// this — not `plan_roster.is_empty()` — to decide whether an empty
+    /// roster means "genuinely no plans" or "not receiving plan data."
+    pub(crate) plan_roster_supported: bool,
 }
 
 /// Parsed plan data, mirroring `coord.plan_parser.WorkerPlan.to_dict()`.

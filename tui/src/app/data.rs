@@ -1312,6 +1312,11 @@ pub(crate) fn load_data() -> BoardData {
         // #975: local SQLite path has no daemon to compute the plan roster.
         // Pass empty; the Plans panel renders a "no plans yet" placeholder.
         Vec::new(),
+        // #976: local SQLite path has no daemon at all, so plan_roster is
+        // never "supported" here — the Plans panel must show its
+        // not-connected-to-a-daemon message rather than treating the empty
+        // Vec above as a genuinely empty roster.
+        false,
     )
 }
 
@@ -1345,6 +1350,7 @@ pub(crate) fn assemble_board_data(
     issue_stage_projection: Vec<IssueStageProjection>,
     milestone_work_orders: Vec<MilestoneWorkOrder>,
     plan_roster: Vec<PlanRosterEntry>,
+    plan_roster_supported: bool,
 ) -> BoardData {
     // ── Machine reachability probes + health fetches ──────────────────────
     // Probe using the Tailscale host (fixes #121: machine name ≠ Tailscale hostname).
@@ -1458,6 +1464,7 @@ pub(crate) fn assemble_board_data(
         issue_stage_projection,
         milestone_work_orders,
         plan_roster,
+        plan_roster_supported,
     }
 }
 
@@ -1730,6 +1737,10 @@ pub(crate) fn load_data_remote(url: &str, token: Option<&str>) -> BoardData {
         // #975: server-computed plan roster; empty when the daemon predates
         // #975 (the Plans panel shows a placeholder in that case).
         payload.plan_roster,
+        // #976: capability flag distinguishing "empty roster" from "daemon
+        // predates #975/#976 and never computed one" — see
+        // `BoardData::plan_roster_supported`.
+        payload.plan_roster_supported,
     )
 }
 

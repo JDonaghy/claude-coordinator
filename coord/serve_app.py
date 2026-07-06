@@ -505,6 +505,17 @@ def _board_response_schema(components: dict) -> dict:
                     ],
                 },
             },
+            "plan_roster_supported": {
+                "type": "boolean",
+                "description": (
+                    "#976: capability flag — true whenever this daemon computes "
+                    "plan_roster at all (even if it came back empty this tick due "
+                    "to a per-repo aggregation error). Absent (defaults false on "
+                    "the client) on daemons older than #975, which never emit "
+                    "plan_roster. Lets the Plans panel distinguish a genuinely "
+                    "empty roster from a daemon too old to compute one."
+                ),
+            },
             "milestone_work_orders": {
                 "type": "array",
                 "description": (
@@ -1665,6 +1676,16 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         # projection["issues"] + build_board() snapshot as milestone_work_orders
         # above — no extra `gh` round trip. Fail-open: any error produces an
         # empty list rather than 503ing the board.
+        # #976: always stamp the capability flag — even a daemon that hits the
+        # per-repo `except` below (or a downstream error) still *supports*
+        # plan-roster; only its computation failed this tick. Without this,
+        # the TUI can't tell "genuinely zero milestones" apart from "daemon
+        # predates #975/#976 and never sends `plan_roster` at all" — both
+        # rendered as an identical, silent "0 plans" empty state (the #976
+        # review finding). A pre-#975 daemon never runs this line, so the
+        # field is simply absent from its JSON and the client's
+        # `#[serde(default)]` leaves `plan_roster_supported` false.
+        projection["plan_roster_supported"] = True
         try:
             from coord.plans import aggregate_repo_plans as _aggregate_repo_plans  # noqa: PLC0415
 
