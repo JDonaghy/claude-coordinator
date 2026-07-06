@@ -26,6 +26,7 @@ from pathlib import Path
 import httpx
 
 from coord.config import Config
+from coord.models import Machine
 
 AGENT_PORT = 7433
 
@@ -270,6 +271,23 @@ def _get_issue_body(repo_github: str, issue_number: int) -> str:
     return ""
 
 
+def local_machine(config: Config) -> Machine | None:
+    """The configured ``Machine`` (if any) whose ``name`` or ``host`` prefix
+    matches this process's hostname.
+
+    Extracted out of :func:`find_local_repo_path`'s hostname-matching so
+    callers that need the ``Machine`` object itself (e.g. #966's acceptance
+    capability check, which needs ``.capabilities``, not just a repo path)
+    don't have to re-derive the match. Returns ``None`` when this host isn't
+    a recognized machine in ``coordinator.yml``.
+    """
+    local_hostname = socket.gethostname().split(".")[0]
+    for machine in config.machines:
+        if machine.name == local_hostname or machine.host.split(".")[0] == local_hostname:
+            return machine
+    return None
+
+
 def find_local_repo_path(repo_name: str, config: Config) -> Path | None:
     """Locate the repo on the local machine by matching against coordinator.yml.
 
@@ -280,13 +298,12 @@ def find_local_repo_path(repo_name: str, config: Config) -> Path | None:
     Public so that callers outside this module (e.g. ``coord/cli.py``) can
     reuse it without duplicating the hostname-matching logic.
     """
-    local_hostname = socket.gethostname().split(".")[0]
     # Prefer a machine entry that looks like this machine.
-    for machine in config.machines:
-        if machine.name == local_hostname or machine.host.split(".")[0] == local_hostname:
-            p = machine.repo_path(repo_name)
-            if p:
-                return Path(p).expanduser()
+    here = local_machine(config)
+    if here is not None:
+        p = here.repo_path(repo_name)
+        if p:
+            return Path(p).expanduser()
     # Fall back to any machine that has a repo_path configured.
     for machine in config.machines:
         p = machine.repo_path(repo_name)
