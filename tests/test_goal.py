@@ -47,6 +47,25 @@ class TestParseGoalHeader:
         assert result["days_since_update"] is None
         assert result["headline"] == "Ship it."
 
+    def test_h1_title_containing_north_star_does_not_shadow_the_real_section(self):
+        """Regression (#978 review): the real GOAL.md's H1 is literally
+        "# Current Goal — North Star" — itself a match for a heading-level
+        1-6 "north star" regex — followed by a bolded blockquote sentence
+        *before* the real "## North star" section. A heading regex that
+        matches level-1 headings binds to the H1 and then picks up the
+        blockquote's bold text instead of the intended headline.
+        """
+        text = (
+            "# Current Goal — North Star\n\n"
+            "> **The living, cross-repo / cross-machine objective for the "
+            "coordinator and every agent it dispatches.**\n"
+            "> Some more framing.\n\n"
+            "## North star\n\n"
+            "**Do the real thing.**\n"
+        )
+        result = parse_goal_header(text)
+        assert result["headline"] == "Do the real thing."
+
     def test_missing_north_star_section_falls_back_to_h1_title(self):
         text = "# Some Other Title\n\n_Last updated: 2020-01-01_\n\nNo north star heading here.\n"
         result = parse_goal_header(text)
