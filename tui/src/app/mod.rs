@@ -1954,6 +1954,11 @@ pub struct CoordApp {
     /// accumulating the description; Enter records test_state=failed AND
     /// dispatches `coord fix <work_id> --guidance <buf>`.  Esc cancels.
     pending_report_fix: Option<String>,
+    /// #977: inline title input for the Plans-panel "fast plan capture" key
+    /// (`c` while `active_view == SidebarView::Plans`). `Some(buf)` means we
+    /// are accumulating the plan title; Enter dispatches `coord milestone
+    /// capture <repo> --title <buf>` via `capture_plan_stub`. Esc cancels.
+    pending_plan_capture: Option<String>,
     /// #264: refinement-chat dispatch is pending — we've shelled `coord
     /// refine-chat <repo> <issue>` and are polling the DB for the new
     /// `type="refinement"` assignment to appear so we can open the chat
@@ -2742,6 +2747,7 @@ impl CoordApp {
             pending_purge: None,
             pending_test_fail: None,
             pending_report_fix: None,
+            pending_plan_capture: None,
             pending_refinement: None,
             pending_test_chat: None,
             pending_chat_resume: None,

@@ -306,6 +306,7 @@
             pending_purge: None,
             pending_test_fail: None,
             pending_report_fix: None,
+            pending_plan_capture: None,
             pending_refinement: None,
             pending_test_chat: None,
             pending_chat_resume: None,
@@ -25891,6 +25892,63 @@ Milestone tracking issue.
         );
     }
 
+    // ── #977: Plans panel — fast plan capture TuiDriver tests ────────────
+
+    /// Pressing `c` in the Plans panel opens the capture prompt; typing a
+    /// title and pressing Enter dispatches `coord milestone capture <repo>
+    /// --title <title>` through the command runner. `make_test_app` wires a
+    /// `CommandRunner::new_for_test()` (no real `coord` subprocess), so a
+    /// dispatch on an idle runner resolves immediately to the "Plan
+    /// captured" toast, observable on screen.
+    #[test]
+    fn plans_panel_capture_key_dispatches_milestone_capture() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_test_app(make_plan_roster_board_data());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "◆");
+
+        driver.press(quadraui::Key::Char('c'));
+        assert!(
+            driver.screen_contains("New plan"),
+            "#977: 'c' in the Plans panel must open the capture prompt:\n{}",
+            driver.screen(),
+        );
+
+        for ch in "Redesign onboarding".chars() {
+            driver.type_char(ch);
+        }
+        // The typed text must be visible in the input before submitting.
+        assert!(
+            driver.screen_contains("Redesign onboarding"),
+            "#977: typed title must render in the capture input:\n{}",
+            driver.screen(),
+        );
+
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        assert!(
+            !driver.screen_contains("New plan"),
+            "#977: Enter must close the capture prompt:\n{}",
+            driver.screen(),
+        );
+        assert!(
+            driver.screen_contains("Plan captured"),
+            "#977: Enter must dispatch and toast 'Plan captured':\n{}",
+            driver.screen(),
+        );
+        assert!(
+            driver.screen_contains("Redesign onboarding"),
+            "#977: the toast must name the captured plan title:\n{}",
+            driver.screen(),
+        );
+        assert!(
+            driver.screen_contains("api"),
+            "#977: the toast must name the target repo (the selected row's 'api'):\n{}",
+            driver.screen(),
+        );
+    }
+
     /// No badge at all when every plan-roster entry has an empty
     /// `needs_you` — the status bar must not falsely claim attention is
     /// needed.
@@ -25921,5 +25979,31 @@ Milestone tracking issue.
         assert!(
             !screen.contains("need you") && !screen.contains("needs you"),
             "#976: no plans-attention badge when nothing needs attention:\n{screen}",
+        );
+    }
+
+    /// Escape while the capture prompt is open discards the buffer and
+    /// fires no command — the "Plan captured" toast must never appear.
+    #[test]
+    fn plans_panel_capture_escape_cancels_without_dispatch() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_test_app(make_plan_roster_board_data());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "◆");
+
+        driver.press(quadraui::Key::Char('c'));
+        driver.type_char('x');
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        assert!(
+            !driver.screen_contains("New plan"),
+            "#977: Escape must close the capture prompt:\n{}",
+            driver.screen(),
+        );
+        assert!(
+            !driver.screen_contains("Plan captured"),
+            "#977: Escape must not dispatch — no 'Plan captured' toast:\n{}",
+            driver.screen(),
         );
     }
