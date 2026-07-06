@@ -79,6 +79,16 @@ def test_transcript_floor_prefers_issue_tagged_review(tmp_path: Path) -> None:
     assert "issue-370" in findings.body
 
 
+def test_with_coord_on_path_prefixes_agent_venv_bin() -> None:
+    # #606 PATH-fix: the session command is prefixed so `coord` resolves (agent
+    # self-report path), preserving the original command and the session's PATH.
+    out = interactive._with_coord_on_path("claude --interactive")
+    assert out.endswith("claude --interactive")  # original command preserved
+    assert out.startswith("export PATH=")
+    assert "$HOME/.coord-venv/bin" in out  # agent coord bin prepended (literal $HOME)
+    assert "$PATH" in out  # session's own PATH preserved for runtime expansion
+
+
 def test_transcript_floor_sibling_issue_cross_reference_not_mis_attributed(
     tmp_path: Path,
 ) -> None:

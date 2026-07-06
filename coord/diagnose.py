@@ -215,12 +215,13 @@ def _recover_review_findings(assignment: "Assignment", config: "Config") -> str 
 
     if not assignment.assignment_id:
         return None
+    assignment_id: str = assignment.assignment_id
     ssh_target = _ssh_target_for(assignment, config)
     started_at = assignment.dispatched_at
     findings = _review_findings_from_transcript(
         assignment.issue_number,
         started_at,
-        assignment_id=assignment.assignment_id,
+        assignment_id=assignment_id,
         ssh_target=ssh_target,
     )
     if findings is None:
@@ -228,7 +229,7 @@ def _recover_review_findings(assignment: "Assignment", config: "Config") -> str 
     repo_cfg = next((r for r in config.repos if r.name == assignment.repo_name), None)
     issue_store.post_result(
         issue_store.ResultRecord(
-            assignment_id=assignment.assignment_id,
+            assignment_id=assignment_id,
             machine_name=assignment.machine_name or "unknown",
             repo_name=assignment.repo_name,
             repo_github=(repo_cfg.github if repo_cfg else assignment.repo_name),
