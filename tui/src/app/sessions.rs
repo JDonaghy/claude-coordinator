@@ -1055,11 +1055,24 @@ impl CoordApp {
             .any(|s| s.issue_number == Some(issue_number))
     }
 
+    /// Like [`Self::issue_has_any_discovered_session`] but also matches
+    /// `repo_name`, so a zombie session for repo-b/#N does not falsely
+    /// surface a "Reattach" item on repo-a/#N's right-click menu.
+    pub(crate) fn issue_has_any_discovered_session_for_repo(
+        &self,
+        issue_number: u64,
+        repo_name: &str,
+    ) -> bool {
+        self.live_tmux_sessions.iter().any(|s| {
+            s.issue_number == Some(issue_number)
+                && s.repo_name.as_deref() == Some(repo_name)
+        })
+    }
+
     /// Like [`Self::issue_has_live_session`] but also matches `repo_name`, so
     /// a live session for repo-b/#10 does not falsely block repo-a/#10's
     /// stage-advance.  Use this for all stage-advance gate paths where the
-    /// repo is known.  The right-click menu items use the repo-agnostic
-    /// variant because they have no repo context (pre-existing limitation).
+    /// repo is known.
     pub(crate) fn issue_has_live_session_for_repo(&self, issue_number: u64, repo_name: &str) -> bool {
         self.live_tmux_sessions
             .iter()
