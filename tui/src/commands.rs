@@ -147,6 +147,57 @@ fn find_config_with(
     None
 }
 
+/// Bare Click groups (no group-level `--config` option of their own) — see
+/// [`build_full_args`]'s doc comment. `--config` must land after the leaf
+/// subcommand (argv[1]) for these, not after the group name (argv[0]).
+const BARE_GROUPS: &[&str] = &["milestone", "issue", "context", "acceptance"];
+
+/// Pure builder for the real argv `do_spawn` hands to `Command::new("coord")`.
+/// Split out (rather than inlined in `do_spawn`) so it's unit-testable
+/// without spawning a real subprocess — the `no_spawn` test fast-path
+/// bypasses this entirely, which is exactly how the #977 review's
+/// `--config` placement bug shipped with green tests.
+///
+/// Injects `--config <path>` after the command that actually owns the
+/// option, then appends the rest of `argv` unchanged:
+///
+/// - Flag-style `argv[0]` (e.g. `--version`, starts with `-`): no injection.
+/// - Single leaf verb (`"assign"`, `"merge"`, `"notify"`, `"agent"`, ...):
+///   inject right after `argv[0]` — its own Click command (or, for `agent`,
+///   its own group callback) declares `--config`.
+/// - `coord <group> <verb>` where `group` is one of [`BARE_GROUPS`] (e.g.
+///   `["milestone", "capture", repo, "--title", title]`): the group itself
+///   has no `--config` option — only leaf subcommands do — so `--config`
+///   must land after `argv[1]` instead, or Click's group-level parser
+///   rejects it before the subcommand ever sees it (`Error: No such option:
+///   --config`).
+fn build_full_args(argv: &[String], config_path: Option<&std::path::Path>) -> Vec<String> {
+    let mut v: Vec<String> = Vec::with_capacity(argv.len() + 2);
+    let mut iter = argv.iter();
+    if let Some(first) = iter.next() {
+        v.push(first.clone());
+        // For a bare group, carry the leaf subcommand along before
+        // injecting --config so it lands after that, not the group.
+        let mut owner = first;
+        if !first.starts_with('-') && BARE_GROUPS.contains(&first.as_str()) {
+            if let Some(second) = iter.next() {
+                v.push(second.clone());
+                owner = second;
+            }
+        }
+        if !owner.starts_with('-') {
+            if let Some(cfg) = config_path {
+                v.push("--config".to_string());
+                v.push(cfg.to_string_lossy().into_owned());
+            }
+        }
+        for a in iter {
+            v.push(a.clone());
+        }
+    }
+    v
+}
+
 impl CommandRunner {
     pub fn new() -> Self {
         Self {
@@ -212,10 +263,10 @@ impl CommandRunner {
     /// and transition to `Running` state.  Caller **must** verify the runner
     /// is [`CommandState::Idle`] before calling.
     ///
-    /// For real subcommands (i.e. `argv[0]` does not start with `-`) this
-    /// injects `--config <absolute_path>` into the child's argument list so
-    /// `coord` locates `coordinator.yml` even when the TUI was launched from
-    /// a different working directory.  The injected flag is NOT reflected in
+    /// The real child argv (with `--config <absolute_path>` injected so
+    /// `coord` locates `coordinator.yml` regardless of the TUI's launch
+    /// directory) is built by [`build_full_args`] — see its doc comment for
+    /// where the flag actually lands. The injected flag is NOT reflected in
     /// `label` or the stored `argv` (kept clean for status display and dedup).
     fn do_spawn(&mut self, argv: Vec<String>) {
         let label = format!("coord {}", argv.join(" "));
@@ -258,25 +309,7 @@ impl CommandRunner {
         }
         let (tx, rx) = mpsc::channel();
 
-        // Build the full argument list, injecting --config after the subcommand
-        // name (but not for flag-style args like --version which start with '-').
-        let full_args: Vec<String> = {
-            let mut v: Vec<String> = Vec::with_capacity(argv.len() + 2);
-            let mut iter = argv.iter();
-            if let Some(first) = iter.next() {
-                v.push(first.clone());
-                if !first.starts_with('-') {
-                    if let Some(cfg) = &self.config_path {
-                        v.push("--config".to_string());
-                        v.push(cfg.to_string_lossy().into_owned());
-                    }
-                }
-                for a in iter {
-                    v.push(a.clone());
-                }
-            }
-            v
-        };
+        let full_args = build_full_args(&argv, self.config_path.as_deref());
 
         let label_clone = label.clone();
         std::thread::spawn(move || {
@@ -668,6 +701,109 @@ mod tests {
         let found = find_config_with(None, Some(cwd), Some(home));
         assert_eq!(found, None);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ── `build_full_args` (#977 review: real-argv `--config` placement) ──────
+    //
+    // These exercise the REAL argv-construction path directly (not through
+    // `no_spawn`, which short-circuits `do_spawn` before this logic ever
+    // runs — exactly why the original bug shipped with green tests).
+
+    fn s(args: &[&str]) -> Vec<String> {
+        args.iter().map(|a| a.to_string()).collect()
+    }
+
+    #[test]
+    fn build_full_args_single_leaf_verb_injects_after_argv0() {
+        let argv = s(&["merge", "--skip-review"]);
+        let out = build_full_args(&argv, Some(std::path::Path::new("/cfg.yml")));
+        assert_eq!(
+            out,
+            s(&["merge", "--config", "/cfg.yml", "--skip-review"])
+        );
+    }
+
+    #[test]
+    fn build_full_args_flag_style_argv0_skips_injection() {
+        let argv = s(&["--version"]);
+        let out = build_full_args(&argv, Some(std::path::Path::new("/cfg.yml")));
+        assert_eq!(out, s(&["--version"]));
+    }
+
+    #[test]
+    fn build_full_args_no_config_path_skips_injection() {
+        let argv = s(&["merge"]);
+        let out = build_full_args(&argv, None);
+        assert_eq!(out, s(&["merge"]));
+    }
+
+    /// The #977 review bug: `["milestone", "capture", repo, "--title",
+    /// title]` must get `--config` after `capture` (the leaf subcommand
+    /// that actually declares `@_CONFIG_OPTION`), not after `milestone` (the
+    /// bare Click group, which has no `--config` option and rejects it as
+    /// "No such option: --config" before `capture` ever runs).
+    #[test]
+    fn build_full_args_milestone_capture_injects_after_leaf_subcommand() {
+        let argv = s(&["milestone", "capture", "myrepo", "--title", "Do the thing"]);
+        let out = build_full_args(&argv, Some(std::path::Path::new("/cfg.yml")));
+        assert_eq!(
+            out,
+            s(&[
+                "milestone",
+                "capture",
+                "--config",
+                "/cfg.yml",
+                "myrepo",
+                "--title",
+                "Do the thing",
+            ])
+        );
+    }
+
+    /// `dispatch_milestone_action` (milestone_dag.rs) builds the identical
+    /// `["milestone", "dispatch", ...]` shape — same bare-group bug, same fix.
+    #[test]
+    fn build_full_args_milestone_dispatch_injects_after_leaf_subcommand() {
+        let argv = s(&["milestone", "dispatch", "myrepo", "42"]);
+        let out = build_full_args(&argv, Some(std::path::Path::new("/cfg.yml")));
+        assert_eq!(
+            out,
+            s(&["milestone", "dispatch", "--config", "/cfg.yml", "myrepo", "42"])
+        );
+    }
+
+    /// `coord agent restart --machine X` is NOT a bare group: `agent`'s own
+    /// group callback declares `--config` itself (so it can run standalone
+    /// with no subcommand), so injecting right after `argv[0]` is correct —
+    /// unlike `milestone`/`issue`/`context`/`acceptance`.
+    #[test]
+    fn build_full_args_agent_group_injects_after_argv0_not_leaf() {
+        let argv = s(&["agent", "restart", "--machine", "precision"]);
+        let out = build_full_args(&argv, Some(std::path::Path::new("/cfg.yml")));
+        assert_eq!(
+            out,
+            s(&[
+                "agent",
+                "--config",
+                "/cfg.yml",
+                "restart",
+                "--machine",
+                "precision",
+            ])
+        );
+    }
+
+    #[test]
+    fn build_full_args_other_bare_groups_inject_after_leaf_subcommand() {
+        for group in ["issue", "context", "acceptance"] {
+            let argv = s(&[group, "verb", "arg1"]);
+            let out = build_full_args(&argv, Some(std::path::Path::new("/cfg.yml")));
+            assert_eq!(
+                out,
+                s(&[group, "verb", "--config", "/cfg.yml", "arg1"]),
+                "group {group}"
+            );
+        }
     }
 
     // ── Queue tests ───────────────────────────────────────────────────────────

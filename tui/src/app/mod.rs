@@ -6371,6 +6371,11 @@ impl CoordApp {
                 " j/k=nav  a=merge-all-ready  m=merge-only-this  M=force-merge  d=drop  s=interactive{}  q=quit ",
                 attn
             )
+        } else if self.active_view == SidebarView::Plans {
+            // #977 review: the fast plan-capture key (`c`) had no visible
+            // hint anywhere — surface it here alongside the other Plans
+            // panel bindings so it's discoverable without reading the diff.
+            " j/k=nav  Enter=open epic  c=capture plan  q=quit ".to_string()
         } else {
             // #192: `p` / `a` / `A` retired alongside the PROPOSALS
             // section.  Right-click → Send to Pipeline (#261) is the
