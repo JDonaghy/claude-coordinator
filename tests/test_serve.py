@@ -558,6 +558,72 @@ def test_plan_roster_supported_flag_true_with_populated_roster(
     assert len(board["plan_roster"]) > 0
 
 
+# ── #978: goal_header in /board payload ───────────────────────────────────────
+
+def test_goal_header_in_board_payload(file_db: Path, valid_config_path: Path, monkeypatch):
+    """#978: /board carries a `goal_header` field sourced from
+    `coord.goal.read_goal_header()` — the coord-tui Plans panel pins this
+    above the roster as the GOAL.md north-star header.
+    """
+    import coord.goal as goal_mod
+
+    monkeypatch.setattr(
+        goal_mod,
+        "read_goal_header",
+        lambda: {
+            "available": True,
+            "headline": "Ship the thing end to end.",
+            "last_updated": "2026-07-04",
+            "days_since_update": 2,
+        },
+    )
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(file_db), cfg)
+    with TestClient(app) as cli:
+        board = cli.get("/board").json()
+
+    assert "goal_header" in board, "goal_header key missing from /board"
+    header = board["goal_header"]
+    assert header["available"] is True
+    assert header["headline"] == "Ship the thing end to end."
+    assert header["last_updated"] == "2026-07-04"
+    assert header["days_since_update"] == 2
+
+
+def test_goal_header_unavailable_is_fail_open(file_db: Path, valid_config_path: Path, monkeypatch):
+    """#978: when GOAL.md can't be found/read (packaged install, no repo
+    root, ...), `goal_header` degrades to `{"available": False}` — it must
+    never 503 the whole board.
+    """
+    import coord.goal as goal_mod
+
+    monkeypatch.setattr(goal_mod, "read_goal_header", lambda: {"available": False})
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(file_db), cfg)
+    with TestClient(app) as cli:
+        board = cli.get("/board").json()
+
+    assert board["goal_header"] == {"available": False}
+
+
+def test_goal_header_failure_does_not_blank_board(file_db: Path, valid_config_path: Path, monkeypatch):
+    """#978: a raising `read_goal_header()` must still fail open, not blank
+    the rest of the board payload."""
+    import coord.goal as goal_mod
+
+    def _boom():
+        raise RuntimeError("goal.md parsing exploded")
+
+    monkeypatch.setattr(goal_mod, "read_goal_header", _boom)
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(file_db), cfg)
+    with TestClient(app) as cli:
+        board = cli.get("/board").json()
+
+    assert board["goal_header"] == {"available": False}
+    assert board["round_number"] == 7  # rest of the board is untouched
+
+
 def _make_finished_milestone_db(path: Path) -> None:
     """Seed a milestone (#7, "Wrapped up") whose tracking epic AND every
     work-order child are closed, but the milestone itself is still open on

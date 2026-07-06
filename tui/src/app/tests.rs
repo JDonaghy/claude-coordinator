@@ -25864,6 +25864,99 @@ Milestone tracking issue.
         );
     }
 
+    /// #978: when `goal_header.available`, the Plans panel pins a GOAL.md
+    /// north-star header strip above the roster — headline + "updated
+    /// <date>" line — and the roster rows still render below it.
+    #[test]
+    fn plans_panel_renders_pinned_goal_header_when_available() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_test_app(BoardData {
+            goal_header: GoalHeader {
+                available: true,
+                headline: "Ship the thing end to end.".to_string(),
+                last_updated: Some("2026-07-04".to_string()),
+                days_since_update: Some(2),
+            },
+            ..make_plan_roster_board_data()
+        });
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 160, 40);
+        click_activity_icon(&mut driver, "◆");
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("NORTH STAR"),
+            "#978: pinned GOAL.md header must render:\n{screen}",
+        );
+        assert!(
+            screen.contains("Ship the thing end to end."),
+            "#978: header must show the GOAL.md headline:\n{screen}",
+        );
+        assert!(
+            screen.contains("2026-07-04"),
+            "#978: header must show the last-updated date:\n{screen}",
+        );
+        assert!(
+            !screen.contains("stale"),
+            "#978: a 2-day-old GOAL.md must not be flagged stale:\n{screen}",
+        );
+        // The roster below the pinned header must still render.
+        assert!(
+            screen.contains("Substrate"),
+            "#978: plan roster rows must still render below the pinned header:\n{screen}",
+        );
+    }
+
+    /// #978: a GOAL.md older than the staleness threshold gets a visible
+    /// "stale" hint alongside its age.
+    #[test]
+    fn plans_panel_flags_stale_goal_header() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_test_app(BoardData {
+            goal_header: GoalHeader {
+                available: true,
+                headline: "Old news.".to_string(),
+                last_updated: Some("2026-05-01".to_string()),
+                days_since_update: Some(30),
+            },
+            ..make_plan_roster_board_data()
+        });
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 160, 40);
+        click_activity_icon(&mut driver, "◆");
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("stale"),
+            "#978: a 30-day-old GOAL.md must be flagged stale:\n{screen}",
+        );
+        assert!(
+            screen.contains("30d ago"),
+            "#978: staleness hint must show the day count:\n{screen}",
+        );
+    }
+
+    /// #978: when `goal_header.available` is false (older daemon / no
+    /// daemon at all — the default), the Plans panel renders exactly as it
+    /// did before this field existed — no pinned header, no "NORTH STAR"
+    /// text anywhere on screen.
+    #[test]
+    fn plans_panel_omits_goal_header_when_unavailable() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_test_app(make_plan_roster_board_data());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 160, 40);
+        click_activity_icon(&mut driver, "◆");
+
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("NORTH STAR"),
+            "#978: no pinned header when goal_header.available is false:\n{screen}",
+        );
+        // Roster still renders unaffected.
+        assert!(screen.contains("Substrate"));
+    }
+
     /// The "N plans need you" status-bar badge (#976) must be visible from
     /// ANY view — not just Plans — since the whole point is reminding the
     /// user without them opening the panel. `make_plan_roster_board_data`
