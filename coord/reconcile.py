@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 
 from coord.config import Config
 from coord.dispatch import AGENT_PORT
-from coord.models import Assignment, Board
+from coord.models import WORK_LIKE_TYPES, Assignment, Board
 
 if TYPE_CHECKING:
     from coord.merge_queue import QueuedMerge
@@ -425,10 +425,11 @@ def reconcile(board: Board, config: Config) -> list[str]:
                 branch=branch,
             )
             if done is not None:
-                if done.type == "work":
-                    # Always mark work completions as pending review so the
-                    # dispatch loop below (and future reconcile passes) can
-                    # pick them up reliably.
+                if done.type in WORK_LIKE_TYPES:
+                    # Always mark work(-like) completions as pending review so
+                    # the dispatch loop below (and future reconcile passes)
+                    # can pick them up reliably. #930: "mock-author" is
+                    # work-like too — see WORK_LIKE_TYPES.
                     done.review_state = "pending"
                     newly_done_work.append(done)
                 elif done.type == "review":
@@ -454,7 +455,7 @@ def reconcile(board: Board, config: Config) -> list[str]:
             if done is not None:
                 # mark_done_by_id sets status="done"; correct it to "advisory".
                 done.status = "advisory"
-                if done.type == "work":
+                if done.type in WORK_LIKE_TYPES:
                     # No code pushed → nothing to review. Set review_state to
                     # "advisory" so the review-dispatch loop skips this entry.
                     done.review_state = "advisory"

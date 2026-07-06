@@ -489,6 +489,7 @@ class TestMergeAutoEnqueue:
         issue_number: int = 218,
         assignment_id: str = "w1",
         branch: str = "issue-218-fix",
+        assignment_type: str = "work",
     ) -> None:
         from coord.models import Assignment, Board
         from coord.state import save_board
@@ -502,7 +503,7 @@ class TestMergeAutoEnqueue:
             assignment_id=assignment_id,
             status="done",
             branch=branch,
-            type="work",
+            type=assignment_type,
             test_state="passed",  # smoke gate satisfied (#465)
         )
         save_board(Board(active=[], completed=[a]))
@@ -534,6 +535,36 @@ class TestMergeAutoEnqueue:
         assert result.exit_code == 0, result.output
         assert "auto-enqueued" in result.output
         assert "#218" in result.output
+        create.assert_called_once()
+        merge_fn.assert_called_once()
+
+    def test_auto_enqueues_done_mock_author_when_queue_empty(
+        self, config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        """#930 fix: a completed ``type="mock-author"`` (Gate A) assignment
+        must auto-enqueue through `coord merge` the same as ordinary work —
+        previously the auto-enqueue scan hard-filtered on ``type == "work"``
+        so a Gate A branch could never reach the merge queue via this
+        command."""
+        self._seed_board_with_done_work(
+            coord_db,
+            issue_number=930,
+            assignment_id="ma1",
+            branch="ms-5-gate-a",
+            assignment_type="mock-author",
+        )
+        self._seed_issue_state(coord_db, number=930, state="open")
+
+        with patch("coord.github_ops.create_pr") as create, \
+             patch("coord.github_ops.merge_pr") as merge_fn, \
+             patch("coord.github_ops.get_pr_size", return_value=10):
+            create.return_value = {"number": 99, "url": "u/99", "existed": False}
+            merge_fn.return_value = (True, "ok")
+            result = CliRunner().invoke(main, ["merge", "--config", str(config_file)])
+
+        assert result.exit_code == 0, result.output
+        assert "auto-enqueued" in result.output
+        assert "#930" in result.output
         create.assert_called_once()
         merge_fn.assert_called_once()
 

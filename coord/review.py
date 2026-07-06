@@ -36,7 +36,7 @@ import httpx
 from coord import github_ops
 from coord.config import Config, ReviewsConfig
 from coord.dispatch import AGENT_PORT
-from coord.models import Assignment, Board, Machine
+from coord.models import WORK_LIKE_TYPES, Assignment, Board, Machine
 
 log = logging.getLogger(__name__)
 
@@ -886,7 +886,7 @@ def dispatch_review(
     """
     if not config.reviews.enabled or not config.reviews.auto_dispatch:
         return None
-    if completed.type != "work":
+    if completed.type not in WORK_LIKE_TYPES:
         return None
     if completed.status != "done":
         return None
@@ -1238,8 +1238,9 @@ def dispatch_pending_reviews(board, config, *, test_gate_active: bool = False, n
        the remainder stay ``"pending"`` and are picked up next pass, so even a
        moderate batch bleeds out at a bounded rate instead of all at once.
 
-    A row is eligible when its ``review_state`` is ``None``/``"pending"``, it is
-    a ``"work"`` assignment, the (optional) test gate is satisfied, and #459's
+    A row is eligible when its ``review_state`` is ``None``/``"pending"``, its
+    ``type`` is in :data:`coord.models.WORK_LIKE_TYPES` (``"work"`` or
+    ``"mock-author"``, #930), the (optional) test gate is satisfied, and #459's
     ``has_active_work_followup`` is False (don't review code a live fix is
     rewriting). Both ``reconcile()`` and ``coord notify`` route bulk dispatch
     through here so the cap, surge gate, and #459 dedupe are enforced on every
@@ -1271,7 +1272,7 @@ def dispatch_pending_reviews(board, config, *, test_gate_active: bool = False, n
         c
         for c in board.completed
         if c.review_state in (None, "pending")
-        and c.type == "work"
+        and c.type in WORK_LIKE_TYPES
         # #555: NEVER auto-dispatch a headless `claude -p` review for an
         # *interactive* (`provider_name="claude-pty"`) work completion. The
         # interactive Work→Review handoff is human-attended (TUI confirm →

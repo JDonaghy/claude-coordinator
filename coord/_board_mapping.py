@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from coord.models import Assignment, Board
+from coord.models import WORK_LIKE_TYPES, Assignment, Board
 
 _ACTIVE_STATUSES = ("running", "pending")
 
@@ -157,7 +157,9 @@ def infer_review_state(
     review_rows: list,
     notified_ids: set[str],
 ) -> None:
-    """Set ``review_state`` on completed work assignments from their linked reviews.
+    """Set ``review_state`` on completed work-like assignments from their linked
+    reviews (#930: includes ``type="mock-author"`` — see
+    :data:`coord.models.WORK_LIKE_TYPES`).
 
     Pure core of ``coord.state._infer_review_state``: takes the already-fetched
     review rows (each a mapping with ``assignment_id`` /
@@ -170,7 +172,7 @@ def infer_review_state(
         review_status_for[row["review_of_assignment_id"]] = row["status"]
 
     for a in board.completed:
-        if a.type != "work" or a.assignment_id is None:
+        if a.type not in WORK_LIKE_TYPES or a.assignment_id is None:
             continue
         if a.review_state is not None:
             continue  # explicitly set — don't override

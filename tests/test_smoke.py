@@ -341,6 +341,24 @@ def test_dispatch_smoke_skipped_for_failed_or_review(
     ) is None
 
 
+def test_dispatch_smoke_dispatches_for_mock_author_type(
+    gtk_and_server_config: Config,
+) -> None:
+    """#930 fix: a completed ``type="mock-author"`` (Gate A) assignment must
+    be eligible for automatic smoke dispatch, not just ``type="work"`` —
+    mirrors the same fix applied to review/merge dispatch so the Test stage
+    of Work -> Test -> Review -> Merge also fires for Gate A branches."""
+    mock_author = replace(_completed(), type="mock-author", assignment_id="ma1")
+    result = dispatch_smoke(
+        mock_author, Board(), gtk_and_server_config,
+        http_client=_FakeClient({"id": "smoke-ma"}),
+        diff_lookup=lambda repo, branch: ["src/gtk/window.c"],
+    )
+    assert result is not None
+    assert result.type == "smoke"
+    assert result.review_of_assignment_id == "ma1"
+
+
 def test_dispatch_smoke_sends_to_capable_different_machine(
     gtk_and_server_config: Config,
 ) -> None:

@@ -904,6 +904,32 @@ class TestSmokeGate:
         board = self._board(completed=[work])
         assert mq.has_smoke_verdict(_q("w1"), board) is False
 
+    def test_has_smoke_verdict_mock_author_none_returns_false(self) -> None:
+        """#930 fix: a ``type="mock-author"`` (Gate A) entry with no test
+        verdict must correctly fail the gate (``False``), not silently fail
+        open — before the fix, the ``type == "work"`` filter excluded the
+        mock-author row itself from ``branch_work``, so this incorrectly
+        returned ``True`` (fail-open) regardless of ``test_state``."""
+        mock_author = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="ma1", type="mock-author", status="done",
+            branch="ms-5-gate-a", test_state=None,
+        )
+        board = self._board(completed=[mock_author])
+        assert mq.has_smoke_verdict(_q("ma1", branch="ms-5-gate-a"), board) is False
+
+    def test_has_smoke_verdict_mock_author_passed(self) -> None:
+        """#930 fix: same as above but with a passed verdict — must now
+        correctly return True by actually checking test_state, rather than
+        via the old accidental fail-open."""
+        mock_author = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="ma1", type="mock-author", status="done",
+            branch="ms-5-gate-a", test_state="passed",
+        )
+        board = self._board(completed=[mock_author])
+        assert mq.has_smoke_verdict(_q("ma1", branch="ms-5-gate-a"), board) is True
+
     def test_has_smoke_verdict_no_matching_work_fails_open(self) -> None:
         """When no work assignment for the branch is found on the board, the
         gate fails open (returns True) — can't block without evidence."""
@@ -1230,6 +1256,29 @@ class TestEnqueueApprovedWork:
         assert len(items) == 1
         assert items[0].assignment_id == "w1"
         assert items[0].branch == "issue-1-w1"
+
+    def test_enqueues_mock_author_completion(self, coord_db) -> None:
+        """#930 fix: a completed ``type="mock-author"`` (Gate A) assignment
+        with an approved review + passed test must be enqueued the same as
+        ordinary work — previously the scan hard-filtered on
+        ``type == "work"`` so a Gate A branch could never reach the merge
+        queue through any coord command."""
+        cfg = self._config()
+        mock_author = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="ma1", type="mock-author", status="done",
+            branch="ms-5-gate-a", test_state="passed",
+        )
+        rev = self._review("ma1", verdict="approve")
+        board = self._board(completed=[mock_author, rev])
+
+        changed = mq.enqueue_approved_work(cfg, board)
+
+        assert changed == ["ma1"]
+        items = load_queue()
+        assert len(items) == 1
+        assert items[0].assignment_id == "ma1"
+        assert items[0].branch == "ms-5-gate-a"
 
     def test_enqueues_when_test_state_is_skipped(self, coord_db) -> None:
         """test_state='skipped' also satisfies the smoke gate."""
@@ -2047,6 +2096,23 @@ class TestStagingItems:
         assert items[0].assignment_id == "w1"
         assert items[0].status == mq.STAGING_READY
         assert items[0].reason is None
+
+    def test_ready_when_mock_author_approved_and_smoke_passed(self, coord_db) -> None:
+        """#930 fix: a ``type="mock-author"`` (Gate A) completion is a
+        staging item too — mirrors ordinary work, since it must flow through
+        the same Work -> Test -> Review -> Merge pipeline."""
+        work = Assignment(
+            machine_name="m1", repo_name="api", issue_number=42,
+            issue_title="Some feature", assignment_id="ma1", type="mock-author",
+            status="done", branch="ms-5-gate-a", test_state="passed",
+        )
+        rev = self._review("ma1")
+        board = self._board(completed=[work, rev])
+        cfg = self._config()
+        items = mq.staging_items(board, cfg)
+        assert len(items) == 1
+        assert items[0].assignment_id == "ma1"
+        assert items[0].status == mq.STAGING_READY
 
     def test_ready_when_approved_and_smoke_skipped(self, coord_db) -> None:
         """Approved review + skipped test → READY (skipped counts as verdict)."""
