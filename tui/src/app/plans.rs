@@ -144,7 +144,28 @@ impl CoordApp {
     ///
     /// The currently-selected row is highlighted via `selected_idx` so the
     /// "Enter to open tracking epic" action has a visible target.
-    pub(crate) fn render_plans_panel(&self, backend: &mut dyn Backend, rect: Rect, _lh: f32) {
+    ///
+    /// **#978:** when `BoardData::goal_header.available`, a pinned GOAL.md
+    /// north-star header strip is carved off the top of `rect` and drawn
+    /// first via `render_goal_header_strip`; the roster below (empty-state
+    /// or populated) renders into the remaining `list_rect`. Absent/older
+    /// daemons leave `goal_header.available == false` (the type's
+    /// `Default`), so `list_rect == rect` and nothing changes from before
+    /// this field existed.
+    pub(crate) fn render_plans_panel(&self, backend: &mut dyn Backend, rect: Rect, lh: f32) {
+        let list_rect = if self.data.goal_header.available {
+            let goal_rect = Self::plans_goal_header_rect(rect, lh);
+            self.render_goal_header_strip(backend, goal_rect);
+            Rect::new(
+                rect.x,
+                rect.y + goal_rect.height,
+                rect.width,
+                (rect.height - goal_rect.height).max(0.0),
+            )
+        } else {
+            rect
+        };
+
         let entries = self.plans_entries();
         if entries.is_empty() {
             // #976: an empty roster is ambiguous on its own — it means either
@@ -164,7 +185,7 @@ impl CoordApp {
                  `coord serve` daemon that supports it (v0.4.64+); connect via \
                  ~/.coord/client.toml, or upgrade + restart the daemon if already connected."
             };
-            backend.draw_list(rect, &plain_list("plans-empty", message, 0));
+            backend.draw_list(list_rect, &plain_list("plans-empty", message, 0));
             return;
         }
         let sel = self.plans_sel.min(entries.len() - 1);
@@ -229,7 +250,7 @@ impl CoordApp {
 
         let total = items.len();
         backend.draw_list(
-            rect,
+            list_rect,
             &ListView {
                 id: WidgetId::new("plans-list"),
                 title: Some(StyledText::plain(" PLANS ")),
@@ -241,6 +262,87 @@ impl CoordApp {
                 h_scroll: 0,
                 max_content_width: None,
                 show_v_scrollbar: total > 10,
+            },
+        );
+    }
+
+    /// Carve the pinned GOAL.md header strip off the top of the Plans main
+    /// panel rect (#978). Reserves 2 rows (headline + staleness line),
+    /// capped at 30% of the available height so a short terminal still
+    /// leaves room for at least one roster row below it. Mirrors
+    /// `pipeline_detail_pv_rect_strip` in `render.rs`.
+    fn plans_goal_header_rect(main: Rect, lh: f32) -> Rect {
+        if lh <= 0.0 {
+            return Rect::new(main.x, main.y, main.width, 0.0);
+        }
+        let want_rows = 2.0_f32;
+        let max_h = (main.height * 0.30).max(lh);
+        let h = (want_rows * lh).min(max_h);
+        Rect::new(main.x, main.y, main.width, h)
+    }
+
+    /// Render the pinned GOAL.md north-star header (#978): the headline
+    /// one-liner plus a "updated <date> · <N>d ago" staleness hint, amber +
+    /// `⚠ stale` past `GOAL_STALE_DAYS`. Read-only — not part of the
+    /// selectable roster drawn below it. Only called when
+    /// `self.data.goal_header.available`.
+    fn render_goal_header_strip(&self, backend: &mut dyn Backend, rect: Rect) {
+        const GOAL_STALE_DAYS: i64 = 14;
+        let goal = &self.data.goal_header;
+        let headline = if goal.headline.is_empty() {
+            "GOAL.md".to_string()
+        } else {
+            trunc(&goal.headline, 100).to_string()
+        };
+        let mut items = vec![ListItem {
+            text: StyledText {
+                spans: vec![
+                    StyledSpan::with_fg(" ★ NORTH STAR  ".to_string(), Color::rgb(230, 200, 120)),
+                    StyledSpan::with_fg(headline, Color::rgb(220, 220, 220)),
+                ],
+            },
+            icon: None,
+            detail: None,
+            decoration: Decoration::Header,
+        }];
+        if let Some(last_updated) = &goal.last_updated {
+            let (age_text, age_color) = match goal.days_since_update {
+                Some(days) if days > GOAL_STALE_DAYS => (
+                    format!("   updated {last_updated} · {days}d ago  ⚠ stale"),
+                    Color::rgb(220, 140, 90),
+                ),
+                Some(0) => (
+                    format!("   updated {last_updated} · today"),
+                    Color::rgb(140, 140, 150),
+                ),
+                Some(days) => (
+                    format!("   updated {last_updated} · {days}d ago"),
+                    Color::rgb(140, 140, 150),
+                ),
+                None => (format!("   updated {last_updated}"), Color::rgb(140, 140, 150)),
+            };
+            items.push(ListItem {
+                text: StyledText {
+                    spans: vec![StyledSpan::with_fg(age_text, age_color)],
+                },
+                icon: None,
+                detail: None,
+                decoration: Decoration::Normal,
+            });
+        }
+        backend.draw_list(
+            rect,
+            &ListView {
+                id: WidgetId::new("plans-goal-header"),
+                title: None,
+                items,
+                selected_idx: 0,
+                scroll_offset: 0,
+                has_focus: false,
+                bordered: false,
+                h_scroll: 0,
+                max_content_width: None,
+                show_v_scrollbar: false,
             },
         );
     }

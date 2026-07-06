@@ -1317,6 +1317,10 @@ pub(crate) fn load_data() -> BoardData {
         // not-connected-to-a-daemon message rather than treating the empty
         // Vec above as a genuinely empty roster.
         false,
+        // #978: local SQLite path has no daemon to read GOAL.md from —
+        // `GoalHeader::default()` (available: false) leaves the Plans panel
+        // with no pinned header, exactly as before this field existed.
+        GoalHeader::default(),
     )
 }
 
@@ -1351,6 +1355,7 @@ pub(crate) fn assemble_board_data(
     milestone_work_orders: Vec<MilestoneWorkOrder>,
     plan_roster: Vec<PlanRosterEntry>,
     plan_roster_supported: bool,
+    goal_header: GoalHeader,
 ) -> BoardData {
     // ── Machine reachability probes + health fetches ──────────────────────
     // Probe using the Tailscale host (fixes #121: machine name ≠ Tailscale hostname).
@@ -1465,6 +1470,7 @@ pub(crate) fn assemble_board_data(
         milestone_work_orders,
         plan_roster,
         plan_roster_supported,
+        goal_header,
     }
 }
 
@@ -1741,6 +1747,9 @@ pub(crate) fn load_data_remote(url: &str, token: Option<&str>) -> BoardData {
         // predates #975/#976 and never computed one" — see
         // `BoardData::plan_roster_supported`.
         payload.plan_roster_supported,
+        // #978: server-computed GOAL.md north-star header; `available: false`
+        // (the `Default`) on daemons that predate #978.
+        payload.goal_header,
     )
 }
 

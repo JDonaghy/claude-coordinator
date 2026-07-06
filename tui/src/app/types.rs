@@ -502,6 +502,12 @@ pub(crate) struct BoardPayload {
     /// finding: a stale/pre-#975 daemon produced exactly this ambiguity).
     #[serde(default)]
     pub(crate) plan_roster_supported: bool,
+    /// #978: GOAL.md pinned north-star header for the Plans panel — see
+    /// `GoalHeader` doc comment. `#[serde(default)]` leaves `available:
+    /// false` (the type's `Default`) on daemons that predate #978, which
+    /// never emit this key at all.
+    #[serde(default)]
+    pub(crate) goal_header: GoalHeader,
 }
 
 /// #584: serde deserializer for `Assignment::test_plan` on the remote
@@ -950,6 +956,40 @@ pub(crate) struct PlanRosterEntry {
     pub(crate) needs_you: Vec<String>,
 }
 
+/// GOAL.md pinned north-star header for the Plans panel (#978).
+///
+/// Deserialized from the top-level `goal_header` object, computed
+/// server-side by `coord.goal.read_goal_header()` and injected into the
+/// `/board` payload by `coord/serve_app.py`'s `board()` handler. GOAL.md is a
+/// repo-root doc that isn't shipped in the `coord` PyPI package, so this is
+/// only ever populated when the daemon happens to be running from an actual
+/// git checkout — everywhere else (older daemons that predate #978, packaged
+/// installs, local-SQLite-mode with no daemon at all) `available` is `false`
+/// (the `Default` impl, also what `#[serde(default)]` on `BoardData`'s field
+/// produces when the key is absent entirely) and the Plans panel renders
+/// exactly as it did before this field existed — no header strip, full rect
+/// to the roster.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub(crate) struct GoalHeader {
+    /// True iff the daemon located and parsed a GOAL.md this tick.
+    #[serde(default)]
+    pub(crate) available: bool,
+    /// The north-star one-liner (bolded sentence under GOAL.md's "North
+    /// star" heading, or its H1 title as a fallback), pre-truncated
+    /// server-side.
+    #[serde(default)]
+    pub(crate) headline: String,
+    /// ISO `YYYY-MM-DD` parsed from GOAL.md's `_Last updated: ..._` line, or
+    /// `None` if that line is missing/malformed.
+    #[serde(default)]
+    pub(crate) last_updated: Option<String>,
+    /// Server-computed `today - last_updated` in days (Python's `datetime`
+    /// does the calendar math so the Rust side never needs a date crate).
+    /// `None` whenever `last_updated` is `None`.
+    #[serde(default)]
+    pub(crate) days_since_update: Option<i64>,
+}
+
 /// CI check status for one PR, fetched in the background via `gh pr checks`.
 ///
 /// Populated from `fetch_ci_checks_summary` and stored on `CoordApp` keyed by
@@ -1295,6 +1335,11 @@ pub(crate) struct BoardData {
     /// this — not `plan_roster.is_empty()` — to decide whether an empty
     /// roster means "genuinely no plans" or "not receiving plan data."
     pub(crate) plan_roster_supported: bool,
+    /// #978: mirrors `BoardPayload::goal_header` — the pinned GOAL.md
+    /// north-star header for the Plans panel. `available: false` (the
+    /// type's `Default`) on the local-SQLite-mode read path (no daemon to
+    /// read GOAL.md from) and on daemons older than #978.
+    pub(crate) goal_header: GoalHeader,
 }
 
 /// Parsed plan data, mirroring `coord.plan_parser.WorkerPlan.to_dict()`.

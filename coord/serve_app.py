@@ -516,6 +516,24 @@ def _board_response_schema(components: dict) -> dict:
                     "empty roster from a daemon too old to compute one."
                 ),
             },
+            "goal_header": {
+                "type": "object",
+                "description": (
+                    "#978: GOAL.md pinned north-star header for the coord-tui "
+                    "Plans panel. Computed server-side by coord.goal.read_goal_header() "
+                    "from the repo-root GOAL.md this daemon is running from — fail-open "
+                    "to {\"available\": false} when GOAL.md can't be located (a "
+                    "packaged/PyPI install has no repo root to read; see "
+                    "pyproject.toml, which never ships GOAL.md) or read."
+                ),
+                "properties": {
+                    "available": {"type": "boolean"},
+                    "headline": {"type": "string"},
+                    "last_updated": {"type": ["string", "null"], "description": "ISO YYYY-MM-DD"},
+                    "days_since_update": {"type": ["integer", "null"]},
+                },
+                "required": ["available"],
+            },
             "milestone_work_orders": {
                 "type": "array",
                 "description": (
@@ -1782,6 +1800,15 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             projection["plan_roster"] = _plan_roster
         except Exception:  # noqa: BLE001 — plan-roster failure must not blank the board
             projection["plan_roster"] = []
+        # #978: GOAL.md pinned north-star header for the Plans panel. Fail-open
+        # to {"available": False} — a packaged/PyPI install has no repo root to
+        # read GOAL.md from (see coord/goal.py's `_resolve_goal_md_path`), and a
+        # parse failure must not blank the board.
+        try:
+            from coord.goal import read_goal_header as _read_goal_header  # noqa: PLC0415
+            projection["goal_header"] = _read_goal_header()
+        except Exception:  # noqa: BLE001 — goal-header failure must not blank the board
+            projection["goal_header"] = {"available": False}
         return JSONResponse(projection)
 
     async def serve_config(request: Request) -> Response:  # noqa: ARG001
