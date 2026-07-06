@@ -541,6 +541,12 @@ pub(crate) enum ContextMenuTarget {
     /// Right-click on a Pipeline sidebar row.
     PipelineRow {
         issue_number: Option<u64>,
+        /// Coord-local repo name for the row, drawn from
+        /// `PipelineIssue::coord_repo`.  Used to gate live/zombie-session
+        /// actions (Reattach vs Start) repo-precisely so that repo-a/#N and
+        /// repo-b/#N don't cross-contaminate each other's menus (#983).
+        /// `None` when no row is selected or the issue has no `coord_repo`.
+        repo_name: Option<String>,
         /// #262: lifecycle classification of the row at right-click
         /// time.  Drives which menu items appear (e.g. Start with
         /// Plan / Skip Plan only on New rows).

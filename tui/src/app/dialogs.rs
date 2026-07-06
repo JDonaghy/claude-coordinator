@@ -442,6 +442,11 @@ impl CoordApp {
         &self,
         issue_number: Option<u64>,
         lifecycle: &PipelineRowLifecycle,
+        // Coord-local repo name for the selected Pipeline row.  When `Some`,
+        // the live/zombie session gates are scoped to that repo so that
+        // repo-a/#N and repo-b/#N cannot cross-contaminate the menu (#983).
+        // Falls back to the repo-agnostic helpers only when `None`.
+        repo_name: Option<&str>,
     ) -> Vec<ContextMenuItem> {
         let mut items: Vec<ContextMenuItem> = Vec::new();
         // #467 / #607: "Start" launchers grouped into pull-right submenus.
@@ -461,12 +466,22 @@ impl CoordApp {
             // or is absent.  The zombie case adds "Reattach" alongside the Start
             // actions rather than hard-locking the menu, so the operator can
             // still access Kill/Diagnose/Drop-to-backlog (#676 guard).
+            // #983: gate on the repo-precise variants when the row's repo is
+            // known, so a live/zombie session for repo-a/#N does not falsely
+            // show "Reattach" on repo-b/#N's menu.  Falls back to the
+            // repo-agnostic helpers only when repo_name is unknown.
             let has_running = issue_number
-                .map(|n| self.issue_has_live_session(n))
+                .map(|n| match repo_name {
+                    Some(r) => self.issue_has_live_session_for_repo(n, r),
+                    None => self.issue_has_live_session(n),
+                })
                 .unwrap_or(false);
             let has_zombie = !has_running
                 && issue_number
-                    .map(|n| self.issue_has_any_discovered_session(n))
+                    .map(|n| match repo_name {
+                        Some(r) => self.issue_has_any_discovered_session_for_repo(n, r),
+                        None => self.issue_has_any_discovered_session(n),
+                    })
                     .unwrap_or(false);
             if has_running {
                 // Running session — collapse the entire launcher block to a
@@ -677,12 +692,16 @@ impl CoordApp {
             SidebarView::Pipeline => {
                 let sel = self.pipeline_sel.and_then(|i| self.pipeline_issues.get(i));
                 let issue_number = sel.map(|i| i.number);
+                // #983: carry the coord-local repo name so the menu gate can
+                // be scoped repo-precisely (no cross-repo #N collision).
+                let repo_name = sel.and_then(|i| i.coord_repo.clone());
                 // #262: classify the row so the menu offers Start only when New.
                 let lifecycle = sel
                     .map(|i| self.pipeline_row_lifecycle(i))
                     .unwrap_or(PipelineRowLifecycle::Other);
                 Some(ContextMenuTarget::PipelineRow {
                     issue_number,
+                    repo_name,
                     lifecycle,
                 })
             }
@@ -721,8 +740,13 @@ impl CoordApp {
             ),
             ContextMenuTarget::PipelineRow {
                 issue_number,
+                repo_name,
                 lifecycle,
-            } => self.context_menu_items_for_pipeline_row(*issue_number, lifecycle),
+            } => self.context_menu_items_for_pipeline_row(
+                *issue_number,
+                lifecycle,
+                repo_name.as_deref(),
+            ),
             ContextMenuTarget::MachineRow { name, is_paused } => {
                 self.context_menu_items_for_machine_row(name, *is_paused)
             }

@@ -11686,7 +11686,7 @@
         );
         // #727: the menu offers BOTH Reattach (zombie) AND Start launchers.
         let items =
-            app.context_menu_items_for_pipeline_row(Some(514), &PipelineRowLifecycle::InProgress);
+            app.context_menu_items_for_pipeline_row(Some(514), &PipelineRowLifecycle::InProgress, None);
         assert!(
             items.iter().any(|i| i.label == "Reattach to live session"),
             "#727: zombie session must offer Reattach in the right-click menu"
@@ -11740,7 +11740,7 @@
         }];
 
         let items =
-            app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::InProgress);
+            app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::InProgress, None);
         assert!(
             items.iter().any(|i| i.label == "Reattach to live session"),
             "#727: zombie must offer 'Reattach to live session' in the right-click menu"
@@ -11788,7 +11788,7 @@
             "#727: absent-from-board session must count as a discovered session"
         );
         let items =
-            app.context_menu_items_for_pipeline_row(Some(77), &PipelineRowLifecycle::InProgress);
+            app.context_menu_items_for_pipeline_row(Some(77), &PipelineRowLifecycle::InProgress, None);
         assert!(
             items.iter().any(|i| i.label == "Reattach to live session"),
             "#727: absent-from-board session must still offer Reattach"
@@ -11912,7 +11912,7 @@
         let lifecycle = PipelineRowLifecycle::New;
 
         // No live session → the Start (interactive/automated) submenu parents are present.
-        let items = app.context_menu_items_for_pipeline_row(Some(514), &lifecycle);
+        let items = app.context_menu_items_for_pipeline_row(Some(514), &lifecycle, None);
         assert!(
             items.iter().any(|i| i.label == "Start (interactive)"),
             "#607: Start (interactive) parent must be present when no live session"
@@ -11932,11 +11932,129 @@
             pane_dead: false,
             pending_sweep_count: 0,
         }];
-        let items = app.context_menu_items_for_pipeline_row(Some(514), &lifecycle);
+        let items = app.context_menu_items_for_pipeline_row(Some(514), &lifecycle, None);
         assert!(items.iter().any(|i| i.label == "Reattach to live session"));
         // Submenu parents must not appear alongside Reattach.
         assert!(!items.iter().any(|i| i.label == "Start (interactive)"));
         assert!(!items.iter().any(|i| i.label == "Start (automated)"));
+    }
+
+    /// #983: a live/zombie session for repo-a/#N must NOT cause repo-b/#N's
+    /// Pipeline right-click menu to offer "Reattach to live session".
+    ///
+    /// Before the fix `context_menu_items_for_pipeline_row` keyed on bare
+    /// issue number, so any live session with the same number (regardless of
+    /// repo) would suppress the normal Start launchers and show Reattach.
+    #[test]
+    fn pipeline_menu_gate_does_not_cross_repo_contaminate() {
+        let mut app = make_app_default();
+
+        // repo-a/#420 has a RUNNING interactive session.
+        let work_a = make_assignment_typed("running", 420, "repo-a", Some("work"));
+        let aid_a = work_a.id.clone();
+        app.data.assignments.push(work_a);
+        app.live_tmux_sessions
+            .push(make_live_tmux_session(&aid_a, 420, "repo-a"));
+
+        // repo-b/#420 has NO session of its own.
+        app.data
+            .assignments
+            .push(make_assignment_typed("done", 420, "repo-b", Some("work")));
+
+        // Sanity: repo-agnostic helper sees a live session for #420 (any repo).
+        assert!(
+            app.issue_has_live_session(420),
+            "issue_has_live_session must see repo-a's running session"
+        );
+
+        // The repo-precise gate: repo-a's menu should collapse to Reattach.
+        let items_a = app.context_menu_items_for_pipeline_row(
+            Some(420),
+            &PipelineRowLifecycle::InProgress,
+            Some("repo-a"),
+        );
+        assert!(
+            items_a.iter().any(|i| i.label == "Reattach to live session"),
+            "#983: repo-a/#420 must offer Reattach (it has a live session)"
+        );
+        assert!(
+            !items_a.iter().any(|i| i.label == "Start (interactive)"),
+            "#983: repo-a/#420 must NOT offer Start alongside Reattach (running session)"
+        );
+
+        // repo-b/#420 must NOT see Reattach — its session is dead (done).
+        let items_b = app.context_menu_items_for_pipeline_row(
+            Some(420),
+            &PipelineRowLifecycle::InProgress,
+            Some("repo-b"),
+        );
+        assert!(
+            !items_b.iter().any(|i| i.label == "Reattach to live session"),
+            "#983: repo-b/#420 must NOT offer Reattach — its session belongs to repo-a"
+        );
+        assert!(
+            items_b.iter().any(|i| i.label == "Start (interactive)"),
+            "#983: repo-b/#420 must offer normal Start (interactive) actions"
+        );
+        assert!(
+            items_b.iter().any(|i| i.label == "Start (automated)"),
+            "#983: repo-b/#420 must offer normal Start (automated) actions"
+        );
+    }
+
+    /// #983: cross-repo zombie session collision — a zombie tmux session for
+    /// repo-a/#N must not surface "Reattach" on repo-b/#N's menu.
+    #[test]
+    fn pipeline_menu_zombie_gate_does_not_cross_repo_contaminate() {
+        let mut app = make_app_default();
+
+        // repo-a/#420: assignment is done but tmux session still alive (zombie).
+        let done_a = make_assignment_typed("done", 420, "repo-a", Some("work"));
+        let aid_a = done_a.id.clone();
+        app.data.assignments.push(done_a);
+        app.live_tmux_sessions
+            .push(make_live_tmux_session(&aid_a, 420, "repo-a"));
+
+        // repo-b/#420 has its own done assignment, no live session.
+        app.data
+            .assignments
+            .push(make_assignment_typed("done", 420, "repo-b", Some("work")));
+
+        // Sanity: repo-agnostic helper sees a discovered session for #420.
+        assert!(
+            app.issue_has_any_discovered_session(420),
+            "issue_has_any_discovered_session must see repo-a's zombie"
+        );
+
+        // repo-a: zombie → menu shows Reattach alongside Start.
+        let items_a = app.context_menu_items_for_pipeline_row(
+            Some(420),
+            &PipelineRowLifecycle::InProgress,
+            Some("repo-a"),
+        );
+        assert!(
+            items_a.iter().any(|i| i.label == "Reattach to live session"),
+            "#983: repo-a/#420 zombie must offer Reattach"
+        );
+        assert!(
+            items_a.iter().any(|i| i.label == "Start (interactive)"),
+            "#983: repo-a/#420 zombie must also offer Start (not hard-locked)"
+        );
+
+        // repo-b: NO zombie of its own → normal menu, no Reattach.
+        let items_b = app.context_menu_items_for_pipeline_row(
+            Some(420),
+            &PipelineRowLifecycle::InProgress,
+            Some("repo-b"),
+        );
+        assert!(
+            !items_b.iter().any(|i| i.label == "Reattach to live session"),
+            "#983: repo-b/#420 must NOT show Reattach for repo-a's zombie session"
+        );
+        assert!(
+            items_b.iter().any(|i| i.label == "Start (interactive)"),
+            "#983: repo-b/#420 must offer normal Start (interactive)"
+        );
     }
 
     #[test]
@@ -11980,6 +12098,7 @@
     fn pipeline_target(issue_number: Option<u64>) -> ContextMenuTarget {
         ContextMenuTarget::PipelineRow {
             issue_number,
+            repo_name: None,
             lifecycle: PipelineRowLifecycle::Other,
         }
     }
@@ -12317,7 +12436,7 @@
             "no Chat without an issue number",
         );
         let has_chat_pipe = |lc: &PipelineRowLifecycle| -> bool {
-            app.context_menu_items_for_pipeline_row(Some(42), lc)
+            app.context_menu_items_for_pipeline_row(Some(42), lc, None)
                 .iter()
                 .any(|it| it.action_id.as_deref() == Some("chat-about-issue"))
         };
@@ -12382,7 +12501,7 @@
         // #607: start actions are now inside pull-right submenus — search
         // recursively.
         let app = make_app_default();
-        let items = app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::New);
+        let items = app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::New, None);
         let action_ids = all_action_ids_recursive(&items);
         assert!(
             action_ids.contains(&"start-with-plan"),
@@ -12411,7 +12530,7 @@
         // Start (automated) submenu — search recursively.
         let app = make_app_default();
         let items =
-            app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::InProgress);
+            app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::InProgress, None);
         let action_ids = all_action_ids_recursive(&items);
         assert!(action_ids.contains(&"start-with-plan"));
         assert!(action_ids.contains(&"start-skip-plan"));
@@ -12421,7 +12540,7 @@
     fn pipeline_done_row_offers_noninteractive_start() {
         // #leg1 / #607: also offered on Done rows — nested in Start (automated).
         let app = make_app_default();
-        let items = app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::Done);
+        let items = app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::Done, None);
         let action_ids = all_action_ids_recursive(&items);
         assert!(action_ids.contains(&"start-with-plan"));
         assert!(action_ids.contains(&"start-skip-plan"));
@@ -12434,7 +12553,7 @@
         // The "Start (interactive)" item must be a parent with children, not
         // a flat action.  The flat "Start work (interactive)" label is gone.
         let app = make_app_default();
-        let items = app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::New);
+        let items = app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::New, None);
         let parent = items.iter().find(|i| i.label == "Start (interactive)");
         assert!(parent.is_some(), "Start (interactive) parent must exist");
         let parent = parent.unwrap();
@@ -12457,7 +12576,7 @@
     fn pipeline_drop_to_backlog_gating() {
         // Returns Some(disabled) when the item exists, else None.
         fn drop_disabled(app: &CoordApp, lifecycle: PipelineRowLifecycle) -> Option<bool> {
-            app.context_menu_items_for_pipeline_row(Some(42), &lifecycle)
+            app.context_menu_items_for_pipeline_row(Some(42), &lifecycle, None)
                 .iter()
                 .find(|i| i.action_id.as_deref() == Some("drop-to-backlog"))
                 .map(|i| i.disabled)
@@ -12556,7 +12675,7 @@
         // "Start (automated)" must contain Work, Plan, AND Merge as children
         // with the correct action_ids.
         let app = make_app_default();
-        let items = app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::New);
+        let items = app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::New, None);
         let parent = items.iter().find(|i| i.label == "Start (automated)");
         assert!(parent.is_some(), "Start (automated) parent must exist");
         let parent = parent.unwrap();
@@ -12575,7 +12694,7 @@
         // `start-merge-automated` must be disabled when no done work assignment
         // with a branch exists for the selected issue.
         let app = make_app_default();
-        let items = app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::New);
+        let items = app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::New, None);
         let children = items
             .iter()
             .find(|i| i.label == "Start (automated)")
@@ -12602,7 +12721,7 @@
         work.branch = Some("issue-42-feature".to_string()); // branch required by completed_work_aid_for
         app.data.assignments.push(work);
         let items =
-            app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::New);
+            app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::New, None);
         let children = items
             .iter()
             .find(|i| i.label == "Start (automated)")
@@ -12635,7 +12754,7 @@
             .assignments
             .push(make_assignment_typed("running", 42, "api", Some("merge")));
         let items =
-            app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::New);
+            app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::New, None);
         let children = items
             .iter()
             .find(|i| i.label == "Start (automated)")
@@ -12755,7 +12874,7 @@
         // Review, Testing, and Merge inside Start (interactive) must be
         // disabled when no completed work assignment exists (#539 / #517).
         let app = make_app_default();
-        let items = app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::New);
+        let items = app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::New, None);
         let children = items
             .iter()
             .find(|i| i.label == "Start (interactive)")
@@ -12779,6 +12898,7 @@
             Point::new(0.0, 0.0),
             ContextMenuTarget::PipelineRow {
                 issue_number: Some(42),
+                repo_name: None,
                 lifecycle: PipelineRowLifecycle::New,
             },
         );
@@ -12809,6 +12929,7 @@
             Point::new(0.0, 0.0),
             ContextMenuTarget::PipelineRow {
                 issue_number: Some(42),
+                repo_name: None,
                 lifecycle: PipelineRowLifecycle::New,
             },
         );
@@ -12836,6 +12957,7 @@
             Point::new(0.0, 0.0),
             ContextMenuTarget::PipelineRow {
                 issue_number: Some(42),
+                repo_name: None,
                 lifecycle: PipelineRowLifecycle::New,
             },
         );
@@ -12876,7 +12998,7 @@
         // with an empty bar (only Copy + Refresh, both filtered out).
         let app = make_app_default();
         let items =
-            app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::InProgress);
+            app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::InProgress, None);
         let action_ids: Vec<&str> = items
             .iter()
             .filter_map(|it| it.action_id.as_deref())
@@ -12896,7 +13018,7 @@
     #[test]
     fn pipeline_done_row_offers_open_pr() {
         let app = make_app_default();
-        let items = app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::Done);
+        let items = app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::Done, None);
         let action_ids: Vec<&str> = items
             .iter()
             .filter_map(|it| it.action_id.as_deref())
@@ -12915,7 +13037,7 @@
         // "diagnose-fix-stage" (Diagnose & fix stage…).
         let app = make_app_default();
         let items =
-            app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::InProgress);
+            app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::InProgress, None);
         let ids: Vec<&str> = items
             .iter()
             .filter_map(|it| it.action_id.as_deref())
@@ -12966,7 +13088,7 @@
         app.data.assignments.push(review);
 
         let items =
-            app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::InProgress);
+            app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::InProgress, None);
         let action_ids: Vec<&str> = items
             .iter()
             .filter_map(|it| it.action_id.as_deref())
@@ -12995,7 +13117,7 @@
         app.data.assignments.push(review);
 
         let items =
-            app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::InProgress);
+            app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::InProgress, None);
         let action_ids: Vec<&str> = items
             .iter()
             .filter_map(|it| it.action_id.as_deref())
@@ -13068,7 +13190,7 @@
         // can also diagnose a stall.
         let app = make_app_default();
         let items =
-            app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::InProgress);
+            app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::InProgress, None);
         let action_ids: Vec<&str> = items
             .iter()
             .filter_map(|it| it.action_id.as_deref())
@@ -13091,7 +13213,7 @@
         // only makes sense for InProgress items.
         let app = make_app_default();
         let items =
-            app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::New);
+            app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::New, None);
         let action_ids: Vec<&str> = items
             .iter()
             .filter_map(|it| it.action_id.as_deref())
@@ -13115,6 +13237,7 @@
         app.pipeline_sel = Some(0);
         let target = ContextMenuTarget::PipelineRow {
             issue_number: Some(42),
+            repo_name: None,
             lifecycle: PipelineRowLifecycle::InProgress,
         };
         let handled = app.dispatch_context_menu_action("troubleshoot-interactive", &target);
@@ -20665,7 +20788,7 @@
     fn context_menu_testing_enabled_only_for_done_work_with_branch() {
         fn testing_disabled(app: &CoordApp) -> bool {
             let items = app
-                .context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::Other);
+                .context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::Other, None);
             let parent = items
                 .iter()
                 .find(|i| i.label == "Start (interactive)")
@@ -24330,6 +24453,7 @@ Milestone tracking issue.
         let items = app.context_menu_items_for_pipeline_row(
             Some(42),
             &PipelineRowLifecycle::InProgress,
+            None,
         );
         let action_ids: Vec<&str> = items
             .iter()
