@@ -45,6 +45,22 @@ def _active(*, issue: int, repo: str = "api") -> Assignment:
     )
 
 
+def _chat(
+    *, issue: int, repo: str = "api", status: str = "running"
+) -> Assignment:
+    """A ``type="milestone-chat"`` assignment against the tracking issue —
+    what `coord milestone chat <repo> <tracking_issue>` dispatches (#976)."""
+    return Assignment(
+        machine_name="laptop",
+        repo_name=repo,
+        issue_number=issue,
+        issue_title=f"Milestone chat #{issue}",
+        status=status,
+        assignment_id=f"chat{issue}",
+        type="milestone-chat",
+    )
+
+
 def _ms(number: int, title: str = "") -> dict:
     return {"number": number, "title": title or f"Milestone {number}"}
 
@@ -300,6 +316,129 @@ class TestAggregatePlanSignals:
         )
         assert entry.has_work_order is False
         assert "no_work_order" in entry.needs_you
+
+
+# ── aggregate_plan — chat_pending signal (#976) ──────────────────────────────
+
+
+class TestChatPendingSignal:
+    def test_chat_pending_alongside_ready_waiting(self) -> None:
+        """A running milestone-chat session on the tracking issue surfaces
+        `chat_pending` in addition to whatever other signal already fired."""
+        board = Board()
+        board.active.append(_chat(issue=9))
+        entry = aggregate_plan(
+            milestone_title="v1",
+            milestone_number=1,
+            repo_name="api",
+            repo_github="acme/api",
+            tracking_issue_number=9,
+            tracking_body=WORK_ORDER_BODY,
+            board=board,
+            open_issue_numbers={10, 11, 12},
+        )
+        assert "ready_waiting" in entry.needs_you
+        assert "chat_pending" in entry.needs_you
+
+    def test_chat_pending_with_no_work_order(self) -> None:
+        """A milestone-chat session against a tracking issue that has no
+        parseable work order yet still surfaces alongside `no_work_order`."""
+        board = Board()
+        board.active.append(_chat(issue=9))
+        entry = aggregate_plan(
+            milestone_title="v1",
+            milestone_number=1,
+            repo_name="api",
+            repo_github="acme/api",
+            tracking_issue_number=9,
+            tracking_body=None,
+            board=board,
+            open_issue_numbers=set(),
+        )
+        assert entry.has_work_order is False
+        assert "no_work_order" in entry.needs_you
+        assert "chat_pending" in entry.needs_you
+
+    def test_chat_pending_absent_when_no_active_chat(self) -> None:
+        entry = aggregate_plan(
+            milestone_title="v1",
+            milestone_number=1,
+            repo_name="api",
+            repo_github="acme/api",
+            tracking_issue_number=9,
+            tracking_body=WORK_ORDER_BODY,
+            board=Board(),
+            open_issue_numbers={10, 11, 12},
+        )
+        assert "chat_pending" not in entry.needs_you
+
+    def test_chat_pending_ignores_other_assignment_types(self) -> None:
+        """A `work` assignment on the tracking issue number is not a chat —
+        only `type="milestone-chat"` counts."""
+        board = Board()
+        board.active.append(_active(issue=9))
+        entry = aggregate_plan(
+            milestone_title="v1",
+            milestone_number=1,
+            repo_name="api",
+            repo_github="acme/api",
+            tracking_issue_number=9,
+            tracking_body=WORK_ORDER_BODY,
+            board=board,
+            open_issue_numbers={10, 11, 12},
+        )
+        assert "chat_pending" not in entry.needs_you
+
+    def test_chat_pending_ignores_failed_chat(self) -> None:
+        """A failed chat dispatch never actually opened — not "pending"."""
+        board = Board()
+        board.active.append(_chat(issue=9, status="failed"))
+        entry = aggregate_plan(
+            milestone_title="v1",
+            milestone_number=1,
+            repo_name="api",
+            repo_github="acme/api",
+            tracking_issue_number=9,
+            tracking_body=WORK_ORDER_BODY,
+            board=board,
+            open_issue_numbers={10, 11, 12},
+        )
+        assert "chat_pending" not in entry.needs_you
+
+    def test_chat_pending_scoped_to_repo(self) -> None:
+        """A milestone-chat session on the same issue number but a different
+        repo must not leak across repos."""
+        board = Board()
+        board.active.append(_chat(issue=9, repo="other-repo"))
+        entry = aggregate_plan(
+            milestone_title="v1",
+            milestone_number=1,
+            repo_name="api",
+            repo_github="acme/api",
+            tracking_issue_number=9,
+            tracking_body=WORK_ORDER_BODY,
+            board=board,
+            open_issue_numbers={10, 11, 12},
+        )
+        assert "chat_pending" not in entry.needs_you
+
+    def test_chat_pending_true_on_done_milestone(self) -> None:
+        """chat_pending is orthogonal — it can fire even when every
+        work-order node is done and no other signal would otherwise."""
+        board = Board()
+        board.active.append(_chat(issue=9))
+        entry = aggregate_plan(
+            milestone_title="v1",
+            milestone_number=1,
+            repo_name="api",
+            repo_github="acme/api",
+            tracking_issue_number=9,
+            tracking_body=WORK_ORDER_BODY,
+            board=board,
+            open_issue_numbers=set(),  # all closed → all terminal
+        )
+        assert entry.done == entry.total
+        assert entry.needs_you == ["chat_pending"]
 
 
 # ── aggregate_repo_plans ─────────────────────────────────────────────────────

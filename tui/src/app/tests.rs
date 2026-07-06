@@ -25479,3 +25479,192 @@ Milestone tracking issue.
             driver.screen(),
         );
     }
+
+    // ── #976: Plans health chips + ActivityBar attention badge ───────────
+
+    /// A plan-roster entry carrying two `needs_you` signals at once
+    /// (`stalled` + `chat_pending`) and partial completion (done=2/total=4)
+    /// — exercises the #976 per-signal health chips (each signal renders
+    /// individually rather than one flat bracket list) and the always-on
+    /// `NN% done` chip.
+    fn make_plan_roster_with_chat_pending_board_data() -> BoardData {
+        BoardData {
+            pipeline_default_gates: vec!["review".to_string(), "merge".to_string()],
+            pipeline_tracked_labels: vec!["coord".to_string()],
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            plan_roster: vec![PlanRosterEntry {
+                repo: "api".to_string(),
+                title: "Stalled Plan".to_string(),
+                milestone_number: 7,
+                tracking_issue: Some(700),
+                has_work_order: true,
+                ready_frontier: 0,
+                blocked: 2,
+                in_flight: 0,
+                done: 2,
+                total: 4,
+                needs_you: vec!["stalled".to_string(), "chat_pending".to_string()],
+            }],
+            ..BoardData::default()
+        }
+    }
+
+    /// A single plan-roster entry with no work order (no epic yet) — used
+    /// to assert the `NN% done` chip is *absent* when there's no total to
+    /// compute a percentage from, without a second row's chip muddying the
+    /// whole-screen text assertion.
+    fn make_single_no_work_order_plan_board_data() -> BoardData {
+        BoardData {
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            plan_roster: vec![PlanRosterEntry {
+                repo: "api".to_string(),
+                title: "Bare Milestone".to_string(),
+                milestone_number: 9,
+                tracking_issue: None,
+                has_work_order: false,
+                ready_frontier: 0,
+                blocked: 0,
+                in_flight: 0,
+                done: 0,
+                total: 0,
+                needs_you: vec!["no_work_order".to_string()],
+            }],
+            ..BoardData::default()
+        }
+    }
+
+    /// Each `needs_you` signal renders as its own health chip (#976) — the
+    /// raw signal tokens stay on screen (backward-compatible with #975's
+    /// substring assertions on `ready_waiting`/`no_work_order`), and a plan
+    /// with two simultaneous signals (`stalled` + `chat_pending`) shows
+    /// both, plus the new always-on `NN% done` chip.
+    #[test]
+    fn plans_panel_renders_per_signal_health_chips_and_done_percent() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_test_app(make_plan_roster_with_chat_pending_board_data());
+        // Wide enough that the row (base info + three chips) isn't clipped
+        // by the panel border — 160 cols truncated the trailing "% done".
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 220, 40);
+        click_activity_icon(&mut driver, "◆");
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("stalled"),
+            "#976: `stalled` health chip must render:\n{screen}",
+        );
+        assert!(
+            screen.contains("chat_pending"),
+            "#976: `chat_pending` health chip must render alongside `stalled`:\n{screen}",
+        );
+        assert!(
+            screen.contains("50% done"),
+            "#976: a done=2/total=4 plan must show a '50% done' chip:\n{screen}",
+        );
+    }
+
+    /// A milestone with no work order gets the `no_work_order` chip only —
+    /// no `NN% done` chip, since there's no total to compute a percentage
+    /// from.
+    #[test]
+    fn plans_panel_omits_done_percent_chip_without_work_order() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_test_app(make_single_no_work_order_plan_board_data());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 160, 40);
+        click_activity_icon(&mut driver, "◆");
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("no_work_order"),
+            "#976: `no_work_order` chip must still render:\n{screen}",
+        );
+        assert!(
+            !screen.contains("% done"),
+            "#976: a milestone with no work order must not show a done%% chip:\n{screen}",
+        );
+    }
+
+    /// The "N plans need you" status-bar badge (#976) must be visible from
+    /// ANY view — not just Plans — since the whole point is reminding the
+    /// user without them opening the panel. `make_plan_roster_board_data`
+    /// seeds two entries that both carry a `needs_you` signal (Substrate:
+    /// `ready_waiting`; Follow-up: `no_work_order`), so the count is 2.
+    /// Deliberately does NOT click the ◆ icon — the default view is Board.
+    #[test]
+    fn status_bar_shows_plans_attention_badge_from_any_view() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_test_app(make_plan_roster_board_data());
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 160, 40);
+        assert!(
+            driver.screen_contains("2 plans need you"),
+            "#976: status bar must show the plans-attention badge from the default (Board) view:\n{}",
+            driver.screen(),
+        );
+    }
+
+    /// Singular wording: exactly one plan needing attention reads "1 plan
+    /// needs you" (not "1 plans need you").
+    #[test]
+    fn status_bar_plans_attention_badge_uses_singular_wording() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let data = BoardData {
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            plan_roster: vec![PlanRosterEntry {
+                repo: "api".to_string(),
+                title: "Solo".to_string(),
+                milestone_number: 1,
+                tracking_issue: Some(100),
+                has_work_order: true,
+                ready_frontier: 1,
+                blocked: 0,
+                in_flight: 0,
+                done: 0,
+                total: 1,
+                needs_you: vec!["ready_waiting".to_string()],
+            }],
+            ..BoardData::default()
+        };
+        let app = make_test_app(data);
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 160, 40);
+        assert!(
+            driver.screen_contains("1 plan needs you"),
+            "#976: singular wording '1 plan needs you' must render:\n{}",
+            driver.screen(),
+        );
+    }
+
+    /// No badge at all when every plan-roster entry has an empty
+    /// `needs_you` — the status bar must not falsely claim attention is
+    /// needed.
+    #[test]
+    fn status_bar_hides_plans_attention_badge_when_nothing_needs_attention() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let data = BoardData {
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            plan_roster: vec![PlanRosterEntry {
+                repo: "api".to_string(),
+                title: "All Done".to_string(),
+                milestone_number: 2,
+                tracking_issue: Some(200),
+                has_work_order: true,
+                ready_frontier: 0,
+                blocked: 0,
+                in_flight: 0,
+                done: 3,
+                total: 3,
+                needs_you: vec![],
+            }],
+            ..BoardData::default()
+        };
+        let app = make_test_app(data);
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 160, 40);
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("need you") && !screen.contains("needs you"),
+            "#976: no plans-attention badge when nothing needs attention:\n{screen}",
+        );
+    }

@@ -15,8 +15,21 @@
 //! (a mistyped field would fail the whole `BoardPayload` parse and blank the
 //! board, per #632).
 //!
-//! **Read-only in this slice.** Health chips + attention badges (#976), fast
-//! capture (#977), and the GOAL.md header (#978) come later.
+//! **Read-only in this slice.** Fast capture (#977) and the GOAL.md header
+//! (#978) come later.
+//!
+//! **Health chips + attention badge (#976).** Each `needs_you` signal
+//! renders as its own coloured/iconed chip (see `health_chip_for_signal`)
+//! instead of the flat `[a, b, c]` bracket list from #975 — the raw signal
+//! tokens still appear on screen (just individually coloured now) so
+//! nothing that grepped for them breaks. A `NN% done` chip is appended
+//! whenever the plan has a work order, independent of `needs_you`. The
+//! ActivityBar (the quadraui `PanelDefinition` behind the ◆ icon) has no
+//! badge/count slot in the vendored quadraui version, so the "N plans need
+//! you" attention badge lives on the always-visible status bar instead
+//! (`plans_needing_attention_count` below, read from `status_bar()` in
+//! `mod.rs`), mirroring the existing `live_tmux_sessions` badge pattern —
+//! visible from any view, satisfying "remind me without opening it."
 #[allow(unused_imports)]
 use super::*;
 
@@ -45,13 +58,25 @@ impl CoordApp {
         entries.into_iter().nth(idx)
     }
 
+    /// Count of plan-roster entries carrying at least one `needs_you`
+    /// attention signal — the shared basis for the Plans sidebar hint
+    /// (below) and the global status-bar "N plans need you" badge (#976,
+    /// `status_bar()` in `mod.rs`) so the two never drift out of sync.
+    pub(crate) fn plans_needing_attention_count(&self) -> usize {
+        self.data
+            .plan_roster
+            .iter()
+            .filter(|e| !e.needs_you.is_empty())
+            .count()
+    }
+
     /// Sidebar placeholder for the Plans view — plan count + "attention"
     /// hint (any entry with a `needs_you` signal).  All content lives in the
     /// main panel; mirrors `merge_queue_sidebar` / `milestone_dag_sidebar`.
     pub(crate) fn plans_sidebar(&self) -> ListView {
         let entries = self.plans_entries();
         let n = entries.len();
-        let attn_count = entries.iter().filter(|e| !e.needs_you.is_empty()).count();
+        let attn_count = self.plans_needing_attention_count();
         let attn = if attn_count > 0 {
             format!(" ⚠ {} need attention", attn_count)
         } else {
@@ -77,12 +102,33 @@ impl CoordApp {
         }
     }
 
+    /// Map one `needs_you` signal to its health-chip `(icon+label, color)`
+    /// (#976). The raw signal token stays in the label text — anything that
+    /// greps/asserts on `"ready_waiting"` etc. (see #975's tests) still
+    /// matches; only the icon + per-signal color are new. Unknown/future
+    /// signals fall back to a plain amber chip so an older TUI build against
+    /// a newer daemon degrades gracefully instead of dropping the signal.
+    fn health_chip_for_signal(signal: &str) -> (String, Color) {
+        match signal {
+            "no_work_order" => ("⚑ no_work_order".to_string(), Color::rgb(220, 170, 90)),
+            "ready_waiting" => ("● ready_waiting".to_string(), Color::rgb(120, 210, 120)),
+            "stalled" => ("⏸ stalled".to_string(), Color::rgb(220, 100, 90)),
+            "chat_pending" => ("◐ chat_pending".to_string(), Color::rgb(120, 190, 230)),
+            other => (format!("▲ {other}"), Color::rgb(220, 190, 120)),
+        }
+    }
+
     /// Render the Plans main panel — one row per milestone/epic:
     ///
     /// ```text
-    /// api  #5  Substrate                    epic:#500  ready=2  in-flight=0  blocked=1  done=0/3  [ready_waiting]
-    /// api  #6  Follow-up                    epic:—     no work order  [no_work_order]
+    /// api  #5  Substrate                    epic:#500  ready=2  in-flight=0  blocked=1  done=0/3  [● ready_waiting] [67% done]
+    /// api  #6  Follow-up                    epic:—     no work order  [⚑ no_work_order]
     /// ```
+    ///
+    /// Each `needs_you` entry gets its own coloured chip (health chips,
+    /// #976) instead of one flat bracketed list, plus an always-on
+    /// `NN% done` chip whenever the plan has a work order (independent of
+    /// `needs_you` — it's a progress indicator, not an attention signal).
     ///
     /// The currently-selected row is highlighted via `selected_idx` so the
     /// "Enter to open tracking epic" action has a visible target.
@@ -115,36 +161,44 @@ impl CoordApp {
             } else {
                 "no work order".to_string()
             };
-            let needs = if entry.needs_you.is_empty() {
-                String::new()
-            } else {
-                format!("  [{}]", entry.needs_you.join(", "))
-            };
             let row_label = format!(
-                " {}  #{}  {}   {}   {}{}",
+                " {}  #{}  {}   {}   {}",
                 entry.repo,
                 entry.milestone_number,
                 trunc(&entry.title, 32),
                 tracking,
                 stats,
-                needs,
             );
-            let color = if !entry.needs_you.is_empty() {
-                // Any attention signal → warmer accent so the row reads
-                // as "look at me" without needing #976's chips yet.
+            let base_color = if !entry.needs_you.is_empty() {
+                // Any attention signal → warmer accent on the base text so
+                // the row reads as "look at me" even before the chips.
                 Color::rgb(220, 190, 120)
             } else {
                 Color::rgb(200, 200, 200)
             };
+            let mut spans = vec![StyledSpan::with_fg(row_label, base_color)];
+            for signal in &entry.needs_you {
+                let (label, color) = Self::health_chip_for_signal(signal);
+                spans.push(StyledSpan::with_fg(format!("  [{label}]"), color));
+            }
+            // Always-on done% chip — a progress indicator, not an attention
+            // signal, so it renders regardless of `needs_you`.
+            if entry.has_work_order && entry.total > 0 {
+                let pct = (entry.done * 100) / entry.total;
+                let pct_color = if pct >= 100 {
+                    Color::rgb(120, 210, 120)
+                } else {
+                    Color::rgb(150, 150, 160)
+                };
+                spans.push(StyledSpan::with_fg(format!("  [{pct}% done]"), pct_color));
+            }
             let decoration = if i == sel {
                 Decoration::Header
             } else {
                 Decoration::Normal
             };
             items.push(ListItem {
-                text: StyledText {
-                    spans: vec![StyledSpan::with_fg(row_label, color)],
-                },
+                text: StyledText { spans },
                 icon: None,
                 detail: None,
                 decoration,

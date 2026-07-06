@@ -479,6 +479,50 @@ def test_plan_roster_in_board_payload(plan_roster_db: Path, valid_config_path: P
     assert followup["total"] == 0
 
 
+def test_plan_roster_chat_pending_signal(plan_roster_db: Path, valid_config_path: Path):
+    """#976: a running `type="milestone-chat"` assignment against a
+    milestone's tracking issue surfaces `chat_pending` in `plan_roster`'s
+    `needs_you`, alongside whatever other signal already fired.
+
+    Same override-connection dance as
+    `test_milestone_work_orders_claimed_node_ready_but_not_next_up` above —
+    `build_board()` reads `coord.state.get_connection()`, not the on-disk
+    `plan_roster_db` fixture's connection, so the milestone-chat assignment
+    has to be seeded through a file-backed override of that same global.
+    """
+    from coord import db as _db
+
+    conn = sqlite3.connect(str(plan_roster_db), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+        "repo_github, issue_number, issue_title, status, type) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        ("chat500", "laptop", "api", "acme/api", 500, "Milestone chat #500", "running", "milestone-chat"),
+    )
+    conn.commit()
+    _db.override_connection(conn)
+
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(plan_roster_db), cfg)
+    with TestClient(app) as cli:
+        board = cli.get("/board").json()
+
+    entries_by_ms = {e["milestone_number"]: e for e in board["plan_roster"]}
+    substrate = entries_by_ms[5]
+    assert "chat_pending" in substrate["needs_you"], (
+        f"chat_pending signal missing: {substrate['needs_you']}"
+    )
+    assert "ready_waiting" in substrate["needs_you"], (
+        "chat_pending must be additive, not replace the existing signal: "
+        f"{substrate['needs_you']}"
+    )
+
+    # milestone #6 (no epic, no chat dispatched against it) is unaffected.
+    followup = entries_by_ms[6]
+    assert "chat_pending" not in followup["needs_you"]
+
+
 def test_plan_roster_empty_when_no_milestones(file_db: Path, valid_config_path: Path):
     """#975: fail-open — no milestone-tagged issues means plan_roster is []."""
     cfg = load_config(valid_config_path)
