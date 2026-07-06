@@ -1032,6 +1032,223 @@ def test_stash_artifacts_keeps_lone_hash_suffixed_binary(tmp_path: Path) -> None
     )
 
 
+# ── #982: narrow_artifact_paths unit tests ───────────────────────────────────
+
+def test_narrow_artifact_paths_replaces_glob_with_matching_name() -> None:
+    """Smoke test names a specific example → glob is replaced with that path."""
+    from coord.agent import narrow_artifact_paths
+
+    result = narrow_artifact_paths(
+        ["target/debug/examples/tui_*"],
+        ["tui_submenu — run it — menu should appear"],
+    )
+    assert result == ["target/debug/examples/tui_submenu"]
+
+
+def test_narrow_artifact_paths_multiple_examples_in_one_bullet() -> None:
+    """Two example names in the same bullet → both specific paths in result."""
+    from coord.agent import narrow_artifact_paths
+
+    result = narrow_artifact_paths(
+        ["target/debug/examples/tui_*", "target/debug/examples/gtk_*"],
+        ["tui_submenu and gtk_scrollbar — run them — should render"],
+    )
+    assert sorted(result) == sorted([
+        "target/debug/examples/tui_submenu",
+        "target/debug/examples/gtk_scrollbar",
+    ])
+
+
+def test_narrow_artifact_paths_fallback_when_no_smoke_tests_none() -> None:
+    """smoke_tests=None → original artifact_paths returned unchanged."""
+    from coord.agent import narrow_artifact_paths
+
+    paths = ["target/debug/examples/tui_*", "target/debug/coord-tui"]
+    result = narrow_artifact_paths(paths, None)
+    assert result == paths
+
+
+def test_narrow_artifact_paths_fallback_when_smoke_tests_empty_list() -> None:
+    """smoke_tests=[] (internal change) → original list returned unchanged."""
+    from coord.agent import narrow_artifact_paths
+
+    paths = ["target/debug/examples/tui_*"]
+    result = narrow_artifact_paths(paths, [])
+    assert result == paths
+
+
+def test_narrow_artifact_paths_fallback_when_no_name_matches_glob() -> None:
+    """No candidate name matches the glob → return original list unchanged."""
+    from coord.agent import narrow_artifact_paths
+
+    # Words like "run", "the", "tests", "check" don't match "tui_*"
+    result = narrow_artifact_paths(
+        ["target/debug/examples/tui_*"],
+        ["run the tests and check output carefully"],
+    )
+    assert result == ["target/debug/examples/tui_*"]
+
+
+def test_narrow_artifact_paths_preserves_literal_paths() -> None:
+    """Literal (non-glob) paths are always preserved unchanged."""
+    from coord.agent import narrow_artifact_paths
+
+    result = narrow_artifact_paths(
+        ["target/debug/examples/tui_*", "target/debug/coord-tui"],
+        ["tui_submenu — run it — check submenu"],
+    )
+    assert "target/debug/examples/tui_submenu" in result
+    assert "target/debug/coord-tui" in result
+    assert "target/debug/examples/tui_*" not in result
+
+
+def test_narrow_artifact_paths_unmatched_glob_kept_unchanged() -> None:
+    """A glob with no matching candidates is left in the list unchanged."""
+    from coord.agent import narrow_artifact_paths
+
+    # Only tui_* has a match; gtk_* has none — gtk glob stays
+    result = narrow_artifact_paths(
+        ["target/debug/examples/tui_*", "target/debug/examples/gtk_*"],
+        ["tui_submenu — run it — check menu"],
+    )
+    assert "target/debug/examples/tui_submenu" in result
+    # glob narrowed
+    assert "target/debug/examples/tui_*" not in result
+    # unmatched glob kept (no gtk name in smoke tests)
+    assert "target/debug/examples/gtk_*" in result
+
+
+def test_narrow_artifact_paths_no_glob_in_list_returns_unchanged() -> None:
+    """When artifact_paths contains no globs, return list unchanged."""
+    from coord.agent import narrow_artifact_paths
+
+    paths = ["target/debug/coord-tui", "target/debug/mybinary"]
+    result = narrow_artifact_paths(paths, ["tui_submenu — run — check"])
+    assert result == paths
+
+
+def test_narrow_artifact_paths_empty_artifact_paths_returns_empty() -> None:
+    """Empty artifact_paths → empty list returned."""
+    from coord.agent import narrow_artifact_paths
+
+    result = narrow_artifact_paths([], ["tui_submenu — run — check"])
+    assert result == []
+
+
+# ── #982: stash integration tests ────────────────────────────────────────────
+
+def test_stash_artifacts_scoped_spec_stashes_only_named_binary(
+    tmp_path: Path,
+) -> None:
+    """spec.artifact_paths with a specific binary name stashes only that
+    binary, not all files matching the repo-wide glob.  #982."""
+    from coord.agent import DONE, AgentAssignment, AgentServer, AssignmentSpec
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True)
+    wt_path = state_dir / "worktrees" / "asgn-982-scoped"
+    examples_dir = wt_path / "target" / "debug" / "examples"
+    examples_dir.mkdir(parents=True)
+
+    payload = b"\x7fELF" + b"\x00" * 200
+    for name in ["tui_submenu", "tui_scrollbar", "tui_colors"]:
+        (examples_dir / name).write_bytes(payload)
+
+    server = AgentServer(
+        machine_name="test",
+        repos=["quadraui"],
+        state_dir=state_dir,
+        worker_command=lambda spec: ["/bin/sh", "-c", "echo ok"],
+        repo_paths={"quadraui": str(tmp_path / "repo")},
+        # Server-wide config: the broad glob
+        artifact_paths={"quadraui": ["target/debug/examples/tui_*"]},
+    )
+
+    # Spec carries a narrowed list (as if dispatch used narrow_artifact_paths)
+    spec = AssignmentSpec(
+        repo_name="quadraui",
+        repo_path=str(tmp_path / "repo"),
+        issue_number=982,
+        issue_title="submenu scoped",
+        briefing="b",
+        branch="main",
+        # Override: only stash tui_submenu
+        artifact_paths=["target/debug/examples/tui_submenu"],
+    )
+    a = AgentAssignment(
+        id="asgn-982-scoped",
+        spec=spec,
+        status=DONE,
+        branch="issue-982-submenu-scoped",
+    )
+    a.worktree_path = str(wt_path)
+
+    server._stash_artifacts(a)
+
+    stash_dir = (
+        state_dir / "artifacts" / "quadraui" / "issue-982-submenu-scoped"
+    )
+    stashed = {p.name for p in stash_dir.iterdir() if not p.name.startswith(".")}
+    assert stashed == {"tui_submenu"}, (
+        f"scoped spec should stash only tui_submenu; got {stashed!r}"
+    )
+
+
+def test_stash_artifacts_no_spec_override_uses_repo_wide_glob(
+    tmp_path: Path,
+) -> None:
+    """With no spec.artifact_paths override, the server's repo-wide glob
+    stashes all matching files.  #982: fallback path preserved."""
+    from coord.agent import DONE, AgentAssignment, AgentServer, AssignmentSpec
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True)
+    wt_path = state_dir / "worktrees" / "asgn-982-fallback"
+    examples_dir = wt_path / "target" / "debug" / "examples"
+    examples_dir.mkdir(parents=True)
+
+    payload = b"\x7fELF" + b"\x00" * 200
+    for name in ["tui_submenu", "tui_scrollbar"]:
+        (examples_dir / name).write_bytes(payload)
+
+    server = AgentServer(
+        machine_name="test",
+        repos=["quadraui"],
+        state_dir=state_dir,
+        worker_command=lambda spec: ["/bin/sh", "-c", "echo ok"],
+        repo_paths={"quadraui": str(tmp_path / "repo")},
+        artifact_paths={"quadraui": ["target/debug/examples/tui_*"]},
+    )
+
+    # Spec has no artifact_paths override → falls back to server-wide glob
+    spec = AssignmentSpec(
+        repo_name="quadraui",
+        repo_path=str(tmp_path / "repo"),
+        issue_number=983,
+        issue_title="fallback glob",
+        briefing="b",
+        branch="main",
+        artifact_paths=[],  # empty → use server config
+    )
+    a = AgentAssignment(
+        id="asgn-982-fallback",
+        spec=spec,
+        status=DONE,
+        branch="issue-983-fallback-glob",
+    )
+    a.worktree_path = str(wt_path)
+
+    server._stash_artifacts(a)
+
+    stash_dir = (
+        state_dir / "artifacts" / "quadraui" / "issue-983-fallback-glob"
+    )
+    stashed = {p.name for p in stash_dir.iterdir() if not p.name.startswith(".")}
+    assert stashed == {"tui_submenu", "tui_scrollbar"}, (
+        f"fallback should stash all tui_* files; got {stashed!r}"
+    )
+
+
 def test_gc_artifacts_removes_old_directories(tmp_path: Path) -> None:
     """_gc_artifacts should remove stash dirs older than ttl_days."""
     import os

@@ -1198,6 +1198,7 @@ def _dispatch_fix_of(
     from coord.agent import (  # noqa: PLC0415
         AssignmentSpec as _AssignmentSpecFx,
         _GitError as _AgentGitErrorFx,
+        narrow_artifact_paths as _narrow_ap_fx,
         setup_interactive_worktree as _setup_wt_fx,
     )
     from coord.models import Assignment as _AssignmentFx  # noqa: PLC0415
@@ -1485,6 +1486,13 @@ def _dispatch_fix_of(
             )
             sys.exit(0)
 
+        # #982: narrow the stash to only the examples named in the work
+        # assignment's smoke tests (if any).  Falls back to the repo-wide
+        # glob when no smoke tests were captured or nothing matched.
+        _aps_fx = _narrow_ap_fx(
+            list(repo_cfg.artifact_paths),
+            getattr(work, "smoke_tests", None),
+        )
         try:
             finalize_result = finalize_interactive_exit(
                 assignment_id=assignment_id,
@@ -1498,7 +1506,7 @@ def _dispatch_fix_of(
                 started_at=started_at,
                 log_path=None,
                 repo_path=fix_repo_path,
-                artifact_paths=repo_cfg.artifact_paths,
+                artifact_paths=_aps_fx,
                 branch=work.branch,
             )
             if finalize_result.already_recorded:
@@ -1764,6 +1772,13 @@ def _dispatch_fix_of(
     # record the completion, and clean up the remote worktree.  Safe
     # even when the worktree was never created — _remote_push_and_count
     # detects the missing directory (exit 91) and marks push_ok=False.
+    #
+    # #982: narrow the stash to only the examples named in the work
+    # assignment's smoke tests (if any).
+    _aps_fx_remote = _narrow_ap_fx(
+        list(repo_cfg.artifact_paths),
+        getattr(work, "smoke_tests", None),
+    )
     try:
         _fr = finalize_remote_interactive_exit(
             assignment_id=assignment_id,
@@ -1778,7 +1793,7 @@ def _dispatch_fix_of(
             base_branch=fix_default_branch,
             exit_code=exit_code,
             started_at=started_at,
-            artifact_paths=repo_cfg.artifact_paths,
+            artifact_paths=_aps_fx_remote,
         )
         if _fr.already_recorded:
             click.echo(
@@ -1855,6 +1870,7 @@ def _dispatch_rework_of(
     from coord.agent import (  # noqa: PLC0415
         AssignmentSpec as _AssignmentSpecRw,
         _GitError as _AgentGitErrorRw,
+        narrow_artifact_paths as _narrow_ap_rw,
         setup_interactive_worktree as _setup_wt_rw,
     )
     from coord.models import Assignment as _AssignmentRw  # noqa: PLC0415
@@ -2039,6 +2055,12 @@ def _dispatch_rework_of(
             )
             sys.exit(0)
 
+        # #982: narrow the stash to only the examples named in the
+        # rework-target assignment's smoke tests (if any).
+        _aps_rw = _narrow_ap_rw(
+            list(repo_cfg.artifact_paths),
+            getattr(_rw_work, "smoke_tests", None) if _rw_work is not None else None,
+        )
         try:
             finalize_result = finalize_interactive_exit(
                 assignment_id=assignment_id,
@@ -2052,7 +2074,7 @@ def _dispatch_rework_of(
                 started_at=started_at,
                 log_path=None,
                 repo_path=rw_repo_path,
-                artifact_paths=repo_cfg.artifact_paths,
+                artifact_paths=_aps_rw,
                 branch=rw_branch,
             )
             if finalize_result.already_recorded:
@@ -2303,6 +2325,12 @@ def _dispatch_rework_of(
 
     # Remote finalize: push the rework commits to origin/<branch>,
     # record the completion, and clean up the remote worktree.
+    # #982: narrow the stash to the examples named in the rework-target's
+    # smoke tests (if any).
+    _aps_rw_remote = _narrow_ap_rw(
+        list(repo_cfg.artifact_paths),
+        getattr(_rw_work, "smoke_tests", None) if _rw_work is not None else None,
+    )
     try:
         _fr = finalize_remote_interactive_exit(
             assignment_id=assignment_id,
@@ -2317,7 +2345,7 @@ def _dispatch_rework_of(
             base_branch=rw_default_branch,
             exit_code=exit_code,
             started_at=started_at,
-            artifact_paths=repo_cfg.artifact_paths,
+            artifact_paths=_aps_rw_remote,
         )
         if _fr.already_recorded:
             click.echo(
@@ -2728,7 +2756,7 @@ def _dispatch_interactive_work(
             )
             sys.exit(1)
 
-    from coord.agent import AssignmentSpec  # noqa: PLC0415
+    from coord.agent import AssignmentSpec, narrow_artifact_paths as _narrow_ap_work  # noqa: PLC0415
     from coord.models import Proposal  # noqa: PLC0415
 
     resolved_model = model if model else cfg.models.default
@@ -2896,6 +2924,10 @@ def _dispatch_interactive_work(
         # whether the agent typed `coord report-result` first.  The
         # finalizer respects an existing report (it checks the DB row's
         # status before clobbering).
+        # #982: no pre-existing smoke_tests for a fresh interactive work
+        # session (none available before the worker runs), so fall back to
+        # the full repo-wide glob via narrow_artifact_paths(_, None).
+        _aps_work = _narrow_ap_work(list(repo_cfg.artifact_paths), None)
         try:
             finalize_result = finalize_interactive_exit(
                 assignment_id=assignment_id,
@@ -2909,7 +2941,7 @@ def _dispatch_interactive_work(
                 started_at=started_at,
                 log_path=None,
                 repo_path=repo_path,
-                artifact_paths=repo_cfg.artifact_paths,
+                artifact_paths=_aps_work,
                 branch=_interactive_branch,
             )
             if finalize_result.already_recorded:
@@ -3241,6 +3273,9 @@ def _dispatch_interactive_work(
         # fire), and clean up the remote worktree.  Mirrors the remote-FIX
         # path; the only difference is the branch is the fresh feature
         # branch this work session created, not an existing one.
+        # #982: no pre-existing smoke_tests for a fresh interactive work
+        # session, so fall back to the full repo-wide glob.
+        _aps_work_remote = _narrow_ap_work(list(repo_cfg.artifact_paths), None)
         try:
             _fr = finalize_remote_interactive_exit(
                 assignment_id=assignment_id,
@@ -3255,7 +3290,7 @@ def _dispatch_interactive_work(
                 base_branch=repo_default_branch,
                 exit_code=exit_code,
                 started_at=started_at,
-                artifact_paths=repo_cfg.artifact_paths,
+                artifact_paths=_aps_work_remote,
             )
             if _fr.already_recorded:
                 click.echo(

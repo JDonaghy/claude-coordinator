@@ -6,6 +6,7 @@ tests can drive it directly without standing up a real server.
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import re
@@ -736,6 +737,92 @@ def _strip_debug_symbols(path: Path) -> bool:
         return result.returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         return False
+
+
+def narrow_artifact_paths(
+    artifact_paths: list[str],
+    smoke_tests: list[str] | None,
+) -> list[str]:
+    """Narrow glob-containing *artifact_paths* to the examples named in *smoke_tests*.
+
+    For each glob-containing entry in *artifact_paths* (e.g.
+    ``target/debug/examples/tui_*``), extracts candidate binary names from the
+    *smoke_tests* bullets that match the filename glob and replaces the glob
+    with those specific paths (e.g. ``target/debug/examples/tui_submenu``).
+    Globs with no matching candidate are left unchanged.
+
+    Falls back to the original list (unchanged) when:
+
+    * *smoke_tests* is ``None`` or empty — no smoke tests emitted or change
+      is internal (``SMOKE_TESTS: (none — change is internal)``).
+    * No candidate name extracted from *smoke_tests* matches any glob in the
+      list — nothing is named, so narrowing would be wrong.
+
+    Token extraction: every word-boundary-delimited token starting with a
+    letter (``[a-zA-Z][a-zA-Z0-9_-]*[a-zA-Z0-9]``) is a candidate.  Only
+    tokens that *match* a filename glob (via :func:`fnmatch.fnmatch`) are
+    used, so common prose words like "run", "it", "see" are silently
+    discarded when they don't fit the glob pattern.
+
+    #982: used at the six interactive-dispatch backstop sites in
+    :mod:`coord.commands.dispatch_workers` so the stash captures 1–2
+    relevant example binaries instead of every file matching a broad glob
+    (e.g. ``tui_*`` matching ~72 Cargo debug examples).
+    """
+    if not smoke_tests or not artifact_paths:
+        return list(artifact_paths)
+
+    # Short-circuit when no entry in the list is a glob.
+    if not any("*" in p or "?" in p or "[" in p for p in artifact_paths):
+        return list(artifact_paths)
+
+    # Extract candidate binary names from smoke-test bullets.  We pull every
+    # contiguous word-token (letters, digits, underscores, hyphens) that
+    # starts and ends with a letter-or-digit.  These are then matched against
+    # the filename part of each glob using fnmatch, so only tokens that *fit*
+    # the pattern contribute ("tui_submenu" matches "tui_*"; "run", "it",
+    # "see", "above" do not).
+    _token_re = re.compile(r"\b([a-zA-Z][a-zA-Z0-9_-]*[a-zA-Z0-9])\b")
+    candidate_names: set[str] = set()
+    for bullet in smoke_tests:
+        for m in _token_re.finditer(bullet):
+            candidate_names.add(m.group(1))
+
+    if not candidate_names:
+        return list(artifact_paths)
+
+    narrowed: list[str] = []
+    any_narrowed = False
+
+    for path_glob in artifact_paths:
+        if "*" not in path_glob and "?" not in path_glob and "[" not in path_glob:
+            # Literal path — keep unchanged regardless of smoke tests.
+            narrowed.append(path_glob)
+            continue
+
+        # Separate the directory prefix from the filename glob.
+        slash = path_glob.rfind("/")
+        if slash >= 0:
+            dir_part = path_glob[:slash]
+            name_glob = path_glob[slash + 1 :]
+        else:
+            dir_part = ""
+            name_glob = path_glob
+
+        matches = sorted(
+            name for name in candidate_names if fnmatch.fnmatch(name, name_glob)
+        )
+
+        if matches:
+            any_narrowed = True
+            for m in matches:
+                narrowed.append(f"{dir_part}/{m}" if dir_part else m)
+        else:
+            # No candidate matched this glob — leave it unchanged so the
+            # fallback stashes all files for unscoped patterns.
+            narrowed.append(path_glob)
+
+    return narrowed if any_narrowed else list(artifact_paths)
 
 
 def stash_artifacts_for_branch(
