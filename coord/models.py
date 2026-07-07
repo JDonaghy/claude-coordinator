@@ -175,13 +175,17 @@ class Assignment:
     finished_at: float | None = None
     smoke_test: str | None = None  # None | pass | fail
     smoke_test_reason: str | None = None
-    # "work" (default), "review", "plan", "smoke", or "conflict-fix".
-    # Review assignments target an existing PR rather than implementing a
-    # fresh issue. Plan assignments are read-only: the worker analyses the
-    # codebase and outputs a structured plan without writing any code.
-    # conflict-fix is dispatched when a merge fails with a mechanical
+    # "work" (default), "review", "plan", "smoke", "conflict-fix", "audit",
+    # or a handful of other human-attended flavours (troubleshoot, chat,
+    # merge). Review assignments target an existing PR rather than
+    # implementing a fresh issue. Plan assignments are read-only: the worker
+    # analyses the codebase and outputs a structured plan without writing any
+    # code. conflict-fix is dispatched when a merge fails with a mechanical
     # (non-semantic) conflict — the worker rebases, resolves obvious
     # additive merges, and force-pushes; the coordinator owns the retry.
+    # audit (#885) is a read-only, human-attended milestone-outcome analyst —
+    # dispatched via `--audit-of <epic_issue>`, never through the headless
+    # Work → Test → Review → Merge pipeline.
     type: str = "work"
     review_target: str | None = None
     review_of_assignment_id: str | None = None

@@ -1466,6 +1466,99 @@ class TestAssignInteractiveMerge:
         assert "mutually exclusive" in result.output
 
 
+class TestAssignInteractiveAudit:
+    """#885: `coord assign --interactive --audit-of <epic_issue>` — a
+    human-attended READ-ONLY milestone-outcome analyst for a milestone's
+    tracking epic."""
+
+    def test_audit_of_requires_interactive(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        with patch("coord.github_ops.get_issue", return_value={"title": "t"}):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "1", "--config", str(config_file),
+                 "--audit-of", "751"],
+            )
+        assert result.exit_code == 2
+        assert "--audit-of requires --interactive" in result.output
+
+    def test_audit_of_mutually_exclusive_with_smoke_of(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        with patch("coord.github_ops.get_issue", return_value={"title": "t"}):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "1", "--config", str(config_file),
+                 "--interactive", "--audit-of", "751", "--smoke-of", "work-1",
+                 "--dry-run"],
+            )
+        assert result.exit_code == 2
+        assert "mutually exclusive" in result.output
+
+    def test_audit_of_rejects_non_numeric_value(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        with patch("coord.github_ops.get_issue", return_value={"title": "t"}), \
+             patch("socket.gethostname", return_value="laptop"):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "1", "--config", str(config_file),
+                 "--interactive", "--audit-of", "not-a-number", "--dry-run"],
+            )
+        assert result.exit_code == 2
+        assert "must be a GitHub issue number" in result.output
+
+    def test_audit_of_requires_milestone(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "Epic", "body": "goals", "milestone": None}), \
+             patch("socket.gethostname", return_value="laptop"):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "751", "--config", str(config_file),
+                 "--interactive", "--audit-of", "751", "--dry-run"],
+            )
+        assert result.exit_code == 2
+        assert "issue has no milestone" in result.output
+
+    def test_audit_of_dry_run_builds_audit_dispatch(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        epic = {
+            "title": "Milestone-Driven Workflow epic",
+            "body": "## Goals\n1. Do the thing\n",
+            "milestone": {"number": 9, "title": "Milestone-Driven Workflow"},
+        }
+        milestone_issues = [
+            {"number": 750, "title": "Sub-task A", "state": "CLOSED", "labels": []},
+            {"number": 751, "title": "Epic", "state": "OPEN", "labels": [{"name": "epic"}]},
+        ]
+        with patch("coord.github_ops.get_issue", return_value=epic), \
+             patch("coord.github_ops.get_milestone_issues", return_value=milestone_issues) as gmi, \
+             patch("socket.gethostname", return_value="laptop"):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "751", "--config", str(config_file),
+                 "--interactive", "--audit-of", "751", "--dry-run"],
+            )
+        assert result.exit_code == 0, result.output
+        assert "AUDIT of epic #751" in result.output
+        assert "read-only" in result.output
+        assert "no worktree" in result.output
+        assert "Milestone-Driven Workflow" in result.output
+        # Read-only tool set — no Edit/Write granted to the live checkout.
+        assert "Read,Bash,Grep,Glob" in result.output
+        assert "(dry run — not launched)" in result.output
+        gmi.assert_called_once_with("acme/api", "Milestone-Driven Workflow")
+        # Dry-run must NOT persist an audit row.
+        from coord.state import build_board
+        b = build_board()
+        audit_rows = [a for a in b.active + b.completed if a.type == "audit"]
+        assert audit_rows == [], "dry-run must not persist an audit assignment"
+
+
 # ── Config YAML with explicit model tiers for escalation tests ────────────────
 
 _ESCALATION_CONFIG_YAML = """\

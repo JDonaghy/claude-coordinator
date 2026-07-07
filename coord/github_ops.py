@@ -648,6 +648,27 @@ def get_milestone(repo: str, milestone_number: int) -> dict:
     return json.loads(raw)
 
 
+def get_milestone_issues(
+    repo: str, milestone_title: str, *, state: str = "all"
+) -> list[dict]:
+    """Return every issue under *milestone_title* in *repo* (open+closed by default).
+
+    Each item has ``number``, ``title``, ``state`` ("OPEN"/"CLOSED"), and
+    ``labels`` (list of ``{"name": ...}``). ``gh issue list --milestone`` takes
+    the milestone TITLE, not its number (unlike most other milestone-related
+    calls in this module) — matches the existing ``--milestone`` usage in
+    :func:`create_issue`. Used by ``--audit-of`` (#885) to enumerate a
+    milestone's issue states for the audit briefing without a separate call
+    per issue.
+    """
+    raw = _gh(
+        "issue", "list", "--repo", repo, "--milestone", milestone_title,
+        "--state", state, "--json", "number,title,state,labels",
+        "--limit", "200",
+    )
+    return json.loads(raw)
+
+
 def assign_issue_milestone(
     repo: str, issue_number: int, milestone_number: int
 ) -> None:

@@ -590,6 +590,19 @@ impl CoordApp {
             // questions, sketch the UX, diagnose a stall, edit the issue, send it
             // to Pending. Subsumes the old (InProgress-only) Troubleshoot.
             items.push(ContextMenuItem::action("chat-about-issue", "Chat about issue"));
+            // Milestone Outcome Audit Phase 1 (#885): "Audit outcomes" —
+            // human-attended READ-ONLY milestone-outcome analyst — only for
+            // rows carrying the `epic` label (a milestone's tracking issue).
+            let is_epic_row = issue_number
+                .map(|n| {
+                    self.pipeline_issues
+                        .iter()
+                        .any(|iss| iss.number == n && iss.all_labels.iter().any(|l| l == "epic"))
+                })
+                .unwrap_or(false);
+            if is_epic_row {
+                items.push(ContextMenuItem::action("audit-outcomes", "Audit outcomes"));
+            }
             items.push(ContextMenuItem::separator());
         }
         match lifecycle {
@@ -5137,6 +5150,19 @@ impl CoordApp {
                 }
                 self.launch_interactive_session_for_selected_issue(
                     InteractiveLaunchMode::Chat,
+                );
+                true
+            }
+            // Milestone Outcome Audit Phase 1 (#885): human-attended
+            // read-only milestone-outcome analyst for an epic row.
+            "audit-outcomes" => {
+                if self.active_view == SidebarView::Board {
+                    self.board_detail_tab = BoardDetailTab::Terminal;
+                } else {
+                    self.pipeline_detail_tab = PipelineDetailTab::Terminal;
+                }
+                self.launch_interactive_session_for_selected_issue(
+                    InteractiveLaunchMode::Audit,
                 );
                 true
             }

@@ -538,6 +538,7 @@ pub(crate) fn icon_for_action(action_id: &str) -> Option<&'static str> {
         "start-fix-interactive" => Some("⌨"),
         "reattach-live-session" => Some("⌨"),
         "chat-about-issue" => Some("✦"),
+        "audit-outcomes" => Some("🔍"),
         "troubleshoot-interactive" => Some("⚕"),
         "diagnose-fix-stage" => Some("⚕"),
         "diagnose-stage" => Some("⚕"),
