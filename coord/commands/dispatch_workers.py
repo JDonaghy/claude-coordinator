@@ -798,6 +798,284 @@ def _dispatch_smoke_of(
     return
 
 
+def _dispatch_audit_of(
+    *,
+    machine: str,
+    repo: str,
+    model: str | None,
+    dry_run: bool,
+    audit_of: str,
+    cfg: Config,
+    machine_obj: object,
+    repo_cfg: object,
+    provider: object,
+    _is_local: bool,
+    _issue_ctx: str,
+) -> None:
+    """Milestone Outcome Audit Phase 1 (#885): human-attended, READ-ONLY
+    milestone-outcome analyst for the milestone's tracking EPIC ISSUE.
+
+    Mirrors `_dispatch_smoke_of`'s read-only / live-checkout / no-worktree
+    shape, but the target (``audit_of``) is a GitHub issue number — the
+    milestone's tracking epic — not a board work-assignment id, so there is
+    no board lookup here. The epic's own body (goals/acceptance/plan
+    checklist) and its milestone's issue states are fetched fresh and handed
+    to the agent, which measures each goal against the code with shell tools
+    and posts a scorecard via `coord report-result` (landing as a comment on
+    the epic, per issue_number below).
+    """
+    import time as _time  # noqa: PLC0415
+    import uuid as _uuid  # noqa: PLC0415
+
+    from coord.board_service import read_board as _read_board_au  # noqa: PLC0415
+    from coord.board_service import write_board as _write_board_au  # noqa: PLC0415
+    from coord.interactive import (  # noqa: PLC0415
+        finalize_interactive_exit,
+        launch_human_attended_interactive,
+        tmux_available as _tmux_avail,
+        tmux_session_alive as _tmux_alive,
+        tmux_session_name as _tmux_name,
+    )
+    from coord.models import Assignment as _AssignmentAu  # noqa: PLC0415
+    from coord.state import record_dispatched_assignment as _record_au  # noqa: PLC0415
+    from coord.agent import AssignmentSpec as _AssignmentSpecAu  # noqa: PLC0415
+
+    if not _is_local:
+        click.echo(
+            "error: --audit-of is local-only for now; run it on the "
+            "machine that holds the checkout.",
+            err=True,
+        )
+        sys.exit(2)
+
+    try:
+        epic_num = int(audit_of)
+    except ValueError:
+        click.echo(
+            f"error: --audit-of {audit_of!r} must be a GitHub issue number "
+            "(the milestone's tracking epic).",
+            err=True,
+        )
+        sys.exit(2)
+
+    try:
+        epic_data = github_ops.get_issue(repo_cfg.github, epic_num)
+    except RuntimeError as e:
+        click.echo(f"error: could not fetch epic issue #{epic_num}: {e}", err=True)
+        sys.exit(1)
+
+    epic_title = epic_data.get("title") or f"Issue #{epic_num}"
+    epic_body = epic_data.get("body") or "(no body)"
+    milestone = epic_data.get("milestone")
+    if not milestone or not milestone.get("title"):
+        click.echo(
+            f"error: --audit-of {epic_num}: issue has no milestone — the "
+            "audit needs a milestone to enumerate issue states for (assign "
+            "one with `coord milestone assign` first).",
+            err=True,
+        )
+        sys.exit(2)
+    milestone_title = milestone["title"]
+
+    try:
+        milestone_issues = github_ops.get_milestone_issues(repo_cfg.github, milestone_title)
+    except RuntimeError as e:
+        click.echo(
+            f"error: could not list issues for milestone {milestone_title!r}: {e}",
+            err=True,
+        )
+        sys.exit(1)
+
+    audit_repo_path = str(
+        Path(machine_obj.repo_path(repo) or str(Path.cwd())).expanduser()
+    )
+    audit_default_branch = repo_cfg.default_branch or "main"
+    resolved_model = model if model else cfg.models.default
+    assignment_id = _uuid.uuid4().hex[:12]
+
+    # Table of milestone issue states (number/state/title/labels) so the
+    # agent has them up front — it has no `gh` access to fetch this itself.
+    _issue_lines = [
+        "- #{num} [{state}] {title}{labels}".format(
+            num=iss.get("number"),
+            state=iss.get("state", "?"),
+            title=iss.get("title", ""),
+            labels=(
+                "  ({})".format(", ".join(lbl.get("name", "") for lbl in iss.get("labels") or []))
+                if iss.get("labels")
+                else ""
+            ),
+        )
+        for iss in sorted(milestone_issues, key=lambda i: i.get("number", 0))
+    ]
+    milestone_issues_block = "\n".join(_issue_lines) or "(no issues found under this milestone)"
+
+    INTERACTIVE_AUDIT_SYSTEM_PROMPT = (
+        "You are a human-attended MILESTONE OUTCOME AUDITOR dispatched by "
+        "the coordinator (#885). You are an independent analyst — measure "
+        "reality, do not rubber-stamp ticket state.\n\n"
+        "Rules:\n"
+        "- READ-ONLY. Do NOT modify code, commit, push, or open/merge PRs "
+        "(Edit/Write are not available to you).\n"
+        "- Do NOT run `gh` commands. The coordinator owns GitHub — the epic "
+        "body and milestone issue states are already in your briefing "
+        "below.\n"
+        "- You MAY run read-only git (log/diff/show/merge-base/branch -r) "
+        "and any read-only shell tool (wc, grep -r, find, cat, test/coverage "
+        "runs, etc.) against the LIVE checkout to measure reality.\n\n"
+        "Method:\n"
+        "1. Read the epic's goals, acceptance criteria, and any plan/work-"
+        "order checklist from its body (below).\n"
+        "2. Review the milestone's issue states (below) — which are open, "
+        "closed, still in flight.\n"
+        "3. For EACH goal, MEASURE it against the actual code — never trust "
+        "ticket state or a self-reported summary. Concretely:\n"
+        "   - decomposition/size claims -> `wc -l <file>` on the files in "
+        "question\n"
+        "   - \"feature X exists\" claims -> `grep -rn` for the actual "
+        "symbols/call sites\n"
+        "   - \"branch Y merged\" claims -> `git merge-base --is-ancestor "
+        "<branch> origin/main` (or confirm the file exists on the default "
+        "branch)\n"
+        "   - test/coverage claims -> run the test suite or read coverage "
+        "output where relevant\n"
+        "4. Emit a scorecard: one row per goal — before/after, "
+        "met|partial|gap, and the concrete evidence (command + result) that "
+        "backs the verdict. Call out specific files/line-counts/gaps by "
+        "name (e.g. a god-file that grew instead of shrank, an open seam "
+        "issue that was supposed to close).\n"
+        "5. End with a one-line bottom-line verdict (e.g. \"5/6 goals "
+        "met\").\n\n"
+        "When done, write the FULL scorecard to a temp file and relay it "
+        "with:\n"
+        "  coord report-result --assignment <assignment_id> --status done "
+        "--summary \"<bottom-line, one paragraph>\" --body-file "
+        "<path-to-scorecard.md>\n"
+        "The --body-file is what posts the full scorecard as a comment on "
+        "the epic issue — --summary alone only carries the one-liner.\n"
+    )
+
+    audit_briefing = (
+        f"# Milestone outcome audit: {repo_cfg.github} epic #{epic_num}\n\n"
+        f"**Epic:** {epic_title}\n"
+        f"**Milestone:** {milestone_title}\n"
+        f"**Repo checkout:** {audit_repo_path}\n\n"
+        "## ⚠ Do NOT move this checkout's branch\n\n"
+        f"`{audit_repo_path}` is the **live checkout that runs the "
+        "coordinator itself** (and the worktree base for workers). Do "
+        "**NOT** `git checkout` / `git switch` / `git reset` / "
+        "`git stash` it. Read files, run read-only git/shell commands, and "
+        "measure — never move the branch.\n\n"
+        f"## Epic body (goals / acceptance / plan)\n\n{epic_body}\n\n"
+        f"## Milestone issue states ({milestone_title})\n\n"
+        f"{milestone_issues_block}\n\n"
+        "## Your job\n\n"
+        "Measure each goal against the code (see the system prompt for the "
+        "method), emit a scorecard, and relay it with `coord report-result "
+        f"--assignment {assignment_id} --status done --summary \"...\" "
+        "--body-file <scorecard.md>`.\n"
+    )
+
+    report_reminder = (
+        f"[Coordinator audit assignment {assignment_id}] HUMAN-ATTENDED "
+        "read-only milestone-outcome audit (#885). When done, run `coord "
+        f"report-result --assignment {assignment_id} --status done "
+        "--summary \"<bottom-line>\" --body-file <scorecard.md>` so the "
+        "scorecard posts as a comment on the epic AND this session's row "
+        "closes.\n\n"
+    )
+    effective_briefing = _issue_ctx + report_reminder + audit_briefing
+
+    spec = _AssignmentSpecAu(
+        repo_name=repo,
+        repo_path=audit_repo_path,
+        issue_number=epic_num,
+        issue_title=f"[audit] {epic_title}",
+        briefing=effective_briefing,
+        model=resolved_model,
+        type="audit",
+        provider="claude-pty",
+    )
+    # READ-ONLY: no Edit/Write — the audit measures, it never fixes.
+    argv = provider.build_command(
+        spec,
+        resolved_model=resolved_model,
+        system_prompt=INTERACTIVE_AUDIT_SYSTEM_PROMPT,
+        allowed_tools="Read,Bash,Grep,Glob",
+    )
+
+    click.echo(
+        f"{machine} (local TTY) → AUDIT of epic #{epic_num}: {epic_title}"
+    )
+    click.echo("  mode: HUMAN-ATTENDED read-only milestone-outcome audit (#885)")
+    click.echo(f"  assignment id: {assignment_id}  (audit_of={epic_num})")
+    click.echo(f"  milestone: {milestone_title}")
+    click.echo(
+        f"  cwd: {audit_repo_path} (live checkout — read-only, no worktree)"
+    )
+    if dry_run:
+        click.echo("  (dry run — not launched)")
+        click.echo(f"  would exec: {argv}")
+        return
+
+    audit_assignment = _AssignmentAu(
+        machine_name=machine,
+        repo_name=repo,
+        issue_number=epic_num,
+        issue_title=f"[audit] {epic_title}",
+        briefing=effective_briefing,
+        assignment_id=assignment_id,
+        status="running",
+        dispatched_at=_time.time(),
+        type="audit",
+        model=resolved_model,
+        provider_name="claude-pty",
+    )
+    _record_au(assignment=audit_assignment, repo_github=repo_cfg.github)
+    _write_board_au(_read_board_au())
+    os.environ["COORD_ASSIGNMENT_ID"] = assignment_id
+
+    started_at = _time.time()
+    exit_code = launch_human_attended_interactive(
+        argv,
+        effective_briefing,
+        assignment_id=assignment_id,
+        cwd=audit_repo_path,
+    )
+    if exit_code != 0:
+        click.echo(f"  claude exited with status {exit_code}", err=True)
+
+    _sname = _tmux_name(assignment_id) if _tmux_avail() else None
+    if _sname and _tmux_alive(_sname):
+        click.echo(
+            f"  session still running in tmux: {_sname}\n"
+            f"  reattach with:  coord reattach {assignment_id}"
+        )
+        sys.exit(0)
+
+    # worktree_path=None: read-only, live checkout — never push/remove it.
+    try:
+        finalize_interactive_exit(
+            assignment_id=assignment_id,
+            repo_name=repo,
+            repo_github=repo_cfg.github,
+            issue_number=epic_num,
+            machine_name=machine,
+            worktree_path=None,
+            base_branch=audit_default_branch,
+            exit_code=exit_code,
+            started_at=started_at,
+            log_path=None,
+            repo_path=None,
+        )
+    except Exception as exc:  # noqa: BLE001 — best-effort backstop
+        click.echo(
+            f"  warning: backstop failed to record audit exit: {exc}",
+            err=True,
+        )
+    return
+
+
 def _run_troubleshoot_or_chat(
     is_chat: bool,
     *,

@@ -17,6 +17,7 @@ from coord import github_ops
 
 from coord.commands._common import AGENT_PORT, _CONFIG_OPTION, _load_config
 from coord.commands.dispatch_workers import (
+    _dispatch_audit_of,
     _dispatch_chat,
     _dispatch_fix_of,
     _dispatch_headless,
@@ -540,6 +541,23 @@ def approve(
 )
 
 
+@click.option(
+    "--audit-of",
+    "audit_of",
+    default=None,
+    help=(
+        "Milestone Outcome Audit Phase 1 (#885): launch a human-attended "
+        "READ-ONLY analyst for the milestone tracking epic <EPIC_ISSUE>. Reads "
+        "the epic body's goals/acceptance/plan checklist, enumerates the "
+        "milestone's issue states, measures each goal against the code with "
+        "shell tools (never trusting ticket state or self-report), and relays "
+        "a scorecard verdict via `coord report-result` — posted as a comment "
+        "on the epic. Runs in the LIVE checkout with NO claim and NO worktree "
+        "(read-only tools only). Requires --interactive; local-only for now."
+    ),
+)
+
+
 def assign(
     machine: str,
     repo: str,
@@ -562,6 +580,7 @@ def assign(
     rework_of: str | None,
     smoke_of: str | None,
     merge_of: str | None,
+    audit_of: str | None,
 ) -> None:
     cfg = _load_config(config_path)
 
@@ -674,8 +693,14 @@ def assign(
         click.echo("error: --merge-of requires --interactive", err=True)
         sys.exit(2)
 
+    # #885: --audit-of (interactive milestone-outcome analyst) also requires
+    # --interactive — same shape as smoke/merge above.
+    if audit_of is not None and not interactive:
+        click.echo("error: --audit-of requires --interactive", err=True)
+        sys.exit(2)
+
     # All interactive flavours are mutually exclusive — a dispatch is exactly
-    # one shape (review / fix / troubleshoot / rework / smoke / merge).
+    # one shape (review / fix / troubleshoot / rework / smoke / merge / audit).
     _interactive_flavours = [
         ("--review-of", review_of is not None),
         ("--fix-of", fix_of is not None),
@@ -684,6 +709,7 @@ def assign(
         ("--rework-of", rework_of is not None),
         ("--smoke-of", smoke_of is not None),
         ("--merge-of", merge_of is not None),
+        ("--audit-of", audit_of is not None),
     ]
     _set_flavours = [name for name, on in _interactive_flavours if on]
     if len(_set_flavours) > 1:
@@ -786,6 +812,15 @@ def assign(
                 cfg=cfg, machine_obj=machine_obj, repo_cfg=repo_cfg,
                 issue_title=issue_title, provider=provider, _is_local=_is_local,
                 _svc=_svc, _interactive_board=_interactive_board, _issue_ctx=_issue_ctx,
+            )
+            return
+        if audit_of is not None:
+            _dispatch_audit_of(
+                machine=machine, repo=repo, model=model,
+                dry_run=dry_run, audit_of=audit_of,
+                cfg=cfg, machine_obj=machine_obj, repo_cfg=repo_cfg,
+                provider=provider, _is_local=_is_local,
+                _issue_ctx=_issue_ctx,
             )
             return
 

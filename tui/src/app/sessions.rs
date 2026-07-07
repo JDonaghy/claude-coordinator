@@ -1010,7 +1010,9 @@ impl CoordApp {
     ) -> Option<String> {
         if matches!(
             mode,
-            InteractiveLaunchMode::Troubleshoot | InteractiveLaunchMode::Chat
+            InteractiveLaunchMode::Troubleshoot
+                | InteractiveLaunchMode::Chat
+                | InteractiveLaunchMode::Audit
         ) {
             return None;
         }
@@ -1411,10 +1413,14 @@ impl CoordApp {
         // machine and skip both the machine picker and the reattach
         // short-circuit below.  (A picker here would offer remote machines that
         // `coord assign --troubleshoot` rejects with "local-only".)  #628: Chat
-        // is the same — local-only, no completed-work target.
+        // is the same — local-only, no completed-work target.  #885: Audit is
+        // the same again — local-only, read-only, and the target IS the
+        // selected issue (no work_aid to resolve).
         if matches!(
             mode,
-            InteractiveLaunchMode::Troubleshoot | InteractiveLaunchMode::Chat
+            InteractiveLaunchMode::Troubleshoot
+                | InteractiveLaunchMode::Chat
+                | InteractiveLaunchMode::Audit
         ) {
             let machine = self.data.local_machine.clone();
             self.launch_interactive_session_on_machine(mode, machine, None, false);
@@ -2404,6 +2410,9 @@ impl CoordApp {
                     // Leg 3c (#517): merge-prep ends with the operator merging
                     // manually (TUI Go / `coord merge`) — no auto-advance to arm.
                     InteractiveLaunchMode::Merge => {}
+                    // #885: Audit is a standalone read-only analysis — it never
+                    // feeds Work → Test → Review → Merge, so nothing to arm.
+                    InteractiveLaunchMode::Audit => {}
                 }
 
                 let status_msg = if maybe_live_session.is_some() {
@@ -2418,6 +2427,7 @@ impl CoordApp {
                         InteractiveLaunchMode::Test => "testing",
                         InteractiveLaunchMode::Merge => "merge",
                         InteractiveLaunchMode::Chat => "chat",
+                        InteractiveLaunchMode::Audit => "audit",
                     };
                     format!(
                         "Launching interactive {} session for {} #{} …",
@@ -2675,6 +2685,13 @@ pub(crate) enum InteractiveLaunchMode {
     /// local-only, no claim/worktree, briefed-from-file. Emits `coord assign
     /// --interactive --chat …`.
     Chat,
+    /// Milestone Outcome Audit Phase 1 (#885): human-attended READ-ONLY
+    /// milestone-outcome analyst for a milestone's tracking epic. Only
+    /// offered on rows carrying the `epic` label. Like Troubleshoot/Chat:
+    /// local-only, no claim/worktree — the target IS the selected issue, so
+    /// no separate work_aid is needed. Emits `coord assign --interactive
+    /// --audit-of <issue_num> …`.
+    Audit,
 }
 
 /// #486: short verb for an interactive launch mode — used in the machine-picker
@@ -2689,6 +2706,7 @@ pub(crate) fn interactive_mode_verb(mode: InteractiveLaunchMode) -> &'static str
         InteractiveLaunchMode::Test => "testing",
         InteractiveLaunchMode::Merge => "merge",
         InteractiveLaunchMode::Chat => "chat",
+        InteractiveLaunchMode::Audit => "audit",
     }
 }
 
@@ -2708,6 +2726,7 @@ pub(crate) fn interactive_mode_assignment_type(mode: InteractiveLaunchMode) -> &
         InteractiveLaunchMode::Troubleshoot => "troubleshoot",
         // Chat never reattaches (callers guard); sentinel matches nothing.
         InteractiveLaunchMode::Chat => "chat",
+        InteractiveLaunchMode::Audit => "audit",
     }
 }
 
@@ -2843,6 +2862,17 @@ pub(crate) fn build_interactive_launch_cmd(
             format!(
                 "coord assign {}--interactive --merge-of {} {} {} {}\r",
                 cfg, aid, m, r, issue_num,
+            )
+        }
+        InteractiveLaunchMode::Audit => {
+            // Milestone Outcome Audit Phase 1 (#885): `coord assign
+            // --interactive --audit-of <epic_issue>` launches the human-
+            // attended read-only milestone-outcome analyst. The audited epic
+            // IS the selected issue, so `--audit-of` carries the same
+            // `issue_num` as the trailing positional — no work_aid involved.
+            format!(
+                "coord assign {}--interactive --audit-of {} {} {} {}\r",
+                cfg, issue_num, m, r, issue_num,
             )
         }
     }

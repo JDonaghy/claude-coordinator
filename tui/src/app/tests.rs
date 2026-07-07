@@ -2180,6 +2180,95 @@
         assert!(cmd.ends_with('\r'), "launcher must auto-run");
     }
 
+    #[test]
+    fn build_interactive_launch_cmd_audit_mode_emits_audit_of_the_issue_itself() {
+        // #885: the audited epic IS the selected issue — no separate work_aid,
+        // --audit-of carries the same issue number as the trailing positional.
+        let cmd = build_interactive_launch_cmd(
+            None,
+            "m",
+            "api",
+            751,
+            InteractiveLaunchMode::Audit,
+            None,
+        );
+        assert!(
+            cmd.contains("--audit-of 751"),
+            "Audit mode must emit --audit-of <epic_issue>, got: {cmd}",
+        );
+        assert!(cmd.contains("--interactive"));
+        assert!(cmd.trim_end().ends_with("api 751"), "must target the same issue number: {cmd}");
+        assert!(cmd.ends_with('\r'), "launcher must auto-run");
+    }
+
+    /// #885: fixture for the "Audit outcomes" black-box menu test — one
+    /// epic-labelled row (index 0) and one ordinary row (index 1), with
+    /// the Pipeline sidebar already selected and focused on `selected_idx`.
+    fn make_pipeline_app_for_audit_menu_test(selected_idx: usize) -> CoordApp {
+        let data = BoardData {
+            pipeline_default_gates: vec!["review".to_string(), "merge".to_string()],
+            pipeline_tracked_labels: vec!["coord".to_string(), "epic".to_string()],
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        app.pipeline_issues = vec![
+            PipelineIssue {
+                number: 751,
+                title: "Milestone-driven workflow epic".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string(), "epic".to_string()],
+                all_labels: vec!["coord".to_string(), "epic".to_string(), "status:ready".to_string()],
+                is_closed: false,
+            },
+            PipelineIssue {
+                number: 42,
+                title: "Ordinary sub-task".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string(), "status:ready".to_string()],
+                is_closed: false,
+            },
+        ];
+        app.rebuild_pipeline_sidebar(None);
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(selected_idx);
+        app
+    }
+
+    #[test]
+    fn audit_outcomes_menu_item_present_only_on_epic_labeled_row() {
+        // Black-box coverage for #885: drives the FULL event → handle → render
+        // path (the keyboard equivalent of right-click, '.', per #259) and
+        // reads the painted context menu off the TestBackend screen — not a
+        // direct call into `context_menu_items_for_pipeline_row`.
+        use quadraui::tui::testing::driver_with_shell;
+
+        // Row 0 carries the `epic` label — "Audit outcomes" must appear.
+        let epic_app = make_pipeline_app_for_audit_menu_test(0);
+        let mut driver = driver_with_shell(epic_app, CoordApp::shell_config(), 120, 40);
+        driver.type_char('.');
+        assert!(
+            driver.screen_contains("Audit outcomes"),
+            "epic row's context menu must offer 'Audit outcomes':\n{}",
+            driver.screen(),
+        );
+
+        // Row 1 has no `epic` label — "Audit outcomes" must be absent.
+        let plain_app = make_pipeline_app_for_audit_menu_test(1);
+        let mut driver = driver_with_shell(plain_app, CoordApp::shell_config(), 120, 40);
+        driver.type_char('.');
+        assert!(
+            !driver.screen_contains("Audit outcomes"),
+            "non-epic row's context menu must NOT offer 'Audit outcomes':\n{}",
+            driver.screen(),
+        );
+    }
+
     // ── Leg 3c / A3 (#517, #581): test-verdict routing ────────────────────
 
     fn done_work_with_test_state(issue: u64, repo: &str, state: &str) -> Assignment {
@@ -11333,6 +11422,8 @@
             interactive_mode_verb(InteractiveLaunchMode::Troubleshoot),
             "troubleshoot"
         );
+        // #885: Audit's verb, used in the machine-picker prompt/dialog title.
+        assert_eq!(interactive_mode_verb(InteractiveLaunchMode::Audit), "audit");
     }
 
     #[test]
@@ -11345,6 +11436,10 @@
         assert_eq!(interactive_mode_assignment_type(InteractiveLaunchMode::Review), "review");
         assert_eq!(interactive_mode_assignment_type(InteractiveLaunchMode::Test), "smoke");
         assert_eq!(interactive_mode_assignment_type(InteractiveLaunchMode::Merge), "merge");
+        // #885: Audit is its own board assignment type — never reattaches into
+        // a running work/review/smoke/merge session, and nothing else
+        // reattaches into a running audit session.
+        assert_eq!(interactive_mode_assignment_type(InteractiveLaunchMode::Audit), "audit");
     }
 
     #[test]

@@ -1187,6 +1187,7 @@ fn session_type_label(t: &str) -> &str {
         "refinement" => "Refinement",
         "conflict-fix" => "Conflict-fix",
         "smoke" => "Smoke",
+        "audit" => "Audit",
         other => other,
     }
 }
