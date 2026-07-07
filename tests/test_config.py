@@ -427,6 +427,70 @@ def test_pipeline_gates_for_label_falls_back_to_default(tmp_path: Path) -> None:
     assert cfg.pipeline.gates_for_label(None) == ["test", "review", "merge"]
 
 
+# ── #846: attention_thresholds / convergence_rounds ─────────────────────────
+
+
+def test_pipeline_attention_thresholds_default() -> None:
+    cfg = PipelineConfig()
+    assert cfg.attention_threshold_for("work") == 45 * 60.0
+    assert cfg.attention_threshold_for("review") == 15 * 60.0
+    assert cfg.attention_threshold_for("smoke") == 20 * 60.0
+    # Unknown type falls back to the "work" default.
+    assert cfg.attention_threshold_for("mock-author") == 45 * 60.0
+    assert cfg.convergence_rounds == 3
+
+
+def test_pipeline_attention_thresholds_parsed_from_yaml(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+        "pipeline:\n"
+        "  attention_thresholds:\n"
+        "    work: 90m\n"
+        "    review: 600\n"
+        "  convergence_rounds: 5\n"
+    )
+    cfg = load(p)
+    assert cfg.pipeline.attention_threshold_for("work") == 90 * 60.0
+    assert cfg.pipeline.attention_threshold_for("review") == 600.0
+    # smoke wasn't overridden — falls back to this config's own "work"
+    # value (the user's intent), not the hardcoded built-in default.
+    assert cfg.pipeline.attention_threshold_for("smoke") == 90 * 60.0
+    assert cfg.pipeline.convergence_rounds == 5
+
+
+def test_pipeline_attention_thresholds_rejects_bad_duration(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+        "pipeline:\n"
+        "  attention_thresholds:\n"
+        "    work: not-a-duration\n"
+    )
+    with pytest.raises(ConfigError, match="attention_thresholds"):
+        load(p)
+
+
+def test_pipeline_convergence_rounds_rejects_non_positive(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n"
+        "pipeline:\n"
+        "  convergence_rounds: 0\n"
+    )
+    with pytest.raises(ConfigError, match="convergence_rounds"):
+        load(p)
+
+
 # ── concurrency: daemon-spawn stall mitigations (#299) ───────────────────────
 
 def test_concurrency_defaults() -> None:

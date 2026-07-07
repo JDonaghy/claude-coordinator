@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from click.testing import CliRunner
@@ -342,6 +343,94 @@ class TestAcceptanceRecord:
 
         wt_path = tmp_path / "acceptance-worktrees" / "coord-tui-944"
         assert not wt_path.exists(), "worktree leaked on manifest-missing error path"
+
+
+class TestAcceptanceStall:
+    """`coord acceptance stall` (#846) — the worker self-report path for a
+    churning acceptance slice: pinned #603 context note, best-effort WIP
+    push, one-shot 'needs attention' GitHub comment."""
+
+    def test_stall_pushes_wip_records_context_and_posts_comment(
+        self, tmp_path: Path, coord_db,
+    ) -> None:
+        from coord import state
+
+        repo_dir = tmp_path / "repo"
+        _init_git_repo(repo_dir)
+        config_path = _write_config(tmp_path, repo_path=str(repo_dir), run_cmd="true")
+
+        state.record_dispatched(
+            assignment_id="aid-1",
+            proposal=Proposal(
+                id=1, machine_name="laptop", repo_name="coord-tui",
+                issue_number=944, issue_title="oracle loop runner", rationale="",
+            ),
+            repo_github="acme/coord-tui",
+        )
+
+        with patch("coord.commands.acceptance.github_ops") as mock_gh:
+            result = CliRunner().invoke(main, [
+                "acceptance", "stall", "--repo", "coord-tui", "--issue", "944",
+                "--tried", "tightened the regex, retried the driver",
+                "--stuck", "ms01::b keeps failing on the empty-input case",
+                "--path", str(repo_dir), "--config", str(config_path),
+            ])
+
+        assert result.exit_code == 0, result.output
+        assert "Recorded acceptance stall" in result.output
+        assert "WIP snapshot pushed" in result.output
+
+        assert mock_gh.post_issue_comment.called
+        (repo_github, issue_number, body), _ = mock_gh.post_issue_comment.call_args
+        assert repo_github == "acme/coord-tui"
+        assert issue_number == 944
+        assert "Not converging" in body
+        assert "aid-1" in body
+        assert "laptop" in body
+
+        entries = state.list_issue_context("coord-tui", 944)
+        assert any(
+            "Acceptance stall reported" in e["body"]
+            and e["pinned"]
+            and e["source"] == "acceptance-stall"
+            for e in entries
+        )
+
+    def test_stall_without_work_assignment_still_reports(
+        self, tmp_path: Path, coord_db,
+    ) -> None:
+        """No dispatched work row for this issue yet — still push, note, and
+        post a comment (assignment id just comes back blank)."""
+        from coord import state
+
+        repo_dir = tmp_path / "repo"
+        _init_git_repo(repo_dir)
+        config_path = _write_config(tmp_path, repo_path=str(repo_dir), run_cmd="true")
+
+        with patch("coord.commands.acceptance.github_ops") as mock_gh:
+            result = CliRunner().invoke(main, [
+                "acceptance", "stall", "--repo", "coord-tui", "--issue", "944",
+                "--tried", "x", "--stuck", "y",
+                "--path", str(repo_dir), "--config", str(config_path),
+            ])
+
+        assert result.exit_code == 0, result.output
+        assert mock_gh.post_issue_comment.called
+        entries = state.list_issue_context("coord-tui", 944)
+        assert any("Acceptance stall reported" in e["body"] for e in entries)
+
+    def test_stall_unknown_repo_errors(self, tmp_path: Path, coord_db) -> None:
+        repo_dir = tmp_path / "repo"
+        _init_git_repo(repo_dir)
+        config_path = _write_config(tmp_path, repo_path=str(repo_dir), run_cmd="true")
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "stall", "--repo", "nope", "--issue", "944",
+            "--tried", "x", "--stuck", "y",
+            "--path", str(repo_dir), "--config", str(config_path),
+        ])
+        assert result.exit_code != 0
+        assert "unknown repo" in result.output
 
 
 class TestAcceptanceCapabilityRouting:

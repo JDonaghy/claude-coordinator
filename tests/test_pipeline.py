@@ -337,6 +337,56 @@ class TestComputePipeline:
         assert "enqueue" in gate_actions
 
 
+# ── #846: needs_attention field ─────────────────────────────────────────────
+
+
+class TestNeedsAttentionField:
+    def test_defaults_false_for_a_fresh_running_assignment(self) -> None:
+        a = _work(status="running")
+        pv = compute_pipeline(a, _board(a), [], _config())
+        assert pv.needs_attention is False
+        assert pv.needs_attention_reason is None
+
+    def test_wall_clock_past_threshold_flags_true(self) -> None:
+        cfg = _config()
+        cfg.pipeline.attention_thresholds = {"work": 60.0}
+        a = _work(status="running")
+        a.dispatched_at = 0.0
+        with patch("coord.notify.time") as mock_time:
+            mock_time.time.return_value = 120.0
+            pv = compute_pipeline(a, _board(a), [], cfg)
+        assert pv.needs_attention is True
+        assert pv.needs_attention_reason == "wall_clock"
+        assert pv.needs_attention_detail
+
+    def test_wall_clock_under_threshold_stays_false(self) -> None:
+        cfg = _config()
+        cfg.pipeline.attention_thresholds = {"work": 6000.0}
+        a = _work(status="running")
+        a.dispatched_at = 0.0
+        with patch("coord.notify.time") as mock_time:
+            mock_time.time.return_value = 120.0
+            pv = compute_pipeline(a, _board(a), [], cfg)
+        assert pv.needs_attention is False
+
+    def test_non_convergence_flags_true(self) -> None:
+        cfg = _config()
+        cfg.pipeline.convergence_rounds = 3
+        a = _work(status="running")
+        a.review_iteration = 3
+        pv = compute_pipeline(a, _board(a), [], cfg)
+        assert pv.needs_attention is True
+        assert pv.needs_attention_reason == "non_convergence"
+
+    def test_not_running_never_flags(self) -> None:
+        cfg = _config()
+        cfg.pipeline.convergence_rounds = 1
+        a = _work(status="done")
+        a.review_iteration = 5
+        pv = compute_pipeline(a, Board(active=[], completed=[a]), [], cfg)
+        assert pv.needs_attention is False
+
+
 # ── Required-gates persistence ──────────────────────────────────────────────
 
 

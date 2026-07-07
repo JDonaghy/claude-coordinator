@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,8 +25,10 @@ from coord.comments import (
     EVENT_ADVISORY,
     EVENT_COMPLETION,
     EVENT_FAILURE,
+    EVENT_NEEDS_ATTENTION,
     EVENT_PLAN,
     EVENT_STUCK,
+    format_needs_attention,
     format_plan,
     format_stuck,
 )
@@ -69,6 +72,163 @@ def _stuck_notified_key(assignment_id: str) -> str:
     completion/failure notifications (which key on bare assignment_id).
     """
     return f"{assignment_id}:stuck"
+
+
+@dataclass
+class NeedsAttentionDetection:
+    assignment_id: str
+    machine_name: str
+    repo_name: str
+    issue_number: int
+    reason: str  # "wall_clock" | "non_convergence"
+    detail: str
+
+
+def _needs_attention_notified_key(assignment_id: str) -> str:
+    """Notified ledger key for needs-attention events (#846).
+
+    Composite key (mirrors :func:`_stuck_notified_key`) so a one-shot
+    needs-attention comment does not block later completion/failure/stuck
+    notifications, and vice versa.
+    """
+    return f"{assignment_id}:needs-attention"
+
+
+def _fmt_minutes(seconds: float) -> str:
+    minutes = seconds / 60.0
+    if minutes < 1:
+        return f"{seconds:.0f}s"
+    if minutes == int(minutes):
+        return f"{int(minutes)}m"
+    return f"{minutes:.1f}m"
+
+
+def attention_signal(
+    *,
+    assignment_type: str,
+    status: str | None,
+    dispatched_at: float | None,
+    review_iteration: int,
+    config: Config,
+    now: float | None = None,
+) -> tuple[str, str] | tuple[None, None]:
+    """Pure #846 detection core: the two "needs attention" signals, decoupled
+    from where the assignment's fields come from.
+
+    1. **Non-convergence**: ``review_iteration >= config.pipeline.
+       convergence_rounds`` fix/review rounds without reaching a terminal
+       green test verdict + approved review. Checked first — a thrashing
+       assignment is worth flagging even if it hasn't yet cleared the
+       wall-clock threshold.
+    2. **Wall-clock**: running longer than
+       ``config.pipeline.attention_threshold_for(assignment_type)``,
+       computed from *dispatched_at*.
+
+    Deliberately time/round-based rather than self-report-based (#448: the
+    failure mode that motivated this was a worker that never emitted a
+    ``STUCK:`` line — it just silently burned budget while looking
+    "productive").
+
+    Shared by :func:`detect_needs_attention` (the coordinator backstop,
+    dispatch-ledger-dict based), ``coord.pipeline.compute_pipeline`` (the
+    ``/api/pipeline`` field the web dashboard renders), and the dashboard's
+    background poller (``Assignment``-object based) — one signal, several
+    call sites, instead of three copies of the same threshold logic.
+
+    Returns ``(reason, detail)`` — ``reason`` is ``"wall_clock"`` or
+    ``"non_convergence"`` — or ``(None, None)`` when nothing is flagged.
+    """
+    if (status or "").lower() != "running":
+        return None, None
+    if now is None:
+        now = time.time()
+
+    if review_iteration >= config.pipeline.convergence_rounds:
+        return "non_convergence", (
+            f"{review_iteration} fix/review round(s) on this assignment "
+            f"without reaching a green test verdict + approved review "
+            f"(threshold: {config.pipeline.convergence_rounds})."
+        )
+
+    threshold = config.pipeline.attention_threshold_for(assignment_type)
+    if dispatched_at is not None:
+        running_for = now - dispatched_at
+        if running_for > threshold:
+            return "wall_clock", (
+                f"Running {_fmt_minutes(running_for)}, past the "
+                f"{_fmt_minutes(threshold)} threshold for "
+                f"type={assignment_type!r}."
+            )
+
+    return None, None
+
+
+def detect_needs_attention(
+    config: Config, *, now: float | None = None
+) -> list[tuple[NeedsAttentionDetection, dict]]:
+    """Scan dispatched assignments for the two #846 "needs attention" signals
+    (see :func:`attention_signal`). Detection only — no dispatch/kill/handoff
+    behaviour.
+
+    Returns ``(NeedsAttentionDetection, dispatch_record)`` pairs for
+    assignments that haven't already been notified as needing attention (or
+    reached a terminal notification), mirroring :func:`detect_stuck`'s shape
+    so callers can post + mark idempotently the same way.
+    """
+    dispatched = load_dispatched()
+    if not dispatched:
+        return []
+    notified = load_notified()
+
+    active_records = [
+        r for r in dispatched
+        if r["assignment_id"] not in notified
+        and _needs_attention_notified_key(r["assignment_id"]) not in notified
+    ]
+    if not active_records:
+        return []
+
+    results: list[tuple[NeedsAttentionDetection, dict]] = []
+    for record in active_records:
+        reason, detail = attention_signal(
+            assignment_type=record.get("type") or "work",
+            status=record.get("status"),
+            dispatched_at=record.get("dispatched_at"),
+            review_iteration=record.get("review_iteration") or 0,
+            config=config,
+            now=now,
+        )
+        if reason is None:
+            continue
+        results.append((
+            NeedsAttentionDetection(
+                assignment_id=record["assignment_id"],
+                machine_name=record["machine_name"],
+                repo_name=record["repo_name"],
+                issue_number=record["issue_number"],
+                reason=reason,
+                detail=detail,
+            ),
+            record,
+        ))
+
+    return results
+
+
+def post_needs_attention(detection: NeedsAttentionDetection, record: dict) -> None:
+    """Post a needs-attention comment to GitHub and mark notified (#846)."""
+    body = format_needs_attention(
+        assignment_id=detection.assignment_id,
+        machine_name=detection.machine_name,
+        repo_name=detection.repo_name,
+        issue_number=detection.issue_number,
+        reason=detection.reason,
+        detail=detection.detail,
+    )
+    github_ops.post_issue_comment(
+        record["repo_github"], detection.issue_number, body
+    )
+    mark_notified(_needs_attention_notified_key(detection.assignment_id), EVENT_NEEDS_ATTENTION)
 
 
 def _agent_status(host: str, port: int = AGENT_PORT, timeout: float = 5.0) -> dict | None:
@@ -1021,14 +1181,17 @@ def _dispatch_board_pending_reviews(config: Config) -> None:
         write_board(board)
 
 
-def run(config: Config) -> tuple[list[Transition], list[StuckDetection]]:
-    """Detect and post all pending transitions and stuck signals.
+def run(
+    config: Config,
+) -> tuple[list[Transition], list[StuckDetection], list[NeedsAttentionDetection]]:
+    """Detect and post all pending transitions, stuck signals, and #846
+    needs-attention detections.
 
     Also dispatches any pending reviews found on the saved board so that
     ``coord notify`` acts as a reliable review-dispatch trigger in addition
     to ``coord status --reconcile``.
 
-    Returns (posted_transitions, posted_stuck).
+    Returns (posted_transitions, posted_stuck, posted_needs_attention).
     """
     # Refresh the agent-host cache so _try_parse_and_post_review (and any
     # other helper using _agent_host) can resolve hostnames without
@@ -1075,6 +1238,20 @@ def run(config: Config) -> tuple[list[Transition], list[StuckDetection]]:
         except Exception:  # noqa: BLE001
             continue
         stuck_posted.append(detection)
+
+    # #846: coordinator backstop for long-running / non-converging
+    # assignments. Best-effort, non-fatal — one bad record must not sink the
+    # rest of the notify run.
+    needs_attention_posted: list[NeedsAttentionDetection] = []
+    try:
+        for detection, record in detect_needs_attention(config):
+            try:
+                post_needs_attention(detection, record)
+            except Exception:  # noqa: BLE001
+                continue
+            needs_attention_posted.append(detection)
+    except Exception:  # noqa: BLE001
+        log.exception("detect_needs_attention: unexpected error")
 
     # Dispatch pending reviews from the saved board (best-effort, non-fatal).
     try:
@@ -1145,4 +1322,4 @@ def run(config: Config) -> tuple[list[Transition], list[StuckDetection]]:
         except Exception:  # noqa: BLE001
             log.exception("auto_loop: unexpected error in fix completion loop")
 
-    return posted, stuck_posted
+    return posted, stuck_posted, needs_attention_posted

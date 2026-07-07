@@ -144,11 +144,6 @@ def oracle_loop_contract_block(
     error. Fully fail-soft — mirrors ``coord.state.issue_context_block``
     (#603): this runs on the dispatch hot path, so a manifest hiccup must
     degrade to "no block" rather than break dispatch.
-
-    Note: the contract's "stop and report" step below intentionally says
-    to use a ``STUCK:`` line rather than ``coord acceptance stall`` — the
-    latter is #846 and not implemented yet. Update this text once #846
-    ships a real ``coord acceptance stall`` command.
     """
     try:
         ms_dir = ms_dir_for_issue(acceptance_root, issue_number)
@@ -172,9 +167,11 @@ def oracle_loop_contract_block(
         "- Write your own unit / internal tests too — that is still your "
         "job.\n"
         "- If your slice won't converge — the failing set churns rather "
-        "than shrinks across 2 rounds — **stop grinding**: report it in a "
-        "`STUCK:` line with what you tried and the stuck test ids so the "
-        "coordinator can intervene.\n\n"
+        "than shrinks across 2 rounds — **stop grinding**: run "
+        f"`coord acceptance stall --repo {repo_name} --issue {issue_number} "
+        '--tried "..." --stuck "..."` (#846) so the coordinator sees it '
+        "immediately, in addition to a `STUCK:` line for the interactive "
+        "log.\n\n"
         "---\n\n"
     )
 

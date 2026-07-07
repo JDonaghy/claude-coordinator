@@ -269,6 +269,17 @@ class DispatchConfig:
     require_plan: bool = False
 
 
+# #846: default wall-clock thresholds (seconds) an assignment of a given
+# `type` may run before `coord.notify.detect_needs_attention` flags it.
+# Deliberately generous — this is a "human should glance at this" signal,
+# not a kill switch (detection + surfacing only, see issue #846).
+_DEFAULT_ATTENTION_THRESHOLDS: dict[str, float] = {
+    "work": 45 * 60.0,
+    "review": 15 * 60.0,
+    "smoke": 20 * 60.0,
+}
+
+
 @dataclass
 class PipelineConfig:
     """Assignment lifecycle gate configuration.
@@ -294,6 +305,17 @@ class PipelineConfig:
     iteration climbs one rung up ``models.escalation`` (capped at the top).
     When ``False``, fix dispatches set no model (today's behaviour: the
     agent falls back to ``claude -p``'s default).
+
+    ``attention_thresholds`` (#846) maps assignment ``type`` (``"work"``,
+    ``"review"``, ``"smoke"``, ...) to a wall-clock duration (seconds) that
+    an assignment may sit in ``status="running"`` before
+    ``coord.notify.detect_needs_attention`` flags it. A type not present in
+    the mapping falls back to ``_DEFAULT_ATTENTION_THRESHOLDS``.
+
+    ``convergence_rounds`` (#846) is the number of fix/review rounds
+    (``Assignment.review_iteration``) an assignment may accumulate without
+    reaching a green test verdict + approved review before it is flagged as
+    non-converging (thrashing). Default 3.
     """
 
     default_gates: list[str] = field(default_factory=lambda: ["test", "review", "merge"])
@@ -301,6 +323,25 @@ class PipelineConfig:
     auto_loop: bool = True
     max_review_iterations: int = 5
     escalate_fix_model: bool = True
+    attention_thresholds: dict[str, float] = field(
+        default_factory=lambda: dict(_DEFAULT_ATTENTION_THRESHOLDS)
+    )
+    convergence_rounds: int = 3
+
+    def attention_threshold_for(self, assignment_type: str) -> float:
+        """Wall-clock threshold (seconds) for *assignment_type*.
+
+        Falls back to this config's own ``"work"`` entry when *assignment_type*
+        has no explicit override (so a user who only overrides ``work`` gets
+        that value applied to unlisted types too, not the hardcoded
+        default) — and only reaches for the hardcoded default when even
+        ``"work"`` was never configured.
+        """
+        if assignment_type in self.attention_thresholds:
+            return self.attention_thresholds[assignment_type]
+        return self.attention_thresholds.get(
+            "work", _DEFAULT_ATTENTION_THRESHOLDS["work"]
+        )
 
     def tracked_labels(self) -> list[str]:
         """Return the GitHub issue labels considered part of the pipeline.
@@ -1056,7 +1097,72 @@ def _parse_pipeline(raw: Any) -> PipelineConfig:
             raise ConfigError("pipeline.escalate_fix_model must be a boolean")
         cfg.escalate_fix_model = value
 
+    if "attention_thresholds" in raw:
+        value = raw["attention_thresholds"]
+        if not isinstance(value, dict):
+            raise ConfigError(
+                "pipeline.attention_thresholds must be a mapping of "
+                "assignment type -> duration (e.g. '45m', '15m', or seconds)"
+            )
+        parsed: dict[str, float] = {}
+        for k, v in value.items():
+            if not isinstance(k, str):
+                raise ConfigError("pipeline.attention_thresholds keys must be strings")
+            parsed[k] = _parse_duration_seconds(
+                v, context=f"pipeline.attention_thresholds[{k!r}]"
+            )
+        cfg.attention_thresholds = parsed
+
+    if "convergence_rounds" in raw:
+        value = raw["convergence_rounds"]
+        if not isinstance(value, int) or value < 1:
+            raise ConfigError("pipeline.convergence_rounds must be a positive integer")
+        cfg.convergence_rounds = value
+
     return cfg
+
+
+_DURATION_UNIT_SECONDS: dict[str, float] = {
+    "s": 1.0,
+    "m": 60.0,
+    "h": 3600.0,
+    "d": 86400.0,
+}
+
+
+def _parse_duration_seconds(value: Any, *, context: str) -> float:
+    """Parse a duration into seconds. Accepts a bare number (seconds) or a
+    string like ``"45m"``, ``"15m"``, ``"2h"``, ``"90s"``. Used for
+    ``pipeline.attention_thresholds`` (#846)."""
+    if isinstance(value, bool):
+        raise ConfigError(f"{context} must be a number of seconds or a duration string")
+    if isinstance(value, (int, float)):
+        if value <= 0:
+            raise ConfigError(f"{context} must be a positive duration")
+        return float(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text and text[-1] in _DURATION_UNIT_SECONDS and text[:-1].strip():
+            number_part = text[:-1].strip()
+            try:
+                number = float(number_part)
+            except ValueError:
+                pass
+            else:
+                if number <= 0:
+                    raise ConfigError(f"{context} must be a positive duration")
+                return number * _DURATION_UNIT_SECONDS[text[-1]]
+        try:
+            number = float(text)
+        except ValueError:
+            raise ConfigError(
+                f"{context} must be a number of seconds or a duration string "
+                f"like '45m', '15m', '2h' (got {value!r})"
+            ) from None
+        if number <= 0:
+            raise ConfigError(f"{context} must be a positive duration")
+        return number
+    raise ConfigError(f"{context} must be a number of seconds or a duration string")
 
 
 def _parse_dispatch(raw: Any) -> DispatchConfig:

@@ -243,10 +243,16 @@ EXTENDED_ALLOWLIST: dict[str, set[tuple[str, str]]] = {
         # rerouted to the daemon on thin clients.
         ("detect_transitions", "load_dispatched"),
         ("detect_stuck", "load_dispatched"),
+        # #846: detect_needs_attention mirrors detect_stuck exactly — same
+        # load_dispatched() scan, same call site (inside notify.run()).
+        ("detect_needs_attention", "load_dispatched"),
         # mark_notified: called from post_transition / post_stuck /
         # post_orphaned_review_findings — all inside notify.run() → daemon.
         ("post_transition", "mark_notified"),
         ("post_stuck", "mark_notified"),
+        # #846: post_needs_attention mirrors post_stuck exactly — same
+        # call site (inside notify.run()).
+        ("post_needs_attention", "mark_notified"),
         ("post_orphaned_review_findings", "mark_notified"),
         # save_plan: called from _try_parse_and_post_plan (inside
         # post_transition) → daemon via COORD_NOTIFY_ON_DAEMON.

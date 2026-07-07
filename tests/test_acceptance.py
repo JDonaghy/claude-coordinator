@@ -189,8 +189,9 @@ class TestOracleLoopContractBlock:
         assert "coord acceptance run --repo api --issue 945" in block
         assert "tests/acceptance/**" in block
         assert "STUCK:" in block
-        # #846 not implemented yet — must not tell the worker to run it.
-        assert "coord acceptance stall" not in block
+        # #846: the contract points a churning worker at `coord acceptance
+        # stall` (in addition to a STUCK: line for the interactive log).
+        assert "coord acceptance stall --repo api --issue 945" in block
 
 
 class TestAcceptanceCapabilityGap:

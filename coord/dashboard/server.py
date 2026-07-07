@@ -52,6 +52,11 @@ ASSIGNMENT_CANCELLED = "assignment_cancelled"
 # red failure — it's a "needs attention" state.  Route it to a distinct
 # event so the dashboard can style it appropriately (warning, not failure).
 ASSIGNMENT_ADVISORY = "assignment_advisory"
+# #846: an assignment running past its wall-clock threshold, or thrashing
+# through fix/review rounds without converging (coord.notify.attention_signal
+# — same detection core as the coordinator's GitHub-comment backstop).
+# Detection + surfacing only.
+ASSIGNMENT_NEEDS_ATTENTION = "assignment_needs_attention"
 
 
 def _fetch_agent_status(host: str, port: int = AGENT_PORT, timeout: float = 5.0) -> dict | None:
@@ -73,12 +78,21 @@ async def _poll_once(
     board=None,
     now: float | None = None,
     stuck_threshold: float = _STUCK_THRESHOLD,
+    needs_attention_seen: set[str] | None = None,
 ) -> list[dict]:
     """One iteration of the background agent poller.
 
     Queries each machine's agent server, publishes ``assignment_completed`` /
     ``assignment_failed`` / ``assignment_cancelled`` SSE events on transitions,
     and returns a list of possibly-stuck assignment info dicts.
+
+    Also publishes ``ASSIGNMENT_NEEDS_ATTENTION`` (#846) — a live counterpart
+    to the coordinator's GitHub-comment backstop — the first time a running
+    assignment trips the shared ``coord.notify.attention_signal`` wall-clock
+    / non-convergence check. *needs_attention_seen* is caller-owned dedupe
+    state (mirrors *seen_terminal*) so the toast fires once per assignment,
+    not every poll interval; pass ``None`` to skip this check entirely (e.g.
+    from callers that don't track dedupe state, such as older tests).
 
     Extracted to module level so unit tests can drive it directly without
     standing up a full HTTP server.
@@ -97,6 +111,33 @@ async def _poll_once(
     }
     if not running:
         return []
+
+    if needs_attention_seen is not None:
+        from coord.notify import attention_signal  # noqa: PLC0415
+
+        for aid, assignment in running.items():
+            if aid in needs_attention_seen:
+                continue
+            reason, detail = attention_signal(
+                assignment_type=assignment.type,
+                status=assignment.status,
+                dispatched_at=assignment.dispatched_at,
+                review_iteration=assignment.review_iteration,
+                config=config,
+                now=now,
+            )
+            if reason is None:
+                continue
+            needs_attention_seen.add(aid)
+            event_source.publish(ASSIGNMENT_NEEDS_ATTENTION, {
+                "assignment_id": aid,
+                "repo_name": assignment.repo_name,
+                "issue_number": assignment.issue_number,
+                "issue_title": assignment.issue_title,
+                "machine_name": assignment.machine_name,
+                "reason": reason,
+                "detail": detail,
+            })
 
     machines_by_name = {m.name: m for m in config.machines}
     needed_machines = {a.machine_name for a in running.values()}
@@ -183,6 +224,11 @@ async def _poll_once(
     for aid in list(orphaned_since):
         if aid not in running:
             del orphaned_since[aid]
+
+    if needs_attention_seen is not None:
+        for aid in list(needs_attention_seen):
+            if aid not in running:
+                needs_attention_seen.discard(aid)
 
     return possibly_stuck
 
@@ -410,6 +456,9 @@ def build_app(config: Config) -> Starlette:
     _seen_terminal: set[str] = set()
     # assignment_id → timestamp when we first noticed it orphaned.
     _orphaned_since: dict[str, float] = {}
+    # #846: assignment_ids that already fired an ASSIGNMENT_NEEDS_ATTENTION
+    # toast, so the live poller doesn't re-publish every _POLL_INTERVAL.
+    _needs_attention_seen: set[str] = set()
 
     async def _background_poller() -> None:
         """Runs forever; polls agents every _POLL_INTERVAL seconds."""
@@ -417,7 +466,8 @@ def build_app(config: Config) -> Starlette:
         while True:
             try:
                 possibly_stuck = await _poll_once(
-                    config, event_source, _seen_terminal, _orphaned_since
+                    config, event_source, _seen_terminal, _orphaned_since,
+                    needs_attention_seen=_needs_attention_seen,
                 )
                 event_source.publish(BOARD_UPDATED, {
                     "possibly_stuck": possibly_stuck,
