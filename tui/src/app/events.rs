@@ -1725,10 +1725,14 @@ impl CoordApp {
                     }
 
                     // ── Plans panel keyboard nav (#975) ──────────────────
+                    // #1001: `plans_sel` indexes into `plans_visible_entries()`
+                    // — the currently-rendered rows — not the full roster, so
+                    // navigation never lands on a collapsed no-work-order
+                    // milestone that isn't on screen.
                     Key::Char('j') | Key::Named(NamedKey::Down)
                         if self.active_view == SidebarView::Plans =>
                     {
-                        let n = self.plans_entries().len();
+                        let n = self.plans_visible_entries().len();
                         if n > 0 {
                             self.plans_sel = (self.plans_sel + 1).min(n.saturating_sub(1));
                         }
@@ -1738,6 +1742,13 @@ impl CoordApp {
                         if self.active_view == SidebarView::Plans =>
                     {
                         self.plans_sel = self.plans_sel.saturating_sub(1);
+                        needs_redraw = true;
+                    }
+                    // #1001: `u` toggles whether the currently-selected row's
+                    // repo shows its "without a work order" milestones
+                    // (default: collapsed into a "+N" summary line).
+                    Key::Char('u') if self.active_view == SidebarView::Plans => {
+                        self.toggle_plans_repo_expansion();
                         needs_redraw = true;
                     }
                     // Enter — open the tracking epic of the selected plan in
@@ -2615,8 +2626,9 @@ impl CoordApp {
                                 }
                             }
                             // #975: Plans — End jumps to last plan.
+                            // #1001: bounded by the visible (rendered) roster.
                             SidebarView::Plans => {
-                                let n = self.plans_entries().len();
+                                let n = self.plans_visible_entries().len();
                                 if n > 0 {
                                     self.plans_sel = n - 1;
                                 }
