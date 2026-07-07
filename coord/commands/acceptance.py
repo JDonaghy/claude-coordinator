@@ -28,6 +28,7 @@ from pathlib import Path
 
 import click
 
+from coord import github_ops
 from coord.acceptance import (
     ACCEPTANCE_DIRNAME,
     acceptance_capability_gap,
@@ -39,6 +40,7 @@ from coord.acceptance import (
 )
 from coord.acceptance_drivers import DriverError, run_driver
 from coord.commands._common import _CONFIG_OPTION, _load_config
+from coord.comments import format_needs_attention
 
 
 @click.group("acceptance")
@@ -416,6 +418,122 @@ def _acceptance_record_local(
     else:
         click.echo(f"  worktree kept for inspection: {wt_path}")
         sys.exit(1)
+
+
+def _stall_push_wip_snapshot(cwd: Path) -> str:
+    """Best-effort WIP snapshot push (#846 worker self-report).
+
+    Not the coordinator's remote-exec finalize path
+    (``coord.interactive.finalize_remote_interactive_exit`` — that's for a
+    *remote* interactive fix session over ssh, the wrong shape here since
+    this runs inside the worker's own local checkout) — just a plain
+    ``git push`` of whatever is on the current branch, so nothing is lost if
+    the coordinator takes over. Never raises: a worker calling ``stall`` is
+    already stuck, and a push failure shouldn't block the rest of the
+    report.
+    """
+    try:
+        branch_res = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=str(cwd), capture_output=True, text=True, timeout=15,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        return f"WIP push skipped: could not resolve branch ({exc})."
+    branch = branch_res.stdout.strip()
+    if branch_res.returncode != 0 or not branch or branch == "HEAD":
+        return "WIP push skipped: not on a branch (detached HEAD)."
+    try:
+        push_res = subprocess.run(
+            ["git", "push", "origin", f"HEAD:{branch}"],
+            cwd=str(cwd), capture_output=True, text=True, timeout=60,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        return f"WIP push failed (branch `{branch}`): {exc}"
+    if push_res.returncode == 0:
+        return f"WIP snapshot pushed to `{branch}`."
+    return f"WIP push failed (branch `{branch}`): {push_res.stderr.strip()[:200]}"
+
+
+@acceptance_group.command(
+    "stall",
+    help=(
+        "Worker self-report (#846, preferred over a coordinator wall-clock "
+        "backstop): call this when your acceptance slice for REPO #ISSUE "
+        "isn't converging — the failing-set churns rather than shrinks "
+        "across >=2 rounds. Records a pinned #603 context note, "
+        "best-effort pushes a WIP snapshot of the current branch, and "
+        "posts the same one-shot 'needs attention' GitHub comment the "
+        "coordinator's backstop (coord.notify.detect_needs_attention) "
+        "would otherwise post later. This is the 'stop grinding and "
+        "report it' step the oracle-loop contract "
+        "(coord.acceptance.oracle_loop_contract_block) points workers at."
+    ),
+)
+@click.option("--repo", required=True, help="Local repo name (coordinator.yml repos[].name).")
+@click.option("--issue", "issue_number", type=int, required=True, help="Issue number.")
+@click.option(
+    "--tried", required=True,
+    help="What you tried across the churning rounds (one or two sentences).",
+)
+@click.option(
+    "--stuck", required=True,
+    help="Which test id(s)/behavior are still failing and why, as best understood.",
+)
+@click.option(
+    "--path", "path_opt", type=click.Path(file_okay=False), default=None,
+    help="Repo checkout to push the WIP snapshot from (default: current directory).",
+)
+@_CONFIG_OPTION
+def acceptance_stall(
+    repo: str,
+    issue_number: int,
+    tried: str,
+    stuck: str,
+    path_opt: str | None,
+    config_path: Path,
+) -> None:
+    """Report that REPO #ISSUE's acceptance slice isn't converging."""
+    from coord.board_service import read_board  # noqa: PLC0415
+    from coord.diagnose import stage_assignments  # noqa: PLC0415
+    from coord.state import add_issue_context_entry  # noqa: PLC0415
+
+    cfg = _load_config(config_path)
+    repo_entry = cfg.repo(repo)
+    if repo_entry is None:
+        click.echo(f"error: unknown repo {repo!r}", err=True)
+        sys.exit(2)
+
+    cwd = Path(path_opt).expanduser() if path_opt else Path.cwd()
+    push_note = _stall_push_wip_snapshot(cwd)
+
+    tried = tried.strip()
+    stuck = stuck.strip()
+    note = f"Acceptance stall reported. Tried: {tried} Stuck: {stuck} {push_note}".strip()
+    add_issue_context_entry(repo, issue_number, note, pinned=True, source="acceptance-stall")
+
+    board = read_board()
+    work_rows = stage_assignments(board, repo, issue_number, "work")
+    work = work_rows[0] if work_rows else None
+
+    body = format_needs_attention(
+        assignment_id=(work.assignment_id if work else None) or "",
+        machine_name=(work.machine_name if work else None) or "(self-reported)",
+        repo_name=repo,
+        issue_number=issue_number,
+        reason="non_convergence",
+        detail=(
+            "Acceptance slice not converging (worker self-report).\n\n"
+            f"**Tried:** {tried}\n\n**Stuck:** {stuck}\n\n{push_note}"
+        ),
+    )
+    try:
+        github_ops.post_issue_comment(repo_entry.github, issue_number, body)
+    except Exception as exc:  # noqa: BLE001 — the context note above already
+        # landed; a comment-post failure shouldn't turn this into a hard error.
+        click.echo(f"warning: could not post needs-attention comment: {exc}", err=True)
+
+    click.echo(f"Recorded acceptance stall for {repo} #{issue_number}.")
+    click.echo(f"  {push_note}")
 
 
 @acceptance_group.command(

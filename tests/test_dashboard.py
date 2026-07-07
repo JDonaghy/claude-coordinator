@@ -1042,6 +1042,96 @@ class TestPollOnce:
         assert len(es._history) == 0
 
 
+# ── #846: needs_attention live SSE toast ────────────────────────────────────
+
+
+class TestPollOnceNeedsAttention:
+    """`_poll_once`'s optional live counterpart to the coordinator's
+    GitHub-comment backstop (coord.notify.detect_needs_attention) — same
+    coord.notify.attention_signal core, gated behind needs_attention_seen so
+    callers that don't pass it (e.g. the pre-#846 tests above) see no
+    behaviour change."""
+
+    def _make_config(self) -> Config:
+        return Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(name="laptop", host="laptop.tailnet", repos=["api"])],
+        )
+
+    def _running_board(self, aid: str = "abc", dispatched_at: float = 1.0) -> Board:
+        return Board(
+            active=[
+                Assignment(
+                    machine_name="laptop", repo_name="api",
+                    issue_number=42, issue_title="Fix auth",
+                    assignment_id=aid, status="running",
+                    dispatched_at=dispatched_at,
+                ),
+            ],
+        )
+
+    def test_omitted_seen_set_skips_the_check_entirely(self) -> None:
+        """Backward compat: no needs_attention_seen kwarg -> no new event,
+        even for an assignment that's been running for hours."""
+        from coord.dashboard.server import ASSIGNMENT_NEEDS_ATTENTION, _poll_once
+        from coord.events import EventSource
+
+        config = self._make_config()
+        es = EventSource()
+        board = self._running_board("abc", dispatched_at=0.0)
+
+        with patch("coord.dashboard.server._fetch_agent_status", return_value=None):
+            asyncio.run(_poll_once(config, es, {}, {}, board=board, now=100000.0))
+
+        assert not any(e.type == ASSIGNMENT_NEEDS_ATTENTION for e in es._history)
+
+    def test_wall_clock_over_threshold_fires_once(self) -> None:
+        from coord.dashboard.server import ASSIGNMENT_NEEDS_ATTENTION, _poll_once
+        from coord.events import EventSource
+
+        config = self._make_config()
+        es = EventSource()
+        board = self._running_board("abc", dispatched_at=0.0)
+        seen: set[str] = set()
+
+        with patch("coord.dashboard.server._fetch_agent_status", return_value=None):
+            # Past the default 45m "work" threshold.
+            asyncio.run(_poll_once(
+                config, es, set(), {}, board=board, now=100000.0,
+                needs_attention_seen=seen,
+            ))
+            assert "abc" in seen
+            attn_events = [e for e in es._history if e.type == ASSIGNMENT_NEEDS_ATTENTION]
+            assert len(attn_events) == 1
+            assert attn_events[0].data["reason"] == "wall_clock"
+
+            # A second poll must not re-fire for the same assignment.
+            asyncio.run(_poll_once(
+                config, es, set(), {}, board=board, now=100001.0,
+                needs_attention_seen=seen,
+            ))
+            attn_events = [e for e in es._history if e.type == ASSIGNMENT_NEEDS_ATTENTION]
+            assert len(attn_events) == 1
+
+    def test_under_threshold_does_not_fire(self) -> None:
+        from coord.dashboard.server import ASSIGNMENT_NEEDS_ATTENTION, _poll_once
+        from coord.events import EventSource
+
+        config = self._make_config()
+        es = EventSource()
+        board = self._running_board("abc", dispatched_at=1000.0)
+        seen: set[str] = set()
+
+        with patch("coord.dashboard.server._fetch_agent_status", return_value=None):
+            asyncio.run(_poll_once(
+                config, es, set(), {}, board=board, now=1010.0,
+                needs_attention_seen=seen,
+            ))
+
+        assert not any(e.type == ASSIGNMENT_NEEDS_ATTENTION for e in es._history)
+        assert seen == set()
+
+
 # ── Bug regression tests (HTML/JS) ──────────────────────────────────────────
 
 

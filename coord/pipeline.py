@@ -79,6 +79,14 @@ class PipelineView:
     # Populated by compute_pipeline so the phone detail screen can display the
     # current verdict and the Record Test Verdict gate can offer Pass/Fail.
     test_verdict: str | None = None
+    # #846: True when this assignment is running past its wall-clock
+    # threshold or thrashing through fix/review rounds without converging
+    # (see coord.notify.attention_signal — same detection core the
+    # coordinator's GitHub-comment backstop uses). Detection + surfacing
+    # only; nothing is killed or reassigned automatically.
+    needs_attention: bool = False
+    needs_attention_reason: str | None = None  # "wall_clock" | "non_convergence" | None
+    needs_attention_detail: str | None = None
 
 
 # ── Stage progression constants ──────────────────────────────────────────────
@@ -310,6 +318,20 @@ def compute_pipeline(
     # Reads from Assignment.test_state (None | "passed" | "failed" | "skipped").
     test_verdict = assignment.test_state
 
+    # #846: long-running / non-converging signal, shared with the coordinator
+    # backstop (coord.notify.detect_needs_attention) via the same pure
+    # coord.notify.attention_signal core — local import to avoid a module-load
+    # cycle (mirrors the coord.merge_queue import above).
+    from coord.notify import attention_signal  # noqa: PLC0415
+
+    needs_attention_reason, needs_attention_detail = attention_signal(
+        assignment_type=assignment.type,
+        status=assignment.status,
+        dispatched_at=assignment.dispatched_at,
+        review_iteration=assignment.review_iteration,
+        config=config,
+    )
+
     return PipelineView(
         assignment_id=aid,
         issue_number=assignment.issue_number,
@@ -324,4 +346,7 @@ def compute_pipeline(
         review_verdict=review_verdict,
         review_findings_body=review_findings_body,
         test_verdict=test_verdict,
+        needs_attention=needs_attention_reason is not None,
+        needs_attention_reason=needs_attention_reason,
+        needs_attention_detail=needs_attention_detail,
     )

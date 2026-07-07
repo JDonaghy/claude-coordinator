@@ -396,6 +396,9 @@ def _row_to_dispatched_dict(row: object) -> dict:
         "review_of_assignment_id": d.get("review_of_assignment_id"),
         "review_target": d.get("review_target"),
         "status": d.get("status"),
+        # #846: needed by coord.notify.detect_needs_attention's non-convergence
+        # check (>= pipeline.convergence_rounds fix/review rounds).
+        "review_iteration": d.get("review_iteration", 0) or 0,
     }
 
 

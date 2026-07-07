@@ -83,6 +83,9 @@ export interface PipelineView {
   review_verdict: 'approve' | 'request-changes' | null
   review_findings_body: string | null
   test_verdict: TestVerdict | null
+  needs_attention: boolean
+  needs_attention_reason: string | null
+  needs_attention_detail: string | null
 }
 
 export interface Assignment {

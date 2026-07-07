@@ -19,6 +19,12 @@ EVENT_FAILURE = "failure"
 EVENT_STUCK = "stuck"
 EVENT_PLAN = "plan"
 EVENT_ADVISORY = "advisory"
+# #846: an assignment running past its wall-clock threshold, or thrashing
+# through fix/review rounds without converging. Distinct from EVENT_STUCK
+# (a worker self-reported STATUS/STUCK line) — this fires from time/round
+# based detection, which also catches the "silently burned budget, looked
+# productive the whole time" failure mode STUCK: lines miss (see #448).
+EVENT_NEEDS_ATTENTION = "needs_attention"
 
 
 @dataclass
@@ -216,6 +222,47 @@ def format_stuck(
         "",
         "The worker has stopped and is waiting for guidance. Use:",
         f"`coord resume-stuck {assignment_id} --guidance \"your answer here\"`",
+    ]
+    return "\n".join(lines)
+
+
+def format_needs_attention(
+    *,
+    assignment_id: str,
+    machine_name: str,
+    repo_name: str,
+    issue_number: int,
+    reason: str,
+    detail: str,
+) -> str:
+    """Format a "needs attention" comment (#846) — a time/round-based signal
+    that an assignment is running long or thrashing, distinct from a
+    worker's self-reported ``STUCK:`` line.
+
+    *reason* is ``"wall_clock"`` or ``"non_convergence"``; *detail* is a
+    human-readable one-liner (e.g. "running 52m, threshold 45m" or
+    "4 fix/review rounds without a green test + approved review").
+    """
+    marker = _marker(
+        EVENT_NEEDS_ATTENTION,
+        assignment=assignment_id,
+        machine=machine_name,
+        repo=repo_name,
+        reason=reason,
+    )
+    lines = [
+        marker,
+        "## ⏱ Needs attention",
+        f"**Machine:** {machine_name}",
+        f"**Assignment:** {assignment_id}",
+        f"**Issue:** #{issue_number}",
+        f"**Reason:** {'Running too long' if reason == 'wall_clock' else 'Not converging'}",
+        "",
+        detail.strip(),
+        "",
+        "Detection + surfacing only — nothing was killed or reassigned. A "
+        "human should take a look; use `coord log <id>` to see what it's "
+        "doing, or `coord retry`/`coord stop` to intervene.",
     ]
     return "\n".join(lines)
 
