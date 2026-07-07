@@ -904,6 +904,36 @@ def _openapi_spec() -> dict:
                 },
             }
         },
+        "/needs-attention-notified": {
+            "post": {
+                "summary": (
+                    "Mark the one-shot #846 'needs attention' ledger entry "
+                    "for an assignment (thin-client route for `coord "
+                    "acceptance stall`'s self-report, #846 review)"
+                ),
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "assignment_id": {"type": "string"},
+                                },
+                                "required": ["assignment_id"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {"application/json": {"schema": ok_response}},
+                    },
+                    "400": {"description": "Missing assignment_id"},
+                },
+            }
+        },
         "/assignment-usage": {
             "post": {
                 "summary": "Route cost/token/is_interactive/smoke_tests writes (#665/#749)",
@@ -2089,6 +2119,28 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             )
         return JSONResponse({"ok": True})
 
+    async def post_needs_attention_notified(request: Request) -> Response:
+        # #846 review: mark the one-shot "needs attention" ledger entry on
+        # the daemon's DB so `coord acceptance stall`'s self-report is a
+        # true one-shot from a thin client too — otherwise the wall-clock
+        # backstop (coord.notify.detect_needs_attention) stays eligible to
+        # flag the same assignment again later.
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        try:
+            state._mark_needs_attention_notified_local(body["assignment_id"])
+        except KeyError as e:
+            return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "needs-attention-notified write failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"ok": True})
+
     async def post_board(request: Request) -> Response:
         # #749: generic whole-board upsert endpoint backing
         # coord.board_service.write_board() for the commands that still
@@ -3009,6 +3061,11 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/acceptance-record", post_acceptance_record, methods=["POST"]),
         Route("/review-findings", post_review_findings, methods=["POST"]),
         Route("/review-posted", post_review_posted, methods=["POST"]),
+        Route(
+            "/needs-attention-notified",
+            post_needs_attention_notified,
+            methods=["POST"],
+        ),
         Route("/board", post_board, methods=["POST"]),
         Route("/assignment-usage", post_assignment_usage, methods=["POST"]),
         Route("/assignment-session-id", post_assignment_session_id, methods=["POST"]),
