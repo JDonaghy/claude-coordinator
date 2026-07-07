@@ -439,6 +439,8 @@
             milestone_dag_sel: 0,
             // #975
             plans_sel: 0,
+            // #1001
+            plans_expanded_repos: std::collections::HashSet::new(),
             // #217: use the default dark palette for test helpers.
             active_theme: crate::settings::Theme::Dark.to_quadraui_theme(),
             // #728: default 2h window for tests (can be overridden per test).
@@ -25646,20 +25648,73 @@ Milestone tracking issue.
             screen.contains("ready_waiting"),
             "#975: Plans row must surface the `ready_waiting` attention signal:\n{screen}",
         );
-
-        // Follow-up milestone (no epic yet): renders with `no work order`
-        // + `no_work_order` attention signal.
+        // #1001: a repo header row precedes the milestones, with per-repo
+        // tracked/ready/blocked/attention counts.
         assert!(
-            screen.contains("Follow-up"),
-            "#975: Plans row for milestone 'Follow-up' must render:\n{screen}",
+            screen.contains("▾ api"),
+            "#1001: a repo header row for 'api' must render:\n{screen}",
         );
         assert!(
-            screen.contains("no work order"),
-            "#975: milestone without epic must render 'no work order':\n{screen}",
+            screen.contains("(1 tracked)"),
+            "#1001: repo header must show the tracked-milestone count:\n{screen}",
+        );
+
+        // Follow-up milestone (no epic yet) is collapsed by default (#1001)
+        // — summarised by a trailing "+N without a work order" line instead
+        // of always rendering inline.
+        assert!(
+            !screen.contains("Follow-up"),
+            "#1001: an untracked milestone must be collapsed by default:\n{screen}",
+        );
+        assert!(
+            screen.contains("+1 without a work order"),
+            "#1001: a collapsed repo must show a '+N without a work order' summary line:\n{screen}",
+        );
+    }
+
+    /// #1001: pressing `u` on a tracked row expands that row's repo,
+    /// revealing the previously-collapsed `no_work_order` milestone
+    /// ("Follow-up") inline with its `no_work_order` chip; pressing `u`
+    /// again re-collapses it.
+    #[test]
+    fn plans_panel_u_toggles_untracked_milestones_for_selected_repo() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_test_app(make_plan_roster_board_data());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "◆");
+
+        assert!(
+            !driver.screen_contains("Follow-up"),
+            "sanity: Follow-up starts collapsed:\n{}",
+            driver.screen(),
+        );
+
+        driver.press(quadraui::Key::Char('u'));
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Follow-up"),
+            "#1001: `u` must expand the selected row's repo, revealing Follow-up:\n{screen}",
         );
         assert!(
             screen.contains("no_work_order"),
-            "#975: milestone without epic must surface `no_work_order` signal:\n{screen}",
+            "#1001: the revealed row must still carry its `no_work_order` chip:\n{screen}",
+        );
+        assert!(
+            !screen.contains("without a work order"),
+            "#1001: the '+N without a work order' summary must disappear once expanded:\n{screen}",
+        );
+
+        // Toggle again — back to collapsed.
+        driver.press(quadraui::Key::Char('u'));
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("Follow-up"),
+            "#1001: a second `u` must re-collapse the repo:\n{screen}",
+        );
+        assert!(
+            screen.contains("+1 without a work order"),
+            "#1001: re-collapsing must restore the summary line:\n{screen}",
         );
     }
 
@@ -25702,7 +25757,9 @@ Milestone tracking issue.
         let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
         click_activity_icon(&mut driver, "◆");
 
-        // Advance selection to row 1 (Follow-up, no epic).
+        // #1001: Follow-up (no epic) is collapsed by default — expand its
+        // repo first, then advance selection to row 1 (Follow-up, no epic).
+        driver.press(quadraui::Key::Char('u'));
         driver.press(quadraui::Key::Char('j'));
         driver.press_named(quadraui::NamedKey::Enter);
         assert!(
@@ -25853,6 +25910,11 @@ Milestone tracking issue.
         let mut driver = driver_with_shell(app, CoordApp::shell_config(), 160, 40);
         click_activity_icon(&mut driver, "◆");
 
+        // #1001: this repo has zero tracked milestones, so it starts fully
+        // collapsed — expand it (falls back to the first roster repo since
+        // nothing is selectable yet) to reach the chip.
+        driver.press(quadraui::Key::Char('u'));
+
         let screen = driver.screen();
         assert!(
             screen.contains("no_work_order"),
@@ -25960,9 +26022,12 @@ Milestone tracking issue.
     /// The "N plans need you" status-bar badge (#976) must be visible from
     /// ANY view — not just Plans — since the whole point is reminding the
     /// user without them opening the panel. `make_plan_roster_board_data`
-    /// seeds two entries that both carry a `needs_you` signal (Substrate:
-    /// `ready_waiting`; Follow-up: `no_work_order`), so the count is 2.
-    /// Deliberately does NOT click the ◆ icon — the default view is Board.
+    /// seeds two entries (Substrate: `ready_waiting`; Follow-up:
+    /// `no_work_order`), but #1001 restricts the badge to *loud* signals
+    /// (`ready_waiting`/`stalled`) only — `no_work_order` is informational,
+    /// not an alarm — so only Substrate counts and the badge reads "1 plan
+    /// needs you" (singular), not "2 plans need you". Deliberately does NOT
+    /// click the ◆ icon — the default view is Board.
     #[test]
     fn status_bar_shows_plans_attention_badge_from_any_view() {
         use quadraui::tui::testing::driver_with_shell;
@@ -25970,8 +26035,14 @@ Milestone tracking issue.
         let app = make_test_app(make_plan_roster_board_data());
         let driver = driver_with_shell(app, CoordApp::shell_config(), 160, 40);
         assert!(
-            driver.screen_contains("2 plans need you"),
-            "#976: status bar must show the plans-attention badge from the default (Board) view:\n{}",
+            driver.screen_contains("1 plan needs you"),
+            "#1001: status bar must count only loud (ready_waiting/stalled) signals, \
+             excluding no_work_order, from the default (Board) view:\n{}",
+            driver.screen(),
+        );
+        assert!(
+            !driver.screen_contains("2 plans need you"),
+            "#1001: no_work_order must no longer inflate the attention badge count:\n{}",
             driver.screen(),
         );
     }
@@ -26121,5 +26192,169 @@ Milestone tracking issue.
             !driver.screen_contains("Plan captured"),
             "#977: Escape must not dispatch — no 'Plan captured' toast:\n{}",
             driver.screen(),
+        );
+    }
+
+    // ── #1001: repo grouping + severity-split attention badge ────────────
+
+    /// `plans_needing_attention_count` — the shared basis for the sidebar
+    /// hint and the status-bar badge — must count only *loud* signals
+    /// (`ready_waiting`/`stalled`), not `no_work_order`/`chat_pending`.
+    /// Direct method call (no driver) so this asserts the underlying logic
+    /// independent of rendering/layout.
+    #[test]
+    fn plans_needing_attention_count_ignores_no_work_order_and_chat_pending() {
+        let data = BoardData {
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            plan_roster: vec![
+                PlanRosterEntry {
+                    repo: "api".to_string(),
+                    title: "Ready one".to_string(),
+                    milestone_number: 1,
+                    tracking_issue: Some(100),
+                    has_work_order: true,
+                    ready_frontier: 1,
+                    blocked: 0,
+                    in_flight: 0,
+                    done: 0,
+                    total: 1,
+                    needs_you: vec!["ready_waiting".to_string()],
+                },
+                PlanRosterEntry {
+                    repo: "api".to_string(),
+                    title: "Stalled one".to_string(),
+                    milestone_number: 2,
+                    tracking_issue: Some(101),
+                    has_work_order: true,
+                    ready_frontier: 0,
+                    blocked: 1,
+                    in_flight: 0,
+                    done: 0,
+                    total: 1,
+                    needs_you: vec!["stalled".to_string()],
+                },
+                PlanRosterEntry {
+                    repo: "api".to_string(),
+                    title: "Untracked one".to_string(),
+                    milestone_number: 3,
+                    tracking_issue: None,
+                    has_work_order: false,
+                    ready_frontier: 0,
+                    blocked: 0,
+                    in_flight: 0,
+                    done: 0,
+                    total: 0,
+                    needs_you: vec!["no_work_order".to_string()],
+                },
+                PlanRosterEntry {
+                    repo: "api".to_string(),
+                    title: "Untracked two".to_string(),
+                    milestone_number: 4,
+                    tracking_issue: None,
+                    has_work_order: false,
+                    ready_frontier: 0,
+                    blocked: 0,
+                    in_flight: 0,
+                    done: 0,
+                    total: 0,
+                    needs_you: vec!["no_work_order".to_string()],
+                },
+                PlanRosterEntry {
+                    repo: "api".to_string(),
+                    title: "Chatting one".to_string(),
+                    milestone_number: 5,
+                    tracking_issue: Some(105),
+                    has_work_order: true,
+                    ready_frontier: 0,
+                    blocked: 1,
+                    in_flight: 1,
+                    done: 0,
+                    total: 2,
+                    needs_you: vec!["chat_pending".to_string()],
+                },
+            ],
+            ..BoardData::default()
+        };
+        let app = make_test_app(data);
+        assert_eq!(
+            app.plans_needing_attention_count(),
+            2,
+            "#1001: only the ready_waiting + stalled entries should count — \
+             two no_work_order entries and one chat_pending-only entry must \
+             NOT inflate this past 2",
+        );
+    }
+
+    /// Multi-repo roster: each repo gets its own `▾ {repo}` header with a
+    /// per-repo tracked count, and repos render in a stable (already-sorted)
+    /// order. A repo whose only milestone has no work order shows
+    /// "(0 tracked)" in its header and no attention marker, while a repo
+    /// with a ready milestone shows the "N need attention" suffix.
+    #[test]
+    fn plans_panel_renders_one_header_per_repo_with_counts() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let data = BoardData {
+            pipeline_repos: vec![
+                ("api".to_string(), "acme/api".to_string()),
+                ("web".to_string(), "acme/web".to_string()),
+            ],
+            plan_roster: vec![
+                PlanRosterEntry {
+                    repo: "api".to_string(),
+                    title: "Substrate".to_string(),
+                    milestone_number: 5,
+                    tracking_issue: Some(500),
+                    has_work_order: true,
+                    ready_frontier: 2,
+                    blocked: 1,
+                    in_flight: 0,
+                    done: 0,
+                    total: 3,
+                    needs_you: vec!["ready_waiting".to_string()],
+                },
+                PlanRosterEntry {
+                    repo: "web".to_string(),
+                    title: "Old category bucket".to_string(),
+                    milestone_number: 1,
+                    tracking_issue: None,
+                    has_work_order: false,
+                    ready_frontier: 0,
+                    blocked: 0,
+                    in_flight: 0,
+                    done: 0,
+                    total: 0,
+                    needs_you: vec!["no_work_order".to_string()],
+                },
+            ],
+            ..BoardData::default()
+        };
+        let app = make_test_app(data);
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 160, 40);
+        click_activity_icon(&mut driver, "◆");
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("▾ api"),
+            "#1001: 'api' repo header must render:\n{screen}",
+        );
+        assert!(
+            screen.contains("▾ web"),
+            "#1001: 'web' repo header must render:\n{screen}",
+        );
+        assert!(
+            screen.contains("(0 tracked)"),
+            "#1001: 'web' has zero has_work_order milestones — header must \
+             say '(0 tracked)':\n{screen}",
+        );
+        assert!(
+            screen.contains("+1 without a work order"),
+            "#1001: 'web' repo's untracked milestone must be summarised, \
+             not rendered inline:\n{screen}",
+        );
+        assert!(
+            !screen.contains("Old category bucket"),
+            "#1001: the untracked milestone title must not appear while \
+             collapsed:\n{screen}",
         );
     }

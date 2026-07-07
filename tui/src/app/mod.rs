@@ -2505,10 +2505,18 @@ pub struct CoordApp {
     milestone_dag_sel: usize,
 
     // ── #975: Plans ActivityBar panel ────────────────────────────────────────
-    /// Selected plan-roster index (0-based) into `plans_entries()`'s return
-    /// order.  Clamped to bounds on navigation, same pattern as
+    /// Selected plan-roster index (0-based) into `plans_visible_entries()`'s
+    /// return order (#1001: the currently-*rendered* rows, not the full
+    /// unfiltered roster — collapsed no-work-order milestones aren't
+    /// selectable).  Clamped to bounds on navigation, same pattern as
     /// `milestone_dag_sel`.
     plans_sel: usize,
+    /// Repos whose "without a work order" milestones are expanded in the
+    /// Plans panel (#1001).  Absent = collapsed (the default) — only
+    /// `has_work_order` milestones render under that repo's header, with a
+    /// trailing "+N without a work order" summary line instead. Toggled with
+    /// `u` on the repo of the currently-selected row.
+    plans_expanded_repos: std::collections::HashSet<String>,
 
     // ── #541: global Telescope-style issue fuzzy finder ──────────────────────
     /// Active state of the issue fuzzy-finder overlay.  `None` when the
@@ -2885,6 +2893,9 @@ impl CoordApp {
             milestone_dag_sel: 0,
             // #975: Plans panel — selection starts at the top.
             plans_sel: 0,
+            // #1001: no repo starts expanded — untracked milestones default
+            // to collapsed everywhere.
+            plans_expanded_repos: std::collections::HashSet::new(),
             // #217: resolved theme palette — computed from settings + optional
             // ~/.coord/theme.toml override file.
             active_theme: {
@@ -6375,7 +6386,9 @@ impl CoordApp {
             // #977 review: the fast plan-capture key (`c`) had no visible
             // hint anywhere — surface it here alongside the other Plans
             // panel bindings so it's discoverable without reading the diff.
-            " j/k=nav  Enter=open epic  c=capture plan  q=quit ".to_string()
+            // #1001: `u` toggles the "+N without a work order" collapse for
+            // the selected row's repo — same discoverability bar.
+            " j/k=nav  Enter=open epic  c=capture plan  u=toggle untracked  q=quit ".to_string()
         } else {
             // #192: `p` / `a` / `A` retired alongside the PROPOSALS
             // section.  Right-click → Send to Pipeline (#261) is the
