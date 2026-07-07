@@ -495,7 +495,7 @@ def acceptance_stall(
     """Report that REPO #ISSUE's acceptance slice isn't converging."""
     from coord.board_service import read_board  # noqa: PLC0415
     from coord.diagnose import stage_assignments  # noqa: PLC0415
-    from coord.state import add_issue_context_entry  # noqa: PLC0415
+    from coord.state import add_issue_context_entry, mark_needs_attention_notified  # noqa: PLC0415
 
     cfg = _load_config(config_path)
     repo_entry = cfg.repo(repo)
@@ -531,6 +531,15 @@ def acceptance_stall(
     except Exception as exc:  # noqa: BLE001 — the context note above already
         # landed; a comment-post failure shouldn't turn this into a hard error.
         click.echo(f"warning: could not post needs-attention comment: {exc}", err=True)
+    else:
+        # #846 review: share the notified-ledger with the coordinator's
+        # wall-clock backstop (coord.notify.detect_needs_attention) so this
+        # self-report is a true one-shot — otherwise the same assignment
+        # stays eligible and can get a second "needs attention" comment
+        # later. Skip when no work assignment id was resolved (matches the
+        # existing blank-assignment-id test case).
+        if work is not None:
+            mark_needs_attention_notified(work.assignment_id)
 
     click.echo(f"Recorded acceptance stall for {repo} #{issue_number}.")
     click.echo(f"  {push_note}")

@@ -871,6 +871,43 @@ def mark_notified(
     conn.commit()
 
 
+def mark_needs_attention_notified(assignment_id: str) -> None:
+    """Record the one-shot #846 'needs attention' ledger entry for
+    *assignment_id* (the composite ``f"{assignment_id}:needs-attention"``
+    key :func:`coord.notify._needs_attention_notified_key` uses).
+
+    Daemon-aware wrapper for ``coord acceptance stall`` (#846 review fix):
+    unlike ``coord notify``'s own ``mark_notified()`` call sites — which are
+    covered by the ``COORD_NOTIFY_ON_DAEMON`` *whole-command* reroute — the
+    ``acceptance stall`` self-report path only routes specific helper calls
+    individually, so this needs its own routed write to reach the daemon's
+    shared DB from a thin client (mirrors :func:`mark_review_posted`).
+    Without this, a thin-client self-report would only update the client's
+    local, non-canonical ledger, leaving the assignment eligible for a
+    second "needs attention" comment from the coordinator's wall-clock
+    backstop — the exact double-notify the ledger write exists to prevent.
+
+    Routes to ``POST /needs-attention-notified`` when a ``board_service``
+    is configured; otherwise writes the local ledger directly.
+    """
+    svc = _board_service()
+    resp = _route_write(svc, "/needs-attention-notified", {"assignment_id": assignment_id})
+    if resp is not None:
+        return
+    _mark_needs_attention_notified_local(assignment_id)
+
+
+def _mark_needs_attention_notified_local(assignment_id: str) -> None:
+    """Local-DB write for :func:`mark_needs_attention_notified`.
+
+    Called directly by the daemon endpoint so it never re-routes back over
+    HTTP.
+    """
+    from coord.comments import EVENT_NEEDS_ATTENTION  # noqa: PLC0415
+
+    mark_notified(f"{assignment_id}:needs-attention", EVENT_NEEDS_ATTENTION)
+
+
 # ── Review-findings tracking ──────────────────────────────────────────────────
 
 def update_assignment_review_findings(

@@ -225,3 +225,145 @@ class TestFormatNeedsAttention:
             detail="4 fix/review round(s)...",
         )
         assert "Not converging" in body
+
+
+# ── mark_needs_attention_notified: daemon routing (#846 review) ─────────────
+#
+# `coord acceptance stall` (coord/commands/acceptance.py) is the worker
+# self-report path for this ledger entry. Unlike `coord notify`'s own
+# mark_notified() call sites — covered by the COORD_NOTIFY_ON_DAEMON
+# whole-command reroute — `acceptance stall` only routes specific helper
+# calls individually, so the ledger write needs its own daemon route to
+# actually reach the shared DB from a thin client (mirrors
+# tests/test_review_verdict_relay.py's mark_review_posted coverage).
+
+
+class _FakeSvc:
+    url = "http://daemon:7435"
+    token = "t"
+
+
+class TestMarkNeedsAttentionNotifiedRouting:
+    def test_routes_to_daemon_when_service_configured(
+        self, monkeypatch, coord_db
+    ) -> None:
+        import coord.client as cc
+
+        captured: dict = {}
+        monkeypatch.setattr(cc, "resolve_board_service", lambda *a, **k: _FakeSvc())
+        monkeypatch.setattr(
+            cc,
+            "post_record",
+            lambda svc, path, payload, **kw: captured.update(
+                path=path, payload=payload
+            )
+            or {"ok": True},
+        )
+
+        state_mod.mark_needs_attention_notified("aid-846")
+
+        assert captured["path"] == "/needs-attention-notified"
+        assert captured["payload"]["assignment_id"] == "aid-846"
+
+        # Local DB must NOT have been written (empty local DB, thin-client).
+        notified = state_mod.load_notified()
+        assert "aid-846:needs-attention" not in notified
+
+    def test_writes_local_ledger_when_no_service(self, coord_db) -> None:
+        state_mod.mark_needs_attention_notified("aid-local")
+
+        notified = state_mod.load_notified()
+        assert notified["aid-local:needs-attention"]["event"] == EVENT_NEEDS_ATTENTION
+
+
+def test_post_needs_attention_notified_endpoint_writes_ledger(
+    tmp_path: Path,
+) -> None:
+    """POST /needs-attention-notified writes the ledger entry on the
+    daemon's DB (the endpoint backing mark_needs_attention_notified's
+    daemon route)."""
+    import sqlite3
+
+    from starlette.testclient import TestClient
+
+    from coord.config import load as load_config
+    from coord.dao import SqliteStore
+    from coord.db import _ensure_schema, override_connection
+    from coord.serve_app import build_app
+
+    rw_conn = sqlite3.connect(str(tmp_path / "rw.db"), check_same_thread=False)
+    rw_conn.row_factory = sqlite3.Row
+    _ensure_schema(rw_conn)
+    override_connection(rw_conn)
+
+    file_db = tmp_path / "coord.db"
+    file_conn = sqlite3.connect(str(file_db))
+    file_conn.row_factory = sqlite3.Row
+    _ensure_schema(file_conn)
+    file_conn.commit()
+    file_conn.close()
+
+    config_path = tmp_path / "coordinator.yml"
+    config_path.write_text(
+        "repos:\n"
+        "  - name: api\n"
+        "    github: acme/api\n"
+        "machines:\n"
+        "  - name: laptop\n"
+        "    host: laptop.tail\n"
+        "    repos: [api]\n"
+    )
+
+    app = build_app(SqliteStore(file_db), load_config(config_path))
+    with TestClient(app) as cli:
+        resp = cli.post(
+            "/needs-attention-notified", json={"assignment_id": "aid-905"}
+        )
+    assert resp.status_code == 200 and resp.json()["ok"] is True
+
+    row = rw_conn.execute(
+        "SELECT event FROM notifications WHERE assignment_id='aid-905:needs-attention'"
+    ).fetchone()
+    assert row["event"] == EVENT_NEEDS_ATTENTION
+
+
+def test_post_needs_attention_notified_endpoint_missing_field_returns_400(
+    tmp_path: Path,
+) -> None:
+    import sqlite3
+
+    from starlette.testclient import TestClient
+
+    from coord.config import load as load_config
+    from coord.dao import SqliteStore
+    from coord.db import _ensure_schema, override_connection
+
+    from coord.serve_app import build_app
+
+    rw_conn = sqlite3.connect(str(tmp_path / "rw.db"), check_same_thread=False)
+    rw_conn.row_factory = sqlite3.Row
+    _ensure_schema(rw_conn)
+    override_connection(rw_conn)
+
+    file_db = tmp_path / "coord.db"
+    file_conn = sqlite3.connect(str(file_db))
+    file_conn.row_factory = sqlite3.Row
+    _ensure_schema(file_conn)
+    file_conn.commit()
+    file_conn.close()
+
+    config_path = tmp_path / "coordinator.yml"
+    config_path.write_text(
+        "repos:\n"
+        "  - name: api\n"
+        "    github: acme/api\n"
+        "machines:\n"
+        "  - name: laptop\n"
+        "    host: laptop.tail\n"
+        "    repos: [api]\n"
+    )
+
+    app = build_app(SqliteStore(file_db), load_config(config_path))
+    with TestClient(app) as cli:
+        resp = cli.post("/needs-attention-notified", json={})
+    assert resp.status_code == 400

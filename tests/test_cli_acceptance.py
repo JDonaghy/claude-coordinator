@@ -396,6 +396,70 @@ class TestAcceptanceStall:
             for e in entries
         )
 
+        # #846 review: the self-report must share the notified-ledger with
+        # the coordinator's wall-clock backstop, otherwise the same
+        # assignment stays eligible for a second "needs attention" comment.
+        notified = state.load_notified()
+        assert "aid-1:needs-attention" in notified
+        assert notified["aid-1:needs-attention"]["event"] == "needs_attention"
+
+    def test_stall_no_double_notify_with_backstop(
+        self, tmp_path: Path, coord_db,
+    ) -> None:
+        """After a self-reported stall, the coordinator's wall-clock backstop
+        (`detect_needs_attention`) must not re-flag the same assignment."""
+        from coord import config as config_mod
+        from coord import notify, state
+        from coord.models import Assignment, Board
+
+        repo_dir = tmp_path / "repo"
+        _init_git_repo(repo_dir)
+        config_path = _write_config(tmp_path, repo_path=str(repo_dir), run_cmd="true")
+        cfg = config_mod.load(config_path)
+
+        state.record_dispatched(
+            assignment_id="aid-2",
+            proposal=Proposal(
+                id=1, machine_name="laptop", repo_name="coord-tui",
+                issue_number=944, issue_title="oracle loop runner", rationale="",
+            ),
+            repo_github="acme/coord-tui",
+        )
+
+        with patch("coord.commands.acceptance.github_ops") as mock_gh:
+            result = CliRunner().invoke(main, [
+                "acceptance", "stall", "--repo", "coord-tui", "--issue", "944",
+                "--tried", "x", "--stuck", "y",
+                "--path", str(repo_dir), "--config", str(config_path),
+            ])
+        assert result.exit_code == 0, result.output
+        assert mock_gh.post_issue_comment.called
+
+        # Simulate the assignment continuing to thrash after the self-report
+        # (review_iteration climbing to convergence_rounds) — the exact
+        # scenario from the review finding. Without the ledger write this
+        # would still flag `aid-2` a second time.
+        state.save_board(Board(
+            active=[
+                Assignment(
+                    assignment_id="aid-2",
+                    machine_name="laptop",
+                    repo_name="coord-tui",
+                    issue_number=944,
+                    issue_title="oracle loop runner",
+                    status="running",
+                    type="work",
+                    review_iteration=cfg.pipeline.convergence_rounds,
+                )
+            ],
+            completed=[],
+        ))
+
+        detections = notify.detect_needs_attention(cfg)
+        assert not any(
+            detection.assignment_id == "aid-2" for detection, _ in detections
+        )
+
     def test_stall_without_work_assignment_still_reports(
         self, tmp_path: Path, coord_db,
     ) -> None:
@@ -418,6 +482,11 @@ class TestAcceptanceStall:
         assert mock_gh.post_issue_comment.called
         entries = state.list_issue_context("coord-tui", 944)
         assert any("Acceptance stall reported" in e["body"] for e in entries)
+
+        # No work assignment id was resolved, so there's nothing to mark in
+        # the notified-ledger (mirrors the blank-assignment-id comment body).
+        notified = state.load_notified()
+        assert not any(key.endswith(":needs-attention") for key in notified)
 
     def test_stall_unknown_repo_errors(self, tmp_path: Path, coord_db) -> None:
         repo_dir = tmp_path / "repo"
