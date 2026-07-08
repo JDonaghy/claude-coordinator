@@ -635,6 +635,9 @@ mod pure_tests {
             test_reason: None,
             review_state: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         }
     }
 

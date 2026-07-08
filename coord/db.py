@@ -328,6 +328,19 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # Summary tab has a durable, board-sourced field.  NULL when the
         # worker emitted no summary (best-effort; never blocks completion).
         "ALTER TABLE assignments ADD COLUMN completion_summary TEXT",
+        # #886 Phase 2: structured Milestone Outcome Audit verdict. Written by
+        # issue_store._persist_audit_result for type="audit" assignments only
+        # (the epic's issue_number doubles as the audit's issue_number — see
+        # #885's _dispatch_audit_of). audit_goals_json is a JSON array of
+        # {goal, metric_before, metric_after, verdict (met|partial|gap),
+        # evidence} — kept as a raw JSON string on the wire, same convention
+        # as review_findings above. audit_run_number increments once per
+        # `--audit-of <epic>` run against the same (repo_name, issue_number)
+        # so later runs can diff against earlier ones. NULL for every row
+        # predating this feature and for non-audit assignment types.
+        "ALTER TABLE assignments ADD COLUMN audit_goals_json TEXT",
+        "ALTER TABLE assignments ADD COLUMN audit_bottom_line TEXT",
+        "ALTER TABLE assignments ADD COLUMN audit_run_number INTEGER",
     ]
     for sql in migrations:
         try:

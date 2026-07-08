@@ -40,8 +40,10 @@ Design decisions (#974):
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 
+from coord.issue_store import diff_audit_goals
 from coord.milestone_order import (
     TRACKING_ISSUE_LABEL,
     WorkOrder,
@@ -107,6 +109,17 @@ class PlanEntry:
                                it yet.  Orthogonal to the other three signals:
                                it can appear alongside any of them (or alone
                                on an otherwise "done" milestone).
+
+        outcome_run_number, outcome_met, outcome_partial, outcome_gap,
+        outcome_bottom_line, outcome_diff_summary:
+                           #886 Phase 2 — the latest Milestone Outcome Audit
+                           (``--audit-of``) verdict for this milestone's epic,
+                           independent of the issue-closed counts above. All
+                           ``None`` when no audit has ever run against this
+                           epic. ``outcome_diff_summary`` is a pre-rendered
+                           one-line delta vs the previous run (e.g. "closed:
+                           tests.rs split; still open: #550"), ``None`` on the
+                           first run (nothing to diff against yet).
     """
 
     repo: str
@@ -120,6 +133,12 @@ class PlanEntry:
     done: int
     total: int
     needs_you: list[str] = field(default_factory=list)
+    outcome_run_number: int | None = None
+    outcome_met: int | None = None
+    outcome_partial: int | None = None
+    outcome_gap: int | None = None
+    outcome_bottom_line: str | None = None
+    outcome_diff_summary: str | None = None
 
     def to_dict(self) -> dict:
         """Serialise to a plain dict suitable for ``json.dumps``."""
@@ -135,6 +154,12 @@ class PlanEntry:
             "done": self.done,
             "total": self.total,
             "needs_you": list(self.needs_you),
+            "outcome_run_number": self.outcome_run_number,
+            "outcome_met": self.outcome_met,
+            "outcome_partial": self.outcome_partial,
+            "outcome_gap": self.outcome_gap,
+            "outcome_bottom_line": self.outcome_bottom_line,
+            "outcome_diff_summary": self.outcome_diff_summary,
         }
 
 
@@ -198,6 +223,79 @@ def _has_pending_chat(
     )
 
 
+def _latest_audit_outcome(
+    board: Board, repo_name: str, tracking_issue_number: int | None,
+) -> dict | None:
+    """The latest ``--audit-of`` verdict for this milestone's epic (#886
+    Phase 2), or ``None`` when no audit has ever run against it.
+
+    Scans ``board.completed`` for ``type="audit"`` rows keyed by
+    ``(repo_name, tracking_issue_number)`` — the epic's own issue number
+    doubles as the audit assignment's ``issue_number`` (see #885's
+    ``_dispatch_audit_of``) — and picks the highest ``audit_run_number``.
+    When a second-highest run also exists, pre-renders a short delta string
+    (via :func:`coord.issue_store.diff_audit_goals`) so callers (the TUI)
+    don't need to re-derive a diff from two raw JSON blobs.  Board-driven and
+    pure, like the rest of this module — no DB access here even though the
+    Board's assignment rows ultimately came from one.
+    """
+    if tracking_issue_number is None:
+        return None
+    runs = sorted(
+        (
+            a
+            for a in board.completed
+            if a.type == "audit"
+            and a.repo_name == repo_name
+            and a.issue_number == tracking_issue_number
+            and a.audit_run_number is not None
+        ),
+        key=lambda a: a.audit_run_number,
+    )
+    if not runs:
+        return None
+    latest = runs[-1]
+    try:
+        latest_goals = json.loads(latest.audit_goals_json or "[]")
+    except (TypeError, ValueError):
+        latest_goals = []
+    met = sum(1 for g in latest_goals if g.get("verdict") == "met")
+    gap = sum(1 for g in latest_goals if g.get("verdict") == "gap")
+    total = len(latest_goals)
+    partial = total - met - gap
+
+    diff_summary: str | None = None
+    if len(runs) >= 2:
+        prev = runs[-2]
+        try:
+            prev_goals = json.loads(prev.audit_goals_json or "[]")
+        except (TypeError, ValueError):
+            prev_goals = []
+        diff = diff_audit_goals(prev_goals, latest_goals)
+        parts = []
+        if diff["closed"]:
+            parts.append(f"closed: {', '.join(diff['closed'])}")
+        if diff["regressed"]:
+            parts.append(f"REGRESSED: {', '.join(diff['regressed'])}")
+        if diff["still_open"]:
+            parts.append(f"still open: {', '.join(diff['still_open'])}")
+        if parts:
+            diff_summary = (
+                f"v{prev.audit_run_number}→v{latest.audit_run_number}: "
+                + "; ".join(parts)
+            )
+
+    return {
+        "run_number": latest.audit_run_number,
+        "met": met,
+        "partial": partial,
+        "gap": gap,
+        "total": total,
+        "bottom_line": latest.audit_bottom_line or "",
+        "diff_summary": diff_summary,
+    }
+
+
 def aggregate_plan(
     *,
     milestone_title: str,
@@ -243,6 +341,23 @@ def aggregate_plan(
         and all counts are 0.
     """
     chat_pending = _has_pending_chat(board, repo_name, tracking_issue_number)
+    # #886 Phase 2: the audit outcome is independent of the work-order/issue
+    # counts below (the whole point — completion judged by goals met, not
+    # issues closed), so it's computed once and attached to EVERY return path,
+    # including the has_work_order=False ones.
+    outcome = _latest_audit_outcome(board, repo_name, tracking_issue_number)
+    outcome_kwargs = (
+        {
+            "outcome_run_number": outcome["run_number"],
+            "outcome_met": outcome["met"],
+            "outcome_partial": outcome["partial"],
+            "outcome_gap": outcome["gap"],
+            "outcome_bottom_line": outcome["bottom_line"],
+            "outcome_diff_summary": outcome["diff_summary"],
+        }
+        if outcome is not None
+        else {}
+    )
 
     _no_work_order_signals = ["no_work_order"]
     if chat_pending:
@@ -259,6 +374,7 @@ def aggregate_plan(
         done=0,
         total=0,
         needs_you=_no_work_order_signals,
+        **outcome_kwargs,
     )
 
     if not tracking_body:
@@ -317,6 +433,7 @@ def aggregate_plan(
         done=done,
         total=total,
         needs_you=needs_you,
+        **outcome_kwargs,
     )
 
 

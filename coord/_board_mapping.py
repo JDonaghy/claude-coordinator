@@ -123,6 +123,11 @@ def row_to_assignment(row: object) -> Assignment:
         acceptance_passed=d.get("acceptance_passed"),
         # #874: worker ### Summary prose; None when the worker emitted no block.
         completion_summary=d.get("completion_summary"),
+        # #886 Phase 2: Milestone Outcome Audit structured verdict; None for
+        # non-audit assignments and for rows predating this feature.
+        audit_goals_json=d.get("audit_goals_json"),
+        audit_bottom_line=d.get("audit_bottom_line"),
+        audit_run_number=d.get("audit_run_number"),
     )
 
 

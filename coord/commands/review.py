@@ -458,6 +458,22 @@ def _prompt_and_relay_test_verdict(
 )
 
 
+@click.option(
+    "--audit-json", "audit_json_file",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help=(
+        "Milestone Outcome Audit (#886 Phase 2) ONLY — path to a JSON file "
+        "with the structured verdict: "
+        '{"bottom_line": "...", "goals": [{"goal": "...", "metric_before": '
+        '"...", "metric_after": "...", "verdict": "met|partial|gap", '
+        '"evidence": "..."}]}. Routes the result through the audit dual-write '
+        "path (assignment row + epic comment + #603 context store) instead of "
+        "the generic done-comment body. Only valid on a --audit-of assignment."
+    ),
+)
+
+
 @_CONFIG_OPTION
 def report_result(
     assignment_id_opt: str | None,
@@ -466,6 +482,7 @@ def report_result(
     summary: str,
     body_file: str | None,
     body_inline: str | None,
+    audit_json_file: str | None,
     config_path: Path,
 ) -> None:
     """``coord report-result --assignment <id> --status <s> [--verdict <v>] --summary <text>``
@@ -489,6 +506,47 @@ def report_result(
             err=True,
         )
         sys.exit(2)
+
+    # #886 Phase 2: Milestone Outcome Audit structured verdict. Parsed and
+    # validated FIRST — before any board/config resolution — so an obvious
+    # malformed-JSON typo fails fast without needing a reachable daemon/config
+    # (issue_store._validate_result re-validates server-side too, the one seam
+    # every caller funnels through, but this saves the agent a round trip).
+    audit_goals: list[dict] | None = None
+    audit_bottom_line: str | None = None
+    if audit_json_file:
+        import json as _json  # noqa: PLC0415
+
+        try:
+            audit_payload = _json.loads(Path(audit_json_file).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            click.echo(
+                f"error: could not read/parse --audit-json {audit_json_file!r}: {exc}",
+                err=True,
+            )
+            sys.exit(2)
+        if not isinstance(audit_payload, dict) or not isinstance(
+            audit_payload.get("goals"), list
+        ):
+            click.echo(
+                "error: --audit-json must be a JSON object with a 'goals' list, "
+                'e.g. {"bottom_line": "...", "goals": [{"goal": "...", '
+                '"metric_before": "...", "metric_after": "...", "verdict": '
+                '"met|partial|gap", "evidence": "..."}]}',
+                err=True,
+            )
+            sys.exit(2)
+        audit_goals = audit_payload["goals"]
+        audit_bottom_line = audit_payload.get("bottom_line") or None
+        for _goal in audit_goals:
+            _verdict = _goal.get("verdict") if isinstance(_goal, dict) else None
+            if _verdict not in ("met", "partial", "gap"):
+                click.echo(
+                    f"error: --audit-json goal {_goal!r} has invalid verdict "
+                    f"{_verdict!r} (expected one of 'met'/'partial'/'gap')",
+                    err=True,
+                )
+                sys.exit(2)
 
     repo_github: str | None = None
     repo_name: str | None = None
@@ -644,6 +702,8 @@ def report_result(
         summary=summary,
         branch=branch,
         findings_body=findings_body,
+        audit_goals=audit_goals,
+        audit_bottom_line=audit_bottom_line,
     )
     try:
         outcome = issue_store.post_result(record_obj)
@@ -651,11 +711,11 @@ def report_result(
         click.echo(f"error: {exc}", err=True)
         sys.exit(2)
     except RuntimeError as exc:
-        # #990: the verdict write couldn't be durably confirmed (retries
+        # #886/#990: the verdict write couldn't be durably confirmed (retries
         # exhausted, or a readback mismatch) — surface this loudly instead of
-        # reporting success while the merge-gate-critical review_verdict
-        # column never actually landed. Re-running the identical command is
-        # the recovery path.
+        # reporting success while the merge-gate-critical review_verdict (or
+        # the audit run_number versioning invariant) column never actually
+        # landed. Re-running the identical command is the recovery path.
         click.echo(f"error: {exc}", err=True)
         sys.exit(1)
 

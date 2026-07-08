@@ -35,6 +35,7 @@ issue, so the pipeline sees an interactive completion identically to a
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import asdict, dataclass
 from typing import Literal
@@ -45,6 +46,7 @@ from coord.comments import (
     EVENT_COMPLETION,
     EVENT_FAILURE,
     format_advisory,
+    format_audit_scorecard,
     format_completion,
     format_failure,
 )
@@ -57,11 +59,14 @@ __all__ = [
     "post_result",
     "ResultStatus",
     "ResultVerdict",
+    "AuditVerdict",
     "STATUS_DONE",
     "STATUS_BLOCKED",
     "STATUS_ALREADY_IMPLEMENTED",
     "VERDICT_APPROVE",
     "VERDICT_REQUEST_CHANGES",
+    "get_audit_runs_for_epic",
+    "diff_audit_goals",
 ]
 
 
@@ -79,6 +84,12 @@ _VALID_VERDICTS = (VERDICT_APPROVE, VERDICT_REQUEST_CHANGES)
 
 ResultStatus = Literal["done", "blocked", "already-implemented"]
 ResultVerdict = Literal["approve", "request-changes"]
+
+# #886 Phase 2: per-goal verdict for a Milestone Outcome Audit run.
+AuditVerdict = Literal["met", "partial", "gap"]
+_VALID_AUDIT_VERDICTS = ("met", "partial", "gap")
+# Ranking used by diff_audit_goals to classify a goal's movement between runs.
+_AUDIT_VERDICT_RANK = {"gap": 0, "partial": 1, "met": 2}
 
 
 # ── Records (the wire shape the future IssueStore interface accepts) ────────
@@ -125,6 +136,14 @@ class ResultRecord:
     # machine-parseable marker so the fix worker can recover it from any machine
     # via the GitHub message bus (not just the one-line `summary`).
     findings_body: str | None = None
+    # #886 Phase 2: structured Milestone Outcome Audit verdict — only meaningful
+    # for a type="audit" assignment (see #885's --audit-of). One dict per goal:
+    # {"goal": str, "metric_before": str, "metric_after": str,
+    #  "verdict": "met"|"partial"|"gap", "evidence": str}. When present, the
+    # write routes through the audit dual-write path (assignment row + epic
+    # comment + #603 context store) instead of the generic done-comment body.
+    audit_goals: list[dict] | None = None
+    audit_bottom_line: str | None = None
 
 
 # ── Resolved terminal state (what the seam writes back) ─────────────────────
@@ -272,6 +291,29 @@ def _validate_result(record: ResultRecord) -> None:
             "nothing to fix (#607). Recover the findings from the session "
             "transcript or supply them with --body-file."
         )
+
+    # ── #886 Phase 2: structured audit verdict shape ─────────────────────────
+    # A dropped/garbled goal here would corrupt the versioned diff every later
+    # `--audit-of` run depends on, so validate the full shape up front rather
+    # than discovering a bad goal mid-persist.
+    if record.audit_goals is not None:
+        if not record.audit_goals:
+            raise ValueError(
+                "audit_goals must be a non-empty list when supplied — an audit "
+                "run reporting zero goals is not a meaningful verdict (#886)"
+            )
+        for goal in record.audit_goals:
+            if not isinstance(goal, dict) or not str(goal.get("goal", "")).strip():
+                raise ValueError(
+                    f"audit goal missing non-empty 'goal' text: {goal!r}"
+                )
+            verdict = goal.get("verdict")
+            if verdict not in _VALID_AUDIT_VERDICTS:
+                raise ValueError(
+                    f"invalid audit goal verdict {verdict!r} for goal "
+                    f"{goal.get('goal')!r} (expected one of "
+                    f"{_VALID_AUDIT_VERDICTS!r})"
+                )
 
 
 # ── Public surface ──────────────────────────────────────────────────────────
@@ -509,6 +551,241 @@ def _persist_review_verdict(record: ResultRecord) -> None:
     ) from last_exc
 
 
+# ── Milestone Outcome Audit — versioned runs + diff (#886 Phase 2) ─────────
+
+
+def get_audit_runs_for_epic(repo_name: str, epic_issue_number: int) -> list[dict]:
+    """All ``type="audit"`` assignment rows for ``(repo_name, epic_issue_number)``
+    that have a persisted verdict, oldest run first.
+
+    The epic's own issue number doubles as the audit assignment's
+    ``issue_number`` (see #885's ``_dispatch_audit_of``), so a single
+    ``(repo_name, issue_number)`` pair identifies every ``--audit-of`` run ever
+    made against that milestone. Used both to compute the next
+    ``audit_run_number`` (``len(...) + 1``) and to diff the newest run against
+    the previous one. Returns ``[]`` on any lookup failure — a transient DB
+    hiccup here must not crash the reporting path (the caller falls back to
+    treating this as the first run, which just skips the diff).
+    """
+    from coord.state import get_connection  # noqa: PLC0415
+
+    try:
+        conn = get_connection()
+        rows = conn.execute(
+            "SELECT assignment_id, audit_run_number, audit_goals_json, "
+            "audit_bottom_line, dispatched_at FROM assignments "
+            "WHERE repo_name=? AND issue_number=? AND type='audit' "
+            "AND audit_run_number IS NOT NULL ORDER BY audit_run_number ASC",
+            (repo_name, epic_issue_number),
+        ).fetchall()
+    except Exception:  # noqa: BLE001 — best-effort; treat as "no prior runs"
+        return []
+    return [dict(r) for r in rows]
+
+
+def diff_audit_goals(
+    prev_goals: list[dict] | None, new_goals: list[dict]
+) -> dict[str, list[str]]:
+    """Classify how each goal in ``new_goals`` moved relative to ``prev_goals``
+    (keyed by the ``goal`` text — the only stable identifier an agent-authored
+    scorecard has across runs).
+
+    Returns ``{"closed": [...], "regressed": [...], "still_open": [...],
+    "new": [...]}`` — the concrete "v1: 3 gaps -> v2: 0 gaps" delta the issue
+    asks for. ``closed`` = moved to ``met`` from something else; ``regressed``
+    = moved to a lower rank (e.g. ``met`` -> ``gap``, a real regression worth
+    flagging loudly); ``still_open`` = present in both runs, still not
+    ``met``; ``new`` = a goal that didn't appear in the prior run at all
+    (scope changed, or first time this goal was tracked).
+    """
+    prev_by_goal = {g.get("goal"): g.get("verdict") for g in (prev_goals or [])}
+    closed: list[str] = []
+    regressed: list[str] = []
+    still_open: list[str] = []
+    new: list[str] = []
+    for goal in new_goals:
+        name = goal.get("goal")
+        verdict = goal.get("verdict")
+        if name not in prev_by_goal:
+            new.append(name)
+            continue
+        prev_verdict = prev_by_goal[name]
+        prev_rank = _AUDIT_VERDICT_RANK.get(prev_verdict, 0)
+        new_rank = _AUDIT_VERDICT_RANK.get(verdict, 0)
+        if new_rank == _AUDIT_VERDICT_RANK["met"] and prev_rank != new_rank:
+            closed.append(name)
+        elif new_rank < prev_rank:
+            regressed.append(name)
+        elif new_rank != _AUDIT_VERDICT_RANK["met"]:
+            still_open.append(name)
+    return {
+        "closed": closed,
+        "regressed": regressed,
+        "still_open": still_open,
+        "new": new,
+    }
+
+
+def _read_audit_run_local(assignment_id: str) -> int | None:
+    """Read back the persisted ``audit_run_number`` column, or ``None`` if the
+    row is absent. Used by :func:`_persist_audit_result` to verify a write
+    actually landed rather than trusting a bare ``commit()`` call."""
+    from coord.state import get_connection  # noqa: PLC0415
+
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT audit_run_number FROM assignments WHERE assignment_id = ?",
+        (assignment_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return row["audit_run_number"] if hasattr(row, "keys") else row[0]
+
+
+def _persist_audit_result(record: ResultRecord, *, run_number: int) -> None:
+    """Durably record the structured audit verdict on the assignment row.
+
+    Mirrors :func:`_persist_review_verdict` (#990): retries a few times with
+    backoff, then reads the ``audit_run_number`` column back and compares it
+    to what was intended — a silently-dropped write here would corrupt the
+    versioning invariant every later ``--audit-of`` diff depends on (two runs
+    could collide on the same ``run_number``, or a run could vanish from the
+    history entirely). Raises ``RuntimeError`` if the write can't be
+    confirmed; callers MUST NOT swallow this.
+    """
+    goals_json = json.dumps(record.audit_goals)
+    attempts = 4
+    delay = 0.15
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            from coord.state import get_connection  # noqa: PLC0415
+
+            conn = get_connection()
+            conn.execute(
+                "UPDATE assignments SET audit_goals_json=?, audit_bottom_line=?, "
+                "audit_run_number=? WHERE assignment_id=?",
+                (
+                    goals_json,
+                    record.audit_bottom_line,
+                    run_number,
+                    record.assignment_id,
+                ),
+            )
+            conn.commit()
+            actual = _read_audit_run_local(record.assignment_id)
+            if actual == run_number:
+                return
+            last_exc = RuntimeError(
+                f"audit_run_number readback mismatch for assignment "
+                f"{record.assignment_id!r}: wrote {run_number!r}, read back "
+                f"{actual!r} (attempt {attempt}/{attempts})"
+            )
+        except Exception as exc:  # noqa: BLE001 — retried below; re-raised after
+            last_exc = exc
+        if attempt < attempts:
+            time.sleep(delay)
+            delay *= 2
+    raise RuntimeError(
+        f"failed to durably persist audit run {run_number} for assignment "
+        f"{record.assignment_id!r} after {attempts} attempts (#886): {last_exc}"
+    ) from last_exc
+
+
+def _post_audit_result_path(record: ResultRecord) -> StoreOutcome:
+    """Milestone Outcome Audit (#886 Phase 2) dual-write path.
+
+    Reached from :func:`_post_result_local` when ``record.audit_goals`` is
+    supplied (i.e. ``coord report-result --audit-json`` was used). Writes the
+    structured verdict three ways for durability, exactly as the issue asks:
+
+    1. the assignment row (``audit_goals_json``/``audit_bottom_line``/
+       ``audit_run_number`` — see :func:`_persist_audit_result`);
+    2. a comment on the epic issue carrying the rendered scorecard, the delta
+       vs the prior run, and the raw JSON (:func:`coord.comments.
+       format_audit_scorecard`) so any machine can recover the full verdict
+       from the GitHub message bus alone, same as the review-findings block;
+    3. the #603 per-issue context store, so the next ``--audit-of`` run (and
+       every other future agent on this epic) sees a durable one-line note
+       without re-fetching/re-parsing the GitHub comment.
+    """
+    prior_runs = get_audit_runs_for_epic(record.repo_name, record.issue_number)
+    run_number = len(prior_runs) + 1
+    prev_goals: list[dict] | None = None
+    if prior_runs and prior_runs[-1].get("audit_goals_json"):
+        try:
+            prev_goals = json.loads(prior_runs[-1]["audit_goals_json"])
+        except (TypeError, ValueError):
+            prev_goals = None
+    diff = diff_audit_goals(prev_goals, record.audit_goals) if prev_goals is not None else None
+
+    _persist_audit_result(record, run_number=run_number)
+
+    bottom_line = (record.audit_bottom_line or record.summary or "").strip()
+    scorecard_body = format_audit_scorecard(
+        assignment_id=record.assignment_id,
+        run_number=run_number,
+        bottom_line=bottom_line,
+        goals=record.audit_goals,
+        diff=diff,
+    )
+    completion_body = format_completion(
+        assignment_id=record.assignment_id,
+        machine_name=record.machine_name,
+        repo_name=record.repo_name,
+        issue_number=record.issue_number,
+        exit_code=0,
+        duration_seconds=record.duration_seconds,
+        log_path=record.log_path,
+        summary=record.summary or bottom_line,
+    )
+    posted, err = _post_github_comment(
+        repo_github=record.repo_github,
+        issue_number=record.issue_number,
+        body=completion_body + "\n\n" + scorecard_body,
+    )
+    _update_local_state(
+        assignment_id=record.assignment_id,
+        terminal_status="done",
+        branch=record.branch,
+        review_state="pending",
+    )
+    _record_notification(
+        assignment_id=record.assignment_id,
+        event=EVENT_COMPLETION,
+        branch=record.branch,
+    )
+    # #603: durable one-line finding for every future agent on this epic —
+    # the "re-ask the question" payoff without re-parsing the GitHub comment.
+    try:
+        from coord.state import _add_issue_context_entry_local  # noqa: PLC0415
+
+        total = len(record.audit_goals)
+        met = sum(1 for g in record.audit_goals if g.get("verdict") == "met")
+        gap = sum(1 for g in record.audit_goals if g.get("verdict") == "gap")
+        partial = total - met - gap
+        note = f"Audit v{run_number}: {met}/{total} goals met"
+        if partial:
+            note += f", {partial} partial"
+        if gap:
+            note += f", {gap} gap"
+        if diff:
+            if diff.get("closed"):
+                note += f" — closed: {', '.join(diff['closed'])}"
+            if diff.get("still_open"):
+                note += f"; still open: {', '.join(diff['still_open'])}"
+            if diff.get("regressed"):
+                note += f"; REGRESSED: {', '.join(diff['regressed'])}"
+        _add_issue_context_entry_local(
+            record.repo_name, record.issue_number, note, source="audit",
+        )
+    except Exception:  # noqa: BLE001 — best-effort; never blocks the write
+        pass
+    return StoreOutcome(
+        status="done", event=EVENT_COMPLETION, posted=posted, error=err,
+    )
+
+
 def _post_result_local(record: ResultRecord) -> StoreOutcome:
     """Structured report from the interactive agent (local-DB write).
 
@@ -549,6 +826,19 @@ def _post_result_local(record: ResultRecord) -> StoreOutcome:
                 "`coord report-result` with the review id. A verdict on a "
                 "non-review row marks it done and stamps a bogus review_verdict "
                 "(the #646 premature-finalize of a live interactive session)."
+            )
+
+    # #886 Phase 2: same misrouting invariant as the review-verdict gate above,
+    # but for the structured audit verdict — it belongs ONLY on a type="audit"
+    # assignment (see #885's --audit-of). Only gate when the type is KNOWN.
+    if record.audit_goals is not None:
+        atype = _assignment_type_local(record.assignment_id)
+        if atype is not None and atype != "audit":
+            raise ValueError(
+                f"refusing to record a structured audit verdict on assignment "
+                f"{record.assignment_id!r}: it is type={atype!r}, not 'audit'. "
+                "--audit-json belongs on a --audit-of assignment (#886) — "
+                "re-run `coord report-result` with the audit id."
             )
 
     # #676: chat and troubleshoot sessions are non-mutating diagnostics — they
@@ -639,6 +929,12 @@ def _post_result_local(record: ResultRecord) -> StoreOutcome:
         )
 
     # status == "done"
+    # #886 Phase 2: a structured audit verdict routes through its own
+    # dual-write path (assignment row + epic comment + #603 context store)
+    # instead of the generic done-comment body below.
+    if record.audit_goals is not None:
+        return _post_audit_result_path(record)
+
     summary_lines: list[str] = []
     if record.summary.strip():
         summary_lines.append(record.summary.strip())

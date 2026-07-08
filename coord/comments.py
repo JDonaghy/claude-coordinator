@@ -9,6 +9,7 @@ Marker grammar: `<!-- coord:event=<event> assignment=<id> ... -->`
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from typing import Iterable
@@ -76,6 +77,98 @@ def extract_findings_block(
     if not body:
         return None
     return (verdict, body)
+
+
+# ── Milestone Outcome Audit scorecard (#886 Phase 2) ────────────────────────
+# The structured, versioned verdict from a `--audit-of` run (#885), embedded
+# under a parseable marker so ANY machine can recover the full goal-by-goal
+# JSON from the GitHub message bus alone — the same "no shared DB required"
+# design as the review-findings block above.
+AUDIT_BEGIN = "coord:audit-scorecard"
+AUDIT_END = "coord:audit-scorecard-end"
+
+
+def format_audit_scorecard(
+    *,
+    assignment_id: str,
+    run_number: int,
+    bottom_line: str,
+    goals: list[dict],
+    diff: dict[str, list[str]] | None = None,
+) -> str:
+    """Render a milestone-audit scorecard: a human-readable table + delta vs
+    the prior run, with the raw goal JSON tucked in a collapsible section so
+    a future agent (or `extract_audit_scorecard`) can recover it exactly."""
+
+    def _cell(v: object) -> str:
+        return str(v if v is not None else "").replace("|", "\\|").replace("\n", " ")
+
+    table = ["| Goal | Before | After | Verdict | Evidence |", "|---|---|---|---|---|"]
+    for g in goals:
+        table.append(
+            f"| {_cell(g.get('goal'))} | {_cell(g.get('metric_before'))} | "
+            f"{_cell(g.get('metric_after'))} | {_cell(g.get('verdict'))} | "
+            f"{_cell(g.get('evidence'))} |"
+        )
+    lines = [
+        f"### Milestone outcome audit — run v{run_number}",
+        f"<!-- {AUDIT_BEGIN} assignment={assignment_id} run={run_number} -->",
+        "",
+        f"**Bottom line:** {bottom_line or '(none provided)'}",
+        "",
+        *table,
+    ]
+    if diff and any(diff.get(k) for k in ("closed", "regressed", "still_open", "new")):
+        lines.append("")
+        lines.append(f"**Delta vs run v{run_number - 1}:**")
+        if diff.get("closed"):
+            lines.append(f"- ✅ closed: {', '.join(diff['closed'])}")
+        if diff.get("regressed"):
+            lines.append(f"- ⚠️ regressed: {', '.join(diff['regressed'])}")
+        if diff.get("still_open"):
+            lines.append(f"- still open: {', '.join(diff['still_open'])}")
+        if diff.get("new"):
+            lines.append(f"- new goals: {', '.join(diff['new'])}")
+    lines.append("")
+    lines.append("<details><summary>Structured verdict (JSON)</summary>")
+    lines.append("")
+    lines.append("```json")
+    lines.append(json.dumps(goals, indent=2))
+    lines.append("```")
+    lines.append("")
+    lines.append("</details>")
+    lines.append(f"<!-- {AUDIT_END} -->")
+    return "\n".join(lines)
+
+
+def extract_audit_scorecard(comment_body: str) -> dict | None:
+    """Parse a marked audit scorecard back into
+    ``{"assignment_id", "run_number", "bottom_line", "goals"}``, or ``None``
+    if the comment carries no scorecard block. Round-trip counterpart to
+    :func:`format_audit_scorecard`."""
+    pat = re.compile(
+        r"<!--\s*" + re.escape(AUDIT_BEGIN)
+        + r"\s+assignment=(?P<aid>\S+)\s+run=(?P<run>\d+)\s*-->"
+        r"(?P<body>.*?)<!--\s*" + re.escape(AUDIT_END) + r"\s*-->",
+        re.DOTALL,
+    )
+    m = pat.search(comment_body or "")
+    if not m:
+        return None
+    body = m.group("body")
+    bl_m = re.search(r"\*\*Bottom line:\*\*\s*(.+)", body)
+    bottom_line = bl_m.group(1).strip() if bl_m else ""
+    json_m = re.search(r"```json\s*(\[.*?\])\s*```", body, re.DOTALL)
+    try:
+        goals = json.loads(json_m.group(1)) if json_m else []
+    except (TypeError, ValueError):
+        goals = []
+    return {
+        "assignment_id": m.group("aid"),
+        "run_number": int(m.group("run")),
+        "bottom_line": bottom_line,
+        "goals": goals,
+    }
 
 
 def _marker(event: str, **fields: str | int | None) -> str:

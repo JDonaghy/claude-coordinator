@@ -638,6 +638,9 @@
             test_reason: None,
             review_state: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         }
     }
 
@@ -1963,6 +1966,9 @@
             test_reason: None,
             review_state: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         };
         BoardData {
             assignments: vec![work],
@@ -2452,6 +2458,9 @@
             test_reason: None,
             review_state: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         }
     }
 
@@ -3754,6 +3763,9 @@
             test_reason: None,
             review_state: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         });
         // Has assignment → in-progress, even though status:ready label is set.
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
@@ -4123,6 +4135,9 @@
             test_reason: None,
             review_state: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         });
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
         assert_eq!(section, "new");
@@ -4206,6 +4221,9 @@
             test_reason: None,
             review_state: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         });
         // is_closed wins over has-assignment.
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
@@ -4408,6 +4426,9 @@
             test_reason: None,
             review_state: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         });
 
         // With no queue entry but a merged work assignment, Merge stage → Done.
@@ -5240,6 +5261,9 @@
             test_reason: None,
             review_state: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         }
     }
 
@@ -7239,6 +7263,9 @@
             test_reason: None,
             review_state: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         });
         let issue = &app.pipeline_issues[0];
         assert!(app.issue_has_any_assignment(issue));
@@ -7294,6 +7321,9 @@
                 test_reason: None,
                 review_state: None,
                 pr_url: None,
+                audit_goals_json: None,
+                audit_bottom_line: None,
+                audit_run_number: None,
             });
         }
         let issue = &app.pipeline_issues[0];
@@ -7343,6 +7373,9 @@
             test_reason: None,
             review_state: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         });
         // Same issue number but different repo — should be excluded.
         app.data.assignments.push(Assignment {
@@ -7381,6 +7414,9 @@
             test_reason: None,
             review_state: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         });
         let issue = &app.pipeline_issues[0];  // coord_repo = Some("api")
         let total = app.issue_total_cost(issue).expect("should have cost");
@@ -7430,6 +7466,9 @@
             test_reason: None,
             review_state: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         });
         // Interactive session — cost_usd is None (Max subscription).
         app.data.assignments.push(Assignment {
@@ -7468,6 +7507,9 @@
             test_reason: None,
             review_state: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         });
         let issue = &app.pipeline_issues[0];
         let total = app.issue_total_cost(issue).expect("should have cost from auto assignment");
@@ -7522,6 +7564,9 @@
                 test_reason: None,
                 review_state: None,
                 pr_url: None,
+                audit_goals_json: None,
+                audit_bottom_line: None,
+                audit_run_number: None,
             });
         }
         let issue = &app.pipeline_issues[0];
@@ -7570,6 +7615,9 @@
             test_reason: None,
             review_state: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         });
         // Same issue number, different repo — should be excluded.
         app.data.assignments.push(Assignment {
@@ -7608,6 +7656,9 @@
             test_reason: None,
             review_state: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         });
         let issue = &app.pipeline_issues[0];  // coord_repo = Some("api")
         assert_eq!(app.issue_total_tokens(issue), 1200, "expected 1000+200=1200 for api repo only");
@@ -7665,6 +7716,9 @@
             test_reason: None,
             review_state: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -7722,6 +7776,9 @@
             test_reason: None,
             review_state: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.derive_current_stage(issue), "done");
@@ -7865,6 +7922,9 @@
             test_reason: None,
             review_state: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         // Work stage ran → Done.
@@ -7943,6 +8003,9 @@
             test_reason: None,
             review_state: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Active);
@@ -7987,6 +8050,9 @@
             test_reason: None,
             review_state: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -8036,6 +8102,9 @@
             test_reason: None,
             review_state: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         });
         // Newer successful retry.
         app.data.assignments.push(Assignment {
@@ -8074,6 +8143,9 @@
             test_reason: None,
             review_state: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -8120,6 +8192,9 @@
             test_reason: None,
             review_state: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         });
         let issue = &app.pipeline_issues[0];
         // issue.coord_repo == "api", assignment.repo == "different-repo" →
@@ -8195,6 +8270,9 @@
             test_reason: None,
             review_state: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].label, "Work");
@@ -8250,6 +8328,9 @@
             test_reason: None,
             review_state: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         });
         app.data.assignments.push(Assignment {
             id: "r1".to_string(),
@@ -8287,6 +8368,9 @@
             test_reason: None,
             review_state: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         // Both stages done, no Merge stage remaining.
@@ -8501,6 +8585,9 @@
             test_reason: None,
             review_state: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         }
     }
 
@@ -8850,6 +8937,9 @@
                 test_reason: None,
                 review_state: None,
                 pr_url: None,
+                audit_goals_json: None,
+                audit_bottom_line: None,
+                audit_run_number: None,
             });
         }
         app.data.merge_queue.push(MergeQueueEntry {
@@ -8912,6 +9002,9 @@
             test_reason: None,
             review_state: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].status, StageStatus::Failed);
@@ -8965,6 +9058,9 @@
             test_reason: None,
             review_state: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         for stage in &view.stages {
@@ -9061,6 +9157,9 @@
             test_reason: None,
             review_state: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "plan"), StageStatus::Done);
@@ -9113,6 +9212,9 @@
             test_reason: None,
             review_state: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         });
         let issue = &app.pipeline_issues[0].clone();
         let id = app.find_done_plan_assignment_id(issue, "api");
@@ -9159,6 +9261,9 @@
             test_reason: None,
             review_state: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         });
         let issue = &app.pipeline_issues[0].clone();
         assert_eq!(app.find_done_plan_assignment_id(issue, "api"), None);
@@ -14167,6 +14272,9 @@
             test_reason: None,
             review_state: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         }];
 
         let result = parse_session_summaries_from_comments(&comments, &assignments);
@@ -14296,6 +14404,9 @@
             test_reason: None,
             review_state: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         };
         let result = parse_session_summaries_from_comments(&comments, &[fix_assignment]);
         assert_eq!(result.len(), 1);
@@ -14462,6 +14573,9 @@
             acceptance_total: None,
             acceptance_passed: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         };
 
         let data = BoardData {
@@ -14581,6 +14695,9 @@
             acceptance_total: None,
             acceptance_passed: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         };
 
         let data = BoardData {
@@ -14952,6 +15069,9 @@
             test_reason: None,
             review_state: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         };
         let mut app = make_test_app(BoardData {
             assignments: vec![work_assignment],
@@ -22779,6 +22899,9 @@
             test_reason: None,
             review_state: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         };
 
         // Review for the fix — approved.
@@ -22818,6 +22941,9 @@
             test_reason: None,
             review_state: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         };
 
         // The merge queue has the ORIGINAL work (different aid, same branch).
@@ -22895,6 +23021,9 @@
             test_reason: None,
             review_state: None,
             pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
         });
 
         let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
@@ -25660,6 +25789,12 @@ Milestone tracking issue.
                     done: 0,
                     total: 3,
                     needs_you: vec!["ready_waiting".to_string()],
+                    outcome_run_number: None,
+                    outcome_met: None,
+                    outcome_partial: None,
+                    outcome_gap: None,
+                    outcome_bottom_line: None,
+                    outcome_diff_summary: None,
                 },
                 PlanRosterEntry {
                     repo: "api".to_string(),
@@ -25673,6 +25808,12 @@ Milestone tracking issue.
                     done: 0,
                     total: 0,
                     needs_you: vec!["no_work_order".to_string()],
+                    outcome_run_number: None,
+                    outcome_met: None,
+                    outcome_partial: None,
+                    outcome_gap: None,
+                    outcome_bottom_line: None,
+                    outcome_diff_summary: None,
                 },
             ],
             ..BoardData::default()
@@ -25935,6 +26076,12 @@ Milestone tracking issue.
                 done: 2,
                 total: 4,
                 needs_you: vec!["stalled".to_string(), "chat_pending".to_string()],
+                outcome_run_number: None,
+                outcome_met: None,
+                outcome_partial: None,
+                outcome_gap: None,
+                outcome_bottom_line: None,
+                outcome_diff_summary: None,
             }],
             ..BoardData::default()
         }
@@ -25959,6 +26106,12 @@ Milestone tracking issue.
                 done: 0,
                 total: 0,
                 needs_you: vec!["no_work_order".to_string()],
+                outcome_run_number: None,
+                outcome_met: None,
+                outcome_partial: None,
+                outcome_gap: None,
+                outcome_bottom_line: None,
+                outcome_diff_summary: None,
             }],
             ..BoardData::default()
         }
@@ -26162,6 +26315,12 @@ Milestone tracking issue.
                 done: 0,
                 total: 1,
                 needs_you: vec!["ready_waiting".to_string()],
+                outcome_run_number: None,
+                outcome_met: None,
+                outcome_partial: None,
+                outcome_gap: None,
+                outcome_bottom_line: None,
+                outcome_diff_summary: None,
             }],
             ..BoardData::default()
         };
@@ -26252,6 +26411,12 @@ Milestone tracking issue.
                 done: 3,
                 total: 3,
                 needs_you: vec![],
+                outcome_run_number: None,
+                outcome_met: None,
+                outcome_partial: None,
+                outcome_gap: None,
+                outcome_bottom_line: None,
+                outcome_diff_summary: None,
             }],
             ..BoardData::default()
         };
@@ -26314,6 +26479,12 @@ Milestone tracking issue.
                     done: 0,
                     total: 1,
                     needs_you: vec!["ready_waiting".to_string()],
+                    outcome_run_number: None,
+                    outcome_met: None,
+                    outcome_partial: None,
+                    outcome_gap: None,
+                    outcome_bottom_line: None,
+                    outcome_diff_summary: None,
                 },
                 PlanRosterEntry {
                     repo: "api".to_string(),
@@ -26327,6 +26498,12 @@ Milestone tracking issue.
                     done: 0,
                     total: 1,
                     needs_you: vec!["stalled".to_string()],
+                    outcome_run_number: None,
+                    outcome_met: None,
+                    outcome_partial: None,
+                    outcome_gap: None,
+                    outcome_bottom_line: None,
+                    outcome_diff_summary: None,
                 },
                 PlanRosterEntry {
                     repo: "api".to_string(),
@@ -26340,6 +26517,12 @@ Milestone tracking issue.
                     done: 0,
                     total: 0,
                     needs_you: vec!["no_work_order".to_string()],
+                    outcome_run_number: None,
+                    outcome_met: None,
+                    outcome_partial: None,
+                    outcome_gap: None,
+                    outcome_bottom_line: None,
+                    outcome_diff_summary: None,
                 },
                 PlanRosterEntry {
                     repo: "api".to_string(),
@@ -26353,6 +26536,12 @@ Milestone tracking issue.
                     done: 0,
                     total: 0,
                     needs_you: vec!["no_work_order".to_string()],
+                    outcome_run_number: None,
+                    outcome_met: None,
+                    outcome_partial: None,
+                    outcome_gap: None,
+                    outcome_bottom_line: None,
+                    outcome_diff_summary: None,
                 },
                 PlanRosterEntry {
                     repo: "api".to_string(),
@@ -26366,6 +26555,12 @@ Milestone tracking issue.
                     done: 0,
                     total: 2,
                     needs_you: vec!["chat_pending".to_string()],
+                    outcome_run_number: None,
+                    outcome_met: None,
+                    outcome_partial: None,
+                    outcome_gap: None,
+                    outcome_bottom_line: None,
+                    outcome_diff_summary: None,
                 },
             ],
             ..BoardData::default()
@@ -26407,6 +26602,12 @@ Milestone tracking issue.
                     done: 0,
                     total: 3,
                     needs_you: vec!["ready_waiting".to_string()],
+                    outcome_run_number: None,
+                    outcome_met: None,
+                    outcome_partial: None,
+                    outcome_gap: None,
+                    outcome_bottom_line: None,
+                    outcome_diff_summary: None,
                 },
                 PlanRosterEntry {
                     repo: "web".to_string(),
@@ -26420,6 +26621,12 @@ Milestone tracking issue.
                     done: 0,
                     total: 0,
                     needs_you: vec!["no_work_order".to_string()],
+                    outcome_run_number: None,
+                    outcome_met: None,
+                    outcome_partial: None,
+                    outcome_gap: None,
+                    outcome_bottom_line: None,
+                    outcome_diff_summary: None,
                 },
             ],
             ..BoardData::default()
@@ -26451,5 +26658,111 @@ Milestone tracking issue.
             !screen.contains("Old category bucket"),
             "#1001: the untracked milestone title must not appear while \
              collapsed:\n{screen}",
+        );
+    }
+
+    /// #886 Phase 2: the Plans panel's per-milestone Outcome chip shows the
+    /// LATEST `--audit-of` verdict (goals met/gap, independent of the
+    /// done/total issue-closed counts) plus the pre-rendered delta vs the
+    /// prior run — seeded here as a `PlanRosterEntry` whose `outcome_*`
+    /// fields represent the aggregate `coord.plans._latest_audit_outcome`
+    /// would have computed after two `--audit-of` runs (v1 then v2).
+    #[test]
+    fn plans_panel_renders_latest_audit_outcome_and_delta() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let data = BoardData {
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            plan_roster: vec![PlanRosterEntry {
+                repo: "api".to_string(),
+                title: "Substrate".to_string(),
+                milestone_number: 5,
+                tracking_issue: Some(751),
+                has_work_order: true,
+                ready_frontier: 0,
+                blocked: 0,
+                in_flight: 0,
+                done: 2,
+                total: 2,
+                needs_you: vec![],
+                // Second audit run: 2/3 goals met, 1 still a gap — the
+                // done-gate verdict, independent of done=2/total=2 above
+                // (all work-order issues closed, but the audit still flags
+                // a gap — exactly the divergence #886 exists to surface).
+                outcome_run_number: Some(2),
+                outcome_met: Some(2),
+                outcome_partial: Some(0),
+                outcome_gap: Some(1),
+                outcome_bottom_line: Some("2/3 goals met".to_string()),
+                outcome_diff_summary: Some(
+                    "v1→v2: closed: tests.rs split; still open: #550".to_string(),
+                ),
+            }],
+            ..BoardData::default()
+        };
+        let app = make_test_app(data);
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 300, 40);
+        click_activity_icon(&mut driver, "◆");
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("goals 2/3 met"),
+            "#886: Outcome chip must show the latest run's goals met/total:\n{screen}",
+        );
+        assert!(
+            screen.contains("1 gap"),
+            "#886: Outcome chip must surface the gap count — the done-gate \
+             signal, independent of the done=2/total=2 issue-closed counts:\n{screen}",
+        );
+        assert!(
+            screen.contains("v1→v2"),
+            "#886: the pre-rendered delta vs the prior run must render so the \
+             \"re-ask the question\" payoff is visible, not just the latest \
+             snapshot:\n{screen}",
+        );
+        assert!(
+            screen.contains("still open: #550"),
+            "#886: the delta's still-open detail must be visible:\n{screen}",
+        );
+    }
+
+    /// A milestone with NO audit run yet must not fabricate an Outcome chip
+    /// (no "0/0 met" noise) — the chip is omitted entirely until the first
+    /// `--audit-of` run posts a verdict.
+    #[test]
+    fn plans_panel_omits_outcome_chip_when_no_audit_has_run() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let data = BoardData {
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            plan_roster: vec![PlanRosterEntry {
+                repo: "api".to_string(),
+                title: "Substrate".to_string(),
+                milestone_number: 5,
+                tracking_issue: Some(751),
+                has_work_order: true,
+                ready_frontier: 1,
+                blocked: 0,
+                in_flight: 0,
+                done: 1,
+                total: 2,
+                needs_you: vec!["ready_waiting".to_string()],
+                outcome_run_number: None,
+                outcome_met: None,
+                outcome_partial: None,
+                outcome_gap: None,
+                outcome_bottom_line: None,
+                outcome_diff_summary: None,
+            }],
+            ..BoardData::default()
+        };
+        let app = make_test_app(data);
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 200, 40);
+        click_activity_icon(&mut driver, "◆");
+
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("goals"),
+            "#886: no Outcome chip should render before any audit has run:\n{screen}",
         );
     }

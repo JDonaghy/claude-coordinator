@@ -288,6 +288,17 @@ class Assignment:
     # summary.  A durable, board-sourced complement to the ephemeral GitHub
     # comment (which already contained the same text).
     completion_summary: str | None = None
+    # #886 Phase 2: Milestone Outcome Audit structured verdict, set only on
+    # type="audit" assignments (see #885's --audit-of).  audit_goals_json is
+    # a raw JSON string — a list of {goal, metric_before, metric_after,
+    # verdict, evidence} — deliberately NOT decoded here (mirrors
+    # review_findings: the coord-tui client consumes it as Option<String>).
+    # audit_run_number increments once per `--audit-of <epic>` run against
+    # the same (repo_name, issue_number) so later runs can diff against
+    # earlier ones. All None for rows predating this feature.
+    audit_goals_json: str | None = None
+    audit_bottom_line: str | None = None
+    audit_run_number: int | None = None
 
 
 @dataclass

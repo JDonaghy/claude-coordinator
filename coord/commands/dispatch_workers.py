@@ -910,6 +910,50 @@ def _dispatch_audit_of(
     ]
     milestone_issues_block = "\n".join(_issue_lines) or "(no issues found under this milestone)"
 
+    # #886 Phase 2: fetch prior `--audit-of` runs against this epic (if any) so
+    # the agent measures AGAINST the last verdict — the concrete "re-ask the
+    # question" loop the issue asks for — and so the next run_number is known
+    # up front. Best-effort: a lookup failure just means this looks like run 1.
+    import json as _json_au  # noqa: PLC0415
+
+    from coord import issue_store as _issue_store_au  # noqa: PLC0415
+
+    try:
+        _prior_audit_runs = _issue_store_au.get_audit_runs_for_epic(repo, epic_num)
+    except Exception:  # noqa: BLE001 — best-effort; treat as no prior runs
+        _prior_audit_runs = []
+    _next_run_number = len(_prior_audit_runs) + 1
+    if _prior_audit_runs:
+        _last_run = _prior_audit_runs[-1]
+        _last_goals: list = []
+        try:
+            _last_goals = _json_au.loads(_last_run.get("audit_goals_json") or "[]")
+        except (TypeError, ValueError):
+            _last_goals = []
+        _prior_goal_lines = [
+            "- {goal}: {verdict} ({evidence})".format(
+                goal=g.get("goal", "?"),
+                verdict=g.get("verdict", "?"),
+                evidence=g.get("evidence", "") or "no evidence recorded",
+            )
+            for g in _last_goals
+        ]
+        prior_run_block = (
+            f"## Prior audit run (v{_last_run.get('audit_run_number')})\n\n"
+            f"**Bottom line:** {_last_run.get('audit_bottom_line') or '(none recorded)'}\n\n"
+            + ("\n".join(_prior_goal_lines) or "(no goals recorded)")
+            + "\n\n**This is run v"
+            + str(_next_run_number)
+            + "** — measure each goal again from scratch (never trust the "
+            "prior verdict without re-checking), then report whether each "
+            "moved (gap→met, still open, regressed, or new).\n\n"
+        )
+    else:
+        prior_run_block = (
+            f"## Prior audit runs\n\n(none — this is run v{_next_run_number}, "
+            "the first audit of this milestone.)\n\n"
+        )
+
     INTERACTIVE_AUDIT_SYSTEM_PROMPT = (
         "You are a human-attended MILESTONE OUTCOME AUDITOR dispatched by "
         "the coordinator (#885). You are an independent analyst — measure "
@@ -945,14 +989,27 @@ def _dispatch_audit_of(
         "name (e.g. a god-file that grew instead of shrank, an open seam "
         "issue that was supposed to close).\n"
         "5. End with a one-line bottom-line verdict (e.g. \"5/6 goals "
-        "met\").\n\n"
-        "When done, write the FULL scorecard to a temp file and relay it "
-        "with:\n"
+        "met\").\n"
+        "6. If a PRIOR AUDIT RUN is included in your briefing below, measure "
+        "each of ITS goals again too (same goal text) so the coordinator can "
+        "compute the diff — which gaps closed, which are still open, whether "
+        "anything regressed.\n\n"
+        "When done, write BOTH of these and relay them together in ONE "
+        "`coord report-result` call:\n"
+        "  (a) the FULL prose scorecard to a temp file (--body-file), AND\n"
+        "  (b) a STRUCTURED JSON file (--audit-json) shaped exactly like:\n"
+        '      {"bottom_line": "5/6 goals met", "goals": [{"goal": '
+        '"short goal name — MUST match the prior run\'s goal text exactly '
+        'when re-measuring it", "metric_before": "...", "metric_after": '
+        '"...", "verdict": "met|partial|gap", "evidence": "command + '
+        'result"}, ...]}\n'
         "  coord report-result --assignment <assignment_id> --status done "
         "--summary \"<bottom-line, one paragraph>\" --body-file "
-        "<path-to-scorecard.md>\n"
-        "The --body-file is what posts the full scorecard as a comment on "
-        "the epic issue — --summary alone only carries the one-liner.\n"
+        "<path-to-scorecard.md> --audit-json <path-to-verdict.json>\n"
+        "Both flags are REQUIRED — --body-file posts the readable scorecard "
+        "as a comment; --audit-json is what makes the verdict structured, "
+        "versioned, and diffable run-over-run (#886). Omitting --audit-json "
+        "leaves this run un-diffable against the next one.\n"
     )
 
     audit_briefing = (
@@ -969,20 +1026,22 @@ def _dispatch_audit_of(
         f"## Epic body (goals / acceptance / plan)\n\n{epic_body}\n\n"
         f"## Milestone issue states ({milestone_title})\n\n"
         f"{milestone_issues_block}\n\n"
+        f"{prior_run_block}"
         "## Your job\n\n"
         "Measure each goal against the code (see the system prompt for the "
         "method), emit a scorecard, and relay it with `coord report-result "
         f"--assignment {assignment_id} --status done --summary \"...\" "
-        "--body-file <scorecard.md>`.\n"
+        "--body-file <scorecard.md> --audit-json <verdict.json>`.\n"
     )
 
     report_reminder = (
         f"[Coordinator audit assignment {assignment_id}] HUMAN-ATTENDED "
-        "read-only milestone-outcome audit (#885). When done, run `coord "
+        "read-only milestone-outcome audit (#885/#886), run v"
+        f"{_next_run_number}. When done, run `coord "
         f"report-result --assignment {assignment_id} --status done "
-        "--summary \"<bottom-line>\" --body-file <scorecard.md>` so the "
-        "scorecard posts as a comment on the epic AND this session's row "
-        "closes.\n\n"
+        "--summary \"<bottom-line>\" --body-file <scorecard.md> --audit-json "
+        "<verdict.json>` so the scorecard AND the structured verdict post "
+        "together and this session's row closes.\n\n"
     )
     effective_briefing = _issue_ctx + report_reminder + audit_briefing
 
