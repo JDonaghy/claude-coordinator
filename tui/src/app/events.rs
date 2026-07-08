@@ -3483,6 +3483,26 @@ impl CoordApp {
                         }
                     }
                 } else if ctx.in_main(pos.x, pos.y) {
+                    // #1003 fix-up: the Plans-panel roster lives in the MAIN
+                    // panel, not the sidebar (unlike Board/Pipeline/Machines,
+                    // handled above) — the sidebar-only branch above left
+                    // every Plans right-click a silent no-op, so the CRUD
+                    // context menu this issue adds was unreachable by mouse.
+                    // Pre-select the row under the cursor (mirrors the
+                    // synthetic-left-click pattern above) before resolving
+                    // the target from the now-current selection.
+                    if self.active_view == SidebarView::Plans {
+                        let main_b = ctx.main_bounds();
+                        let lh = backend.line_height();
+                        if let Some(idx) = self.plans_row_at(pos, main_b, lh) {
+                            self.plans_sel = idx;
+                        }
+                        if let Some(target) = self.context_menu_target_for_selection() {
+                            if self.open_context_menu(pos, target) {
+                                return true;
+                            }
+                        }
+                    }
                     // #454: Forward right-click Press to the embedded PTY when
                     // mouse reporting is enabled.  Without this the PTY would
                     // receive an orphaned Release (from the MouseUp arm) with
@@ -4316,6 +4336,21 @@ impl CoordApp {
                     return true;
                 }
                 Some(BoardHit::ColumnHeader(_)) | Some(BoardHit::Empty) | None => {}
+            }
+            return false;
+        }
+        // #1003 fix-up: the Plans-panel roster is a raw `ListView` painted
+        // straight into the main panel (unlike Board/Pipeline/Machines,
+        // whose selectable rows live in the sidebar) — without this, a
+        // left-click here never moved `plans_sel`, and — more importantly —
+        // the right-click handler's synthetic-left-then-select flow (which
+        // this same hit-test also backs, see `handle_mouse`) had nothing to
+        // pre-select, leaving the #1003 CRUD context menu unreachable by
+        // mouse entirely.
+        if self.active_view == SidebarView::Plans {
+            if let Some(idx) = self.plans_row_at(pos, main_b, lh) {
+                self.plans_sel = idx;
+                return true;
             }
             return false;
         }

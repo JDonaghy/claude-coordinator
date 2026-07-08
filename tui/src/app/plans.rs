@@ -271,12 +271,7 @@ impl CoordApp {
         let list_rect = if self.data.goal_header.available {
             let goal_rect = Self::plans_goal_header_rect(rect, lh);
             self.render_goal_header_strip(backend, goal_rect);
-            Rect::new(
-                rect.x,
-                rect.y + goal_rect.height,
-                rect.width,
-                (rect.height - goal_rect.height).max(0.0),
-            )
+            Self::plans_list_rect_below_goal_header(rect, goal_rect)
         } else {
             rect
         };
@@ -497,6 +492,86 @@ impl CoordApp {
                 show_v_scrollbar: total > 10,
             },
         );
+    }
+
+    /// Shared geometry helper: the roster's `list_rect` once the optional
+    /// pinned GOAL.md header strip (#978) has been carved off the top of
+    /// `rect`. Split out of `render_plans_panel` so `plans_row_at`'s
+    /// hit-test can reproduce the exact same layout the paint path used —
+    /// duplicating this arithmetic ad hoc would drift the two apart the
+    /// first time either one changed (#1003 fix-up).
+    fn plans_list_rect_below_goal_header(rect: Rect, goal_rect: Rect) -> Rect {
+        Rect::new(
+            rect.x,
+            rect.y + goal_rect.height,
+            rect.width,
+            (rect.height - goal_rect.height).max(0.0),
+        )
+    }
+
+    /// Map a screen position in the main panel to the plan-roster row index
+    /// under the cursor, for mouse click / right-click support (#1003
+    /// fix-up).
+    ///
+    /// **Why this exists:** unlike Board/Pipeline/Machines, whose
+    /// selectable row list lives in the *sidebar* (handled generically by
+    /// `mouse_sidebar_click` + the quadraui sidebar tree/list controller),
+    /// the Plans roster is a raw `ListView` painted straight into the
+    /// *main* panel (`render_plans_panel`) — there was no hit-test at all
+    /// for it, so neither a left-click (row selection) nor a right-click
+    /// (the #1003 CRUD context menu) could ever resolve a target: right-click
+    /// support in `handle_mouse`'s `MouseDown`/`Right` arm only ever tried
+    /// `ctx.in_sidebar(..)`, silently no-op-ing for `ctx.in_main(..)` clicks.
+    /// This mirrors `render_plans_panel`'s exact geometry (goal-header
+    /// carve-out via `plans_list_rect_below_goal_header`, then the bordered
+    /// `ListView` with a 1-row title) through quadraui's own
+    /// `ListView::layout`/`hit_test` — the same D6 layout API `pipeline.rs`
+    /// already uses for its main-panel hit-tests — rather than hand-rolling
+    /// row arithmetic that could drift from the paint path.
+    ///
+    /// Returns `None` when the position isn't over a row (title strip, goal
+    /// header, empty tail, or an empty roster).
+    pub(crate) fn plans_row_at(&self, pos: Point, main_b: Rect, lh: f32) -> Option<usize> {
+        let entries = self.plans_entries();
+        if entries.is_empty() {
+            return None;
+        }
+        let list_rect = if self.data.goal_header.available {
+            let goal_rect = Self::plans_goal_header_rect(main_b, lh);
+            Self::plans_list_rect_below_goal_header(main_b, goal_rect)
+        } else {
+            main_b
+        };
+        // Content of each placeholder item is irrelevant to `layout` — it
+        // only consults `items.len()` (as the scroll-iteration bound) and
+        // the `measure_item` closure below for row heights.
+        let placeholder = ListItem {
+            text: StyledText::plain(String::new()),
+            icon: None,
+            detail: None,
+            decoration: Decoration::Normal,
+        };
+        let list = ListView {
+            id: WidgetId::new("plans-list"),
+            title: Some(StyledText::plain(" PLANS ")),
+            items: vec![placeholder; entries.len()],
+            selected_idx: 0,
+            scroll_offset: 0,
+            has_focus: true,
+            bordered: true,
+            h_scroll: 0,
+            max_content_width: None,
+            show_v_scrollbar: entries.len() > 10,
+        };
+        let layout = list.layout(list_rect.width, list_rect.height, lh, |_| {
+            ListItemMeasure::new(lh)
+        });
+        let local_x = pos.x - list_rect.x;
+        let local_y = pos.y - list_rect.y;
+        match layout.hit_test(local_x, local_y) {
+            ListViewHit::Item(idx) => Some(idx),
+            _ => None,
+        }
     }
 
     /// Carve the pinned GOAL.md header strip off the top of the Plans main
