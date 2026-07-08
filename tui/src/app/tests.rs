@@ -24750,6 +24750,7 @@ Milestone tracking issue.
                 done: 0,
                 total: 1,
                 needs_you: vec![],
+                ..Default::default()
             }],
             ..Default::default()
         });
@@ -24789,6 +24790,7 @@ Milestone tracking issue.
                 done: 0,
                 total: 0,
                 needs_you: vec!["no_work_order".to_string()],
+                ..Default::default()
             }],
             ..Default::default()
         });
@@ -26341,6 +26343,102 @@ Milestone tracking issue.
             screen.contains("Open milestone chat"),
             "#1003: right-click on a Plans row must open the CRUD context menu:\n{}",
             screen
+        );
+    }
+
+    /// #1003/#1001 rebase regression: once the roster spans more than one
+    /// repo group, `render_plans_panel` (#1001) interleaves a non-selectable
+    /// header row per repo and an optional trailing "+N without a work
+    /// order" summary row, and `plans_sel` indexes into
+    /// `plans_visible_entries()` — NOT the flat, header-blind
+    /// `plans_entries()` shape `plans_row_at` was originally written
+    /// against (pre-#1001). Left-clicking a row belonging to the *second*
+    /// repo group must select that exact row (verified by pressing Enter
+    /// afterwards and checking which tracking epic opens) — not some other
+    /// row shifted by the intervening header/summary rows.
+    #[test]
+    fn plans_panel_click_on_second_repo_row_selects_correct_row() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let board = BoardData {
+            pipeline_default_gates: vec!["review".to_string(), "merge".to_string()],
+            pipeline_tracked_labels: vec!["coord".to_string()],
+            pipeline_repos: vec![
+                ("api".to_string(), "acme/api".to_string()),
+                ("web".to_string(), "acme/web".to_string()),
+            ],
+            plan_roster_supported: true,
+            plan_roster: vec![
+                PlanRosterEntry {
+                    repo: "api".to_string(),
+                    title: "Substrate".to_string(),
+                    milestone_number: 5,
+                    tracking_issue: Some(500),
+                    has_work_order: true,
+                    ready_frontier: 2,
+                    blocked: 1,
+                    total: 3,
+                    needs_you: vec!["ready_waiting".to_string()],
+                    ..Default::default()
+                },
+                // Untracked + not expanded → collapsed into the "+1 without
+                // a work order" summary line (its own non-selectable row),
+                // not its own selectable row — exercises the summary-row
+                // offset, not just the header-row offset.
+                PlanRosterEntry {
+                    repo: "api".to_string(),
+                    title: "Follow-up".to_string(),
+                    milestone_number: 6,
+                    ..Default::default()
+                },
+                PlanRosterEntry {
+                    repo: "web".to_string(),
+                    title: "Frontend Revamp".to_string(),
+                    milestone_number: 12,
+                    tracking_issue: Some(1200),
+                    has_work_order: true,
+                    ready_frontier: 1,
+                    total: 1,
+                    ..Default::default()
+                },
+            ],
+            ..BoardData::default()
+        };
+
+        let app = make_test_app(board);
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "◆");
+
+        let (x, y) = driver.find("Frontend Revamp").unwrap_or_else(|| {
+            panic!(
+                "could not find Plans row 'Frontend Revamp' on initial render:\n{}",
+                driver.screen()
+            )
+        });
+        driver.click(x, y);
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Opening plan"),
+            "clicking a Plans row then pressing Enter must fire the 'Opening \
+             plan' toast:\n{}",
+            screen,
+        );
+        // Both #500 (Substrate) and #1200 (Frontend Revamp) are always
+        // visible as static row text regardless of selection, so scope the
+        // assertion to the toast line itself rather than the whole screen.
+        let toast_line = screen
+            .lines()
+            .find(|line| line.contains("gh issue view"))
+            .unwrap_or_else(|| panic!("no 'gh issue view' toast line found:\n{screen}"));
+        assert!(
+            toast_line.contains("#1200"),
+            "clicking the second repo's row then pressing Enter must open ITS \
+             tracking epic (#1200), not the first repo's (#500) — a \
+             header/summary-row count mismatch in `plans_row_at` mis-maps \
+             the click to the wrong row:\n{}",
+            screen,
         );
     }
 

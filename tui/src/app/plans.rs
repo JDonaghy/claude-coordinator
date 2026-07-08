@@ -529,8 +529,25 @@ impl CoordApp {
     /// already uses for its main-panel hit-tests — rather than hand-rolling
     /// row arithmetic that could drift from the paint path.
     ///
-    /// Returns `None` when the position isn't over a row (title strip, goal
-    /// header, empty tail, or an empty roster).
+    /// **#1001 rebase fix-up:** `render_plans_panel` now paints a
+    /// header-interleaved, collapse-filtered item list (one non-selectable
+    /// header row per repo group, milestone rows only for `has_work_order`
+    /// entries or expanded repos, an optional trailing non-selectable "+N
+    /// without a work order" line) rather than one flat row per
+    /// `plans_entries()` element, and the caller (`plans_sel`, see `mod.rs`)
+    /// indexes into `plans_visible_entries()`, not `plans_entries()`. This
+    /// helper must therefore build the *same shaped* placeholder list
+    /// `render_plans_panel` paints — not just the same length as
+    /// `plans_entries()` — and translate a hit back into
+    /// `plans_visible_entries()` space, or `None` for a header/summary row.
+    /// Left uncorrected this silently mis-maps every click once a roster has
+    /// more than one repo group or any collapsed milestone (the header/
+    /// summary rows shift every subsequent row index, and the returned
+    /// index lands in the wrong index space besides).
+    ///
+    /// Returns `None` when the position isn't over a selectable row (title
+    /// strip, goal header, a header/summary row, empty tail, or an empty
+    /// roster).
     pub(crate) fn plans_row_at(&self, pos: Point, main_b: Rect, lh: f32) -> Option<usize> {
         let entries = self.plans_entries();
         if entries.is_empty() {
@@ -542,6 +559,40 @@ impl CoordApp {
         } else {
             main_b
         };
+
+        // Reproduce `render_plans_panel`'s item list *shape* — one entry per
+        // painted row, `Some(visible_idx)` for a selectable milestone row
+        // (indexing into `plans_visible_entries()`) or `None` for a
+        // non-selectable header/summary row. Grouping/filter conditions
+        // below MUST stay identical to `render_plans_panel`'s loop.
+        let mut row_targets: Vec<Option<usize>> = Vec::with_capacity(entries.len() + 8);
+        let mut visible_idx = 0usize;
+        let mut i = 0usize;
+        while i < entries.len() {
+            let start = i;
+            let repo = entries[start].repo.clone();
+            while i < entries.len() && entries[i].repo == repo {
+                i += 1;
+            }
+            let group = &entries[start..i];
+            row_targets.push(None); // per-repo header row
+
+            let untracked_count = group.iter().filter(|e| !e.has_work_order).count();
+            let expanded = self.plans_expanded_repos.contains(&repo);
+            for entry in group {
+                if !entry.has_work_order && !expanded {
+                    // Collapsed by default — summarised by the trailing
+                    // "+N without a work order" line, not its own row.
+                    continue;
+                }
+                row_targets.push(Some(visible_idx));
+                visible_idx += 1;
+            }
+            if untracked_count > 0 && !expanded {
+                row_targets.push(None); // "+N without a work order" line
+            }
+        }
+
         // Content of each placeholder item is irrelevant to `layout` — it
         // only consults `items.len()` (as the scroll-iteration bound) and
         // the `measure_item` closure below for row heights.
@@ -554,14 +605,14 @@ impl CoordApp {
         let list = ListView {
             id: WidgetId::new("plans-list"),
             title: Some(StyledText::plain(" PLANS ")),
-            items: vec![placeholder; entries.len()],
+            items: vec![placeholder; row_targets.len()],
             selected_idx: 0,
             scroll_offset: 0,
             has_focus: true,
             bordered: true,
             h_scroll: 0,
             max_content_width: None,
-            show_v_scrollbar: entries.len() > 10,
+            show_v_scrollbar: row_targets.len() > 10,
         };
         let layout = list.layout(list_rect.width, list_rect.height, lh, |_| {
             ListItemMeasure::new(lh)
@@ -569,7 +620,7 @@ impl CoordApp {
         let local_x = pos.x - list_rect.x;
         let local_y = pos.y - list_rect.y;
         match layout.hit_test(local_x, local_y) {
-            ListViewHit::Item(idx) => Some(idx),
+            ListViewHit::Item(idx) => row_targets.get(idx).copied().flatten(),
             _ => None,
         }
     }
