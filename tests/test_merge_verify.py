@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -390,6 +390,237 @@ class TestFinalizeMergeGate:
         assert result.already_recorded is True
         assert result.merge_verify is None
         assert _read_status("rev-x") == "done"
+
+
+# ── _remote_verify_merge_branch (#1007) — ssh analogue of the primitive ──────
+
+
+def _ssh_result(stdout: str, *, returncode: int = 0) -> MagicMock:
+    m = MagicMock()
+    m.returncode = returncode
+    m.stdout = stdout
+    m.stderr = ""
+    return m
+
+
+class TestRemoteVerifyMergeBranch:
+    """#1007: the remote (--merge-of on a non-local machine) analogue of
+    :func:`coord.agent.verify_merge_branch` — same checks, but derived from a
+    single ssh call into the remote worktree instead of local subprocess git.
+    """
+
+    def test_clean_branch_is_ok(self) -> None:
+        from coord.interactive import _remote_verify_merge_branch
+
+        stdout = (
+            "__DEFAULT_AHEAD=0\n"
+            "__ADDED=deadbeef1234\tfeat(#604): real work\n"
+        )
+        with patch("coord.interactive.subprocess.run",
+                   return_value=_ssh_result(stdout)):
+            mv = _remote_verify_merge_branch(
+                "precision.tailnet", "$HOME/.coord/worktrees/mg1",
+                base="main", issue_number=604,
+            )
+        assert mv.default_ahead == 0
+        assert len(mv.added) == 1
+        assert mv.foreign == []
+        assert mv.ok is True
+
+    def test_branch_behind_base_is_blocked(self) -> None:
+        from coord.interactive import _remote_verify_merge_branch
+
+        with patch("coord.interactive.subprocess.run",
+                   return_value=_ssh_result("__DEFAULT_AHEAD=1\n")):
+            mv = _remote_verify_merge_branch(
+                "precision.tailnet", "$HOME/.coord/worktrees/mg2",
+                base="main", issue_number=604,
+            )
+        assert mv.default_ahead == 1
+        assert mv.ok is False
+
+    def test_foreign_commit_is_blocked(self) -> None:
+        from coord.interactive import _remote_verify_merge_branch
+
+        stdout = (
+            "__DEFAULT_AHEAD=0\n"
+            "__ADDED=aaa1111\tfeat(#604): real work\n"
+            "__ADDED=bbb2222\tfix(#514): unrelated already-merged work\n"
+        )
+        with patch("coord.interactive.subprocess.run",
+                   return_value=_ssh_result(stdout)):
+            mv = _remote_verify_merge_branch(
+                "precision.tailnet", "$HOME/.coord/worktrees/mg3",
+                base="main", issue_number=604,
+            )
+        assert mv.default_ahead == 0
+        assert len(mv.foreign) == 1
+        _, subj = mv.foreign[0]
+        assert "#514" in subj
+        assert mv.ok is False
+
+    def test_ref_missing_is_not_ok(self) -> None:
+        """The remote worktree can't resolve origin/<base> OR <base> → the
+        same conservative 'unverifiable ⇒ not ok' fallback as the local
+        primitive's missing-base-ref case."""
+        from coord.interactive import _remote_verify_merge_branch
+
+        with patch("coord.interactive.subprocess.run",
+                   return_value=_ssh_result("__REF_MISSING\n")):
+            mv = _remote_verify_merge_branch(
+                "precision.tailnet", "$HOME/.coord/worktrees/mg4",
+                base="does-not-exist", issue_number=604,
+            )
+        assert mv.default_ahead is None
+        assert mv.ok is False
+
+    def test_ssh_failure_is_not_ok(self) -> None:
+        from coord.interactive import _remote_verify_merge_branch
+
+        with patch("coord.interactive.subprocess.run",
+                   side_effect=OSError("ssh unreachable")):
+            mv = _remote_verify_merge_branch(
+                "precision.tailnet", "$HOME/.coord/worktrees/mg5",
+                base="main", issue_number=604,
+            )
+        assert mv.default_ahead is None
+        assert mv.ok is False
+
+
+# ── finalize_remote_interactive_exit(verify_merge=True) — remote gate ────────
+
+
+class TestFinalizeRemoteMergeGate:
+    """#1007: the remote analogue of ``TestFinalizeMergeGate`` — the #604
+    git-truth-overrides-self-report gate must hold on the remote
+    ``--merge-of`` path too, not just local."""
+
+    def test_clean_rebase_records_done(self) -> None:
+        from coord.agent import MergeVerify
+        from coord.interactive import finalize_remote_interactive_exit
+        from tests.test_issue_store_seam import _seed_running_assignment
+
+        _seed_running_assignment("mg-remote-clean", issue_number=604)
+        clean_mv = MergeVerify(
+            default_ahead=0, added=[("a1", "feat(#604): fix")], foreign=[]
+        )
+        with patch("coord.interactive.remote_worktree_exists", return_value=True), \
+             patch("coord.interactive._remote_verify_merge_branch",
+                   return_value=clean_mv), \
+             patch("coord.interactive._remote_push_and_count",
+                   return_value=(True, None, 1, "issue-604-fix")), \
+             patch("coord.interactive._remote_worktree_remove", return_value=True), \
+             patch("coord.github_ops.post_issue_comment"):
+            result = finalize_remote_interactive_exit(
+                assignment_id="mg-remote-clean",
+                repo_name="api",
+                repo_github="acme/api",
+                issue_number=604,
+                machine_name="precision",
+                ssh_target="precision.tailnet",
+                remote_worktree_sh="$HOME/.coord/worktrees/mg-remote-clean",
+                remote_repo_sh="$HOME/src/api",
+                branch="issue-604-fix",
+                base_branch="main",
+                exit_code=0,
+                started_at=None,
+                verify_merge=True,
+            )
+
+        assert result.merge_verify is not None
+        assert result.merge_verify.ok is True
+        assert result.terminal_status == "done"
+        assert _read_status("mg-remote-clean") == "done"
+
+    def test_polluted_rebase_blocks_and_overrides_self_reported_done(self) -> None:
+        """The remote #494 incident: agent self-reports done from a remote
+        session but the branch is behind origin/main.  Git truth (derived
+        over ssh) must override → failed, same as the local gate."""
+        from coord.agent import MergeVerify
+        import coord.issue_store as issue_store
+        from coord.interactive import finalize_remote_interactive_exit
+        from tests.test_issue_store_seam import _seed_running_assignment
+
+        _seed_running_assignment("mg-remote-bad", issue_number=604)
+        with patch("coord.github_ops.post_issue_comment"):
+            issue_store.post_result(
+                issue_store.ResultRecord(
+                    assignment_id="mg-remote-bad",
+                    machine_name="precision",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=604,
+                    status="done",
+                    verdict=None,
+                    summary="rebased and pushed",
+                )
+            )
+        assert _read_status("mg-remote-bad") == "done"
+
+        bad_mv = MergeVerify(default_ahead=1, added=[], foreign=[])
+        with patch("coord.interactive.remote_worktree_exists", return_value=True), \
+             patch("coord.interactive._remote_verify_merge_branch",
+                   return_value=bad_mv), \
+             patch("coord.interactive._remote_worktree_remove",
+                   return_value=True) as mock_rm, \
+             patch("coord.github_ops.post_issue_comment") as post:
+            result = finalize_remote_interactive_exit(
+                assignment_id="mg-remote-bad",
+                repo_name="api",
+                repo_github="acme/api",
+                issue_number=604,
+                machine_name="precision",
+                ssh_target="precision.tailnet",
+                remote_worktree_sh="$HOME/.coord/worktrees/mg-remote-bad",
+                remote_repo_sh="$HOME/src/api",
+                branch="issue-604-fix",
+                base_branch="main",
+                exit_code=0,
+                started_at=None,
+                verify_merge=True,
+            )
+
+        assert result.merge_verify is not None
+        assert result.merge_verify.ok is False
+        assert result.already_recorded is True, "the prior done must be visible"
+        assert result.terminal_status == "failed"
+        assert _read_status("mg-remote-bad") == "failed"
+        mock_rm.assert_called_once()
+        post.assert_called()
+
+    def test_worktree_missing_skips_verify(self) -> None:
+        """When the remote worktree was never created (a #560 setup
+        failure), the verify step must be SKIPPED — mirrors the local
+        function's ``wt_v.exists()`` guard — rather than blocking on an
+        unverifiable branch that never got a chance to rebase."""
+        from coord.interactive import finalize_remote_interactive_exit
+        from tests.test_issue_store_seam import _seed_running_assignment
+
+        _seed_running_assignment("mg-remote-missing", issue_number=604)
+        with patch("coord.interactive.remote_worktree_exists",
+                   return_value=False) as mock_exists, \
+             patch("coord.interactive._remote_verify_merge_branch") as mock_verify, \
+             patch("coord.interactive._remote_push_and_count",
+                   return_value=(False, "no such file or directory", None, None)), \
+             patch("coord.github_ops.post_issue_comment"):
+            result = finalize_remote_interactive_exit(
+                assignment_id="mg-remote-missing",
+                repo_name="api",
+                repo_github="acme/api",
+                issue_number=604,
+                machine_name="precision",
+                ssh_target="precision.tailnet",
+                remote_worktree_sh="$HOME/.coord/worktrees/mg-remote-missing",
+                remote_repo_sh="$HOME/src/api",
+                branch="issue-604-fix",
+                base_branch="main",
+                exit_code=1,
+                started_at=None,
+                verify_merge=True,
+            )
+        mock_exists.assert_called_once()
+        mock_verify.assert_not_called()
+        assert result.merge_verify is None
 
 
 # ── coord verify-merge CLI — thin-client routing (#681) ──────────────────────

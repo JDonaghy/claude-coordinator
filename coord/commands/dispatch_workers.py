@@ -2675,12 +2675,33 @@ def _dispatch_merge_of(
     _interactive_board: object,
     _issue_ctx: str,
 ) -> None:
+    """Leg 3c (#517, #306): human-attended MERGE-PREP for approved work.
+
+    #1007: runs on the LOCAL TTY or on a REMOTE machine over ssh+tmux,
+    mirroring the local/remote split already in production for
+    ``--review-of`` / ``--fix-of`` / ``--rework-of``.  Like a fix, a merge
+    WRITES (rebase + force-push) — it needs a worktree on the EXISTING
+    branch; unlike a fix, the merge-prep agent itself runs `git push
+    --force-with-lease` and `coord merge` as part of its own instructed
+    flow, so the coordinator's remote finalize does not need a push-back
+    step of its own (the #604 verify-merge gate is the piece that must run
+    on whichever host holds the worktree).
+    """
     import time as _time  # noqa: PLC0415
     import uuid as _uuid  # noqa: PLC0415
 
     from coord.interactive import (  # noqa: PLC0415
+        TmuxHost,
+        _holder_is_base_checkout as _holder_is_base,
+        _launch_via_tmux as _tmux_launch,
+        _remote_base_checkout_free_branch as _remote_free_base,
+        _remote_orphan_is_safe_to_prune as _remote_orphan_safe,
+        _remote_worktree_remove as _remote_wt_remove,
+        find_remote_branch_holder as _find_branch_holder,
         finalize_interactive_exit,
+        finalize_remote_interactive_exit,
         launch_human_attended_interactive,
+        remote_worktree_exists as _remote_wt_exists,
         tmux_available as _tmux_avail,
         tmux_session_alive as _tmux_alive,
         tmux_session_name as _tmux_name,
@@ -2698,14 +2719,34 @@ def _dispatch_merge_of(
         save_board as _save_board_mg,
     )
 
-    if not _is_local:
-        click.echo(
-            "error: --merge-of is local-only for now; run it on the "
-            "machine that holds the checkout (remote interactive merge "
-            "is Track B / #486).",
-            err=True,
-        )
-        sys.exit(2)
+    def _echo_merge_finalize(finalize_result: object, target_branch: str) -> None:
+        # Forensics (#604): the worktree + reflog are gone by now, so this
+        # echo is the only post-hoc record of what would merge.
+        _mv = finalize_result.merge_verify
+        if _mv is not None:
+            click.echo(
+                f"  merge verify: {target_branch}-ahead="
+                f"{_mv.default_ahead} added={len(_mv.added)} commit(s)"
+            )
+            for _sha, _subj in _mv.added:
+                _flag = " [FOREIGN]" if (_sha, _subj) in _mv.foreign else ""
+                click.echo(f"    {_sha[:9]} {_subj}{_flag}")
+            if not _mv.ok:
+                click.echo(
+                    "  ✗ MERGE BLOCKED (#604): "
+                    f"{_mv.block_summary(target_branch)}",
+                    err=True,
+                )
+        if finalize_result.already_recorded and (_mv is None or _mv.ok):
+            click.echo(
+                "  result recorded via `coord report-result`; backstop "
+                "did not overwrite"
+            )
+        else:
+            click.echo(
+                f"  backstop: status={finalize_result.terminal_status} "
+                f"commits_ahead={finalize_result.commits_ahead}"
+            )
 
     _mg_board = _interactive_board(_build_board_mg)
     work = _mg_board.find_by_id(merge_of)
@@ -2725,9 +2766,12 @@ def _dispatch_merge_of(
 
     resolved_model = model if model else cfg.models.default
     assignment_id = _uuid.uuid4().hex[:12]
-    merge_repo_path = str(
-        Path(machine_obj.repo_path(repo) or str(Path.cwd())).expanduser()
-    )
+    if _is_local:
+        merge_repo_path = str(
+            Path(machine_obj.repo_path(repo) or str(Path.cwd())).expanduser()
+        )
+    else:
+        merge_repo_path = machine_obj.repo_path(repo) or f"~/src/{repo}"
     merge_target_branch = repo_cfg.default_branch or "main"
     _merge_test_cmd = None
     try:
@@ -2828,9 +2872,16 @@ def _dispatch_merge_of(
     # Full worker tool set (Read/Edit/Write/Bash) — rebasing and resolving
     # conflicts mutates the checkout.
     argv = provider.build_command(spec, resolved_model=resolved_model)
+    # Remote: bare "claude" isn't on the SSH login PATH (#424/#425).
+    if not _is_local:
+        argv = ["~/.local/bin/claude"] + list(argv)[1:]
 
+    _mg_location = (
+        "local TTY" if _is_local
+        else f"{machine_obj.host} (remote tmux)"
+    )
     click.echo(
-        f"{machine} (local TTY) → MERGE-PREP of #{issue} "
+        f"{machine} ({_mg_location}) → MERGE-PREP of #{issue} "
         f"on branch {work.branch}: {issue_title}"
     )
     click.echo("  mode: HUMAN-ATTENDED interactive merge agent (leg 3c)")
@@ -2841,27 +2892,13 @@ def _dispatch_merge_of(
     if dry_run:
         click.echo("  (dry run — not launched)")
         click.echo(f"  would continue branch: {work.branch}")
+        if not _is_local:
+            click.echo(
+                f"  remote worktree: $HOME/.coord/worktrees/{assignment_id}"
+                f" on {machine_obj.host} (branch: {work.branch})"
+            )
         click.echo(f"  would exec: {argv}")
         return
-
-    try:
-        _wt_path, _ = _setup_wt_mg(
-            Path(merge_repo_path),
-            issue_number=issue,
-            issue_title=issue_title,
-            assignment_id=assignment_id,
-            default_branch=merge_target_branch,
-            existing_branch=work.branch,
-        )
-        worktree_path = str(_wt_path)
-    except (_AgentGitErrorMg, OSError) as _wt_err:
-        click.echo(
-            f"  error: could not create merge worktree on branch "
-            f"{work.branch}: {_wt_err}",
-            err=True,
-        )
-        sys.exit(1)
-    click.echo(f"  worktree: {worktree_path} (branch: {work.branch})")
 
     merge_assignment = _AssignmentMg(
         machine_name=machine,
@@ -2883,76 +2920,346 @@ def _dispatch_merge_of(
     if _svc is None:
         _save_board_mg(_build_board_mg())
 
+    if _is_local:
+        try:
+            _wt_path, _ = _setup_wt_mg(
+                Path(merge_repo_path),
+                issue_number=issue,
+                issue_title=issue_title,
+                assignment_id=assignment_id,
+                default_branch=merge_target_branch,
+                existing_branch=work.branch,
+            )
+            worktree_path = str(_wt_path)
+        except (_AgentGitErrorMg, OSError) as _wt_err:
+            click.echo(
+                f"  error: could not create merge worktree on branch "
+                f"{work.branch}: {_wt_err}",
+                err=True,
+            )
+            sys.exit(1)
+        click.echo(f"  worktree: {worktree_path} (branch: {work.branch})")
+
+        started_at = _time.time()
+        exit_code = launch_human_attended_interactive(
+            argv,
+            effective_briefing,
+            assignment_id=assignment_id,
+            cwd=worktree_path,
+        )
+        if exit_code != 0:
+            click.echo(f"  claude exited with status {exit_code}", err=True)
+
+        _sname = _tmux_name(assignment_id) if _tmux_avail() else None
+        if _sname and _tmux_alive(_sname):
+            click.echo(
+                f"  session still running in tmux: {_sname}\n"
+                f"  reattach with:  coord reattach {assignment_id}"
+            )
+            sys.exit(0)
+
+        try:
+            finalize_result = finalize_interactive_exit(
+                assignment_id=assignment_id,
+                repo_name=repo,
+                repo_github=repo_cfg.github,
+                issue_number=issue,
+                machine_name=machine,
+                worktree_path=worktree_path,
+                base_branch=merge_target_branch,
+                exit_code=exit_code,
+                started_at=started_at,
+                log_path=None,
+                repo_path=merge_repo_path,
+                # #604: git truth overrides the agent's self-report on the
+                # merge path — a botched rebase records `blocked`, not `done`.
+                verify_merge=True,
+                branch=work.branch,
+            )
+            _echo_merge_finalize(finalize_result, merge_target_branch)
+        except Exception as exc:  # noqa: BLE001 — best-effort backstop
+            click.echo(
+                f"  warning: backstop failed to record merge exit: {exc}",
+                err=True,
+            )
+        sys.exit(exit_code)
+
+    # ── REMOTE MERGE (#1007) ──────────────────────────────────────
+    # A remote worktree on the EXISTING branch (`-B <branch>
+    # origin/<branch>` resets a dedicated local branch to the reviewed
+    # work's branch) — same shape as the remote fix path.  The merge-prep
+    # agent itself runs `git push --force-with-lease` and `coord merge` as
+    # part of its instructed flow (INTERACTIVE_MERGE_SYSTEM_PROMPT above),
+    # so on exit the coordinator's job is to VERIFY the rebase (#604) on
+    # the remote worktree before trusting any self-report, then record
+    # the completion.
+    import shlex as _shlex_mg  # noqa: PLC0415
+
+    _remote_wt = "$HOME/.coord/worktrees/" + assignment_id
+    _rp_sh = (
+        "$HOME/" + merge_repo_path[2:]
+        if merge_repo_path.startswith("~/")
+        else ("$HOME" if merge_repo_path == "~" else merge_repo_path)
+    )
+    _claude_args = _shlex_mg.join(list(argv)[1:])
+    _br_q = _shlex_mg.quote(work.branch)
+    _orig_ref = _shlex_mg.quote(f"origin/{work.branch}")
+    _remote_cmd = (
+        f"mkdir -p $HOME/.coord/worktrees"
+        f" && cd {_rp_sh}"
+        f" && git fetch origin --prune 2>/dev/null || true"
+        f" && git worktree prune 2>/dev/null || true"
+        f" && git worktree add -B {_br_q} {_remote_wt} {_orig_ref}"
+        f" && cd {_remote_wt}"
+        f" && COORD_ASSIGNMENT_ID={assignment_id} {argv[0]} {_claude_args}"
+    )
+    _tmux_host = TmuxHost(ssh_target=machine_obj.host)
+    _sname = _tmux_name(assignment_id)
+    click.echo(
+        f"  remote worktree: $HOME/.coord/worktrees/{assignment_id}"
+        f" on {machine_obj.host} (branch: {work.branch})"
+    )
+
+    if effective_briefing.strip():
+        _hdr = (
+            "--- seeded briefing -- review below; "
+            "submit the pre-filled input in Claude to send ---"
+        )
+        _ftr = "-" * len(_hdr)
+        _preview = f"\n{_hdr}\n{effective_briefing.rstrip()}\n{_ftr}\n\n"
+        try:
+            os.write(sys.stdout.fileno(), _preview.encode("utf-8"))
+        except OSError:
+            pass
+
     started_at = _time.time()
-    exit_code = launch_human_attended_interactive(
+    _rc = _tmux_launch(
         argv,
         effective_briefing,
-        assignment_id=assignment_id,
-        cwd=worktree_path,
+        _sname,
+        cwd=None,
+        host=_tmux_host,
+        raw_shell_cmd=_remote_cmd,
     )
-    if exit_code != 0:
-        click.echo(f"  claude exited with status {exit_code}", err=True)
-
-    _sname = _tmux_name(assignment_id) if _tmux_avail() else None
-    if _sname and _tmux_alive(_sname):
+    if _rc is None:
         click.echo(
-            f"  session still running in tmux: {_sname}\n"
-            f"  reattach with:  coord reattach {assignment_id}"
+            "  error: could not create remote tmux session on "
+            f"{machine_obj.host}",
+            err=True,
+        )
+        sys.exit(1)
+    exit_code = _rc
+
+    if _tmux_alive(_sname, host=_tmux_host):
+        click.echo(
+            f"  session still running in remote tmux: {_sname}\n"
+            f"  reattach with:  ssh -t {machine_obj.host}"
+            f" tmux attach-session -t {_sname}\n"
+            "  (the merge is not finalized until the session ends and "
+            "the coordinator finalizes)"
         )
         sys.exit(0)
 
+    # ── #560: detect setup failures (worktree never created) ──────
+    _wt_setup_ok_mg: bool = True
+    if exit_code != 0:
+        if not _remote_wt_exists(machine_obj.host, _remote_wt):
+            _wt_setup_ok_mg = False
+            _holder = _find_branch_holder(
+                machine_obj.host, _rp_sh, work.branch,
+            )
+            if _holder:
+                _holder_aid = Path(_holder).name
+                _holder_sname = f"coord-{_holder_aid}"
+                _holder_live = _tmux_alive(_holder_sname, host=_tmux_host)
+                _err_header = (
+                    f"  error: setup failed — branch {work.branch!r} is "
+                    f"already checked out at {_holder} on {machine_obj.host}."
+                )
+                if _holder_live:
+                    click.echo("\n".join([
+                        _err_header,
+                        f"  active tmux session: {_holder_sname}",
+                        f"  reattach:  coord reattach {_holder_aid}",
+                        "  exit the session first, then retry this merge.",
+                    ]), err=True)
+                else:
+                    # Dead holder — detect base checkout vs stale orphan (#814).
+                    if _holder_is_base(_holder):
+                        # #814: the base checkout ~/src/<repo> is on the
+                        # merge branch.  NEVER prune the base (#561) —
+                        # checkout the default branch to free the lock.
+                        click.echo(
+                            f"  base checkout {_holder!r} is on branch"
+                            f" {work.branch!r} on {machine_obj.host}"
+                            f" — checking out {merge_target_branch!r}"
+                            f" to free it …"
+                        )
+                        _freed = _remote_free_base(
+                            machine_obj.host, _rp_sh, merge_target_branch,
+                        )
+                        if _freed:
+                            click.echo(
+                                "  base checkout freed — retrying launch …"
+                            )
+                            _rc2 = _tmux_launch(
+                                argv, effective_briefing, _sname,
+                                cwd=None, host=_tmux_host,
+                                raw_shell_cmd=_remote_cmd,
+                            )
+                            if _rc2 is None:
+                                click.echo(
+                                    f"  error: could not create remote tmux"
+                                    f" session on {machine_obj.host}"
+                                    f" (retry after base-checkout free)",
+                                    err=True,
+                                )
+                            else:
+                                exit_code = _rc2
+                                if _tmux_alive(_sname, host=_tmux_host):
+                                    click.echo(
+                                        f"  session still running in remote"
+                                        f" tmux: {_sname}\n"
+                                        f"  reattach with:  ssh -t"
+                                        f" {machine_obj.host}"
+                                        f" tmux attach-session -t {_sname}\n"
+                                        "  (the merge is not finalized until"
+                                        " the session ends and the"
+                                        " coordinator finalizes)"
+                                    )
+                                    sys.exit(0)
+                                if (
+                                    exit_code == 0
+                                    or _remote_wt_exists(
+                                        machine_obj.host, _remote_wt
+                                    )
+                                ):
+                                    _wt_setup_ok_mg = True  # retry succeeded
+                        else:
+                            click.echo("\n".join([
+                                _err_header,
+                                f"  base checkout is stuck on"
+                                f" {work.branch!r} —",
+                                f"  free it manually with:",
+                                f"    ssh {machine_obj.host}"
+                                f" 'git -C {_rp_sh} checkout"
+                                f" {merge_target_branch}'",
+                            ]), err=True)
+                    else:
+                        # Dead orphan — safety-gated auto-prune-and-retry (#759).
+                        _auto_pruned = False
+                        if _remote_orphan_safe(
+                            machine_obj.host, _rp_sh, _holder, work.branch,
+                        ):
+                            click.echo(
+                                f"  auto-pruning stale orphan {_holder}"
+                                f" on {machine_obj.host} …"
+                            )
+                            _auto_pruned = _remote_wt_remove(
+                                machine_obj.host, _rp_sh, _holder,
+                            )
+                        if _auto_pruned:
+                            click.echo(
+                                "  stale orphan auto-pruned — retrying launch …"
+                            )
+                            _rc2 = _tmux_launch(
+                                argv, effective_briefing, _sname,
+                                cwd=None, host=_tmux_host,
+                                raw_shell_cmd=_remote_cmd,
+                            )
+                            if _rc2 is None:
+                                click.echo(
+                                    f"  error: could not create remote tmux"
+                                    f" session on {machine_obj.host}"
+                                    f" (retry after prune)",
+                                    err=True,
+                                )
+                            else:
+                                exit_code = _rc2
+                                if _tmux_alive(_sname, host=_tmux_host):
+                                    click.echo(
+                                        f"  session still running in remote"
+                                        f" tmux: {_sname}\n"
+                                        f"  reattach with:  ssh -t"
+                                        f" {machine_obj.host}"
+                                        f" tmux attach-session -t {_sname}\n"
+                                        "  (the merge is not finalized until"
+                                        " the session ends and the"
+                                        " coordinator finalizes)"
+                                    )
+                                    sys.exit(0)
+                                if (
+                                    exit_code == 0
+                                    or _remote_wt_exists(
+                                        machine_obj.host, _remote_wt
+                                    )
+                                ):
+                                    _wt_setup_ok_mg = True  # retry succeeded
+                        else:
+                            # Not safe or prune failed → manual command.
+                            click.echo("\n".join([
+                                _err_header,
+                                "  stale worktree — prune it first:",
+                                f"    ssh {machine_obj.host} 'cd {_rp_sh}"
+                                f" && git worktree remove --force"
+                                f" {_shlex_mg.quote(_holder)}'",
+                            ]), err=True)
+            else:
+                click.echo(
+                    f"  error: setup failed — the remote worktree was "
+                    f"never created (git worktree add refused on "
+                    f"{machine_obj.host}).",
+                    err=True,
+                )
+        else:
+            click.echo(
+                f"  claude exited with status {exit_code}", err=True,
+            )
+
+    # Remote finalize (#1007): verify the rebase (#604) on the remote
+    # worktree BEFORE trusting any self-report, then record the
+    # completion and clean up.  Safe even when the worktree was never
+    # created — remote_worktree_exists() gates the verify step and
+    # _remote_push_and_count detects the missing directory.
     try:
-        finalize_result = finalize_interactive_exit(
+        finalize_result = finalize_remote_interactive_exit(
             assignment_id=assignment_id,
             repo_name=repo,
             repo_github=repo_cfg.github,
             issue_number=issue,
             machine_name=machine,
-            worktree_path=worktree_path,
+            ssh_target=machine_obj.host,
+            remote_worktree_sh=_remote_wt,
+            remote_repo_sh=_rp_sh,
+            branch=work.branch,
             base_branch=merge_target_branch,
             exit_code=exit_code,
             started_at=started_at,
-            log_path=None,
-            repo_path=merge_repo_path,
-            # #604: git truth overrides the agent's self-report on the
-            # merge path — a botched rebase records `blocked`, not `done`.
             verify_merge=True,
-            branch=work.branch,
         )
-        # Forensics (#604): the worktree + reflog are gone by now, so
-        # this echo is the only post-hoc record of what would merge.
+        _echo_merge_finalize(finalize_result, merge_target_branch)
         _mv = finalize_result.merge_verify
-        if _mv is not None:
-            click.echo(
-                f"  merge verify: {merge_target_branch}-ahead="
-                f"{_mv.default_ahead} added={len(_mv.added)} commit(s)"
-            )
-            for _sha, _subj in _mv.added:
-                _flag = " [FOREIGN]" if (_sha, _subj) in _mv.foreign else ""
-                click.echo(f"    {_sha[:9]} {_subj}{_flag}")
-            if not _mv.ok:
-                click.echo(
-                    "  ✗ MERGE BLOCKED (#604): "
-                    f"{_mv.block_summary(merge_target_branch)}",
-                    err=True,
-                )
-        if finalize_result.already_recorded and (
+        if not finalize_result.push_ok and _wt_setup_ok_mg and (
             _mv is None or _mv.ok
         ):
+            # Worker ran but the coordinator's own backstop push failed —
+            # the agent's own `git push --force-with-lease` (briefing step
+            # 5) may still have landed; this is a secondary signal only.
             click.echo(
-                "  result recorded via `coord report-result`; backstop "
-                "did not overwrite"
+                f"  warning: remote push failed: {finalize_result.push_error}",
+                err=True,
             )
-        else:
             click.echo(
-                f"  backstop: status={finalize_result.terminal_status} "
-                f"commits_ahead={finalize_result.commits_ahead}"
+                f"  merge commits preserved in {_remote_wt} on "
+                f"{machine_obj.host} (worktree NOT removed)",
+                err=True,
             )
     except Exception as exc:  # noqa: BLE001 — best-effort backstop
         click.echo(
-            f"  warning: backstop failed to record merge exit: {exc}",
+            f"  warning: backstop failed to record remote merge exit: {exc}",
             err=True,
         )
+    sys.exit(exit_code)
 
 
 def _dispatch_interactive_work(

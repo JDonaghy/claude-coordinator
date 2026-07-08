@@ -1132,6 +1132,7 @@ def _make_finalize_result(
     push_ok: bool = False,
     push_error: str | None = None,
     already_recorded: bool = False,
+    merge_verify: Any = None,
 ) -> Any:
     """Build a mock InteractiveFinalizeResult for finalize_remote_interactive_exit."""
     from coord.interactive import InteractiveFinalizeResult
@@ -1141,6 +1142,7 @@ def _make_finalize_result(
         push_ok=push_ok,
         push_error=push_error,
         already_recorded=already_recorded,
+        merge_verify=merge_verify,
     )
 
 
@@ -1298,3 +1300,146 @@ class TestRemoteFixWorktreeCollision:
         assert "push rejected" in out or "remote push failed" in out, out
         # Must NOT print the "setup failed" error.
         assert "setup failed" not in out, out
+
+
+# ── #1007: --merge-of on a REMOTE machine ─────────────────────────────────────
+
+
+def _seed_merge_board(work_id: str, branch: str) -> None:
+    """Seed a completed+approved work assignment for `--merge-of` tests."""
+    from coord.models import Assignment, Board, Repo
+    from coord.state import save_board
+
+    work = Assignment(
+        machine_name="precision",
+        repo_name="api",
+        issue_number=1,
+        issue_title="Fix bug",
+        assignment_id=work_id,
+        status="done",
+        branch=branch,
+        type="work",
+        dispatched_at=0.0,
+        finished_at=1.0,
+    )
+    board = Board(
+        repos=[Repo(name="api", github="acme/api", default_branch="main")],
+        machines=[],
+        active=[],
+        completed=[work],
+    )
+    save_board(board)
+
+
+class TestRemoteMergeOf:
+    """#1007: --merge-of must work on a REMOTE machine over ssh+tmux — the
+    same shape as --fix-of / --rework-of — instead of hard `sys.exit(2)`."""
+
+    def test_remote_machine_uses_tmux_launch_for_merge_of(
+        self, remote_config_file: Path, coord_dir: Path,
+    ) -> None:
+        """Selecting a non-local machine for --merge-of must take the
+        ssh+tmux branch (_launch_via_tmux with a real ssh_target), not
+        launch_human_attended_interactive (the local TTY path) and NOT
+        `sys.exit(2)` with the old 'local-only for now' error."""
+        _seed_merge_board("work-mg1", "issue-1-fix-bug")
+
+        captured_host: list[TmuxHost] = []
+
+        def _fake_tmux_launch(
+            argv: Any, briefing: Any, session_name: Any, *,
+            cwd: Any = None, host: TmuxHost = TmuxHost(None),
+            raw_shell_cmd: Any = None,
+        ) -> int:
+            captured_host.append(host)
+            return 0
+
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "Fix bug", "body": "b"}), \
+             patch("coord.interactive._launch_via_tmux",
+                   side_effect=_fake_tmux_launch) as mock_tmux, \
+             patch("coord.interactive.launch_human_attended_interactive") as mock_local, \
+             patch("coord.interactive.tmux_session_alive", return_value=False), \
+             patch("coord.interactive.finalize_remote_interactive_exit",
+                   return_value=_make_finalize_result(push_ok=True)):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "precision", "api", "1",
+                 "--config", str(remote_config_file),
+                 "--interactive", "--merge-of", "work-mg1"],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "error: --merge-of is local-only" not in result.output, result.output
+        mock_local.assert_not_called()
+        mock_tmux.assert_called_once()
+
+        # TmuxHost must have the remote machine's host as ssh_target.
+        assert len(captured_host) == 1
+        assert captured_host[0].ssh_target == "precision.tailnet"
+
+    def test_remote_merge_of_finalizes_with_verify_merge(
+        self, remote_config_file: Path, coord_dir: Path,
+    ) -> None:
+        """The remote finalize call must pass verify_merge=True (#604) so a
+        botched remote rebase can never be silently recorded as `done`."""
+        _seed_merge_board("work-mg2", "issue-1-fix-bug")
+
+        captured_kwargs: list[dict[str, Any]] = []
+
+        def _fake_finalize(**kwargs: Any) -> Any:
+            captured_kwargs.append(kwargs)
+            return _make_finalize_result(push_ok=True)
+
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "Fix bug", "body": "b"}), \
+             patch("coord.interactive._launch_via_tmux", return_value=0), \
+             patch("coord.interactive.launch_human_attended_interactive") as mock_local, \
+             patch("coord.interactive.tmux_session_alive", return_value=False), \
+             patch("coord.interactive.finalize_remote_interactive_exit",
+                   side_effect=_fake_finalize):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "precision", "api", "1",
+                 "--config", str(remote_config_file),
+                 "--interactive", "--merge-of", "work-mg2"],
+            )
+
+        assert result.exit_code == 0, result.output
+        mock_local.assert_not_called()
+        assert len(captured_kwargs) == 1
+        assert captured_kwargs[0]["verify_merge"] is True
+        assert captured_kwargs[0]["ssh_target"] == "precision.tailnet"
+        assert captured_kwargs[0]["branch"] == "issue-1-fix-bug"
+
+    def test_local_merge_of_still_uses_local_tty(
+        self, config_file: Path, coord_dir: Path,
+    ) -> None:
+        """Local behaviour must be unchanged: --merge-of on the local machine
+        still uses launch_human_attended_interactive, not _launch_via_tmux."""
+        _seed_merge_board("work-mg3", "issue-1-fix-bug")
+
+        def _fake_local(argv: Any, briefing: Any, **kw: Any) -> int:
+            return 0
+
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "Fix bug", "body": "b"}), \
+             patch("coord.agent.setup_interactive_worktree",
+                   return_value=(Path("/tmp/wt"), "issue-1-fix-bug")), \
+             patch("coord.interactive.launch_human_attended_interactive",
+                   side_effect=_fake_local) as mock_local, \
+             patch("coord.interactive._launch_via_tmux") as mock_remote, \
+             patch("coord.interactive.tmux_available", return_value=False), \
+             patch("coord.interactive.tmux_session_alive", return_value=False), \
+             patch("coord.interactive.finalize_interactive_exit",
+                   return_value=_make_finalize_result(push_ok=True)):
+            result = CliRunner().invoke(
+                main,
+                ["assign", _LOCAL_HOST, "api", "1",
+                 "--config", str(config_file),
+                 "--interactive", "--merge-of", "work-mg3"],
+            )
+
+        assert result.exit_code == 0, result.output
+        mock_local.assert_called_once()
+        mock_remote.assert_not_called()
