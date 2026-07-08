@@ -113,6 +113,7 @@ __all__ = [
     "reap_stale_remote_interactive_sessions",
     "InteractiveFinalizeResult",
     "TMUX_SESSION_PREFIX",
+    "TERM_SESSION_PREFIX",
     "TmuxHost",
     "tmux_session_name",
     "tmux_available",
@@ -128,6 +129,15 @@ __all__ = [
 #: ``coord-<assignment_id>`` so that a ``tmux ls`` output can be filtered
 #: cheaply and the assignment_id is directly recoverable.
 TMUX_SESSION_PREFIX = "coord-"
+
+#: Prefix for free-floating "plain terminal" tmux sessions (#952) — shells
+#: not tied to any issue/assignment, created via ``coord terminal new``.
+#: Deliberately a DISTINCT, longer prefix than :data:`TMUX_SESSION_PREFIX`
+#: (which it also starts with) so the two kinds never collide on a name but
+#: each side can still filter its own: assignment-session discovery
+#: (:func:`list_coord_tmux_sessions`) explicitly excludes this prefix, and
+#: ``coord terminal list`` (``coord/commands/terminal.py``) matches only it.
+TERM_SESSION_PREFIX = "coord-term-"
 
 #: SSH connection-multiplexing options for remote (#486/#494) tmux calls.
 #: One interactive launch fires ~5+ separate ssh invocations (has-session →
@@ -326,6 +336,13 @@ def list_coord_tmux_sessions(
     When a session has multiple panes the *most conservative* (alive=0) value
     wins — i.e. the session is only marked dead when every pane has exited.
 
+    Free-floating ``coord-term-*`` sessions (#952, ``coord terminal new``)
+    are explicitly excluded even though they also start with
+    :data:`TMUX_SESSION_PREFIX` — they carry no assignment_id and must not
+    show up as a phantom "(unknown issue)" row in ``coord sessions``/
+    reattach discovery.  ``coord terminal list`` is the dedicated surface
+    for them.
+
     Args:
         host: Target host.  Defaults to ``TmuxHost(None)`` (local).
 
@@ -355,6 +372,8 @@ def list_coord_tmux_sessions(
             name, pane_dead = parts[0].strip(), parts[1].strip()
             if not name.startswith(TMUX_SESSION_PREFIX):
                 continue
+            if name.startswith(TERM_SESSION_PREFIX):
+                continue  # #952: free-floating terminal, not an assignment session
             existing = pane_dead_per_session.get(name)
             # "0" (alive) wins over "1" (dead).
             if existing is None or pane_dead == "0":
