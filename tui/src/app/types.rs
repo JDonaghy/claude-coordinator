@@ -622,6 +622,10 @@ pub(crate) enum ContextMenuTarget {
         milestone_title: String,
         milestone_number: i64,
     },
+    /// #956: right-click on a Terminal-view tree TERMINAL row (not a
+    /// machine row — those have no menu yet). Carries what "Kill terminal"
+    /// needs to dispatch `coord terminal kill <machine>:<name>`.
+    TerminalRow { machine: String, name: String },
 }
 
 /// #262: lifecycle bucket for a Pipeline sidebar row at right-click

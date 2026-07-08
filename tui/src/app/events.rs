@@ -1320,6 +1320,26 @@ impl CoordApp {
             }
         }
 
+        // ── #956: Pending kill-terminal confirmation: intercept ALL key
+        // presses ─────────────────────────────────────────────────────────
+        // While a kill is pending, 'y'/'Y' fires it; every other key
+        // cancels.  Mirrors `pending_restart` immediately above.
+        if self.pending_kill_terminal.is_some() {
+            if let UiEvent::KeyPressed { key, .. } = &event {
+                match key {
+                    Key::Char('y') | Key::Char('Y') => {
+                        if let Some(p) = self.pending_kill_terminal.take() {
+                            self.confirm_kill_terminal(p);
+                        }
+                    }
+                    _ => {
+                        self.pending_kill_terminal = None;
+                    }
+                }
+                return Reaction::Redraw;
+            }
+        }
+
         // ── Pending purge confirmation: intercept ALL key presses ─────────────
         // While a purge is pending, 'y'/'Y' executes it; every other key
         // cancels.  We return early so the normal key dispatch never fires.
@@ -3068,6 +3088,18 @@ impl CoordApp {
                                     );
                                 }
                             }
+                            needs_redraw = true;
+                        }
+                    }
+
+                    // ── K — Terminal: kill selected terminal (#956) ───────
+                    // Matches the `LiveSessionsOverlay` convention where `K`
+                    // kills a session. Always routes through the confirm
+                    // dialog (terminals are persistent and may hold live
+                    // work) — no-op when the selection is a machine row or
+                    // nothing is selected.
+                    Key::Char('K') if self.active_view == SidebarView::Terminal => {
+                        if self.open_kill_terminal_confirm() {
                             needs_redraw = true;
                         }
                     }

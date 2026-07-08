@@ -413,6 +413,7 @@
             // #955
             fleet_terminal_sessions: std::collections::HashMap::new(),
             fleet_terminal_spawn_errors: std::collections::HashMap::new(),
+            pending_kill_terminal: None,
             fix_briefing_preview: None,
             fix_briefing_rx: None,
             // Leg 2 (#517)
@@ -28138,4 +28139,190 @@ Milestone tracking issue.
              the PTY is focused (bug 1: it was swallowed by the shell):\n{}",
             driver.screen(),
         );
+    }
+
+    // ── #956: kill a terminal from the machine tree ──────────────────────────
+
+    /// TuiDriver black-box: seed a discovered terminal, select it, press `K`,
+    /// confirm the dialog, and assert the node disappears from the rendered
+    /// tree — the acceptance criteria's "optimistic removal". The exact
+    /// dispatched argv isn't observable through the `driver_with_shell`
+    /// wrapper (it returns an opaque `impl AppLogic` with no field access
+    /// back to `CoordApp`), so that's covered separately by the direct-app
+    /// unit test `confirm_kill_terminal_dispatches_qualified_target` below —
+    /// this test is the rendered-tree half of the acceptance criteria.
+    #[test]
+    fn kill_terminal_confirm_removes_node_from_tree() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(BoardData {
+            machines: vec![mk_machine("precision", "precision.tail", true, &[])],
+            ..BoardData::default()
+        });
+        app.fleet_terminals = vec![FleetTerminal {
+            name: "scratch".to_string(),
+            machine: "precision".to_string(),
+            attached: false,
+            pending: false,
+            pending_sweep_count: 0,
+        }];
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        click_activity_icon(&mut driver, ">");
+
+        // Select the terminal row (not the machine row above it).
+        let (x, y) = driver.find("scratch").unwrap_or_else(|| {
+            panic!("'scratch' terminal row must be findable:\n{}", driver.screen())
+        });
+        driver.click(x, y);
+
+        driver.press(Key::Char('K'));
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Kill Terminal") || screen.contains("Kill terminal"),
+            "K on a selected terminal row must open the kill-confirm dialog:\n{screen}",
+        );
+        assert!(
+            screen.contains("scratch"),
+            "confirm dialog must name the terminal being killed:\n{screen}",
+        );
+
+        driver.press(Key::Char('y'));
+
+        // The post-kill toast also names the terminal ("Terminal killed —
+        // scratch on precision"), so a whole-screen `contains("scratch")`
+        // check would false-negative on the toast text below the tree.
+        // Check the TREE specifically: the machine row must lose its
+        // terminal-count suffix and no longer have a nested child row.
+        let screen = driver.screen();
+        let lines: Vec<&str> = screen.lines().collect();
+        let precision_row = lines
+            .iter()
+            .position(|l| l.contains("precision"))
+            .expect("precision row");
+        assert!(
+            !lines[precision_row].contains("(1)"),
+            "machine row must lose its terminal count once its only terminal is killed:\n{screen}",
+        );
+        assert!(
+            lines
+                .get(precision_row + 1)
+                .map(|l| !l.contains("scratch"))
+                .unwrap_or(true),
+            "killed terminal must no longer render as a nested tree row:\n{screen}",
+        );
+    }
+
+    /// Cancelling the kill-confirm (any key other than y/Y) must leave the
+    /// terminal untouched — node still in the tree.
+    #[test]
+    fn kill_terminal_cancel_leaves_terminal_untouched() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(BoardData {
+            machines: vec![mk_machine("precision", "precision.tail", true, &[])],
+            ..BoardData::default()
+        });
+        app.fleet_terminals = vec![FleetTerminal {
+            name: "scratch".to_string(),
+            machine: "precision".to_string(),
+            attached: false,
+            pending: false,
+            pending_sweep_count: 0,
+        }];
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        click_activity_icon(&mut driver, ">");
+        let (x, y) = driver.find("scratch").unwrap_or_else(|| {
+            panic!("'scratch' terminal row must be findable:\n{}", driver.screen())
+        });
+        driver.click(x, y);
+
+        driver.press(Key::Char('K'));
+        driver.press(Key::Named(quadraui::NamedKey::Escape));
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("scratch"),
+            "cancelled kill must leave the terminal in the tree:\n{screen}",
+        );
+    }
+
+    /// Direct-app unit test (no `TuiDriver` — see the note on
+    /// `kill_terminal_confirm_removes_node_from_tree` above for why): select
+    /// a REMOTE machine's terminal, confirm the kill, and assert the exact
+    /// `["terminal", "kill", "<machine>:<name>"]` argv reached the no-spawn
+    /// `CommandRunner` seam — the acceptance criteria's "assert the kill
+    /// command is issued for the right machine:name". `coord terminal kill`
+    /// itself (#952) resolves local-vs-remote/ssh routing from
+    /// `coordinator.yml`, so the TUI dispatches the identical qualified
+    /// target regardless of which machine owns the terminal.
+    #[test]
+    fn confirm_kill_terminal_dispatches_qualified_target() {
+        let mut app = make_test_app(BoardData {
+            machines: vec![mk_machine("dellserver", "dellserver.tail", true, &[])],
+            ..BoardData::default()
+        });
+        app.fleet_terminals = vec![FleetTerminal {
+            name: "build".to_string(),
+            machine: "dellserver".to_string(),
+            attached: false,
+            pending: false,
+            pending_sweep_count: 0,
+        }];
+        app.active_view = SidebarView::Terminal;
+        app.terminal_tree_selected = Some(vec![0, 0]);
+
+        assert!(
+            app.open_kill_terminal_confirm(),
+            "a selected terminal row must arm the confirm"
+        );
+        let pending = app
+            .pending_kill_terminal
+            .clone()
+            .expect("pending_kill_terminal must be set");
+        assert_eq!(pending.machine, "dellserver");
+        assert_eq!(pending.name, "build");
+
+        app.confirm_kill_terminal(pending);
+
+        assert_eq!(
+            app.command_runner.spawned_calls,
+            vec![vec![
+                "terminal".to_string(),
+                "kill".to_string(),
+                "dellserver:build".to_string(),
+            ]],
+            "must dispatch `coord terminal kill dellserver:build`; got {:?}",
+            app.command_runner.spawned_calls,
+        );
+        assert!(
+            app.fleet_terminals.is_empty(),
+            "killed terminal must be removed from fleet_terminals optimistically"
+        );
+    }
+
+    /// `K` / the context-menu item on a MACHINE row (not a terminal row) must
+    /// be a no-op — kill only applies to terminal rows.
+    #[test]
+    fn open_kill_terminal_confirm_noop_on_machine_row() {
+        let mut app = make_test_app(BoardData {
+            machines: vec![mk_machine("precision", "precision.tail", true, &[])],
+            ..BoardData::default()
+        });
+        app.fleet_terminals = vec![FleetTerminal {
+            name: "scratch".to_string(),
+            machine: "precision".to_string(),
+            attached: false,
+            pending: false,
+            pending_sweep_count: 0,
+        }];
+        app.active_view = SidebarView::Terminal;
+        app.terminal_tree_selected = Some(vec![0]); // machine row, not [0, 0]
+
+        assert!(
+            !app.open_kill_terminal_confirm(),
+            "a machine-row selection must not arm the kill confirm"
+        );
+        assert!(app.pending_kill_terminal.is_none());
     }

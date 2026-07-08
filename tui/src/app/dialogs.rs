@@ -752,6 +752,11 @@ impl CoordApp {
                     milestone_number: e.milestone_number,
                 })
             }),
+            // #956: Terminal-view tree — only terminal rows get a menu; a
+            // machine row (or nothing selected) has no verb defined yet.
+            SidebarView::Terminal => self
+                .selected_fleet_terminal()
+                .map(|(machine, name)| ContextMenuTarget::TerminalRow { machine, name }),
             _ => None,
         }
     }
@@ -794,6 +799,7 @@ impl CoordApp {
                 milestone_title,
                 *milestone_number,
             ),
+            ContextMenuTarget::TerminalRow { .. } => self.context_menu_items_for_terminal_row(),
         };
         if items.is_empty() {
             return false;
@@ -1985,6 +1991,38 @@ impl CoordApp {
             });
         }
 
+        // ── #956: Kill terminal confirm ───────────────────────────────────
+        if let Some(ref p) = self.pending_kill_terminal {
+            return Some(Dialog {
+                table: None,
+                id: WidgetId::new("dialog:kill-terminal"),
+                title: StyledText::plain("Kill Terminal"),
+                body: vec![StyledText::plain(format!(
+                    "Kill terminal '{}' on {}? The tmux session ends immediately.",
+                    p.name, p.machine,
+                ))],
+                buttons: vec![
+                    DialogButton {
+                        id: WidgetId::new("yes"),
+                        label: "y  Confirm kill".into(),
+                        is_default: true,
+                        is_cancel: false,
+                        tint: Some(Color::rgb(200, 80, 80)),
+                    },
+                    DialogButton {
+                        id: WidgetId::new("cancel"),
+                        label: "Cancel".into(),
+                        is_default: false,
+                        is_cancel: true,
+                        tint: None,
+                    },
+                ],
+                severity: Some(DialogSeverity::Warning),
+                vertical_buttons: false,
+                input: None,
+            });
+        }
+
         // ── Restart confirm ──────────────────────────────────────────────
         if let Some(ref name) = self.pending_restart {
             let active = self
@@ -2380,6 +2418,8 @@ impl CoordApp {
             );
         } else if self.pending_restart.is_some() {
             self.pending_restart = None;
+        } else if self.pending_kill_terminal.is_some() {
+            self.pending_kill_terminal = None;
         } else if self.pending_purge.is_some() {
             self.pending_purge = None;
         } else if self.artifact_pull_dialog.is_some() {
@@ -2896,6 +2936,17 @@ impl CoordApp {
                         ToastSeverity::Info,
                     );
                 }
+            }
+            *self.dialog_layout.borrow_mut() = None;
+            return;
+        }
+
+        // ── #956: Kill terminal ────────────────────────────────────────────
+        if let Some(p) = self.pending_kill_terminal.clone() {
+            if id == "yes" {
+                self.confirm_kill_terminal(p);
+            } else {
+                self.pending_kill_terminal = None;
             }
             *self.dialog_layout.borrow_mut() = None;
             return;
@@ -5229,6 +5280,7 @@ impl CoordApp {
                     }
                     ContextMenuTarget::MachineRow { .. } => 0,
                     ContextMenuTarget::MilestoneHeader { tracking_issue, .. } => *tracking_issue,
+                    ContextMenuTarget::TerminalRow { .. } => 0,
                 };
                 self.push_toast(
                     "Copy",
@@ -5306,6 +5358,19 @@ impl CoordApp {
                         );
                     }
                 }
+                true
+            }
+            // #956: Kill terminal — arms the confirm dialog rather than
+            // killing directly (terminals are persistent and may hold live
+            // work). Shares `pending_kill_terminal` with the `K` keybinding.
+            "kill-terminal" => {
+                let (machine, name) = match target {
+                    ContextMenuTarget::TerminalRow { machine, name } => {
+                        (machine.clone(), name.clone())
+                    }
+                    _ => return false,
+                };
+                self.pending_kill_terminal = Some(PendingKillTerminal { machine, name });
                 true
             }
             // #815: View in Pipeline — jump from the Board to the matching

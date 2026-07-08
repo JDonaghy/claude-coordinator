@@ -37,6 +37,16 @@ pub(crate) enum TerminalTreeRow {
     Terminal(usize, usize),
 }
 
+/// #956: pending "Kill terminal" confirmation — carries everything
+/// `confirm_kill_terminal` needs to fire `coord terminal kill <machine>:<name>`
+/// and clean up the tree without re-deriving the target from the (possibly
+/// already-changed) selection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingKillTerminal {
+    pub(crate) machine: String,
+    pub(crate) name: String,
+}
+
 impl CoordApp {
     /// Terminals hosted on `machine_name`, sorted by name for a stable,
     /// deterministic display and click-index mapping.
@@ -484,4 +494,72 @@ fn sanitize_terminal_name(raw: &str) -> String {
             }
         })
         .collect()
+}
+
+impl CoordApp {
+    // ── #956: kill a terminal ────────────────────────────────────────────
+
+    /// `(machine, name)` of the currently-selected Terminal-tree node, iff
+    /// it's a terminal row (not a machine row / nothing selected). Shared by
+    /// the `K` keybinding and the "Kill terminal" context-menu item so both
+    /// resolve the target identically.
+    pub(crate) fn selected_fleet_terminal(&self) -> Option<(String, String)> {
+        let path = self.terminal_tree_selected.as_ref()?;
+        let (mi, ti) = match path.as_slice() {
+            [m, t] => (*m as usize, *t as usize),
+            _ => return None,
+        };
+        let machine = self.data.machines.get(mi)?.name.clone();
+        let name = self
+            .fleet_terminals_for_machine(&machine)
+            .get(ti)
+            .map(|t| t.name.clone())?;
+        Some((machine, name))
+    }
+
+    /// Arm the "Kill terminal" confirm dialog for the currently-selected
+    /// terminal-tree node. No-op (returns `false`) when the selection isn't
+    /// a terminal row — e.g. a machine row or nothing selected.
+    pub(crate) fn open_kill_terminal_confirm(&mut self) -> bool {
+        let Some((machine, name)) = self.selected_fleet_terminal() else {
+            return false;
+        };
+        self.pending_kill_terminal = Some(PendingKillTerminal { machine, name });
+        true
+    }
+
+    /// Fire the confirmed kill (#956): dispatches `coord terminal kill
+    /// <machine>:<name>` (the backend, #952, resolves local-vs-remote and
+    /// ssh routing from `coordinator.yml` — the TUI doesn't need to
+    /// replicate `kill_session_by_aid`'s manual tmux/ssh dance here) and
+    /// removes the node from the tree immediately — optimistic, reconciled
+    /// by the next discovery sweep or restart per the issue's acceptance
+    /// criteria. Clears/advances the selected-node cursor when the killed
+    /// terminal was selected so the cursor doesn't point at a stale path.
+    pub(crate) fn confirm_kill_terminal(&mut self, killed: PendingKillTerminal) {
+        let target = format!("{}:{}", killed.machine, killed.name);
+        self.command_runner
+            .spawn_queued(&["terminal", "kill", &target]);
+
+        self.fleet_terminals
+            .retain(|t| !(t.machine == killed.machine && t.name == killed.name));
+
+        // The selection may now point past the end of the (shrunk) terminal
+        // list for this machine, or at a stale [machine, terminal] path
+        // entirely — re-resolve against the freshly-flattened tree rather
+        // than just clearing, so the cursor lands on a sensible neighbour.
+        let (_, index) = self.terminal_tree_rows();
+        if self.terminal_tree_selected_flat_index(&index).is_none() {
+            self.terminal_tree_selected = index.last().map(|entry| match *entry {
+                TerminalTreeRow::Machine(mi) => vec![mi as u16],
+                TerminalTreeRow::Terminal(mi, ti) => vec![mi as u16, ti as u16],
+            });
+        }
+
+        self.push_toast(
+            "Terminal killed",
+            &format!("{} on {}", killed.name, killed.machine),
+            ToastSeverity::Info,
+        );
+    }
 }

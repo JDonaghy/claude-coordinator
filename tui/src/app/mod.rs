@@ -2474,6 +2474,11 @@ pub struct CoordApp {
     terminal_tree_selected: Option<TreePath>,
     /// Scroll offset (in flattened tree rows) for the Terminal-view tree.
     terminal_tree_scroll: usize,
+    /// #956: pending "Kill terminal" confirmation — armed by `K` or the
+    /// context-menu "Kill terminal" item on a selected terminal-tree node.
+    /// `y`/`Y` (or the dialog's confirm button) fires the kill; any other
+    /// key/outside click cancels.  Mirrors `pending_restart`.
+    pending_kill_terminal: Option<PendingKillTerminal>,
 
     // ── #955: attached fleet-terminal sessions (Terminal-view main pane) ───
     /// Local PTYs running `coord terminal attach <machine:name>`, keyed by
@@ -2959,6 +2964,7 @@ impl CoordApp {
             // is selected and `drive_terminal_pane` lazily attaches it.
             fleet_terminal_sessions: std::collections::HashMap::new(),
             fleet_terminal_spawn_errors: std::collections::HashMap::new(),
+            pending_kill_terminal: None,
             // #603: fix-briefing preview (lazily populated when a dialog raises).
             fix_briefing_preview: None,
             fix_briefing_rx: None,

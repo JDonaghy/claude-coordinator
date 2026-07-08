@@ -104,6 +104,15 @@ impl CoordApp {
         items
     }
 
+    /// #956: right-click menu for a Terminal-view tree TERMINAL row. One
+    /// verb — "Kill terminal" — matching the `LiveSessionsOverlay`
+    /// convention where `K` kills a session; the menu item and the `K`
+    /// keybinding both arm the same confirm dialog rather than killing
+    /// directly (terminals are persistent and may hold live work).
+    pub(crate) fn context_menu_items_for_terminal_row(&self) -> Vec<ContextMenuItem> {
+        vec![ContextMenuItem::action("kill-terminal", "Kill terminal").with_shortcut("K")]
+    }
+
     /// Hit-test a left-click against the sidebar action bar at the top
     /// of `sidebar_b`.  Returns `(shrunken_sidebar_b, consumed)` — same
     /// shape as `hit_test_panel_toolbar`.
@@ -194,6 +203,7 @@ impl CoordApp {
             || self.pending_refinement_notes_synth.is_some()
             || self.file_issue_modal.is_some()
             || self.pending_restart.is_some()
+            || self.pending_kill_terminal.is_some()
             || self.live_sessions_overlay.is_some()
     }
 
