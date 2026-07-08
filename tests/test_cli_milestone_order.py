@@ -359,7 +359,8 @@ class TestMilestoneChatCmd:
         assert result.exit_code == 0, result.output
         assert result.output.strip().splitlines()[-1] == "asg123"
         mock_dispatch.assert_called_once_with(
-            "api", 100, mock_dispatch.call_args[0][2], machine_override=None
+            "api", 100, mock_dispatch.call_args[0][2],
+            machine_override=None, add_child_issue=None,
         )
 
     def test_dispatch_failure_reports_error(self, config_file: Path) -> None:

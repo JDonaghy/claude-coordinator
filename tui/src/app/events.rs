@@ -1237,6 +1237,40 @@ impl CoordApp {
             }
         }
 
+        // ── #1017 Pending "New milestone via chat…" title input: intercept
+        // all keys ───────────────────────────────────────────────────────
+        // Bare `C` in the Plans panel opens this buffer (sibling to #977's
+        // `c` capture, above). Enter dispatches `coord milestone chat
+        // <repo> --new [--title <buf>]` via `capture_plan_chat` — an empty
+        // buffer is a valid submission here (the operator can leave the
+        // title for the chat to work out). Esc cancels without dispatching
+        // anything.
+        if self.pending_new_milestone_chat.is_some() {
+            if let UiEvent::KeyPressed { key, .. } = &event {
+                match key {
+                    Key::Named(NamedKey::Enter) => {
+                        let title = self.pending_new_milestone_chat.take().unwrap_or_default();
+                        self.capture_plan_chat(title);
+                    }
+                    Key::Named(NamedKey::Escape) => {
+                        self.pending_new_milestone_chat = None;
+                    }
+                    Key::Named(NamedKey::Backspace) => {
+                        if let Some(ref mut buf) = self.pending_new_milestone_chat {
+                            buf.pop();
+                        }
+                    }
+                    Key::Char(ch) => {
+                        if let Some(ref mut buf) = self.pending_new_milestone_chat {
+                            buf.push(*ch);
+                        }
+                    }
+                    _ => {}
+                }
+                return Reaction::Redraw;
+            }
+        }
+
         // ── #1003 Pending Plans-row single-field input: intercept all keys ───
         // Set by "Edit milestone…" / "Add issue to milestone…" / "Remove
         // issue from milestone…" (Plans-panel / MilestoneDag row context
@@ -1915,6 +1949,19 @@ impl CoordApp {
                             && self.pending_plan_capture.is_none() =>
                     {
                         self.pending_plan_capture = Some(String::new());
+                        needs_redraw = true;
+                    }
+                    // "New milestone via chat…" (#1017) — chat-driven sibling
+                    // of `c` above: pops an (optional) title prompt, then
+                    // dispatches `coord milestone chat <repo> --new` instead
+                    // of the direct `coord milestone capture`. Bare `C` is
+                    // free in this view (Ctrl+C copy-selection above is
+                    // gated on modifiers.ctrl).
+                    Key::Char('C')
+                        if self.active_view == SidebarView::Plans
+                            && self.pending_new_milestone_chat.is_none() =>
+                    {
+                        self.pending_new_milestone_chat = Some(String::new());
                         needs_redraw = true;
                     }
                     // "Dispatch milestone" — promote the selected milestone's

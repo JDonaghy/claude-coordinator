@@ -831,6 +831,60 @@ impl CoordApp {
             }
         }
     }
+
+    /// Submit handler for the #1017 "New milestone via chat…" prompt (`C`
+    /// in the Plans panel) — the chat-driven sibling of #977's `capture_
+    /// plan_stub`. Fires `coord milestone chat <repo> --new [--title
+    /// <title>]` through the command runner, seeding a `type=
+    /// "milestone-chat"` steward session to discuss goal/scope rather than
+    /// creating the milestone directly (`build_new_milestone_chat_briefing`,
+    /// #1009). Unlike `capture_plan_stub`, an empty title is a *valid*
+    /// submission — the operator can leave it for the chat to work out —
+    /// so only "no repo configured" is a hard noop.
+    ///
+    /// Target repo: same resolution as `capture_plan_stub` — the repo of
+    /// the currently-selected plan-roster row, or (when the roster is
+    /// empty) the first configured repo.
+    pub(crate) fn capture_plan_chat(&mut self, title: String) {
+        let title = title.trim().to_string();
+        let Some(repo) = self
+            .plans_selected()
+            .map(|e| e.repo)
+            .or_else(|| self.data.pipeline_repos.first().map(|(n, _)| n.clone()))
+        else {
+            self.push_toast(
+                "New milestone via chat",
+                "No repo configured — nothing to chat about.",
+                ToastSeverity::Info,
+            );
+            return;
+        };
+        let mut args: Vec<String> = vec!["milestone".into(), "chat".into(), repo.clone(), "--new".into()];
+        if !title.is_empty() {
+            args.push("--title".into());
+            args.push(title.clone());
+        }
+        let label_title = if title.is_empty() { "(untitled)".to_string() } else { title };
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        use crate::commands::SpawnQueuedOutcome;
+        match self.command_runner.spawn_queued(&arg_refs) {
+            SpawnQueuedOutcome::Deduped => {}
+            SpawnQueuedOutcome::Queued => {
+                self.push_toast(
+                    "New milestone chat queued",
+                    &format!("\"{label_title}\" ({repo}) — will open after current command."),
+                    ToastSeverity::Info,
+                );
+            }
+            SpawnQueuedOutcome::Started => {
+                self.push_toast(
+                    "New milestone chat",
+                    &format!("\"{label_title}\" ({repo}) — dispatching steward chat…"),
+                    ToastSeverity::Info,
+                );
+            }
+        }
+    }
 }
 
 // ─── Pure-function unit tests ─────────────────────────────────────────────────

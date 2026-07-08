@@ -309,6 +309,7 @@
             pending_plan_capture: None,
             pending_milestone_row_input: None,
             pending_close_plan: None,
+            pending_new_milestone_chat: None,
             pending_refinement: None,
             pending_test_chat: None,
             pending_chat_resume: None,
@@ -25204,6 +25205,214 @@ Milestone tracking issue.
         };
         app.submit_milestone_row_input(input);
         assert!(app.command_runner.spawned_calls.is_empty());
+    }
+
+    // #1017 — "Chat about this…" wired into New/Edit/Add-sub-issue ────────────
+    //
+    // "Edit" chat is already covered by #1009's `open_milestone_chat_action`
+    // (dispatches `coord milestone chat <repo> <tracking_issue>`, seeded with
+    // current title/description/due — see the `open-milestone-chat` tests
+    // above); no new code was needed for that leg. #1017 adds two new legs:
+    // "Add sub-issue via chat…" (below) and "New milestone via chat…"
+    // (plans.rs `capture_plan_chat`, tested further down).
+
+    /// #1017: the milestone-header context menu carries the new "Add
+    /// sub-issue via chat…" item alongside #1008's dialog-based
+    /// "Add sub-issue to epic…".
+    #[test]
+    fn milestone_header_context_menu_has_add_sub_issue_chat_item() {
+        let app = make_milestone_dag_app();
+        let items =
+            app.context_menu_items_for_milestone_header("coord-repo", 100, "v0.5", 5);
+        let ids: Vec<String> = items.iter().filter_map(|i| i.action_id.clone()).collect();
+        assert!(
+            ids.iter().any(|id| id == "add-sub-issue-to-epic-chat"),
+            "expected `add-sub-issue-to-epic-chat` in milestone-header menu ids {ids:?}"
+        );
+    }
+
+    /// #1017: "Add sub-issue via chat…" opens the row-input dialog with an
+    /// empty buffer and the `AddSubIssueChat` kind.
+    #[test]
+    fn open_add_sub_issue_to_epic_chat_input_opens_empty_dialog() {
+        let mut app = make_milestone_dag_app();
+        let target = ContextMenuTarget::MilestoneHeader {
+            repo_name: "coord-repo".to_string(),
+            tracking_issue: 100,
+            milestone_title: "v0.5".to_string(),
+            milestone_number: 5,
+        };
+        assert!(app.open_add_sub_issue_to_epic_chat_input(&target));
+        let input = app
+            .pending_milestone_row_input
+            .clone()
+            .expect("dialog must be pending");
+        assert_eq!(input.kind, MilestoneRowInputKind::AddSubIssueChat);
+        assert_eq!(input.tracking_issue, 100);
+        assert!(input.buf.is_empty());
+    }
+
+    /// #1017: a bare candidate issue number spawns `coord milestone chat
+    /// <repo> <tracking_issue> --add-child <issue>` — the chat-driven
+    /// sibling of #1008's direct `add-child` dispatch.
+    #[test]
+    fn add_sub_issue_chat_flow_spawns_milestone_chat_with_add_child_flag() {
+        let mut app = make_milestone_dag_app();
+        app.command_runner = crate::commands::CommandRunner::new_for_test();
+        let target = ContextMenuTarget::MilestoneHeader {
+            repo_name: "coord-repo".to_string(),
+            tracking_issue: 100,
+            milestone_title: "v0.5".to_string(),
+            milestone_number: 5,
+        };
+        assert!(app.open_add_sub_issue_to_epic_chat_input(&target));
+        let mut input = app.pending_milestone_row_input.take().expect("pending");
+        input.buf = "1050".to_string();
+        app.submit_milestone_row_input(input);
+
+        assert_eq!(
+            app.command_runner.spawned_calls,
+            vec![vec![
+                "milestone".to_string(),
+                "chat".to_string(),
+                "coord-repo".to_string(),
+                "100".to_string(),
+                "--add-child".to_string(),
+                "1050".to_string(),
+            ]],
+        );
+    }
+
+    /// #1017: `#1050` (leading `#`) parses the same as a bare number.
+    #[test]
+    fn add_sub_issue_chat_flow_strips_leading_hash() {
+        let mut app = make_milestone_dag_app();
+        app.command_runner = crate::commands::CommandRunner::new_for_test();
+        let input = PendingMilestoneRowInput {
+            kind: MilestoneRowInputKind::AddSubIssueChat,
+            repo_name: "coord-repo".to_string(),
+            tracking_issue: 100,
+            milestone_number: 5,
+            milestone_title: "v0.5".to_string(),
+            buf: "#1050".to_string(),
+        };
+        app.submit_milestone_row_input(input);
+
+        assert_eq!(
+            app.command_runner.spawned_calls,
+            vec![vec![
+                "milestone".to_string(),
+                "chat".to_string(),
+                "coord-repo".to_string(),
+                "100".to_string(),
+                "--add-child".to_string(),
+                "1050".to_string(),
+            ]],
+        );
+    }
+
+    /// #1017: a non-numeric candidate issue is rejected before spawning
+    /// anything — mirrors `add_sub_issue_rejects_non_numeric_input`.
+    #[test]
+    fn add_sub_issue_chat_rejects_non_numeric_input() {
+        let mut app = make_milestone_dag_app();
+        app.command_runner = crate::commands::CommandRunner::new_for_test();
+        let input = PendingMilestoneRowInput {
+            kind: MilestoneRowInputKind::AddSubIssueChat,
+            repo_name: "coord-repo".to_string(),
+            tracking_issue: 100,
+            milestone_number: 5,
+            milestone_title: "v0.5".to_string(),
+            buf: "not-a-number".to_string(),
+        };
+        app.submit_milestone_row_input(input);
+        assert!(app.command_runner.spawned_calls.is_empty());
+    }
+
+    /// #1017: "New milestone via chat…" (`capture_plan_chat`) with a title
+    /// spawns `coord milestone chat <repo> --new --title <title>` — the
+    /// chat-driven sibling of #977's `capture_plan_stub`.
+    #[test]
+    fn capture_plan_chat_with_title_spawns_milestone_chat_new_with_title() {
+        let mut app = make_test_app(make_plan_roster_board_data());
+        app.command_runner = crate::commands::CommandRunner::new_for_test();
+        app.active_view = SidebarView::Plans;
+        app.plans_sel = 0;
+
+        app.capture_plan_chat("Q4 push".to_string());
+
+        assert_eq!(
+            app.command_runner.spawned_calls,
+            vec![vec![
+                "milestone".to_string(),
+                "chat".to_string(),
+                "api".to_string(),
+                "--new".to_string(),
+                "--title".to_string(),
+                "Q4 push".to_string(),
+            ]],
+        );
+    }
+
+    /// #1017: unlike `capture_plan_stub` (which no-ops on an empty title),
+    /// `capture_plan_chat` treats an empty/whitespace-only title as a valid
+    /// submission — the operator can leave the title for the chat to work
+    /// out — so it dispatches without `--title`.
+    #[test]
+    fn capture_plan_chat_with_blank_title_omits_title_flag() {
+        let mut app = make_test_app(make_plan_roster_board_data());
+        app.command_runner = crate::commands::CommandRunner::new_for_test();
+        app.active_view = SidebarView::Plans;
+        app.plans_sel = 0;
+
+        app.capture_plan_chat("   ".to_string());
+
+        assert_eq!(
+            app.command_runner.spawned_calls,
+            vec![vec![
+                "milestone".to_string(),
+                "chat".to_string(),
+                "api".to_string(),
+                "--new".to_string(),
+            ]],
+        );
+    }
+
+    /// #1017: with no repo configured at all, `capture_plan_chat` noops
+    /// (toast only, no spawn) — mirrors `capture_plan_stub`'s same guard.
+    #[test]
+    fn capture_plan_chat_with_no_repo_configured_noops() {
+        let mut app = make_test_app(BoardData::default());
+        app.command_runner = crate::commands::CommandRunner::new_for_test();
+
+        app.capture_plan_chat("Untitled".to_string());
+
+        assert!(app.command_runner.spawned_calls.is_empty());
+    }
+
+    /// #1017: bare `C` in the Plans panel opens the "New milestone via
+    /// chat…" prompt (black-box: drives the real key → handle → render
+    /// path via `TuiDriver`, per this repo's acceptance-test convention).
+    #[test]
+    fn plans_panel_capital_c_opens_new_milestone_chat_prompt() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_test_app(make_plan_roster_board_data());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "◆");
+
+        assert!(
+            !driver.screen_contains("New milestone via chat"),
+            "sanity: prompt not open yet:\n{}",
+            driver.screen(),
+        );
+
+        driver.press(quadraui::Key::Char('C'));
+        let screen = driver.screen();
+        assert!(
+            screen.contains("New milestone via chat"),
+            "#1017: `C` must open the New-milestone-via-chat prompt:\n{screen}",
+        );
     }
 
     // #935 Part B — Diagnose & fix stage dialog ───────────────────────────────

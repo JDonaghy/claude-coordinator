@@ -162,6 +162,38 @@ def test_new_milestone_briefing_handles_no_seed():
     assert "(none supplied)" in out
 
 
+# ── build_milestone_chat_briefing (candidate_child_issue, #1017) ────────────
+
+
+def test_briefing_without_candidate_child_omits_add_sub_issue_mode():
+    out = milestone_chat.build_milestone_chat_briefing(
+        repo_name="api",
+        repo_slug="acme/api",
+        milestone_title="Q3 push",
+        tracking_issue_number=100,
+        tracking_issue_body="",
+        issues=[],
+    )
+    assert "ADD SUB-ISSUE MODE" not in out
+
+
+def test_briefing_with_candidate_child_includes_add_sub_issue_mode():
+    out = milestone_chat.build_milestone_chat_briefing(
+        repo_name="api",
+        repo_slug="acme/api",
+        milestone_title="Q3 push",
+        tracking_issue_number=100,
+        tracking_issue_body="",
+        issues=[],
+        candidate_child_issue={"number": 1050, "title": "Do the thing", "body": "details"},
+    )
+    assert "ADD SUB-ISSUE MODE" in out
+    assert "#1050: Do the thing" in out
+    assert "details" in out
+    assert "coord milestone add-child api 100 1050" in out
+    assert "coord milestone add-child api 100 1050 --remove" in out
+
+
 # ── _fetch_milestone_issues ──────────────────────────────────────────────────
 
 
@@ -325,6 +357,65 @@ def test_dispatch_survives_milestone_metadata_fetch_failure(tmp_path):
     assert assignment_id == "asg-xyz"
 
 
+def test_dispatch_with_add_child_issue_seeds_add_sub_issue_mode(tmp_path):
+    """#1017: passing add_child_issue fetches the candidate issue and seeds
+    the briefing's "Add sub-issue" mode."""
+    cfg = _cfg_with_repo_and_machine(tmp_path)
+    tracking_issue_data = {
+        "number": 100, "title": "Milestone tracker", "body": "",
+        "milestone": {"number": 9, "title": "Q3"},
+    }
+    child_issue_data = {"number": 1050, "title": "Do the thing", "body": "details"}
+
+    def _fake_get_issue(_slug, number):
+        return child_issue_data if number == 1050 else tracking_issue_data
+
+    with patch("coord.github_ops.get_issue", side_effect=_fake_get_issue), \
+         patch("coord.github_ops.get_open_issues", return_value=[]), \
+         patch(
+             "coord.github_ops.get_milestone",
+             return_value={"number": 9, "title": "Q3", "description": None, "due_on": None},
+         ), \
+         patch("coord.dispatch.dispatch_with_retry", return_value={"id": "asg-child"}) as mock_dispatch, \
+         patch("coord.state.record_dispatched_assignment"):
+        assignment_id, _machine_name = milestone_chat.dispatch_milestone_chat(
+            "api", 100, cfg, add_child_issue=1050
+        )
+
+    assert assignment_id == "asg-child"
+    proposal = mock_dispatch.call_args[0][0]
+    assert "ADD SUB-ISSUE MODE" in proposal.briefing
+    assert "#1050: Do the thing" in proposal.briefing
+
+
+def test_dispatch_survives_candidate_child_fetch_failure(tmp_path):
+    """Best-effort: a failed candidate-child fetch must not abort the whole
+    dispatch — it just falls back to a plain milestone chat."""
+    cfg = _cfg_with_repo_and_machine(tmp_path)
+    tracking_issue_data = {
+        "number": 100, "title": "Milestone tracker", "body": "",
+        "milestone": {"number": 9, "title": "Q3"},
+    }
+
+    def _fake_get_issue(_slug, number):
+        if number == 1050:
+            raise RuntimeError("gh boom")
+        return tracking_issue_data
+
+    with patch("coord.github_ops.get_issue", side_effect=_fake_get_issue), \
+         patch("coord.github_ops.get_open_issues", return_value=[]), \
+         patch(
+             "coord.github_ops.get_milestone",
+             return_value={"number": 9, "title": "Q3", "description": None, "due_on": None},
+         ), \
+         patch("coord.dispatch.dispatch_with_retry", return_value={"id": "asg-xyz"}), \
+         patch("coord.state.record_dispatched_assignment"):
+        assignment_id, _machine_name = milestone_chat.dispatch_milestone_chat(
+            "api", 100, cfg, add_child_issue=1050
+        )
+    assert assignment_id == "asg-xyz"
+
+
 def test_dispatch_machine_override_must_claim_repo(tmp_path):
     cfg = _cfg_with_repo_and_machine(tmp_path)
     with patch(
@@ -474,16 +565,16 @@ def test_milestone_chat_deny_list_blocks_raw_gh_and_unrelated_coord_writes():
     denies = " ".join(MILESTONE_CHAT_DENY_COMMANDS)
     assert "gh issue edit" in denies
     assert "gh api -X PATCH" in denies
-    assert "coord milestone add-child" in denies
     assert "coord approve" in denies
     assert "coord merge" in denies
     assert "coord assign" in denies
 
 
-def test_milestone_chat_deny_list_now_permits_create_edit_assign():
-    """#1009: create/edit/assign are widened into the allowed write set —
-    the deny list must no longer block them (only add-child, which doesn't
-    exist yet, plus the unrelated fleet-dispatch commands, stay denied)."""
+def test_milestone_chat_deny_list_now_permits_create_edit_assign_add_child():
+    """#1009 widened create/edit/assign into the allowed write set; #1017
+    (now that #1008 merged) adds add-child to that set too — the deny list
+    must not block any of them, only the unrelated fleet-dispatch
+    commands."""
     denies = " ".join(MILESTONE_CHAT_DENY_COMMANDS)
     assert "coord milestone create" not in denies
     assert "coord milestone edit" not in denies
@@ -491,13 +582,14 @@ def test_milestone_chat_deny_list_now_permits_create_edit_assign():
     # top-level fleet `coord assign <machine> <repo> <issue>` is) — confirm
     # the fleet form's deny entry doesn't also read as "milestone assign".
     assert "coord milestone assign" not in denies
+    assert "coord milestone add-child" not in denies
 
 
 def test_milestone_chat_prompt_documents_widened_write_commands():
-    """#1009: the system prompt must name all three newly-permitted write
-    commands so the model knows the exact confirm-then-run invocation."""
+    """#1009/#1017: the system prompt must name all four newly-permitted
+    write commands so the model knows the exact confirm-then-run
+    invocation."""
     assert "coord milestone create <repo>" in MILESTONE_CHAT_SYSTEM_PROMPT
     assert "coord milestone edit <repo> <number>" in MILESTONE_CHAT_SYSTEM_PROMPT
     assert "coord milestone assign <repo> <issue>" in MILESTONE_CHAT_SYSTEM_PROMPT
-    # add-child is explicitly out of scope until #1008 merges.
-    assert "add-child" in MILESTONE_CHAT_SYSTEM_PROMPT
+    assert "coord milestone add-child <repo> <epic> <issue>" in MILESTONE_CHAT_SYSTEM_PROMPT

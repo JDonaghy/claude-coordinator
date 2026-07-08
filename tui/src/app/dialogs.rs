@@ -1447,6 +1447,48 @@ impl CoordApp {
             });
         }
 
+        // ── #1017 New-milestone-via-chat title input ────────────────────────
+        if let Some(ref buf) = self.pending_new_milestone_chat {
+            let repo = self
+                .plans_selected()
+                .map(|e| e.repo)
+                .or_else(|| self.data.pipeline_repos.first().map(|(n, _)| n.clone()))
+                .unwrap_or_else(|| "?".to_string());
+            return Some(Dialog {
+                table: None,
+                id: WidgetId::new("dialog:new-milestone-chat"),
+                title: StyledText::plain("New milestone via chat"),
+                body: vec![StyledText::plain(format!(
+                    "Optional seed title for {repo} — a milestone-chat steward will \
+                     discuss goal/scope with you before creating anything. Leave \
+                     blank to start from scratch:"
+                ))],
+                buttons: vec![
+                    DialogButton {
+                        id: WidgetId::new("submit"),
+                        label: "Submit".into(),
+                        is_default: true,
+                        is_cancel: false,
+                        tint: None,
+                    },
+                    DialogButton {
+                        id: WidgetId::new("cancel"),
+                        label: "Cancel".into(),
+                        is_default: false,
+                        is_cancel: true,
+                        tint: None,
+                    },
+                ],
+                severity: None,
+                vertical_buttons: false,
+                input: Some(DialogInput::TextInput(DialogTextInput {
+                    value: buf.clone(),
+                    placeholder: "seed title (optional)…".into(),
+                    cursor: Some(buf.len()),
+                })),
+            });
+        }
+
         // ── #1003 Plans-row single-field input (Edit milestone / Add issue /
         // Remove issue) ─────────────────────────────────────────────────────
         if let Some(ref input) = self.pending_milestone_row_input {
@@ -1483,6 +1525,16 @@ impl CoordApp {
                         input.milestone_title, input.repo_name
                     ),
                     "e.g. 1050 or 1050 {group: B}…",
+                ),
+                MilestoneRowInputKind::AddSubIssueChat => (
+                    "Add sub-issue via chat",
+                    format!(
+                        "Candidate issue number to discuss adding as a sub-issue of \
+                         \"{}\" ({}) — a milestone-chat steward will propose the \
+                         `{{group/after}}` annotation with you:",
+                        input.milestone_title, input.repo_name
+                    ),
+                    "issue number…",
                 ),
             };
             return Some(Dialog {
@@ -2827,6 +2879,21 @@ impl CoordApp {
                 }
                 _ => {
                     self.pending_plan_capture = None;
+                }
+            }
+            *self.dialog_layout.borrow_mut() = None;
+            return;
+        }
+
+        // ── #1017 New-milestone-via-chat ─────────────────────────────────
+        if self.pending_new_milestone_chat.is_some() {
+            match id {
+                "submit" => {
+                    let title = self.pending_new_milestone_chat.take().unwrap_or_default();
+                    self.capture_plan_chat(title);
+                }
+                _ => {
+                    self.pending_new_milestone_chat = None;
                 }
             }
             *self.dialog_layout.borrow_mut() = None;
@@ -5683,6 +5750,8 @@ impl CoordApp {
             // #1008: splices the epic's own `## Sub-issues` checklist
             // (`coord milestone add-child`) — see milestone_dag.rs.
             "add-sub-issue-to-epic" => self.open_add_sub_issue_to_epic_input(target),
+            // #1017: chat-driven alternative — see milestone_dag.rs.
+            "add-sub-issue-to-epic-chat" => self.open_add_sub_issue_to_epic_chat_input(target),
             "close-plan" => self.open_close_plan_confirm(target),
             // #685: open the test-mode choice dialog (SetOnly — no dispatch).
             "set-test-mode" => {

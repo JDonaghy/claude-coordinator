@@ -94,6 +94,15 @@ pub(crate) enum MilestoneRowInputKind {
     /// the shared bare-issue-number path the other two kinds use, since the
     /// buffer may carry more than just a number.
     AddSubIssue,
+    /// "Add sub-issue via chat…" (#1017) — a bare candidate issue number
+    /// (no `{group/after}` annotation here; that gets discussed live in the
+    /// chat instead of parsed client-side). Submitting calls `coord
+    /// milestone chat <repo> <tracking_issue> --add-child <issue>`, seeding
+    /// a `type="milestone-chat"` steward session with the epic body plus
+    /// the candidate issue (`build_milestone_chat_briefing`'s
+    /// `candidate_child_issue` seed mode). Parsed by
+    /// `submit_add_sub_issue_chat_input`.
+    AddSubIssueChat,
 }
 
 /// #1003: pending single-field text input for a Plans-panel / MilestoneDag
@@ -604,6 +613,11 @@ impl CoordApp {
             // checklist (`coord milestone add-child`) rather than assigning
             // GitHub milestone membership (`coord milestone assign`).
             ContextMenuItem::action("add-sub-issue-to-epic", "Add sub-issue to epic…"),
+            // #1017: chat-driven alternative to the dialog above — discusses
+            // the candidate + its `{group/after}` annotation with a
+            // milestone-chat steward instead of typing it into the quick
+            // dialog buffer.
+            ContextMenuItem::action("add-sub-issue-to-epic-chat", "Add sub-issue via chat…"),
             ContextMenuItem::separator(),
             ContextMenuItem::action("close-plan", "Close / archive plan"),
             ContextMenuItem::separator(),
@@ -931,6 +945,39 @@ impl CoordApp {
         true
     }
 
+    /// Open the "Add sub-issue via chat…" quick dialog (#1017) — same
+    /// target shape as [`Self::open_add_sub_issue_to_epic_input`], just a
+    /// different `kind` so submission routes to the chat dispatch instead
+    /// of the direct `add-child` CLI call.
+    pub(crate) fn open_add_sub_issue_to_epic_chat_input(
+        &mut self,
+        target: &ContextMenuTarget,
+    ) -> bool {
+        let (repo_name, tracking_issue, milestone_number, milestone_title) = match target {
+            ContextMenuTarget::MilestoneHeader {
+                repo_name,
+                tracking_issue,
+                milestone_title,
+                milestone_number,
+            } => (
+                repo_name.clone(),
+                *tracking_issue,
+                *milestone_number,
+                milestone_title.clone(),
+            ),
+            _ => return false,
+        };
+        self.pending_milestone_row_input = Some(PendingMilestoneRowInput {
+            kind: MilestoneRowInputKind::AddSubIssueChat,
+            repo_name,
+            tracking_issue,
+            milestone_number,
+            milestone_title,
+            buf: String::new(),
+        });
+        true
+    }
+
     /// Submit handler for the #1003 Plans-row single-field input dialogs —
     /// mirrors `capture_plan_stub`'s validate-then-spawn-and-toast shape.
     pub(crate) fn submit_milestone_row_input(&mut self, input: PendingMilestoneRowInput) {
@@ -944,6 +991,12 @@ impl CoordApp {
         // own parse-and-dispatch path rather than the bare-number one below.
         if input.kind == MilestoneRowInputKind::AddSubIssue {
             self.submit_add_sub_issue_input(input, &buf);
+            return;
+        }
+        // #1017: `AddSubIssueChat` is a bare issue number that dispatches a
+        // milestone-chat session rather than the direct `add-child` CLI.
+        if input.kind == MilestoneRowInputKind::AddSubIssueChat {
+            self.submit_add_sub_issue_chat_input(input, &buf);
             return;
         }
         let needs_issue_number = matches!(
@@ -994,6 +1047,11 @@ impl CoordApp {
             // this arm exists only so the match stays exhaustive.
             MilestoneRowInputKind::AddSubIssue => {
                 unreachable!("AddSubIssue is dispatched via submit_add_sub_issue_input")
+            }
+            // Handled by `submit_add_sub_issue_chat_input` above (early
+            // return) — this arm exists only so the match stays exhaustive.
+            MilestoneRowInputKind::AddSubIssueChat => {
+                unreachable!("AddSubIssueChat is dispatched via submit_add_sub_issue_chat_input")
             }
         };
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
@@ -1081,6 +1139,56 @@ impl CoordApp {
             }
             SpawnQueuedOutcome::Started => {
                 self.push_toast(&label, "dispatching…", ToastSeverity::Info);
+            }
+        }
+    }
+
+    /// Parse + dispatch the "Add sub-issue via chat…" input (#1017): a bare
+    /// candidate issue number — unlike [`Self::submit_add_sub_issue_input`],
+    /// no `{group/after}` annotation grammar here; that gets proposed and
+    /// confirmed live in the chat instead. Fires `coord milestone chat
+    /// <repo> <tracking_issue> --add-child <issue>`, which seeds
+    /// `build_milestone_chat_briefing`'s "Add sub-issue" mode
+    /// (`coord/milestone_chat.py`) with the epic body plus the candidate
+    /// issue.
+    fn submit_add_sub_issue_chat_input(&mut self, input: PendingMilestoneRowInput, buf: &str) {
+        let issue_part = buf.trim().trim_start_matches('#');
+        let Ok(issue_number) = issue_part.parse::<u64>() else {
+            self.push_toast(
+                "Add sub-issue via chat",
+                "Issue number must be numeric.",
+                ToastSeverity::Warning,
+            );
+            return;
+        };
+
+        let repo = input.repo_name.clone();
+        let tracking_issue_str = input.tracking_issue.to_string();
+        let issue_str = issue_number.to_string();
+        let label = format!(
+            "Chat about adding #{} to {}'s sub-issues",
+            issue_number, input.milestone_title
+        );
+        use crate::commands::SpawnQueuedOutcome;
+        let outcome = self.command_runner.spawn_queued(&[
+            "milestone",
+            "chat",
+            &repo,
+            &tracking_issue_str,
+            "--add-child",
+            &issue_str,
+        ]);
+        match outcome {
+            SpawnQueuedOutcome::Deduped => {}
+            SpawnQueuedOutcome::Queued => {
+                self.push_toast(
+                    &label,
+                    "queued — will open after current command.",
+                    ToastSeverity::Info,
+                );
+            }
+            SpawnQueuedOutcome::Started => {
+                self.push_toast(&label, "dispatching steward chat…", ToastSeverity::Info);
             }
         }
     }

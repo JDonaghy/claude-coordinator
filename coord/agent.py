@@ -1606,7 +1606,7 @@ writing, and idempotently replaces any existing `## Work order` section \
 rather than duplicating it — safe to re-run after the operator asks for \
 changes.
 
-You may ALSO propose and (once confirmed) run these three milestone-authoring \
+You may ALSO propose and (once confirmed) run these four milestone-authoring \
 commands — each is a single, explicit write, never chained, never run \
 speculatively:
 - Creating the milestone (only when the first user message says none exists \
@@ -1629,8 +1629,20 @@ milestone, and once confirmed:
 
     coord milestone assign <repo> <issue> '<milestone_number_or_title>'
 
+- Splicing a child issue onto an epic's `## Sub-issues` checklist (#1008) — \
+when the operator wants to add (or remove) a sub-issue of the tracking \
+issue you're discussing: present the candidate issue, and — when adding — \
+any `group`/`after` annotation you're inferring the same way you would for \
+a `## Work order` entry, then once confirmed:
+
+    coord milestone add-child <repo> <epic> <issue> [--group '<group>'] [--after <N>[,<M>...]]
+    coord milestone add-child <repo> <epic> <issue> --remove
+
+  `add-child` is idempotent (re-adding with identical annotations is a \
+no-op; adding again with different ones updates the line in place) and \
+leaves the epic's `## Work order` section untouched — safe to re-run.
 - Shell-quote every title/description/milestone value you fill into the \
-three templates above with SINGLE quotes, never double quotes — double \
+four templates above with SINGLE quotes, never double quotes — double \
 quotes let the shell expand `$(...)`, backticks, and `$VAR` in the value \
 before `coord` ever sees it, which is unsafe for arbitrary operator-\
 supplied text (this is exactly why the `write-order` heredoc above uses \
@@ -1646,16 +1658,16 @@ confirmed.
 Rules:
 - Do NOT run mutating `gh` commands (issue edit/create/close, pr *, api -X \
 PATCH/POST/DELETE, milestone *) — the write paths are `coord milestone \
-write-order`, `coord milestone create`, `coord milestone edit`, and `coord \
-milestone assign`; never raw `gh`.
+write-order`, `coord milestone create`, `coord milestone edit`, `coord \
+milestone assign`, and `coord milestone add-child`; never raw `gh`.
 - Do NOT run `git push`, `git commit`, or any command that writes to the repo.
-- Do NOT run `coord milestone add-child` (not yet available), `coord \
-approve`, `coord merge`, or the top-level `coord assign <machine> <repo> \
-<issue>` (fleet work dispatch — a different, much bigger-blast-radius \
-command than `coord milestone assign` above) — all outside this session's job.
-- Do NOT write ANYTHING (work order, milestone create/edit, or milestone \
-assign) until the operator has explicitly confirmed that specific change in \
-this conversation.
+- Do NOT run `coord approve`, `coord merge`, or the top-level `coord assign \
+<machine> <repo> <issue>` (fleet work dispatch — a different, much \
+bigger-blast-radius command than `coord milestone assign` above) — all \
+outside this session's job.
+- Do NOT write ANYTHING (work order, milestone create/edit/assign, or \
+add-child) until the operator has explicitly confirmed that specific change \
+in this conversation.
 - Use `Read` and read-only `Bash` (e.g. `coord milestone order <repo> \
 <tracking_issue>` to preview the live frontier, `gh issue view`/`gh api \
 GET` to look things up) to ground your proposal in the current board state \
@@ -1663,13 +1675,12 @@ when useful.\
 """
 
 # Deny list applied to milestone-chat workers.  The write actions permitted
-# are `coord milestone write-order` / `create` / `edit` / `assign` (allowed
-# by omission — this list only blocks); raw `gh` mutations and unrelated
-# `coord` write commands are blocked so GitHub milestones/issues are the
-# only thing this session can touch, and only via the validated coord path.
-# `coord milestone add-child` (#1008) is intentionally NOT permitted yet —
-# it doesn't exist on this branch; when #1008 merges, extend both this list
-# and the system prompt above to cover it (#1009 follow-up).
+# are `coord milestone write-order` / `create` / `edit` / `assign` /
+# `add-child` (allowed by omission — this list only blocks); raw `gh`
+# mutations and unrelated `coord` write commands are blocked so GitHub
+# milestones/issues are the only thing this session can touch, and only via
+# the validated coord path. `coord milestone add-child` (#1008) was denied
+# until #1008 merged; #1017 lifts that restriction now that it has.
 MILESTONE_CHAT_DENY_COMMANDS: list[str] = [
     "Bash(gh issue edit *)",
     "Bash(gh issue create *)",
@@ -1688,7 +1699,6 @@ MILESTONE_CHAT_DENY_COMMANDS: list[str] = [
     "Bash(git checkout -- .)",
     "Bash(git clean -f *)",
     "Bash(rm -rf *)",
-    "Bash(coord milestone add-child *)",
     "Bash(coord approve *)",
     "Bash(coord merge *)",
     "Bash(coord assign *)",
