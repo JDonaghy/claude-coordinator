@@ -1418,6 +1418,172 @@ class TestAssignInteractiveSmoke:
         assert "SMOKE TEST of #1" in result.output
 
 
+class TestAssignInteractiveSmokeRemote:
+    """#1010: `coord assign --interactive --smoke-of <work_aid>` must work on
+    a REMOTE machine over ssh+tmux — the same read-only / live-checkout /
+    no-worktree shape as `--review-of` — instead of hard `sys.exit(2)`."""
+
+    def test_smoke_of_remote_dry_run_builds_remote_dispatch(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """The local-only gate is gone; the dry-run shows the read-only
+        ssh+tmux dispatch (remote checkout, no worktree, absolute claude
+        path) instead of the old local-only error."""
+        _seed_done_work("work-sm-r1", "issue-1-fix-bug")
+        # gethostname=laptop ⇒ machine "server" resolves as REMOTE.
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "Fix bug", "body": "the body"}), \
+             patch("socket.gethostname", return_value="laptop"):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "server", "api", "1", "--config", str(config_file),
+                 "--interactive", "--smoke-of", "work-sm-r1", "--dry-run"],
+            )
+        assert result.exit_code == 0, result.output
+        assert "local-only" not in result.output
+        assert "SMOKE TEST of #1" in result.output
+        assert "remote tmux" in result.output
+        assert "remote checkout" in result.output
+        assert "/tmp/api" in result.output
+        assert "read-only, no worktree" in result.output
+        assert "~/.local/bin/claude" in result.output
+        assert "(dry run — not launched)" in result.output
+        # Dry-run must NOT persist a smoke row.
+        from coord.state import build_board
+        smoke_rows = [
+            a for a in build_board().completed + build_board().active
+            if a.type == "smoke"
+        ]
+        assert smoke_rows == [], "dry-run must not persist a smoke assignment"
+
+    def test_smoke_of_remote_uses_tmux_launch_not_local(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """Selecting a non-local machine must take the ssh+tmux branch, not
+        the local-TTY launcher."""
+        from unittest.mock import MagicMock
+
+        _seed_done_work("work-sm-r2", "issue-1-fix-bug")
+        local_spy = MagicMock(return_value=0)
+        remote_spy = MagicMock(return_value=0)
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "Fix bug", "body": "b"}), \
+             patch("socket.gethostname", return_value="laptop"), \
+             patch("coord.interactive.launch_human_attended_interactive", local_spy), \
+             patch("coord.interactive._launch_via_tmux", remote_spy), \
+             patch("coord.interactive.tmux_session_alive", return_value=False), \
+             patch("coord.interactive.finalize_interactive_exit",
+                   return_value=MagicMock(already_recorded=False)), \
+             patch("coord.commands.dispatch_workers._prompt_and_relay_test_verdict",
+                   return_value=True):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "server", "api", "1", "--config", str(config_file),
+                 "--interactive", "--smoke-of", "work-sm-r2"],
+            )
+        assert result.exit_code == 0, result.output
+        local_spy.assert_not_called()
+        remote_spy.assert_called_once()
+
+    def test_smoke_of_remote_session_ended_finalizes_and_prompts_verdict(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """When the remote smoke tmux session has ENDED, the coordinator must
+        record a terminal state for the SMOKE SESSION row via
+        finalize_interactive_exit (worktree_path=None, repo_path=None,
+        ssh_target=the remote host) and then run the #923 test-verdict
+        backstop (which records against the WORK row, not the session row)."""
+        from unittest.mock import MagicMock
+
+        _seed_done_work("work-sm-r3", "issue-1-fix-bug")
+        fake_result = MagicMock(already_recorded=False, terminal_status="advisory")
+        finalize_spy = MagicMock(return_value=fake_result)
+        verdict_spy = MagicMock(return_value=True)
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "Fix bug", "body": "b"}), \
+             patch("socket.gethostname", return_value="laptop"), \
+             patch("coord.interactive._launch_via_tmux", return_value=0), \
+             patch("coord.interactive.tmux_session_alive", return_value=False), \
+             patch("coord.interactive.finalize_interactive_exit", finalize_spy), \
+             patch("coord.commands.dispatch_workers._prompt_and_relay_test_verdict",
+                   verdict_spy):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "server", "api", "1", "--config", str(config_file),
+                 "--interactive", "--smoke-of", "work-sm-r3"],
+            )
+        assert result.exit_code == 0, result.output
+        assert finalize_spy.call_count == 1
+        kwargs = finalize_spy.call_args.kwargs
+        assert kwargs["worktree_path"] is None
+        assert kwargs["repo_path"] is None
+        assert kwargs["ssh_target"] == "server.tailnet"
+
+        verdict_spy.assert_called_once()
+        vkwargs = verdict_spy.call_args.kwargs
+        # The verdict is recorded against the WORK id, not the smoke session.
+        assert vkwargs["work_assignment_id"] == "work-sm-r3"
+
+    def test_smoke_of_remote_session_alive_skips_finalize(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """When the remote smoke session is still DETACHED in tmux, finalize
+        and the verdict backstop must NOT run — the row stays running,
+        awaiting reattach."""
+        from unittest.mock import MagicMock
+
+        _seed_done_work("work-sm-r4", "issue-1-fix-bug")
+        finalize_spy = MagicMock()
+        verdict_spy = MagicMock()
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "Fix bug", "body": "b"}), \
+             patch("socket.gethostname", return_value="laptop"), \
+             patch("coord.interactive._launch_via_tmux", return_value=0), \
+             patch("coord.interactive.tmux_session_alive", return_value=True), \
+             patch("coord.interactive.finalize_interactive_exit", finalize_spy), \
+             patch("coord.commands.dispatch_workers._prompt_and_relay_test_verdict",
+                   verdict_spy):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "server", "api", "1", "--config", str(config_file),
+                 "--interactive", "--smoke-of", "work-sm-r4"],
+            )
+        assert result.exit_code == 0, result.output
+        assert finalize_spy.call_count == 0
+        assert verdict_spy.call_count == 0
+        assert "session still running in remote tmux" in result.output
+
+    def test_smoke_of_local_still_uses_local_tty(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """Local behaviour must be unchanged: --smoke-of on the local machine
+        still uses launch_human_attended_interactive, not _launch_via_tmux."""
+        from unittest.mock import MagicMock
+
+        _seed_done_work("work-sm-r5", "issue-1-fix-bug")
+        local_spy = MagicMock(return_value=0)
+        remote_spy = MagicMock()
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "Fix bug", "body": "b"}), \
+             patch("socket.gethostname", return_value="laptop"), \
+             patch("coord.interactive.launch_human_attended_interactive", local_spy), \
+             patch("coord.interactive._launch_via_tmux", remote_spy), \
+             patch("coord.interactive.tmux_available", return_value=False), \
+             patch("coord.interactive.tmux_session_alive", return_value=False), \
+             patch("coord.interactive.finalize_interactive_exit",
+                   return_value=MagicMock(already_recorded=False)), \
+             patch("coord.commands.dispatch_workers._prompt_and_relay_test_verdict",
+                   return_value=True):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "1", "--config", str(config_file),
+                 "--interactive", "--smoke-of", "work-sm-r5"],
+            )
+        assert result.exit_code == 0, result.output
+        local_spy.assert_called_once()
+        remote_spy.assert_not_called()
+
+
 class TestAssignInteractiveMerge:
     """Leg 3c: `coord assign --interactive --merge-of <work_aid>` — a
     human-attended interactive merge agent (proactive rebase, #306)."""

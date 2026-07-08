@@ -521,7 +521,8 @@ def approve(
         "smoke tests, pulls the build artifact, guides you through running it, "
         "interviews you about what you saw, and records the verdict with "
         "`coord test --passed|--fail`. Read-only tools, NO worktree (runs in the "
-        "live checkout). Requires --interactive; local-only for now."
+        "live checkout). Requires --interactive; works local and remote (#1010, "
+        "same ssh+tmux live-checkout shape as --review-of)."
     ),
 )
 
