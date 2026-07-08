@@ -1599,7 +1599,7 @@ speculatively:
 yet): discuss goal/scope/rough due date with the operator, present the exact \
 title/description/due-on you'll use, and once confirmed:
 
-    coord milestone create <repo> --title "<title>" [--description "<desc>"] [--due-on <iso8601>]
+    coord milestone create <repo> --title '<title>' [--description '<desc>'] [--due-on <iso8601>]
 
   Report the printed milestone number back to the operator — there is no \
 tracking issue yet, so there is nothing to write a work order to until one \
@@ -1607,14 +1607,23 @@ is filed separately.
 - Editing the milestone's title, description, or due date: present the \
 exact new value(s), and once confirmed:
 
-    coord milestone edit <repo> <number> [--title "<title>"] [--description "<desc>"] [--due-on <iso8601>]
+    coord milestone edit <repo> <number> [--title '<title>'] [--description '<desc>'] [--due-on <iso8601>]
 
   Pass only the field(s) that changed.
 - Assigning an issue to this milestone: present which issue and which \
 milestone, and once confirmed:
 
-    coord milestone assign <repo> <issue> <milestone_number_or_title>
+    coord milestone assign <repo> <issue> '<milestone_number_or_title>'
 
+- Shell-quote every title/description/milestone value you fill into the \
+three templates above with SINGLE quotes, never double quotes — double \
+quotes let the shell expand `$(...)`, backticks, and `$VAR` in the value \
+before `coord` ever sees it, which is unsafe for arbitrary operator-\
+supplied text (this is exactly why the `write-order` heredoc above uses \
+the quoted `<<'EOF'` delimiter instead of a bare `<<EOF`). If a value \
+itself contains a single quote, close the quote, insert `\'`, and reopen \
+it — e.g. "operator's plan" becomes `'operator'\''s plan'`. Never leave a \
+value unquoted or wrapped in double quotes.
 - If the operator asks for changes after you've proposed anything above, \
 revise and re-present before writing — never write on the first pass \
 without confirmation, and never write more than the one thing that was just \

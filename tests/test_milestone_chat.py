@@ -406,11 +406,18 @@ def test_new_dispatch_success_records_assignment_with_sentinel_issue_number(tmp_
 
 def test_new_dispatch_defaults_issue_title_when_no_seed_title(tmp_path):
     cfg = _cfg_with_repo_and_machine(tmp_path)
-    with patch("coord.dispatch.dispatch_with_retry", return_value={"id": "asg-new"}), \
-         patch("coord.state.record_dispatched_assignment"):
+    with patch("coord.dispatch.dispatch_with_retry", return_value={"id": "asg-new"}) as mock_dispatch, \
+         patch("coord.state.record_dispatched_assignment") as mock_record:
         _assignment_id, _machine_name = milestone_chat.dispatch_new_milestone_chat(
             "api", cfg
         )
+
+    mock_dispatch.assert_called_once()
+    proposal = mock_dispatch.call_args[0][0]
+    assert proposal.issue_title == "(new milestone draft)"
+    mock_record.assert_called_once()
+    asg = mock_record.call_args.kwargs["assignment"]
+    assert asg.issue_title == "(new milestone draft)"
 
 
 # ── agent.py milestone-chat branch ───────────────────────────────────────────
