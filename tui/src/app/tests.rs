@@ -25077,6 +25077,123 @@ Milestone tracking issue.
         );
     }
 
+    // #1008 — "Add sub-issue to epic…" epic-child splice helper ──────────────
+
+    /// #1008: the milestone-header context menu carries the new "Add
+    /// sub-issue to epic…" item alongside #1003's row-CRUD set.
+    #[test]
+    fn milestone_header_context_menu_has_add_sub_issue_item() {
+        let app = make_milestone_dag_app();
+        let items =
+            app.context_menu_items_for_milestone_header("coord-repo", 100, "v0.5", 5);
+        let ids: Vec<String> = items.iter().filter_map(|i| i.action_id.clone()).collect();
+        assert!(
+            ids.iter().any(|id| id == "add-sub-issue-to-epic"),
+            "expected `add-sub-issue-to-epic` in milestone-header menu ids {ids:?}"
+        );
+    }
+
+    /// #1008: "Add sub-issue to epic…" opens the row-input dialog with an
+    /// empty buffer (no pre-fill, unlike "Edit milestone…").
+    #[test]
+    fn open_add_sub_issue_to_epic_input_opens_empty_dialog() {
+        let mut app = make_milestone_dag_app();
+        let target = ContextMenuTarget::MilestoneHeader {
+            repo_name: "coord-repo".to_string(),
+            tracking_issue: 100,
+            milestone_title: "v0.5".to_string(),
+            milestone_number: 5,
+        };
+        assert!(app.open_add_sub_issue_to_epic_input(&target));
+        let input = app
+            .pending_milestone_row_input
+            .clone()
+            .expect("dialog must be pending");
+        assert_eq!(input.kind, MilestoneRowInputKind::AddSubIssue);
+        assert_eq!(input.tracking_issue, 100);
+        assert!(input.buf.is_empty());
+    }
+
+    /// #1008: a bare issue number spawns `coord milestone add-child <repo>
+    /// <epic> <issue>` with no `--group`/`--after`.
+    #[test]
+    fn add_sub_issue_flow_spawns_add_child_with_bare_issue_number() {
+        let mut app = make_milestone_dag_app();
+        app.command_runner = crate::commands::CommandRunner::new_for_test();
+        let target = ContextMenuTarget::MilestoneHeader {
+            repo_name: "coord-repo".to_string(),
+            tracking_issue: 100,
+            milestone_title: "v0.5".to_string(),
+            milestone_number: 5,
+        };
+        assert!(app.open_add_sub_issue_to_epic_input(&target));
+        let mut input = app.pending_milestone_row_input.take().expect("pending");
+        input.buf = "1050".to_string();
+        app.submit_milestone_row_input(input);
+
+        assert_eq!(
+            app.command_runner.spawned_calls,
+            vec![vec![
+                "milestone".to_string(),
+                "add-child".to_string(),
+                "coord-repo".to_string(),
+                "100".to_string(),
+                "1050".to_string(),
+            ]],
+        );
+    }
+
+    /// #1008: `1050 {group: B, after: #1049}` parses the annotation and
+    /// spawns `--group`/`--after` alongside the issue number.
+    #[test]
+    fn add_sub_issue_flow_parses_group_and_after_annotation() {
+        let mut app = make_milestone_dag_app();
+        app.command_runner = crate::commands::CommandRunner::new_for_test();
+        let target = ContextMenuTarget::MilestoneHeader {
+            repo_name: "coord-repo".to_string(),
+            tracking_issue: 100,
+            milestone_title: "v0.5".to_string(),
+            milestone_number: 5,
+        };
+        assert!(app.open_add_sub_issue_to_epic_input(&target));
+        let mut input = app.pending_milestone_row_input.take().expect("pending");
+        input.buf = "1050 {group: B, after: #1049}".to_string();
+        app.submit_milestone_row_input(input);
+
+        assert_eq!(
+            app.command_runner.spawned_calls,
+            vec![vec![
+                "milestone".to_string(),
+                "add-child".to_string(),
+                "coord-repo".to_string(),
+                "100".to_string(),
+                "1050".to_string(),
+                "--group".to_string(),
+                "B".to_string(),
+                "--after".to_string(),
+                "1049".to_string(),
+            ]],
+        );
+    }
+
+    /// #1008: a non-numeric leading token is rejected before spawning
+    /// anything — mirrors `add_issue_to_milestone_rejects_non_numeric_input`.
+    #[test]
+    fn add_sub_issue_rejects_non_numeric_input() {
+        let mut app = make_milestone_dag_app();
+        app.command_runner = crate::commands::CommandRunner::new_for_test();
+        let input = PendingMilestoneRowInput {
+            kind: MilestoneRowInputKind::AddSubIssue,
+            repo_name: "coord-repo".to_string(),
+            tracking_issue: 100,
+            milestone_number: 5,
+            milestone_title: "v0.5".to_string(),
+            buf: "not-a-number".to_string(),
+        };
+        app.submit_milestone_row_input(input);
+        assert!(app.command_runner.spawned_calls.is_empty());
+    }
+
     // #935 Part B — Diagnose & fix stage dialog ───────────────────────────────
 
     /// Helper: build an app with a populated `pending_diagnose_dialog`.

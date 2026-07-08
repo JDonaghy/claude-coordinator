@@ -381,3 +381,245 @@ class TestMilestoneChatCmd:
         )
         assert result.exit_code == 2
         assert "unknown repo" in result.output
+
+
+# ── `coord milestone add-child` (#1008: epic-child splice helper) ──────────
+
+
+class TestMilestoneAddChildCmd:
+    def test_adds_first_child_creating_section(self, config_file: Path) -> None:
+        def get_issue(repo, number):
+            if number == 100:
+                return {
+                    "number": 100, "title": "epic",
+                    "body": "Epic intro.\n", "state": "OPEN",
+                }
+            return {"number": number, "title": f"issue {number}", "body": "", "state": "OPEN"}
+
+        with patch("coord.github_ops.get_issue", side_effect=get_issue), \
+             patch("coord.github_ops.update_issue_body") as mock_update:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "add-child", "api", "100", "1050", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        assert "#1050 added to #100's" in result.output
+        mock_update.assert_called_once()
+        call_repo, call_issue, call_body = mock_update.call_args[0]
+        assert call_repo == "acme/api"
+        assert call_issue == 100
+        assert "Epic intro." in call_body
+        assert "## Sub-issues" in call_body
+        assert "#1050" in call_body
+
+    def test_adds_with_group_and_after_annotations(self, config_file: Path) -> None:
+        tracking_body = "## Sub-issues\n- [ ] #1050\n"
+
+        def get_issue(repo, number):
+            if number == 100:
+                return {"number": 100, "title": "epic", "body": tracking_body, "state": "OPEN"}
+            return {"number": number, "title": f"issue {number}", "body": "", "state": "OPEN"}
+
+        with patch("coord.github_ops.get_issue", side_effect=get_issue), \
+             patch("coord.github_ops.update_issue_body") as mock_update:
+            result = CliRunner().invoke(
+                main,
+                [
+                    "milestone", "add-child", "api", "100", "1051",
+                    "--group", "B", "--after", "1050",
+                    "--config", str(config_file),
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        mock_update.assert_called_once()
+        _repo, _issue, call_body = mock_update.call_args[0]
+        assert "#1050" in call_body and "#1051" in call_body
+        from coord.milestone_order import parse_sub_issues
+        wo = parse_sub_issues(call_body)
+        assert wo.node(1051).group == "B"
+        assert wo.node(1051).after == (1050,)
+
+    def test_idempotent_readd_is_a_noop(self, config_file: Path) -> None:
+        tracking_body = "## Sub-issues\n- [ ] #1050  {group: A}\n"
+
+        def get_issue(repo, number):
+            if number == 100:
+                return {"number": 100, "title": "epic", "body": tracking_body, "state": "OPEN"}
+            return {"number": number, "title": f"issue {number}", "body": "", "state": "OPEN"}
+
+        with patch("coord.github_ops.get_issue", side_effect=get_issue), \
+             patch("coord.github_ops.update_issue_body") as mock_update:
+            result = CliRunner().invoke(
+                main,
+                [
+                    "milestone", "add-child", "api", "100", "1050",
+                    "--group", "A", "--config", str(config_file),
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        assert "unchanged (idempotent no-op)" in result.output or "already in" in result.output
+        mock_update.assert_not_called()
+
+    def test_readd_with_different_annotations_updates_in_place(self, config_file: Path) -> None:
+        tracking_body = "## Sub-issues\n- [x] #1050  {group: A}\n"
+
+        def get_issue(repo, number):
+            if number == 100:
+                return {"number": 100, "title": "epic", "body": tracking_body, "state": "OPEN"}
+            return {"number": number, "title": f"issue {number}", "body": "", "state": "OPEN"}
+
+        with patch("coord.github_ops.get_issue", side_effect=get_issue), \
+             patch("coord.github_ops.update_issue_body") as mock_update:
+            result = CliRunner().invoke(
+                main,
+                [
+                    "milestone", "add-child", "api", "100", "1050",
+                    "--group", "B", "--config", str(config_file),
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        mock_update.assert_called_once()
+        _repo, _issue, call_body = mock_update.call_args[0]
+        from coord.milestone_order import parse_sub_issues
+        wo = parse_sub_issues(call_body)
+        # Annotation updated, but the existing checked state is preserved.
+        assert wo.node(1050).group == "B"
+        assert wo.node(1050).checked is True
+
+    def test_remove_drops_existing_child(self, config_file: Path) -> None:
+        tracking_body = "## Sub-issues\n- [ ] #1050\n- [ ] #1051\n"
+
+        def get_issue(repo, number):
+            return {"number": 100, "title": "epic", "body": tracking_body, "state": "OPEN"}
+
+        with patch("coord.github_ops.get_issue", side_effect=get_issue), \
+             patch("coord.github_ops.update_issue_body") as mock_update:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "add-child", "api", "100", "1050", "--remove", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        assert "removed from" in result.output
+        mock_update.assert_called_once()
+        _repo, _issue, call_body = mock_update.call_args[0]
+        from coord.milestone_order import parse_sub_issues
+        assert parse_sub_issues(call_body).issue_numbers == (1051,)
+
+    def test_remove_absent_child_is_a_noop(self, config_file: Path) -> None:
+        tracking_body = "## Sub-issues\n- [ ] #1050\n"
+
+        def get_issue(repo, number):
+            return {"number": 100, "title": "epic", "body": tracking_body, "state": "OPEN"}
+
+        with patch("coord.github_ops.get_issue", side_effect=get_issue), \
+             patch("coord.github_ops.update_issue_body") as mock_update:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "add-child", "api", "100", "9999", "--remove", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        assert "no-op" in result.output
+        mock_update.assert_not_called()
+
+    def test_remove_rejects_group_and_after(self, config_file: Path) -> None:
+        result = CliRunner().invoke(
+            main,
+            [
+                "milestone", "add-child", "api", "100", "1050",
+                "--remove", "--group", "A", "--config", str(config_file),
+            ],
+        )
+        assert result.exit_code == 2
+        assert "cannot be combined" in result.output
+
+    def test_leaves_existing_work_order_section_untouched(self, config_file: Path) -> None:
+        tracking_body = (
+            "## Work order\n- [ ] #762  {group: A}\n\n"
+            "## Sub-issues\n- [ ] #1050\n"
+        )
+
+        def get_issue(repo, number):
+            if number == 100:
+                return {"number": 100, "title": "epic", "body": tracking_body, "state": "OPEN"}
+            return {"number": number, "title": f"issue {number}", "body": "", "state": "OPEN"}
+
+        with patch("coord.github_ops.get_issue", side_effect=get_issue), \
+             patch("coord.github_ops.update_issue_body") as mock_update:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "add-child", "api", "100", "1051", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        _repo, _issue, call_body = mock_update.call_args[0]
+        from coord.milestone_order import parse_sub_issues, parse_work_order
+        assert parse_work_order(call_body).issue_numbers == (762,)
+        assert parse_sub_issues(call_body).issue_numbers == (1050, 1051)
+
+    def test_invalid_after_value_errors(self, config_file: Path) -> None:
+        result = CliRunner().invoke(
+            main,
+            [
+                "milestone", "add-child", "api", "100", "1050",
+                "--after", "not-a-number", "--config", str(config_file),
+            ],
+        )
+        assert result.exit_code == 2
+        assert "--after must be a comma-separated list" in result.output
+
+    def test_refuses_to_write_a_cycle(self, config_file: Path) -> None:
+        tracking_body = "## Sub-issues\n- [ ] #1050  {after: #1051}\n- [ ] #1051\n"
+
+        def get_issue(repo, number):
+            if number == 100:
+                return {"number": 100, "title": "epic", "body": tracking_body, "state": "OPEN"}
+            return {"number": number, "title": f"issue {number}", "body": "", "state": "OPEN"}
+
+        with patch("coord.github_ops.get_issue", side_effect=get_issue), \
+             patch("coord.github_ops.update_issue_body") as mock_update:
+            result = CliRunner().invoke(
+                main,
+                [
+                    "milestone", "add-child", "api", "100", "1051",
+                    "--after", "1050", "--config", str(config_file),
+                ],
+            )
+        assert result.exit_code == 1
+        assert "cycle" in result.output
+        mock_update.assert_not_called()
+
+    def test_unknown_child_issue_errors(self, config_file: Path) -> None:
+        def get_issue(repo, number):
+            if number == 100:
+                return {"number": 100, "title": "epic", "body": "", "state": "OPEN"}
+            raise RuntimeError("gh issue view 9999 failed: no such issue")
+
+        with patch("coord.github_ops.get_issue", side_effect=get_issue), \
+             patch("coord.github_ops.update_issue_body") as mock_update:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "add-child", "api", "100", "9999", "--config", str(config_file)],
+            )
+        assert result.exit_code == 1
+        assert "could not fetch issue #9999" in result.output
+        mock_update.assert_not_called()
+
+    def test_unknown_epic_errors(self, config_file: Path) -> None:
+        with patch(
+            "coord.github_ops.get_issue",
+            side_effect=RuntimeError("gh issue view 100 failed: no such issue"),
+        ), patch("coord.github_ops.update_issue_body") as mock_update:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "add-child", "api", "100", "1050", "--config", str(config_file)],
+            )
+        assert result.exit_code == 1
+        assert "could not fetch epic #100" in result.output
+        mock_update.assert_not_called()
+
+    def test_unknown_repo_errors(self, config_file: Path) -> None:
+        result = CliRunner().invoke(
+            main,
+            ["milestone", "add-child", "nope", "100", "1050", "--config", str(config_file)],
+        )
+        assert result.exit_code == 2
+        assert "unknown repo" in result.output

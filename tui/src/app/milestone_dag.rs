@@ -85,6 +85,15 @@ pub(crate) enum MilestoneRowInputKind {
     /// "Remove issue from milestone…" — an issue number; submitting calls
     /// `coord milestone remove <repo> <buf>`.
     RemoveIssue,
+    /// "Add sub-issue to epic…" (#1008) — an issue number, optionally
+    /// followed by a `{group: G, after: #N,...}` annotation (same grammar
+    /// as a `## Sub-issues` / `## Work order` checklist line, e.g. `1050`
+    /// or `1050 {group: B, after: #1049}`); submitting calls `coord
+    /// milestone add-child <repo> <tracking_issue> <issue> [--group G]
+    /// [--after N,...]`. Parsed by `submit_add_sub_issue_input` rather than
+    /// the shared bare-issue-number path the other two kinds use, since the
+    /// buffer may carry more than just a number.
+    AddSubIssue,
 }
 
 /// #1003: pending single-field text input for a Plans-panel / MilestoneDag
@@ -590,6 +599,11 @@ impl CoordApp {
                 "remove-issue-from-milestone",
                 "Remove issue from milestone…",
             ),
+            // #1008: distinct from "Add issue to milestone…" above — this
+            // splices the epic tracking issue's own `## Sub-issues`
+            // checklist (`coord milestone add-child`) rather than assigning
+            // GitHub milestone membership (`coord milestone assign`).
+            ContextMenuItem::action("add-sub-issue-to-epic", "Add sub-issue to epic…"),
             ContextMenuItem::separator(),
             ContextMenuItem::action("close-plan", "Close / archive plan"),
             ContextMenuItem::separator(),
@@ -890,12 +904,46 @@ impl CoordApp {
         true
     }
 
+    /// Open the "Add sub-issue to epic…" quick dialog (#1008).
+    pub(crate) fn open_add_sub_issue_to_epic_input(&mut self, target: &ContextMenuTarget) -> bool {
+        let (repo_name, tracking_issue, milestone_number, milestone_title) = match target {
+            ContextMenuTarget::MilestoneHeader {
+                repo_name,
+                tracking_issue,
+                milestone_title,
+                milestone_number,
+            } => (
+                repo_name.clone(),
+                *tracking_issue,
+                *milestone_number,
+                milestone_title.clone(),
+            ),
+            _ => return false,
+        };
+        self.pending_milestone_row_input = Some(PendingMilestoneRowInput {
+            kind: MilestoneRowInputKind::AddSubIssue,
+            repo_name,
+            tracking_issue,
+            milestone_number,
+            milestone_title,
+            buf: String::new(),
+        });
+        true
+    }
+
     /// Submit handler for the #1003 Plans-row single-field input dialogs —
     /// mirrors `capture_plan_stub`'s validate-then-spawn-and-toast shape.
     pub(crate) fn submit_milestone_row_input(&mut self, input: PendingMilestoneRowInput) {
         let buf = input.buf.trim().to_string();
         if buf.is_empty() {
             self.push_toast("Milestone", "Nothing entered — cancelled.", ToastSeverity::Info);
+            return;
+        }
+        // #1008: `AddSubIssue`'s buffer may carry more than a bare issue
+        // number (an optional `{group/after}` annotation), so it gets its
+        // own parse-and-dispatch path rather than the bare-number one below.
+        if input.kind == MilestoneRowInputKind::AddSubIssue {
+            self.submit_add_sub_issue_input(input, &buf);
             return;
         }
         let needs_issue_number = matches!(
@@ -942,7 +990,84 @@ impl CoordApp {
                 ],
                 format!("Remove #{} from {}", buf, input.milestone_title),
             ),
+            // Handled by `submit_add_sub_issue_input` above (early return) —
+            // this arm exists only so the match stays exhaustive.
+            MilestoneRowInputKind::AddSubIssue => {
+                unreachable!("AddSubIssue is dispatched via submit_add_sub_issue_input")
+            }
         };
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        use crate::commands::SpawnQueuedOutcome;
+        match self.command_runner.spawn_queued(&arg_refs) {
+            SpawnQueuedOutcome::Deduped => {}
+            SpawnQueuedOutcome::Queued => {
+                self.push_toast(
+                    &label,
+                    "queued — will run after current command.",
+                    ToastSeverity::Info,
+                );
+            }
+            SpawnQueuedOutcome::Started => {
+                self.push_toast(&label, "dispatching…", ToastSeverity::Info);
+            }
+        }
+    }
+
+    /// Parse + dispatch the "Add sub-issue to epic…" input (#1008): an
+    /// issue number optionally followed by a `{group: G, after: #N,...}`
+    /// annotation — the same grammar a `## Sub-issues` / `## Work order`
+    /// checklist line uses, so `1050`, `1050 {group: B}`, and
+    /// `1050{after: #1049}` all parse. Reuses the module's own
+    /// [`parse_annotations`] (the pure Rust port of
+    /// `coord.milestone_order`'s annotation grammar already used to render
+    /// the DAG) rather than re-deriving it. Fires `coord milestone
+    /// add-child <repo> <tracking_issue> <issue> [--group G] [--after
+    /// N,...]`.
+    fn submit_add_sub_issue_input(&mut self, input: PendingMilestoneRowInput, buf: &str) {
+        let split_at = buf.find(|c: char| c.is_whitespace() || c == '{');
+        let (issue_part, rest) = match split_at {
+            Some(idx) => (buf[..idx].trim(), buf[idx..].trim()),
+            None => (buf, ""),
+        };
+        let Ok(issue_number) = issue_part.trim_start_matches('#').parse::<u64>() else {
+            self.push_toast(
+                "Add sub-issue",
+                "Issue number must be numeric.",
+                ToastSeverity::Warning,
+            );
+            return;
+        };
+
+        let mut args: Vec<String> = vec![
+            "milestone".into(),
+            "add-child".into(),
+            input.repo_name.clone(),
+            input.tracking_issue.to_string(),
+            issue_number.to_string(),
+        ];
+        if !rest.is_empty() {
+            let inside = rest.trim_start_matches('{').trim_end_matches('}');
+            let (group, after) = parse_annotations(inside);
+            if let Some(g) = group {
+                args.push("--group".into());
+                args.push(g);
+            }
+            if !after.is_empty() {
+                args.push("--after".into());
+                args.push(
+                    after
+                        .iter()
+                        .map(|n| n.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                );
+            }
+        }
+
+        let label = format!(
+            "Add #{} to {}'s sub-issues",
+            issue_number, input.milestone_title
+        );
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         use crate::commands::SpawnQueuedOutcome;
         match self.command_runner.spawn_queued(&arg_refs) {

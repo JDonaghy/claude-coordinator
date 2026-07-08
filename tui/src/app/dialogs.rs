@@ -1391,6 +1391,15 @@ impl CoordApp {
                     ),
                     "issue number…",
                 ),
+                MilestoneRowInputKind::AddSubIssue => (
+                    "Add sub-issue to epic",
+                    format!(
+                        "Issue number to add as a sub-issue of \"{}\" ({}) — \
+                         optionally `{{group: G, after: #N,...}}`:",
+                        input.milestone_title, input.repo_name
+                    ),
+                    "e.g. 1050 or 1050 {group: B}…",
+                ),
             };
             return Some(Dialog {
                 table: None,
@@ -5485,6 +5494,9 @@ impl CoordApp {
             "remove-issue-from-milestone" => {
                 self.open_remove_issue_from_milestone_input(target)
             }
+            // #1008: splices the epic's own `## Sub-issues` checklist
+            // (`coord milestone add-child`) — see milestone_dag.rs.
+            "add-sub-issue-to-epic" => self.open_add_sub_issue_to_epic_input(target),
             "close-plan" => self.open_close_plan_confirm(target),
             // #685: open the test-mode choice dialog (SetOnly — no dispatch).
             "set-test-mode" => {
