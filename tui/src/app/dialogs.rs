@@ -1125,6 +1125,84 @@ impl CoordApp {
             });
         }
 
+        // ── #954: "New terminal" machine picker ───────────────────────────
+        if let Some(ref machines) = self.pending_new_terminal_picker {
+            let mut buttons: Vec<DialogButton> = machines
+                .iter()
+                .enumerate()
+                .map(|(i, m)| {
+                    let where_tag = if m.is_local { "local" } else { "remote" };
+                    let reach = if m.reachable { "●" } else { "○ offline?" };
+                    DialogButton {
+                        id: WidgetId::new(format!("new-terminal-machine:{i}")),
+                        label: format!(
+                            "{}  {} ({}) {}  {}",
+                            i + 1,
+                            m.name,
+                            where_tag,
+                            reach,
+                            m.host
+                        ),
+                        is_default: i == 0,
+                        is_cancel: false,
+                        tint: None,
+                    }
+                })
+                .collect();
+            buttons.push(DialogButton {
+                id: WidgetId::new("cancel"),
+                label: "Esc  Cancel".into(),
+                is_default: false,
+                is_cancel: true,
+                tint: None,
+            });
+            return Some(Dialog {
+                table: None,
+                id: WidgetId::new("dialog:new-terminal-machine-picker"),
+                title: StyledText::plain("Select machine for new terminal"),
+                body: vec![StyledText::plain(
+                    "Local runs on this TTY; a remote machine creates over ssh+tmux.",
+                )],
+                buttons,
+                severity: Some(DialogSeverity::Question),
+                vertical_buttons: true,
+                input: None,
+            });
+        }
+
+        // ── #954: New-terminal optional name input ─────────────────────────
+        if let Some(ref input) = self.pending_new_terminal {
+            return Some(Dialog {
+                table: None,
+                id: WidgetId::new("dialog:new-terminal-name"),
+                title: StyledText::plain(format!("New terminal on {}", input.machine)),
+                body: vec![StyledText::plain("Optional name (Enter to auto-name):")],
+                buttons: vec![
+                    DialogButton {
+                        id: WidgetId::new("submit"),
+                        label: "Submit".into(),
+                        is_default: true,
+                        is_cancel: false,
+                        tint: None,
+                    },
+                    DialogButton {
+                        id: WidgetId::new("cancel"),
+                        label: "Cancel".into(),
+                        is_default: false,
+                        is_cancel: true,
+                        tint: None,
+                    },
+                ],
+                severity: None,
+                vertical_buttons: false,
+                input: Some(DialogInput::TextInput(DialogTextInput {
+                    value: input.buf.clone(),
+                    placeholder: "terminal name…".into(),
+                    cursor: Some(input.buf.len()),
+                })),
+            });
+        }
+
         // ── Repo picker ──────────────────────────────────────────────────
         if let Some(ref picker) = self.pending_repo_picker {
             let mut buttons: Vec<DialogButton> = picker
@@ -2255,6 +2333,10 @@ impl CoordApp {
             self.pending_rework = None;
         } else if self.pending_machine_picker.is_some() {
             self.pending_machine_picker = None;
+        } else if self.pending_new_terminal_picker.is_some() {
+            self.pending_new_terminal_picker = None;
+        } else if self.pending_new_terminal.is_some() {
+            self.pending_new_terminal = None;
         } else if self.pending_test_fix.is_some() {
             // #722: blocking-dialog guard for the test-fix offer.
             let blocked = self
@@ -2417,6 +2499,24 @@ impl CoordApp {
                             let mode = picker.mode;
                             let machine = entry.name.clone();
                             self.launch_interactive_session_on_machine(mode, machine, None, false);
+                        }
+                    }
+                }
+            }
+            *self.dialog_layout.borrow_mut() = None;
+            return;
+        }
+
+        // ── #954: "New terminal" machine picker (mouse) ──────────────────
+        if self.pending_new_terminal_picker.is_some() {
+            if id == "cancel" {
+                self.pending_new_terminal_picker = None;
+            } else if let Some(idx_str) = id.strip_prefix("new-terminal-machine:") {
+                if let Ok(idx) = idx_str.parse::<usize>() {
+                    if let Some(machines) = self.pending_new_terminal_picker.take() {
+                        if let Some(entry) = machines.get(idx) {
+                            let machine = entry.name.clone();
+                            self.begin_new_terminal_name_prompt(machine);
                         }
                     }
                 }

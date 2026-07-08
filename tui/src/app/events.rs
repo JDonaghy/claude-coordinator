@@ -993,6 +993,65 @@ impl CoordApp {
             }
         }
 
+        // ── #954: pending "new terminal" machine picker ──────────────────────
+        // Armed by `open_new_terminal_picker` (`n` in the Terminal view) when
+        // >1 fleet machine is configured. Numeric keys (1, 2, …) pick the
+        // machine and open the optional-name prompt; Esc cancels.
+        if self.pending_new_terminal_picker.is_some() {
+            if let UiEvent::KeyPressed { key, .. } = &event {
+                match key {
+                    Key::Char(ch) if ch.is_ascii_digit() && *ch != '0' => {
+                        let digit = (*ch as u32 - '1' as u32) as usize;
+                        if let Some(machines) = self.pending_new_terminal_picker.as_ref() {
+                            if digit < machines.len() {
+                                let machine = machines[digit].name.clone();
+                                self.pending_new_terminal_picker = None;
+                                self.begin_new_terminal_name_prompt(machine);
+                                return Reaction::Redraw;
+                            }
+                        }
+                    }
+                    Key::Named(NamedKey::Escape) => {
+                        self.pending_new_terminal_picker = None;
+                    }
+                    _ => {}
+                }
+                return Reaction::Redraw;
+            }
+        }
+
+        // ── #954: pending "new terminal" optional name input ─────────────────
+        // Armed by `begin_new_terminal_name_prompt` once a machine is chosen
+        // (picker selection, or the single-machine fast path). Enter creates
+        // + attaches via `create_and_attach_terminal` (empty buffer ⇒
+        // auto-generated slug). Esc cancels.
+        if self.pending_new_terminal.is_some() {
+            if let UiEvent::KeyPressed { key, .. } = &event {
+                match key {
+                    Key::Named(NamedKey::Enter) => {
+                        if let Some(input) = self.pending_new_terminal.take() {
+                            self.create_and_attach_terminal(input.machine, input.buf);
+                        }
+                    }
+                    Key::Named(NamedKey::Escape) => {
+                        self.pending_new_terminal = None;
+                    }
+                    Key::Named(NamedKey::Backspace) => {
+                        if let Some(ref mut input) = self.pending_new_terminal {
+                            input.buf.pop();
+                        }
+                    }
+                    Key::Char(ch) => {
+                        if let Some(ref mut input) = self.pending_new_terminal {
+                            input.buf.push(*ch);
+                        }
+                    }
+                    _ => {}
+                }
+                return Reaction::Redraw;
+            }
+        }
+
         // ── #353: Pending repo picker for [Add] button ─────────────────────────
         // When multiple repos exist, this shows a numeric picker (1, 2, …).
         // Numeric keys select a repo, Enter dispatches, Esc cancels.
@@ -2857,6 +2916,24 @@ impl CoordApp {
                         needs_redraw = true;
                     }
 
+                    // ── #954: n — new terminal (Terminal-view machine picker) ─
+                    // Must sit ABOVE the global `n` → notify binding below
+                    // (which gains a `SidebarView::Terminal` exclusion), same
+                    // top-to-bottom-shadowing discipline as the `r` arm above
+                    // ('n' is otherwise taken globally by `notify`, per the
+                    // #977 Plans-panel `c` binding's comment). Guarded on
+                    // `!terminal_focused` too: while the embedded PTY has
+                    // focus every key is passthrough (#424) and never reaches
+                    // this match at all, but the guard documents the intent
+                    // explicitly rather than relying on that upstream cutoff.
+                    Key::Char('n')
+                        if self.active_view == SidebarView::Terminal
+                            && !self.terminal_focused =>
+                    {
+                        self.open_new_terminal_picker();
+                        needs_redraw = true;
+                    }
+
                     // ── S — force issue sync (Board panel) ───────────────
                     Key::Char('S')
                         if self.active_view == SidebarView::Board && !self.board_search.focused =>
@@ -2871,7 +2948,9 @@ impl CoordApp {
                     // Pipeline (#261) is the canonical dispatch path
                     // now; `coord plan` still exists as a CLI escape
                     // hatch but doesn't earn a keybind.
-                    Key::Char('n') => {
+                    // #954: excluded from the Terminal view — the guarded
+                    // arm above claims 'n' there for "new terminal" instead.
+                    Key::Char('n') if self.active_view != SidebarView::Terminal => {
                         use crate::commands::SpawnQueuedOutcome;
                         match self.command_runner.spawn_queued(&["notify"]) {
                             SpawnQueuedOutcome::Started => {
