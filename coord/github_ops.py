@@ -685,6 +685,23 @@ def assign_issue_milestone(
     )
 
 
+def unassign_issue_milestone(repo: str, issue_number: int) -> None:
+    """Clear *issue_number*'s milestone on *repo* via the GitHub API (#1003).
+
+    The counterpart to :func:`assign_issue_milestone` — ``-F milestone=null``
+    sends a JSON ``null`` (per ``gh api``'s typed-field convention: literal
+    ``null``/``true``/``false``/numbers are sent as their JSON type, not a
+    string), which GitHub's REST API treats as "remove the milestone".
+    Idempotent — clearing an issue that has no milestone is a no-op on
+    GitHub's side. Raises RuntimeError on any ``gh`` failure.
+    """
+    _gh(
+        "api", "-X", "PATCH",
+        f"repos/{repo}/issues/{issue_number}",
+        "-F", "milestone=null",
+    )
+
+
 def close_pr(repo: str, number: int, *, comment: str | None = None) -> None:
     """Close an open PR, optionally posting a comment first.
 

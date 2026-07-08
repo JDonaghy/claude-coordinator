@@ -1164,6 +1164,58 @@ impl CoordApp {
             }
         }
 
+        // ── #1003 Pending Plans-row single-field input: intercept all keys ───
+        // Set by "Edit milestone…" / "Add issue to milestone…" / "Remove
+        // issue from milestone…" (Plans-panel / MilestoneDag row context
+        // menu). Enter submits via `submit_milestone_row_input`. Esc cancels.
+        if self.pending_milestone_row_input.is_some() {
+            if let UiEvent::KeyPressed { key, .. } = &event {
+                match key {
+                    Key::Named(NamedKey::Enter) => {
+                        if let Some(input) = self.pending_milestone_row_input.take() {
+                            self.submit_milestone_row_input(input);
+                        }
+                    }
+                    Key::Named(NamedKey::Escape) => {
+                        self.pending_milestone_row_input = None;
+                    }
+                    Key::Named(NamedKey::Backspace) => {
+                        if let Some(ref mut input) = self.pending_milestone_row_input {
+                            input.buf.pop();
+                        }
+                    }
+                    Key::Char(ch) => {
+                        if let Some(ref mut input) = self.pending_milestone_row_input {
+                            input.buf.push(*ch);
+                        }
+                    }
+                    _ => {}
+                }
+                return Reaction::Redraw;
+            }
+        }
+
+        // ── #1003 Pending "Close / archive plan" confirmation: intercept ALL
+        // key presses ─────────────────────────────────────────────────────
+        // Set by the Plans-panel / MilestoneDag row context menu's "Close /
+        // archive plan" item. 'y'/'Y' confirms (`coord issue close`); every
+        // other key cancels. Mirrors `pending_restart`.
+        if self.pending_close_plan.is_some() {
+            if let UiEvent::KeyPressed { key, .. } = &event {
+                match key {
+                    Key::Char('y') | Key::Char('Y') => {
+                        if let Some(plan) = self.pending_close_plan.take() {
+                            self.confirm_close_plan(plan);
+                        }
+                    }
+                    _ => {
+                        self.pending_close_plan = None;
+                    }
+                }
+                return Reaction::Redraw;
+            }
+        }
+
         // ── Pending restart confirmation: intercept ALL key presses ──────────
         // While a restart is pending, 'y'/'Y' fires the restart; every other
         // key cancels.  We return early so normal key dispatch never fires.
@@ -1782,6 +1834,7 @@ impl CoordApp {
                                 repo_name: v.repo_name.clone(),
                                 tracking_issue: v.tracking_issue,
                                 milestone_title: v.milestone_title.clone(),
+                                milestone_number: v.milestone_number,
                             }
                         });
                         if let Some(target) = target {
