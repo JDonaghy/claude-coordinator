@@ -100,6 +100,68 @@ def test_briefing_names_the_write_order_command():
     assert "coord milestone write-order api 100" in out
 
 
+def test_briefing_includes_milestone_metadata_when_available():
+    """#1009: edit-mode convenience — current description/due date are
+    seeded so the model can propose diffs against the real current values."""
+    out = milestone_chat.build_milestone_chat_briefing(
+        repo_name="api",
+        repo_slug="acme/api",
+        milestone_title="M",
+        tracking_issue_number=100,
+        tracking_issue_body="",
+        issues=[],
+        milestone_number=9,
+        milestone_description="Ship the widget",
+        milestone_due_on="2026-08-01T00:00:00Z",
+    )
+    assert "MILESTONE NUMBER: 9" in out
+    assert "Ship the widget" in out
+    assert "2026-08-01T00:00:00Z" in out
+    assert "coord milestone edit api 9" in out
+    assert "coord milestone assign api <issue> 9" in out
+
+
+def test_briefing_omits_milestone_metadata_when_unavailable():
+    """Best-effort: no metadata block, no edit/assign hint, when the caller
+    couldn't fetch milestone details (e.g. `gh api` failure)."""
+    out = milestone_chat.build_milestone_chat_briefing(
+        repo_name="api",
+        repo_slug="acme/api",
+        milestone_title="M",
+        tracking_issue_number=100,
+        tracking_issue_body="",
+        issues=[],
+    )
+    assert "MILESTONE NUMBER" not in out
+    assert "coord milestone edit" not in out
+
+
+# ── build_new_milestone_chat_briefing ────────────────────────────────────────
+
+
+def test_new_milestone_briefing_includes_seed_title_and_prompt():
+    out = milestone_chat.build_new_milestone_chat_briefing(
+        repo_name="api",
+        repo_slug="acme/api",
+        seed_title="Q4 push",
+        seed_prompt="ship the widget",
+    )
+    assert "acme/api" in out
+    assert "Q4 push" in out
+    assert "ship the widget" in out
+    assert "coord milestone create api --title" in out
+
+
+def test_new_milestone_briefing_handles_no_seed():
+    out = milestone_chat.build_new_milestone_chat_briefing(
+        repo_name="api",
+        repo_slug="acme/api",
+        seed_title=None,
+        seed_prompt=None,
+    )
+    assert "(none supplied)" in out
+
+
 # ── _fetch_milestone_issues ──────────────────────────────────────────────────
 
 
@@ -223,6 +285,10 @@ def test_dispatch_success_records_assignment(tmp_path):
     }
     with patch("coord.github_ops.get_issue", return_value=issue_data), \
          patch("coord.github_ops.get_open_issues", return_value=[]), \
+         patch(
+             "coord.github_ops.get_milestone",
+             return_value={"number": 9, "title": "Q3", "description": "d", "due_on": None},
+         ), \
          patch("coord.dispatch.dispatch_with_retry", return_value={"id": "asg-xyz"}) as mock_dispatch, \
          patch("coord.state.record_dispatched_assignment") as mock_record:
         assignment_id, machine_name = milestone_chat.dispatch_milestone_chat(
@@ -236,7 +302,27 @@ def test_dispatch_success_records_assignment(tmp_path):
     assert proposal.type == "milestone-chat"
     assert proposal.issue_number == 100
     assert proposal.issue_title == "Milestone tracker"
+    assert "MILESTONE NUMBER: 9" in proposal.briefing
     mock_record.assert_called_once()
+
+
+def test_dispatch_survives_milestone_metadata_fetch_failure(tmp_path):
+    """Best-effort: a `gh api` failure fetching description/due date must
+    not abort the whole dispatch — the chat still works without it."""
+    cfg = _cfg_with_repo_and_machine(tmp_path)
+    issue_data = {
+        "number": 100, "title": "Milestone tracker", "body": "",
+        "milestone": {"number": 9, "title": "Q3"},
+    }
+    with patch("coord.github_ops.get_issue", return_value=issue_data), \
+         patch("coord.github_ops.get_open_issues", return_value=[]), \
+         patch("coord.github_ops.get_milestone", side_effect=RuntimeError("gh boom")), \
+         patch("coord.dispatch.dispatch_with_retry", return_value={"id": "asg-xyz"}), \
+         patch("coord.state.record_dispatched_assignment"):
+        assignment_id, _machine_name = milestone_chat.dispatch_milestone_chat(
+            "api", 100, cfg
+        )
+    assert assignment_id == "asg-xyz"
 
 
 def test_dispatch_machine_override_must_claim_repo(tmp_path):
@@ -255,6 +341,76 @@ def test_dispatch_machine_override_must_claim_repo(tmp_path):
             assert False, "expected RuntimeError"
         except RuntimeError as e:
             assert "not in coordinator.yml" in str(e)
+
+
+# ── dispatch_new_milestone_chat (#1009) ──────────────────────────────────────
+
+
+def test_new_dispatch_raises_for_unknown_repo(tmp_path):
+    cfg = _cfg_with_repo_and_machine(tmp_path)
+    try:
+        milestone_chat.dispatch_new_milestone_chat("nope", cfg)
+        assert False, "expected RuntimeError"
+    except RuntimeError as e:
+        assert "not in coordinator.yml" in str(e)
+
+
+def test_new_dispatch_raises_when_no_machine_claims_repo(tmp_path):
+    from coord.config import Config, ModelsConfig
+    from coord.models import Repo
+
+    repo = Repo(name="api", github="acme/api", default_branch="main")
+    cfg = Config(repos=[repo], machines=[], models=ModelsConfig(default=None))
+    try:
+        milestone_chat.dispatch_new_milestone_chat("api", cfg)
+        assert False, "expected RuntimeError"
+    except RuntimeError as e:
+        assert "no machine claims repo" in str(e)
+
+
+def test_new_dispatch_machine_override_must_claim_repo(tmp_path):
+    cfg = _cfg_with_repo_and_machine(tmp_path)
+    try:
+        milestone_chat.dispatch_new_milestone_chat(
+            "api", cfg, machine_override="nonexistent"
+        )
+        assert False, "expected RuntimeError"
+    except RuntimeError as e:
+        assert "not in coordinator.yml" in str(e)
+
+
+def test_new_dispatch_success_records_assignment_with_sentinel_issue_number(tmp_path):
+    """No tracking issue exists yet — issue_number=0 is the established
+    sentinel (matches new_issue_chat.py / refine_chat.py board-chat)."""
+    cfg = _cfg_with_repo_and_machine(tmp_path)
+    with patch("coord.dispatch.dispatch_with_retry", return_value={"id": "asg-new"}) as mock_dispatch, \
+         patch("coord.state.record_dispatched_assignment") as mock_record:
+        assignment_id, machine_name = milestone_chat.dispatch_new_milestone_chat(
+            "api", cfg, seed_title="Q4 push", seed_prompt="ship the widget"
+        )
+
+    assert assignment_id == "asg-new"
+    assert machine_name == "laptop"
+    mock_dispatch.assert_called_once()
+    proposal = mock_dispatch.call_args[0][0]
+    assert proposal.type == "milestone-chat"
+    assert proposal.issue_number == 0
+    assert proposal.issue_title == "Q4 push"
+    assert "Q4 push" in proposal.briefing
+    assert "ship the widget" in proposal.briefing
+    mock_record.assert_called_once()
+    asg = mock_record.call_args.kwargs["assignment"]
+    assert asg.issue_number == 0
+    assert asg.type == "milestone-chat"
+
+
+def test_new_dispatch_defaults_issue_title_when_no_seed_title(tmp_path):
+    cfg = _cfg_with_repo_and_machine(tmp_path)
+    with patch("coord.dispatch.dispatch_with_retry", return_value={"id": "asg-new"}), \
+         patch("coord.state.record_dispatched_assignment"):
+        _assignment_id, _machine_name = milestone_chat.dispatch_new_milestone_chat(
+            "api", cfg
+        )
 
 
 # ── agent.py milestone-chat branch ───────────────────────────────────────────
@@ -311,6 +467,30 @@ def test_milestone_chat_deny_list_blocks_raw_gh_and_unrelated_coord_writes():
     denies = " ".join(MILESTONE_CHAT_DENY_COMMANDS)
     assert "gh issue edit" in denies
     assert "gh api -X PATCH" in denies
-    assert "coord milestone create" in denies
+    assert "coord milestone add-child" in denies
     assert "coord approve" in denies
     assert "coord merge" in denies
+    assert "coord assign" in denies
+
+
+def test_milestone_chat_deny_list_now_permits_create_edit_assign():
+    """#1009: create/edit/assign are widened into the allowed write set —
+    the deny list must no longer block them (only add-child, which doesn't
+    exist yet, plus the unrelated fleet-dispatch commands, stay denied)."""
+    denies = " ".join(MILESTONE_CHAT_DENY_COMMANDS)
+    assert "coord milestone create" not in denies
+    assert "coord milestone edit" not in denies
+    # `coord milestone assign` itself was never on the deny list (only the
+    # top-level fleet `coord assign <machine> <repo> <issue>` is) — confirm
+    # the fleet form's deny entry doesn't also read as "milestone assign".
+    assert "coord milestone assign" not in denies
+
+
+def test_milestone_chat_prompt_documents_widened_write_commands():
+    """#1009: the system prompt must name all three newly-permitted write
+    commands so the model knows the exact confirm-then-run invocation."""
+    assert "coord milestone create <repo>" in MILESTONE_CHAT_SYSTEM_PROMPT
+    assert "coord milestone edit <repo> <number>" in MILESTONE_CHAT_SYSTEM_PROMPT
+    assert "coord milestone assign <repo> <issue>" in MILESTONE_CHAT_SYSTEM_PROMPT
+    # add-child is explicitly out of scope until #1008 merges.
+    assert "add-child" in MILESTONE_CHAT_SYSTEM_PROMPT

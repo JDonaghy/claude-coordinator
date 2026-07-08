@@ -940,21 +940,43 @@ def milestone_write_order_cmd(
 @milestone_group.command(
     "chat",
     help=(
-        "#770 (Phase 2 of #767): dispatch a milestone-steward chat session.\n\n"
+        "#770 (Phase 2 of #767) + #1009: dispatch a milestone-steward chat "
+        "session.\n\n"
         "Seeds a `type=\"milestone-chat\"` `claude -p` worker with the "
         "milestone tracking issue's current body and the open issues filed "
         "under the milestone, then prints the new assignment id to stdout. "
         "The steward discusses the milestone, proposes a `## Work order` "
         "block inferring parallel cohorts (`group`) vs. hard dependencies "
-        "(`after`) from the issue bodies, and — only once the operator "
-        "confirms in the conversation — writes it via `coord milestone "
-        "write-order` (never raw `gh`).\n\n"
+        "(`after`) from the issue bodies, and can also propose creating/"
+        "editing the milestone or assigning an issue to it — each written "
+        "only once the operator confirms in the conversation, via `coord "
+        "milestone write-order`/`create`/`edit`/`assign` (never raw `gh`).\n\n"
         "REPO is the local repo name from coordinator.yml; TRACKING_ISSUE is "
-        "the GH issue number of the tracking issue (must carry a milestone)."
+        "the GH issue number of the tracking issue (must carry a milestone). "
+        "Pass `--new` instead of TRACKING_ISSUE to start a chat for a "
+        "brand-new milestone that doesn't have a tracking issue yet."
     ),
 )
 @click.argument("repo")
-@click.argument("tracking_issue", type=int)
+@click.argument("tracking_issue", type=int, required=False, default=None)
+@click.option(
+    "--new",
+    "is_new",
+    is_flag=True,
+    help="Start a chat to create a brand-new milestone (no tracking issue yet) instead of discussing an existing one.",
+)
+@click.option(
+    "--title",
+    "seed_title",
+    default=None,
+    help="Optional seed title for --new (the operator can still change it in conversation).",
+)
+@click.option(
+    "--seed",
+    "seed_prompt",
+    default=None,
+    help="Optional seed prompt for --new describing the milestone's goal/scope.",
+)
 @click.option(
     "--machine",
     default=None,
@@ -962,7 +984,13 @@ def milestone_write_order_cmd(
 )
 @_CONFIG_OPTION
 def milestone_chat_cmd(
-    repo: str, tracking_issue: int, machine: str | None, config_path: Path
+    repo: str,
+    tracking_issue: int | None,
+    is_new: bool,
+    seed_title: str | None,
+    seed_prompt: str | None,
+    machine: str | None,
+    config_path: Path,
 ) -> None:
     cfg = _load_config(config_path)
     repo_entry = cfg.repo(repo)
@@ -970,18 +998,44 @@ def milestone_chat_cmd(
         click.echo(f"error: unknown repo {repo!r}", err=True)
         sys.exit(2)
 
-    from coord.milestone_chat import dispatch_milestone_chat
+    if is_new:
+        if tracking_issue is not None:
+            click.echo("error: pass either TRACKING_ISSUE or --new, not both", err=True)
+            sys.exit(2)
 
-    try:
-        assignment_id, _picked_machine = dispatch_milestone_chat(
-            repo,
-            tracking_issue,
-            cfg,
-            machine_override=machine,
-        )
-    except RuntimeError as exc:
-        click.echo(f"error: {exc}", err=True)
-        sys.exit(1)
+        from coord.milestone_chat import dispatch_new_milestone_chat
+
+        try:
+            assignment_id, _picked_machine = dispatch_new_milestone_chat(
+                repo,
+                cfg,
+                seed_title=seed_title,
+                seed_prompt=seed_prompt,
+                machine_override=machine,
+            )
+        except RuntimeError as exc:
+            click.echo(f"error: {exc}", err=True)
+            sys.exit(1)
+    else:
+        if tracking_issue is None:
+            click.echo("error: TRACKING_ISSUE is required unless --new is given", err=True)
+            sys.exit(2)
+        if seed_title is not None or seed_prompt is not None:
+            click.echo("error: --title/--seed only apply with --new", err=True)
+            sys.exit(2)
+
+        from coord.milestone_chat import dispatch_milestone_chat
+
+        try:
+            assignment_id, _picked_machine = dispatch_milestone_chat(
+                repo,
+                tracking_issue,
+                cfg,
+                machine_override=machine,
+            )
+        except RuntimeError as exc:
+            click.echo(f"error: {exc}", err=True)
+            sys.exit(1)
 
     # Print the assignment id as the LAST stdout line so callers (the TUI,
     # eventually — #771/#645) can capture it with a "last non-empty line"
