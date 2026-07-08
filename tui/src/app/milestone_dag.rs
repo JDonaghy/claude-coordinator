@@ -68,6 +68,49 @@ pub(crate) struct MilestoneDagView {
     pub(crate) nodes: Vec<MilestoneDagNode>,
 }
 
+// ─── #1003: Plans-panel / MilestoneDag row CRUD pending state ────────────────
+
+/// Which single-field prompt [`PendingMilestoneRowInput`] is currently
+/// collecting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MilestoneRowInputKind {
+    /// "Edit milestone…" — pre-filled with the current title; submitting
+    /// calls `coord milestone edit <repo> <number> --title <buf>`. Title-only
+    /// for now (description/due are the fuller multi-field / chat-driven
+    /// edit path #1003 defers to a follow-up).
+    EditTitle,
+    /// "Add issue to milestone…" — an issue number; submitting calls
+    /// `coord milestone assign <repo> <buf> <milestone_number>`.
+    AddIssue,
+    /// "Remove issue from milestone…" — an issue number; submitting calls
+    /// `coord milestone remove <repo> <buf>`.
+    RemoveIssue,
+}
+
+/// #1003: pending single-field text input for a Plans-panel / MilestoneDag
+/// row action. Mirrors the #977 `pending_plan_capture` single-buffer
+/// pattern (one `String` buf, Enter submits, Esc cancels) — quick and
+/// keyboard-only rather than a full multi-field form.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingMilestoneRowInput {
+    pub(crate) kind: MilestoneRowInputKind,
+    pub(crate) repo_name: String,
+    pub(crate) tracking_issue: u64,
+    pub(crate) milestone_number: i64,
+    pub(crate) milestone_title: String,
+    pub(crate) buf: String,
+}
+
+/// #1003: pending "Close / archive plan" confirmation — closes the
+/// milestone's tracking issue via `coord issue close`. Mirrors the
+/// `pending_restart` yes/any-other-key-cancels pattern.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingClosePlan {
+    pub(crate) repo_name: String,
+    pub(crate) tracking_issue: u64,
+    pub(crate) milestone_title: String,
+}
+
 // ─── Parsing (pure, mirrors coord/milestone_order.py's grammar) ──────────────
 
 /// Parse the `## Work order` block out of a tracking issue's markdown body.
@@ -520,14 +563,35 @@ impl CoordApp {
 
     /// Context-menu items for a milestone header row (right-click, or the
     /// keyboard shortcut / Menu key on the selected header).
+    ///
+    /// #1003: extended from the original "Dispatch milestone" + Refresh pair
+    /// to the full row-level CRUD set the Plans panel now shares this target
+    /// with — chat, next-pick, read-only order view, edit/add/remove, and
+    /// close/archive. `_milestone_number` isn't read here (the item list
+    /// doesn't depend on it — only the id matters); it's accepted for
+    /// symmetry with the target's fields and because a future item may need
+    /// it for a disabled-state check.
     pub(crate) fn context_menu_items_for_milestone_header(
         &self,
         _repo_name: &str,
         _tracking_issue: u64,
         _milestone_title: &str,
+        _milestone_number: i64,
     ) -> Vec<ContextMenuItem> {
         vec![
+            ContextMenuItem::action("open-milestone-chat", "Open milestone chat"),
             ContextMenuItem::action("dispatch-milestone", "Dispatch milestone").with_shortcut("d"),
+            ContextMenuItem::action("dispatch-milestone-next", "Dispatch next…"),
+            ContextMenuItem::action("view-milestone-order", "View order / DAG"),
+            ContextMenuItem::separator(),
+            ContextMenuItem::action("edit-milestone", "Edit milestone…"),
+            ContextMenuItem::action("add-issue-to-milestone", "Add issue to milestone…"),
+            ContextMenuItem::action(
+                "remove-issue-from-milestone",
+                "Remove issue from milestone…",
+            ),
+            ContextMenuItem::separator(),
+            ContextMenuItem::action("close-plan", "Close / archive plan"),
             ContextMenuItem::separator(),
             ContextMenuItem::action("refresh", "Refresh").with_shortcut("r"),
         ]
@@ -543,6 +607,7 @@ impl CoordApp {
                 repo_name,
                 tracking_issue,
                 milestone_title,
+                ..
             } => (repo_name.clone(), *tracking_issue, milestone_title.clone()),
             _ => {
                 self.push_toast(
@@ -576,6 +641,370 @@ impl CoordApp {
             }
         }
         true
+    }
+
+    /// "Open milestone chat" (#1003) — dispatch a `type="milestone-chat"`
+    /// steward session the same fire-and-forget way "Dispatch milestone"
+    /// spawns its `coord` subcommand. The session id isn't captured here
+    /// (no live chat-overlay attach, unlike refine-chat's
+    /// `maybe_bind_pending_refinement`) — reattaching to watch/participate
+    /// is via the Machines/sessions view, same as any other background
+    /// worker. Deeper chat-attach integration is exactly the "chat-driven
+    /// authoring" scope #1003 defers to a follow-up.
+    pub(crate) fn open_milestone_chat_action(&mut self, target: &ContextMenuTarget) -> bool {
+        let (repo, tracking_issue, title) = match target {
+            ContextMenuTarget::MilestoneHeader {
+                repo_name,
+                tracking_issue,
+                milestone_title,
+                ..
+            } => (repo_name.clone(), *tracking_issue, milestone_title.clone()),
+            _ => {
+                self.push_toast(
+                    "Open milestone chat",
+                    "No milestone target — focus a milestone header first.",
+                    ToastSeverity::Info,
+                );
+                return false;
+            }
+        };
+        let issue_str = tracking_issue.to_string();
+        use crate::commands::SpawnQueuedOutcome;
+        match self
+            .command_runner
+            .spawn_queued(&["milestone", "chat", &repo, &issue_str])
+        {
+            SpawnQueuedOutcome::Deduped => {}
+            SpawnQueuedOutcome::Queued => {
+                self.push_toast(
+                    "Milestone chat",
+                    &format!("{}: queued — will open after current command.", title),
+                    ToastSeverity::Info,
+                );
+            }
+            SpawnQueuedOutcome::Started => {
+                self.push_toast(
+                    "Milestone chat",
+                    &format!("{}: dispatching steward chat…", title),
+                    ToastSeverity::Info,
+                );
+            }
+        }
+        true
+    }
+
+    /// "Dispatch next…" (#1003) — lighter-weight than "Dispatch milestone"
+    /// (which drains the whole current ready frontier): computes the ready
+    /// frontier **client-side** (the same `NodeState::Ready` computation the
+    /// MilestoneDag panel already renders, mirroring
+    /// `coord/milestone_order.py`'s grammar/semantics) and dispatches the
+    /// first ready item non-interactively via `--next --pick
+    /// <issue_number>` (a #1003 CLI addition — `coord milestone dispatch
+    /// --next` on its own drops into an interactive `click.prompt`, which
+    /// `spawn_queued`'s non-TTY subprocess can never answer). Machine
+    /// availability/capability is still resolved server-side; a
+    /// ready-but-unschedulable issue surfaces as an ordinary
+    /// command-failure toast rather than being silently skipped.
+    pub(crate) fn dispatch_milestone_next_action(&mut self, target: &ContextMenuTarget) -> bool {
+        let (repo, tracking_issue, title) = match target {
+            ContextMenuTarget::MilestoneHeader {
+                repo_name,
+                tracking_issue,
+                milestone_title,
+                ..
+            } => (repo_name.clone(), *tracking_issue, milestone_title.clone()),
+            _ => {
+                self.push_toast(
+                    "Dispatch next",
+                    "No milestone target — focus a milestone header first.",
+                    ToastSeverity::Info,
+                );
+                return false;
+            }
+        };
+        let next_issue = self
+            .milestone_dag_views()
+            .into_iter()
+            .find(|v| v.repo_name == repo && v.tracking_issue == tracking_issue)
+            .and_then(|v| {
+                v.nodes
+                    .into_iter()
+                    .find(|n| n.state == NodeState::Ready)
+                    .map(|n| n.issue_number)
+            });
+        let Some(issue_number) = next_issue else {
+            self.push_toast(
+                "Dispatch next",
+                &format!("{}: no ready frontier item right now.", title),
+                ToastSeverity::Info,
+            );
+            return false;
+        };
+        let issue_str = tracking_issue.to_string();
+        let pick_str = issue_number.to_string();
+        use crate::commands::SpawnQueuedOutcome;
+        let outcome = self.command_runner.spawn_queued(&[
+            "milestone",
+            "dispatch",
+            &repo,
+            &issue_str,
+            "--next",
+            "--pick",
+            &pick_str,
+        ]);
+        match outcome {
+            SpawnQueuedOutcome::Deduped => {}
+            SpawnQueuedOutcome::Queued => {
+                self.push_toast(
+                    "Dispatch next",
+                    &format!("#{} ({}): queued — will run after current command.", issue_number, title),
+                    ToastSeverity::Info,
+                );
+            }
+            SpawnQueuedOutcome::Started => {
+                self.push_toast(
+                    "Dispatch next",
+                    &format!("#{} ({}): dispatching…", issue_number, title),
+                    ToastSeverity::Info,
+                );
+            }
+        }
+        true
+    }
+
+    /// "View order / DAG" (#1003) — switches to the already-shipped
+    /// MilestoneDag view and selects this milestone, rather than shelling
+    /// out to the read-only `coord milestone order` CLI: the DAG view
+    /// already computes the identical ready/blocked/in-flight/done state
+    /// client-side (`milestones_with_work_orders`) and renders it
+    /// interactively, so reusing it is strictly more useful than a static
+    /// text dump.
+    pub(crate) fn view_milestone_order_action(&mut self, target: &ContextMenuTarget) -> bool {
+        let (repo, tracking_issue) = match target {
+            ContextMenuTarget::MilestoneHeader {
+                repo_name,
+                tracking_issue,
+                ..
+            } => (repo_name.clone(), *tracking_issue),
+            _ => return false,
+        };
+        let views = self.milestone_dag_views();
+        let Some(idx) = views
+            .iter()
+            .position(|v| v.repo_name == repo && v.tracking_issue == tracking_issue)
+        else {
+            self.push_toast(
+                "View order / DAG",
+                "This milestone has no parsed `## Work order` block yet.",
+                ToastSeverity::Info,
+            );
+            return false;
+        };
+        self.milestone_dag_sel = idx;
+        self.active_view = SidebarView::MilestoneDag;
+        true
+    }
+
+    /// Open the "Edit milestone…" quick dialog, pre-filled with the current
+    /// title (#1003). Title-only — see [`MilestoneRowInputKind::EditTitle`].
+    pub(crate) fn open_edit_milestone_input(&mut self, target: &ContextMenuTarget) -> bool {
+        let (repo_name, tracking_issue, milestone_number, milestone_title) = match target {
+            ContextMenuTarget::MilestoneHeader {
+                repo_name,
+                tracking_issue,
+                milestone_title,
+                milestone_number,
+            } => (
+                repo_name.clone(),
+                *tracking_issue,
+                *milestone_number,
+                milestone_title.clone(),
+            ),
+            _ => return false,
+        };
+        self.pending_milestone_row_input = Some(PendingMilestoneRowInput {
+            kind: MilestoneRowInputKind::EditTitle,
+            repo_name,
+            tracking_issue,
+            milestone_number,
+            milestone_title: milestone_title.clone(),
+            buf: milestone_title,
+        });
+        true
+    }
+
+    /// Open the "Add issue to milestone…" quick dialog (#1003).
+    pub(crate) fn open_add_issue_to_milestone_input(&mut self, target: &ContextMenuTarget) -> bool {
+        let (repo_name, tracking_issue, milestone_number, milestone_title) = match target {
+            ContextMenuTarget::MilestoneHeader {
+                repo_name,
+                tracking_issue,
+                milestone_title,
+                milestone_number,
+            } => (
+                repo_name.clone(),
+                *tracking_issue,
+                *milestone_number,
+                milestone_title.clone(),
+            ),
+            _ => return false,
+        };
+        self.pending_milestone_row_input = Some(PendingMilestoneRowInput {
+            kind: MilestoneRowInputKind::AddIssue,
+            repo_name,
+            tracking_issue,
+            milestone_number,
+            milestone_title,
+            buf: String::new(),
+        });
+        true
+    }
+
+    /// Open the "Remove issue from milestone…" quick dialog (#1003).
+    pub(crate) fn open_remove_issue_from_milestone_input(
+        &mut self,
+        target: &ContextMenuTarget,
+    ) -> bool {
+        let (repo_name, tracking_issue, milestone_number, milestone_title) = match target {
+            ContextMenuTarget::MilestoneHeader {
+                repo_name,
+                tracking_issue,
+                milestone_title,
+                milestone_number,
+            } => (
+                repo_name.clone(),
+                *tracking_issue,
+                *milestone_number,
+                milestone_title.clone(),
+            ),
+            _ => return false,
+        };
+        self.pending_milestone_row_input = Some(PendingMilestoneRowInput {
+            kind: MilestoneRowInputKind::RemoveIssue,
+            repo_name,
+            tracking_issue,
+            milestone_number,
+            milestone_title,
+            buf: String::new(),
+        });
+        true
+    }
+
+    /// Submit handler for the #1003 Plans-row single-field input dialogs —
+    /// mirrors `capture_plan_stub`'s validate-then-spawn-and-toast shape.
+    pub(crate) fn submit_milestone_row_input(&mut self, input: PendingMilestoneRowInput) {
+        let buf = input.buf.trim().to_string();
+        if buf.is_empty() {
+            self.push_toast("Milestone", "Nothing entered — cancelled.", ToastSeverity::Info);
+            return;
+        }
+        let needs_issue_number = matches!(
+            input.kind,
+            MilestoneRowInputKind::AddIssue | MilestoneRowInputKind::RemoveIssue
+        );
+        if needs_issue_number && buf.parse::<u64>().is_err() {
+            self.push_toast(
+                "Milestone",
+                "Issue number must be numeric.",
+                ToastSeverity::Warning,
+            );
+            return;
+        }
+        let ms_str = input.milestone_number.to_string();
+        let (args, label): (Vec<String>, String) = match input.kind {
+            MilestoneRowInputKind::EditTitle => (
+                vec![
+                    "milestone".into(),
+                    "edit".into(),
+                    input.repo_name.clone(),
+                    ms_str,
+                    "--title".into(),
+                    buf.clone(),
+                ],
+                format!("Edit milestone: \"{}\"", buf),
+            ),
+            MilestoneRowInputKind::AddIssue => (
+                vec![
+                    "milestone".into(),
+                    "assign".into(),
+                    input.repo_name.clone(),
+                    buf.clone(),
+                    ms_str,
+                ],
+                format!("Add #{} to {}", buf, input.milestone_title),
+            ),
+            MilestoneRowInputKind::RemoveIssue => (
+                vec![
+                    "milestone".into(),
+                    "remove".into(),
+                    input.repo_name.clone(),
+                    buf.clone(),
+                ],
+                format!("Remove #{} from {}", buf, input.milestone_title),
+            ),
+        };
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        use crate::commands::SpawnQueuedOutcome;
+        match self.command_runner.spawn_queued(&arg_refs) {
+            SpawnQueuedOutcome::Deduped => {}
+            SpawnQueuedOutcome::Queued => {
+                self.push_toast(
+                    &label,
+                    "queued — will run after current command.",
+                    ToastSeverity::Info,
+                );
+            }
+            SpawnQueuedOutcome::Started => {
+                self.push_toast(&label, "dispatching…", ToastSeverity::Info);
+            }
+        }
+    }
+
+    /// Open the "Close / archive plan" confirm (#1003) — mirrors
+    /// `pending_restart`'s y/any-other-key-cancels pattern.
+    pub(crate) fn open_close_plan_confirm(&mut self, target: &ContextMenuTarget) -> bool {
+        let (repo_name, tracking_issue, milestone_title) = match target {
+            ContextMenuTarget::MilestoneHeader {
+                repo_name,
+                tracking_issue,
+                milestone_title,
+                ..
+            } => (repo_name.clone(), *tracking_issue, milestone_title.clone()),
+            _ => return false,
+        };
+        self.pending_close_plan = Some(PendingClosePlan {
+            repo_name,
+            tracking_issue,
+            milestone_title,
+        });
+        true
+    }
+
+    /// Fire `coord issue close <repo> <tracking_issue>` for a confirmed
+    /// "Close / archive plan" (#1003).
+    pub(crate) fn confirm_close_plan(&mut self, plan: PendingClosePlan) {
+        let issue_str = plan.tracking_issue.to_string();
+        use crate::commands::SpawnQueuedOutcome;
+        match self
+            .command_runner
+            .spawn_queued(&["issue", "close", &plan.repo_name, &issue_str])
+        {
+            SpawnQueuedOutcome::Deduped => {}
+            SpawnQueuedOutcome::Queued => {
+                self.push_toast(
+                    "Close plan",
+                    &format!("#{}: queued — will close after current command.", plan.tracking_issue),
+                    ToastSeverity::Info,
+                );
+            }
+            SpawnQueuedOutcome::Started => {
+                self.push_toast(
+                    "Close plan",
+                    &format!("#{} ({}): closing…", plan.tracking_issue, plan.milestone_title),
+                    ToastSeverity::Info,
+                );
+            }
+        }
     }
 }
 

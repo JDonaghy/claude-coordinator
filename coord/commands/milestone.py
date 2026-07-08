@@ -241,6 +241,43 @@ def milestone_assign_cmd(
     click.echo(f"#{issue} ({repo_entry.github}) assigned to milestone {ms_label}")
 
 
+@milestone_group.command(
+    "remove",
+    help=(
+        "Unassign an issue from its milestone (#1003) — the counterpart to "
+        "`coord milestone assign`. REPO is the local repo name from "
+        "coordinator.yml; ISSUE is the GH issue number. Idempotent — "
+        "clearing an issue that has no milestone is a no-op. Routes through "
+        "the daemon seam (``POST /issue-milestone-remove``) so the local "
+        "issues cache ``milestone_number``/``milestone_title`` columns are "
+        "cleared immediately (no need to wait for ``coord sync``)."
+    ),
+)
+@click.argument("repo")
+@click.argument("issue", type=int)
+@_CONFIG_OPTION
+def milestone_remove_cmd(
+    repo: str,
+    issue: int,
+    config_path: Path,
+) -> None:
+    cfg = _load_config(config_path)
+    repo_entry = cfg.repo(repo)
+    if repo_entry is None:
+        click.echo(f"error: unknown repo {repo!r}", err=True)
+        sys.exit(2)
+
+    from coord.state import unassign_issue_milestone  # noqa: PLC0415
+
+    try:
+        unassign_issue_milestone(repo, issue, repo_github=repo_entry.github)
+    except Exception as e:  # noqa: BLE001
+        click.echo(f"error: milestone remove failed: {e}", err=True)
+        sys.exit(1)
+
+    click.echo(f"#{issue} ({repo_entry.github}) removed from its milestone")
+
+
 _DEFAULT_CAPTURE_BODY = (
     "Captured via coord-tui fast plan capture — no work order yet. "
     "Promote to a full epic with `coord milestone chat`."
@@ -438,10 +475,29 @@ def _echo_outcome(outcome: DispatchOutcome) -> None:
         "milestone — does not register for daemon auto-drain."
     ),
 )
+@click.option(
+    "--pick", "pick_issue", type=int, default=None,
+    help=(
+        "#1003: non-interactive companion to --next — dispatch this "
+        "specific ready-frontier issue number without the interactive "
+        "prompt (the coord-tui Plans-panel/MilestoneDag \"Dispatch next…\" "
+        "action's backend; a bare TTY-less `--next` would otherwise hang "
+        "on `click.prompt`). Errors if the issue isn't currently in the "
+        "ready-to-dispatch frontier."
+    ),
+)
 @_CONFIG_OPTION
 def milestone_dispatch_cmd(
-    repo: str, tracking_issue: int, dry_run: bool, next_: bool, config_path: Path
+    repo: str,
+    tracking_issue: int,
+    dry_run: bool,
+    next_: bool,
+    pick_issue: int | None,
+    config_path: Path,
 ) -> None:
+    if pick_issue is not None and not next_:
+        click.echo("error: --pick requires --next", err=True)
+        sys.exit(2)
     cfg = _load_config(config_path)
     repo_entry = cfg.repo(repo)
     if repo_entry is None:
@@ -487,6 +543,38 @@ def milestone_dispatch_cmd(
                 click.echo("Waiting:")
                 for b in plan.waiting:
                     click.echo(f"  #{b.issue_number}: {b.reason}")
+            return
+
+        # #1003: --pick short-circuits the interactive prompt entirely — the
+        # operator (or, via coord-tui, a client that already knows the
+        # issue number it wants) names the issue directly instead of
+        # picking an index off a numbered list. Search the FULL
+        # to-dispatch set, not just the top-3 `choices` shown to a human —
+        # a non-interactive caller has no reason to be limited to the
+        # truncated display.
+        if pick_issue is not None:
+            chosen = next(
+                (p for p in plan.to_dispatch if p.entry.issue_number == pick_issue),
+                None,
+            )
+            if chosen is None:
+                click.echo(
+                    f"error: #{pick_issue} is not in the ready-to-dispatch "
+                    "frontier right now",
+                    err=True,
+                )
+                sys.exit(1)
+            if dry_run:
+                click.echo(
+                    f"(dry run — would dispatch #{pick_issue} -> {chosen.machine.name})"
+                )
+                return
+            outcome = dispatch_entry(
+                chosen, repo_entry, cfg, board, tracking_issue=tracking_issue
+            )
+            _echo_outcome(outcome)
+            if not outcome.ok:
+                sys.exit(1)
             return
 
         choices = plan.to_dispatch[:3]

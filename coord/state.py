@@ -2497,6 +2497,118 @@ def _assign_issue_milestone_local(
     conn.commit()
 
 
+def unassign_issue_milestone(
+    repo_name: str,
+    issue_number: int,
+    *,
+    repo_github: str | None = None,
+) -> None:
+    """Clear *issue_number*'s milestone through the issue-tracker seam (#1003).
+
+    The counterpart to :func:`assign_issue_milestone` — routes to the daemon
+    (``POST /issue-milestone-remove``) when ``board_service`` is set, else
+    writes locally. Also clears the local ``issues`` cache
+    ``milestone_number``/``milestone_title`` columns so the TUI reflects the
+    change on its next refresh without waiting for ``coord sync``.
+    """
+    svc = _board_service()
+    resp = _route_write(
+        svc,
+        "/issue-milestone-remove",
+        {
+            "repo_name": repo_name,
+            "issue_number": issue_number,
+            "repo_github": repo_github,
+        },
+    )
+    if resp is not None:
+        return
+    _unassign_issue_milestone_local(repo_name, issue_number, repo_github=repo_github)
+
+
+def _unassign_issue_milestone_local(
+    repo_name: str,
+    issue_number: int,
+    *,
+    repo_github: str | None = None,
+) -> None:
+    """Backend adapter (GitHub today): clear the milestone via ``github_ops``,
+    then mirror the clear into the local ``issues`` cache, mirroring
+    ``_assign_issue_milestone_local``.
+
+    The daemon endpoint (``POST /issue-milestone-remove``) calls this function
+    directly — it never recurses back out over HTTP.
+    """
+    from coord import github_ops  # noqa: PLC0415
+
+    slug = repo_github or repo_name
+    github_ops.unassign_issue_milestone(slug, issue_number)
+
+    conn = get_connection()
+    conn.execute(
+        "UPDATE issues SET milestone_number = NULL, milestone_title = NULL"
+        " WHERE repo_name = ? AND number = ?",
+        (repo_name, issue_number),
+    )
+    conn.commit()
+
+
+def close_issue(
+    repo_name: str,
+    issue_number: int,
+    *,
+    comment: str | None = None,
+    repo_github: str | None = None,
+) -> None:
+    """Close an issue through the issue-tracker seam (#1003, mirrors
+    ``edit_issue_content``).
+
+    Routes to the daemon (``POST /issue-close``) when ``board_service`` is
+    set, else writes locally. The actual TRACKER write (GitHub via ``gh``
+    today) lives in the ``_local`` impl, so the backend stays behind one
+    seam — the "Close / archive plan" Plans-panel action never calls raw
+    ``gh``.
+    """
+    svc = _board_service()
+    resp = _route_write(
+        svc,
+        "/issue-close",
+        {
+            "repo_name": repo_name,
+            "issue_number": issue_number,
+            "comment": comment,
+            "repo_github": repo_github,
+        },
+    )
+    if resp is not None:
+        return
+    _close_issue_local(
+        repo_name, issue_number, comment=comment, repo_github=repo_github
+    )
+
+
+def _close_issue_local(
+    repo_name: str,
+    issue_number: int,
+    *,
+    comment: str | None = None,
+    repo_github: str | None = None,
+) -> None:
+    """Backend adapter (GitHub today): close the issue via ``github_ops``.
+
+    The daemon endpoint (``POST /issue-close``) calls this function directly
+    — it never recurses back out over HTTP. Best-effort cache mirror is
+    skipped here (unlike the milestone helpers): the local ``issues`` cache
+    only tracks *open* issues (see ``upsert_open_issues``), so a closed issue
+    is dropped from it on the next ``coord sync`` rather than updated in
+    place.
+    """
+    from coord import github_ops  # noqa: PLC0415
+
+    slug = repo_github or repo_name
+    github_ops.close_issue(slug, issue_number, comment=comment)
+
+
 def upsert_open_issues(repo_name: str, issues: list[dict]) -> None:
     """Persist open issues for a repo into the issues table — routes to the
     daemon when ``board_service`` is set (#601), else writes the local DB.

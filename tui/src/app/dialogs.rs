@@ -730,7 +730,27 @@ impl CoordApp {
                     repo_name: v.repo_name.clone(),
                     tracking_issue: v.tracking_issue,
                     milestone_title: v.milestone_title.clone(),
+                    milestone_number: v.milestone_number,
                 }
+            }),
+            // #1003: Plans-panel row — reuses `MilestoneHeader` rather than a
+            // new parallel target (the Plans panel's own doc comment says it
+            // "elevates and subsumes" the old MilestoneDag view). Only rows
+            // that already have a tracking epic (`tracking_issue: Some`) get
+            // a menu — a milestone surfaced purely because member issues
+            // reference it (no epic yet, `PlanRosterEntry::tracking_issue ==
+            // None`) has no issue for `coord milestone dispatch`/`chat`/
+            // `order`/"Close" to act on. Right-click on such a row is a
+            // silent no-op for now (matches pre-#1003 behaviour — not a
+            // regression); promoting a stub to a full epic is `coord
+            // milestone chat` today, same as before this issue.
+            SidebarView::Plans => self.plans_selected().and_then(|e| {
+                e.tracking_issue.map(|tracking_issue| ContextMenuTarget::MilestoneHeader {
+                    repo_name: e.repo.clone(),
+                    tracking_issue,
+                    milestone_title: e.title.clone(),
+                    milestone_number: e.milestone_number,
+                })
             }),
             _ => None,
         }
@@ -767,10 +787,12 @@ impl CoordApp {
                 repo_name,
                 tracking_issue,
                 milestone_title,
+                milestone_number,
             } => self.context_menu_items_for_milestone_header(
                 repo_name,
                 *tracking_issue,
                 milestone_title,
+                *milestone_number,
             ),
         };
         if items.is_empty() {
@@ -1338,6 +1360,98 @@ impl CoordApp {
                     placeholder: "plan title…".into(),
                     cursor: Some(buf.len()),
                 })),
+            });
+        }
+
+        // ── #1003 Plans-row single-field input (Edit milestone / Add issue /
+        // Remove issue) ─────────────────────────────────────────────────────
+        if let Some(ref input) = self.pending_milestone_row_input {
+            let (title, body, placeholder) = match input.kind {
+                MilestoneRowInputKind::EditTitle => (
+                    "Edit milestone",
+                    format!(
+                        "New title for milestone #{} ({}):",
+                        input.milestone_number, input.repo_name
+                    ),
+                    "milestone title…",
+                ),
+                MilestoneRowInputKind::AddIssue => (
+                    "Add issue to milestone",
+                    format!(
+                        "Issue number to add to \"{}\" ({}):",
+                        input.milestone_title, input.repo_name
+                    ),
+                    "issue number…",
+                ),
+                MilestoneRowInputKind::RemoveIssue => (
+                    "Remove issue from milestone",
+                    format!(
+                        "Issue number to remove from \"{}\" ({}):",
+                        input.milestone_title, input.repo_name
+                    ),
+                    "issue number…",
+                ),
+            };
+            return Some(Dialog {
+                table: None,
+                id: WidgetId::new("dialog:milestone-row-input"),
+                title: StyledText::plain(title),
+                body: vec![StyledText::plain(body)],
+                buttons: vec![
+                    DialogButton {
+                        id: WidgetId::new("submit"),
+                        label: "Submit".into(),
+                        is_default: true,
+                        is_cancel: false,
+                        tint: None,
+                    },
+                    DialogButton {
+                        id: WidgetId::new("cancel"),
+                        label: "Cancel".into(),
+                        is_default: false,
+                        is_cancel: true,
+                        tint: None,
+                    },
+                ],
+                severity: None,
+                vertical_buttons: false,
+                input: Some(DialogInput::TextInput(DialogTextInput {
+                    value: input.buf.clone(),
+                    placeholder: placeholder.into(),
+                    cursor: Some(input.buf.len()),
+                })),
+            });
+        }
+
+        // ── #1003 Close / archive plan confirm ──────────────────────────────
+        if let Some(ref plan) = self.pending_close_plan {
+            return Some(Dialog {
+                table: None,
+                id: WidgetId::new("dialog:close-plan"),
+                title: StyledText::plain("Close / archive plan"),
+                body: vec![StyledText::plain(format!(
+                    "Close #{} — \"{}\" ({})? This closes the tracking issue on GitHub.",
+                    plan.tracking_issue, plan.milestone_title, plan.repo_name
+                ))],
+                buttons: vec![
+                    DialogButton {
+                        id: WidgetId::new("yes"),
+                        label: "y  Confirm close".into(),
+                        is_default: true,
+                        is_cancel: false,
+                        tint: None,
+                    },
+                    DialogButton {
+                        id: WidgetId::new("cancel"),
+                        label: "Cancel".into(),
+                        is_default: false,
+                        is_cancel: true,
+                        tint: None,
+                    },
+                ],
+                severity: Some(DialogSeverity::Warning),
+                vertical_buttons: false,
+                input: None,
             });
         }
 
@@ -2543,6 +2657,38 @@ impl CoordApp {
                 }
                 _ => {
                     self.pending_plan_capture = None;
+                }
+            }
+            *self.dialog_layout.borrow_mut() = None;
+            return;
+        }
+
+        // ── #1003 Plans-row single-field input ─────────────────────────────
+        if self.pending_milestone_row_input.is_some() {
+            match id {
+                "submit" => {
+                    if let Some(input) = self.pending_milestone_row_input.take() {
+                        self.submit_milestone_row_input(input);
+                    }
+                }
+                _ => {
+                    self.pending_milestone_row_input = None;
+                }
+            }
+            *self.dialog_layout.borrow_mut() = None;
+            return;
+        }
+
+        // ── #1003 Close / archive plan confirm ──────────────────────────────
+        if self.pending_close_plan.is_some() {
+            match id {
+                "yes" => {
+                    if let Some(plan) = self.pending_close_plan.take() {
+                        self.confirm_close_plan(plan);
+                    }
+                }
+                _ => {
+                    self.pending_close_plan = None;
                 }
             }
             *self.dialog_layout.borrow_mut() = None;
@@ -5329,6 +5475,17 @@ impl CoordApp {
             // #771: promote a milestone's whole declared work order into the
             // pipeline — `coord milestone dispatch <repo> <tracking_issue>`.
             "dispatch-milestone" => self.dispatch_milestone_action(target),
+            // #1003: Plans-panel / MilestoneDag row CRUD — see
+            // milestone_dag.rs for each action's doc comment.
+            "open-milestone-chat" => self.open_milestone_chat_action(target),
+            "dispatch-milestone-next" => self.dispatch_milestone_next_action(target),
+            "view-milestone-order" => self.view_milestone_order_action(target),
+            "edit-milestone" => self.open_edit_milestone_input(target),
+            "add-issue-to-milestone" => self.open_add_issue_to_milestone_input(target),
+            "remove-issue-from-milestone" => {
+                self.open_remove_issue_from_milestone_input(target)
+            }
+            "close-plan" => self.open_close_plan_confirm(target),
             // #685: open the test-mode choice dialog (SetOnly — no dispatch).
             "set-test-mode" => {
                 let result = self.arm_set_test_mode_for_selected();

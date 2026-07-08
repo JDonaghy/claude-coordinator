@@ -573,7 +573,7 @@ where
 /// `repo_name` carries the **coord-local** name (matches `coordinator.yml`),
 /// which is what `coord refine` / `coord ready` / etc. take as their
 /// `<repo>` arg — the GH slug is looked up internally on the Python side.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ContextMenuTarget {
     /// Right-click on a Board sidebar row.
     BoardRow {
@@ -610,10 +610,17 @@ pub(crate) enum ContextMenuTarget {
     /// view's milestone header. Carries what `coord milestone dispatch`
     /// needs — the coord-local repo name and the tracking-issue number —
     /// so the menu's "Dispatch milestone" item can spawn it directly.
+    ///
+    /// #1003: also reused for a right-click on a **Plans-panel** row (the
+    /// Plans panel "elevates and subsumes" this view per its own doc
+    /// comment) — `milestone_number` was added so the CRUD items (Edit
+    /// milestone…, Add/Remove issue…) have what `coord milestone
+    /// edit`/`assign`/`remove` need without a second GH round trip.
     MilestoneHeader {
         repo_name: String,
         tracking_issue: u64,
         milestone_title: String,
+        milestone_number: i64,
     },
 }
 

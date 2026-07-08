@@ -275,6 +275,90 @@ class TestMilestoneDispatchNext:
         assert "#762" in result.output
         assert "#763" in result.output
 
+    def test_pick_dispatches_without_prompt(self, config_file: Path) -> None:
+        """#1003: --pick is the non-interactive companion to --next — the
+        coord-tui "Dispatch next…" action's backend, which has no TTY to
+        answer `click.prompt`."""
+        open_issues = [
+            {"number": 762, "milestone": {"number": 9}},
+            {"number": 763, "milestone": {"number": 9}},
+            {"number": 765, "milestone": {"number": 9}},
+        ]
+        with patch("coord.github_ops.get_issue", side_effect=_get_issue), \
+             patch("coord.github_ops.get_open_issues", return_value=open_issues), \
+             patch("coord.board_service.read_board", return_value=Board()), \
+             patch("coord.dispatch.dispatch", return_value={"id": "picked-1"}) as disp, \
+             patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.github_ops.check_branch_exists", return_value=False):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "milestone", "dispatch", "api", "100", "--config", str(config_file),
+                    "--next", "--pick", "763",
+                ],
+                # No stdin — a prompt here would hang/abort the test.
+                input="",
+            )
+        assert result.exit_code == 0, result.output
+        disp.assert_called_once()
+        assert "picked-1" in result.output
+        assert state_mod.list_milestone_drains() == []
+
+    def test_pick_dry_run_previews_without_dispatching(self, config_file: Path) -> None:
+        open_issues = [
+            {"number": 762, "milestone": {"number": 9}},
+            {"number": 763, "milestone": {"number": 9}},
+            {"number": 765, "milestone": {"number": 9}},
+        ]
+        with patch("coord.github_ops.get_issue", side_effect=_get_issue), \
+             patch("coord.github_ops.get_open_issues", return_value=open_issues), \
+             patch("coord.board_service.read_board", return_value=Board()), \
+             patch("coord.dispatch.dispatch") as disp:
+            result = CliRunner().invoke(
+                main,
+                [
+                    "milestone", "dispatch", "api", "100", "--config", str(config_file),
+                    "--next", "--pick", "762", "--dry-run",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        disp.assert_not_called()
+        assert "#762" in result.output
+        assert "dry run" in result.output.lower()
+
+    def test_pick_issue_not_in_ready_frontier_errors(self, config_file: Path) -> None:
+        open_issues = [
+            {"number": 762, "milestone": {"number": 9}},
+            {"number": 763, "milestone": {"number": 9}},
+            {"number": 765, "milestone": {"number": 9}},
+        ]
+        with patch("coord.github_ops.get_issue", side_effect=_get_issue), \
+             patch("coord.github_ops.get_open_issues", return_value=open_issues), \
+             patch("coord.board_service.read_board", return_value=Board()), \
+             patch("coord.dispatch.dispatch") as disp:
+            result = CliRunner().invoke(
+                main,
+                [
+                    "milestone", "dispatch", "api", "100", "--config", str(config_file),
+                    # #765 is gated on #762/#763 — not ready yet.
+                    "--next", "--pick", "765",
+                ],
+            )
+        assert result.exit_code == 1
+        assert "not in the ready-to-dispatch frontier" in result.output
+        disp.assert_not_called()
+
+    def test_pick_without_next_errors(self, config_file: Path) -> None:
+        result = CliRunner().invoke(
+            main,
+            [
+                "milestone", "dispatch", "api", "100", "--config", str(config_file),
+                "--pick", "762",
+            ],
+        )
+        assert result.exit_code == 2
+        assert "--pick requires --next" in result.output
+
 
 class TestMilestoneDispatchGateA:
     """#930 (docs/ORACLE_LOOP.md, Gate A) — the issue's specified black-box

@@ -109,6 +109,7 @@ use self::sessions::*;
 use self::events::*;
 #[allow(unused_imports)]
 use self::pipeline::*;
+use self::milestone_dag::*;
 
 // ─── Auto-refresh interval ────────────────────────────────────────────────────
 
@@ -1960,6 +1961,16 @@ pub struct CoordApp {
     /// are accumulating the plan title; Enter dispatches `coord milestone
     /// capture <repo> --title <buf>` via `capture_plan_stub`. Esc cancels.
     pending_plan_capture: Option<String>,
+    /// #1003: pending single-field text input for a Plans-panel /
+    /// MilestoneDag row action (Edit milestone title / Add issue to
+    /// milestone / Remove issue from milestone). Mirrors the #977
+    /// `pending_plan_capture` single-buffer pattern — Enter submits via
+    /// `submit_milestone_row_input`, Esc cancels.
+    pending_milestone_row_input: Option<PendingMilestoneRowInput>,
+    /// #1003: pending "Close / archive plan" confirmation (`coord issue
+    /// close`) — 'y' confirms, any other key cancels, mirroring
+    /// `pending_restart`.
+    pending_close_plan: Option<PendingClosePlan>,
     /// #264: refinement-chat dispatch is pending — we've shelled `coord
     /// refine-chat <repo> <issue>` and are polling the DB for the new
     /// `type="refinement"` assignment to appear so we can open the chat
@@ -2757,6 +2768,8 @@ impl CoordApp {
             pending_test_fail: None,
             pending_report_fix: None,
             pending_plan_capture: None,
+            pending_milestone_row_input: None,
+            pending_close_plan: None,
             pending_refinement: None,
             pending_test_chat: None,
             pending_chat_resume: None,

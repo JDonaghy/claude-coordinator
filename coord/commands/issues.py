@@ -102,6 +102,43 @@ def issue_edit_cmd(
 
 
 @issue_group.command(
+    "close",
+    help=(
+        "Close an issue, optionally posting --comment first (#1003). REPO "
+        "is the local repo name from coordinator.yml; ISSUE is the GH issue "
+        "number. The Plans-panel \"Close / archive plan\" action's backend "
+        "— thin wrapper around the already-existing "
+        "``github_ops.close_issue()`` (previously only called internally by "
+        "``coord merge``), now operator-exposed through the tracker seam. "
+        "Idempotent — closing an already-closed issue is a no-op."
+    ),
+)
+@click.argument("repo")
+@click.argument("issue", type=int)
+@click.option(
+    "--comment", default=None, help="Comment to post before closing (markdown)."
+)
+@_CONFIG_OPTION
+def issue_close_cmd(
+    repo: str,
+    issue: int,
+    comment: str | None,
+    config_path: Path,
+) -> None:
+    cfg = _load_config(config_path)
+    repo_entry = cfg.repo(repo)
+    slug = repo_entry.github if repo_entry else repo
+    from coord.state import close_issue  # noqa: PLC0415
+
+    try:
+        close_issue(repo, issue, comment=comment, repo_github=slug)
+    except Exception as e:  # noqa: BLE001
+        click.echo(f"error: issue close failed: {e}", err=True)
+        sys.exit(1)
+    click.echo(f"#{issue} ({slug}) closed")
+
+
+@issue_group.command(
     "create",
     help=(
         "Create a new GitHub issue through the backend-agnostic seam. REPO "

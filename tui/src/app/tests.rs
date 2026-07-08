@@ -307,6 +307,8 @@
             pending_test_fail: None,
             pending_report_fix: None,
             pending_plan_capture: None,
+            pending_milestone_row_input: None,
+            pending_close_plan: None,
             pending_refinement: None,
             pending_test_chat: None,
             pending_chat_resume: None,
@@ -24709,6 +24711,7 @@ Milestone tracking issue.
             repo_name: v.repo_name.clone(),
             tracking_issue: v.tracking_issue,
             milestone_title: v.milestone_title.clone(),
+            milestone_number: v.milestone_number,
         });
         let target = target.expect("#771: fixture must have a selectable milestone");
         assert!(app.dispatch_milestone_action(&target));
@@ -24722,6 +24725,353 @@ Milestone tracking issue.
                 "100".to_string(),
             ]],
             "#771: Dispatch milestone must spawn `coord milestone dispatch <repo> <tracking_issue>`",
+        );
+    }
+
+    // #1003 — Plans-panel / MilestoneDag row CRUD context menu ────────────────
+
+    /// #1003: a right-click (or Menu-key) on a Plans-panel row reuses
+    /// `ContextMenuTarget::MilestoneHeader` — the panel no longer opens an
+    /// empty menu, and the target carries the milestone_number the CRUD
+    /// items need.
+    #[test]
+    fn plans_panel_row_builds_milestone_header_target() {
+        let mut app = make_test_app(BoardData {
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            plan_roster: vec![PlanRosterEntry {
+                repo: "api".to_string(),
+                title: "Substrate".to_string(),
+                milestone_number: 5,
+                tracking_issue: Some(500),
+                has_work_order: true,
+                ready_frontier: 1,
+                blocked: 0,
+                in_flight: 0,
+                done: 0,
+                total: 1,
+                needs_you: vec![],
+            }],
+            ..Default::default()
+        });
+        app.active_view = SidebarView::Plans;
+        app.plans_sel = 0;
+
+        let target = app.context_menu_target_for_selection();
+        assert_eq!(
+            target,
+            Some(ContextMenuTarget::MilestoneHeader {
+                repo_name: "api".to_string(),
+                tracking_issue: 500,
+                milestone_title: "Substrate".to_string(),
+                milestone_number: 5,
+            }),
+            "#1003: Plans row right-click must resolve a MilestoneHeader target"
+        );
+    }
+
+    /// #1003: a Plans row with no tracking epic yet (`tracking_issue: None`
+    /// — a #977 fast-capture stub) has no issue for `coord milestone
+    /// dispatch`/`chat`/`order`/close to act on, so the menu stays absent —
+    /// matching pre-#1003 behaviour (not a regression), not a crash.
+    #[test]
+    fn plans_panel_row_without_tracking_issue_has_no_menu() {
+        let mut app = make_test_app(BoardData {
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            plan_roster: vec![PlanRosterEntry {
+                repo: "api".to_string(),
+                title: "Bare Milestone".to_string(),
+                milestone_number: 9,
+                tracking_issue: None,
+                has_work_order: false,
+                ready_frontier: 0,
+                blocked: 0,
+                in_flight: 0,
+                done: 0,
+                total: 0,
+                needs_you: vec!["no_work_order".to_string()],
+            }],
+            ..Default::default()
+        });
+        app.active_view = SidebarView::Plans;
+        app.plans_sel = 0;
+
+        assert_eq!(app.context_menu_target_for_selection(), None);
+    }
+
+    /// #1003: the milestone-header context menu now carries the full row +
+    /// panel CRUD set, not just Dispatch milestone + Refresh.
+    #[test]
+    fn milestone_header_context_menu_has_full_crud_item_set() {
+        let app = make_milestone_dag_app();
+        let items =
+            app.context_menu_items_for_milestone_header("coord-repo", 100, "v0.5", 5);
+        let ids: Vec<String> = items.iter().filter_map(|i| i.action_id.clone()).collect();
+        for expected in [
+            "open-milestone-chat",
+            "dispatch-milestone",
+            "dispatch-milestone-next",
+            "view-milestone-order",
+            "edit-milestone",
+            "add-issue-to-milestone",
+            "remove-issue-from-milestone",
+            "close-plan",
+            "refresh",
+        ] {
+            assert!(
+                ids.iter().any(|id| id == expected),
+                "expected `{expected}` in milestone-header menu ids {ids:?}"
+            );
+        }
+    }
+
+    /// #1003: "Open milestone chat" spawns `coord milestone chat <repo>
+    /// <tracking_issue>`.
+    #[test]
+    fn open_milestone_chat_action_spawns_milestone_chat_command() {
+        let mut app = make_milestone_dag_app();
+        app.command_runner = crate::commands::CommandRunner::new_for_test();
+        let target = ContextMenuTarget::MilestoneHeader {
+            repo_name: "coord-repo".to_string(),
+            tracking_issue: 100,
+            milestone_title: "v0.5".to_string(),
+            milestone_number: 5,
+        };
+        assert!(app.open_milestone_chat_action(&target));
+        assert_eq!(
+            app.command_runner.spawned_calls,
+            vec![vec![
+                "milestone".to_string(),
+                "chat".to_string(),
+                "coord-repo".to_string(),
+                "100".to_string(),
+            ]],
+        );
+    }
+
+    /// #1003: "Dispatch next…" computes the ready frontier client-side
+    /// (mirrors the MilestoneDag panel's own NodeState::Ready computation)
+    /// and dispatches the single ready item non-interactively via `--next
+    /// --pick <issue_number>` — `make_milestone_dag_app`'s fixture has
+    /// exactly one ready node (#766; #762 is done, #763 is in-flight, #765
+    /// is blocked on #763).
+    #[test]
+    fn dispatch_milestone_next_action_picks_the_ready_node() {
+        let mut app = make_milestone_dag_app();
+        app.command_runner = crate::commands::CommandRunner::new_for_test();
+        let target = ContextMenuTarget::MilestoneHeader {
+            repo_name: "coord-repo".to_string(),
+            tracking_issue: 100,
+            milestone_title: "v0.5".to_string(),
+            milestone_number: 5,
+        };
+        assert!(app.dispatch_milestone_next_action(&target));
+        assert_eq!(
+            app.command_runner.spawned_calls,
+            vec![vec![
+                "milestone".to_string(),
+                "dispatch".to_string(),
+                "coord-repo".to_string(),
+                "100".to_string(),
+                "--next".to_string(),
+                "--pick".to_string(),
+                "766".to_string(),
+            ]],
+        );
+    }
+
+    /// #1003: with no ready-frontier item (everything done/in-flight/
+    /// blocked), "Dispatch next…" toasts instead of spawning anything.
+    #[test]
+    fn dispatch_milestone_next_action_toasts_when_nothing_ready() {
+        let tracking_body = "\
+Milestone tracking issue.
+
+## Work order
+- [ ] #762
+";
+        let open_issues = vec![
+            make_open_issue(
+                "coord-repo", 100, "Epic", tracking_body, &["epic", "coord"],
+                "open", Some(5), Some("v0.5"),
+            ),
+            make_open_issue(
+                "coord-repo", 762, "Done already", "", &[], "closed", Some(5), Some("v0.5"),
+            ),
+        ];
+        let mut app = make_test_app(BoardData {
+            open_issues,
+            ..Default::default()
+        });
+        app.command_runner = crate::commands::CommandRunner::new_for_test();
+        let target = ContextMenuTarget::MilestoneHeader {
+            repo_name: "coord-repo".to_string(),
+            tracking_issue: 100,
+            milestone_title: "v0.5".to_string(),
+            milestone_number: 5,
+        };
+        assert!(!app.dispatch_milestone_next_action(&target));
+        assert!(app.command_runner.spawned_calls.is_empty());
+    }
+
+    /// #1003: "View order / DAG" switches to the MilestoneDag view and
+    /// selects the matching milestone — client-side, no subprocess.
+    #[test]
+    fn view_milestone_order_action_switches_view_and_selects_milestone() {
+        let mut app = make_milestone_dag_app();
+        app.active_view = SidebarView::Plans;
+        let target = ContextMenuTarget::MilestoneHeader {
+            repo_name: "coord-repo".to_string(),
+            tracking_issue: 100,
+            milestone_title: "v0.5".to_string(),
+            milestone_number: 5,
+        };
+        assert!(app.view_milestone_order_action(&target));
+        assert_eq!(app.active_view, SidebarView::MilestoneDag);
+        assert_eq!(
+            app.milestone_dag_selected().map(|v| v.tracking_issue),
+            Some(100)
+        );
+    }
+
+    /// #1003: "Edit milestone…" opens the row-input dialog pre-filled with
+    /// the current title; submitting spawns `coord milestone edit <repo>
+    /// <number> --title <buf>`.
+    #[test]
+    fn edit_milestone_flow_prefills_and_spawns_edit_command() {
+        let mut app = make_milestone_dag_app();
+        app.command_runner = crate::commands::CommandRunner::new_for_test();
+        let target = ContextMenuTarget::MilestoneHeader {
+            repo_name: "coord-repo".to_string(),
+            tracking_issue: 100,
+            milestone_title: "v0.5".to_string(),
+            milestone_number: 5,
+        };
+        assert!(app.open_edit_milestone_input(&target));
+        let input = app
+            .pending_milestone_row_input
+            .clone()
+            .expect("dialog must be pending");
+        assert_eq!(input.kind, MilestoneRowInputKind::EditTitle);
+        assert_eq!(input.buf, "v0.5");
+
+        let mut edited = input;
+        edited.buf = "v0.6".to_string();
+        app.submit_milestone_row_input(edited);
+
+        assert_eq!(
+            app.command_runner.spawned_calls,
+            vec![vec![
+                "milestone".to_string(),
+                "edit".to_string(),
+                "coord-repo".to_string(),
+                "5".to_string(),
+                "--title".to_string(),
+                "v0.6".to_string(),
+            ]],
+        );
+    }
+
+    /// #1003: "Add issue to milestone…" spawns `coord milestone assign
+    /// <repo> <issue> <milestone_number>`.
+    #[test]
+    fn add_issue_to_milestone_flow_spawns_assign_command() {
+        let mut app = make_milestone_dag_app();
+        app.command_runner = crate::commands::CommandRunner::new_for_test();
+        let target = ContextMenuTarget::MilestoneHeader {
+            repo_name: "coord-repo".to_string(),
+            tracking_issue: 100,
+            milestone_title: "v0.5".to_string(),
+            milestone_number: 5,
+        };
+        assert!(app.open_add_issue_to_milestone_input(&target));
+        let mut input = app.pending_milestone_row_input.take().expect("pending");
+        assert_eq!(input.kind, MilestoneRowInputKind::AddIssue);
+        input.buf = "884".to_string();
+        app.submit_milestone_row_input(input);
+
+        assert_eq!(
+            app.command_runner.spawned_calls,
+            vec![vec![
+                "milestone".to_string(),
+                "assign".to_string(),
+                "coord-repo".to_string(),
+                "884".to_string(),
+                "5".to_string(),
+            ]],
+        );
+    }
+
+    /// #1003: "Remove issue from milestone…" spawns `coord milestone
+    /// remove <repo> <issue>`.
+    #[test]
+    fn remove_issue_from_milestone_flow_spawns_remove_command() {
+        let mut app = make_milestone_dag_app();
+        app.command_runner = crate::commands::CommandRunner::new_for_test();
+        let target = ContextMenuTarget::MilestoneHeader {
+            repo_name: "coord-repo".to_string(),
+            tracking_issue: 100,
+            milestone_title: "v0.5".to_string(),
+            milestone_number: 5,
+        };
+        assert!(app.open_remove_issue_from_milestone_input(&target));
+        let mut input = app.pending_milestone_row_input.take().expect("pending");
+        assert_eq!(input.kind, MilestoneRowInputKind::RemoveIssue);
+        input.buf = "884".to_string();
+        app.submit_milestone_row_input(input);
+
+        assert_eq!(
+            app.command_runner.spawned_calls,
+            vec![vec![
+                "milestone".to_string(),
+                "remove".to_string(),
+                "coord-repo".to_string(),
+                "884".to_string(),
+            ]],
+        );
+    }
+
+    /// #1003: a non-numeric issue number is rejected before spawning
+    /// anything.
+    #[test]
+    fn add_issue_to_milestone_rejects_non_numeric_input() {
+        let mut app = make_milestone_dag_app();
+        app.command_runner = crate::commands::CommandRunner::new_for_test();
+        let input = PendingMilestoneRowInput {
+            kind: MilestoneRowInputKind::AddIssue,
+            repo_name: "coord-repo".to_string(),
+            tracking_issue: 100,
+            milestone_number: 5,
+            milestone_title: "v0.5".to_string(),
+            buf: "not-a-number".to_string(),
+        };
+        app.submit_milestone_row_input(input);
+        assert!(app.command_runner.spawned_calls.is_empty());
+    }
+
+    /// #1003: "Close / archive plan" opens a confirm; confirming spawns
+    /// `coord issue close <repo> <tracking_issue>`.
+    #[test]
+    fn close_plan_flow_spawns_issue_close_command() {
+        let mut app = make_milestone_dag_app();
+        app.command_runner = crate::commands::CommandRunner::new_for_test();
+        let target = ContextMenuTarget::MilestoneHeader {
+            repo_name: "coord-repo".to_string(),
+            tracking_issue: 100,
+            milestone_title: "v0.5".to_string(),
+            milestone_number: 5,
+        };
+        assert!(app.open_close_plan_confirm(&target));
+        let plan = app.pending_close_plan.take().expect("pending");
+        app.confirm_close_plan(plan);
+
+        assert_eq!(
+            app.command_runner.spawned_calls,
+            vec![vec![
+                "issue".to_string(),
+                "close".to_string(),
+                "coord-repo".to_string(),
+                "100".to_string(),
+            ]],
         );
     }
 
