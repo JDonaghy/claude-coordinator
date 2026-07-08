@@ -153,6 +153,28 @@ impl CoordApp {
         }
     }
 
+    /// #955: `(machine, name)` identity of the fleet terminal selected in
+    /// the Terminal-view tree, or `None` when nothing is selected, the
+    /// selection is a machine row rather than a terminal leaf, or the
+    /// selected leaf no longer resolves (e.g. after a discovery refresh
+    /// reshuffled the sorted per-machine terminal list). Drives which PTY
+    /// (`fleet_terminal_sessions[key]` vs. the bare `terminal_session`
+    /// fallback) the standalone Terminal view's main pane shows —
+    /// `render.rs` and `terminal.rs`'s `drive_terminal_pane` both call this
+    /// rather than re-deriving the tree lookup.
+    pub(crate) fn selected_fleet_terminal_key(&self) -> Option<(String, String)> {
+        let path = self.terminal_tree_selected.as_ref()?;
+        let [mi, ti] = path.as_slice() else {
+            return None;
+        };
+        let m = self.data.machines.get(*mi as usize)?;
+        let t = self
+            .fleet_terminals_for_machine(&m.name)
+            .get(*ti as usize)
+            .copied()?;
+        Some((t.machine.clone(), t.name.clone()))
+    }
+
     /// Flattened index of `terminal_tree_selected` within `index`, if any
     /// (and if it still resolves — e.g. after a collapse changed the row
     /// count).

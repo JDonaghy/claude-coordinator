@@ -408,6 +408,9 @@
             terminal_tree_expanded: std::collections::HashMap::new(),
             terminal_tree_selected: None,
             terminal_tree_scroll: 0,
+            // #955
+            fleet_terminal_sessions: std::collections::HashMap::new(),
+            fleet_terminal_spawn_errors: std::collections::HashMap::new(),
             fix_briefing_preview: None,
             fix_briefing_rx: None,
             // Leg 2 (#517)
@@ -27468,5 +27471,205 @@ Milestone tracking issue.
                 .iter()
                 .any(|l| l.contains("scratch") || l.contains("build")),
             "'dellserver' has no terminals and must render with no nested children:\n{screen}",
+        );
+    }
+
+    // ── #955: attach & switch the selected terminal in the main pane ────────
+
+    /// #955 TuiDriver black-box: with 2 fleet terminals discovered, clicking
+    /// each tree leaf in turn must switch the standalone Terminal view's
+    /// main pane to THAT leaf's attach target.
+    ///
+    /// The actual `coord terminal attach <machine:name>` PTY is spawned
+    /// lazily by `tick()` (`drive_terminal_pane`) — but only the live
+    /// runner's loop calls `AppLogic::tick` (`quadraui::tui::run::run_inner`);
+    /// `TuiDriver::dispatch` (which every click/key goes through) does not.
+    /// So this test asserts on the pre-attach placeholder
+    /// (`"Attaching to <machine:name>…"`, `render.rs`'s `SidebarView::Terminal`
+    /// branch), which already reflects the selected leaf's target — proving
+    /// the click→selection→main-pane wiring without needing a live PTY. The
+    /// PTY itself (real attach command reaching a real shell) is covered by
+    /// `selecting_fleet_terminal_attaches_and_keeps_prior_session_warm`
+    /// below, which drives `drive_terminal_pane` directly. Raw
+    /// terminal-protocol fidelity is out of `TestBackend`'s reach per this
+    /// repo's CLAUDE.md — a live smoke covers that.
+    #[test]
+    fn selecting_tree_leaf_switches_main_pane_attach_target() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(BoardData {
+            machines: vec![mk_machine("precision", "precision.tail", true, &[])],
+            ..BoardData::default()
+        });
+        app.fleet_terminals = vec![
+            FleetTerminal {
+                name: "scratch".to_string(),
+                machine: "precision".to_string(),
+                attached: false,
+            },
+            FleetTerminal {
+                name: "build".to_string(),
+                machine: "precision".to_string(),
+                attached: false,
+            },
+        ];
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        // The activity bar column truncates the ">_" Terminal icon down to
+        // just ">" at this width (mirrors the #953 tree test's icon lookup).
+        click_activity_icon(&mut driver, ">");
+
+        // Select "scratch".
+        let (x, y) = driver.find("scratch").unwrap_or_else(|| {
+            panic!("'scratch' row not found:\n{}", driver.screen())
+        });
+        driver.click(x, y);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Attaching to precision:scratch"),
+            "selecting 'scratch' should target precision:scratch in the main pane:\n{screen}",
+        );
+        assert!(
+            !screen.contains("Attaching to precision:build"),
+            "the 'build' leaf must not be the active attach target yet:\n{screen}",
+        );
+
+        // Select "build" — the main pane must switch to it. The two rows
+        // sit one cell apart, so back-to-back clicks land inside
+        // quadraui's double-click detector's radius/time window (400ms /
+        // 1.5 cells — `tui/events.rs::DoubleClickDetector`) and would
+        // otherwise fold into a `DoubleClick` event the tree doesn't
+        // handle, silently dropping the second click. Sleeping past the
+        // window keeps this a plain two-click sequence.
+        std::thread::sleep(std::time::Duration::from_millis(450));
+        let (x, y) = driver.find("build").unwrap_or_else(|| {
+            panic!("'build' row not found:\n{}", driver.screen())
+        });
+        driver.click(x, y);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Attaching to precision:build"),
+            "selecting 'build' should switch the main pane to precision:build:\n{screen}",
+        );
+        assert!(
+            !screen.contains("Attaching to precision:scratch"),
+            "the previously-selected 'scratch' target must no longer be shown:\n{screen}",
+        );
+    }
+
+    /// #955: selecting a fleet-terminal leaf attaches it — a local PTY
+    /// running `coord terminal attach <machine:name>` — into
+    /// `fleet_terminal_sessions`, and switching to a DIFFERENT leaf keeps
+    /// the first session warm (cached, not evicted) while attaching the
+    /// second; `standalone_pty_session()` always resolves to whichever leaf
+    /// is currently selected. Drives a real spawned shell directly (mirrors
+    /// the #464 host-selection tests' pattern) since `TuiDriver` cannot
+    /// exercise `tick()` — see the black-box test above for the
+    /// selection-only, no-tick surface.
+    #[test]
+    #[cfg(unix)]
+    fn selecting_fleet_terminal_attaches_and_keeps_prior_session_warm() {
+        use std::time::{Duration, Instant};
+
+        fn poll_until(
+            app: &mut CoordApp,
+            key: &(String, String),
+            max_ms: u64,
+            predicate: impl Fn(&quadraui::terminal_engine::TerminalSession) -> bool,
+        ) -> bool {
+            let start = Instant::now();
+            let limit = Duration::from_millis(max_ms);
+            loop {
+                app.drive_terminal_pane();
+                if let Some(sess) = app.fleet_terminal_sessions.get(key) {
+                    if predicate(sess) {
+                        return true;
+                    }
+                }
+                if start.elapsed() >= limit {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        let mut app = make_test_app(BoardData {
+            machines: vec![mk_machine("precision", "precision.tail", true, &[])],
+            ..BoardData::default()
+        });
+        app.active_view = SidebarView::Terminal;
+        app.fleet_terminals = vec![
+            FleetTerminal {
+                name: "scratch".to_string(),
+                machine: "precision".to_string(),
+                attached: false,
+            },
+            FleetTerminal {
+                name: "build".to_string(),
+                machine: "precision".to_string(),
+                attached: false,
+            },
+        ];
+        // `render_content` normally stashes this on the first paint;
+        // simulate that a frame already happened so `drive_terminal_pane`
+        // doesn't stall waiting for dims.
+        app.terminal_pending_dims.set(Some((80, 24)));
+
+        // Sorted-by-name per-machine list is ["build", "scratch"], so
+        // "scratch" is tree index 1.
+        app.terminal_tree_selected = Some(vec![0, 1]);
+        let scratch_key = ("precision".to_string(), "scratch".to_string());
+        assert!(
+            poll_until(&mut app, &scratch_key, 5_000, |s| s
+                .full_text()
+                .contains("coord terminal attach")),
+            "expected the attach command to appear in the 'scratch' PTY's output"
+        );
+        let scratch_text = app
+            .fleet_terminal_sessions
+            .get(&scratch_key)
+            .unwrap()
+            .full_text();
+        assert!(
+            scratch_text.contains("coord terminal attach 'precision:scratch'"),
+            "attach command should target precision:scratch:\n{scratch_text}"
+        );
+        assert!(
+            app.standalone_pty_session()
+                .map(|s| s.full_text().contains("coord terminal attach"))
+                .unwrap_or(false),
+            "standalone_pty_session should resolve to the attached 'scratch' PTY"
+        );
+
+        // Switch selection to "build" (tree index 0).
+        app.terminal_tree_selected = Some(vec![0, 0]);
+        let build_key = ("precision".to_string(), "build".to_string());
+        assert!(
+            poll_until(&mut app, &build_key, 5_000, |s| s
+                .full_text()
+                .contains("coord terminal attach")),
+            "expected the attach command to appear in the 'build' PTY's output"
+        );
+        let build_text = app
+            .fleet_terminal_sessions
+            .get(&build_key)
+            .unwrap()
+            .full_text();
+        assert!(
+            build_text.contains("coord terminal attach 'precision:build'"),
+            "attach command should target precision:build:\n{build_text}"
+        );
+
+        // 'scratch' must still be cached (kept warm), not evicted by the switch.
+        assert!(
+            app.fleet_terminal_sessions.contains_key(&scratch_key),
+            "switching away from 'scratch' must not evict its cached session"
+        );
+
+        // `standalone_pty_session` must now resolve to 'build'.
+        let now_visible = app.standalone_pty_session().unwrap().full_text();
+        assert!(
+            now_visible.contains("coord terminal attach 'precision:build'"),
+            "standalone_pty_session should switch to 'build' after re-selection:\n{now_visible}"
         );
     }

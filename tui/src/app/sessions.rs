@@ -1618,6 +1618,14 @@ impl CoordApp {
             .unwrap_or_default();
         let cmd = format!("coord reattach {}{}\r", cfg, shell_quote_arg(aid));
 
+        // #955: a selected Terminal-tree leaf takes over the main pane
+        // (routes to `fleet_terminal_sessions` instead of `terminal_session`
+        // — see `standalone_pty_session_mut`), which would hide the claude
+        // session this call is about to attach. Clear the tree selection so
+        // the bare-shell pane (the one this function writes into) is what
+        // the operator actually sees.
+        self.terminal_tree_selected = None;
+
         // Switch to the standalone Terminal panel and send the command.
         self.active_view = SidebarView::Terminal;
         // Lazily spawn the standalone terminal if not already alive.
@@ -1642,6 +1650,62 @@ impl CoordApp {
                 self.terminal_spawn_error = None;
             }
             // If spawn fails the operator sees an error banner on the Terminal tab.
+        }
+    }
+
+    /// #955: attach (or reuse a warm) local PTY running `coord terminal
+    /// attach <machine:name>` for the fleet terminal identified by `key =
+    /// (machine, name)`.  Mirrors `reattach_session_by_aid`'s pattern for
+    /// claude sessions: spawn a bare local shell, then feed it the attach
+    /// command as literal keystrokes — `tmux attach`/`ssh -t … tmux attach`
+    /// (#952) then takes over the PTY exactly as if the operator had typed
+    /// the command themselves.
+    ///
+    /// No-op when a session (or a recorded spawn error) already exists for
+    /// `key` — `drive_terminal_pane` calls this every tick while the leaf
+    /// is selected, and re-attaching on every tick would both be wasteful
+    /// and would spam the shell with duplicate `coord terminal attach`
+    /// invocations.  Also a no-op until `terminal_pending_dims` has been
+    /// populated by a render pass (mirrors the standalone terminal's lazy
+    /// spawn) — retried on the next tick once dims are known.
+    pub(crate) fn ensure_fleet_terminal_attached(&mut self, key: &(String, String)) {
+        if self.fleet_terminal_sessions.contains_key(key)
+            || self.fleet_terminal_spawn_errors.contains_key(key)
+        {
+            return;
+        }
+        let Some((cols, rows)) = self.terminal_pending_dims.get() else {
+            return;
+        };
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+        let shell = quadraui::terminal_engine::default_shell();
+        match quadraui::terminal_engine::TerminalSession::spawn(
+            cols.max(20),
+            rows.max(5),
+            &shell,
+            &cwd,
+            10_000, // 10 000-line scrollback
+        ) {
+            Ok(mut sess) => {
+                let cfg = self
+                    .command_runner
+                    .config_path
+                    .as_ref()
+                    .map(|p| format!("--config {} ", shell_quote_arg(&p.to_string_lossy())))
+                    .unwrap_or_default();
+                let target = format!("{}:{}", key.0, key.1);
+                let cmd = format!(
+                    "coord terminal attach {}{}\r",
+                    cfg,
+                    shell_quote_arg(&target)
+                );
+                sess.send_str(&cmd);
+                self.fleet_terminal_sessions.insert(key.clone(), sess);
+            }
+            Err(e) => {
+                self.fleet_terminal_spawn_errors
+                    .insert(key.clone(), e.to_string());
+            }
         }
     }
 

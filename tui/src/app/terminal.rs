@@ -226,9 +226,72 @@ impl CoordApp {
     pub(crate) fn drive_terminal_pane(&mut self) -> bool {
         let mut changed = false;
 
+        // ── #955: fleet-terminal attach/poll ──────────────────────────
+        //
+        // Runs BEFORE the bare-shell fallback below: when the Terminal
+        // tree has a leaf selected, that leaf's attached PTY is what the
+        // main pane shows (see `standalone_pty_session[_mut]` /
+        // `render.rs`), so only the bare-shell branch needs the
+        // `is_none()` spawn guard to stay silent — spawning a $SHELL
+        // nobody will see would waste a process for every operator who
+        // never leaves fleet terminals.
+        let selected_fleet_key = self.selected_fleet_terminal_key();
+        if let Some(ref key) = selected_fleet_key {
+            self.ensure_fleet_terminal_attached(key);
+        }
+        // Resize + poll EVERY cached fleet session (not just the selected
+        // one) so background output keeps accumulating while the operator
+        // is looking at a different leaf — mirrors `drive_detail_terminals`.
+        if let Some((cols, rows)) = self.terminal_pending_dims.get() {
+            for sess in self.fleet_terminal_sessions.values_mut() {
+                if cols != sess.cols() || rows != sess.rows() {
+                    sess.resize(cols, rows);
+                }
+            }
+        }
+        let mut fleet_keys_changed: Vec<(String, String)> = Vec::new();
+        let mut fleet_panicked: Vec<((String, String), String)> = Vec::new();
+        for (key, sess) in self.fleet_terminal_sessions.iter_mut() {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sess.poll())) {
+                Ok(c) => {
+                    if c {
+                        fleet_keys_changed.push(key.clone());
+                    }
+                }
+                Err(e) => {
+                    fleet_panicked.push((key.clone(), vt100_panic_to_string(&e)));
+                    fleet_keys_changed.push(key.clone());
+                }
+            }
+        }
+        // #597: evict panicked sessions outside the borrow, same treatment
+        // as the bare pane and the per-issue detail terminals.
+        for (key, msg) in fleet_panicked {
+            self.fleet_terminal_sessions.remove(&key);
+            self.fleet_terminal_spawn_errors
+                .insert(key, format!("Session ended (renderer fault: {})", msg));
+            self.report_terminal_panic(msg);
+        }
+        // Only the currently-visible fleet session's output should trigger
+        // a repaint here — background leaves have already drained into
+        // their own scrollback (#789-style suppression, mirrors
+        // `drive_detail_terminals`'s `visible_key_changed`).
+        let visible_fleet_changed = selected_fleet_key
+            .as_ref()
+            .map_or(false, |k| fleet_keys_changed.contains(k));
+        changed |= visible_fleet_changed;
+
+        // ── Bare-shell fallback ────────────────────────────────────────
+        // Only spawned/driven while NO fleet-terminal leaf is selected
+        // (empty tree, or a machine row selected) — this is the pre-#955
+        // scratch shell behaviour, preserved as-is for that case.
+        //
         // 1. Lazy spawn — only triggered the first time the user opens
         //    the Terminal view (so the renderer has stashed real dims).
-        if self.terminal_session.is_none() && self.terminal_spawn_error.is_none() {
+        if selected_fleet_key.is_none()
+            && self.terminal_session.is_none()
+            && self.terminal_spawn_error.is_none()
+        {
             if let Some((cols, rows)) = self.terminal_pending_dims.get() {
                 let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
                 let shell = quadraui::terminal_engine::default_shell();
@@ -251,12 +314,19 @@ impl CoordApp {
             }
         }
 
+        // #955: whether the bare-shell pane is the one actually shown in
+        // the main pane right now — gates the `changed` contributions
+        // below so a background bare-shell update doesn't force a redraw
+        // while a fleet-terminal leaf is what's visible (kept warm, but
+        // silently, exactly like a background fleet session would be).
+        let bare_visible = selected_fleet_key.is_none();
+
         // 2. Resize on dimension change.
         if let Some(ref mut sess) = self.terminal_session {
             if let Some((cols, rows)) = self.terminal_pending_dims.get() {
                 if cols != sess.cols() || rows != sess.rows() {
                     sess.resize(cols, rows);
-                    changed = true;
+                    changed |= bare_visible;
                 }
             }
         }
@@ -276,7 +346,7 @@ impl CoordApp {
             .as_mut()
             .map(|sess| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sess.poll())));
         match terminal_poll {
-            Some(Ok(c)) => changed |= c,
+            Some(Ok(c)) => changed |= c && bare_visible,
             Some(Err(e)) => {
                 // #672: renderer-only fault — the session is treated as
                 // terminated so the pane shows a clean "session ended"
@@ -295,7 +365,7 @@ impl CoordApp {
                 // #816: surface a dismissible modal so the operator sees an
                 // explicit notification rather than silently losing the pane.
                 self.report_terminal_panic(panic_msg);
-                changed = true;
+                changed |= bare_visible;
             }
             None => {}
         }
@@ -533,8 +603,33 @@ impl CoordApp {
         }
     }
 
+    /// #955: whichever PTY currently backs the standalone Terminal view's
+    /// main pane — the attached fleet-terminal session for the selected
+    /// tree leaf (`fleet_terminal_sessions`), or the bare local-shell
+    /// fallback (`terminal_session`) when nothing/only a machine row is
+    /// selected. Centralizes the fleet-vs-bare routing so mouse/keyboard/
+    /// selection code doesn't have to re-derive it at every call site.
+    pub(crate) fn standalone_pty_session(
+        &self,
+    ) -> Option<&quadraui::terminal_engine::TerminalSession> {
+        if let Some(key) = self.selected_fleet_terminal_key() {
+            return self.fleet_terminal_sessions.get(&key);
+        }
+        self.terminal_session.as_ref()
+    }
+
+    /// Mutable counterpart of [`Self::standalone_pty_session`].
+    pub(crate) fn standalone_pty_session_mut(
+        &mut self,
+    ) -> Option<&mut quadraui::terminal_engine::TerminalSession> {
+        if let Some(key) = self.selected_fleet_terminal_key() {
+            return self.fleet_terminal_sessions.get_mut(&key);
+        }
+        self.terminal_session.as_mut()
+    }
+
     pub(crate) fn forward_key_to_pty(&mut self, key: &Key, mods: &quadraui::Modifiers) -> bool {
-        let Some(sess) = self.terminal_session.as_mut() else {
+        let Some(sess) = self.standalone_pty_session_mut() else {
             return false;
         };
         if sess.is_exited() {
@@ -565,7 +660,7 @@ impl CoordApp {
     /// Returns `true` when the paste was consumed (session exists);
     /// `false` when no live session is available.
     pub(crate) fn forward_paste_to_pty(&mut self, text: &str) -> bool {
-        let Some(sess) = self.terminal_session.as_mut() else {
+        let Some(sess) = self.standalone_pty_session_mut() else {
             return false;
         };
         if sess.is_exited() {
