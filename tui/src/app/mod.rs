@@ -68,6 +68,9 @@ use quadraui::{
     ToolbarButton, ToolbarHoverTracker, ToolbarItemMeasure, TreeRow, UiEvent, WidgetId,
     BadgeStatus, BoardCard, BoardColumn, BoardHit, BoardLayout, BoardModel, MoveDir,
     Stage,
+    // #953: Terminal-view left-pane machine tree — the app's first direct
+    // `backend.draw_tree` sidebar (bypassing `SidebarSystem`).
+    SelectionMode, TreePath, TreeStyle, TreeView,
 };
 use quadraui::terminal_engine::TerminalMouseKind;
 
@@ -85,6 +88,7 @@ pub(crate) mod events;
 pub(crate) mod pipeline;
 pub(crate) mod milestone_dag;
 pub(crate) mod plans;
+pub(crate) mod fleet_terminals;
 #[allow(unused_imports)]
 use self::types::*;
 #[allow(unused_imports)]
@@ -110,6 +114,8 @@ use self::events::*;
 #[allow(unused_imports)]
 use self::pipeline::*;
 use self::milestone_dag::*;
+#[allow(unused_imports)]
+use self::fleet_terminals::*;
 
 // ─── Auto-refresh interval ────────────────────────────────────────────────────
 
@@ -2421,6 +2427,27 @@ pub struct CoordApp {
     pending_remote_sessions:
         Option<std::sync::mpsc::Receiver<Vec<LiveTmuxSession>>>,
 
+    // ── #953: fleet terminal discovery (Terminal-view left-pane tree) ───────
+    /// Persistent `coord-term-*` terminals discovered via `coord terminal
+    /// list --json[--remote]`, grouped by machine in the Terminal view's
+    /// left-pane tree (`fleet_terminals` module). Separate from
+    /// `live_tmux_sessions` (assignment-scoped `coord-<aid>` sessions) —
+    /// different prefix, different data model, no board/pipeline involvement.
+    fleet_terminals: Vec<FleetTerminal>,
+    /// In-flight background sweep of `coord terminal list --json --remote`,
+    /// armed at startup and re-armed by `refresh()`. Mirrors
+    /// `pending_remote_sessions`; when it lands it REPLACES `fleet_terminals`.
+    pending_remote_terminals: Option<std::sync::mpsc::Receiver<Vec<FleetTerminal>>>,
+    /// Per-machine expand state for the Terminal-view tree, keyed by machine
+    /// name. Absent entries default to expanded when the machine hosts ≥1
+    /// terminal, collapsed (no chevron) otherwise.
+    terminal_tree_expanded: std::collections::HashMap<String, bool>,
+    /// Selected-node cursor for the Terminal-view tree: `[machine_idx]` for
+    /// a machine row, `[machine_idx, terminal_idx]` for a terminal row.
+    terminal_tree_selected: Option<TreePath>,
+    /// Scroll offset (in flattened tree rows) for the Terminal-view tree.
+    terminal_tree_scroll: usize,
+
     // ── #603: exact fix-briefing preview for the fail→fix / rework dialog ───
     /// The resolved fix briefing text (context block + findings/test story),
     /// shown in the confirm dialog so the operator sees what the fix worker
@@ -2867,6 +2894,15 @@ impl CoordApp {
             pending_remote_sessions: Some(spawn_remote_tmux_sessions_fetch(
                 crate::commands::find_config(),
             )),
+            // #953: fleet terminal discovery — local snapshot now, remote
+            // sweep in the background (mirrors #487's session discovery).
+            fleet_terminals: fetch_fleet_terminals(),
+            pending_remote_terminals: Some(spawn_remote_fleet_terminals_fetch(
+                crate::commands::find_config(),
+            )),
+            terminal_tree_expanded: std::collections::HashMap::new(),
+            terminal_tree_selected: None,
+            terminal_tree_scroll: 0,
             // #603: fix-briefing preview (lazily populated when a dialog raises).
             fix_briefing_preview: None,
             fix_briefing_rx: None,
@@ -3061,6 +3097,12 @@ impl CoordApp {
         // stays in Idle forever until the TUI is restarted.
         if self.pending_remote_sessions.is_none() {
             self.pending_remote_sessions = Some(spawn_remote_tmux_sessions_fetch(
+                crate::commands::find_config(),
+            ));
+        }
+        // #953: re-arm the fleet-terminal remote sweep for the same reason.
+        if self.pending_remote_terminals.is_none() {
+            self.pending_remote_terminals = Some(spawn_remote_fleet_terminals_fetch(
                 crate::commands::find_config(),
             ));
         }

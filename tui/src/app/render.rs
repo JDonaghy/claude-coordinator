@@ -74,11 +74,11 @@ impl ShellApp for CoordApp {
                     backend.draw_list(sidebar_rect, &self.settings_sidebar_placeholder());
                 }
                 SidebarView::Terminal => {
-                    // #424: no sidebar list for the Terminal view — the
-                    // pane is one big PTY surface in the main area.  Draw
-                    // an empty placeholder so the sidebar header
-                    // (TERMINAL / chrome) keeps a stable height.
-                    backend.draw_list(sidebar_rect, &self.terminal_sidebar_placeholder());
+                    // #953: left-pane machine-grouped tree of open
+                    // terminals (read-only discovery). The main area is
+                    // still a single PTY surface — this tree only lists
+                    // what's out there; create/kill/attach are follow-ups.
+                    backend.draw_tree(sidebar_rect, &self.terminal_tree_view());
                 }
                 // #638: Kanban sidebar is a placeholder — all content is in the main panel.
                 SidebarView::Kanban => {

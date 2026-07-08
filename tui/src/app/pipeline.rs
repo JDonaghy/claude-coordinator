@@ -5437,4 +5437,26 @@ impl CoordApp {
             }
         }
     }
+
+    /// #953: drain the background local+remote `coord terminal list` sweep.
+    /// Simpler than `poll_remote_sessions` — fleet terminals carry no
+    /// optimistic "pending-" entries to merge, so a landed result just
+    /// REPLACES `fleet_terminals` outright. Returns `true` on update.
+    pub(crate) fn poll_remote_terminals(&mut self) -> bool {
+        let Some(rx) = self.pending_remote_terminals.as_ref() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(terminals) => {
+                self.fleet_terminals = terminals;
+                self.pending_remote_terminals = None;
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.pending_remote_terminals = None;
+                false
+            }
+        }
+    }
 }

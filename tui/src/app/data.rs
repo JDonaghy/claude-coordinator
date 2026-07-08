@@ -1951,6 +1951,107 @@ pub(crate) fn spawn_remote_tmux_sessions_fetch(
     rx
 }
 
+/// #953: one persistent, free-floating `coord-term-*` terminal discovered via
+/// `coord terminal list --json` (#952). Distinct from [`LiveTmuxSession`]
+/// (`coord-<assignment_id>` interactive claude sessions): a `FleetTerminal`
+/// carries no issue/repo/assignment — it's a plain shell, grouped in the
+/// Terminal view's left-pane tree by the machine it runs on.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct FleetTerminal {
+    /// The `coord-term-<slug>` slug (without the `coord-term-` prefix).
+    pub(crate) name: String,
+    /// Coordinator-local machine name (`coordinator.yml` `machines[].name`),
+    /// matching `Machine.name` so the tree can group by parent.
+    pub(crate) machine: String,
+    /// `true` when a client currently has the tmux session attached.
+    pub(crate) attached: bool,
+}
+
+/// Fetch local `coord-term-*` terminals by running `coord terminal list --json`.
+///
+/// Mirrors [`fetch_live_tmux_sessions`]: returns an empty `Vec` when tmux is
+/// not running, `coord` is not on PATH, or parsing fails. Called once at
+/// startup — cheap but synchronous so it runs before the TUI is visible.
+pub(crate) fn fetch_fleet_terminals() -> Vec<FleetTerminal> {
+    let out = std::process::Command::new("coord")
+        .args(["terminal", "list", "--json"])
+        .output()
+        .ok();
+    let out = match out {
+        Some(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    parse_fleet_terminals_json(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Parse the JSON emitted by `coord terminal list --json`.
+///
+/// Unlike `coord sessions --json`'s `{"sessions": [...]}` envelope, this is
+/// a **bare JSON array** of `{"name","attached","machine","host",...}`
+/// objects (see `coord/commands/terminal.py::terminal_list`). Shared by the
+/// synchronous local fetch and the background remote fetch.
+pub(crate) fn parse_fleet_terminals_json(text: &str) -> Vec<FleetTerminal> {
+    let v: serde_json::Value = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let arr = match v.as_array() {
+        Some(a) => a,
+        None => return Vec::new(),
+    };
+    arr.iter()
+        .filter_map(|entry| {
+            let name = entry.get("name")?.as_str()?.to_string();
+            let machine = entry
+                .get("machine")
+                .and_then(|m| m.as_str())
+                .unwrap_or("")
+                .to_string();
+            let attached = entry
+                .get("attached")
+                .and_then(|a| a.as_bool())
+                .unwrap_or(false);
+            Some(FleetTerminal {
+                name,
+                machine,
+                attached,
+            })
+        })
+        .collect()
+}
+
+/// #953: fetch local + REMOTE `coord-term-*` terminals in the background.
+///
+/// Mirrors [`spawn_remote_tmux_sessions_fetch`]: runs `coord terminal list
+/// --json --remote` off the startup path so the TUI appears immediately;
+/// the result REPLACES the local-only startup snapshot when it arrives.
+pub(crate) fn spawn_remote_fleet_terminals_fetch(
+    config_path: Option<std::path::PathBuf>,
+) -> std::sync::mpsc::Receiver<Vec<FleetTerminal>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut args: Vec<String> = vec![
+            "terminal".into(),
+            "list".into(),
+            "--json".into(),
+            "--remote".into(),
+        ];
+        if let Some(cfg) = config_path {
+            args.push("--config".into());
+            args.push(cfg.to_string_lossy().into_owned());
+        }
+        let out = std::process::Command::new("coord").args(&args).output().ok();
+        let terminals = match out {
+            Some(o) if o.status.success() => {
+                parse_fleet_terminals_json(&String::from_utf8_lossy(&o.stdout))
+            }
+            _ => Vec::new(),
+        };
+        let _ = tx.send(terminals);
+    });
+    rx
+}
+
 /// #603: fetch the EXACT fix briefing for `aid` (`coord fix-briefing <aid>`) off
 /// the UI thread, so the fail→fix / rework confirm dialog can show the operator
 /// what the fix worker will be briefed with.  stdout IS the briefing text; on

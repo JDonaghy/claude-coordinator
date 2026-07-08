@@ -402,6 +402,12 @@
             // #487
             live_tmux_sessions: Vec::new(),
             pending_remote_sessions: None,
+            // #953
+            fleet_terminals: Vec::new(),
+            pending_remote_terminals: None,
+            terminal_tree_expanded: std::collections::HashMap::new(),
+            terminal_tree_selected: None,
+            terminal_tree_scroll: 0,
             fix_briefing_preview: None,
             fix_briefing_rx: None,
             // Leg 2 (#517)
@@ -27369,5 +27375,98 @@ Milestone tracking issue.
         assert!(
             !screen.contains("goals"),
             "#886: no Outcome chip should render before any audit has run:\n{screen}",
+        );
+    }
+
+    // ── #953: Terminal-view left-pane machine tree ──────────────────────────
+
+    /// TuiDriver black-box: seed 2 machines — one with 2 discovered
+    /// `FleetTerminal`s, one with none — open the Terminal view and assert
+    /// the left-pane tree renders machines as parents with their terminals
+    /// nested directly beneath the correct machine (not interleaved with
+    /// the other machine's rows), and that the empty machine renders with
+    /// no terminal children at all.
+    #[test]
+    fn terminal_tree_groups_terminals_under_correct_machine() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(BoardData {
+            machines: vec![
+                mk_machine("precision", "precision.tail", true, &[]),
+                mk_machine("dellserver", "dellserver.tail", true, &[]),
+            ],
+            ..BoardData::default()
+        });
+        app.fleet_terminals = vec![
+            FleetTerminal {
+                name: "scratch".to_string(),
+                machine: "precision".to_string(),
+                attached: false,
+            },
+            FleetTerminal {
+                name: "build".to_string(),
+                machine: "precision".to_string(),
+                attached: true,
+            },
+        ];
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        click_activity_icon(&mut driver, ">");
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("precision"),
+            "machine 'precision' should render as a tree parent:\n{screen}",
+        );
+        assert!(
+            screen.contains("dellserver"),
+            "machine 'dellserver' should render as a tree parent even with no terminals:\n{screen}",
+        );
+        assert!(
+            screen.contains("scratch"),
+            "'precision' terminal 'scratch' should be nested in the tree:\n{screen}",
+        );
+        assert!(
+            screen.contains("build"),
+            "'precision' terminal 'build' should be nested in the tree:\n{screen}",
+        );
+
+        // Nesting: both terminal rows must appear strictly between the
+        // "precision" row and the "dellserver" row — i.e. under the correct
+        // machine, not after the empty machine's (childless) row.
+        let lines: Vec<&str> = screen.lines().collect();
+        let precision_row = lines
+            .iter()
+            .position(|l| l.contains("precision"))
+            .expect("precision row");
+        let dellserver_row = lines
+            .iter()
+            .position(|l| l.contains("dellserver"))
+            .expect("dellserver row");
+        let scratch_row = lines
+            .iter()
+            .position(|l| l.contains("scratch"))
+            .expect("scratch row");
+        let build_row = lines
+            .iter()
+            .position(|l| l.contains("build"))
+            .expect("build row");
+        assert!(
+            precision_row < scratch_row
+                && scratch_row < dellserver_row
+                && precision_row < build_row
+                && build_row < dellserver_row,
+            "terminals must be nested between their machine's row and the next \
+             machine's row (precision={precision_row}, scratch={scratch_row}, \
+             build={build_row}, dellserver={dellserver_row}):\n{screen}",
+        );
+
+        // The empty machine ('dellserver') must render with no children: no
+        // terminal name appears on or after its own row.
+        assert!(
+            !lines[dellserver_row..]
+                .iter()
+                .any(|l| l.contains("scratch") || l.contains("build")),
+            "'dellserver' has no terminals and must render with no nested children:\n{screen}",
         );
     }

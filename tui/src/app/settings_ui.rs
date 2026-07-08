@@ -688,6 +688,10 @@ impl CoordApp {
         if self.pending_remote_sessions.is_some() && self.poll_remote_sessions() {
             needs_redraw = true;
         }
+        // #953: drain the background local+remote fleet-terminal fetch.
+        if self.pending_remote_terminals.is_some() && self.poll_remote_terminals() {
+            needs_redraw = true;
+        }
 
         // #603: the fix-briefing preview arrived → repaint the confirm dialog.
         if self.fix_briefing_rx.is_some() && self.poll_fix_briefing_preview() {
@@ -1126,28 +1130,6 @@ impl CoordApp {
         }
     }
 
-    /// #424: empty list shown in the sidebar slot while the Terminal
-    /// view is active — keeps the sidebar header at a stable height so
-    /// the layout doesn't shift when switching to/from this view.
-    pub(crate) fn terminal_sidebar_placeholder(&self) -> ListView {
-        let hint = if self.terminal_focused {
-            "  PTY focused — F12 to release"
-        } else {
-            "  PTY released — F12 to focus"
-        };
-        ListView {
-            id: WidgetId::new("terminal-sidebar-placeholder"),
-            title: Some(StyledText::plain(" TERMINAL ")),
-            items: vec![activity_item(hint, Color::rgb(160, 160, 160))],
-            selected_idx: 0,
-            scroll_offset: 0,
-            has_focus: false,
-            bordered: false,
-            h_scroll: 0,
-            max_content_width: None,
-            show_v_scrollbar: false,
-        }
-    }
 
     /// Build the unified settings `Form`.
     ///
