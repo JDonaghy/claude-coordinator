@@ -358,6 +358,8 @@
             pending_board_chat: None,
             pending_repo_picker: None,
             pending_machine_picker: None,
+            pending_new_terminal_picker: None,
+            pending_new_terminal: None,
             pending_diagnose_dialog: None,
             pending_diagnose_legacy_retry: None,
             pending_quit_confirm: false,
@@ -27405,11 +27407,15 @@ Milestone tracking issue.
                 name: "scratch".to_string(),
                 machine: "precision".to_string(),
                 attached: false,
+                pending: false,
+                pending_sweep_count: 0,
             },
             FleetTerminal {
                 name: "build".to_string(),
                 machine: "precision".to_string(),
                 attached: true,
+                pending: false,
+                pending_sweep_count: 0,
             },
         ];
 
@@ -27758,4 +27764,93 @@ Milestone tracking issue.
         let _ = std::process::Command::new("ssh")
             .args(["elitebook", "tmux", "kill-session", "-t", sess_name])
             .status();
+    }
+
+    // ── #954: create a new terminal on a chosen fleet machine ───────────────
+
+    /// TuiDriver black-box: seed 2 machines, open the Terminal view, press
+    /// `n` to open the "new terminal" machine picker, pick the SECOND
+    /// machine, accept the default (auto-generated) name, and assert an
+    /// optimistic pending node appears directly under the CHOSEN machine —
+    /// not the other one — in the left-pane tree. The real create+attach
+    /// PTY/tmux/ssh mechanics aren't observable under `TestBackend`, so this
+    /// exercises the picker → optimistic-insert path per the issue's
+    /// acceptance criteria ("a new node appears under the correct machine…
+    /// immediately (optimistic)").
+    #[test]
+    fn new_terminal_picker_inserts_optimistic_node_under_chosen_machine() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_test_app(BoardData {
+            machines: vec![
+                mk_machine("precision", "precision.tail", true, &[]),
+                mk_machine("dellserver", "dellserver.tail", true, &[]),
+            ],
+            ..BoardData::default()
+        });
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        click_activity_icon(&mut driver, ">");
+
+        // #424: entering the Terminal view defaults to PTY-focused (typed
+        // keys go straight to the shell) — F12 releases focus back to the
+        // TUI chrome so 'n' reaches the new-terminal keybinding below
+        // instead of being typed into the shell.
+        driver.press_named(quadraui::NamedKey::F(12));
+
+        driver.type_char('n');
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Select machine for new terminal"),
+            "'n' in the Terminal view should open the new-terminal machine \
+             picker:\n{screen}",
+        );
+        assert!(
+            screen.contains("dellserver"),
+            "the picker should list the second machine:\n{screen}",
+        );
+
+        // `fleet_machines_for_terminal` sorts local-first/reachable/name —
+        // neither seeded machine is "local" and both are reachable, so the
+        // picker lists them alphabetically: "dellserver" (1) before
+        // "precision" (2). Pick machine 1 (dellserver).
+        driver.type_char('1');
+        let screen = driver.screen();
+        assert!(
+            screen.contains("New terminal on dellserver"),
+            "picking a machine should open the optional-name prompt:\n{screen}",
+        );
+
+        // Accept the default (auto-generated) name.
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("creating"),
+            "the optimistic pending terminal should render with its \
+             'creating…' marker:\n{screen}",
+        );
+
+        // Nesting: the pending row must appear strictly after 'dellserver'
+        // (and 'precision', which has no children, must come before it) —
+        // i.e. under the chosen machine, not the other one.
+        let lines: Vec<&str> = screen.lines().collect();
+        let precision_row = lines
+            .iter()
+            .position(|l| l.contains("precision"))
+            .expect("precision row");
+        let dellserver_row = lines
+            .iter()
+            .position(|l| l.contains("dellserver"))
+            .expect("dellserver row");
+        let pending_row = lines
+            .iter()
+            .position(|l| l.contains("creating"))
+            .expect("pending terminal row");
+        assert!(
+            precision_row < dellserver_row && dellserver_row < pending_row,
+            "the optimistic node must nest directly under 'dellserver' \
+             (precision={precision_row}, dellserver={dellserver_row}, \
+             pending={pending_row}):\n{screen}",
+        );
     }

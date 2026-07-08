@@ -167,6 +167,8 @@ impl CoordApp {
             || self.artifact_pull_dialog.is_some()
             || self.pty_panic_dialog.is_some()
             || self.pending_machine_picker.is_some()
+            || self.pending_new_terminal_picker.is_some()
+            || self.pending_new_terminal.is_some()
             || self.pending_repo_picker.is_some()
             || self.refinement_notes_modal.is_some()
             || self.pending_refinement_notes_synth.is_some()
@@ -201,6 +203,7 @@ impl CoordApp {
             || self.pending_fix_force_confirm.is_some()
             || self.artifact_pull_dialog.is_some()
             || self.pty_panic_dialog.is_some()
+            || self.pending_new_terminal.is_some()
         {
             return None;
         }

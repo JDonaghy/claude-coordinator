@@ -1,11 +1,11 @@
 //! Terminal-view left-pane machine-grouped tree of open terminals (#953).
 //!
-//! Read-only discovery tree: parent nodes are fleet machines
-//! (`self.data.machines`), child nodes are persistent `coord-term-*`
-//! terminals discovered via `coord terminal list --json[--remote]`
-//! (`FleetTerminal`, populated in `data.rs` — #952 backend). Create / kill /
-//! attach are out of scope here — see #953's non-goals (later issues build
-//! on this tree).
+//! Discovery tree: parent nodes are fleet machines (`self.data.machines`),
+//! child nodes are persistent `coord-term-*` terminals discovered via
+//! `coord terminal list --json[--remote]` (`FleetTerminal`, populated in
+//! `data.rs` — #952 backend). #954 adds the create+attach affordance on top
+//! of this tree (`open_new_terminal_picker` / `create_and_attach_terminal`);
+//! kill (#5) is still out of scope here.
 //!
 //! This is the app's first sidebar built from a raw quadraui `TreeView`
 //! drawn via `backend.draw_tree` directly, rather than through the
@@ -113,7 +113,15 @@ impl CoordApp {
             if has_terms && expanded {
                 for (ti, t) in terms.iter().enumerate() {
                     let mut spans = vec![StyledSpan::plain(format!("  {}", t.name))];
-                    if t.attached {
+                    if t.pending {
+                        // #954: optimistic entry inserted by
+                        // `create_and_attach_terminal`, not yet confirmed by
+                        // a `coord terminal list` discovery sweep.
+                        spans.push(StyledSpan::with_fg(
+                            " (creating…)",
+                            Color::rgb(200, 180, 90),
+                        ));
+                    } else if t.attached {
                         spans.push(StyledSpan::with_fg(
                             " [attached]",
                             Color::rgb(140, 200, 140),
@@ -261,4 +269,176 @@ impl CoordApp {
             self.terminal_tree_scroll = sel + 1 - visible;
         }
     }
+
+    // ── #954: create a new terminal on a chosen fleet machine ────────────
+
+    /// Fleet machines eligible to host a NEW terminal. Unlike
+    /// `fleet_machines_for_repo` (`sessions.rs`), a plain terminal carries
+    /// no repo/issue, so EVERY configured machine qualifies — not just ones
+    /// running a particular repo. Same local-first/reachable/name ordering
+    /// so the picker (and the single-machine fast path) behaves familiarly.
+    pub(crate) fn fleet_machines_for_terminal(&self) -> Vec<MachinePickEntry> {
+        let local = self.data.local_machine.clone();
+        let mut v: Vec<MachinePickEntry> = self
+            .data
+            .machines
+            .iter()
+            .map(|m| MachinePickEntry {
+                name: m.name.clone(),
+                host: m.host.clone(),
+                reachable: m.reachable,
+                is_local: m.name == local,
+            })
+            .collect();
+        v.sort_by(|a, b| {
+            b.is_local
+                .cmp(&a.is_local)
+                .then(b.reachable.cmp(&a.reachable))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        v
+    }
+
+    /// Open the "new terminal" machine picker (`n` in the Terminal view).
+    /// Skips straight to the name prompt when only one machine is
+    /// configured — mirrors `launch_interactive_session_for_selected_issue`'s
+    /// single-candidate fast path (`sessions.rs`).
+    pub(crate) fn open_new_terminal_picker(&mut self) {
+        let machines = self.fleet_machines_for_terminal();
+        if machines.is_empty() {
+            self.push_toast(
+                "New terminal",
+                "No fleet machines configured — cannot create a terminal.",
+                ToastSeverity::Warning,
+            );
+            return;
+        }
+        if machines.len() == 1 {
+            self.begin_new_terminal_name_prompt(machines[0].name.clone());
+            return;
+        }
+        self.pending_new_terminal_picker = Some(machines);
+    }
+
+    /// A machine has been chosen (picker selection, or the single-machine
+    /// fast path) — open the optional-name prompt before creating.
+    pub(crate) fn begin_new_terminal_name_prompt(&mut self, machine: String) {
+        self.pending_new_terminal = Some(PendingNewTerminal {
+            machine,
+            buf: String::new(),
+        });
+    }
+
+    /// Create a terminal on `machine` (`coord terminal new <machine> --name
+    /// <slug>`) and attach it in the standalone Terminal pane, exactly as
+    /// `reattach_session_by_aid` (`sessions.rs`) drives an EXISTING session:
+    /// the local PTY types the command line, `coord` does the ssh+tmux work
+    /// on the target machine.
+    ///
+    /// `name_buf` is the operator's optional typed name (from the
+    /// `pending_new_terminal` prompt); an empty/blank buffer auto-generates
+    /// a slug. The slug is always resolved CLIENT-SIDE and passed explicitly
+    /// via `--name` — never left to the backend's own auto-naming — because
+    /// the exact slug is needed up front to chain the `attach` command, and
+    /// there is no way to read the `new` subcommand's stdout back out of a
+    /// PTY session it was typed into.
+    ///
+    /// Inserts an optimistic PENDING `FleetTerminal` immediately so the tree
+    /// shows the new node without waiting for the next discovery sweep
+    /// (mirrors the `"pending-"` `LiveTmuxSession` insert in
+    /// `launch_interactive_session_on_machine_inner`); `poll_remote_terminals`
+    /// reconciles/evicts it once a real `coord terminal list` result covers
+    /// `(machine, slug)`.
+    pub(crate) fn create_and_attach_terminal(&mut self, machine: String, name_buf: String) {
+        let sanitized = sanitize_terminal_name(&name_buf);
+        let slug = if sanitized.is_empty() {
+            generate_terminal_slug()
+        } else {
+            sanitized
+        };
+
+        // Drop any stale pending entry for this (machine, slug) — e.g. the
+        // operator retried after a failed attempt without an intervening
+        // discovery sweep — before adding the fresh one.
+        self.fleet_terminals
+            .retain(|t| !(t.pending && t.machine == machine && t.name == slug));
+        self.fleet_terminals.push(FleetTerminal {
+            name: slug.clone(),
+            machine: machine.clone(),
+            attached: false,
+            pending: true,
+            pending_sweep_count: 0,
+        });
+        self.terminal_tree_expanded.insert(machine.clone(), true);
+        if let Some(mi) = self.data.machines.iter().position(|m| m.name == machine) {
+            let ti = self
+                .fleet_terminals_for_machine(&machine)
+                .iter()
+                .position(|t| t.name == slug)
+                .unwrap_or(0);
+            self.terminal_tree_selected = Some(vec![mi as u16, ti as u16]);
+        }
+
+        let cfg = self
+            .command_runner
+            .config_path
+            .as_ref()
+            .map(|p| format!("--config {} ", shell_quote_arg(&p.to_string_lossy())))
+            .unwrap_or_default();
+        let target = format!("{machine}:{slug}");
+        let cmd = format!(
+            "coord terminal new {}{} --name {} && coord terminal attach {}{}\r",
+            cfg,
+            shell_quote_arg(&machine),
+            shell_quote_arg(&slug),
+            cfg,
+            shell_quote_arg(&target),
+        );
+
+        // Switch to the standalone Terminal panel and send the command —
+        // same lazy-spawn-or-reuse fallback as `reattach_session_by_aid`.
+        self.active_view = SidebarView::Terminal;
+        if let Some(ref mut sess) = self.terminal_session {
+            sess.send_str(&cmd);
+        } else {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+            let shell = quadraui::terminal_engine::default_shell();
+            if let Ok(mut sess) =
+                quadraui::terminal_engine::TerminalSession::spawn(80, 24, &shell, &cwd, 10_000)
+            {
+                sess.send_str(&cmd);
+                self.terminal_session = Some(sess);
+                self.terminal_spawn_error = None;
+            }
+            // If spawn fails the operator sees an error banner on the
+            // Terminal tab, same as the reattach fallback.
+        }
+    }
+}
+
+/// #954: client-side terminal slug generator. Always distinct enough for a
+/// same-second double-`n` — millisecond-resolution suffix, same idiom used
+/// elsewhere in this module for unique ids (`SystemTime`/`UNIX_EPOCH`).
+fn generate_terminal_slug() -> String {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    format!("tui-{millis:x}")
+}
+
+/// #954: sanitize an operator-typed terminal name into a slug tmux/the
+/// shell can swallow unquoted-adjacent — trims whitespace and replaces any
+/// character that isn't alphanumeric/`-`/`_` with `-`.
+fn sanitize_terminal_name(raw: &str) -> String {
+    raw.trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }

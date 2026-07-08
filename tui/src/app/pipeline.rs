@@ -5445,17 +5445,49 @@ impl CoordApp {
         }
     }
 
+    /// #954: maximum number of discovery sweeps an optimistic `pending`
+    /// `FleetTerminal` may survive uncovered by a real result before it's
+    /// evicted. Mirrors `PENDING_SESSION_SWEEP_BUDGET`.
+    pub(crate) const PENDING_TERMINAL_SWEEP_BUDGET: u8 = 2;
+
     /// #953: drain the background local+remote `coord terminal list` sweep.
-    /// Simpler than `poll_remote_sessions` — fleet terminals carry no
-    /// optimistic "pending-" entries to merge, so a landed result just
-    /// REPLACES `fleet_terminals` outright. Returns `true` on update.
+    ///
+    /// #954: unlike the #953-era doc comment this superseded, fleet
+    /// terminals now CAN carry an optimistic `pending` entry (inserted by
+    /// `create_and_attach_terminal` on a fresh `n` → create), so a landed
+    /// result merges rather than blindly replacing — mirrors
+    /// `poll_remote_sessions`'s `"pending-"` merge, keyed on
+    /// `(machine, name)` instead of `(repo_name, issue_number)`. Returns
+    /// `true` on update.
     pub(crate) fn poll_remote_terminals(&mut self) -> bool {
         let Some(rx) = self.pending_remote_terminals.as_ref() else {
             return false;
         };
         match rx.try_recv() {
             Ok(terminals) => {
-                self.fleet_terminals = terminals;
+                let covered: std::collections::HashSet<(String, String)> = terminals
+                    .iter()
+                    .map(|t| (t.machine.clone(), t.name.clone()))
+                    .collect();
+                let surviving_pending: Vec<FleetTerminal> = self
+                    .fleet_terminals
+                    .drain(..)
+                    .filter_map(|mut t| {
+                        if !t.pending {
+                            return None; // real entries are replaced by discovery
+                        }
+                        if covered.contains(&(t.machine.clone(), t.name.clone())) {
+                            return None; // real terminal appeared → drop optimistic
+                        }
+                        t.pending_sweep_count = t.pending_sweep_count.saturating_add(1);
+                        if t.pending_sweep_count > Self::PENDING_TERMINAL_SWEEP_BUDGET {
+                            return None; // budget exhausted → evict phantom
+                        }
+                        Some(t)
+                    })
+                    .collect();
+                self.fleet_terminals = surviving_pending;
+                self.fleet_terminals.extend(terminals);
                 self.pending_remote_terminals = None;
                 true
             }

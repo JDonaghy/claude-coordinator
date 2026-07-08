@@ -748,6 +748,21 @@ pub(crate) struct MachinePickEntry {
     is_local: bool,
 }
 
+/// #954: pending optional-name prompt for a new terminal about to be
+/// created on `machine`. Armed by `begin_new_terminal_name_prompt` once a
+/// machine is chosen (picker selection, or the single-machine fast path).
+/// `buf` accumulates the operator's typed name; Enter submits via
+/// `create_and_attach_terminal` (an empty buffer means "auto-generate a
+/// slug"); Esc cancels. Mirrors the `pending_plan_capture` single-buffer
+/// text-input pattern.
+#[derive(Clone)]
+pub(crate) struct PendingNewTerminal {
+    /// Coordinator machine NAME the terminal will be created on.
+    machine: String,
+    /// Operator-typed name buffer, empty until they type something.
+    buf: String,
+}
+
 /// #935 Part B: pending "Diagnose & fix stage…" results dialog.
 ///
 /// Populated from the `DIAGNOSE_JSON:` output of a `coord diagnose --json
@@ -2235,6 +2250,16 @@ pub struct CoordApp {
     /// Review/Fix launch.  Intercepts numeric keys (1, 2, …) to pick the
     /// target machine, or Esc to cancel.  Cleared when a machine is chosen.
     pending_machine_picker: Option<PendingMachinePicker>,
+    /// #954: pending machine picker for "new terminal" (`n` in the Terminal
+    /// view). Distinct from `pending_machine_picker` — a new terminal
+    /// carries no repo/issue, so EVERY configured machine is a candidate
+    /// (`fleet_machines_for_terminal`, not `fleet_machines_for_repo`), and
+    /// picking one opens the name prompt rather than launching an
+    /// interactive session. Intercepts numeric keys (1, 2, …); Esc cancels.
+    pending_new_terminal_picker: Option<Vec<MachinePickEntry>>,
+    /// #954: pending optional-name prompt for a terminal about to be
+    /// created — see `PendingNewTerminal`.
+    pending_new_terminal: Option<PendingNewTerminal>,
     /// #935 Part B: parsed results from a `coord diagnose --json --dry-run`
     /// run, waiting for the user to choose Recover / Reset / Clear phantom /
     /// Dismiss in `build_prompt_dialog`.
@@ -2436,7 +2461,9 @@ pub struct CoordApp {
     fleet_terminals: Vec<FleetTerminal>,
     /// In-flight background sweep of `coord terminal list --json --remote`,
     /// armed at startup and re-armed by `refresh()`. Mirrors
-    /// `pending_remote_sessions`; when it lands it REPLACES `fleet_terminals`.
+    /// `pending_remote_sessions`; when it lands it merges into
+    /// `fleet_terminals` (#954: preserving any not-yet-covered `pending`
+    /// optimistic entry, see `poll_remote_terminals`).
     pending_remote_terminals: Option<std::sync::mpsc::Receiver<Vec<FleetTerminal>>>,
     /// Per-machine expand state for the Terminal-view tree, keyed by machine
     /// name. Absent entries default to expanded when the machine hosts ≥1
@@ -2869,6 +2896,8 @@ impl CoordApp {
             pending_board_chat: None,
             pending_repo_picker: None,
             pending_machine_picker: None,
+            pending_new_terminal_picker: None,
+            pending_new_terminal: None,
             pending_diagnose_dialog: None,
             pending_diagnose_legacy_retry: None,
             pending_quit_confirm: false,

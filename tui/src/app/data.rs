@@ -1965,6 +1965,21 @@ pub(crate) struct FleetTerminal {
     pub(crate) machine: String,
     /// `true` when a client currently has the tmux session attached.
     pub(crate) attached: bool,
+    /// #954: `true` for an optimistic entry inserted by
+    /// `create_and_attach_terminal` immediately on creation, before the next
+    /// `coord terminal list` discovery sweep can confirm it. Always `false`
+    /// on entries parsed from a real discovery result. Mirrors
+    /// `LiveTmuxSession`'s `"pending-"`-prefix convention, but as an
+    /// explicit field since `FleetTerminal` slugs carry no such prefix.
+    pub(crate) pending: bool,
+    /// #954: number of discovery sweeps a `pending` entry has survived
+    /// without being covered by a real result. Only meaningful when
+    /// `pending` is `true`; always 0 on real entries. Mirrors
+    /// `LiveTmuxSession::pending_sweep_count` / `PENDING_SESSION_SWEEP_BUDGET`
+    /// — `poll_remote_terminals` evicts the entry once this exceeds
+    /// `PENDING_TERMINAL_SWEEP_BUDGET`, so a phantom entry that never
+    /// becomes a real tmux session doesn't linger in the tree forever.
+    pub(crate) pending_sweep_count: u8,
 }
 
 /// Fetch local `coord-term-*` terminals by running `coord terminal list --json`.
@@ -2015,6 +2030,8 @@ pub(crate) fn parse_fleet_terminals_json(text: &str) -> Vec<FleetTerminal> {
                 name,
                 machine,
                 attached,
+                pending: false,
+                pending_sweep_count: 0,
             })
         })
         .collect()
