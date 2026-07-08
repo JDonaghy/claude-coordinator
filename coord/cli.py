@@ -71,6 +71,7 @@ from coord.commands.sessions import (
     wait,
     watch,
 )
+from coord.commands.terminal import terminal_group
 from coord.commands.merge import (
     bounce,
     merge,
@@ -264,6 +265,7 @@ main.add_command(done)
 main.add_command(session)
 main.add_command(sessions_cmd)
 main.add_command(reattach)
+main.add_command(terminal_group)
 main.add_command(usage)
 main.add_command(web)
 main.add_command(serve)
