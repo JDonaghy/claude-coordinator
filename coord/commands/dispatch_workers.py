@@ -525,6 +525,8 @@ def _dispatch_smoke_of(
     import uuid as _uuid  # noqa: PLC0415
 
     from coord.interactive import (  # noqa: PLC0415
+        TmuxHost,
+        _launch_via_tmux as _tmux_launch,
         finalize_interactive_exit,
         launch_human_attended_interactive,
         tmux_available as _tmux_avail,
@@ -557,18 +559,17 @@ def _dispatch_smoke_of(
         )
         sys.exit(2)
 
-    if not _is_local:
-        click.echo(
-            "error: --smoke-of is local-only for now; run it on the "
-            "machine that holds the checkout (remote interactive smoke "
-            "is Track B / #486).",
-            err=True,
+    # #1010 (mirrors --review-of / Track B #486): smoke is READ-ONLY (no
+    # worktree, no branch mutation) either way, so the remote path is the
+    # same low-risk shape as the review path — ssh+tmux into the live
+    # checkout, no worktree machinery needed.
+    if _is_local:
+        smoke_repo_path = str(
+            Path(machine_obj.repo_path(repo) or str(Path.cwd())).expanduser()
         )
-        sys.exit(2)
-
-    smoke_repo_path = str(
-        Path(machine_obj.repo_path(repo) or str(Path.cwd())).expanduser()
-    )
+    else:
+        # Keep the raw path so the remote shell expands `~`/$HOME itself.
+        smoke_repo_path = machine_obj.repo_path(repo) or f"~/src/{repo}"
     smoke_default_branch = repo_cfg.default_branch or "main"
     resolved_model = model if model else cfg.models.default
     assignment_id = _uuid.uuid4().hex[:12]
@@ -689,18 +690,34 @@ def _dispatch_smoke_of(
         system_prompt=INTERACTIVE_SMOKE_SYSTEM_PROMPT,
         allowed_tools="Read,Bash,Grep,Glob",
     )
+    # Remote: a bare "claude" is not on the SSH login PATH (#424/#425).
+    if not _is_local:
+        argv = ["~/.local/bin/claude"] + list(argv)[1:]
 
+    _sm_location = (
+        "local TTY" if _is_local
+        else f"{machine_obj.host} (remote tmux)"
+    )
     click.echo(
-        f"{machine} (local TTY) → SMOKE TEST of #{issue} "
+        f"{machine} ({_sm_location}) → SMOKE TEST of #{issue} "
         f"on branch {work.branch}: {issue_title}"
     )
-    click.echo("  mode: HUMAN-ATTENDED interactive smoke test (leg 3c / A3)")
+    click.echo(
+        "  mode: HUMAN-ATTENDED interactive smoke test (leg 3c / A3, #1010)"
+    )
     click.echo(
         f"  assignment id: {assignment_id}  (smoke_of={smoke_of})"
     )
-    click.echo(
-        f"  cwd: {smoke_repo_path} (live checkout — read-only, no worktree)"
-    )
+    if _is_local:
+        click.echo(
+            f"  cwd: {smoke_repo_path} (live checkout — read-only, "
+            "no worktree)"
+        )
+    else:
+        click.echo(
+            f"  remote checkout: {smoke_repo_path} on "
+            f"{machine_obj.host} (read-only, no worktree)"
+        )
     if dry_run:
         click.echo("  (dry run — not launched)")
         click.echo(f"  would exec: {argv}")
@@ -727,27 +744,155 @@ def _dispatch_smoke_of(
         _save_board_sm(_build_board_sm())
     os.environ["COORD_ASSIGNMENT_ID"] = assignment_id
 
+    # #923: Test-verdict backstop hint — shared by both the local and
+    # remote paths below.  The verdict itself lands on the shared board the
+    # moment `coord test` runs INSIDE the session (routes through the
+    # daemon, #590, same as `coord report-result`) — this hint/prompt only
+    # covers the case where the agent exited without running it.
+    _test_verdict_cmd = (
+        f"    coord test --passed {smoke_of}   # all good\n"
+        f"    coord test --fail {smoke_of} --reason \"<story>\"   # broken"
+    )
+
+    if _is_local:
+        started_at = _time.time()
+        exit_code = launch_human_attended_interactive(
+            argv,
+            effective_briefing,
+            assignment_id=assignment_id,
+            cwd=smoke_repo_path,
+        )
+        if exit_code != 0:
+            click.echo(f"  claude exited with status {exit_code}", err=True)
+
+        _sname = _tmux_name(assignment_id) if _tmux_avail() else None
+        if _sname and _tmux_alive(_sname):
+            click.echo(
+                f"  session still running in tmux: {_sname}\n"
+                f"  reattach with:  coord reattach {assignment_id}"
+            )
+            sys.exit(0)
+
+        # worktree_path=None: read-only smoke runs in the live checkout, the
+        # backstop must never push or remove it.  The verdict that matters
+        # is the `coord test` write on the WORK row, not this session's row.
+        try:
+            finalize_interactive_exit(
+                assignment_id=assignment_id,
+                repo_name=repo,
+                repo_github=repo_cfg.github,
+                issue_number=issue,
+                machine_name=machine,
+                worktree_path=None,
+                base_branch=smoke_default_branch,
+                exit_code=exit_code,
+                started_at=started_at,
+                log_path=None,
+                repo_path=None,
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort backstop
+            click.echo(
+                f"  warning: backstop failed to record smoke exit: {exc}",
+                err=True,
+            )
+
+        try:
+            if not _prompt_and_relay_test_verdict(
+                work_assignment_id=smoke_of,
+                smoke_assignment_id=assignment_id,
+                repo_name=repo,
+                repo_github=repo_cfg.github,
+                issue_number=issue,
+                machine_name=machine,
+                verdict_cmd_hint=_test_verdict_cmd,
+            ):
+                click.echo(
+                    "  smoke session ended with no test verdict recorded "
+                    "— the merge gate stays blocked until a verdict is "
+                    "reported."
+                )
+        except Exception as exc:  # noqa: BLE001 — best-effort backstop
+            click.echo(
+                f"  warning: test-verdict backstop failed: {exc}",
+                err=True,
+            )
+        return
+
+    # ── REMOTE SMOKE TEST (#1010) ──────────────────────────────────
+    # Read-only: cd into the remote LIVE checkout, fetch+prune so the
+    # smoke agent can inspect origin/<branch>, then launch it.  NO
+    # worktree and NO branch mutation — the live checkout is the worker
+    # worktree base and must not be disturbed (same shape as the remote
+    # review path).  The Test verdict is recorded on the shared board the
+    # moment `coord test --passed|--fail` runs INSIDE the remote session
+    # (routes through the daemon, #590) — no remote-specific plumbing
+    # needed for that part; only the SESSION row's terminal state (this
+    # smoke assignment, not the WORK row) needs a coordinator-side backstop.
+    import shlex as _shlex_sm  # noqa: PLC0415
+
+    _rp_sh = (
+        "$HOME/" + smoke_repo_path[2:]
+        if smoke_repo_path.startswith("~/")
+        else ("$HOME" if smoke_repo_path == "~" else smoke_repo_path)
+    )
+    _claude_args = _shlex_sm.join(list(argv)[1:])
+    _remote_cmd = (
+        f"cd {_rp_sh}"
+        f" && git fetch origin --prune 2>/dev/null || true"
+        f" && COORD_ASSIGNMENT_ID={assignment_id} {argv[0]} {_claude_args}"
+    )
+    _tmux_host = TmuxHost(ssh_target=machine_obj.host)
+    _sname = _tmux_name(assignment_id)
+
+    # Echo the briefing to the LOCAL terminal before attaching, so the
+    # operator can read it before pressing Enter (mirrors the remote
+    # review/work paths).
+    if effective_briefing.strip():
+        _hdr = (
+            "--- seeded briefing -- review below; "
+            "submit the pre-filled input in Claude to send ---"
+        )
+        _ftr = "-" * len(_hdr)
+        _preview = f"\n{_hdr}\n{effective_briefing.rstrip()}\n{_ftr}\n\n"
+        try:
+            os.write(sys.stdout.fileno(), _preview.encode("utf-8"))
+        except OSError:
+            pass
+
     started_at = _time.time()
-    exit_code = launch_human_attended_interactive(
+    _rc = _tmux_launch(
         argv,
         effective_briefing,
-        assignment_id=assignment_id,
-        cwd=smoke_repo_path,
+        _sname,
+        cwd=None,
+        host=_tmux_host,
+        raw_shell_cmd=_remote_cmd,
     )
+    if _rc is None:
+        click.echo(
+            "  error: could not create remote tmux session on "
+            f"{machine_obj.host}",
+            err=True,
+        )
+        sys.exit(1)
+    exit_code = _rc
     if exit_code != 0:
         click.echo(f"  claude exited with status {exit_code}", err=True)
 
-    _sname = _tmux_name(assignment_id) if _tmux_avail() else None
-    if _sname and _tmux_alive(_sname):
+    if _tmux_alive(_sname, host=_tmux_host):
         click.echo(
-            f"  session still running in tmux: {_sname}\n"
-            f"  reattach with:  coord reattach {assignment_id}"
+            f"  session still running in remote tmux: {_sname}\n"
+            f"  reattach with:  ssh -t {machine_obj.host}"
+            f" tmux attach-session -t {_sname}"
         )
         sys.exit(0)
 
-    # worktree_path=None: read-only smoke runs in the live checkout, the
-    # backstop must never push or remove it.  The verdict that matters
-    # is the `coord test` write on the WORK row, not this session's row.
+    # Session ended.  Record a terminal state for THIS SMOKE SESSION row
+    # (not the WORK row) so it doesn't linger as a phantom 'running' worker
+    # holding the issue claim forever — worktree_path=None/repo_path=None
+    # since this is read-only (no push, no worktree touch), identical to
+    # the local path above.  ssh_target lets any future transcript-floor
+    # recovery read the session's OWN host (mirrors the #617 review fix).
     try:
         finalize_interactive_exit(
             assignment_id=assignment_id,
@@ -761,6 +906,7 @@ def _dispatch_smoke_of(
             started_at=started_at,
             log_path=None,
             repo_path=None,
+            ssh_target=machine_obj.host,
         )
     except Exception as exc:  # noqa: BLE001 — best-effort backstop
         click.echo(
@@ -768,14 +914,8 @@ def _dispatch_smoke_of(
             err=True,
         )
 
-    # #923: Test-verdict backstop — if the agent exited without running
-    # `coord test --passed|--fail|--skipped`, prompt the operator here (we
-    # are on a TTY) and relay via the daemon-routed record_test_verdict.
-    # Idempotent: no-op when the WORK row already has test_state set.
-    _test_verdict_cmd = (
-        f"    coord test --passed {smoke_of}   # all good\n"
-        f"    coord test --fail {smoke_of} --reason \"<story>\"   # broken"
-    )
+    # #923: Test-verdict backstop — see comment above the shared
+    # _test_verdict_cmd definition.
     try:
         if not _prompt_and_relay_test_verdict(
             work_assignment_id=smoke_of,
@@ -795,7 +935,7 @@ def _dispatch_smoke_of(
             f"  warning: test-verdict backstop failed: {exc}",
             err=True,
         )
-    return
+    sys.exit(exit_code)
 
 
 def _dispatch_audit_of(
