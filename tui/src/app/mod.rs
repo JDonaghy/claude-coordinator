@@ -1992,6 +1992,15 @@ pub struct CoordApp {
     /// close`) — 'y' confirms, any other key cancels, mirroring
     /// `pending_restart`.
     pending_close_plan: Option<PendingClosePlan>,
+    /// #1017: inline (optional) title input for the Plans-panel "New
+    /// milestone via chat…" key (bare `C` while `active_view ==
+    /// SidebarView::Plans`, sibling to #977's `c` capture). `Some(buf)`
+    /// means we are accumulating an optional seed title; Enter dispatches
+    /// `coord milestone chat <repo> --new [--title <buf>]` via
+    /// `capture_plan_chat` — unlike `pending_plan_capture`, an empty buffer
+    /// is a valid submission (the operator discusses the title in chat).
+    /// Esc cancels.
+    pending_new_milestone_chat: Option<String>,
     /// #264: refinement-chat dispatch is pending — we've shelled `coord
     /// refine-chat <repo> <issue>` and are polling the DB for the new
     /// `type="refinement"` assignment to appear so we can open the chat
@@ -2852,6 +2861,7 @@ impl CoordApp {
             pending_plan_capture: None,
             pending_milestone_row_input: None,
             pending_close_plan: None,
+            pending_new_milestone_chat: None,
             pending_refinement: None,
             pending_test_chat: None,
             pending_chat_resume: None,

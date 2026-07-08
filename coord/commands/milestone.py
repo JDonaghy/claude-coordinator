@@ -948,13 +948,17 @@ def milestone_write_order_cmd(
         "The steward discusses the milestone, proposes a `## Work order` "
         "block inferring parallel cohorts (`group`) vs. hard dependencies "
         "(`after`) from the issue bodies, and can also propose creating/"
-        "editing the milestone or assigning an issue to it — each written "
-        "only once the operator confirms in the conversation, via `coord "
-        "milestone write-order`/`create`/`edit`/`assign` (never raw `gh`).\n\n"
+        "editing the milestone, assigning an issue to it, or splicing a "
+        "sub-issue onto its epic — each written only once the operator "
+        "confirms in the conversation, via `coord milestone write-order`/"
+        "`create`/`edit`/`assign`/`add-child` (never raw `gh`).\n\n"
         "REPO is the local repo name from coordinator.yml; TRACKING_ISSUE is "
         "the GH issue number of the tracking issue (must carry a milestone). "
         "Pass `--new` instead of TRACKING_ISSUE to start a chat for a "
-        "brand-new milestone that doesn't have a tracking issue yet."
+        "brand-new milestone that doesn't have a tracking issue yet. Pass "
+        "`--add-child ISSUE` alongside TRACKING_ISSUE (#1017) to seed an "
+        "\"add sub-issue\" chat about splicing ISSUE onto the epic's `## "
+        "Sub-issues` checklist via `coord milestone add-child`."
     ),
 )
 @click.argument("repo")
@@ -978,6 +982,13 @@ def milestone_write_order_cmd(
     help="Optional seed prompt for --new describing the milestone's goal/scope.",
 )
 @click.option(
+    "--add-child",
+    "add_child_issue",
+    type=int,
+    default=None,
+    help="Seed an \"add sub-issue\" chat (#1017) about splicing this candidate issue onto TRACKING_ISSUE's epic via `coord milestone add-child`. Requires TRACKING_ISSUE; invalid with --new.",
+)
+@click.option(
     "--machine",
     default=None,
     help="Override machine selection (default: first unpaused machine that lists the repo).",
@@ -989,6 +1000,7 @@ def milestone_chat_cmd(
     is_new: bool,
     seed_title: str | None,
     seed_prompt: str | None,
+    add_child_issue: int | None,
     machine: str | None,
     config_path: Path,
 ) -> None:
@@ -1001,6 +1013,9 @@ def milestone_chat_cmd(
     if is_new:
         if tracking_issue is not None:
             click.echo("error: pass either TRACKING_ISSUE or --new, not both", err=True)
+            sys.exit(2)
+        if add_child_issue is not None:
+            click.echo("error: --add-child requires TRACKING_ISSUE, not --new", err=True)
             sys.exit(2)
 
         from coord.milestone_chat import dispatch_new_milestone_chat
@@ -1032,6 +1047,7 @@ def milestone_chat_cmd(
                 tracking_issue,
                 cfg,
                 machine_override=machine,
+                add_child_issue=add_child_issue,
             )
         except RuntimeError as exc:
             click.echo(f"error: {exc}", err=True)

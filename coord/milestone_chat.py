@@ -1,4 +1,5 @@
-"""#770 (Phase 2 of #767) + #1009: dispatch a `type="milestone-chat"` session.
+"""#770 (Phase 2 of #767) + #1009 + #1017: dispatch a `type="milestone-chat"`
+session.
 
 Lets the operator chat about a milestone's issues and — once they confirm —
 write the `## Work order` block that ``coord/milestone_order.py`` (#768)
@@ -6,23 +7,26 @@ parses into a DAG/frontier. #1009 widened this beyond that original narrow
 slice: the same propose-then-confirm-then-write discipline now also covers
 creating a brand-new milestone (:func:`dispatch_new_milestone_chat`, no
 tracking issue yet), editing an existing milestone's title/description/due
-date, and assigning an issue to a milestone — see
+date, and assigning an issue to a milestone. #1017 adds a third seed mode —
+an "add sub-issue" chat seeded with the epic body plus a candidate child
+issue (:func:`build_milestone_chat_briefing`'s ``candidate_child_issue``
+param) — now that #1008 shipped `coord milestone add-child`. See
 ``MILESTONE_CHAT_SYSTEM_PROMPT`` in ``coord/agent.py`` for the exact
 commands the worker is allowed to run. Full #645 "milestone-steward" scope
-(creating/editing the *issues themselves*, splicing sub-issues via
-``coord milestone add-child`` from #1008) stays out of scope until that
+(creating/editing the *issues themselves*) stays out of scope until that
 lands; nothing here forecloses it.
 
-Used by `coord milestone chat <repo> <tracking_issue>` (existing milestone)
-and `coord milestone chat <repo> --new` (brand-new milestone) — both CLI
-entry points live in ``coord/commands/milestone.py``.
+Used by `coord milestone chat <repo> <tracking_issue>` (existing milestone,
+optionally `--add-child <issue>` to seed the add-sub-issue mode) and
+`coord milestone chat <repo> --new` (brand-new milestone) — both CLI entry
+points live in ``coord/commands/milestone.py``.
 
 The session itself runs as a `type="milestone-chat"` assignment on an agent
 server. Tools are `Read,Bash` (see `coord/agent.py`); a deny list blocks raw
 `gh` mutations and unrelated `coord` write commands — the write actions the
-worker may take are `coord milestone write-order`, `create`, `edit`, and
-`assign`, and only after the operator has explicitly confirmed the specific
-proposed change in conversation.
+worker may take are `coord milestone write-order`, `create`, `edit`,
+`assign`, and `add-child`, and only after the operator has explicitly
+confirmed the specific proposed change in conversation.
 """
 from __future__ import annotations
 
@@ -94,6 +98,7 @@ def build_milestone_chat_briefing(
     milestone_number: int | None = None,
     milestone_description: str | None = None,
     milestone_due_on: str | None = None,
+    candidate_child_issue: dict | None = None,
 ) -> str:
     """Compose the seed briefing the worker sees as its first user message.
 
@@ -105,6 +110,12 @@ def build_milestone_chat_briefing(
     conversation has the current values to propose changes against without
     a separate lookup. Omitted (``None``) when the caller couldn't fetch
     them; the chat still works, just without that convenience context.
+
+    *candidate_child_issue* (#1017) is an optional ``{"number", "title",
+    "body"}`` dict — when supplied (the TUI's "Add sub-issue via chat…"
+    entry, or `coord milestone chat --add-child`), the briefing calls out
+    that candidate and steers the conversation toward proposing a `coord
+    milestone add-child` splice rather than a generic discussion.
     """
     parts: list[str] = []
     parts.append(
@@ -167,6 +178,35 @@ def build_milestone_chat_briefing(
             "escape it as `'\\''` (close the quote, insert an escaped quote, "
             "reopen), e.g. \"operator's plan\" becomes 'operator'\\''s plan'."
         )
+    if candidate_child_issue is not None:
+        child_number = candidate_child_issue.get("number")
+        child_title = candidate_child_issue.get("title") or ""
+        child_body = candidate_child_issue.get("body") or "(no body)"
+        parts.append("")
+        parts.append(
+            f"ADD SUB-ISSUE MODE: the operator wants to discuss splicing "
+            f"#{child_number} onto this epic's `## Sub-issues` checklist "
+            "(#1008/#1017) as a child of the tracking issue above. Candidate "
+            "issue:"
+        )
+        parts.append(f"--- #{child_number}: {child_title} ---")
+        parts.append(child_body)
+        parts.append("")
+        parts.append(
+            "Discuss whether this candidate belongs under the epic, and if "
+            "so, whether it should carry a `{group: <label>}` cohort or a "
+            "`{after: #N[,#M...]}` hard dependency — ground any inference in "
+            "explicit signals in the issue bodies, the same way you would "
+            "for a `## Work order` entry. Present the exact splice you're "
+            "proposing, and only after the operator explicitly confirms it, "
+            "run:\n\n"
+            f"  coord milestone add-child {repo_name} {tracking_issue_number} "
+            f"{child_number} [--group '<group>'] [--after <N>[,<M>...]]\n\n"
+            "Omit --group/--after entirely for a bare splice with no "
+            "annotation. To remove a sub-issue instead, run `coord milestone "
+            f"add-child {repo_name} {tracking_issue_number} {child_number} "
+            "--remove` (only after the operator confirms removal)."
+        )
     return "\n".join(parts)
 
 
@@ -223,9 +263,18 @@ def dispatch_milestone_chat(
     config: Config,
     *,
     machine_override: str | None = None,
+    add_child_issue: int | None = None,
 ) -> tuple[str, str]:
     """End-to-end: resolve the milestone, pick a machine, seed the
     briefing, dispatch a ``type="milestone-chat"`` assignment.
+
+    *add_child_issue* (#1017) is an optional candidate child issue number —
+    when given, it's fetched and passed to
+    :func:`build_milestone_chat_briefing` as ``candidate_child_issue`` so
+    the seed steers the conversation toward an "Add sub-issue" chat (the
+    TUI's "Add sub-issue via chat…" entry, or `coord milestone chat
+    --add-child`). Best-effort: a fetch failure falls back to a plain
+    milestone chat rather than failing the whole dispatch.
 
     Returns ``(assignment_id, machine_name)``. Raises ``RuntimeError`` when
     the repo is unknown, the tracking issue can't be fetched or has no
@@ -282,6 +331,22 @@ def dispatch_milestone_chat(
     except RuntimeError:
         pass
 
+    # #1017: best-effort fetch of the candidate child issue for an "Add
+    # sub-issue" chat. A fetch failure just falls back to a plain milestone
+    # chat rather than failing the whole dispatch.
+    candidate_child_issue: dict | None = None
+    if add_child_issue is not None:
+        try:
+            child_data = github_ops.get_issue(repo_cfg.github, add_child_issue)
+        except RuntimeError:
+            child_data = None
+        if child_data is not None:
+            candidate_child_issue = {
+                "number": add_child_issue,
+                "title": child_data.get("title") or "",
+                "body": child_data.get("body") or "",
+            }
+
     briefing = build_milestone_chat_briefing(
         repo_name=repo_name,
         repo_slug=repo_cfg.github,
@@ -292,6 +357,7 @@ def dispatch_milestone_chat(
         milestone_number=milestone_number,
         milestone_description=milestone_description,
         milestone_due_on=milestone_due_on,
+        candidate_child_issue=candidate_child_issue,
     )
 
     tracking_title = issue_data.get("title") or f"Milestone chat #{tracking_issue_number}"
