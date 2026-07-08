@@ -3400,8 +3400,7 @@ impl CoordApp {
                         // Only peek when there's actually a session.
                         match self.active_view {
                             SidebarView::Terminal => self
-                                .terminal_session
-                                .as_ref()
+                                .standalone_pty_session()
                                 .map(|s| s.mouse_reporting_enabled())
                                 .unwrap_or(false),
                             SidebarView::Pipeline
@@ -4407,7 +4406,7 @@ impl CoordApp {
                 if let Some((col, row)) =
                     terminal_pixel_to_cell(pos, main_b, main_b.y, char_w, lh)
                 {
-                    if let Some(ref mut sess) = self.terminal_session {
+                    if let Some(sess) = self.standalone_pty_session_mut() {
                         return sess.forward_mouse(kind, button, col, row, modifiers);
                     }
                 }
@@ -4462,7 +4461,7 @@ impl CoordApp {
             SidebarView::Terminal => {
                 let (col, row) =
                     terminal_pixel_to_cell_clamped(pos, main_b, main_b.y, char_w, lh);
-                if let Some(ref mut sess) = self.terminal_session {
+                if let Some(sess) = self.standalone_pty_session_mut() {
                     return sess.forward_mouse(
                         TerminalMouseKind::Release,
                         button,
@@ -4535,7 +4534,7 @@ impl CoordApp {
         &mut self,
     ) -> Option<&mut quadraui::terminal_engine::TerminalSession> {
         match self.active_view {
-            SidebarView::Terminal => self.terminal_session.as_mut(),
+            SidebarView::Terminal => self.standalone_pty_session_mut(),
             SidebarView::Pipeline
                 if self.pipeline_detail_tab == PipelineDetailTab::Terminal =>
             {
@@ -4549,7 +4548,7 @@ impl CoordApp {
     /// Return the selected text from the active terminal session, if any.
     pub(crate) fn active_terminal_selected_text(&self) -> Option<String> {
         match self.active_view {
-            SidebarView::Terminal => self.terminal_session.as_ref()?.selected_text(),
+            SidebarView::Terminal => self.standalone_pty_session()?.selected_text(),
             SidebarView::Pipeline
                 if self.pipeline_detail_tab == PipelineDetailTab::Terminal =>
             {
@@ -4913,7 +4912,7 @@ impl CoordApp {
                     if let Some((col, row)) =
                         terminal_pixel_to_cell(pos, main_b, main_b.y, char_w, lh)
                     {
-                        if let Some(ref mut sess) = self.terminal_session {
+                        if let Some(sess) = self.standalone_pty_session_mut() {
                             let kind = if delta.y > 0.0 {
                                 TerminalMouseKind::WheelUp
                             } else {

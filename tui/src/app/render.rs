@@ -402,7 +402,12 @@ impl ShellApp for CoordApp {
                 let rows = (term_rect.height / cell_h).floor().max(1.0) as u16;
                 self.terminal_pending_dims.set(Some((cols, rows)));
 
-                if let Some(ref sess) = self.terminal_session {
+                // #955: a selected Terminal-tree leaf switches the main
+                // pane to that fleet terminal's attached PTY; otherwise
+                // it's the bare local-shell fallback — both are painted
+                // identically via `standalone_pty_session` once live.
+                let selected_fleet = self.selected_fleet_terminal_key();
+                if let Some(sess) = self.standalone_pty_session() {
                     let total = sess.history_len() + sess.rows() as usize;
                     let sb = if total > sess.rows() as usize {
                         Some(sess.scrollbar_state(None))
@@ -413,21 +418,41 @@ impl ShellApp for CoordApp {
                     backend.draw_terminal(term_rect, &snapshot);
                 } else {
                     // No session yet — show a one-line placeholder.  The
-                    // first `tick` after this render will spawn it.
-                    let msg = match &self.terminal_spawn_error {
-                        // §3 (#782): numeric keys no longer switch views —
-                        // point at the activity bar instead.
-                        Some(err) => format!(
-                            "  ⚠ Terminal session error: {}  (click the activity bar to switch views)",
-                            err
-                        ),
-                        None => "  Starting shell session…".to_string(),
+                    // first `tick` after this render will spawn/attach it.
+                    let (msg, is_err) = if let Some((machine, name)) = selected_fleet.as_ref() {
+                        match self
+                            .fleet_terminal_spawn_errors
+                            .get(&(machine.clone(), name.clone()))
+                        {
+                            Some(err) => (
+                                format!(
+                                    "  ⚠ Attach error ({}:{}): {}  (click the activity bar to switch views)",
+                                    machine, name, err
+                                ),
+                                true,
+                            ),
+                            None => (format!("  Attaching to {}:{}…", machine, name), false),
+                        }
+                    } else {
+                        match &self.terminal_spawn_error {
+                            // §3 (#782): numeric keys no longer switch views —
+                            // point at the activity bar instead.
+                            Some(err) => (
+                                format!(
+                                    "  ⚠ Terminal session error: {}  (click the activity bar to switch views)",
+                                    err
+                                ),
+                                true,
+                            ),
+                            None => ("  Starting shell session…".to_string(), false),
+                        }
                     };
                     let item = activity_item(
                         &msg,
-                        match self.terminal_spawn_error {
-                            Some(_) => Color::rgb(220, 80, 80),
-                            None => Color::rgb(180, 180, 180),
+                        if is_err {
+                            Color::rgb(220, 80, 80)
+                        } else {
+                            Color::rgb(180, 180, 180)
                         },
                     );
                     backend.draw_list(

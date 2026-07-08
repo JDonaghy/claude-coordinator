@@ -1816,6 +1816,13 @@ impl CoordApp {
     /// standalone Terminal pane (SidebarView::Terminal), reusing the same PTY
     /// infrastructure as Chat/Troubleshoot modes.
     pub(crate) fn launch_merge_queue_interactive(&mut self) {
+        // #955: a selected Terminal-tree leaf takes over the main pane
+        // (routes to `fleet_terminal_sessions` — see
+        // `standalone_pty_session_mut`), which would hide the merge-agent
+        // session this call is about to launch into `terminal_session`.
+        // Clear the tree selection so the bare-shell pane is visible.
+        self.terminal_tree_selected = None;
+
         // Prefer merge_plan (v0.4.53+ daemon); fall back to raw merge_queue.
         let (work_aid, repo_github, issue_num): (String, String, u64) =
             if !self.data.merge_plan.is_empty() {

@@ -2448,6 +2448,26 @@ pub struct CoordApp {
     /// Scroll offset (in flattened tree rows) for the Terminal-view tree.
     terminal_tree_scroll: usize,
 
+    // ── #955: attached fleet-terminal sessions (Terminal-view main pane) ───
+    /// Local PTYs running `coord terminal attach <machine:name>`, keyed by
+    /// `(machine, name)` — one per fleet-terminal tree leaf the operator has
+    /// selected this run. Mirrors `detail_terminal_sessions`'s per-key
+    /// cache: kept warm across selection swaps so switching back to a
+    /// previously-attached terminal is instant rather than re-spawning +
+    /// re-attaching. Selecting a *different* leaf does not evict the prior
+    /// entry — only the render path (`SidebarView::Terminal` in
+    /// `render.rs`) decides which one is currently visible, driven by
+    /// `terminal_tree_selected`. Distinct from `terminal_session` (the
+    /// bare-`$SHELL` fallback used when no fleet-terminal leaf is
+    /// selected — e.g. an empty tree, or a machine row selected).
+    fleet_terminal_sessions:
+        std::collections::HashMap<(String, String), quadraui::terminal_engine::TerminalSession>,
+    /// Spawn/attach errors for `fleet_terminal_sessions`, keyed the same
+    /// way — mirrors `detail_terminal_spawn_errors`. Prevents an endless
+    /// respawn loop (e.g. target machine unreachable over ssh) and lets the
+    /// Terminal pane show a readable diagnostic instead of a blank screen.
+    fleet_terminal_spawn_errors: std::collections::HashMap<(String, String), String>,
+
     // ── #603: exact fix-briefing preview for the fail→fix / rework dialog ───
     /// The resolved fix briefing text (context block + findings/test story),
     /// shown in the confirm dialog so the operator sees what the fix worker
@@ -2903,6 +2923,10 @@ impl CoordApp {
             terminal_tree_expanded: std::collections::HashMap::new(),
             terminal_tree_selected: None,
             terminal_tree_scroll: 0,
+            // #955: attached fleet-terminal PTYs — empty until a tree leaf
+            // is selected and `drive_terminal_pane` lazily attaches it.
+            fleet_terminal_sessions: std::collections::HashMap::new(),
+            fleet_terminal_spawn_errors: std::collections::HashMap::new(),
             // #603: fix-briefing preview (lazily populated when a dialog raises).
             fix_briefing_preview: None,
             fix_briefing_rx: None,
