@@ -16,9 +16,12 @@ from coord.milestone_order import (
     WorkOrder,
     WorkOrderError,
     WorkOrderNode,
+    parse_sub_issues,
     parse_work_order,
     ready_frontier,
+    render_sub_issues,
     render_work_order,
+    replace_sub_issues_section,
     replace_work_order_section,
     validate_milestone_membership,
 )
@@ -350,3 +353,130 @@ class TestReplaceWorkOrderSection:
         new_body = replace_work_order_section(body, "- [ ] #1\n- [ ] #2")
         assert "### Sub-heading\nkept" in new_body
         assert parse_work_order(new_body).issue_numbers == (1, 2)
+
+
+# ── parse_sub_issues / render_sub_issues / replace_sub_issues_section (#1008) ─
+# Mirrors the Work-order test classes above almost line for line — same
+# grammar, same validation, different heading — plus a coexistence check
+# proving the two sections don't step on each other in one tracking body.
+
+
+SUB_ISSUES_BODY = """\
+Epic intro prose.
+
+## Sub-issues
+- [ ] #1050  {group: A}
+- [ ] #1051  {after: #1050}
+- [x] #1052
+
+## Refs
+Not part of the sub-issues checklist.
+"""
+
+
+class TestParseSubIssues:
+    def test_parses_nodes_and_annotations(self) -> None:
+        wo = parse_sub_issues(SUB_ISSUES_BODY)
+        assert wo.issue_numbers == (1050, 1051, 1052)
+        assert wo.node(1050).group == "A"
+        assert wo.node(1051).after == (1050,)
+        assert wo.node(1052).checked is True
+
+    def test_no_heading_returns_empty(self) -> None:
+        assert parse_sub_issues("just prose, no sub-issues here").nodes == ()
+
+    def test_does_not_pick_up_a_work_order_block(self) -> None:
+        """A body with only `## Work order` (no `## Sub-issues`) parses empty
+        for parse_sub_issues — the two sections are independent."""
+        assert parse_sub_issues(SAMPLE_BODY).nodes == ()
+
+
+class TestParseSubIssuesErrors:
+    def test_cycle_raises(self) -> None:
+        body = "## Sub-issues\n- [ ] #1 {after: #2}\n- [ ] #2 {after: #1}\n"
+        with pytest.raises(WorkOrderError, match=r"cycle.*#1.*#2"):
+            parse_sub_issues(body)
+
+    def test_undeclared_after_target_raises(self) -> None:
+        body = "## Sub-issues\n- [ ] #1 {after: #99}\n"
+        with pytest.raises(WorkOrderError, match=r"sub-issues.*#1.*after:#99.*not declared"):
+            parse_sub_issues(body)
+
+    def test_duplicate_issue_raises(self) -> None:
+        body = "## Sub-issues\n- [ ] #1\n- [ ] #1\n"
+        with pytest.raises(WorkOrderError, match=r"sub-issues.*#1.*more than once"):
+            parse_sub_issues(body)
+
+    def test_unknown_annotation_key_raises(self) -> None:
+        body = "## Sub-issues\n- [ ] #1 {bogus: x}\n"
+        with pytest.raises(WorkOrderError, match="unknown annotation key"):
+            parse_sub_issues(body)
+
+    def test_unparseable_line_raises(self) -> None:
+        body = "## Sub-issues\n- this is not a sub-issue item\n"
+        with pytest.raises(WorkOrderError, match="unparseable line"):
+            parse_sub_issues(body)
+
+
+class TestRenderSubIssues:
+    def test_is_render_work_order(self) -> None:
+        """render_sub_issues is an alias — heading-agnostic rendering means
+        there's only one checklist-rendering implementation to maintain."""
+        assert render_sub_issues is render_work_order
+
+    def test_round_trips_through_parse(self) -> None:
+        wo = parse_sub_issues(SUB_ISSUES_BODY)
+        rendered = render_sub_issues(wo)
+        reparsed = parse_sub_issues("## Sub-issues\n" + rendered)
+        assert reparsed == wo
+
+
+class TestReplaceSubIssuesSection:
+    def test_replaces_existing_section_in_place(self) -> None:
+        body = (
+            "Intro.\n\n"
+            "## Sub-issues\n"
+            "- [ ] #1050\n\n"
+            "## Refs\n"
+            "other stuff\n"
+        )
+        new_body = replace_sub_issues_section(
+            body, "- [ ] #1050  {group: A}\n- [ ] #1051  {after: #1050}"
+        )
+        assert "## Refs\nother stuff" in new_body
+        assert "Intro." in new_body
+        wo = parse_sub_issues(new_body)
+        assert wo.issue_numbers == (1050, 1051)
+        assert new_body.count("## Sub-issues") == 1
+
+    def test_appends_section_when_absent(self) -> None:
+        body = "Just prose, no sub-issues yet.\n"
+        new_body = replace_sub_issues_section(body, "- [ ] #1050")
+        assert "Just prose, no sub-issues yet." in new_body
+        assert parse_sub_issues(new_body).issue_numbers == (1050,)
+
+    def test_is_idempotent(self) -> None:
+        body = "## Sub-issues\n- [ ] #1050  {group: A}\n"
+        once = replace_sub_issues_section(body, "- [ ] #1050  {group: A}")
+        twice = replace_sub_issues_section(once, "- [ ] #1050  {group: A}")
+        assert once == twice
+
+    def test_does_not_disturb_a_coexisting_work_order_section(self) -> None:
+        """The whole point of keying on separate headings (#1008): splicing
+        `## Sub-issues` must leave an existing `## Work order` block (and
+        vice versa) completely untouched."""
+        body = (
+            "## Work order\n"
+            "- [ ] #762  {group: A}\n\n"
+            "## Sub-issues\n"
+            "- [ ] #1050\n"
+        )
+        new_body = replace_sub_issues_section(body, "- [ ] #1050\n- [ ] #1051")
+        assert parse_work_order(new_body).issue_numbers == (762,)
+        assert parse_sub_issues(new_body).issue_numbers == (1050, 1051)
+
+        # And the reverse: replacing `## Work order` must leave `##
+        # Sub-issues` untouched too.
+        newer_body = replace_work_order_section(new_body, "- [ ] #762\n- [ ] #763")
+        assert parse_work_order(newer_body).issue_numbers == (762, 763)
+        assert parse_sub_issues(newer_body).issue_numbers == (1050, 1051)

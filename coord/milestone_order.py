@@ -40,6 +40,15 @@ re-run ``coord milestone order`` is expected and still a valid node; only
 its *readiness* (via ``terminal_issues``) changes, not its validity in the
 DAG. Only a genuinely wrong/foreign issue number raises
 ``WorkOrderError``.
+
+#1008 adds a second checklist convention living in the *same* tracking-issue
+body: ``## Sub-issues`` — the epic's child-issue list, spliced by ``coord
+milestone add-child`` (:func:`parse_sub_issues` / :func:`render_sub_issues`
+/ :func:`replace_sub_issues_section`). It reuses the identical `- [ ] #N
+{group: ..., after: ...}` checklist grammar and the same
+:class:`WorkOrderNode` / :class:`WorkOrder` shapes as the work order — only
+the section heading differs — so the two conventions can coexist in one
+tracking-issue body without either splice helper disturbing the other.
 """
 
 from __future__ import annotations
@@ -60,6 +69,9 @@ __all__ = [
     "parse_work_order",
     "render_work_order",
     "replace_work_order_section",
+    "parse_sub_issues",
+    "render_sub_issues",
+    "replace_sub_issues_section",
     "validate_milestone_membership",
     "FrontierEntry",
     "BlockedNode",
@@ -117,6 +129,8 @@ class WorkOrder:
 # ── Parsing ──────────────────────────────────────────────────────────────────
 
 _HEADING_RE = re.compile(r"^#{1,6}\s*Work order\s*$", re.IGNORECASE)
+# #1008: the epic's child-issue checklist — same grammar, different heading.
+_SUB_ISSUES_HEADING_RE = re.compile(r"^#{1,6}\s*Sub-issues\s*$", re.IGNORECASE)
 _ITEM_RE = re.compile(r"^-\s*\[([ xX])\]\s*#(\d+)\s*(\{([^}]*)\})?")
 # Splits `key: value` pairs on commas that precede the *next* key, so an
 # `after: #762,#763` value (itself comma-separated) isn't cut mid-list.
@@ -139,10 +153,41 @@ def parse_work_order(body: str) -> WorkOrder:
     - an ``after`` edge to an issue not itself declared in this block
     - a dependency cycle
     """
+    return _parse_checklist_section(body, _HEADING_RE, "work order")
+
+
+def parse_sub_issues(body: str) -> WorkOrder:
+    """Parse the `## Sub-issues` block out of an epic tracking-issue body (#1008).
+
+    Mirrors :func:`parse_work_order` exactly — same checklist grammar
+    (`- [ ] #N  {group: ..., after: ...}`), same validation (duplicates,
+    unknown annotation keys, malformed/undeclared ``after`` targets, cycles)
+    — only the section heading (`## Sub-issues` vs `## Work order`) and the
+    error-message label differ. Returns an empty :class:`WorkOrder` when the
+    body has no `## Sub-issues` heading. Reuses :class:`WorkOrder` /
+    :class:`WorkOrderNode` rather than introducing parallel types since the
+    shape is identical; ``coord milestone add-child`` is the write-side
+    counterpart (mirrors ``coord milestone write-order``'s relationship to
+    :func:`parse_work_order`).
+    """
+    return _parse_checklist_section(body, _SUB_ISSUES_HEADING_RE, "sub-issues")
+
+
+def _parse_checklist_section(
+    body: str, heading_re: re.Pattern[str], label: str
+) -> WorkOrder:
+    """Shared implementation behind :func:`parse_work_order` /
+    :func:`parse_sub_issues`: find *heading_re*'s section in *body*, parse
+    its `- [ ] #N {...}` lines into nodes, then validate (no duplicates,
+    every ``after`` target declared in the same section, no cycle).
+    *label* (e.g. ``"work order"`` / ``"sub-issues"``) is folded into every
+    :class:`WorkOrderError` message so a failure is traceable to the right
+    section of the tracking-issue body.
+    """
     lines = body.splitlines()
     start = None
     for i, line in enumerate(lines):
-        if _HEADING_RE.match(line.strip()):
+        if heading_re.match(line.strip()):
             start = i + 1
             break
     if start is None:
@@ -155,13 +200,13 @@ def parse_work_order(body: str) -> WorkOrder:
         if not stripped:
             continue
         if stripped.startswith("#"):
-            # A markdown heading — the work-order block has ended.
+            # A markdown heading — the section has ended.
             break
         m = _ITEM_RE.match(stripped)
         if not m:
             if stripped.startswith("-"):
                 raise WorkOrderError(
-                    f"work order: unparseable line: {stripped!r} "
+                    f"{label}: unparseable line: {stripped!r} "
                     "(expected '- [ ] #N  {annotations}')"
                 )
             continue
@@ -169,10 +214,10 @@ def parse_work_order(body: str) -> WorkOrder:
         issue_number = int(m.group(2))
         if issue_number in seen:
             raise WorkOrderError(
-                f"work order: #{issue_number} is declared more than once"
+                f"{label}: #{issue_number} is declared more than once"
             )
         seen.add(issue_number)
-        group, after = _parse_annotation(issue_number, m.group(4) or "")
+        group, after = _parse_annotation(issue_number, m.group(4) or "", label)
         nodes.append(WorkOrderNode(issue_number, group, tuple(after), checked))
 
     numbers = {n.issue_number for n in nodes}
@@ -180,15 +225,17 @@ def parse_work_order(body: str) -> WorkOrder:
         for target in n.after:
             if target not in numbers:
                 raise WorkOrderError(
-                    f"work order: #{n.issue_number} has after:#{target}, "
-                    f"but #{target} is not declared in the work order block"
+                    f"{label}: #{n.issue_number} has after:#{target}, "
+                    f"but #{target} is not declared in the {label} block"
                 )
 
-    _check_cycles(nodes)
+    _check_cycles(nodes, label)
     return WorkOrder(nodes=tuple(nodes))
 
 
-def _parse_annotation(issue_number: int, raw: str) -> tuple[str | None, list[int]]:
+def _parse_annotation(
+    issue_number: int, raw: str, label: str = "work order"
+) -> tuple[str | None, list[int]]:
     raw = raw.strip()
     if not raw:
         return None, []
@@ -202,21 +249,23 @@ def _parse_annotation(issue_number: int, raw: str) -> tuple[str | None, list[int
         if key == "group":
             group = value
         elif key == "after":
-            after = _parse_after_list(issue_number, value)
+            after = _parse_after_list(issue_number, value, label)
         else:
             raise WorkOrderError(
-                f"work order: #{issue_number} has unknown annotation key "
+                f"{label}: #{issue_number} has unknown annotation key "
                 f"{key!r} (expected 'group' or 'after')"
             )
     if not matched_any:
         raise WorkOrderError(
-            f"work order: #{issue_number} has an unparseable annotation "
+            f"{label}: #{issue_number} has an unparseable annotation "
             f"{{{raw}}}"
         )
     return group, after
 
 
-def _parse_after_list(issue_number: int, value: str) -> list[int]:
+def _parse_after_list(
+    issue_number: int, value: str, label: str = "work order"
+) -> list[int]:
     items: list[int] = []
     for chunk in value.split(","):
         chunk = chunk.strip()
@@ -225,7 +274,7 @@ def _parse_after_list(issue_number: int, value: str) -> list[int]:
         m = _AFTER_ITEM_RE.fullmatch(chunk)
         if not m:
             raise WorkOrderError(
-                f"work order: #{issue_number} has a malformed after-entry "
+                f"{label}: #{issue_number} has a malformed after-entry "
                 f"{chunk!r} (expected '#N')"
             )
         items.append(int(m.group(1)))
@@ -239,6 +288,10 @@ def render_work_order(work_order: WorkOrder) -> str:
     through it: ``parse_work_order(f"## Work order\\n{render_work_order(wo)}")
     == wo``. Used by :func:`replace_work_order_section` and by
     ``coord milestone write-order`` (#770) to persist a chat-proposed order.
+
+    Heading-agnostic (renders checklist lines only), so it doubles as the
+    render step for the `## Sub-issues` checklist (#1008) too — see the
+    :func:`render_sub_issues` alias.
     """
     lines: list[str] = []
     for n in work_order.nodes:
@@ -251,6 +304,13 @@ def render_work_order(work_order: WorkOrder) -> str:
         annotation = f"  {{{', '.join(bits)}}}" if bits else ""
         lines.append(f"- [{box}] #{n.issue_number}{annotation}")
     return "\n".join(lines)
+
+
+# #1008: `render_work_order` already renders checklist lines only — no
+# heading — so it's identical to what a `## Sub-issues` block needs. Aliased
+# (rather than duplicated) so `coord milestone add-child` reads naturally
+# alongside `parse_sub_issues` / `replace_sub_issues_section`.
+render_sub_issues = render_work_order
 
 
 def replace_work_order_section(body: str, new_block: str) -> str:
@@ -267,10 +327,34 @@ def replace_work_order_section(body: str, new_block: str) -> str:
     duplicates. If *body* has no such heading, `## Work order\\n` +
     *new_block* is appended at the end (blank-line separated).
     """
+    return _splice_checklist_section(body, new_block, _HEADING_RE, "## Work order")
+
+
+def replace_sub_issues_section(body: str, new_block: str) -> str:
+    """Idempotently insert/replace the `## Sub-issues` section of *body* (#1008).
+
+    Mirrors :func:`replace_work_order_section` exactly — same
+    splice-not-duplicate semantics — keyed on a `## Sub-issues` heading
+    instead of `## Work order`, so the two sections can coexist in one
+    tracking-issue body and each splice helper only ever touches its own
+    section. ``coord milestone add-child`` is the write path that calls
+    this (mirrors ``coord milestone write-order`` calling
+    :func:`replace_work_order_section`).
+    """
+    return _splice_checklist_section(
+        body, new_block, _SUB_ISSUES_HEADING_RE, "## Sub-issues"
+    )
+
+
+def _splice_checklist_section(
+    body: str, new_block: str, heading_re: re.Pattern[str], heading_line: str
+) -> str:
+    """Shared implementation behind :func:`replace_work_order_section` /
+    :func:`replace_sub_issues_section`."""
     lines = body.splitlines()
     start = None
     for i, line in enumerate(lines):
-        if _HEADING_RE.match(line.strip()):
+        if heading_re.match(line.strip()):
             start = i + 1
             break
 
@@ -279,7 +363,7 @@ def replace_work_order_section(body: str, new_block: str) -> str:
     if start is None:
         prefix = body.rstrip("\n")
         sep = "\n\n" if prefix else ""
-        rendered = "\n".join(["## Work order", *new_block_lines])
+        rendered = "\n".join([heading_line, *new_block_lines])
         return f"{prefix}{sep}{rendered}\n"
 
     end = len(lines)
@@ -296,7 +380,7 @@ def replace_work_order_section(body: str, new_block: str) -> str:
     return "\n".join(new_lines).rstrip("\n") + "\n"
 
 
-def _check_cycles(nodes: list[WorkOrderNode]) -> None:
+def _check_cycles(nodes: list[WorkOrderNode], label: str = "work order") -> None:
     by_number = {n.issue_number: n for n in nodes}
     WHITE, GRAY, BLACK = 0, 1, 2
     color = {n.issue_number: WHITE for n in nodes}
@@ -308,7 +392,7 @@ def _check_cycles(nodes: list[WorkOrderNode]) -> None:
             if color[dep] == GRAY:
                 cycle = path[path.index(dep):] + [dep]
                 raise WorkOrderError(
-                    "work order: dependency cycle: "
+                    f"{label}: dependency cycle: "
                     + " -> ".join(f"#{n}" for n in cycle)
                 )
             if color[dep] == WHITE:

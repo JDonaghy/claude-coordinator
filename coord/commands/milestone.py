@@ -31,7 +31,11 @@ from coord.milestone_dispatch import (
 from coord.milestone_order import (
     WorkOrder,
     WorkOrderError,
+    WorkOrderNode,
+    parse_sub_issues,
     parse_work_order,
+    render_sub_issues,
+    replace_sub_issues_section,
     replace_work_order_section,
     validate_milestone_membership,
 )
@@ -276,6 +280,156 @@ def milestone_remove_cmd(
         sys.exit(1)
 
     click.echo(f"#{issue} ({repo_entry.github}) removed from its milestone")
+
+
+@milestone_group.command(
+    "add-child",
+    help=(
+        "Idempotent append/remove on an epic tracking issue's `## "
+        "Sub-issues` checklist (#1008) — same splice-not-duplicate spirit "
+        "as `coord milestone write-order` for `## Work order`, keyed on a "
+        "different heading. REPO is the local repo name from "
+        "coordinator.yml; EPIC is the GH issue number of the epic tracking "
+        "issue; ISSUE is the child issue number to add (or remove, with "
+        "--remove).\n\n"
+        "Adding an ISSUE already present with identical --group/--after "
+        "is a no-op; adding it again with different annotations updates "
+        "that line in place (preserving its `[x]` checked state). "
+        "--remove drops ISSUE from the checklist (no-op if absent) and "
+        "cannot be combined with --group/--after. The resulting checklist "
+        "is re-parsed and validated (no duplicate/undeclared-`after`/cycle) "
+        "before writing via `github_ops.update_issue_body` — the epic's "
+        "`## Work order` section (if any) is left untouched."
+    ),
+)
+@click.argument("repo")
+@click.argument("epic", type=int)
+@click.argument("issue", type=int)
+@click.option(
+    "--group", default=None, help="Optional `{group: G}` annotation for ISSUE."
+)
+@click.option(
+    "--after", "after_raw", default=None,
+    help="Optional `{after: N,...}` annotation — comma-separated issue numbers.",
+)
+@click.option(
+    "--remove", is_flag=True,
+    help="Remove ISSUE from the epic's `## Sub-issues` checklist instead of adding it.",
+)
+@_CONFIG_OPTION
+def milestone_add_child_cmd(
+    repo: str,
+    epic: int,
+    issue: int,
+    group: str | None,
+    after_raw: str | None,
+    remove: bool,
+    config_path: Path,
+) -> None:
+    cfg = _load_config(config_path)
+    repo_entry = cfg.repo(repo)
+    if repo_entry is None:
+        click.echo(f"error: unknown repo {repo!r}", err=True)
+        sys.exit(2)
+
+    if remove and (group is not None or after_raw is not None):
+        click.echo("error: --remove cannot be combined with --group/--after", err=True)
+        sys.exit(2)
+
+    after: tuple[int, ...] = ()
+    if after_raw:
+        try:
+            after = tuple(
+                int(chunk.strip().lstrip("#"))
+                for chunk in after_raw.split(",")
+                if chunk.strip()
+            )
+        except ValueError:
+            click.echo(
+                f"error: --after must be a comma-separated list of issue "
+                f"numbers, got {after_raw!r}",
+                err=True,
+            )
+            sys.exit(2)
+
+    from coord import github_ops  # noqa: PLC0415
+
+    try:
+        epic_data = github_ops.get_issue(repo_entry.github, epic)
+    except RuntimeError as e:
+        click.echo(f"error: could not fetch epic #{epic}: {e}", err=True)
+        sys.exit(1)
+
+    if not remove:
+        # Catch a typo'd child issue number before it's baked into the
+        # epic's body — mirrors write-order's pre-write validation rigor.
+        try:
+            github_ops.get_issue(repo_entry.github, issue)
+        except RuntimeError as e:
+            click.echo(f"error: could not fetch issue #{issue}: {e}", err=True)
+            sys.exit(1)
+
+    old_body = epic_data.get("body") or ""
+    try:
+        current = parse_sub_issues(old_body)
+    except WorkOrderError as e:
+        click.echo(f"error: existing `## Sub-issues` block is invalid: {e}", err=True)
+        sys.exit(1)
+
+    nodes = list(current.nodes)
+    existing_idx = next(
+        (i for i, n in enumerate(nodes) if n.issue_number == issue), None
+    )
+
+    if remove:
+        if existing_idx is None:
+            click.echo(
+                f"#{epic} ({repo_entry.github}): #{issue} is not in the "
+                "`## Sub-issues` checklist (no-op)"
+            )
+            return
+        nodes.pop(existing_idx)
+    else:
+        prior_checked = (
+            nodes[existing_idx].checked if existing_idx is not None else False
+        )
+        candidate_node = WorkOrderNode(
+            issue_number=issue, group=group, after=after, checked=prior_checked
+        )
+        if existing_idx is not None:
+            if nodes[existing_idx] == candidate_node:
+                click.echo(
+                    f"#{epic} ({repo_entry.github}): #{issue} already in the "
+                    "`## Sub-issues` checklist (no-op)"
+                )
+                return
+            nodes[existing_idx] = candidate_node
+        else:
+            nodes.append(candidate_node)
+
+    new_block = render_sub_issues(WorkOrder(nodes=tuple(nodes)))
+    candidate_body = replace_sub_issues_section(old_body, new_block)
+
+    try:
+        parse_sub_issues(candidate_body)
+    except WorkOrderError as e:
+        click.echo(
+            f"error: resulting `## Sub-issues` block would be invalid: {e}", err=True
+        )
+        sys.exit(1)
+
+    if candidate_body == old_body:
+        click.echo(
+            f"#{epic} ({repo_entry.github}): `## Sub-issues` unchanged "
+            "(idempotent no-op)"
+        )
+        return
+
+    github_ops.update_issue_body(repo_entry.github, epic, candidate_body)
+    action = "removed from" if remove else "added to"
+    click.echo(
+        f"#{issue} {action} #{epic}'s ({repo_entry.github}) `## Sub-issues` checklist"
+    )
 
 
 _DEFAULT_CAPTURE_BODY = (
