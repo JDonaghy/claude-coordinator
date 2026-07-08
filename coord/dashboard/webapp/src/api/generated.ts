@@ -132,4 +132,7 @@ export interface Assignment {
   acceptance_total: number | null
   acceptance_passed: number | null
   completion_summary: string | null
+  audit_goals_json: string | null
+  audit_bottom_line: string | null
+  audit_run_number: number | null
 }

@@ -312,6 +312,21 @@ pub(crate) struct Assignment {
     /// `None` when no PR URL is known.
     #[serde(default)]
     pub(crate) pr_url: Option<String>,
+    /// #886 Phase 2: Milestone Outcome Audit structured verdict, set only on
+    /// `type="audit"` assignments (see #885's `--audit-of`). Kept as a raw
+    /// JSON STRING on the wire, same convention as `review_findings` above.
+    /// The Plans panel renders the *aggregated* latest-run-per-milestone view
+    /// via `PlanRosterEntry`'s `outcome_*` fields, not this raw column — these
+    /// are present for a possible future per-assignment audit detail view.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub(crate) audit_goals_json: Option<String>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub(crate) audit_bottom_line: Option<String>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub(crate) audit_run_number: Option<i64>,
 }
 
 /// Deserialize a boolean the daemon may send as a SQLite-style integer (0/1)
@@ -954,6 +969,32 @@ pub(crate) struct PlanRosterEntry {
     /// #976 will paint these as health chips on each row.
     #[serde(default)]
     pub(crate) needs_you: Vec<String>,
+    /// #886 Phase 2: the latest Milestone Outcome Audit (`--audit-of`) run
+    /// number for this milestone's epic. `None` when no audit has ever run
+    /// against it — the Outcome chip is omitted entirely in that case rather
+    /// than showing a fabricated 0/0.
+    #[serde(default)]
+    pub(crate) outcome_run_number: Option<u32>,
+    /// Goals verdicted `"met"` in the latest run.
+    #[serde(default)]
+    pub(crate) outcome_met: Option<u32>,
+    /// Goals verdicted `"partial"` in the latest run.
+    #[serde(default)]
+    pub(crate) outcome_partial: Option<u32>,
+    /// Goals verdicted `"gap"` in the latest run — the count the done-gate
+    /// cares about: milestone completion is judged by goals met, not issues
+    /// closed.
+    #[serde(default)]
+    pub(crate) outcome_gap: Option<u32>,
+    /// The latest run's one-line bottom-line verdict (e.g. "5/6 goals met").
+    #[serde(default)]
+    pub(crate) outcome_bottom_line: Option<String>,
+    /// Pre-rendered delta vs the previous run (e.g. "v1→v2: closed: tests.rs
+    /// split; still open: #550"), computed server-side by
+    /// `coord.plans._latest_audit_outcome`. `None` on the first run (nothing
+    /// to diff against) or when neither run moved any goal.
+    #[serde(default)]
+    pub(crate) outcome_diff_summary: Option<String>,
 }
 
 /// GOAL.md pinned north-star header for the Plans panel (#978).

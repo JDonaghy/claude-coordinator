@@ -1017,7 +1017,8 @@ pub(crate) fn load_data() -> BoardData {
              COALESCE(review_iteration, 0), \
              acceptance_state, acceptance_reason, acceptance_sha, \
              acceptance_total, acceptance_passed, \
-             test_reason, review_state, pr_url \
+             test_reason, review_state, pr_url, \
+             audit_goals_json, audit_bottom_line, audit_run_number \
              FROM assignments ORDER BY dispatched_at DESC",
         ) {
             Ok(s) => s,
@@ -1087,6 +1088,11 @@ pub(crate) fn load_data() -> BoardData {
                 test_reason: row.get::<_, Option<String>>(32).unwrap_or(None),
                 review_state: row.get::<_, Option<String>>(33).unwrap_or(None),
                 pr_url: row.get::<_, Option<String>>(34).unwrap_or(None),
+                // #886 Phase 2: Milestone Outcome Audit columns. unwrap_or(None)
+                // for the same graceful-degradation reason as pr_url above.
+                audit_goals_json: row.get::<_, Option<String>>(35).unwrap_or(None),
+                audit_bottom_line: row.get::<_, Option<String>>(36).unwrap_or(None),
+                audit_run_number: row.get::<_, Option<i64>>(37).unwrap_or(None),
             })
         }) {
             Ok(r) => r,

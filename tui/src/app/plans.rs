@@ -410,13 +410,55 @@ impl CoordApp {
                     };
                     spans.push(StyledSpan::with_fg(format!("  [{pct}% done]"), pct_color));
                 }
+                // #886 Phase 2: Milestone Outcome Audit — the done-gate is the
+                // verdict (goals met/partial/gap), independent of the
+                // issue-closed counts above. Omitted entirely when no
+                // `--audit-of` run has ever posted against this epic (no
+                // fabricated 0/0). Always-on like the done% chip, not an
+                // attention signal.
+                if let Some(run) = entry.outcome_run_number {
+                    let met = entry.outcome_met.unwrap_or(0);
+                    let gap = entry.outcome_gap.unwrap_or(0);
+                    let total = met + entry.outcome_partial.unwrap_or(0) + gap;
+                    let outcome_color = if gap > 0 {
+                        Color::rgb(220, 130, 120)
+                    } else if met == total && total > 0 {
+                        Color::rgb(120, 210, 120)
+                    } else {
+                        Color::rgb(150, 150, 160)
+                    };
+                    spans.push(StyledSpan::with_fg(
+                        format!("  [v{run}: goals {met}/{total} met · {gap} gap]"),
+                        outcome_color,
+                    ));
+                }
                 if data_idx == sel {
                     selected_idx = items.len();
                 }
+                // Extra outcome context, right-aligned on the row via
+                // `detail` (quadraui pins it to the visible viewport
+                // regardless of h_scroll and regardless of selection, same as
+                // any other always-on row metadata): prefer the pre-rendered
+                // delta vs the previous audit run (e.g. "v1→v2: closed:
+                // tests.rs split; still open: #550") — the concrete "re-ask
+                // the question" payoff (#886) — and fall back to the latest
+                // run's one-line bottom-line verdict when there's no prior
+                // run to diff against yet (v1).
+                let detail = entry
+                    .outcome_diff_summary
+                    .as_ref()
+                    .or(entry.outcome_bottom_line.as_ref())
+                    .filter(|s| !s.is_empty())
+                    .map(|summary| StyledText {
+                        spans: vec![StyledSpan::with_fg(
+                            summary.clone(),
+                            Color::rgb(150, 150, 160),
+                        )],
+                    });
                 items.push(ListItem {
                     text: StyledText { spans },
                     icon: None,
-                    detail: None,
+                    detail,
                     decoration: Decoration::Normal,
                 });
                 data_idx += 1;
@@ -690,6 +732,12 @@ mod pure_tests {
             done: 0,
             total: 0,
             needs_you: needs.iter().map(|s| s.to_string()).collect(),
+            outcome_run_number: None,
+            outcome_met: None,
+            outcome_partial: None,
+            outcome_gap: None,
+            outcome_bottom_line: None,
+            outcome_diff_summary: None,
         }
     }
 

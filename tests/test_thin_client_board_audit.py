@@ -308,6 +308,12 @@ EXTENDED_ALLOWLIST: dict[str, set[tuple[str, str]]] = {
         # local-DB-only seam, no new daemon-bypass.
         ("_read_review_verdict_local", "get_connection"),
         ("_persist_review_verdict", "get_connection"),
+        # #886 Phase 2: Milestone Outcome Audit structured verdict — same
+        # local-DB-only seam as the #990 pair above (retry + readback-verify
+        # write, plus the read helpers that support it and the diff).
+        ("get_audit_runs_for_epic", "get_connection"),
+        ("_read_audit_run_local", "get_connection"),
+        ("_persist_audit_result", "get_connection"),
     },
     # coord/interactive.py — raw get_connection calls for session/assignment
     # management (reading status, marking stale rows terminal).  These are
