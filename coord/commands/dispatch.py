@@ -536,7 +536,8 @@ def approve(
         "in a worktree, fetches + rebases it onto the repo's default branch "
         "(proactive rebase, #306), resolves mechanical conflicts, runs the "
         "tests, pushes --force-with-lease, then guides you to merge. Requires "
-        "--interactive; local-only for now."
+        "--interactive; works local and remote (#1007, same ssh+tmux worktree "
+        "as --fix-of/--rework-of)."
     ),
 )
 

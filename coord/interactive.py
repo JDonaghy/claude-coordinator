@@ -2528,6 +2528,152 @@ def _remote_stash_artifacts(
     return "__STASH_DONE" in (result.stdout or "")
 
 
+def _remote_verify_merge_branch(
+    ssh_target: str,
+    remote_worktree_sh: str,
+    *,
+    base: str,
+    issue_number: int,
+    timeout: float = 30.0,
+) -> MergeVerify:
+    """Remote (over ssh) analogue of :func:`coord.agent.verify_merge_branch`
+    for a ``--merge-of`` session whose worktree lives on *ssh_target* rather
+    than the local filesystem (#1007).
+
+    Runs the identical ``git rev-list`` / ``git log`` plumbing the local
+    function uses — resolve ``origin/<base>`` then fall back to ``<base>``
+    (mirrors :func:`coord.agent._resolve_base_ref`'s order), count commits
+    HEAD is missing from that ref, and list the commits HEAD adds over it —
+    but as a single ssh call into *remote_worktree_sh* (a ``$HOME``-form path,
+    passed unquoted so the remote shell expands ``$HOME``).  *base* is
+    shell-quoted since it comes from repo config data.
+
+    Returns a :class:`~coord.agent.MergeVerify` with ``default_ahead=None``
+    (not ``ok``) when the base ref can't be resolved on the remote side, the
+    ssh call fails/times out, or the remote worktree directory is gone —
+    same conservative "unverifiable ⇒ not ok" fallback as the local function.
+    """
+    from coord.agent import (  # noqa: PLC0415
+        MergeVerify,
+        _subject_references_foreign_issue,
+    )
+
+    base_q = shlex.quote(base)
+    remote_cmd = (
+        f"cd {remote_worktree_sh} || exit 91; "
+        f"if git rev-parse --verify --quiet origin/{base_q} >/dev/null 2>&1; then "
+        f"REF=origin/{base_q}; "
+        f"elif git rev-parse --verify --quiet {base_q} >/dev/null 2>&1; then "
+        f"REF={base_q}; "
+        f"else echo __REF_MISSING; exit 0; fi; "
+        f'echo "__DEFAULT_AHEAD=$(git rev-list --count HEAD..$REF 2>/dev/null)"; '
+        f'git log --format="__ADDED=%H%x09%s" "$REF"..HEAD 2>/dev/null'
+    )
+    try:
+        result = subprocess.run(
+            ["ssh", *_SSH_MUX_OPTS, ssh_target, remote_cmd],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return MergeVerify(default_ahead=None, added=[], foreign=[])
+
+    default_ahead: int | None = None
+    added: list[tuple[str, str]] = []
+    ref_missing = False
+    for raw in (result.stdout or "").splitlines():
+        line = raw.rstrip("\n")
+        if line.strip() == "__REF_MISSING":
+            ref_missing = True
+        elif line.startswith("__DEFAULT_AHEAD="):
+            val = line.split("=", 1)[1].strip()
+            if val.isdigit():
+                default_ahead = int(val)
+        elif line.startswith("__ADDED="):
+            payload = line[len("__ADDED="):]
+            sha, _, subject = payload.partition("\t")
+            if sha:
+                added.append((sha, subject))
+
+    if ref_missing or default_ahead is None:
+        return MergeVerify(default_ahead=None, added=[], foreign=[])
+
+    foreign = [
+        (sha, subj)
+        for sha, subj in added
+        if _subject_references_foreign_issue(subj, issue_number)
+    ]
+    return MergeVerify(default_ahead=default_ahead, added=added, foreign=foreign)
+
+
+def _finalize_remote_merge_blocked(
+    *,
+    merge_verify,  # agent.MergeVerify (not ok)
+    assignment_id: str,
+    machine_name: str,
+    repo_name: str,
+    repo_github: str,
+    issue_number: int,
+    ssh_target: str,
+    remote_repo_sh: str,
+    remote_worktree_sh: str,
+    branch: str | None,
+    base_branch: str,
+    started_at: float | None,
+) -> InteractiveFinalizeResult:
+    """Remote analogue of :func:`_finalize_merge_blocked` (#1007): record a
+    botched remote ``--merge-of`` rebase as ``blocked`` → ``failed``, via the
+    same ``post_result`` seam ``coord report-result`` uses, OVERRIDING any
+    ``done`` the agent self-reported — mirrors the local function's
+    git-truth-wins ordering (vimcode #494).  The remote worktree is removed
+    afterwards, same as the local path (the offending commits already rode in
+    *merge_verify* for forensics before the worktree + reflog disappear).
+    """
+    from coord.issue_store import (  # noqa: PLC0415
+        STATUS_BLOCKED,
+        ResultRecord,
+        post_result,
+    )
+
+    prior_recorded = _assignment_already_recorded(assignment_id)
+
+    duration = (
+        max(0.0, time.time() - started_at) if started_at is not None else None
+    )
+
+    outcome = post_result(
+        ResultRecord(
+            assignment_id=assignment_id,
+            machine_name=machine_name,
+            repo_name=repo_name,
+            repo_github=repo_github,
+            issue_number=issue_number,
+            status=STATUS_BLOCKED,
+            verdict=None,
+            summary=merge_verify.block_summary(base_branch),
+            duration_seconds=duration,
+            log_path=None,
+            branch=branch,
+        )
+    )
+
+    worktree_removed = _remote_worktree_remove(
+        ssh_target, remote_repo_sh, remote_worktree_sh,
+    )
+
+    return InteractiveFinalizeResult(
+        terminal_status=outcome.status,  # "failed" (blocked → failed)
+        commits_ahead=merge_verify.default_ahead,
+        push_ok=True,
+        push_error=None,
+        already_recorded=prior_recorded,
+        seam_outcome=outcome,
+        worktree_removed=worktree_removed,
+        merge_verify=merge_verify,
+    )
+
+
 def finalize_remote_interactive_exit(
     *,
     assignment_id: str,
@@ -2543,9 +2689,10 @@ def finalize_remote_interactive_exit(
     exit_code: int,
     started_at: float | None = None,
     artifact_paths: list[str] | None = None,
+    verify_merge: bool = False,
 ) -> InteractiveFinalizeResult:
     """Remote (#486d) analog of :func:`finalize_interactive_exit` for a remote
-    interactive FIX.
+    interactive FIX (and, since #1007, a remote ``--merge-of``).
 
     The fix session ran in a worktree ON the remote machine, so the local
     git-floor backstop can't see its commits.  This sshs in to:
@@ -2564,8 +2711,41 @@ def finalize_remote_interactive_exit(
     Respects an existing ``coord report-result`` (same as the local backstop):
     if the row already holds a terminal status, the verdict/result wins and
     this only attempts worktree cleanup (after a best-effort remote stash).
+
+    ``verify_merge=True`` (the remote ``--merge-of`` path, #1007) mirrors
+    :func:`finalize_interactive_exit`'s #604 gate: GIT TRUTH on the remote
+    worktree overrides everything else, including an already-recorded
+    self-report, so a botched remote rebase is never silently accepted as
+    ``done``.  This check runs FIRST, before the ``_assignment_already_recorded``
+    fast path below — do NOT reorder it after that check.
     """
     _effective_patterns = list(artifact_paths or [])
+
+    # ── Merge-prep verification gate (#604 / #1007) ──────────────────────────
+    # Same precedence inversion as the local function: for merge-prep, a
+    # clean-exit self-report is exactly what a botched rebase looks like, so
+    # re-derive the truth from git on the remote worktree and let it override.
+    merge_verify = None
+    if verify_merge and remote_worktree_exists(ssh_target, remote_worktree_sh):
+        merge_verify = _remote_verify_merge_branch(
+            ssh_target, remote_worktree_sh,
+            base=base_branch, issue_number=issue_number,
+        )
+        if not merge_verify.ok:
+            return _finalize_remote_merge_blocked(
+                merge_verify=merge_verify,
+                assignment_id=assignment_id,
+                machine_name=machine_name,
+                repo_name=repo_name,
+                repo_github=repo_github,
+                issue_number=issue_number,
+                ssh_target=ssh_target,
+                remote_repo_sh=remote_repo_sh,
+                remote_worktree_sh=remote_worktree_sh,
+                branch=branch,
+                base_branch=base_branch,
+                started_at=started_at,
+            )
 
     if _assignment_already_recorded(assignment_id):
         # #562: stash artifacts before removing the worktree, even when the
@@ -2587,6 +2767,7 @@ def finalize_remote_interactive_exit(
             already_recorded=True,
             seam_outcome=None,
             worktree_removed=removed,
+            merge_verify=merge_verify,
         )
 
     push_ok, push_error, commits, branch_now = _remote_push_and_count(
@@ -2645,6 +2826,7 @@ def finalize_remote_interactive_exit(
         already_recorded=False,
         seam_outcome=outcome,
         worktree_removed=worktree_removed,
+        merge_verify=merge_verify,
     )
 
 
