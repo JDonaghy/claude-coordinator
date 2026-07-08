@@ -2318,10 +2318,14 @@ impl CoordApp {
                             }
                             // Settings: handled by the earlier guarded arm.
                             SidebarView::Settings => {}
-                            // #424: Terminal view nav happens via F12 +
-                            // PTY passthrough — bare j/k when unfocused
-                            // are inert (no list to navigate).
-                            SidebarView::Terminal => {}
+                            // #953: move the tree cursor down one flattened
+                            // row (machine or terminal). #424: when the PTY
+                            // has focus, keys never reach here (intercepted
+                            // earlier as passthrough), so this is safe.
+                            SidebarView::Terminal => {
+                                self.terminal_tree_move_selection(1);
+                                self.fix_terminal_tree_scroll(content_visible_rows(list_b, lh));
+                            }
                             // #638: Kanban j/k handled by the earlier guarded arm.
                             SidebarView::Kanban => {}
                             // #737: MergeQueue j/k handled by the earlier guarded arm.
@@ -2376,8 +2380,11 @@ impl CoordApp {
                             }
                             // Settings: handled by the earlier guarded arm.
                             SidebarView::Settings => {}
-                            // #424: see Down/j arm above.
-                            SidebarView::Terminal => {}
+                            // #953: see Down/j arm above.
+                            SidebarView::Terminal => {
+                                self.terminal_tree_move_selection(-1);
+                                self.fix_terminal_tree_scroll(content_visible_rows(list_b, lh));
+                            }
                             // #638: Kanban k handled by the earlier guarded arm.
                             SidebarView::Kanban => {}
                             // #737: MergeQueue k handled by the earlier guarded arm.
@@ -3946,6 +3953,18 @@ impl CoordApp {
                 }
                 false
             }
+            // #953: the Terminal-view tree is a raw `TreeView` (not
+            // `SidebarSystem`), so — like Machines above — click dispatch
+            // uses flat pixel-row math rather than a `SidebarEvent`. No
+            // title row (unlike Machines' `ListView.title`), so row 0 maps
+            // directly to the first tree row.
+            SidebarView::Terminal => {
+                if pos.y < sidebar_b.y {
+                    return false;
+                }
+                let row = ((pos.y - sidebar_b.y) / lh).floor() as usize + self.terminal_tree_scroll;
+                self.terminal_tree_click_row(row)
+            }
             SidebarView::Pipeline => {
                 let prev = self.pipeline_sel;
                 let result = self.pipeline_sidebar.handle(event, backend, sidebar_b);
@@ -4072,8 +4091,6 @@ impl CoordApp {
                 let _ = (pos, sidebar_b, backend);
                 false
             }
-            // #424: Terminal sidebar is a hint placeholder; clicks are inert.
-            SidebarView::Terminal => false,
             // #638: Kanban sidebar is a placeholder; clicks are inert.
             SidebarView::Kanban => false,
             // #737: Merge Queue sidebar is a placeholder; clicks are inert.
