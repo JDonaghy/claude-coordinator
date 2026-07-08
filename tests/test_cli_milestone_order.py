@@ -382,6 +382,30 @@ class TestMilestoneChatCmd:
         assert result.exit_code == 2
         assert "unknown repo" in result.output
 
+    def test_missing_tracking_issue_without_new_errors(self, config_file: Path) -> None:
+        result = CliRunner().invoke(
+            main,
+            ["milestone", "chat", "api", "--config", str(config_file)],
+        )
+        assert result.exit_code == 2
+        assert "TRACKING_ISSUE is required" in result.output
+
+    def test_new_and_tracking_issue_together_errors(self, config_file: Path) -> None:
+        result = CliRunner().invoke(
+            main,
+            ["milestone", "chat", "api", "100", "--new", "--config", str(config_file)],
+        )
+        assert result.exit_code == 2
+        assert "not both" in result.output
+
+    def test_seed_options_without_new_error(self, config_file: Path) -> None:
+        result = CliRunner().invoke(
+            main,
+            ["milestone", "chat", "api", "100", "--title", "Foo", "--config", str(config_file)],
+        )
+        assert result.exit_code == 2
+        assert "only apply with --new" in result.output
+
 
 # ── `coord milestone add-child` (#1008: epic-child splice helper) ──────────
 
@@ -620,6 +644,54 @@ class TestMilestoneAddChildCmd:
         result = CliRunner().invoke(
             main,
             ["milestone", "add-child", "nope", "100", "1050", "--config", str(config_file)],
+        )
+        assert result.exit_code == 2
+        assert "unknown repo" in result.output
+
+
+# ── `coord milestone chat --new` (#1009 brand-new-milestone dispatch) ───────
+
+
+class TestMilestoneChatNewCmd:
+    def test_dispatches_and_prints_assignment_id(self, config_file: Path) -> None:
+        with patch(
+            "coord.milestone_chat.dispatch_new_milestone_chat",
+            return_value=("asg456", "laptop"),
+        ) as mock_dispatch:
+            result = CliRunner().invoke(
+                main,
+                [
+                    "milestone", "chat", "api", "--new",
+                    "--title", "Q4 push", "--seed", "ship the widget",
+                    "--config", str(config_file),
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        assert result.output.strip().splitlines()[-1] == "asg456"
+        mock_dispatch.assert_called_once_with(
+            "api",
+            mock_dispatch.call_args[0][1],
+            seed_title="Q4 push",
+            seed_prompt="ship the widget",
+            machine_override=None,
+        )
+
+    def test_dispatch_failure_reports_error(self, config_file: Path) -> None:
+        with patch(
+            "coord.milestone_chat.dispatch_new_milestone_chat",
+            side_effect=RuntimeError("no machine claims repo 'api'"),
+        ):
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "chat", "api", "--new", "--config", str(config_file)],
+            )
+        assert result.exit_code == 1
+        assert "no machine claims repo" in result.output
+
+    def test_unknown_repo_errors(self, config_file: Path) -> None:
+        result = CliRunner().invoke(
+            main,
+            ["milestone", "chat", "nope", "--new", "--config", str(config_file)],
         )
         assert result.exit_code == 2
         assert "unknown repo" in result.output

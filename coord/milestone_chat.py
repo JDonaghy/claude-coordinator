@@ -1,21 +1,28 @@
-"""#770 (Phase 2 of #767): dispatch a `type="milestone-chat"` session.
+"""#770 (Phase 2 of #767) + #1009: dispatch a `type="milestone-chat"` session.
 
 Lets the operator chat about a milestone's issues and — once they confirm —
 write the `## Work order` block that ``coord/milestone_order.py`` (#768)
-parses into a DAG/frontier. This is a deliberately narrow slice of #645's
-broader "milestone-steward" chat (create milestone, create/edit issues,
-assess relevance): it exists only to close the #767 Phase 2 loop — propose
-an order, confirm with the operator, write it. Full #645 scope stays a
-separate, later piece of work; nothing here forecloses it.
+parses into a DAG/frontier. #1009 widened this beyond that original narrow
+slice: the same propose-then-confirm-then-write discipline now also covers
+creating a brand-new milestone (:func:`dispatch_new_milestone_chat`, no
+tracking issue yet), editing an existing milestone's title/description/due
+date, and assigning an issue to a milestone — see
+``MILESTONE_CHAT_SYSTEM_PROMPT`` in ``coord/agent.py`` for the exact
+commands the worker is allowed to run. Full #645 "milestone-steward" scope
+(creating/editing the *issues themselves*, splicing sub-issues via
+``coord milestone add-child`` from #1008) stays out of scope until that
+lands; nothing here forecloses it.
 
-Used by `coord milestone chat <repo> <tracking_issue>` (the CLI command in
-``coord/commands/milestone.py``).
+Used by `coord milestone chat <repo> <tracking_issue>` (existing milestone)
+and `coord milestone chat <repo> --new` (brand-new milestone) — both CLI
+entry points live in ``coord/commands/milestone.py``.
 
 The session itself runs as a `type="milestone-chat"` assignment on an agent
 server. Tools are `Read,Bash` (see `coord/agent.py`); a deny list blocks raw
-`gh` mutations and unrelated `coord` write commands — the one write action
-the worker may take is `coord milestone write-order`, and only after the
-operator has explicitly confirmed the proposed block in conversation.
+`gh` mutations and unrelated `coord` write commands — the write actions the
+worker may take are `coord milestone write-order`, `create`, `edit`, and
+`assign`, and only after the operator has explicitly confirmed the specific
+proposed change in conversation.
 """
 from __future__ import annotations
 
@@ -84,17 +91,35 @@ def build_milestone_chat_briefing(
     tracking_issue_number: int,
     tracking_issue_body: str,
     issues: list[dict],
+    milestone_number: int | None = None,
+    milestone_description: str | None = None,
+    milestone_due_on: str | None = None,
 ) -> str:
     """Compose the seed briefing the worker sees as its first user message.
 
     The agent's ``MILESTONE_CHAT_SYSTEM_PROMPT`` already tells it how to
     behave; this packs the milestone context into the first user turn.
+
+    *milestone_number*/*milestone_description*/*milestone_due_on* are
+    optional (#1009) — best-effort metadata so an "edit this milestone"
+    conversation has the current values to propose changes against without
+    a separate lookup. Omitted (``None``) when the caller couldn't fetch
+    them; the chat still works, just without that convenience context.
     """
     parts: list[str] = []
     parts.append(
         f"=== Milestone chat context for {repo_slug} "
         f"— milestone {milestone_title!r} ===\n"
     )
+
+    if milestone_number is not None:
+        parts.append(f"MILESTONE NUMBER: {milestone_number}")
+        parts.append(
+            "CURRENT DESCRIPTION: "
+            + (milestone_description.strip() if milestone_description and milestone_description.strip() else "(none)")
+        )
+        parts.append(f"CURRENT DUE DATE: {milestone_due_on or '(none)'}")
+        parts.append("")
 
     parts.append(f"TRACKING ISSUE: #{tracking_issue_number}")
     parts.append(
@@ -126,6 +151,56 @@ def build_milestone_chat_briefing(
         "  - [ ] #762  {group: A}\n"
         "  ...\n"
         "  EOF\n"
+    )
+    if milestone_number is not None:
+        parts.append(
+            "The operator may also ask you to edit this milestone's title/"
+            "description/due date, or assign an issue to it — propose the "
+            "exact change, and once confirmed run:\n\n"
+            f"  coord milestone edit {repo_name} {milestone_number} "
+            "[--title \"...\"] [--description \"...\"] [--due-on <iso8601>]\n"
+            f"  coord milestone assign {repo_name} <issue> {milestone_number}\n"
+        )
+    return "\n".join(parts)
+
+
+def build_new_milestone_chat_briefing(
+    *,
+    repo_name: str,
+    repo_slug: str,
+    seed_title: str | None,
+    seed_prompt: str | None,
+) -> str:
+    """Compose the seed briefing for a brand-new milestone (#1009) — no
+    tracking issue exists yet, so there's nothing to fetch from GitHub.
+
+    *seed_title*/*seed_prompt* are whatever the operator supplied when
+    starting the chat (e.g. from a TUI "New milestone… → Chat about this"
+    action); both are optional since the operator may want to start from a
+    blank conversation.
+    """
+    parts: list[str] = []
+    parts.append(f"=== New-milestone chat context for {repo_slug} ===\n")
+    parts.append("No milestone exists yet for this conversation.")
+    parts.append(f"SEED TITLE: {seed_title if seed_title else '(none supplied)'}")
+    parts.append(
+        "SEED PROMPT: "
+        + (seed_prompt.strip() if seed_prompt and seed_prompt.strip() else "(none supplied)")
+    )
+    parts.append("")
+    parts.append("---")
+    parts.append(
+        "Discuss the new milestone's goal and scope with the operator — what "
+        "it's for, roughly what it covers, any target due date. Once you "
+        "both agree on a title (and optionally a description/due date), "
+        "present the exact values you'll use, and only after the operator "
+        "explicitly confirms, create it with:\n\n"
+        f"  coord milestone create {repo_name} --title \"<title>\" "
+        "[--description \"<desc>\"] [--due-on <iso8601>]\n\n"
+        "Report the printed milestone number back to the operator. There is "
+        "no tracking issue yet and none is created here — filing one (and "
+        "assigning it to the new milestone with `coord milestone assign`) is "
+        "a separate, later step."
     )
     return "\n".join(parts)
 
@@ -183,6 +258,18 @@ def dispatch_milestone_chat(
 
     issues = _fetch_milestone_issues(repo_cfg.github, milestone_number)
 
+    # Best-effort: pull the milestone's own description/due date so an
+    # "edit this milestone" conversation has current values to propose
+    # changes against (#1009). Never fatal — the chat still works without it.
+    milestone_description: str | None = None
+    milestone_due_on: str | None = None
+    try:
+        ms_data = github_ops.get_milestone(repo_cfg.github, milestone_number)
+        milestone_description = ms_data.get("description")
+        milestone_due_on = ms_data.get("due_on")
+    except RuntimeError:
+        pass
+
     briefing = build_milestone_chat_briefing(
         repo_name=repo_name,
         repo_slug=repo_cfg.github,
@@ -190,6 +277,9 @@ def dispatch_milestone_chat(
         tracking_issue_number=tracking_issue_number,
         tracking_issue_body=issue_data.get("body") or "",
         issues=issues,
+        milestone_number=milestone_number,
+        milestone_description=milestone_description,
+        milestone_due_on=milestone_due_on,
     )
 
     tracking_title = issue_data.get("title") or f"Milestone chat #{tracking_issue_number}"
@@ -225,6 +315,113 @@ def dispatch_milestone_chat(
         repo_name=repo_name,
         issue_number=tracking_issue_number,
         issue_title=tracking_title,
+        files_allowed=[],
+        files_forbidden=[],
+        briefing=briefing,
+        assignment_id=assignment_id,
+        status="running",
+        dispatched_at=time.time(),
+        type="milestone-chat",
+        model=resolved_model,
+    )
+    record_dispatched_assignment(
+        assignment=asg,
+        repo_github=repo_cfg.github,
+    )
+
+    return assignment_id, machine.name
+
+
+def dispatch_new_milestone_chat(
+    repo_name: str,
+    config: Config,
+    *,
+    seed_title: str | None = None,
+    seed_prompt: str | None = None,
+    machine_override: str | None = None,
+) -> tuple[str, str]:
+    """End-to-end (#1009): pick a machine, seed a brand-new-milestone
+    briefing, dispatch a ``type="milestone-chat"`` assignment.
+
+    Unlike :func:`dispatch_milestone_chat`, there is no existing tracking
+    issue or milestone to fetch — this is the "New milestone… → Chat about
+    this" entry point, seeded with only the repo and whatever *seed_title*/
+    *seed_prompt* the caller supplied. ``issue_number=0`` is used as the
+    sentinel for "no real issue yet" — the same established pattern
+    ``coord/new_issue_chat.py`` and ``coord/refine_chat.py`` (board-level
+    chat) already use; the TUI routes ``issue_number == 0`` rows to a
+    board-level tab rather than a per-issue one.
+
+    Returns ``(assignment_id, machine_name)``. Raises ``RuntimeError`` when
+    the repo is unknown, no machine claims it, or the agent rejects the
+    dispatch.
+    """
+    repo_cfg = config.repo(repo_name)
+    if repo_cfg is None:
+        raise RuntimeError(f"repo {repo_name!r} not in coordinator.yml")
+
+    if machine_override:
+        machine = next(
+            (m for m in config.machines if m.name == machine_override),
+            None,
+        )
+        if machine is None:
+            raise RuntimeError(f"machine {machine_override!r} not in coordinator.yml")
+        if not machine.can_work_on(repo_name):
+            raise RuntimeError(
+                f"machine {machine_override!r} does not list repo {repo_name!r}"
+            )
+    else:
+        picked = pick_milestone_chat_machine(config, repo_name)
+        if picked is None:
+            raise RuntimeError(
+                f"no machine claims repo {repo_name!r} — milestone-chat needs a "
+                "machine that has the repo cloned"
+            )
+        machine = picked
+
+    briefing = build_new_milestone_chat_briefing(
+        repo_name=repo_name,
+        repo_slug=repo_cfg.github,
+        seed_title=seed_title,
+        seed_prompt=seed_prompt,
+    )
+
+    draft_title = seed_title or "(new milestone draft)"
+    resolved_model = config.models.default
+    proposal = Proposal(
+        id=0,
+        machine_name=machine.name,
+        repo_name=repo_name,
+        # No tracking issue exists yet — 0 is the established sentinel
+        # (see coord/new_issue_chat.py, coord/refine_chat.py).
+        issue_number=0,
+        issue_title=draft_title,
+        rationale="milestone-chat",
+        briefing=briefing,
+        model=resolved_model,
+        type="milestone-chat",
+        required_gates=[],
+    )
+
+    from coord.dispatch import dispatch_with_retry
+    from coord.models import Assignment
+    from coord.state import record_dispatched_assignment
+
+    response = dispatch_with_retry(
+        proposal,
+        config,
+        max_retries=config.concurrency.max_retries,
+        backoff_base=config.concurrency.backoff_base,
+    )
+
+    assignment_id = response.get("id") or uuid.uuid4().hex[:12]
+
+    asg = Assignment(
+        machine_name=machine.name,
+        repo_name=repo_name,
+        issue_number=0,
+        issue_title=draft_title,
         files_allowed=[],
         files_forbidden=[],
         briefing=briefing,
