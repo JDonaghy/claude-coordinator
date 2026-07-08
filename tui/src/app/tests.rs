@@ -26304,6 +26304,46 @@ Milestone tracking issue.
         );
     }
 
+    /// #1003 fix-up: a real right-click (full `UiEvent::MouseDown { button:
+    /// Right }` → `handle` → `open_context_menu` path, same as
+    /// `tuidriver_right_click_opens_board_context_menu`) on a Plans-panel row
+    /// must open the CRUD context menu. Before this fix, `handle_mouse`'s
+    /// right-click arm only ever tried `ctx.in_sidebar(..)` — the Plans
+    /// roster lives in the *main* panel, so every right-click there fell
+    /// through as a silent no-op and the menu this issue promises was
+    /// unreachable by mouse (the only coverage that existed called
+    /// `context_menu_target_for_selection()` directly, bypassing the mouse
+    /// hit-test entirely and masking the gap).
+    #[test]
+    fn tuidriver_right_click_on_plans_row_opens_context_menu() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_test_app(make_plan_roster_board_data());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "◆");
+
+        let (x, y) = driver.find("Substrate").unwrap_or_else(|| {
+            panic!(
+                "#1003: could not find Plans row 'Substrate' on initial render:\n{}",
+                driver.screen()
+            )
+        });
+
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: MouseButton::Right,
+            position: Point::new(x, y),
+            modifiers: Modifiers::default(),
+        });
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Open milestone chat"),
+            "#1003: right-click on a Plans row must open the CRUD context menu:\n{}",
+            screen
+        );
+    }
+
     /// After landing on Plans, pressing Enter on the selected row opens the
     /// tracking epic (visible as an "Opening plan" toast in-test — the real
     /// `gh` spawn is `#[cfg(not(test))]`-gated to keep the sandbox hermetic).
