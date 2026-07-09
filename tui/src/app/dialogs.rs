@@ -282,8 +282,18 @@ impl CoordApp {
         // + `pipeline_detail_pv_rect_strip`) now sits above every non-Overview
         // tab, so duplicating it here would show the strip twice.
 
+        // #1022: flat-row rule — the Test-gate verdict/reason belongs on the
+        // Test (smoke) row, never the Work/Fix row that actually recorded it
+        // in the DB (`test_state`/`test_reason` live on the WORK assignment —
+        // see `coord/state.py::record_test_verdict`). Precompute which row
+        // (if any) is the LAST Test row so the reason renders exactly once.
+        let last_smoke_idx = assignments
+            .iter()
+            .rposition(|a| a.assignment_type.as_deref().unwrap_or("work") == "smoke");
+        let has_any_smoke_row = last_smoke_idx.is_some();
+
         // --- Per-assignment entries ---
-        for a in &assignments {
+        for (idx, a) in assignments.iter().enumerate() {
             // Skip scoping sessions (refinement, chat, new-issue-chat) that are
             // not pipeline execution.
             let atype = a.assignment_type.as_deref().unwrap_or("work");
@@ -300,7 +310,23 @@ impl CoordApp {
             } else {
                 session_type_label(atype)
             };
-            let (badge_text, badge_color) = assignment_status_badge(a);
+            // #1022: a Test (smoke) row's badge shows the Test-gate verdict
+            // from the work/fix assignment it actually tested (linked via
+            // `review_of_assignment_id`, or the latest verdict-bearing
+            // work-like assignment as a defensive fallback) — falling back
+            // to the smoke row's own status only when no verdict has been
+            // recorded anywhere.
+            let (badge_text, badge_color) = if atype == "smoke" {
+                let (verdict, _) = resolve_smoke_test_verdict(a, &assignments);
+                match verdict {
+                    Some("passed") => ("passed ✓".to_string(), Color::rgb(120, 200, 120)),
+                    Some("failed") => ("failed ✗".to_string(), Color::rgb(220, 70, 70)),
+                    Some("skipped") => ("skipped ↷".to_string(), Color::rgb(150, 150, 150)),
+                    _ => assignment_status_badge(a),
+                }
+            } else {
+                assignment_status_badge(a)
+            };
 
             // Duration: finished_at - dispatched_at.
             let dur_str = match (a.dispatched_at, a.finished_at) {
@@ -349,7 +375,28 @@ impl CoordApp {
 
             // Reason inline: test_reason for failed tests; review_findings for
             // reviews; failure_reason for hard-failed assignments.
-            let reason = board_assignment_reason(a);
+            //
+            // #1022: flat-row rule — render the test reason exactly once,
+            // under the LAST Test row. Work/Fix rows only fall back to their
+            // own `test_reason` when the issue has no Test row at all (e.g. a
+            // bare `coord test <id>` verdict recorded with no smoke session
+            // ever dispatched to carry it) — otherwise #865's "the reason
+            // must be visible somewhere" guarantee would silently regress.
+            let reason = if atype == "smoke" {
+                if last_smoke_idx == Some(idx) {
+                    let (_, linked_reason) = resolve_smoke_test_verdict(a, &assignments);
+                    linked_reason
+                        .map(|s| s.to_string())
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or_else(|| board_assignment_reason(a))
+                } else {
+                    String::new()
+                }
+            } else if has_any_smoke_row {
+                board_assignment_reason_sans_test(a)
+            } else {
+                board_assignment_reason(a)
+            };
             if !reason.is_empty() {
                 for line in reason.lines().take(8) {
                     let s: String = line.chars().take(200).collect();
@@ -5985,6 +6032,15 @@ pub(crate) fn board_assignment_reason(a: &Assignment) -> String {
             return r.to_string();
         }
     }
+    board_assignment_reason_sans_test(a)
+}
+
+/// #1022: `board_assignment_reason` minus the `test_reason` branch.
+///
+/// Used for Work/Fix rows once a dedicated Test (smoke) row exists to carry
+/// the test verdict/reason instead — the flat-row rule means each stage owns
+/// only the text relevant to itself, and `test_reason` moves to the Test row.
+pub(crate) fn board_assignment_reason_sans_test(a: &Assignment) -> String {
     if let Some(r) = a.review_findings.as_deref() {
         if !r.trim().is_empty() {
             // `review_findings` is a JSON envelope, not plain prose — parse
@@ -6000,6 +6056,52 @@ pub(crate) fn board_assignment_reason(a: &Assignment) -> String {
         }
     }
     String::new()
+}
+
+/// #1022: Resolve the Test-gate verdict + reason to show on a Test (`smoke`)
+/// row. `test_state`/`test_reason` are recorded on the WORK/FIX assignment
+/// (`coord test <work_id> --passed|--fail --reason ...` —
+/// `coord/state.py::record_test_verdict`), never on the smoke row itself, so
+/// the smoke row's own fields are only a last-resort fallback.
+///
+/// Preference order:
+///   1. The work/fix assignment this smoke row explicitly tested — linked via
+///      `review_of_assignment_id`, set by both automated (`coord/smoke.py`)
+///      and interactive (`--smoke-of`, `coord/commands/dispatch_workers.py`)
+///      dispatch.
+///   2. The most-recently-dispatched work-like assignment for the issue that
+///      has recorded a verdict (defensive: rows predating the link).
+///   3. The smoke assignment's own `test_state`/`test_reason` (defensive;
+///      should not normally be populated on a smoke row).
+pub(crate) fn resolve_smoke_test_verdict<'a>(
+    smoke: &'a Assignment,
+    assignments: &[&'a Assignment],
+) -> (Option<&'a str>, Option<&'a str>) {
+    if let Some(work_id) = smoke.review_of_assignment_id.as_deref() {
+        if let Some(w) = assignments.iter().find(|a| a.id == work_id) {
+            if w.test_state.is_some() {
+                return (w.test_state.as_deref(), w.test_reason.as_deref());
+            }
+        }
+    }
+    let latest_work = assignments
+        .iter()
+        .filter(|a| {
+            !matches!(
+                a.assignment_type.as_deref().unwrap_or("work"),
+                "smoke" | "review" | "re-review"
+            )
+        })
+        .filter(|a| a.test_state.is_some())
+        .max_by(|a, b| {
+            a.dispatched_at
+                .partial_cmp(&b.dispatched_at)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    if let Some(w) = latest_work {
+        return (w.test_state.as_deref(), w.test_reason.as_deref());
+    }
+    (smoke.test_state.as_deref(), smoke.test_reason.as_deref())
 }
 
 /// #269: Hit-test a click against a TUI tab bar's labels.  Walks the

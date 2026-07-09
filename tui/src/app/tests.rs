@@ -14735,6 +14735,232 @@
         );
     }
 
+    // ── #1022 fix iteration 1: reason moves to the Test row, verdict is linked ──
+
+    /// #1022 fix: reproduces the reviewer's exact failure on issue #954 — a
+    /// Test (smoke) row whose `review_of_assignment_id` links back to the
+    /// Work assignment that actually recorded the Test-gate verdict
+    /// (`test_state`/`test_reason` live on the WORK row per
+    /// `coord/state.py::record_test_verdict`, never on the smoke row itself).
+    /// The Test row must show the linked verdict as its own badge, the
+    /// reason text must render exactly once — after (under) the Test row,
+    /// not the Work row — and the Work row must keep a plain completion
+    /// badge with no composite overlay.
+    #[test]
+    fn summary_tab_test_row_shows_linked_work_verdict_and_reason_moves_off_work() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut work = make_assignment_typed("done", 954, "api", Some("work"));
+        work.id = "work-954".to_string();
+        work.dispatched_at = Some(1_000_000.0);
+        work.finished_at = Some(1_001_200.0);
+        work.branch = Some("issue-954-work".to_string());
+        work.model = Some("sonnet".to_string());
+        work.test_state = Some("failed".to_string());
+        work.test_reason =
+            Some("RE-TEST of the same commit that previously failed".to_string());
+
+        let mut test_row = make_assignment_typed("done", 954, "api", Some("smoke"));
+        test_row.id = "test-954".to_string();
+        test_row.dispatched_at = Some(1_002_000.0);
+        test_row.finished_at = Some(1_003_000.0);
+        test_row.machine = "precision".to_string();
+        test_row.review_of_assignment_id = Some("work-954".to_string());
+        // #1022: the smoke row itself carries NO test_state — matching real
+        // board data, where the verdict lives only on the linked work row.
+
+        let data = BoardData {
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            assignments: vec![work, test_row],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 954,
+            title: "Issue 954".to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: false,
+        }];
+        app.rebuild_pipeline_sidebar(None);
+        app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Summary;
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        let screen = driver.screen();
+
+        // The Test row must show the linked work assignment's verdict, not a
+        // plain "done".
+        assert!(
+            screen.contains("failed ✗"),
+            "#1022: Test row must show the linked work assignment's verdict 'failed ✗':\n{}",
+            screen,
+        );
+        // The reason text must appear exactly once.
+        let occurrences = screen.matches("RE-TEST of the same commit").count();
+        assert_eq!(
+            occurrences, 1,
+            "#1022: reason text must render exactly once:\n{}",
+            screen,
+        );
+        // ...and it must sit AFTER the Test row's verdict badge in render
+        // order (i.e. under the Test row, not the earlier Work row) — this
+        // is the exact regression the reviewer caught.
+        let reason_idx = screen
+            .find("RE-TEST of the same commit")
+            .expect("reason text must be present");
+        let badge_idx = screen.find("failed ✗").expect("verdict badge must be present");
+        assert!(
+            reason_idx > badge_idx,
+            "#1022: reason text must render under the Test row (after its verdict badge), not the Work row:\n{}",
+            screen,
+        );
+        // The Work row's own badge must stay a plain "done" — no composite.
+        assert!(
+            !screen.contains("done · Test"),
+            "#1022: Work row must not carry a composite test-verdict badge:\n{}",
+            screen,
+        );
+    }
+
+    /// #1022: With TWO Test (smoke) rows for the same issue (a fail → fix →
+    /// re-test cycle), the reason text must render exactly once — under the
+    /// LAST Test row only — even though an earlier Test row's linked work
+    /// assignment also carries a `test_reason`. Each Test row still shows its
+    /// own linked verdict badge.
+    #[test]
+    fn summary_tab_reason_renders_once_under_last_test_row_only() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut work1 = make_assignment_typed("done", 42, "api", Some("work"));
+        work1.id = "work-1".to_string();
+        work1.dispatched_at = Some(1_000_000.0);
+        work1.finished_at = Some(1_000_500.0);
+        work1.test_state = Some("failed".to_string());
+        work1.test_reason = Some("FIRST_ITER_FAILURE_TEXT".to_string());
+
+        let mut test1 = make_assignment_typed("done", 42, "api", Some("smoke"));
+        test1.id = "test-1".to_string();
+        test1.dispatched_at = Some(1_001_000.0);
+        test1.finished_at = Some(1_001_500.0);
+        test1.review_of_assignment_id = Some("work-1".to_string());
+
+        let mut work2 = make_assignment_typed("done", 42, "api", Some("fix"));
+        work2.id = "work-2".to_string();
+        work2.dispatched_at = Some(1_002_000.0);
+        work2.finished_at = Some(1_002_500.0);
+        work2.test_state = Some("passed".to_string());
+        work2.test_reason = Some("SECOND_ITER_SUCCESS_TEXT".to_string());
+
+        let mut test2 = make_assignment_typed("done", 42, "api", Some("smoke"));
+        test2.id = "test-2".to_string();
+        test2.dispatched_at = Some(1_003_000.0);
+        test2.finished_at = Some(1_003_500.0);
+        test2.review_of_assignment_id = Some("work-2".to_string());
+
+        let data = BoardData {
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            assignments: vec![work1, test1, work2, test2],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 42,
+            title: "Issue 42".to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: false,
+        }];
+        app.rebuild_pipeline_sidebar(None);
+        app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Summary;
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 120, 60);
+        let screen = driver.screen();
+
+        assert!(
+            !screen.contains("FIRST_ITER_FAILURE_TEXT"),
+            "#1022: only the LAST Test row's reason should render:\n{}",
+            screen,
+        );
+        assert!(
+            screen.contains("SECOND_ITER_SUCCESS_TEXT"),
+            "#1022: the LAST Test row's reason must render:\n{}",
+            screen,
+        );
+        // Both Test rows still show their own linked verdict badge.
+        assert!(
+            screen.contains("failed ✗"),
+            "first Test row's linked verdict missing:\n{}",
+            screen,
+        );
+        assert!(
+            screen.contains("passed ✓"),
+            "second Test row's linked verdict missing:\n{}",
+            screen,
+        );
+    }
+
+    // ── #1022 fix iteration 1: resolve_smoke_test_verdict unit tests ────────────
+
+    /// #1022: The Test row's verdict/reason must be sourced from the linked
+    /// work assignment (`review_of_assignment_id`), not the smoke row itself.
+    #[test]
+    fn resolve_smoke_test_verdict_prefers_linked_work_assignment() {
+        let mut work = make_assignment_typed("done", 1, "repo-a", Some("work"));
+        work.id = "w1".to_string();
+        work.test_state = Some("failed".to_string());
+        work.test_reason = Some("boom".to_string());
+
+        let mut smoke = make_assignment_typed("done", 1, "repo-a", Some("smoke"));
+        smoke.id = "s1".to_string();
+        smoke.review_of_assignment_id = Some("w1".to_string());
+
+        let assignments: Vec<&Assignment> = vec![&work, &smoke];
+        let (verdict, reason) = resolve_smoke_test_verdict(&smoke, &assignments);
+        assert_eq!(verdict, Some("failed"));
+        assert_eq!(reason, Some("boom"));
+    }
+
+    /// #1022: When the link is absent (defensive: rows predating it), fall
+    /// back to the most-recently-dispatched work-like assignment that has a
+    /// recorded verdict.
+    #[test]
+    fn resolve_smoke_test_verdict_falls_back_to_latest_work_when_unlinked() {
+        let mut work = make_assignment_typed("done", 1, "repo-a", Some("work"));
+        work.id = "w1".to_string();
+        work.test_state = Some("passed".to_string());
+
+        let mut smoke = make_assignment_typed("done", 1, "repo-a", Some("smoke"));
+        smoke.id = "s1".to_string();
+        // No review_of_assignment_id set — exercises the defensive fallback.
+
+        let assignments: Vec<&Assignment> = vec![&work, &smoke];
+        let (verdict, _) = resolve_smoke_test_verdict(&smoke, &assignments);
+        assert_eq!(verdict, Some("passed"));
+    }
+
+    /// #1022: When no verdict is recorded anywhere, fall back to the smoke
+    /// row's own (empty) fields rather than panicking or fabricating one.
+    #[test]
+    fn resolve_smoke_test_verdict_falls_back_to_own_fields_when_no_verdict_anywhere() {
+        let work = make_assignment_typed("done", 1, "repo-a", Some("work"));
+        let smoke = make_assignment_typed("done", 1, "repo-a", Some("smoke"));
+
+        let assignments: Vec<&Assignment> = vec![&work, &smoke];
+        let (verdict, reason) = resolve_smoke_test_verdict(&smoke, &assignments);
+        assert_eq!(verdict, None);
+        assert_eq!(reason, None);
+    }
+
     // ── #1022: Unit tests for assignment_status_badge flat-row rule ──────────────
 
     /// #1022: Work/fix rows must show only their own completion status — no
