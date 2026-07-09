@@ -120,6 +120,111 @@ pub(crate) fn pty_button_bit(button: MouseButton) -> u8 {
 }
 
 
+/// #955 fix: a fleet-terminal PTY session paired with the tmux target
+/// needed to cleanly DETACH (never kill) its remote or local tmux CLIENT
+/// when the cached entry is dropped (leaf switched away permanently,
+/// discovery eviction, or the whole TUI quitting).
+///
+/// Root cause this exists to fix: `quadraui::terminal_engine::
+/// TerminalSession`'s PTY writer (`UnixMasterWriter`) writes a trailing
+/// `\n` + EOF byte (Ctrl-D) into the PTY when it drops — a deliberate
+/// nicety so the BARE `$SHELL` scratch pane (`terminal_session`) asks its
+/// shell to exit gracefully instead of just vanishing underneath it. For
+/// a fleet-terminal leaf, though, that PTY isn't running a throwaway
+/// shell — it's running `ssh -t <host> tmux attach-session -t <session>`
+/// (`ensure_fleet_terminal_attached`, `sessions.rs`), so the stray Ctrl-D
+/// travels over ssh, into the ATTACHED tmux client, and lands on the
+/// remote shell inside the session as keyboard input. An interactive
+/// shell receiving EOF on stdin exits — and once the session's last pane
+/// closes, tmux destroys the whole session. That is exactly backwards:
+/// quitting coord-tui (or otherwise dropping a cached fleet session) must
+/// DETACH, never kill, per the persistence guarantee `coord terminal
+/// new`/tmux is supposed to provide (#955).
+///
+/// The fix: `Drop for FleetTerminalSession` runs `tmux detach-client -s
+/// <session>` (a protocol-level command over a SEPARATE connection, not a
+/// keystroke through the PTY) BEFORE the wrapped `TerminalSession` (and
+/// therefore its EOF-on-drop writer) actually tears down. By the time the
+/// EOF byte gets written moments later, the local `ssh`/`tmux
+/// attach-session` process has already exited on its own (its remote
+/// command finished cleanly once the client was detached), so the byte
+/// lands on the now-idle local shell at worst — harmless.
+///
+/// This is a newtype around the session (rather than `impl Drop for
+/// CoordApp` directly) because `CoordApp`'s test suite builds and
+/// destructures values with plain field moves and functional-update
+/// syntax (`..make_test_app(...)`), both of which Rust rejects (E0509)
+/// on any type that itself implements `Drop`. Scoping `Drop` to just this
+/// leaf type keeps `CoordApp` itself move-friendly everywhere else.
+/// Transparently derefs to `TerminalSession` so every existing
+/// `.poll()`, `.full_text()`, `.resize()`, … call site is unaffected.
+///
+/// Verified against a real remote tmux session (see the #955 fix
+/// discussion): without this, quitting with a fleet terminal attached
+/// reliably kills the remote session; with it, the session survives and
+/// remains attachable.
+pub(crate) struct FleetTerminalSession {
+    session: quadraui::terminal_engine::TerminalSession,
+    /// `Some(ssh_host)` for a remote machine; `None` for the local one —
+    /// selects the `ssh <host> tmux …` vs. bare `tmux …` detach command.
+    ssh_host: Option<String>,
+    /// The bare `coord-term-<name>` tmux session name (no `machine:` prefix).
+    tmux_session_name: String,
+}
+
+impl FleetTerminalSession {
+    pub(crate) fn new(
+        session: quadraui::terminal_engine::TerminalSession,
+        ssh_host: Option<String>,
+        terminal_name: &str,
+    ) -> Self {
+        Self {
+            session,
+            ssh_host,
+            tmux_session_name: format!("coord-term-{}", terminal_name),
+        }
+    }
+}
+
+impl std::ops::Deref for FleetTerminalSession {
+    type Target = quadraui::terminal_engine::TerminalSession;
+    fn deref(&self) -> &Self::Target {
+        &self.session
+    }
+}
+
+impl std::ops::DerefMut for FleetTerminalSession {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.session
+    }
+}
+
+impl Drop for FleetTerminalSession {
+    fn drop(&mut self) {
+        let status = match &self.ssh_host {
+            Some(host) => std::process::Command::new("ssh")
+                .args([
+                    "-o",
+                    "ConnectTimeout=5",
+                    host,
+                    "tmux",
+                    "detach-client",
+                    "-s",
+                    &self.tmux_session_name,
+                ])
+                .status(),
+            None => std::process::Command::new("tmux")
+                .args(["detach-client", "-s", &self.tmux_session_name])
+                .status(),
+        };
+        // Best-effort: a session that's already gone, or an unreachable
+        // machine, just no-ops — there's nothing a departing TUI can
+        // usefully surface to the operator about it, and `detach-client`
+        // on a session with no attached clients is itself a harmless no-op.
+        let _ = status;
+    }
+}
+
 // ─── #424: embedded terminal pane plumbing ────────────────────────────────────
 
 /// Convert a `std::panic::catch_unwind` payload to a displayable string.
@@ -613,7 +718,10 @@ impl CoordApp {
         &self,
     ) -> Option<&quadraui::terminal_engine::TerminalSession> {
         if let Some(key) = self.selected_fleet_terminal_key() {
-            return self.fleet_terminal_sessions.get(&key);
+            // `fleet_terminal_sessions` values are `FleetTerminalSession`
+            // (#955: carries the tmux detach-on-drop target) — deref
+            // through it to the plain `TerminalSession` callers expect.
+            return self.fleet_terminal_sessions.get(&key).map(|w| &**w);
         }
         self.terminal_session.as_ref()
     }
@@ -623,7 +731,7 @@ impl CoordApp {
         &mut self,
     ) -> Option<&mut quadraui::terminal_engine::TerminalSession> {
         if let Some(key) = self.selected_fleet_terminal_key() {
-            return self.fleet_terminal_sessions.get_mut(&key);
+            return self.fleet_terminal_sessions.get_mut(&key).map(|w| &mut **w);
         }
         self.terminal_session.as_mut()
     }
