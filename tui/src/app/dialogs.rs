@@ -1531,10 +1531,12 @@ impl CoordApp {
                     format!(
                         "Candidate issue number to discuss adding as a sub-issue of \
                          \"{}\" ({}) — a milestone-chat steward will propose the \
-                         `{{group/after}}` annotation with you:",
+                         `{{group/after}}` annotation with you. Bare number, `#`-prefix \
+                         both OK (e.g. 1050 or #1050) — same-repo issue only, no \
+                         owner/repo#N form:",
                         input.milestone_title, input.repo_name
                     ),
-                    "issue number…",
+                    "e.g. 1050 or #1050…",
                 ),
             };
             return Some(Dialog {

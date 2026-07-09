@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 
 import click
+import httpx
 
 from coord.commands._common import _CONFIG_OPTION, _load_config
 from coord.milestone_dispatch import (
@@ -1031,6 +1032,25 @@ def milestone_chat_cmd(
         except RuntimeError as exc:
             click.echo(f"error: {exc}", err=True)
             sys.exit(1)
+        except httpx.HTTPError as exc:
+            # #1017 review: dispatch_with_retry raises httpx.HTTPError (not
+            # RuntimeError) after exhausting retries on a transient network
+            # failure — previously this escaped as an unhandled traceback,
+            # which looked to the TUI operator like a silent no-op (the
+            # subprocess still exited non-zero, but no clean one-line
+            # `error:` reason was there for `first_meaningful_stderr_line`
+            # to surface as a toast).
+            from coord.network import classify_error
+
+            state, reason = classify_error(exc)
+            click.echo(f"error: dispatch failed — {state}: {reason}", err=True)
+            sys.exit(1)
+        except ValueError as exc:
+            # dispatch() raises ValueError for an unknown machine or a
+            # missing repo_path — likewise not a RuntimeError, likewise
+            # deserves a clean one-line message instead of a traceback.
+            click.echo(f"error: dispatch failed — {exc}", err=True)
+            sys.exit(1)
     else:
         if tracking_issue is None:
             click.echo("error: TRACKING_ISSUE is required unless --new is given", err=True)
@@ -1051,6 +1071,17 @@ def milestone_chat_cmd(
             )
         except RuntimeError as exc:
             click.echo(f"error: {exc}", err=True)
+            sys.exit(1)
+        except httpx.HTTPError as exc:
+            # See the --new branch above (#1017 review) for why this and the
+            # ValueError case are caught separately from RuntimeError.
+            from coord.network import classify_error
+
+            state, reason = classify_error(exc)
+            click.echo(f"error: dispatch failed — {state}: {reason}", err=True)
+            sys.exit(1)
+        except ValueError as exc:
+            click.echo(f"error: dispatch failed — {exc}", err=True)
             sys.exit(1)
 
     # Print the assignment id as the LAST stdout line so callers (the TUI,
