@@ -2525,6 +2525,27 @@ impl CoordApp {
             return;
         }
 
+        // ── #954 bug 2: New-terminal name prompt (mouse) ──────────────────
+        // The name-entry dialog's "Submit" button previously had NO click
+        // dispatch here, so only the Enter key (`events.rs`) created the
+        // terminal — a click on Submit did nothing. Mirror that keyboard
+        // path: "submit" creates + attaches (empty buffer ⇒ auto-name),
+        // anything else (Cancel / outside click) discards.
+        if self.pending_new_terminal.is_some() {
+            match id {
+                "submit" => {
+                    if let Some(input) = self.pending_new_terminal.take() {
+                        self.create_and_attach_terminal(input.machine, input.buf);
+                    }
+                }
+                _ => {
+                    self.pending_new_terminal = None;
+                }
+            }
+            *self.dialog_layout.borrow_mut() = None;
+            return;
+        }
+
         // ── Leg 3c / A3 (#517, #581): test failed → start fix ────────────
         if self.pending_test_fix.is_some() {
             if id == "fix" {

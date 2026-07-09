@@ -27899,13 +27899,32 @@ Milestone tracking issue.
         app.create_and_attach_terminal("dellserver".to_string(), String::new());
 
         // "the main area hosts a live terminal surface": create_and_attach
-        // must have spawned (or reused) a real PTY session into the
-        // standalone Terminal pane — not left it to the render-time
-        // "Starting shell session…" placeholder.
+        // must have spawned a real PTY session for the new leaf and selected
+        // it, so the standalone pane resolves to a live session — not left it
+        // to the render-time "Starting shell session…" placeholder.
+        //
+        // #954 bugs 3/4 (post-#955): the live PTY lives in the leaf's OWN
+        // cached `fleet_terminal_sessions[(machine, slug)]` (the #955 model),
+        // NOT the bare `terminal_session` scratch shell — `standalone_pty_session()`
+        // routes to whichever the selected leaf uses, so it's the model-accurate
+        // assertion here (and stays green whichever backing map holds it).
         assert!(
-            app.terminal_session.is_some(),
+            app.standalone_pty_session().is_some(),
             "create_and_attach_terminal must spawn/attach a live PTY session \
              into the main Terminal pane, not just insert the tree node",
+        );
+        assert!(
+            app.fleet_terminal_sessions
+                .contains_key(&("dellserver".to_string(), {
+                    app.fleet_terminals
+                        .iter()
+                        .find(|t| t.pending && t.machine == "dellserver")
+                        .map(|t| t.name.clone())
+                        .expect("optimistic pending entry")
+                })),
+            "the live PTY must be cached under the new leaf's (machine, slug) \
+             key so the #955 attach path treats it as already-attached (no \
+             duplicate/racing second attach — bug 3)",
         );
 
         let pending_slug = app
@@ -28024,5 +28043,99 @@ Milestone tracking issue.
             screen.contains("Select machine for new terminal"),
             "clicking the header button must open the same new-terminal \
              machine picker the 'n' keybinding opens:\n{screen}",
+        );
+    }
+
+    /// #954 bug 2 (broken Submit button): the name-entry dialog's on-screen
+    /// "Submit" button had NO click dispatch in `fire_dialog_button` — only the
+    /// Enter key (`events.rs`) created the terminal, so a mouse click on Submit
+    /// did nothing. A mouse click on a dialog button routes
+    /// `handle_dialog_click` → `fire_dialog_button("submit", …)`; this drives
+    /// that dispatch method directly (the button hit-region geometry for a
+    /// TextInput dialog is a quadraui rendering detail out of scope here) and
+    /// asserts it fires the same create path Enter does.
+    #[test]
+    fn new_terminal_name_prompt_submit_button_fires_create() {
+        let mut app = make_test_app(BoardData {
+            machines: vec![mk_machine("precision", "precision.tail", true, &[])],
+            ..BoardData::default()
+        });
+        // Arm the name prompt (equivalent to picking a machine in the picker).
+        app.begin_new_terminal_name_prompt("precision".to_string());
+        assert!(
+            app.pending_new_terminal.is_some(),
+            "precondition: the name prompt must be armed",
+        );
+
+        // Fire the dialog's "Submit" button exactly as a mouse click on it
+        // does. The backend arg is unused by this branch but required by the
+        // signature; a headless `TuiBackend` satisfies it.
+        let mut backend = quadraui::tui::TuiBackend::new();
+        app.fire_dialog_button("submit", &mut backend);
+
+        // The prompt is consumed and an optimistic pending terminal created —
+        // the same effect as pressing Enter. Before the fix, "submit" fell
+        // through `fire_dialog_button` with no handler and NOTHING happened.
+        assert!(
+            app.pending_new_terminal.is_none(),
+            "clicking Submit must consume the name prompt",
+        );
+        assert!(
+            app.fleet_terminals
+                .iter()
+                .any(|t| t.pending && t.machine == "precision"),
+            "clicking Submit must create the optimistic pending terminal, \
+             exactly as pressing Enter does — a Submit click that does nothing \
+             is the bug: {:?}",
+            app.fleet_terminals,
+        );
+    }
+
+    /// #954 bug 1 (focus-stealing): entering the Terminal view auto-focuses
+    /// the embedded PTY (#424), so every key is normally forwarded to the
+    /// shell. When a create-terminal modal is open, though, the modal must own
+    /// ALL input — otherwise the focused PTY swallows the number-key selection
+    /// and Esc, leaving the picker stuck (the reviewer's manual repro). Open
+    /// the picker via the header button (a mouse click, unaffected by PTY
+    /// focus), then type '1' WITHOUT releasing focus (no F12) and assert the
+    /// key reached the picker (name prompt opens) instead of the shell.
+    #[test]
+    fn new_terminal_picker_receives_keys_while_pty_focused() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_test_app(BoardData {
+            machines: vec![
+                mk_machine("precision", "precision.tail", true, &[]),
+                mk_machine("dellserver", "dellserver.tail", true, &[]),
+            ],
+            ..BoardData::default()
+        });
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        // Entering the Terminal view sets `terminal_focused = true` (#424) —
+        // the PTY is focused, the common case the reviewer hit.
+        click_activity_icon(&mut driver, ">");
+
+        // Open the picker via the header button (mouse — reaches the dialog
+        // regardless of PTY focus, which is why the operator could OPEN it).
+        let (x, y) = driver.find("New terminal").unwrap_or_else(|| {
+            panic!("'New terminal' header button not found:\n{}", driver.screen())
+        });
+        driver.click(x, y);
+        assert!(
+            driver.screen_contains("Select machine for new terminal"),
+            "picker must open:\n{}",
+            driver.screen(),
+        );
+
+        // Crux of bug 1: type '1' with the PTY still focused (NO F12). The
+        // modal must receive it and advance to the name prompt — before the
+        // fix this key was swallowed by the focused PTY and the picker stuck.
+        driver.type_char('1');
+        assert!(
+            driver.screen_contains("New terminal on dellserver"),
+            "the number-key selection must reach the open picker even while \
+             the PTY is focused (bug 1: it was swallowed by the shell):\n{}",
+            driver.screen(),
         );
     }

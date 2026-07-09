@@ -349,6 +349,24 @@ impl CoordApp {
     /// `launch_interactive_session_on_machine_inner`); `poll_remote_terminals`
     /// reconciles/evicts it once a real `coord terminal list` result covers
     /// `(machine, slug)`.
+    ///
+    /// #954 bugs 3 & 4 (post-#955 rebase): the create+attach now runs in the
+    /// new leaf's OWN cached fleet session — `fleet_terminal_sessions[(machine,
+    /// slug)]` — exactly the map [`ensure_fleet_terminal_attached`] fills for
+    /// an EXISTING leaf. The pre-#955 version typed the command into the bare
+    /// `terminal_session` scratch shell, but #955 changed the main pane to
+    /// render `standalone_pty_session()` (= the selected leaf's cached session)
+    /// whenever a leaf is selected — the bare shell is shown ONLY when no leaf
+    /// is selected, and `drive_terminal_pane` doesn't even poll it then. So the
+    /// old path (a) sent `coord terminal new` into an invisible, unpolled shell
+    /// while (b) `ensure_fleet_terminal_attached` independently spawned a
+    /// SECOND session that ran a bare `attach` against a not-yet-created tmux
+    /// session — a race that dropped the second terminal (bug 3) and left
+    /// nothing durably created for restart discovery to find (bug 4). Creating
+    /// + attaching in the one keyed session fixes both: it's the pane actually
+    /// shown, it's polled, and its presence makes `ensure_fleet_terminal_attached`
+    /// a no-op for this key (it early-returns when the key exists), so the
+    /// terminal is created and attached exactly once.
     pub(crate) fn create_and_attach_terminal(&mut self, machine: String, name_buf: String) {
         let sanitized = sanitize_terminal_name(&name_buf);
         let slug = if sanitized.is_empty() {
@@ -379,39 +397,64 @@ impl CoordApp {
             self.terminal_tree_selected = Some(vec![mi as u16, ti as u16]);
         }
 
-        let cfg = self
-            .command_runner
-            .config_path
-            .as_ref()
-            .map(|p| format!("--config {} ", shell_quote_arg(&p.to_string_lossy())))
-            .unwrap_or_default();
-        let target = format!("{machine}:{slug}");
-        let cmd = format!(
-            "coord terminal new {}{} --name {} && coord terminal attach {}{}\r",
-            cfg,
-            shell_quote_arg(&machine),
-            shell_quote_arg(&slug),
-            cfg,
-            shell_quote_arg(&target),
-        );
-
-        // Switch to the standalone Terminal panel and send the command —
-        // same lazy-spawn-or-reuse fallback as `reattach_session_by_aid`.
+        // Switch to the standalone Terminal panel; the newly-selected leaf's
+        // session (spawned just below) is what its main pane will render.
         self.active_view = SidebarView::Terminal;
-        if let Some(ref mut sess) = self.terminal_session {
-            sess.send_str(&cmd);
-        } else {
-            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
-            let shell = quadraui::terminal_engine::default_shell();
-            if let Ok(mut sess) =
-                quadraui::terminal_engine::TerminalSession::spawn(80, 24, &shell, &cwd, 10_000)
-            {
+
+        let key = (machine.clone(), slug.clone());
+        // Second-create guard (bug 3): if a session is somehow already cached
+        // for this exact key, don't spawn a duplicate — the existing one is
+        // already attached / attaching.
+        if self.fleet_terminal_sessions.contains_key(&key) {
+            return;
+        }
+        // A prior failed attempt for this key must not permanently poison it.
+        self.fleet_terminal_spawn_errors.remove(&key);
+
+        // Use the last-rendered pane dims when known (a frame has painted),
+        // else a sane default — the session resizes on the next
+        // `drive_terminal_pane` tick once real dims are stashed.
+        let (cols, rows) = self.terminal_pending_dims.get().unwrap_or((80, 24));
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+        let shell = quadraui::terminal_engine::default_shell();
+        match quadraui::terminal_engine::TerminalSession::spawn(
+            cols.max(20),
+            rows.max(5),
+            &shell,
+            &cwd,
+            10_000, // 10 000-line scrollback
+        ) {
+            Ok(mut sess) => {
+                let cfg = self
+                    .command_runner
+                    .config_path
+                    .as_ref()
+                    .map(|p| format!("--config {} ", shell_quote_arg(&p.to_string_lossy())))
+                    .unwrap_or_default();
+                let target = format!("{machine}:{slug}");
+                // Create THEN attach in one chained command: `&&` guarantees
+                // the durable tmux session exists (bug 4) before we attach, so
+                // there's no attach-before-create race. `coord terminal new`
+                // does the ssh+tmux work on the target machine; `--name` pins
+                // the client-resolved slug so this attach line matches it.
+                let cmd = format!(
+                    "coord terminal new {}{} --name {} && coord terminal attach {}{}\r",
+                    cfg,
+                    shell_quote_arg(&machine),
+                    shell_quote_arg(&slug),
+                    cfg,
+                    shell_quote_arg(&target),
+                );
                 sess.send_str(&cmd);
-                self.terminal_session = Some(sess);
-                self.terminal_spawn_error = None;
+                let ssh_host = self.resolve_fleet_terminal_ssh_host(&machine);
+                self.fleet_terminal_sessions
+                    .insert(key, FleetTerminalSession::new(sess, ssh_host, &slug));
             }
-            // If spawn fails the operator sees an error banner on the
-            // Terminal tab, same as the reattach fallback.
+            Err(e) => {
+                // Spawn failed — record it so the pane shows a readable banner
+                // for this leaf instead of a silent blank.
+                self.fleet_terminal_spawn_errors.insert(key, e.to_string());
+            }
         }
     }
 }
