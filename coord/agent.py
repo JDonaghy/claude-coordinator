@@ -1397,6 +1397,13 @@ generic app sanity.  Include any commands the human should re-run on \
 their hardware (e.g. `cargo test --features gtk` when only that build \
 exercises the changed delegation).
 
+For coord-tui changes: any behaviour reachable through the TuiDriver \
+harness (``driver_with_shell`` + ``TestBackend``) belongs in an \
+**in-crate ``#[cfg(test)]`` test**, not a SMOKE_TESTS bullet — the \
+automated headless smoke is the gate.  Reserve SMOKE_TESTS for the \
+quadraui#302 blind spot: raw-mode, SGR mouse, and the embedded claude \
+PTY pane that TuiDriver cannot reach.
+
 If the change is purely internal — no user-visible behaviour, no new \
 codepaths the existing test suite already covered — emit exactly:
 
@@ -1432,6 +1439,13 @@ Keep it to 2-5 items, one bullet per line. Each bullet has three \
 em-dash-separated parts: the scenario, the trigger, and the success signal. \
 Include any commands the human should re-run on their hardware (e.g. \
 `cargo test --features gtk` when only that build exercises the change).
+
+For coord-tui changes: any behaviour reachable through the TuiDriver \
+harness (``driver_with_shell`` + ``TestBackend``) belongs in an \
+in-crate ``#[cfg(test)]`` test, not a SMOKE_TESTS bullet — the \
+automated headless smoke is the gate. Reserve SMOKE_TESTS for the \
+quadraui#302 blind spot: raw-mode, SGR mouse, and the embedded claude \
+PTY pane that TuiDriver cannot reach.
 
 If the change is purely internal — no user-visible behaviour, automated \
 tests already cover the affected paths — emit exactly:

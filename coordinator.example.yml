@@ -35,8 +35,9 @@ repos:
     # and still uses ~/.coord-venv/bin/pip so PEP 668 ("externally-managed-
     # environment" when pip resolves to /usr/bin/pip) doesn't bite.
     build_command: "~/.coord-venv/bin/pip wheel --no-deps --wheel-dir /tmp/coord-test-build ."
-    # test_command omitted: pytest isn't installed in ~/.coord-venv
-    # (runtime-only) and the human Test gate (#200) handles verification.
+    # #1021: coord-tui's TuiDriver harness runs via `cargo test` inside tui/.
+    # The headless smoke routes here when the smoke capability rule matches.
+    test_command: "cd tui && cargo test"
     # artifact_paths: []  # no compiled binaries to stash for a Python package
 
 machines:
@@ -77,6 +78,15 @@ machines:
     repos: [claude-coordinator]
     repo_paths:
       claude-coordinator: ~/src/claude-coordinator
+
+smoke_tests:
+  # #1021: auto-dispatch headless smoke assignments when a work assignment
+  # completes.  The capability rule routes coord-tui changes (tui/ tree) to
+  # a machine with the rust capability so `cd tui && cargo test` compiles.
+  auto_queue: true
+  capability_rules:
+    - files: [tui/]
+      requires: [rust]
 
 pipeline:
   # Lifecycle gate order. Test precedes Review so the smoke test runs before the

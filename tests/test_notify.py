@@ -1150,3 +1150,181 @@ class TestMilestoneChatNotifySuppression:
         mock_mark_notified.assert_called_once_with(
             "mc-1", EVENT_COMPLETION, branch=None
         )
+
+
+# ── #1021: headless smoke exit code → parent work row Test verdict ────────────
+
+
+class TestSmokeCompletionVerdict:
+    """#1021: when a type='smoke' assignment completes, its exit code must be
+    propagated to the parent work assignment's test_state via record_test_verdict.
+    """
+
+    def _record_work(self, assignment_id: str) -> None:
+        """Insert a minimal work assignment into the DB."""
+        from coord.models import Assignment
+        from coord.state import _record_dispatched_assignment_local  # noqa: PLC0415
+
+        work = Assignment(
+            assignment_id=assignment_id,
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=42,
+            issue_title="Fix thing",
+            type="work",
+            status="done",
+            branch="issue-42-fix-thing",
+        )
+        _record_dispatched_assignment_local(assignment=work, repo_github="acme/api")
+
+    def _record_smoke(
+        self, smoke_id: str, *, parent_id: str
+    ) -> None:
+        """Insert a smoke assignment that links back to a work assignment."""
+        from coord.models import Assignment
+        from coord.state import _record_dispatched_assignment_local  # noqa: PLC0415
+
+        smoke = Assignment(
+            assignment_id=smoke_id,
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=42,
+            issue_title="[smoke] Fix thing",
+            type="smoke",
+            status="running",
+            review_of_assignment_id=parent_id,
+            branch="issue-42-fix-thing",
+        )
+        _record_dispatched_assignment_local(assignment=smoke, repo_github="acme/api")
+
+    def _make_transition_and_entry(
+        self, smoke_id: str, exit_code: int
+    ) -> tuple:
+        from coord.notify import Transition, EVENT_COMPLETION  # noqa: PLC0415
+
+        transition = Transition(
+            assignment_id=smoke_id,
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=42,
+            event=EVENT_COMPLETION,
+            exit_code=exit_code,
+        )
+        record = {
+            "repo_github": "acme/api",
+            "type": "smoke",
+            "review_of_assignment_id": "work-1",
+        }
+        entry = {
+            "started_at": 1000.0,
+            "finished_at": 1010.0,
+            "branch": "issue-42-fix-thing",
+            "log_path": None,
+        }
+        return transition, record, entry
+
+    def test_passing_smoke_sets_parent_test_state_passed(
+        self, coord_db
+    ) -> None:
+        """Exit code 0 → parent work row test_state='passed'."""
+        from coord.notify import post_transition  # noqa: PLC0415
+        from coord.state import get_connection  # noqa: PLC0415
+
+        self._record_work("work-1")
+        self._record_smoke("smoke-1", parent_id="work-1")
+        transition, record, entry = self._make_transition_and_entry(
+            "smoke-1", exit_code=0
+        )
+
+        with (
+            patch("coord.notify.post_completion"),
+            patch("coord.notify.mark_notified"),
+            patch("coord.notify._capture_cost"),
+            patch("coord.notify._capture_smoke_tests"),
+            patch("coord.notify._capture_completion_summary"),
+            patch("coord.notify._capture_claude_session_id"),
+        ):
+            post_transition(transition, record, entry)
+
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT test_state FROM assignments WHERE assignment_id=?", ("work-1",)
+        ).fetchone()
+        assert row is not None, "work assignment must exist in DB"
+        assert row["test_state"] == "passed", (
+            f"expected test_state='passed' for exit_code=0, got {row['test_state']!r}"
+        )
+
+    def test_failing_smoke_sets_parent_test_state_failed(
+        self, coord_db
+    ) -> None:
+        """Non-zero exit code → parent work row test_state='failed'."""
+        from coord.notify import post_transition  # noqa: PLC0415
+        from coord.state import get_connection  # noqa: PLC0415
+
+        self._record_work("work-2")
+        self._record_smoke("smoke-2", parent_id="work-2")
+        transition, record, entry = self._make_transition_and_entry(
+            "smoke-2", exit_code=1
+        )
+        record = dict(record)
+        record["review_of_assignment_id"] = "work-2"
+
+        with (
+            patch("coord.notify.post_completion"),
+            patch("coord.notify.mark_notified"),
+            patch("coord.notify._capture_cost"),
+            patch("coord.notify._capture_smoke_tests"),
+            patch("coord.notify._capture_completion_summary"),
+            patch("coord.notify._capture_claude_session_id"),
+        ):
+            post_transition(transition, record, entry)
+
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT test_state FROM assignments WHERE assignment_id=?", ("work-2",)
+        ).fetchone()
+        assert row is not None, "work assignment must exist in DB"
+        assert row["test_state"] == "failed", (
+            f"expected test_state='failed' for non-zero exit_code, got {row['test_state']!r}"
+        )
+
+    def test_interactive_smoke_mode_not_auto_certified(
+        self, coord_db
+    ) -> None:
+        """test-mode:smoke → auto-certification is suppressed; test_state stays None."""
+        from coord.notify import post_transition  # noqa: PLC0415
+        from coord.state import get_connection  # noqa: PLC0415
+
+        self._record_work("work-3")
+        self._record_smoke("smoke-3", parent_id="work-3")
+        transition, record, entry = self._make_transition_and_entry(
+            "smoke-3", exit_code=0
+        )
+        record = dict(record)
+        record["review_of_assignment_id"] = "work-3"
+
+        with (
+            patch("coord.notify.post_completion"),
+            patch("coord.notify.mark_notified"),
+            patch("coord.notify._capture_cost"),
+            patch("coord.notify._capture_smoke_tests"),
+            patch("coord.notify._capture_completion_summary"),
+            patch("coord.notify._capture_claude_session_id"),
+            # Simulate test-mode:smoke label on the issue.
+            patch(
+                "coord.state.get_issue_test_mode",
+                return_value="smoke",
+            ),
+        ):
+            post_transition(transition, record, entry)
+
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT test_state FROM assignments WHERE assignment_id=?", ("work-3",)
+        ).fetchone()
+        assert row is not None, "work assignment must exist in DB"
+        assert row["test_state"] is None, (
+            "test-mode:smoke must suppress auto-certification; "
+            f"test_state should be None but got {row['test_state']!r}"
+        )
