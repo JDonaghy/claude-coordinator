@@ -867,23 +867,26 @@ impl CoordApp {
         let label_title = if title.is_empty() { "(untitled)".to_string() } else { title };
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         use crate::commands::SpawnQueuedOutcome;
-        match self.command_runner.spawn_queued(&arg_refs) {
-            SpawnQueuedOutcome::Deduped => {}
-            SpawnQueuedOutcome::Queued => {
-                self.push_toast(
-                    "New milestone chat queued",
-                    &format!("\"{label_title}\" ({repo}) — will open after current command."),
-                    ToastSeverity::Info,
-                );
-            }
-            SpawnQueuedOutcome::Started => {
-                self.push_toast(
-                    "New milestone chat",
-                    &format!("\"{label_title}\" ({repo}) — dispatching steward chat…"),
-                    ToastSeverity::Info,
-                );
-            }
+        let outcome = self.command_runner.spawn_queued(&arg_refs);
+        if outcome == SpawnQueuedOutcome::Deduped {
+            return;
         }
+        // #1017: arm the bind so the next tick attaches the live chat overlay
+        // to the new brand-new-milestone `type="milestone-chat"` session.
+        // There is no tracking issue yet, so it lands on the `issue_number=0`
+        // sentinel (dispatch_new_milestone_chat) — a board-level chat.
+        self.pending_milestone_chat = Some(PendingMilestoneChat {
+            repo: repo.clone(),
+            issue_number: 0,
+            label: format!("\"{label_title}\" ({repo})"),
+            dispatched_at: Instant::now(),
+        });
+        let msg = if outcome == SpawnQueuedOutcome::Queued {
+            format!("\"{label_title}\" ({repo}) — chat opens after current command.")
+        } else {
+            format!("\"{label_title}\" ({repo}) — opening steward chat…")
+        };
+        self.push_toast("New milestone chat", &msg, ToastSeverity::Info);
     }
 }
 

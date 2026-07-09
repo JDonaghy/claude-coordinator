@@ -3308,12 +3308,17 @@ impl CoordApp {
     /// board-level chat (`issue_number == 0`).  Board chats render inline in
     /// `BoardDetailTab::Chat` rather than a Pipeline Refinement tab.  Covers
     /// both `type="new-issue-chat"` and board `type="refinement"` sessions.
+    ///
+    /// #1017: `type="milestone-chat"` sessions also render here regardless of
+    /// their tracking-issue number — they are plan/board-level conversations
+    /// (the Plans-panel New/Open/Add-sub-issue chat entries), so the Board
+    /// Chat tab is their natural home.
     pub(crate) fn chat_is_board_chat(&self) -> bool {
         if self.inject_chat.is_none() {
             return false;
         }
         self.focused_watch_state()
-            .map(|w| w.issue_number == 0)
+            .map(|w| w.issue_number == 0 || w.assignment_type == "milestone-chat")
             .unwrap_or(false)
     }
 

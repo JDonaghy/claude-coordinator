@@ -671,14 +671,14 @@ impl CoordApp {
         true
     }
 
-    /// "Open milestone chat" (#1003) — dispatch a `type="milestone-chat"`
-    /// steward session the same fire-and-forget way "Dispatch milestone"
-    /// spawns its `coord` subcommand. The session id isn't captured here
-    /// (no live chat-overlay attach, unlike refine-chat's
-    /// `maybe_bind_pending_refinement`) — reattaching to watch/participate
-    /// is via the Machines/sessions view, same as any other background
-    /// worker. Deeper chat-attach integration is exactly the "chat-driven
-    /// authoring" scope #1003 defers to a follow-up.
+    /// "Open milestone chat" (#1003, #1017) — dispatch a
+    /// `type="milestone-chat"` steward session and arm `pending_milestone_chat`
+    /// so the next tick attaches the live chat overlay to it
+    /// (`maybe_bind_pending_milestone_chat`, mirroring refine-chat's
+    /// `maybe_bind_pending_refinement`). #1017 replaced the original
+    /// fire-and-forget dispatch — the operator now gets an actual attached,
+    /// interactive chat pane (Board Chat tab) they can converse in, not a
+    /// headless one-shot worker.
     pub(crate) fn open_milestone_chat_action(&mut self, target: &ContextMenuTarget) -> bool {
         let (repo, tracking_issue, title) = match target {
             ContextMenuTarget::MilestoneHeader {
@@ -698,26 +698,27 @@ impl CoordApp {
         };
         let issue_str = tracking_issue.to_string();
         use crate::commands::SpawnQueuedOutcome;
-        match self
+        let outcome = self
             .command_runner
-            .spawn_queued(&["milestone", "chat", &repo, &issue_str])
-        {
-            SpawnQueuedOutcome::Deduped => {}
-            SpawnQueuedOutcome::Queued => {
-                self.push_toast(
-                    "Milestone chat",
-                    &format!("{}: queued — will open after current command.", title),
-                    ToastSeverity::Info,
-                );
-            }
-            SpawnQueuedOutcome::Started => {
-                self.push_toast(
-                    "Milestone chat",
-                    &format!("{}: dispatching steward chat…", title),
-                    ToastSeverity::Info,
-                );
-            }
+            .spawn_queued(&["milestone", "chat", &repo, &issue_str]);
+        if outcome == SpawnQueuedOutcome::Deduped {
+            // Already running/queued — don't overwrite pending state or re-toast.
+            return false;
         }
+        // #1017: arm the bind so the next tick attaches the live chat overlay
+        // to the new `type="milestone-chat"` session (was fire-and-forget).
+        self.pending_milestone_chat = Some(PendingMilestoneChat {
+            repo,
+            issue_number: tracking_issue,
+            label: title.clone(),
+            dispatched_at: Instant::now(),
+        });
+        let msg = if outcome == SpawnQueuedOutcome::Queued {
+            format!("{}: queued — chat opens after current command.", title)
+        } else {
+            format!("{}: opening steward chat…", title)
+        };
+        self.push_toast("Milestone chat", &msg, ToastSeverity::Info);
         true
     }
 
@@ -1178,19 +1179,24 @@ impl CoordApp {
             "--add-child",
             &issue_str,
         ]);
-        match outcome {
-            SpawnQueuedOutcome::Deduped => {}
-            SpawnQueuedOutcome::Queued => {
-                self.push_toast(
-                    &label,
-                    "queued — will open after current command.",
-                    ToastSeverity::Info,
-                );
-            }
-            SpawnQueuedOutcome::Started => {
-                self.push_toast(&label, "dispatching steward chat…", ToastSeverity::Info);
-            }
+        if outcome == SpawnQueuedOutcome::Deduped {
+            return;
         }
+        // #1017: arm the bind so the next tick attaches the live chat overlay
+        // to the new `type="milestone-chat"` add-sub-issue session — the epic's
+        // tracking issue is the target row (issue_number == tracking_issue).
+        self.pending_milestone_chat = Some(PendingMilestoneChat {
+            repo,
+            issue_number: input.tracking_issue,
+            label: label.clone(),
+            dispatched_at: Instant::now(),
+        });
+        let msg = if outcome == SpawnQueuedOutcome::Queued {
+            "queued — chat opens after current command."
+        } else {
+            "opening steward chat…"
+        };
+        self.push_toast(&label, msg, ToastSeverity::Info);
     }
 
     /// Open the "Close / archive plan" confirm (#1003) — mirrors
