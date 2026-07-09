@@ -27512,11 +27512,15 @@ Milestone tracking issue.
                 name: "scratch".to_string(),
                 machine: "precision".to_string(),
                 attached: false,
+                pending: false,
+                pending_sweep_count: 0,
             },
             FleetTerminal {
                 name: "build".to_string(),
                 machine: "precision".to_string(),
                 attached: false,
+                pending: false,
+                pending_sweep_count: 0,
             },
         ];
 
@@ -27609,11 +27613,15 @@ Milestone tracking issue.
                 name: "scratch".to_string(),
                 machine: "precision".to_string(),
                 attached: false,
+                pending: false,
+                pending_sweep_count: 0,
             },
             FleetTerminal {
                 name: "build".to_string(),
                 machine: "precision".to_string(),
                 attached: false,
+                pending: false,
+                pending_sweep_count: 0,
             },
         ];
         // `render_content` normally stashes this on the first paint;
@@ -27718,6 +27726,8 @@ Milestone tracking issue.
             name: "regress955".to_string(),
             machine: "elitebook".to_string(),
             attached: false,
+            pending: false,
+            pending_sweep_count: 0,
         }];
         app.terminal_pending_dims.set(Some((80, 24)));
         app.terminal_tree_selected = Some(vec![0, 0]);
@@ -27852,5 +27862,167 @@ Milestone tracking issue.
             "the optimistic node must nest directly under 'dellserver' \
              (precision={precision_row}, dellserver={dellserver_row}, \
              pending={pending_row}):\n{screen}",
+        );
+    }
+
+    /// #954 Gap B/C: the prior test above only asserted the optimistic
+    /// node's initial placement — it never drove a discovery sweep to
+    /// completion, so the reconciliation/eviction path (and the "main area
+    /// hosts a live terminal surface" acceptance bullet) shipped unasserted.
+    /// That gap is exactly how the stuck-forever "(creating…)" bug (a real
+    /// tmux session existed per `coord terminal list --remote`, but the
+    /// tree never reconciled) reached a human smoke test undetected.
+    ///
+    /// `TuiDriver` offers no way to reach back into a `ShellApp` once it's
+    /// wrapped (no `tick()`, no field access through the opaque
+    /// `ShellAdapter`), so this drives `CoordApp` methods directly — the
+    /// same private-field access `terminal_tree_groups_terminals_under_correct_machine`
+    /// above already relies on (`app.fleet_terminals = vec![...]` before
+    /// handing the app to `driver_with_shell`) — then re-wraps the app in a
+    /// fresh driver afterwards to assert the FINAL state through the normal
+    /// black-box screen.
+    #[test]
+    fn new_terminal_reconciles_after_discovery_sweep_and_hosts_live_terminal() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(BoardData {
+            machines: vec![
+                mk_machine("precision", "precision.tail", true, &[]),
+                mk_machine("dellserver", "dellserver.tail", true, &[]),
+            ],
+            ..BoardData::default()
+        });
+
+        // Drive the create+attach path directly (equivalent to picking
+        // "dellserver" and accepting the default name via the `n` picker —
+        // see `create_and_attach_terminal`'s doc comment).
+        app.create_and_attach_terminal("dellserver".to_string(), String::new());
+
+        // "the main area hosts a live terminal surface": create_and_attach
+        // must have spawned (or reused) a real PTY session into the
+        // standalone Terminal pane — not left it to the render-time
+        // "Starting shell session…" placeholder.
+        assert!(
+            app.terminal_session.is_some(),
+            "create_and_attach_terminal must spawn/attach a live PTY session \
+             into the main Terminal pane, not just insert the tree node",
+        );
+
+        let pending_slug = app
+            .fleet_terminals
+            .iter()
+            .find(|t| t.pending && t.machine == "dellserver")
+            .map(|t| t.name.clone())
+            .expect("create_and_attach_terminal must insert an optimistic pending FleetTerminal");
+
+        // Simulate a landed `coord terminal list --remote` discovery sweep
+        // that now covers (machine, slug) as a real, attached session —
+        // exactly the state the reviewer's manual repro confirmed via
+        // `coord terminal list --remote` (e.g. "elitebook:4f37a8") while the
+        // tree stayed stuck on "(creating…)".
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(vec![FleetTerminal {
+            name: pending_slug.clone(),
+            machine: "dellserver".to_string(),
+            attached: true,
+            pending: false,
+            pending_sweep_count: 0,
+        }])
+        .expect("send discovery result");
+        app.pending_remote_terminals = Some(rx);
+
+        let changed = app.poll_remote_terminals();
+        assert!(changed, "poll_remote_terminals must report a landed sweep");
+
+        // Reconciliation: exactly one entry for (dellserver, slug) survives,
+        // it is no longer `pending`, and it carries the real `attached`
+        // state from the discovery result — not a duplicate optimistic +
+        // real pair, and not evicted outright.
+        let matching: Vec<&FleetTerminal> = app
+            .fleet_terminals
+            .iter()
+            .filter(|t| t.machine == "dellserver" && t.name == pending_slug)
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "the optimistic entry must be replaced by exactly one real entry \
+             after discovery, not duplicated or dropped: {:?}",
+            app.fleet_terminals,
+        );
+        assert!(
+            !matching[0].pending,
+            "the reconciled entry must no longer be optimistic/pending: {:?}",
+            matching[0],
+        );
+        assert!(
+            matching[0].attached,
+            "the reconciled entry must carry the discovery result's \
+             `attached` state: {:?}",
+            matching[0],
+        );
+
+        // Re-render the FINAL state through the normal black-box driver:
+        // the tree must show the terminal as attached, and must NOT still
+        // show the "(creating…)" marker — the exact symptom the operator
+        // reported ("waited 30+ seconds, no change").
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        click_activity_icon(&mut driver, ">");
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("creating"),
+            "after a discovery sweep confirms the real session, the tree must \
+             NOT still show the optimistic '(creating…)' marker:\n{screen}",
+        );
+        assert!(
+            screen.contains(&pending_slug) && screen.contains("attached"),
+            "the reconciled terminal must render as attached in the tree:\n{screen}",
+        );
+        assert!(
+            !screen.contains("Starting shell session…") && !screen.contains("Terminal session error"),
+            "the main pane must show the live PTY surface, not the \
+             no-session placeholder:\n{screen}",
+        );
+    }
+
+    /// #954 Gap A: the issue requires "a keybinding (e.g. `n`) AND a
+    /// context-menu / header '+ New terminal' entry" in the Terminal view —
+    /// the `n` keybinding shipped in the original PR, but there was no
+    /// visible affordance for an operator who doesn't already know the
+    /// shortcut (confirmed missing by the reviewer's manual walkthrough).
+    /// Assert the sidebar header button exists, is labelled, and clicking
+    /// it opens the same machine picker as `n`.
+    #[test]
+    fn terminal_view_header_has_new_terminal_button() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_test_app(BoardData {
+            machines: vec![
+                mk_machine("precision", "precision.tail", true, &[]),
+                mk_machine("dellserver", "dellserver.tail", true, &[]),
+            ],
+            ..BoardData::default()
+        });
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        click_activity_icon(&mut driver, ">");
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("New terminal"),
+            "the Terminal view sidebar header must show a '+ New terminal' \
+             affordance, not just the 'n' keybinding:\n{screen}",
+        );
+
+        let (x, y) = driver.find("New terminal").unwrap_or_else(|| {
+            panic!("'New terminal' header button not found:\n{}", driver.screen())
+        });
+        driver.click(x, y);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Select machine for new terminal"),
+            "clicking the header button must open the same new-terminal \
+             machine picker the 'n' keybinding opens:\n{screen}",
         );
     }

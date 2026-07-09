@@ -36,6 +36,22 @@ impl CoordApp {
                 tooltip: "coord sync — fetch all open issues from GitHub".to_string(),
             });
         }
+        // #954 Gap A: the Terminal view's machine/terminal tree (#953) had
+        // only the `n` keybinding to create a terminal — no visible
+        // affordance for an operator who doesn't know the shortcut. Mirror
+        // the Board "Sync" header button above with a "+ New terminal" one,
+        // wired to the same `open_new_terminal_picker` entry point as `n`.
+        if self.active_view == SidebarView::Terminal {
+            buttons.push(ToolbarButton::Action {
+                id: WidgetId::new("sidebar-action:new-terminal"),
+                label: "New terminal".to_string(),
+                icon: Some("+".to_string()),
+                key_hint: Some("n".to_string()),
+                enabled: true,
+                is_active: false,
+                tooltip: "Create a new terminal on a fleet machine".to_string(),
+            });
+        }
         if buttons.is_empty() {
             // No header button → don't reserve the slot; the tree gets the
             // full sidebar height.
@@ -110,10 +126,14 @@ impl CoordApp {
         let content_rect = layout.content_bounds;
         match layout.hit_test(pos.x, pos.y) {
             SidebarPanelHit::ToolbarButton(id) => {
-                // The Board "Sync" button is the only header action left — the
-                // #270 contextual verbs now live in the keyboard context menu.
-                if id.as_str().strip_prefix("sidebar-action:") == Some("sync-issues") {
-                    self.force_issue_sync();
+                // The Board "Sync" and Terminal "New terminal" buttons are
+                // the only header actions left — the #270 contextual verbs
+                // now live in the keyboard context menu.
+                match id.as_str().strip_prefix("sidebar-action:") {
+                    Some("sync-issues") => self.force_issue_sync(),
+                    // #954 Gap A: same entry point as the `n` keybinding.
+                    Some("new-terminal") => self.open_new_terminal_picker(),
+                    _ => {}
                 }
                 (content_rect, true)
             }
