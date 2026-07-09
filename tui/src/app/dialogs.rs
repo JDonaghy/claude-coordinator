@@ -6068,21 +6068,36 @@ pub(crate) fn board_assignment_reason_sans_test(a: &Assignment) -> String {
 ///   1. The work/fix assignment this smoke row explicitly tested — linked via
 ///      `review_of_assignment_id`, set by both automated (`coord/smoke.py`)
 ///      and interactive (`--smoke-of`, `coord/commands/dispatch_workers.py`)
-///      dispatch.
+///      dispatch. **When the link is valid but the linked work has not yet
+///      been verdicted (test_state is None — i.e. the Test is still running),
+///      resolution short-circuits to tier 3 (this smoke row's own status).**
+///      An in-progress Test must show `running…`/its own status, NOT borrow an
+///      unrelated historical verdict via tier 2 (#1022 smoke-round-2 bug).
 ///   2. The most-recently-dispatched work-like assignment for the issue that
-///      has recorded a verdict (defensive: rows predating the link).
-///   3. The smoke assignment's own `test_state`/`test_reason` (defensive;
-///      should not normally be populated on a smoke row).
+///      has recorded a verdict (defensive: **legacy rows only** — rows with no
+///      `review_of_assignment_id`, or whose linked assignment no longer
+///      exists). Never fires when the smoke row carries a valid link.
+///   3. The smoke assignment's own `test_state`/`test_reason` — the fallback
+///      for a linked-but-not-yet-verdicted (still-running) Test row, and a
+///      last resort for legacy rows with no verdict recorded anywhere.
 pub(crate) fn resolve_smoke_test_verdict<'a>(
     smoke: &'a Assignment,
     assignments: &[&'a Assignment],
 ) -> (Option<&'a str>, Option<&'a str>) {
     if let Some(work_id) = smoke.review_of_assignment_id.as_deref() {
         if let Some(w) = assignments.iter().find(|a| a.id == work_id) {
+            // The link is valid — this smoke row tested a known assignment.
+            // Return that assignment's verdict if one has been recorded;
+            // otherwise fall straight through to tier 3 (the smoke row's own
+            // status).  A linked-but-unverdicted Test is still in progress and
+            // must NOT resurrect an older, unrelated verdict from tier 2.
             if w.test_state.is_some() {
                 return (w.test_state.as_deref(), w.test_reason.as_deref());
             }
+            return (smoke.test_state.as_deref(), smoke.test_reason.as_deref());
         }
+        // The linked id is set but the assignment is no longer present — treat
+        // as an orphaned/legacy link and fall through to the defensive scan.
     }
     let latest_work = assignments
         .iter()

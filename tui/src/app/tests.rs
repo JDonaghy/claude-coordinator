@@ -14961,6 +14961,71 @@
         assert_eq!(reason, None);
     }
 
+    /// #1022 fix iter 2 (smoke-round-2 bug): a smoke row whose linked work has
+    /// NOT been verdicted yet (Test still running) must show its OWN status —
+    /// NOT resurrect an older sibling's stale verdict via the tier-2 scan.
+    ///
+    /// Repro: an in-progress Test on the current work iteration was showing
+    /// `failed ✗` with the write-up from a PRIOR, unrelated smoke round because
+    /// tier 2 unconditionally scanned every work-like assignment for any
+    /// recorded verdict — even when the row's own link was valid, just pending.
+    #[test]
+    fn resolve_smoke_test_verdict_linked_but_unverdicted_uses_own_status_not_stale_sibling() {
+        // Older iteration: a work assignment that DID get a failed verdict.
+        let mut old_work = make_assignment_typed("done", 1, "repo-a", Some("work"));
+        old_work.id = "w_old".to_string();
+        old_work.test_state = Some("failed".to_string());
+        old_work.test_reason = Some("stale story from a prior round".to_string());
+
+        // Current iteration: work assignment, no verdict recorded yet.
+        // Higher issue number ⇒ later dispatched_at ⇒ would win the tier-2 scan
+        // IF it had a verdict — but it doesn't, which is the whole point.
+        let mut new_work = make_assignment_typed("done", 2, "repo-a", Some("work"));
+        new_work.id = "w_new".to_string();
+        // new_work.test_state stays None — the Test is still in progress.
+
+        // The smoke row links to the CURRENT work and is itself still running.
+        let mut smoke = make_assignment_typed("running", 2, "repo-a", Some("smoke"));
+        smoke.id = "s_new".to_string();
+        smoke.review_of_assignment_id = Some("w_new".to_string());
+        // smoke.test_state stays None — no verdict borrowed, no own verdict.
+
+        let assignments: Vec<&Assignment> = vec![&old_work, &new_work, &smoke];
+        let (verdict, reason) = resolve_smoke_test_verdict(&smoke, &assignments);
+        assert_eq!(
+            verdict, None,
+            "a linked-but-unverdicted Test must NOT borrow a sibling's verdict"
+        );
+        assert_eq!(
+            reason, None,
+            "a linked-but-unverdicted Test must NOT show a prior round's reason"
+        );
+    }
+
+    /// #1022 fix iter 2: an ORPHANED link (review_of_assignment_id points to an
+    /// assignment that no longer exists — a legacy/deleted row) still falls
+    /// through to the tier-2 defensive scan. Only a VALID-but-pending link
+    /// short-circuits to tier 3.
+    #[test]
+    fn resolve_smoke_test_verdict_orphaned_link_falls_through_to_scan() {
+        let mut work = make_assignment_typed("done", 1, "repo-a", Some("work"));
+        work.id = "w1".to_string();
+        work.test_state = Some("passed".to_string());
+
+        let mut smoke = make_assignment_typed("done", 1, "repo-a", Some("smoke"));
+        smoke.id = "s1".to_string();
+        // Points at an id that isn't in `assignments` — orphaned link.
+        smoke.review_of_assignment_id = Some("w_missing".to_string());
+
+        let assignments: Vec<&Assignment> = vec![&work, &smoke];
+        let (verdict, _) = resolve_smoke_test_verdict(&smoke, &assignments);
+        assert_eq!(
+            verdict,
+            Some("passed"),
+            "an orphaned link must fall through to the tier-2 scan"
+        );
+    }
+
     // ── #1022: Unit tests for assignment_status_badge flat-row rule ──────────────
 
     /// #1022: Work/fix rows must show only their own completion status — no
