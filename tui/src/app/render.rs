@@ -75,9 +75,11 @@ impl ShellApp for CoordApp {
                 }
                 SidebarView::Terminal => {
                     // #953: left-pane machine-grouped tree of open
-                    // terminals (read-only discovery). The main area is
-                    // still a single PTY surface — this tree only lists
-                    // what's out there; create/kill/attach are follow-ups.
+                    // terminals. #954 added create+attach (the `n`
+                    // keybinding and the header "+ New terminal" button
+                    // above this tree, see `build_sidebar_action_panel`) —
+                    // kill is still a follow-up. The main area remains a
+                    // single PTY surface.
                     backend.draw_tree(sidebar_rect, &self.terminal_tree_view());
                 }
                 // #638: Kanban sidebar is a placeholder — all content is in the main panel.

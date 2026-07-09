@@ -157,15 +157,17 @@ impl CoordApp {
             }
         };
         if should_refresh && self.pending_data.is_none() {
-            // #955 bug 2: route through `refresh()` (not a bare
-            // `start_data_load()` call) so the periodic cadence ALSO
+            // #955 bug 2 / #954 Gap B: route through `refresh()` (not a
+            // bare `start_data_load()` call) so the periodic cadence ALSO
             // re-arms the remote-session (#559) and fleet-terminal (#953)
             // discovery sweeps below — both were previously re-armed only
             // reactively, after a coord-CLI mutation completed INSIDE the
             // TUI (`refresh()`'s other call sites). A `coord terminal new`
             // run from an EXTERNAL shell never triggers one of those, so
             // the Terminal-view tree stayed stale until a full TUI
-            // restart picked up the one-shot startup sweep again.
+            // restart picked up the one-shot startup sweep again. Also
+            // re-evicts/reconciles an optimistic pending `FleetTerminal`
+            // so it doesn't sit showing "(creating…)" indefinitely.
             self.refresh();
             if self.active_view == SidebarView::Pipeline {
                 self.maybe_kick_pipeline_loader();
