@@ -671,6 +671,13 @@ impl CoordApp {
             needs_redraw = true;
         }
 
+        // #1017: bind a pending milestone-chat dispatch (New/Open/Add-sub-issue
+        // via chat) to its `type="milestone-chat"` assignment row when it
+        // appears in the DB, so the operator gets a live, attachable chat pane.
+        if self.pending_milestone_chat.is_some() && self.maybe_bind_pending_milestone_chat() {
+            needs_redraw = true;
+        }
+
         // #314 Phase B: bind a pending test-chat dispatch to its new assignment row.
         if self.pending_test_chat.is_some() && self.maybe_bind_pending_test_chat() {
             needs_redraw = true;

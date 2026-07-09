@@ -703,6 +703,28 @@ struct PendingBoardChat {
     dispatched_at: Instant,
 }
 
+/// #1017: pending milestone-chat dispatch.  Armed by the Plans-panel
+/// "New milestone via chat" / "Open milestone chat" / "Add sub-issue via
+/// chat…" entries after they shell `coord milestone chat …`; cleared on bind
+/// or timeout.  Same poll+bind lifecycle as `PendingBoardChat` — the backend
+/// records a `type="milestone-chat"` stream-json session (the refine-chat /
+/// new-issue-chat family) and prints its assignment id, so the TUI can attach
+/// the live chat overlay to it rather than leaving it a fire-and-forget
+/// headless worker the operator can't participate in.
+#[derive(Clone)]
+struct PendingMilestoneChat {
+    /// Coord-local repo name (matches `coordinator.yml`).
+    repo: String,
+    /// Tracking-issue number the chat is about, or `0` for a brand-new
+    /// milestone that has no tracking issue yet — the backend's
+    /// `issue_number=0` sentinel (`dispatch_new_milestone_chat`).
+    issue_number: u64,
+    /// Human-readable label for the bind toast / chat status strip.
+    label: String,
+    /// Wall-clock dispatch instant — bounds the wait at `REFINEMENT_BIND_TIMEOUT`.
+    dispatched_at: Instant,
+}
+
 /// #353: pending repo picker for the [Add] button on the Board panel.
 /// When multiple repos exist, this shows a numeric picker (1, 2, …) for
 /// the user to select which repo to open a refine-board chat for.
@@ -2250,6 +2272,12 @@ pub struct CoordApp {
     /// refine-board` / `coord new-issue-chat` is running.  Polled each
     /// tick; on bind we open the chat overlay in the Board Chat tab.
     pending_board_chat: Option<PendingBoardChat>,
+    /// #1017: pending milestone-chat dispatch — armed by the Plans-panel
+    /// "New milestone via chat" / "Open milestone chat" / "Add sub-issue via
+    /// chat…" entries.  Polled each tick; on bind we attach the live chat
+    /// overlay to the new `type="milestone-chat"` session so the operator can
+    /// converse in it (the #1017 review fix — previously fire-and-forget).
+    pending_milestone_chat: Option<PendingMilestoneChat>,
     /// #353: pending repo picker for the [Add] button on the Board panel.
     /// Armed when the user clicks [Add] and multiple repos exist. The picker
     /// intercepts numeric keys (1, 2, …) to select a repo, or Esc to cancel.
@@ -2909,6 +2937,7 @@ impl CoordApp {
             pending_refinement_close_prompt: None,
             finalise_after_notes_post: false,
             pending_board_chat: None,
+            pending_milestone_chat: None,
             pending_repo_picker: None,
             pending_machine_picker: None,
             pending_new_terminal_picker: None,

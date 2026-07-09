@@ -357,6 +357,7 @@
             pending_refinement_close_prompt: None,
             finalise_after_notes_post: false,
             pending_board_chat: None,
+            pending_milestone_chat: None,
             pending_repo_picker: None,
             pending_machine_picker: None,
             pending_new_terminal_picker: None,
@@ -25388,6 +25389,129 @@ Milestone tracking issue.
         app.capture_plan_chat("Untitled".to_string());
 
         assert!(app.command_runner.spawned_calls.is_empty());
+    }
+
+    /// #1017 (review fix): `capture_plan_chat` arms `pending_milestone_chat`
+    /// so the next tick attaches a LIVE chat overlay to the new
+    /// `type="milestone-chat"` session — the review-fix replacement for the
+    /// old fire-and-forget dispatch. New milestones have no tracking issue,
+    /// so the pending row carries `issue_number == 0` (the backend sentinel).
+    #[test]
+    fn capture_plan_chat_arms_pending_milestone_chat_for_new() {
+        let mut app = make_test_app(make_plan_roster_board_data());
+        app.command_runner = crate::commands::CommandRunner::new_for_test();
+        app.active_view = SidebarView::Plans;
+        app.plans_sel = 0;
+
+        app.capture_plan_chat("Q4 push".to_string());
+
+        let pending = app
+            .pending_milestone_chat
+            .as_ref()
+            .expect("capture_plan_chat should arm pending_milestone_chat");
+        assert_eq!(pending.repo, "api");
+        assert_eq!(pending.issue_number, 0);
+    }
+
+    /// #1017 (review fix): "Open milestone chat" arms `pending_milestone_chat`
+    /// keyed on the epic's tracking-issue number, and shells `coord milestone
+    /// chat <repo> <tracking_issue>`.
+    #[test]
+    fn open_milestone_chat_arms_pending_for_tracking_issue() {
+        let mut app = make_test_app(make_plan_roster_board_data());
+        app.command_runner = crate::commands::CommandRunner::new_for_test();
+
+        let target = ContextMenuTarget::MilestoneHeader {
+            repo_name: "api".to_string(),
+            tracking_issue: 973,
+            milestone_title: "Sprint 4".to_string(),
+            milestone_number: 28,
+        };
+        assert!(app.open_milestone_chat_action(&target));
+
+        assert_eq!(
+            app.command_runner.spawned_calls,
+            vec![vec![
+                "milestone".to_string(),
+                "chat".to_string(),
+                "api".to_string(),
+                "973".to_string(),
+            ]],
+        );
+        let pending = app
+            .pending_milestone_chat
+            .as_ref()
+            .expect("open_milestone_chat_action should arm pending_milestone_chat");
+        assert_eq!(pending.repo, "api");
+        assert_eq!(pending.issue_number, 973);
+    }
+
+    /// #1017 (review fix): once the `type="milestone-chat"` assignment row
+    /// appears, `maybe_bind_pending_milestone_chat` opens the live chat
+    /// overlay (`inject_chat`), routes to the Board Chat tab, and clears the
+    /// pending state — the operator can now converse in it. This is the crux
+    /// of the fix: no more headless one-shot the operator can't participate in.
+    #[test]
+    fn maybe_bind_pending_milestone_chat_attaches_overlay() {
+        let mut app = make_test_app(make_plan_roster_board_data());
+        app.pending_milestone_chat = Some(PendingMilestoneChat {
+            repo: "api".to_string(),
+            issue_number: 973,
+            label: "Sprint 4".to_string(),
+            dispatched_at: Instant::now(),
+        });
+        app.data.assignments.push(Assignment {
+            id: "mc1".to_string(),
+            repo: "api".to_string(),
+            issue_number: 973,
+            issue_title: "Sprint 4 epic".to_string(),
+            machine: "m1".to_string(),
+            status: "running".to_string(),
+            branch: None,
+            model: None,
+            dispatched_at: Some(2.0),
+            finished_at: None,
+            exit_code: None,
+            assignment_type: Some("milestone-chat".to_string()),
+            test_state: None,
+            review_verdict: None,
+            review_of_assignment_id: None,
+            cost_usd: None,
+            smoke_tests: None,
+            review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            is_interactive: false,
+            failure_reason: None,
+            review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
+            test_reason: None,
+            review_state: None,
+            pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
+        });
+
+        assert!(app.maybe_bind_pending_milestone_chat());
+        assert!(
+            app.inject_chat.is_some(),
+            "bind should open the live chat overlay",
+        );
+        assert!(app.pending_milestone_chat.is_none(), "pending should clear");
+        assert_eq!(app.watch_focused.as_deref(), Some("mc1"));
+        assert_eq!(app.active_view, SidebarView::Board);
+        assert_eq!(app.board_detail_tab, BoardDetailTab::Chat);
+        // A milestone chat renders inline in the Board Chat tab.
+        assert!(app.chat_is_board_chat());
     }
 
     /// #1017: bare `C` in the Plans panel opens the "New milestone via

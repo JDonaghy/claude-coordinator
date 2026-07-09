@@ -3932,6 +3932,133 @@ impl CoordApp {
         true
     }
 
+    /// #1017: called each tick while `pending_milestone_chat` is armed.
+    /// Looks for the freshly-dispatched `type="milestone-chat"` assignment in
+    /// `self.data.assignments` (matching by repo + tracking-issue number,
+    /// where `0` is the brand-new-milestone sentinel), adds it to
+    /// `watch_pool`, focuses it, and opens the inject_chat overlay in the
+    /// Board Chat tab.  Mirrors `maybe_bind_pending_board_chat` — a
+    /// milestone-chat is the same stream-json `claude -p` session family as
+    /// refine-chat / new-issue-chat, so the operator gets a live, attachable
+    /// chat pane instead of a fire-and-forget headless worker (the review
+    /// finding this fixes).  Returns true when the overlay was opened.
+    pub(crate) fn maybe_bind_pending_milestone_chat(&mut self) -> bool {
+        let pending = match &self.pending_milestone_chat {
+            Some(p) => p.clone(),
+            None => return false,
+        };
+        if pending.dispatched_at.elapsed() > REFINEMENT_BIND_TIMEOUT {
+            self.pending_milestone_chat = None;
+            self.push_toast(
+                "Milestone chat timed out",
+                &format!(
+                    "No milestone-chat session appeared for {} within {}s.",
+                    pending.label,
+                    REFINEMENT_BIND_TIMEOUT.as_secs(),
+                ),
+                ToastSeverity::Warning,
+            );
+            return true;
+        }
+        let pick = self
+            .data
+            .assignments
+            .iter()
+            .filter(|a| a.issue_number == pending.issue_number)
+            .filter(|a| a.repo == pending.repo)
+            .filter(|a| a.assignment_type.as_deref() == Some("milestone-chat"))
+            .filter(|a| a.status == "running")
+            .max_by(|a, b| {
+                a.dispatched_at
+                    .partial_cmp(&b.dispatched_at)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .cloned();
+        let Some(asg) = pick else {
+            return false;
+        };
+
+        let aid = asg.id.clone();
+        if !self.watch_pool.contains_key(&aid) {
+            let state = WatchState {
+                assignment_id: aid.clone(),
+                machine: asg.machine.clone(),
+                repo: asg.repo.clone(),
+                issue_number: asg.issue_number,
+                assignment_type: asg
+                    .assignment_type
+                    .clone()
+                    .unwrap_or_else(|| "milestone-chat".to_string()),
+                scroll: usize::MAX,
+            };
+            let sse = if let Some(m) = self.data.machines.iter().find(|m| m.name == asg.machine) {
+                if !m.host.is_empty() {
+                    let rx = spawn_sse_watch(&m.host, &aid, 0);
+                    WatchSseState {
+                        rx,
+                        lines: Vec::new(),
+                        last_event_id: 0,
+                        fail_count: 0,
+                        first_fail_at: None,
+                        done: false,
+                        host: m.host.clone(),
+                        pending_tail: String::new(),
+                        line_times: Vec::new(),
+                        current_turn: 0,
+                    }
+                } else {
+                    make_local_sse_state(&aid)
+                }
+            } else {
+                make_local_sse_state(&aid)
+            };
+            if self.watch_pool.len() >= WATCH_POOL_CAP {
+                let lru_id = self
+                    .watch_pool
+                    .iter()
+                    .min_by_key(|(_, ctx)| ctx.last_focused_at)
+                    .map(|(id, _)| id.clone());
+                if let Some(id) = lru_id {
+                    self.watch_pool.remove(&id);
+                }
+            }
+            self.watch_pool.insert(
+                aid.clone(),
+                WatchContext {
+                    state,
+                    sse,
+                    inject_transcript: Vec::new(),
+                    inject_sse_offsets: Vec::new(),
+                    history_turns: Vec::new(),
+                    last_focused_at: Instant::now(),
+                },
+            );
+        }
+        self.watch_focused = Some(aid.clone());
+
+        let mut chat = ChatController::new("milestone-chat");
+        chat.set_status(StyledText::plain(format!(
+            "  Milestone chat → {}  (Ctrl+S/Alt+Enter = send · Esc = close)",
+            pending.label
+        )));
+        chat.set_transcript(Vec::new());
+        self.inject_chat = Some(chat);
+
+        // Route to the Board Chat tab — milestone chats are plan/board-level
+        // conversations (`chat_is_board_chat()` returns true for them so the
+        // overlay renders inline there rather than modally).
+        self.active_view = SidebarView::Board;
+        self.board_detail_tab = BoardDetailTab::Chat;
+
+        self.pending_milestone_chat = None;
+        self.push_toast(
+            "Milestone chat",
+            &format!("{}: chat ready — type to start.", pending.label),
+            ToastSeverity::Info,
+        );
+        true
+    }
+
     /// #314 Phase B: shell `coord test-chat <work_assignment_id>` and arm
     /// `pending_test_chat` so the next tick can bind the chat overlay to the
     /// new assignment row when it appears in the DB.

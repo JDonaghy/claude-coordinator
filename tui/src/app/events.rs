@@ -821,7 +821,15 @@ impl CoordApp {
                 // chat input doesn't see Ctrl+F as a literal character.
                 // Previously matched bare `f`/`F` (#366: fixed to require Ctrl
                 // so literal 'f' can be typed in the chat input).
-                if chat_is_board {
+                // #1017: gate on the actual new-issue-chat type, not just
+                // `chat_is_board` — milestone chats also render in the Board
+                // Chat tab now, and Ctrl+F must stay a literal char there
+                // (there is no draft issue to file from a milestone chat).
+                let chat_is_new_issue = self
+                    .focused_watch_state()
+                    .map(|w| w.assignment_type == "new-issue-chat")
+                    .unwrap_or(false);
+                if chat_is_board && chat_is_new_issue {
                     if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
                         if matches!(key, Key::Char('f') | Key::Char('F'))
                             && modifiers.ctrl
