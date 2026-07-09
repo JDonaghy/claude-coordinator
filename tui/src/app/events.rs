@@ -204,7 +204,18 @@ impl CoordApp {
         // Mouse/window events fall through to normal handlers — the
         // Terminal view doesn't need special mouse handling for the MVP
         // (copy-out is now implemented in #464 above).
-        if self.active_view == SidebarView::Terminal {
+        //
+        // #954 bug 1 (focus-stealing fix): skip the whole PTY-passthrough
+        // arbitration while a blocking modal is open (the new-terminal
+        // machine picker / name prompt, or any other). Otherwise a
+        // PTY-focused Terminal view — the common case, since entering the
+        // view auto-focuses the shell (#424/#646) — swallows every key and
+        // returns before the modal handlers below ever run, so number-key
+        // selection and Esc never reach the picker/name dialog. The modal
+        // owns ALL input while open (the codebase-wide one-modal invariant);
+        // `any_blocking_modal_active()` already includes both new-terminal
+        // dialogs, so this hands keyboard input back to them.
+        if self.active_view == SidebarView::Terminal && !self.any_blocking_modal_active() {
             if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
                 // F12 = focus-toggle — always handled, independent of
                 // current focus state, so the user can escape from the
@@ -504,7 +515,10 @@ impl CoordApp {
             && self.pipeline_detail_tab == PipelineDetailTab::Terminal;
         let in_board_terminal = self.active_view == SidebarView::Board
             && self.board_detail_tab == BoardDetailTab::Terminal;
-        if in_pipeline_terminal || in_board_terminal {
+        // #954 bug 1: as with the standalone Terminal pane above, a blocking
+        // modal (e.g. a machine picker) must own ALL input — don't let a
+        // focused detail PTY swallow keys meant for the dialog.
+        if (in_pipeline_terminal || in_board_terminal) && !self.any_blocking_modal_active() {
             if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
                 if matches!(key, Key::Named(NamedKey::F(12)))
                     && !modifiers.ctrl

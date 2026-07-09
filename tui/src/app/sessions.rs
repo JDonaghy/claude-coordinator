@@ -1723,7 +1723,7 @@ impl CoordApp {
     /// the local machine (bare `tmux detach-client`), `Some(host)` for a
     /// remote one (`ssh <host> tmux detach-client`). Same lookup
     /// `kill_session_by_aid` below uses for the analogous kill path.
-    fn resolve_fleet_terminal_ssh_host(&self, machine: &str) -> Option<String> {
+    pub(crate) fn resolve_fleet_terminal_ssh_host(&self, machine: &str) -> Option<String> {
         let is_local = machine == self.data.local_machine || machine.is_empty();
         if is_local {
             return None;
