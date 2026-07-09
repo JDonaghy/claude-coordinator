@@ -965,6 +965,31 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
                 machine_name=transition.machine_name,
                 succeeded=True,
             )
+    elif transition.event == EVENT_COMPLETION and assignment_type == "smoke":
+        # #1021: propagate the headless smoke exit code to the parent work
+        # row's Test verdict so the merge gate is satisfied automatically.
+        post_completion(exit_code=transition.exit_code or 0, **common)
+        mark_notified(
+            transition.assignment_id,
+            transition.event,
+            branch=entry.get("branch"),
+        )
+        parent_id = record.get("review_of_assignment_id")
+        if parent_id:
+            # Guard: only auto-certify when the issue's test-mode is "auto"
+            # or unset (no label).  A "smoke" label means the TUI offers an
+            # interactive smoke agent — do NOT auto-certify here.
+            from coord.state import get_issue_test_mode, record_test_verdict  # noqa: PLC0415
+            test_mode = get_issue_test_mode(
+                transition.repo_name, transition.issue_number
+            )
+            if test_mode != "smoke":
+                succeeded = (transition.exit_code or 0) == 0
+                record_test_verdict(
+                    assignment_id=parent_id,
+                    test_state="passed" if succeeded else "failed",
+                    test_reason="headless smoke",
+                )
     elif transition.event == EVENT_COMPLETION:
         post_completion(exit_code=transition.exit_code or 0, **common)
         mark_notified(
