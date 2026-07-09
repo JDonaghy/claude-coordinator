@@ -150,7 +150,18 @@ fn find_config_with(
 /// Bare Click groups (no group-level `--config` option of their own) — see
 /// [`build_full_args`]'s doc comment. `--config` must land after the leaf
 /// subcommand (argv[1]) for these, not after the group name (argv[0]).
-const BARE_GROUPS: &[&str] = &["milestone", "issue", "context", "acceptance"];
+///
+/// `"terminal"` added by #956's fix iteration: `confirm_kill_terminal`
+/// (`app/fleet_terminals.rs`) spawns `["terminal", "kill", target]`, and
+/// `coord terminal` is a bare group just like `milestone`/`issue`/`context`/
+/// `acceptance` — only its leaf subcommands (`kill`/`list`/`new`/`attach`)
+/// declare `--config`. Without this entry, `build_full_args` injected
+/// `--config` after `"terminal"` and Click rejected it before `kill` ever
+/// ran ("Error: No such option '--config'"), so confirming a kill in the
+/// live TUI silently did nothing even though every test that only inspected
+/// `spawn_queued`'s raw argv (not the real `build_full_args`-processed argv)
+/// passed.
+const BARE_GROUPS: &[&str] = &["milestone", "issue", "context", "acceptance", "terminal"];
 
 /// Pure builder for the real argv `do_spawn` hands to `Command::new("coord")`.
 /// Split out (rather than inlined in `do_spawn`) so it's unit-testable
@@ -795,7 +806,7 @@ mod tests {
 
     #[test]
     fn build_full_args_other_bare_groups_inject_after_leaf_subcommand() {
-        for group in ["issue", "context", "acceptance"] {
+        for group in ["issue", "context", "acceptance", "terminal"] {
             let argv = s(&[group, "verb", "arg1"]);
             let out = build_full_args(&argv, Some(std::path::Path::new("/cfg.yml")));
             assert_eq!(
@@ -804,6 +815,31 @@ mod tests {
                 "group {group}"
             );
         }
+    }
+
+    /// Regression for #956's fix iteration: `confirm_kill_terminal`
+    /// (`app/fleet_terminals.rs`) spawns `["terminal", "kill",
+    /// "machine:name"]`. `coord terminal` is a bare Click group — only its
+    /// leaf subcommands declare `--config` — so `--config` must land after
+    /// `kill`, not after `terminal`. The unit/TuiDriver tests that only
+    /// assert on `spawn_queued`'s raw argv can't catch this because they
+    /// never exercise `build_full_args`; this test exercises the real
+    /// argv-construction path directly, exactly like the sibling
+    /// `milestone`/`agent` tests above.
+    #[test]
+    fn build_full_args_terminal_kill_injects_after_leaf_subcommand() {
+        let argv = s(&["terminal", "kill", "precision:coord-956"]);
+        let out = build_full_args(&argv, Some(std::path::Path::new("/cfg.yml")));
+        assert_eq!(
+            out,
+            s(&[
+                "terminal",
+                "kill",
+                "--config",
+                "/cfg.yml",
+                "precision:coord-956",
+            ])
+        );
     }
 
     // ── Queue tests ───────────────────────────────────────────────────────────
