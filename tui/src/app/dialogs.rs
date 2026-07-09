@@ -291,7 +291,15 @@ impl CoordApp {
                 continue;
             }
 
-            let type_label = session_type_label(atype);
+            // #1022: relabel "smoke" → "Test" locally in the Summary view so
+            // the stage name matches the pipeline gate name ("Test").  The shared
+            // `session_type_label` in mod.rs is NOT changed (it is tested and
+            // used by other views).
+            let type_label = if atype == "smoke" {
+                "Test"
+            } else {
+                session_type_label(atype)
+            };
             let (badge_text, badge_color) = assignment_status_badge(a);
 
             // Duration: finished_at - dispatched_at.
@@ -309,7 +317,11 @@ impl CoordApp {
                     .unwrap_or_default()
             };
 
-            // Header row: ● <type>  <machine>  <badge>  [duration]  [cost]  [model]
+            // #1022: relative completion timestamp ("Xm ago") so the operator
+            // can see at a glance when each stage finished.
+            let ago_str = a.finished_at.map(format_unix_time).unwrap_or_default();
+
+            // Header row: ● <type>  <machine>  <badge>  [duration]  [cost]  [model]  [ago]
             let mut spans: Vec<StyledSpan> = vec![
                 StyledSpan::with_fg("● ", muted),
                 StyledSpan::with_fg(format!("{:<10}", type_label), muted),
@@ -324,6 +336,9 @@ impl CoordApp {
             }
             if let Some(m) = a.model.as_deref() {
                 spans.push(StyledSpan::with_fg(format!("  {}", m), model_color));
+            }
+            if !ago_str.is_empty() {
+                spans.push(StyledSpan::with_fg(format!("  {}", ago_str), duration_color));
             }
             items.push(ListItem {
                 text: StyledText { spans },
@@ -5906,10 +5921,13 @@ impl CoordApp {
     }
 }
 
-/// #876: Derive a coloured status/verdict badge text from an assignment row.
-fn assignment_status_badge(a: &Assignment) -> (String, Color) {
+/// #876 / #1022: Derive a coloured status/verdict badge text from an assignment row.
+///
+/// #1022: Flat-row rule — each stage owns its own status; the Test verdict is
+/// shown on the Test (smoke) row, **not** overlaid on the Work row.
+pub(crate) fn assignment_status_badge(a: &Assignment) -> (String, Color) {
     let atype = a.assignment_type.as_deref().unwrap_or("work");
-    // Review: verdict is the primary signal.
+    // Review / re-review: verdict is the primary signal.
     if atype == "review" || atype == "re-review" {
         return match a.review_verdict.as_deref() {
             Some("approve") => ("approve ✓".to_string(), Color::rgb(120, 200, 120)),
@@ -5920,15 +5938,21 @@ fn assignment_status_badge(a: &Assignment) -> (String, Color) {
             _ => ("done".to_string(), Color::rgb(120, 120, 120)),
         };
     }
-    // Work / fix / smoke: status + test_state overlay.
+    // Smoke / test: the session IS the test, so test_state is the primary badge.
+    if atype == "smoke" {
+        return match a.test_state.as_deref() {
+            Some("passed") => ("passed ✓".to_string(), Color::rgb(120, 200, 120)),
+            Some("failed") => ("failed ✗".to_string(), Color::rgb(220, 70, 70)),
+            Some("skipped") => ("skipped ↷".to_string(), Color::rgb(150, 150, 150)),
+            _ if a.status == "running" => ("testing…".to_string(), Color::rgb(100, 180, 220)),
+            _ => ("done".to_string(), Color::rgb(120, 120, 120)),
+        };
+    }
+    // Work / fix / plan / conflict-fix: each stage owns its own completion status
+    // only.  The test verdict belongs to the Test row and is NOT shown here.
     match a.status.as_str() {
         "running" => ("running…".to_string(), Color::rgb(100, 180, 220)),
-        "done" => match a.test_state.as_deref() {
-            Some("failed") => ("done · Test ✗".to_string(), Color::rgb(220, 70, 70)),
-            Some("passed") => ("done · Test ✓".to_string(), Color::rgb(120, 200, 120)),
-            Some("skipped") => ("done · Test ↷".to_string(), Color::rgb(150, 150, 150)),
-            _ => ("done".to_string(), Color::rgb(120, 120, 120)),
-        },
+        "done" => ("done".to_string(), Color::rgb(120, 120, 120)),
         "failed" => ("failed".to_string(), Color::rgb(220, 70, 70)),
         other => (other.to_string(), Color::rgb(200, 200, 70)),
     }

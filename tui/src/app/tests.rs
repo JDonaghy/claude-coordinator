@@ -14542,14 +14542,18 @@
         );
     }
 
-    // ── #876: TuiDriver black-box — Summary tab sources from board layer ─────────
+    // ── #876 / #1022: TuiDriver black-box — Summary tab sources from board layer ────
 
-    /// #876: The Summary tab must show the Test FAILED verdict AND the
-    /// `test_reason` text, sourced from the in-memory board (not GitHub
-    /// comments).  This is the exact regression from #865: test_reason
-    /// is board-only and was never visible before this fix.
+    /// #876 / #1022: The Summary tab for a Work assignment whose test_state=failed
+    /// must:
+    ///   1. Show the Work badge as "done" — the flat-row rule (#1022) moves the
+    ///      test verdict off the Work row onto the Test row; Work owns only its
+    ///      own completion status.
+    ///   2. Still surface the `test_reason` text (the #865 regression guard: it
+    ///      is board-only and was never visible before #876 fixed it).
+    ///   3. NOT contain the old composite "done · Test" format.
     #[test]
-    fn summary_tab_shows_test_failed_verdict_and_reason_from_board() {
+    fn summary_tab_work_row_shows_done_not_test_verdict() {
         use quadraui::tui::testing::driver_with_shell;
 
         // Build a work assignment: done, test=failed, reason set.
@@ -14623,18 +14627,179 @@
 
         let driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
 
-        // The Summary tab must render the FAILED verdict badge.
+        // #1022 flat-row: Work badge must be "done" only — no composite "Test ✗".
+        // The test verdict belongs to the Test (smoke) row, not the Work row.
         assert!(
-            driver.screen_contains("Test ✗"),
-            "Summary tab must show test=failed badge:\n{}",
+            !driver.screen_contains("done · Test"),
+            "#1022: Work row must NOT show composite test-verdict badge:\n{}",
             driver.screen(),
         );
-        // The test_reason text must be visible — this is the #865 regression.
+        // The test_reason text must still be visible as inline text — #865 regression guard.
         assert!(
             driver.screen_contains("cargo test failed"),
-            "Summary tab must show test_reason from board layer:\n{}",
+            "Summary tab must still show test_reason inline text:\n{}",
             driver.screen(),
         );
+    }
+
+    /// #1022: The Summary tab must relabel a smoke (type="smoke") assignment as
+    /// "Test" and display the test_state as the row's own badge (not overlaid on
+    /// a Work row).  A passed smoke shows "passed ✓" and "Test"; a failed smoke
+    /// shows "failed ✗" and "Test".
+    #[test]
+    fn summary_tab_smoke_row_relabeled_test_and_shows_verdict() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        // Smoke assignment: done, test=passed.
+        let smoke = Assignment {
+            id: "s-55-pass".to_string(),
+            repo: "api".to_string(),
+            issue_number: 55,
+            issue_title: "Improve thing".to_string(),
+            machine: "precision".to_string(),
+            status: "done".to_string(),
+            branch: Some("issue-55-work".to_string()),
+            model: None,
+            dispatched_at: Some(2_000_000.0),
+            finished_at: Some(2_001_800.0),
+            exit_code: Some(0),
+            assignment_type: Some("smoke".to_string()),
+            test_state: Some("passed".to_string()),
+            test_reason: None,
+            review_verdict: None,
+            review_state: None,
+            review_of_assignment_id: None,
+            cost_usd: None,
+            smoke_tests: None,
+            review_findings: None,
+            test_plan: None,
+            test_plan_branch_head: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            is_interactive: false,
+            failure_reason: None,
+            review_iteration: 0,
+            acceptance_state: None,
+            acceptance_reason: None,
+            acceptance_sha: None,
+            acceptance_total: None,
+            acceptance_passed: None,
+            pr_url: None,
+            audit_goals_json: None,
+            audit_bottom_line: None,
+            audit_run_number: None,
+        };
+
+        let data = BoardData {
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            assignments: vec![smoke],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 55,
+            title: "Improve thing".to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: false,
+        }];
+        app.rebuild_pipeline_sidebar(None);
+        app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Summary;
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+
+        // #1022: smoke is relabeled "Test" in the Summary view.
+        assert!(
+            driver.screen_contains("Test"),
+            "#1022: smoke assignment must be relabeled 'Test' in Summary tab:\n{}",
+            driver.screen(),
+        );
+        // #1022: the test_state verdict is on the Test row itself ("passed ✓").
+        assert!(
+            driver.screen_contains("passed ✓"),
+            "#1022: Test row must show test_state verdict 'passed ✓':\n{}",
+            driver.screen(),
+        );
+        // "Smoke" must NOT appear — relabeled locally.
+        assert!(
+            !driver.screen_contains("Smoke"),
+            "#1022: 'Smoke' label must be replaced by 'Test' in Summary tab:\n{}",
+            driver.screen(),
+        );
+    }
+
+    // ── #1022: Unit tests for assignment_status_badge flat-row rule ──────────────
+
+    /// #1022: Work/fix rows must show only their own completion status — no
+    /// test_state overlay.  The test verdict belongs to the Test row.
+    #[test]
+    fn assignment_status_badge_work_shows_only_completion_status() {
+        // Work done with test_state=passed — must NOT show "done · Test ✓".
+        let mut work_passed = make_assignment_typed("done", 10, "repo-a", Some("work"));
+        work_passed.test_state = Some("passed".to_string());
+        let (text, _) = assignment_status_badge(&work_passed);
+        assert_eq!(text, "done", "work+test=passed must show 'done', not composite");
+
+        // Work done with test_state=failed — must NOT show "done · Test ✗".
+        let mut work_failed = make_assignment_typed("done", 11, "repo-a", Some("work"));
+        work_failed.test_state = Some("failed".to_string());
+        let (text, _) = assignment_status_badge(&work_failed);
+        assert_eq!(text, "done", "work+test=failed must show 'done', not composite");
+
+        // Work done with test_state=skipped — must NOT show "done · Test ↷".
+        let mut work_skipped = make_assignment_typed("done", 12, "repo-a", Some("work"));
+        work_skipped.test_state = Some("skipped".to_string());
+        let (text, _) = assignment_status_badge(&work_skipped);
+        assert_eq!(text, "done", "work+test=skipped must show 'done', not composite");
+
+        // Work running: no test_state yet.
+        let work_running = make_assignment_typed("running", 13, "repo-a", Some("work"));
+        let (text, _) = assignment_status_badge(&work_running);
+        assert_eq!(text, "running…");
+
+        // Work failed (hard failure).
+        let work_fail = make_assignment_typed("failed", 14, "repo-a", Some("work"));
+        let (text, _) = assignment_status_badge(&work_fail);
+        assert_eq!(text, "failed");
+    }
+
+    /// #1022: Smoke (Test) rows must show the test_state as their own badge.
+    #[test]
+    fn assignment_status_badge_smoke_shows_test_verdict() {
+        // Smoke passed.
+        let mut smoke_passed = make_assignment_typed("done", 20, "repo-a", Some("smoke"));
+        smoke_passed.test_state = Some("passed".to_string());
+        let (text, _) = assignment_status_badge(&smoke_passed);
+        assert_eq!(text, "passed ✓", "smoke+passed must show 'passed ✓'");
+
+        // Smoke failed.
+        let mut smoke_failed = make_assignment_typed("done", 21, "repo-a", Some("smoke"));
+        smoke_failed.test_state = Some("failed".to_string());
+        let (text, _) = assignment_status_badge(&smoke_failed);
+        assert_eq!(text, "failed ✗", "smoke+failed must show 'failed ✗'");
+
+        // Smoke skipped.
+        let mut smoke_skipped = make_assignment_typed("done", 22, "repo-a", Some("smoke"));
+        smoke_skipped.test_state = Some("skipped".to_string());
+        let (text, _) = assignment_status_badge(&smoke_skipped);
+        assert_eq!(text, "skipped ↷", "smoke+skipped must show 'skipped ↷'");
+
+        // Smoke running (no verdict yet).
+        let smoke_running = make_assignment_typed("running", 23, "repo-a", Some("smoke"));
+        let (text, _) = assignment_status_badge(&smoke_running);
+        assert_eq!(text, "testing…", "smoke running must show 'testing…'");
+
+        // Smoke done but no test_state (incomplete verdict).
+        let smoke_done = make_assignment_typed("done", 24, "repo-a", Some("smoke"));
+        let (text, _) = assignment_status_badge(&smoke_done);
+        assert_eq!(text, "done", "smoke done without verdict must show 'done'");
     }
 
     // ── #818: TuiDriver black-box — detail-tab redesign ───────────────────────
