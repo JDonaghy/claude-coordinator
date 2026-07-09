@@ -27673,3 +27673,89 @@ Milestone tracking issue.
             "standalone_pty_session should switch to 'build' after re-selection:\n{now_visible}"
         );
     }
+
+    /// #955 fix regression: dropping a cached fleet-terminal session (e.g.
+    /// the whole TUI quitting) must DETACH the remote tmux client, never
+    /// kill the session — that's the entire persistence guarantee `coord
+    /// terminal new`/tmux is supposed to provide. Attaches to a REAL tmux
+    /// session on a reachable fleet machine (`elitebook` in this repo's
+    /// dev fleet), drops the cached `FleetTerminalSession` the same way
+    /// `CoordApp` drops its `fleet_terminal_sessions` map on exit, and
+    /// asserts the remote session is still listed afterward.
+    ///
+    /// `#[ignore]`d — needs a real `elitebook` host reachable over ssh
+    /// with `coord`/`tmux` installed; not something CI can provide. Run
+    /// manually with `cargo test --lib -- --ignored
+    /// scratch_repro_quit_kills_remote_tmux_session`.
+    #[test]
+    #[ignore]
+    #[cfg(unix)]
+    fn dropping_fleet_terminal_session_detaches_not_kills_remote_tmux() {
+        use std::time::{Duration, Instant};
+
+        let sess_name = "coord-term-regress955";
+        let _ = std::process::Command::new("ssh")
+            .args(["elitebook", "tmux", "kill-session", "-t", sess_name])
+            .status();
+        let created = std::process::Command::new("ssh")
+            .args(["elitebook", "tmux", "new-session", "-d", "-s", sess_name])
+            .status()
+            .expect("ssh new-session");
+        assert!(created.success(), "failed to create remote session");
+
+        let mut app = make_test_app(BoardData {
+            machines: vec![mk_machine("elitebook", "elitebook", true, &[])],
+            ..BoardData::default()
+        });
+        app.active_view = SidebarView::Terminal;
+        app.fleet_terminals = vec![FleetTerminal {
+            name: "regress955".to_string(),
+            machine: "elitebook".to_string(),
+            attached: false,
+        }];
+        app.terminal_pending_dims.set(Some((80, 24)));
+        app.terminal_tree_selected = Some(vec![0, 0]);
+
+        let key = ("elitebook".to_string(), "regress955".to_string());
+        let start = Instant::now();
+        loop {
+            app.drive_terminal_pane();
+            if let Some(sess) = app.fleet_terminal_sessions.get(&key) {
+                if sess.full_text().contains("coord terminal attach") {
+                    break;
+                }
+            }
+            assert!(start.elapsed() < Duration::from_secs(10), "attach never started");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Let the ssh connection + tmux attach fully settle before tearing
+        // down — attaching and immediately dropping wouldn't exercise the
+        // race this test guards against.
+        let settle_start = Instant::now();
+        while settle_start.elapsed() < Duration::from_secs(4) {
+            app.drive_terminal_pane();
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        // Simulate app quit: drop every cached fleet session, same as
+        // `CoordApp`'s `fleet_terminal_sessions` field dropping at process
+        // exit.
+        app.fleet_terminal_sessions.clear();
+
+        std::thread::sleep(Duration::from_secs(3));
+
+        let out = std::process::Command::new("ssh")
+            .args(["elitebook", "tmux", "list-sessions"])
+            .output()
+            .expect("ssh list-sessions");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains(sess_name),
+            "remote tmux session {sess_name} was destroyed after dropping the local \
+             session — expected a clean detach:\n{stdout}"
+        );
+
+        let _ = std::process::Command::new("ssh")
+            .args(["elitebook", "tmux", "kill-session", "-t", sess_name])
+            .status();
+    }

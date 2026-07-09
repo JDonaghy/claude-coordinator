@@ -1700,13 +1700,42 @@ impl CoordApp {
                     shell_quote_arg(&target)
                 );
                 sess.send_str(&cmd);
-                self.fleet_terminal_sessions.insert(key.clone(), sess);
+                // #955: wrap in `FleetTerminalSession` so a later cache
+                // eviction (leaf switched away, discovery reshuffle, or
+                // the whole TUI quitting) cleanly detaches the tmux
+                // client instead of letting the PTY's EOF-on-drop write
+                // kill the remote session — see that type's doc comment.
+                let ssh_host = self.resolve_fleet_terminal_ssh_host(&key.0);
+                self.fleet_terminal_sessions.insert(
+                    key.clone(),
+                    FleetTerminalSession::new(sess, ssh_host, &key.1),
+                );
             }
             Err(e) => {
                 self.fleet_terminal_spawn_errors
                     .insert(key.clone(), e.to_string());
             }
         }
+    }
+
+    /// #955: resolve `machine` (a `self.data.machines` name) to the ssh
+    /// host a [`FleetTerminalSession`] should detach through — `None` for
+    /// the local machine (bare `tmux detach-client`), `Some(host)` for a
+    /// remote one (`ssh <host> tmux detach-client`). Same lookup
+    /// `kill_session_by_aid` below uses for the analogous kill path.
+    fn resolve_fleet_terminal_ssh_host(&self, machine: &str) -> Option<String> {
+        let is_local = machine == self.data.local_machine || machine.is_empty();
+        if is_local {
+            return None;
+        }
+        Some(
+            self.data
+                .machines
+                .iter()
+                .find(|mm| mm.name == machine)
+                .map(|mm| mm.host.clone())
+                .unwrap_or_else(|| machine.to_string()),
+        )
     }
 
     /// Kill a live tmux session by assignment id.  Runs `tmux kill-session -t

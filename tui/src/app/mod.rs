@@ -2460,8 +2460,11 @@ pub struct CoordApp {
     /// `terminal_tree_selected`. Distinct from `terminal_session` (the
     /// bare-`$SHELL` fallback used when no fleet-terminal leaf is
     /// selected — e.g. an empty tree, or a machine row selected).
-    fleet_terminal_sessions:
-        std::collections::HashMap<(String, String), quadraui::terminal_engine::TerminalSession>,
+    /// Values are [`self::terminal::FleetTerminalSession`] (#955), a thin
+    /// wrapper that cleanly detaches (never kills) the tmux client on drop
+    /// — see that type's doc comment for why a plain `TerminalSession`
+    /// isn't safe here.
+    fleet_terminal_sessions: std::collections::HashMap<(String, String), FleetTerminalSession>,
     /// Spawn/attach errors for `fleet_terminal_sessions`, keyed the same
     /// way — mirrors `detail_terminal_spawn_errors`. Prevents an endless
     /// respawn loop (e.g. target machine unreachable over ssh) and lets the
