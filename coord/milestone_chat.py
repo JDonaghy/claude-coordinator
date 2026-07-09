@@ -293,8 +293,22 @@ def dispatch_milestone_chat(
     milestone = issue_data.get("milestone") or {}
     milestone_number = milestone.get("number")
     if milestone_number is None:
-        raise RuntimeError(f"#{tracking_issue_number} has no milestone")
-    milestone_title = milestone.get("title") or f"#{milestone_number}"
+        # #1017: the "add sub-issue" chat targets an epic tracking issue's
+        # `## Sub-issues` checklist via `coord milestone add-child`, which
+        # operates purely on the issue *body* and does NOT require the epic
+        # to carry a GitHub milestone. Requiring one here was the root cause
+        # of the smoke-test "silent no-op": `coord milestone chat <repo>
+        # <epic> --add-child <issue>` bailed with `#<epic> has no milestone`
+        # (exit 1) for any epic without a GitHub milestone — the common case.
+        # Fall back to the epic's own title as the chat label and skip the
+        # milestone-scoped GitHub fetches below; `build_milestone_chat_briefing`
+        # already tolerates `milestone_number=None`. A plain milestone chat
+        # (no --add-child) still legitimately requires a milestone.
+        if add_child_issue is None:
+            raise RuntimeError(f"#{tracking_issue_number} has no milestone")
+        milestone_title = issue_data.get("title") or f"#{tracking_issue_number}"
+    else:
+        milestone_title = milestone.get("title") or f"#{milestone_number}"
 
     # Pick the machine.
     if machine_override:
@@ -317,19 +331,26 @@ def dispatch_milestone_chat(
             )
         machine = picked
 
-    issues = _fetch_milestone_issues(repo_cfg.github, milestone_number)
+    # A milestone-less epic (add-child path, see above) has no milestone to
+    # scope issues to and no milestone metadata to fetch — skip both.
+    issues = (
+        _fetch_milestone_issues(repo_cfg.github, milestone_number)
+        if milestone_number is not None
+        else []
+    )
 
     # Best-effort: pull the milestone's own description/due date so an
     # "edit this milestone" conversation has current values to propose
     # changes against (#1009). Never fatal — the chat still works without it.
     milestone_description: str | None = None
     milestone_due_on: str | None = None
-    try:
-        ms_data = github_ops.get_milestone(repo_cfg.github, milestone_number)
-        milestone_description = ms_data.get("description")
-        milestone_due_on = ms_data.get("due_on")
-    except RuntimeError:
-        pass
+    if milestone_number is not None:
+        try:
+            ms_data = github_ops.get_milestone(repo_cfg.github, milestone_number)
+            milestone_description = ms_data.get("description")
+            milestone_due_on = ms_data.get("due_on")
+        except RuntimeError:
+            pass
 
     # #1017: best-effort fetch of the candidate child issue for an "Add
     # sub-issue" chat. A fetch failure just falls back to a plain milestone
