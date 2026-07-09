@@ -388,6 +388,47 @@ def test_dispatch_with_add_child_issue_seeds_add_sub_issue_mode(tmp_path):
     assert "#1050: Do the thing" in proposal.briefing
 
 
+def test_dispatch_add_child_succeeds_when_epic_has_no_milestone(tmp_path):
+    """#1017 root-cause regression: the "add sub-issue" chat targets an epic
+    tracking issue's `## Sub-issues` checklist via `coord milestone add-child`,
+    which operates on the issue *body* and does NOT require the epic to carry a
+    GitHub milestone. Requiring one made `coord milestone chat <repo> <epic>
+    --add-child <issue>` bail with `#<epic> has no milestone` (exit 1) for the
+    common milestone-less epic — the smoke-test "silent no-op". Dispatch must
+    now succeed, seed the Add-sub-issue mode, and NOT touch the milestone-scoped
+    GitHub fetches (`get_open_issues` / `get_milestone`)."""
+    cfg = _cfg_with_repo_and_machine(tmp_path)
+    epic_issue_data = {
+        "number": 100, "title": "Epic tracker", "body": "## Sub-issues\n",
+        "milestone": None,
+    }
+    child_issue_data = {"number": 1050, "title": "Do the thing", "body": "details"}
+
+    def _fake_get_issue(_slug, number):
+        return child_issue_data if number == 1050 else epic_issue_data
+
+    with patch("coord.github_ops.get_issue", side_effect=_fake_get_issue), \
+         patch("coord.github_ops.get_open_issues") as mock_open_issues, \
+         patch("coord.github_ops.get_milestone") as mock_get_milestone, \
+         patch("coord.dispatch.dispatch_with_retry", return_value={"id": "asg-child"}) as mock_dispatch, \
+         patch("coord.state.record_dispatched_assignment"):
+        assignment_id, machine_name = milestone_chat.dispatch_milestone_chat(
+            "api", 100, cfg, add_child_issue=1050
+        )
+
+    assert assignment_id == "asg-child"
+    assert machine_name == "laptop"
+    # Milestone-scoped GitHub fetches must be skipped for a milestone-less epic.
+    mock_open_issues.assert_not_called()
+    mock_get_milestone.assert_not_called()
+    proposal = mock_dispatch.call_args[0][0]
+    assert proposal.type == "milestone-chat"
+    assert "ADD SUB-ISSUE MODE" in proposal.briefing
+    assert "#1050: Do the thing" in proposal.briefing
+    # No milestone → the briefing must not claim one.
+    assert "MILESTONE NUMBER:" not in proposal.briefing
+
+
 def test_dispatch_survives_candidate_child_fetch_failure(tmp_path):
     """Best-effort: a failed candidate-child fetch must not abort the whole
     dispatch — it just falls back to a plain milestone chat."""
