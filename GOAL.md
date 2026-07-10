@@ -8,6 +8,11 @@
 > ([`docs/ORACLE_LOOP.md`](docs/ORACLE_LOOP.md)): tighten the Work↔Test cycle into a warm in-session
 > loop against an independent, sealed acceptance oracle, to drive user-acceptance pass-rate toward
 > the >90% bar without the cold-start token bleed.
+>
+> _Layering on this (2026-07-10):_ **architecture & security gates**
+> ([`docs/ARCH_SECURITY_GATES.md`](docs/ARCH_SECURITY_GATES.md)) — a living per-repo `ARCHITECTURE.md`
+> (intended-map paired with the graphify graph), an approval-gated epic architecture guide, and
+> independent `security` / `architecture` review lenses on the post-work audit.
 
 ## 🎯 North star
 

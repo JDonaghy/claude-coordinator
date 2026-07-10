@@ -11,6 +11,11 @@
 > waterfall), and the runner sits above **pluggable framework drivers** (TUI/web/native). Where this
 > doc and ORACLE_LOOP.md differ on *how acceptance works* or *how Gate A runs*, **ORACLE_LOOP.md
 > wins**; the merge-bounce, observability, and git-model parts below are unchanged.
+>
+> **Extended 2026-07-10 by [`ARCH_SECURITY_GATES.md`](ARCH_SECURITY_GATES.md):** Gate A gains an
+> internal-architecture half (a chat-authored, approval-gated epic architecture guide), Gate B folds
+> its decisions back into a living per-repo `ARCHITECTURE.md`, and the post-work Review fans out into
+> independent `correctness` / `security` / `architecture` lenses (the last a graph-queryable lint).
 
 ## Why
 
@@ -75,15 +80,15 @@ MILESTONE  feature/ms-NN ──────────────────�
 | **Work** | Worker implements; writes **unit / internal** tests only — **not** the acceptance tests. | commits pushed |
 | **Test** | The repo's normal automated suite (`cargo test` / `pytest`), incl. the worker's unit tests. | suite green + a recorded verdict (#923 backstop) |
 | **Acceptance** | The **independent, feature-level** black-box suite (a *separate target/dir*). The worker iterates against it **sealed & in-session** during Work (ORACLE_LOOP.md); the coordinator re-runs it externally against the pushed SHA as the trust gate. Partial-green expected until the feature completes. | its slice green (externally verified) |
-| **Review** | Adversarial code review, zero shared context (unchanged). | approved / bounce → Fix |
+| **Review** | Adversarial code review, zero shared context — fans out into independent `correctness` / `security` / `architecture` lenses ([`ARCH_SECURITY_GATES.md`](ARCH_SECURITY_GATES.md)). | approved / bounce → Fix |
 | **Merge** | **Explicit, driven, bounce-capable** box (see below). The merge queue still sequences underneath but is **hidden** — Merge is a first-class stage the operator drives. | rebased-delta re-gated + CI green → merged into `feature/ms-NN` |
 
 ### Milestone-level gates
 
 | Gate | What it is |
 |---|---|
-| **A — Arch gate** | Before any issue work: **mock-first** (ORACLE_LOOP.md) — an independent agent renders a **viewable mock** in the target medium; the operator reacts to *that* (UX discovery against a cheap artifact, not a text spec); the approved mock + an **amendable, versioned `contract.md`** pin the black-box surface; a second independent agent authors the acceptance suite **red** against the contract. |
-| **B — Arch review** | After the issues land: an independent review that the milestone was **implemented to the Gate-A spec** (not just that each issue passed). |
+| **A — Arch gate** | Before any issue work: **mock-first** (ORACLE_LOOP.md) — an independent agent renders a **viewable mock** in the target medium; the operator reacts to *that* (UX discovery against a cheap artifact, not a text spec); the approved mock + an **amendable, versioned `contract.md`** pin the black-box surface; a second independent agent authors the acceptance suite **red** against the contract. Its **internal-architecture** half — an approval-gated epic architecture guide + threat-model note — is specced in [`ARCH_SECURITY_GATES.md`](ARCH_SECURITY_GATES.md). |
+| **B — Arch review** | After the issues land: an independent review that the milestone was **implemented to the Gate-A spec** (not just that each issue passed). Its output folds the milestone's new boundaries/invariants back into the living `ARCHITECTURE.md` ([`ARCH_SECURITY_GATES.md`](ARCH_SECURITY_GATES.md)). |
 | **C — Full acceptance suite** | The whole accumulated acceptance suite must be **green** — catches the integration gaps *between* issues that per-issue runs miss. |
 | **D — Ship** | Merge `feature/ms-NN → develop`, gated on B + C. |
 
@@ -188,8 +193,8 @@ Adopted in two steps to de-risk the big rewire:
   #920 — sequence high-overlap siblings · #923 — interactive Test-verdict backstop *(shipped)*
 
 **Phases 3–4 — Two-tier milestone pipeline** (epic #929)
-- #930 — (A) pre-work architecture gate + black-box contract
+- #930 — (A) pre-work architecture gate + black-box contract *(+ internal arch guide + security lens — [`ARCH_SECURITY_GATES.md`](ARCH_SECURITY_GATES.md))*
 - #931 — independent feature-level acceptance test authoring (`type=test-author`)
 - #932 — acceptance run stage + Gate-C full-suite gate
-- #933 — (B) post-milestone architecture review (built-to-spec)
+- #933 — (B) post-milestone architecture review (built-to-spec) *(+ living-doc fold-back — [`ARCH_SECURITY_GATES.md`](ARCH_SECURITY_GATES.md))*
 - #934 — (D) `develop` + feature-branch-per-milestone git model *(Phase 4, last)*

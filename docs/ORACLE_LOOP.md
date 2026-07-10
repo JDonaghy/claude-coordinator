@@ -4,6 +4,10 @@
 > "Independent acceptance testing" and Gate A. Pipeline v2's merge-bounce, observability, and
 > git-model parts are unchanged; this doc replaces *how acceptance testing works* and *how Gate A
 > is run*. Build slice + issue map at the bottom.
+>
+> **See also [`ARCH_SECURITY_GATES.md`](ARCH_SECURITY_GATES.md)** (2026-07-10): the same
+> author-once / check-cheaply move applied to **architecture** (a graph-queryable conformance lint)
+> and **security** (a dedicated post-work lens), layered on this doc's milestone tier.
 
 ## The problem this fixes
 
