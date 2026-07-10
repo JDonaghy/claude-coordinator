@@ -197,6 +197,10 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         fleet_terminal_sessions: std::collections::HashMap::new(),
         fleet_terminal_spawn_errors: std::collections::HashMap::new(),
         pending_kill_terminal: None,
+        // #1032
+        sessions_tree_expanded: std::collections::HashMap::new(),
+        sessions_tree_selected: None,
+        sessions_tree_scroll: 0,
         fix_briefing_preview: None,
         fix_briefing_rx: None,
         // Leg 2 (#517)

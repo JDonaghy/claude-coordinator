@@ -1855,6 +1855,12 @@ pub(crate) struct LiveTmuxSession {
     /// `poll_remote_sessions` drops the entry so a phantom "Live" badge cannot
     /// linger forever when a session never actually started.
     pub(crate) pending_sweep_count: u8,
+    /// #1031: `true` when a client is currently attached to the tmux
+    /// session, from `coord sessions --json`'s `attached` key. Mirrors
+    /// `FleetTerminal::attached`'s `#{session_attached}` handling. `false`
+    /// for sessions discovered by a probe that pre-dates this field.
+    /// Surfaced as a `[attached]` tag in the #1032 Sessions-panel tree.
+    pub(crate) attached: bool,
 }
 
 /// Fetch live `coord-*` tmux sessions by running `coord sessions --json`.
@@ -1909,6 +1915,13 @@ pub(crate) fn parse_sessions_json(text: &str) -> Vec<LiveTmuxSession> {
                 .and_then(|v| v.as_str())
                 .map(|s| s == "1")
                 .unwrap_or(false);
+            // #1031: `attached` is a JSON bool (not a "0"/"1" string like
+            // `pane_dead`) — see `coord/commands/sessions.py`'s
+            // `sessions_cmd`. Absent for a probe that pre-dates the field.
+            let attached = entry
+                .get("attached")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             Some(LiveTmuxSession {
                 assignment_id,
                 issue_number,
@@ -1917,6 +1930,7 @@ pub(crate) fn parse_sessions_json(text: &str) -> Vec<LiveTmuxSession> {
                 machine,
                 pane_dead,
                 pending_sweep_count: 0,
+                attached,
             })
         })
         .collect()

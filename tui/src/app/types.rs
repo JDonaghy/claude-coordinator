@@ -146,6 +146,13 @@ pub(crate) enum SidebarView {
     /// GOAL.md header (#978) come later.  Selecting a row opens that plan's
     /// tracking epic in the browser via `gh issue view --web`.
     Plans,
+    /// #1032: Sessions panel — fleet-wide, machine → repo grouped tree of
+    /// live `coord-<aid>` claude work sessions (`self.live_tmux_sessions`).
+    /// Built on the same `TreeView` + flat-pixel-row click pattern as the
+    /// #953 Terminal-view tree (`fleet_sessions.rs`), extended one level
+    /// deeper (machine → repo → session leaf). Read-only nav/select in this
+    /// slice — attach/kill/stop are a follow-up.
+    Sessions,
 }
 
 impl SidebarView {
@@ -160,6 +167,7 @@ impl SidebarView {
             SidebarView::MergeQueue => "Merge Queue",
             SidebarView::MilestoneDag => "Milestones",
             SidebarView::Plans => "Plans",
+            SidebarView::Sessions => "Sessions",
         }
     }
 
@@ -184,6 +192,7 @@ impl SidebarView {
             SidebarView::Kanban => Some(WidgetId::new("panel:kanban")),
             SidebarView::MergeQueue => Some(WidgetId::new("panel:mergequeue")),
             SidebarView::Plans => Some(WidgetId::new("panel:plans")),
+            SidebarView::Sessions => Some(WidgetId::new("panel:sessions")),
             SidebarView::MilestoneDag => None,
         }
     }
