@@ -285,12 +285,18 @@ impl CoordApp {
         // #1022: flat-row rule — the Test-gate verdict/reason belongs on the
         // Test (smoke) row, never the Work/Fix row that actually recorded it
         // in the DB (`test_state`/`test_reason` live on the WORK assignment —
-        // see `coord/state.py::record_test_verdict`). Precompute which row
-        // (if any) is the LAST Test row so the reason renders exactly once.
-        let last_smoke_idx = assignments
+        // see `coord/state.py::record_test_verdict`).
+        //
+        // The reason must render once *per verdict source*, not once globally:
+        // a single commit re-tested N times shares one source (reason shows
+        // once), but N independent fix iterations each own a distinct
+        // `test_reason` on their own work assignment and must each stay visible
+        // under their own iteration's last Test row. So we key on
+        // `smoke_test_source_id` (which assignment owns the reason) rather than
+        // a single global last-smoke-row gate.
+        let has_any_smoke_row = assignments
             .iter()
-            .rposition(|a| a.assignment_type.as_deref().unwrap_or("work") == "smoke");
-        let has_any_smoke_row = last_smoke_idx.is_some();
+            .any(|a| a.assignment_type.as_deref().unwrap_or("work") == "smoke");
 
         // --- Per-assignment entries ---
         for (idx, a) in assignments.iter().enumerate() {
@@ -376,14 +382,24 @@ impl CoordApp {
             // Reason inline: test_reason for failed tests; review_findings for
             // reviews; failure_reason for hard-failed assignments.
             //
-            // #1022: flat-row rule — render the test reason exactly once,
-            // under the LAST Test row. Work/Fix rows only fall back to their
-            // own `test_reason` when the issue has no Test row at all (e.g. a
-            // bare `coord test <id>` verdict recorded with no smoke session
-            // ever dispatched to carry it) — otherwise #865's "the reason
-            // must be visible somewhere" guarantee would silently regress.
+            // #1022: flat-row rule — render each verdict source's test reason
+            // exactly once, under the LAST Test row that displays that source.
+            // A Test row shows its reason iff no *later* Test row resolves to
+            // the same source (so a re-tested commit's shared reason renders
+            // once, while each independent fix iteration's own reason stays
+            // visible under its own Test row). Work/Fix rows only fall back to
+            // their own `test_reason` when the issue has no Test row at all
+            // (e.g. a bare `coord test <id>` verdict recorded with no smoke
+            // session to carry it) — otherwise #865's "the reason must be
+            // visible somewhere" guarantee would silently regress.
             let reason = if atype == "smoke" {
-                if last_smoke_idx == Some(idx) {
+                let source_id = smoke_test_source_id(a, &assignments);
+                let is_last_for_source =
+                    !assignments.iter().skip(idx + 1).any(|other| {
+                        other.assignment_type.as_deref().unwrap_or("work") == "smoke"
+                            && smoke_test_source_id(other, &assignments) == source_id
+                    });
+                if is_last_for_source {
                     let (_, linked_reason) = resolve_smoke_test_verdict(a, &assignments);
                     linked_reason
                         .map(|s| s.to_string())
@@ -6117,6 +6133,54 @@ pub(crate) fn resolve_smoke_test_verdict<'a>(
         return (w.test_state.as_deref(), w.test_reason.as_deref());
     }
     (smoke.test_state.as_deref(), smoke.test_reason.as_deref())
+}
+
+/// #1022: Identify WHICH assignment owns the verdict/reason a Test (`smoke`)
+/// row displays — the "reason source". This mirrors `resolve_smoke_test_verdict`'s
+/// resolution tiers exactly but returns the *source assignment id* instead of
+/// the text, so the Summary view can group Test rows that share a reason.
+///
+/// Why it exists: when an issue has multiple independent fix iterations, each
+/// iteration's work/fix assignment records its own distinct `test_reason`. Each
+/// of those reasons must stay visible under its own iteration's Test row — the
+/// reason must render once *per source*, not once globally. Grouping by this id
+/// lets the caller pick the last Test row for each source (so a single commit
+/// re-tested N times still shows its shared reason exactly once, while N
+/// independent iterations each show their own).
+pub(crate) fn smoke_test_source_id<'a>(
+    smoke: &'a Assignment,
+    assignments: &[&'a Assignment],
+) -> &'a str {
+    if let Some(work_id) = smoke.review_of_assignment_id.as_deref() {
+        if let Some(w) = assignments.iter().find(|a| a.id == work_id) {
+            // Valid link with a recorded verdict → that work owns the reason.
+            if w.test_state.is_some() {
+                return w.id.as_str();
+            }
+            // Linked but unverdicted (Test still running) → this row owns its
+            // own (probably empty) reason; keep it in its own group.
+            return smoke.id.as_str();
+        }
+        // Orphaned link — fall through to the tier-2 defensive scan.
+    }
+    let latest_work = assignments
+        .iter()
+        .filter(|a| {
+            !matches!(
+                a.assignment_type.as_deref().unwrap_or("work"),
+                "smoke" | "review" | "re-review"
+            )
+        })
+        .filter(|a| a.test_state.is_some())
+        .max_by(|a, b| {
+            a.dispatched_at
+                .partial_cmp(&b.dispatched_at)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    if let Some(w) = latest_work {
+        return w.id.as_str();
+    }
+    smoke.id.as_str()
 }
 
 /// #269: Hit-test a click against a TUI tab bar's labels.  Walks the
