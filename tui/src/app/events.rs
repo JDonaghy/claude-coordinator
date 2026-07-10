@@ -235,6 +235,27 @@ impl CoordApp {
                     let _ = self.forward_key_to_pty(key, modifiers);
                     return Reaction::Redraw;
                 }
+                // #1029 bug B: Esc, once PTY focus has been released,
+                // returns the operator to wherever they were before an
+                // entry point like milestone chat jumped them into this
+                // standalone Terminal view — the issue's explicit
+                // "Esc/detach returns focus to the originating
+                // Plans/milestone view" promise. Only fires when a return
+                // view was actually bookmarked: `launch_milestone_chat_session`
+                // is the only site that sets `terminal_return_view` today,
+                // so an ordinary ActivityBar-driven visit to Terminal has
+                // nothing to return to and Esc falls through unchanged
+                // (e.g. to whatever else consumes it, up to quitting).
+                if matches!(key, Key::Named(NamedKey::Escape))
+                    && !modifiers.ctrl
+                    && !modifiers.alt
+                    && !modifiers.shift
+                {
+                    if let Some(origin) = self.terminal_return_view.take() {
+                        self.switch_active_view(origin);
+                        return Reaction::Redraw;
+                    }
+                }
             }
             // #468: forward host-clipboard paste to the PTY when focused.
             // Wraps in ESC[200~…ESC[201~ when the PTY has bracketed-paste

@@ -401,7 +401,8 @@ impl CoordApp {
             return;
         };
         self.pipeline_sel = Some(idx);
-        self.active_view = SidebarView::Pipeline;
+        // #1029 bug A: keep the ActivityBar/header chrome in sync too.
+        self.switch_active_view(SidebarView::Pipeline);
         self.pipeline_detail_tab = PipelineDetailTab::Terminal;
         self.launch_interactive_session_for_selected_issue(InteractiveLaunchMode::Review);
     }
@@ -585,7 +586,8 @@ impl CoordApp {
             return;
         };
         self.pipeline_sel = Some(idx);
-        self.active_view = SidebarView::Pipeline;
+        // #1029 bug A: keep the ActivityBar/header chrome in sync too.
+        self.switch_active_view(SidebarView::Pipeline);
         self.pipeline_detail_tab = PipelineDetailTab::Terminal;
         // #587: bypass the secondary "no findings captured" gate — we just
         // wrote the findings above so there is no need to re-prompt.
@@ -636,7 +638,8 @@ impl CoordApp {
             return;
         };
         self.pipeline_sel = Some(idx);
-        self.active_view = SidebarView::Pipeline;
+        // #1029 bug A: keep the ActivityBar/header chrome in sync too.
+        self.switch_active_view(SidebarView::Pipeline);
         self.pipeline_detail_tab = PipelineDetailTab::Terminal;
         match p.kind {
             StageLaunchKind::Fix => {
@@ -1627,7 +1630,9 @@ impl CoordApp {
         self.terminal_tree_selected = None;
 
         // Switch to the standalone Terminal panel and send the command.
-        self.active_view = SidebarView::Terminal;
+        // #1029 bug A: `switch_active_view` (not a raw field write) keeps
+        // quadraui's ActivityBar highlight + sidebar header in sync too.
+        self.switch_active_view(SidebarView::Terminal);
         // Lazily spawn the standalone terminal if not already alive.
         // The session spawns on the first drive_terminal_pane() call after
         // the dims become available; if it's already live, just send the cmd.
@@ -1680,6 +1685,20 @@ impl CoordApp {
         tracking_issue: u64,
         add_child: Option<u64>,
     ) {
+        // #1029 bug B: remember where the operator was so Esc (once PTY
+        // focus is released) can return them there instead of stranding
+        // them in the Terminal view with no way back but manual
+        // navigation. Captured before the reattach short-circuit below so
+        // both the "already running" and "fresh spawn" paths get it —
+        // `reattach_session_by_aid` itself has no origin of its own to
+        // record (it's also used from the live-sessions overlay, which
+        // has no "back to" concept). A no-op if we're already parked in
+        // Terminal (e.g. re-triggering from a context menu reachable from
+        // there) — nothing to bookmark.
+        if self.active_view != SidebarView::Terminal {
+            self.terminal_return_view = Some(self.active_view);
+        }
+
         if let Some(aid) =
             self.reattachable_session_aid(tracking_issue, &repo, InteractiveLaunchMode::MilestoneChat)
         {
@@ -1705,7 +1724,8 @@ impl CoordApp {
         // the selection so the bare-shell pane this writes into is visible
         // (mirrors `reattach_session_by_aid` / `launch_merge_queue_interactive`).
         self.terminal_tree_selected = None;
-        self.active_view = SidebarView::Terminal;
+        // #1029 bug A: keep the ActivityBar/header chrome in sync too.
+        self.switch_active_view(SidebarView::Terminal);
 
         if let Some(ref mut sess) = self.terminal_session {
             sess.send_str(&launch_line);
@@ -2116,7 +2136,8 @@ impl CoordApp {
             return;
         };
         self.pipeline_sel = Some(idx);
-        self.active_view = SidebarView::Pipeline;
+        // #1029 bug A: keep the ActivityBar/header chrome in sync too.
+        self.switch_active_view(SidebarView::Pipeline);
         self.pipeline_detail_tab = PipelineDetailTab::Terminal;
         self.launch_interactive_session_for_selected_issue(InteractiveLaunchMode::Fix);
     }
@@ -2171,7 +2192,8 @@ impl CoordApp {
             return;
         };
         self.pipeline_sel = Some(idx);
-        self.active_view = SidebarView::Pipeline;
+        // #1029 bug A: keep the ActivityBar/header chrome in sync too.
+        self.switch_active_view(SidebarView::Pipeline);
         self.pipeline_detail_tab = PipelineDetailTab::Terminal;
         self.launch_interactive_session_for_selected_issue(InteractiveLaunchMode::Merge);
     }

@@ -3808,7 +3808,8 @@ impl CoordApp {
         // tab was removed in #818, so we land on Overview instead.  The
         // refinement chat backend continues to run; its output appears in
         // the log (coord assign --interactive launched by the board CTA).
-        self.active_view = SidebarView::Pipeline;
+        // #1029 bug A: keep the ActivityBar/header chrome in sync too.
+        self.switch_active_view(SidebarView::Pipeline);
         self.pipeline_detail_tab = PipelineDetailTab::Overview;
         if let Some(idx) = self
             .pipeline_issues
@@ -3993,7 +3994,8 @@ impl CoordApp {
         self.inject_chat = Some(chat);
 
         // Route to Board Chat tab immediately.
-        self.active_view = SidebarView::Board;
+        // #1029 bug A: keep the ActivityBar/header chrome in sync too.
+        self.switch_active_view(SidebarView::Board);
         self.board_detail_tab = BoardDetailTab::Chat;
 
         self.pending_board_chat = None;
@@ -4125,7 +4127,8 @@ impl CoordApp {
         // Route to the Board Chat tab — milestone chats are plan/board-level
         // conversations (`chat_is_board_chat()` returns true for them so the
         // overlay renders inline there rather than modally).
-        self.active_view = SidebarView::Board;
+        // #1029 bug A: keep the ActivityBar/header chrome in sync too.
+        self.switch_active_view(SidebarView::Board);
         self.board_detail_tab = BoardDetailTab::Chat;
 
         self.pending_milestone_chat = None;
@@ -4292,7 +4295,8 @@ impl CoordApp {
         chat.set_transcript(Vec::new());
         self.inject_chat = Some(chat);
         // #818: Refinement tab removed; land on Overview instead.
-        self.active_view = SidebarView::Pipeline;
+        // #1029 bug A: keep the ActivityBar/header chrome in sync too.
+        self.switch_active_view(SidebarView::Pipeline);
         self.pipeline_detail_tab = PipelineDetailTab::Overview;
         if let Some(idx) = self
             .pipeline_issues
@@ -4618,7 +4622,8 @@ impl CoordApp {
         });
         if let Some(pi) = pipeline_entry {
             let repo_slug = pi.repo_slug.clone();
-            self.active_view = SidebarView::Pipeline;
+            // #1029 bug A: keep the ActivityBar/header chrome in sync too.
+            self.switch_active_view(SidebarView::Pipeline);
             // `rebuild_pipeline_sidebar` with prev_sel_override wires up the
             // sidebar selection highlight and syncs `pipeline_sel` for us.
             self.rebuild_pipeline_sidebar(Some((repo_slug, number)));
@@ -4627,7 +4632,7 @@ impl CoordApp {
             self.pipeline_stage_content_scroll = 0;
         } else {
             // Fall back to the Board view.
-            self.active_view = SidebarView::Board;
+            self.switch_active_view(SidebarView::Board);
             self.select_issue(&repo, number);
             self.detail_scroll = 0;
         }
@@ -4674,7 +4679,8 @@ impl CoordApp {
                 self.pipeline_milestone_expanded
                     .insert((lc_key.to_string(), repo_key, mil_key), true);
             }
-            self.active_view = SidebarView::Pipeline;
+            // #1029 bug A: keep the ActivityBar/header chrome in sync too.
+            self.switch_active_view(SidebarView::Pipeline);
             self.rebuild_pipeline_sidebar(Some((repo_slug, issue_number)));
             self.pipeline_focused_stage = self.default_focused_stage_for_selected_issue();
             self.pipeline_stage_content_scroll = 0;

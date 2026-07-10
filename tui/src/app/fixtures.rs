@@ -162,6 +162,10 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         terminal_focused: false,
         terminal_pending_dims: std::cell::Cell::new(None),
         terminal_spawn_error: None,
+        // #1029: no queued programmatic panel switch / Terminal
+        // return-view bookmark on startup.
+        pending_panel_switch: None,
+        terminal_return_view: None,
         // #440
         detail_terminal_sessions: std::collections::HashMap::new(),
         detail_terminal_spawn_errors: std::collections::HashMap::new(),

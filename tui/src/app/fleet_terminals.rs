@@ -409,7 +409,8 @@ impl CoordApp {
 
         // Switch to the standalone Terminal panel; the newly-selected leaf's
         // session (spawned just below) is what its main pane will render.
-        self.active_view = SidebarView::Terminal;
+        // #1029 bug A: keep the ActivityBar/header chrome in sync too.
+        self.switch_active_view(SidebarView::Terminal);
 
         let key = (machine.clone(), slug.clone());
         // Second-create guard (bug 3): if a session is somehow already cached

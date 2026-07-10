@@ -629,6 +629,16 @@ impl ShellApp for CoordApp {
         };
     }
 
+    /// #1029 bug A: hand quadraui the panel queued by
+    /// `CoordApp::switch_active_view`, if any. `ShellAdapter` applies it to
+    /// the real `AppShell` state (ActivityBar highlight + sidebar header)
+    /// and re-fires `on_shell_event(PanelChanged)` — the same notification
+    /// a mouse click produces, so `on_shell_event` above stays the single
+    /// place `active_view` gets set from shell-driven switches.
+    fn take_requested_panel(&mut self) -> Option<WidgetId> {
+        self.pending_panel_switch.take()
+    }
+
     /// Periodic callback driven by the quadraui runner (~60Hz on TUI).
     /// Does the same time-based work as `handle()` so background refreshes,
     /// command-runner draining, and watch-log polling proceed even when the
