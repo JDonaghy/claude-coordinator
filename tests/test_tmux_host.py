@@ -420,6 +420,23 @@ class TestListCoordTmuxSessionsWithHost:
         assert sessions[0]["session_name"] == "coord-abc"
         assert sessions[0]["pane_dead"] == "0"
 
+    def test_remote_host_carries_attached_field(self) -> None:
+        """#1031: the remote probe is a raw ssh+tmux call, so 'attached' needs
+        no agent release — it's carried through the same as pane_dead."""
+        m = MagicMock()
+        m.returncode = 0
+        m.stdout = "coord-abc\t0\t1\n"
+
+        with patch("subprocess.run", return_value=m) as mock_run:
+            sessions = list_coord_tmux_sessions(host=TmuxHost("remotehost"))
+
+        cmd = mock_run.call_args[0][0]
+        assert cmd[0] == "ssh"
+        # The raw tmux format string is sent over ssh — no remote
+        # `coord sessions --json` involved.
+        assert any("session_attached" in arg for arg in cmd)
+        assert sessions[0]["attached"] is True
+
 
 # ── remote FIX push-back (#486d) ──────────────────────────────────────────────
 

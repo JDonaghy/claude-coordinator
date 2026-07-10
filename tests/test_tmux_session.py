@@ -206,6 +206,50 @@ class TestListCoordTmuxSessions:
             sessions = list_coord_tmux_sessions()
         assert sessions[0]["session_name"] == "coord-trimme"
 
+    def test_attached_true_when_client_attached(self) -> None:
+        """#1031: session_attached='1' surfaces as attached=True."""
+        m = MagicMock()
+        m.returncode = 0
+        m.stdout = "coord-attachedaid\t0\t1\n"
+        with patch("subprocess.run", return_value=m):
+            sessions = list_coord_tmux_sessions()
+        assert len(sessions) == 1
+        assert sessions[0]["attached"] is True
+
+    def test_attached_false_when_client_detached(self) -> None:
+        """#1031: session_attached='0' surfaces as attached=False."""
+        m = MagicMock()
+        m.returncode = 0
+        m.stdout = "coord-detachedaid\t0\t0\n"
+        with patch("subprocess.run", return_value=m):
+            sessions = list_coord_tmux_sessions()
+        assert len(sessions) == 1
+        assert sessions[0]["attached"] is False
+
+    def test_attached_well_defined_for_dead_pane_session(self) -> None:
+        """#1031: a dead-pane session still reports a well-defined attached bool."""
+        m = MagicMock()
+        m.returncode = 0
+        # Dead pane (claude exited) but a client is still attached to the
+        # tmux session (detach-and-abandon didn't happen — operator is
+        # sitting on a finished pane).
+        m.stdout = "coord-deadbutattached\t1\t1\n"
+        with patch("subprocess.run", return_value=m):
+            sessions = list_coord_tmux_sessions()
+        assert len(sessions) == 1
+        assert sessions[0]["pane_dead"] == "1"
+        assert sessions[0]["attached"] is True
+
+    def test_attached_missing_field_defaults_false(self) -> None:
+        """Rows without a third (session_attached) column default to False."""
+        m = MagicMock()
+        m.returncode = 0
+        m.stdout = "coord-legacyaid\t0\n"
+        with patch("subprocess.run", return_value=m):
+            sessions = list_coord_tmux_sessions()
+        assert len(sessions) == 1
+        assert sessions[0]["attached"] is False
+
     def test_uses_list_panes_subcommand(self) -> None:
         """Verify the tmux list-panes -a subcommand is used (not ls)."""
         captured: list[list[str]] = []

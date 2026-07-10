@@ -893,6 +893,11 @@ def sessions_cmd(
         # the tmux session is still up (detach-and-abandon case).  "0" while
         # running.  Missing for remote sessions that pre-date the #491 field.
         pane_dead = s.get("pane_dead", "0")
+        # attached: True when a client is currently attached to the tmux
+        # session (#1031) — mirrors ``coord terminal list --json``'s
+        # ``#{session_attached}`` handling.  Missing (falls back to False)
+        # for sessions discovered by a probe that pre-dates this field.
+        attached = bool(s.get("attached", False))
         enriched.append(
             {
                 "session_name": session_name,
@@ -902,6 +907,7 @@ def sessions_cmd(
                 "issue_title": issue_title,
                 "machine": machine,
                 "pane_dead": pane_dead,
+                "attached": attached,
             }
         )
 
