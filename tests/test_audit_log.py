@@ -286,3 +286,93 @@ class TestHookedTransitions:
             if r["event_type"] == "branch_set"
         ]
         assert len(rows_2) == 1
+
+    def test_dispatch_duplicate_assignment_id_writes_no_second_row(
+        self, coord_db
+    ) -> None:
+        """#1036 fix review finding 1: a second dispatch with the same
+        assignment_id hits ON CONFLICT DO NOTHING — the INSERT is a no-op,
+        so it must not emit a phantom second 'dispatched' row."""
+        _dispatch(coord_db, assignment_id="aid-1", issue_number=42)
+        rows = _audit_rows(coord_db, assignment_id="aid-1")
+        assert len(rows) == 1
+
+        # Same assignment_id, different issue — simulates a retry/collision;
+        # the INSERT no-ops so the original row's issue must be untouched
+        # and no new audit row should appear.
+        _dispatch(coord_db, assignment_id="aid-1", issue_number=99)
+        rows_2 = _audit_rows(coord_db, assignment_id="aid-1")
+        assert len(rows_2) == 1
+        assert rows_2[0]["issue"] == 42
+
+    def test_launch_failure_reason_no_audit_for_unknown_assignment_id(
+        self, coord_db
+    ) -> None:
+        """#1036 fix review finding 2: the UPDATE ... WHERE assignment_id=?
+        touches no row for a bad/stale id — must not emit an audit row for
+        a transition that didn't happen."""
+        from coord.state import set_assignment_failure_reason
+
+        set_assignment_failure_reason("no-such-assignment", "boom")
+        rows = [
+            r for r in _audit_rows(coord_db)
+            if r["event_type"] == "launch_failed"
+        ]
+        assert rows == []
+
+    def test_launch_failure_reason_writes_one_row_with_coordinator_actor(
+        self, coord_db
+    ) -> None:
+        """#1036 fix review finding 3: this is a coordinator/launcher-side
+        backstop (fires before the worker session starts), not a worker
+        self-report — actor should be 'coordinator'."""
+        from coord.state import set_assignment_failure_reason
+
+        _dispatch(coord_db, assignment_id="aid-1")
+        set_assignment_failure_reason("aid-1", "worktree add failed")
+        rows = [
+            r for r in _audit_rows(coord_db, assignment_id="aid-1")
+            if r["event_type"] == "launch_failed"
+        ]
+        assert len(rows) == 1
+        assert rows[0]["actor"] == "coordinator"
+        assert rows[0]["category"] == "error"
+
+    def test_review_findings_retry_with_same_verdict_writes_one_row(
+        self, coord_db
+    ) -> None:
+        """#1036 fix review finding 4: a retried write of the identical
+        (verdict, body) pair — the shape of issue_store._persist_review_
+        verdict's retry loop when a successful UPDATE is followed by a
+        readback that looks mismatched — must not double the audit row."""
+        from coord.state import update_assignment_review_findings
+
+        _dispatch(coord_db, assignment_id="aid-1")
+        update_assignment_review_findings(
+            "aid-1", verdict="approved", body="looks good"
+        )
+        rows = [
+            r for r in _audit_rows(coord_db, assignment_id="aid-1")
+            if r["event_type"] == "review_approved"
+        ]
+        assert len(rows) == 1
+
+        # Retry with the identical verdict + body — no second row.
+        update_assignment_review_findings(
+            "aid-1", verdict="approved", body="looks good"
+        )
+        rows_2 = [
+            r for r in _audit_rows(coord_db, assignment_id="aid-1")
+            if r["event_type"] == "review_approved"
+        ]
+        assert len(rows_2) == 1
+
+        # A genuinely new verdict/body IS a real transition — new row.
+        update_assignment_review_findings(
+            "aid-1", verdict="request-changes", body="needs work"
+        )
+        rows_3 = [
+            r for r in _audit_rows(coord_db, assignment_id="aid-1")
+            if r["event_type"] in ("review_approved", "review_request-changes")
+        ]
+        assert len(rows_3) == 2
