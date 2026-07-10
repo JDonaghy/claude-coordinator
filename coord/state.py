@@ -542,7 +542,7 @@ def _record_dispatched_local(
     )
 
     conn = get_connection()
-    conn.execute(
+    cur = conn.execute(
         """INSERT INTO assignments (
             assignment_id, machine_name, repo_name, repo_github,
             issue_number, issue_title, status, type, briefing,
@@ -568,19 +568,27 @@ def _record_dispatched_local(
         ),
     )
     conn.commit()
-    _record_audit(
-        tier="business",
-        category="dispatch",
-        event_type="dispatched",
-        actor="coordinator",
-        summary=f"Dispatched {proposal.type} to {proposal.machine_name}: "
-        f"{proposal.repo_name}#{proposal.issue_number}",
-        repo=proposal.repo_name,
-        issue=proposal.issue_number,
-        assignment_id=assignment_id,
-        machine=proposal.machine_name,
-        details={"type": proposal.type, "branch": branch},
-    )
+    if cur.rowcount > 0:
+        # #1036 fix review finding 1: the INSERT above is a no-op on a
+        # duplicate assignment_id (ON CONFLICT DO NOTHING) — e.g. a caller
+        # retry after an ambiguous dispatch response, or two failed
+        # dispatches colliding on the "pending" id fallback
+        # (milestone_dispatch.py). Only audit when a row was actually
+        # inserted, matching the rowcount-guard pattern used by
+        # update_assignment_branch / mark_assignment_merged below.
+        _record_audit(
+            tier="business",
+            category="dispatch",
+            event_type="dispatched",
+            actor="coordinator",
+            summary=f"Dispatched {proposal.type} to {proposal.machine_name}: "
+            f"{proposal.repo_name}#{proposal.issue_number}",
+            repo=proposal.repo_name,
+            issue=proposal.issue_number,
+            assignment_id=assignment_id,
+            machine=proposal.machine_name,
+            details={"type": proposal.type, "branch": branch},
+        )
 
 
 def record_dispatched_assignment(
@@ -1071,17 +1079,32 @@ def _update_assignment_review_findings_local(
     """
     payload = json.dumps({"verdict": verdict, "body": body})
     conn = get_connection()
+    # #1036 fix review finding 4: capture the pre-write values so a retry
+    # that re-persists an already-converged (verdict, body) pair — e.g.
+    # issue_store._persist_review_verdict's retry loop, when an attempt's
+    # UPDATE actually succeeded but the readback that follows it looked
+    # mismatched — doesn't emit a second audit row for what is, from the
+    # assignments table's perspective, a single transition.
+    prior = conn.execute(
+        "SELECT review_verdict, review_findings FROM assignments WHERE assignment_id=?",
+        (assignment_id,),
+    ).fetchone()
     conn.execute(
         "UPDATE assignments SET review_findings=?, review_verdict=? "
         "WHERE assignment_id=?",
         (payload, verdict, assignment_id),
     )
     conn.commit()
+    already_recorded = (
+        prior is not None
+        and prior["review_verdict"] == verdict
+        and prior["review_findings"] == payload
+    )
     row = conn.execute(
         "SELECT repo_name, issue_number, machine_name FROM assignments WHERE assignment_id=?",
         (assignment_id,),
     ).fetchone()
-    if row is not None:
+    if row is not None and not already_recorded:
         _record_audit(
             tier="business",
             category="review",
@@ -1823,7 +1846,7 @@ def _set_assignment_failure_reason_local(assignment_id: str, reason: str) -> Non
     conn = get_connection()
     now = time.time()
     try:
-        conn.execute(
+        cur = conn.execute(
             "UPDATE assignments SET failure_reason=?, status='failed', finished_at=? "
             "WHERE assignment_id=?",
             (reason[:512], now, assignment_id),  # cap at 512 chars — one-liner
@@ -1831,6 +1854,11 @@ def _set_assignment_failure_reason_local(assignment_id: str, reason: str) -> Non
         conn.commit()
     except sqlite3.OperationalError:
         # Column may not exist on a pre-migration DB — best-effort.
+        return
+    # #1036 fix review finding 2: no matching row (bad/stale assignment_id)
+    # means the UPDATE above touched nothing — don't audit a transition that
+    # didn't happen, matching the rowcount-guard pattern used elsewhere.
+    if cur.rowcount == 0:
         return
     row = conn.execute(
         "SELECT repo_name, issue_number, machine_name FROM assignments WHERE assignment_id=?",
@@ -1840,7 +1868,11 @@ def _set_assignment_failure_reason_local(assignment_id: str, reason: str) -> Non
         tier="business",
         category="error",
         event_type="launch_failed",
-        actor="worker",
+        # #1036 fix review finding 3: this fires from the daemon endpoint as
+        # a launcher-side backstop (e.g. worktree-add failure) *before* the
+        # worker session starts — a coordinator/launcher self-report, not an
+        # agent one. See serve_app.py's own docstring for this call site.
+        actor="coordinator",
         summary=f"Launch failed: {reason[:200]}",
         repo=row["repo_name"] if row is not None else None,
         issue=row["issue_number"] if row is not None else None,
