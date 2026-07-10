@@ -210,11 +210,34 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             created_at   REAL    NOT NULL
         );
 
+        -- #1036: durable, append-only audit trail.  One row per real
+        -- state-changing transition, captured at the state._*_local /
+        -- issue_store write choke points (never at the ~30 CLI call
+        -- sites) so the log is topology-agnostic (thin-client vs daemon).
+        -- Modeled on issue_context above: additive, no UPDATE/DELETE
+        -- except the opportunistic audit.max_rows trim in coord/audit.py.
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts            REAL    NOT NULL,
+            tier          TEXT    NOT NULL,
+            category      TEXT    NOT NULL,
+            event_type    TEXT    NOT NULL,
+            actor         TEXT    NOT NULL,
+            repo          TEXT,
+            issue         INTEGER,
+            assignment_id TEXT,
+            machine       TEXT,
+            summary       TEXT    NOT NULL DEFAULT '',
+            details_json  TEXT
+        );
+
         CREATE INDEX IF NOT EXISTS idx_assignments_status ON assignments(status);
         CREATE INDEX IF NOT EXISTS idx_assignments_machine ON assignments(machine_name);
         CREATE INDEX IF NOT EXISTS idx_merge_queue_state ON merge_queue(state);
         CREATE INDEX IF NOT EXISTS idx_issue_context_issue
             ON issue_context(repo_name, issue_number);
+        CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log(ts);
+        CREATE INDEX IF NOT EXISTS idx_audit_log_assignment ON audit_log(assignment_id);
 
         INSERT OR IGNORE INTO schema_version VALUES (1);
     """)

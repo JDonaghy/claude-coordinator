@@ -1338,3 +1338,104 @@ class TestReconcileParity:
         match = [a for a in board.completed if a.assignment_id == "rp-2"]
         assert len(match) == 1
         assert match[0].review_state == "advisory"
+
+
+# ── #1036: audit trail hooked at the issue_store choke point ───────────────
+
+
+def _audit_rows(assignment_id: str) -> list:
+    return state_mod.get_connection().execute(
+        "SELECT * FROM audit_log WHERE assignment_id=? ORDER BY id", (assignment_id,)
+    ).fetchall()
+
+
+class TestAuditHook:
+    """`post_completion` / `post_result` both funnel through
+    `issue_store._record_notification` — the issue_store analogue of
+    `state.mark_notified` — which is where `record_audit` is hooked."""
+
+    def test_post_completion_done_writes_coordinator_actor_row(self) -> None:
+        _seed_running_assignment("aid-audit-done")
+        with patch("coord.github_ops.post_issue_comment"):
+            issue_store.post_completion(
+                issue_store.CompletionRecord(
+                    assignment_id="aid-audit-done",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=7,
+                    exit_code=0,
+                    commits_ahead=2,
+                    branch="issue-7-foo",
+                )
+            )
+        # _seed_running_assignment's own record_dispatched() writes a
+        # "dispatched" row too — filter to the completion row this test cares
+        # about.
+        rows = [r for r in _audit_rows("aid-audit-done") if r["event_type"] == "completion"]
+        assert len(rows) == 1
+        assert rows[0]["tier"] == "business"
+        # Git-floor backstop is coordinator-inferred, not agent self-report.
+        assert rows[0]["actor"] == "coordinator"
+        assert rows[0]["repo"] == "api"
+        assert rows[0]["issue"] == 7
+
+    def test_post_completion_failure_writes_one_row(self) -> None:
+        _seed_running_assignment("aid-audit-fail")
+        with patch("coord.github_ops.post_issue_comment"):
+            issue_store.post_completion(
+                issue_store.CompletionRecord(
+                    assignment_id="aid-audit-fail",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=7,
+                    exit_code=1,
+                    commits_ahead=0,
+                )
+            )
+        rows = [r for r in _audit_rows("aid-audit-fail") if r["event_type"] == "failure"]
+        assert len(rows) == 1
+        assert rows[0]["actor"] == "coordinator"
+
+    def test_post_result_done_writes_worker_actor_row(self) -> None:
+        _seed_running_assignment("aid-audit-rr")
+        with patch("coord.github_ops.post_issue_comment"):
+            issue_store.post_result(
+                issue_store.ResultRecord(
+                    assignment_id="aid-audit-rr",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=7,
+                    status="done",
+                    verdict=None,
+                    summary="landed fix",
+                )
+            )
+        rows = [r for r in _audit_rows("aid-audit-rr") if r["event_type"] == "completion"]
+        assert len(rows) == 1
+        # Structured self-report from the interactive agent.
+        assert rows[0]["actor"] == "worker"
+
+    def test_post_result_bodyless_review_verdict_writes_review_row(self) -> None:
+        _seed_running_assignment("aid-audit-verdict", assignment_type="review")
+        with patch("coord.github_ops.post_issue_comment"):
+            issue_store.post_result(
+                issue_store.ResultRecord(
+                    assignment_id="aid-audit-verdict",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=7,
+                    status="done",
+                    verdict="approve",
+                    summary="LGTM",
+                )
+            )
+        rows = _audit_rows("aid-audit-verdict")
+        categories = {r["category"] for r in rows}
+        assert "review" in categories
+        review_row = [r for r in rows if r["category"] == "review"][0]
+        assert review_row["event_type"] == "review_approve"
+        assert review_row["actor"] == "worker"

@@ -30,6 +30,7 @@ from coord._board_mapping import (
     json_loads as _json_loads,
     row_to_assignment as _row_to_assignment,
 )
+from coord.audit import record_audit as _record_audit
 from coord.board_service import resolve as _board_service_resolve
 from coord.board_service import route_write as _route_write
 from coord.db import get_connection
@@ -567,6 +568,19 @@ def _record_dispatched_local(
         ),
     )
     conn.commit()
+    _record_audit(
+        tier="business",
+        category="dispatch",
+        event_type="dispatched",
+        actor="coordinator",
+        summary=f"Dispatched {proposal.type} to {proposal.machine_name}: "
+        f"{proposal.repo_name}#{proposal.issue_number}",
+        repo=proposal.repo_name,
+        issue=proposal.issue_number,
+        assignment_id=assignment_id,
+        machine=proposal.machine_name,
+        details={"type": proposal.type, "branch": branch},
+    )
 
 
 def record_dispatched_assignment(
@@ -638,6 +652,24 @@ def _record_dispatched_assignment_local(
         ),
     )
     conn.commit()
+    _record_audit(
+        tier="business",
+        category="dispatch",
+        event_type="dispatched",
+        actor="coordinator",
+        summary=f"Dispatched {assignment.type} to {assignment.machine_name}: "
+        f"{assignment.repo_name}#{assignment.issue_number}",
+        repo=assignment.repo_name,
+        issue=assignment.issue_number,
+        assignment_id=assignment.assignment_id,
+        machine=assignment.machine_name,
+        details={
+            "type": assignment.type,
+            "review_of_assignment_id": assignment.review_of_assignment_id,
+            "review_target": assignment.review_target,
+            "review_iteration": assignment.review_iteration,
+        },
+    )
 
 
 def record_acceptance_verdict(
@@ -709,22 +741,41 @@ def _record_acceptance_verdict_local(
     )
     conn.commit()
 
+    row = conn.execute(
+        "SELECT repo_name, issue_number, machine_name FROM assignments WHERE assignment_id=?",
+        (assignment_id,),
+    ).fetchone()
+    if row is not None:
+        _record_audit(
+            tier="business",
+            category="test",
+            event_type=f"acceptance_{acceptance_state}",
+            actor="coordinator",
+            summary=f"Acceptance {acceptance_state}: "
+            f"{row['repo_name']}#{row['issue_number']}",
+            repo=row["repo_name"],
+            issue=row["issue_number"],
+            assignment_id=assignment_id,
+            machine=row["machine_name"],
+            details={
+                "acceptance_reason": acceptance_reason,
+                "acceptance_sha": acceptance_sha,
+                "acceptance_total": acceptance_total,
+                "acceptance_passed": acceptance_passed,
+            },
+        )
+
     # #603: a failed external acceptance re-run is durable context for EVERY
     # future agent on the issue — mirrors the test-failure note below. Local
     # writer (we're already daemon-side on a thin client), so use the
     # _local variant to avoid re-routing.
-    if acceptance_state == "failed" and (acceptance_reason or "").strip():
-        row = conn.execute(
-            "SELECT repo_name, issue_number FROM assignments WHERE assignment_id=?",
-            (assignment_id,),
-        ).fetchone()
-        if row is not None:
-            _add_issue_context_entry_local(
-                row["repo_name"],
-                row["issue_number"],
-                f"Acceptance FAILED @ {acceptance_sha or '?'}: {acceptance_reason.strip()}",
-                source="test",
-            )
+    if acceptance_state == "failed" and (acceptance_reason or "").strip() and row is not None:
+        _add_issue_context_entry_local(
+            row["repo_name"],
+            row["issue_number"],
+            f"Acceptance FAILED @ {acceptance_sha or '?'}: {acceptance_reason.strip()}",
+            source="test",
+        )
 
 
 def record_test_verdict(
@@ -787,22 +838,36 @@ def _record_test_verdict_local(
             (smoke_test, smoke_test_reason, assignment_id),
         )
     conn.commit()
+
+    row = conn.execute(
+        "SELECT repo_name, issue_number, machine_name FROM assignments WHERE assignment_id=?",
+        (assignment_id,),
+    ).fetchone()
+    if row is not None:
+        _record_audit(
+            tier="business",
+            category="test",
+            event_type=f"test_{test_state}",
+            actor="user",
+            summary=f"Test {test_state}: {row['repo_name']}#{row['issue_number']}",
+            repo=row["repo_name"],
+            issue=row["issue_number"],
+            assignment_id=assignment_id,
+            machine=row["machine_name"],
+            details={"test_reason": test_reason, "smoke_test": smoke_test},
+        )
+
     # #603: a test failure is durable context for EVERY future agent on the
     # issue (not just the immediate fix worker) — record it in the per-issue
     # digest.  Local writer (we're already daemon-side on a thin client), so
     # use the _local variant to avoid re-routing.
-    if test_state == "failed" and (test_reason or "").strip():
-        row = conn.execute(
-            "SELECT repo_name, issue_number FROM assignments WHERE assignment_id=?",
-            (assignment_id,),
-        ).fetchone()
-        if row is not None:
-            _add_issue_context_entry_local(
-                row["repo_name"],
-                row["issue_number"],
-                f"Test FAILED: {test_reason.strip()}",
-                source="test",
-            )
+    if test_state == "failed" and (test_reason or "").strip() and row is not None:
+        _add_issue_context_entry_local(
+            row["repo_name"],
+            row["issue_number"],
+            f"Test FAILED: {test_reason.strip()}",
+            source="test",
+        )
 
 
 # ── Notification ledger ────────────────────────────────────────────────────────
@@ -842,7 +907,14 @@ def mark_notified(
     call.
     """
     _thin_client_local_board_guard("mark_notified")
-    from coord.comments import EVENT_COMPLETION, EVENT_PLAN
+    from coord.comments import (
+        EVENT_ADVISORY,
+        EVENT_COMPLETION,
+        EVENT_FAILURE,
+        EVENT_NEEDS_ATTENTION,
+        EVENT_PLAN,
+        EVENT_STUCK,
+    )
 
     conn = get_connection()
     now = time.time()
@@ -869,6 +941,49 @@ def mark_notified(
             (now, assignment_id),
         )
     conn.commit()
+
+    # #1036: this is the single funnel every notify.py call site (completion,
+    # failure, advisory, stuck, needs-attention) reaches — hook here rather
+    # than at each of the ~10 mark_notified() call sites.  Stuck/needs-
+    # attention keys are composite (f"{aid}:stuck" / f"{aid}:needs-attention",
+    # see notify.py's _stuck_notified_key / _needs_attention_notified_key) so
+    # strip the suffix to recover the real assignment_id for the repo/issue
+    # lookup and for the audit row's correlation key.
+    real_assignment_id = assignment_id
+    for _suffix in (":stuck", ":needs-attention"):
+        if real_assignment_id.endswith(_suffix):
+            real_assignment_id = real_assignment_id[: -len(_suffix)]
+            break
+    row = conn.execute(
+        "SELECT repo_name, issue_number, machine_name FROM assignments WHERE assignment_id=?",
+        (real_assignment_id,),
+    ).fetchone()
+    _event_category = {
+        EVENT_COMPLETION: "dispatch",
+        EVENT_FAILURE: "dispatch",
+        EVENT_ADVISORY: "dispatch",
+        EVENT_PLAN: "plan",
+        EVENT_STUCK: "override",
+        EVENT_NEEDS_ATTENTION: "override",
+    }.get(event, "dispatch")
+    _event_actor = {
+        EVENT_STUCK: "daemon",
+        EVENT_NEEDS_ATTENTION: "daemon",
+    }.get(event, "worker")
+    _record_audit(
+        tier="business",
+        category=_event_category,
+        event_type=event,
+        actor=_event_actor,
+        summary=f"{event} notified: "
+        f"{row['repo_name']}#{row['issue_number']}" if row is not None
+        else f"{event} notified: {real_assignment_id}",
+        repo=row["repo_name"] if row is not None else None,
+        issue=row["issue_number"] if row is not None else None,
+        assignment_id=real_assignment_id,
+        machine=row["machine_name"] if row is not None else None,
+        details={"branch": branch} if branch is not None else None,
+    )
 
 
 def mark_needs_attention_notified(assignment_id: str) -> None:
@@ -962,6 +1077,23 @@ def _update_assignment_review_findings_local(
         (payload, verdict, assignment_id),
     )
     conn.commit()
+    row = conn.execute(
+        "SELECT repo_name, issue_number, machine_name FROM assignments WHERE assignment_id=?",
+        (assignment_id,),
+    ).fetchone()
+    if row is not None:
+        _record_audit(
+            tier="business",
+            category="review",
+            event_type=f"review_{verdict}",
+            actor="worker",
+            summary=f"Review {verdict}: {row['repo_name']}#{row['issue_number']}",
+            repo=row["repo_name"],
+            issue=row["issue_number"],
+            assignment_id=assignment_id,
+            machine=row["machine_name"],
+            details={"body_len": len(body)},
+        )
 
 
 def delete_assignments_for_issue(
@@ -1288,12 +1420,30 @@ def update_assignment_branch(assignment_id: str, branch: str) -> None:
     if not assignment_id or not branch:
         return
     conn = get_connection()
-    conn.execute(
+    cur = conn.execute(
         "UPDATE assignments SET branch=? WHERE assignment_id=? "
         "AND (branch IS NULL OR branch = '')",
         (branch, assignment_id),
     )
     conn.commit()
+    if cur.rowcount > 0:
+        row = conn.execute(
+            "SELECT repo_name, issue_number, machine_name FROM assignments WHERE assignment_id=?",
+            (assignment_id,),
+        ).fetchone()
+        _record_audit(
+            tier="business",
+            category="dispatch",
+            event_type="branch_set",
+            actor="coordinator",
+            summary=f"Backfilled branch {branch!r}"
+            + (f" for {row['repo_name']}#{row['issue_number']}" if row is not None else ""),
+            repo=row["repo_name"] if row is not None else None,
+            issue=row["issue_number"] if row is not None else None,
+            assignment_id=assignment_id,
+            machine=row["machine_name"] if row is not None else None,
+            details={"branch": branch},
+        )
 
 
 def mark_assignment_merged(assignment_id: str) -> None:
@@ -1309,12 +1459,29 @@ def mark_assignment_merged(assignment_id: str) -> None:
     if not assignment_id:
         return
     conn = get_connection()
-    conn.execute(
+    cur = conn.execute(
         "UPDATE assignments SET status='merged' WHERE assignment_id=? "
         "AND status='done'",
         (assignment_id,),
     )
     conn.commit()
+    if cur.rowcount > 0:
+        row = conn.execute(
+            "SELECT repo_name, issue_number, machine_name FROM assignments WHERE assignment_id=?",
+            (assignment_id,),
+        ).fetchone()
+        _record_audit(
+            tier="business",
+            category="merge",
+            event_type="merged",
+            actor="coordinator",
+            summary=f"Merged: {row['repo_name']}#{row['issue_number']}"
+            if row is not None else f"Merged: {assignment_id}",
+            repo=row["repo_name"] if row is not None else None,
+            issue=row["issue_number"] if row is not None else None,
+            assignment_id=assignment_id,
+            machine=row["machine_name"] if row is not None else None,
+        )
 
 
 def mark_work_review_settled(assignment_id: str) -> None:
@@ -1664,7 +1831,23 @@ def _set_assignment_failure_reason_local(assignment_id: str, reason: str) -> Non
         conn.commit()
     except sqlite3.OperationalError:
         # Column may not exist on a pre-migration DB — best-effort.
-        pass
+        return
+    row = conn.execute(
+        "SELECT repo_name, issue_number, machine_name FROM assignments WHERE assignment_id=?",
+        (assignment_id,),
+    ).fetchone()
+    _record_audit(
+        tier="business",
+        category="error",
+        event_type="launch_failed",
+        actor="worker",
+        summary=f"Launch failed: {reason[:200]}",
+        repo=row["repo_name"] if row is not None else None,
+        issue=row["issue_number"] if row is not None else None,
+        assignment_id=assignment_id,
+        machine=row["machine_name"] if row is not None else None,
+        details={"reason": reason[:512]},
+    )
 
 
 def mark_review_posted(assignment_id: str) -> None:
@@ -1696,6 +1879,22 @@ def _mark_review_posted_local(assignment_id: str) -> None:
         (time.time(), assignment_id),
     )
     conn.commit()
+    row = conn.execute(
+        "SELECT repo_name, issue_number, machine_name FROM assignments WHERE assignment_id=?",
+        (assignment_id,),
+    ).fetchone()
+    if row is not None:
+        _record_audit(
+            tier="business",
+            category="review",
+            event_type="review_findings_posted",
+            actor="coordinator",
+            summary=f"Review findings posted: {row['repo_name']}#{row['issue_number']}",
+            repo=row["repo_name"],
+            issue=row["issue_number"],
+            assignment_id=assignment_id,
+            machine=row["machine_name"],
+        )
 
 
 def load_done_reviews_needing_post(repo_name: str | None = None) -> list[dict]:

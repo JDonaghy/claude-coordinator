@@ -202,9 +202,23 @@ def _update_local_state(
     conn.commit()
 
 
-def _record_notification(*, assignment_id: str, event: str, branch: str | None) -> None:
+def _record_notification(
+    *, assignment_id: str, event: str, branch: str | None, actor: str = "worker",
+) -> None:
     """Best-effort notification-ledger write so ``coord notify`` won't
-    double-post the same completion."""
+    double-post the same completion.
+
+    #1036: this is the issue_store analogue of ``state.mark_notified`` — the
+    single funnel every interactive-session outcome (``post_completion``'s
+    git-floor backstop AND ``post_result``'s agent self-report) reaches, so
+    it is where ``record_audit`` is hooked rather than at each call site.
+    ``actor`` defaults to ``"worker"`` (the ``post_result`` self-report
+    case, the majority of call sites); the git-floor backstop paths
+    (``_post_done_path``/``_post_advisory_path``/``_post_failure_path``)
+    pass ``actor="coordinator"`` since those are inferred from git state,
+    not agent self-report.
+    """
+    from coord.audit import record_audit  # noqa: PLC0415
     from coord.state import get_connection  # noqa: PLC0415
 
     if not assignment_id:
@@ -217,6 +231,24 @@ def _record_notification(*, assignment_id: str, event: str, branch: str | None) 
         (assignment_id, event, branch, time.time()),
     )
     conn.commit()
+    row = conn.execute(
+        "SELECT repo_name, issue_number, machine_name FROM assignments WHERE assignment_id=?",
+        (assignment_id,),
+    ).fetchone()
+    record_audit(
+        tier="business",
+        category="dispatch",
+        event_type=event,
+        actor=actor,
+        summary=f"{event} notified: "
+        f"{row['repo_name']}#{row['issue_number']}" if row is not None
+        else f"{event} notified: {assignment_id}",
+        repo=row["repo_name"] if row is not None else None,
+        issue=row["issue_number"] if row is not None else None,
+        assignment_id=assignment_id,
+        machine=row["machine_name"] if row is not None else None,
+        details={"branch": branch} if branch is not None else None,
+    )
 
 
 def _post_github_comment(
@@ -522,6 +554,7 @@ def _persist_review_verdict(record: ResultRecord) -> None:
                     verdict=record.verdict,
                     body=record.findings_body.strip(),
                 )
+                bodyless_verdict = False
             else:
                 from coord.state import get_connection  # noqa: PLC0415
 
@@ -531,8 +564,39 @@ def _persist_review_verdict(record: ResultRecord) -> None:
                     (record.verdict, record.assignment_id),
                 )
                 conn.commit()
+                bodyless_verdict = True
             actual = _read_review_verdict_local(record.assignment_id)
             if actual == record.verdict:
+                # #1036: the update_assignment_review_findings() branch above
+                # already emits an audit row itself (it funnels through
+                # state._update_assignment_review_findings_local, hooked
+                # there). This is the bodyless-verdict twin of that write —
+                # only reachable here, so hook it here, and only once the
+                # readback has confirmed the write is durable (avoids a
+                # duplicate row per retry attempt).
+                if bodyless_verdict:
+                    from coord.audit import record_audit  # noqa: PLC0415
+                    from coord.state import get_connection  # noqa: PLC0415
+
+                    conn = get_connection()
+                    row = conn.execute(
+                        "SELECT repo_name, issue_number, machine_name FROM assignments "
+                        "WHERE assignment_id=?",
+                        (record.assignment_id,),
+                    ).fetchone()
+                    if row is not None:
+                        record_audit(
+                            tier="business",
+                            category="review",
+                            event_type=f"review_{record.verdict}",
+                            actor="worker",
+                            summary=f"Review {record.verdict}: "
+                            f"{row['repo_name']}#{row['issue_number']}",
+                            repo=row["repo_name"],
+                            issue=row["issue_number"],
+                            assignment_id=record.assignment_id,
+                            machine=row["machine_name"],
+                        )
                 return
             last_exc = RuntimeError(
                 f"review_verdict readback mismatch for assignment "
@@ -1036,6 +1100,7 @@ def _post_done_path(record: CompletionRecord) -> StoreOutcome:
         assignment_id=record.assignment_id,
         event=EVENT_COMPLETION,
         branch=record.branch,
+        actor="coordinator",
     )
     return StoreOutcome(
         status="done", event=EVENT_COMPLETION, posted=posted, error=err,
@@ -1071,6 +1136,7 @@ def _post_advisory_path(record: CompletionRecord) -> StoreOutcome:
         assignment_id=record.assignment_id,
         event=EVENT_ADVISORY,
         branch=record.branch,
+        actor="coordinator",
     )
     return StoreOutcome(
         status="advisory", event=EVENT_ADVISORY, posted=posted, error=err,
@@ -1103,6 +1169,7 @@ def _post_failure_path(record: CompletionRecord) -> StoreOutcome:
         assignment_id=record.assignment_id,
         event=EVENT_FAILURE,
         branch=record.branch,
+        actor="coordinator",
     )
     return StoreOutcome(
         status="failed", event=EVENT_FAILURE, posted=posted, error=err,

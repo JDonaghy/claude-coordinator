@@ -453,6 +453,22 @@ class CiStoreConfig:
 
 
 @dataclass
+class AuditConfig:
+    """``audit:`` block (#1036) — the append-only ``audit_log`` table's
+    only tunable.
+
+    ``max_rows`` is a future retention cap, not a pruning sweep: when set
+    above the default ``0`` (unlimited), :func:`coord.audit.record_audit`
+    opportunistically deletes the oldest rows past that count after every
+    insert.  ``0`` means keep everything forever — the default for this
+    milestone, since retention policy is explicitly out of scope (see the
+    issue's "Out of scope" section).
+    """
+
+    max_rows: int = 0
+
+
+@dataclass
 class ProviderDef:
     """Definition of a single named worker-command provider.
 
@@ -529,6 +545,7 @@ class Config:
     merge: MergeConfig = field(default_factory=MergeConfig)
     milestone: MilestoneConfig = field(default_factory=MilestoneConfig)
     providers: ProvidersConfig = field(default_factory=ProvidersConfig)
+    audit: AuditConfig = field(default_factory=AuditConfig)
     path: Path | None = None
 
     def repo(self, name: str) -> Repo | None:
@@ -576,6 +593,7 @@ def load(path: str | Path | None = None) -> Config:
     merge = _parse_merge(raw.get("merge"))
     milestone = _parse_milestone(raw.get("milestone"))
     providers = _parse_providers(raw.get("providers"))
+    audit = _parse_audit(raw.get("audit"))
 
     return Config(
         repos=repos,
@@ -592,6 +610,7 @@ def load(path: str | Path | None = None) -> Config:
         merge=merge,
         milestone=milestone,
         providers=providers,
+        audit=audit,
         path=p,
     )
 
@@ -1253,6 +1272,26 @@ def _parse_milestone(raw: Any) -> MilestoneConfig:
         if not isinstance(value, bool):
             raise ConfigError("milestone.auto_dispatch must be a boolean")
         cfg.auto_dispatch = value
+    return cfg
+
+
+def _parse_audit(raw: Any) -> AuditConfig:
+    """Parse the optional ``audit:`` block from coordinator.yml (#1036).
+
+    An absent block returns ``AuditConfig()`` — ``max_rows=0`` (unlimited),
+    preserving existing behaviour: ``coord.audit.record_audit`` never trims.
+    """
+    if raw is None:
+        return AuditConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'audit' must be a mapping")
+
+    cfg = AuditConfig()
+    if "max_rows" in raw:
+        value = raw["max_rows"]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ConfigError("audit.max_rows must be a non-negative integer")
+        cfg.max_rows = value
     return cfg
 
 
