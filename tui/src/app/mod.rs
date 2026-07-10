@@ -6702,5 +6702,15 @@ fn first_meaningful_stderr_line(stderr: &str) -> Option<String> {
 
 
 
+// #1042: app-construction fixtures (`make_test_app` + siblings), used by the
+// in-crate `#[cfg(test)]` suite below and — when the `test-support` feature
+// is enabled — re-exported at the crate root so an external integration-test
+// crate (`tui/tests/acceptance.rs`) can build a `CoordApp` from in-memory
+// `BoardData` without a live daemon. `pub` here is inert unless something
+// downstream (lib.rs) actually re-exports it; the feature stays off for a
+// normal `cargo build`/`cargo test`.
+#[cfg(any(test, feature = "test-support"))]
+pub mod fixtures;
+
 #[cfg(test)]
 mod tests;

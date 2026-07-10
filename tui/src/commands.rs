@@ -80,7 +80,10 @@ pub struct CommandRunner {
     no_spawn: bool,
     /// Argv of every "spawned" call, in order.  Populated only when
     /// `no_spawn = true` so tests can assert on what commands would have run.
-    #[cfg(test)]
+    // #1042: also compiled under `test-support` — `spawned_calls` backs
+    // `new_for_test`, which `app::fixtures::make_test_app` calls, and that
+    // module is itself gated `#[cfg(any(test, feature = "test-support"))]`.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) spawned_calls: Vec<Vec<String>>,
     /// FIFO queue of `(exit_code, stdout, stderr)` overrides for the NEXT
     /// `do_spawn` calls in `no_spawn` mode — lets a test simulate a failing
@@ -89,7 +92,7 @@ pub struct CommandRunner {
     /// zero-exit success with empty output.  Popped one-per-spawn; once
     /// empty, `do_spawn` falls back to the default success result.  See
     /// [`Self::push_canned_result`] / [`Self::push_canned_result_with_stdout`].
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     canned_results: VecDeque<(i32, String, String)>,
 }
 
@@ -217,20 +220,23 @@ impl CommandRunner {
             message: None,
             config_path: find_config(),
             no_spawn: false,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             spawned_calls: Vec::new(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             canned_results: VecDeque::new(),
         }
     }
 
-    /// Construct a runner suitable for unit / TuiDriver tests.
+    /// Construct a runner suitable for unit / TuiDriver tests (and, under
+    /// the `test-support` feature, for `app::fixtures::make_test_app` —
+    /// #1042 — so an external acceptance-test crate gets the same
+    /// no-real-subprocess isolation).
     ///
     /// In this mode [`do_spawn`] records the call in [`Self::spawned_calls`]
     /// and immediately synthesises a zero-exit success result — **no real
     /// `coord` subprocess is ever started**.  This prevents merge-queue
     /// key-binding tests from reaching the live daemon.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new_for_test() -> Self {
         Self {
             state: CommandState::Idle,
@@ -287,20 +293,21 @@ impl CommandRunner {
         // immediately-resolved success result so poll() sees completion on the
         // next tick.  No real subprocess is started.
         if self.no_spawn {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             self.spawned_calls.push(argv.clone());
             // #863/#935: consume a queued (exit_code, stdout, stderr)
             // override if the test pushed one via `push_canned_result` /
             // `push_canned_result_with_stdout`; otherwise the usual
-            // zero-exit success with empty output (unconditional call in
-            // non-test builds since `no_spawn` can only be true via
-            // `new_for_test`, which is itself `#[cfg(test)]`).
-            #[cfg(test)]
+            // zero-exit success with empty output (unconditional call
+            // otherwise, since `no_spawn` can only be true via
+            // `new_for_test`, which is itself `#[cfg(any(test, feature =
+            // "test-support"))]` — #1042).
+            #[cfg(any(test, feature = "test-support"))]
             let (exit_code, stdout, stderr) = self
                 .canned_results
                 .pop_front()
                 .unwrap_or((0, String::new(), String::new()));
-            #[cfg(not(test))]
+            #[cfg(not(any(test, feature = "test-support")))]
             let (exit_code, stdout, stderr) = (0, String::new(), String::new());
             let (tx, rx) = mpsc::channel();
             let _ = tx.send(CommandResult {

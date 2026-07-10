@@ -165,7 +165,14 @@ impl SidebarView {
 }
 
 #[derive(Clone, serde::Deserialize)]
-pub(crate) struct Assignment {
+// #1042: `pub`, not `pub(crate)` — it's a parameter/return type of the
+// `test-support`-feature-gated fixtures in `app::fixtures` (e.g.
+// `make_app_with_assignments(Vec<Assignment>)`), which must be at least as
+// visible as those `pub fn`s (E0446) to be reachable from an external
+// integration-test crate. Fields stay `pub(crate)`: nothing outside the
+// crate constructs one field-by-field, only via `app::fixtures` helpers or
+// `serde::Deserialize`.
+pub struct Assignment {
     #[serde(rename = "assignment_id")]
     pub(crate) id: String,
     #[serde(rename = "repo_name")]
@@ -1314,7 +1321,11 @@ pub(crate) fn fix_model_for_iteration(models: &PipelineModels, iteration: i64) -
 }
 
 #[derive(Default)]
-pub(crate) struct BoardData {
+// #1042: `pub`, not `pub(crate)` — see the note on `Assignment` above; this
+// is `make_test_app`'s parameter type. Fields stay `pub(crate)`; external
+// callers only ever need `BoardData::default()` (derived, no field access
+// required) to build a fixture.
+pub struct BoardData {
     pub(crate) local_machine: String,
     pub(crate) assignments: Vec<Assignment>,
     /// Open issues from the local SQLite `issues` table — the full backlog.
