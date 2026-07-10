@@ -808,7 +808,12 @@ impl CoordApp {
             return false;
         };
         self.milestone_dag_sel = idx;
-        self.active_view = SidebarView::MilestoneDag;
+        // #1029: MilestoneDag has no ActivityBar entry of its own (reached
+        // only as a Plans drill-down), so `switch_active_view` queues no
+        // chrome update here — this is a plain `active_view` write with a
+        // single call site, kept in the helper for consistency with every
+        // other programmatic view switch.
+        self.switch_active_view(SidebarView::MilestoneDag);
         true
     }
 

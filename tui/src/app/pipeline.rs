@@ -1908,7 +1908,8 @@ impl CoordApp {
                 self.terminal_session = Some(sess);
                 self.terminal_spawn_error = None;
                 self.terminal_focused = true;
-                self.active_view = SidebarView::Terminal;
+                // #1029 bug A: keep the ActivityBar/header chrome in sync too.
+                self.switch_active_view(SidebarView::Terminal);
                 self.push_toast(
                     "Resolve interactively",
                     &format!("Launched merge agent for #{}", issue_num),

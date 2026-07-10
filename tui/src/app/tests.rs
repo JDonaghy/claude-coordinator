@@ -27205,6 +27205,136 @@ Milestone tracking issue.
         );
     }
 
+    /// #1029 fix-iteration regression (bug A): opening milestone chat from
+    /// the Plans panel must update quadraui's ActivityBar highlight AND
+    /// sidebar panel header, not just the main-pane content. Before this
+    /// fix, `launch_milestone_chat_session` set `active_view` via a raw
+    /// field write, which `render_content`'s `match self.active_view` obeys
+    /// (so the sidebar tree + main pane *did* switch to Terminal) but which
+    /// `AppShell` never learns about — its own `active_panel` index (which
+    /// drives the ActivityBar highlight and the "PLANS"/"TERMINAL" sidebar
+    /// header text) is private state only mutated by a mouse click or the
+    /// `ShellApp::take_requested_panel` hook. Drives the exact reviewer
+    /// repro end-to-end: right-click a Plans row, click "Open milestone
+    /// chat", assert the header follows.
+    #[test]
+    #[cfg(unix)]
+    fn tuidriver_open_milestone_chat_updates_activity_chrome_not_just_content() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(make_plan_roster_board_data());
+        app.command_runner = crate::commands::CommandRunner::new_for_test();
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "◆");
+
+        assert!(
+            driver.screen_contains("PLANS"),
+            "sanity: sidebar header should read PLANS before opening chat:\n{}",
+            driver.screen()
+        );
+
+        let (x, y) = driver.find("Substrate").unwrap_or_else(|| {
+            panic!(
+                "could not find Plans row 'Substrate' on initial render:\n{}",
+                driver.screen()
+            )
+        });
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: MouseButton::Right,
+            position: Point::new(x, y),
+            modifiers: Modifiers::default(),
+        });
+        assert!(
+            driver.screen_contains("Open milestone chat"),
+            "context menu should be open with 'Open milestone chat' as its \
+             first (pre-selected) item:\n{}",
+            driver.screen()
+        );
+        // Activate the pre-selected first item ("Open milestone chat") via
+        // Enter rather than a second mouse click — a mouse click on this
+        // particular menu's item rows is a separate, pre-existing quadraui
+        // hit-test/paint offset (menu item hit-regions don't account for
+        // the border row the TUI rasteriser draws around them) unrelated to
+        // #1029; Enter drives `context_menu_activate_selected`, which acts
+        // on `selected_idx` directly and isn't affected by that offset.
+        driver.press_named(NamedKey::Enter);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("TERMINAL"),
+            "sidebar header must follow the programmatic switch to the \
+             Terminal view, matching the sidebar tree + main pane that \
+             already switched:\n{}",
+            screen
+        );
+        assert!(
+            !screen.contains("PLANS"),
+            "the stale PLANS header must not still be showing once \
+             milestone chat is open (#1029 bug A):\n{}",
+            screen
+        );
+    }
+
+    /// #1029 fix-iteration regression (bug B): once PTY focus is released
+    /// (F12), Esc must return the operator to the Plans panel milestone
+    /// chat was opened from — the issue's explicit "Esc/detach returns
+    /// focus to the originating Plans/milestone view" promise. Before this
+    /// fix there was no origin-tracking state at all, so Esc did nothing
+    /// and the operator had to navigate back to Plans manually.
+    #[test]
+    #[cfg(unix)]
+    fn tuidriver_esc_after_releasing_pty_focus_returns_to_plans_origin() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(make_plan_roster_board_data());
+        app.command_runner = crate::commands::CommandRunner::new_for_test();
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "◆");
+
+        let (x, y) = driver.find("Substrate").unwrap_or_else(|| {
+            panic!(
+                "could not find Plans row 'Substrate' on initial render:\n{}",
+                driver.screen()
+            )
+        });
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: MouseButton::Right,
+            position: Point::new(x, y),
+            modifiers: Modifiers::default(),
+        });
+        // Activate the pre-selected first item ("Open milestone chat") via
+        // Enter — see the sibling chrome-desync test for why not a second
+        // mouse click on the menu itself.
+        driver.press_named(NamedKey::Enter);
+        assert!(
+            driver.screen_contains("TERMINAL"),
+            "sanity: should have landed on Terminal after opening chat:\n{}",
+            driver.screen()
+        );
+
+        // Entering Terminal auto-focuses the PTY (#424) — Esc must not leak
+        // into the shell while focused, so release focus first (F12), the
+        // same way the operator would per the status-bar hint.
+        driver.press_named(NamedKey::F(12));
+        driver.press_named(NamedKey::Escape);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("PLANS"),
+            "Esc (once PTY focus is released) must return to the \
+             originating Plans view (#1029 bug B):\n{}",
+            screen
+        );
+        assert!(
+            !screen.contains("TERMINAL"),
+            "must have actually left the Terminal view, not just repainted \
+             its own chrome:\n{}",
+            screen
+        );
+    }
+
     /// #1003/#1001 rebase regression: once the roster spans more than one
     /// repo group, `render_plans_panel` (#1001) interleaves a non-selectable
     /// header row per repo and an optional trailing "+N without a work

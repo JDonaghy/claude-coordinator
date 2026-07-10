@@ -2409,6 +2409,23 @@ pub struct CoordApp {
     /// `$SHELL`, fork failure, etc.).  Displayed in the Terminal pane
     /// as a one-line placeholder so the user knows why nothing rendered.
     terminal_spawn_error: Option<String>,
+    /// #1029 bug A fix: queued by [`Self::switch_active_view`], polled once
+    /// by `ShellApp::take_requested_panel` (`render.rs`). Lets an action
+    /// handler (e.g. `launch_milestone_chat_session`) jump `active_view`
+    /// straight to a different panel — no ActivityBar click — while still
+    /// keeping quadraui's AppShell chrome (ActivityBar highlight + sidebar
+    /// panel header) in sync, instead of the two drifting apart the way a
+    /// raw `self.active_view = ...` write left them.
+    pending_panel_switch: Option<WidgetId>,
+    /// #1029 bug B fix: the view to restore on Esc-close of a standalone
+    /// Terminal session that was launched *from* somewhere other than the
+    /// Terminal panel itself (currently: milestone chat, set in
+    /// `launch_milestone_chat_session`). `None` means there is nothing to
+    /// return to — e.g. the Terminal panel was reached by an ordinary
+    /// ActivityBar click, or the return has already been consumed. Cleared
+    /// whenever `active_view` moves to anything other than `Terminal` (see
+    /// `switch_active_view`) so a stale bookmark can't fire later.
+    terminal_return_view: Option<SidebarView>,
     // ── #440: per-issue detail-view terminals ──────────────────────────
     /// Per-issue terminal sessions for the Pipeline detail Terminal tab.
     /// Keyed by `(repo_slug, issue_number)` (#455) so that same-numbered
@@ -2968,6 +2985,10 @@ impl CoordApp {
             terminal_focused: false,
             terminal_pending_dims: std::cell::Cell::new(None),
             terminal_spawn_error: None,
+            // #1029: no queued programmatic panel switch / Terminal
+            // return-view bookmark on startup.
+            pending_panel_switch: None,
+            terminal_return_view: None,
             // #440: per-issue detail-view terminals.
             detail_terminal_sessions: std::collections::HashMap::new(),
             detail_terminal_spawn_errors: std::collections::HashMap::new(),
@@ -3185,6 +3206,43 @@ impl CoordApp {
         config.min_sidebar_width = 20.0;
         config.max_sidebar_width = 55.0;
         config
+    }
+
+    /// Switch `active_view`, keeping quadraui's AppShell chrome (ActivityBar
+    /// highlight + sidebar panel header) in sync (#1029 bug A).
+    ///
+    /// `on_shell_event` (`render.rs`) already keeps the two in sync for a
+    /// switch the operator drove by clicking the ActivityBar — the shell
+    /// tells us about those. It has no equivalent for the *other*
+    /// direction: an action handler (e.g. `launch_milestone_chat_session`)
+    /// that decides on its own to jump to a different panel. A raw
+    /// `self.active_view = ...` write in that case changes what
+    /// `render_content` draws in the main pane / sidebar tree, but leaves
+    /// the ActivityBar highlight and panel header — state quadraui's
+    /// `AppShell` owns internally and never exposes for direct mutation —
+    /// still pointing at whatever panel was active before. Every
+    /// programmatic (non-click) view switch should go through this method
+    /// instead of writing `active_view` directly; it queues the panel id
+    /// for `ShellApp::take_requested_panel` to hand back to quadraui, which
+    /// applies it to the real `AppShell` state and re-fires
+    /// `on_shell_event` exactly as a click would.
+    ///
+    /// `MilestoneDag` has no ActivityBar entry of its own (reached only as
+    /// a Plans drill-down — see `SidebarView::panel_widget_id`), so
+    /// switching to it queues nothing; that matches its pre-#1029 behavior,
+    /// since there was never any chrome for it to desync from.
+    pub(crate) fn switch_active_view(&mut self, view: SidebarView) {
+        self.active_view = view;
+        if let Some(id) = view.panel_widget_id() {
+            self.pending_panel_switch = Some(id);
+        }
+        // The "return to origin on Esc" bookmark (#1029 bug B) is only
+        // meaningful while still parked in the Terminal view it was set
+        // for — clear it as soon as the operator lands anywhere else so a
+        // later, unrelated visit to Terminal can't replay a stale jump.
+        if view != SidebarView::Terminal {
+            self.terminal_return_view = None;
+        }
     }
 
     /// Kick off a background data load if one is not already in flight.
@@ -5205,7 +5263,8 @@ impl CoordApp {
                 let repo_part = &s[..colon];
                 if let Some(repo_colon) = repo_part.rfind(':') {
                     let repo = &repo_part[repo_colon + 1..];
-                    self.active_view = SidebarView::Board;
+                    // #1029 bug A: keep the ActivityBar/header chrome in sync too.
+                    self.switch_active_view(SidebarView::Board);
                     self.select_issue(repo, num);
                 }
             }
@@ -6433,6 +6492,12 @@ impl CoordApp {
             // #605: Ctrl-W is the keyboard pane leader (Ctrl-W h = side panel).
             if self.terminal_focused {
                 " PTY focused — F12 / Ctrl-W h = release  (typed keys go to the shell) ".to_string()
+            } else if self.terminal_return_view.is_some() {
+                // #1029 bug B: only surface the Esc-return hint when there's
+                // actually somewhere to return to (e.g. milestone chat) —
+                // an ordinary ActivityBar-driven visit to Terminal has no
+                // bookmark and Esc does nothing special here.
+                " PTY released — F12 / Ctrl-W l = focus  ·  Esc = return  ·  click activity bar to switch view  ·  q=quit ".to_string()
             } else {
                 " PTY released — F12 / Ctrl-W l = focus  ·  click activity bar to switch view  ·  q=quit ".to_string()
             }

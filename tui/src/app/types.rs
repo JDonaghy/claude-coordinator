@@ -2,7 +2,7 @@
 //!
 //! DTO/enum structs and their pure impls — no I/O, no quadraui rendering.
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use quadraui::Color;
+use quadraui::{Color, WidgetId};
 use super::format::fmt_dur;
 
 
@@ -160,6 +160,31 @@ impl SidebarView {
             SidebarView::MergeQueue => "Merge Queue",
             SidebarView::MilestoneDag => "Milestones",
             SidebarView::Plans => "Plans",
+        }
+    }
+
+    /// The ActivityBar `WidgetId` (see `CoordApp::shell_config`) this view
+    /// corresponds to, or `None` when the view has no top-level ActivityBar
+    /// entry of its own (`MilestoneDag` — reached only as a drill-down from
+    /// Plans; see the `#975` note on the `Plans` variant above).
+    ///
+    /// This is the inverse of the `panel_id_str` match in
+    /// `render.rs::on_shell_event`. `CoordApp::switch_active_view` (#1029
+    /// bug A) uses it to keep quadraui's ActivityBar highlight + sidebar
+    /// header in sync with a *programmatic* view switch — one not already
+    /// driven by an ActivityBar click, which `on_shell_event` already
+    /// handles correctly.
+    pub(crate) fn panel_widget_id(self) -> Option<WidgetId> {
+        match self {
+            SidebarView::Board => Some(WidgetId::new("panel:board")),
+            SidebarView::Machines => Some(WidgetId::new("panel:machines")),
+            SidebarView::Pipeline => Some(WidgetId::new("panel:pipeline")),
+            SidebarView::Settings => Some(WidgetId::new("panel:settings")),
+            SidebarView::Terminal => Some(WidgetId::new("panel:terminal")),
+            SidebarView::Kanban => Some(WidgetId::new("panel:kanban")),
+            SidebarView::MergeQueue => Some(WidgetId::new("panel:mergequeue")),
+            SidebarView::Plans => Some(WidgetId::new("panel:plans")),
+            SidebarView::MilestoneDag => None,
         }
     }
 }
