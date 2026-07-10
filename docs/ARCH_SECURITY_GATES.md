@@ -157,6 +157,71 @@ This makes the architecture gate cheap enough to run **twice**, oracle-style: as
 (Gate B) and as a per-issue lens — the same suite, two jobs, same as `acceptance run` vs
 `acceptance record`.
 
+## Rule grammar — `coord arch lint` (settled 2026-07-10)
+
+Grounded in the real graph (`graphify-out/graph.json`: ~11.5k nodes, ~32k links). Two facts fix the
+grammar: every **node carries `source_file`**, and every **link carries a `relation`** — the
+dependency-bearing ones (`imports`, `imports_from`, `calls`, `uses`, `references`, `inherits`,
+`implements`) are all present with resolvable `source`/`target` node ids. So a **layer is a glob over
+`source_file`**, and a dependency rule classifies both endpoints of an edge into layers.
+
+**Four rule kinds across two evaluators** — the oracle is graph-based for dep/layering (the clean 80%)
+and diff-based for the rest:
+
+| Kind | Evaluator | Example |
+|---|---|---|
+| `forbidden-dep` / layering | **graph** edges | cli must not import/call `state` directly (#584) |
+| `forbidden-content` | **diff text** (regex) | no platform code in shared paths |
+| `co-change` / seam-mirror | **diff file-set** (heuristic, not proof) | #632 — one side of the `/board` wire changed, the other didn't |
+| `metric-delta` | git line/symbol counts vs base | `app.rs` no-growth (#751) |
+
+**Strawman** (lives under `## Rules` in each repo's `ARCHITECTURE.md`, coordinator-authored):
+
+```yaml
+layers:                                # globs over graph node.source_file
+  tui:    ["tui/src/**"]
+  cli:    ["coord/cli.py"]
+  daemon: ["coord/serve_app.py", "coord/agent_app.py"]
+  state:  ["coord/state.py", "coord/db.py"]
+  brain:  ["coord/brain.py", "coord/dispatch.py", "coord/review.py", "coord/merge_queue.py"]
+  wire:   ["coord/_board_mapping.py", "coord/models.py"]
+
+rules:
+  - id: cli-no-direct-state
+    kind: forbidden-dep
+    edges: [imports, imports_from, calls]
+    from: cli
+    to:   state
+    why:  "#584 — board writes route through the daemon seam, not a local DB."
+    severity: error
+  - id: tui-only-through-wire
+    kind: forbidden-dep
+    from: tui
+    to:   [daemon, state, brain]
+    except-to: wire
+    severity: error
+  # forbidden-content / co-change / metric-delta — Slice 1b
+```
+
+**Five settled decisions:**
+
+1. **Selector = glob over `source_file`** — not graphify `community` (unstable integers) or the
+   `rationale` god-nodes (explanation layer, not code).
+2. **Deny-list first, allow-list later** — enumerate *forbidden* edges to start (cheap adoption);
+   graduate a mature layer to default-deny (declare its whole allowed adjacency) once its boundary is
+   well understood. Proportional-to-maturity.
+3. **Net-new semantics (make-or-break)** — fail only on violations the diff *introduces* vs the base
+   SHA; grandfather existing debt. Without this the lint red-flags every issue on legacy coupling.
+4. **Run on the pushed SHA, not the dirty worktree** — graphify rebuilds per-commit (git hooks), so a
+   fresh graph exists only for committed state. Runs externally, `acceptance record`-style; ToS-clean
+   (git + a computed check, never the TTY).
+5. **Visible waivers, never silent** — `severity: error|warn` + an `exceptions:` allowlist (rule-id +
+   reason, logged) for a deliberate, reviewed boundary change. Mirrors the `--force-merge` ethos.
+
+**Build order:** Slice 1 ships **only** the graph-based `forbidden-dep` evaluator with net-new
+semantics + deny-list — highest value, cleanest, no diff-text or heuristics. The `forbidden-content`,
+`co-change` (incl. the #632 seam-mirror), and `metric-delta` kinds are **Slice 1b**.
+
 ## `coord` command surface
 
 Mirrors the `coord acceptance …` family.
@@ -240,11 +305,16 @@ graph↔doc conformance oracle · the A-arch guide gate that blocks dispatch · 
 
 ## Build slice — mapped to existing issues
 
-**Slice 1 — the living doc + the lint (the arch oracle, unblocks everything):**
-- Formalize `docs/ARCHITECTURE.md` as the per-repo living doc + a machine-checkable rule block. → *new
-  issue (coord first; template for other repos).*
-- `coord arch lint` — evaluate the rule block against the graph for a diff. Deterministic findings. →
-  *new issue (reads `graphify-out/`; coord-live).*
+**Slice 1 — the living doc + the graph-only lint (the arch oracle, unblocks everything):**
+- Formalize `docs/ARCHITECTURE.md` as the per-repo living doc + a `## Rules` block (`layers:` +
+  `forbidden-dep` rules). → *new issue (coord first; template for other repos).*
+- `coord arch lint` — the **graph-based `forbidden-dep` evaluator only**, with **net-new-vs-base-SHA**
+  semantics + deny-list, run on the **pushed SHA**. Deterministic findings. → *new issue (reads
+  `graphify-out/`; coord-live).*
+
+**Slice 1b — the remaining rule kinds** (after Slice 1 proves the engine):
+- `forbidden-content` (diff-text regex), `co-change`/seam-mirror (#632, heuristic), `metric-delta`
+  (god-file no-growth) — each a distinct evaluator under the same `coord arch lint`. → *new issue(s).*
 
 **Slice 2 — the post-work lenses (immediate audit value, no git-model change):**
 - `review:security` lens + `reviews.repo_overrides` security block + relevance-gating. → *new issue
