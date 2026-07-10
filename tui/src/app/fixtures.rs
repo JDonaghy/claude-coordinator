@@ -165,6 +165,7 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         // #1029: no queued programmatic panel switch / Terminal
         // return-view bookmark on startup.
         pending_panel_switch: None,
+        pending_switch_is_programmatic: false,
         terminal_return_view: None,
         // #440
         detail_terminal_sessions: std::collections::HashMap::new(),

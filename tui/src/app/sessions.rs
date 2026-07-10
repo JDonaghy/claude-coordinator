@@ -1688,21 +1688,24 @@ impl CoordApp {
         // #1029 bug B: remember where the operator was so Esc (once PTY
         // focus is released) can return them there instead of stranding
         // them in the Terminal view with no way back but manual
-        // navigation. Captured before the reattach short-circuit below so
-        // both the "already running" and "fresh spawn" paths get it —
-        // `reattach_session_by_aid` itself has no origin of its own to
-        // record (it's also used from the live-sessions overlay, which
-        // has no "back to" concept). A no-op if we're already parked in
-        // Terminal (e.g. re-triggering from a context menu reachable from
-        // there) — nothing to bookmark.
-        if self.active_view != SidebarView::Terminal {
-            self.terminal_return_view = Some(self.active_view);
-        }
+        // navigation. Captured *before* any view switch, but applied
+        // *after* (see `bookmark_origin` below) — because `switch_active_view`
+        // now unconditionally clears `terminal_return_view` (iter-2 fix), so
+        // setting it beforehand would be wiped by the switch into Terminal.
+        // A no-op if we're already parked in Terminal (e.g. re-triggering
+        // from a context menu reachable from there) — nothing to bookmark.
+        let bookmark_origin = (self.active_view != SidebarView::Terminal).then_some(self.active_view);
 
         if let Some(aid) =
             self.reattachable_session_aid(tracking_issue, &repo, InteractiveLaunchMode::MilestoneChat)
         {
+            // `reattach_session_by_aid` switches into Terminal (clearing the
+            // bookmark); re-apply the origin afterwards so both the "already
+            // running" and "fresh spawn" paths return correctly on Esc.
+            // (Reattach is also used from the live-sessions overlay, which has
+            // no origin — hence we set it here, not inside reattach.)
             self.reattach_session_by_aid(&aid);
+            self.terminal_return_view = bookmark_origin;
             return;
         }
 
@@ -1726,6 +1729,9 @@ impl CoordApp {
         self.terminal_tree_selected = None;
         // #1029 bug A: keep the ActivityBar/header chrome in sync too.
         self.switch_active_view(SidebarView::Terminal);
+        // #1029 bug B (iter-2): re-apply the origin bookmark *after* the
+        // switch, which cleared it.
+        self.terminal_return_view = bookmark_origin;
 
         if let Some(ref mut sess) = self.terminal_session {
             sess.send_str(&launch_line);
