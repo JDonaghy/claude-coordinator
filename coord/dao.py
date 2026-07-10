@@ -53,6 +53,11 @@ def _board_retention_days() -> int:
         return _DEFAULT_BOARD_RETENTION_DAYS
 
 
+# #1037: recency window (seconds) behind the /board `audit_recent_count`
+# summary field — see SqliteStore._audit_recent_count.
+_AUDIT_RECENT_WINDOW_SECONDS = 900
+
+
 def _board_retention_cutoff(now: float | None = None) -> float | None:
     """Unix-timestamp floor for terminal rows on the board, or None when the
     cap is disabled (``COORD_BOARD_RETENTION_DAYS=0``)."""
@@ -268,6 +273,24 @@ class SqliteStore:
         except (TypeError, ValueError):
             return 0
 
+    def _audit_recent_count(self, conn: sqlite3.Connection) -> int:
+        """#1037: single-integer summary for the TUI activity-bar badge —
+        rows written to ``audit_log`` in the last :data:`_AUDIT_RECENT_WINDOW_SECONDS`.
+        A real "unseen since I last looked" count needs per-client read-cursor
+        state that doesn't exist yet; a rolling recency window is the
+        forward-compatible stand-in the issue asks for (#1039 can replace the
+        semantics without a wire-shape change — it's still one integer).
+        Fail-open to 0 so a missing/pre-migration table never 503s the board.
+        """
+        try:
+            cutoff = time.time() - _AUDIT_RECENT_WINDOW_SECONDS
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM audit_log WHERE ts >= ?", (cutoff,)
+            ).fetchone()
+            return int(row["n"]) if row else 0
+        except sqlite3.Error:
+            return 0
+
     # ── public reads ────────────────────────────────────────────────────────────
     def list_assignments(self) -> list[dict]:
         with closing(self._connect()) as conn:
@@ -378,6 +401,7 @@ class SqliteStore:
                 "plans": self._plans(conn),
                 "notifications": self._capped_notifications(conn, keep, cutoff),
                 "board_meta": self._board_meta(conn),
+                "audit_recent_count": self._audit_recent_count(conn),
             }
 
     # ── writes (deferred to #590) ────────────────────────────────────────────────

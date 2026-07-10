@@ -23,6 +23,7 @@ import os
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -199,3 +200,41 @@ def fetch_issue_context(
         return []
     entries = data.get("entries") if isinstance(data, dict) else None
     return entries if isinstance(entries, list) else []
+
+
+def fetch_audit_log(
+    svc: ServiceConfig,
+    *,
+    since: float | None = None,
+    until: float | None = None,
+    event_type: str | None = None,
+    category: str | None = None,
+    repo: str | None = None,
+    issue: int | None = None,
+    assignment_id: str | None = None,
+    tier: str | None = None,
+    limit: int = 200,
+    cursor: str | None = None,
+    timeout: float = _DEFAULT_TIMEOUT,
+) -> dict:
+    """GET the paginated audit log from the daemon (#1037).
+
+    Unlike :func:`fetch_issue_context`, this does NOT fail-soft: ``coord
+    audit`` is an explicit read the user asked for, so a transport/HTTP
+    error (including a 404 from a daemon that predates this endpoint —
+    see the endpoint-deploy-ordering rule) raises ``httpx.HTTPError`` for
+    the CLI to report plainly instead of silently rendering an empty log.
+    """
+    params: dict[str, Any] = {"limit": limit}
+    for key, value in (
+        ("since", since), ("until", until), ("type", event_type),
+        ("category", category), ("repo", repo), ("issue", issue),
+        ("assignment", assignment_id), ("tier", tier), ("cursor", cursor),
+    ):
+        if value is not None:
+            params[key] = value
+    resp = httpx.get(
+        f"{svc.url}/audit", params=params, headers=_headers(svc), timeout=timeout
+    )
+    resp.raise_for_status()
+    return resp.json()

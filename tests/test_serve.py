@@ -3500,3 +3500,99 @@ def test_deregister_milestone_drain_removes_only_matching_entry(coord_db):
     state.register_milestone_drain(repo_name="web", tracking_issue=200)
     state.deregister_milestone_drain(repo_name="api", tracking_issue=100)
     assert state.list_milestone_drains() == [{"repo_name": "web", "tracking_issue": 200}]
+
+
+# ── #1037: GET /audit + audit_recent_count on /board ────────────────────────
+
+def test_serve_get_audit_returns_entries_newest_first(
+    file_db: Path, valid_config_path: Path, rw_db
+):
+    from coord.audit import record_audit
+
+    record_audit(tier="business", category="test", event_type="test_passed", actor="user", summary="a", ts=1000.0)
+    record_audit(tier="business", category="test", event_type="test_failed", actor="user", summary="b", ts=1001.0)
+
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.get("/audit")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [e["summary"] for e in body["entries"]] == ["b", "a"]
+    assert body["has_more"] is False
+    assert body["next_cursor"] is None
+
+
+def test_serve_get_audit_filters_plumb_through(
+    file_db: Path, valid_config_path: Path, rw_db
+):
+    from coord.audit import record_audit
+
+    record_audit(tier="business", category="merge", event_type="merged", actor="coordinator", summary="a", repo="api", issue=1, ts=1000.0)
+    record_audit(tier="business", category="test", event_type="test_passed", actor="user", summary="b", repo="web", issue=2, ts=1001.0)
+
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.get("/audit", params={"category": "merge", "repo": "api"})
+    assert resp.status_code == 200
+    entries = resp.json()["entries"]
+    assert len(entries) == 1
+    assert entries[0]["summary"] == "a"
+
+
+def test_serve_get_audit_pagination_via_cursor(
+    file_db: Path, valid_config_path: Path, rw_db
+):
+    from coord.audit import record_audit
+
+    for i in range(3):
+        record_audit(
+            tier="business", category="test", event_type="test_passed",
+            actor="user", summary=f"row {i}", ts=1000.0 + i,
+        )
+
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        page1 = cli.get("/audit", params={"limit": 2}).json()
+        assert [e["summary"] for e in page1["entries"]] == ["row 2", "row 1"]
+        assert page1["has_more"] is True
+
+        page2 = cli.get(
+            "/audit", params={"limit": 2, "cursor": page1["next_cursor"]}
+        ).json()
+        assert [e["summary"] for e in page2["entries"]] == ["row 0"]
+        assert page2["has_more"] is False
+
+
+def test_serve_get_audit_bad_query_param_400(
+    file_db: Path, valid_config_path: Path, rw_db
+):
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.get("/audit", params={"issue": "not-an-int"})
+    assert resp.status_code == 400
+
+
+def test_audit_recent_count_in_board_payload(file_db: Path, valid_config_path: Path):
+    import time as _time
+
+    conn = sqlite3.connect(str(file_db))
+    conn.execute(
+        "INSERT INTO audit_log (ts, tier, category, event_type, actor, summary) "
+        "VALUES (?, 'business', 'test', 'test_passed', 'user', 'recent')",
+        (_time.time(),),
+    )
+    conn.execute(
+        "INSERT INTO audit_log (ts, tier, category, event_type, actor, summary) "
+        "VALUES (?, 'business', 'test', 'test_passed', 'user', 'stale')",
+        (_time.time() - 100_000,),
+    )
+    conn.commit()
+    conn.close()
+
+    proj = SqliteStore(file_db).board_projection()
+    assert proj["audit_recent_count"] == 1
+
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        board = cli.get("/board").json()
+    assert board["audit_recent_count"] == 1

@@ -3126,6 +3126,46 @@ def list_issue_context(repo_name: str, issue_number: int) -> list[dict]:
     return _list_issue_context_local(repo_name, issue_number)
 
 
+def list_audit_log(
+    *,
+    since: float | None = None,
+    until: float | None = None,
+    event_type: str | None = None,
+    category: str | None = None,
+    repo: str | None = None,
+    issue: int | None = None,
+    assignment_id: str | None = None,
+    tier: str | None = None,
+    limit: int = 200,
+    cursor: str | None = None,
+) -> dict:
+    """Paginated read over the audit trail (#1037) — routes to the daemon
+    when ``board_service`` is set, else queries the local DB directly.
+
+    Unlike :func:`list_issue_context` (fail-soft — it rides the briefing
+    read-path), a daemon-fetch failure here propagates: ``coord audit`` is
+    the user's explicit ask for this data, so a transport/HTTP error should
+    surface as a CLI error, not silently render an empty log.
+    """
+    svc = _board_service()
+    if svc is not None:
+        from coord.client import fetch_audit_log  # noqa: PLC0415
+
+        return fetch_audit_log(
+            svc,
+            since=since, until=until, event_type=event_type, category=category,
+            repo=repo, issue=issue, assignment_id=assignment_id, tier=tier,
+            limit=limit, cursor=cursor,
+        )
+    from coord.audit import query_audit_log  # noqa: PLC0415
+
+    return query_audit_log(
+        since=since, until=until, event_type=event_type, category=category,
+        repo=repo, issue=issue, assignment_id=assignment_id, tier=tier,
+        limit=limit, cursor=cursor,
+    )
+
+
 def _list_issue_context_local(repo_name: str, issue_number: int) -> list[dict]:
     conn = get_connection()
     rows = conn.execute(

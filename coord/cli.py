@@ -29,6 +29,7 @@ import httpx  # noqa: F401
 from coord import __version__
 
 from coord.commands.acceptance import acceptance_group
+from coord.commands.audit import audit
 
 # Re-exported for back-compat: some tests do `from coord.cli import
 # _save_config_snapshot` / `_load_config` / etc. directly.
@@ -247,6 +248,7 @@ main.add_command(housekeeping)
 main.add_command(diagnose)
 main.add_command(issue_group)
 main.add_command(context_group)
+main.add_command(audit)
 main.add_command(milestone_group)
 main.add_command(plans_cmd)
 main.add_command(fix_briefing_cmd)

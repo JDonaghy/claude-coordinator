@@ -11,6 +11,8 @@ Endpoints:
 
 * ``GET /healthz``  — liveness; no DB access, never auth-gated.
 * ``GET /board``    — the full board projection (``CoordStore.board_projection``).
+* ``GET /audit``    — paginated, newest-first read over the append-only
+  ``audit_log`` (#1037); keyset cursor, not part of ``/board``.
 * ``GET /config``   — the raw ``coordinator.yml`` bytes the daemon owns, so a
   client needs no local config file.
 * ``POST /result``  — record an interactive-session result (#590); body is a
@@ -567,6 +569,15 @@ def _board_response_schema(components: dict) -> dict:
             },
             "notifications": {"type": "array", "items": {"type": "object"}},
             "board_meta": {"type": "object", "additionalProperties": {"type": "string"}},
+            "audit_recent_count": {
+                "type": "integer",
+                "description": (
+                    "#1037: count of audit_log rows written in the last 15 "
+                    "minutes — a single forward-compatible integer so the "
+                    "coord-tui activity bar can show an attention badge "
+                    "without fetching the full paginated /audit log."
+                ),
+            },
             "merge_plan": {
                 "type": "array",
                 "description": "#776: server-side, gate-annotated merge plan",
@@ -1533,6 +1544,65 @@ def _openapi_spec() -> dict:
                     "400": {"description": "Missing field / unknown action"},
                 },
             },
+        },
+        "/audit": {
+            "get": {
+                "summary": (
+                    "#1037: paginated, newest-first read over the append-only "
+                    "audit_log — NOT part of /board (deliberately unbounded, "
+                    "its own endpoint)"
+                ),
+                "parameters": [
+                    {"name": "since", "in": "query", "schema": {"type": "string"}, "description": "epoch seconds or ISO-8601"},
+                    {"name": "until", "in": "query", "schema": {"type": "string"}, "description": "epoch seconds or ISO-8601"},
+                    {"name": "type", "in": "query", "schema": {"type": "string"}, "description": "event_type filter"},
+                    {"name": "category", "in": "query", "schema": {"type": "string"}},
+                    {"name": "repo", "in": "query", "schema": {"type": "string"}},
+                    {"name": "issue", "in": "query", "schema": {"type": "integer"}},
+                    {"name": "assignment", "in": "query", "schema": {"type": "string"}, "description": "assignment_id filter"},
+                    {"name": "tier", "in": "query", "schema": {"type": "string"}, "description": "business|operational"},
+                    {"name": "limit", "in": "query", "schema": {"type": "integer"}, "description": "default 200, hard-capped at 500"},
+                    {"name": "cursor", "in": "query", "schema": {"type": "string"}, "description": "opaque keyset cursor from a previous response's next_cursor"},
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "entries": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "id": {"type": "integer"},
+                                                    "ts": {"type": "number"},
+                                                    "tier": {"type": "string"},
+                                                    "category": {"type": "string"},
+                                                    "event_type": {"type": "string"},
+                                                    "actor": {"type": "string"},
+                                                    "repo": {"type": ["string", "null"]},
+                                                    "issue": {"type": ["integer", "null"]},
+                                                    "assignment_id": {"type": ["string", "null"]},
+                                                    "machine": {"type": ["string", "null"]},
+                                                    "summary": {"type": "string"},
+                                                    "details": {"type": ["object", "null"]},
+                                                },
+                                            },
+                                        },
+                                        "next_cursor": {"type": ["string", "null"]},
+                                        "has_more": {"type": "boolean"},
+                                    },
+                                    "required": ["entries", "has_more"],
+                                }
+                            }
+                        },
+                    },
+                    "400": {"description": "Bad query parameter"},
+                },
+            }
         },
         "/merge": {
             "post": {
@@ -2813,6 +2883,59 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             )
         return JSONResponse({"error": f"unknown action: {action!r}"}, status_code=400)
 
+    async def get_audit(request: Request) -> Response:
+        # #1037: paginated read over audit_log — deliberately its own endpoint
+        # (NOT riding /board, which is a bounded current-state snapshot). Keyset
+        # pagination on (ts, id) DESC via `cursor`, not OFFSET, so a growing
+        # table stays fast.
+        from coord import audit as _audit  # noqa: PLC0415
+
+        qp = request.query_params
+
+        def _int_param(name: str) -> int | None:
+            raw = qp.get(name)
+            if raw is None or raw == "":
+                return None
+            return int(raw)
+
+        def _ts_param(name: str) -> float | None:
+            """Accept either an epoch number or an ISO-8601 timestamp."""
+            raw = qp.get(name)
+            if raw is None or raw == "":
+                return None
+            try:
+                return float(raw)
+            except ValueError:
+                from datetime import datetime  # noqa: PLC0415
+
+                return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+
+        try:
+            since = _ts_param("since")
+            until = _ts_param("until")
+            issue = _int_param("issue")
+            limit_raw = qp.get("limit")
+            limit = int(limit_raw) if limit_raw else _audit.DEFAULT_LIMIT
+        except ValueError as e:
+            return JSONResponse({"error": f"bad query parameter: {e}"}, status_code=400)
+
+        try:
+            result = _audit.query_audit_log(
+                since=since,
+                until=until,
+                event_type=qp.get("type") or None,
+                category=qp.get("category") or None,
+                repo=qp.get("repo") or None,
+                issue=issue,
+                assignment_id=qp.get("assignment") or None,
+                tier=qp.get("tier") or None,
+                limit=limit,
+                cursor=qp.get("cursor") or None,
+            )
+        except Exception as e:  # noqa: BLE001 — surface a clean 503 rather than a stack trace
+            return JSONResponse({"error": "audit read failed", "detail": str(e)}, status_code=503)
+        return JSONResponse(result)
+
     async def post_merge(request: Request) -> Response:
         # #584: the merge queue + board live in THIS (canonical) DB, and gh is
         # authenticated here — so a thin client's `coord merge` / TUI 'Go' routes
@@ -3283,6 +3406,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
     routes = [
         Route("/healthz", healthz, methods=["GET"]),
         Route("/board", board, methods=["GET"]),
+        Route("/audit", get_audit, methods=["GET"]),
         Route("/config", serve_config, methods=["GET"]),
         Route("/result", post_result, methods=["POST"]),
         Route("/completion", post_completion, methods=["POST"]),
