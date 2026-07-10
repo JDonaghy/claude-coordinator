@@ -327,14 +327,23 @@ def list_coord_tmux_sessions(
     * ``"pane_dead"`` — ``"1"`` when the session's pane process has exited
       (``claude`` finished but the tmux session is still up — the
       detach-and-abandon case), ``"0"`` while the pane is still running.
+    * ``"attached"`` — ``bool``, ``True`` when a client is currently attached
+      to the tmux session (#1031).  Mirrors
+      :func:`coord.commands.terminal.list_tmux_terminal_sessions`'s
+      ``#{session_attached}`` handling so the TUI Sessions panel can flag
+      orphaned/detached sessions at a glance.
 
     Returns an empty list when tmux is not available, not running, or has
     no matching sessions.
 
-    Uses ``tmux list-panes -a -F "#{session_name}\t#{pane_dead}"`` to fetch
-    both the session name and pane-dead status in a single subprocess call.
-    When a session has multiple panes the *most conservative* (alive=0) value
-    wins — i.e. the session is only marked dead when every pane has exited.
+    Uses ``tmux list-panes -a -F "#{session_name}\t#{pane_dead}\t#{session_attached}"``
+    to fetch the session name, pane-dead status, and attached status in a
+    single subprocess call.  When a session has multiple panes the *most
+    conservative* (alive=0) value wins for ``pane_dead`` — i.e. the session
+    is only marked dead when every pane has exited; ``session_attached`` is
+    a session-level (not pane-level) tmux value, so every pane row for a
+    given session reports the same value, but any row showing attached wins
+    (defensive OR) to avoid a stray malformed line flipping it to detached.
 
     Free-floating ``coord-term-*`` sessions (#952, ``coord terminal new``)
     are explicitly excluded even though they also start with
@@ -344,18 +353,26 @@ def list_coord_tmux_sessions(
     for them.
 
     Args:
-        host: Target host.  Defaults to ``TmuxHost(None)`` (local).
+        host: Target host.  Defaults to ``TmuxHost(None)`` (local).  This
+            same function drives the ``--remote`` sweep in ``coord sessions``
+            (a raw ``ssh <host> tmux list-panes ...`` call — never remote
+            ``coord sessions --json``), so ``attached`` is carried through
+            for remote hosts with no agent release / ``coord agent update``
+            required (#1031).
 
     Example::
 
         [
-            {"session_name": "coord-abc123", "pane_dead": "0"},
-            {"session_name": "coord-def456", "pane_dead": "1"},
+            {"session_name": "coord-abc123", "pane_dead": "0", "attached": True},
+            {"session_name": "coord-def456", "pane_dead": "1", "attached": False},
         ]
     """
     try:
         result = subprocess.run(
-            host.cmd(["list-panes", "-a", "-F", "#{session_name}\t#{pane_dead}"]),
+            host.cmd([
+                "list-panes", "-a", "-F",
+                "#{session_name}\t#{pane_dead}\t#{session_attached}",
+            ]),
             capture_output=True,
             text=True,
             timeout=5.0,
@@ -363,10 +380,11 @@ def list_coord_tmux_sessions(
         if result.returncode != 0:
             return []
         # Collect per-session: "0" (alive) beats "1" (dead) — any alive pane
-        # keeps the session active.
+        # keeps the session active.  Attached: any row reporting attached wins.
         pane_dead_per_session: dict[str, str] = {}
+        attached_per_session: dict[str, bool] = {}
         for raw_line in result.stdout.splitlines():
-            parts = raw_line.split("\t", 1)
+            parts = raw_line.split("\t")
             if len(parts) < 2:
                 continue
             name, pane_dead = parts[0].strip(), parts[1].strip()
@@ -378,8 +396,15 @@ def list_coord_tmux_sessions(
             # "0" (alive) wins over "1" (dead).
             if existing is None or pane_dead == "0":
                 pane_dead_per_session[name] = pane_dead
+            attached_raw = parts[2].strip() if len(parts) > 2 else ""
+            is_attached = attached_raw not in ("", "0")
+            attached_per_session[name] = attached_per_session.get(name, False) or is_attached
         return [
-            {"session_name": name, "pane_dead": pd}
+            {
+                "session_name": name,
+                "pane_dead": pd,
+                "attached": attached_per_session.get(name, False),
+            }
             for name, pd in pane_dead_per_session.items()
         ]
     except (subprocess.SubprocessError, OSError):

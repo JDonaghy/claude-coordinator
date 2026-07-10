@@ -253,6 +253,46 @@ class TestSessionsCmd:
         data = json.loads(result.output)
         assert data["sessions"][0]["pane_dead"] == "1"
 
+    def test_json_includes_attached_field_true(self, coord_db: Any) -> None:
+        """#1031: JSON envelope surfaces attached=True for an attached session."""
+        raw = [{"session_name": "coord-myaid", "pane_dead": "0", "attached": True}]
+        with patch("coord.interactive.list_coord_tmux_sessions", return_value=raw):
+            result = CliRunner().invoke(main, ["sessions", "--json"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        s = data["sessions"][0]
+        assert "attached" in s, "attached must appear in JSON output"
+        assert s["attached"] is True
+
+    def test_json_includes_attached_field_false(self, coord_db: Any) -> None:
+        """#1031: JSON envelope surfaces attached=False for a detached session."""
+        raw = [{"session_name": "coord-detachedaid", "pane_dead": "0", "attached": False}]
+        with patch("coord.interactive.list_coord_tmux_sessions", return_value=raw):
+            result = CliRunner().invoke(main, ["sessions", "--json"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["sessions"][0]["attached"] is False
+
+    def test_json_attached_well_defined_for_dead_pane_session(self, coord_db: Any) -> None:
+        """#1031: attached is well-defined (not missing) for a dead-pane session."""
+        raw = [{"session_name": "coord-deadaid", "pane_dead": "1", "attached": True}]
+        with patch("coord.interactive.list_coord_tmux_sessions", return_value=raw):
+            result = CliRunner().invoke(main, ["sessions", "--json"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        s = data["sessions"][0]
+        assert s["pane_dead"] == "1"
+        assert s["attached"] is True
+
+    def test_json_attached_defaults_false_when_missing(self, coord_db: Any) -> None:
+        """A probe result that pre-dates the attached field defaults to False."""
+        raw = [{"session_name": "coord-legacyaid", "pane_dead": "0"}]
+        with patch("coord.interactive.list_coord_tmux_sessions", return_value=raw):
+            result = CliRunner().invoke(main, ["sessions", "--json"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["sessions"][0]["attached"] is False
+
     def test_text_dead_pane_shows_dead_tag(self, coord_db: Any) -> None:
         """Dead-pane sessions show a [DEAD PANE] tag in text output."""
         raw = [{"session_name": "coord-deadaid", "pane_dead": "1"}]
