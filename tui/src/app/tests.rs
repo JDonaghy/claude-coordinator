@@ -27335,6 +27335,139 @@ Milestone tracking issue.
         );
     }
 
+    /// #1029 bug B (iter-2 review finding): `switch_active_view` must clear a
+    /// pre-existing `terminal_return_view` bookmark on EVERY switch — crucially
+    /// including a switch *into* Terminal for an unrelated reason
+    /// (review/fix/merge/fleet-terminal/reattach). The iter-1 fix only cleared
+    /// when the target wasn't Terminal, so a milestone-chat bookmark leaked
+    /// across a later, unrelated Terminal visit and Esc teleported the operator
+    /// out of a live review session to the stale Plans origin.
+    #[test]
+    fn switch_active_view_into_terminal_clears_stale_return_bookmark() {
+        let mut app = make_app_default();
+        // Simulate the leftover state after a milestone chat was opened and
+        // the operator navigated away: a bookmark still parked on Plans.
+        app.terminal_return_view = Some(SidebarView::Plans);
+
+        // An unrelated flow (Start review/fix/merge, fleet-terminal, reattach
+        // from the live-sessions overlay) lands on Terminal via
+        // `switch_active_view` — it must NOT inherit the stale bookmark.
+        app.switch_active_view(SidebarView::Terminal);
+
+        assert_eq!(
+            app.terminal_return_view, None,
+            "an unrelated switch into Terminal must clear the stale \
+             milestone-chat bookmark so Esc has nothing to replay"
+        );
+    }
+
+    /// Companion to the above: `launch_milestone_chat_session` re-sets its
+    /// bookmark *after* the (now-clearing) switch, so the legitimate return
+    /// path still works — the bookmark points at the pre-launch origin.
+    #[test]
+    #[cfg(unix)]
+    fn launch_milestone_chat_session_bookmarks_origin_after_clearing_switch() {
+        let mut app = make_test_app(make_plan_roster_board_data());
+        app.command_runner = crate::commands::CommandRunner::new_for_test();
+        app.active_view = SidebarView::Plans;
+
+        app.launch_milestone_chat_session("api".to_string(), 500, None);
+
+        assert_eq!(
+            app.active_view,
+            SidebarView::Terminal,
+            "milestone chat lands on the Terminal view"
+        );
+        assert_eq!(
+            app.terminal_return_view,
+            Some(SidebarView::Plans),
+            "the origin (Plans) must survive the clearing switch, re-set \
+             afterwards, so Esc returns there (#1029 bug B)"
+        );
+    }
+
+    /// #1029 bug B (iter-2 review finding) — full mouse-driven repro through
+    /// the real shell event path: a stale milestone-chat bookmark must not
+    /// survive ordinary ActivityBar navigation and teleport the operator out
+    /// of a later, unrelated Terminal visit. A *real* ActivityBar click is a
+    /// fresh operator choice and invalidates the bookmark; only the
+    /// programmatic replay of our own queued switch is exempt.
+    #[test]
+    #[cfg(unix)]
+    fn tuidriver_stale_bookmark_cleared_by_activitybar_navigation() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(make_plan_roster_board_data());
+        app.command_runner = crate::commands::CommandRunner::new_for_test();
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "◆");
+
+        // 1. Open milestone chat from Plans → bookmark = Some(Plans), Terminal.
+        let (x, y) = driver.find("Substrate").unwrap_or_else(|| {
+            panic!(
+                "could not find Plans row 'Substrate' on initial render:\n{}",
+                driver.screen()
+            )
+        });
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: MouseButton::Right,
+            position: Point::new(x, y),
+            modifiers: Modifiers::default(),
+        });
+        driver.press_named(NamedKey::Enter);
+        assert!(
+            driver.screen_contains("TERMINAL"),
+            "sanity: should have landed on Terminal after opening chat:\n{}",
+            driver.screen()
+        );
+
+        // 2. Ordinary ActivityBar navigation away (Board). A real click is a
+        //    fresh operator choice → the stale bookmark is invalidated. The
+        //    "B" glyph the activity bar paints for Board sits at the very top
+        //    of the screen (row 0, col 1), so `find("B")` lands on it.
+        click_activity_icon(&mut driver, "B");
+        assert!(
+            driver.screen_contains("BOARD"),
+            "sanity: clicking the Board icon should switch to Board:\n{}",
+            driver.screen()
+        );
+
+        // 3. A later, unrelated fresh visit back to the Terminal panel (plain
+        //    ActivityBar click) has nothing to return to. The activity bar
+        //    paints only the first char of each icon (quadraui
+        //    `activity_bar.rs`), so the ">_" Terminal glyph shows as ">".
+        //    (We navigate away via Board rather than Pipeline because a
+        //    pre-existing quadraui quirk swallows activity-bar clicks on the
+        //    rows immediately adjacent to a selected Pipeline row — unrelated
+        //    to #1029; clicking the Terminal icon from Board is unaffected.)
+        click_activity_icon(&mut driver, ">");
+        assert!(
+            driver.screen_contains("TERMINAL"),
+            "sanity: clicking the Terminal icon should switch to Terminal:\n{}",
+            driver.screen()
+        );
+
+        // 4. Release PTY focus and press Esc — with the stale bookmark cleared
+        //    by the navigation in step 2, Esc must NOT teleport to Plans; the
+        //    operator stays on this plain Terminal visit. Before the iter-2
+        //    fix the bookmark leaked and Esc jumped them to the stale PLANS.
+        driver.press_named(NamedKey::F(12));
+        driver.press_named(NamedKey::Escape);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("TERMINAL"),
+            "Esc on a plain Terminal visit (no bookmark) must not teleport \
+             the operator to the stale Plans origin:\n{}",
+            screen
+        );
+        assert!(
+            !screen.contains("PLANS"),
+            "the stale PLANS bookmark must not have replayed a jump:\n{}",
+            screen
+        );
+    }
+
     /// #1003/#1001 rebase regression: once the roster spans more than one
     /// repo group, `render_plans_panel` (#1001) interleaves a non-selectable
     /// header row per repo and an optional trailing "+N without a work

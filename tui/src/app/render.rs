@@ -600,6 +600,21 @@ impl ShellApp for CoordApp {
             _ => return,
         };
         self.focused_region = FocusedRegion::Sidebar;
+        // #1029 bug B (iter-2): a *real* ActivityBar click is always a fresh,
+        // explicit operator choice, so it invalidates any pending
+        // "return to origin on Esc" bookmark — even a click that lands on
+        // Terminal (a plain visit with nothing to return to). The one
+        // exception is the programmatic replay of our own queued panel switch
+        // (`pending_panel_switch`): quadraui pulls it via
+        // `take_requested_panel` and immediately re-fires this handler as a
+        // `PanelChanged`, but that replay must NOT wipe the bookmark a
+        // milestone-chat launch just set. `take_requested_panel` flags that
+        // one replay; consume the flag here and skip the clear for it only.
+        if self.pending_switch_is_programmatic {
+            self.pending_switch_is_programmatic = false;
+        } else {
+            self.terminal_return_view = None;
+        }
         self.active_view = match panel_id_str {
             "panel:board" => SidebarView::Board,
             "panel:machines" => SidebarView::Machines,
@@ -636,7 +651,17 @@ impl ShellApp for CoordApp {
     /// a mouse click produces, so `on_shell_event` above stays the single
     /// place `active_view` gets set from shell-driven switches.
     fn take_requested_panel(&mut self) -> Option<WidgetId> {
-        self.pending_panel_switch.take()
+        let panel = self.pending_panel_switch.take();
+        // #1029 bug B (iter-2): quadraui always follows a non-None pull here
+        // with an `on_shell_event(PanelChanged)` replay (see quadraui
+        // `apply_requested_panel`). Flag that replay so `on_shell_event`
+        // treats it as programmatic — leaving any freshly-set
+        // `terminal_return_view` bookmark intact — instead of as a fresh
+        // operator click that would clear it.
+        if panel.is_some() {
+            self.pending_switch_is_programmatic = true;
+        }
+        panel
     }
 
     /// Periodic callback driven by the quadraui runner (~60Hz on TUI).

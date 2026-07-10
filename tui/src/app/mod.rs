@@ -2417,14 +2417,33 @@ pub struct CoordApp {
     /// panel header) in sync, instead of the two drifting apart the way a
     /// raw `self.active_view = ...` write left them.
     pending_panel_switch: Option<WidgetId>,
+    /// #1029 bug B (iter-2): marks the *next* `on_shell_event` as the
+    /// programmatic replay of a queued [`Self::pending_panel_switch`] rather
+    /// than a fresh operator mouse click. Set in
+    /// [`ShellApp::take_requested_panel`] the moment quadraui pulls the
+    /// queued panel (it always follows that pull with an
+    /// `on_shell_event(PanelChanged)` — see quadraui `apply_requested_panel`),
+    /// and consumed by `on_shell_event`. Needed because both a real
+    /// ActivityBar click *and* our own programmatic switch funnel through the
+    /// same `on_shell_event`, but only a real click should invalidate the
+    /// `terminal_return_view` bookmark — the programmatic replay of a
+    /// milestone-chat launch must leave the freshly-set bookmark intact.
+    pending_switch_is_programmatic: bool,
     /// #1029 bug B fix: the view to restore on Esc-close of a standalone
     /// Terminal session that was launched *from* somewhere other than the
     /// Terminal panel itself (currently: milestone chat, set in
     /// `launch_milestone_chat_session`). `None` means there is nothing to
     /// return to — e.g. the Terminal panel was reached by an ordinary
-    /// ActivityBar click, or the return has already been consumed. Cleared
-    /// whenever `active_view` moves to anything other than `Terminal` (see
-    /// `switch_active_view`) so a stale bookmark can't fire later.
+    /// ActivityBar click, or the return has already been consumed.
+    ///
+    /// Invalidated aggressively so a stale bookmark can never replay a jump
+    /// from an earlier, unrelated flow (iter-2 fix): (1) `switch_active_view`
+    /// clears it on *every* view switch — including switches *into* Terminal
+    /// for an unrelated reason (review/fix/merge/fleet/reattach); (2)
+    /// `on_shell_event` clears it on every real (non-programmatic) ActivityBar
+    /// click. The single site that legitimately wants a bookmark
+    /// (`launch_milestone_chat_session`) re-sets it *after* switching, and its
+    /// programmatic replay is skipped via `pending_switch_is_programmatic`.
     terminal_return_view: Option<SidebarView>,
     // ── #440: per-issue detail-view terminals ──────────────────────────
     /// Per-issue terminal sessions for the Pipeline detail Terminal tab.
@@ -2988,6 +3007,7 @@ impl CoordApp {
             // #1029: no queued programmatic panel switch / Terminal
             // return-view bookmark on startup.
             pending_panel_switch: None,
+            pending_switch_is_programmatic: false,
             terminal_return_view: None,
             // #440: per-issue detail-view terminals.
             detail_terminal_sessions: std::collections::HashMap::new(),
@@ -3236,13 +3256,15 @@ impl CoordApp {
         if let Some(id) = view.panel_widget_id() {
             self.pending_panel_switch = Some(id);
         }
-        // The "return to origin on Esc" bookmark (#1029 bug B) is only
-        // meaningful while still parked in the Terminal view it was set
-        // for — clear it as soon as the operator lands anywhere else so a
-        // later, unrelated visit to Terminal can't replay a stale jump.
-        if view != SidebarView::Terminal {
-            self.terminal_return_view = None;
-        }
+        // The "return to origin on Esc" bookmark (#1029 bug B) belongs to
+        // the single milestone-chat launch that set it. Clear it on EVERY
+        // view switch — crucially including switches *into* Terminal for an
+        // unrelated reason (review/fix/merge/fleet-terminal/reattach), which
+        // the old `if view != Terminal` guard silently let inherit a stale
+        // bookmark from an earlier milestone chat (iter-1 review Bug B gap).
+        // The one site that legitimately wants a bookmark
+        // (`launch_milestone_chat_session`) re-sets it *after* calling this.
+        self.terminal_return_view = None;
     }
 
     /// Kick off a background data load if one is not already in flight.
