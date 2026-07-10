@@ -1275,6 +1275,218 @@ def _dispatch_audit_of(
     return
 
 
+def _dispatch_milestone_chat_of(
+    *,
+    machine: str,
+    repo: str,
+    model: str | None,
+    dry_run: bool,
+    milestone_chat_of: str,
+    add_child: str | None,
+    cfg: Config,
+    machine_obj: object,
+    repo_cfg: object,
+    provider: object,
+    _is_local: bool,
+) -> None:
+    """#1029: human-attended, genuine tmux-attached interactive milestone-chat
+    session — replaces the headless `claude -p` / SSE-overlay mechanism
+    (`coord/milestone_chat.py::dispatch_milestone_chat`, still used by the
+    remote/headless `coord milestone chat` CLI path and by
+    `dispatch_new_milestone_chat`'s `--new` flow, which stays out of scope).
+
+    Mirrors `_dispatch_audit_of`'s shape: the target (`milestone_chat_of`) is
+    a GitHub issue number — the milestone's tracking issue — not a board
+    work-assignment id, so there is no board lookup. The milestone/issue
+    resolution and seed-briefing content are shared with the headless path
+    via `coord.milestone_chat.resolve_milestone_chat_briefing` so the two
+    dispatch mechanisms can never drift apart on what the agent is told.
+
+    `--system-prompt`/`--allowedTools` are deliberately NOT passed to
+    `provider.build_command` — `ClaudePtyProvider.build_command` already has
+    a `spec.type == "milestone-chat"` branch (added for the headless path)
+    that supplies `MILESTONE_CHAT_SYSTEM_PROMPT` +
+    `build_deny_prompt(MILESTONE_CHAT_DENY_COMMANDS)` and `Read,Bash` tools
+    automatically from `spec.type` alone.
+    """
+    import tempfile as _tempfile  # noqa: PLC0415
+    import time as _time  # noqa: PLC0415
+    import uuid as _uuid  # noqa: PLC0415
+
+    from coord.interactive import (  # noqa: PLC0415
+        finalize_interactive_exit,
+        launch_human_attended_interactive,
+        tmux_available as _tmux_avail,
+        tmux_session_alive as _tmux_alive,
+        tmux_session_name as _tmux_name,
+    )
+    from coord.milestone_chat import resolve_milestone_chat_briefing  # noqa: PLC0415
+    from coord.board_service import read_board as _read_board_mc  # noqa: PLC0415
+    from coord.board_service import write_board as _write_board_mc  # noqa: PLC0415
+    from coord.models import Assignment as _AssignmentMc  # noqa: PLC0415
+    from coord.state import record_dispatched_assignment as _record_mc  # noqa: PLC0415
+    from coord.agent import AssignmentSpec as _AssignmentSpecMc  # noqa: PLC0415
+
+    if not _is_local:
+        click.echo(
+            "error: --milestone-chat-of is local-only for now; run it on the "
+            "machine that holds the checkout.",
+            err=True,
+        )
+        sys.exit(2)
+
+    try:
+        tracking_issue = int(milestone_chat_of)
+    except ValueError:
+        click.echo(
+            f"error: --milestone-chat-of {milestone_chat_of!r} must be a GitHub "
+            "issue number (the milestone's tracking issue).",
+            err=True,
+        )
+        sys.exit(2)
+
+    add_child_issue: int | None = None
+    if add_child is not None:
+        try:
+            add_child_issue = int(add_child)
+        except ValueError:
+            click.echo(
+                f"error: --add-child {add_child!r} must be a GitHub issue number.",
+                err=True,
+            )
+            sys.exit(2)
+
+    try:
+        ctx = resolve_milestone_chat_briefing(
+            repo, tracking_issue, cfg, add_child_issue=add_child_issue,
+        )
+    except RuntimeError as e:
+        click.echo(f"error: {e}", err=True)
+        sys.exit(1)
+
+    mc_repo_path = str(
+        Path(machine_obj.repo_path(repo) or str(Path.cwd())).expanduser()
+    )
+    mc_default_branch = repo_cfg.default_branch or "main"
+    resolved_model = model if model else cfg.models.default
+    assignment_id = _uuid.uuid4().hex[:12]
+
+    # Write the full briefing to a temp file and pre-fill only a SHORT
+    # single-line seed pointing at it — mirrors `_run_troubleshoot_or_chat`'s
+    # rationale: a multi-KB multi-line paste over the embedded-terminal /
+    # tmux path is less reliable than a short one, and this degrades
+    # gracefully (the operator can open the file by hand if the paste misses).
+    _mc_brief_path = str(
+        Path(_tempfile.gettempdir()) / f"coord-milestone-chat-{tracking_issue}.md"
+    )
+    Path(_mc_brief_path).write_text(ctx.briefing, encoding="utf-8")
+    if add_child_issue is not None:
+        seed_prompt = (
+            f"Milestone chat for {repo} #{tracking_issue} ({ctx.milestone_title}): "
+            f"read the full context at {_mc_brief_path} — it includes candidate "
+            f"sub-issue #{add_child_issue}. Discuss whether it belongs under this "
+            "epic and, once I confirm, run the `coord milestone add-child` splice "
+            "described there."
+        )
+    else:
+        seed_prompt = (
+            f"Milestone chat for {repo} #{tracking_issue} ({ctx.milestone_title}): "
+            f"read the full context at {_mc_brief_path} (tracking issue body, open "
+            "issues under the milestone, current work order) and let's talk it "
+            "through. Once I confirm a work order / edit / assignment, write it "
+            "with the exact `coord milestone ...` command described there."
+        )
+
+    spec = _AssignmentSpecMc(
+        repo_name=repo,
+        repo_path=mc_repo_path,
+        issue_number=tracking_issue,
+        issue_title=f"[milestone-chat] {ctx.tracking_title}",
+        briefing=ctx.briefing,
+        model=resolved_model,
+        type="milestone-chat",
+        provider="claude-pty",
+    )
+    # No explicit system_prompt/allowed_tools: ClaudePtyProvider.build_command's
+    # spec.type == "milestone-chat" branch supplies MILESTONE_CHAT_SYSTEM_PROMPT
+    # + the deny-list + Read,Bash automatically.
+    argv = provider.build_command(spec, resolved_model=resolved_model)
+
+    click.echo(
+        f"{machine} (local TTY) → MILESTONE CHAT #{tracking_issue}: "
+        f"{ctx.milestone_title}"
+    )
+    click.echo(
+        "  mode: HUMAN-ATTENDED interactive milestone chat "
+        "(live checkout, no claim, no worktree) (#1029)"
+    )
+    click.echo(f"  assignment id: {assignment_id}  (milestone_chat_of={tracking_issue})")
+    if add_child_issue is not None:
+        click.echo(f"  add-child candidate: #{add_child_issue}")
+    click.echo(f"  cwd: {mc_repo_path} (live checkout — read-only, no worktree)")
+    if dry_run:
+        click.echo("  (dry run — not launched)")
+        click.echo(f"  would exec: {argv}")
+        return
+
+    mc_assignment = _AssignmentMc(
+        machine_name=machine,
+        repo_name=repo,
+        issue_number=tracking_issue,
+        issue_title=f"[milestone-chat] {ctx.tracking_title}",
+        briefing=ctx.briefing,
+        assignment_id=assignment_id,
+        status="running",
+        dispatched_at=_time.time(),
+        type="milestone-chat",
+        model=resolved_model,
+        provider_name="claude-pty",
+    )
+    _record_mc(assignment=mc_assignment, repo_github=repo_cfg.github)
+    _write_board_mc(_read_board_mc())
+    os.environ["COORD_ASSIGNMENT_ID"] = assignment_id
+
+    started_at = _time.time()
+    exit_code = launch_human_attended_interactive(
+        argv,
+        seed_prompt,
+        assignment_id=assignment_id,
+        cwd=mc_repo_path,
+    )
+    if exit_code != 0:
+        click.echo(f"  claude exited with status {exit_code}", err=True)
+
+    _sname = _tmux_name(assignment_id) if _tmux_avail() else None
+    if _sname and _tmux_alive(_sname):
+        click.echo(
+            f"  session still running in tmux: {_sname}\n"
+            f"  reattach with:  coord reattach {assignment_id}"
+        )
+        sys.exit(0)
+
+    # worktree_path=None: read-only, live checkout — never push/remove it.
+    try:
+        finalize_interactive_exit(
+            assignment_id=assignment_id,
+            repo_name=repo,
+            repo_github=repo_cfg.github,
+            issue_number=tracking_issue,
+            machine_name=machine,
+            worktree_path=None,
+            base_branch=mc_default_branch,
+            exit_code=exit_code,
+            started_at=started_at,
+            log_path=None,
+            repo_path=None,
+        )
+    except Exception as exc:  # noqa: BLE001 — best-effort backstop
+        click.echo(
+            f"  warning: backstop failed to record milestone-chat exit: {exc}",
+            err=True,
+        )
+    return
+
+
 def _run_troubleshoot_or_chat(
     is_chat: bool,
     *,

@@ -23,6 +23,7 @@ from coord.commands.dispatch_workers import (
     _dispatch_headless,
     _dispatch_interactive_work,
     _dispatch_merge_of,
+    _dispatch_milestone_chat_of,
     _dispatch_review_of,
     _dispatch_rework_of,
     _dispatch_smoke_of,
@@ -560,6 +561,39 @@ def approve(
 )
 
 
+@click.option(
+    "--milestone-chat-of",
+    "milestone_chat_of",
+    default=None,
+    help=(
+        "#1029: launch a human-attended interactive MILESTONE CHAT for the "
+        "milestone's tracking issue <TRACKING_ISSUE> — a genuine tmux-attached "
+        "`claude` session, replacing the old headless `claude -p` / SSE-overlay "
+        "mechanism. Resolves the milestone/tracking-issue context the same way "
+        "the headless `coord milestone chat` CLI path does (shared via "
+        "`coord.milestone_chat.resolve_milestone_chat_briefing`), and may write "
+        "a `## Work order` block / edit the milestone / add a sub-issue via "
+        "`coord milestone ...` once you confirm in conversation — never raw "
+        "`gh`. Runs in the LIVE checkout with NO claim and NO worktree; "
+        "type=milestone-chat. Requires --interactive; local-only for now (the "
+        "headless path remains available for remote machines via `coord "
+        "milestone chat`)."
+    ),
+)
+
+
+@click.option(
+    "--add-child",
+    "chat_add_child",
+    default=None,
+    help=(
+        "#1029: paired with --milestone-chat-of — seeds an 'Add sub-issue' "
+        "milestone chat for candidate child issue <ISSUE> (mirrors `coord "
+        "milestone chat --add-child`). Ignored without --milestone-chat-of."
+    ),
+)
+
+
 def assign(
     machine: str,
     repo: str,
@@ -583,6 +617,8 @@ def assign(
     smoke_of: str | None,
     merge_of: str | None,
     audit_of: str | None,
+    milestone_chat_of: str | None,
+    chat_add_child: str | None,
 ) -> None:
     cfg = _load_config(config_path)
 
@@ -701,8 +737,17 @@ def assign(
         click.echo("error: --audit-of requires --interactive", err=True)
         sys.exit(2)
 
+    # #1029: --milestone-chat-of (interactive milestone chat) — same shape.
+    if milestone_chat_of is not None and not interactive:
+        click.echo("error: --milestone-chat-of requires --interactive", err=True)
+        sys.exit(2)
+    if chat_add_child is not None and milestone_chat_of is None:
+        click.echo("error: --add-child requires --milestone-chat-of", err=True)
+        sys.exit(2)
+
     # All interactive flavours are mutually exclusive — a dispatch is exactly
-    # one shape (review / fix / troubleshoot / rework / smoke / merge / audit).
+    # one shape (review / fix / troubleshoot / rework / smoke / merge / audit /
+    # milestone-chat).
     _interactive_flavours = [
         ("--review-of", review_of is not None),
         ("--fix-of", fix_of is not None),
@@ -712,6 +757,7 @@ def assign(
         ("--smoke-of", smoke_of is not None),
         ("--merge-of", merge_of is not None),
         ("--audit-of", audit_of is not None),
+        ("--milestone-chat-of", milestone_chat_of is not None),
     ]
     _set_flavours = [name for name, on in _interactive_flavours if on]
     if len(_set_flavours) > 1:
@@ -823,6 +869,15 @@ def assign(
                 cfg=cfg, machine_obj=machine_obj, repo_cfg=repo_cfg,
                 provider=provider, _is_local=_is_local,
                 _issue_ctx=_issue_ctx,
+            )
+            return
+        if milestone_chat_of is not None:
+            _dispatch_milestone_chat_of(
+                machine=machine, repo=repo, model=model,
+                dry_run=dry_run, milestone_chat_of=milestone_chat_of,
+                add_child=chat_add_child,
+                cfg=cfg, machine_obj=machine_obj, repo_cfg=repo_cfg,
+                provider=provider, _is_local=_is_local,
             )
             return
 

@@ -1653,6 +1653,90 @@ impl CoordApp {
         }
     }
 
+    /// #1029: launch (or reattach to) an interactive milestone-chat session
+    /// for an EXISTING milestone's tracking issue — the "Open milestone
+    /// chat" / "Add sub-issue via chat…" entries on the Milestone DAG
+    /// panel's context menu.  Unlike the per-pipeline-issue interactive
+    /// launchers (`launch_interactive_session_for_selected_issue` and
+    /// friends), the target here is a `MilestoneHeader` context-menu target,
+    /// not "the selected pipeline issue" — so this fires into the
+    /// STANDALONE Terminal pane (`self.terminal_session`), mirroring
+    /// `launch_merge_queue_interactive`'s shape, rather than the pipeline
+    /// card's per-issue detail-terminal machinery (which is tied to the
+    /// Work → Test → Review → Merge stage-advance flow that milestone chat
+    /// is not part of).
+    ///
+    /// Reattach: if a `type="milestone-chat"` session is already running for
+    /// `(repo, tracking_issue)`, delegate straight to
+    /// [`Self::reattach_session_by_aid`] — zero new reattach code, and the
+    /// operator lands back in the SAME conversation instead of a duplicate
+    /// (#1029 bug #4). Otherwise build a fresh `coord assign --interactive
+    /// --milestone-chat-of …` line via [`build_milestone_chat_launch_cmd`]
+    /// and spawn/reuse the standalone terminal exactly as
+    /// `reattach_session_by_aid` does.
+    pub(crate) fn launch_milestone_chat_session(
+        &mut self,
+        repo: String,
+        tracking_issue: u64,
+        add_child: Option<u64>,
+    ) {
+        if let Some(aid) =
+            self.reattachable_session_aid(tracking_issue, &repo, InteractiveLaunchMode::MilestoneChat)
+        {
+            self.reattach_session_by_aid(&aid);
+            return;
+        }
+
+        let cfg_path = self
+            .command_runner
+            .config_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned());
+        let machine = self.data.local_machine.clone();
+        let launch_line = build_milestone_chat_launch_cmd(
+            cfg_path.as_deref(),
+            &machine,
+            &repo,
+            tracking_issue,
+            add_child,
+        );
+
+        // #955: a selected Terminal-tree leaf takes over the main pane — clear
+        // the selection so the bare-shell pane this writes into is visible
+        // (mirrors `reattach_session_by_aid` / `launch_merge_queue_interactive`).
+        self.terminal_tree_selected = None;
+        self.active_view = SidebarView::Terminal;
+
+        if let Some(ref mut sess) = self.terminal_session {
+            sess.send_str(&launch_line);
+        } else {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+            let shell = quadraui::terminal_engine::default_shell();
+            match quadraui::terminal_engine::TerminalSession::spawn(80, 24, &shell, &cwd, 10_000) {
+                Ok(mut sess) => {
+                    sess.send_str(&launch_line);
+                    self.terminal_session = Some(sess);
+                    self.terminal_spawn_error = None;
+                }
+                Err(e) => {
+                    self.terminal_spawn_error = Some(e.to_string());
+                    self.push_toast(
+                        "Milestone chat",
+                        &format!("Failed to spawn terminal: {}", e),
+                        ToastSeverity::Error,
+                    );
+                    return;
+                }
+            }
+        }
+        self.terminal_focused = true;
+        self.push_toast(
+            "Milestone chat",
+            &format!("Launching interactive milestone chat for {} #{} …", repo, tracking_issue),
+            ToastSeverity::Info,
+        );
+    }
+
     /// #955: attach (or reuse a warm) local PTY running `coord terminal
     /// attach <machine:name>` for the fleet terminal identified by `key =
     /// (machine, name)`.  Mirrors `reattach_session_by_aid`'s pattern for
@@ -2506,6 +2590,10 @@ impl CoordApp {
                     // #885: Audit is a standalone read-only analysis — it never
                     // feeds Work → Test → Review → Merge, so nothing to arm.
                     InteractiveLaunchMode::Audit => {}
+                    // #1029: MilestoneChat never reaches this function (it has
+                    // its own dedicated launcher, `launch_milestone_chat_session`)
+                    // — arm included only for match exhaustiveness.
+                    InteractiveLaunchMode::MilestoneChat => {}
                 }
 
                 let status_msg = if maybe_live_session.is_some() {
@@ -2521,6 +2609,9 @@ impl CoordApp {
                         InteractiveLaunchMode::Merge => "merge",
                         InteractiveLaunchMode::Chat => "chat",
                         InteractiveLaunchMode::Audit => "audit",
+                        // #1029: never reached — MilestoneChat has its own
+                        // dedicated launcher; arm only for exhaustiveness.
+                        InteractiveLaunchMode::MilestoneChat => "milestone chat",
                     };
                     format!(
                         "Launching interactive {} session for {} #{} …",
@@ -2785,6 +2876,17 @@ pub(crate) enum InteractiveLaunchMode {
     /// no separate work_aid is needed. Emits `coord assign --interactive
     /// --audit-of <issue_num> …`.
     Audit,
+    /// #1029: human-attended MILESTONE CHAT for an existing milestone's
+    /// tracking issue — a genuine tmux-attached `claude` session, replacing
+    /// the old headless `claude -p` / SSE-chat-overlay mechanism. Like
+    /// Chat/Troubleshoot/Audit: local-only, no claim/worktree — the target IS
+    /// the milestone's tracking issue, so no separate work_aid is needed.
+    /// UNLIKE Chat/Troubleshoot/Audit, it DOES reattach (re-opening "Open
+    /// milestone chat" on an already-running session must resume it, not
+    /// spawn a duplicate — the whole point of #1029). Emits `coord assign
+    /// --interactive --milestone-chat-of <tracking_issue> [--add-child <n>]
+    /// …`.
+    MilestoneChat,
 }
 
 /// #486: short verb for an interactive launch mode — used in the machine-picker
@@ -2800,6 +2902,7 @@ pub(crate) fn interactive_mode_verb(mode: InteractiveLaunchMode) -> &'static str
         InteractiveLaunchMode::Merge => "merge",
         InteractiveLaunchMode::Chat => "chat",
         InteractiveLaunchMode::Audit => "audit",
+        InteractiveLaunchMode::MilestoneChat => "milestone chat",
     }
 }
 
@@ -2820,6 +2923,10 @@ pub(crate) fn interactive_mode_assignment_type(mode: InteractiveLaunchMode) -> &
         // Chat never reattaches (callers guard); sentinel matches nothing.
         InteractiveLaunchMode::Chat => "chat",
         InteractiveLaunchMode::Audit => "audit",
+        // #1029: MilestoneChat DOES reattach — this must match the board
+        // `type="milestone-chat"` row so reopening "Open milestone chat" on a
+        // still-running session resumes it instead of spawning a duplicate.
+        InteractiveLaunchMode::MilestoneChat => "milestone-chat",
     }
 }
 
@@ -2968,7 +3075,52 @@ pub(crate) fn build_interactive_launch_cmd(
                 cfg, issue_num, m, r, issue_num,
             )
         }
+        // #1029: MilestoneChat is dispatched from the Milestone DAG panel's
+        // context menu (a `MilestoneHeader` target), never from "the
+        // selected pipeline issue" this function resolves its args from —
+        // it has its own dedicated launcher/builder
+        // (`launch_milestone_chat_session` / `build_milestone_chat_launch_cmd`)
+        // and must never reach this one.
+        InteractiveLaunchMode::MilestoneChat => unreachable!(
+            "MilestoneChat mode must not reach build_interactive_launch_cmd — \
+             handle it in launch_milestone_chat_session with \
+             build_milestone_chat_launch_cmd"
+        ),
     }
+}
+
+/// #1029: Build the single-line shell command that launches (or, via a
+/// running-session reattach elsewhere, resumes) an interactive milestone
+/// chat for an EXISTING milestone's tracking issue.  Unlike
+/// Troubleshoot/Chat, the seed content is resolved entirely server-side
+/// (`coord.milestone_chat.resolve_milestone_chat_briefing`, fetched fresh
+/// from GitHub) — mirroring `--audit-of` — so no briefing file needs to be
+/// written or passed from the TUI.  `add_child` is `Some(n)` for the "Add
+/// sub-issue via chat…" entry point, `None` for plain "Open milestone chat".
+pub(crate) fn build_milestone_chat_launch_cmd(
+    config_path: Option<&str>,
+    machine: &str,
+    repo: &str,
+    tracking_issue: u64,
+    add_child: Option<u64>,
+) -> String {
+    let cfg = match config_path {
+        Some(p) if !p.is_empty() => format!("--config {} ", shell_quote_arg(p)),
+        _ => String::new(),
+    };
+    let child_flag = match add_child {
+        Some(n) => format!("--add-child {} ", n),
+        None => String::new(),
+    };
+    format!(
+        "coord assign {}--interactive --milestone-chat-of {} {}{} {} {}\r",
+        cfg,
+        tracking_issue,
+        child_flag,
+        shell_quote_arg(machine),
+        shell_quote_arg(repo),
+        tracking_issue,
+    )
 }
 
 /// #569: Build the single-line shell command that launches a read-only
