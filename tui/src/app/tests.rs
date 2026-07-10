@@ -14827,13 +14827,15 @@
         );
     }
 
-    /// #1022: With TWO Test (smoke) rows for the same issue (a fail → fix →
-    /// re-test cycle), the reason text must render exactly once — under the
-    /// LAST Test row only — even though an earlier Test row's linked work
-    /// assignment also carries a `test_reason`. Each Test row still shows its
-    /// own linked verdict badge.
+    /// #1022: With TWO independent fix iterations (work1 fail → fix → work2
+    /// pass), each iteration's Test row links a *different* work assignment,
+    /// each carrying its own distinct `test_reason`. Per the issue's design
+    /// goal ("each stage owns its own status"), BOTH reasons must render —
+    /// each exactly once, under its own iteration's Test row. Neither is
+    /// suppressed just because a later iteration exists. Each Test row also
+    /// shows its own linked verdict badge.
     #[test]
-    fn summary_tab_reason_renders_once_under_last_test_row_only() {
+    fn summary_tab_each_iteration_reason_renders_under_its_own_test_row() {
         use quadraui::tui::testing::driver_with_shell;
 
         let mut work1 = make_assignment_typed("done", 42, "api", Some("work"));
@@ -14886,14 +14888,33 @@
         let driver = driver_with_shell(app, CoordApp::shell_config(), 120, 60);
         let screen = driver.screen();
 
-        assert!(
-            !screen.contains("FIRST_ITER_FAILURE_TEXT"),
-            "#1022: only the LAST Test row's reason should render:\n{}",
+        // Each iteration owns its own reason — both must render, each exactly
+        // once. The earlier iteration's reason must NOT be suppressed just
+        // because a later iteration's Test row exists (the fix-2 regression).
+        assert_eq!(
+            screen.matches("FIRST_ITER_FAILURE_TEXT").count(),
+            1,
+            "#1022: the first iteration's reason must render exactly once, under its own Test row:\n{}",
             screen,
         );
+        assert_eq!(
+            screen.matches("SECOND_ITER_SUCCESS_TEXT").count(),
+            1,
+            "#1022: the second iteration's reason must render exactly once, under its own Test row:\n{}",
+            screen,
+        );
+        // Each reason sits under its own iteration's Test row. work1/test1
+        // (failed) render before work2/test2 (passed), so FIRST must precede
+        // SECOND on screen.
+        let first_idx = screen
+            .find("FIRST_ITER_FAILURE_TEXT")
+            .expect("first iteration's reason must be present");
+        let second_idx = screen
+            .find("SECOND_ITER_SUCCESS_TEXT")
+            .expect("second iteration's reason must be present");
         assert!(
-            screen.contains("SECOND_ITER_SUCCESS_TEXT"),
-            "#1022: the LAST Test row's reason must render:\n{}",
+            first_idx < second_idx,
+            "#1022: each reason must render under its own iteration's Test row (chronological order):\n{}",
             screen,
         );
         // Both Test rows still show their own linked verdict badge.
@@ -14905,6 +14926,66 @@
         assert!(
             screen.contains("passed ✓"),
             "second Test row's linked verdict missing:\n{}",
+            screen,
+        );
+    }
+
+    /// #1022: The illustrative case in the issue — ONE work commit re-tested
+    /// multiple times (all Test rows link the SAME work assignment, one shared
+    /// verdict/reason). Here the reason must still render exactly ONCE, under
+    /// the last Test row, since all rows share a single verdict source.
+    #[test]
+    fn summary_tab_shared_source_reason_renders_once_under_last_test_row() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut work1 = make_assignment_typed("done", 42, "api", Some("work"));
+        work1.id = "work-1".to_string();
+        work1.dispatched_at = Some(1_000_000.0);
+        work1.finished_at = Some(1_000_500.0);
+        work1.test_state = Some("failed".to_string());
+        work1.test_reason = Some("SHARED_RETEST_REASON".to_string());
+
+        // Two Test rows, both linking the SAME work assignment (re-test cycle).
+        let mut test1 = make_assignment_typed("done", 42, "api", Some("smoke"));
+        test1.id = "test-1".to_string();
+        test1.dispatched_at = Some(1_001_000.0);
+        test1.finished_at = Some(1_001_500.0);
+        test1.review_of_assignment_id = Some("work-1".to_string());
+
+        let mut test2 = make_assignment_typed("done", 42, "api", Some("smoke"));
+        test2.id = "test-2".to_string();
+        test2.dispatched_at = Some(1_002_000.0);
+        test2.finished_at = Some(1_002_500.0);
+        test2.review_of_assignment_id = Some("work-1".to_string());
+
+        let data = BoardData {
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            assignments: vec![work1, test1, test2],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 42,
+            title: "Issue 42".to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: false,
+        }];
+        app.rebuild_pipeline_sidebar(None);
+        app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_detail_tab = PipelineDetailTab::Summary;
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 120, 60);
+        let screen = driver.screen();
+
+        assert_eq!(
+            screen.matches("SHARED_RETEST_REASON").count(),
+            1,
+            "#1022: a shared verdict source's reason must render exactly once (not once per Test row):\n{}",
             screen,
         );
     }
