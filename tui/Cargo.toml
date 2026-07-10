@@ -15,6 +15,17 @@ name = "coord-tui-gtk"
 path = "src/bin/gtk.rs"
 required-features = ["gtk"]
 
+# #1042: tui/tests/acceptance.rs is entirely `#![cfg(feature = "test-support")]`.
+# Without this stanza, the configured Gate-A driver invocation (which never
+# passes `--features test-support`; see docs/ORACLE_LOOP.md) silently compiles
+# the target down to zero tests and reports a vacuous "0 passed" success.
+# Pinning `required-features` here converts that into a loud build failure
+# instead, forcing whoever owns the driver invocation to add the flag before
+# Gate-A can even build.
+[[test]]
+name = "acceptance"
+required-features = ["test-support"]
+
 [features]
 # Enables the GTK4 backend in quadraui and the coord-tui-gtk binary.
 # Requires GTK4 development libraries on the build host.
