@@ -1954,6 +1954,50 @@
         assert!(cmd.ends_with('\r'), "launcher must auto-run");
     }
 
+    /// #1029: "Open milestone chat" (no add-child) emits `--milestone-chat-of
+    /// <tracking_issue>` with no `--add-child` flag, targeting the same issue
+    /// number as the trailing positional (mirrors Audit's shape — no separate
+    /// work_aid).
+    #[test]
+    fn build_milestone_chat_launch_cmd_plain_emits_milestone_chat_of() {
+        let cmd = build_milestone_chat_launch_cmd(None, "m", "api", 973, None);
+        assert!(
+            cmd.contains("--milestone-chat-of 973"),
+            "must emit --milestone-chat-of <tracking_issue>, got: {cmd}",
+        );
+        assert!(!cmd.contains("--add-child"), "plain open must not carry --add-child: {cmd}");
+        assert!(cmd.contains("--interactive"));
+        assert!(cmd.trim_end().ends_with("api 973"), "must target the same issue number: {cmd}");
+        assert!(cmd.ends_with('\r'), "launcher must auto-run");
+    }
+
+    /// #1029: "Add sub-issue via chat…" additionally carries `--add-child
+    /// <candidate_issue>`.
+    #[test]
+    fn build_milestone_chat_launch_cmd_add_child_emits_both_flags() {
+        let cmd = build_milestone_chat_launch_cmd(None, "m", "api", 973, Some(1050));
+        assert!(cmd.contains("--milestone-chat-of 973"), "got: {cmd}");
+        assert!(cmd.contains("--add-child 1050"), "got: {cmd}");
+        assert!(cmd.ends_with('\r'), "launcher must auto-run");
+    }
+
+    /// #1029: `--config` is injected the same way every other interactive
+    /// launcher does.
+    #[test]
+    fn build_milestone_chat_launch_cmd_injects_config_path() {
+        let cmd = build_milestone_chat_launch_cmd(
+            Some("/home/john/coordinator.yml"),
+            "m",
+            "api",
+            973,
+            None,
+        );
+        assert!(
+            cmd.contains("--config /home/john/coordinator.yml"),
+            "got: {cmd}",
+        );
+    }
+
     /// #885: fixture for the "Audit outcomes" black-box menu test — one
     /// epic-labelled row (index 0) and one ordinary row (index 1), with
     /// the Pipeline sidebar already selected and focused on `selected_idx`.
@@ -11254,6 +11298,12 @@
         );
         // #885: Audit's verb, used in the machine-picker prompt/dialog title.
         assert_eq!(interactive_mode_verb(InteractiveLaunchMode::Audit), "audit");
+        // #1029: MilestoneChat's verb (never actually shown — no machine
+        // picker for a local-only mode — but must exist for exhaustiveness).
+        assert_eq!(
+            interactive_mode_verb(InteractiveLaunchMode::MilestoneChat),
+            "milestone chat"
+        );
     }
 
     #[test]
@@ -11270,6 +11320,44 @@
         // a running work/review/smoke/merge session, and nothing else
         // reattaches into a running audit session.
         assert_eq!(interactive_mode_assignment_type(InteractiveLaunchMode::Audit), "audit");
+        // #1029: MilestoneChat is its own board assignment type too — and
+        // UNLIKE Chat/Troubleshoot/Audit it DOES reattach (see
+        // `milestone_chat_reattaches_to_running_session` below).
+        assert_eq!(
+            interactive_mode_assignment_type(InteractiveLaunchMode::MilestoneChat),
+            "milestone-chat"
+        );
+    }
+
+    /// #1029: unlike Chat/Troubleshoot/Audit (which never reattach — callers
+    /// guard), MilestoneChat MUST reattach to an already-running
+    /// `type="milestone-chat"` session for the same (repo, tracking_issue) —
+    /// the whole point of #1029 bug #4 ("Open milestone chat" on an
+    /// already-running session must resume it, not spawn a duplicate).
+    #[test]
+    fn milestone_chat_reattaches_to_running_session() {
+        let mc = make_assignment_typed("running", 973, "api", Some("milestone-chat"));
+        let aid = mc.id.clone();
+        let mut app = make_app_with_assignments(vec![mc]);
+        app.live_tmux_sessions.push(LiveTmuxSession {
+            assignment_id: aid.clone(),
+            issue_number: Some(973),
+            repo_name: Some("api".to_string()),
+            issue_title: None,
+            machine: None,
+            pane_dead: false,
+            pending_sweep_count: 0,
+        });
+
+        assert_eq!(
+            app.reattachable_session_aid(973, "api", InteractiveLaunchMode::MilestoneChat),
+            Some(aid),
+        );
+        // A DIFFERENT running type for the same issue must not match.
+        assert_eq!(
+            app.reattachable_session_aid(973, "api", InteractiveLaunchMode::Review),
+            None,
+        );
     }
 
     #[test]
@@ -25086,10 +25174,16 @@ Milestone tracking issue.
         }
     }
 
-    /// #1003: "Open milestone chat" spawns `coord milestone chat <repo>
-    /// <tracking_issue>`.
+    /// #1003, #1029: "Open milestone chat" launches a genuine tmux-attached
+    /// interactive session (`coord assign --interactive --milestone-chat-of
+    /// <tracking_issue> …`) rather than the old headless `coord milestone
+    /// chat <repo> <tracking_issue>` dispatch — see
+    /// `open_milestone_chat_action_launches_interactive_tmux_session` for the
+    /// full round-trip assertion; this one just confirms the same holds for
+    /// the `make_milestone_dag_app` fixture the sibling CRUD-menu tests use.
     #[test]
-    fn open_milestone_chat_action_spawns_milestone_chat_command() {
+    #[cfg(unix)]
+    fn open_milestone_chat_action_no_longer_spawns_headless_command() {
         let mut app = make_milestone_dag_app();
         app.command_runner = crate::commands::CommandRunner::new_for_test();
         let target = ContextMenuTarget::MilestoneHeader {
@@ -25099,15 +25193,11 @@ Milestone tracking issue.
             milestone_number: 5,
         };
         assert!(app.open_milestone_chat_action(&target));
-        assert_eq!(
-            app.command_runner.spawned_calls,
-            vec![vec![
-                "milestone".to_string(),
-                "chat".to_string(),
-                "coord-repo".to_string(),
-                "100".to_string(),
-            ]],
+        assert!(
+            app.command_runner.spawned_calls.is_empty(),
+            "should not use the headless spawn_queued dispatch path",
         );
+        assert_eq!(app.active_view, SidebarView::Terminal);
     }
 
     /// #1003: "Dispatch next…" computes the ready frontier client-side
@@ -25499,13 +25589,23 @@ Milestone tracking issue.
         assert!(input.buf.is_empty());
     }
 
-    /// #1017: a bare candidate issue number spawns `coord milestone chat
-    /// <repo> <tracking_issue> --add-child <issue>` — the chat-driven
-    /// sibling of #1008's direct `add-child` dispatch.
+    /// #1029: a bare candidate issue number now launches a genuine
+    /// tmux-attached interactive session via `launch_milestone_chat_session`
+    /// (`coord assign --interactive --milestone-chat-of <tracking_issue>
+    /// --add-child <issue> …`) instead of the old headless `coord milestone
+    /// chat --add-child` dispatch.
     #[test]
-    fn add_sub_issue_chat_flow_spawns_milestone_chat_with_add_child_flag() {
+    #[cfg(unix)]
+    fn add_sub_issue_chat_flow_launches_interactive_session_with_add_child_flag() {
+        use std::time::{Duration, Instant};
+
         let mut app = make_milestone_dag_app();
         app.command_runner = crate::commands::CommandRunner::new_for_test();
+        let cwd = std::env::temp_dir();
+        let sess = quadraui::terminal_engine::TerminalSession::spawn(80, 24, "/bin/sh", &cwd, 1000)
+            .expect("spawn /bin/sh");
+        app.terminal_session = Some(sess);
+
         let target = ContextMenuTarget::MilestoneHeader {
             repo_name: "coord-repo".to_string(),
             tracking_issue: 100,
@@ -25517,24 +25617,46 @@ Milestone tracking issue.
         input.buf = "1050".to_string();
         app.submit_milestone_row_input(input);
 
-        assert_eq!(
-            app.command_runner.spawned_calls,
-            vec![vec![
-                "milestone".to_string(),
-                "chat".to_string(),
-                "coord-repo".to_string(),
-                "100".to_string(),
-                "--add-child".to_string(),
-                "1050".to_string(),
-            ]],
+        // No more headless spawn_queued dispatch or overlay arming.
+        assert!(app.command_runner.spawned_calls.is_empty());
+        assert!(app.pending_milestone_chat.is_none());
+        assert_eq!(app.active_view, SidebarView::Terminal);
+
+        let start = Instant::now();
+        let mut found = false;
+        while start.elapsed() < Duration::from_secs(5) {
+            app.terminal_session.as_mut().unwrap().poll();
+            if app
+                .terminal_session
+                .as_ref()
+                .unwrap()
+                .full_text()
+                .contains("--milestone-chat-of 100 --add-child 1050")
+            {
+                found = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            found,
+            "expected the milestone-chat-of/--add-child command line to echo \
+             in the pty; full_text={:?}",
+            app.terminal_session.as_ref().unwrap().full_text(),
         );
     }
 
-    /// #1017: `#1050` (leading `#`) parses the same as a bare number.
+    /// #1017/#1029: `#1050` (leading `#`) parses the same as a bare number.
     #[test]
+    #[cfg(unix)]
     fn add_sub_issue_chat_flow_strips_leading_hash() {
         let mut app = make_milestone_dag_app();
         app.command_runner = crate::commands::CommandRunner::new_for_test();
+        let cwd = std::env::temp_dir();
+        let sess = quadraui::terminal_engine::TerminalSession::spawn(80, 24, "/bin/sh", &cwd, 1000)
+            .expect("spawn /bin/sh");
+        app.terminal_session = Some(sess);
+
         let input = PendingMilestoneRowInput {
             kind: MilestoneRowInputKind::AddSubIssueChat,
             repo_name: "coord-repo".to_string(),
@@ -25545,17 +25667,10 @@ Milestone tracking issue.
         };
         app.submit_milestone_row_input(input);
 
-        assert_eq!(
-            app.command_runner.spawned_calls,
-            vec![vec![
-                "milestone".to_string(),
-                "chat".to_string(),
-                "coord-repo".to_string(),
-                "100".to_string(),
-                "--add-child".to_string(),
-                "1050".to_string(),
-            ]],
-        );
+        // Parsed fine (didn't bail on the leading `#`) and reached the
+        // interactive launcher rather than the old headless dispatch.
+        assert!(app.command_runner.spawned_calls.is_empty());
+        assert_eq!(app.active_view, SidebarView::Terminal);
     }
 
     /// #1017: a non-numeric candidate issue is rejected before spawning
@@ -25659,13 +25774,24 @@ Milestone tracking issue.
         assert_eq!(pending.issue_number, 0);
     }
 
-    /// #1017 (review fix): "Open milestone chat" arms `pending_milestone_chat`
-    /// keyed on the epic's tracking-issue number, and shells `coord milestone
-    /// chat <repo> <tracking_issue>`.
+    /// #1029: "Open milestone chat" now launches a genuine tmux-attached
+    /// interactive session (`coord assign --interactive --milestone-chat-of
+    /// <tracking_issue> …`) via `launch_milestone_chat_session`, instead of
+    /// the old headless `coord milestone chat <repo> <tracking_issue>`
+    /// dispatch + `pending_milestone_chat` overlay-arming (#1017) — that
+    /// machinery is retained only for `capture_plan_chat`'s `--new` (no
+    /// tracking issue yet) case.
     #[test]
-    fn open_milestone_chat_arms_pending_for_tracking_issue() {
+    #[cfg(unix)]
+    fn open_milestone_chat_action_launches_interactive_tmux_session() {
+        use std::time::{Duration, Instant};
+
         let mut app = make_test_app(make_plan_roster_board_data());
         app.command_runner = crate::commands::CommandRunner::new_for_test();
+        let cwd = std::env::temp_dir();
+        let sess = quadraui::terminal_engine::TerminalSession::spawn(80, 24, "/bin/sh", &cwd, 1000)
+            .expect("spawn /bin/sh");
+        app.terminal_session = Some(sess);
 
         let target = ContextMenuTarget::MilestoneHeader {
             repo_name: "api".to_string(),
@@ -25675,28 +25801,53 @@ Milestone tracking issue.
         };
         assert!(app.open_milestone_chat_action(&target));
 
-        assert_eq!(
-            app.command_runner.spawned_calls,
-            vec![vec![
-                "milestone".to_string(),
-                "chat".to_string(),
-                "api".to_string(),
-                "973".to_string(),
-            ]],
+        assert!(
+            app.command_runner.spawned_calls.is_empty(),
+            "should not use the headless spawn_queued dispatch path",
         );
-        let pending = app
-            .pending_milestone_chat
-            .as_ref()
-            .expect("open_milestone_chat_action should arm pending_milestone_chat");
-        assert_eq!(pending.repo, "api");
-        assert_eq!(pending.issue_number, 973);
+        assert!(
+            app.pending_milestone_chat.is_none(),
+            "should not arm the headless-overlay pending state for an existing milestone",
+        );
+        assert_eq!(app.active_view, SidebarView::Terminal);
+        assert!(app.terminal_focused);
+
+        let start = Instant::now();
+        let mut found = false;
+        while start.elapsed() < Duration::from_secs(5) {
+            app.terminal_session.as_mut().unwrap().poll();
+            if app
+                .terminal_session
+                .as_ref()
+                .unwrap()
+                .full_text()
+                .contains("--milestone-chat-of 973")
+            {
+                found = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            found,
+            "expected the milestone-chat-of command line to echo in the pty; \
+             full_text={:?}",
+            app.terminal_session.as_ref().unwrap().full_text(),
+        );
     }
 
     /// #1017 (review fix): once the `type="milestone-chat"` assignment row
     /// appears, `maybe_bind_pending_milestone_chat` opens the live chat
     /// overlay (`inject_chat`), routes to the Board Chat tab, and clears the
-    /// pending state — the operator can now converse in it. This is the crux
-    /// of the fix: no more headless one-shot the operator can't participate in.
+    /// pending state. #1029 moved "Open milestone chat" / "Add sub-issue via
+    /// chat…" (an EXISTING milestone) off this bind entirely onto a genuine
+    /// tmux-attached session — this bind/overlay machinery is now only
+    /// exercised by `capture_plan_chat`'s "New milestone via chat…" path
+    /// (`issue_number == 0`, no tracking issue yet, #1029 explicitly out of
+    /// scope), which still needs headless dispatch since there's no issue to
+    /// key a tmux session's identity on yet. Exercised here directly (rather
+    /// than via `capture_plan_chat`) purely to keep the bind function itself
+    /// covered independent of that caller.
     #[test]
     fn maybe_bind_pending_milestone_chat_attaches_overlay() {
         let mut app = make_test_app(make_plan_roster_board_data());

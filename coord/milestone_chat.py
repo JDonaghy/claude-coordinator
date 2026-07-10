@@ -30,6 +30,7 @@ confirmed the specific proposed change in conversation.
 """
 from __future__ import annotations
 
+import dataclasses
 import time
 import uuid
 
@@ -257,16 +258,31 @@ def build_new_milestone_chat_briefing(
     return "\n".join(parts)
 
 
-def dispatch_milestone_chat(
+@dataclasses.dataclass
+class MilestoneChatBriefing:
+    """Resolved milestone-chat context (#1029) — shared by the headless
+    (:func:`dispatch_milestone_chat`) and interactive
+    (``coord/commands/dispatch_workers.py::_dispatch_milestone_chat_of``)
+    dispatch paths so their seed prompts can never drift apart.
+    """
+
+    repo_github: str
+    tracking_title: str
+    milestone_title: str
+    milestone_number: int | None
+    briefing: str
+
+
+def resolve_milestone_chat_briefing(
     repo_name: str,
     tracking_issue_number: int,
     config: Config,
     *,
-    machine_override: str | None = None,
     add_child_issue: int | None = None,
-) -> tuple[str, str]:
-    """End-to-end: resolve the milestone, pick a machine, seed the
-    briefing, dispatch a ``type="milestone-chat"`` assignment.
+) -> MilestoneChatBriefing:
+    """Resolve the milestone/tracking-issue context and build the seed
+    briefing for a milestone-chat session (#1029 extraction — this used to
+    be the top half of :func:`dispatch_milestone_chat`, inlined).
 
     *add_child_issue* (#1017) is an optional candidate child issue number —
     when given, it's fetched and passed to
@@ -276,10 +292,9 @@ def dispatch_milestone_chat(
     --add-child`). Best-effort: a fetch failure falls back to a plain
     milestone chat rather than failing the whole dispatch.
 
-    Returns ``(assignment_id, machine_name)``. Raises ``RuntimeError`` when
-    the repo is unknown, the tracking issue can't be fetched or has no
-    milestone, no machine claims the repo, or the agent rejects the
-    dispatch.
+    Raises ``RuntimeError`` when the repo is unknown, the tracking issue
+    can't be fetched, or it has no milestone (and no ``add_child_issue`` to
+    fall back on).
     """
     repo_cfg = config.repo(repo_name)
     if repo_cfg is None:
@@ -309,27 +324,6 @@ def dispatch_milestone_chat(
         milestone_title = issue_data.get("title") or f"#{tracking_issue_number}"
     else:
         milestone_title = milestone.get("title") or f"#{milestone_number}"
-
-    # Pick the machine.
-    if machine_override:
-        machine = next(
-            (m for m in config.machines if m.name == machine_override),
-            None,
-        )
-        if machine is None:
-            raise RuntimeError(f"machine {machine_override!r} not in coordinator.yml")
-        if not machine.can_work_on(repo_name):
-            raise RuntimeError(
-                f"machine {machine_override!r} does not list repo {repo_name!r}"
-            )
-    else:
-        picked = pick_milestone_chat_machine(config, repo_name)
-        if picked is None:
-            raise RuntimeError(
-                f"no machine claims repo {repo_name!r} — milestone-chat needs a "
-                "machine that has the repo cloned"
-            )
-        machine = picked
 
     # A milestone-less epic (add-child path, see above) has no milestone to
     # scope issues to and no milestone metadata to fetch — skip both.
@@ -382,6 +376,66 @@ def dispatch_milestone_chat(
     )
 
     tracking_title = issue_data.get("title") or f"Milestone chat #{tracking_issue_number}"
+
+    return MilestoneChatBriefing(
+        repo_github=repo_cfg.github,
+        tracking_title=tracking_title,
+        milestone_title=milestone_title,
+        milestone_number=milestone_number,
+        briefing=briefing,
+    )
+
+
+def dispatch_milestone_chat(
+    repo_name: str,
+    tracking_issue_number: int,
+    config: Config,
+    *,
+    machine_override: str | None = None,
+    add_child_issue: int | None = None,
+) -> tuple[str, str]:
+    """End-to-end: resolve the milestone, pick a machine, seed the
+    briefing, dispatch a ``type="milestone-chat"`` assignment.
+
+    Returns ``(assignment_id, machine_name)``. Raises ``RuntimeError`` when
+    the repo is unknown, the tracking issue can't be fetched or has no
+    milestone, no machine claims the repo, or the agent rejects the
+    dispatch.
+    """
+    repo_cfg = config.repo(repo_name)
+    if repo_cfg is None:
+        raise RuntimeError(f"repo {repo_name!r} not in coordinator.yml")
+
+    ctx = resolve_milestone_chat_briefing(
+        repo_name,
+        tracking_issue_number,
+        config,
+        add_child_issue=add_child_issue,
+    )
+
+    # Pick the machine.
+    if machine_override:
+        machine = next(
+            (m for m in config.machines if m.name == machine_override),
+            None,
+        )
+        if machine is None:
+            raise RuntimeError(f"machine {machine_override!r} not in coordinator.yml")
+        if not machine.can_work_on(repo_name):
+            raise RuntimeError(
+                f"machine {machine_override!r} does not list repo {repo_name!r}"
+            )
+    else:
+        picked = pick_milestone_chat_machine(config, repo_name)
+        if picked is None:
+            raise RuntimeError(
+                f"no machine claims repo {repo_name!r} — milestone-chat needs a "
+                "machine that has the repo cloned"
+            )
+        machine = picked
+
+    briefing = ctx.briefing
+    tracking_title = ctx.tracking_title
     resolved_model = config.models.default
     proposal = Proposal(
         id=0,

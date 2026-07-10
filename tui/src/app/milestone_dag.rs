@@ -94,14 +94,14 @@ pub(crate) enum MilestoneRowInputKind {
     /// the shared bare-issue-number path the other two kinds use, since the
     /// buffer may carry more than just a number.
     AddSubIssue,
-    /// "Add sub-issue via chat…" (#1017) — a bare candidate issue number
-    /// (no `{group/after}` annotation here; that gets discussed live in the
-    /// chat instead of parsed client-side). Submitting calls `coord
-    /// milestone chat <repo> <tracking_issue> --add-child <issue>`, seeding
-    /// a `type="milestone-chat"` steward session with the epic body plus
-    /// the candidate issue (`build_milestone_chat_briefing`'s
-    /// `candidate_child_issue` seed mode). Parsed by
-    /// `submit_add_sub_issue_chat_input`.
+    /// "Add sub-issue via chat…" (#1017, #1029) — a bare candidate issue
+    /// number (no `{group/after}` annotation here; that gets discussed live
+    /// in the chat instead of parsed client-side). Submitting launches (or
+    /// reattaches to) a genuine tmux-attached interactive milestone chat via
+    /// `launch_milestone_chat_session`, seeding a `type="milestone-chat"`
+    /// session with the epic body plus the candidate issue
+    /// (`resolve_milestone_chat_briefing`'s `candidate_child_issue` seed
+    /// mode). Parsed by `submit_add_sub_issue_chat_input`.
     AddSubIssueChat,
 }
 
@@ -671,22 +671,22 @@ impl CoordApp {
         true
     }
 
-    /// "Open milestone chat" (#1003, #1017) — dispatch a
-    /// `type="milestone-chat"` steward session and arm `pending_milestone_chat`
-    /// so the next tick attaches the live chat overlay to it
-    /// (`maybe_bind_pending_milestone_chat`, mirroring refine-chat's
-    /// `maybe_bind_pending_refinement`). #1017 replaced the original
-    /// fire-and-forget dispatch — the operator now gets an actual attached,
-    /// interactive chat pane (Board Chat tab) they can converse in, not a
-    /// headless one-shot worker.
+    /// "Open milestone chat" (#1003, #1017, #1029) — launch (or reattach to)
+    /// a genuine tmux-attached interactive `claude` session via
+    /// [`Self::launch_milestone_chat_session`]. #1029 replaced the headless
+    /// `claude -p` / SSE-chat-overlay mechanism #1017 introduced — that
+    /// overlay never actually cleared its "worker exited" banner, locked out
+    /// board/tab navigation while open, and could spawn a duplicate session
+    /// on reopen. The tmux path fixes all of that by construction: the
+    /// terminal itself is the truth, reopening reattaches to the same
+    /// session, and there's no bespoke modal held open over the whole screen.
     pub(crate) fn open_milestone_chat_action(&mut self, target: &ContextMenuTarget) -> bool {
-        let (repo, tracking_issue, title) = match target {
+        let (repo, tracking_issue) = match target {
             ContextMenuTarget::MilestoneHeader {
                 repo_name,
                 tracking_issue,
-                milestone_title,
                 ..
-            } => (repo_name.clone(), *tracking_issue, milestone_title.clone()),
+            } => (repo_name.clone(), *tracking_issue),
             _ => {
                 self.push_toast(
                     "Open milestone chat",
@@ -696,29 +696,7 @@ impl CoordApp {
                 return false;
             }
         };
-        let issue_str = tracking_issue.to_string();
-        use crate::commands::SpawnQueuedOutcome;
-        let outcome = self
-            .command_runner
-            .spawn_queued(&["milestone", "chat", &repo, &issue_str]);
-        if outcome == SpawnQueuedOutcome::Deduped {
-            // Already running/queued — don't overwrite pending state or re-toast.
-            return false;
-        }
-        // #1017: arm the bind so the next tick attaches the live chat overlay
-        // to the new `type="milestone-chat"` session (was fire-and-forget).
-        self.pending_milestone_chat = Some(PendingMilestoneChat {
-            repo,
-            issue_number: tracking_issue,
-            label: title.clone(),
-            dispatched_at: Instant::now(),
-        });
-        let msg = if outcome == SpawnQueuedOutcome::Queued {
-            format!("{}: queued — chat opens after current command.", title)
-        } else {
-            format!("{}: opening steward chat…", title)
-        };
-        self.push_toast("Milestone chat", &msg, ToastSeverity::Info);
+        self.launch_milestone_chat_session(repo, tracking_issue, None);
         true
     }
 
@@ -1144,14 +1122,15 @@ impl CoordApp {
         }
     }
 
-    /// Parse + dispatch the "Add sub-issue via chat…" input (#1017): a bare
-    /// candidate issue number — unlike [`Self::submit_add_sub_issue_input`],
-    /// no `{group/after}` annotation grammar here; that gets proposed and
-    /// confirmed live in the chat instead. Fires `coord milestone chat
-    /// <repo> <tracking_issue> --add-child <issue>`, which seeds
-    /// `build_milestone_chat_briefing`'s "Add sub-issue" mode
-    /// (`coord/milestone_chat.py`) with the epic body plus the candidate
-    /// issue.
+    /// Parse + dispatch the "Add sub-issue via chat…" input (#1017, #1029):
+    /// a bare candidate issue number — unlike
+    /// [`Self::submit_add_sub_issue_input`], no `{group/after}` annotation
+    /// grammar here; that gets proposed and confirmed live in the chat
+    /// instead. Launches (or reattaches to) an interactive milestone-chat
+    /// session via [`Self::launch_milestone_chat_session`] with the
+    /// candidate child issue, which seeds `resolve_milestone_chat_briefing`'s
+    /// "Add sub-issue" mode (`coord/milestone_chat.py`) with the epic body
+    /// plus the candidate issue.
     fn submit_add_sub_issue_chat_input(&mut self, input: PendingMilestoneRowInput, buf: &str) {
         let issue_part = buf.trim().trim_start_matches('#');
         let Ok(issue_number) = issue_part.parse::<u64>() else {
@@ -1163,40 +1142,11 @@ impl CoordApp {
             return;
         };
 
-        let repo = input.repo_name.clone();
-        let tracking_issue_str = input.tracking_issue.to_string();
-        let issue_str = issue_number.to_string();
-        let label = format!(
-            "Chat about adding #{} to {}'s sub-issues",
-            issue_number, input.milestone_title
+        self.launch_milestone_chat_session(
+            input.repo_name.clone(),
+            input.tracking_issue,
+            Some(issue_number),
         );
-        use crate::commands::SpawnQueuedOutcome;
-        let outcome = self.command_runner.spawn_queued(&[
-            "milestone",
-            "chat",
-            &repo,
-            &tracking_issue_str,
-            "--add-child",
-            &issue_str,
-        ]);
-        if outcome == SpawnQueuedOutcome::Deduped {
-            return;
-        }
-        // #1017: arm the bind so the next tick attaches the live chat overlay
-        // to the new `type="milestone-chat"` add-sub-issue session — the epic's
-        // tracking issue is the target row (issue_number == tracking_issue).
-        self.pending_milestone_chat = Some(PendingMilestoneChat {
-            repo,
-            issue_number: input.tracking_issue,
-            label: label.clone(),
-            dispatched_at: Instant::now(),
-        });
-        let msg = if outcome == SpawnQueuedOutcome::Queued {
-            "queued — chat opens after current command."
-        } else {
-            "opening steward chat…"
-        };
-        self.push_toast(&label, msg, ToastSeverity::Info);
     }
 
     /// Open the "Close / archive plan" confirm (#1003) — mirrors

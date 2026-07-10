@@ -1725,6 +1725,137 @@ class TestAssignInteractiveAudit:
         assert audit_rows == [], "dry-run must not persist an audit assignment"
 
 
+class TestAssignInteractiveMilestoneChat:
+    """#1029: `coord assign --interactive --milestone-chat-of <tracking_issue>
+    [--add-child <issue>]` — a genuine tmux-attached interactive milestone
+    chat, replacing the headless `claude -p` / SSE-overlay mechanism."""
+
+    def test_milestone_chat_of_requires_interactive(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        with patch("coord.github_ops.get_issue", return_value={"title": "t"}):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "1", "--config", str(config_file),
+                 "--milestone-chat-of", "1"],
+            )
+        assert result.exit_code == 2
+        assert "--milestone-chat-of requires --interactive" in result.output
+
+    def test_add_child_requires_milestone_chat_of(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        with patch("coord.github_ops.get_issue", return_value={"title": "t"}):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "1", "--config", str(config_file),
+                 "--interactive", "--add-child", "5", "--dry-run"],
+            )
+        assert result.exit_code == 2
+        assert "--add-child requires --milestone-chat-of" in result.output
+
+    def test_milestone_chat_of_mutually_exclusive_with_audit_of(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        with patch("coord.github_ops.get_issue", return_value={"title": "t"}):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "1", "--config", str(config_file),
+                 "--interactive", "--milestone-chat-of", "1", "--audit-of", "1",
+                 "--dry-run"],
+            )
+        assert result.exit_code == 2
+        assert "mutually exclusive" in result.output
+
+    def test_milestone_chat_of_rejects_non_numeric_value(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        with patch("coord.github_ops.get_issue", return_value={"title": "t"}), \
+             patch("socket.gethostname", return_value="laptop"):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "1", "--config", str(config_file),
+                 "--interactive", "--milestone-chat-of", "not-a-number", "--dry-run"],
+            )
+        assert result.exit_code == 2
+        assert "must be a GitHub issue number" in result.output
+
+    def test_milestone_chat_of_requires_milestone(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "Epic", "body": "goals", "milestone": None}), \
+             patch("socket.gethostname", return_value="laptop"):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "973", "--config", str(config_file),
+                 "--interactive", "--milestone-chat-of", "973", "--dry-run"],
+            )
+        assert result.exit_code == 1
+        assert "has no milestone" in result.output
+
+    def test_milestone_chat_of_dry_run_builds_dispatch(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        tracking_issue = {
+            "title": "Sprint 4",
+            "body": "## Work order\n- [ ] #762\n",
+            "milestone": {"number": 28, "title": "Sprint 4"},
+        }
+        with patch("coord.github_ops.get_issue", return_value=tracking_issue), \
+             patch("coord.github_ops.get_open_issues", return_value=[]), \
+             patch("coord.github_ops.get_milestone",
+                   return_value={"description": None, "due_on": None}), \
+             patch("socket.gethostname", return_value="laptop"):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "973", "--config", str(config_file),
+                 "--interactive", "--milestone-chat-of", "973", "--dry-run"],
+            )
+        assert result.exit_code == 0, result.output
+        assert "MILESTONE CHAT #973" in result.output
+        assert "Sprint 4" in result.output
+        assert "no worktree" in result.output
+        # No explicit system_prompt override — ClaudePtyProvider.build_command's
+        # own spec.type == "milestone-chat" branch supplies the deny-listed
+        # MILESTONE_CHAT_SYSTEM_PROMPT + Read,Bash automatically (#1029).
+        assert "Read,Bash" in result.output
+        assert "milestone steward" in result.output.lower()
+        assert "(dry run — not launched)" in result.output
+        # Dry-run must NOT persist a milestone-chat row.
+        from coord.state import build_board
+        b = build_board()
+        mc_rows = [a for a in b.active + b.completed if a.type == "milestone-chat"]
+        assert mc_rows == [], "dry-run must not persist a milestone-chat assignment"
+
+    def test_milestone_chat_of_add_child_dry_run_shows_candidate(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        tracking_issue = {
+            "title": "Sprint 4 epic",
+            "body": "epic body",
+            "milestone": {"number": 28, "title": "Sprint 4"},
+        }
+        child_issue = {"title": "Candidate sub-task", "body": "child body"}
+
+        def _get_issue(repo: str, number: int) -> dict:
+            return child_issue if number == 1050 else tracking_issue
+
+        with patch("coord.github_ops.get_issue", side_effect=_get_issue), \
+             patch("coord.github_ops.get_open_issues", return_value=[]), \
+             patch("coord.github_ops.get_milestone",
+                   return_value={"description": None, "due_on": None}), \
+             patch("socket.gethostname", return_value="laptop"):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "973", "--config", str(config_file),
+                 "--interactive", "--milestone-chat-of", "973", "--add-child", "1050",
+                 "--dry-run"],
+            )
+        assert result.exit_code == 0, result.output
+        assert "add-child candidate: #1050" in result.output
+
+
 # ── Config YAML with explicit model tiers for escalation tests ────────────────
 
 _ESCALATION_CONFIG_YAML = """\
