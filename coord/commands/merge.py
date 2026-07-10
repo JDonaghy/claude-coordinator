@@ -904,6 +904,7 @@ def merge(
     # HUMAN_REQUIRED naturally without a separate save_queue call.
     conflict_events = [ev for ev in events if ev.kind == "conflict"]
     if conflict_events and not dry_run:
+        from coord.audit import record_audit
         from coord.conflict_fix import dispatch_conflict_fix, has_prior_conflict_fix
         from coord.merge_queue import HUMAN_REQUIRED, classify_conflict
         from coord.state import load_board, save_board
@@ -923,6 +924,23 @@ def merge(
                         click.echo(
                             f"  {ev.entry.repo_name} #{ev.entry.issue_number}: "
                             "conflict-fix retry cap hit — manual resolution required"
+                        )
+                        # #1038: the coordinator's own retry-cap logic made
+                        # this call, not the human running `coord merge` —
+                        # operational tier, same as the other automatic
+                        # conflict-classification outcomes below.
+                        record_audit(
+                            tier="operational",
+                            category="merge",
+                            event_type="conflict_human_required",
+                            actor="daemon",
+                            summary=f"conflict-fix retry cap hit: "
+                            f"{ev.entry.repo_name}#{ev.entry.issue_number} — "
+                            "manual resolution required",
+                            repo=ev.entry.repo_name,
+                            issue=ev.entry.issue_number,
+                            assignment_id=ev.entry.assignment_id,
+                            details={"reason": "retry_cap"},
                         )
                         continue
                     fix = dispatch_conflict_fix(
@@ -949,6 +967,19 @@ def merge(
                     click.echo(
                         f"  {ev.entry.repo_name} #{ev.entry.issue_number}: "
                         "permission/protection error — manual resolution required"
+                    )
+                    record_audit(
+                        tier="operational",
+                        category="merge",
+                        event_type="conflict_human_required",
+                        actor="daemon",
+                        summary=f"conflict classified non-rebaseable: "
+                        f"{ev.entry.repo_name}#{ev.entry.issue_number} — "
+                        "manual resolution required",
+                        repo=ev.entry.repo_name,
+                        issue=ev.entry.issue_number,
+                        assignment_id=ev.entry.assignment_id,
+                        details={"reason": "permission_or_protection"},
                     )
             if dispatched_any:
                 save_board(fix_board)

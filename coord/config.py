@@ -454,8 +454,8 @@ class CiStoreConfig:
 
 @dataclass
 class AuditConfig:
-    """``audit:`` block (#1036) — the append-only ``audit_log`` table's
-    only tunable.
+    """``audit:`` block (#1036/#1038) — the append-only ``audit_log``
+    table's tunables.
 
     ``max_rows`` is a future retention cap, not a pruning sweep: when set
     above the default ``0`` (unlimited), :func:`coord.audit.record_audit`
@@ -463,9 +463,19 @@ class AuditConfig:
     insert.  ``0`` means keep everything forever — the default for this
     milestone, since retention policy is explicitly out of scope (see the
     issue's "Out of scope" section).
+
+    ``level`` (#1038) selects how much of the audit taxonomy is captured:
+    ``"business"`` records only real board transitions (dispatch, verdicts,
+    merge, ...); ``"operational"`` (the default) additionally records the
+    daemon-tick's autonomic actions (passive reconcile, merge-queue
+    enqueue/drain, conflict-fix dispatch, housekeeping sweeps) tagged
+    ``tier="operational"``, ``actor="daemon"``.  Business-tier rows are
+    always recorded regardless of ``level`` — this only gates the
+    operational tier.
     """
 
     max_rows: int = 0
+    level: str = "operational"
 
 
 @dataclass
@@ -1275,11 +1285,15 @@ def _parse_milestone(raw: Any) -> MilestoneConfig:
     return cfg
 
 
-def _parse_audit(raw: Any) -> AuditConfig:
-    """Parse the optional ``audit:`` block from coordinator.yml (#1036).
+_VALID_AUDIT_LEVELS = ("business", "operational")
 
-    An absent block returns ``AuditConfig()`` — ``max_rows=0`` (unlimited),
-    preserving existing behaviour: ``coord.audit.record_audit`` never trims.
+
+def _parse_audit(raw: Any) -> AuditConfig:
+    """Parse the optional ``audit:`` block from coordinator.yml (#1036/#1038).
+
+    An absent block returns ``AuditConfig()`` — ``max_rows=0`` (unlimited)
+    and ``level="operational"`` — preserving existing behaviour:
+    ``coord.audit.record_audit`` never trims and captures both tiers.
     """
     if raw is None:
         return AuditConfig()
@@ -1292,6 +1306,13 @@ def _parse_audit(raw: Any) -> AuditConfig:
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise ConfigError("audit.max_rows must be a non-negative integer")
         cfg.max_rows = value
+    if "level" in raw:
+        value = raw["level"]
+        if not isinstance(value, str) or value not in _VALID_AUDIT_LEVELS:
+            raise ConfigError(
+                f"audit.level must be one of {_VALID_AUDIT_LEVELS!r}, got {value!r}"
+            )
+        cfg.level = value
     return cfg
 
 

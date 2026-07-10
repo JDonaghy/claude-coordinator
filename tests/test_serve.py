@@ -2613,6 +2613,64 @@ def test_passive_tick_is_idempotent(
     assert enqueued2 == []
 
 
+def test_passive_tick_writes_operational_audit_rows_for_enqueue(
+    valid_config_path: Path, rw_db, monkeypatch
+) -> None:
+    """#1038: the daemon-tick enqueue step writes an operational audit row,
+    tagged actor="daemon", separate from any business-tier row."""
+    from coord.config import load as load_config
+    from coord.serve_app import _passive_tick
+
+    # record_audit's level gate reloads config independently — point it at
+    # the same file the test uses (default audit.level="operational").
+    monkeypatch.setenv("COORD_CONFIG", str(valid_config_path))
+    monkeypatch.setattr("coord.reconcile._query_agent", lambda host: None)
+    _seed_approved_done_work(rw_db)
+    cfg = load_config(valid_config_path)
+
+    _passive_tick(cfg)
+
+    rows = rw_db.execute(
+        "SELECT * FROM audit_log WHERE tier='operational'"
+    ).fetchall()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["category"] == "merge_queue"
+    assert row["event_type"] == "enqueued"
+    assert row["actor"] == "daemon"
+    assert row["repo"] == "api"
+    assert row["issue"] == 7
+    assert row["assignment_id"] == "work99"
+
+
+def test_passive_tick_suppresses_operational_rows_when_level_is_business(
+    valid_config_path: Path, rw_db, monkeypatch
+) -> None:
+    """#1038: audit.level: business drops the operational enqueue row —
+    the merge queue write itself is unaffected (best-effort, never blocks)."""
+    from coord.config import load as load_config
+    from coord import merge_queue as mq
+    from coord.serve_app import _passive_tick
+
+    business_config_path = valid_config_path.with_name("business.yml")
+    business_config_path.write_text(
+        valid_config_path.read_text() + "audit:\n  level: business\n"
+    )
+    monkeypatch.setenv("COORD_CONFIG", str(business_config_path))
+    monkeypatch.setattr("coord.reconcile._query_agent", lambda host: None)
+    _seed_approved_done_work(rw_db)
+    cfg = load_config(valid_config_path)
+
+    reconciled, enqueued = _passive_tick(cfg)
+
+    assert enqueued == ["work99"]  # the merge-queue write still happens
+    assert mq.load_queue()[0].assignment_id == "work99"
+    rows = rw_db.execute(
+        "SELECT * FROM audit_log WHERE tier='operational'"
+    ).fetchall()
+    assert rows == []
+
+
 # ── #775: _reconcile_merges_tick + _sync_issues_tick ─────────────────────────
 
 
@@ -2666,6 +2724,10 @@ def test_reconcile_merges_tick_flips_merged_and_prunes_queue(
     from coord.config import load as load_config
     from coord.serve_app import _reconcile_merges_tick
 
+    # record_audit's level gate reloads config independently (#1038) — pin
+    # it to this test's config so the assertions are deterministic
+    # regardless of the host's real ~/.coord/coordinator.yml.
+    monkeypatch.setenv("COORD_CONFIG", str(valid_config_path))
     # Stub all GitHub probes so we never shell out.
     monkeypatch.setattr(github_ops, "work_is_terminal", lambda *a, **k: True)
     monkeypatch.setattr(
@@ -2697,6 +2759,21 @@ def test_reconcile_merges_tick_flips_merged_and_prunes_queue(
     assert not any(e.assignment_id == "work-m1" for e in queue), (
         f"merge_queue row should have been pruned; queue: {[e.assignment_id for e in queue]}"
     )
+    # #1038: one coarse operational row summarizing the tick's actions,
+    # separate from the business-tier "merged" row mark_assignment_merged
+    # already writes (#1036) regardless of caller.
+    op_rows = rw_db.execute(
+        "SELECT * FROM audit_log WHERE tier='operational'"
+    ).fetchall()
+    assert len(op_rows) == 1
+    assert op_rows[0]["category"] == "reconcile"
+    assert op_rows[0]["event_type"] == "merge_reconcile"
+    assert op_rows[0]["actor"] == "daemon"
+    business_rows = rw_db.execute(
+        "SELECT * FROM audit_log WHERE tier='business' AND category='merge'"
+    ).fetchall()
+    assert len(business_rows) == 1
+    assert business_rows[0]["actor"] == "coordinator"
 
 
 def test_sync_issues_tick_marks_issues_closed(
@@ -3056,7 +3133,9 @@ def test_auto_drain_ready_entry_merges(
     monkeypatch.setattr("coord.ci_store.build_ci_store", lambda t: _NoOpCi())
 
     _seed_queued_ready_entry(rw_db)
-    cfg = load_config(_make_drain_config(tmp_path, auto_drain=True))
+    drain_config_path = _make_drain_config(tmp_path, auto_drain=True)
+    monkeypatch.setenv("COORD_CONFIG", str(drain_config_path))  # #1038 level gate
+    cfg = load_config(drain_config_path)
     assert cfg.merge.auto_drain is True
 
     events = _auto_drain_tick(cfg)
@@ -3071,6 +3150,16 @@ def test_auto_drain_ready_entry_merges(
     assert any(item.state == MERGED for item in items), (
         f"expected MERGED in queue, got: {[item.state for item in items]}"
     )
+
+    # #1038: one operational row per MergeEvent this auto-drain tick
+    # produced (process() emits "opened" then "merged" for a fresh entry).
+    op_rows = rw_db.execute(
+        "SELECT * FROM audit_log WHERE tier='operational' AND category='merge'"
+    ).fetchall()
+    assert len(op_rows) == len(events)
+    assert {r["event_type"] for r in op_rows} == {f"merge_{ev.kind}" for ev in events}
+    assert all(r["actor"] == "daemon" for r in op_rows)
+    assert all(r["assignment_id"] == "work-drain1" for r in op_rows)
 
 
 def test_auto_drain_blocked_entry_not_touched(
@@ -3146,6 +3235,68 @@ def test_auto_drain_error_isolation(
     after = mq.load_queue()
     assert len(after) == 1
     assert after[0].state == "pending"
+
+
+# ── #1038: operational-tier audit hooks ──────────────────────────────────────
+
+
+def test_audit_reconciled_writes_one_row_per_flip(
+    rw_db, monkeypatch, tmp_path
+) -> None:
+    """#1038: _audit_reconciled (the Step-1 reconcile hook) writes one
+    operational row per reconciled assignment."""
+    from coord.serve_app import _audit_reconciled
+
+    # No coordinator.yml here — pin $COORD_CONFIG to a definitely-absent
+    # path so record_audit's level gate is deterministic (defaults to
+    # "operational") regardless of the host's real config.
+    monkeypatch.setenv("COORD_CONFIG", str(tmp_path / "nonexistent.yml"))
+
+    _audit_reconciled([
+        {
+            "assignment_id": "aid-1", "issue_number": 7, "repo": "api",
+            "type": "work", "to_status": "done", "plan_captured": False,
+        },
+        {
+            "assignment_id": "aid-2", "issue_number": 9, "repo": "api",
+            "type": "work", "to_status": "failed", "plan_captured": False,
+        },
+    ])
+    rows = rw_db.execute(
+        "SELECT * FROM audit_log WHERE tier='operational' ORDER BY id"
+    ).fetchall()
+    assert len(rows) == 2
+    assert rows[0]["category"] == "reconcile"
+    assert rows[0]["event_type"] == "passive_reconcile"
+    assert rows[0]["actor"] == "daemon"
+    assert rows[0]["assignment_id"] == "aid-1"
+    assert rows[0]["issue"] == 7
+    assert rows[1]["assignment_id"] == "aid-2"
+
+
+def test_audit_housekeeping_sweep_writes_summary_row(
+    rw_db, monkeypatch, tmp_path
+) -> None:
+    """#1038: _audit_housekeeping_sweep (the Step-4 housekeeping hook)
+    writes one operational row summarizing the archival sweep."""
+    import json
+
+    from coord.serve_app import _audit_housekeeping_sweep
+
+    monkeypatch.setenv("COORD_CONFIG", str(tmp_path / "nonexistent.yml"))
+
+    _audit_housekeeping_sweep({
+        "archived_assignments": 3, "archived_notifications": 5,
+        "dry_run": False, "retention_days": 30,
+    })
+    rows = rw_db.execute(
+        "SELECT * FROM audit_log WHERE tier='operational'"
+    ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["category"] == "housekeeping"
+    assert rows[0]["event_type"] == "sweep"
+    assert rows[0]["actor"] == "daemon"
+    assert json.loads(rows[0]["details_json"])["archived_assignments"] == 3
 
 
 # ── #769 Phase 1: _milestone_drain_tick ──────────────────────────────────────
