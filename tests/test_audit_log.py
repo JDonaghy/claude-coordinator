@@ -149,6 +149,56 @@ class TestRecordAudit:
         ] == []
 
 
+class TestAuditLevel:
+    """#1038: `audit.level` gates the operational tier at the record_audit
+    choke point.  Business-tier rows are never gated."""
+
+    def test_operational_row_suppressed_when_level_is_business(
+        self, coord_db, monkeypatch
+    ) -> None:
+        monkeypatch.setattr("coord.audit._resolve_level", lambda: "business")
+        record_audit(
+            tier="operational", category="reconcile", event_type="passive_reconcile",
+            actor="daemon", summary="should be dropped",
+        )
+        assert _audit_rows(coord_db) == []
+
+    def test_operational_row_included_when_level_is_operational(
+        self, coord_db, monkeypatch
+    ) -> None:
+        monkeypatch.setattr("coord.audit._resolve_level", lambda: "operational")
+        record_audit(
+            tier="operational", category="reconcile", event_type="passive_reconcile",
+            actor="daemon", summary="should land",
+        )
+        rows = _audit_rows(coord_db)
+        assert len(rows) == 1
+        assert rows[0]["tier"] == "operational"
+        assert rows[0]["actor"] == "daemon"
+
+    def test_operational_row_included_by_default(
+        self, coord_db, monkeypatch, tmp_path
+    ) -> None:
+        """No resolvable coordinator.yml → `_resolve_level` defaults to
+        `"operational"`, so operational rows are captured, not silently
+        dropped.  Points ``$COORD_CONFIG`` at a nonexistent path so this is
+        deterministic regardless of the host's real config."""
+        monkeypatch.setenv("COORD_CONFIG", str(tmp_path / "nonexistent.yml"))
+        record_audit(
+            tier="operational", category="reconcile", event_type="passive_reconcile",
+            actor="daemon", summary="default level",
+        )
+        assert len(_audit_rows(coord_db)) == 1
+
+    def test_business_row_never_gated_by_level(self, coord_db, monkeypatch) -> None:
+        monkeypatch.setattr("coord.audit._resolve_level", lambda: "business")
+        record_audit(
+            tier="business", category="merge", event_type="merged",
+            actor="coordinator", summary="business rows always land",
+        )
+        assert len(_audit_rows(coord_db)) == 1
+
+
 class TestHookedTransitions:
     """One audit_log row per real transition at the state.py choke points."""
 

@@ -183,6 +183,41 @@ class TestMergeCommand:
             f"expected HUMAN_REQUIRED, got {persisted[0].state!r}"
         )
 
+    def test_human_classified_conflict_writes_operational_audit_row(
+        self, config_file: Path, coord_dir: Path, coord_db, monkeypatch,
+    ) -> None:
+        """#1038: promoting a conflict to HUMAN_REQUIRED — the coordinator's
+        own conflict-classification decision, not a per-entry human choice —
+        writes an operational-tier row (actor="daemon")."""
+        from coord.models import Board
+        from coord.state import save_board
+        # record_audit's level gate reloads config independently — pin it to
+        # this test's config (default audit.level="operational").
+        monkeypatch.setenv("COORD_CONFIG", str(config_file))
+        save_board(Board())
+        _seed_queue([_entry("p1")])
+
+        def fake_create_pr(repo, *, base, head, title, body):
+            return {"number": 999, "url": "u/999", "existed": False}
+
+        def fake_merge(repo, number, method="rebase"):
+            return False, "permission denied — branch protection enabled"
+
+        with patch("coord.github_ops.create_pr", side_effect=fake_create_pr), \
+             patch("coord.github_ops.get_pr_size", return_value=10), \
+             patch("coord.github_ops.merge_pr", side_effect=fake_merge):
+            result = CliRunner().invoke(main, ["merge", "--config", str(config_file)])
+        assert result.exit_code == 0, result.output
+
+        rows = coord_db.execute(
+            "SELECT * FROM audit_log WHERE tier='operational'"
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["category"] == "merge"
+        assert rows[0]["event_type"] == "conflict_human_required"
+        assert rows[0]["actor"] == "daemon"
+        assert rows[0]["repo"] == "api"
+
     def test_review_gate_refuses_merge_without_approval(
         self, config_file: Path, coord_dir: Path, coord_db
     ) -> None:

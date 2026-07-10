@@ -298,4 +298,26 @@ def dispatch_conflict_fix(
         repo_github=repo.github,
     )
 
+    # #1038: operational-tier row alongside the business-tier "dispatched"
+    # row `record_dispatched_assignment` already writes.  The business row
+    # marks WHAT happened (a conflict-fix assignment was dispatched); this
+    # marks that it was the coordinator's own automatic mechanical-conflict
+    # classification/retry-cap logic that decided to do it, not a human
+    # picking this entry — the same distinction the other #1038 hooks draw.
+    from coord.audit import record_audit  # noqa: PLC0415
+
+    record_audit(
+        tier="operational",
+        category="merge",
+        event_type="conflict_fix_dispatched",
+        actor="daemon",
+        summary=f"conflict-fix dispatched: {entry.repo_name}#{entry.issue_number} "
+        f"→ {machine.name}",
+        repo=entry.repo_name,
+        issue=entry.issue_number,
+        assignment_id=fix_assignment.assignment_id,
+        machine=machine.name,
+        details={"merge_entry_id": entry.assignment_id},
+    )
+
     return fix_assignment

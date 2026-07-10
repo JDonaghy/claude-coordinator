@@ -127,8 +127,99 @@ def _passive_tick(config: Config) -> tuple[list[dict], list[str]]:
     from coord import merge_queue as mq  # noqa: PLC0415
 
     reconciled = reconcile_completed_assignments(config)
+    _audit_reconciled(reconciled)
     enqueued = mq.enqueue_approved_work(config)  # loads its own board snapshot
+    _audit_enqueued(enqueued)
     return reconciled, enqueued
+
+
+# ── #1038: operational-tier audit hooks for the daemon tick ────────────────
+#
+# These are coarse, tick-scoped rows (``tier="operational"``, ``actor=
+# "daemon"``) recorded ALONGSIDE the fine-grained business-tier rows #1036
+# already emits at the state.py/issue_store.py write choke points (e.g.
+# ``mark_assignment_merged`` already records a business ``merged`` row
+# regardless of caller).  The operational layer exists specifically to mark
+# *that the daemon tick itself* drove the action — a human running
+# ``coord merge``/``coord reconcile-merges`` produces the same business rows
+# without these.  Hooked here (the tick call sites) rather than inside the
+# shared ``reconcile``/``merge_queue`` functions so CLI-triggered runs never
+# get mislabeled ``actor="daemon"``.  ``record_audit`` never raises, so none
+# of these need their own try/except.
+
+
+def _audit_reconciled(reconciled: list[dict]) -> None:
+    """One operational row per assignment the passive reconcile flipped
+    running → terminal (#625's reconcile, #1038's audit)."""
+    from coord.audit import record_audit  # noqa: PLC0415
+
+    for r in reconciled:
+        repo = r.get("repo")
+        issue = r.get("issue_number")
+        record_audit(
+            tier="operational",
+            category="reconcile",
+            event_type="passive_reconcile",
+            actor="daemon",
+            summary=f"passive reconcile: {repo}#{issue} → {r.get('to_status')}"
+            if repo is not None and issue is not None
+            else f"passive reconcile: {r.get('assignment_id')} → {r.get('to_status')}",
+            repo=repo,
+            issue=issue,
+            assignment_id=r.get("assignment_id"),
+            details={"type": r.get("type"), "to_status": r.get("to_status")},
+        )
+
+
+def _audit_enqueued(enqueued: list[str]) -> None:
+    """One operational row per assignment id the passive tick added/re-keyed
+    into the merge queue (#736/#217, #1038's audit).
+
+    ``enqueue_approved_work`` returns bare assignment ids; look the freshly
+    written rows back up via ``load_queue()`` for repo/issue context.
+    """
+    if not enqueued:
+        return
+    from coord.audit import record_audit  # noqa: PLC0415
+    from coord import merge_queue as mq  # noqa: PLC0415
+
+    ids = set(enqueued)
+    by_id = {item.assignment_id: item for item in mq.load_queue() if item.assignment_id in ids}
+    for aid in enqueued:
+        entry = by_id.get(aid)
+        record_audit(
+            tier="operational",
+            category="merge_queue",
+            event_type="enqueued",
+            actor="daemon",
+            summary=f"enqueued: {entry.repo_name}#{entry.issue_number}"
+            if entry is not None else f"enqueued: {aid}",
+            repo=entry.repo_name if entry is not None else None,
+            issue=entry.issue_number if entry is not None else None,
+            assignment_id=aid,
+            details={"branch": entry.branch} if entry is not None else None,
+        )
+
+
+def _audit_housekeeping_sweep(swept: dict) -> None:
+    """One operational row summarizing a housekeeping archival sweep
+    (#762's ``housekeeping.sweep()``, #1038's audit).  Called only when the
+    sweep actually archived something — an empty sweep is a no-op tick, not
+    an event worth a row."""
+    from coord.audit import record_audit  # noqa: PLC0415
+
+    record_audit(
+        tier="operational",
+        category="housekeeping",
+        event_type="sweep",
+        actor="daemon",
+        summary=(
+            f"housekeeping: archived {swept.get('archived_assignments', 0)} "
+            f"assignment(s), {swept.get('archived_notifications', 0)} "
+            "notification(s)"
+        ),
+        details=swept,
+    )
 
 
 def _reconcile_merges_tick(config: Config) -> list[str]:
@@ -148,6 +239,21 @@ def _reconcile_merges_tick(config: Config) -> list[str]:
     board = build_board()
     actions = reconcile_board_merges(board, config)
     save_board(board)
+    if actions:
+        # #1038: one coarse operational row per tick that did something —
+        # the individual branch-backfill/mark-merged writes already get
+        # their own business-tier rows (state.py), this just marks that the
+        # daemon tick (not a manual `coord reconcile-merges`) drove them.
+        from coord.audit import record_audit  # noqa: PLC0415
+
+        record_audit(
+            tier="operational",
+            category="reconcile",
+            event_type="merge_reconcile",
+            actor="daemon",
+            summary=f"merge reconcile: {len(actions)} action(s)",
+            details={"actions": actions[:20]},
+        )
     return actions
 
 
@@ -278,6 +384,27 @@ def _auto_drain_tick(config: Config) -> "list":
     by_id = {item.assignment_id: item for item in ready_items}
     merged = [by_id.get(item.assignment_id, item) for item in fresh]
     mq.save_queue(merged)
+
+    # #1038: one operational row per MergeEvent this auto-drain tick produced
+    # (opened/sized/merged/checks_failed/checks_pending/review_required/
+    # smoke_required/conflict/...).  process() is also called by the
+    # `coord merge` CLI (human-triggered, business intent) so the audit call
+    # lives here — the auto-drain-exclusive call site — not inside
+    # merge_queue.process() itself.
+    from coord.audit import record_audit  # noqa: PLC0415
+
+    for ev in events:
+        record_audit(
+            tier="operational",
+            category="merge",
+            event_type=f"merge_{ev.kind}",
+            actor="daemon",
+            summary=f"auto-drain {ev.kind}: {ev.entry.repo_name}#{ev.entry.issue_number} — {ev.message}",
+            repo=ev.entry.repo_name,
+            issue=ev.entry.issue_number,
+            assignment_id=ev.entry.assignment_id,
+            details={"kind": ev.kind, "pr_number": ev.entry.pr_number},
+        )
 
     return events
 
@@ -3010,6 +3137,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                                 for r in reconciled
                             ),
                         )
+                        _audit_reconciled(reconciled)
                 except Exception:  # noqa: BLE001 — a tick must never crash the daemon
                     log.warning("passive reconcile tick failed", exc_info=True)
                 # Step 2: enqueue approved work (#736 / #217 invisible limbo fix).
@@ -3027,6 +3155,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                             len(enqueued),
                             ", ".join(enqueued),
                         )
+                        _audit_enqueued(enqueued)
                 except Exception:  # noqa: BLE001
                     log.warning("passive enqueue tick failed", exc_info=True)
                 # Step 3: #781 auto-drain READY merge-queue entries.
@@ -3100,6 +3229,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                                 swept["archived_assignments"],
                                 swept["archived_notifications"],
                             )
+                            _audit_housekeeping_sweep(swept)
                     except Exception:  # noqa: BLE001
                         log.warning("housekeeping tick failed", exc_info=True)
                 # Steps 5 + 6: #775 record out-of-band merges and sync the

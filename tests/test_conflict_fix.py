@@ -340,6 +340,39 @@ class TestDispatch:
         assert result is None
         assert client.calls == [], "HTTP should not be called when retry cap hit"
 
+    def test_dispatch_writes_operational_audit_row(
+        self, two_machine_config: Config, coord_db, monkeypatch, tmp_path,
+    ) -> None:
+        """#1038: a successful dispatch writes an operational-tier row
+        (actor="daemon") alongside the business-tier "dispatched" row
+        `record_dispatched_assignment` already writes regardless of caller."""
+        monkeypatch.setenv("COORD_CONFIG", str(tmp_path / "nonexistent.yml"))
+        board = Board()
+        client = _FakeHTTPClient({"id": "fix-id-audit"})
+        result = dispatch_conflict_fix(
+            _entry(), board, two_machine_config,
+            http_client=client, prefer_machine="laptop",
+        )
+        assert result is not None
+
+        op_rows = coord_db.execute(
+            "SELECT * FROM audit_log WHERE tier='operational'"
+        ).fetchall()
+        assert len(op_rows) == 1
+        assert op_rows[0]["category"] == "merge"
+        assert op_rows[0]["event_type"] == "conflict_fix_dispatched"
+        assert op_rows[0]["actor"] == "daemon"
+        assert op_rows[0]["repo"] == "api"
+        assert op_rows[0]["issue"] == 1
+        assert op_rows[0]["assignment_id"] == result.assignment_id
+        assert op_rows[0]["machine"] == "laptop"
+
+        business_rows = coord_db.execute(
+            "SELECT * FROM audit_log WHERE tier='business' AND category='dispatch'"
+        ).fetchall()
+        assert len(business_rows) == 1
+        assert business_rows[0]["actor"] == "coordinator"
+
     def test_retry_cap_not_consumed_by_successful_fix(
         self, two_machine_config: Config, coord_db,
     ) -> None:

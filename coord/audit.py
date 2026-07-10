@@ -64,8 +64,16 @@ def record_audit(
     Also performs the opportunistic ``audit.max_rows`` trim (#1036
     deliverable 4) after a successful insert, when the config knob is set
     above its default of ``0`` (unlimited).
+
+    #1038: when ``tier="operational"`` and ``audit.level`` is set to
+    ``"business"`` (default ``"operational"``), the row is dropped here —
+    the single choke point every operational-tier caller funnels through —
+    so callers (the daemon-tick hooks) stay unconditional.  Business-tier
+    rows are never gated by this check.
     """
     try:
+        if tier == "operational" and _resolve_level() == "business":
+            return
         _record_audit_unsafe(
             tier=tier,
             category=category,
@@ -157,3 +165,17 @@ def _resolve_max_rows() -> int:
         return max(0, int(cfg.audit.max_rows))
     except Exception:  # noqa: BLE001 — best-effort; unlimited is the safe default
         return 0
+
+
+def _resolve_level() -> str:
+    """Read ``audit.level`` from coordinator.yml.  Returns ``"operational"``
+    (the default — capture everything) on any failure, so a missing/invalid
+    config never silently suppresses audit rows."""
+    try:
+        from coord.config import load as _load_config  # noqa: PLC0415
+
+        cfg = _load_config()
+        level = cfg.audit.level
+        return level if level in _VALID_TIERS else "operational"
+    except Exception:  # noqa: BLE001 — best-effort; capture-everything is the safe default
+        return "operational"
