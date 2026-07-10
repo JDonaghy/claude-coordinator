@@ -20,6 +20,14 @@ required-features = ["gtk"]
 # Requires GTK4 development libraries on the build host.
 gtk = ["quadraui/gtk"]
 
+# #1042: exposes `make_test_app` and sibling app-construction fixtures
+# (`app::fixtures`, normally `#[cfg(test)]`-private) as `pub` at the crate
+# root, so an external integration-test crate (`tui/tests/acceptance.rs`)
+# can build a `CoordApp` from in-memory `BoardData` — no live daemon —
+# exactly like the in-crate tests do. Off for a normal `cargo build`/
+# `cargo test`; enable with `cargo test --features test-support`.
+test-support = []
+
 [dependencies]
 # `terminal` enables quadraui's PTY + vt100 + scrollback engine
 # (`quadraui::terminal_engine::TerminalSession`) so the Terminal panel
