@@ -2546,6 +2546,7 @@ impl CoordApp {
                         machine: None,
                         pane_dead: false,
                         pending_sweep_count: 0,
+                        attached: false,
                     });
                 }
 

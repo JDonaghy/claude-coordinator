@@ -98,6 +98,11 @@ impl ShellApp for CoordApp {
                 SidebarView::Plans => {
                     backend.draw_list(sidebar_rect, &self.plans_sidebar());
                 }
+                // #1032: Sessions sidebar — machine → repo → session tree,
+                // same raw-`TreeView` pattern as the #953 Terminal tree.
+                SidebarView::Sessions => {
+                    backend.draw_tree(sidebar_rect, &self.sessions_tree_view());
+                }
             }
         }
 
@@ -495,6 +500,11 @@ impl ShellApp for CoordApp {
             SidebarView::Plans => {
                 self.render_plans_panel(backend, m, lh);
             }
+            // #1032: Sessions panel — detail view of the selected session
+            // leaf (assignment id, issue/repo, machine, type, status).
+            SidebarView::Sessions => {
+                backend.draw_list(m, &self.sessions_detail_list());
+            }
         }
 
         // ── Inject chat overlay — renders over the main panel ───────────
@@ -640,6 +650,8 @@ impl ShellApp for CoordApp {
             // view); the MilestoneDag view itself remains accessible as a
             // future drill-down but no longer has its own top-level entry.
             "panel:plans" | "panel:milestones" => SidebarView::Plans,
+            // #1032: Sessions panel — fleet-wide machine → repo → session tree.
+            "panel:sessions" => SidebarView::Sessions,
             _ => return,
         };
     }

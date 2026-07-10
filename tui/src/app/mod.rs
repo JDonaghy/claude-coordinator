@@ -89,6 +89,7 @@ pub(crate) mod pipeline;
 pub(crate) mod milestone_dag;
 pub(crate) mod plans;
 pub(crate) mod fleet_terminals;
+pub(crate) mod fleet_sessions;
 #[allow(unused_imports)]
 use self::types::*;
 #[allow(unused_imports)]
@@ -2553,6 +2554,20 @@ pub struct CoordApp {
     /// key/outside click cancels.  Mirrors `pending_restart`.
     pending_kill_terminal: Option<PendingKillTerminal>,
 
+    // ── #1032: Sessions panel (machine → repo → session tree) ───────────────
+    /// Per-machine expand state for the Sessions-view tree, keyed by machine
+    /// name. Absent entries default to expanded when the machine hosts ≥1
+    /// live session, collapsed (no chevron) otherwise. Mirrors
+    /// `terminal_tree_expanded`; repo groups beneath an expanded machine are
+    /// always shown (no separate per-repo collapse in this read-only slice).
+    sessions_tree_expanded: std::collections::HashMap<String, bool>,
+    /// Selected-node cursor for the Sessions-view tree: `[machine_idx]` for a
+    /// machine row, `[machine_idx, repo_idx]` for a repo-group row,
+    /// `[machine_idx, repo_idx, session_idx]` for a session leaf.
+    sessions_tree_selected: Option<TreePath>,
+    /// Scroll offset (in flattened tree rows) for the Sessions-view tree.
+    sessions_tree_scroll: usize,
+
     // ── #955: attached fleet-terminal sessions (Terminal-view main pane) ───
     /// Local PTYs running `coord terminal attach <machine:name>`, keyed by
     /// `(machine, name)` — one per fleet-terminal tree leaf the operator has
@@ -3045,6 +3060,11 @@ impl CoordApp {
             fleet_terminal_sessions: std::collections::HashMap::new(),
             fleet_terminal_spawn_errors: std::collections::HashMap::new(),
             pending_kill_terminal: None,
+            // #1032: Sessions panel tree — no persisted expand/selection
+            // state, mirrors terminal_tree_*'s defaults.
+            sessions_tree_expanded: std::collections::HashMap::new(),
+            sessions_tree_selected: None,
+            sessions_tree_scroll: 0,
             // #603: fix-briefing preview (lazily populated when a dialog raises).
             fix_briefing_preview: None,
             fix_briefing_rx: None,
@@ -3216,6 +3236,15 @@ impl CoordApp {
                     icon: "◆".into(),
                     tooltip: "Plans".into(),
                     title: "PLANS".into(),
+                },
+                // #1032: Sessions panel — fleet-wide machine → repo → session
+                // tree of live claude work sessions. ◉ matches the icon used
+                // by the pre-existing #628 fleet-wide live-sessions overlay.
+                PanelDefinition {
+                    id: WidgetId::new("panel:sessions"),
+                    icon: "◉".into(),
+                    tooltip: "Sessions".into(),
+                    title: "SESSIONS".into(),
                 },
             ],
         )
@@ -6199,6 +6228,72 @@ impl CoordApp {
             items,
             selected_idx: 0,
             scroll_offset: self.machine_detail_scroll,
+            has_focus: false,
+            bordered: false,
+            h_scroll: 0,
+            max_content_width: None,
+            show_v_scrollbar: false,
+        }
+    }
+
+    // ── #1032: Sessions panel main-pane detail ────────────────────────────
+
+    /// Detail panel for the session leaf selected in the Sessions-view tree
+    /// (`selected_fleet_session`, `fleet_sessions.rs`): assignment id,
+    /// issue/repo, machine, type, and attached/dead status. Shows a
+    /// placeholder when nothing is selected or the selection is a
+    /// machine/repo row rather than a session leaf — this slice is
+    /// read-only nav/select, no actions live here yet (#1032).
+    fn sessions_detail_list(&self) -> ListView {
+        let mut items: Vec<ListItem> = Vec::new();
+        match self.selected_fleet_session() {
+            None => {
+                items.push(kv_item(
+                    "",
+                    " Select a session to see its details",
+                    Some(Color::rgb(140, 140, 140)),
+                ));
+            }
+            Some(s) => {
+                let header_text = format!(" {} ", s.assignment_id);
+                items.push(ListItem {
+                    text: StyledText {
+                        spans: vec![StyledSpan::with_fg(&header_text, Color::rgb(210, 220, 255))],
+                    },
+                    icon: None,
+                    detail: None,
+                    decoration: Decoration::Header,
+                });
+                items.push(kv_item("", "", None)); // blank
+
+                let issue_val = s
+                    .issue_number
+                    .map(|n| format!("#{}", n))
+                    .unwrap_or_else(|| "(unknown)".to_string());
+                items.push(kv_item("Issue", &issue_val, None));
+                items.push(kv_item(
+                    "Repo",
+                    s.repo_name.as_deref().unwrap_or("(unknown)"),
+                    None,
+                ));
+                items.push(kv_item("Machine", &self.session_machine_for(s), None));
+                items.push(kv_item("Type", &self.session_type_for(s), None));
+                let (status_val, status_col) = if s.pane_dead {
+                    ("dead pane".to_string(), Color::rgb(220, 80, 80))
+                } else if s.attached {
+                    ("attached".to_string(), Color::rgb(140, 200, 140))
+                } else {
+                    ("detached".to_string(), Color::rgb(190, 200, 215))
+                };
+                items.push(kv_item("Status", &status_val, Some(status_col)));
+            }
+        }
+        ListView {
+            id: WidgetId::new("sessions-detail"),
+            title: None,
+            items,
+            selected_idx: 0,
+            scroll_offset: 0,
             has_focus: false,
             bordered: false,
             h_scroll: 0,

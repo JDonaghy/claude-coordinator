@@ -841,6 +841,7 @@
             machine: Some("precision".to_string()),
             pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
         }
     }
 
@@ -3588,6 +3589,7 @@
             machine: None,
             pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
         }];
         let groups = app.pipeline_active_by_liveness();
         assert_eq!(groups.len(), 1);
@@ -3605,6 +3607,7 @@
             machine: None,
             pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
         }];
         let groups = app.pipeline_active_by_liveness();
         assert_eq!(groups[0].0, "idle", "cross-repo session must not mark it live");
@@ -3626,6 +3629,7 @@
             machine: None,
             pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
         }];
         app.rebuild_pipeline_sidebar(None);
         // Default selection is [0, 0] = first group (Live) → #42.
@@ -5747,6 +5751,7 @@
                 machine: None,
                 pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
             },
             LiveTmuxSession {
                 assignment_id: "b".into(),
@@ -5756,6 +5761,7 @@
                 machine: None,
                 pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
             },
         ];
         assert!(
@@ -5821,6 +5827,7 @@
                 machine: None,
                 pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
             },
             LiveTmuxSession {
                 assignment_id: "s2".into(),
@@ -5830,6 +5837,7 @@
                 machine: None,
                 pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
             },
             LiveTmuxSession {
                 assignment_id: "s3".into(),
@@ -5839,6 +5847,7 @@
                 machine: None,
                 pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
             },
             // A session with no matching assignment can't be attributed → ignored.
             LiveTmuxSession {
@@ -5849,6 +5858,7 @@
                 machine: None,
                 pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
             },
         ];
 
@@ -5873,6 +5883,7 @@
             machine: Some("elitebook".into()),
             pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
         }];
         assert!(app.live_sessions_overlay.is_none());
         // Simulate the L-toggle guard: sessions non-empty, no modal, no overlay.
@@ -5919,6 +5930,7 @@
             machine: None,
             pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
         }];
         app.live_sessions_overlay = Some(LiveSessionsOverlay::default());
         app.handle_live_sessions_overlay_key(
@@ -5943,6 +5955,7 @@
             machine: None,
             pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
         }];
         app.live_sessions_overlay = Some(LiveSessionsOverlay::default());
         app.handle_live_sessions_overlay_key(&Key::Char('L'), &Modifiers::default());
@@ -5965,6 +5978,7 @@
                 machine: None,
                 pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
             },
             LiveTmuxSession {
                 assignment_id: "a2".into(),
@@ -5974,6 +5988,7 @@
                 machine: None,
                 pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
             },
         ];
         app.live_sessions_overlay = Some(LiveSessionsOverlay { selected_idx: 0 });
@@ -6008,6 +6023,7 @@
                 machine: None,
                 pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
             },
             LiveTmuxSession {
                 assignment_id: "a2".into(),
@@ -6017,6 +6033,7 @@
                 machine: None,
                 pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
             },
         ];
         app.live_sessions_overlay = Some(LiveSessionsOverlay { selected_idx: 1 });
@@ -6040,6 +6057,7 @@
             machine: None, // no machine → local kill path (will fail gracefully)
             pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
         }];
         app.live_sessions_overlay = Some(LiveSessionsOverlay { selected_idx: 0 });
         // K (uppercase) kills the session; lowercase k is navigation-up.
@@ -6073,6 +6091,7 @@
             machine: None,
             pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
         }];
         app.live_sessions_overlay = Some(LiveSessionsOverlay { selected_idx: 0 });
         app.handle_live_sessions_overlay_key(&Key::Char('f'), &Modifiers::default());
@@ -10891,6 +10910,7 @@
             machine: None,
             pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
         }])
         .unwrap();
         app.pending_remote_sessions = Some(rx);
@@ -10961,6 +10981,7 @@
             machine: None,
             pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
         }];
         let (tx, rx) = std::sync::mpsc::channel();
         // Discovery returns an unrelated session only.
@@ -10972,6 +10993,7 @@
             machine: None,
             pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
         }])
         .unwrap();
         app.pending_remote_sessions = Some(rx);
@@ -11001,6 +11023,7 @@
             machine: None,
             pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
         }];
         let (tx, rx) = std::sync::mpsc::channel();
         tx.send(vec![LiveTmuxSession {
@@ -11011,6 +11034,7 @@
             machine: None,
             pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
         }])
         .unwrap();
         app.pending_remote_sessions = Some(rx);
@@ -11041,6 +11065,7 @@
             machine: None,
             pane_dead: false,
             pending_sweep_count: budget, // already at the limit
+            attached: false,
         }];
 
         // A discovery sweep that does NOT include (api, #99).
@@ -11074,6 +11099,7 @@
             machine: None,
             pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
         }];
 
         // Drive `budget` uncovered sweeps — the entry must survive each one.
@@ -11139,6 +11165,7 @@
             machine: None,
             pane_dead: false,
             pending_sweep_count: budget + 1,
+            attached: false,
         }];
 
         assert!(
@@ -11182,6 +11209,7 @@
             machine: None,
             pane_dead: false,
             pending_sweep_count: budget,
+            attached: false,
         }];
 
         assert!(
@@ -11347,6 +11375,7 @@
             machine: None,
             pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
         });
 
         assert_eq!(
@@ -11378,6 +11407,7 @@
             machine: None,
             pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
         });
 
         // Fix wants a running "work" session — the only one running is a review.
@@ -11414,6 +11444,7 @@
             machine: None,
             pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
         });
         assert_eq!(
             app.reattachable_session_aid(10, "repo-a", InteractiveLaunchMode::Fix),
@@ -11460,6 +11491,7 @@
             machine: None,
             pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
         });
 
         // The dedicated reattach path picks the running review type-agnostically.
@@ -11596,6 +11628,7 @@
             machine: None,
             pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
         }];
         assert_eq!(
             app.selected_issue_live_session_id().as_deref(),
@@ -11611,6 +11644,7 @@
             machine: None,
             pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
         }];
         assert!(
             app.selected_issue_live_session_id().is_none(),
@@ -11655,6 +11689,7 @@
                 machine: None,
                 pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
             },
             LiveTmuxSession {
                 assignment_id: "id-494-running".to_string(),
@@ -11664,6 +11699,7 @@
                 machine: None,
                 pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
             },
         ];
         assert_eq!(
@@ -11712,6 +11748,7 @@
             machine: None,
             pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
         }];
 
         // Running-only resolver returns None (assignment not running).
@@ -11778,6 +11815,7 @@
             machine: None,
             pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
         }];
 
         let items =
@@ -11822,6 +11860,7 @@
             machine: None,
             pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
         }];
 
         assert!(
@@ -11871,6 +11910,7 @@
             machine: None,
             pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
         }];
         assert_eq!(
             app.selected_issue_any_session_id().as_deref(),
@@ -11891,6 +11931,7 @@
             machine: None,
             pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
         });
         assert_eq!(
             app.selected_issue_any_session_id().as_deref(),
@@ -11928,6 +11969,7 @@
             machine: None,
             pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
         }];
 
         let target = pipeline_target(Some(300));
@@ -11972,6 +12014,7 @@
             machine: None,
             pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
         }];
         let items = app.context_menu_items_for_pipeline_row(Some(514), &lifecycle, None);
         assert!(items.iter().any(|i| i.label == "Reattach to live session"));
@@ -12667,6 +12710,7 @@
             machine: None,
             pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
         }];
         assert_eq!(
             drop_disabled(&app, PipelineRowLifecycle::InProgress),
@@ -21695,6 +21739,7 @@
             machine: None,
             pane_dead: false,
             pending_sweep_count: 0,
+            attached: false,
         }];
 
         // Open the context menu for the pipeline row (same state as right-click).
@@ -21846,6 +21891,7 @@
             machine: None,
             pane_dead: true,
             pending_sweep_count: 0,
+            attached: false,
         }];
 
         // Use a wider terminal so the badge isn't squeezed out by the right-
@@ -21874,6 +21920,7 @@
             machine: None,
             pane_dead: true,
             pending_sweep_count: 0,
+            attached: false,
         }];
         // Open the overlay (same state as pressing L with sessions present).
         app.live_sessions_overlay = Some(LiveSessionsOverlay::default());
@@ -25965,6 +26012,7 @@ Milestone tracking issue.
                 machine: None,
                 pane_dead: false,
                 pending_sweep_count: 0,
+                attached: false,
             });
         }
         app.pending_diagnose_dialog = Some(PendingDiagnoseDialog {
@@ -28471,6 +28519,152 @@ Milestone tracking issue.
                 .iter()
                 .any(|l| l.contains("scratch") || l.contains("build")),
             "'dellserver' has no terminals and must render with no nested children:\n{screen}",
+        );
+    }
+
+    // ── #1032: Sessions-view left-pane machine → repo → session tree ────────
+
+    /// TuiDriver black-box: seed live sessions across 2 machines and 2
+    /// repos — one attached, one plain detached, one dead-pane — open the
+    /// Sessions view and assert the left-pane tree nests machine → repo →
+    /// session correctly and tags `[attached]` / `(dead)` sessions.
+    #[test]
+    fn sessions_tree_nests_machine_repo_session_and_shows_status_tags() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(BoardData {
+            machines: vec![
+                mk_machine("precision", "precision.tail", true, &[]),
+                mk_machine("dellserver", "dellserver.tail", true, &[]),
+            ],
+            ..BoardData::default()
+        });
+        app.live_tmux_sessions = vec![
+            // precision / repo-a: one attached session.
+            LiveTmuxSession {
+                assignment_id: "aid-attached".to_string(),
+                issue_number: Some(101),
+                repo_name: Some("repo-a".to_string()),
+                issue_title: None,
+                machine: Some("precision".to_string()),
+                pane_dead: false,
+                pending_sweep_count: 0,
+                attached: true,
+            },
+            // precision / repo-b: one plain detached session.
+            LiveTmuxSession {
+                assignment_id: "aid-detached".to_string(),
+                issue_number: Some(202),
+                repo_name: Some("repo-b".to_string()),
+                issue_title: None,
+                machine: Some("precision".to_string()),
+                pane_dead: false,
+                pending_sweep_count: 0,
+                attached: false,
+            },
+            // dellserver / repo-a: one dead-pane session.
+            LiveTmuxSession {
+                assignment_id: "aid-dead".to_string(),
+                issue_number: Some(303),
+                repo_name: Some("repo-a".to_string()),
+                issue_title: None,
+                machine: Some("dellserver".to_string()),
+                pane_dead: true,
+                pending_sweep_count: 0,
+                attached: false,
+            },
+        ];
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        click_activity_icon(&mut driver, "◉");
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("precision"),
+            "machine 'precision' should render as a tree parent:\n{screen}",
+        );
+        assert!(
+            screen.contains("dellserver"),
+            "machine 'dellserver' should render as a tree parent:\n{screen}",
+        );
+        assert!(
+            screen.contains("repo-a"),
+            "'repo-a' group should be nested under both machines:\n{screen}",
+        );
+        assert!(
+            screen.contains("repo-b"),
+            "'repo-b' group should be nested under 'precision':\n{screen}",
+        );
+        assert!(
+            screen.contains("#101") && screen.contains("[attached]"),
+            "the attached session should show its issue # and an [attached] tag:\n{screen}",
+        );
+        assert!(
+            screen.contains("#202"),
+            "the plain detached session should render with no status tag:\n{screen}",
+        );
+        assert!(
+            screen.contains("#303") && screen.contains("(dead)"),
+            "the dead-pane session should show its issue # and a (dead) tag:\n{screen}",
+        );
+
+        // Nesting: machine → repo → session — every row for a machine's
+        // sessions must appear strictly between that machine's row and the
+        // next machine's row.
+        let lines: Vec<&str> = screen.lines().collect();
+        let precision_row = lines
+            .iter()
+            .position(|l| l.contains("precision"))
+            .expect("precision row");
+        let dellserver_row = lines
+            .iter()
+            .position(|l| l.contains("dellserver"))
+            .expect("dellserver row");
+        let repo_a_rows: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains("repo-a"))
+            .map(|(i, _)| i)
+            .collect();
+        let repo_b_row = lines
+            .iter()
+            .position(|l| l.contains("repo-b"))
+            .expect("repo-b row");
+        let attached_row = lines
+            .iter()
+            .position(|l| l.contains("#101"))
+            .expect("#101 row");
+        let detached_row = lines
+            .iter()
+            .position(|l| l.contains("#202"))
+            .expect("#202 row");
+        let dead_row = lines
+            .iter()
+            .position(|l| l.contains("#303"))
+            .expect("#303 row");
+
+        assert_eq!(
+            repo_a_rows.len(),
+            2,
+            "'repo-a' should appear once per machine that hosts it:\n{screen}"
+        );
+        let precision_repo_a_row = repo_a_rows[0];
+        let dellserver_repo_a_row = repo_a_rows[1];
+        assert!(
+            precision_row < precision_repo_a_row
+                && precision_repo_a_row < attached_row
+                && attached_row < repo_b_row
+                && repo_b_row < detached_row
+                && detached_row < dellserver_row,
+            "precision's repo-a/repo-b groups and sessions must nest between \
+             precision's row and dellserver's row (precision={precision_row}, \
+             repo-a={precision_repo_a_row}, #101={attached_row}, repo-b={repo_b_row}, \
+             #202={detached_row}, dellserver={dellserver_row}):\n{screen}",
+        );
+        assert!(
+            dellserver_row < dellserver_repo_a_row && dellserver_repo_a_row < dead_row,
+            "dellserver's repo-a group and session must nest after dellserver's row \
+             (dellserver={dellserver_row}, repo-a={dellserver_repo_a_row}, #303={dead_row}):\n{screen}",
         );
     }
 

@@ -2503,6 +2503,12 @@ impl CoordApp {
                             SidebarView::MilestoneDag => {}
                             // #975: Plans j/k handled by the earlier guarded arm.
                             SidebarView::Plans => {}
+                            // #1032: move the Sessions tree cursor down
+                            // one flattened row (machine/repo/session).
+                            SidebarView::Sessions => {
+                                self.sessions_tree_move_selection(1);
+                                self.fix_sessions_tree_scroll(content_visible_rows(list_b, lh));
+                            }
                         }
                         needs_redraw = true;
                     }
@@ -2562,6 +2568,11 @@ impl CoordApp {
                             SidebarView::MilestoneDag => {}
                             // #975: Plans k handled by the earlier guarded arm.
                             SidebarView::Plans => {}
+                            // #1032: see Down/j arm above.
+                            SidebarView::Sessions => {
+                                self.sessions_tree_move_selection(-1);
+                                self.fix_sessions_tree_scroll(content_visible_rows(list_b, lh));
+                            }
                         }
                         needs_redraw = true;
                     }
@@ -2793,6 +2804,9 @@ impl CoordApp {
                             SidebarView::Plans => {
                                 self.plans_sel = 0;
                             }
+                            // #1032: Sessions — no nav target for Home, same
+                            // as Terminal (j/k tree-walk covers navigation).
+                            SidebarView::Sessions => {}
                         }
                         needs_redraw = true;
                     }
@@ -2862,6 +2876,9 @@ impl CoordApp {
                                     self.plans_sel = n - 1;
                                 }
                             }
+                            // #1032: Sessions — no nav target for End, same
+                            // as Terminal (j/k tree-walk covers navigation).
+                            SidebarView::Sessions => {}
                         }
                         needs_redraw = true;
                     }
@@ -4301,6 +4318,17 @@ impl CoordApp {
             // #975: Plans sidebar is a placeholder; the plan-roster list lives
             // in the main panel (`mouse_main_click`).
             SidebarView::Plans => false,
+            // #1032: the Sessions-view tree is a raw `TreeView` (not
+            // `SidebarSystem`), so — like Terminal above — click dispatch
+            // uses flat pixel-row math rather than a `SidebarEvent`. No
+            // title row, so row 0 maps directly to the first tree row.
+            SidebarView::Sessions => {
+                if pos.y < sidebar_b.y {
+                    return false;
+                }
+                let row = ((pos.y - sidebar_b.y) / lh).floor() as usize + self.sessions_tree_scroll;
+                self.sessions_tree_click_row(row)
+            }
         }
     }
 
@@ -4897,6 +4925,10 @@ impl CoordApp {
             SidebarView::MilestoneDag => false,
             // #975: Plans sidebar is a placeholder — no sidebar scroll.
             SidebarView::Plans => false,
+            // #1032: Sessions tree has no mouse-wheel scroll wired in this
+            // read-only slice — j/k tree-walk covers navigation, same as
+            // Terminal above.
+            SidebarView::Sessions => false,
         }
     }
 
@@ -5147,6 +5179,10 @@ impl CoordApp {
             SidebarView::MilestoneDag => true,
             // #975: Plans panel — j/k handles navigation; wheel is no-op for now.
             SidebarView::Plans => true,
+            // #1032: Sessions main-panel detail is a static, unscrollable
+            // view of the selected leaf; wheel is a no-op, same as Kanban/
+            // MergeQueue/MilestoneDag/Plans above.
+            SidebarView::Sessions => true,
         }
     }
 }
