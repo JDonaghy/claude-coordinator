@@ -2241,6 +2241,111 @@
         );
     }
 
+    // ── #1059 fix-2: Gate A dispatch-failure full-text modal ──────────────
+
+    #[test]
+    fn is_gate_a_mock_dispatch_label_matches_only_the_mock_command() {
+        // The label `spawn_queued` records for a Gate A dispatch.
+        assert!(is_gate_a_mock_dispatch_label(
+            "coord acceptance mock claude-coordinator 1041"
+        ));
+        // Trailing-whitespace / no-arg edge (defensive).
+        assert!(is_gate_a_mock_dispatch_label("coord acceptance mock"));
+        // Sibling `acceptance` leaf verbs must NOT be captured — they are not
+        // Gate A dispatches and get the normal command-failed toast.
+        assert!(!is_gate_a_mock_dispatch_label(
+            "coord acceptance run --issue 1041"
+        ));
+        assert!(!is_gate_a_mock_dispatch_label(
+            "coord acceptance record --issue 1041 --sha abc"
+        ));
+        assert!(!is_gate_a_mock_dispatch_label("coord milestone dispatch api 42"));
+    }
+
+    #[test]
+    fn gate_a_dispatch_failure_opens_full_text_error_dialog() {
+        // #1059 fix-2: the exact failure the operator hit — "Dispatch Gate A
+        // mock" against a repo with no acceptance driver — must surface the
+        // COMPLETE reason in a dismissible modal, NOT a ~40-col-truncated
+        // "Command failed" toast that reads as a permanent wedge.
+        let mut app = make_app_default();
+        let full_reason = "error: repo 'claude-coordinator' has no acceptance \
+             driver configured — add it under acceptance.drivers in \
+             coordinator.yml before running Gate A (docs/ORACLE_LOOP.md)";
+        // Queue the failing result BEFORE spawning — `new_for_test`'s no_spawn
+        // path resolves synchronously at spawn time.
+        app.command_runner.push_canned_result(1, full_reason);
+        app.command_runner
+            .spawn_queued(&["acceptance", "mock", "claude-coordinator", "1041"]);
+        let toasts_before = app.toasts.len();
+
+        // Drain the (already-resolved) result through the poll handler.
+        app.run_periodic_work();
+
+        let body = app
+            .gate_a_error_dialog
+            .as_ref()
+            .expect("a failed Gate A dispatch must raise the full-text modal");
+        assert!(
+            body.contains("no acceptance driver configured"),
+            "the full reason must be preserved (not truncated), got: {body}"
+        );
+        // The generic "Command failed" toast must be suppressed for this case
+        // (the modal is the single, complete notification).
+        assert!(
+            !app
+                .toasts
+                .iter()
+                .skip(toasts_before)
+                .any(|(t, _, _)| t.title == "Command failed"),
+            "the truncating command-failed toast must be suppressed when the \
+             full-text Gate A modal is shown"
+        );
+    }
+
+    #[test]
+    fn gate_a_error_dialog_renders_full_reason_and_dismisses() {
+        // #1059 fix-2: the modal actually paints through the full
+        // ShellAdapter → render path (word-wrapped, so a long reason is
+        // readable), and Esc dismisses it.
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_app_default();
+        app.gate_a_error_dialog = Some(
+            "repo 'claude-coordinator' has no acceptance driver configured — \
+             add it under acceptance.drivers in coordinator.yml"
+                .to_string(),
+        );
+
+        // Structural: title + the full reason survive into the built dialog.
+        let dlg = app
+            .build_prompt_dialog()
+            .expect("gate-a error dialog must build when set");
+        let body = dialog_body_text(&dlg).join(" ");
+        assert!(
+            body.contains("no acceptance driver configured"),
+            "dialog body must carry the full reason, got:\n{body}"
+        );
+        assert!(
+            body.contains("Nothing was claimed"),
+            "dialog must reassure the operator nothing was left in-flight, got:\n{body}"
+        );
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        assert!(
+            driver.screen_contains("Gate A dispatch failed"),
+            "modal title must render on screen:\n{}",
+            driver.screen(),
+        );
+        // Esc dismisses the modal.
+        driver.press(quadraui::Key::Named(quadraui::NamedKey::Escape));
+        assert!(
+            !driver.screen_contains("Gate A dispatch failed"),
+            "Esc must dismiss the Gate A error modal:\n{}",
+            driver.screen(),
+        );
+    }
+
     // ── Leg 3c / A3 (#517, #581): test-verdict routing ────────────────────
 
     fn done_work_with_test_state(issue: u64, repo: &str, state: &str) -> Assignment {

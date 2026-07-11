@@ -644,6 +644,21 @@ fn is_fix_cap_preflight_label(label: &str, work_aid: &str) -> bool {
     label.contains("--fix-of") && label.contains(work_aid) && label.contains("--dry-run")
 }
 
+/// #1059: true when `label` is a "Dispatch Gate A mock" command
+/// (`coord acceptance mock <repo> <tracking_issue>`).  A completed
+/// `CommandResult` with a non-zero exit and a label matching this is routed
+/// into the full-text `gate_a_error_dialog` (rather than the truncated
+/// command-failed toast) so the operator can read the COMPLETE reason —
+/// crucially the "no acceptance driver configured — add it under
+/// acceptance.drivers…" case that otherwise reads as a permanent wedge.
+///
+/// Matched on the raw label (`coord acceptance mock …`) — the same label
+/// `spawn_queued` records — so it never fires on an unrelated `acceptance`
+/// subcommand (e.g. `acceptance run` / `acceptance record`).
+pub(crate) fn is_gate_a_mock_dispatch_label(label: &str) -> bool {
+    label.contains("acceptance mock ") || label.trim_end().ends_with("acceptance mock")
+}
+
 /// #532: Classify a key press while the artifact-pull dialog is open.
 ///
 /// Pure function so tests can exhaustively drive every key path without
@@ -2726,6 +2741,23 @@ pub struct CoordApp {
     /// [`vt100_panic_to_string`].  Set by [`report_terminal_panic`]; cleared
     /// when the operator dismisses the dialog (Esc / Enter / outside-click).
     pty_panic_dialog: Option<String>,
+
+    // ── #1059: Gate A dispatch-failure modal ──────────────────────────────────
+    /// When `Some`, a dismissible modal dialog shows the COMPLETE reason a
+    /// "Dispatch Gate A mock" (`coord acceptance mock`) attempt failed.
+    ///
+    /// The generic command-failed toast is a single un-wrapped ~40-col line
+    /// (quadraui#771), so a long Gate A reason — e.g. "repo 'x' has no
+    /// acceptance driver configured — add it under acceptance.drivers in
+    /// coordinator.yml before running Gate A (docs/ORACLE_LOOP.md)" — is cut
+    /// off mid-sentence with nowhere to read the rest.  The operator read that
+    /// truncation as a *permanent wedge* (#1041 "PERMANENTLY STUCK") when it
+    /// was actually a clean pre-dispatch failure that claimed nothing.  This
+    /// modal word-wraps the full message and states explicitly that nothing
+    /// was left in-flight, so a config gap can never masquerade as a stuck
+    /// epic again.  Set by the poll handler in `settings_ui.rs`; cleared on
+    /// dismiss (Esc / Enter / outside-click).
+    gate_a_error_dialog: Option<String>,
 }
 
 /// #728: Time-window for the Done section in the Pipeline sidebar.
@@ -3115,6 +3147,8 @@ impl CoordApp {
             done_window: DoneWindow::H2,
             // #816: no pending PTY-panic dialog on startup.
             pty_panic_dialog: None,
+            // #1059: no pending Gate A dispatch-failure dialog on startup.
+            gate_a_error_dialog: None,
         };
         // #584: a thin client pulls config from the daemon (no local
         // coordinator.yml) so the status bar doesn't warn and subcommands have
