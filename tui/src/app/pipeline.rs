@@ -1866,6 +1866,222 @@ impl CoordApp {
         }
     }
 
+    /// #1060 (docs/ORACLE_LOOP.md, #931): resolve the milestone
+    /// tracking-issue number for `issue` via `self.data.milestone_work_orders`
+    /// (#795) — the epic that owns the `## Work order` block `issue` is a
+    /// member node of. `None` when the issue has no `coord_repo`, the daemon
+    /// predates #795 (empty list), or the issue isn't a member of any
+    /// tracked work order. Used to build the `coord acceptance author
+    /// <repo> <tracking_issue> --issue <N>` argument list without a new
+    /// board field — the work-order projection already carries it.
+    pub(crate) fn milestone_tracking_issue_for(&self, issue: &PipelineIssue) -> Option<u64> {
+        let repo = issue.coord_repo.as_deref()?;
+        self.data.milestone_work_orders.iter().find_map(|mwo| {
+            (mwo.repo_name == repo && mwo.nodes.iter().any(|n| n.issue_number == issue.number))
+                .then_some(mwo.tracking_issue)
+        })
+    }
+
+    /// #1060: local-filesystem check mirroring Python's
+    /// `coord.acceptance.gate_a_contract_path` — whether
+    /// `tests/acceptance/ms-NN/contract.md` exists in the issue's local
+    /// checkout, where NN is the issue's milestone number (via
+    /// `pipeline_issue_milestone`). Used to gate "Author acceptance tests":
+    /// the independent test-author reads the contract from its own checkout
+    /// (#931), so JIT authoring is meaningless before Gate A has written it.
+    /// Conservatively `false` (disabled) when the issue has no resolvable
+    /// milestone or no local checkout path is known — the same "can't
+    /// dispatch, so don't offer it" default the other gates in this file use.
+    pub(crate) fn gate_a_contract_exists_for(&self, issue: &PipelineIssue) -> bool {
+        let Some((milestone_number, _)) = self.pipeline_issue_milestone(issue) else {
+            return false;
+        };
+        let Some(repo) = issue.coord_repo.as_deref() else {
+            return false;
+        };
+        let Some(local_path) = self.data.pipeline_repo_paths.get(repo) else {
+            return false;
+        };
+        std::path::Path::new(local_path.as_str())
+            .join("tests")
+            .join("acceptance")
+            .join(format!("ms-{}", milestone_number))
+            .join("contract.md")
+            .is_file()
+    }
+
+    /// #1060 (docs/ORACLE_LOOP.md, #931): dispatch `coord acceptance author
+    /// <repo> <tracking_issue> --issue <N>` for the selected pipeline row —
+    /// the independent test-author's JIT slice for this issue, extending the
+    /// milestone's sealed acceptance suite from its Gate A contract.
+    /// Headless, like `dispatch_gate_a_mock_for_selected_pipeline_row`: a
+    /// normal (non-interactive) `claude -p` worker, not a live tmux session.
+    /// The CLI's own validation (contract exists, issue is a work-order
+    /// member) surfaces failures via the command runner's usual toast path.
+    pub(crate) fn dispatch_acceptance_author_for_selected_pipeline_row(&mut self) -> bool {
+        let Some(idx) = self.pipeline_sel else {
+            return false;
+        };
+        let Some(issue) = self.pipeline_issues.get(idx).cloned() else {
+            return false;
+        };
+        let Some(repo) = issue.coord_repo.clone() else {
+            self.push_toast(
+                "Author acceptance tests",
+                "No local repo mapping for this issue — cannot dispatch.",
+                ToastSeverity::Warning,
+            );
+            return false;
+        };
+        let Some(tracking_issue) = self.milestone_tracking_issue_for(&issue) else {
+            self.push_toast(
+                "Author acceptance tests",
+                "This issue isn't a member of any tracked milestone work order — \
+                 cannot resolve the tracking issue to author against.",
+                ToastSeverity::Warning,
+            );
+            return false;
+        };
+        let cmd_strs: Vec<String> = vec![
+            "acceptance".to_string(),
+            "author".to_string(),
+            repo.clone(),
+            tracking_issue.to_string(),
+            "--issue".to_string(),
+            issue.number.to_string(),
+        ];
+        let cmd_refs: Vec<&str> = cmd_strs.iter().map(|s| s.as_str()).collect();
+        use crate::commands::SpawnQueuedOutcome;
+        match self.command_runner.spawn_queued(&cmd_refs) {
+            SpawnQueuedOutcome::Started => {
+                self.push_toast(
+                    "Acceptance author dispatched",
+                    &format!(
+                        "coord acceptance author {} {} --issue {}",
+                        repo, tracking_issue, issue.number
+                    ),
+                    ToastSeverity::Info,
+                );
+                true
+            }
+            SpawnQueuedOutcome::Queued => {
+                self.push_toast(
+                    "⏳ Queued",
+                    "Acceptance author dispatch runs after current command",
+                    ToastSeverity::Info,
+                );
+                true
+            }
+            SpawnQueuedOutcome::Deduped => false,
+        }
+    }
+
+    /// #1060 (docs/ORACLE_LOOP.md, #932): dispatch `coord acceptance record
+    /// --repo <repo> --issue <N> --sha <sha>` for the selected pipeline
+    /// row — the coordinator's external trust-gate re-run of the sealed
+    /// acceptance slice against the pushed SHA. The SHA is resolved from the
+    /// latest completed work assignment's branch by reading the local
+    /// checkout's git refs directly (`read_git_branch_head`, the same
+    /// mechanism `poll_test_plan_staleness` uses) — a headless worker can lie
+    /// about "green" in its own session; it can't fake the coordinator
+    /// re-running the sealed suite itself against the exact SHA it pushed.
+    pub(crate) fn dispatch_acceptance_record_for_selected_pipeline_row(&mut self) -> bool {
+        let Some(idx) = self.pipeline_sel else {
+            return false;
+        };
+        let Some(issue) = self.pipeline_issues.get(idx).cloned() else {
+            return false;
+        };
+        let Some(repo) = issue.coord_repo.clone() else {
+            self.push_toast(
+                "Record acceptance",
+                "No local repo mapping for this issue — cannot dispatch.",
+                ToastSeverity::Warning,
+            );
+            return false;
+        };
+        let Some(work) = self
+            .data
+            .assignments
+            .iter()
+            .filter(|a| a.issue_number == issue.number && a.repo == repo)
+            .filter(|a| {
+                matches!(a.assignment_type.as_deref().unwrap_or("work"), "work" | "mock-author")
+            })
+            .filter(|a| a.status == "done")
+            .filter(|a| a.branch.as_deref().map(|b| !b.is_empty()).unwrap_or(false))
+            .max_by(|a, b| {
+                a.dispatched_at
+                    .partial_cmp(&b.dispatched_at)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .cloned()
+        else {
+            self.push_toast(
+                "Record acceptance",
+                "No completed work assignment with a branch for this issue — \
+                 nothing to record against yet.",
+                ToastSeverity::Warning,
+            );
+            return false;
+        };
+        let branch = work.branch.clone().unwrap_or_default();
+        let sha = self
+            .data
+            .pipeline_repo_paths
+            .get(repo.as_str())
+            .and_then(|path| read_git_branch_head(std::path::Path::new(path.as_str()), &branch));
+        let Some(sha) = sha else {
+            self.push_toast(
+                "Record acceptance",
+                &format!(
+                    "Could not resolve the HEAD SHA for branch '{}' in the local \
+                     checkout — fetch it locally first, or run `coord acceptance \
+                     record --repo {} --issue {} --sha <sha>` manually.",
+                    branch, repo, issue.number
+                ),
+                ToastSeverity::Warning,
+            );
+            return false;
+        };
+        let cmd_strs: Vec<String> = vec![
+            "acceptance".to_string(),
+            "record".to_string(),
+            "--repo".to_string(),
+            repo.clone(),
+            "--issue".to_string(),
+            issue.number.to_string(),
+            "--sha".to_string(),
+            sha.clone(),
+        ];
+        let cmd_refs: Vec<&str> = cmd_strs.iter().map(|s| s.as_str()).collect();
+        use crate::commands::SpawnQueuedOutcome;
+        match self.command_runner.spawn_queued(&cmd_refs) {
+            SpawnQueuedOutcome::Started => {
+                self.push_toast(
+                    "Acceptance record dispatched",
+                    &format!(
+                        "coord acceptance record --repo {} --issue {} --sha {}",
+                        repo,
+                        issue.number,
+                        &sha[..sha.len().min(8)]
+                    ),
+                    ToastSeverity::Info,
+                );
+                true
+            }
+            SpawnQueuedOutcome::Queued => {
+                self.push_toast(
+                    "⏳ Queued",
+                    "Acceptance record runs after current command",
+                    ToastSeverity::Info,
+                );
+                true
+            }
+            SpawnQueuedOutcome::Deduped => false,
+        }
+    }
+
     /// Launch `coord assign --interactive --merge-of <assignment_id>` in the
     /// standalone Terminal pane (SidebarView::Terminal), reusing the same PTY
     /// infrastructure as Chat/Troubleshoot modes.

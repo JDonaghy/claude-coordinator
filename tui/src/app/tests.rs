@@ -2346,6 +2346,313 @@
         );
     }
 
+    // ── #1060: per-issue acceptance actions (JIT author + record) ─────────
+
+    /// Row 0 (#42) is a member of milestone tracking-issue #751's work order
+    /// (via `milestone_work_orders`) and has an `open_issues` entry carrying
+    /// milestone #9 (via `pipeline_issue_milestone`) — the acceptance menu
+    /// items apply. Row 1 (#99) is an ordinary issue in the same repo with no
+    /// work-order membership — the items must not appear.
+    /// `repo_path` backs `pipeline_repo_paths["api"]`, used by
+    /// `gate_a_contract_exists_for`'s on-disk contract.md check.
+    fn make_pipeline_app_for_acceptance_menu_test(selected_idx: usize, repo_path: &str) -> CoordApp {
+        let mut pipeline_repo_paths = std::collections::HashMap::new();
+        pipeline_repo_paths.insert("api".to_string(), repo_path.to_string());
+        let data = BoardData {
+            pipeline_default_gates: vec!["review".to_string(), "merge".to_string()],
+            pipeline_tracked_labels: vec!["coord".to_string()],
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            pipeline_repo_paths,
+            open_issues: vec![OpenIssue {
+                repo_name: "api".to_string(),
+                number: 42,
+                title: "Milestone member issue".to_string(),
+                body: String::new(),
+                state: "open".to_string(),
+                labels: vec!["coord".to_string()],
+                milestone_number: Some(9),
+                milestone_title: Some("v1.0".to_string()),
+            }],
+            milestone_work_orders: vec![MilestoneWorkOrder {
+                repo_name: "api".to_string(),
+                tracking_issue: 751,
+                milestone_title: "v1.0".to_string(),
+                nodes: vec![MilestoneWorkOrderNode {
+                    issue_number: 42,
+                    rank: 0,
+                    ready: true,
+                    next_up: true,
+                    blocked_on: vec![],
+                }],
+            }],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        app.pipeline_issues = vec![
+            PipelineIssue {
+                number: 42,
+                title: "Milestone member issue".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string(), "status:ready".to_string()],
+                is_closed: false,
+            },
+            PipelineIssue {
+                number: 99,
+                title: "Ordinary issue, no work order".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string(), "status:ready".to_string()],
+                is_closed: false,
+            },
+        ];
+        app.rebuild_pipeline_sidebar(None);
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(selected_idx);
+        app
+    }
+
+    #[test]
+    fn acceptance_menu_items_present_only_for_milestone_work_order_member() {
+        // #1060: unlike Gate A dispatch/sign-off (#1059, epic-row-only),
+        // "Author acceptance tests" / "Record acceptance" apply to ordinary
+        // member issues of a milestone's work order.
+        let member_app = make_pipeline_app_for_acceptance_menu_test(0, "/nonexistent/api-repo");
+        let items = member_app.context_menu_items_for_pipeline_row(
+            Some(42),
+            &PipelineRowLifecycle::New,
+            Some("api"),
+        );
+        assert!(
+            items.iter().any(|i| i.action_id.as_deref() == Some("author-acceptance-tests")),
+            "work-order member row must offer 'Author acceptance tests'"
+        );
+        assert!(
+            items.iter().any(|i| i.action_id.as_deref() == Some("record-acceptance")),
+            "work-order member row must offer 'Record acceptance'"
+        );
+
+        let non_member_app = make_pipeline_app_for_acceptance_menu_test(1, "/nonexistent/api-repo");
+        let items = non_member_app.context_menu_items_for_pipeline_row(
+            Some(99),
+            &PipelineRowLifecycle::New,
+            Some("api"),
+        );
+        assert!(
+            !items.iter().any(|i| i.action_id.as_deref() == Some("author-acceptance-tests")),
+            "non-member row must NOT offer 'Author acceptance tests'"
+        );
+        assert!(
+            !items.iter().any(|i| i.action_id.as_deref() == Some("record-acceptance")),
+            "non-member row must NOT offer 'Record acceptance'"
+        );
+    }
+
+    #[test]
+    fn author_acceptance_tests_item_disabled_until_contract_exists_on_disk() {
+        // #1060: "Author acceptance tests" is only meaningful once Gate A's
+        // contract.md exists — the independent test-author reads it from its
+        // own checkout, so JIT authoring against a missing contract is a
+        // guaranteed failure. Gated via a local-filesystem check
+        // (`gate_a_contract_exists_for`), mirroring the coordinator's own
+        // `coord.acceptance.gate_a_contract_path` layout.
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let tmp = std::env::temp_dir().join(format!("coord-tui-test-gate-a-contract-{}", tid));
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let app = make_pipeline_app_for_acceptance_menu_test(0, tmp.to_str().unwrap());
+        let items = app.context_menu_items_for_pipeline_row(
+            Some(42),
+            &PipelineRowLifecycle::New,
+            Some("api"),
+        );
+        let author_item = items
+            .iter()
+            .find(|i| i.action_id.as_deref() == Some("author-acceptance-tests"))
+            .expect("work-order member row must offer 'author-acceptance-tests'");
+        assert!(
+            author_item.disabled,
+            "must be disabled before contract.md exists on disk"
+        );
+
+        // Write the contract at the expected ms-9 path (milestone #9, from
+        // the fixture's `open_issues` entry) and re-check.
+        let contract_dir = tmp.join("tests").join("acceptance").join("ms-9");
+        std::fs::create_dir_all(&contract_dir).unwrap();
+        std::fs::write(contract_dir.join("contract.md"), "# Gate A contract\n").unwrap();
+
+        let app = make_pipeline_app_for_acceptance_menu_test(0, tmp.to_str().unwrap());
+        let items = app.context_menu_items_for_pipeline_row(
+            Some(42),
+            &PipelineRowLifecycle::New,
+            Some("api"),
+        );
+        let author_item = items
+            .iter()
+            .find(|i| i.action_id.as_deref() == Some("author-acceptance-tests"))
+            .expect("work-order member row must offer 'author-acceptance-tests'");
+        assert!(
+            !author_item.disabled,
+            "must enable once contract.md exists on disk"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn record_acceptance_item_disabled_until_a_completed_work_assignment_exists() {
+        // #1060: "Record acceptance" needs a completed work assignment with
+        // a branch to resolve the SHA from — same gate Testing/Merge use.
+        let app = make_pipeline_app_for_acceptance_menu_test(0, "/nonexistent/api-repo");
+        let items = app.context_menu_items_for_pipeline_row(
+            Some(42),
+            &PipelineRowLifecycle::New,
+            Some("api"),
+        );
+        let record_item = items
+            .iter()
+            .find(|i| i.action_id.as_deref() == Some("record-acceptance"))
+            .expect("work-order member row must offer 'record-acceptance'");
+        assert!(
+            record_item.disabled,
+            "must be disabled before any work assignment has completed"
+        );
+
+        let mut app_with_work = make_pipeline_app_for_acceptance_menu_test(0, "/nonexistent/api-repo");
+        let mut a = make_assignment_typed("done", 42, "api", Some("work"));
+        a.branch = Some("issue-42-fix".to_string());
+        app_with_work.data.assignments.push(a);
+        let items = app_with_work.context_menu_items_for_pipeline_row(
+            Some(42),
+            &PipelineRowLifecycle::New,
+            Some("api"),
+        );
+        let record_item = items
+            .iter()
+            .find(|i| i.action_id.as_deref() == Some("record-acceptance"))
+            .expect("work-order member row must offer 'record-acceptance'");
+        assert!(
+            !record_item.disabled,
+            "must enable once a done work assignment with a branch exists"
+        );
+    }
+
+    #[test]
+    fn author_acceptance_tests_action_spawns_acceptance_author_command() {
+        // #1060: the menu action fires `coord acceptance author <repo>
+        // <tracking_issue> --issue <N>` headlessly — same dispatch
+        // mechanism as `coord acceptance mock` (#1059), not an interactive
+        // session. `<tracking_issue>` (751) comes from the fixture's
+        // `milestone_work_orders` entry, resolved via
+        // `milestone_tracking_issue_for`.
+        let mut app = make_pipeline_app_for_acceptance_menu_test(0, "/nonexistent/api-repo");
+        let target = ContextMenuTarget::PipelineRow {
+            issue_number: Some(42),
+            repo_name: Some("api".to_string()),
+            lifecycle: PipelineRowLifecycle::New,
+        };
+        let handled = app.dispatch_context_menu_action("author-acceptance-tests", &target);
+        assert!(handled, "author-acceptance-tests must be a recognised action");
+        assert_eq!(
+            app.command_runner.spawned_calls.len(),
+            1,
+            "exactly one command must be spawned, got: {:?}",
+            app.command_runner.spawned_calls,
+        );
+        assert_eq!(
+            app.command_runner.spawned_calls[0],
+            vec![
+                "acceptance".to_string(),
+                "author".to_string(),
+                "api".to_string(),
+                "751".to_string(),
+                "--issue".to_string(),
+                "42".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn record_acceptance_action_toasts_when_no_completed_work_yet() {
+        // #1060: without a completed work assignment there is no branch to
+        // resolve a SHA from — must toast a clear reason rather than
+        // silently no-op or dispatch a bogus command.
+        let mut app = make_pipeline_app_for_acceptance_menu_test(0, "/nonexistent/api-repo");
+        let target = ContextMenuTarget::PipelineRow {
+            issue_number: Some(42),
+            repo_name: Some("api".to_string()),
+            lifecycle: PipelineRowLifecycle::New,
+        };
+        let toasts_before = app.toasts.len();
+        let handled = app.dispatch_context_menu_action("record-acceptance", &target);
+        assert!(handled, "record-acceptance must be a recognised action");
+        assert!(
+            app.command_runner.spawned_calls.is_empty(),
+            "no command must spawn without a completed work assignment"
+        );
+        assert!(
+            app.toasts.len() > toasts_before,
+            "must toast when no completed work assignment exists yet"
+        );
+        assert!(
+            app.toasts.last().unwrap().0.title.contains("Record acceptance"),
+            "toast should be scoped to the Record acceptance action, got: {:?}",
+            app.toasts.last().unwrap().0.title,
+        );
+    }
+
+    #[test]
+    fn record_acceptance_action_spawns_acceptance_record_command_with_resolved_sha() {
+        // #1060: the menu action resolves the pushed branch's HEAD SHA from
+        // the local checkout (`read_git_branch_head`, same mechanism the
+        // #349 test-plan staleness check uses) and fires `coord acceptance
+        // record --repo <repo> --issue <N> --sha <sha>`.
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let tmp = std::env::temp_dir().join(format!("coord-tui-test-acceptance-record-{}", tid));
+        let refs_dir = tmp.join(".git").join("refs").join("heads");
+        std::fs::create_dir_all(&refs_dir).unwrap();
+        let sha = "cafebabe1234567890abcdef1234567890abcdef";
+        std::fs::write(refs_dir.join("issue-42-fix"), format!("{}\n", sha)).unwrap();
+
+        let mut app = make_pipeline_app_for_acceptance_menu_test(0, tmp.to_str().unwrap());
+        let mut a = make_assignment_typed("done", 42, "api", Some("work"));
+        a.branch = Some("issue-42-fix".to_string());
+        app.data.assignments.push(a);
+
+        let target = ContextMenuTarget::PipelineRow {
+            issue_number: Some(42),
+            repo_name: Some("api".to_string()),
+            lifecycle: PipelineRowLifecycle::New,
+        };
+        let handled = app.dispatch_context_menu_action("record-acceptance", &target);
+        assert!(handled, "record-acceptance must be a recognised action");
+        assert_eq!(
+            app.command_runner.spawned_calls.len(),
+            1,
+            "exactly one command must be spawned, got: {:?}",
+            app.command_runner.spawned_calls,
+        );
+        assert_eq!(
+            app.command_runner.spawned_calls[0],
+            vec![
+                "acceptance".to_string(),
+                "record".to_string(),
+                "--repo".to_string(),
+                "api".to_string(),
+                "--issue".to_string(),
+                "42".to_string(),
+                "--sha".to_string(),
+                sha.to_string(),
+            ],
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     // ── Leg 3c / A3 (#517, #581): test-verdict routing ────────────────────
 
     fn done_work_with_test_state(issue: u64, repo: &str, state: &str) -> Assignment {
