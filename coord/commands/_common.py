@@ -154,25 +154,31 @@ def _load_config(path: Path | None) -> Config:
         from coord.config import resolve_config_path  # noqa: PLC0415
 
         path = resolve_config_path()
-    # #584/#591: a thin client (board_service set) has no local coordinator.yml.
-    # When the path is absent, fetch + cache the daemon's config and load that,
-    # so EVERY command — not just `coord status` — is config-portable. On the
-    # host (svc unset) or when a local config exists, this is a no-op.
+    # #1080: "am I a thin client" (board_service configured) is the PRIMARY
+    # branch, checked before "does a local file exist" — not after. A thin
+    # client must never trust a local coordinator.yml, even one that happens
+    # to exist: a stray ~/.coord/coordinator.yml or ./coordinator.yml can
+    # silently diverge from the daemon's real config with no signal that it's
+    # stale (#947 friction log — a 7-week-old symlink shadowed the daemon's
+    # config on every command). On a machine with no client.toml/board_service
+    # (svc is None — e.g. the daemon host), this is a no-op and local-file
+    # resolution proceeds exactly as before (#584/#591).
     try:
-        if not Path(path).exists():
-            from coord.client import resolve_board_service  # noqa: PLC0415
+        from coord.client import resolve_board_service  # noqa: PLC0415
 
-            svc = resolve_board_service()
-            if svc is not None:
-                from coord.client import fetch_remote_config  # noqa: PLC0415
+        svc = resolve_board_service()
+        if svc is not None:
+            from coord.client import fetch_remote_config  # noqa: PLC0415
 
-                try:
-                    path = fetch_remote_config(svc)
-                except Exception as exc:  # noqa: BLE001 — fall through to the normal error
-                    click.echo(
-                        f"warning: could not fetch config from {svc.url}: {exc}",
-                        err=True,
-                    )
+            try:
+                path = fetch_remote_config(svc)
+            except Exception as exc:  # noqa: BLE001 — do NOT fall through to
+                # load(path): path may point at a local file that happens to
+                # exist (the exact bypass this issue closes). Fail loudly
+                # instead of silently trusting whatever is on disk.
+                raise ConfigError(
+                    f"could not fetch config from {svc.url}: {exc}"
+                ) from exc
         cfg = load(path)
     except ConfigError as e:
         click.echo(f"error: {e}", err=True)

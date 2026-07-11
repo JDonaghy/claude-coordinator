@@ -2348,6 +2348,10 @@ def test_test_plan_generation_on_daemon_uses_resolved_claude_path(
     monkeypatch.setattr(
         cc, "resolve_board_service", lambda *a, **k: cc.ServiceConfig("http://d:7435")
     )
+    # #1080: _load_config now always fetches on a thin client (never trusts a
+    # local file that happens to exist), so stand in for the daemon's /config
+    # with the same coordinator.yml already loaded into `app` above.
+    monkeypatch.setattr(cc, "fetch_remote_config", lambda svc, **kw: valid_config_path)
     # Route the thin-client POST into the real daemon endpoint in-process
     # instead of over a live HTTP socket.
     monkeypatch.setattr(
@@ -2421,6 +2425,10 @@ def test_log_falls_back_to_daemon_board_machine_name(coord_db, tmp_path, monkeyp
     monkeypatch.setattr(
         cc, "resolve_board_service", lambda *a, **k: cc.ServiceConfig("http://d:7435")
     )
+    # #1080: _load_config now always fetches on a thin client (never trusts a
+    # local file that happens to exist), so stand in for the daemon's /config
+    # with the same coordinator.yml this test already wrote to cfg.
+    monkeypatch.setattr(cc, "fetch_remote_config", lambda svc, **kw: cfg)
     monkeypatch.setattr(
         cc,
         "fetch_board_payload",

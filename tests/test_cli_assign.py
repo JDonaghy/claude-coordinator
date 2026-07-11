@@ -1404,6 +1404,11 @@ class TestAssignInteractiveSmoke:
             lambda *a, **k: cc.ServiceConfig("http://daemon:7435"),
         )
         monkeypatch.setattr(cc, "fetch_remote_board", lambda *a, **k: remote)
+        # #1080: _load_config now always fetches on a thin client (never
+        # trusts a local file that happens to exist), so stand in for the
+        # daemon's /config with the same coordinator.yml already written to
+        # config_file.
+        monkeypatch.setattr(cc, "fetch_remote_config", lambda *a, **k: config_file)
         # NOTE: no _seed_done_work — the local DB is intentionally empty; the
         # target exists only on the (mocked) daemon board.
         with patch("coord.github_ops.get_issue",

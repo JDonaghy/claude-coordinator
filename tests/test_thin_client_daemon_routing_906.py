@@ -485,6 +485,10 @@ def test_chat_continue_finds_prior_assignment_via_daemon_board(monkeypatch, coor
     )
 
     monkeypatch.setattr(cc, "resolve_board_service", lambda *a, **k: _FakeSvc())
+    # #1080: _load_config now always fetches on a thin client (never trusts a
+    # local file that happens to exist), so stand in for the daemon's /config
+    # with the same coordinator.yml this test already wrote to cfg_path.
+    monkeypatch.setattr(cc, "fetch_remote_config", lambda svc, **kw: cfg_path)
     monkeypatch.setattr(
         cc,
         "fetch_board_payload",
