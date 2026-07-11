@@ -405,15 +405,70 @@ impl CoordApp {
     }
 
     /// Stop (finalize) the assignment behind the currently-selected
-    /// Sessions-tree leaf via `coord stop <aid>`. No-op when the selection
-    /// isn't a session row. Mirrors the `L` overlay's `f` handler exactly —
-    /// same command, no extra confirm (stop is non-destructive to the
+    /// Sessions-tree leaf via `coord stop <aid>`. No-op (returns `false`)
+    /// when the selection isn't a session row — mirrors the `L` overlay's
+    /// `f` handler, no extra confirm (stop is non-destructive to the
     /// worktree, unlike kill).
+    ///
+    /// #1033 fix: the previous version fired `coord stop` with NO feedback
+    /// at all — no status-bar message, no toast, on success OR failure —
+    /// which made the action indistinguishable from "not wired" (the
+    /// reviewer's repro). Uses a toast (not `pipeline_status`, which only
+    /// renders inside the Pipeline detail view) so the confirmation is
+    /// actually visible from the Sessions panel itself — `pipeline_status`
+    /// is still set too, mirroring `dispatch_stop_for_selected_pipeline_row`
+    /// / `kill_watched`, in case the operator switches to Pipeline shortly
+    /// after.
+    ///
+    /// Also guards against firing `coord stop` on a leaf whose board
+    /// assignment is already non-`running`: the Sessions tree can select a
+    /// "zombie" leaf — a discovered tmux session still alive after its
+    /// board assignment already finished (see
+    /// `selected_issue_any_session_id`'s doc comment) — and `coord stop`'s
+    /// CLI unconditionally POSTs `/cancel` + marks the assignment `failed`
+    /// regardless of its current status. Firing it blindly on an
+    /// already-finalized assignment (e.g. `review done`) would silently
+    /// flip a completed assignment to `failed` instead of no-op'ing, so we
+    /// check first and surface a clear "nothing to stop" message instead.
     pub(crate) fn stop_selected_fleet_session(&mut self) -> bool {
-        let Some(aid) = self.selected_fleet_session().map(|s| s.assignment_id.clone()) else {
+        let Some(s) = self.selected_fleet_session() else {
             return false;
         };
-        self.command_runner.spawn_queued(&["stop", &aid]);
+        let aid = s.assignment_id.clone();
+        let issue_label = s
+            .issue_number
+            .map(|n| format!("#{}", n))
+            .unwrap_or_else(|| aid.clone());
+        if !self.session_assignment_is_running(&aid) {
+            self.push_toast(
+                "Nothing to stop",
+                &format!("{issue_label}: assignment already finished — nothing to stop."),
+                ToastSeverity::Info,
+            );
+            return true;
+        }
+        use crate::commands::SpawnQueuedOutcome;
+        match self.command_runner.spawn_queued(&["stop", &aid]) {
+            SpawnQueuedOutcome::Started => {
+                self.pipeline_status = Some((
+                    format!("stop dispatched for {issue_label}"),
+                    Instant::now(),
+                ));
+                self.push_toast(
+                    "Stop dispatched",
+                    &format!("{issue_label}: `coord stop` running…"),
+                    ToastSeverity::Info,
+                );
+            }
+            SpawnQueuedOutcome::Queued => {
+                self.push_toast(
+                    "⏳ Queued",
+                    "stop runs after current command",
+                    ToastSeverity::Info,
+                );
+            }
+            SpawnQueuedOutcome::Deduped => {}
+        }
         true
     }
 }

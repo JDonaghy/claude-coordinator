@@ -5984,6 +5984,113 @@
         );
     }
 
+    /// TuiDriver black-box (#1033 fix): pressing `f` on a session leaf whose
+    /// board assignment is `running` must render VISIBLE feedback — the
+    /// reviewer's repro was that the stop action was a "complete no-op": no
+    /// toast, no status message, no observable change on screen. Asserts the
+    /// dispatch toast is actually painted, not just returned from the
+    /// method (a screen-level check, since `pipeline_status` — which the
+    /// underlying method also sets — never renders on the Sessions panel).
+    #[test]
+    fn sessions_panel_stop_running_session_shows_feedback_toast() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(BoardData {
+            machines: vec![mk_machine("precision", "precision.tail", true, &[])],
+            ..BoardData::default()
+        });
+        let mut running = make_assignment("running");
+        running.id = "test-aid".into();
+        app.data.assignments.push(running);
+        app.live_tmux_sessions = vec![LiveTmuxSession {
+            assignment_id: "test-aid".into(),
+            issue_number: Some(99),
+            repo_name: Some("api".into()),
+            issue_title: None,
+            machine: Some("precision".into()),
+            pane_dead: false,
+            pending_sweep_count: 0,
+            attached: false,
+        }];
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        click_activity_icon(&mut driver, "◉");
+        let (x, y) = driver.find("#99").unwrap_or_else(|| {
+            panic!("'#99' session row must be findable:\n{}", driver.screen())
+        });
+        driver.click(x, y);
+
+        driver.press(Key::Char('f'));
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Stop dispatched"),
+            "f on a running session must render visible dispatch feedback, \
+             not a silent no-op:\n{screen}",
+        );
+        // The actual `coord stop <aid>` dispatch is asserted directly against
+        // `command_runner.spawned_calls` in the direct-app unit test
+        // `stop_selected_fleet_session_queues_coord_stop` below — the
+        // TuiDriver shell adapter here doesn't expose the wrapped `CoordApp`
+        // for a typed field check, only the rendered screen.
+    }
+
+    /// TuiDriver black-box (#1033 fix): pressing `f` on a session leaf whose
+    /// board assignment already finished must render a clear "nothing to
+    /// stop" message rather than silently doing nothing — this was
+    /// precisely the reviewer's repro (selected a `review done` assignment,
+    /// pressed `f`, saw no confirmation, no error, no change of any kind).
+    #[test]
+    fn sessions_panel_stop_finished_session_shows_nothing_to_stop() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(BoardData {
+            machines: vec![mk_machine("precision", "precision.tail", true, &[])],
+            ..BoardData::default()
+        });
+        let mut done = make_assignment("done");
+        done.id = "finished-aid".into();
+        app.data.assignments.push(done);
+        app.live_tmux_sessions = vec![LiveTmuxSession {
+            assignment_id: "finished-aid".into(),
+            issue_number: Some(1032),
+            repo_name: Some("claude-coordinator".into()),
+            issue_title: None,
+            machine: Some("precision".into()),
+            pane_dead: false,
+            pending_sweep_count: 0,
+            attached: false,
+        }];
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        click_activity_icon(&mut driver, "◉");
+        let (x, y) = driver.find("#1032").unwrap_or_else(|| {
+            panic!("'#1032' session row must be findable:\n{}", driver.screen())
+        });
+        driver.click(x, y);
+
+        driver.press(Key::Char('f'));
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Nothing to stop"),
+            "f on an already-finished session must show a clear message, \
+             not a silent no-op:\n{screen}",
+        );
+        // The `coord stop` non-dispatch is asserted directly against
+        // `command_runner.spawned_calls` in the direct-app unit test
+        // `stop_selected_fleet_session_noop_when_not_running` below — the
+        // TuiDriver shell adapter here doesn't expose the wrapped `CoordApp`
+        // for a typed field check, only the rendered screen.
+        //
+        // The zombie leaf must stay in the tree — this is informational
+        // feedback, not a removal (unlike kill).
+        assert!(
+            screen.contains("#1032"),
+            "an already-finished session must remain visible in the tree after 'nothing to stop'",
+        );
+    }
+
     /// Direct-app unit test: reattaching the selected Sessions-tree leaf
     /// delegates to `reattach_session_by_aid` — asserted via its
     /// side-effect (switching the active view to Terminal), same as
@@ -6053,13 +6160,23 @@
 
     /// Direct-app unit test: `f` on the selected Sessions-tree leaf queues
     /// `coord stop <aid>` via the `CommandRunner` seam — mirrors
-    /// `confirm_kill_terminal_dispatches_qualified_target` (#956).
+    /// `confirm_kill_terminal_dispatches_qualified_target` (#956). The
+    /// board assignment must be `running` for the dispatch to fire (#1033
+    /// fix — see `stop_selected_fleet_session_noop_when_not_running` for the
+    /// terminal-state case) — also asserts the dispatch pushes a toast (and
+    /// sets a status-bar message) so the action is never silent (the
+    /// reviewer's repro). The toast is the one guaranteed to render on the
+    /// Sessions panel itself — `pipeline_status` only paints inside the
+    /// Pipeline detail view.
     #[test]
     fn stop_selected_fleet_session_queues_coord_stop() {
         let mut app = make_test_app(BoardData {
             machines: vec![mk_machine("precision", "precision.tail", true, &[])],
             ..BoardData::default()
         });
+        let mut running = make_assignment("running");
+        running.id = "stop-aid".into();
+        app.data.assignments.push(running);
         app.live_tmux_sessions = vec![LiveTmuxSession {
             assignment_id: "stop-aid".into(),
             issue_number: Some(42),
@@ -6082,6 +6199,67 @@
             vec![vec!["stop".to_string(), "stop-aid".to_string()]],
             "must dispatch `coord stop stop-aid`; got {:?}",
             app.command_runner.spawned_calls,
+        );
+        assert!(
+            app.pipeline_status
+                .as_ref()
+                .is_some_and(|(msg, _)| msg.contains("stop dispatched") && msg.contains("#42")),
+            "a dispatched stop must set a status-bar message, not fire silently; got {:?}",
+            app.pipeline_status,
+        );
+        assert!(
+            app.toasts
+                .iter()
+                .any(|t| t.0.title.contains("Stop dispatched") && t.0.body.contains("#42")),
+            "a dispatched stop must also toast — the Sessions panel doesn't \
+             render `pipeline_status`, so the toast is what the operator \
+             actually sees; got {:?}",
+            app.toasts.iter().map(|t| &t.0.title).collect::<Vec<_>>(),
+        );
+    }
+
+    /// #1033 fix: `f` on a Sessions-tree leaf whose board assignment is
+    /// already finished (not `running`) must NOT fire `coord stop` — the
+    /// CLI unconditionally marks the target `failed` regardless of its
+    /// current status, so blindly stopping an already-`done`/`review done`
+    /// assignment would corrupt it. Instead the TUI must surface a clear
+    /// "nothing to stop" toast (the reviewer's repro: selecting a
+    /// completed assignment and pressing `f` produced total silence).
+    #[test]
+    fn stop_selected_fleet_session_noop_when_not_running() {
+        let mut app = make_test_app(BoardData {
+            machines: vec![mk_machine("precision", "precision.tail", true, &[])],
+            ..BoardData::default()
+        });
+        let mut done = make_assignment("done");
+        done.id = "finished-aid".into();
+        app.data.assignments.push(done);
+        app.live_tmux_sessions = vec![LiveTmuxSession {
+            assignment_id: "finished-aid".into(),
+            issue_number: Some(1032),
+            repo_name: Some("claude-coordinator".into()),
+            issue_title: None,
+            machine: Some("precision".into()),
+            pane_dead: false,
+            pending_sweep_count: 0,
+            attached: false,
+        }];
+        app.active_view = SidebarView::Sessions;
+        app.sessions_tree_selected = Some(vec![0, 0, 0]);
+
+        assert!(
+            app.stop_selected_fleet_session(),
+            "a selected session leaf resolves — this is a handled no-op, not an unresolved selection"
+        );
+        assert!(
+            app.command_runner.spawned_calls.is_empty(),
+            "must NOT dispatch `coord stop` against an already-finished assignment; got {:?}",
+            app.command_runner.spawned_calls,
+        );
+        assert!(
+            app.toasts.iter().any(|t| t.0.title.contains("Nothing to stop")),
+            "must surface a clear 'nothing to stop' toast instead of silence; got {:?}",
+            app.toasts.iter().map(|t| &t.0.title).collect::<Vec<_>>(),
         );
     }
 
