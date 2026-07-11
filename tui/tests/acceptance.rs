@@ -28,3 +28,11 @@ fn make_test_app_builds_from_board_data_with_no_live_daemon() {
     let app = make_test_app(BoardData::default());
     let _ = app;
 }
+
+// ── Sealed oracle suite (docs/ORACLE_LOOP.md) — DO NOT REMOVE ─────────────
+// Wires each milestone's independently-authored acceptance slice under
+// `tests/acceptance/ms-NN/` into this `--test acceptance` target so the
+// configured `tui-tuidriver` driver command runs them. The slice files hold
+// the assertions; this file only pastes them in at crate root. Paths are
+// relative to this file (`tui/tests/`), so `../../` is the repo root.
+include!("../../tests/acceptance/ms-33/audit_1039.rs");

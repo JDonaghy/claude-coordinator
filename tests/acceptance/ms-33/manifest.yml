@@ -1,0 +1,14 @@
+# Acceptance manifest for milestone ms-33 (Audit Trail TUI, tracking #1041).
+# Maps each acceptance test-id -> the work-order issue it covers.
+#
+# Test-ids are the libtest `name` emitted by `cargo test --test acceptance`
+# (module-qualified fn path). The slice files live in this directory and are
+# `include!`d at crate root by `tui/tests/acceptance.rs`.
+#
+# Merged (never clobbered) across issues by coord.acceptance.load_manifest —
+# other issues' slices append their own entries here.
+tests:
+  audit_1039::activity_bar_shows_section_icon: 1039
+  audit_1039::sidebar_header_shows_title: 1039
+  audit_1039::empty_state_message: 1039
+  audit_1039::status_bar_hints_list_mode: 1039
