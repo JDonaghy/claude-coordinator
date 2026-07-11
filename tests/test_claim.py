@@ -311,6 +311,26 @@ def test_smoke_assignment_does_not_block_claim() -> None:
     assert claim is None
 
 
+def test_chat_assignment_does_not_block_claim() -> None:
+    """#1059: a "Chat about issue" session (#628) is read-only/diagnostic —
+    a stale one left on an issue must not permanently wedge a real dispatch
+    (reproduced against issue #1041's dangling Gate-A claim)."""
+    chat = _active(issue=42, type_="chat", aid="chat-1")
+    board = Board(active=[chat])
+    claim = find_work_claim(42, "api", "acme/api", board, branch_lookup=lambda *a: [])
+    assert claim is None
+
+
+def test_troubleshoot_assignment_does_not_block_claim() -> None:
+    """#1059: "troubleshoot" is the legacy predecessor of "chat" (#628) —
+    same read-only/advisory-only treatment in coord/issue_store.py, same
+    exemption here."""
+    troubleshoot = _active(issue=42, type_="troubleshoot", aid="ts-1")
+    board = Board(active=[troubleshoot])
+    claim = find_work_claim(42, "api", "acme/api", board, branch_lookup=lambda *a: [])
+    assert claim is None
+
+
 def test_running_work_assignment_still_blocks_claim() -> None:
     work = _active(issue=42, type_="work", aid="work-1")
     board = Board(active=[work])

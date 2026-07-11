@@ -59,7 +59,19 @@ def find_work_claim(
         if a.issue_number == issue_number and a.repo_name == repo_name:
             if a.status == "failed":
                 continue
-            if a.type in ("plan", "review", "smoke"):
+            # #1059 fix: "chat"/"troubleshoot" are human-attended, read-only
+            # diagnostic sessions (#628/#676, coord/issue_store.py's
+            # `("chat", "troubleshoot")` advisory-only special case) — they
+            # never commit code and are always finalized as "advisory"
+            # regardless of how they end. A stale one (session died without
+            # the TUI ever finalizing it, e.g. a "Chat about issue" left
+            # open on an epic) must not permanently block a real dispatch
+            # for the same issue, the way a genuine work/review/smoke claim
+            # should. Without this, a leftover chat row on a tracking issue
+            # wedged every future "Dispatch Gate A mock" attempt with
+            # "already in flight" against a claim with no backing worker and
+            # no way to clear it short of `coord diagnose`.
+            if a.type in ("plan", "review", "smoke", "chat", "troubleshoot"):
                 continue
             return Claim(
                 issue_number=issue_number,

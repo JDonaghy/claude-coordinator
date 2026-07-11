@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import uuid
 
+import httpx
+
 from coord import github_ops
 from coord.acceptance import ms_dirname
 from coord.claim import claim_message, find_work_claim
@@ -187,12 +189,26 @@ def dispatch_acceptance_mock(
     from coord.dispatch import dispatch_with_retry, post_briefing  # noqa: PLC0415
     from coord.state import record_dispatched  # noqa: PLC0415
 
-    response = dispatch_with_retry(
-        proposal,
-        config,
-        max_retries=config.concurrency.max_retries,
-        backoff_base=config.concurrency.backoff_base,
-    )
+    # #1059 review: dispatch_with_retry can raise ValueError (bad machine/repo
+    # config) or httpx.HTTPError (agent unreachable/rejected the payload) —
+    # neither was previously caught here, so it propagated past this
+    # function's documented "raises RuntimeError" contract as a raw
+    # traceback. `acceptance_mock_cmd` only catches RuntimeError, so an
+    # uncaught one would dump a multi-line Python traceback to stderr instead
+    # of a clean `error: ...` line — exactly the "inconsistent/unreadable
+    # error" the operator hit, just via a different trigger than the one
+    # reproduced. Translate to RuntimeError so every failure path here is a
+    # single clean line, no partial dispatch is recorded (record_dispatched
+    # below never runs when this raises), and no claim is left dangling.
+    try:
+        response = dispatch_with_retry(
+            proposal,
+            config,
+            max_retries=config.concurrency.max_retries,
+            backoff_base=config.concurrency.backoff_base,
+        )
+    except (ValueError, httpx.HTTPError) as e:
+        raise RuntimeError(f"could not dispatch mock-author to {machine.name!r}: {e}") from e
 
     assignment_id = response.get("id") or uuid.uuid4().hex[:12]
 
