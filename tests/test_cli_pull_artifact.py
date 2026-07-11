@@ -153,6 +153,12 @@ def test_pull_artifact_thin_client_resolves_from_daemon(
     monkeypatch.setattr(
         cc, "resolve_board_service", lambda *a, **k: cc.ServiceConfig("http://d:7435")
     )
+    # #1080: _load_config now always fetches on a thin client (never trusts a
+    # local file that happens to exist). Stand in for the daemon's /config with
+    # the same coordinator.yml already written to cfg — real httpx.get is
+    # patched below for the artifact-pull query only, and would otherwise be
+    # hit by the real fetch_remote_config too.
+    monkeypatch.setattr(cc, "fetch_remote_config", lambda *a, **k: cfg)
     monkeypatch.setattr(
         cc, "fetch_board_payload",
         lambda svc, **k: {

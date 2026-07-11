@@ -29,15 +29,19 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
     from coord import freshness as fresh
     from coord.deps import blocked_repos as compute_blocked, build_dep_graph
     from coord.board_service import read_board, write_board
-    from coord.client import fetch_remote_config, resolve_board_service
+    from coord.client import resolve_board_service
     from coord.network import check_all, fetch_repos, fetch_status
     from coord.state import load_dispatched, load_notified
 
-    # #584: when a board service is configured, read the board + config from the
-    # daemon instead of local SQLite.  Unset ⇒ unchanged local behaviour.
+    # #584/#1080: when a board service is configured, read the board + config
+    # from the daemon instead of local SQLite. _load_config() itself now always
+    # fetches the daemon's config on a thin client (never trusts a local file
+    # that happens to exist — the config-fetch pre-step that used to live here
+    # was a redundant duplicate of that same buggy "local file exists" check,
+    # removed in #1080). `svc` below is still needed to gate the local-only
+    # reads (queue/notified/session) further down. Unset ⇒ unchanged local
+    # behaviour.
     svc = resolve_board_service()
-    if svc and not Path(config_path).exists():
-        config_path = fetch_remote_config(svc)
     cfg = _load_config(config_path)
 
     # Dependency graph (only when --machine isn't narrowing the view).
