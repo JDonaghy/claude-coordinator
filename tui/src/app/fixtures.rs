@@ -248,6 +248,8 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         done_window: DoneWindow::H2,
         // #816: no pending PTY-panic dialog in test helpers.
         pty_panic_dialog: None,
+        // #1059: no pending Gate A dispatch-failure dialog in test helpers.
+        gate_a_error_dialog: None,
     }
 }
 

@@ -1611,6 +1611,24 @@ impl CoordApp {
             }
         }
 
+        // ── #1059: Gate A dispatch-failure dialog key intercept ─────────────
+        // Higher priority than the artifact-pull dialog below (mirrors the
+        // pty_panic ordering): Esc / Enter dismiss, other keys are swallowed
+        // so the full failure reason stays readable.
+        if self.gate_a_error_dialog.is_some() {
+            if let UiEvent::KeyPressed { key, .. } = &event {
+                let dismiss = matches!(
+                    key,
+                    Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Enter)
+                );
+                if dismiss {
+                    self.gate_a_error_dialog = None;
+                    *self.dialog_layout.borrow_mut() = None;
+                }
+                return Reaction::Redraw;
+            }
+        }
+
         // ── #532: Artifact-pull dialog: intercept key presses ──────────────
         // While the info dialog is open:
         //   'c'/'C' — copy path to clipboard (when available), then dismiss.
@@ -1673,6 +1691,25 @@ impl CoordApp {
                 );
                 if dismiss {
                     self.pty_panic_dialog = None;
+                    *self.dialog_layout.borrow_mut() = None;
+                }
+                return Reaction::Redraw;
+            }
+        }
+
+        // ── #1059: Gate A dispatch-failure dialog key intercept ─────────────
+        // Esc / Enter dismiss; any other key is swallowed so the operator can
+        // read the full (word-wrapped) failure reason without accidentally
+        // dismissing on Tab / arrow keys.  Same shape as the pty_panic block
+        // above.
+        if self.gate_a_error_dialog.is_some() {
+            if let UiEvent::KeyPressed { key, .. } = &event {
+                let dismiss = matches!(
+                    key,
+                    Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Enter)
+                );
+                if dismiss {
+                    self.gate_a_error_dialog = None;
                     *self.dialog_layout.borrow_mut() = None;
                 }
                 return Reaction::Redraw;

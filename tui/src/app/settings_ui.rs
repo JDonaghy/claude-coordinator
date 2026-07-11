@@ -237,6 +237,15 @@ impl CoordApp {
                         && parse_diagnose_label_repo_issue(&result.label)
                             == Some((repo.clone(), *issue))
                 });
+            // #1059: a failed "Dispatch Gate A mock" (`coord acceptance mock`)
+            // is surfaced as a full-text modal dialog (below) rather than the
+            // single-line command-failed toast — a long reason like "no
+            // acceptance driver configured — add it under acceptance.drivers…"
+            // is unreadable when truncated to ~40 cols, and the operator read
+            // that truncation as a permanent wedge (#1041). Suppress the
+            // generic toast for this one case so we don't double-notify.
+            let gate_a_dispatch_failed =
+                result.exit_code != 0 && is_gate_a_mock_dispatch_label(&result.label);
             if result.exit_code != 0
                 && !should_suppress_command_failed_toast(
                     &result.label,
@@ -245,6 +254,7 @@ impl CoordApp {
                 && !suppress_for_fix_cap
                 && !diagnose_json_rejected
                 && !is_diagnose_legacy_retry
+                && !gate_a_dispatch_failed
             {
                 let reason = first_meaningful_stderr_line(&result.stderr)
                     .unwrap_or_else(|| format!("exit {} — no stderr captured", result.exit_code));
@@ -265,6 +275,18 @@ impl CoordApp {
                     &format!("{}  ({})", reason, result.label),
                     ToastSeverity::Error,
                 );
+            }
+            // #1059: raise the full-text Gate A dispatch-failure modal so the
+            // operator can read the COMPLETE reason (word-wrapped), not a
+            // ~40-col truncation. This is the fix for the recurring "Dispatch
+            // Gate A mock … reads as a permanent wedge" report — a clean
+            // pre-dispatch failure (e.g. no acceptance driver configured for
+            // the repo) now shows its full, actionable message and states
+            // that nothing was claimed.
+            if gate_a_dispatch_failed {
+                let reason = first_meaningful_stderr_line(&result.stderr)
+                    .unwrap_or_else(|| format!("exit {} — no stderr captured", result.exit_code));
+                self.gate_a_error_dialog = Some(reason);
             }
             // #863: Fix-dispatch cap preflight completed.  A clean exit means
             // the cap doesn't block this dispatch (or `--force` already

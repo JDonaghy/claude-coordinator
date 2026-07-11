@@ -134,7 +134,16 @@ def dispatch_acceptance_mock(
 
     claim = find_work_claim(tracking_issue_number, repo_name, repo_cfg.github, board)
     if claim is not None:
-        raise RuntimeError(f"Gate A already in flight: {claim_message(claim)}")
+        # #1059: make the refusal actionable. The operator's "PERMANENTLY
+        # STUCK" report (#1041) was a stale claim they "found no way to clear
+        # through normal coord commands" — so name the escape hatch. A live
+        # claim means a real Gate A worker is already running (leave it); a
+        # dead one is cleared by `coord diagnose <repo> <issue>`.
+        raise RuntimeError(
+            f"Gate A already in flight: {claim_message(claim)} — if that "
+            f"session is dead, clear it with `coord diagnose {repo_name} "
+            f"{tracking_issue_number}`, then dispatch again"
+        )
 
     # Pick the machine.
     if machine_override:

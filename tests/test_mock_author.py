@@ -198,6 +198,10 @@ def test_dispatch_raises_when_gate_a_already_claimed(tmp_path):
             assert False, "expected RuntimeError"
         except RuntimeError as e:
             assert "already in flight" in str(e)
+            # #1059 fix-2: the refusal must name the escape hatch — the
+            # operator's "PERMANENTLY STUCK" report was a claim they found
+            # "no way to clear through normal coord commands".
+            assert "coord diagnose api 100" in str(e)
 
 
 def test_dispatch_not_blocked_by_stale_chat_session(tmp_path):

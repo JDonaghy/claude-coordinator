@@ -2375,6 +2375,39 @@ impl CoordApp {
             });
         }
 
+        // ── #1059: Gate A dispatch-failure modal ────────────────────────────
+        // Shown when a "Dispatch Gate A mock" (`coord acceptance mock`) attempt
+        // fails.  The generic command-failed toast truncates a long reason to
+        // ~40 cols (quadraui#771); this modal word-wraps the FULL message so a
+        // config gap ("no acceptance driver configured — add it under
+        // acceptance.drivers…") can't read as a permanent wedge.  Dismissed by
+        // Esc / Enter / outside-click.
+        if let Some(ref reason) = self.gate_a_error_dialog {
+            let body = format!(
+                "The Gate A mock dispatch could not start:\n\n{}\n\n\
+                 Nothing was claimed and no worker is in flight — this is a \
+                 clean pre-dispatch failure, not a stuck epic.  Fix the cause \
+                 above and dispatch again.",
+                reason
+            );
+            return Some(Dialog {
+                table: None,
+                id: WidgetId::new("dialog:gate-a-error"),
+                title: StyledText::plain("Gate A dispatch failed"),
+                body: vec![StyledText::plain(body)],
+                buttons: vec![DialogButton {
+                    id: WidgetId::new("close"),
+                    label: "Esc / Enter  Dismiss".into(),
+                    is_default: true,
+                    is_cancel: true,
+                    tint: None,
+                }],
+                severity: Some(DialogSeverity::Warning),
+                vertical_buttons: false,
+                input: None,
+            });
+        }
+
         // ── Artifact-pull result (#532) ─────────────────────────────────────
         // Info dialog shown after `coord pull-artifact` completes, and
         // re-openable at any time by pressing `a` on the same pipeline row.
@@ -2613,6 +2646,9 @@ impl CoordApp {
         } else if self.pty_panic_dialog.is_some() {
             // #816: dismiss the PTY-panic notification dialog.
             self.pty_panic_dialog = None;
+        } else if self.gate_a_error_dialog.is_some() {
+            // #1059: dismiss the Gate A dispatch-failure dialog.
+            self.gate_a_error_dialog = None;
         }
         *self.dialog_layout.borrow_mut() = None;
     }
@@ -3245,6 +3281,12 @@ impl CoordApp {
         // ── #816: PTY-panic notification ────────────────────────────────────
         if self.pty_panic_dialog.is_some() && id == "close" {
             self.pty_panic_dialog = None;
+            *self.dialog_layout.borrow_mut() = None;
+        }
+
+        // ── #1059: Gate A dispatch-failure notification ─────────────────────
+        if self.gate_a_error_dialog.is_some() && id == "close" {
+            self.gate_a_error_dialog = None;
             *self.dialog_layout.borrow_mut() = None;
         }
     }

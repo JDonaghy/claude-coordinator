@@ -196,6 +196,7 @@ impl CoordApp {
             || self.pending_rework.is_some()
             || self.artifact_pull_dialog.is_some()
             || self.pty_panic_dialog.is_some()
+            || self.gate_a_error_dialog.is_some()
             || self.pending_machine_picker.is_some()
             || self.pending_new_terminal_picker.is_some()
             || self.pending_new_terminal.is_some()
@@ -235,6 +236,7 @@ impl CoordApp {
             || self.pending_fix_force_confirm.is_some()
             || self.artifact_pull_dialog.is_some()
             || self.pty_panic_dialog.is_some()
+            || self.gate_a_error_dialog.is_some()
             || self.pending_new_terminal.is_some()
         {
             return None;
