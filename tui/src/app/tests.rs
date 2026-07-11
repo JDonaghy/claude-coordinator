@@ -4201,8 +4201,9 @@
 
     #[test]
     fn active_liveness_selection_resolves_through_nested_path() {
-        // End-to-end: the new [group, issue] path for Active resolves back to
-        // the right pipeline_issues index via selected_pipeline_index().
+        // End-to-end: the [group, milestone, issue] path for Active (#1069)
+        // resolves back to the right pipeline_issues index via
+        // selected_pipeline_index().
         let mut app = make_pipeline_app();
         app.data
             .assignments
@@ -4218,7 +4219,9 @@
             attached: false,
         }];
         app.rebuild_pipeline_sidebar(None);
-        // Default selection is [0, 0] = first group (Live) → #42.
+        // Default selection is [0, 0, 0] = first group (Live) → first
+        // milestone (No milestone, since this fixture has no milestone
+        // data) → #42.
         let idx = app
             .selected_pipeline_index()
             .expect("Active selection resolves through the nested path");
@@ -5532,9 +5535,10 @@
 
     #[test]
     fn pipeline_active_section_rows_have_repo_tag_badge_and_flat_path() {
-        // In-progress issues must appear as flat rows with a single-letter
-        // repo tag badge.  New / Refining / Pending / Done rows use path
-        // [ri, ii].
+        // In-progress issues appear under the liveness → milestone tree
+        // (#1069); see `pipeline_selected_pipeline_index_resolves_three_level_path`
+        // and the dedicated in-progress milestone tests below for path/badge
+        // assertions.  This test just covers the section presence.
         let mut app = make_pipeline_app();
         // Make issue #42 active (add an assignment).
         app.data
@@ -18294,8 +18298,12 @@
 
     #[test]
     fn pipeline_in_progress_not_milestone_grouped() {
-        // In-progress section must remain liveness-grouped (Live/Idle), NOT
-        // milestone-grouped — milestone grouping is New/Done only.
+        // The *outer* In-progress grouping (`pipeline_active_by_liveness`)
+        // must remain liveness-only (Live/Idle) — #1069 nests a milestone
+        // tier *underneath* each liveness group (see the
+        // `pipeline_in_progress_*milestone*` tests below), but the liveness
+        // helper itself must never emit milestone keys as its top-level
+        // groups.
         let mut app = make_pipeline_milestone_app();
         // Add an active assignment for issue #10 to put it in-progress.
         app.data
@@ -18318,6 +18326,267 @@
                 "in-progress group key must be 'live' or 'idle', got '{key}'",
             );
         }
+    }
+
+    // ── #1069: In-progress milestone tier ──────────────────────────────────
+
+    /// Helper: build an App with three in-progress issues in one repo — two
+    /// running (Live) across two different named milestones, and one with a
+    /// `done`-status assignment (Idle) with no milestone.  Mirrors
+    /// `make_pipeline_milestone_app` but puts the issues in the In-progress
+    /// lifecycle instead of New.
+    fn make_pipeline_inprogress_milestone_app() -> CoordApp {
+        let mut app = make_pipeline_app();
+        app.data.open_issues = vec![
+            OpenIssue {
+                repo_name: "api".to_string(),
+                number: 10,
+                title: "Milestone v1 issue".to_string(),
+                body: String::new(),
+                labels: vec!["coord".to_string()],
+                state: "open".to_string(),
+                milestone_number: Some(1),
+                milestone_title: Some("v1.0".to_string()),
+            },
+            OpenIssue {
+                repo_name: "api".to_string(),
+                number: 20,
+                title: "Milestone v2 issue".to_string(),
+                body: String::new(),
+                labels: vec!["coord".to_string()],
+                state: "open".to_string(),
+                milestone_number: Some(2),
+                milestone_title: Some("v2.0".to_string()),
+            },
+            OpenIssue {
+                repo_name: "api".to_string(),
+                number: 30,
+                title: "No milestone issue".to_string(),
+                body: String::new(),
+                labels: vec!["coord".to_string()],
+                state: "open".to_string(),
+                milestone_number: None,
+                milestone_title: None,
+            },
+        ];
+        app.pipeline_issues = vec![
+            PipelineIssue {
+                number: 10,
+                title: "Milestone v1 issue".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string()],
+                is_closed: false,
+            },
+            PipelineIssue {
+                number: 20,
+                title: "Milestone v2 issue".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string()],
+                is_closed: false,
+            },
+            PipelineIssue {
+                number: 30,
+                title: "No milestone issue".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string()],
+                is_closed: false,
+            },
+        ];
+        app.data.assignments = vec![
+            make_assignment_typed("running", 10, "api", Some("work")),
+            make_assignment_typed("running", 20, "api", Some("work")),
+            make_assignment_typed("done", 30, "api", Some("work")),
+        ];
+        app.rebuild_pipeline_sidebar(None);
+        app
+    }
+
+    #[test]
+    fn pipeline_milestone_header_repo_tag_single_repo_bucket() {
+        // A milestone bucket whose issues all share one repo resolves to
+        // that repo's tag.
+        let app = make_pipeline_inprogress_milestone_app();
+        let all_repos = vec!["api".to_string()];
+        let tag = app.pipeline_milestone_header_repo_tag(&[0, 1], &all_repos);
+        assert_eq!(tag, Some("A".to_string()));
+    }
+
+    #[test]
+    fn pipeline_milestone_header_repo_tag_mixed_repo_bucket_returns_none() {
+        // A milestone bucket mixing issues from two repos can't show a
+        // single header tag — the render path falls back to per-issue tags.
+        let mut app = make_pipeline_inprogress_milestone_app();
+        app.pipeline_issues[1].coord_repo = Some("web".to_string());
+        app.pipeline_issues[1].repo_slug = "acme/web".to_string();
+        let all_repos = vec!["api".to_string(), "web".to_string()];
+        let tag = app.pipeline_milestone_header_repo_tag(&[0, 1], &all_repos);
+        assert_eq!(
+            tag, None,
+            "mixed-repo bucket must not resolve to a single header tag"
+        );
+    }
+
+    #[test]
+    fn pipeline_in_progress_milestones_grouped_within_liveness() {
+        // Within the Live liveness group, issues #10 and #20 must land in
+        // separate named-milestone buckets; the Idle group's #30 must land
+        // in "No milestone".
+        let app = make_pipeline_inprogress_milestone_app();
+        let active = app.pipeline_active_by_liveness();
+        let (_, live_idxs) = active
+            .iter()
+            .find(|(k, _)| k == "live")
+            .expect("Live group must exist");
+        let live_milestones = app.pipeline_milestones_for_issues(live_idxs);
+        assert_eq!(live_milestones.len(), 2, "two named milestones under Live");
+        assert_eq!(live_milestones[0].1, "v1.0");
+        assert_eq!(live_milestones[1].1, "v2.0");
+
+        let (_, idle_idxs) = active
+            .iter()
+            .find(|(k, _)| k == "idle")
+            .expect("Idle group must exist");
+        let idle_milestones = app.pipeline_milestones_for_issues(idle_idxs);
+        assert_eq!(idle_milestones.len(), 1);
+        assert_eq!(idle_milestones[0].1, "No milestone");
+    }
+
+    #[test]
+    fn pipeline_in_progress_selected_index_resolves_three_level_path() {
+        // Selecting an issue row (3-level [gi, mi, ii] path) resolves to the
+        // right pipeline_issues index; selecting a milestone header
+        // (2-level path) resolves to None.
+        let mut app = make_pipeline_inprogress_milestone_app();
+        let section = app
+            .pipeline_state_section_names
+            .iter()
+            .position(|&k| k == "in-progress")
+            .expect("in-progress section must exist")
+            + 1; // + search_offset
+        app.pipeline_sidebar.set_active_section(Some(section));
+
+        // Live (gi=0) → v1.0 (mi=0) → #10 (ii=0).
+        app.pipeline_sidebar
+            .set_selected_path(section, Some(vec![0, 0, 0]));
+        let idx = app
+            .selected_pipeline_index()
+            .expect("3-level issue path must resolve");
+        assert_eq!(app.pipeline_issues[idx].number, 10);
+
+        // Live (gi=0) → v2.0 (mi=1) → #20 (ii=0).
+        app.pipeline_sidebar
+            .set_selected_path(section, Some(vec![0, 1, 0]));
+        let idx = app
+            .selected_pipeline_index()
+            .expect("3-level issue path must resolve");
+        assert_eq!(app.pipeline_issues[idx].number, 20);
+
+        // A 2-level path (milestone header selected) must resolve to None.
+        app.pipeline_sidebar
+            .set_selected_path(section, Some(vec![0, 0]));
+        assert_eq!(
+            app.selected_pipeline_index(),
+            None,
+            "selecting a milestone header must not resolve to an issue index"
+        );
+
+        // A 1-level path (liveness header selected) must also resolve to None.
+        app.pipeline_sidebar
+            .set_selected_path(section, Some(vec![0]));
+        assert_eq!(
+            app.selected_pipeline_index(),
+            None,
+            "selecting a liveness header must not resolve to an issue index"
+        );
+    }
+
+    #[test]
+    fn tuidriver_in_progress_milestone_headers_between_liveness_and_issues() {
+        // TuiDriver: with active issues across two milestones in the Live
+        // group, the milestone headers must render between "Live" and the
+        // "#N" issue rows, and the repo tag must appear on the milestone
+        // header (not on the issue row underneath it).
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_pipeline_inprogress_milestone_app();
+        app.active_view = SidebarView::Pipeline;
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        let screen = driver.screen();
+
+        assert!(
+            driver.screen_contains("Live"),
+            "Live liveness header must be visible:\n{screen}"
+        );
+        assert!(
+            driver.screen_contains("v1.0"),
+            "milestone header 'v1.0' must be visible:\n{screen}"
+        );
+        assert!(
+            driver.screen_contains("v2.0"),
+            "milestone header 'v2.0' must be visible:\n{screen}"
+        );
+        assert!(
+            driver.screen_contains("#10"),
+            "issue #10 must be visible under its milestone:\n{screen}"
+        );
+        assert!(
+            driver.screen_contains("#20"),
+            "issue #20 must be visible under its milestone:\n{screen}"
+        );
+
+        // Ordering: Live header above both milestone headers, which are
+        // above their respective issue rows.
+        let (_, live_y) = driver.find("Live").expect("Live header must be found");
+        let (_, v1_y) = driver.find("v1.0").expect("v1.0 header must be found");
+        let (_, v2_y) = driver.find("v2.0").expect("v2.0 header must be found");
+        let (_, i10_y) = driver.find("#10").expect("#10 row must be found");
+        let (_, i20_y) = driver.find("#20").expect("#20 row must be found");
+        assert!(live_y < v1_y, "Live header must render above v1.0:\n{screen}");
+        assert!(v1_y < i10_y, "v1.0 header must render above #10:\n{screen}");
+        assert!(v1_y < v2_y, "v1.0 must render above v2.0 (sorted by milestone number):\n{screen}");
+        assert!(v2_y < i20_y, "v2.0 header must render above #20:\n{screen}");
+
+        // Indentation: milestone headers are indented one level deeper than
+        // the liveness header; issue rows one level deeper still.
+        let (live_x, _) = driver.find("Live").unwrap();
+        let (v1_x, _) = driver.find("v1.0").unwrap();
+        let (i10_x, _) = driver.find("#10").unwrap();
+        assert!(
+            v1_x > live_x,
+            "milestone header must be indented deeper than the liveness header:\n{screen}"
+        );
+        assert!(
+            i10_x > v1_x,
+            "issue row must be indented deeper than its milestone header:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn pipeline_in_progress_no_milestone_bucket_for_untracked_issue() {
+        // An in-progress issue with no milestone data must fall into a
+        // "No milestone" group underneath its liveness bucket.
+        let app = make_pipeline_inprogress_milestone_app();
+        let active = app.pipeline_active_by_liveness();
+        let (_, idle_idxs) = active
+            .iter()
+            .find(|(k, _)| k == "idle")
+            .expect("Idle group must exist (issue #30 has a done, non-live assignment)");
+        assert_eq!(idle_idxs.len(), 1);
+        assert_eq!(app.pipeline_issues[idle_idxs[0]].number, 30);
+        let milestones = app.pipeline_milestones_for_issues(idle_idxs);
+        assert_eq!(milestones.len(), 1);
+        assert_eq!(milestones[0].0, "no-milestone");
+        assert_eq!(milestones[0].1, "No milestone");
     }
 
     #[test]
@@ -25295,6 +25564,75 @@
             pipeline_screen.contains("Jump test issue") || pipeline_screen.contains("#7"),
             "#869: issue #7 must be visible in the Pipeline after jumping, even though its \
              milestone group defaulted to collapsed:\n{pipeline_screen}"
+        );
+    }
+
+    /// #1069: `jump_board_to_pipeline` must apply the same #869 reveal fix
+    /// to the In-progress section's new milestone tier — force both the
+    /// liveness group and the milestone group open even if a user
+    /// previously collapsed one of them, so the jump never lands on a
+    /// hidden row.
+    #[test]
+    fn jump_to_pipeline_expands_collapsed_in_progress_milestone_group() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let running = make_assignment_typed("running", 7, "myrepo", Some("work"));
+        let mut app = make_test_app(BoardData {
+            assignments: vec![running],
+            open_issues: vec![OpenIssue {
+                repo_name: "myrepo".to_string(),
+                number: 7,
+                title: "Jump test issue".to_string(),
+                body: String::new(),
+                labels: vec!["coord".to_string()],
+                state: "open".to_string(),
+                milestone_number: Some(3),
+                milestone_title: Some("Sprint 1".to_string()),
+            }],
+            pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
+            ..BoardData::default()
+        });
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 7,
+            title: "Jump test issue".to_string(),
+            body: String::new(),
+            repo_slug: "acme/myrepo".to_string(),
+            coord_repo: Some("myrepo".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: false,
+        }];
+        app.rebuild_board_sidebar();
+        app.rebuild_pipeline_sidebar(None);
+
+        // Explicitly collapse both the Live liveness group and the Sprint 1
+        // milestone group, simulating a user who collapsed them earlier.
+        app.pipeline_lifecycle_expanded
+            .insert(("in-progress".to_string(), "live".to_string()), false);
+        app.pipeline_milestone_expanded.insert(
+            ("in-progress".to_string(), "live".to_string(), "3".to_string()),
+            false,
+        );
+
+        app.active_view = SidebarView::Board;
+        app.select_issue("myrepo", 7);
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+
+        // Sanity: with both groups collapsed, issue #7 is not on screen
+        // before the jump (still on Board, but this also proves the map
+        // entries above actually took effect once we check post-jump).
+        driver.press(quadraui::Key::Char('p'));
+
+        let pipeline_screen = driver.screen();
+        assert!(
+            pipeline_screen.contains("Sprint 1"),
+            "#1069: the milestone sub-header must be visible after the jump:\n{pipeline_screen}"
+        );
+        assert!(
+            pipeline_screen.contains("#7"),
+            "#1069: issue #7 must be visible after the jump, even though its liveness \
+             and milestone groups were both collapsed beforehand:\n{pipeline_screen}"
         );
     }
 

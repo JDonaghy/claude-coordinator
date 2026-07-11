@@ -4328,14 +4328,18 @@ impl CoordApp {
                         true
                     }
                     SidebarEvent::RowToggleExpand { section, ref path } if path.len() == 2 => {
-                        // #668: A two-level path = a milestone sub-header was
-                        // toggled within a New section.  Persist the state in
-                        // pipeline_milestone_expanded keyed by (lc_key, repo_key,
-                        // milestone_key).  Refining/Pending have no milestone tier,
-                        // so a path.len()==2 there is an issue row (not a header) —
-                        // those sections handle selection via RowSelected, not here.
-                        // #728: Done no longer has milestone sub-headers (flat list),
-                        // so path.len()==2 in Done is an issue row — skip it here.
+                        // #668/#1069: A two-level path = a milestone sub-header
+                        // was toggled, within either a New section (grouped
+                        // repo → milestone) or an In-progress section (grouped
+                        // liveness → milestone).  Persist the state in
+                        // pipeline_milestone_expanded keyed by (lc_key,
+                        // repo_key_or_liveness_key, milestone_key).
+                        // Refining/Pending have no milestone tier, so a
+                        // path.len()==2 there is an issue row (not a header) —
+                        // those sections handle selection via RowSelected, not
+                        // here.  #728: Done no longer has milestone
+                        // sub-headers (flat list), so path.len()==2 in Done is
+                        // an issue row — skip it here.
                         let search_offset = 1usize;
                         if section >= search_offset {
                             let state_idx = section - search_offset;
@@ -4365,6 +4369,31 @@ impl CoordApp {
                                                     mil_key,
                                                 ))
                                                 .or_insert(false);
+                                            *entry = !*entry;
+                                            self.rebuild_pipeline_sidebar(None);
+                                        }
+                                    }
+                                } else if lc_key == "in-progress" {
+                                    let groups = self.pipeline_active_by_liveness();
+                                    let gi = path[0] as usize;
+                                    let mi = path[1] as usize;
+                                    if let Some((group_key, issue_idxs)) = groups.get(gi) {
+                                        let group_key = group_key.clone();
+                                        let milestones =
+                                            self.pipeline_milestones_for_issues(issue_idxs);
+                                        if let Some((mil_key, _, _)) = milestones.get(mi) {
+                                            let mil_key = mil_key.clone();
+                                            // #1069: default is expanded — unlike
+                                            // New, In-progress work is already
+                                            // in flight and should be visible.
+                                            let entry = self
+                                                .pipeline_milestone_expanded
+                                                .entry((
+                                                    lc_key.to_string(),
+                                                    group_key,
+                                                    mil_key,
+                                                ))
+                                                .or_insert(true);
                                             *entry = !*entry;
                                             self.rebuild_pipeline_sidebar(None);
                                         }

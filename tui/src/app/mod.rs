@@ -1901,19 +1901,24 @@ pub struct CoordApp {
     pipeline_state_section_names: Vec<&'static str>,
     /// Filter state (query / cursor / focus) for the Pipeline sidebar's FILTER box.
     pipeline_search: SidebarFilter,
-    /// Expanded state for each (lifecycle_key, repo_key) sub-group in the
-    /// Pipeline sidebar's New/Done sections.  Default: true (expanded).
-    /// Persists across rebuilds so collapse survives refresh.
+    /// Expanded state for each (lifecycle_key, group_key) sub-group in the
+    /// Pipeline sidebar's New/Refining/Pending/In-progress sections (Done is
+    /// a flat list post-#728 and never keys into this map).  Default: true
+    /// (expanded).  Persists across rebuilds so collapse survives refresh.
     ///
-    /// Key semantics: `(lifecycle_key, repo_key)` — note the order is
-    /// lifecycle-first now that lifecycle is the top-level grouping and repo
-    /// is the sub-group.
+    /// Key semantics: `(lifecycle_key, group_key)` — note the order is
+    /// lifecycle-first now that lifecycle is the top-level grouping and the
+    /// sub-group is repo (New/Refining/Pending) or liveness (In-progress).
     pipeline_lifecycle_expanded: std::collections::HashMap<(String, String), bool>,
-    /// #668/#857: Expanded state for milestone sub-headers in the Pipeline
-    /// New section (Done is a flat list post-#728 and never keys into this
-    /// map).  Key: `(lifecycle_key, repo_key, milestone_key)`.
-    /// Default for an untouched key: false (collapsed) — #857 milestones-
-    /// first view.  Persists across rebuilds once a user toggles a key.
+    /// #668/#857/#1069: Expanded state for milestone sub-headers in the
+    /// Pipeline New and In-progress sections (Done is a flat list post-#728
+    /// and Refining/Pending have no milestone tier, so neither keys into this
+    /// map).  Key: `(lifecycle_key, group_key, milestone_key)` — `group_key`
+    /// is the repo for New, the liveness bucket (Live/Idle) for In-progress.
+    /// Default for an untouched key: New → false (collapsed, #857
+    /// milestones-first view); In-progress → true (expanded — that work is
+    /// already in flight).  Persists across rebuilds once a user toggles a
+    /// key.
     pipeline_milestone_expanded: std::collections::HashMap<(String, String, String), bool>,
     /// Tracked issues for the Pipeline panel (loaded asynchronously via gh).
     pipeline_issues: Vec<PipelineIssue>,
