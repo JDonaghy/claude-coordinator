@@ -1516,99 +1516,6 @@ impl CoordApp {
         self.launch_interactive_session_on_machine(mode, machine, None, false);
     }
 
-    /// Reattach to the live interactive session for the selected issue,
-    /// whatever its type (work / review / test / merge).  This is the dedicated
-    /// "Reattach to live session" action: unlike the type-gated Start launchers
-    /// (#569 keeps "Start fix" from reattaching into a running review), it
-    /// reattaches to ANY running session for this issue by passing the resolved
-    /// aid explicitly to `launch_interactive_session_on_machine`, which then
-    /// runs `coord reattach <aid>` instead of a fresh (claim-blocked)
-    /// `coord assign`.
-    // ── #628 Scope A: session-overlay actions ───────────────────────────────
-
-    /// Handle a keypress when the live-sessions overlay is open.
-    ///
-    /// Extracted from `handle()` so it can be unit-tested without a backend.
-    /// Returns `true` if the overlay consumed the key (always true — the caller
-    /// must swallow all keys regardless, otherwise board shortcuts fire behind
-    /// the overlay).
-    pub(crate) fn handle_live_sessions_overlay_key(
-        &mut self,
-        key: &Key,
-        modifiers: &Modifiers,
-    ) -> bool {
-        let n = self.live_tmux_sessions.len();
-        match key {
-            Key::Named(NamedKey::Escape) | Key::Char('L') => {
-                self.live_sessions_overlay = None;
-            }
-            Key::Named(NamedKey::Down) | Key::Char('j')
-                if !modifiers.ctrl && !modifiers.alt =>
-            {
-                if let Some(ov) = &mut self.live_sessions_overlay {
-                    if n > 0 {
-                        ov.selected_idx = (ov.selected_idx + 1).min(n - 1);
-                    }
-                }
-            }
-            Key::Named(NamedKey::Up) | Key::Char('k')
-                if !modifiers.ctrl && !modifiers.alt =>
-            {
-                if let Some(ov) = &mut self.live_sessions_overlay {
-                    ov.selected_idx = ov.selected_idx.saturating_sub(1);
-                }
-            }
-            Key::Char('r') | Key::Char('R') if !modifiers.ctrl && !modifiers.alt => {
-                // Reattach to the selected session.
-                let aid = self
-                    .live_sessions_overlay
-                    .as_ref()
-                    .and_then(|ov| {
-                        let idx = ov.selected_idx.min(n.saturating_sub(1));
-                        self.live_tmux_sessions.get(idx)
-                    })
-                    .map(|s| s.assignment_id.clone());
-                self.live_sessions_overlay = None;
-                if let Some(aid) = aid {
-                    self.reattach_session_by_aid(&aid);
-                }
-            }
-            Key::Char('f') | Key::Char('F') if !modifiers.ctrl && !modifiers.alt => {
-                // Stop/finalize the selected session's assignment.
-                let aid = self
-                    .live_sessions_overlay
-                    .as_ref()
-                    .and_then(|ov| {
-                        let idx = ov.selected_idx.min(n.saturating_sub(1));
-                        self.live_tmux_sessions.get(idx)
-                    })
-                    .map(|s| s.assignment_id.clone());
-                self.live_sessions_overlay = None;
-                if let Some(aid) = aid {
-                    self.command_runner.spawn_queued(&["stop", &aid]);
-                }
-            }
-            Key::Char('K') if !modifiers.ctrl && !modifiers.alt => {
-                // Kill the tmux session (best-effort; prune hint toasted).
-                // Uppercase K avoids conflict with lowercase k (navigate up).
-                let selected = self
-                    .live_sessions_overlay
-                    .as_ref()
-                    .and_then(|ov| {
-                        let idx = ov.selected_idx.min(n.saturating_sub(1));
-                        self.live_tmux_sessions.get(idx)
-                    })
-                    .map(|s| (s.assignment_id.clone(), s.machine.clone()));
-                self.live_sessions_overlay = None;
-                if let Some((aid, machine)) = selected {
-                    self.kill_session_by_aid(&aid, machine.as_deref());
-                }
-            }
-            _ => {}
-        }
-        true
-    }
-
     /// Reattach to a live session by id, opening the standalone Terminal panel
     /// and running `coord reattach <aid>` in it.  Does not require a selected
     /// pipeline issue — the standalone terminal is always available.
@@ -1898,6 +1805,14 @@ impl CoordApp {
         self.push_toast("Session killed", &msg, ToastSeverity::Info);
     }
 
+    /// Reattach to the live interactive session for the selected issue,
+    /// whatever its type (work / review / test / merge).  This is the dedicated
+    /// "Reattach to live session" action: unlike the type-gated Start launchers
+    /// (#569 keeps "Start fix" from reattaching into a running review), it
+    /// reattaches to ANY running session for this issue by passing the resolved
+    /// aid explicitly to `launch_interactive_session_on_machine`, which then
+    /// runs `coord reattach <aid>` instead of a fresh (claim-blocked)
+    /// `coord assign`.
     pub(crate) fn reattach_to_selected_issue_live_session(&mut self) {
         // #727: use the wider resolver so zombie sessions (tmux alive but board
         // assignment already done/failed) are also reachable from the menu.

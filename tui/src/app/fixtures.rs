@@ -201,6 +201,8 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         sessions_tree_expanded: std::collections::HashMap::new(),
         sessions_tree_selected: None,
         sessions_tree_scroll: 0,
+        // #1033
+        pending_kill_session: None,
         fix_briefing_preview: None,
         fix_briefing_rx: None,
         // Leg 2 (#517)
@@ -216,8 +218,6 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         rework_bypass: false,
         // #541
         issue_finder: None,
-        // #628 Scope A
-        live_sessions_overlay: None,
         // Leg 3c / A3 (#517, #581)
         armed_for_test_verdict: std::collections::HashMap::new(),
         pending_test_fix: None,

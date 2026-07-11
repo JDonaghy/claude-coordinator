@@ -5867,238 +5867,250 @@
         assert_eq!(app.live_session_count_for_machine("precision"), 0);
     }
 
-    // ── #628 Scope A: fleet-wide live-sessions overlay ─────────────────────
+    // ── #1033: Sessions panel actions (attach / kill / stop) ───────────────
+    // Retires the #628 fleet-wide live-sessions overlay in favor of these —
+    // same verbs (reattach / kill / stop), now wired to the #1032 Sessions
+    // tree's selected leaf instead of a modal overlay's flat list.
 
+    /// TuiDriver black-box: `L` from any non-modal, non-PTY view switches the
+    /// active view to the Sessions panel (retiring the old open/close toggle
+    /// — see the events.rs #1033 comment). Asserted via the Sessions panel's
+    /// unique empty-detail placeholder text, since `driver_with_shell`
+    /// exposes no direct field access back into `CoordApp`.
     #[test]
-    fn live_sessions_overlay_opens_on_l_when_sessions_present() {
-        // L opens the overlay when there are live sessions. We test via the
-        // guard logic directly (same logic handle() checks) rather than calling
-        // handle() which requires a real Backend.
-        let mut app = make_test_app(BoardData::default());
-        app.live_tmux_sessions = vec![LiveTmuxSession {
-            assignment_id: "aid1".into(),
-            issue_number: Some(10),
-            repo_name: Some("api".into()),
-            issue_title: None,
-            machine: Some("elitebook".into()),
-            pane_dead: false,
-            pending_sweep_count: 0,
-            attached: false,
-        }];
-        assert!(app.live_sessions_overlay.is_none());
-        // Simulate the L-toggle guard: sessions non-empty, no modal, no overlay.
-        // This is the exact condition the L handler checks.
-        let should_open = !app.live_tmux_sessions.is_empty()
-            && app.issue_finder.is_none()
-            && !app.any_blocking_modal_active()
-            && app.live_sessions_overlay.is_none();
-        assert!(should_open, "L guard must be true when sessions are present");
-        if should_open {
-            app.live_sessions_overlay = Some(LiveSessionsOverlay::default());
-        }
-        assert!(
-            app.live_sessions_overlay.is_some(),
-            "L must open the live-sessions overlay when sessions are present"
-        );
-    }
+    fn l_key_switches_to_sessions_panel() {
+        use quadraui::tui::testing::driver_with_shell;
 
-    #[test]
-    fn live_sessions_overlay_does_not_open_when_no_sessions() {
-        // L must be a no-op when there are no live sessions.
         let app = make_test_app(BoardData::default());
-        assert!(app.live_tmux_sessions.is_empty());
-        let should_open = !app.live_tmux_sessions.is_empty();
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        // Board is the default view — its placeholder must not be showing yet.
         assert!(
-            !should_open,
-            "L guard must be false when no sessions are present"
+            !driver.screen().contains("Select a session to see its details"),
+            "must start on a view other than Sessions:\n{}",
+            driver.screen(),
         );
+
+        driver.press(Key::Char('L'));
+
+        let screen = driver.screen();
         assert!(
-            app.live_sessions_overlay.is_none(),
-            "overlay must remain closed"
+            screen.contains("Select a session to see its details"),
+            "L must switch the active view to Sessions:\n{screen}",
         );
     }
 
+    /// TuiDriver black-box: seed one live session, select its tree leaf,
+    /// press `K`, confirm the dialog, and assert the entry drops from the
+    /// rendered tree — mirrors `kill_terminal_confirm_removes_node_from_tree`
+    /// (#956) for the Sessions panel.
     #[test]
-    fn live_sessions_overlay_closes_on_esc() {
-        // Esc closes the overlay via handle_live_sessions_overlay_key.
-        let mut app = make_test_app(BoardData::default());
-        app.live_tmux_sessions = vec![LiveTmuxSession {
-            assignment_id: "aid1".into(),
-            issue_number: Some(10),
-            repo_name: None,
-            issue_title: None,
-            machine: None,
-            pane_dead: false,
-            pending_sweep_count: 0,
-            attached: false,
-        }];
-        app.live_sessions_overlay = Some(LiveSessionsOverlay::default());
-        app.handle_live_sessions_overlay_key(
-            &Key::Named(NamedKey::Escape),
-            &Modifiers::default(),
-        );
-        assert!(
-            app.live_sessions_overlay.is_none(),
-            "Esc must close the live-sessions overlay"
-        );
-    }
+    fn sessions_panel_kill_confirm_removes_node_from_tree() {
+        use quadraui::tui::testing::driver_with_shell;
 
-    #[test]
-    fn live_sessions_overlay_closes_on_l() {
-        // L is a toggle — pressing it again while open must close the overlay.
-        let mut app = make_test_app(BoardData::default());
-        app.live_tmux_sessions = vec![LiveTmuxSession {
-            assignment_id: "aid1".into(),
-            issue_number: None,
-            repo_name: None,
-            issue_title: None,
-            machine: None,
-            pane_dead: false,
-            pending_sweep_count: 0,
-            attached: false,
-        }];
-        app.live_sessions_overlay = Some(LiveSessionsOverlay::default());
-        app.handle_live_sessions_overlay_key(&Key::Char('L'), &Modifiers::default());
-        assert!(
-            app.live_sessions_overlay.is_none(),
-            "L pressed while open must close the overlay"
-        );
-    }
-
-    #[test]
-    fn live_sessions_overlay_navigates_with_j_k() {
-        // j/k move the selection within the session list.
-        let mut app = make_test_app(BoardData::default());
-        app.live_tmux_sessions = vec![
-            LiveTmuxSession {
-                assignment_id: "a1".into(),
-                issue_number: Some(1),
-                repo_name: None,
-                issue_title: None,
-                machine: None,
-                pane_dead: false,
-            pending_sweep_count: 0,
-            attached: false,
-            },
-            LiveTmuxSession {
-                assignment_id: "a2".into(),
-                issue_number: Some(2),
-                repo_name: None,
-                issue_title: None,
-                machine: None,
-                pane_dead: false,
-            pending_sweep_count: 0,
-            attached: false,
-            },
-        ];
-        app.live_sessions_overlay = Some(LiveSessionsOverlay { selected_idx: 0 });
-
-        // j moves down.
-        app.handle_live_sessions_overlay_key(&Key::Char('j'), &Modifiers::default());
-        assert_eq!(
-            app.live_sessions_overlay.as_ref().unwrap().selected_idx,
-            1,
-            "j must move selection down"
-        );
-
-        // k moves back up.
-        app.handle_live_sessions_overlay_key(&Key::Char('k'), &Modifiers::default());
-        assert_eq!(
-            app.live_sessions_overlay.as_ref().unwrap().selected_idx,
-            0,
-            "k must move selection up"
-        );
-    }
-
-    #[test]
-    fn live_sessions_overlay_j_clamps_at_last_session() {
-        // j on the last item must not wrap or panic.
-        let mut app = make_test_app(BoardData::default());
-        app.live_tmux_sessions = vec![
-            LiveTmuxSession {
-                assignment_id: "a1".into(),
-                issue_number: None,
-                repo_name: None,
-                issue_title: None,
-                machine: None,
-                pane_dead: false,
-            pending_sweep_count: 0,
-            attached: false,
-            },
-            LiveTmuxSession {
-                assignment_id: "a2".into(),
-                issue_number: None,
-                repo_name: None,
-                issue_title: None,
-                machine: None,
-                pane_dead: false,
-            pending_sweep_count: 0,
-            attached: false,
-            },
-        ];
-        app.live_sessions_overlay = Some(LiveSessionsOverlay { selected_idx: 1 });
-        app.handle_live_sessions_overlay_key(&Key::Char('j'), &Modifiers::default());
-        assert_eq!(
-            app.live_sessions_overlay.as_ref().unwrap().selected_idx,
-            1,
-            "j on last item must clamp, not wrap"
-        );
-    }
-
-    #[test]
-    fn live_sessions_overlay_kill_removes_session_and_closes() {
-        // k kills the session: removes it from live_tmux_sessions and closes overlay.
-        let mut app = make_test_app(BoardData::default());
+        let mut app = make_test_app(BoardData {
+            machines: vec![mk_machine("precision", "precision.tail", true, &[])],
+            ..BoardData::default()
+        });
         app.live_tmux_sessions = vec![LiveTmuxSession {
             assignment_id: "test-aid".into(),
             issue_number: Some(99),
             repo_name: Some("api".into()),
             issue_title: None,
-            machine: None, // no machine → local kill path (will fail gracefully)
+            machine: Some("precision".into()),
             pane_dead: false,
             pending_sweep_count: 0,
             attached: false,
         }];
-        app.live_sessions_overlay = Some(LiveSessionsOverlay { selected_idx: 0 });
-        // K (uppercase) kills the session; lowercase k is navigation-up.
-        app.handle_live_sessions_overlay_key(&Key::Char('K'), &Modifiers::default());
 
-        // Overlay closes immediately regardless of tmux success.
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        click_activity_icon(&mut driver, "◉");
+
+        let (x, y) = driver.find("#99").unwrap_or_else(|| {
+            panic!("'#99' session row must be findable:\n{}", driver.screen())
+        });
+        driver.click(x, y);
+
+        driver.press(Key::Char('K'));
+        let screen = driver.screen();
         assert!(
-            app.live_sessions_overlay.is_none(),
-            "kill must close the overlay"
+            screen.contains("Kill Session") || screen.contains("Kill session"),
+            "K on a selected session row must open the kill-confirm dialog:\n{screen}",
         );
-        // Session is removed from the discovered list.
+
+        driver.press(Key::Char('y'));
+
+        let screen = driver.screen();
         assert!(
-            !app.live_tmux_sessions
-                .iter()
-                .any(|s| s.assignment_id == "test-aid"),
-            "killed session must be removed from live_tmux_sessions"
+            !screen.contains("#99"),
+            "killed session must no longer render in the tree:\n{screen}",
         );
     }
 
+    /// Cancelling the kill-confirm (any key other than y/Y) must leave the
+    /// session untouched — node still in the tree.
     #[test]
-    fn live_sessions_overlay_stop_closes_and_queues_coord_stop() {
-        // f stops the assignment: closes the overlay; verifies coord stop is
-        // dispatched. We can't easily verify the CommandRunner action without
-        // mocking, but we can verify the overlay closes.
-        let mut app = make_test_app(BoardData::default());
+    fn sessions_panel_kill_cancel_leaves_session_untouched() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(BoardData {
+            machines: vec![mk_machine("precision", "precision.tail", true, &[])],
+            ..BoardData::default()
+        });
+        app.live_tmux_sessions = vec![LiveTmuxSession {
+            assignment_id: "test-aid".into(),
+            issue_number: Some(99),
+            repo_name: Some("api".into()),
+            issue_title: None,
+            machine: Some("precision".into()),
+            pane_dead: false,
+            pending_sweep_count: 0,
+            attached: false,
+        }];
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        click_activity_icon(&mut driver, "◉");
+        let (x, y) = driver.find("#99").unwrap_or_else(|| {
+            panic!("'#99' session row must be findable:\n{}", driver.screen())
+        });
+        driver.click(x, y);
+
+        driver.press(Key::Char('K'));
+        driver.press(Key::Named(quadraui::NamedKey::Escape));
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("#99"),
+            "cancelled kill must leave the session in the tree:\n{screen}",
+        );
+    }
+
+    /// Direct-app unit test: reattaching the selected Sessions-tree leaf
+    /// delegates to `reattach_session_by_aid` — asserted via its
+    /// side-effect (switching the active view to Terminal), same as
+    /// `reattach_session_by_aid`'s other callers are verified elsewhere.
+    #[test]
+    fn reattach_selected_fleet_session_switches_to_terminal() {
+        let mut app = make_test_app(BoardData {
+            machines: vec![mk_machine("precision", "precision.tail", true, &[])],
+            ..BoardData::default()
+        });
+        app.live_tmux_sessions = vec![LiveTmuxSession {
+            assignment_id: "aid-1".into(),
+            issue_number: Some(7),
+            repo_name: Some("api".into()),
+            issue_title: None,
+            machine: Some("precision".into()),
+            pane_dead: false,
+            pending_sweep_count: 0,
+            attached: false,
+        }];
+        app.active_view = SidebarView::Sessions;
+        app.sessions_tree_selected = Some(vec![0, 0, 0]);
+
+        assert!(
+            app.reattach_selected_fleet_session(),
+            "a selected session leaf must resolve for reattach"
+        );
+        assert_eq!(
+            app.active_view,
+            SidebarView::Terminal,
+            "reattach must switch the active view to Terminal"
+        );
+    }
+
+    /// Direct-app unit test: `r` is a no-op (returns `false`) when the
+    /// Sessions-tree selection is a machine/repo row rather than a session
+    /// leaf — mirrors `open_kill_terminal_confirm_noop_on_machine_row` (#956).
+    #[test]
+    fn reattach_selected_fleet_session_noop_on_machine_row() {
+        let mut app = make_test_app(BoardData {
+            machines: vec![mk_machine("precision", "precision.tail", true, &[])],
+            ..BoardData::default()
+        });
+        app.live_tmux_sessions = vec![LiveTmuxSession {
+            assignment_id: "aid-1".into(),
+            issue_number: Some(7),
+            repo_name: Some("api".into()),
+            issue_title: None,
+            machine: Some("precision".into()),
+            pane_dead: false,
+            pending_sweep_count: 0,
+            attached: false,
+        }];
+        app.active_view = SidebarView::Sessions;
+        app.sessions_tree_selected = Some(vec![0]); // machine row, not a leaf
+
+        assert!(
+            !app.reattach_selected_fleet_session(),
+            "a machine-row selection must not resolve for reattach"
+        );
+        assert_eq!(
+            app.active_view,
+            SidebarView::Sessions,
+            "a no-op reattach must not switch views"
+        );
+    }
+
+    /// Direct-app unit test: `f` on the selected Sessions-tree leaf queues
+    /// `coord stop <aid>` via the `CommandRunner` seam — mirrors
+    /// `confirm_kill_terminal_dispatches_qualified_target` (#956).
+    #[test]
+    fn stop_selected_fleet_session_queues_coord_stop() {
+        let mut app = make_test_app(BoardData {
+            machines: vec![mk_machine("precision", "precision.tail", true, &[])],
+            ..BoardData::default()
+        });
         app.live_tmux_sessions = vec![LiveTmuxSession {
             assignment_id: "stop-aid".into(),
             issue_number: Some(42),
             repo_name: None,
             issue_title: None,
-            machine: None,
+            machine: Some("precision".into()),
             pane_dead: false,
             pending_sweep_count: 0,
             attached: false,
         }];
-        app.live_sessions_overlay = Some(LiveSessionsOverlay { selected_idx: 0 });
-        app.handle_live_sessions_overlay_key(&Key::Char('f'), &Modifiers::default());
+        app.active_view = SidebarView::Sessions;
+        app.sessions_tree_selected = Some(vec![0, 0, 0]);
+
         assert!(
-            app.live_sessions_overlay.is_none(),
-            "f (stop) must close the overlay"
+            app.stop_selected_fleet_session(),
+            "a selected session leaf must resolve for stop"
         );
+        assert_eq!(
+            app.command_runner.spawned_calls,
+            vec![vec!["stop".to_string(), "stop-aid".to_string()]],
+            "must dispatch `coord stop stop-aid`; got {:?}",
+            app.command_runner.spawned_calls,
+        );
+    }
+
+    /// Direct-app unit test: `K` on a machine/repo row (not a session leaf)
+    /// must be a no-op — mirrors `open_kill_terminal_confirm_noop_on_machine_row`.
+    #[test]
+    fn open_kill_session_confirm_noop_on_machine_row() {
+        let mut app = make_test_app(BoardData {
+            machines: vec![mk_machine("precision", "precision.tail", true, &[])],
+            ..BoardData::default()
+        });
+        app.live_tmux_sessions = vec![LiveTmuxSession {
+            assignment_id: "aid-1".into(),
+            issue_number: Some(7),
+            repo_name: Some("api".into()),
+            issue_title: None,
+            machine: Some("precision".into()),
+            pane_dead: false,
+            pending_sweep_count: 0,
+            attached: false,
+        }];
+        app.active_view = SidebarView::Sessions;
+        app.sessions_tree_selected = Some(vec![0]); // machine row, not a leaf
+
+        assert!(
+            !app.open_kill_session_confirm(),
+            "a machine-row selection must not arm the kill confirm"
+        );
+        assert!(app.pending_kill_session.is_none());
     }
 
     #[test]
@@ -21904,31 +21916,34 @@
         );
     }
 
-    /// #491 black-box (TuiDriver): when the live-sessions overlay is open and
-    /// a session has `pane_dead = true`, the overlay row must show the "(dead)"
-    /// tag so the operator can identify dead sessions at a glance.
+    /// #491 black-box (TuiDriver): pressing `L` with a dead-pane session
+    /// present must land on the Sessions panel (#1033 retired the old
+    /// live-sessions overlay) and the tree row must show the "(dead)" tag so
+    /// the operator can identify dead sessions at a glance.
     #[test]
-    fn tuidriver_dead_pane_shows_dead_tag_in_overlay() {
+    fn tuidriver_dead_pane_shows_dead_tag_via_l_key() {
         use quadraui::tui::testing::driver_with_shell;
 
-        let mut app = make_test_app(BoardData::default());
+        let mut app = make_test_app(BoardData {
+            machines: vec![mk_machine("dellserver", "dellserver.tail", true, &[])],
+            ..BoardData::default()
+        });
         app.live_tmux_sessions = vec![LiveTmuxSession {
             assignment_id: "aid-dead".into(),
             issue_number: Some(99),
             repo_name: Some("api".into()),
             issue_title: None,
-            machine: None,
+            machine: Some("dellserver".into()),
             pane_dead: true,
             pending_sweep_count: 0,
             attached: false,
         }];
-        // Open the overlay (same state as pressing L with sessions present).
-        app.live_sessions_overlay = Some(LiveSessionsOverlay::default());
 
-        let driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        driver.press(Key::Char('L'));
         assert!(
-            driver.screen_contains("dead"),
-            "dead-pane session must show dead indicator in the sessions overlay:\n{}",
+            driver.screen_contains("(dead)"),
+            "dead-pane session must show a dead indicator on the Sessions panel:\n{}",
             driver.screen()
         );
     }

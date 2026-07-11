@@ -117,6 +117,8 @@ use self::pipeline::*;
 use self::milestone_dag::*;
 #[allow(unused_imports)]
 use self::fleet_terminals::*;
+#[allow(unused_imports)]
+use self::fleet_sessions::*;
 
 // ─── Auto-refresh interval ────────────────────────────────────────────────────
 
@@ -297,21 +299,6 @@ impl IssueFinder {
     fn move_up(&mut self) {
         self.selected_idx = self.selected_idx.saturating_sub(1);
     }
-}
-
-// ─── Fleet-wide live-sessions overlay ────────────────────────────────────────
-
-/// #628 Scope A: state for the fleet-wide live-sessions overlay.
-///
-/// Shows ALL `coord-*` tmux sessions across the fleet regardless of board
-/// row status — a merged/Done row says nothing about whether its session is
-/// still live.  Opened/closed with `L` from any non-PTY, non-modal view.
-///
-/// Actions (per row): [r]eattach · [K]ill · [f]stop.
-#[derive(Default)]
-struct LiveSessionsOverlay {
-    /// Index of the highlighted session row.
-    selected_idx: usize,
 }
 
 // ─── Detail panel tabs ────────────────────────────────────────────────────────
@@ -2567,6 +2554,11 @@ pub struct CoordApp {
     sessions_tree_selected: Option<TreePath>,
     /// Scroll offset (in flattened tree rows) for the Sessions-view tree.
     sessions_tree_scroll: usize,
+    /// #1033: pending "Kill session" confirmation — armed by `K` on a
+    /// selected Sessions-tree leaf. `y`/`Y` (or the dialog's confirm button)
+    /// fires the kill; any other key/outside click cancels. Mirrors
+    /// `pending_kill_terminal`.
+    pending_kill_session: Option<PendingKillSession>,
 
     // ── #955: attached fleet-terminal sessions (Terminal-view main pane) ───
     /// Local PTYs running `coord terminal attach <machine:name>`, keyed by
@@ -2705,11 +2697,6 @@ pub struct CoordApp {
     /// overlay is closed.  Opened with Ctrl+P from any non-PTY view; closed
     /// with Esc or Enter (Enter also navigates to the selected issue).
     issue_finder: Option<IssueFinder>,
-
-    // ── #628 Scope A: fleet-wide live-sessions overlay ────────────────────────
-    /// Active state of the fleet-wide live-sessions overlay.  `None` when
-    /// closed.  Opened/closed with `L` from any non-PTY, non-modal view.
-    live_sessions_overlay: Option<LiveSessionsOverlay>,
 
     // ── #217 Theming ─────────────────────────────────────────────────────────
     /// Resolved colour palette, derived from `settings.theme` (and an optional
@@ -3065,6 +3052,8 @@ impl CoordApp {
             sessions_tree_expanded: std::collections::HashMap::new(),
             sessions_tree_selected: None,
             sessions_tree_scroll: 0,
+            // #1033: pending "Kill session" confirmation — closed by default.
+            pending_kill_session: None,
             // #603: fix-briefing preview (lazily populated when a dialog raises).
             fix_briefing_preview: None,
             fix_briefing_rx: None,
@@ -3081,8 +3070,6 @@ impl CoordApp {
             rework_bypass: false,
             // #541: global issue fuzzy finder — closed by default.
             issue_finder: None,
-            // #628 Scope A: fleet-wide live-sessions overlay — closed by default.
-            live_sessions_overlay: None,
             // Leg 3c / A3 (#517, #581): test-verdict routing.
             armed_for_test_verdict: std::collections::HashMap::new(),
             pending_test_fix: None,
@@ -6728,6 +6715,11 @@ impl CoordApp {
             // #1001: `u` toggles the "+N without a work order" collapse for
             // the selected row's repo — same discoverability bar.
             " j/k=nav  Enter=open epic  c=capture plan  u=toggle untracked  q=quit ".to_string()
+        } else if self.active_view == SidebarView::Sessions {
+            // #1033: mirrors the retired #628 live-sessions overlay's
+            // footer hint verbatim ([r]eattach / [K]ill / [f]stop), now
+            // scoped to the Sessions-tree's selected leaf.
+            " j/k=nav  r=reattach  K=kill  f=stop  q=quit ".to_string()
         } else {
             // #192: `p` / `a` / `A` retired alongside the PROPOSALS
             // section.  Right-click → Send to Pipeline (#261) is the
