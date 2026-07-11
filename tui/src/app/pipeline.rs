@@ -1812,6 +1812,60 @@ impl CoordApp {
         }
     }
 
+    /// #1059 (docs/ORACLE_LOOP.md, #930): dispatch Gate A for the selected
+    /// epic/tracking-issue Pipeline row — `coord acceptance mock <repo>
+    /// <tracking_issue>`. Headless, like `coord assign`: the mock-author is
+    /// a normal (non-interactive) `claude -p` worker
+    /// (`coord/mock_author.py`), not a live tmux session — this just fires
+    /// the CLI from the row's context menu instead of a terminal. The CLI's
+    /// own claim-detection refuses a duplicate dispatch (Gate A already in
+    /// flight) with a clear stderr message; the command runner surfaces
+    /// that as a toast via its usual failure path.
+    pub(crate) fn dispatch_gate_a_mock_for_selected_pipeline_row(&mut self) -> bool {
+        let Some(idx) = self.pipeline_sel else {
+            return false;
+        };
+        let Some(issue) = self.pipeline_issues.get(idx).cloned() else {
+            return false;
+        };
+        let Some(repo) = issue.coord_repo.clone() else {
+            self.push_toast(
+                "Dispatch Gate A mock",
+                "No local repo mapping for this issue — cannot dispatch.",
+                ToastSeverity::Warning,
+            );
+            return false;
+        };
+        let issue_str = issue.number.to_string();
+        let cmd_strs: Vec<String> = vec![
+            "acceptance".to_string(),
+            "mock".to_string(),
+            repo.clone(),
+            issue_str,
+        ];
+        let cmd_refs: Vec<&str> = cmd_strs.iter().map(|s| s.as_str()).collect();
+        use crate::commands::SpawnQueuedOutcome;
+        match self.command_runner.spawn_queued(&cmd_refs) {
+            SpawnQueuedOutcome::Started => {
+                self.push_toast(
+                    "Gate A mock dispatched",
+                    &format!("coord acceptance mock {} {}", repo, issue.number),
+                    ToastSeverity::Info,
+                );
+                true
+            }
+            SpawnQueuedOutcome::Queued => {
+                self.push_toast(
+                    "⏳ Queued",
+                    "Gate A mock dispatch runs after current command",
+                    ToastSeverity::Info,
+                );
+                true
+            }
+            SpawnQueuedOutcome::Deduped => false,
+        }
+    }
+
     /// Launch `coord assign --interactive --merge-of <assignment_id>` in the
     /// standalone Terminal pane (SidebarView::Terminal), reusing the same PTY
     /// infrastructure as Chat/Troubleshoot modes.

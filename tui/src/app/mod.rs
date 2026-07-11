@@ -881,11 +881,20 @@ struct IssueGroup {
 /// and any `fix-N` variant.  Chat/scoping types (`refinement`,
 /// `test-chat`, `new-issue-chat`) return `false`.
 ///
+/// #1059: also `mock-author` (Gate A's mock-author, #930) — it dispatches
+/// through the same Work → Test → Review → Merge pipeline as any other
+/// branch (`coord/mock_author.py`'s docstring: "Gate A produces a normal
+/// reviewed commit, not a special-cased one"), mirroring Python's
+/// `coord.models.WORK_LIKE_TYPES`. Without it, an epic row with an active
+/// Gate-A dispatch stayed classified "new" instead of "in-progress",
+/// hiding Watch/Stop.
+///
 /// Used by `IssueGroup::lifecycle_section` so that an issue that only
 /// has chat-type assignments still lands in Backlog / Refining / Refined
 /// rather than being dragged into In-flight.
 fn is_workable_type(ty: &str) -> bool {
-    matches!(ty, "work" | "review" | "smoke" | "conflict-fix") || ty.starts_with("fix-")
+    matches!(ty, "work" | "mock-author" | "review" | "smoke" | "conflict-fix")
+        || ty.starts_with("fix-")
 }
 
 impl IssueGroup {

@@ -2067,6 +2067,180 @@
         );
     }
 
+    // ── #1059: Gate A dispatch + sign-off menu items ──────────────────────
+
+    #[test]
+    fn dispatch_gate_a_mock_menu_item_present_only_on_epic_row() {
+        // Black-box coverage for #1059: drives the full event → handle →
+        // render path (keyboard equivalent of right-click, '.') and reads
+        // the painted context menu off the TestBackend screen, mirroring
+        // `audit_outcomes_menu_item_present_only_on_epic_labeled_row`.
+        use quadraui::tui::testing::driver_with_shell;
+
+        // Row 0 carries the `epic` label — "Dispatch Gate A mock" must appear.
+        let epic_app = make_pipeline_app_for_audit_menu_test(0);
+        let mut driver = driver_with_shell(epic_app, CoordApp::shell_config(), 120, 40);
+        driver.type_char('.');
+        assert!(
+            driver.screen_contains("Dispatch Gate A mock"),
+            "epic row's context menu must offer 'Dispatch Gate A mock':\n{}",
+            driver.screen(),
+        );
+        assert!(
+            driver.screen_contains("View Gate A mock"),
+            "epic row's context menu must offer 'View Gate A mock':\n{}",
+            driver.screen(),
+        );
+
+        // Row 1 has no `epic` label — neither Gate A item may appear.
+        let plain_app = make_pipeline_app_for_audit_menu_test(1);
+        let mut driver = driver_with_shell(plain_app, CoordApp::shell_config(), 120, 40);
+        driver.type_char('.');
+        assert!(
+            !driver.screen_contains("Dispatch Gate A mock"),
+            "non-epic row's context menu must NOT offer 'Dispatch Gate A mock':\n{}",
+            driver.screen(),
+        );
+        assert!(
+            !driver.screen_contains("View Gate A mock"),
+            "non-epic row's context menu must NOT offer 'View Gate A mock':\n{}",
+            driver.screen(),
+        );
+    }
+
+    #[test]
+    fn view_gate_a_mock_item_disabled_until_a_pr_exists() {
+        // #1059: "View Gate A mock" is the sign-off viewer (opens the
+        // mock-author's PR — contract.md + the rendered mock(s) — in the
+        // browser). It must stay disabled until a PR actually exists for
+        // the epic's tracking issue, same rationale as the Done-lifecycle
+        // "Open PR" item.
+        let app = make_pipeline_app_for_audit_menu_test(0);
+        let items = app.context_menu_items_for_pipeline_row(
+            Some(751),
+            &PipelineRowLifecycle::New,
+            Some("api"),
+        );
+        let view_item = items
+            .iter()
+            .find(|i| i.action_id.as_deref() == Some("view-gate-a-mock"))
+            .expect("epic row must offer 'view-gate-a-mock'");
+        assert!(
+            view_item.disabled,
+            "View Gate A mock must be disabled when no PR exists yet"
+        );
+
+        // Once a merge_queue entry with a pr_number exists for #751, the
+        // item must enable.
+        let mut app_with_pr = make_pipeline_app_for_audit_menu_test(0);
+        app_with_pr.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "gate-a-1".to_string(),
+            issue_number: Some(751),
+            state: "review".to_string(),
+            pr_number: Some(202),
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: None,
+            branch: None,
+            milestone_title: None,
+            last_attempt: None,
+        });
+        let items = app_with_pr.context_menu_items_for_pipeline_row(
+            Some(751),
+            &PipelineRowLifecycle::New,
+            Some("api"),
+        );
+        let view_item = items
+            .iter()
+            .find(|i| i.action_id.as_deref() == Some("view-gate-a-mock"))
+            .expect("epic row must offer 'view-gate-a-mock'");
+        assert!(
+            !view_item.disabled,
+            "View Gate A mock must enable once the mock-author's PR exists"
+        );
+    }
+
+    #[test]
+    fn dispatch_gate_a_mock_action_spawns_acceptance_mock_command() {
+        // #1059: the menu action fires `coord acceptance mock <repo>
+        // <tracking_issue>` headlessly — same dispatch mechanism as
+        // `coord assign`, not an interactive session.
+        let mut app = make_pipeline_app_for_audit_menu_test(0);
+        let target = ContextMenuTarget::PipelineRow {
+            issue_number: Some(751),
+            repo_name: Some("api".to_string()),
+            lifecycle: PipelineRowLifecycle::New,
+        };
+        let handled = app.dispatch_context_menu_action("dispatch-gate-a-mock", &target);
+        assert!(handled, "dispatch-gate-a-mock must be a recognised action");
+        assert_eq!(
+            app.command_runner.spawned_calls.len(),
+            1,
+            "exactly one command must be spawned, got: {:?}",
+            app.command_runner.spawned_calls,
+        );
+        assert_eq!(
+            app.command_runner.spawned_calls[0],
+            vec![
+                "acceptance".to_string(),
+                "mock".to_string(),
+                "api".to_string(),
+                "751".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn view_gate_a_mock_action_toasts_when_no_pr_yet() {
+        // #1059: without a PR yet, the viewer can't open anything — it
+        // must toast a clear reason instead of silently doing nothing.
+        let mut app = make_pipeline_app_for_audit_menu_test(0);
+        let target = ContextMenuTarget::PipelineRow {
+            issue_number: Some(751),
+            repo_name: Some("api".to_string()),
+            lifecycle: PipelineRowLifecycle::New,
+        };
+        let toasts_before = app.toasts.len();
+        let handled = app.dispatch_context_menu_action("view-gate-a-mock", &target);
+        assert!(handled, "view-gate-a-mock must be a recognised action");
+        assert!(
+            app.toasts.len() > toasts_before,
+            "must toast when no PR exists yet to view"
+        );
+        assert!(
+            app.toasts.last().unwrap().0.title.contains("View Gate A mock"),
+            "toast should be scoped to the View Gate A mock action, got: {:?}",
+            app.toasts.last().unwrap().0.title,
+        );
+    }
+
+    #[test]
+    fn completed_work_aid_for_recognizes_mock_author_type() {
+        // #1059: Gate A's mock-author (#930) dispatches through the same
+        // Work → Test → Review → Merge pipeline as an ordinary work
+        // assignment (coord/mock_author.py). `completed_work_aid_for` (and
+        // therefore Testing/Review/Merge gating) must recognize a `done`
+        // `mock-author` assignment exactly like a `done` `work` one —
+        // without this, those actions stayed permanently disabled for an
+        // epic row once its Gate-A worker completed.
+        let app = make_test_app(BoardData::default());
+        assert!(
+            app.completed_work_aid_for("api", 751).is_none(),
+            "no assignments yet — nothing to find"
+        );
+
+        let mut app = make_test_app(BoardData::default());
+        let mut a = make_assignment_typed("done", 751, "api", Some("mock-author"));
+        a.branch = Some("ms-9-gate-a".to_string());
+        app.data.assignments.push(a);
+        assert_eq!(
+            app.completed_work_aid_for("api", 751).as_deref(),
+            Some("id-751-done"),
+            "a done mock-author assignment with a branch must resolve just like a work one"
+        );
+    }
+
     // ── Leg 3c / A3 (#517, #581): test-verdict routing ────────────────────
 
     fn done_work_with_test_state(issue: u64, repo: &str, state: &str) -> Assignment {

@@ -671,15 +671,35 @@ impl CoordApp {
             // Milestone Outcome Audit Phase 1 (#885): "Audit outcomes" —
             // human-attended READ-ONLY milestone-outcome analyst — only for
             // rows carrying the `epic` label (a milestone's tracking issue).
-            let is_epic_row = issue_number
-                .map(|n| {
-                    self.pipeline_issues
-                        .iter()
-                        .any(|iss| iss.number == n && iss.all_labels.iter().any(|l| l == "epic"))
-                })
+            let epic_issue: Option<&PipelineIssue> = issue_number
+                .and_then(|n| self.pipeline_issues.iter().find(|iss| iss.number == n));
+            let is_epic_row = epic_issue
+                .map(|iss| iss.all_labels.iter().any(|l| l == "epic"))
                 .unwrap_or(false);
             if is_epic_row {
                 items.push(ContextMenuItem::action("audit-outcomes", "Audit outcomes"));
+                // #1059 (docs/ORACLE_LOOP.md, #930/#947): Gate A dispatch +
+                // sign-off for the milestone this epic tracks. "Dispatch Gate
+                // A mock" runs `coord acceptance mock <repo> <tracking_issue>`
+                // headlessly (an independent mock-author agent renders the
+                // viewable mock + writes tests/acceptance/ms-NN/contract.md —
+                // the CLI's own claim-detection refuses a duplicate dispatch).
+                // "View Gate A mock" opens that worker's PR in the browser
+                // (same mechanism as the Done-lifecycle "Open PR" below) so a
+                // human can read contract.md + the rendered mock(s) and
+                // review/merge the branch — the Test → Review → Merge round
+                // trip that constitutes sign-off — before `coord acceptance
+                // author` (out of scope here) is run against the merged
+                // contract.
+                items.push(ContextMenuItem::action(
+                    "dispatch-gate-a-mock",
+                    "Dispatch Gate A mock",
+                ));
+                let mut view_gate_a_item =
+                    ContextMenuItem::action("view-gate-a-mock", "View Gate A mock (PR)");
+                view_gate_a_item.disabled =
+                    epic_issue.and_then(|iss| self.pipeline_pr_number(iss)).is_none();
+                items.push(view_gate_a_item);
             }
             items.push(ContextMenuItem::separator());
         }
@@ -5642,6 +5662,31 @@ impl CoordApp {
                 self.launch_interactive_session_for_selected_issue(
                     InteractiveLaunchMode::Audit,
                 );
+                true
+            }
+            // #1059: Gate A dispatch for an epic row — headless (mirrors
+            // `start-skip-plan`/`start-merge-automated`), NOT an interactive
+            // session: `coord acceptance mock` dispatches a normal
+            // (non-interactive) `claude -p` mock-author worker
+            // (`coord/mock_author.py`), same as `coord assign`.
+            "dispatch-gate-a-mock" => {
+                self.dispatch_gate_a_mock_for_selected_pipeline_row();
+                true
+            }
+            // #1059: view the Gate-A mock-author's PR (contract.md + the
+            // rendered mock(s)) for human sign-off — reuses the same "Open
+            // PR" mechanism as the Done-lifecycle item below, just reachable
+            // on an epic row before it reaches Done.
+            "view-gate-a-mock" => {
+                let opened = self.dispatch_open_pr_for_selected_pipeline_row();
+                if !opened {
+                    self.push_toast(
+                        "View Gate A mock",
+                        "No PR yet for this issue — dispatch Gate A mock first, \
+                         or wait for the worker to push its branch.",
+                        ToastSeverity::Warning,
+                    );
+                }
                 true
             }
             // #935 Part B: unified per-stage doctor — dry-run-diagnoses first,

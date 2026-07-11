@@ -95,13 +95,24 @@ impl CoordApp {
     /// non-empty branch for `(coord_repo, issue_num)`, or `None`.  Generalises
     /// [`selected_completed_work_aid`] to an arbitrary issue so the auto-advance
     /// detector can check issues other than the selected row.
+    ///
+    /// #1059: also matches `type="mock-author"` (Gate A, #930) — mirrors
+    /// Python's `coord.models.WORK_LIKE_TYPES`. A Gate-A mock-author
+    /// assignment is dispatched against the milestone's own tracking-epic
+    /// issue number and flows through the same Work → Test → Review → Merge
+    /// pipeline as an ordinary work assignment; without this, Testing/
+    /// Review/Merge stayed permanently disabled for an epic row once its
+    /// Gate-A worker completed, since the strict `"work"` match never found
+    /// it.
     pub(crate) fn completed_work_aid_for(&self, coord_repo: &str, issue_num: u64) -> Option<String> {
         self.data
             .assignments
             .iter()
             .filter(|a| a.issue_number == issue_num)
             .filter(|a| a.repo == coord_repo)
-            .filter(|a| a.assignment_type.as_deref().unwrap_or("work") == "work")
+            .filter(|a| {
+                matches!(a.assignment_type.as_deref().unwrap_or("work"), "work" | "mock-author")
+            })
             .filter(|a| a.status == "done")
             .filter(|a| a.branch.as_deref().map(|b| !b.is_empty()).unwrap_or(false))
             .max_by(|a, b| {
