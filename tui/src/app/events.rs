@@ -1942,6 +1942,18 @@ impl CoordApp {
                         self.pending_quit_confirm = true;
                         needs_redraw = true;
                     }
+                    // #1039: Esc closes the Audit entry-detail pane back to
+                    // the list-only view (contract §7) instead of quitting —
+                    // must precede the unguarded catch-all below, same
+                    // reasoning as the `watch_focused`/live-session guards
+                    // just above.
+                    Key::Named(NamedKey::Escape)
+                        if self.active_view == SidebarView::Audit
+                            && self.audit_detail_open =>
+                    {
+                        self.audit_detail_open = false;
+                        needs_redraw = true;
+                    }
                     Key::Char('q') | Key::Named(NamedKey::Escape) => return Reaction::Exit,
 
                     // §3 (#782): numeric keys 1-7 used to switch sidebar views
@@ -2058,6 +2070,50 @@ impl CoordApp {
                                 ToastSeverity::Info,
                             );
                         }
+                        needs_redraw = true;
+                    }
+
+                    // ── Audit panel keyboard nav (#1039) ─────────────────
+                    // Nav/Enter/`r` are only meaningful in list-only mode;
+                    // Esc closes the detail pane back to the list (contract
+                    // §7). Global Esc handling elsewhere (dialogs, chat,
+                    // etc.) takes priority — this arm only fires when
+                    // nothing else already claimed Esc for this frame.
+                    Key::Char('j') | Key::Named(NamedKey::Down)
+                        if self.active_view == SidebarView::Audit
+                            && !self.audit_detail_open =>
+                    {
+                        let n = self.audit_entries().len();
+                        if n > 0 {
+                            self.audit_sel = (self.audit_sel + 1).min(n - 1);
+                        }
+                        needs_redraw = true;
+                    }
+                    Key::Char('k') | Key::Named(NamedKey::Up)
+                        if self.active_view == SidebarView::Audit
+                            && !self.audit_detail_open =>
+                    {
+                        self.audit_sel = self.audit_sel.saturating_sub(1);
+                        needs_redraw = true;
+                    }
+                    Key::Named(NamedKey::Enter)
+                        if self.active_view == SidebarView::Audit
+                            && !self.audit_detail_open
+                            && !self.audit_entries().is_empty() =>
+                    {
+                        self.audit_detail_open = true;
+                        needs_redraw = true;
+                    }
+                    // Esc (while the detail pane is open) is handled earlier,
+                    // alongside the other pending-state Escape guards, since
+                    // it must run *before* the unguarded global `q`/Esc = Exit
+                    // catch-all below — see the block just above that
+                    // catch-all (`terminal_tab_has_live_session` guard).
+                    Key::Char('r')
+                        if self.active_view == SidebarView::Audit
+                            && !self.audit_detail_open =>
+                    {
+                        self.refresh_audit();
                         needs_redraw = true;
                     }
 
@@ -2552,6 +2608,11 @@ impl CoordApp {
                                 self.sessions_tree_move_selection(1);
                                 self.fix_sessions_tree_scroll(content_visible_rows(list_b, lh));
                             }
+                            // #1039: list-mode j/k handled by the earlier
+                            // guarded arm; a no-op here (which only runs
+                            // while the detail pane is open, since the
+                            // guarded arm requires `!audit_detail_open`).
+                            SidebarView::Audit => {}
                         }
                         needs_redraw = true;
                     }
@@ -2616,6 +2677,8 @@ impl CoordApp {
                                 self.sessions_tree_move_selection(-1);
                                 self.fix_sessions_tree_scroll(content_visible_rows(list_b, lh));
                             }
+                            // #1039: see Down/j arm above.
+                            SidebarView::Audit => {}
                         }
                         needs_redraw = true;
                     }
@@ -2850,6 +2913,10 @@ impl CoordApp {
                             // #1032: Sessions — no nav target for Home, same
                             // as Terminal (j/k tree-walk covers navigation).
                             SidebarView::Sessions => {}
+                            // #1039: Audit — Home jumps to the first entry.
+                            SidebarView::Audit => {
+                                self.audit_sel = 0;
+                            }
                         }
                         needs_redraw = true;
                     }
@@ -2922,6 +2989,13 @@ impl CoordApp {
                             // #1032: Sessions — no nav target for End, same
                             // as Terminal (j/k tree-walk covers navigation).
                             SidebarView::Sessions => {}
+                            // #1039: Audit — End jumps to the last entry.
+                            SidebarView::Audit => {
+                                let n = self.audit_entries().len();
+                                if n > 0 {
+                                    self.audit_sel = n - 1;
+                                }
+                            }
                         }
                         needs_redraw = true;
                     }
@@ -4448,6 +4522,9 @@ impl CoordApp {
                 let row = ((pos.y - sidebar_b.y) / lh).floor() as usize + self.sessions_tree_scroll;
                 self.sessions_tree_click_row(row)
             }
+            // #1039: Audit sidebar is a placeholder (count + badge only);
+            // the entry list lives in the main panel (`mouse_main_click`).
+            SidebarView::Audit => false,
         }
     }
 
@@ -4714,6 +4791,18 @@ impl CoordApp {
         if self.active_view == SidebarView::Plans {
             if let Some(idx) = self.plans_row_at(pos, main_b, lh) {
                 self.plans_sel = idx;
+                return true;
+            }
+            return false;
+        }
+        // #1039: Audit panel list is also a raw `ListView` painted straight
+        // into the main panel. Clicking a row while the detail pane is
+        // closed selects it; the detail pane itself isn't a selectable-row
+        // target (it has no rows of its own to pick), so `audit_row_at`
+        // isn't consulted while `audit_detail_open`.
+        if self.active_view == SidebarView::Audit && !self.audit_detail_open {
+            if let Some(idx) = self.audit_row_at(pos, main_b, lh) {
+                self.audit_sel = idx;
                 return true;
             }
             return false;
@@ -5048,6 +5137,9 @@ impl CoordApp {
             // read-only slice — j/k tree-walk covers navigation, same as
             // Terminal above.
             SidebarView::Sessions => false,
+            // #1039: Audit sidebar is a placeholder (count + badge only) —
+            // no sidebar scroll.
+            SidebarView::Audit => false,
         }
     }
 
@@ -5302,6 +5394,9 @@ impl CoordApp {
             // view of the selected leaf; wheel is a no-op, same as Kanban/
             // MergeQueue/MilestoneDag/Plans above.
             SidebarView::Sessions => true,
+            // #1039: Audit panel — j/k handles navigation; wheel is a no-op
+            // for now, same as Plans/MergeQueue/MilestoneDag above.
+            SidebarView::Audit => true,
         }
     }
 }

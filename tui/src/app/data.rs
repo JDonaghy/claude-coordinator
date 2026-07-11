@@ -428,6 +428,63 @@ pub(crate) fn spawn_artifact_fetch(
     rx
 }
 
+/// Outcome of a single `GET /audit` request (#1039), delivered via channel
+/// from `spawn_audit_fetch`.
+pub(crate) enum AuditFetchOutcome {
+    /// HTTP 200 with a parsed `AuditPage` (may have zero entries).
+    Page(AuditPage),
+    /// No board service is configured (`resolve_board_service` returned
+    /// `None`) — the Audit panel has nothing to fetch from in this mode
+    /// (local-SQLite-mode has no `/audit` HTTP surface). Rendered the same
+    /// as "fetch not yet completed" (contract §4b empty state).
+    NoBoardService,
+    /// Network / parse error, or a non-2xx HTTP status.
+    Unreachable(String),
+}
+
+/// How often to re-fetch `/audit` while the Audit panel is visible (#1039).
+/// Mirrors the 30 s TTL `ArtifactCacheEntry` uses for the Pipeline Test
+/// stage — audit entries are append-only and low-volume, so a slightly
+/// slower cadence than the 5 s machine-metrics poll is plenty responsive.
+pub(crate) const AUDIT_FETCH_TTL: Duration = Duration::from_secs(15);
+
+/// #1039: spawn a background thread that fetches the first page of
+/// `GET /audit` (no filters — filters are #1040) from the configured board
+/// service (`resolve_board_service`), mirroring `spawn_artifact_fetch`'s
+/// thread-per-request pattern. Armed by the caller only while
+/// `active_view == SidebarView::Audit` (see the poll loop in
+/// `settings_ui.rs`), same gating discipline as the Machines-panel metrics
+/// poll above.
+pub(crate) fn spawn_audit_fetch() -> std::sync::mpsc::Receiver<AuditFetchOutcome> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let Some((url, token)) = resolve_board_service() else {
+        let _ = tx.send(AuditFetchOutcome::NoBoardService);
+        return rx;
+    };
+    std::thread::spawn(move || {
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(8))
+            .build();
+        let mut req = agent.get(&format!("{url}/audit"));
+        if let Some(t) = &token {
+            req = req.set("Authorization", &format!("Bearer {t}"));
+        }
+        let outcome = match req.call() {
+            Ok(resp) => match resp.into_string() {
+                Ok(body) => match serde_json::from_str::<AuditPage>(&body) {
+                    Ok(page) => AuditFetchOutcome::Page(page),
+                    Err(e) => AuditFetchOutcome::Unreachable(format!("json: {e}")),
+                },
+                Err(e) => AuditFetchOutcome::Unreachable(e.to_string()),
+            },
+            Err(e) => AuditFetchOutcome::Unreachable(e.to_string()),
+        };
+        let _ = tx.send(outcome);
+    });
+    rx
+}
+
 /// #315: signal that `spawn_inject_post` sends to the main thread when
 /// the /inject POST returns HTTP 409 ("assignment is `done`") or 410
 /// (BrokenPipeError — worker stdin closed).  Both mean the worker exited
@@ -1327,6 +1384,11 @@ pub(crate) fn load_data() -> BoardData {
         // `GoalHeader::default()` (available: false) leaves the Plans panel
         // with no pinned header, exactly as before this field existed.
         GoalHeader::default(),
+        // #1037/#1039: local SQLite path has no daemon computing the
+        // 15-minute audit-recency window; the Audit panel's sidebar badge
+        // simply shows nothing (0) on this path, same posture as
+        // plan_roster_supported above.
+        0,
     )
 }
 
@@ -1362,6 +1424,7 @@ pub(crate) fn assemble_board_data(
     plan_roster: Vec<PlanRosterEntry>,
     plan_roster_supported: bool,
     goal_header: GoalHeader,
+    audit_recent_count: u64,
 ) -> BoardData {
     // ── Machine reachability probes + health fetches ──────────────────────
     // Probe using the Tailscale host (fixes #121: machine name ≠ Tailscale hostname).
@@ -1477,6 +1540,7 @@ pub(crate) fn assemble_board_data(
         plan_roster,
         plan_roster_supported,
         goal_header,
+        audit_recent_count,
     }
 }
 
@@ -1495,7 +1559,19 @@ pub(crate) fn resolve_board_service() -> Option<(String, Option<String>)> {
     // the production daemon during `cargo test`.  The `OnceLock` cache in
     // `is_remote_board_service()` would otherwise latch a developer-machine
     // value of `true` for the entire test process.
-    #[cfg(test)]
+    //
+    // #1039: also gated on `feature = "test-support"`, not just `cfg(test)`
+    // — the sealed `tests/acceptance/**` suite (`tui/tests/acceptance.rs`,
+    // the #1042 seam) is a separate integration-test binary, so the library
+    // it links against is compiled *without* `cfg(test)` (only the
+    // top-level test binary gets that cfg). Without this, a TuiDriver test
+    // that navigates to the Audit panel would arm `spawn_audit_fetch` for
+    // real against whatever `~/.coord/client.toml` happens to exist on the
+    // machine running the suite — exactly the flaky/slow real-network trap
+    // this function exists to avoid.  `cargo test --features test-support`
+    // enables the feature crate-wide for that whole build (lib + every test
+    // binary sharing the invocation), so this stays reliable there too.
+    #[cfg(any(test, feature = "test-support"))]
     return None;
 
     // Env first.
@@ -1756,6 +1832,10 @@ pub(crate) fn load_data_remote(url: &str, token: Option<&str>) -> BoardData {
         // #978: server-computed GOAL.md north-star header; `available: false`
         // (the `Default`) on daemons that predate #978.
         payload.goal_header,
+        // #1037/#1039: 15-minute audit-recency count for the Audit panel's
+        // sidebar badge; `0` (`#[serde(default)]`) on daemons that predate
+        // #1037.
+        payload.audit_recent_count,
     )
 }
 

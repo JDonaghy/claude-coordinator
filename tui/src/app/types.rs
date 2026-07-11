@@ -153,6 +153,10 @@ pub(crate) enum SidebarView {
     /// deeper (machine → repo → session leaf). Read-only nav/select in this
     /// slice — attach/kill/stop are a follow-up.
     Sessions,
+    /// #1039: Audit panel — a scrollable, newest-first list of the audit
+    /// trail (`/audit`, #1037) with an inline entry-detail view, modeled on
+    /// the Plans panel. Filters (#1040) are a follow-up.
+    Audit,
 }
 
 impl SidebarView {
@@ -168,6 +172,7 @@ impl SidebarView {
             SidebarView::MilestoneDag => "Milestones",
             SidebarView::Plans => "Plans",
             SidebarView::Sessions => "Sessions",
+            SidebarView::Audit => "Audit",
         }
     }
 
@@ -193,6 +198,7 @@ impl SidebarView {
             SidebarView::MergeQueue => Some(WidgetId::new("panel:mergequeue")),
             SidebarView::Plans => Some(WidgetId::new("panel:plans")),
             SidebarView::Sessions => Some(WidgetId::new("panel:sessions")),
+            SidebarView::Audit => Some(WidgetId::new("panel:audit")),
             SidebarView::MilestoneDag => None,
         }
     }
@@ -564,6 +570,13 @@ pub(crate) struct BoardPayload {
     /// never emit this key at all.
     #[serde(default)]
     pub(crate) goal_header: GoalHeader,
+    /// #1037/#1039: count of `audit_log` rows written in the last 15
+    /// minutes — a single forward-compatible integer so the Audit
+    /// ActivityBar panel can show an attention badge without fetching the
+    /// full paginated `/audit` log.  `0` (the `Default`/`#[serde(default)]`
+    /// value) on daemons older than #1037, which never emit this key.
+    #[serde(default)]
+    pub(crate) audit_recent_count: u64,
 }
 
 /// #584: serde deserializer for `Assignment::test_plan` on the remote
@@ -1083,6 +1096,63 @@ pub(crate) struct GoalHeader {
     pub(crate) days_since_update: Option<i64>,
 }
 
+/// #1039: one row from the `/audit` endpoint (#1037) — deserialized
+/// verbatim from the `entries[*]` wire shape pinned by contract §6
+/// (`tests/acceptance/ms-33/contract.md`).
+///
+/// `pub`, not `pub(crate)`: this is the parameter type of
+/// `app::fixtures::make_app_with_audit_json` (test-support-feature-gated),
+/// which must be at least as visible as that `pub fn` (E0446) to be
+/// reachable from an external integration-test crate — same rationale as
+/// `Assignment` above.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct AuditEntry {
+    pub id: i64,
+    pub ts: f64,
+    #[serde(default)]
+    pub tier: Option<String>,
+    pub category: String,
+    pub event_type: String,
+    pub actor: String,
+    #[serde(default)]
+    pub repo: Option<String>,
+    #[serde(default)]
+    pub issue: Option<u64>,
+    #[serde(default)]
+    pub assignment_id: Option<String>,
+    #[serde(default)]
+    pub machine: Option<String>,
+    pub summary: String,
+    /// JSON-decoded `details` object — `null` (→ `None`) when the source
+    /// `details_json` column was `NULL`.
+    #[serde(default)]
+    pub details: Option<serde_json::Value>,
+}
+
+/// #1039: the `/audit` endpoint's paginated response envelope (contract
+/// §6). Cached on `CoordApp` (see `audit_page`), populated by
+/// `spawn_audit_fetch`/`data::spawn_audit_fetch` — deliberately kept off
+/// `BoardData`/`BoardPayload` (the epic's instruction: "Do not add the log
+/// to BoardPayload" — `/board` carries only the `audit_recent_count`
+/// summary integer below).
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub struct AuditPage {
+    #[serde(default)]
+    pub entries: Vec<AuditEntry>,
+    /// Keyset cursor for the next page (contract §6). Unread in this slice:
+    /// `spawn_audit_fetch` only ever requests the first page (filters/
+    /// pagination are #1040+); kept on the wire-shape type now so a later
+    /// "load more" doesn't need another deserializer change.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub next_cursor: Option<String>,
+    /// Whether more pages exist beyond `next_cursor`. Same rationale as
+    /// `next_cursor` above.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub has_more: bool,
+}
+
 /// CI check status for one PR, fetched in the background via `gh pr checks`.
 ///
 /// Populated from `fetch_ci_checks_summary` and stored on `CoordApp` keyed by
@@ -1437,6 +1507,11 @@ pub struct BoardData {
     /// type's `Default`) on the local-SQLite-mode read path (no daemon to
     /// read GOAL.md from) and on daemons older than #978.
     pub(crate) goal_header: GoalHeader,
+    /// #1037/#1039: mirrors `BoardPayload::audit_recent_count` — count of
+    /// audit rows written in the last 15 minutes, driving the Audit panel's
+    /// sidebar "N recent" badge. `0` on the local-SQLite-mode read path and
+    /// on daemons older than #1037.
+    pub(crate) audit_recent_count: u64,
 }
 
 /// Parsed plan data, mirroring `coord.plan_parser.WorkerPlan.to_dict()`.

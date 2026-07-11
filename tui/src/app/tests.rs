@@ -30630,3 +30630,227 @@ Milestone tracking issue.
         );
         assert!(app.pending_kill_terminal.is_none());
     }
+
+    // ── #1039: Audit panel ───────────────────────────────────────────────────
+    //
+    // The sealed acceptance slice (`tests/acceptance/ms-33/audit_1039.rs`)
+    // only covers panel registration, sidebar header, the empty state, and
+    // list-mode status hints — the populated-list/detail-pane/badge
+    // assertions were deliberately deferred there pending a no-daemon
+    // seeding seam (see that file's trailing TODO block), which
+    // `app::fixtures::make_app_with_audit_json` now provides. These
+    // in-crate tests cover exactly that deferred set, per this repo's
+    // convention that a worker owns its own unit/internal test coverage for
+    // anything the acceptance contract doesn't already assert.
+
+    /// Build a two-entry `/audit` JSON page (contract §6 wire shape) with
+    /// `NEWEST_MARKER` ~10s old and `OLDEST_MARKER` ~500s old, already in
+    /// newest-first order — mirrors the server's `ts DESC, id DESC`
+    /// invariant, which the TUI trusts rather than re-sorting client-side
+    /// (same "server-computed, thin client" posture as `plan_roster`).
+    fn audit_page_json_two_entries() -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        format!(
+            r#"{{
+                "entries": [
+                    {{
+                        "id": 2, "ts": {newest_ts}, "tier": "business",
+                        "category": "dispatch", "event_type": "dispatched",
+                        "actor": "coordinator", "repo": "claude-coordinator",
+                        "issue": 1039, "assignment_id": "a1b2c3d4",
+                        "machine": "laptop", "summary": "NEWEST_MARKER",
+                        "details": {{"branch": "issue-1039-x"}}
+                    }},
+                    {{
+                        "id": 1, "ts": {oldest_ts}, "tier": "operational",
+                        "category": "test", "event_type": "passed",
+                        "actor": "worker", "repo": "claude-coordinator",
+                        "issue": 1030, "assignment_id": null,
+                        "machine": null, "summary": "OLDEST_MARKER",
+                        "details": null
+                    }}
+                ],
+                "next_cursor": null,
+                "has_more": false
+            }}"#,
+            newest_ts = now - 10.0,
+            oldest_ts = now - 500.0,
+        )
+    }
+
+    #[test]
+    fn audit_populated_list_shows_categories_actor_and_relative_time() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_app_with_audit_json(BoardData::default(), &audit_page_json_two_entries());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "§");
+        driver.render();
+
+        let screen = driver.screen();
+        for needle in ["dispatch", "test", "coordinator", "worker", "ago"] {
+            assert!(
+                screen.contains(needle),
+                "contract §4a: populated Audit list must show {needle:?}:\n{screen}"
+            );
+        }
+    }
+
+    #[test]
+    fn audit_populated_list_is_newest_first() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_app_with_audit_json(BoardData::default(), &audit_page_json_two_entries());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "§");
+        driver.render();
+
+        let (_, newest_y) = driver.find("NEWEST_MARKER").unwrap_or_else(|| {
+            panic!("NEWEST_MARKER row not rendered:\n{}", driver.screen())
+        });
+        let (_, oldest_y) = driver.find("OLDEST_MARKER").unwrap_or_else(|| {
+            panic!("OLDEST_MARKER row not rendered:\n{}", driver.screen())
+        });
+        assert!(
+            newest_y < oldest_y,
+            "contract §4a: newest entry (highest ts) must render above the \
+             older one — newest_y={newest_y} oldest_y={oldest_y}"
+        );
+    }
+
+    #[test]
+    fn audit_sidebar_shows_count_and_recent_badge() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let data = BoardData {
+            audit_recent_count: 7,
+            ..BoardData::default()
+        };
+        let app = make_app_with_audit_json(data, &audit_page_json_two_entries());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "§");
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("2 entries"),
+            "contract §3: sidebar count line must reflect the cached \
+             AuditPage's entry count (2), not audit_recent_count:\n{screen}"
+        );
+        assert!(
+            screen.contains("7 recent"),
+            "contract §3: sidebar must show the /board audit_recent_count \
+             badge when > 0:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn audit_sidebar_omits_recent_badge_when_zero() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        // audit_recent_count defaults to 0 via BoardData::default().
+        let app = make_app_with_audit_json(BoardData::default(), &audit_page_json_two_entries());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "§");
+        driver.render();
+
+        assert!(
+            !driver.screen_contains("recent"),
+            "contract §3: no 'N recent' badge when audit_recent_count == 0:\n{}",
+            driver.screen()
+        );
+    }
+
+    #[test]
+    fn audit_entry_detail_pane_opens_on_enter() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_app_with_audit_json(BoardData::default(), &audit_page_json_two_entries());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "§");
+        driver.render();
+        driver.press_named(NamedKey::Enter);
+
+        let screen = driver.screen();
+        for needle in [
+            "Entry Detail",
+            "ts:",
+            "category:",
+            "event_type:",
+            "actor:",
+            "summary:",
+        ] {
+            assert!(
+                screen.contains(needle),
+                "contract §4c: entry-detail pane must show {needle:?}:\n{screen}"
+            );
+        }
+    }
+
+    #[test]
+    fn audit_entry_detail_esc_closes_and_hints_revert() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_app_with_audit_json(BoardData::default(), &audit_page_json_two_entries());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "§");
+        driver.render();
+        driver.press_named(NamedKey::Enter);
+        assert!(
+            driver.screen_contains("Esc=close detail"),
+            "contract §7: detail-mode status hint must show 'Esc=close \
+             detail':\n{}",
+            driver.screen()
+        );
+
+        driver.press_named(NamedKey::Escape);
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("Entry Detail"),
+            "Esc must close the detail pane back to list-only view:\n{screen}"
+        );
+        assert!(
+            screen.contains("Enter=detail"),
+            "list-mode hints must be back once the detail pane is closed:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn refresh_audit_clears_cached_fetch_state() {
+        let mut app = make_test_app(BoardData::default());
+        app.audit_last_fetched = Some(Instant::now());
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.audit_fetch_rx = Some(rx);
+
+        app.refresh_audit();
+
+        assert!(app.audit_last_fetched.is_none());
+        assert!(app.audit_fetch_rx.is_none());
+    }
+
+    #[test]
+    fn audit_row_at_maps_position_to_flat_index() {
+        let app = make_app_with_audit_json(BoardData::default(), &audit_page_json_two_entries());
+        let main_b = Rect::new(0.0, 0.0, 100.0, 20.0);
+        let lh = 1.0;
+        assert_eq!(
+            app.audit_row_at(Point::new(5.0, 0.4), main_b, lh),
+            Some(0)
+        );
+        assert_eq!(
+            app.audit_row_at(Point::new(5.0, 1.4), main_b, lh),
+            Some(1)
+        );
+        // Past the last entry (only 2 entries seeded) → no row.
+        assert_eq!(app.audit_row_at(Point::new(5.0, 2.4), main_b, lh), None);
+    }
+
+    #[test]
+    fn audit_row_at_returns_none_on_empty_list() {
+        let app = make_test_app(BoardData::default());
+        let main_b = Rect::new(0.0, 0.0, 100.0, 20.0);
+        assert_eq!(app.audit_row_at(Point::new(5.0, 0.4), main_b, 1.0), None);
+    }

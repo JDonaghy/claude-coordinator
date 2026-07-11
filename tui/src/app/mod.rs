@@ -88,6 +88,7 @@ pub(crate) mod events;
 pub(crate) mod pipeline;
 pub(crate) mod milestone_dag;
 pub(crate) mod plans;
+pub(crate) mod audit;
 pub(crate) mod fleet_terminals;
 pub(crate) mod fleet_sessions;
 #[allow(unused_imports)]
@@ -2721,6 +2722,35 @@ pub struct CoordApp {
     /// `u` on the repo of the currently-selected row.
     plans_expanded_repos: std::collections::HashSet<String>,
 
+    // ── #1039: Audit ActivityBar panel ───────────────────────────────────────
+    /// Cached first page of `/audit` (#1037), fetched by `spawn_audit_fetch`
+    /// (`data.rs`) and armed only while `active_view == SidebarView::Audit`
+    /// (mirrors `artifact_cache`/`artifact_fetch_rx`'s Pipeline-only
+    /// gating). `None` before the first fetch completes — the panel renders
+    /// the same "No audit events yet." empty state as a genuinely-empty
+    /// page (contract §4b) so a slow first fetch never reads as broken.
+    audit_page: Option<AuditPage>,
+    /// In-flight `/audit` fetch, if any. Drained each tick in the same poll
+    /// loop that drains `artifact_fetch_rx`/`pending_metrics`.
+    audit_fetch_rx: Option<std::sync::mpsc::Receiver<AuditFetchOutcome>>,
+    /// When the current `audit_page` was fetched — drives the re-fetch
+    /// cadence while the panel is active (mirrors `ArtifactCacheEntry`'s
+    /// TTL). `None` forces an immediate fetch on the next tick the panel is
+    /// visible (startup, or after `r` — see below).
+    audit_last_fetched: Option<Instant>,
+    /// Selected row index (0-based) into `audit_page`'s entries. Clamped to
+    /// bounds on navigation, same pattern as `plans_sel`.
+    audit_sel: usize,
+    /// `true` when the inline entry-detail pane (Enter on a selected row) is
+    /// open. `Esc` closes it back to the list-only view (contract §4c/§7).
+    audit_detail_open: bool,
+    /// Reason the most recent `/audit` fetch failed (network error / bad
+    /// status / parse error), or `None` when the last attempt succeeded (or
+    /// no board service is configured — that's not an error, just nothing
+    /// to fetch from). Appended to the empty-state message so a genuinely
+    /// unreachable daemon reads differently from "nothing fetched yet".
+    audit_fetch_error: Option<String>,
+
     // ── #541: global Telescope-style issue fuzzy finder ──────────────────────
     /// Active state of the issue fuzzy-finder overlay.  `None` when the
     /// overlay is closed.  Opened with Ctrl+P from any non-PTY view; closed
@@ -3141,6 +3171,14 @@ impl CoordApp {
             // #1001: no repo starts expanded — untracked milestones default
             // to collapsed everywhere.
             plans_expanded_repos: std::collections::HashSet::new(),
+            // #1039: Audit panel — nothing fetched yet; the first tick with
+            // active_view == Audit arms spawn_audit_fetch (settings_ui.rs).
+            audit_page: None,
+            audit_fetch_rx: None,
+            audit_last_fetched: None,
+            audit_sel: 0,
+            audit_detail_open: false,
+            audit_fetch_error: None,
             // #217: resolved theme palette — computed from settings + optional
             // ~/.coord/theme.toml override file.
             active_theme: {
@@ -3280,6 +3318,16 @@ impl CoordApp {
                     icon: "◉".into(),
                     tooltip: "Sessions".into(),
                     title: "SESSIONS".into(),
+                },
+                // #1039: Audit panel — newest-first list of the audit trail
+                // (`/audit`, #1037) with an inline entry-detail view. `§`
+                // (section-mark) is the contract-pinned icon
+                // (tests/acceptance/ms-33/contract.md §1).
+                PanelDefinition {
+                    id: WidgetId::new("panel:audit"),
+                    icon: "§".into(),
+                    tooltip: "Audit".into(),
+                    title: "AUDIT".into(),
                 },
             ],
         )
@@ -6768,6 +6816,13 @@ impl CoordApp {
             // footer hint verbatim ([r]eattach / [K]ill / [f]stop), now
             // scoped to the Sessions-tree's selected leaf.
             " j/k=nav  r=reattach  K=kill  f=stop  q=quit ".to_string()
+        } else if self.active_view == SidebarView::Audit {
+            // #1039 contract §7: list-mode vs detail-mode hint sets.
+            if self.audit_detail_open {
+                " Esc=close detail  q=quit ".to_string()
+            } else {
+                " j/k=nav  Enter=detail  r=refresh  q=quit ".to_string()
+            }
         } else {
             // #192: `p` / `a` / `A` retired alongside the PROPOSALS
             // section.  Right-click → Send to Pipeline (#261) is the
