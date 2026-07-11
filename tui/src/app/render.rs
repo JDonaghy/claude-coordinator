@@ -103,6 +103,10 @@ impl ShellApp for CoordApp {
                 SidebarView::Sessions => {
                     backend.draw_tree(sidebar_rect, &self.sessions_tree_view());
                 }
+                // #1039: Audit sidebar — entry count + "N recent" badge.
+                SidebarView::Audit => {
+                    backend.draw_list(sidebar_rect, &self.audit_sidebar());
+                }
             }
         }
 
@@ -505,6 +509,11 @@ impl ShellApp for CoordApp {
             SidebarView::Sessions => {
                 backend.draw_list(m, &self.sessions_detail_list());
             }
+            // #1039: Audit panel — newest-first entry list, with an inline
+            // detail split when `audit_detail_open`.
+            SidebarView::Audit => {
+                self.render_audit_panel(backend, m, lh);
+            }
         }
 
         // ── Inject chat overlay — renders over the main panel ───────────
@@ -645,6 +654,8 @@ impl ShellApp for CoordApp {
             "panel:plans" | "panel:milestones" => SidebarView::Plans,
             // #1032: Sessions panel — fleet-wide machine → repo → session tree.
             "panel:sessions" => SidebarView::Sessions,
+            // #1039: Audit panel — newest-first audit-trail list.
+            "panel:audit" => SidebarView::Audit,
             _ => return,
         };
     }

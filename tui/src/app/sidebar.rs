@@ -271,12 +271,14 @@ impl CoordApp {
                 ]
             }
             // Pipeline, Machines, Settings, Terminal, Kanban, MergeQueue, MilestoneDag,
-            // Sessions: no panel-level toolbar.
+            // Sessions, Audit: no panel-level toolbar.
             // Pipeline verbs are fully covered by keybinds; Terminal is a
             // pure pass-through pane (#424); Kanban uses the Board widget natively;
             // MergeQueue actions are surfaced in the status-bar hints (#737);
             // MilestoneDag's "Dispatch milestone" is a keybind + context menu (#771);
-            // Sessions is read-only nav/select in this slice (#1032).
+            // Sessions is read-only nav/select in this slice (#1032); Audit's
+            // verbs (nav/detail/refresh) are all keybinds, surfaced in the
+            // status-bar hints (#1039).
             SidebarView::Pipeline
             | SidebarView::Machines
             | SidebarView::Settings
@@ -285,7 +287,8 @@ impl CoordApp {
             | SidebarView::MergeQueue
             | SidebarView::MilestoneDag
             | SidebarView::Plans
-            | SidebarView::Sessions => return None,
+            | SidebarView::Sessions
+            | SidebarView::Audit => return None,
         };
 
         Some(Toolbar {

@@ -950,6 +950,60 @@ impl CoordApp {
             }
         }
 
+        // #1039: Audit panel fetch — armed only while the panel is visible
+        // (mirrors the artifact-fetch Pipeline-only gating above), so no
+        // background thread runs while the operator is elsewhere.
+        if self.active_view == SidebarView::Audit {
+            if let Some(rx) = &self.audit_fetch_rx {
+                match rx.try_recv() {
+                    Ok(AuditFetchOutcome::Page(page)) => {
+                        self.audit_page = Some(page);
+                        self.audit_fetch_error = None;
+                        self.audit_last_fetched = Some(Instant::now());
+                        self.audit_fetch_rx = None;
+                        needs_redraw = true;
+                    }
+                    Ok(AuditFetchOutcome::NoBoardService) => {
+                        // Not an error — just nothing configured to fetch
+                        // from (local-SQLite-mode). Leave any previously
+                        // cached page as-is; stop retrying until the TTL
+                        // elapses again.
+                        self.audit_fetch_error = None;
+                        self.audit_last_fetched = Some(Instant::now());
+                        self.audit_fetch_rx = None;
+                    }
+                    Ok(AuditFetchOutcome::Unreachable(reason)) => {
+                        // Genuine failure — surfaced via `audit_fetch_error`
+                        // in the empty-state message (`audit.rs`). Leave any
+                        // previously cached page as-is; stop retrying until
+                        // the TTL elapses again so a down daemon doesn't
+                        // spin threads.
+                        self.audit_fetch_error = Some(reason);
+                        self.audit_last_fetched = Some(Instant::now());
+                        self.audit_fetch_rx = None;
+                        needs_redraw = true;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        // Still in flight.
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        self.audit_fetch_rx = None;
+                    }
+                }
+            }
+            // Kick a fresh fetch on first visit, after `r` (which clears
+            // `audit_last_fetched`), or once the TTL has elapsed.
+            if self.audit_fetch_rx.is_none() {
+                let needs_fetch = match self.audit_last_fetched {
+                    None => true,
+                    Some(t) => t.elapsed() >= AUDIT_FETCH_TTL,
+                };
+                if needs_fetch {
+                    self.audit_fetch_rx = Some(spawn_audit_fetch());
+                }
+            }
+        }
+
         needs_redraw
     }
 

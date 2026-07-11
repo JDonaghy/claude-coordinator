@@ -242,6 +242,14 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         plans_sel: 0,
         // #1001
         plans_expanded_repos: std::collections::HashSet::new(),
+        // #1039: Audit panel — nothing seeded by default; use
+        // `make_app_with_audit_json` to pre-populate `audit_page`.
+        audit_page: None,
+        audit_fetch_rx: None,
+        audit_last_fetched: None,
+        audit_sel: 0,
+        audit_detail_open: false,
+        audit_fetch_error: None,
         // #217: use the default dark palette for test helpers.
         active_theme: crate::settings::Theme::Dark.to_quadraui_theme(),
         // #728: default 2h window for tests (can be overridden per test).
@@ -262,6 +270,26 @@ pub fn make_app_with_assignments(assignments: Vec<Assignment>) -> CoordApp {
         ..BoardData::default()
     });
     app.rebuild_board_sidebar();
+    app
+}
+
+/// #1039 data-model seam: build a [`CoordApp`] with the Audit panel's cache
+/// (`audit_page`) pre-seeded from a raw JSON string shaped exactly like the
+/// `GET /audit` response body (contract §6, `tests/acceptance/ms-33/
+/// contract.md`) — no live daemon, no background fetch thread.
+///
+/// This is the seam a later JIT extension of the sealed acceptance suite
+/// needs for the populated-list / entry-detail / count+badge assertions
+/// that `tests/acceptance/ms-33/audit_1039.rs` deliberately deferred (its
+/// TODO block names this exact helper shape). Malformed JSON is a silent
+/// no-op (`audit_page` stays whatever `data` implied, i.e. `None`) rather
+/// than a panic — callers that care should assert on the resulting screen,
+/// not on this function's return.
+pub fn make_app_with_audit_json(data: BoardData, audit_json: &str) -> CoordApp {
+    let mut app = make_test_app(data);
+    if let Ok(page) = serde_json::from_str::<super::types::AuditPage>(audit_json) {
+        app.audit_page = Some(page);
+    }
     app
 }
 
