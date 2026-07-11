@@ -659,12 +659,13 @@ impl CoordApp {
             return Reaction::Redraw;
         }
 
-        // ── #628 Scope A: fleet-wide live-sessions overlay (L toggle) ────────
-        // `L` opens/closes the overlay from any non-PTY, non-modal view.
-        // `any_blocking_modal_active()` includes `live_sessions_overlay.is_some()`
-        // so Ctrl+P and other global shortcuts can't open on top of this overlay.
-        // Note: `L` is intentionally NOT bound to Board/Pipeline view-specific
-        // actions, so it is free to use as a global here.
+        // ── #1033: `L` opens/focuses the Sessions panel ───────────────────────
+        // Retired the #628 fleet-wide live-sessions overlay in favor of the
+        // always-visible Sessions panel (#1032) — `L` now just switches/
+        // focuses that view instead of toggling a modal, so existing
+        // muscle-memory still works. Guarded the same way the old overlay
+        // toggle was (no PTY focus, no blocking modal, no issue finder) so
+        // `L` doesn't steal a literal 'L' keystroke typed into a chat/terminal.
         if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
             let pty_active = (self.active_view == SidebarView::Terminal
                 && self.terminal_focused)
@@ -677,25 +678,10 @@ impl CoordApp {
                 && !pty_active
                 && self.issue_finder.is_none()
                 && !self.any_blocking_modal_active()
-                && !self.live_tmux_sessions.is_empty()
             {
-                if self.live_sessions_overlay.is_none() {
-                    self.live_sessions_overlay = Some(LiveSessionsOverlay::default());
-                } else {
-                    self.live_sessions_overlay = None;
-                }
+                self.switch_active_view(SidebarView::Sessions);
                 return Reaction::Redraw;
             }
-        }
-
-        // ── #628 Scope A: live-sessions overlay owns ALL input while open ─────
-        // Esc=close, j/k/↑/↓=navigate, r=reattach, k=kill, f=stop.
-        // All other keys swallowed so board/pipeline shortcuts can't fire.
-        if self.live_sessions_overlay.is_some() {
-            if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
-                self.handle_live_sessions_overlay_key(key, modifiers);
-            }
-            return Reaction::Redraw;
         }
 
         // ── #316 Phase B: file-issue modal owns ALL input while open ───
@@ -1397,6 +1383,26 @@ impl CoordApp {
                     }
                     _ => {
                         self.pending_kill_terminal = None;
+                    }
+                }
+                return Reaction::Redraw;
+            }
+        }
+
+        // ── #1033: Pending kill-session confirmation: intercept ALL key
+        // presses ─────────────────────────────────────────────────────────
+        // While a kill is pending, 'y'/'Y' fires it; every other key
+        // cancels.  Mirrors `pending_kill_terminal` immediately above.
+        if self.pending_kill_session.is_some() {
+            if let UiEvent::KeyPressed { key, .. } = &event {
+                match key {
+                    Key::Char('y') | Key::Char('Y') => {
+                        if let Some(p) = self.pending_kill_session.take() {
+                            self.confirm_kill_session(p);
+                        }
+                    }
+                    _ => {
+                        self.pending_kill_session = None;
                     }
                 }
                 return Reaction::Redraw;
@@ -3032,12 +3038,15 @@ impl CoordApp {
                     }
 
                     // NOTE: This is the *default* `r` binding. View-specific
-                    // overrides (Machines, Pipeline) sit further down with
-                    // their own `if self.active_view == …` guards and would
-                    // be dead code without this exclusion — Rust evaluates
-                    // match arms top-to-bottom, so an unguarded `r` here
-                    // would silently shadow them.
-                    Key::Char('r') if self.active_view != SidebarView::Machines => {
+                    // overrides (Machines, Pipeline, Sessions) sit further
+                    // down with their own `if self.active_view == …` guards
+                    // and would be dead code without this exclusion — Rust
+                    // evaluates match arms top-to-bottom, so an unguarded `r`
+                    // here would silently shadow them.
+                    Key::Char('r')
+                        if self.active_view != SidebarView::Machines
+                            && self.active_view != SidebarView::Sessions =>
+                    {
                         self.refresh();
                         self.kick_issue_sync();
                         needs_redraw = true;
@@ -3186,14 +3195,58 @@ impl CoordApp {
                     }
 
                     // ── K — Terminal: kill selected terminal (#956) ───────
-                    // Matches the `LiveSessionsOverlay` convention where `K`
-                    // kills a session. Always routes through the confirm
-                    // dialog (terminals are persistent and may hold live
-                    // work) — no-op when the selection is a machine row or
-                    // nothing is selected.
+                    // Uppercase `K` is the fleet-wide "kill" convention (also
+                    // used by the Sessions panel below, and formerly by the
+                    // retired #628 live-sessions overlay). Always routes
+                    // through the confirm dialog (terminals are persistent
+                    // and may hold live work) — no-op when the selection is
+                    // a machine row or nothing is selected.
                     Key::Char('K') if self.active_view == SidebarView::Terminal => {
                         if self.open_kill_terminal_confirm() {
                             needs_redraw = true;
+                        }
+                    }
+
+                    // ── #1033: Sessions panel — attach / kill / stop ──────
+                    // Mirrors the retired #628 live-sessions overlay's
+                    // r=reattach / K=kill / f=stop keys, now scoped to the
+                    // Sessions-tree's selected leaf. Each is a no-op (with a
+                    // toast) when the selection isn't a session row.
+                    Key::Char('r') | Key::Char('R')
+                        if self.active_view == SidebarView::Sessions =>
+                    {
+                        if self.reattach_selected_fleet_session() {
+                            needs_redraw = true;
+                        } else {
+                            self.push_toast(
+                                "No session selected",
+                                "Select a session leaf in the tree first.",
+                                ToastSeverity::Info,
+                            );
+                        }
+                    }
+                    Key::Char('K') if self.active_view == SidebarView::Sessions => {
+                        if self.open_kill_session_confirm() {
+                            needs_redraw = true;
+                        } else {
+                            self.push_toast(
+                                "No session selected",
+                                "Select a session leaf in the tree first.",
+                                ToastSeverity::Info,
+                            );
+                        }
+                    }
+                    Key::Char('f') | Key::Char('F')
+                        if self.active_view == SidebarView::Sessions =>
+                    {
+                        if self.stop_selected_fleet_session() {
+                            needs_redraw = true;
+                        } else {
+                            self.push_toast(
+                                "No session selected",
+                                "Select a session leaf in the tree first.",
+                                ToastSeverity::Info,
+                            );
                         }
                     }
 

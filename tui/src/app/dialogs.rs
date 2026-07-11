@@ -2155,6 +2155,38 @@ impl CoordApp {
             });
         }
 
+        // ── #1033: Kill session confirm ───────────────────────────────────
+        if let Some(ref p) = self.pending_kill_session {
+            return Some(Dialog {
+                table: None,
+                id: WidgetId::new("dialog:kill-session"),
+                title: StyledText::plain("Kill Session"),
+                body: vec![StyledText::plain(format!(
+                    "Kill session '{}'? The tmux session ends immediately.",
+                    p.label,
+                ))],
+                buttons: vec![
+                    DialogButton {
+                        id: WidgetId::new("yes"),
+                        label: "y  Confirm kill".into(),
+                        is_default: true,
+                        is_cancel: false,
+                        tint: Some(Color::rgb(200, 80, 80)),
+                    },
+                    DialogButton {
+                        id: WidgetId::new("cancel"),
+                        label: "Cancel".into(),
+                        is_default: false,
+                        is_cancel: true,
+                        tint: None,
+                    },
+                ],
+                severity: Some(DialogSeverity::Warning),
+                vertical_buttons: false,
+                input: None,
+            });
+        }
+
         // ── Restart confirm ──────────────────────────────────────────────
         if let Some(ref name) = self.pending_restart {
             let active = self
@@ -2552,6 +2584,8 @@ impl CoordApp {
             self.pending_restart = None;
         } else if self.pending_kill_terminal.is_some() {
             self.pending_kill_terminal = None;
+        } else if self.pending_kill_session.is_some() {
+            self.pending_kill_session = None;
         } else if self.pending_purge.is_some() {
             self.pending_purge = None;
         } else if self.artifact_pull_dialog.is_some() {
@@ -3094,6 +3128,17 @@ impl CoordApp {
                 self.confirm_kill_terminal(p);
             } else {
                 self.pending_kill_terminal = None;
+            }
+            *self.dialog_layout.borrow_mut() = None;
+            return;
+        }
+
+        // ── #1033: Kill session ─────────────────────────────────────────────
+        if let Some(p) = self.pending_kill_session.clone() {
+            if id == "yes" {
+                self.confirm_kill_session(p);
+            } else {
+                self.pending_kill_session = None;
             }
             *self.dialog_layout.borrow_mut() = None;
             return;
@@ -4903,7 +4948,10 @@ impl CoordApp {
         );
     }
 
-    // ── #628 Scope A: fleet-wide live-sessions overlay ────────────────────────
+    // ── Live-session display helpers ────────────────────────────────────────
+    // Originally added for the #628 fleet-wide live-sessions overlay
+    // (retired by #1033); still used by the #1032/#1033 Sessions panel's
+    // tree rows and detail view.
 
     /// Return the coordinator assignment type label for a live session, e.g.
     /// `"work"`, `"review"`, `"fix"`, `"smoke"`, `"chat"`.  Falls back to
@@ -4937,197 +4985,6 @@ impl CoordApp {
             .map(|a| a.machine.clone())
             .filter(|m| !m.is_empty())
             .unwrap_or_else(|| "(local)".to_string())
-    }
-
-    /// #628 Scope A: render the fleet-wide live-sessions overlay.
-    ///
-    /// A centered box (~80 % wide, auto-height capped at ~60 % tall) lists
-    /// every discovered `coord-*` tmux session with its id, issue, type, and
-    /// machine.  Actions shown in the footer: `[r]eattach`, `[K]ill`,
-    /// `[f]stop`, `Esc` close.
-    ///
-    /// Rendered above all other content (called last in `render_content`).
-    pub(crate) fn render_live_sessions_overlay(&self, backend: &mut dyn Backend, viewport: Rect) {
-        let Some(overlay) = &self.live_sessions_overlay else {
-            return;
-        };
-        let lh = backend.line_height();
-        let sessions = &self.live_tmux_sessions;
-
-        // ── Size + position ──────────────────────────────────────────────────
-        let row_count = sessions.len().max(1) + 4; // header + sep + rows + sep + footer
-        let natural_h = (row_count as f32) * lh;
-        let box_h = natural_h.min(viewport.height * 0.65).max(5.0 * lh);
-        let box_w = (viewport.width * 0.82).clamp(50.0 * lh, 100.0 * lh);
-        let box_x = viewport.x + (viewport.width - box_w) * 0.5;
-        let box_y = viewport.y + (viewport.height - box_h) * 0.35;
-        let overlay_rect = Rect::new(box_x, box_y, box_w, box_h);
-
-        // Outer bordered box (background + border).
-        backend.draw_list(
-            overlay_rect,
-            &ListView {
-                id: WidgetId::new("live-sessions-bg"),
-                title: None,
-                items: Vec::new(),
-                selected_idx: 0,
-                scroll_offset: 0,
-                has_focus: true,
-                bordered: true,
-                h_scroll: 0,
-                max_content_width: None,
-                show_v_scrollbar: false,
-            },
-        );
-
-        let inner = shrink_rect(overlay_rect, lh * 0.5);
-        let sep_chars = (box_w / lh) as usize;
-        let sep_line = "─".repeat(sep_chars);
-
-        let mut items: Vec<ListItem> = Vec::new();
-
-        // ── Title ────────────────────────────────────────────────────────────
-        items.push(ListItem {
-            text: StyledText {
-                spans: vec![StyledSpan::with_fg(
-                    format!(
-                        "  ◉ Fleet live sessions ({})  — L / Esc to close",
-                        sessions.len()
-                    ),
-                    Color::rgb(150, 210, 255),
-                )],
-            },
-            icon: None,
-            detail: None,
-            decoration: Decoration::Normal,
-        });
-        items.push(ListItem {
-            text: StyledText {
-                spans: vec![StyledSpan::with_fg(sep_line.clone(), Color::rgb(60, 70, 90))],
-            },
-            icon: None,
-            detail: None,
-            decoration: Decoration::Normal,
-        });
-
-        // ── Session rows ─────────────────────────────────────────────────────
-        let visible_rows: usize = ((box_h / lh) as usize).saturating_sub(4).max(1);
-        let sel = overlay.selected_idx.min(sessions.len().saturating_sub(1));
-        let scroll_offset = if sel >= visible_rows {
-            sel + 1 - visible_rows
-        } else {
-            0
-        };
-
-        if sessions.is_empty() {
-            items.push(ListItem {
-                text: StyledText {
-                    spans: vec![StyledSpan::with_fg(
-                        "  (no live sessions discovered)".to_string(),
-                        Color::rgb(100, 100, 120),
-                    )],
-                },
-                icon: None,
-                detail: None,
-                decoration: Decoration::Normal,
-            });
-        } else {
-            for (idx, session) in sessions
-                .iter()
-                .enumerate()
-                .skip(scroll_offset)
-                .take(visible_rows)
-            {
-                let is_selected = idx == sel;
-                let prefix = if is_selected { "▶ " } else { "  " };
-                // #491: dead-pane sessions appear dimmed + tagged.
-                let fg = if session.pane_dead {
-                    if is_selected {
-                        Color::rgb(200, 170, 170)  // muted red-ish when selected
-                    } else {
-                        Color::rgb(140, 110, 110)  // dim red-ish for dead sessions
-                    }
-                } else if is_selected {
-                    Color::rgb(230, 240, 255)
-                } else {
-                    Color::rgb(190, 200, 215)
-                };
-
-                let issue_str = session
-                    .issue_number
-                    .map(|n| format!("#{:<5}", n))
-                    .unwrap_or_else(|| "#?    ".to_string());
-                let repo_str = session
-                    .repo_name
-                    .as_deref()
-                    .map(|r| trunc(r, 14).to_string())
-                    .unwrap_or_else(|| "(unknown)".to_string());
-                let kind_str = self.session_type_for(session);
-                let machine_str = self.session_machine_for(session);
-                let aid_short = trunc(&session.assignment_id, 20);
-                // Append "(dead)" tag so dead-pane sessions are unmistakable.
-                let dead_tag = if session.pane_dead { " (dead)" } else { "" };
-
-                // Format: ▶ #42    api            work        elitebook   aid-abc… (dead)
-                let row_text = format!(
-                    "{}{} {:14} {:11} {:12} {}{}",
-                    prefix, issue_str, repo_str, kind_str, machine_str, aid_short, dead_tag
-                );
-
-                items.push(ListItem {
-                    text: StyledText {
-                        spans: vec![StyledSpan::with_fg(row_text, fg)],
-                    },
-                    icon: None,
-                    detail: None,
-                    decoration: if is_selected {
-                        Decoration::Header
-                    } else {
-                        Decoration::Normal
-                    },
-                });
-            }
-        }
-
-        // ── Footer ───────────────────────────────────────────────────────────
-        items.push(ListItem {
-            text: StyledText {
-                spans: vec![StyledSpan::with_fg(sep_line, Color::rgb(60, 70, 90))],
-            },
-            icon: None,
-            detail: None,
-            decoration: Decoration::Normal,
-        });
-        let footer = if sessions.is_empty() {
-            "  Esc close".to_string()
-        } else {
-            "  [r]eattach  ·  [K]ill session  ·  [f]stop assignment  ·  j/k ↑↓  ·  Esc close"
-                .to_string()
-        };
-        items.push(ListItem {
-            text: StyledText {
-                spans: vec![StyledSpan::with_fg(footer, Color::rgb(100, 110, 130))],
-            },
-            icon: None,
-            detail: None,
-            decoration: Decoration::Normal,
-        });
-
-        backend.draw_list(
-            inner,
-            &ListView {
-                id: WidgetId::new("live-sessions-overlay"),
-                title: None,
-                items,
-                selected_idx: 0,
-                scroll_offset: 0,
-                has_focus: true,
-                bordered: false,
-                h_scroll: 0,
-                max_content_width: None,
-                show_v_scrollbar: false,
-            },
-        );
     }
 
     /// #316 Phase A: render the Board Chat tab content.

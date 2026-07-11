@@ -578,13 +578,6 @@ impl ShellApp for CoordApp {
         if self.issue_finder.is_some() {
             self.render_issue_finder(backend, dialog_viewport);
         }
-
-        // ── #628 Scope A: fleet-wide live-sessions overlay ───────────────
-        // Rendered at the same level as the issue finder — topmost overlay.
-        // When the overlay is closed this is a no-op.
-        if self.live_sessions_overlay.is_some() {
-            self.render_live_sessions_overlay(backend, dialog_viewport);
-        }
     }
 
     fn handle(

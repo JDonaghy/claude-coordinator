@@ -1,13 +1,16 @@
 //! Sessions-view left-pane machine → repo grouped tree of live claude work
-//! sessions (#1032).
+//! sessions (#1032), plus the attach / kill / stop actions on its selected
+//! leaf (#1033).
 //!
 //! Extends the #953 Terminal-view tree pattern (`fleet_terminals.rs`) one
 //! level deeper: parent nodes are fleet machines (`self.data.machines`),
 //! middle nodes group that machine's live `coord-<aid>` sessions
 //! (`self.live_tmux_sessions`, #487 discovery) by `repo_name`, and leaf
-//! nodes are the sessions themselves. Read-only nav/select in this slice —
-//! attach/kill/stop land in a follow-up, mirroring the Terminal tree's own
-//! staged rollout (#953 discovery-only → #954 create+attach → #956 kill).
+//! nodes are the sessions themselves. #1032 was nav/select only; #1033 wires
+//! the selected leaf to the EXISTING verbs in `sessions.rs`
+//! (`reattach_session_by_aid`, `kill_session_by_aid`) rather than
+//! reimplementing them — mirroring the Terminal tree's own staged rollout
+//! (#953 discovery-only → #954 create+attach → #956 kill).
 //!
 //! **Import pattern:** `use super::*` is intentional — the impl methods
 //! live on `CoordApp` and need the full parent namespace. See
@@ -30,6 +33,19 @@ pub(crate) enum SessionsTreeRow {
     /// `(machine index, repo-group index, session index within that
     /// repo group's sorted session list)`.
     Session(usize, usize, usize),
+}
+
+/// #1033: pending "Kill session" confirmation — carries everything
+/// `confirm_kill_session` needs to fire `kill_session_by_aid` (`sessions.rs`)
+/// without re-deriving the target from the (possibly already-changed) tree
+/// selection. Mirrors `fleet_terminals::PendingKillTerminal`'s shape.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingKillSession {
+    pub(crate) aid: String,
+    pub(crate) machine: Option<String>,
+    /// Display label for the confirm dialog body — `"#<issue> · <repo>"`,
+    /// falling back to the bare aid when issue/repo are unknown.
+    pub(crate) label: String,
 }
 
 impl CoordApp {
@@ -328,5 +344,76 @@ impl CoordApp {
         } else if sel >= self.sessions_tree_scroll + visible {
             self.sessions_tree_scroll = sel + 1 - visible;
         }
+    }
+
+    // ── #1033: Sessions-panel actions (attach / kill / stop) ────────────────
+    // Wires the tree's selected leaf to the EXISTING verbs in `sessions.rs`
+    // (`reattach_session_by_aid`, `kill_session_by_aid`) — this file adds no
+    // new attach/kill/stop mechanics, only the tree-selection plumbing and,
+    // for kill, a confirm step (the `L` overlay killed directly on `K`; the
+    // Sessions panel is the primary, always-visible view so an accidental
+    // keypress is more costly — hence the extra confirm, same discipline as
+    // `fleet_terminals::open_kill_terminal_confirm`).
+
+    /// Arm the "Kill session" confirm dialog for the currently-selected
+    /// Sessions-tree leaf. No-op (returns `false`) when the selection isn't
+    /// a session row — e.g. a machine/repo row or nothing selected.
+    pub(crate) fn open_kill_session_confirm(&mut self) -> bool {
+        let Some(s) = self.selected_fleet_session() else {
+            return false;
+        };
+        let label = match s.issue_number {
+            Some(n) => format!("#{} · {}", n, s.repo_name.as_deref().unwrap_or("(unknown)")),
+            None => s.assignment_id.clone(),
+        };
+        self.pending_kill_session = Some(PendingKillSession {
+            aid: s.assignment_id.clone(),
+            machine: s.machine.clone(),
+            label,
+        });
+        true
+    }
+
+    /// Fire the confirmed kill (#1033): delegates to `kill_session_by_aid`
+    /// (`sessions.rs`) — reuse, not reimplement — then re-resolves the
+    /// tree's selected-node cursor so it doesn't point at a stale path once
+    /// the killed leaf (and possibly its now-empty repo/machine group)
+    /// disappears. Mirrors `fleet_terminals::confirm_kill_terminal`'s
+    /// post-kill selection fixup.
+    pub(crate) fn confirm_kill_session(&mut self, pending: PendingKillSession) {
+        self.kill_session_by_aid(&pending.aid, pending.machine.as_deref());
+
+        let (_, index) = self.sessions_tree_rows();
+        if self.sessions_tree_selected_flat_index(&index).is_none() {
+            self.sessions_tree_selected = index.last().map(|entry| match *entry {
+                SessionsTreeRow::Machine(mi) => vec![mi as u16],
+                SessionsTreeRow::Repo(mi, ri) => vec![mi as u16, ri as u16],
+                SessionsTreeRow::Session(mi, ri, si) => vec![mi as u16, ri as u16, si as u16],
+            });
+        }
+    }
+
+    /// Reattach to the currently-selected Sessions-tree leaf. No-op when the
+    /// selection isn't a session row. Delegates entirely to
+    /// [`CoordApp::reattach_session_by_aid`] — zero new reattach code.
+    pub(crate) fn reattach_selected_fleet_session(&mut self) -> bool {
+        let Some(aid) = self.selected_fleet_session().map(|s| s.assignment_id.clone()) else {
+            return false;
+        };
+        self.reattach_session_by_aid(&aid);
+        true
+    }
+
+    /// Stop (finalize) the assignment behind the currently-selected
+    /// Sessions-tree leaf via `coord stop <aid>`. No-op when the selection
+    /// isn't a session row. Mirrors the `L` overlay's `f` handler exactly —
+    /// same command, no extra confirm (stop is non-destructive to the
+    /// worktree, unlike kill).
+    pub(crate) fn stop_selected_fleet_session(&mut self) -> bool {
+        let Some(aid) = self.selected_fleet_session().map(|s| s.assignment_id.clone()) else {
+            return false;
+        };
+        self.command_runner.spawn_queued(&["stop", &aid]);
+        true
     }
 }

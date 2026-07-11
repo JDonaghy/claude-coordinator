@@ -105,10 +105,10 @@ impl CoordApp {
     }
 
     /// #956: right-click menu for a Terminal-view tree TERMINAL row. One
-    /// verb — "Kill terminal" — matching the `LiveSessionsOverlay`
-    /// convention where `K` kills a session; the menu item and the `K`
-    /// keybinding both arm the same confirm dialog rather than killing
-    /// directly (terminals are persistent and may hold live work).
+    /// verb — "Kill terminal" — matching the fleet-wide `K` = kill
+    /// convention (also used by the #1033 Sessions panel); the menu item
+    /// and the `K` keybinding both arm the same confirm dialog rather than
+    /// killing directly (terminals are persistent and may hold live work).
     pub(crate) fn context_menu_items_for_terminal_row(&self) -> Vec<ContextMenuItem> {
         vec![ContextMenuItem::action("kill-terminal", "Kill terminal").with_shortcut("K")]
     }
@@ -205,7 +205,7 @@ impl CoordApp {
             || self.file_issue_modal.is_some()
             || self.pending_restart.is_some()
             || self.pending_kill_terminal.is_some()
-            || self.live_sessions_overlay.is_some()
+            || self.pending_kill_session.is_some()
     }
 
     /// an `action_id` of the form `"toolbar:<verb>"` resolved by
