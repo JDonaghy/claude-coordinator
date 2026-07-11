@@ -434,6 +434,31 @@ for host in precision elitebook dellserver; do
 done
 ```
 
+## Operator Claude Code settings (driving the fleet)
+
+When you drive the pipeline you typically have **several interactive Claude Code
+sessions open at once** (one per story / smoke / review). Claude Code's **Agent
+View** surfaces a cross-session roster — a `N awaiting input · N working · N
+completed` header over "Needs input" / "Completed" lists — and it can **pop up
+unprompted in the middle of typing** whenever some *other* session changes stage
+(one completes, or starts awaiting input). That interrupt is disorienting
+mid-task and easy to mistake for something the current session did.
+
+Turn it off on the operator machine with one key in `~/.claude/settings.json`
+(Claude Code's own global config — **not** anything under `~/.coord/`):
+
+```json
+{ "disableAgentView": true }
+```
+
+Equivalent env var: `CLAUDE_CODE_DISABLE_AGENT_VIEW=1`. **Restart Claude Code**
+for it to take effect. This suppresses *only* the cross-session overview; every
+other notification is untouched. (The blunter `"preferredNotifChannel":
+"notifications_disabled"` silences all notifications if you ever want that.)
+
+This is a Claude-Code-**client** preference: it lives per operator machine and is
+**not** part of the coordinator's own config, the board, or the release flow.
+
 ## Passwordless SSH between coordinator and agents
 
 `coord pull-artifact` rsyncs built binaries from the agent's
