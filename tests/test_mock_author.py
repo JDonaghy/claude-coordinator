@@ -200,6 +200,63 @@ def test_dispatch_raises_when_gate_a_already_claimed(tmp_path):
             assert "already in flight" in str(e)
 
 
+def test_dispatch_not_blocked_by_stale_chat_session(tmp_path):
+    """#1059 fix: a dangling `type="chat"` row (a "Chat about issue" session
+    that went stale) on the tracking issue must not permanently wedge Gate A
+    dispatch — reproduces the #1041 "PERMANENTLY STUCK" report, where the
+    real claimant turned out to be a stale chat session, not a real
+    mock-author dispatch."""
+    from coord.models import Assignment, Board
+
+    cfg = _cfg_with_driver(tmp_path)
+    board = Board(active=[Assignment(
+        machine_name="elitebook", repo_name="api", issue_number=100,
+        issue_title="t", status="running", assignment_id="chat-1", type="chat",
+    )])
+    issue_data = {
+        "number": 100, "title": "Milestone tracker", "body": "",
+        "milestone": {"number": 9, "title": "Q3"},
+    }
+    with patch("coord.github_ops.get_issue", return_value=issue_data), \
+         patch("coord.github_ops.get_open_issues", return_value=[]), \
+         patch("coord.board_service.read_board", return_value=board), \
+         patch("coord.dispatch.dispatch_with_retry", return_value={"id": "asg-xyz"}), \
+         patch("coord.dispatch.post_briefing"), \
+         patch("coord.state.record_dispatched"):
+        assignment_id, machine_name = mock_author.dispatch_acceptance_mock("api", 100, cfg)
+
+    assert assignment_id == "asg-xyz"
+    assert machine_name == "laptop"
+
+
+def test_dispatch_translates_dispatch_failure_into_clean_runtime_error(tmp_path):
+    """#1059 review: dispatch_with_retry can raise ValueError/httpx.HTTPError
+    (bad machine config, agent unreachable) — previously uncaught here, so it
+    would propagate past this function's "raises RuntimeError" contract as a
+    raw traceback instead of the clean `error: ...` line every other failure
+    path in this function produces."""
+    from coord.models import Board
+
+    cfg = _cfg_with_driver(tmp_path)
+    issue_data = {
+        "number": 100, "title": "t", "body": "",
+        "milestone": {"number": 9, "title": "M"},
+    }
+    with patch("coord.github_ops.get_issue", return_value=issue_data), \
+         patch("coord.github_ops.get_open_issues", return_value=[]), \
+         patch("coord.board_service.read_board", return_value=Board()), \
+         patch(
+             "coord.dispatch.dispatch_with_retry",
+             side_effect=ValueError("No repo_path configured for 'api'"),
+         ):
+        try:
+            mock_author.dispatch_acceptance_mock("api", 100, cfg)
+            assert False, "expected RuntimeError"
+        except RuntimeError as e:
+            assert "could not dispatch mock-author" in str(e)
+            assert "No repo_path configured" in str(e)
+
+
 def test_dispatch_success_records_assignment(tmp_path):
     from coord.models import Board
 

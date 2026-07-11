@@ -519,7 +519,22 @@ impl CommandRunner {
                 let msg = if result.exit_code == 0 {
                     format!("{} done ({:.1}s)", result.label, result.duration.as_secs_f64())
                 } else {
-                    format!("{} failed (exit {})", result.label, result.exit_code)
+                    // #1059 review: the failure toast this same `poll` result
+                    // feeds (settings_ui.rs) truncates its body to quadraui's
+                    // ~40-col single-line toast box, so a long reason (e.g.
+                    // "repo 'x' has no acceptance driver configured — add it
+                    // under...") reads as cut off with no way to see the
+                    // rest. This status-bar segment is full-width and stays
+                    // up for several seconds — include the same reason here
+                    // so the operator has somewhere to read the complete
+                    // message.
+                    match crate::app::first_meaningful_stderr_line(&result.stderr) {
+                        Some(reason) => format!(
+                            "{} failed (exit {}): {}",
+                            result.label, result.exit_code, reason
+                        ),
+                        None => format!("{} failed (exit {})", result.label, result.exit_code),
+                    }
                 };
                 self.message = Some((msg, Instant::now()));
                 self.state = CommandState::Idle;
@@ -582,6 +597,32 @@ mod tests {
         assert!(runner.spawn(&["--version"]));
         assert!(!runner.spawn(&["--version"]));
         assert!(wait_for_result(&mut runner).is_some(), "command did not finish within 10s");
+    }
+
+    /// #1059 review: the Gate A "Dispatch Gate A mock" failure toast is
+    /// truncated by quadraui's ~40-col single-line toast box, with no way to
+    /// read the rest (e.g. the operator's "Gate A already in flight: issue
+    /// #1041 (claude-coordinator) already claimed by elitebook (assignment
+    /// f5013376f87c)" was cut off mid-sentence). `poll`'s status-bar message
+    /// is full-width, so it should carry the same failure reason as a place
+    /// the operator CAN read the complete message — not just "<label> failed
+    /// (exit N)" with no indication of why.
+    #[test]
+    fn poll_message_includes_stderr_reason_on_failure() {
+        let mut runner = CommandRunner::new_for_test();
+        runner.push_canned_result(
+            1,
+            "error: Gate A already in flight: issue #1041 (claude-coordinator) \
+             already claimed by elitebook (assignment f5013376f87c)",
+        );
+        runner.spawn_queued(&["acceptance", "mock", "claude-coordinator", "1041"]);
+        let result = runner.poll().expect("no_spawn resolves synchronously");
+        assert_eq!(result.exit_code, 1);
+        let (msg, _) = runner.message.as_ref().expect("message set on completion");
+        assert!(
+            msg.contains("Gate A already in flight"),
+            "expected the failure reason in the status-bar message, got: {msg}"
+        );
     }
 
     #[test]

@@ -6848,7 +6848,15 @@ fn read_paused_machines() -> std::collections::HashSet<String> {
 /// the coord CLI emits before the actual error message) so the user gets the
 /// real reason — e.g. `gh failed: 'status:refining' not found` rather than
 /// the wrapping `Error:`/`Traceback…` boilerplate.
-fn first_meaningful_stderr_line(stderr: &str) -> Option<String> {
+///
+/// `pub(crate)` (not private): `commands.rs`'s `CommandRunner::poll` also
+/// uses this — quadraui's toast box is a single ~40-col line with no
+/// wrapping (#771), so a long reason (e.g. Gate A's "repo 'x' has no
+/// acceptance driver configured — add it under...") reads as cut off with no
+/// way to see the rest. The status-bar segment `poll` sets on failure is a
+/// full-width row, so surfacing the same reason there too (#1059 review)
+/// gives the operator somewhere to actually read the complete message.
+pub(crate) fn first_meaningful_stderr_line(stderr: &str) -> Option<String> {
     let trimmed = stderr.trim();
     if trimmed.is_empty() {
         return None;
