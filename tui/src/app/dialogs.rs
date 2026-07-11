@@ -701,6 +701,39 @@ impl CoordApp {
                     epic_issue.and_then(|iss| self.pipeline_pr_number(iss)).is_none();
                 items.push(view_gate_a_item);
             }
+            // #1060 (docs/ORACLE_LOOP.md, #931/#932): per-issue acceptance
+            // actions — JIT authoring of THIS issue's slice of the
+            // milestone's sealed acceptance suite, and the external
+            // trust-gate re-run against the pushed SHA. Unlike the Gate A
+            // dispatch/sign-off pair above, these are NOT epic-gated: they
+            // apply to ordinary member issues of a milestone's `## Work
+            // order`, resolved via `milestone_tracking_issue_for` (#795's
+            // work-order projection, already on the wire — no new board
+            // field needed). Omitted entirely when the row isn't a member of
+            // any tracked work order (nothing to author/record against).
+            if let Some(iss) = epic_issue {
+                if self.milestone_tracking_issue_for(iss).is_some() {
+                    // "Author acceptance tests" is only meaningful once the
+                    // milestone's Gate A contract exists on disk — the
+                    // independent test-author reads it from its own
+                    // checkout (#931) — gated the same way Testing/Merge
+                    // above gate on a completed work assignment.
+                    let mut author_item = ContextMenuItem::action(
+                        "author-acceptance-tests",
+                        "Author acceptance tests",
+                    );
+                    author_item.disabled = !self.gate_a_contract_exists_for(iss);
+                    items.push(author_item);
+                    // "Record acceptance" re-runs the sealed suite
+                    // externally against the pushed SHA — needs a completed
+                    // work assignment with a branch to resolve that SHA
+                    // from (same gate Testing/Merge use above).
+                    let mut record_item =
+                        ContextMenuItem::action("record-acceptance", "Record acceptance");
+                    record_item.disabled = self.selected_completed_work_aid().is_none();
+                    items.push(record_item);
+                }
+            }
             items.push(ContextMenuItem::separator());
         }
         match lifecycle {
@@ -5729,6 +5762,18 @@ impl CoordApp {
                         ToastSeverity::Warning,
                     );
                 }
+                true
+            }
+            // #1060: JIT-author this issue's acceptance-suite slice —
+            // `coord acceptance author <repo> <tracking_issue> --issue N`.
+            "author-acceptance-tests" => {
+                self.dispatch_acceptance_author_for_selected_pipeline_row();
+                true
+            }
+            // #1060: external trust-gate re-run against the pushed SHA —
+            // `coord acceptance record --repo <repo> --issue N --sha <sha>`.
+            "record-acceptance" => {
+                self.dispatch_acceptance_record_for_selected_pipeline_row();
                 true
             }
             // #935 Part B: unified per-stage doctor — dry-run-diagnoses first,

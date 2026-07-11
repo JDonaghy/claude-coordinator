@@ -949,10 +949,10 @@ pub(crate) struct MilestoneWorkOrderNode {
 pub(crate) struct MilestoneWorkOrder {
     pub(crate) repo_name: String,
     /// Tracking issue number (the "epic"-labelled issue carrying the
-    /// `## Work order` block).  Kept for future surfacing (e.g. a
-    /// "jump to tracking issue" action) and round-trip parity with the
-    /// server payload; not rendered in the #795 Phase 3b UI.
-    #[allow(dead_code)]
+    /// `## Work order` block). Not rendered directly in the #795 Phase 3b
+    /// UI, but read by `milestone_tracking_issue_for` (#1060) to build the
+    /// `coord acceptance author <repo> <tracking_issue> --issue N` argument
+    /// list for a member issue's per-row context-menu action.
     pub(crate) tracking_issue: u64,
     /// Milestone title from the tracking issue's GitHub milestone field.
     /// Kept for future display; not shown in the #795 Phase 3b card badges.
