@@ -1006,6 +1006,32 @@ impl CoordApp {
             .collect()
     }
 
+    /// #1069: resolve the single-letter repo tag to show on an In-progress
+    /// milestone header.  A milestone belongs to exactly one repo, so the
+    /// tag normally moves off the per-issue rows and onto the header — this
+    /// returns `Some(tag)` when every issue in `mil_issue_idxs` shares the
+    /// same repo.  Returns `None` when the bucket is mixed-repo (the
+    /// "No milestone" catch-all can pool issues from multiple repos), in
+    /// which case the caller falls back to per-issue tags instead.
+    pub(crate) fn pipeline_milestone_header_repo_tag(
+        &self,
+        mil_issue_idxs: &[usize],
+        all_repos: &[String],
+    ) -> Option<String> {
+        let mut repo_keys: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for &idx in mil_issue_idxs {
+            repo_keys.insert(Self::pipeline_repo_key(&self.pipeline_issues[idx]));
+        }
+        if repo_keys.len() == 1 {
+            repo_keys
+                .into_iter()
+                .next()
+                .map(|key| Self::repo_tag(key, all_repos))
+        } else {
+            None
+        }
+    }
+
     /// Returns a map from GitHub repo slug (`owner/name`) to the count of
     /// `state='pending'` rows in the in-memory merge-queue snapshot.
     ///
@@ -2352,13 +2378,22 @@ impl CoordApp {
                     // session is running in tmux, local or remote) and **Idle**
                     // (in-progress, no session — waiting on you).  Mirrors the
                     // repo-grouped tree the New/Done sections use; the group key
-                    // is the liveness bucket instead of a repo.  Each issue row
-                    // keeps the single-letter repo tag so the repo is still
-                    // legible when repos are mixed within a group.
+                    // is the liveness bucket instead of a repo.
+                    //
+                    // #1069: within each liveness group, issues are further
+                    // grouped by milestone (3-level path [gi, mi, ii]) — the
+                    // same `pipeline_milestones_for_issues` helper the New
+                    // section uses.  Since a milestone belongs to exactly one
+                    // repo, the single-letter repo tag moves from the issue
+                    // row up onto the milestone header; issue rows only keep
+                    // a tag when a bucket (typically "No milestone") turns out
+                    // to be mixed-repo, in which case the header can't carry
+                    // one tag so the per-issue tag stays for legibility.
                     sidebar.set_section_badge(
                         section_idx,
                         Some(StyledText::plain(format!("({})", active_flat.len()))),
                     );
+                    let tag_color = Color::rgb(180, 140, 240);
                     for (gi, (group_key, issue_idxs)) in active_by_liveness.iter().enumerate() {
                         let is_expanded = self
                             .pipeline_lifecycle_expanded
@@ -2392,36 +2427,95 @@ impl CoordApp {
                         if !is_expanded {
                             continue;
                         }
-                        for (ii, &issue_idx) in issue_idxs.iter().enumerate() {
-                            let issue = &self.pipeline_issues[issue_idx];
-                            let tag = Self::repo_tag(Self::pipeline_repo_key(issue), &repos);
-                            let tag_color = Color::rgb(180, 140, 240);
-                            let title_color = if issue.coord_repo.is_some() {
-                                Color::rgb(210, 210, 210)
+                        let milestones = self.pipeline_milestones_for_issues(issue_idxs);
+                        for (mi, (mil_key, mil_display, mil_issue_idxs)) in
+                            milestones.iter().enumerate()
+                        {
+                            let is_mil_expanded = self
+                                .pipeline_milestone_expanded
+                                .get(&(
+                                    "in-progress".to_string(),
+                                    group_key.clone(),
+                                    mil_key.clone(),
+                                ))
+                                .copied()
+                                .unwrap_or(true); // #1069: In-progress defaults expanded.
+                            let mil_color = if mil_key == "no-milestone" {
+                                Color::rgb(100, 100, 120) // dim for unassigned
                             } else {
-                                Color::rgb(140, 140, 140)
+                                Color::rgb(160, 160, 200) // muted purple for named
                             };
+                            // A milestone belongs to exactly one repo, so the
+                            // header carries the tag — unless this bucket
+                            // happens to mix repos (e.g. "No milestone" pooling
+                            // issues from several repos), in which case fall
+                            // back to per-issue tags below.
+                            let header_tag =
+                                self.pipeline_milestone_header_repo_tag(mil_issue_idxs, &repos);
                             rows.push(TreeRow {
-                                path: vec![gi as u16, ii as u16],
+                                path: vec![gi as u16, mi as u16],
                                 indent: 2,
                                 icon: None,
                                 text: StyledText {
-                                    spans: vec![
-                                        StyledSpan::with_fg(
-                                            format!("#{:<5}", issue.number),
-                                            Color::rgb(150, 150, 240),
+                                    spans: vec![StyledSpan::with_fg(
+                                        format!(
+                                            "{} ({})",
+                                            mil_display,
+                                            mil_issue_idxs.len()
                                         ),
-                                        StyledSpan::with_fg(
-                                            trunc(&issue.title, 20),
-                                            title_color,
-                                        ),
-                                    ],
+                                        mil_color,
+                                    )],
                                 },
-                                badge: Some(Badge::colored(tag, tag_color)),
-                                is_expanded: None,
-                                decoration: Decoration::Normal,
+                                badge: header_tag
+                                    .clone()
+                                    .map(|tag| Badge::colored(tag, tag_color)),
+                                is_expanded: Some(is_mil_expanded),
+                                decoration: Decoration::Header,
                                 edit: None,
                             });
+                            if !is_mil_expanded {
+                                continue;
+                            }
+                            for (ii, &issue_idx) in mil_issue_idxs.iter().enumerate() {
+                                let issue = &self.pipeline_issues[issue_idx];
+                                let title_color = if issue.coord_repo.is_some() {
+                                    Color::rgb(210, 210, 210)
+                                } else {
+                                    Color::rgb(140, 140, 140)
+                                };
+                                // Mixed-repo fallback: the header couldn't
+                                // show a single tag, so keep it per-row.
+                                let row_badge = if header_tag.is_none() {
+                                    let tag = Self::repo_tag(
+                                        Self::pipeline_repo_key(issue),
+                                        &repos,
+                                    );
+                                    Some(Badge::colored(tag, tag_color))
+                                } else {
+                                    None
+                                };
+                                rows.push(TreeRow {
+                                    path: vec![gi as u16, mi as u16, ii as u16],
+                                    indent: 3,
+                                    icon: None,
+                                    text: StyledText {
+                                        spans: vec![
+                                            StyledSpan::with_fg(
+                                                format!("#{:<5}", issue.number),
+                                                Color::rgb(150, 150, 240),
+                                            ),
+                                            StyledSpan::with_fg(
+                                                trunc(&issue.title, 20),
+                                                title_color,
+                                            ),
+                                        ],
+                                    },
+                                    badge: row_badge,
+                                    is_expanded: None,
+                                    decoration: Decoration::Normal,
+                                    edit: None,
+                                });
+                            }
                         }
                     }
                 }
@@ -2756,11 +2850,12 @@ impl CoordApp {
         if sidebar.active_section().is_none() && !state_sections.is_empty() {
             let section_idx = search_offset; // first state section
             sidebar.set_active_section(Some(section_idx));
-            // Active / Done / Refining / Pending use path [group_idx, issue_idx] (2-level).
-            // New uses path [repo_idx, milestone_idx, issue_idx] (3-level, #668).
+            // Done / Refining / Pending use path [group_idx, issue_idx] (2-level).
+            // New and In-progress use path [group_idx, milestone_idx, issue_idx]
+            // (3-level — New since #668, In-progress since #1069).
             // #728: Done is now flat [0, issue_idx] (2-level), not 3-level.
             let first_state_key = state_sections.get(0).map(|&(k, _)| k).unwrap_or("");
-            let default_path = if first_state_key == "new" {
+            let default_path = if first_state_key == "new" || first_state_key == "in-progress" {
                 vec![0u16, 0u16, 0u16]
             } else {
                 vec![0u16, 0u16]
@@ -2788,18 +2883,22 @@ impl CoordApp {
             {
                 let section_idx = state_idx + search_offset;
                 if state_key == "in-progress" {
-                    // Active: liveness-grouped — path = [group_idx, issue_idx].
+                    // #1069: Active — liveness-grouped, then milestone-grouped —
+                    // path = [group_idx, milestone_idx, issue_idx].
                     for (gi, (_gk, issue_idxs)) in active_by_liveness.iter().enumerate() {
-                        for (ii, &idx) in issue_idxs.iter().enumerate() {
-                            let issue = &self.pipeline_issues[idx];
-                            if issue.repo_slug == repo && issue.number == num {
-                                self.pipeline_sel = Some(idx);
-                                self.pipeline_sidebar.set_active_section(Some(section_idx));
-                                self.pipeline_sidebar.set_selected_path(
-                                    section_idx,
-                                    Some(vec![gi as u16, ii as u16]),
-                                );
-                                break 'outer;
+                        let milestones = self.pipeline_milestones_for_issues(issue_idxs);
+                        for (mi, (_, _, mil_issue_idxs)) in milestones.iter().enumerate() {
+                            for (ii, &idx) in mil_issue_idxs.iter().enumerate() {
+                                let issue = &self.pipeline_issues[idx];
+                                if issue.repo_slug == repo && issue.number == num {
+                                    self.pipeline_sel = Some(idx);
+                                    self.pipeline_sidebar.set_active_section(Some(section_idx));
+                                    self.pipeline_sidebar.set_selected_path(
+                                        section_idx,
+                                        Some(vec![gi as u16, mi as u16, ii as u16]),
+                                    );
+                                    break 'outer;
+                                }
                             }
                         }
                     }
@@ -2911,7 +3010,8 @@ impl CoordApp {
     /// index.
     ///
     /// Path depth varies by state:
-    /// - `in-progress`: `[group_idx, issue_idx]` (2-level)
+    /// - `in-progress`: `[group_idx, milestone_idx, issue_idx]` (3-level, #1069 —
+    ///   `group_idx` is the liveness bucket, Live/Idle)
     /// - `new`: `[repo_idx, milestone_idx, issue_idx]` (3-level, #668)
     /// - `done`: `[0, issue_idx]` (2-level flat, #728 — no repo/milestone groups)
     /// - `refining` / `pending`: `[repo_idx, issue_idx]` (2-level)
@@ -2952,14 +3052,18 @@ impl CoordApp {
             let done_windowed = self.pipeline_done_windowed();
             done_windowed.get(ii).copied()
         } else if state_key == "in-progress" {
-            if path.len() < 2 {
-                return None; // liveness group header selected
+            // #1069: 3-level path [group_idx, milestone_idx, issue_idx].
+            if path.len() < 3 {
+                return None; // liveness or milestone header selected
             }
             let gi = path[0] as usize;
-            let ii = path[1] as usize;
+            let mi = path[1] as usize;
+            let ii = path[2] as usize;
             let groups = self.pipeline_active_by_liveness();
             let (_, issue_idxs) = groups.get(gi)?;
-            issue_idxs.get(ii).copied()
+            let milestones = self.pipeline_milestones_for_issues(issue_idxs);
+            let (_, _, mil_issue_idxs) = milestones.get(mi)?;
+            mil_issue_idxs.get(ii).copied()
         } else {
             // refining / pending — 2-level [repo_idx, issue_idx].
             if path.len() < 2 {

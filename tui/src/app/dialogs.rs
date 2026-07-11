@@ -4809,15 +4809,36 @@ impl CoordApp {
             // (lifecycle_key, repo_key, milestone_key) bucket now — before
             // the rebuild below reads `pipeline_milestone_expanded` to decide
             // each header's expanded state — so we can force it open.
+            //
+            // #1069: In-progress now has the same milestone tier (nested
+            // under liveness rather than repo).  Its headers default
+            // *expanded*, but a user may have explicitly collapsed one, so
+            // apply the same reveal fix — force both the liveness group and
+            // the milestone group open.
             let lc_key = self.pipeline_lifecycle_section(pi);
             let repo_key = Self::pipeline_repo_key(pi).to_string();
             let mil_key = match self.pipeline_issue_milestone(pi) {
                 Some((n, _)) => n.to_string(),
                 None => "no-milestone".to_string(),
             };
+            let liveness_key = if self.issue_session_is_live(pi) {
+                "live"
+            } else {
+                "idle"
+            }
+            .to_string();
             if lc_key == "new" {
                 self.pipeline_milestone_expanded
                     .insert((lc_key.to_string(), repo_key, mil_key), true);
+            } else if lc_key == "in-progress" {
+                self.pipeline_lifecycle_expanded.insert(
+                    ("in-progress".to_string(), liveness_key.clone()),
+                    true,
+                );
+                self.pipeline_milestone_expanded.insert(
+                    ("in-progress".to_string(), liveness_key, mil_key),
+                    true,
+                );
             }
             // #1029 bug A: keep the ActivityBar/header chrome in sync too.
             self.switch_active_view(SidebarView::Pipeline);
