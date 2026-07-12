@@ -256,6 +256,11 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         audit_time_range: AuditTimeRange::All,
         audit_category: AuditCategory::All,
         audit_type_filter: SidebarFilter::default(),
+        // #1094: no column-width overrides / active resize drag / cached
+        // layout in test helpers by default.
+        audit_column_overrides: vec![None; 5],
+        audit_table_layout: std::cell::RefCell::new(None),
+        audit_resize_col: None,
         // #217: use the default dark palette for test helpers.
         active_theme: crate::settings::Theme::Dark.to_quadraui_theme(),
         // #728: default 2h window for tests (can be overridden per test).
