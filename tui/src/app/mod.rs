@@ -2801,6 +2801,28 @@ pub struct CoordApp {
     /// `DataTableHit::HeaderDivider` and cleared on `MouseUp`. `None` when no
     /// resize drag is in progress.
     audit_resize_col: Option<usize>,
+    /// #1094 fix (fix-iteration-1): vertical scroll offset (index of the
+    /// first visible row) for the Audit `DataTable`. Was hardcoded to `0` in
+    /// the initial #1094 landing — keyboard nav (`j`/`k`/`Home`/`End`) could
+    /// move `audit_sel` off-screen with no way to bring it back into view,
+    /// since `DataTableLayout::hit_test`/`draw_data_table` only page from
+    /// whatever `scroll_offset` the table is built with. Kept in sync with
+    /// `audit_sel` by `fix_audit_scroll` (events.rs nav sites) and settable
+    /// directly by a vertical-scrollbar track click/drag
+    /// (`audit_apply_vscroll`). Session-only, same persistence tier as
+    /// `audit_column_overrides`.
+    audit_scroll: usize,
+    /// #1094 fix: horizontal scroll offset (surface cells) for the same
+    /// table — only does anything once `min_total_width` forces the
+    /// h-scrollbar to appear (narrow terminal). Was also hardcoded to `0.0`
+    /// originally, so the h-scrollbar rendered but could never actually move
+    /// the viewport. Set by `audit_apply_hscroll`.
+    audit_h_scroll: f32,
+    /// #1094 fix: which scrollbar (if any) is being drag-scrolled, set by a
+    /// `MouseDown` that lands in a scrollbar track (`audit_scrollbar_hit`)
+    /// and cleared on `MouseUp`. Mutually exclusive with `audit_resize_col`
+    /// — a single click starts at most one kind of drag.
+    audit_scrollbar_drag: Option<AuditScrollAxis>,
 
     // ── #541: global Telescope-style issue fuzzy finder ──────────────────────
     /// Active state of the issue fuzzy-finder overlay.  `None` when the
@@ -2844,6 +2866,18 @@ pub struct CoordApp {
     /// epic again.  Set by the poll handler in `settings_ui.rs`; cleared on
     /// dismiss (Esc / Enter / outside-click).
     gate_a_error_dialog: Option<String>,
+}
+
+/// #1094 fix: which axis of the Audit `DataTable`'s scrollbars a
+/// `MouseDown`/drag is currently operating on. `quadraui`'s
+/// `DataTableLayout::hit_test` has no concept of the scrollbar strips it
+/// reserves space for (see the #1094 fix-iteration-1 durable finding), so
+/// coord-tui hit-tests them itself (`audit_scrollbar_hit`) and tracks the
+/// in-progress drag here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuditScrollAxis {
+    Vertical,
+    Horizontal,
 }
 
 /// #728: Time-window for the Done section in the Pipeline sidebar.
@@ -3242,6 +3276,9 @@ impl CoordApp {
             audit_column_overrides: vec![None; 5],
             audit_table_layout: std::cell::RefCell::new(None),
             audit_resize_col: None,
+            audit_scroll: 0,
+            audit_h_scroll: 0.0,
+            audit_scrollbar_drag: None,
             // #217: resolved theme palette — computed from settings + optional
             // ~/.coord/theme.toml override file.
             active_theme: {

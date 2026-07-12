@@ -321,12 +321,17 @@ impl CoordApp {
             columns: Self::audit_columns(),
             rows: Self::audit_data_rows(entries),
             selected_idx: Some(sel),
-            scroll_offset: 0,
+            // #1094 fix: was hardcoded to `0`/`0.0` — the table could never
+            // actually scroll (see the #1094 fix-iteration-1 durable
+            // finding). `audit_scroll`/`audit_h_scroll` are kept in sync
+            // with `audit_sel` and scrollbar drags by `fix_audit_scroll` /
+            // `audit_apply_vscroll` / `audit_apply_hscroll` (events.rs).
+            scroll_offset: self.audit_scroll,
             sort: None,
             has_focus: true,
             show_scrollbar: true,
             min_total_width: Some(Self::AUDIT_TABLE_MIN_WIDTH),
-            h_scroll: 0.0,
+            h_scroll: self.audit_h_scroll,
             column_overrides: self.audit_column_overrides.clone(),
         };
         let layout = backend.draw_data_table(list_rect, &table, None);
@@ -373,10 +378,122 @@ impl CoordApp {
         let layout = layout_ref.as_ref()?;
         let x = pos.x - main_b.x;
         let y = pos.y - main_b.y;
-        // `scroll_offset: 0` matches what `render_audit_panel` always builds
-        // the table with — this panel doesn't track its own scroll offset
-        // (pre-existing limitation, unchanged by #1094).
-        Some(layout.hit_test(x, y, 0, n))
+        // `audit_scroll` matches what `render_audit_panel` builds the table
+        // with — must be passed here too (#1094 fix) so a click while
+        // scrolled resolves to the right absolute row index rather than
+        // always assuming `scroll_offset == 0`.
+        Some(layout.hit_test(x, y, self.audit_scroll, n))
+    }
+
+    /// #1094 fix: pre-check a click/drag position against the Audit table's
+    /// scrollbar strips, using the same geometry the TUI rasteriser paints
+    /// them at (`quadraui::tui::data_table::draw_data_table`: the vertical
+    /// track occupies the rightmost `scrollbar_width` columns below the
+    /// header row; the horizontal track occupies the bottom
+    /// `h_scrollbar_height` row(s), left of the vertical track).
+    ///
+    /// `DataTableLayout::hit_test` (quadraui) has no concept of these strips
+    /// at all — a click there falls through to whatever row/header region
+    /// happens to be under the cursor (the #1094 fix-iteration-1 durable
+    /// finding: "hit-testing appears to route straight to
+    /// `DataTableHit::Row`"). Callers must check this *before*
+    /// `audit_table_hit` so a scrollbar click never reaches row selection.
+    pub(crate) fn audit_scrollbar_hit(&self, pos: Point, main_b: Rect) -> Option<AuditScrollAxis> {
+        let layout_ref = self.audit_table_layout.borrow();
+        let layout = layout_ref.as_ref()?;
+        let x = pos.x - main_b.x;
+        let y = pos.y - main_b.y;
+        if x < 0.0 || y < 0.0 || x >= layout.viewport_width || y >= layout.viewport_height {
+            return None;
+        }
+        // Vertical scrollbar takes priority in the bottom-right corner,
+        // matching `hit_test`'s own divider-before-header priority style.
+        if layout.scrollbar_width > 0.0 {
+            let sb_x0 = layout.viewport_width - layout.scrollbar_width;
+            if x >= sb_x0 && y >= layout.header_height {
+                return Some(AuditScrollAxis::Vertical);
+            }
+        }
+        if layout.h_scrollbar_height > 0.0 {
+            let hsb_y0 = layout.viewport_height - layout.h_scrollbar_height;
+            if y >= hsb_y0 {
+                return Some(AuditScrollAxis::Horizontal);
+            }
+        }
+        None
+    }
+
+    /// #1094 fix: jump `audit_scroll` to the row implied by a click/drag
+    /// position along the vertical scrollbar's track — standard
+    /// click/drag-to-position scrollbar behaviour (not thumb-relative
+    /// dragging). No-op when there's nothing to scroll (empty list, or the
+    /// cached layout is stale/missing).
+    pub(crate) fn audit_apply_vscroll(&mut self, pos: Point, main_b: Rect) -> bool {
+        let n = self.audit_entries().len();
+        if n == 0 {
+            return false;
+        }
+        let (track_y0, track_h, visible_rows) = {
+            let layout_ref = self.audit_table_layout.borrow();
+            let Some(layout) = layout_ref.as_ref() else {
+                return false;
+            };
+            let track_y0 = main_b.y + layout.header_height;
+            let track_h = (layout.viewport_height
+                - layout.header_height
+                - layout.h_scrollbar_height)
+                .max(1.0);
+            (track_y0, track_h, layout.visible_rows.max(1))
+        };
+        let max_scroll = n.saturating_sub(visible_rows);
+        self.audit_scroll = if max_scroll == 0 {
+            0
+        } else {
+            let frac = ((pos.y - track_y0) / track_h).clamp(0.0, 1.0);
+            (frac * max_scroll as f32).round() as usize
+        };
+        true
+    }
+
+    /// #1094 fix: same as `audit_apply_vscroll` but for the horizontal
+    /// scrollbar — jumps `audit_h_scroll` to the column offset implied by
+    /// the click/drag position along the horizontal track.
+    pub(crate) fn audit_apply_hscroll(&mut self, pos: Point, main_b: Rect) -> bool {
+        let (track_x0, track_w, content_w, visible_w) = {
+            let layout_ref = self.audit_table_layout.borrow();
+            let Some(layout) = layout_ref.as_ref() else {
+                return false;
+            };
+            let visible_w = (layout.viewport_width - layout.scrollbar_width).max(1.0);
+            (main_b.x, visible_w, layout.content_width, visible_w)
+        };
+        let max_scroll = (content_w - visible_w).max(0.0);
+        self.audit_h_scroll = if max_scroll <= 0.0 {
+            0.0
+        } else {
+            let frac = ((pos.x - track_x0) / track_w).clamp(0.0, 1.0);
+            frac * max_scroll
+        };
+        true
+    }
+
+    /// #1094 fix: keep `audit_sel` inside the visible window, same
+    /// structural pattern as `fix_machine_scroll` (`mod.rs`). Must be called
+    /// after every keyboard nav that moves `audit_sel`
+    /// (`j`/`k`/`Down`/`Up`/`Home`/`End` in events.rs) — the table has no
+    /// concept of "scroll to keep selection visible" on its own; that was
+    /// the root cause of the fix-iteration-1 "no way to reach rows beyond
+    /// the first screenful" report.
+    pub(crate) fn fix_audit_scroll(&mut self, visible: usize) {
+        if visible == 0 {
+            return;
+        }
+        let sel = self.audit_selected_idx();
+        if sel < self.audit_scroll {
+            self.audit_scroll = sel;
+        } else if sel >= self.audit_scroll + visible {
+            self.audit_scroll = sel + 1 - visible;
+        }
     }
 
     /// Minimum width (cells) a column may be dragged down to — keeps a
@@ -430,6 +547,12 @@ impl CoordApp {
     /// persisted cursor on `CoordApp` to explicitly clear.
     pub(crate) fn on_audit_filters_changed(&mut self) {
         self.audit_sel = 0;
+        // #1094 fix: a differently-filtered result set invalidates whatever
+        // window `audit_scroll`/`audit_h_scroll` were pointed at — reset
+        // both alongside `audit_sel` so the panel reopens scrolled to the
+        // top-left instead of a stale offset into the old row set.
+        self.audit_scroll = 0;
+        self.audit_h_scroll = 0.0;
         self.audit_detail_open = false;
         self.refresh_audit();
     }
