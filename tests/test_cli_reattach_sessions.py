@@ -591,6 +591,25 @@ class TestReattachCmd:
         assert result.exit_code == 0
         assert "running" in result.output or "reattach" in result.output.lower()
 
+    def test_reattach_prints_kill_vs_detach_warning(self, config_file: Path) -> None:
+        """#1102: reattach must warn against kill-pane, not just mention detach —
+        a wrong keystroke here is just as destructive as at first launch."""
+        attach_result = MagicMock()
+        attach_result.returncode = 0
+
+        alive_seq = iter([True, True])
+
+        with patch("coord.interactive.tmux_available", return_value=True), \
+             patch("coord.interactive.tmux_session_alive", side_effect=lambda _n, host=None: next(alive_seq, True)), \
+             patch("subprocess.run", return_value=attach_result):
+            result = CliRunner().invoke(
+                main, ["reattach", "aid-running", "--config", str(config_file)]
+            )
+
+        assert result.exit_code == 0
+        assert "Ctrl-b d" in result.output
+        assert "DO NOT" in result.output
+
     def test_session_alive_after_detach_does_not_call_finalize(
         self, config_file: Path
     ) -> None:

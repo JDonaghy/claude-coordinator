@@ -1003,6 +1003,7 @@ def reattach(assignment_id: str, config_path: Path) -> None:
     import time as _time  # noqa: PLC0415
 
     from coord.interactive import (  # noqa: PLC0415
+        TMUX_ATTACH_WARNING,
         TmuxHost,
         finalize_interactive_exit,
         finalize_remote_interactive_exit,
@@ -1434,7 +1435,10 @@ def reattach(assignment_id: str, config_path: Path) -> None:
     # ── Attach ───────────────────────────────────────────────────────────────
     _where = "local" if is_local_session else f"{ssh_target_val} (ssh)"
     click.echo(f"  Attaching to {sname} on {_where} …")
-    click.echo("  (detach with Ctrl-b d to leave the session running)")
+    # #1102: same kill-vs-detach warning as the initial attach in
+    # coord/interactive.py::_launch_via_tmux — a wrong keystroke here is
+    # just as destructive as at first launch.
+    click.echo(TMUX_ATTACH_WARNING.rstrip("\n"))
 
     started_at = _time.time()
     try:
