@@ -251,6 +251,11 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         audit_detail_open: false,
         audit_fetch_error: None,
         audit_no_service: false,
+        // #1040: no filter applied by default in test helpers; individual
+        // tests override these fields directly to exercise the filters.
+        audit_time_range: AuditTimeRange::All,
+        audit_category: AuditCategory::All,
+        audit_type_filter: SidebarFilter::default(),
         // #217: use the default dark palette for test helpers.
         active_theme: crate::settings::Theme::Dark.to_quadraui_theme(),
         // #728: default 2h window for tests (can be overridden per test).

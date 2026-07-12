@@ -51,17 +51,23 @@ impl CoordApp {
         self.audit_entries().get(self.audit_selected_idx())
     }
 
-    /// Sidebar content (#1039 contract §3): the panel title (" AUDIT ",
-    /// rendered by `ShellConfig.with_status_bar()` from `shell_config()`'s
-    /// `PanelDefinition.title`, mirrored here on the `ListView` itself same
-    /// as `plans_sidebar()`) plus an entry-count line and an optional
-    /// "N recent" badge sourced from `/board`'s `audit_recent_count` (kept
-    /// separate from the cached page's own entry count per contract §3:
-    /// "The count comes from the cached AuditPage ... not the /board
-    /// audit_recent_count field").
+    /// Sidebar content (#1039 contract §3; #1040 contract §8/§9): the panel
+    /// title (" AUDIT ", rendered by `ShellConfig.with_status_bar()` from
+    /// `shell_config()`'s `PanelDefinition.title`, mirrored here on the
+    /// `ListView` itself same as `plans_sidebar()`) plus an entry-count line
+    /// (suffixed `" (filtered)"` — mock `audit-panel-filters.screen` —
+    /// whenever any filter is non-default), an optional "N recent" badge
+    /// sourced from `/board`'s `audit_recent_count` (kept separate from the
+    /// cached page's own entry count per contract §3: "The count comes from
+    /// the cached AuditPage ... not the /board audit_recent_count field"),
+    /// and the current time-range / category / type-text filter selection.
     pub(crate) fn audit_sidebar(&self) -> ListView {
         let n = self.audit_entries().len();
-        let count_line = format!("  {n} entr{}", if n == 1 { "y" } else { "ies" });
+        let count_line = format!(
+            "  {n} entr{}{}",
+            if n == 1 { "y" } else { "ies" },
+            if self.audit_filters_active() { " (filtered)" } else { "" },
+        );
         let mut items = vec![activity_item(&count_line, Color::rgb(160, 160, 160))];
         let recent = self.audit_recent_count();
         if recent > 0 {
@@ -70,6 +76,31 @@ impl CoordApp {
                 Color::rgb(120, 210, 120),
             ));
         }
+        // #1040 contract §8/§9: current filter selection is always shown
+        // (not only while non-default) so the `t`/`Tab` affordance is
+        // discoverable before the operator has touched either filter.
+        items.push(activity_item(
+            &format!("  Time: {}", self.audit_time_range.label()),
+            Color::rgb(150, 180, 220),
+        ));
+        items.push(activity_item(
+            &format!("  Category: {}", self.audit_category.label()),
+            Color::rgb(150, 180, 220),
+        ));
+        // #1040 deliverable 1 / contract §10 ("f=filter"): free-text filter
+        // on `/audit`'s `type` param, reusing `SidebarFilter`'s state (same
+        // struct Board/Pipeline embed) but rendered as a plain row here —
+        // this sidebar is a bare `ListView`, not a `SidebarSystem`-backed
+        // tree/form like Board/Pipeline's own embedded filter. A trailing
+        // block cursor stands in for a real text-input caret while focused.
+        let type_line = if self.audit_type_filter.focused {
+            format!("  Type: {}\u{2588}", self.audit_type_filter.query)
+        } else if !self.audit_type_filter.is_empty() {
+            format!("  Type: {}", self.audit_type_filter.query)
+        } else {
+            "  Type: (f to filter)".to_string()
+        };
+        items.push(activity_item(&type_line, Color::rgb(150, 180, 220)));
         ListView {
             id: WidgetId::new("audit-sidebar"),
             title: Some(StyledText::plain(" AUDIT ")),
@@ -92,6 +123,15 @@ impl CoordApp {
     /// read from, so the two can never drift out of sync.
     pub(crate) fn audit_recent_count(&self) -> u64 {
         self.data.audit_recent_count
+    }
+
+    /// #1040: `true` when any Audit filter differs from its default ("All"
+    /// time-range, "all" category, empty type text) — drives the sidebar's
+    /// `" (filtered)"` count-line suffix (mock `audit-panel-filters.screen`).
+    pub(crate) fn audit_filters_active(&self) -> bool {
+        self.audit_time_range != AuditTimeRange::All
+            || self.audit_category != AuditCategory::All
+            || !self.audit_type_filter.is_empty()
     }
 
     /// One main-panel row's display text (contract §4a): relative time,
@@ -265,9 +305,23 @@ impl CoordApp {
     }
 
     /// Force the next `run_periodic_work` tick to re-fetch `/audit`
-    /// immediately, dropping any in-flight request (`r` — contract §7).
+    /// immediately, dropping any in-flight request (`r` — contract §7; also
+    /// the mechanism `on_audit_filters_changed` re-arms on a filter edit).
     pub(crate) fn refresh_audit(&mut self) {
         self.audit_fetch_rx = None;
         self.audit_last_fetched = None;
+    }
+
+    /// #1040 contract §11: apply a just-changed filter (time-range,
+    /// category, or the free-text type field) — reset the row selection
+    /// and close any open detail pane (the previously-selected row may not
+    /// exist in the new, differently-filtered result set), then re-arm the
+    /// fetch. "Reset cursor to None" (contract §11 step 1) is implicit:
+    /// `spawn_audit_fetch` always requests the first page, so there is no
+    /// persisted cursor on `CoordApp` to explicitly clear.
+    pub(crate) fn on_audit_filters_changed(&mut self) {
+        self.audit_sel = 0;
+        self.audit_detail_open = false;
+        self.refresh_audit();
     }
 }

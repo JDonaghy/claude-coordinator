@@ -1870,6 +1870,71 @@ impl CoordApp {
                         needs_redraw = true;
                     }
 
+                    // ── Audit filter: free-text type input (#1040) ───────
+                    // Mirrors the Board/Pipeline `SidebarFilter` arms above
+                    // (`SidebarFilter` itself is `mod.rs:143`) but scoped to
+                    // `active_view == Audit` and toggled with `f` (contract
+                    // §10's `"f=filter"` hint), not `/`. Placed here, well
+                    // before the unguarded `q`/Esc catch-all further down,
+                    // so a typed 'q' (or 't'/Tab/j/k/r/Enter) inserts into
+                    // the filter text instead of triggering the Audit
+                    // keybind it would otherwise mean — same reasoning as
+                    // the Board/Pipeline arms just above.
+                    //
+                    // Esc while focused clears the typed text and blurs.
+                    // Unlike Board/Pipeline's client-side filter (a re-
+                    // render is free), a non-empty value here maps to a
+                    // live `/audit` `type=` query param, so clearing it
+                    // must also re-arm the fetch (contract §11) — but only
+                    // when it actually held a value, so blurring an
+                    // already-empty field doesn't spuriously refetch.
+                    Key::Named(NamedKey::Escape)
+                        if self.active_view == SidebarView::Audit
+                            && self.audit_type_filter.focused =>
+                    {
+                        let had_value = !self.audit_type_filter.is_empty();
+                        self.audit_type_filter.clear(); // also sets focused = false
+                        if had_value {
+                            self.on_audit_filters_changed();
+                        }
+                        needs_redraw = true;
+                    }
+                    Key::Named(NamedKey::Backspace)
+                        if self.active_view == SidebarView::Audit
+                            && self.audit_type_filter.focused =>
+                    {
+                        self.audit_type_filter.backspace();
+                        needs_redraw = true;
+                    }
+                    Key::Char(ch)
+                        if self.active_view == SidebarView::Audit
+                            && self.audit_type_filter.focused =>
+                    {
+                        self.audit_type_filter.insert_char(*ch);
+                        needs_redraw = true;
+                    }
+                    // Enter commits the typed value and re-arms the fetch
+                    // (contract §11).
+                    Key::Named(NamedKey::Enter)
+                        if self.active_view == SidebarView::Audit
+                            && self.audit_type_filter.focused =>
+                    {
+                        self.audit_type_filter.focused = false;
+                        self.on_audit_filters_changed();
+                        needs_redraw = true;
+                    }
+                    // `f` opens the filter for typing when not already
+                    // focused; list-mode only (guarded off the detail pane,
+                    // same as the other Audit-view-only keys below).
+                    Key::Char('f')
+                        if self.active_view == SidebarView::Audit
+                            && !self.audit_type_filter.focused
+                            && !self.audit_detail_open =>
+                    {
+                        self.audit_type_filter.focused = true;
+                        needs_redraw = true;
+                    }
+
                     // ── Watch overlay: control keys ─────────────────────
                     // 'b' opens the ChatController guidance overlay. When the
                     // overlay is open, ALL events are intercepted earlier in
@@ -1952,6 +2017,31 @@ impl CoordApp {
                             && self.audit_detail_open =>
                     {
                         self.audit_detail_open = false;
+                        needs_redraw = true;
+                    }
+                    // #1040 contract §10: Esc clears all active Audit
+                    // filters (time-range/category/type text) back to their
+                    // defaults and re-arms the fetch — must precede the
+                    // unguarded catch-all just below, same reasoning as the
+                    // detail-pane-close arm just above. Guarded off
+                    // `audit_type_filter.focused` (that narrower "blur the
+                    // type field" arm lives further up, alongside the rest
+                    // of the type-filter typing arms) and off
+                    // `audit_detail_open` (closing the detail pane takes
+                    // priority — the arm just above). Only fires when a
+                    // filter is actually non-default, so plain Esc on an
+                    // unfiltered Audit panel still falls through to the
+                    // global quit-confirm catch-all.
+                    Key::Named(NamedKey::Escape)
+                        if self.active_view == SidebarView::Audit
+                            && !self.audit_detail_open
+                            && !self.audit_type_filter.focused
+                            && self.audit_filters_active() =>
+                    {
+                        self.audit_time_range = AuditTimeRange::All;
+                        self.audit_category = AuditCategory::All;
+                        self.audit_type_filter.clear();
+                        self.on_audit_filters_changed();
                         needs_redraw = true;
                     }
                     Key::Char('q') | Key::Named(NamedKey::Escape) => return Reaction::Exit,
@@ -2114,6 +2204,34 @@ impl CoordApp {
                             && !self.audit_detail_open =>
                     {
                         self.refresh_audit();
+                        needs_redraw = true;
+                    }
+                    // #1040 contract §8: `t` cycles the time-range filter
+                    // (Last hour → Today → 7d → All → …) and re-arms the
+                    // fetch. `!audit_type_filter.focused` is belt-and-braces
+                    // here — the type-filter typing arms further up already
+                    // claim every `Char`/`Backspace` while focused, so this
+                    // guard can never actually be false when reached, but
+                    // it documents the intent explicitly.
+                    Key::Char('t')
+                        if self.active_view == SidebarView::Audit
+                            && !self.audit_detail_open
+                            && !self.audit_type_filter.focused =>
+                    {
+                        self.audit_time_range = self.audit_time_range.next();
+                        self.on_audit_filters_changed();
+                        needs_redraw = true;
+                    }
+                    // #1040 contract §9: Tab cycles the category filter
+                    // (all → dispatch → test → review → merge → override →
+                    // plan → error → …) and re-arms the fetch.
+                    Key::Named(NamedKey::Tab)
+                        if self.active_view == SidebarView::Audit
+                            && !self.audit_detail_open
+                            && !self.audit_type_filter.focused =>
+                    {
+                        self.audit_category = self.audit_category.next();
+                        self.on_audit_filters_changed();
                         needs_redraw = true;
                     }
 
