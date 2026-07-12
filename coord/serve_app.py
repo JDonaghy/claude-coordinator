@@ -98,6 +98,58 @@ class _BearerAuthMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+def _reload_config_if_stale(
+    current: Config, last_mtime: float | None
+) -> tuple[Config, float | None]:
+    """Re-parse *current*'s backing ``coordinator.yml`` if it changed on disk (#1081).
+
+    The daemon's in-memory ``Config`` is otherwise fixed at process startup, so
+    a hand-edit to ``coordinator.yml`` on the daemon host silently diverges
+    from the file until a restart — even though ``GET /config`` (which serves
+    the raw bytes fresh every request) shows the new content immediately. This
+    closes that gap for the daemon's *own* gating decisions (review/pipeline/
+    merge-auto-drain/milestone-auto-dispatch) by tracking the file's mtime and
+    swapping in a freshly-parsed ``Config`` whenever a caller notices it moved.
+
+    Returns ``(config, mtime)`` — either *current* unchanged (no backing path,
+    a ``stat()`` failure, or no on-disk change since *last_mtime*) or a
+    freshly-loaded ``Config`` paired with its new mtime. A malformed hand-edit
+    (invalid YAML, a validation error) is logged and swallowed rather than
+    raised into a request handler or the tick loop — the daemon keeps serving
+    the last-good config. *last_mtime* still advances past a bad edit so it
+    isn't re-parsed (and re-logged) on every subsequent call; it will be
+    retried once the file changes again (e.g. the edit is fixed).
+    """
+    path = current.path
+    if path is None:
+        return current, last_mtime
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return current, last_mtime
+    if last_mtime is not None and mtime <= last_mtime:
+        return current, last_mtime
+
+    import logging  # noqa: PLC0415
+
+    from coord.config import ConfigError  # noqa: PLC0415
+    from coord.config import load as _load_coordinator_config  # noqa: PLC0415
+
+    log = logging.getLogger("coord.serve")
+    try:
+        reloaded = _load_coordinator_config(path)
+    except ConfigError as e:
+        log.warning(
+            "coord serve: %s changed on disk but failed to reload (%s); "
+            "keeping last-good config until the file is fixed",
+            path,
+            e,
+        )
+        return current, mtime
+    log.info("coord serve: reloaded %s (on-disk change detected)", path)
+    return reloaded, mtime
+
+
 def _passive_tick(config: Config) -> tuple[list[dict], list[str]]:
     """One passive daemon tick: reconcile completed assignments + enqueue approved work.
 
@@ -1757,11 +1809,30 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
     *token* — when set, every endpoint except ``/healthz`` requires
     ``Authorization: Bearer <token>``.
     """
+    # #1081: track the backing coordinator.yml's mtime so the handlers below
+    # can swap in a freshly-reloaded Config when it changes on disk, instead
+    # of enforcing whatever was current at process startup until a restart.
+    # A bare name reassignment is atomic w.r.t. cooperative asyncio scheduling
+    # (no `await` inside `_refresh_config`), so concurrent in-flight requests
+    # never see a half-swapped config.
+    try:
+        _config_mtime = config.path.stat().st_mtime if config.path is not None else None
+    except OSError:
+        _config_mtime = None
+
+    def _refresh_config() -> None:
+        nonlocal config, _config_mtime
+        config, _config_mtime = _reload_config_if_stale(config, _config_mtime)
 
     async def healthz(request: Request) -> JSONResponse:  # noqa: ARG001
         return JSONResponse({"status": "ok", "schema_version": SCHEMA_VERSION})
 
     async def board(request: Request) -> Response:  # noqa: ARG001
+        # #1081: pick up a hand-edited coordinator.yml before computing the
+        # merge plan / staging / stage-projection below, all of which read
+        # `config` for real gating decisions (reviews.enabled, default_gates,
+        # require_plan, merge/milestone auto-* flags via config.repo(...)).
+        _refresh_config()
         try:
             projection = store.board_projection()
         except Exception as e:  # noqa: BLE001 — surface a clean 503 rather than a stack trace
@@ -3245,6 +3316,13 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
 
             while True:
                 await asyncio.sleep(interval)
+                # #1081: pick up a hand-edited coordinator.yml before this
+                # tick's config.merge.auto_drain / config.milestone.auto_dispatch
+                # checks and the config passed into the tick functions below —
+                # the tick loop's own ~30s cadence makes this the fastest path
+                # for a daemon-side hand-edit to take effect (faster than
+                # waiting on a `/board` request).
+                _refresh_config()
                 # Step 1: reconcile (independent try/except so a failure here
                 # does not prevent the enqueue step below).
                 try:
