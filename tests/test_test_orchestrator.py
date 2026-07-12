@@ -23,6 +23,7 @@ from coord.config import Config
 from coord.models import Machine, Repo
 from coord.test_orchestrator import (
     PLAN_SYSTEM_PROMPT,
+    _COORD_CONFIG_RE,
     _build_user_prompt,
     _strip_fences,
     _validate_plan,
@@ -30,6 +31,38 @@ from coord.test_orchestrator import (
     generate_plan,
     local_machine,
 )
+
+
+# ── PLAN_SYSTEM_PROMPT & _COORD_CONFIG_RE (#1100) ────────────────────────────
+
+class TestCoordConfigRegex:
+    """_COORD_CONFIG_RE must match COORD_CONFIG=<value> tokens only."""
+
+    def test_matches_simple_env_var(self) -> None:
+        assert _COORD_CONFIG_RE.search("COORD_CONFIG=/tmp/coord.yml coord status")
+
+    def test_matches_home_dir_path(self) -> None:
+        assert _COORD_CONFIG_RE.search(
+            "COORD_CONFIG=/home/user/.coord/coordinator.yml coord test-plan abc"
+        )
+
+    def test_does_not_match_timeout_prefix(self) -> None:
+        assert _COORD_CONFIG_RE.search("timeout 3 coord status") is None
+
+    def test_does_not_match_plain_coord_command(self) -> None:
+        assert _COORD_CONFIG_RE.search("coord test-plan abc") is None
+
+    def test_substitution_leaves_rest_intact(self) -> None:
+        cmd = "COORD_CONFIG=/tmp/c.yml coord status --freshness"
+        cleaned = _COORD_CONFIG_RE.sub("", cmd).strip()
+        assert cleaned == "coord status --freshness"
+
+
+class TestPlanSystemPromptContainsCoordConfigRule:
+    """PLAN_SYSTEM_PROMPT must instruct Claude not to emit COORD_CONFIG= (#1100)."""
+
+    def test_system_prompt_prohibits_coord_config(self) -> None:
+        assert "COORD_CONFIG" in PLAN_SYSTEM_PROMPT
 
 
 # ── _strip_fences ─────────────────────────────────────────────────────────────
@@ -116,6 +149,73 @@ class TestValidatePlan:
         for kind in ("pull", "run", "verify"):
             result = _validate_plan({"steps": [{"kind": kind}], "blockers": []})
             assert result["steps"][0]["kind"] == kind
+
+    # ── COORD_CONFIG stripping (#1100) ────────────────────────────────────
+
+    def test_coord_config_stripped_from_cmd(self) -> None:
+        """COORD_CONFIG=<value> prepended by Claude is removed from cmd fields."""
+        plan = {
+            "steps": [
+                {
+                    "kind": "run",
+                    "cmd": "COORD_CONFIG=/home/user/.coord/coordinator.yml coord test-plan abc",
+                }
+            ],
+            "blockers": [],
+        }
+        result = _validate_plan(plan)
+        assert result["steps"][0]["cmd"] == "coord test-plan abc"
+
+    def test_coord_config_stripped_when_not_at_start(self) -> None:
+        """COORD_CONFIG=<value> is stripped even when preceded by other tokens."""
+        plan = {
+            "steps": [
+                {
+                    "kind": "run",
+                    "cmd": "env COORD_CONFIG=/tmp/coord.yml coord status",
+                }
+            ],
+            "blockers": [],
+        }
+        result = _validate_plan(plan)
+        assert result["steps"][0]["cmd"] == "env coord status"
+
+    def test_other_leading_tokens_untouched(self) -> None:
+        """Tokens that are not COORD_CONFIG=... are preserved (e.g. 'timeout 3 ...')."""
+        plan = {
+            "steps": [
+                {"kind": "run", "cmd": "timeout 3 coord status"},
+            ],
+            "blockers": [],
+        }
+        result = _validate_plan(plan)
+        assert result["steps"][0]["cmd"] == "timeout 3 coord status"
+
+    def test_cmd_without_coord_config_unchanged(self) -> None:
+        """A normal cmd with no COORD_CONFIG token is returned as-is."""
+        plan = {
+            "steps": [{"kind": "run", "cmd": "pytest tests/ -x"}],
+            "blockers": [],
+        }
+        result = _validate_plan(plan)
+        assert result["steps"][0]["cmd"] == "pytest tests/ -x"
+
+    def test_non_cmd_fields_not_stripped(self) -> None:
+        """COORD_CONFIG appearing in 'check' or 'label' fields is NOT stripped."""
+        plan = {
+            "steps": [
+                {
+                    "kind": "verify",
+                    "check": "COORD_CONFIG is not set in the environment",
+                    "label": "COORD_CONFIG should be absent",
+                }
+            ],
+            "blockers": [],
+        }
+        result = _validate_plan(plan)
+        # 'check' and 'label' must survive unchanged.
+        assert "COORD_CONFIG" in result["steps"][0]["check"]
+        assert "COORD_CONFIG" in result["steps"][0]["label"]
 
 
 # ── resolve_claude_bin / _call_claude binary resolution (#859) ───────────────

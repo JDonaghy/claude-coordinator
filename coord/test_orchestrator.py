@@ -54,8 +54,19 @@ assertion ("text glyphs visible inside GTK cells", not "looks correct").  \
 Do NOT include "cmd" on verify steps unless a command produces the thing to inspect.
 - The "blockers" array lists prerequisites that must be satisfied before \
 testing can begin.  Leave it empty when there are none.
+- Never include COORD_CONFIG=<value> in cmd strings.  The test runner sets \
+the config path itself; baking it into a cmd creates a path that is wrong on \
+every machine except the one that generated the plan.
 - No markdown, no commentary, no extra keys outside the JSON object.\
 """
+
+
+# Matches a COORD_CONFIG=<value> token anywhere in a command string so it can
+# be stripped from generated "cmd" fields.  Pattern is intentionally narrow:
+# it only removes the env-var assignment token (COORD_CONFIG=<non-whitespace>)
+# followed by any separating whitespace — it does NOT touch other leading
+# tokens such as "timeout 3 ..." or "sudo ...".
+_COORD_CONFIG_RE = re.compile(r"\bCOORD_CONFIG=\S+\s*")
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
@@ -98,8 +109,16 @@ def _validate_plan(data: object) -> dict:
             raise ValueError(
                 f"step {i} has invalid kind {kind!r}; expected one of {sorted(valid_kinds)}"
             )
-        # Pass through all keys (extra keys are allowed for forward-compat)
-        validated_steps.append({k: v for k, v in step.items()})
+        # Pass through all keys (extra keys are allowed for forward-compat).
+        # Strip COORD_CONFIG=<value> from "cmd" fields — Claude sometimes
+        # prepends the env-var to commands; the test runner owns the config
+        # path and must not have it baked into the plan (#1100).
+        cleaned: dict = {}
+        for k, v in step.items():
+            if k == "cmd" and isinstance(v, str):
+                v = _COORD_CONFIG_RE.sub("", v).strip()
+            cleaned[k] = v
+        validated_steps.append(cleaned)
 
     return {
         "steps": validated_steps,
