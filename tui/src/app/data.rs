@@ -1573,6 +1573,60 @@ pub(crate) fn assemble_board_data(
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    /// #1087: test-only per-thread override for [`resolve_board_service`],
+    /// set via [`set_test_board_service`]. Thread-local rather than a
+    /// process env var deliberately: `resolve_board_service` runs
+    /// synchronously on the *caller's* thread (before any network thread
+    /// is spawned), so a thread-local override is visible exactly where a
+    /// test needs it and invisible to every other test running
+    /// concurrently on a different OS thread. `cargo test`'s default
+    /// multi-threaded harness runs ~25 other Audit-panel tests
+    /// (`tests.rs`, `SidebarView::Audit`) that also nudge
+    /// `spawn_audit_fetch` via `run_periodic_work()` — a process-global
+    /// `COORD_SERVICE_URL` mutation would let those transiently observe a
+    /// mock URL they never opted into, an intermittent-failure trap this
+    /// sidesteps entirely.
+    static TEST_BOARD_SERVICE_OVERRIDE: std::cell::RefCell<Option<(String, Option<String>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// #1087: point `resolve_board_service()` at `url` (with optional bearer
+/// `token`) for the remainder of the calling thread, so a test can exercise
+/// `spawn_audit_fetch`'s real network path — e.g. against a
+/// [`super::fixtures::MockBoardService`] — instead of the hard-coded
+/// `AuditFetchOutcome::NoBoardService` every test build produced before
+/// this seam existed. Returns an RAII guard that clears the override on
+/// drop (including on test panic/assertion failure), so a `cargo test`
+/// worker thread reused by a later, unrelated test never inherits stale
+/// state.
+///
+/// `pub` (not `pub(crate)`) and re-exported from [`super::fixtures`]
+/// (`coord_tui::fixtures::set_test_board_service` under the `test-support`
+/// feature) so the same seam is available to an external integration-test
+/// crate — e.g. a future sealed acceptance slice for #1087-shaped coverage
+/// — exactly like `make_test_app` and friends already are.
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_test_board_service(
+    url: impl Into<String>,
+    token: Option<String>,
+) -> TestBoardServiceGuard {
+    TEST_BOARD_SERVICE_OVERRIDE.with(|cell| *cell.borrow_mut() = Some((url.into(), token)));
+    TestBoardServiceGuard(())
+}
+
+/// RAII guard returned by [`set_test_board_service`]; see its doc comment.
+#[cfg(any(test, feature = "test-support"))]
+pub struct TestBoardServiceGuard(());
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for TestBoardServiceGuard {
+    fn drop(&mut self) {
+        TEST_BOARD_SERVICE_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+    }
+}
+
 /// #584: resolve the configured board service URL + optional bearer token.
 ///
 /// Precedence: environment (`COORD_SERVICE_URL` + `COORD_TOKEN`) wins over the
@@ -1582,6 +1636,17 @@ pub(crate) fn assemble_board_data(
 ///
 /// Any trailing `/` is stripped from the URL so callers can append `/board`.
 pub(crate) fn resolve_board_service() -> Option<(String, Option<String>)> {
+    // #1087: a test that opted in via `set_test_board_service` wins over the
+    // hard test-mode short-circuit below — this is the seam that lets the
+    // in-crate suite exercise `spawn_audit_fetch`'s real network path
+    // end-to-end against a mock server. Checked first and scoped to this
+    // thread only; see the doc comment on `set_test_board_service` for why
+    // this isn't a `COORD_SERVICE_URL` env var instead.
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(value) = TEST_BOARD_SERVICE_OVERRIDE.with(|cell| cell.borrow().clone()) {
+        return Some(value);
+    }
+
     // In the test binary, treat the board service as absent.  This prevents
     // `record_test_verdict_remote`, `load_board_data_from_service`, and
     // `fetch_remote_config_to_cache` from firing real HTTP requests against
@@ -1600,6 +1665,11 @@ pub(crate) fn resolve_board_service() -> Option<(String, Option<String>)> {
     // this function exists to avoid.  `cargo test --features test-support`
     // enables the feature crate-wide for that whole build (lib + every test
     // binary sharing the invocation), so this stays reliable there too.
+    //
+    // #1087: this is *not* bypassed by checking `COORD_SERVICE_URL` below —
+    // a real board service is opted into via `set_test_board_service` above
+    // instead, precisely to avoid a process-global env var a concurrently
+    // running unrelated test could observe.
     #[cfg(any(test, feature = "test-support"))]
     return None;
 

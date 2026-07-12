@@ -19,6 +19,15 @@ use super::*;
 // private/`pub(crate)`, only these specific names are re-exported).
 pub use super::types::{Assignment, BoardData};
 
+// #1087: re-exported so `coord_tui::fixtures::set_test_board_service` pairs
+// with `MockBoardService` below for an external integration-test crate,
+// exactly like the other names in this module. Goes through `super::data`
+// (the defining module) rather than `super::set_test_board_service` — the
+// latter only resolves via `app/mod.rs`'s private `use self::data::*;`,
+// which itself isn't re-exportable (same reason `Assignment`/`BoardData`
+// above are re-exported via `super::types::` and not bare `super::`).
+pub use super::data::{set_test_board_service, TestBoardServiceGuard};
+
 /// Build a bare [`CoordApp`] from the given [`BoardData`] — no real `coord`
 /// subprocess is ever spawned (`CommandRunner::new_for_test()`), no live
 /// daemon, no I/O. This is the seam every other fixture in this module (and
@@ -305,6 +314,138 @@ pub fn make_app_with_audit_json(data: BoardData, audit_json: &str) -> CoordApp {
         app.audit_page = Some(page);
     }
     app
+}
+
+/// #1087: a minimal, in-process, `std`-only mock HTTP server for exercising
+/// `spawn_audit_fetch` / `resolve_board_service`'s real network path
+/// end-to-end (paired with [`super::set_test_board_service`]).
+///
+/// Binds to an OS-assigned free port on `127.0.0.1` and, for the lifetime of
+/// the returned value, answers *every* accepted connection with the same
+/// canned response — `200 OK` / `application/json` / the `body` passed to
+/// [`MockBoardService::start`] — regardless of method or path. It loops
+/// rather than serving a single request so an incidental extra connection
+/// (e.g. from an unrelated Audit-panel test on another thread that also
+/// nudges `spawn_audit_fetch`, harmless because of the thread-local scoping
+/// described on `set_test_board_service`, but still a live TCP client that
+/// might dial in) can never "steal" the response meant for the caller's own
+/// request.
+///
+/// No request parsing beyond draining the socket — `spawn_audit_fetch`'s
+/// `GET /audit[?since=...&category=...&type=...]` carries no body, so a
+/// full HTTP parser isn't needed to answer it correctly.
+pub struct MockBoardService {
+    addr: std::net::SocketAddr,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    /// Request line (e.g. `"GET /audit?since=123 HTTP/1.1"`) of every
+    /// request handled so far, oldest first — lets a test assert the real
+    /// path/query `spawn_audit_fetch` sent, not just the parsed response.
+    requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl MockBoardService {
+    /// Start the server. `body` is served verbatim as the JSON response
+    /// body for every request received while this value is alive.
+    pub fn start(body: impl Into<String>) -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("MockBoardService: failed to bind 127.0.0.1:0");
+        let addr = listener
+            .local_addr()
+            .expect("MockBoardService: failed to read local_addr");
+        // Non-blocking + a short poll interval so the accept loop notices
+        // `shutdown` promptly instead of blocking in `accept()` forever.
+        listener
+            .set_nonblocking(true)
+            .expect("MockBoardService: failed to set_nonblocking");
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let body = body.into();
+        let handle = {
+            let shutdown = shutdown.clone();
+            let requests = requests.clone();
+            std::thread::spawn(move || {
+                while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((stream, _)) => Self::respond(stream, &body, &requests),
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        // Any other accept error (e.g. the listener got torn
+                        // down) — stop looping rather than spin.
+                        Err(_) => break,
+                    }
+                }
+            })
+        };
+        Self {
+            addr,
+            shutdown,
+            handle: Some(handle),
+            requests,
+        }
+    }
+
+    /// `http://127.0.0.1:<port>` — pass to [`super::set_test_board_service`]
+    /// so `resolve_board_service()` (and thus `spawn_audit_fetch`) points
+    /// here for the duration of the returned guard.
+    pub fn url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    /// Request lines received so far, oldest first (e.g.
+    /// `"GET /audit?since=123 HTTP/1.1"`). Poisoned-lock recovery falls back
+    /// to an empty list rather than propagating a second panic over a
+    /// first — a test asserting on an empty `requests()` after some other
+    /// assertion already panicked would only obscure the real failure.
+    pub fn requests(&self) -> Vec<String> {
+        self.requests
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    fn respond(
+        mut stream: std::net::TcpStream,
+        body: &str,
+        requests: &std::sync::Mutex<Vec<String>>,
+    ) {
+        use std::io::{BufRead, BufReader, Write};
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+        // Only the request line matters for the mock's purposes (method +
+        // path + query); headers/body (if any) are left undrained on the
+        // socket, which is fine since we respond and close immediately.
+        let mut reader = BufReader::new(stream.try_clone().expect("clone stream for read"));
+        let mut request_line = String::new();
+        if reader.read_line(&mut request_line).is_ok() {
+            let trimmed = request_line.trim_end().to_string();
+            if !trimmed.is_empty() {
+                if let Ok(mut log) = requests.lock() {
+                    log.push(trimmed);
+                }
+            }
+        }
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body,
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    }
+}
+
+impl Drop for MockBoardService {
+    fn drop(&mut self) {
+        self.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Wake the accept loop immediately (rather than waiting up to the
+        // 5ms poll interval) by dialing in once ourselves — keeps teardown
+        // prompt and deterministic instead of racing the sleep.
+        let _ = std::net::TcpStream::connect(self.addr);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 /// #265 helper: build an app where issue #10 is closed (on GitHub) and has a
