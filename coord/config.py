@@ -409,6 +409,7 @@ class MergeConfig:
 
     auto_drain: bool = False
     max_per_tick: int = 0
+    auto_reap_merged: bool = True
 
 
 @dataclass
@@ -1260,6 +1261,11 @@ def _parse_merge(raw: Any) -> MergeConfig:
         if not isinstance(value, int) or value < 0:
             raise ConfigError("merge.max_per_tick must be a non-negative integer")
         cfg.max_per_tick = value
+    if "auto_reap_merged" in raw:
+        value = raw["auto_reap_merged"]
+        if not isinstance(value, bool):
+            raise ConfigError("merge.auto_reap_merged must be a boolean")
+        cfg.auto_reap_merged = value
     return cfg
 
 

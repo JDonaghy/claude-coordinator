@@ -897,7 +897,7 @@ def reconcile_board_merges(
     candidates = [
         a
         for a in board.active + board.completed
-        if a.type in ("work", "test-author")
+        if a.type in ("work", "test-author", "merge")
         and a.status == "done"
         and (repo is None or a.repo_name == repo)
         and (issue is None or a.issue_number == issue)
@@ -954,11 +954,13 @@ def reconcile_board_merges(
         # (b) #609/#951 — flip done work whose branch is merged on GitHub, OR
         # whose issue is closed even when no branch could be resolved above
         # (work_is_terminal's issue-closed check needs no branch).  #1083:
-        # scoped to type='work' only — test-author rows were added to
-        # `candidates` above for sweep (a)'s branch backfill alone; the
+        # scoped to type='work' and type='merge' — test-author rows were added
+        # to `candidates` above for sweep (a)'s branch backfill alone; the
         # merged/review-settled semantics here are pipeline-specific and out
-        # of scope for this fix.
-        if a.type == "work" and github_ops.work_is_terminal(
+        # of scope for this fix.  Interactive merge sessions (type='merge')
+        # reach 'done' the same way work sessions do, so they get the same
+        # terminal-detection sweep so the auto-reaper can pick them up.
+        if a.type in ("work", "merge") and github_ops.work_is_terminal(
             repo_cfg.github, a.issue_number, a.branch, cache=terminal_cache
         ):
             actions.append(

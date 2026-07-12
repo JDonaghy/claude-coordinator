@@ -359,6 +359,186 @@ def _sync_issues_tick(config: Config) -> int:
     return total
 
 
+def _reap_merged_sessions_tick(config: Config) -> list[str]:
+    """Kill detached interactive MERGE sessions once their board row is 'merged'.
+
+    Called by ``_tick_loop`` RIGHT AFTER ``_reconcile_merges_tick`` so that the
+    board has just been swept and any done merge session whose PR landed is
+    already in ``status='merged'``.  When ``merge.auto_reap_merged: false``
+    (default-on) this is a no-op.
+
+    **Three hard ToS guardrails (non-negotiable):**
+
+    1. Trigger ONLY on board ``status='merged'`` — NEVER read claude pane text.
+    2. Action = ``tmux kill-session`` via :func:`coord.diagnose._kill_session` —
+       NEVER inject keystrokes into the pane.
+    3. Only reap DETACHED sessions (``session_attached == False`` from
+       :func:`coord.interactive.list_coord_tmux_sessions`).  Attached sessions
+       are skipped; the next tick reaps them once the operator detaches.
+
+    **Scope = MERGE SESSIONS ONLY.**  Filters on ``type='merge'`` and
+    ``provider_name='claude-pty'`` to avoid touching work/review/test sessions.
+
+    For each reaped session the function:
+
+    1. Calls :func:`coord.interactive.finalize_interactive_exit` (the #466
+       git-floor backstop) to clean the worktree.  The assignment is already
+       recorded (status='merged'), so ``finalize`` skips the DB write and only
+       removes the worktree.
+    2. Calls :func:`coord.diagnose._kill_session` to ``tmux kill-session``.
+    3. Records one ``tier="operational"`` audit row.
+
+    Returns a list of reaped assignment IDs (empty when nothing was reaped).
+
+    Extracted as a module-level function so tests can call it directly without
+    wiring up the async ``_tick_loop`` infrastructure (mirrors the pattern of
+    ``_passive_tick`` / ``_reconcile_merges_tick``).
+    """
+    import logging  # noqa: PLC0415
+
+    from coord.state import build_board, COORD_DIR  # noqa: PLC0415
+    from coord.interactive import (  # noqa: PLC0415
+        TmuxHost,
+        list_coord_tmux_sessions,
+        tmux_session_name,
+        finalize_interactive_exit,
+    )
+    from coord.diagnose import _kill_session, _ssh_target_for  # noqa: PLC0415
+
+    if not config.merge.auto_reap_merged:
+        return []
+
+    log = logging.getLogger("coord.serve")
+    board = build_board()
+
+    # Candidates: interactive merge sessions that the reconcile sweep has
+    # already flipped to 'merged'.  We check both active and completed because
+    # the board assembler puts 'merged' rows into board.completed.
+    candidates = [
+        a
+        for a in board.active + board.completed
+        if a.status == "merged"
+        and a.type == "merge"
+        and a.provider_name == "claude-pty"
+        and a.assignment_id
+    ]
+
+    if not candidates:
+        return []
+
+    reaped: list[str] = []
+
+    for a in candidates:
+        aid = a.assignment_id
+        if not aid:
+            continue
+
+        # Resolve SSH target (None = local).
+        ssh_target = _ssh_target_for(a, config)
+
+        # Query the tmux server on the session's host for live sessions.
+        host = TmuxHost(
+            ssh_target=ssh_target,
+            batch=(ssh_target is not None),
+        )
+        sname = tmux_session_name(aid)
+
+        try:
+            sessions = list_coord_tmux_sessions(host=host)
+        except Exception:  # noqa: BLE001
+            log.warning(
+                "reap-merged: failed to list tmux sessions for %s", aid, exc_info=True
+            )
+            continue
+
+        session_entry = next(
+            (s for s in sessions if s["session_name"] == sname), None
+        )
+
+        if session_entry is None:
+            # No live tmux session for this assignment — already gone.
+            continue
+
+        # ToS guardrail #3: skip attached sessions; operator may still be
+        # looking.  The next tick will pick it up once detached.
+        if session_entry.get("attached"):
+            log.debug(
+                "reap-merged: %s session %s is attached, skipping (will retry later)",
+                aid,
+                sname,
+            )
+            continue
+
+        # Resolve worktree + repo metadata for finalize.
+        repo_cfg = next((r for r in config.repos if r.name == a.repo_name), None)
+        base_branch = (repo_cfg.default_branch if repo_cfg else None) or "main"
+        repo_github = repo_cfg.github if repo_cfg else (a.repo_name or "")
+        repo_path: str | None = None
+        machine = next(
+            (m for m in config.machines if m.name == (a.machine_name or "")), None
+        )
+        if machine is not None and a.repo_name:
+            from pathlib import Path as _Path  # noqa: PLC0415
+
+            rp = machine.repo_path(a.repo_name)
+            if rp:
+                repo_path = str(_Path(rp).expanduser())
+
+        worktree = str(COORD_DIR / "worktrees" / aid)
+
+        # Step 1: finalize (cleans worktree; skips DB write because the
+        # assignment is already in 'merged' terminal state).
+        try:
+            finalize_interactive_exit(
+                assignment_id=aid,
+                repo_name=a.repo_name or "",
+                repo_github=repo_github,
+                issue_number=a.issue_number,
+                machine_name=a.machine_name or "unknown",
+                worktree_path=worktree,
+                base_branch=base_branch,
+                exit_code=0,
+                started_at=a.dispatched_at,
+                repo_path=repo_path,
+                ssh_target=ssh_target,
+            )
+        except Exception:  # noqa: BLE001
+            log.warning("reap-merged: finalize failed for %s", aid, exc_info=True)
+
+        # Step 2: ToS guardrail #2 — tmux kill-session, no keystroke injection.
+        killed = _kill_session(a, config)
+        if killed:
+            reaped.append(aid)
+            log.info(
+                "reap-merged: killed detached merge session %s "
+                "(%s #%d, merged)",
+                aid,
+                a.repo_name,
+                a.issue_number,
+            )
+            # Step 3: operational audit row (one per reap).
+            from coord.audit import record_audit  # noqa: PLC0415
+
+            record_audit(
+                tier="operational",
+                category="session",
+                event_type="reap_merged_session",
+                actor="daemon",
+                summary=(
+                    f"reap-merged: killed detached merge session for "
+                    f"{a.repo_name}#{a.issue_number}"
+                ),
+                repo=a.repo_name,
+                issue=a.issue_number,
+                assignment_id=aid,
+                details={"session_name": sname},
+            )
+        else:
+            log.warning("reap-merged: kill-session failed for %s", aid)
+
+    return reaped
+
+
 def _auto_drain_tick(config: Config) -> "list":
     """Drain READY merge-queue entries — the opt-in daemon auto-merge (#781).
 
@@ -1797,6 +1977,37 @@ def _openapi_spec() -> dict:
                 "responses": {
                     "200": {"description": "OK"},
                     "503": {"description": "Housekeeping failed"},
+                },
+            }
+        },
+        "/reap-merged-sessions": {
+            "post": {
+                "summary": (
+                    "Kill detached interactive MERGE sessions whose board row "
+                    "has reached 'merged' status (#1110)."
+                ),
+                "requestBody": {
+                    "required": False,
+                    "content": {"application/json": {"schema": {"type": "object"}}},
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK — list of reaped assignment IDs",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "reaped": {
+                                            "type": "array",
+                                            "items": {"type": "string"},
+                                        }
+                                    },
+                                }
+                            }
+                        },
+                    },
+                    "503": {"description": "Reap failed"},
                 },
             }
         },
@@ -3345,6 +3556,25 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             )
         return JSONResponse(result)
 
+    async def post_reap_merged_sessions(request: Request) -> Response:
+        """Manual trigger for the merged-session reaper (#1110).
+
+        Runs ``_reap_merged_sessions_tick`` on demand so operators can reap
+        detached interactive MERGE sessions without waiting for the next slow-
+        cadence tick.  The daemon owns the canonical board, so routing here is
+        correct for thin-client ``coord sessions --reap-merged`` calls.
+        """
+        from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
+
+        try:
+            reaped = await run_in_threadpool(_reap_merged_sessions_tick, config)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "reap-merged-sessions failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"reaped": reaped})
+
     def _lifespan(_app: Starlette):  # noqa: ANN202
         """#625: a dispatch-free passive reconcile tick.
 
@@ -3543,6 +3773,22 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                             )
                     except Exception:  # noqa: BLE001
                         log.warning("merge reconcile tick failed", exc_info=True)
+                    # Step 5b: reap detached interactive MERGE sessions whose
+                    # board row just flipped to 'merged' (above).  Independent
+                    # try/except — a reap failure must never silence the issues-
+                    # sync step below.
+                    try:
+                        reaped = await run_in_threadpool(
+                            _reap_merged_sessions_tick, config
+                        )
+                        if reaped:
+                            log.info(
+                                "reap-merged: killed %d detached merge session(s): %s",
+                                len(reaped),
+                                ", ".join(reaped),
+                            )
+                    except Exception:  # noqa: BLE001
+                        log.warning("reap-merged-sessions tick failed", exc_info=True)
                     try:
                         synced = await run_in_threadpool(
                             _sync_issues_tick, config
@@ -3615,6 +3861,9 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/diagnose", post_diagnose, methods=["POST"]),
         Route("/test-plan", post_test_plan, methods=["POST"]),
         Route("/housekeeping", post_housekeeping, methods=["POST"]),
+        Route(
+            "/reap-merged-sessions", post_reap_merged_sessions, methods=["POST"]
+        ),
     ]
     # #757: served OpenAPI 3 spec + Swagger UI docs page. Not exempted from
     # the bearer-auth middleware below (only /healthz is) — "behind the
