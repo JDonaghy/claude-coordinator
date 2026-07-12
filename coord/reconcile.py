@@ -237,6 +237,71 @@ def _capture_tokens_best_effort(assignment_id: str, entry: dict) -> None:
         pass
 
 
+def _build_retry_briefing(failed: Assignment, repo_cfg) -> str:
+    """#1101: reconstruct a real briefing for a retried assignment.
+
+    ``failed.briefing`` is frequently empty or unhelpful by the time a
+    failed assignment is retried — a `work` assignment's fully-assembled
+    briefing (issue body + board context) is built at initial-dispatch
+    time and not always persisted back onto the stored ``Assignment``.
+    Replaying it verbatim can hand the retried worker nothing at all,
+    which reproduced as the worker exiting in one turn with 0 commits
+    (silently reclassified as "advisory" instead of a broken dispatch).
+
+    This rebuilds something the worker can act on:
+    - the original briefing text when present, else a fresh fetch of the
+      issue body from GitHub (mirrors ``coord assign``'s own
+      auto-generate-from-issue-body fallback) so the briefing is never
+      blank;
+    - continuation instructions when the failed assignment already has a
+      branch (mirrors the equivalent ``coord fix`` briefing in
+      ``plan_followup.py``): don't start over, inspect what's already
+      committed;
+    - the recorded failure reason, so the worker knows why the previous
+      attempt stopped instead of re-discovering it from scratch.
+    """
+    base = (failed.briefing or "").strip()
+    if not base and repo_cfg is not None:
+        try:
+            from coord import github_ops  # noqa: PLC0415
+
+            issue_data = github_ops.get_issue(repo_cfg.github, failed.issue_number)
+            issue_body = issue_data.get("body", "")
+            if issue_body:
+                base = f"Issue #{failed.issue_number}: {failed.issue_title}\n\n{issue_body}"
+        except RuntimeError:
+            pass  # best-effort — fall through with whatever we have
+
+    sections: list[str] = []
+    if failed.branch:
+        default_branch = (repo_cfg.default_branch if repo_cfg is not None else None) or "main"
+        sections.append(
+            "## Retry — continuing existing work\n"
+            f"This is a retry of a previously failed assignment "
+            f"({failed.assignment_id}). The previous worker's branch "
+            f"`{failed.branch}` already exists and may carry real, "
+            f"committed work — you are continuing it, NOT starting over.\n"
+            f"Run `git fetch origin && git log --oneline "
+            f"origin/{default_branch}..HEAD` to see what's already done, "
+            f"and `git diff origin/{default_branch}...HEAD` for the full "
+            f"diff, before writing any new code."
+        )
+    if failed.failure_reason:
+        sections.append(f"## Why the previous attempt failed\n{failed.failure_reason}")
+    if base:
+        sections.append(f"## Task\n{base}")
+    if not sections:
+        # Nothing stored, nothing fetched, no branch context either — this
+        # is exactly the silent-empty-briefing failure mode from #1101.
+        sections.append(
+            f"Issue #{failed.issue_number}: {failed.issue_title}\n\n"
+            f"(No stored briefing or issue body was available to "
+            f"reconstruct this retry — investigate issue "
+            f"#{failed.issue_number} directly.)"
+        )
+    return "\n\n".join(sections)
+
+
 def _reassign(
     failed: Assignment, board: Board, config: Config,
     *,
@@ -306,21 +371,31 @@ def _reassign(
     retry_model_wire = config.models.resolve(retry_model)
 
     repo_cfg = config.repo(failed.repo_name)
+    retry_briefing = _build_retry_briefing(failed, repo_cfg)
     payload = {
         "repo_name": failed.repo_name,
         "repo_path": repo_path,
         "issue_number": failed.issue_number,
         "issue_title": f"[retry] {failed.issue_title}",
-        "briefing": failed.briefing,
+        "briefing": retry_briefing,
         "files_allowed": failed.files_allowed,
         "files_forbidden": failed.files_forbidden,
         "pull_repos": [],
         "type": "work",
         "model": retry_model_wire,
         # #255: retry inherits the repo's configured default branch as the
-        # worker's integration base.
+        # worker's integration base (the start point / rebase target).
         "branch": (repo_cfg.default_branch if repo_cfg is not None else None) or "main",
     }
+    # #1101: continue the failed assignment's actual branch instead of
+    # silently forking a fresh one off the repo default — any real work it
+    # already committed and pushed must not be orphaned by a retry. Mirrors
+    # the `target_branch` wire field `--fix-of`/`--rework-of`/
+    # `_dispatch_followup` already use; the agent checks out this exact
+    # branch (hard-reset to the remote tip) when it exists on origin, and
+    # falls back to a fresh branch off `branch` above when it doesn't.
+    if failed.branch:
+        payload["target_branch"] = failed.branch
 
     url = f"http://{machine.host}:{AGENT_PORT}/assign"
     try:
@@ -337,12 +412,17 @@ def _reassign(
         issue_title=f"[retry] {failed.issue_title}",
         files_allowed=failed.files_allowed,
         files_forbidden=failed.files_forbidden,
-        briefing=failed.briefing,
+        briefing=retry_briefing,
         assignment_id=agent_response.get("id") or uuid.uuid4().hex[:12],
         status="running",
         dispatched_at=time.time(),
         type="work",
         model=retry_model,
+        # #1101: record the continued branch on the board immediately
+        # instead of waiting for a later reconcile backfill from agent
+        # /status — the retry payload above already told the agent to
+        # check out `failed.branch` via target_branch.
+        branch=failed.branch,
     )
     board.active.append(retry_assignment)
 

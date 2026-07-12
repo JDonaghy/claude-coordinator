@@ -719,6 +719,208 @@ class TestReassignModel:
         assert payload["model"] == "opus"
 
 
+# ── #1101: reassign continues the failed branch and rebuilds the briefing ──
+
+
+def _reassign_cfg() -> Config:
+    return Config(
+        repos=[Repo(name="api", github="acme/api")],
+        machines=[
+            Machine(
+                name="laptop",
+                host="laptop.tailnet",
+                repos=["api"],
+                repo_paths={"api": "/tmp/api"},
+            ),
+            Machine(
+                name="server",
+                host="server.tailnet",
+                repos=["api"],
+                repo_paths={"api": "/tmp/api"},
+            ),
+        ],
+        models=ModelsConfig(default="sonnet"),
+    )
+
+
+class TestReassignBranchContinuity:
+    @patch("coord.reconcile.httpx.post")
+    def test_reassign_carries_failed_branch_as_target_branch(
+        self, mock_post: MagicMock
+    ) -> None:
+        """A retry must continue the failed assignment's actual branch
+        (via target_branch — the same wire field --fix-of/--rework-of use)
+        instead of silently forking a fresh one off the repo default."""
+        from coord.reconcile import _reassign
+        from coord.models import Board
+
+        resp = MagicMock()
+        resp.json.return_value = {"id": "newid"}
+        mock_post.return_value = resp
+
+        board = Board()
+        failed = Assignment(
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=1,
+            issue_title="t",
+            briefing="b",
+            assignment_id="oldid",
+            status="failed",
+            model="sonnet",
+            branch="issue-1-existing-work",
+        )
+
+        result = _reassign(failed, board, _reassign_cfg())
+        assert result is not None
+
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["target_branch"] == "issue-1-existing-work"
+        # The base "branch" stays the repo default — it's the rebase/start
+        # point, not the branch to check out.
+        assert payload["branch"] == "main"
+        assert result.branch == "issue-1-existing-work"
+
+    @patch("coord.reconcile.httpx.post")
+    def test_reassign_omits_target_branch_when_failed_has_none(
+        self, mock_post: MagicMock
+    ) -> None:
+        """A plan-only failed assignment (no branch) must not invent one —
+        the retry should branch fresh, same as before #1101."""
+        from coord.reconcile import _reassign
+        from coord.models import Board
+
+        resp = MagicMock()
+        resp.json.return_value = {"id": "newid"}
+        mock_post.return_value = resp
+
+        board = Board()
+        failed = Assignment(
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=1,
+            issue_title="t",
+            briefing="b",
+            assignment_id="oldid",
+            status="failed",
+            model="sonnet",
+            branch=None,
+        )
+
+        result = _reassign(failed, board, _reassign_cfg())
+        assert result is not None
+
+        payload = mock_post.call_args.kwargs["json"]
+        assert "target_branch" not in payload
+        assert result.branch is None
+
+
+class TestReassignBriefing:
+    @patch("coord.reconcile.httpx.post")
+    def test_reassign_reuses_existing_briefing(self, mock_post: MagicMock) -> None:
+        """When the failed assignment already carries real briefing text,
+        the retry should reuse it (wrapped with continuation context) rather
+        than re-fetching from GitHub."""
+        from coord.reconcile import _reassign
+        from coord.models import Board
+
+        resp = MagicMock()
+        resp.json.return_value = {"id": "newid"}
+        mock_post.return_value = resp
+
+        board = Board()
+        failed = Assignment(
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=1,
+            issue_title="t",
+            briefing="Fix the widget so it renders correctly.",
+            assignment_id="oldid",
+            status="failed",
+            model="sonnet",
+            branch="issue-1-existing-work",
+        )
+
+        with patch("coord.github_ops.get_issue") as mock_get_issue:
+            result = _reassign(failed, board, _reassign_cfg())
+            mock_get_issue.assert_not_called()
+
+        assert result is not None
+        payload = mock_post.call_args.kwargs["json"]
+        assert "Fix the widget so it renders correctly." in payload["briefing"]
+        assert "continuing" in payload["briefing"].lower()
+        assert result.briefing == payload["briefing"]
+
+    @patch("coord.reconcile.httpx.post")
+    def test_reassign_fetches_issue_when_briefing_empty(
+        self, mock_post: MagicMock
+    ) -> None:
+        """#1101 repro: an empty stored briefing must not be replayed
+        verbatim (the worker gets nothing and exits in one turn). Fall back
+        to fetching the issue body fresh from GitHub."""
+        from coord.reconcile import _reassign
+        from coord.models import Board
+
+        resp = MagicMock()
+        resp.json.return_value = {"id": "newid"}
+        mock_post.return_value = resp
+
+        board = Board()
+        failed = Assignment(
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=1,
+            issue_title="t",
+            briefing="",
+            assignment_id="oldid",
+            status="failed",
+            model="sonnet",
+            branch="issue-1-existing-work",
+        )
+
+        with patch(
+            "coord.github_ops.get_issue",
+            return_value={"body": "Do the actual thing described here."},
+        ) as mock_get_issue:
+            result = _reassign(failed, board, _reassign_cfg())
+            mock_get_issue.assert_called_once_with("acme/api", 1)
+
+        assert result is not None
+        payload = mock_post.call_args.kwargs["json"]
+        assert "Do the actual thing described here." in payload["briefing"]
+        assert payload["briefing"].strip() != ""
+
+    @patch("coord.reconcile.httpx.post")
+    def test_reassign_includes_failure_reason(self, mock_post: MagicMock) -> None:
+        """The retried worker should be told why the previous attempt
+        failed instead of re-discovering it from scratch."""
+        from coord.reconcile import _reassign
+        from coord.models import Board
+
+        resp = MagicMock()
+        resp.json.return_value = {"id": "newid"}
+        mock_post.return_value = resp
+
+        board = Board()
+        failed = Assignment(
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=1,
+            issue_title="t",
+            briefing="Fix the widget.",
+            assignment_id="oldid",
+            status="failed",
+            model="sonnet",
+            branch="issue-1-existing-work",
+            failure_reason="blocked on an external dependency",
+        )
+
+        result = _reassign(failed, board, _reassign_cfg())
+        assert result is not None
+        payload = mock_post.call_args.kwargs["json"]
+        assert "blocked on an external dependency" in payload["briefing"]
+
+
 # ── Assignment dataclass backward compatibility ────────────────────────────
 
 

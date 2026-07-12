@@ -1300,3 +1300,9 @@ def retry(assignment_id: str, config_path: Path) -> None:
         f"Retried: {result.machine_name} → {result.repo_name} "
         f"#{result.issue_number} (assignment {result.assignment_id})"
     )
+    # #1101: surface the continued branch so it's obvious the retry picked
+    # up existing work instead of forking a fresh branch off the default.
+    if result.branch:
+        click.echo(f"  continuing branch: {result.branch}")
+    else:
+        click.echo("  no prior branch recorded — starting a fresh branch")
