@@ -1186,6 +1186,34 @@ class TestRefreshEntryAssignment:
         assert len(items) == 1
         assert items[0].assignment_id == "fix1"
 
+    def test_preserves_assignment_type_across_review_bounce(self, coord_db) -> None:
+        # #1077 (review round 1): a mock-author entry's assignment_type must
+        # survive a review bounce. auto_loop._dispatch_fix_for_review
+        # unconditionally dispatches fix workers with type="work" regardless
+        # of the original assignment's type, and that fix assignment is what
+        # reaches refresh_entry_assignment once its own re-review approves
+        # (via _advance_pipeline). If assignment_type were re-keyed from the
+        # fix assignment here, every ordinary request-changes round trip on a
+        # Gate A mock-author PR would flip the entry back to "work" and
+        # re-enable close-on-merge -- reproducing the original #1077 bug.
+        orig = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="orig", type="mock-author", branch="worker/orig",
+            status="done",
+        )
+        mq.enqueue(orig, repo_github="acme/api", target_branch="main")
+        assert load_queue()[0].assignment_type == "mock-author"
+
+        # Simulate the bounce: fix worker is dispatched with type="work"
+        # hardcoded, same branch as the original.
+        fix = self._work("fix1", branch="worker/orig")
+        assert fix.type == "work"
+        result = mq.refresh_entry_assignment(fix, repo_github="acme/api", target_branch="main")
+        assert result is True
+        items = load_queue()
+        assert items[0].assignment_id == "fix1"  # assignment_id does re-key
+        assert items[0].assignment_type == "mock-author"  # type does NOT
+
     def test_clears_stale_review_error(self, coord_db) -> None:
         orig = Assignment(
             machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
