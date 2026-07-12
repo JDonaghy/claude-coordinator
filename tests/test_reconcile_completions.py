@@ -157,6 +157,54 @@ def test_polls_each_agent_at_most_once() -> None:
     assert calls == ["dellserver"]  # one poll for the shared host, not two
 
 
+def test_captures_branch_from_agent_entry_when_board_branch_missing() -> None:
+    """#1083: the board's own Assignment.branch is still None the FIRST time
+    this tick observes a freshly-completed assignment (this daemon tick runs
+    well ahead of any human-triggered `coord notify`, which is the only other
+    place branch normally gets captured). Passing that stale None straight
+    through — as this used to do unconditionally — left `type='test-author'`
+    rows permanently branch=NULL once the agent's completed-history entry
+    rolled off before `coord notify` ever ran. Fall back to the agent's live
+    entry (populated by AgentServer._reap from the worktree HEAD)."""
+    rec = _Recorder()
+    running = _running("ta1", atype="test-author", branch=None)
+    out = reconcile_completed_assignments(
+        _config(),
+        board=_board(running),
+        agent_status_fn=lambda host: {
+            "completed": [{
+                "id": "ta1", "status": "done",
+                "branch": "issue-1041-test-author-ms-33-acceptance-suite",
+            }]
+        },
+        update_state_fn=rec,
+        capture_plan=False,
+    )
+    assert len(out) == 1
+    assert rec.calls == [
+        {"assignment_id": "ta1", "terminal_status": "done",
+         "branch": "issue-1041-test-author-ms-33-acceptance-suite",
+         "review_state": None}
+    ]
+
+
+def test_prefers_board_branch_over_agent_entry_when_both_present() -> None:
+    """When the board already has a branch recorded, it wins — the agent
+    entry is only a fallback for the (branch is falsy) case."""
+    rec = _Recorder()
+    running = _running("w1", atype="work", branch="issue-1-x")
+    reconcile_completed_assignments(
+        _config(),
+        board=_board(running),
+        agent_status_fn=lambda host: {
+            "completed": [{"id": "w1", "status": "done", "branch": "some-other-branch"}]
+        },
+        update_state_fn=rec,
+        capture_plan=False,
+    )
+    assert rec.calls[0]["branch"] == "issue-1-x"
+
+
 def test_unknown_machine_skipped() -> None:
     # A running assignment on a machine absent from config → no host → skip, no crash.
     rec = _Recorder()

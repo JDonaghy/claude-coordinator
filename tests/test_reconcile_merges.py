@@ -323,6 +323,46 @@ def test_skips_non_work_and_non_done(monkeypatch, config) -> None:
     assert actions == []
 
 
+# ── #1083 test-author branch backfill inherits the #611 sweep ──────────────
+
+
+def test_backfills_branch_for_test_author_type(monkeypatch, config) -> None:
+    """type='test-author' rows never went through `coord.dispatch.dispatch()`
+    (see coord/test_author.py), so they never got the same #611 safety net a
+    type='work' row does when its branch is left NULL. Sweep (a) must cover
+    test-author too so `coord pr <aid>` doesn't need a manual DB patch."""
+    a = _done_work(assignment_id="ta1", issue_number=1041, branch=None)
+    a.type = "test-author"
+    board = Board(completed=[a])
+    writes = _patch_probes(
+        monkeypatch,
+        remote_branches={"issue-1041-test-author-ms-33-acceptance-suite", "main"},
+        terminal=False,
+    )
+
+    actions = reconcile_board_merges(board, config)
+
+    assert a.branch == "issue-1041-test-author-ms-33-acceptance-suite"
+    assert ("branch", "ta1") in writes
+    assert any("backfill branch" in s for s in actions)
+
+
+def test_test_author_not_marked_merged_by_sweep_b(monkeypatch, config) -> None:
+    """Sweep (a)'s branch backfill covers test-author (#1083), but sweep (b)'s
+    out-of-band-merge / review-state-settle semantics are pipeline-specific
+    (Work → Test → Review → Merge) and stay type='work'-only — a test-author
+    row must never get silently flipped to 'merged' by this sweep."""
+    a = _done_work(assignment_id="ta2", issue_number=1041, branch="issue-1041-ta")
+    a.type = "test-author"
+    board = Board(completed=[a])
+    writes = _patch_probes(monkeypatch, terminal=True)
+
+    reconcile_board_merges(board, config)
+
+    assert a.status == "done"
+    assert ("merged", "ta2") not in writes
+
+
 # ── #721 close stale PRs ──────────────────────────────────────────────────────
 
 
