@@ -1832,9 +1832,35 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
     except OSError:
         _config_mtime = None
 
+    # Short-TTL cache for the computed /board projection so burst polls from the
+    # TUI don't each pay the full board_projection + merge-plan + stage-projection
+    # recomputation (~465-issue load measured in the issue). Keyed to nothing
+    # (one board per daemon instance). TTL controlled by COORD_BOARD_CACHE_TTL
+    # (default 1.5 s). Busted immediately on board-mutating POSTs so a user
+    # action is visible on the very next poll without waiting out the TTL.
+    _board_cache: dict | None = None
+    _board_cache_at: float = 0.0
+
+    def _bust_board_cache() -> None:
+        """Invalidate the /board response cache.
+
+        Called from board-mutating POST handlers so user actions are
+        visible on the very next poll without waiting out the TTL.
+        Also called from _refresh_config() when the config actually
+        changed on disk, because a config reload can change the merge
+        plan / gate decisions and thus the computed projection.
+        """
+        nonlocal _board_cache_at
+        _board_cache_at = 0.0
+
     def _refresh_config() -> None:
         nonlocal config, _config_mtime
+        old_cfg = config
         config, _config_mtime = _reload_config_if_stale(config, _config_mtime)
+        if config is not old_cfg:
+            # Config actually changed on disk — the cached projection may now
+            # reflect stale gate decisions (e.g. reviews.enabled toggled).
+            _bust_board_cache()
 
     async def healthz(request: Request) -> JSONResponse:  # noqa: ARG001
         return JSONResponse({"status": "ok", "schema_version": SCHEMA_VERSION})
@@ -1844,335 +1870,381 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         # merge plan / staging / stage-projection below, all of which read
         # `config` for real gating decisions (reviews.enabled, default_gates,
         # require_plan, merge/milestone auto-* flags via config.repo(...)).
+        # _refresh_config() is fast (a stat() in the common case) so we run it
+        # on every request, even when returning a cached result, to keep
+        # config reloads prompt.
         _refresh_config()
+
+        # Part 2 (cache): serve a cached projection if it's still within the TTL.
+        # Burst polls (TUI polls every ~2 s) hit the cache; the real computation
+        # only runs once per TTL window.  Cache is busted immediately by the
+        # board-mutating POST handlers below so user actions are visible on the
+        # very next poll without waiting out the TTL.
+        import time as _time  # noqa: PLC0415
+        _ttl = float(os.getenv("COORD_BOARD_CACHE_TTL", "1.5"))
+        _now = _time.monotonic()
+        nonlocal _board_cache, _board_cache_at
+        if _board_cache is not None and (_now - _board_cache_at) < _ttl:
+            return JSONResponse(_board_cache)
+
+        # Part 1 (threadpool): offload all synchronous computation to a worker
+        # thread so the async event loop stays free for /healthz, POST handlers,
+        # and the tick loop while a slow board_projection or merge-plan runs.
+        # Every other heavy handler in this file already uses this pattern
+        # (run_in_threadpool + local _build/_run); board() was the only outlier.
+        from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
+
+        # Capture config NOW (after refresh) so _build() uses the same Config
+        # snapshot throughout — prevents a mid-computation config swap if another
+        # concurrent request calls _refresh_config() while _build() is running.
+        _cfg = config
+
+        class _BoardReadError(Exception):
+            """Sentinel: board_projection() failed; propagated from threadpool."""
+
+        def _build() -> dict:
+            # ── board projection ──────────────────────────────────────────────
+            try:
+                projection = store.board_projection()
+            except Exception as e:  # noqa: BLE001
+                raise _BoardReadError(str(e)) from e
+
+            # #776/#778/#550: inject server-side merge plan (ordered, gate-
+            # annotated), staging section, and per-issue stage/gate projection
+            # so thin clients get status + reason without re-implementing gate
+            # logic.  All three are derived from the same board snapshot + CI
+            # store, built once here and shared below so a concurrent DB write
+            # can't split them across two snapshots and `list_checks_for_pr`
+            # (a real `gh` round trip) isn't paid twice per request.  Computed
+            # after the projection so a plan failure never 503s the board.
+            _board = None
+            _ci = None
+            try:
+                from coord import merge_queue as _mq  # noqa: PLC0415
+                from coord.ci_store import build_ci_store as _build_ci_store  # noqa: PLC0415
+                from coord.state import build_board as _build_board  # noqa: PLC0415
+                from dataclasses import asdict as _asdict  # noqa: PLC0415
+                _board = _build_board()
+                # Build ci_store so "CI running" / "CI failed" reasons appear
+                # in the plan.  Fail-open: a construction error returns None
+                # which disables the CI gate without blanking the whole plan.
+                try:
+                    _ci = _build_ci_store(_cfg.ci_store.type)
+                except Exception:  # noqa: BLE001
+                    _ci = None
+                projection["merge_plan"] = [
+                    _asdict(pm) for pm in _mq.plan(_board, _cfg, ci_store=_ci)
+                ]
+                # #778: staging section — approved/done work not yet in the
+                # queue.  Reuses the same _board snapshot built above.
+                # Fail-open: any error returns an empty list rather than 503.
+                try:
+                    projection["merge_staging"] = [
+                        _asdict(si) for si in _mq.staging_items(_board, _cfg)
+                    ]
+                except Exception:  # noqa: BLE001
+                    projection["merge_staging"] = []
+            except Exception:  # noqa: BLE001 — plan failure must not blank the board
+                projection["merge_plan"] = []
+                projection["merge_staging"] = []
+            # #550: server-computed per-issue stage/gate projection — generalizes
+            # the #776/#778 pattern to coord-tui's `pipeline.rs` stage-status
+            # functions.  Reuses the `_board`/`_ci` snapshot built above; only
+            # falls back to a fresh `build_board()` if that block above failed
+            # before reaching it (e.g. a DB error), so the common case never
+            # double-builds the board or double-fetches CI checks.  Fail-open:
+            # an error returns an empty list rather than 503ing the board.
+            try:
+                from coord import stage_projection as _sp  # noqa: PLC0415
+                from coord.merge_queue import load_queue as _load_queue  # noqa: PLC0415
+
+                if _board is None:
+                    from coord.state import build_board as _build_board2  # noqa: PLC0415
+                    _board = _build_board2()
+                projection["issue_stage_projection"] = _sp.compute_board_stage_projection(
+                    issues=projection.get("issues", []),
+                    assignments=list(_board.active) + list(_board.completed),
+                    merge_queue_items=_load_queue(),
+                    default_gates=list(_cfg.pipeline.default_gates),
+                    require_plan=bool(_cfg.dispatch.require_plan),
+                    ci_store=_ci,
+                )
+            except Exception:  # noqa: BLE001 — projection failure must not blank the board
+                projection["issue_stage_projection"] = []
+            # #795 Phase 3b: per-milestone work-order rank + ready frontier.
+            # Parsed from each tracking issue's (label="epic") `## Work order`
+            # block using coord.milestone_order (Phase 0); the TUI renders rank,
+            # next-up, and blocked-on badges on Pipeline milestone cards without
+            # re-implementing the DAG logic in Rust.  Fail-open: any
+            # per-milestone error produces an empty node list, not a 503.
+            try:
+                from coord.milestone_order import (  # noqa: PLC0415
+                    TRACKING_ISSUE_LABEL as _TRACKING_LABEL,
+                    parse_work_order as _parse_wo,
+                    ready_frontier as _ready_frontier,
+                )
+
+                if _board is None:
+                    try:
+                        from coord.state import build_board as _build_board3  # noqa: PLC0415
+                        _board = _build_board3()
+                    except Exception:  # noqa: BLE001 — e.g. thread-safety on test in-memory DB
+                        from coord.models import Board as _Board  # noqa: PLC0415
+                        _board = _Board()  # fallback: empty board → no claim blocking
+
+                # Build an open-issue-number set per repo for terminal detection.
+                # Issues absent from this set (missing entirely or state='closed')
+                # are treated as terminal — mirrors the Rust DAG view's semantics.
+                _open_by_repo: dict[str, set[int]] = {}
+                for _oi in projection.get("issues", []):
+                    if _oi.get("state") == "open":
+                        _rn = _oi.get("repo_name", "")
+                        if _rn:
+                            _open_by_repo.setdefault(_rn, set()).add(_oi["number"])
+
+                _milestone_work_orders: list[dict] = []
+                for _ti in projection.get("issues", []):
+                    # Only process tracking issues (carry the "epic" label).
+                    _labels = _ti.get("labels") or []
+                    if _TRACKING_LABEL not in _labels:
+                        continue
+                    _repo_name = _ti.get("repo_name", "")
+                    if not _repo_name:
+                        continue
+                    _body = _ti.get("body") or ""
+                    try:
+                        _wo = _parse_wo(_body)
+                    except Exception:  # noqa: BLE001 — bad work order: skip this tracking issue
+                        continue
+                    if not _wo.nodes:
+                        continue
+
+                    # terminal = in work order but NOT currently open for this repo.
+                    _open_nums = _open_by_repo.get(_repo_name, set())
+                    _terminal: set[int] = {
+                        n.issue_number for n in _wo.nodes
+                        if n.issue_number not in _open_nums
+                    }
+
+                    # Resolve coord-local repo → GitHub slug from config.
+                    _repo_cfg = _cfg.repo(_repo_name)
+                    _repo_github = _repo_cfg.github if _repo_cfg is not None else _repo_name
+
+                    # Compute frontier: board-only claim check (no remote branch
+                    # lookup) to keep the /board endpoint fast.
+                    try:
+                        _frontier = _ready_frontier(
+                            _wo,
+                            _board,
+                            repo_name=_repo_name,
+                            repo_github=_repo_github,
+                            terminal_issues=_terminal,
+                            branch_lookup=lambda _r, _i: [],  # skip slow gh call
+                        )
+                    except Exception:  # noqa: BLE001
+                        # Fallback: mark nodes ready iff all after-deps are terminal.
+                        from coord.milestone_order import FrontierEntry as _FE, Frontier as _Fr  # noqa: PLC0415
+                        _ready_list = [
+                            _FE(n.issue_number, n.group)
+                            for n in _wo.nodes
+                            if n.issue_number not in _terminal
+                            and all(d in _terminal for d in n.after)
+                        ]
+                        _frontier = _Fr(ready=tuple(_ready_list), blocked=())
+
+                    _ready_nums = {fe.issue_number for fe in _frontier.ready}
+                    _blocked_by_num = {bn.issue_number: bn for bn in _frontier.blocked}
+
+                    _nodes = []
+                    for _rank, _node in enumerate(_wo.nodes):
+                        if _node.issue_number in _terminal:
+                            continue  # done — skip from projection
+                        _is_next_up = _node.issue_number in _ready_nums
+                        _bn = _blocked_by_num.get(_node.issue_number)
+                        if _is_next_up:
+                            # In frontier.ready: deps met, unclaimed, uncontested
+                            # — the dispatcher's next candidate for this milestone.
+                            _is_ready = True
+                            _blocked_on: list[int] = []
+                        elif _bn is not None and not _bn.waiting_on_deps:
+                            # In frontier.blocked, but NOT for unmet deps — an
+                            # active claim (assignment/branch elsewhere) or a
+                            # conflict-checker hit. Deps ARE satisfied, so this
+                            # is "ready" in the dependency sense, just not the
+                            # next thing to dispatch (#795 review: previously
+                            # this fell through to the "waiting on deps" branch
+                            # below with an empty `_node.after` remainder,
+                            # producing a dangling blocked_on with nothing to
+                            # point at — distinguish it instead of reporting a
+                            # phantom dependency).
+                            _is_ready = True
+                            _blocked_on = []
+                        elif _bn is not None:
+                            # In frontier.blocked, waiting on unmet deps.
+                            _is_ready = False
+                            _blocked_on = list(_bn.waiting_on_deps)
+                        else:
+                            # `ready_frontier` raised and we fell back to
+                            # unmet-deps-only (see except-block above) — no
+                            # claim/conflict info is available in the fallback.
+                            _blocked_on = [d for d in _node.after if d not in _terminal]
+                            _is_ready = not _blocked_on
+                        _nodes.append({
+                            "issue_number": _node.issue_number,
+                            "rank": _rank,
+                            "ready": _is_ready,
+                            "next_up": _is_next_up,  # ready + unclaimed = next-up
+                            "blocked_on": _blocked_on,
+                        })
+
+                    if _nodes:
+                        _milestone_work_orders.append({
+                            "repo_name": _repo_name,
+                            "tracking_issue": _ti["number"],
+                            "milestone_title": _ti.get("milestone_title") or "",
+                            "nodes": _nodes,
+                        })
+
+                projection["milestone_work_orders"] = _milestone_work_orders
+            except Exception:  # noqa: BLE001 — work-order failure must not blank the board
+                projection["milestone_work_orders"] = []
+            # #975: milestone plan-roster — reuse coord.plans.aggregate_repo_plans
+            # server-side so the Plans TUI panel gets one row per milestone/epic
+            # (ready / blocked / in-flight / done counts, needs_you attention
+            # signals) without shelling out from the client. Sourced from the
+            # same projection["issues"] + build_board() snapshot as
+            # milestone_work_orders above — no extra `gh` round trip. Fail-open:
+            # any error produces an empty list rather than 503ing the board.
+            # #976: always stamp the capability flag — even a daemon that hits the
+            # per-repo `except` below (or a downstream error) still *supports*
+            # plan-roster; only its computation failed this tick. Without this,
+            # the TUI can't tell "genuinely zero milestones" apart from "daemon
+            # predates #975/#976 and never sends `plan_roster` at all" — both
+            # rendered as an identical, silent "0 plans" empty state (the #976
+            # review finding). A pre-#975 daemon never runs this line, so the
+            # field is simply absent from its JSON and the client's
+            # `#[serde(default)]` leaves `plan_roster_supported` false.
+            projection["plan_roster_supported"] = True
+            try:
+                from coord.plans import aggregate_repo_plans as _aggregate_repo_plans  # noqa: PLC0415
+
+                if _board is None:
+                    try:
+                        from coord.state import build_board as _build_board4  # noqa: PLC0415
+                        _board = _build_board4()
+                    except Exception:  # noqa: BLE001 — e.g. thread-safety on test in-memory DB
+                        from coord.models import Board as _Board2  # noqa: PLC0415
+                        _board = _Board2()
+
+                # Group issues by coord-local repo, converting the DAO wire
+                # shape (labels: list[str], flat milestone_number/title) to the
+                # dict shape coord.plans expects (labels: [{"name": ...}],
+                # nested milestone). Only open issues participate — closed epics
+                # are collected separately below so a milestone whose tracking
+                # epic was closed still resolves via #974's
+                # closed_tracking_issues arg.
+                _repo_open_issues: dict[str, list[dict]] = {}
+                _repo_closed_epics: dict[str, list[dict]] = {}
+                _repo_milestones: dict[str, dict[int, dict]] = {}
+                for _oi in projection.get("issues", []):
+                    _rn = _oi.get("repo_name", "")
+                    if not _rn:
+                        continue
+                    _label_names = _oi.get("labels") or []
+                    _adapted = {
+                        "number": _oi.get("number"),
+                        "title": _oi.get("title", ""),
+                        "body": _oi.get("body") or "",
+                        "state": _oi.get("state"),
+                        "labels": [{"name": name} for name in _label_names],
+                        "milestone": (
+                            {
+                                "number": _oi.get("milestone_number"),
+                                "title": _oi.get("milestone_title") or "",
+                            }
+                            if _oi.get("milestone_number") is not None
+                            else None
+                        ),
+                    }
+                    if _oi.get("state") == "open":
+                        _repo_open_issues.setdefault(_rn, []).append(_adapted)
+                        _ms_num = _oi.get("milestone_number")
+                        if _ms_num is not None:
+                            _repo_milestones.setdefault(_rn, {}).setdefault(
+                                _ms_num,
+                                {
+                                    "number": _ms_num,
+                                    "title": _oi.get("milestone_title") or f"Milestone #{_ms_num}",
+                                },
+                            )
+                    elif "epic" in _label_names:
+                        # A closed epic — feed into closed_tracking_issues so
+                        # milestones whose tracking issue was tidied up still
+                        # resolve (mirrors coord/plans.py's #974 fix). Also
+                        # seed _repo_milestones from the epic's own
+                        # milestone_number: if every issue under a milestone
+                        # (epic included) is now closed, no *open* issue would
+                        # otherwise register the milestone, and the outer
+                        # aggregation loop below would never visit it at all —
+                        # silently dropping a finished-but-still-open-on-GitHub
+                        # milestone from the roster instead of surfacing it as
+                        # done.
+                        _repo_closed_epics.setdefault(_rn, []).append(_adapted)
+                        _ms_num = _oi.get("milestone_number")
+                        if _ms_num is not None:
+                            _repo_milestones.setdefault(_rn, {}).setdefault(
+                                _ms_num,
+                                {
+                                    "number": _ms_num,
+                                    "title": _oi.get("milestone_title") or f"Milestone #{_ms_num}",
+                                },
+                            )
+
+                _plan_roster: list[dict] = []
+                for _repo_name2, _milestones_by_num in _repo_milestones.items():
+                    _repo_cfg2 = _cfg.repo(_repo_name2)
+                    _repo_gh = _repo_cfg2.github if _repo_cfg2 is not None else _repo_name2
+                    _milestones_list = [
+                        _milestones_by_num[_k] for _k in sorted(_milestones_by_num.keys())
+                    ]
+                    try:
+                        _entries = _aggregate_repo_plans(
+                            repo_name=_repo_name2,
+                            repo_github=_repo_gh,
+                            milestones=_milestones_list,
+                            open_issues=_repo_open_issues.get(_repo_name2, []),
+                            board=_board,
+                            closed_tracking_issues=_repo_closed_epics.get(_repo_name2, []),
+                        )
+                    except Exception:  # noqa: BLE001 — per-repo fail-open
+                        continue
+                    for _entry in _entries:
+                        _plan_roster.append(_entry.to_dict())
+                projection["plan_roster"] = _plan_roster
+            except Exception:  # noqa: BLE001 — plan-roster failure must not blank the board
+                projection["plan_roster"] = []
+            # #978: GOAL.md pinned north-star header for the Plans panel.
+            # Fail-open to {"available": False} — a packaged/PyPI install has
+            # no repo root to read GOAL.md from (see coord/goal.py's
+            # `_resolve_goal_md_path`), and a parse failure must not blank the
+            # board.
+            try:
+                from coord.goal import read_goal_header as _read_goal_header  # noqa: PLC0415
+                projection["goal_header"] = _read_goal_header()
+            except Exception:  # noqa: BLE001 — goal-header failure must not blank the board
+                projection["goal_header"] = {"available": False}
+            return projection
+
         try:
-            projection = store.board_projection()
-        except Exception as e:  # noqa: BLE001 — surface a clean 503 rather than a stack trace
+            result = await run_in_threadpool(_build)
+        except _BoardReadError as e:
             return JSONResponse(
                 {"error": "board read failed", "detail": str(e)}, status_code=503
             )
-        # #776/#778/#550: inject server-side merge plan (ordered, gate-annotated),
-        # staging section, and per-issue stage/gate projection so thin clients get
-        # status + reason without re-implementing gate logic. All three are derived
-        # from the same board snapshot + CI store, built once here and shared below
-        # so a concurrent DB write can't split them across two snapshots and
-        # `list_checks_for_pr` (a real `gh` round trip) isn't paid twice per
-        # request. Computed after the projection so a plan failure never 503s the
-        # board.
-        _board = None
-        _ci = None
-        try:
-            from coord import merge_queue as _mq  # noqa: PLC0415
-            from coord.ci_store import build_ci_store as _build_ci_store  # noqa: PLC0415
-            from coord.state import build_board as _build_board  # noqa: PLC0415
-            from dataclasses import asdict as _asdict  # noqa: PLC0415
-            _board = _build_board()
-            # Build ci_store so "CI running" / "CI failed" reasons appear in the
-            # plan.  Fail-open: a construction error returns None which disables
-            # the CI gate without blanking the whole plan.
-            try:
-                _ci = _build_ci_store(config.ci_store.type)
-            except Exception:  # noqa: BLE001
-                _ci = None
-            projection["merge_plan"] = [
-                _asdict(pm) for pm in _mq.plan(_board, config, ci_store=_ci)
-            ]
-            # #778: staging section — approved/done work not yet in the queue.
-            # Reuses the same _board snapshot built above.  Fail-open: any
-            # error returns an empty list rather than 503ing the board.
-            try:
-                projection["merge_staging"] = [
-                    _asdict(si) for si in _mq.staging_items(_board, config)
-                ]
-            except Exception:  # noqa: BLE001
-                projection["merge_staging"] = []
-        except Exception:  # noqa: BLE001 — plan failure must not blank the board
-            projection["merge_plan"] = []
-            projection["merge_staging"] = []
-        # #550: server-computed per-issue stage/gate projection — generalizes
-        # the #776/#778 pattern to coord-tui's `pipeline.rs` stage-status
-        # functions.  Reuses the `_board`/`_ci` snapshot built above; only
-        # falls back to a fresh `build_board()` if that block above failed
-        # before reaching it (e.g. a DB error), so the common case never
-        # double-builds the board or double-fetches CI checks.  Fail-open:
-        # an error returns an empty list rather than 503ing the board.
-        try:
-            from coord import stage_projection as _sp  # noqa: PLC0415
-            from coord.merge_queue import load_queue as _load_queue  # noqa: PLC0415
-
-            if _board is None:
-                from coord.state import build_board as _build_board2  # noqa: PLC0415
-                _board = _build_board2()
-            projection["issue_stage_projection"] = _sp.compute_board_stage_projection(
-                issues=projection.get("issues", []),
-                assignments=list(_board.active) + list(_board.completed),
-                merge_queue_items=_load_queue(),
-                default_gates=list(config.pipeline.default_gates),
-                require_plan=bool(config.dispatch.require_plan),
-                ci_store=_ci,
-            )
-        except Exception:  # noqa: BLE001 — projection failure must not blank the board
-            projection["issue_stage_projection"] = []
-        # #795 Phase 3b: per-milestone work-order rank + ready frontier.
-        # Parsed from each tracking issue's (label="epic") `## Work order`
-        # block using coord.milestone_order (Phase 0); the TUI renders rank,
-        # next-up, and blocked-on badges on Pipeline milestone cards without
-        # re-implementing the DAG logic in Rust.  Fail-open: any per-milestone
-        # error produces an empty node list, not a 503.
-        try:
-            from coord.milestone_order import (  # noqa: PLC0415
-                TRACKING_ISSUE_LABEL as _TRACKING_LABEL,
-                parse_work_order as _parse_wo,
-                ready_frontier as _ready_frontier,
-            )
-
-            if _board is None:
-                try:
-                    from coord.state import build_board as _build_board3  # noqa: PLC0415
-                    _board = _build_board3()
-                except Exception:  # noqa: BLE001 — e.g. thread-safety on test in-memory DB
-                    from coord.models import Board as _Board  # noqa: PLC0415
-                    _board = _Board()  # fallback: empty board → no claim blocking
-
-            # Build an open-issue-number set per repo for terminal detection.
-            # Issues absent from this set (missing entirely or state='closed')
-            # are treated as terminal — mirrors the Rust DAG view's semantics.
-            _open_by_repo: dict[str, set[int]] = {}
-            for _oi in projection.get("issues", []):
-                if _oi.get("state") == "open":
-                    _rn = _oi.get("repo_name", "")
-                    if _rn:
-                        _open_by_repo.setdefault(_rn, set()).add(_oi["number"])
-
-            _milestone_work_orders: list[dict] = []
-            for _ti in projection.get("issues", []):
-                # Only process tracking issues (carry the "epic" label).
-                _labels = _ti.get("labels") or []
-                if _TRACKING_LABEL not in _labels:
-                    continue
-                _repo_name = _ti.get("repo_name", "")
-                if not _repo_name:
-                    continue
-                _body = _ti.get("body") or ""
-                try:
-                    _wo = _parse_wo(_body)
-                except Exception:  # noqa: BLE001 — bad work order: skip this tracking issue
-                    continue
-                if not _wo.nodes:
-                    continue
-
-                # terminal = in work order but NOT currently open for this repo.
-                _open_nums = _open_by_repo.get(_repo_name, set())
-                _terminal: set[int] = {
-                    n.issue_number for n in _wo.nodes
-                    if n.issue_number not in _open_nums
-                }
-
-                # Resolve coord-local repo → GitHub slug from config.
-                _repo_cfg = config.repo(_repo_name)
-                _repo_github = _repo_cfg.github if _repo_cfg is not None else _repo_name
-
-                # Compute frontier: board-only claim check (no remote branch
-                # lookup) to keep the /board endpoint fast.
-                try:
-                    _frontier = _ready_frontier(
-                        _wo,
-                        _board,
-                        repo_name=_repo_name,
-                        repo_github=_repo_github,
-                        terminal_issues=_terminal,
-                        branch_lookup=lambda _r, _i: [],  # skip slow gh call
-                    )
-                except Exception:  # noqa: BLE001
-                    # Fallback: mark nodes ready iff all after-deps are terminal.
-                    from coord.milestone_order import FrontierEntry as _FE, Frontier as _Fr  # noqa: PLC0415
-                    _ready_list = [
-                        _FE(n.issue_number, n.group)
-                        for n in _wo.nodes
-                        if n.issue_number not in _terminal
-                        and all(d in _terminal for d in n.after)
-                    ]
-                    _frontier = _Fr(ready=tuple(_ready_list), blocked=())
-
-                _ready_nums = {fe.issue_number for fe in _frontier.ready}
-                _blocked_by_num = {bn.issue_number: bn for bn in _frontier.blocked}
-
-                _nodes = []
-                for _rank, _node in enumerate(_wo.nodes):
-                    if _node.issue_number in _terminal:
-                        continue  # done — skip from projection
-                    _is_next_up = _node.issue_number in _ready_nums
-                    _bn = _blocked_by_num.get(_node.issue_number)
-                    if _is_next_up:
-                        # In frontier.ready: deps met, unclaimed, uncontested
-                        # — the dispatcher's next candidate for this milestone.
-                        _is_ready = True
-                        _blocked_on: list[int] = []
-                    elif _bn is not None and not _bn.waiting_on_deps:
-                        # In frontier.blocked, but NOT for unmet deps — an
-                        # active claim (assignment/branch elsewhere) or a
-                        # conflict-checker hit. Deps ARE satisfied, so this
-                        # is "ready" in the dependency sense, just not the
-                        # next thing to dispatch (#795 review: previously
-                        # this fell through to the "waiting on deps" branch
-                        # below with an empty `_node.after` remainder,
-                        # producing a dangling blocked_on with nothing to
-                        # point at — distinguish it instead of reporting a
-                        # phantom dependency).
-                        _is_ready = True
-                        _blocked_on = []
-                    elif _bn is not None:
-                        # In frontier.blocked, waiting on unmet deps.
-                        _is_ready = False
-                        _blocked_on = list(_bn.waiting_on_deps)
-                    else:
-                        # `ready_frontier` raised and we fell back to
-                        # unmet-deps-only (see except-block above) — no
-                        # claim/conflict info is available in the fallback.
-                        _blocked_on = [d for d in _node.after if d not in _terminal]
-                        _is_ready = not _blocked_on
-                    _nodes.append({
-                        "issue_number": _node.issue_number,
-                        "rank": _rank,
-                        "ready": _is_ready,
-                        "next_up": _is_next_up,  # ready + unclaimed = next-up
-                        "blocked_on": _blocked_on,
-                    })
-
-                if _nodes:
-                    _milestone_work_orders.append({
-                        "repo_name": _repo_name,
-                        "tracking_issue": _ti["number"],
-                        "milestone_title": _ti.get("milestone_title") or "",
-                        "nodes": _nodes,
-                    })
-
-            projection["milestone_work_orders"] = _milestone_work_orders
-        except Exception:  # noqa: BLE001 — work-order failure must not blank the board
-            projection["milestone_work_orders"] = []
-        # #975: milestone plan-roster — reuse coord.plans.aggregate_repo_plans
-        # server-side so the Plans TUI panel gets one row per milestone/epic
-        # (ready / blocked / in-flight / done counts, needs_you attention
-        # signals) without shelling out from the client. Sourced from the same
-        # projection["issues"] + build_board() snapshot as milestone_work_orders
-        # above — no extra `gh` round trip. Fail-open: any error produces an
-        # empty list rather than 503ing the board.
-        # #976: always stamp the capability flag — even a daemon that hits the
-        # per-repo `except` below (or a downstream error) still *supports*
-        # plan-roster; only its computation failed this tick. Without this,
-        # the TUI can't tell "genuinely zero milestones" apart from "daemon
-        # predates #975/#976 and never sends `plan_roster` at all" — both
-        # rendered as an identical, silent "0 plans" empty state (the #976
-        # review finding). A pre-#975 daemon never runs this line, so the
-        # field is simply absent from its JSON and the client's
-        # `#[serde(default)]` leaves `plan_roster_supported` false.
-        projection["plan_roster_supported"] = True
-        try:
-            from coord.plans import aggregate_repo_plans as _aggregate_repo_plans  # noqa: PLC0415
-
-            if _board is None:
-                try:
-                    from coord.state import build_board as _build_board4  # noqa: PLC0415
-                    _board = _build_board4()
-                except Exception:  # noqa: BLE001 — e.g. thread-safety on test in-memory DB
-                    from coord.models import Board as _Board2  # noqa: PLC0415
-                    _board = _Board2()
-
-            # Group issues by coord-local repo, converting the DAO wire shape
-            # (labels: list[str], flat milestone_number/title) to the dict
-            # shape coord.plans expects (labels: [{"name": ...}], nested
-            # milestone). Only open issues participate — closed epics are
-            # collected separately below so a milestone whose tracking epic
-            # was closed still resolves via #974's closed_tracking_issues arg.
-            _repo_open_issues: dict[str, list[dict]] = {}
-            _repo_closed_epics: dict[str, list[dict]] = {}
-            _repo_milestones: dict[str, dict[int, dict]] = {}
-            for _oi in projection.get("issues", []):
-                _rn = _oi.get("repo_name", "")
-                if not _rn:
-                    continue
-                _label_names = _oi.get("labels") or []
-                _adapted = {
-                    "number": _oi.get("number"),
-                    "title": _oi.get("title", ""),
-                    "body": _oi.get("body") or "",
-                    "state": _oi.get("state"),
-                    "labels": [{"name": name} for name in _label_names],
-                    "milestone": (
-                        {
-                            "number": _oi.get("milestone_number"),
-                            "title": _oi.get("milestone_title") or "",
-                        }
-                        if _oi.get("milestone_number") is not None
-                        else None
-                    ),
-                }
-                if _oi.get("state") == "open":
-                    _repo_open_issues.setdefault(_rn, []).append(_adapted)
-                    _ms_num = _oi.get("milestone_number")
-                    if _ms_num is not None:
-                        _repo_milestones.setdefault(_rn, {}).setdefault(
-                            _ms_num,
-                            {
-                                "number": _ms_num,
-                                "title": _oi.get("milestone_title") or f"Milestone #{_ms_num}",
-                            },
-                        )
-                elif "epic" in _label_names:
-                    # A closed epic — feed into closed_tracking_issues so
-                    # milestones whose tracking issue was tidied up still
-                    # resolve (mirrors coord/plans.py's #974 fix). Also seed
-                    # _repo_milestones from the epic's own milestone_number:
-                    # if every issue under a milestone (epic included) is now
-                    # closed, no *open* issue would otherwise register the
-                    # milestone, and the outer aggregation loop below would
-                    # never visit it at all — silently dropping a
-                    # finished-but-still-open-on-GitHub milestone from the
-                    # roster instead of surfacing it as done.
-                    _repo_closed_epics.setdefault(_rn, []).append(_adapted)
-                    _ms_num = _oi.get("milestone_number")
-                    if _ms_num is not None:
-                        _repo_milestones.setdefault(_rn, {}).setdefault(
-                            _ms_num,
-                            {
-                                "number": _ms_num,
-                                "title": _oi.get("milestone_title") or f"Milestone #{_ms_num}",
-                            },
-                        )
-
-            _plan_roster: list[dict] = []
-            for _repo_name, _milestones_by_num in _repo_milestones.items():
-                _repo_cfg2 = config.repo(_repo_name)
-                _repo_gh = _repo_cfg2.github if _repo_cfg2 is not None else _repo_name
-                _milestones_list = [
-                    _milestones_by_num[_k] for _k in sorted(_milestones_by_num.keys())
-                ]
-                try:
-                    _entries = _aggregate_repo_plans(
-                        repo_name=_repo_name,
-                        repo_github=_repo_gh,
-                        milestones=_milestones_list,
-                        open_issues=_repo_open_issues.get(_repo_name, []),
-                        board=_board,
-                        closed_tracking_issues=_repo_closed_epics.get(_repo_name, []),
-                    )
-                except Exception:  # noqa: BLE001 — per-repo fail-open
-                    continue
-                for _entry in _entries:
-                    _plan_roster.append(_entry.to_dict())
-            projection["plan_roster"] = _plan_roster
-        except Exception:  # noqa: BLE001 — plan-roster failure must not blank the board
-            projection["plan_roster"] = []
-        # #978: GOAL.md pinned north-star header for the Plans panel. Fail-open
-        # to {"available": False} — a packaged/PyPI install has no repo root to
-        # read GOAL.md from (see coord/goal.py's `_resolve_goal_md_path`), and a
-        # parse failure must not blank the board.
-        try:
-            from coord.goal import read_goal_header as _read_goal_header  # noqa: PLC0415
-            projection["goal_header"] = _read_goal_header()
-        except Exception:  # noqa: BLE001 — goal-header failure must not blank the board
-            projection["goal_header"] = {"available": False}
-        return JSONResponse(projection)
+        # Cache the fresh result so burst polls within the TTL don't recompute.
+        _board_cache = result
+        _board_cache_at = _time.monotonic()
+        return JSONResponse(result)
 
     async def serve_config(request: Request) -> Response:  # noqa: ARG001
         # Serve the raw coordinator.yml text the daemon owns; the client caches
@@ -2210,6 +2282,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             return JSONResponse(
                 {"error": "result write failed", "detail": str(e)}, status_code=503
             )
+        _bust_board_cache()
         return JSONResponse(asdict(outcome))
 
     async def post_completion(request: Request) -> Response:
@@ -2234,6 +2307,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 {"error": "completion write failed", "detail": str(e)},
                 status_code=503,
             )
+        _bust_board_cache()
         return JSONResponse(asdict(outcome))
 
     async def _read_json(request: Request) -> dict | None:
@@ -2269,6 +2343,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             return JSONResponse(
                 {"error": "dispatch write failed", "detail": str(e)}, status_code=503
             )
+        _bust_board_cache()
         return JSONResponse({"ok": True})
 
     async def post_milestone_drain(request: Request) -> Response:
@@ -2312,6 +2387,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             return JSONResponse(
                 {"error": "dispatch write failed", "detail": str(e)}, status_code=503
             )
+        _bust_board_cache()
         return JSONResponse({"ok": True})
 
     async def post_test_verdict(request: Request) -> Response:
@@ -2505,6 +2581,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             return JSONResponse(
                 {"error": "board write failed", "detail": str(e)}, status_code=503
             )
+        _bust_board_cache()
         return JSONResponse({"ok": True})
 
     async def post_assignment_usage(request: Request) -> Response:

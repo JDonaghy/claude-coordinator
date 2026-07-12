@@ -255,15 +255,21 @@ def test_serve_board_picks_up_config_hand_edit(
 
     Invokes the ``/board`` route's endpoint function directly (via
     ``asyncio.run`` in this test's own thread) rather than through
-    ``TestClient``: ``TestClient`` dispatches into a worker thread, and
-    ``board()``'s ``_build_board()`` call opens the ``coord_db`` fixture's
-    ``:memory:`` sqlite connection created in *this* thread — a pre-existing,
-    unrelated cross-thread sqlite restriction that would make the merge-plan
-    branch silently no-op (caught by its own fail-open ``except``) regardless
-    of this change. Calling the endpoint directly keeps everything on one
-    thread and still exercises the real closure, including the new
-    ``_refresh_config()`` call added for #1081.
+    ``TestClient``.
+
+    With the #<issue> threadpool change, ``board()`` now offloads its body
+    (including ``_build_board()``) to a worker thread via ``run_in_threadpool``.
+    The autouse ``coord_db`` fixture installs a thread-bound ``:memory:``
+    connection, so ``_build_board()`` would fail in the threadpool and the
+    fail-open ``except`` would silently skip ``merge_queue.plan`` — same
+    cross-thread restriction documented in the original test, now in both
+    paths.  Patch ``coord.state.build_board`` to return an empty Board so the
+    threadpool doesn't touch the thread-bound connection; the key invariant
+    under test (_refresh_config → config swap → plan sees new config) is
+    unaffected by this stub.
     """
+    from coord.models import Board as _Board
+
     cfg = load_config(valid_config_path)
     assert cfg.reviews.enabled is True  # sanity: default is on
     app = build_app(SqliteStore(file_db), cfg)
@@ -276,6 +282,9 @@ def test_serve_board_picks_up_config_hand_edit(
         return []
 
     monkeypatch.setattr("coord.merge_queue.plan", _spy_plan)
+    # Stub out build_board() so the threadpool doesn't hit the thread-bound
+    # :memory: connection installed by the coord_db fixture.
+    monkeypatch.setattr("coord.state.build_board", lambda: _Board())
 
     asyncio.run(board_route.endpoint(None))  # request param is unused (# noqa: ARG001)
     assert seen_configs, "merge_queue.plan was never called — board() didn't reach it"
@@ -3754,3 +3763,209 @@ def test_audit_recent_count_in_board_payload(file_db: Path, valid_config_path: P
     with TestClient(app) as cli:
         board = cli.get("/board").json()
     assert board["audit_recent_count"] == 1
+
+
+# ── #<issue> Part 1: threadpool — board() does not block the event loop ──────
+
+
+def test_board_handler_does_not_block_event_loop(
+    file_db: Path, valid_config_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Part 1 regression: board() offloads its synchronous body to a threadpool
+    so the async event loop stays free for concurrent requests.
+
+    Monkeypatches ``SqliteStore.board_projection`` to sleep for SLOW_DELAY
+    seconds (simulating a large board with ~465 issues), then fires /board and
+    /healthz concurrently via ``httpx.AsyncClient`` sharing a single event loop.
+    If board() were still blocking the event loop, /healthz would be serialised
+    behind it and take >= SLOW_DELAY.  With the threadpool offload, /healthz
+    returns almost immediately while the slow computation runs in a worker
+    thread.
+    """
+    import time as _time
+
+    import httpx
+
+    SLOW_DELAY = 0.3  # seconds — clear signal without making the test slow
+
+    original_projection = SqliteStore.board_projection
+
+    def slow_projection(self):  # noqa: ANN001
+        _time.sleep(SLOW_DELAY)
+        return original_projection(self)
+
+    monkeypatch.setattr(SqliteStore, "board_projection", slow_projection)
+    # Stub build_board() so the threadpool doesn't hit the thread-bound
+    # in-memory connection installed by the coord_db fixture (same cross-thread
+    # restriction as in test_serve_board_picks_up_config_hand_edit).
+    from coord.models import Board as _Board
+    monkeypatch.setattr("coord.state.build_board", lambda: _Board())
+
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(file_db), cfg)
+
+    async def _run():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+            # Start /board — it will sleep SLOW_DELAY in the threadpool.
+            board_task = asyncio.create_task(cli.get("/board"))
+            # Brief yield so the board request is dispatched and enters
+            # run_in_threadpool before we time /healthz.
+            await asyncio.sleep(0.05)
+
+            start = _time.monotonic()
+            healthz_resp = await cli.get("/healthz")
+            elapsed = _time.monotonic() - start
+
+            board_resp = await board_task
+        return elapsed, board_resp.status_code, healthz_resp.status_code
+
+    elapsed, board_status, healthz_status = asyncio.run(_run())
+
+    assert board_status == 200
+    assert healthz_status == 200
+    # /healthz should return almost instantly, not blocked behind SLOW_DELAY.
+    # Allow 80% of SLOW_DELAY as threshold to absorb CI scheduling jitter.
+    threshold = SLOW_DELAY * 0.8
+    assert elapsed < threshold, (
+        f"/healthz took {elapsed:.3f}s (threshold {threshold:.3f}s) — "
+        f"board() appears to be blocking the event loop"
+    )
+
+
+# ── #<issue> Part 1: payload shape — _build() returns same projection ────────
+
+
+def test_board_payload_regression(file_db: Path, valid_config_path: Path):
+    """Regression: the threaded _build() function must return the same core
+    fields as a direct SqliteStore.board_projection() call, plus the
+    server-side enrichment keys (merge_plan, issue_stage_projection, etc.).
+
+    Seeded by _make_file_db: one 'done' work assignment, one 'done' review,
+    one machine, round_number=7.
+    """
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(file_db), cfg)
+
+    with TestClient(app) as cli:
+        board = cli.get("/board").json()
+
+    # ── Core projection fields (produced by SqliteStore.board_projection) ──
+    assert board["schema_version"] == 1
+    assert board["round_number"] == 7
+    work = next((a for a in board["assignments"] if a["assignment_id"] == "work1"), None)
+    assert work is not None, "work1 assignment missing from /board payload"
+    assert work["status"] == "done"
+    assert work["files_allowed"] == ["a.py", "b.py"]
+    assert "briefing" not in work, "briefing must be stripped from the wire payload"
+
+    # ── Server-side enrichment (computed by _build() in the threadpool) ────
+    # Every key must be present even when its computation short-circuits to []
+    # via the fail-open except blocks — the TUI asserts on their presence.
+    for key in (
+        "merge_plan",
+        "merge_staging",
+        "issue_stage_projection",
+        "milestone_work_orders",
+        "plan_roster",
+        "plan_roster_supported",
+        "goal_header",
+    ):
+        assert key in board, f"server-enrichment key '{key}' missing from /board"
+    assert board["plan_roster_supported"] is True
+
+
+# ── #<issue> Part 2: cache — burst polls reuse cached projection ─────────────
+
+
+def test_board_cache_ttl_serves_repeated_requests(
+    file_db: Path, valid_config_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Part 2 (cache): repeated GET /board requests within the TTL window must
+    return the cached result without calling board_projection() again.
+
+    Counts how many times board_projection() is invoked; asserts it's called
+    exactly once for two back-to-back requests (the second hits the cache).
+    """
+    call_count = 0
+    original_projection = SqliteStore.board_projection
+
+    def counting_projection(self):  # noqa: ANN001
+        nonlocal call_count
+        call_count += 1
+        return original_projection(self)
+
+    monkeypatch.setattr(SqliteStore, "board_projection", counting_projection)
+    # Long TTL so the second request definitely hits the cache.
+    monkeypatch.setenv("COORD_BOARD_CACHE_TTL", "60")
+
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(file_db), cfg)
+    with TestClient(app) as cli:
+        r1 = cli.get("/board")
+        r2 = cli.get("/board")
+
+    assert r1.status_code == 200
+    assert r2.status_code == 200
+    assert call_count == 1, (
+        f"board_projection() called {call_count}× — expected 1 "
+        f"(second request should hit the TTL cache)"
+    )
+    # Both responses should have the same payload.
+    assert r1.json()["round_number"] == r2.json()["round_number"]
+
+
+def test_board_cache_busted_by_post_board(
+    file_db: Path, valid_config_path: Path, rw_db, monkeypatch: pytest.MonkeyPatch
+):
+    """Part 2 (cache bust): POST /board must invalidate the cache so the next
+    GET /board recomputes rather than serving stale data.
+
+    Uses a 60 s TTL so the cache is definitively warm between requests, making
+    the bust signal unambiguous.
+    """
+    from coord.client import serialize_board
+    from coord.models import Assignment, Board as _Board
+
+    call_count = 0
+    original_projection = SqliteStore.board_projection
+
+    def counting_projection(self):  # noqa: ANN001
+        nonlocal call_count
+        call_count += 1
+        return original_projection(self)
+
+    monkeypatch.setattr(SqliteStore, "board_projection", counting_projection)
+    monkeypatch.setenv("COORD_BOARD_CACHE_TTL", "60")
+
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(file_db), cfg)
+
+    dummy_board = _Board(
+        round_number=99,
+        completed=[
+            Assignment(
+                machine_name="laptop", repo_name="api", issue_number=1,
+                issue_title="cache bust test", assignment_id="bust1", status="done",
+            ),
+        ],
+    )
+
+    with TestClient(app) as cli:
+        # First GET — cache miss, populates the cache (call_count → 1).
+        r1 = cli.get("/board")
+        assert r1.status_code == 200
+        assert call_count == 1
+
+        # POST /board — must bust the cache.
+        resp = cli.post("/board", json=serialize_board(dummy_board))
+        assert resp.status_code == 200 and resp.json()["ok"] is True
+
+        # Second GET — cache was busted, must recompute (call_count → 2).
+        r2 = cli.get("/board")
+        assert r2.status_code == 200
+
+    assert call_count == 2, (
+        f"board_projection() called {call_count}× — expected 2 "
+        f"(initial GET + recompute after POST /board cache bust)"
+    )
