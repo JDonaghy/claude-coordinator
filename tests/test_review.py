@@ -1755,6 +1755,78 @@ def test_bulk_review_gate_activates_from_test_first_default(fake_dispatch) -> No
     assert rows[2].review_state in (None, "pending")
 
 
+def test_mock_author_auto_skips_test_gate(fake_dispatch) -> None:
+    """#1076: a completed `type="mock-author"` (Gate A) row never gets a real
+    Test-gate verdict — a contract/fixture-only diff matches no smoke
+    capability rule by construction — so under an active test-precedes-review
+    gate it must be auto-backfilled to test_state="skipped" and dispatched,
+    not silently excluded from `eligible` forever."""
+    mock_author = Assignment(
+        machine_name="laptop",
+        repo_name="api",
+        issue_number=1076,
+        issue_title="Gate A mock",
+        assignment_id="ma-gate-a",
+        status="done",
+        branch="ms-9-gate-a",
+        type="mock-author",
+        review_state=None,
+        test_state=None,
+        dispatched_at=0.0,
+        finished_at=1.0,
+    )
+    board = Board(completed=[mock_author])
+    cfg = Config(
+        repos=[],
+        machines=[],
+        reviews=ReviewsConfig(max_auto_dispatch_per_pass=5, flood_threshold=12),
+        pipeline=PipelineConfig(default_gates=["test", "review", "merge"]),
+    )
+
+    out = dispatch_pending_reviews(board, cfg)
+
+    assert len(out) == 1
+    assert fake_dispatch == ["ma-gate-a"]
+    assert mock_author.test_state == "skipped"
+    assert mock_author.review_state == "dispatched"
+
+
+def test_mock_author_auto_skip_does_not_weaken_work_gate(fake_dispatch) -> None:
+    """#1076: the mock-author auto-skip must not leak onto `type="work"` rows
+    — the test gate keeps holding untested real-code completions exactly as
+    before."""
+    mock_author = Assignment(
+        machine_name="laptop",
+        repo_name="api",
+        issue_number=1076,
+        issue_title="Gate A mock",
+        assignment_id="ma-gate-a",
+        status="done",
+        branch="ms-9-gate-a",
+        type="mock-author",
+        review_state=None,
+        test_state=None,
+        dispatched_at=0.0,
+        finished_at=1.0,
+    )
+    work = _pending_work(1)[0]  # type="work", test_state=None
+    board = Board(completed=[mock_author, work])
+    cfg = Config(
+        repos=[],
+        machines=[],
+        reviews=ReviewsConfig(max_auto_dispatch_per_pass=5, flood_threshold=12),
+        pipeline=PipelineConfig(default_gates=["test", "review", "merge"]),
+    )
+
+    out = dispatch_pending_reviews(board, cfg)
+
+    assert len(out) == 1
+    assert fake_dispatch == ["ma-gate-a"]
+    assert mock_author.test_state == "skipped"
+    assert work.test_state is None
+    assert work.review_state in (None, "pending")
+
+
 # ── Flood guard: config parsing ──────────────────────────────────────────────
 
 
