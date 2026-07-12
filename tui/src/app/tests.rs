@@ -12021,6 +12021,58 @@
         );
     }
 
+    /// #1097 review finding #1: a pending entry that exceeded its sweep
+    /// budget must still count as live when a running *interactive*
+    /// assignment confirms it — pending- entries are always backed by an
+    /// interactive assignment (the only creation site is the interactive
+    /// launch flow), so gating the pending-budget escape hatch on
+    /// `!is_interactive` would make it dead code for its only real caller.
+    #[test]
+    fn issue_session_is_live_true_for_exhausted_pending_entry_with_interactive_assignment() {
+        use crate::app::CoordApp as CA;
+        let budget = CA::PENDING_SESSION_SWEEP_BUDGET;
+
+        let data = BoardData {
+            pipeline_tracked_labels: vec!["coord".to_string()],
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            open_issues: vec![OpenIssue {
+                repo_name: "api".to_string(),
+                number: 7,
+                title: "issue 7".to_string(),
+                body: String::new(),
+                state: "open".to_string(),
+                labels: vec!["coord".to_string()],
+                milestone_number: None,
+                milestone_title: None,
+            }],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        app.pipeline_issues = app.pipeline_issues_from_cache();
+        let issue = app.pipeline_issues.iter().find(|i| i.number == 7).unwrap().clone();
+
+        // A pending entry with sweep_count > budget — no real session yet —
+        // but a running interactive assignment backs it.
+        app.live_tmux_sessions = vec![LiveTmuxSession {
+            assignment_id: "pending-api-7".to_string(),
+            issue_number: Some(7),
+            repo_name: Some("api".to_string()),
+            issue_title: None,
+            machine: None,
+            pane_dead: false,
+            pending_sweep_count: budget + 1,
+            attached: false,
+        }];
+        let mut a = make_assignment_typed("running", 7, "api", Some("work"));
+        a.is_interactive = true;
+        app.data.assignments.push(a);
+
+        assert!(
+            app.issue_session_is_live(&issue),
+            "exhausted pending entry with a running interactive assignment must still count as live"
+        );
+    }
+
     #[test]
     fn force_quit_dialog_renders_when_armed() {
         let mut app = make_app_default();
