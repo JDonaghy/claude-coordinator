@@ -1,0 +1,91 @@
+"""Tests for `coord pr`'s Closes/Refs briefing keyword selection (#1077).
+
+Non-blocking nit from the #1077 review: plan_followup.py's `pr()` command
+switched its hardcoded "Closes #{issue_number}" briefing text to the new
+`ref_keyword`/`CLOSES_ISSUE_TYPES` branch (mirroring the deterministic
+merge_queue.py/review.py behavior), but had no test coverage. This is only a
+textual hint for the worker (which still runs `gh pr create` itself) — much
+lower stakes than the deterministic paths, which are why this is a separate,
+small test rather than blocking the #1077 fix.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+from click.testing import CliRunner
+
+from coord.cli import main
+from coord.models import Assignment, Board
+from coord import state as state_mod
+
+CONFIG_YAML = """\
+repos:
+  - name: api
+    github: acme/api
+    default_branch: main
+machines:
+  - name: laptop
+    host: laptop.tailnet
+    repos: [api]
+    repo_paths:
+      api: /tmp/api
+"""
+
+
+@pytest.fixture
+def config_file(tmp_path: Path) -> Path:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(CONFIG_YAML)
+    return p
+
+
+def _make_assignment(assignment_id: str, type: str) -> Assignment:
+    return Assignment(
+        machine_name="laptop",
+        repo_name="api",
+        issue_number=42,
+        issue_title="Some issue",
+        assignment_id=assignment_id,
+        type=type,
+        status="done",
+        branch="issue-42-fix",
+    )
+
+
+class TestPrBriefingKeyword:
+    def test_uses_closes_for_work_assignment(self, config_file: Path, coord_db) -> None:
+        a = _make_assignment("work-001", type="work")
+        board = Board(active=[], completed=[a])
+        state_mod.save_board(board)
+
+        with patch(
+            "coord.commands.plan_followup._dispatch_followup", return_value="pr-001"
+        ) as disp:
+            result = CliRunner().invoke(
+                main, ["pr", "work-001", "--config", str(config_file)]
+            )
+
+        assert result.exit_code == 0, result.output
+        briefing = disp.call_args[0][2]
+        assert 'Closes #42' in briefing
+        assert 'Refs #42' not in briefing
+
+    def test_uses_refs_for_mock_author_assignment(self, config_file: Path, coord_db) -> None:
+        a = _make_assignment("mock-001", type="mock-author")
+        board = Board(active=[], completed=[a])
+        state_mod.save_board(board)
+
+        with patch(
+            "coord.commands.plan_followup._dispatch_followup", return_value="pr-002"
+        ) as disp:
+            result = CliRunner().invoke(
+                main, ["pr", "mock-001", "--config", str(config_file)]
+            )
+
+        assert result.exit_code == 0, result.output
+        briefing = disp.call_args[0][2]
+        assert 'Refs #42' in briefing
+        assert 'Closes #42' not in briefing

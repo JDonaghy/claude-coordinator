@@ -641,11 +641,19 @@ def refresh_entry_assignment(
     if existing.state != PENDING:
         return False  # don't touch terminal entries (MERGED, CONFLICT, etc.)
     existing.assignment_id = assignment.assignment_id
-    # #1077: keep the close-on-merge decision in sync with the re-keyed
-    # assignment's type (a bounce/fix iteration is expected to carry the
-    # same type as the original, but this avoids a stale value if it ever
-    # doesn't).
-    existing.assignment_type = assignment.type
+    # #1077 (review round 1): do NOT overwrite existing.assignment_type here.
+    # assignment_type is a structural property of the branch/issue pairing,
+    # fixed once at enqueue() time -- not something to refresh from whatever
+    # assignment last touched the branch. A review-bounce fix worker is
+    # unconditionally dispatched with type="work" (auto_loop.py's
+    # _dispatch_fix_for_review), regardless of the original assignment's
+    # type, so re-keying assignment_type here would clobber a "mock-author"
+    # entry back to "work" on every ordinary request-changes round trip --
+    # silently re-enabling the close-on-merge behavior this issue fixed.
+    # assignment_id legitimately needs to track the latest fix (for
+    # approval-lookup purposes via has_approved_review), but assignment_type
+    # does not -- a bounce/fix iteration is conceptually still "fixing the
+    # same PR", so the type set at enqueue() stays authoritative.
     # Clear a stale "review required" error now that a fresh approval arrived.
     if existing.error == "review required but not approved":
         existing.error = None
