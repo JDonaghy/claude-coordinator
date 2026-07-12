@@ -116,10 +116,13 @@ class TestBriefingEchoBeforeFork:
             "delimiter header should appear so the operator knows what to look at"
         )
 
-    def test_empty_briefing_produces_no_output(
+    def test_empty_briefing_produces_no_briefing_echo(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """When the briefing is empty (or whitespace-only), nothing is written."""
+        """When the briefing is empty (or whitespace-only), the briefing-echo
+        block is skipped.  (The unconditional #1102 no-detach warning still
+        fires regardless of briefing content — see TestNoDetachWarningPtyRelay
+        — so this no longer asserts zero output overall.)"""
         import pty  # noqa: PLC0415
 
         from coord.interactive import launch_human_attended_interactive
@@ -147,8 +150,8 @@ class TestBriefingEchoBeforeFork:
             except OSError:
                 pass
 
-        assert captured == b"", (
-            f"expected no output for a blank briefing, got {captured!r}"
+        assert b"seeded briefing" not in captured, (
+            f"expected no briefing-echo block for a blank briefing, got {captured!r}"
         )
 
     def test_multiline_briefing_preserved_verbatim(
@@ -238,3 +241,76 @@ class TestBriefingEchoBeforeFork:
         assert order == ["echo", "fork"], (
             f"expected echo before fork, got call order: {order}"
         )
+
+
+class TestNoDetachWarningPtyRelay:
+    """#1102: the PTY-relay fallback has no tmux underneath it, so unlike the
+    tmux path there is no detach to protect — closing the terminal or Ctrl-C
+    ends the session immediately.  ``_launch_via_pty`` must say so, every
+    time, regardless of whether a briefing was supplied.
+    """
+
+    def test_warning_written_before_fork(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import pty  # noqa: PLC0415
+
+        from coord.interactive import launch_human_attended_interactive
+
+        r_fd, w_fd = os.pipe()
+        try:
+            monkeypatch.setattr(sys, "stdout", _PipedStdout(w_fd))
+            monkeypatch.setattr(sys, "stdin", _PipedStdin(r_fd))
+            monkeypatch.setattr(pty, "fork", _fake_fork_raiser)
+
+            with pytest.raises(OSError, match="test sentinel"):
+                launch_human_attended_interactive(argv=["claude"], briefing="hi")
+
+            os.close(w_fd)
+            w_fd = -1
+            captured = _drain_pipe(r_fd)
+        finally:
+            if w_fd != -1:
+                try:
+                    os.close(w_fd)
+                except OSError:
+                    pass
+            try:
+                os.close(r_fd)
+            except OSError:
+                pass
+
+        assert b"no detach available" in captured
+        assert b"Ctrl-C ends the claude process" in captured
+
+    def test_warning_written_even_for_empty_briefing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Unlike the briefing echo, the no-detach warning is unconditional —
+        there's no detach whether or not a briefing was seeded."""
+        import pty  # noqa: PLC0415
+
+        from coord.interactive import launch_human_attended_interactive
+
+        r_fd, w_fd = os.pipe()
+        try:
+            monkeypatch.setattr(sys, "stdout", _PipedStdout(w_fd))
+            monkeypatch.setattr(sys, "stdin", _PipedStdin(r_fd))
+            monkeypatch.setattr(pty, "fork", _fake_fork_raiser)
+
+            with pytest.raises(OSError, match="test sentinel"):
+                launch_human_attended_interactive(argv=["claude"], briefing="   ")
+
+            os.close(w_fd)
+            w_fd = -1
+            captured = _drain_pipe(r_fd)
+        finally:
+            if w_fd != -1:
+                try:
+                    os.close(w_fd)
+                except OSError:
+                    pass
+            try:
+                os.close(r_fd)
+            except OSError:
+                pass
+
+        assert b"no detach available" in captured

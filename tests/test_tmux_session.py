@@ -603,3 +603,81 @@ class TestLaunchViaTmuxUnverifiedInjectionSurfaced:
         assert not mock_inject.called
         assert not mock_input.called
         assert not mock_print.called
+
+
+# ── _launch_via_tmux — kill-vs-detach guard (#1102) ──────────────────────────
+
+
+class TestLaunchViaTmuxAttachKillGuard:
+    """#1102: a wrong keystroke (kill-pane) after attach silently destroys
+    the whole session, with no operator-facing distinction from a normal
+    detach.  ``_launch_via_tmux`` must (1) set a best-effort ``pane-died``
+    hook on fresh session creation, and (2) print the kill-vs-detach
+    warning immediately before every attach — fresh session or reuse.
+    """
+
+    def _mock_create_ok(self) -> Any:
+        def _mock_run(cmd: list, **kw: Any) -> MagicMock:
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = ""
+            return m
+
+        return _mock_run
+
+    def test_pane_died_hook_set_on_fresh_session(self) -> None:
+        from coord.interactive import _launch_via_tmux
+
+        with patch("subprocess.run", side_effect=self._mock_create_ok()) as run_mock, \
+             patch("coord.interactive.tmux_session_alive", return_value=False):
+            _launch_via_tmux(["claude"], "", "coord-freshhook")
+
+        hook_calls = [
+            call for call in run_mock.call_args_list
+            if "set-hook" in call.args[0]
+        ]
+        assert hook_calls, "expected a `tmux set-hook ... pane-died ...` call"
+        hook_argv = hook_calls[0].args[0]
+        assert "pane-died" in hook_argv
+        assert "coord-freshhook" in hook_argv
+
+    def test_no_pane_died_hook_when_session_already_alive(self) -> None:
+        """Reuse-after-crash: the hook was already set at creation time —
+        no need (and no session-name arg available) to set it again."""
+        from coord.interactive import _launch_via_tmux
+
+        with patch("subprocess.run", side_effect=self._mock_create_ok()) as run_mock, \
+             patch("coord.interactive.tmux_session_alive", return_value=True):
+            _launch_via_tmux(["claude"], "", "coord-reused")
+
+        hook_calls = [
+            call for call in run_mock.call_args_list
+            if "set-hook" in call.args[0]
+        ]
+        assert not hook_calls
+
+    def test_attach_warning_printed_before_attach_fresh_session(
+        self, capfd: pytest.CaptureFixture[str]
+    ) -> None:
+        from coord.interactive import _launch_via_tmux
+
+        with patch("subprocess.run", side_effect=self._mock_create_ok()), \
+             patch("coord.interactive.tmux_session_alive", return_value=False):
+            _launch_via_tmux(["claude"], "", "coord-warnfresh")
+
+        out = capfd.readouterr().out
+        assert "Ctrl-b d" in out
+        assert "DO NOT" in out
+
+    def test_attach_warning_printed_before_attach_reuse(
+        self, capfd: pytest.CaptureFixture[str]
+    ) -> None:
+        from coord.interactive import _launch_via_tmux
+
+        with patch("subprocess.run", side_effect=self._mock_create_ok()), \
+             patch("coord.interactive.tmux_session_alive", return_value=True):
+            _launch_via_tmux(["claude"], "", "coord-warnreuse")
+
+        out = capfd.readouterr().out
+        assert "Ctrl-b d" in out
+        assert "DO NOT" in out

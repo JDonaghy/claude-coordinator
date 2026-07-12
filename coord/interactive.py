@@ -120,6 +120,8 @@ __all__ = [
     "tmux_session_alive",
     "tmux_pane_dead",
     "list_coord_tmux_sessions",
+    "TMUX_ATTACH_WARNING",
+    "PTY_RELAY_NO_DETACH_WARNING",
 ]
 
 
@@ -154,6 +156,42 @@ _SSH_MUX_OPTS = [
     "-o", "ControlPath=~/.ssh/coord-mux-%C",
     "-o", "ControlPersist=120s",
 ]
+
+# ── #1102 attach/kill guard ─────────────────────────────────────────────────
+#
+# A tmux-hosted coord session has exactly one pane.  Detach (Ctrl-b d) drops
+# the operator's client but leaves the session (and the ``claude`` process
+# inside it) running server-side -- the intended "stop watching here" action.
+# Kill-pane (Ctrl-b x, ``exit``, closing the window) instead kills the pane's
+# process, and since it's the session's only pane, tmux immediately destroys
+# the whole session with it -- silently, with no confirmation and no way
+# back.  Printed at every attach point (fresh launch, reuse-after-crash, and
+# ``coord reattach``) so the distinction is in front of the operator at the
+# moment it matters, not just documented in a docstring nobody re-reads
+# mid-session.
+TMUX_ATTACH_WARNING = (
+    "\n"
+    "=== live session -- read before you touch the keyboard =====================\n"
+    "  Detach   Ctrl-b d          -> claude keeps running; reattach anytime with\n"
+    "                                 `coord reattach <assignment-id>`.\n"
+    "  DO NOT   Ctrl-b x / exit / -> KILLS the running claude process, and since\n"
+    "           close this window    this session has exactly one pane, tmux\n"
+    "                                 destroys the WHOLE session with it. No undo.\n"
+    "==============================================================================\n"
+)
+
+#: Companion warning for the no-tmux PTY-relay fallback (:func:`_launch_via_pty`).
+#: There is no tmux layer here at all, so there is no detach: the operator's
+#: terminal *is* the session, and closing it (or Ctrl-C) ends ``claude``
+#: immediately with no way to pick it back up.
+PTY_RELAY_NO_DETACH_WARNING = (
+    "\n"
+    "=== no detach available (tmux not in use for this session) =================\n"
+    "  This session is attached directly to your terminal -- there is no\n"
+    "  detach.  Closing this window or Ctrl-C ends the claude process\n"
+    "  immediately and it cannot be resumed.\n"
+    "==============================================================================\n"
+)
 
 
 def _get_local_short_hostname() -> str:
@@ -623,7 +661,16 @@ def _launch_via_tmux(
        :func:`_inject_briefing_into_tmux_session`.
     2. If the session already exists (reattach after TUI crash), skip
        creation and injection — the session is already running.
-    3. Attach the current terminal with
+    3. On fresh creation, a ``pane-died`` hook is set on the session
+       (#1102) so an unintended pane death (e.g. an accidental kill-pane)
+       has a chance to surface via ``display-message`` rather than the
+       session just silently vanishing — best-effort, since a single-pane
+       session's pane-death and session-death are simultaneous.
+    4. Immediately before attaching (both fresh and reuse), print
+       :data:`TMUX_ATTACH_WARNING` to the operator's terminal so the
+       kill-vs-detach distinction is the last thing they read before tmux
+       takes over (#1102).
+    5. Attach the current terminal with
        ``tmux attach-session -t <session_name>``.  If the TUI process is
        killed (e.g. SIGHUP on TUI crash), only the *attach* subprocess
        dies; the tmux session and ``claude`` inside it keep running.
@@ -724,6 +771,29 @@ def _launch_via_tmux(
             # Session creation failed (name collision, tmux daemon error, …).
             return None  # signal caller to fall back to PTY relay
 
+        # #1102: best-effort operator-facing signal if the pane dies while
+        # attached (e.g. an accidental kill-pane) rather than the session
+        # just silently vanishing.  Since a coord session has exactly one
+        # pane, pane-death and session-death are simultaneous, so this
+        # ``display-message`` may not always be visible before tmux tears
+        # the session down — it's cheap, harmless, and worth setting
+        # regardless (attached-but-not-focused clients, slower teardown on
+        # some tmux versions, etc. all still benefit).  Failure to set the
+        # hook is non-fatal to the session itself.
+        try:
+            subprocess.run(
+                host.cmd([
+                    "set-hook", "-t", session_name, "pane-died",
+                    "display-message \"coord: pane died -- if this was not an "
+                    "intentional exit, the claude session may be gone. Ctrl-b d "
+                    "detaches without killing; kill-pane destroys the session.\"",
+                ]),
+                capture_output=True,
+                timeout=5.0,
+            )
+        except (subprocess.SubprocessError, OSError):
+            pass
+
         # Inject briefing (best-effort; a failure here is non-fatal to the
         # session itself, but MUST be visible to the operator — #865 review
         # follow-up: the previous code discarded this return value, so an
@@ -750,6 +820,14 @@ def _launch_via_tmux(
                     input("Press Enter to attach to the session... ")
                 except (EOFError, KeyboardInterrupt):
                     pass
+
+    # #1102: print the kill-vs-detach warning immediately before attaching —
+    # both for a fresh session and for reuse-after-crash — so it's the last
+    # thing the operator reads before tmux takes over the terminal.
+    try:
+        os.write(sys.stdout.fileno(), TMUX_ATTACH_WARNING.encode("utf-8"))
+    except OSError:
+        pass
 
     # Attach.  ``subprocess.run`` (not ``os.execvp``) is intentional: we
     # need this process to continue after the operator detaches so that
@@ -1056,6 +1134,15 @@ def _launch_via_pty(
             os.write(fd_out, _preview.encode("utf-8"))
         except OSError:
             pass
+
+    # #1102: this path has no tmux underneath it at all, so — unlike the
+    # tmux-hosted path — there is no detach to protect: the operator's
+    # terminal IS the session.  Say so explicitly rather than leaving the
+    # operator to assume the same Ctrl-b d semantics apply here.
+    try:
+        os.write(fd_out, PTY_RELAY_NO_DETACH_WARNING.encode("utf-8"))
+    except OSError:
+        pass
 
     pid, master_fd = pty.fork()
     if pid == 0:
