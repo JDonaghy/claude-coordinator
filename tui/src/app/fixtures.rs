@@ -378,5 +378,6 @@ pub fn make_assignment_typed(
         audit_goals_json: None,
         audit_bottom_line: None,
         audit_run_number: None,
+        for_issue_number: None,
     }
 }

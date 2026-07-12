@@ -325,6 +325,13 @@ def dispatch_test_author(
         status="running",
         dispatched_at=time.time(),
         type="test-author",
+        # #1084: correlate this JIT dispatch back to the specific member
+        # issue it's extending, so the TUI's per-issue Acceptance-Authoring
+        # mini-pipeline can tell "issue #1039's slice" apart from a sibling
+        # issue's slice sharing the same tracking-issue-keyed assignment
+        # row. None in milestone mode (issue_number is None) — Gate A's own
+        # mock-author track doesn't need this field.
+        for_issue_number=issue_number,
     )
 
     from coord.state import record_dispatched_assignment  # noqa: PLC0415

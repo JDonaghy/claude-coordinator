@@ -1096,7 +1096,8 @@ pub(crate) fn load_data() -> BoardData {
              acceptance_state, acceptance_reason, acceptance_sha, \
              acceptance_total, acceptance_passed, \
              test_reason, review_state, pr_url, \
-             audit_goals_json, audit_bottom_line, audit_run_number \
+             audit_goals_json, audit_bottom_line, audit_run_number, \
+             for_issue_number \
              FROM assignments ORDER BY dispatched_at DESC",
         ) {
             Ok(s) => s,
@@ -1171,6 +1172,13 @@ pub(crate) fn load_data() -> BoardData {
                 audit_goals_json: row.get::<_, Option<String>>(35).unwrap_or(None),
                 audit_bottom_line: row.get::<_, Option<String>>(36).unwrap_or(None),
                 audit_run_number: row.get::<_, Option<i64>>(37).unwrap_or(None),
+                // #1084: JIT test-author per-member-issue correlation.
+                // unwrap_or(None) for the same graceful-degradation reason
+                // as the audit columns above.
+                for_issue_number: row
+                    .get::<_, Option<i64>>(38)
+                    .unwrap_or(None)
+                    .map(|n| n as u64),
             })
         }) {
             Ok(r) => r,

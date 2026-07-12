@@ -374,6 +374,18 @@ pub struct Assignment {
     #[allow(dead_code)]
     #[serde(default)]
     pub(crate) audit_run_number: Option<i64>,
+    /// #1084: for `type="test-author"` JIT-mode assignments, the specific
+    /// work-order member issue this dispatch is extending the acceptance
+    /// suite for (`coord.test_author.dispatch_test_author`'s `issue_number`
+    /// argument) — NOT the same as `issue_number` above, which test-author
+    /// always sets to the milestone's *tracking* issue (every JIT dispatch
+    /// for a milestone shares one branch/PR). `None` for milestone-mode
+    /// (Gate A) authoring, every other assignment type, and rows predating
+    /// this column. Used by the per-issue Acceptance-Authoring mini-
+    /// pipeline to attribute a shared-branch assignment row back to the
+    /// right member issue's row.
+    #[serde(default)]
+    pub(crate) for_issue_number: Option<u64>,
 }
 
 /// Deserialize a boolean the daemon may send as a SQLite-style integer (0/1)

@@ -372,6 +372,12 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # 'work', preserving the prior always-close behavior for entries
         # enqueued before this column existed.
         "ALTER TABLE merge_queue ADD COLUMN assignment_type TEXT DEFAULT 'work'",
+        # #1084: for type="test-author" JIT-mode assignments, the work-order
+        # member issue this dispatch is extending the acceptance suite for —
+        # see coord.models.Assignment.for_issue_number. NULL for milestone-
+        # mode (Gate A) authoring, every other assignment type, and rows
+        # predating this column.
+        "ALTER TABLE assignments ADD COLUMN for_issue_number INTEGER",
     ]
     for sql in migrations:
         try:

@@ -216,6 +216,45 @@ pub(crate) struct FixPreflightTarget {
     pub(crate) work_aid: String,
 }
 
+// ── #1084: oracle-loop pre-req pipeline (Gate A / Acceptance-Authoring) ──
+//
+// Both mock-author (Gate A, milestone-level) and test-author (per-issue JIT
+// authoring) already ride the same generic Work→Test→Review→Merge gate
+// machinery as a normal `type="work"` assignment — they just aren't named
+// "work", so none of the generic stage-status helpers below (which key off
+// `assignment_type == "work"` for the Test/Merge special cases) pick them
+// up. `prereq_pipeline_status_from` and its two callers are a small
+// parallel track that resolves the same 4-stage shape for these two
+// assignment types, so the TUI can render "not-started / running /
+// stuck-on-gate-X / done" for the pre-req pipeline instead of it staying
+// invisible (docs/ORACLE_LOOP.md, claude-coordinator#947's
+// 19-hour-invisible-stall friction log).
+
+/// One stage's resolved status in a [`PrereqPipelineStatus`], plus the
+/// timestamp its *current* status began — `Some` while Active (anchored to
+/// `dispatched_at`) or while Pending directly behind a settled predecessor
+/// (anchored to the predecessor's completion time), so the renderer can
+/// show elapsed time for both "running" and "stuck waiting" without a
+/// separate lookup. `None` for Done/Failed/Skipped stages, and for a
+/// Pending stage whose predecessor hasn't settled either.
+#[derive(Clone)]
+pub(crate) struct PrereqStage {
+    pub(crate) status: StageStatus,
+    pub(crate) since: Option<f64>,
+}
+
+/// Resolved Author→Test→Review→Merge status for one oracle-loop pre-req
+/// track. `author_id` is the short id of the resolved mock-author /
+/// test-author assignment (the "which assignment" half of "running with
+/// elapsed time + assignment id"); `None` when the track has never been
+/// dispatched (every stage Pending, `since: None`).
+#[derive(Clone)]
+pub(crate) struct PrereqPipelineStatus {
+    pub(crate) author_id: Option<String>,
+    /// [Author, Test, Review, Merge], in that order.
+    pub(crate) stages: [PrereqStage; 4],
+}
+
 /// #863: the iteration cap was hit — awaiting the operator's one-key confirm
 /// to re-dispatch the SAME Fix with `--force` (#862's override).  Raised by
 /// the `PendingFixCapPreflight` completion handler; consumed by
@@ -3543,6 +3582,192 @@ impl CoordApp {
                     .unwrap_or(std::cmp::Ordering::Equal)
             })?;
         Some((latest.acceptance_passed?, latest.acceptance_total?))
+    }
+
+    /// Core resolver shared by [`gate_a_prereq_status`] and
+    /// [`acceptance_authoring_prereq_status`]: given the already-resolved
+    /// Author-stage assignment (or `None` if the track never ran), compute
+    /// the 4-stage status. `repo_slug` is the issue's GitHub `owner/repo`
+    /// (used to key the Merge stage's `merge_queue` lookup by branch).
+    pub(crate) fn prereq_pipeline_status_from(
+        &self,
+        repo_slug: &str,
+        author: Option<&Assignment>,
+    ) -> PrereqPipelineStatus {
+        let Some(author) = author else {
+            return PrereqPipelineStatus {
+                author_id: None,
+                stages: [
+                    PrereqStage { status: StageStatus::Pending, since: None },
+                    PrereqStage { status: StageStatus::Pending, since: None },
+                    PrereqStage { status: StageStatus::Pending, since: None },
+                    PrereqStage { status: StageStatus::Pending, since: None },
+                ],
+            };
+        };
+
+        let author_status = match author.status.as_str() {
+            "running" => StageStatus::Active,
+            "done" => StageStatus::Done,
+            "failed" => StageStatus::Failed,
+            _ => StageStatus::Pending,
+        };
+        let author_since = match author_status {
+            StageStatus::Active => author.dispatched_at,
+            _ => None,
+        };
+
+        // Test: mirrors `test_stage_status_for`'s verdict mapping, but reads
+        // `test_state` straight off the Author assignment itself (mock-
+        // author/test-author carry their own Test-gate verdict — they don't
+        // have a separate "work" assignment to key off).
+        let (test_status, test_since) = if author_status != StageStatus::Done {
+            (StageStatus::Pending, None)
+        } else {
+            match author.test_state.as_deref() {
+                Some("passed") | Some("skipped") => (StageStatus::Done, None),
+                Some("failed") => (StageStatus::Failed, None),
+                _ => (StageStatus::Pending, author.finished_at.or(author.dispatched_at)),
+            }
+        };
+
+        // Review: found via `review_of_assignment_id` linkage (NOT a generic
+        // issue_number+type filter) — both Gate A's review and a per-issue
+        // test-author's review are recorded under the milestone's *tracking*
+        // issue number, so a plain issue_number match would conflate the
+        // two tracks (and conflate sibling issues' JIT reviews with each
+        // other) on a shared tracking issue.
+        let review = self
+            .data
+            .assignments
+            .iter()
+            .filter(|a| a.assignment_type.as_deref() == Some("review"))
+            .filter(|a| a.review_of_assignment_id.as_deref() == Some(author.id.as_str()))
+            .max_by(|a, b| {
+                a.dispatched_at
+                    .partial_cmp(&b.dispatched_at)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        let (review_status, review_since) = if test_status != StageStatus::Done {
+            (StageStatus::Pending, None)
+        } else {
+            match review {
+                None => (StageStatus::Pending, test_since.or(author.finished_at)),
+                Some(r) if r.status == "running" => (StageStatus::Active, r.dispatched_at),
+                Some(r) if r.status == "done" => match r.review_verdict.as_deref() {
+                    Some("approve") => (StageStatus::Done, None),
+                    _ => (StageStatus::Failed, None),
+                },
+                Some(r) if r.status == "failed" => (StageStatus::Failed, None),
+                Some(_) => (StageStatus::Pending, None),
+            }
+        };
+
+        // Merge: `merge_queue` dedups by branch (coord/merge_queue.py's
+        // `enqueue` — "the merge queue dedups by branch we'd merge, not the
+        // assignment_id"), so keying by the Author assignment's own branch
+        // is the precise lookup — an issue_number+repo match (as
+        // `merge_stage_status_for_local` uses for the normal Work track)
+        // would ambiguously match BOTH Gate A's and test-author's queue
+        // entries once both exist under the same tracking issue.
+        let (merge_status, merge_since) = if review_status != StageStatus::Done {
+            (StageStatus::Pending, None)
+        } else {
+            match author.branch.as_deref() {
+                None => (StageStatus::Pending, review_since.or(review.and_then(|r| r.finished_at))),
+                Some(branch) => {
+                    let entry = self
+                        .data
+                        .merge_queue
+                        .iter()
+                        .find(|m| m.repo_github == repo_slug && m.branch.as_deref() == Some(branch));
+                    match entry.map(|e| e.state.as_str()) {
+                        Some("merged") => (StageStatus::Done, None),
+                        Some("open") | Some("queued") => (StageStatus::Active, None),
+                        Some("failed") | Some("human_required") => (StageStatus::Failed, None),
+                        _ => (
+                            StageStatus::Pending,
+                            review_since.or(review.and_then(|r| r.finished_at)),
+                        ),
+                    }
+                }
+            }
+        };
+
+        PrereqPipelineStatus {
+            author_id: Some(author.id.clone()),
+            stages: [
+                PrereqStage { status: author_status, since: author_since },
+                PrereqStage { status: test_status, since: test_since },
+                PrereqStage { status: review_status, since: review_since },
+                PrereqStage { status: merge_status, since: merge_since },
+            ],
+        }
+    }
+
+    /// #1084: Gate A's Author→Test→Review→Merge status for the milestone
+    /// whose tracking issue is `issue` (an epic row — Gate A runs once per
+    /// milestone, keyed directly on the tracking issue's own
+    /// `issue_number`, mirroring how `pipeline_pr_number` already keys the
+    /// existing "View Gate A mock (PR)" menu item).
+    pub(crate) fn gate_a_prereq_status(&self, issue: &PipelineIssue) -> PrereqPipelineStatus {
+        let author = self
+            .data
+            .assignments
+            .iter()
+            .filter(|a| a.issue_number == issue.number)
+            .filter(|a| issue.coord_repo.as_deref().is_none_or(|r| a.repo == r))
+            .filter(|a| a.assignment_type.as_deref() == Some("mock-author"))
+            .max_by(|a, b| {
+                a.dispatched_at
+                    .partial_cmp(&b.dispatched_at)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        self.prereq_pipeline_status_from(&issue.repo_slug, author)
+    }
+
+    /// #1084: the per-issue Acceptance-Authoring status for `issue`'s slice
+    /// of `tracking_issue`'s milestone acceptance suite. Resolves the
+    /// specific `test-author` assignment extending *this* issue's slice via
+    /// `for_issue_number` (set at dispatch by
+    /// `coord.test_author.dispatch_test_author`); falls back to the latest
+    /// test-author assignment recorded under the tracking issue for rows
+    /// predating that correlation field, so older boards degrade to "some
+    /// JIT authoring happened for this milestone" rather than showing
+    /// nothing at all.
+    pub(crate) fn acceptance_authoring_prereq_status(
+        &self,
+        issue: &PipelineIssue,
+        tracking_issue: u64,
+    ) -> PrereqPipelineStatus {
+        let candidates: Vec<&Assignment> = self
+            .data
+            .assignments
+            .iter()
+            .filter(|a| a.issue_number == tracking_issue)
+            .filter(|a| issue.coord_repo.as_deref().is_none_or(|r| a.repo == r))
+            .filter(|a| a.assignment_type.as_deref() == Some("test-author"))
+            .collect();
+        let author = candidates
+            .iter()
+            .filter(|a| a.for_issue_number == Some(issue.number))
+            .max_by(|a, b| {
+                a.dispatched_at
+                    .partial_cmp(&b.dispatched_at)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .filter(|a| a.for_issue_number.is_none())
+                    .max_by(|a, b| {
+                        a.dispatched_at
+                            .partial_cmp(&b.dispatched_at)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+            })
+            .copied();
+        self.prereq_pipeline_status_from(&issue.repo_slug, author)
     }
 
     /// Compute the Work stage status without going through the dispatch in

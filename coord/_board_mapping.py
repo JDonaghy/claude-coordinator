@@ -128,6 +128,9 @@ def row_to_assignment(row: object) -> Assignment:
         audit_goals_json=d.get("audit_goals_json"),
         audit_bottom_line=d.get("audit_bottom_line"),
         audit_run_number=d.get("audit_run_number"),
+        # #1084: JIT test-author's per-member-issue correlation; None for
+        # Gate A / every other type and for rows predating this column.
+        for_issue_number=d.get("for_issue_number"),
     )
 
 
