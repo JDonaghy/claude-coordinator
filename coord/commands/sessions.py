@@ -764,9 +764,23 @@ def _prune_dead_sessions(enriched: "list[dict]", config_path: "Path") -> None:
 )
 
 
+@click.option(
+    "--reap-merged",
+    "reap_merged",
+    is_flag=True,
+    default=False,
+    help=(
+        "Kill detached interactive MERGE sessions whose board row has reached "
+        "'merged' status (#1110).  Triggers the same logic as the daemon's "
+        "auto-reap tick.  Only DETACHED sessions are killed; attached sessions "
+        "are skipped so the operator is never surprised."
+    ),
+)
+
+
 @_CONFIG_OPTION
 def sessions_cmd(
-    output_json: bool, remote: bool, prune: bool, config_path: Path
+    output_json: bool, remote: bool, prune: bool, reap_merged: bool, config_path: Path
 ) -> None:
     """List live coord-* tmux sessions with their assignment metadata."""
     import json as _json  # noqa: PLC0415
@@ -926,6 +940,48 @@ def sessions_cmd(
 
     if prune:
         _prune_dead_sessions(enriched, config_path)
+        return
+
+    # ── --reap-merged: kill detached MERGE sessions that have reached 'merged' ─
+    # Routes through the daemon endpoint when a board service is configured
+    # (the board lives on the daemon), or calls the tick function directly.
+
+    if reap_merged:
+        from coord.client import resolve_board_service  # noqa: PLC0415
+
+        _svc = resolve_board_service()
+        if _svc is not None:
+            import httpx  # noqa: PLC0415
+
+            _auth = {"Authorization": f"Bearer {_svc.token}"} if _svc.token else {}
+            try:
+                resp = httpx.post(
+                    f"{_svc.url}/reap-merged-sessions",
+                    json={},
+                    headers=_auth,
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                reaped = resp.json().get("reaped", [])
+            except Exception as _e:  # noqa: BLE001
+                click.echo(f"reap-merged: daemon request failed: {_e}", err=True)
+                return
+        else:
+            from coord.serve_app import _reap_merged_sessions_tick  # noqa: PLC0415
+
+            try:
+                cfg = _load_config(config_path)
+            except Exception as _e:  # noqa: BLE001
+                click.echo(f"reap-merged: could not load config: {_e}", err=True)
+                return
+            reaped = _reap_merged_sessions_tick(cfg)
+
+        if reaped:
+            for aid in reaped:
+                click.echo(f"  reaped: {aid}")
+            click.echo(f"\nReaped {len(reaped)} merged session(s).")
+        else:
+            click.echo("No detached merged MERGE sessions to reap.")
         return
 
     # ── Human-readable output ─────────────────────────────────────────────────
