@@ -675,8 +675,15 @@ impl CoordApp {
     /// so a same-number session in another repo doesn't false-positive (#480).
     /// A session counts as live whether or not a human is attached.
     ///
-    /// The running-assignment check covers ALL assignment types (work / review /
-    /// smoke / conflict-fix) — any active worker makes the issue Live.
+    /// The running-assignment check covers ALL **headless** assignment types
+    /// (work / review / smoke / conflict-fix) — any active headless worker
+    /// makes the issue Live. Interactive/chat assignments are excluded
+    /// (#1097): unlike headless `claude -p` workers, nothing in the daemon
+    /// proactively re-checks whether an interactive tmux session died
+    /// uncleanly, so a stale `status="running"` row would otherwise pin the
+    /// issue "Live" forever. Interactive liveness is decided solely by
+    /// `has_tmux_session`, which self-corrects once the real tmux discovery
+    /// sweep stops finding the session.
     pub(crate) fn issue_session_is_live(&self, issue: &PipelineIssue) -> bool {
         // Interactive path: a coord-<id> tmux session exists.
         //
@@ -694,6 +701,7 @@ impl CoordApp {
                     .map(|r| r == a.repo)
                     .unwrap_or(true)
                 && a.status == "running"
+                && !a.is_interactive
         });
 
         let has_tmux_session = self.live_tmux_sessions.iter().any(|s| {
