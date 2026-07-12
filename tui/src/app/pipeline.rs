@@ -693,7 +693,7 @@ impl CoordApp {
         // the work is active.  A phantom pending- that exhausted its budget
         // without a real session appearing no longer makes the card "Live".
         let repo = Self::pipeline_repo_key(issue);
-        let has_running_assignment = self.data.assignments.iter().any(|a| {
+        let repo_matches = |a: &&Assignment| {
             a.issue_number == issue.number
                 && issue
                     .coord_repo
@@ -701,8 +701,29 @@ impl CoordApp {
                     .map(|r| r == a.repo)
                     .unwrap_or(true)
                 && a.status == "running"
-                && !a.is_interactive
-        });
+        };
+        // Unrestricted: any running assignment (interactive or headless) that
+        // matches this issue+repo. Used only to confirm a freshly-launched
+        // "pending-" tmux entry is real (#935) — an interactive assignment is
+        // exactly what backs a pending- entry (see `sessions.rs`'s
+        // `build_interactive_launch_cmd`), so gating this on `!is_interactive`
+        // would make the pending-budget escape hatch dead code for its only
+        // real-world caller (#1097 review finding #1).
+        let has_any_running_assignment = self
+            .data
+            .assignments
+            .iter()
+            .any(|a| repo_matches(&a));
+        // Headless-only: excludes interactive/chat assignments (#1097).
+        // Unlike headless `claude -p` workers, nothing in the daemon
+        // proactively re-checks whether an interactive tmux session died
+        // uncleanly, so a stale `status="running"` row on an interactive
+        // assignment must not, by itself, pin the issue "Live" forever.
+        let has_running_headless_assignment = self
+            .data
+            .assignments
+            .iter()
+            .any(|a| repo_matches(&a) && !a.is_interactive);
 
         let has_tmux_session = self.live_tmux_sessions.iter().any(|s| {
             if s.issue_number != Some(issue.number) || s.repo_name.as_deref() != Some(repo) {
@@ -710,9 +731,11 @@ impl CoordApp {
             }
             if s.assignment_id.starts_with("pending-") {
                 // Pending entry: live only while under budget OR assignment
-                // confirms it (the headless-path guard from #897).
+                // confirms it (the headless-path guard from #897). Any
+                // running assignment (including interactive) confirms it
+                // here, since pending- entries are always interactive.
                 s.pending_sweep_count <= Self::PENDING_SESSION_SWEEP_BUDGET
-                    || has_running_assignment
+                    || has_any_running_assignment
             } else {
                 true // real session from discovery always counts
             }
@@ -721,9 +744,11 @@ impl CoordApp {
             return true;
         }
         // Headless path (#897): a `claude -p` worker (is_interactive=false)
-        // has no tmux session but is actively running.  Any assignment with
-        // status="running" — across all types — marks the issue as Live.
-        has_running_assignment
+        // has no tmux session but is actively running. Any non-interactive
+        // assignment with status="running" marks the issue as Live;
+        // interactive assignments rely solely on `has_tmux_session` above
+        // (#1097).
+        has_running_headless_assignment
     }
 
     /// Split the in-progress ("Active") issues into two ordered groups by
