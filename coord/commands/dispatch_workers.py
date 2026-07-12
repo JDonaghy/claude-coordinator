@@ -3277,7 +3277,7 @@ def _dispatch_merge_of(
         issue_title=f"[merge] {issue_title}",
         briefing=effective_briefing,
         model=resolved_model,
-        type="merge",
+        type="conflict-fix",
         provider="claude-pty",
     )
     # Full worker tool set (Read/Edit/Write/Bash) — rebasing and resolving
@@ -3322,7 +3322,7 @@ def _dispatch_merge_of(
         branch=work.branch,
         pr_url=work.pr_url,
         dispatched_at=_time.time(),
-        type="merge",
+        type="conflict-fix",
         review_of_assignment_id=work.assignment_id,
         model=resolved_model,
         provider_name="claude-pty",
