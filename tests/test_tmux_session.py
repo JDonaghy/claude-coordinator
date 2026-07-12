@@ -567,6 +567,13 @@ class TestLaunchViaTmuxUnverifiedInjectionSurfaced:
         assert "briefing injection could not be verified" in printed
 
     def test_no_warning_or_ack_when_injection_verified(self) -> None:
+        """No *injection*-specific warning/ack when injection succeeded.
+
+        The unconditional #1102 kill-vs-detach ack (added below, at every
+        attach regardless of injection outcome) still fires exactly once —
+        that is a separate, always-on gate, not the injection-failure one
+        asserted against here.
+        """
         from coord.interactive import _launch_via_tmux
 
         with patch("subprocess.run", side_effect=self._mock_create_ok()), \
@@ -579,15 +586,21 @@ class TestLaunchViaTmuxUnverifiedInjectionSurfaced:
              patch("builtins.input") as mock_input:
             _launch_via_tmux(["claude"], "briefing text", "coord-verified")
 
-        assert not mock_input.called, (
-            "no acknowledgment should be required when injection was verified"
+        assert mock_input.call_count == 1, (
+            "the #1102 kill-vs-detach ack should still fire exactly once "
+            "at attach, independent of injection outcome"
         )
         assert not mock_print.called, (
-            "no warning should be printed when injection was verified"
+            "no injection-unverified warning should be printed when "
+            "injection was verified"
         )
 
     def test_no_warning_for_empty_briefing(self) -> None:
-        """Empty briefing skips injection entirely — nothing to warn about."""
+        """Empty briefing skips injection entirely — nothing to warn about.
+
+        Same distinction as above: the unconditional #1102 ack still fires
+        once; only the injection-specific print/ack is asserted absent.
+        """
         from coord.interactive import _launch_via_tmux
 
         with patch("subprocess.run", side_effect=self._mock_create_ok()), \
@@ -601,7 +614,10 @@ class TestLaunchViaTmuxUnverifiedInjectionSurfaced:
             _launch_via_tmux(["claude"], "   ", "coord-empty-brief")
 
         assert not mock_inject.called
-        assert not mock_input.called
+        assert mock_input.call_count == 1, (
+            "the #1102 kill-vs-detach ack should still fire exactly once "
+            "at attach, even with an empty briefing"
+        )
         assert not mock_print.called
 
 
@@ -681,3 +697,49 @@ class TestLaunchViaTmuxAttachKillGuard:
         out = capfd.readouterr().out
         assert "Ctrl-b d" in out
         assert "DO NOT" in out
+
+    # ── #1102 fix-iteration-1: live human-attended smoke FAILED — the ─────
+    # warning above was printed but immediately covered by the tmux
+    # alt-screen switch on the very next statement, so it was never
+    # actually readable in time.  An explicit acknowledgment gate is now
+    # required between the warning and the attach call, for both the
+    # fresh-session and reuse-after-crash paths.
+
+    def test_attach_pauses_for_ack_after_warning_fresh_session(self) -> None:
+        from coord.interactive import _launch_via_tmux
+
+        with patch("subprocess.run", side_effect=self._mock_create_ok()), \
+             patch("coord.interactive.tmux_session_alive", return_value=False), \
+             patch("builtins.input", return_value="") as mock_input:
+            _launch_via_tmux(["claude"], "", "coord-ackfresh")
+
+        assert mock_input.called, (
+            "operator must explicitly acknowledge the kill-vs-detach "
+            "warning before a fresh session is attached"
+        )
+
+    def test_attach_pauses_for_ack_after_warning_reuse(self) -> None:
+        from coord.interactive import _launch_via_tmux
+
+        with patch("subprocess.run", side_effect=self._mock_create_ok()), \
+             patch("coord.interactive.tmux_session_alive", return_value=True), \
+             patch("builtins.input", return_value="") as mock_input:
+            _launch_via_tmux(["claude"], "", "coord-ackreuse")
+
+        assert mock_input.called, (
+            "operator must explicitly acknowledge the kill-vs-detach "
+            "warning before reattaching to a reused session too"
+        )
+
+    def test_ack_prompt_does_not_crash_on_non_interactive_stdin(self) -> None:
+        """Headless/piped callers (no real TTY on stdin) must not hang or
+        crash — ``input()`` raising immediately (pytest's captured stdin
+        raises ``OSError``; a piped/EOF stdin raises ``EOFError``) is
+        swallowed and the attach proceeds."""
+        from coord.interactive import _launch_via_tmux
+
+        with patch("subprocess.run", side_effect=self._mock_create_ok()), \
+             patch("coord.interactive.tmux_session_alive", return_value=False):
+            rc = _launch_via_tmux(["claude"], "", "coord-headless")
+
+        assert rc == 0

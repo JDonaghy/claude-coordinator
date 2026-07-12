@@ -610,6 +610,33 @@ class TestReattachCmd:
         assert "Ctrl-b d" in result.output
         assert "DO NOT" in result.output
 
+    def test_reattach_pauses_for_ack_after_warning(self, config_file: Path) -> None:
+        """#1102 fix-iteration-1: the live human-attended smoke test found
+        that the warning above was printed but immediately covered by the
+        tmux alt-screen switch on the very next statement — the same defect
+        confirmed at the twin call site in
+        ``coord.interactive._launch_via_tmux``. ``reattach`` must require an
+        explicit acknowledgment between the warning and the attach call too.
+        """
+        attach_result = MagicMock()
+        attach_result.returncode = 0
+
+        alive_seq = iter([True, True])
+
+        with patch("coord.interactive.tmux_available", return_value=True), \
+             patch("coord.interactive.tmux_session_alive", side_effect=lambda _n, host=None: next(alive_seq, True)), \
+             patch("subprocess.run", return_value=attach_result), \
+             patch("builtins.input", return_value="") as mock_input:
+            result = CliRunner().invoke(
+                main, ["reattach", "aid-running", "--config", str(config_file)]
+            )
+
+        assert result.exit_code == 0
+        assert mock_input.called, (
+            "operator must explicitly acknowledge the kill-vs-detach "
+            "warning before reattach() attaches"
+        )
+
     def test_session_alive_after_detach_does_not_call_finalize(
         self, config_file: Path
     ) -> None:
