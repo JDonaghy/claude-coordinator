@@ -1717,6 +1717,7 @@
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         };
         BoardData {
             assignments: vec![work],
@@ -2839,6 +2840,7 @@
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         }
     }
 
@@ -4144,6 +4146,7 @@
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         });
         // Has assignment → in-progress, even though status:ready label is set.
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
@@ -4545,6 +4548,7 @@
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         });
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
         assert_eq!(section, "new");
@@ -4631,6 +4635,7 @@
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         });
         // is_closed wins over has-assignment.
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
@@ -4836,6 +4841,7 @@
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         });
 
         // With no queue entry but a merged work assignment, Merge stage → Done.
@@ -5672,6 +5678,7 @@
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         }
     }
 
@@ -5829,6 +5836,267 @@
         let review = &view.stages[1];
         assert_eq!(review.status, StageStatus::Stale);
         assert_eq!(review.action, None);
+    }
+
+    // ── #1084: oracle-loop pre-req pipeline (Gate A / Acceptance-Authoring) ──
+
+    /// Build an app with a milestone's epic/tracking issue (#751, "epic"
+    /// labelled) and two ordinary work-order member issues (#42, #43) —
+    /// mirrors `make_pipeline_app_for_acceptance_menu_test` but also gives
+    /// the tracking issue its own `PipelineIssue` row (needed to exercise
+    /// the epic-row Gate A block) and a second member issue (needed to
+    /// exercise the `for_issue_number` sibling-disambiguation fallback).
+    fn make_pipeline_app_for_prereq_test() -> CoordApp {
+        let data = BoardData {
+            pipeline_default_gates: vec![
+                "test".to_string(),
+                "review".to_string(),
+                "merge".to_string(),
+            ],
+            pipeline_tracked_labels: vec!["coord".to_string()],
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            milestone_work_orders: vec![MilestoneWorkOrder {
+                repo_name: "api".to_string(),
+                tracking_issue: 751,
+                milestone_title: "v1.0".to_string(),
+                nodes: vec![
+                    MilestoneWorkOrderNode {
+                        issue_number: 42,
+                        rank: 0,
+                        ready: true,
+                        next_up: true,
+                        blocked_on: vec![],
+                    },
+                    MilestoneWorkOrderNode {
+                        issue_number: 43,
+                        rank: 1,
+                        ready: true,
+                        next_up: false,
+                        blocked_on: vec![],
+                    },
+                ],
+            }],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        app.pipeline_issues = vec![
+            PipelineIssue {
+                number: 751,
+                title: "Milestone v1.0 tracking issue".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string(), "epic".to_string(), "status:ready".to_string()],
+                is_closed: false,
+            },
+            PipelineIssue {
+                number: 42,
+                title: "Milestone member issue".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string(), "status:ready".to_string()],
+                is_closed: false,
+            },
+            PipelineIssue {
+                number: 43,
+                title: "Sibling member issue".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string(), "status:ready".to_string()],
+                is_closed: false,
+            },
+        ];
+        app.rebuild_pipeline_sidebar(None);
+        app
+    }
+
+    #[test]
+    fn gate_a_prereq_status_pending_when_never_dispatched() {
+        let app = make_pipeline_app_for_prereq_test();
+        let epic = &app.pipeline_issues[0];
+        let status = app.gate_a_prereq_status(epic);
+        assert_eq!(status.author_id, None);
+        for stage in &status.stages {
+            assert_eq!(stage.status, StageStatus::Pending);
+            assert_eq!(stage.since, None);
+        }
+    }
+
+    #[test]
+    fn gate_a_prereq_status_active_while_author_running() {
+        let mut app = make_pipeline_app_for_prereq_test();
+        let mut a = _stage_assignment("mock1", "mock-author", 100.0, "running");
+        a.issue_number = 751;
+        a.finished_at = None;
+        app.data.assignments.push(a);
+        let epic = &app.pipeline_issues[0];
+        let status = app.gate_a_prereq_status(epic);
+        assert_eq!(status.author_id.as_deref(), Some("mock1"));
+        assert_eq!(status.stages[0].status, StageStatus::Active);
+        assert_eq!(status.stages[0].since, Some(100.0));
+        // Nothing downstream has run yet.
+        assert_eq!(status.stages[1].status, StageStatus::Pending);
+    }
+
+    #[test]
+    fn gate_a_prereq_status_stuck_waiting_on_test_after_author_done() {
+        // claude-coordinator#947's friction-log scenario: Gate A's author
+        // step finished, but nothing has recorded a Test verdict yet — the
+        // Test stage should read Pending with a `since` anchored to the
+        // author's completion, so the renderer can show "waiting Xh Ym"
+        // instead of the block just going silent.
+        let mut app = make_pipeline_app_for_prereq_test();
+        let mut a = _stage_assignment("mock1", "mock-author", 100.0, "done");
+        a.issue_number = 751;
+        a.finished_at = Some(160.0);
+        app.data.assignments.push(a);
+        let epic = &app.pipeline_issues[0];
+        let status = app.gate_a_prereq_status(epic);
+        assert_eq!(status.stages[0].status, StageStatus::Done);
+        assert_eq!(status.stages[1].status, StageStatus::Pending);
+        assert_eq!(status.stages[1].since, Some(160.0));
+        // Review/Merge haven't started — no "since" to show yet.
+        assert_eq!(status.stages[2].since, None);
+        assert_eq!(status.stages[3].since, None);
+    }
+
+    #[test]
+    fn gate_a_prereq_status_all_done_through_merge() {
+        let mut app = make_pipeline_app_for_prereq_test();
+        let mut author = _stage_assignment("mock1", "mock-author", 100.0, "done");
+        author.issue_number = 751;
+        author.finished_at = Some(160.0);
+        author.test_state = Some("passed".to_string());
+        author.branch = Some("ms-9-gate-a".to_string());
+        app.data.assignments.push(author);
+
+        let mut review = _stage_assignment("rev1", "review", 200.0, "done");
+        review.issue_number = 751;
+        review.review_of_assignment_id = Some("mock1".to_string());
+        review.review_verdict = Some("approve".to_string());
+        app.data.assignments.push(review);
+
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "mock1".to_string(),
+            issue_number: Some(751),
+            state: "merged".to_string(),
+            pr_number: Some(7),
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: None,
+            branch: Some("ms-9-gate-a".to_string()),
+            milestone_title: None,
+            last_attempt: None,
+        });
+
+        let epic = &app.pipeline_issues[0];
+        let status = app.gate_a_prereq_status(epic);
+        assert_eq!(status.stages[0].status, StageStatus::Done);
+        assert_eq!(status.stages[1].status, StageStatus::Done);
+        assert_eq!(status.stages[2].status, StageStatus::Done);
+        assert_eq!(status.stages[3].status, StageStatus::Done);
+    }
+
+    #[test]
+    fn gate_a_prereq_guidance_rows_silent_for_non_epic_row() {
+        let mut app = make_pipeline_app_for_prereq_test();
+        let mut a = _stage_assignment("mock1", "mock-author", 100.0, "done");
+        a.issue_number = 42; // member issue, not the tracking issue
+        app.data.assignments.push(a);
+        let member = &app.pipeline_issues[1];
+        let mut items = Vec::new();
+        app.append_gate_a_prereq_guidance_rows(&mut items, member);
+        assert!(items.is_empty(), "non-epic row must not render a Gate A block");
+    }
+
+    #[test]
+    fn acceptance_authoring_prereq_status_resolves_by_for_issue_number() {
+        // Both #42 and #43 dispatch JIT authoring on the SAME shared branch
+        // (test_author.py's fixed assignment_title), landing as two separate
+        // Assignment rows both keyed on issue_number=751 (the tracking
+        // issue) — only `for_issue_number` tells them apart.
+        let mut app = make_pipeline_app_for_prereq_test();
+        let mut a42 = _stage_assignment("ta-42", "test-author", 100.0, "done");
+        a42.issue_number = 751;
+        a42.for_issue_number = Some(42);
+        a42.finished_at = Some(160.0);
+        app.data.assignments.push(a42);
+
+        let mut a43 = _stage_assignment("ta-43", "test-author", 150.0, "running");
+        a43.issue_number = 751;
+        a43.for_issue_number = Some(43);
+        a43.finished_at = None;
+        app.data.assignments.push(a43);
+
+        let member42 = &app.pipeline_issues[1];
+        let status42 = app.acceptance_authoring_prereq_status(member42, 751);
+        assert_eq!(status42.author_id.as_deref(), Some("ta-42"));
+        assert_eq!(status42.stages[0].status, StageStatus::Done);
+
+        let member43 = &app.pipeline_issues[2];
+        let status43 = app.acceptance_authoring_prereq_status(member43, 751);
+        assert_eq!(status43.author_id.as_deref(), Some("ta-43"));
+        assert_eq!(status43.stages[0].status, StageStatus::Active);
+    }
+
+    #[test]
+    fn acceptance_authoring_prereq_status_falls_back_without_for_issue_number() {
+        // Pre-#1084 rows (or a daemon that hasn't picked up the column yet)
+        // carry no `for_issue_number` — degrade to "the latest JIT dispatch
+        // for this milestone" rather than showing nothing.
+        let mut app = make_pipeline_app_for_prereq_test();
+        let mut a = _stage_assignment("ta-old", "test-author", 100.0, "done");
+        a.issue_number = 751;
+        a.for_issue_number = None;
+        app.data.assignments.push(a);
+
+        let member42 = &app.pipeline_issues[1];
+        let status = app.acceptance_authoring_prereq_status(member42, 751);
+        assert_eq!(status.author_id.as_deref(), Some("ta-old"));
+    }
+
+    #[test]
+    fn acceptance_authoring_prereq_guidance_rows_silent_outside_work_order() {
+        let app = make_pipeline_app_for_prereq_test();
+        // The epic/tracking issue row itself is not a work-order *member*.
+        let epic = &app.pipeline_issues[0];
+        let mut items = Vec::new();
+        app.append_acceptance_authoring_prereq_guidance_rows(&mut items, epic);
+        assert!(items.is_empty(), "non-member row must not render an Acceptance-Authoring block");
+    }
+
+    #[test]
+    fn pipeline_tab_body_shows_gate_a_block_with_stage_labels() {
+        let mut app = make_pipeline_app_for_prereq_test();
+        let mut a = _stage_assignment("mock1", "mock-author", 100.0, "done");
+        a.issue_number = 751;
+        a.finished_at = Some(160.0);
+        app.data.assignments.push(a);
+        app.pipeline_sel = Some(0); // the epic row
+        let body = app.pipeline_tab_body_list();
+        let rendered: Vec<String> = body
+            .items
+            .iter()
+            .map(|i| i.text.spans.iter().map(|s| s.text.clone()).collect::<String>())
+            .collect();
+        assert!(
+            rendered.iter().any(|line| line.contains("Gate A")),
+            "expected a 'Gate A' row, got: {rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line.contains("Author") && line.contains("done")),
+            "expected an Author 'done' row, got: {rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line.contains("Test") && line.contains("waiting")),
+            "expected a Test row annotated 'waiting', got: {rendered:?}"
+        );
     }
 
     // ── #200: Test gate ──────────────────────────────────────────────────────
@@ -7879,6 +8147,7 @@
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         });
         let issue = &app.pipeline_issues[0];
         assert!(app.issue_has_any_assignment(issue));
@@ -7937,6 +8206,7 @@
                 audit_goals_json: None,
                 audit_bottom_line: None,
                 audit_run_number: None,
+                for_issue_number: None,
             });
         }
         let issue = &app.pipeline_issues[0];
@@ -7989,6 +8259,7 @@
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         });
         // Same issue number but different repo — should be excluded.
         app.data.assignments.push(Assignment {
@@ -8030,6 +8301,7 @@
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         });
         let issue = &app.pipeline_issues[0];  // coord_repo = Some("api")
         let total = app.issue_total_cost(issue).expect("should have cost");
@@ -8082,6 +8354,7 @@
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         });
         // Interactive session — cost_usd is None (Max subscription).
         app.data.assignments.push(Assignment {
@@ -8123,6 +8396,7 @@
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         });
         let issue = &app.pipeline_issues[0];
         let total = app.issue_total_cost(issue).expect("should have cost from auto assignment");
@@ -8180,6 +8454,7 @@
                 audit_goals_json: None,
                 audit_bottom_line: None,
                 audit_run_number: None,
+                for_issue_number: None,
             });
         }
         let issue = &app.pipeline_issues[0];
@@ -8231,6 +8506,7 @@
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         });
         // Same issue number, different repo — should be excluded.
         app.data.assignments.push(Assignment {
@@ -8272,6 +8548,7 @@
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         });
         let issue = &app.pipeline_issues[0];  // coord_repo = Some("api")
         assert_eq!(app.issue_total_tokens(issue), 1200, "expected 1000+200=1200 for api repo only");
@@ -8332,6 +8609,7 @@
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -8392,6 +8670,7 @@
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.derive_current_stage(issue), "done");
@@ -8538,6 +8817,7 @@
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         // Work stage ran → Done.
@@ -8619,6 +8899,7 @@
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Active);
@@ -8666,6 +8947,7 @@
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -8718,6 +9000,7 @@
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         });
         // Newer successful retry.
         app.data.assignments.push(Assignment {
@@ -8759,6 +9042,7 @@
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -8808,6 +9092,7 @@
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         });
         let issue = &app.pipeline_issues[0];
         // issue.coord_repo == "api", assignment.repo == "different-repo" →
@@ -8886,6 +9171,7 @@
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].label, "Work");
@@ -8944,6 +9230,7 @@
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         });
         app.data.assignments.push(Assignment {
             id: "r1".to_string(),
@@ -8984,6 +9271,7 @@
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         // Both stages done, no Merge stage remaining.
@@ -9201,6 +9489,7 @@
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         }
     }
 
@@ -9553,6 +9842,7 @@
                 audit_goals_json: None,
                 audit_bottom_line: None,
                 audit_run_number: None,
+                for_issue_number: None,
             });
         }
         app.data.merge_queue.push(MergeQueueEntry {
@@ -9618,6 +9908,7 @@
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].status, StageStatus::Failed);
@@ -9674,6 +9965,7 @@
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         for stage in &view.stages {
@@ -9773,6 +10065,7 @@
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "plan"), StageStatus::Done);
@@ -9828,6 +10121,7 @@
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         });
         let issue = &app.pipeline_issues[0].clone();
         let id = app.find_done_plan_assignment_id(issue, "api");
@@ -9877,6 +10171,7 @@
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         });
         let issue = &app.pipeline_issues[0].clone();
         assert_eq!(app.find_done_plan_assignment_id(issue, "api"), None);
@@ -14987,6 +15282,7 @@
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         }];
 
         let result = parse_session_summaries_from_comments(&comments, &assignments);
@@ -15119,6 +15415,7 @@
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         };
         let result = parse_session_summaries_from_comments(&comments, &[fix_assignment]);
         assert_eq!(result.len(), 1);
@@ -15292,6 +15589,7 @@
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         };
 
         let data = BoardData {
@@ -15386,6 +15684,7 @@
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         };
 
         let data = BoardData {
@@ -15947,6 +16246,7 @@
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         };
 
         let data = BoardData {
@@ -16321,6 +16621,7 @@
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         };
         let mut app = make_test_app(BoardData {
             assignments: vec![work_assignment],
@@ -24422,6 +24723,7 @@
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         };
 
         // Review for the fix — approved.
@@ -24464,6 +24766,7 @@
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         };
 
         // The merge queue has the ORIGINAL work (different aid, same branch).
@@ -24544,6 +24847,7 @@
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         });
 
         let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
@@ -27135,6 +27439,7 @@ Milestone tracking issue.
             audit_goals_json: None,
             audit_bottom_line: None,
             audit_run_number: None,
+            for_issue_number: None,
         });
 
         assert!(app.maybe_bind_pending_milestone_chat());

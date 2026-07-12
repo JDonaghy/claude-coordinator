@@ -1097,6 +1097,33 @@ fn kv_item(key: &str, val: &str, val_color: Option<Color>) -> ListItem {
     }
 }
 
+/// #1084: label + colour for one oracle-loop pre-req stage
+/// ([`crate::app::pipeline::PrereqStage`]) — mirrors the colour palette the
+/// rest of the Pipeline detail panel uses for [`StageStatus`] (Done/Failed
+/// green/red; Active a distinct blue since it's genuinely different from a
+/// settled verdict; Pending/Skipped/Stale muted).
+fn prereq_stage_label(status: &StageStatus) -> (&'static str, Color) {
+    match status {
+        StageStatus::Done => ("done", Color::rgb(120, 200, 120)),
+        StageStatus::Active => ("running", Color::rgb(120, 170, 220)),
+        StageStatus::Failed => ("failed", Color::rgb(220, 100, 100)),
+        StageStatus::Stale => ("stale", Color::rgb(220, 150, 80)),
+        StageStatus::Skipped => ("skipped", Color::rgb(160, 160, 180)),
+        StageStatus::Pending => ("pending", Color::rgb(160, 160, 180)),
+    }
+}
+
+/// #1084: `mm:ss`-formatted wall-clock elapsed time since Unix timestamp
+/// `since`, for the pre-req pipeline's "running Xm Ys" / "waiting Xm Ys"
+/// annotations.
+fn elapsed_since_now(since: f64) -> String {
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(since);
+    fmt_elapsed_mmss((now_secs - since).max(0.0) as u64)
+}
+
 // ─── Activity log parsing ─────────────────────────────────────────────────────
 
 /// Build a plain `ListItem` for the Activity feed.

@@ -313,6 +313,16 @@ class Assignment:
     audit_goals_json: str | None = None
     audit_bottom_line: str | None = None
     audit_run_number: int | None = None
+    # #1084: for type="test-author" assignments, the specific work-order
+    # member issue this JIT dispatch is extending the acceptance suite for
+    # (`coord.test_author.dispatch_test_author`'s `issue_number` argument).
+    # NOT the same as `issue_number` above, which test-author always sets to
+    # the milestone's *tracking* issue (every JIT dispatch for a milestone
+    # shares one branch/PR, so `issue_number` alone can't distinguish "this
+    # is issue #1039's slice" from "issue #1042's slice" — see #1084's
+    # friction log). None for milestone-mode (Gate A) authoring and for
+    # every other assignment type; only test-author's JIT mode sets it.
+    for_issue_number: int | None = None
 
 
 @dataclass

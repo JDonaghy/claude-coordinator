@@ -619,8 +619,8 @@ def _record_dispatched_assignment_local(
             issue_number, issue_title, status, type, briefing,
             files_allowed, model, dispatched_at, review_of_assignment_id,
             review_target, required_gates, review_iteration,
-            provider_name, branch
-        ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            provider_name, branch, for_issue_number
+        ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(assignment_id) DO UPDATE SET
             status = 'running',
             machine_name = excluded.machine_name,
@@ -638,7 +638,10 @@ def _record_dispatched_assignment_local(
             provider_name = COALESCE(excluded.provider_name, provider_name),
             -- #557: COALESCE so a re-dispatch doesn't clear a branch that
             -- finalize already wrote (mark_notified sets branch on completion).
-            branch = COALESCE(excluded.branch, branch)""",
+            branch = COALESCE(excluded.branch, branch),
+            -- #1084: COALESCE so a re-dispatch/reload doesn't clear the JIT
+            -- per-issue correlation already recorded for this assignment.
+            for_issue_number = COALESCE(excluded.for_issue_number, for_issue_number)""",
         (
             assignment.assignment_id or "",
             assignment.machine_name,
@@ -657,6 +660,7 @@ def _record_dispatched_assignment_local(
             assignment.review_iteration,
             assignment.provider_name,
             assignment.branch,
+            assignment.for_issue_number,
         ),
     )
     conn.commit()

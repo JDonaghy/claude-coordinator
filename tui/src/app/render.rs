@@ -1977,6 +1977,12 @@ impl CoordApp {
                     ));
                 }
             }
+            // #1084: the oracle-loop pre-req pipeline (Gate A / per-issue
+            // acceptance authoring) precedes — visually and functionally —
+            // this issue's normal Work→Test→Review→Merge strip, so its rows
+            // render first.
+            self.append_gate_a_prereq_guidance_rows(&mut items, issue);
+            self.append_acceptance_authoring_prereq_guidance_rows(&mut items, issue);
             self.append_test_guidance_rows(&mut items, issue);
             self.append_acceptance_guidance_rows(&mut items, issue);
         }
@@ -2455,6 +2461,80 @@ impl CoordApp {
             test_label,
             Some(Color::rgb(160, 160, 180)),
         ));
+    }
+
+    /// #1084: append the Gate A mini-pipeline block (Author → Test → Review
+    /// → Merge) for an epic/tracking-issue row — the milestone-level
+    /// mock-author pre-req that gates every member issue's acceptance
+    /// authoring (docs/ORACLE_LOOP.md). Silent (no rows) for non-epic rows
+    /// and for epics where Gate A has never been dispatched, so the panel
+    /// stays quiet until there's something to report.
+    pub(crate) fn append_gate_a_prereq_guidance_rows(&self, items: &mut Vec<ListItem>, issue: &PipelineIssue) {
+        if !issue.all_labels.iter().any(|l| l == "epic") {
+            return;
+        }
+        let status = self.gate_a_prereq_status(issue);
+        if status.author_id.is_none() {
+            return;
+        }
+        self.append_prereq_pipeline_rows(items, "Gate A", &status);
+    }
+
+    /// #1084: append the per-issue Acceptance-Authoring mini-pipeline block
+    /// (Author → Test → Review → Merge) — the JIT `test-author` slice that
+    /// extends the milestone's sealed acceptance suite for this specific
+    /// work-order member issue, and gates that issue's real Work dispatch
+    /// (docs/ORACLE_LOOP.md). Silent for issues outside a milestone work
+    /// order and for members whose slice has never been dispatched.
+    pub(crate) fn append_acceptance_authoring_prereq_guidance_rows(
+        &self,
+        items: &mut Vec<ListItem>,
+        issue: &PipelineIssue,
+    ) {
+        let Some(tracking_issue) = self.milestone_tracking_issue_for(issue) else {
+            return;
+        };
+        let status = self.acceptance_authoring_prereq_status(issue, tracking_issue);
+        if status.author_id.is_none() {
+            return;
+        }
+        self.append_prereq_pipeline_rows(items, "Acceptance Authoring", &status);
+    }
+
+    /// Shared renderer for the two oracle-loop pre-req blocks above: a
+    /// title row naming the resolved Author-stage assignment, then one row
+    /// per stage (Author/Test/Review/Merge) with its status and — for the
+    /// stage currently "live" (Active) or stalled (Pending directly behind
+    /// a settled predecessor) — an elapsed-time annotation. A long elapsed
+    /// time on a Pending row *is* the "stuck, and on which gate" signal
+    /// (claude-coordinator#947's 19-hour-invisible-stall scenario): no
+    /// separate "stuck" status is needed when the number speaks for itself.
+    fn append_prereq_pipeline_rows(&self, items: &mut Vec<ListItem>, title: &str, status: &PrereqPipelineStatus) {
+        items.push(kv_item("", "", None));
+        let id_short: String = status.author_id.as_deref().unwrap_or("").chars().take(8).collect();
+        items.push(kv_item(
+            title,
+            &format!("(assignment {})", id_short),
+            Some(Color::rgb(160, 160, 180)),
+        ));
+        const STAGE_NAMES: [&str; 4] = ["Author", "Test", "Review", "Merge"];
+        for (name, stage) in STAGE_NAMES.iter().zip(status.stages.iter()) {
+            let (label, color) = prereq_stage_label(&stage.status);
+            let suffix = match (&stage.status, stage.since) {
+                (StageStatus::Active, Some(since)) => {
+                    format!(" — running {}", elapsed_since_now(since))
+                }
+                (StageStatus::Pending, Some(since)) => {
+                    format!(" — waiting {}", elapsed_since_now(since))
+                }
+                _ => String::new(),
+            };
+            items.push(kv_item(
+                &format!("  {}", name),
+                &format!("{label}{suffix}"),
+                Some(color),
+            ));
+        }
     }
 
     /// #932: append an "Acceptance" guidance block — verdict, per-test
