@@ -116,11 +116,11 @@ impl CoordApp {
     }
 
     /// Count of audit rows in the last 15 minutes (`/board`'s
-    /// `audit_recent_count`, #1037) — the basis for a future activity-bar
-    /// attention dot (issue deliverable #7). Mirrors
-    /// `plans_needing_attention_count`'s role as the single source both the
-    /// sidebar badge above and any global status-bar/ActivityBar indicator
-    /// read from, so the two can never drift out of sync.
+    /// `audit_recent_count`, #1037) — backs both the sidebar's "N recent"
+    /// line above and the always-visible status-bar attention badge (#1090,
+    /// #1039 deliverable #7, `mod.rs`'s `status_bar()`). Mirrors
+    /// `plans_needing_attention_count`'s role as the single source both
+    /// readers pull from, so the two can never drift out of sync.
     pub(crate) fn audit_recent_count(&self) -> u64 {
         self.data.audit_recent_count
     }

@@ -6635,6 +6635,23 @@ impl CoordApp {
                 action_id: None,
             });
         }
+        // #1090 (#1039 deliverable #7): persistent "N audit events" attention
+        // badge, mirroring the `plans_attn` segment immediately above —
+        // always visible regardless of `active_view`, so recent audit
+        // activity is noticeable without opening the Audit panel. Reads the
+        // same `audit_recent_count()` the Audit sidebar's "N recent" line
+        // reads (`audit.rs`), so the two can never drift apart.
+        let audit_recent = self.audit_recent_count();
+        if audit_recent > 0 {
+            let noun = if audit_recent == 1 { "event" } else { "events" };
+            left.push(StatusBarSegment {
+                text: format!(" § {} audit {} ", audit_recent, noun),
+                fg: Color::rgb(120, 210, 120),
+                bg: Color::rgb(15, 50, 15),
+                bold: true,
+                action_id: None,
+            });
+        }
         // #628: persistent indicator for live interactive sessions. Detached
         // sessions create no board `running` row, so they were invisible —
         // they only showed in the one-time #487 startup toast and then piled

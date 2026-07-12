@@ -30765,6 +30765,55 @@ Milestone tracking issue.
     }
 
     #[test]
+    fn status_bar_surfaces_audit_recent_count() {
+        // #1090 (#1039 deliverable #7): the audit activity-bar attention
+        // badge must be visible in the global status bar regardless of
+        // `active_view` — mirrors `status_bar_surfaces_live_interactive_sessions`
+        // and the `plans_attn` badge it's modeled on.
+        let left_text = |a: &CoordApp| {
+            a.status_bar()
+                .left_segments
+                .iter()
+                .map(|s| s.text.clone())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+
+        // audit_recent_count == 0 (BoardData::default()) → no badge.
+        let app = make_test_app(BoardData::default());
+        assert!(
+            !left_text(&app).contains("audit event"),
+            "no badge expected when audit_recent_count == 0, got: {}",
+            left_text(&app),
+        );
+
+        // audit_recent_count > 1 → plural badge, visible while on another view.
+        let mut app = make_test_app(BoardData {
+            audit_recent_count: 7,
+            ..BoardData::default()
+        });
+        app.active_view = SidebarView::Board;
+        assert!(
+            left_text(&app).contains("7 audit events"),
+            "expected a '7 audit events' badge, got: {}",
+            left_text(&app),
+        );
+
+        // audit_recent_count == 1 → singular form.
+        let mut app = make_test_app(BoardData {
+            audit_recent_count: 1,
+            ..BoardData::default()
+        });
+        app.active_view = SidebarView::Board;
+        assert!(
+            left_text(&app).contains("1 audit event ")
+                && !left_text(&app).contains("1 audit events"),
+            "expected singular '1 audit event', got: {}",
+            left_text(&app),
+        );
+    }
+
+    #[test]
     fn audit_entry_detail_pane_opens_on_enter() {
         use quadraui::tui::testing::driver_with_shell;
 
