@@ -157,6 +157,20 @@ class Machine:
 # type only needs to be added here.
 WORK_LIKE_TYPES: frozenset[str] = frozenset({"work", "mock-author"})
 
+# #1077: subset of WORK_LIKE_TYPES whose ``issue_number`` is the issue the PR
+# actually *resolves* — i.e. merging it should auto-close that issue. "work"
+# qualifies. "mock-author" (Gate A) is WORK_LIKE (it flows through the same
+# Work → Test → Review → Merge pipeline) but its ``issue_number`` is the
+# *milestone's tracking/epic issue* (see ``coord/mock_author.py``), not
+# something the contract PR resolves — merging it must NOT close that issue,
+# or the epic reads as "done" while its real sub-issues are still open/
+# untouched (claude-coordinator#1041 got closed this way). This is the single
+# source of truth for both the PR-body "Closes #N" vs "Refs #N" keyword
+# choice (``coord/review.py``, ``coord/merge_queue.py``'s ``_briefing_body``)
+# and the deterministic post-merge ``close_issue`` call
+# (``coord/merge_queue.py``'s ``process``).
+CLOSES_ISSUE_TYPES: frozenset[str] = frozenset({"work"})
+
 
 @dataclass
 class Assignment:

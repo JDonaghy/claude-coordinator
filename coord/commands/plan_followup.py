@@ -294,12 +294,24 @@ def pr(assignment_id: str, config_path: Path, no_review: bool) -> None:
         sys.exit(1)
 
     default_branch = repo.default_branch
+    # #1077: "mock-author" (Gate A) assignments' issue_number is the
+    # milestone's tracking issue, not something this PR resolves — closing
+    # it on merge would wrongly flip the epic to "done" while its real
+    # sub-issues are untouched. Only "work"-type PRs get the closing
+    # keyword; everything else gets a non-closing reference.
+    from coord.models import CLOSES_ISSUE_TYPES  # noqa: PLC0415
+
+    ref_keyword = (
+        f"Closes #{assignment.issue_number}"
+        if assignment.type in CLOSES_ISSUE_TYPES
+        else f"Refs #{assignment.issue_number}"
+    )
     briefing = (
         f"You are on branch {assignment.branch}. The code is complete and tests pass.\n"
         f"Create a PR from {assignment.branch} to {default_branch} for issue #{assignment.issue_number}.\n"
         f"Title: {assignment.issue_title}\n\n"
         f"Use gh pr create. Read the diff (git fetch origin && git diff origin/{default_branch}...HEAD) and write a clear\n"
-        f"summary of what changed. Reference the issue with \"Closes #{assignment.issue_number}\".\n"
+        f"summary of what changed. Reference the issue with \"{ref_keyword}\".\n"
         f"Do NOT modify any code — only create the PR."
     )
 

@@ -223,6 +223,7 @@
   "merge_queue": [
     {
       "assignment_id": "work-748a",
+      "assignment_type": "work",
       "branch": "issue-748-fixture",
       "enqueued_at": 1000000950.0,
       "error": null,

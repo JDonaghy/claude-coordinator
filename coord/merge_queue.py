@@ -16,7 +16,7 @@ from typing import Iterable, Protocol
 
 from coord.ci_store import CiStore, NoOpCi, failed_checks, in_flight_checks, summarize
 from coord.db import get_connection
-from coord.models import WORK_LIKE_TYPES, Assignment
+from coord.models import CLOSES_ISSUE_TYPES, WORK_LIKE_TYPES, Assignment
 from coord.state import COORD_DIR
 
 # Legacy path constant — kept for backward compat with monkeypatch calls in tests.
@@ -308,6 +308,14 @@ class QueuedMerge:
     # `review_head_sha` to detect stale approvals (commits pushed after review).
     # None means SHA tracking is not available for this entry.
     branch_head_sha: str | None = None
+    # #1077: the originating assignment's `type` (e.g. "work", "mock-author"),
+    # captured at enqueue time. Drives both the PR-body "Closes #N" vs
+    # "Refs #N" keyword (`_briefing_body`) and whether `process()` closes
+    # `issue_number` deterministically after merge — see
+    # `coord.models.CLOSES_ISSUE_TYPES`. Defaults to "work" for entries
+    # created before this field existed (preserves prior close-on-merge
+    # behavior for old rows).
+    assignment_type: str = "work"
 
 
 class GhOps(Protocol):
@@ -358,6 +366,10 @@ def load_queue() -> list[QueuedMerge]:
             last_attempt=row["last_attempt"],
             error=row["error"],
             enqueued_at=row["enqueued_at"],
+            # #1077: column added via migration; rows written before it
+            # existed read back as NULL, so fall back to "work" (the
+            # pre-existing close-on-merge behavior for those entries).
+            assignment_type=row["assignment_type"] or "work",
         )
         for row in rows
     ]
@@ -373,13 +385,15 @@ def save_queue(items: list[QueuedMerge]) -> None:
                 """INSERT INTO merge_queue (
                     assignment_id, repo_name, repo_github, branch,
                     target_branch, issue_number, issue_title, state,
-                    pr_number, pr_url, size, last_attempt, error, enqueued_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    pr_number, pr_url, size, last_attempt, error, enqueued_at,
+                    assignment_type
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     item.assignment_id, item.repo_name, item.repo_github,
                     item.branch, item.target_branch, item.issue_number,
                     item.issue_title, item.state, item.pr_number, item.pr_url,
                     item.size, item.last_attempt, item.error, item.enqueued_at,
+                    item.assignment_type,
                 ),
             )
 
@@ -442,6 +456,7 @@ def enqueue(
         issue_title=assignment.issue_title,
         size=diff_size,
         enqueued_at=time.time(),
+        assignment_type=assignment.type,
     )
     items.append(entry)
     save_queue(items)
@@ -616,6 +631,7 @@ def refresh_entry_assignment(
             issue_title=assignment.issue_title,
             size=diff_size,
             enqueued_at=time.time(),
+            assignment_type=assignment.type,
         )
         items.append(entry)
         save_queue(items)
@@ -625,6 +641,11 @@ def refresh_entry_assignment(
     if existing.state != PENDING:
         return False  # don't touch terminal entries (MERGED, CONFLICT, etc.)
     existing.assignment_id = assignment.assignment_id
+    # #1077: keep the close-on-merge decision in sync with the re-keyed
+    # assignment's type (a bounce/fix iteration is expected to carry the
+    # same type as the original, but this avoids a stale value if it ever
+    # doesn't).
+    existing.assignment_type = assignment.type
     # Clear a stale "review required" error now that a fresh approval arrived.
     if existing.error == "review required but not approved":
         existing.error = None
@@ -1034,8 +1055,15 @@ def _briefing_body(entry: QueuedMerge) -> str:
     # lifecycle ledger shows the row as In-flight forever (the brain
     # keeps re-synching it as state=open).  Quadraui #239/#240/#242 hit
     # this in 2026-05; closing the issues was a manual cleanup.
+    #
+    # #1077: only emit the closing keyword when this entry's issue_number is
+    # actually resolved by the PR (`CLOSES_ISSUE_TYPES`). A "mock-author"
+    # entry's issue_number is the milestone's tracking issue — closing it on
+    # merge is wrong (the epic reads "done" while its sub-issues are still
+    # open), so it gets the non-closing `Refs #N` instead.
+    keyword = "Closes" if entry.assignment_type in CLOSES_ISSUE_TYPES else "Refs"
     return (
-        f"Closes #{entry.issue_number}\n\n"
+        f"{keyword} #{entry.issue_number}\n\n"
         f"Automated merge from the coordinator for assignment "
         f"{entry.assignment_id} on issue #{entry.issue_number}.\n\n"
         f"Worker branch: `{entry.branch}` → `{entry.target_branch}`."
@@ -1274,17 +1302,31 @@ def process(
                 # Best-effort — a close failure must not undo a successful merge.
                 # Closing on GitHub keeps the daemon the sole DB writer: the next
                 # reconcile/sync flips the cached row to closed (state.py).
-                try:
-                    gh_ops.close_issue(entry.repo_github, entry.issue_number)
+                #
+                # #1077: only for entries whose issue_number is actually
+                # resolved by this PR (CLOSES_ISSUE_TYPES). A "mock-author"
+                # entry's issue_number is the milestone's tracking issue —
+                # closing it here would be the exact #1077 bug regardless of
+                # what the PR body says.
+                if entry.assignment_type in CLOSES_ISSUE_TYPES:
+                    try:
+                        gh_ops.close_issue(entry.repo_github, entry.issue_number)
+                        events.append(MergeEvent(
+                            entry, "merged",
+                            f"merged PR #{entry.pr_number}; closed issue #{entry.issue_number}",
+                        ))
+                    except Exception as e:  # noqa: BLE001 — never fail a merge on close
+                        events.append(MergeEvent(
+                            entry, "merged",
+                            f"merged PR #{entry.pr_number} (warning: could not "
+                            f"close issue #{entry.issue_number}: {e})",
+                        ))
+                else:
                     events.append(MergeEvent(
                         entry, "merged",
-                        f"merged PR #{entry.pr_number}; closed issue #{entry.issue_number}",
-                    ))
-                except Exception as e:  # noqa: BLE001 — never fail a merge on close
-                    events.append(MergeEvent(
-                        entry, "merged",
-                        f"merged PR #{entry.pr_number} (warning: could not "
-                        f"close issue #{entry.issue_number}: {e})",
+                        f"merged PR #{entry.pr_number}; issue #{entry.issue_number} "
+                        f"left open (assignment type {entry.assignment_type!r} "
+                        "does not close its tracking issue, #1077)",
                     ))
                 continue
             entry.state = CONFLICT

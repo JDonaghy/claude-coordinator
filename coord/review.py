@@ -36,7 +36,7 @@ import httpx
 from coord import github_ops
 from coord.config import Config, ReviewsConfig
 from coord.dispatch import AGENT_PORT
-from coord.models import WORK_LIKE_TYPES, Assignment, Board, Machine
+from coord.models import CLOSES_ISSUE_TYPES, WORK_LIKE_TYPES, Assignment, Board, Machine
 
 log = logging.getLogger(__name__)
 
@@ -796,11 +796,22 @@ def _find_or_open_pr(
     default_branch: str,
     issue_number: int,
     issue_title: str,
+    assignment_type: str = "work",
 ) -> dict | None:
     """Return {number, url, existed} for a PR on `branch`, opening one if needed.
 
     Returns None when neither lookup nor open works — caller continues without
     a PR-targeted review (falls back to branch-diff review).
+
+    *assignment_type* decides the PR-body keyword (#1077): for types in
+    :data:`coord.models.CLOSES_ISSUE_TYPES` (``"work"``), ``issue_number`` is
+    the issue this PR resolves, so the body carries the closing keyword
+    ``Closes #N`` and GitHub auto-closes it on merge. For any other
+    WORK_LIKE type — notably ``"mock-author"`` (Gate A), whose
+    ``issue_number`` is the milestone's *tracking* issue, not something the
+    PR resolves — the body uses the non-closing ``Refs #N`` so the tracking
+    issue still gets a discoverable backlink but does not flip to closed
+    when the contract PR merges.
     """
     try:
         existing = github_ops.find_pr_for_branch(repo_github, branch)
@@ -812,6 +823,7 @@ def _find_or_open_pr(
             "url": existing.get("url"),
             "existed": True,
         }
+    keyword = "Closes" if assignment_type in CLOSES_ISSUE_TYPES else "Refs"
     try:
         return github_ops.create_pr(
             repo_github,
@@ -819,7 +831,7 @@ def _find_or_open_pr(
             head=branch,
             title=f"#{issue_number}: {issue_title}",
             body=(
-                f"Closes #{issue_number}\n\n"
+                f"{keyword} #{issue_number}\n\n"
                 f"Automated PR opened by coordinator for review of issue #{issue_number}."
             ),
         )
@@ -960,6 +972,7 @@ def dispatch_review(
         default_branch=repo.default_branch,
         issue_number=completed.issue_number,
         issue_title=completed.issue_title,
+        assignment_type=completed.type,
     )
 
     # #904 (fix #1): build a ranked list of ALL eligible reviewer machines so
