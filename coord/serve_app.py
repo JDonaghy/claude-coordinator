@@ -114,7 +114,9 @@ def _reload_config_if_stale(
     Returns ``(config, mtime)`` — either *current* unchanged (no backing path,
     a ``stat()`` failure, or no on-disk change since *last_mtime*) or a
     freshly-loaded ``Config`` paired with its new mtime. A malformed hand-edit
-    (invalid YAML, a validation error) is logged and swallowed rather than
+    (invalid YAML, a validation error, a permissions change, a TOCTOU race
+    where the file vanishes between our ``stat()`` and ``load()``'s read, or a
+    bad-encoding write caught mid-edit) is logged and swallowed rather than
     raised into a request handler or the tick loop — the daemon keeps serving
     the last-good config. *last_mtime* still advances past a bad edit so it
     isn't re-parsed (and re-logged) on every subsequent call; it will be
@@ -132,17 +134,27 @@ def _reload_config_if_stale(
 
     import logging  # noqa: PLC0415
 
-    from coord.config import ConfigError  # noqa: PLC0415
     from coord.config import load as _load_coordinator_config  # noqa: PLC0415
 
     log = logging.getLogger("coord.serve")
     try:
         reloaded = _load_coordinator_config(path)
-    except ConfigError as e:
+    except Exception as e:  # noqa: BLE001 — a tick must never crash the daemon
+        # Broad on purpose (#1081 review): load() isn't guaranteed to only raise
+        # ConfigError — a TOCTOU race (file deleted/replaced between our stat()
+        # and load()'s own read), a permissions change (OSError), a bad-encoding
+        # write caught mid-edit (UnicodeDecodeError), or a malformed structure
+        # tripping an un-validated code path deeper in the parser (AttributeError/
+        # TypeError/KeyError) can all surface here. Swallowing them matches every
+        # other tick-loop guard in this file — an uncaught exception from this
+        # helper would otherwise either 500 a /board request or, worse,
+        # permanently kill the bare `asyncio.create_task(_tick_loop())` task with
+        # no supervisor to restart it.
         log.warning(
-            "coord serve: %s changed on disk but failed to reload (%s); "
+            "coord serve: %s changed on disk but failed to reload (%s: %s); "
             "keeping last-good config until the file is fixed",
             path,
+            type(e).__name__,
             e,
         )
         return current, mtime

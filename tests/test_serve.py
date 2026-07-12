@@ -214,6 +214,38 @@ def test_reload_config_if_stale_keeps_last_good_on_invalid_yaml(
     assert "failed to reload" in caplog.text
 
 
+def test_reload_config_if_stale_keeps_last_good_on_non_config_error(
+    valid_config_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    """A reload failure that ISN'T a ``ConfigError`` must still be swallowed (#1081 review).
+
+    ``coord.config.load`` isn't guaranteed to only raise ``ConfigError`` — a
+    TOCTOU race (file deleted/replaced between our ``stat()`` and ``load()``'s
+    own read), a permissions change, or a bad-encoding write caught mid-edit
+    can all surface a raw ``OSError``/``UnicodeDecodeError``/etc. This must
+    never propagate into the ``/board`` handler or (worse) permanently kill
+    the bare ``asyncio.create_task(_tick_loop())`` task — it has no supervisor
+    to restart it.
+    """
+    cfg = load_config(valid_config_path)
+    mtime = valid_config_path.stat().st_mtime
+    _bump_mtime(valid_config_path)
+
+    import coord.config as coord_config_module
+
+    def _boom(_path):
+        raise OSError("permission denied (simulated)")
+
+    monkeypatch.setattr(coord_config_module, "load", _boom)
+
+    with caplog.at_level("WARNING", logger="coord.serve"):
+        kept, new_mtime = _reload_config_if_stale(cfg, mtime)
+    assert kept is cfg  # last-good config preserved, not raised into the caller
+    assert new_mtime > mtime  # advances so a bad edit isn't re-parsed every call
+    assert "failed to reload" in caplog.text
+    assert "OSError" in caplog.text
+
+
 def test_serve_board_picks_up_config_hand_edit(
     file_db: Path, valid_config_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
