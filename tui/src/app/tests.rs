@@ -31542,6 +31542,91 @@ Milestone tracking issue.
         );
     }
 
+    // ── #1087: sealed acceptance suite can't exercise real fetch code ───────
+    //
+    // Before this issue, `resolve_board_service()` unconditionally returned
+    // `None` in every test build (`cfg(any(test, feature = "test-support"))`),
+    // so `spawn_audit_fetch` could never take its real `ureq` network branch
+    // under test — only the synthetic-channel `AuditFetchOutcome` shortcuts
+    // exercised above. `set_test_board_service` (a thread-local override, not
+    // a `COORD_SERVICE_URL` env var — see its doc comment for why a process-
+    // global env var would race the ~25 other Audit-panel tests in this file)
+    // plus `MockBoardService` (a minimal `std`-only HTTP server,
+    // `app::fixtures`) close that gap: this test drives `spawn_audit_fetch`
+    // all the way through a real TCP round trip.
+
+    /// End-to-end: with the board service pointed at a live
+    /// [`MockBoardService`], `spawn_audit_fetch` must perform a real HTTP
+    /// `GET /audit` and deliver the parsed page back over its channel —
+    /// exercising the network branch that was unreachable under test before
+    /// #1087.
+    #[test]
+    fn spawn_audit_fetch_hits_real_mock_server() {
+        let mock = MockBoardService::start(audit_page_json_two_entries());
+        let _guard = set_test_board_service(mock.url(), None);
+
+        let rx = spawn_audit_fetch(None, None, None);
+        let outcome = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("spawn_audit_fetch must deliver an outcome before the timeout");
+
+        match outcome {
+            AuditFetchOutcome::Page(page) => {
+                assert_eq!(
+                    page.entries.len(),
+                    2,
+                    "must deserialize both entries from the mock server's response"
+                );
+                assert_eq!(page.entries[0].summary, "NEWEST_MARKER");
+                assert_eq!(page.entries[1].summary, "OLDEST_MARKER");
+            }
+            other => panic!(
+                "expected AuditFetchOutcome::Page from a live mock server, got a \
+                 different variant instead (network path not actually exercised): \
+                 {:?}",
+                match &other {
+                    AuditFetchOutcome::Page(_) => unreachable!(),
+                    AuditFetchOutcome::NoBoardService => "NoBoardService".to_string(),
+                    AuditFetchOutcome::Unreachable(reason) => format!("Unreachable({reason})"),
+                }
+            ),
+        }
+
+        let requests = mock.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "expected exactly one request to reach the mock server; got {:?}",
+            requests
+        );
+        assert!(
+            requests[0].starts_with("GET /audit"),
+            "spawn_audit_fetch must GET /audit; got {:?}",
+            requests[0]
+        );
+    }
+
+    /// The thread-local override is scoped to the guard's lifetime: once
+    /// dropped, `resolve_board_service()` must go back to `None` on the same
+    /// thread — otherwise a later test reusing this `cargo test` worker
+    /// thread would silently inherit a stale mock URL.
+    #[test]
+    fn board_service_override_clears_on_guard_drop() {
+        let mock = MockBoardService::start(audit_page_json_two_entries());
+        {
+            let _guard = set_test_board_service(mock.url(), None);
+            assert!(
+                resolve_board_service().is_some(),
+                "override must be active while the guard is alive"
+            );
+        }
+        assert_eq!(
+            resolve_board_service(),
+            None,
+            "resolve_board_service() must return to None once the guard drops"
+        );
+    }
+
     // ── #1094: Audit panel row list migrated to a `DataTable` ───────────────
     //
     // No Gate-A mock/contract amendment for #1094 has been authored yet
