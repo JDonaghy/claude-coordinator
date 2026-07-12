@@ -31216,6 +31216,246 @@ Milestone tracking issue.
         );
     }
 
+    // ── #1094 fix-iteration-1: Audit `DataTable` scrolling ───────────────────
+    //
+    // The initial #1094 landing hardcoded the table's `scroll_offset`/
+    // `h_scroll` to 0 and never checked scrollbar-track hits before falling
+    // through to row/header hit-testing (`DataTableLayout::hit_test`,
+    // quadraui, has no concept of the scrollbar strips it reserves space
+    // for). A human-attended smoke test reproduced both: keyboard nav could
+    // move `audit_sel` off-screen with no way back, and clicking either
+    // scrollbar selected/opened whatever row happened to be under the
+    // cursor instead of scrolling. See the durable finding + fix-iteration-1
+    // briefing recorded on issue #1094. These tests are the regression
+    // coverage for that fix.
+
+    /// Build `n` audit entries with distinct `ROW_NN` summary markers
+    /// (newest-first, matching wire order — index 0 is `ROW_00`), for tests
+    /// that need more rows than fit in one screenful.
+    fn audit_page_json_n_entries(n: usize) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let entries: Vec<String> = (0..n)
+            .map(|i| {
+                format!(
+                    r#"{{
+                        "id": {id}, "ts": {ts}, "tier": "operational",
+                        "category": "dispatch", "event_type": "dispatched",
+                        "actor": "coordinator", "repo": "claude-coordinator",
+                        "issue": {issue}, "assignment_id": null,
+                        "machine": null, "summary": "ROW_{i:02}",
+                        "details": null
+                    }}"#,
+                    id = n - i,
+                    ts = now - (i as f64 * 10.0),
+                    issue = 1000 + i,
+                    i = i,
+                )
+            })
+            .collect();
+        format!(
+            r#"{{"entries": [{}], "next_cursor": null, "has_more": false}}"#,
+            entries.join(",")
+        )
+    }
+
+    #[test]
+    fn audit_keyboard_down_scrolls_viewport_to_follow_selection() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        // 40 rows at a 140x40 driver size is comfortably more than fit in
+        // the table body, so the last row isn't visible until something
+        // scrolls the viewport there.
+        let n = 40;
+        let app = make_app_with_audit_json(BoardData::default(), &audit_page_json_n_entries(n));
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "§");
+        driver.render();
+
+        assert!(
+            !driver.screen().contains("ROW_39"),
+            "sanity check: the last row must NOT be visible before any \
+             navigation:\n{}",
+            driver.screen()
+        );
+
+        for _ in 0..(n - 1) {
+            driver.press_named(NamedKey::Down);
+        }
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ROW_39"),
+            "pressing Down all the way to the last row must scroll the \
+             viewport to keep the selection visible (previously the table \
+             was built with `scroll_offset` hardcoded to 0):\n{screen}"
+        );
+    }
+
+    #[test]
+    fn audit_home_and_end_keys_scroll_to_first_and_last_row() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let n = 40;
+        let app = make_app_with_audit_json(BoardData::default(), &audit_page_json_n_entries(n));
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "§");
+        driver.render();
+
+        driver.press_named(NamedKey::End);
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ROW_39"),
+            "End must jump AND scroll to the last row:\n{screen}"
+        );
+
+        driver.press_named(NamedKey::Home);
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ROW_00"),
+            "Home must jump AND scroll back to the first row:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn audit_page_down_moves_selection_past_first_screenful() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        // The fix-iteration-1 report explicitly called out PgDn as a
+        // keyboard fallback that should work — it wasn't wired up for the
+        // Audit view at all before this fix.
+        let n = 40;
+        let app = make_app_with_audit_json(BoardData::default(), &audit_page_json_n_entries(n));
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "§");
+        driver.render();
+
+        driver.press_named(NamedKey::PageDown);
+        driver.render();
+        driver.press_named(NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("summary:") && !screen.contains("ROW_00"),
+            "PageDown must move the selection off the first row (detail \
+             pane must show a later entry's summary, not ROW_00):\n{screen}"
+        );
+    }
+
+    #[test]
+    fn audit_vertical_scrollbar_click_scrolls_and_does_not_select_a_row() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let n = 40;
+        let app = make_app_with_audit_json(BoardData::default(), &audit_page_json_n_entries(n));
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "§");
+        driver.render();
+
+        // Locate the v-scrollbar thumb ('█') and the bottom-most track cell
+        // ('█' or '░') at that same column — clicking there is well below
+        // the thumb (which starts at the top when scroll_offset == 0).
+        let lines: Vec<String> = driver.screen().lines().map(str::to_string).collect();
+        let thumb_col = lines
+            .iter()
+            .find_map(|line| line.chars().position(|c| c == '█'))
+            .unwrap_or_else(|| panic!("v-scrollbar thumb not rendered:\n{}", lines.join("\n")));
+        let track_bottom_row = lines
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(y, line)| {
+                let ch = line.chars().nth(thumb_col)?;
+                (ch == '█' || ch == '░').then_some(y)
+            })
+            .unwrap_or_else(|| panic!("v-scrollbar track not rendered:\n{}", lines.join("\n")));
+
+        driver.click(thumb_col as f32 + 0.5, track_bottom_row as f32 + 0.5);
+        driver.render();
+
+        let screen_after_click = driver.screen();
+        assert!(
+            screen_after_click.contains("ROW_39"),
+            "clicking near the bottom of the v-scrollbar track must scroll \
+             the viewport down (previously `DataTableLayout::hit_test` had \
+             no concept of the scrollbar strip, so this click fell through \
+             to row selection instead):\n{screen_after_click}"
+        );
+
+        // The click must NOT have changed the selection — Enter should
+        // still open the detail pane for the still-selected first row
+        // (ROW_00), proving the scrollbar click didn't route through to
+        // `DataTableHit::Row`.
+        driver.press_named(NamedKey::Enter);
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ROW_00"),
+            "a v-scrollbar click must not change row selection — detail \
+             pane must still show the original ROW_00 selection:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn audit_horizontal_scrollbar_click_scrolls_columns_into_view() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        // At 80x24 the table is below `min_total_width` (75) and engages
+        // the h-scrollbar (same setup as
+        // `audit_table_engages_h_scrollbar_below_min_width`). Few rows are
+        // enough here — the h-scrollbar trigger is about total column
+        // width, not row count — and keeps the v-scrollbar out of the way.
+        let n = 5;
+        let app = make_app_with_audit_json(BoardData::default(), &audit_page_json_n_entries(n));
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 80, 24);
+        click_activity_icon(&mut driver, "§");
+        driver.render();
+
+        // The Audit sidebar's own "Time: All" filter line also contains the
+        // literal substring "Time", so assertions below must scope to the
+        // table's HEADER row specifically — always the main panel's first
+        // rendered row (same row as the sidebar's " AUDIT" title) — rather
+        // than `driver.screen()` as a whole.
+        let header_line =
+            |screen: &str| -> String { screen.lines().next().unwrap_or_default().to_string() };
+        assert!(
+            header_line(&driver.screen()).contains("Time"),
+            "sanity check: Time header must be visible before any h-scroll:\n{}",
+            driver.screen()
+        );
+
+        let lines: Vec<String> = driver.screen().lines().map(str::to_string).collect();
+        let (track_row, right_col) = lines
+            .iter()
+            .enumerate()
+            .find_map(|(y, line)| {
+                let chars: Vec<char> = line.chars().collect();
+                let last = chars.iter().rposition(|&c| c == '▄' || c == '▁')?;
+                Some((y, last))
+            })
+            .unwrap_or_else(|| panic!("h-scrollbar not rendered:\n{}", lines.join("\n")));
+
+        // Click near the right end of the track — a click/drag-to-position
+        // scrollbar should jump the viewport close to its max h_scroll.
+        driver.click(right_col as f32 + 0.5, track_row as f32 + 0.5);
+        driver.render();
+
+        let screen_after = driver.screen();
+        assert!(
+            !header_line(&screen_after).contains("Time"),
+            "clicking near the right end of the h-scrollbar must scroll \
+             the Time column out of view (previously `h_scroll` was \
+             hardcoded to 0.0, so the scrollbar rendered but could never \
+             actually move the viewport):\n{screen_after}"
+        );
+    }
+
     // ── #1040: Audit panel filters (time-range / category / type) ──────────
     //
     // No sealed acceptance slice exists for #1040 yet (the ms-33 manifest

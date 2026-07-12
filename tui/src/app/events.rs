@@ -2177,6 +2177,11 @@ impl CoordApp {
                         if n > 0 {
                             self.audit_sel = (self.audit_sel + 1).min(n - 1);
                         }
+                        // #1094 fix: keep the selection inside the viewport
+                        // — the row list is in the MAIN panel here (unlike
+                        // Machines/MergeQueue, whose navigable list IS the
+                        // sidebar), so use `main_bounds`, not `list_b`.
+                        self.fix_audit_scroll(content_visible_rows(ctx.main_bounds(), lh));
                         needs_redraw = true;
                     }
                     Key::Char('k') | Key::Named(NamedKey::Up)
@@ -2184,6 +2189,7 @@ impl CoordApp {
                             && !self.audit_detail_open =>
                     {
                         self.audit_sel = self.audit_sel.saturating_sub(1);
+                        self.fix_audit_scroll(content_visible_rows(ctx.main_bounds(), lh));
                         needs_redraw = true;
                     }
                     Key::Named(NamedKey::Enter)
@@ -3034,6 +3040,10 @@ impl CoordApp {
                             // #1039: Audit — Home jumps to the first entry.
                             SidebarView::Audit => {
                                 self.audit_sel = 0;
+                                // #1094 fix: scroll back to the top too —
+                                // otherwise row 0 is selected but still
+                                // scrolled off-screen above the viewport.
+                                self.audit_scroll = 0;
                             }
                         }
                         needs_redraw = true;
@@ -3113,6 +3123,11 @@ impl CoordApp {
                                 if n > 0 {
                                     self.audit_sel = n - 1;
                                 }
+                                // #1094 fix: scroll the last row into view.
+                                self.fix_audit_scroll(content_visible_rows(
+                                    ctx.main_bounds(),
+                                    lh,
+                                ));
                             }
                         }
                         needs_redraw = true;
@@ -3231,6 +3246,37 @@ impl CoordApp {
                         if new_sel != prev_sel {
                             self.detail_scroll = 0;
                         }
+                        needs_redraw = true;
+                    }
+
+                    // ── PageDown (Audit only) ─────────────────────────────
+                    // #1094 fix: the fix-iteration-1 report called out that
+                    // PgDn didn't work as a keyboard fallback for reaching
+                    // rows beyond the first screenful — it wasn't wired up
+                    // at all. Pages the selection by a full viewport instead
+                    // of one row at a time; `fix_audit_scroll` follows it
+                    // into view same as `j`/`k`.
+                    Key::Named(NamedKey::PageDown)
+                        if self.active_view == SidebarView::Audit
+                            && !self.audit_detail_open =>
+                    {
+                        let n = self.audit_entries().len();
+                        if n > 0 {
+                            let page = content_visible_rows(ctx.main_bounds(), lh).max(1);
+                            self.audit_sel = (self.audit_sel + page).min(n - 1);
+                        }
+                        self.fix_audit_scroll(content_visible_rows(ctx.main_bounds(), lh));
+                        needs_redraw = true;
+                    }
+
+                    // ── PageUp (Audit only) ───────────────────────────────
+                    Key::Named(NamedKey::PageUp)
+                        if self.active_view == SidebarView::Audit
+                            && !self.audit_detail_open =>
+                    {
+                        let page = content_visible_rows(ctx.main_bounds(), lh).max(1);
+                        self.audit_sel = self.audit_sel.saturating_sub(page);
+                        self.fix_audit_scroll(content_visible_rows(ctx.main_bounds(), lh));
                         needs_redraw = true;
                     }
 
@@ -4111,6 +4157,21 @@ impl CoordApp {
                     // the precedence self-documenting.
                     if self.active_view == SidebarView::Audit && buttons.left {
                         redraw |= self.audit_update_resize_drag(pos, main_b);
+                        // #1094 fix: continue an in-progress scrollbar
+                        // track drag (started by a `MouseDown` inside
+                        // `audit_scrollbar_hit`'s region — see
+                        // `mouse_main_click` below), same precedence as the
+                        // column-resize drag just above.
+                        if let Some(axis) = self.audit_scrollbar_drag {
+                            redraw |= match axis {
+                                AuditScrollAxis::Vertical => {
+                                    self.audit_apply_vscroll(pos, main_b)
+                                }
+                                AuditScrollAxis::Horizontal => {
+                                    self.audit_apply_hscroll(pos, main_b)
+                                }
+                            };
+                        }
                     }
                     if self.terminal_host_sel_dragging && buttons.left {
                         if let Some((col, row)) =
@@ -4214,7 +4275,13 @@ impl CoordApp {
                 // HeaderDivider`) before any other `MouseUp` handling —
                 // mirrors the #464 host-selection-drag finalize priority
                 // just below.
-                if btn == MouseButton::Left && self.audit_resize_col.take().is_some() {
+                // #1094 fix: release an in-progress scrollbar-track drag
+                // the same way — started by a `MouseDown` inside
+                // `audit_scrollbar_hit`'s region (`mouse_main_click` below).
+                if btn == MouseButton::Left
+                    && (self.audit_resize_col.take().is_some()
+                        || self.audit_scrollbar_drag.take().is_some())
+                {
                     return true;
                 }
                 if let Some(sidebar_b) = ctx.sidebar_bounds() {
@@ -4939,7 +5006,27 @@ impl CoordApp {
         // pane itself isn't a selectable-row target (it has no rows of its
         // own to pick), so the table isn't hit-tested at all while
         // `audit_detail_open`.
+        //
+        // #1094 fix (fix-iteration-1): a scrollbar-track hit is checked
+        // FIRST, before `audit_table_hit` — `DataTableLayout::hit_test`
+        // (quadraui) has no concept of the scrollbar strips it reserves
+        // space for, so without this a click on either scrollbar fell
+        // through and was mis-hit-tested as a row click (the reported
+        // "scrollbar click passes through and selects/opens the row
+        // underneath" bug).
         if self.active_view == SidebarView::Audit && !self.audit_detail_open {
+            if let Some(axis) = self.audit_scrollbar_hit(pos, main_b) {
+                self.audit_scrollbar_drag = Some(axis);
+                match axis {
+                    AuditScrollAxis::Vertical => {
+                        self.audit_apply_vscroll(pos, main_b);
+                    }
+                    AuditScrollAxis::Horizontal => {
+                        self.audit_apply_hscroll(pos, main_b);
+                    }
+                }
+                return true;
+            }
             return match self.audit_table_hit(pos, main_b) {
                 Some(DataTableHit::Row { idx }) => {
                     self.audit_sel = idx;
