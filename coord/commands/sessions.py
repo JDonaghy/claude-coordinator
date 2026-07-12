@@ -1439,6 +1439,18 @@ def reattach(assignment_id: str, config_path: Path) -> None:
     # coord/interactive.py::_launch_via_tmux — a wrong keystroke here is
     # just as destructive as at first launch.
     click.echo(TMUX_ATTACH_WARNING.rstrip("\n"))
+    # #1102 fix-iteration-1 (live human-attended smoke FAILED): the attach
+    # call a few lines below switches the terminal to tmux's alt-screen
+    # buffer immediately, covering this banner before the operator can read
+    # it — confirmed live at the twin call site in
+    # coord/interactive.py::_launch_via_tmux. Require an explicit
+    # acknowledgment here too. Best-effort: a piped/non-interactive stdin
+    # (tests, scripted callers) raises immediately and is swallowed so this
+    # never hangs a headless run.
+    try:
+        input("Press Enter to attach (read the warning above first)... ")
+    except (EOFError, KeyboardInterrupt, OSError):
+        pass
 
     started_at = _time.time()
     try:

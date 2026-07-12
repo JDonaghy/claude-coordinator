@@ -193,6 +193,12 @@ PTY_RELAY_NO_DETACH_WARNING = (
     "==============================================================================\n"
 )
 
+#: How long to hold the terminal after printing
+#: :data:`PTY_RELAY_NO_DETACH_WARNING` and before ``pty.fork()`` hands the
+#: screen to the child (#1102 follow-up). Long enough for the banner to
+#: register with the operator, short enough not to feel like a hang.
+_PTY_NO_DETACH_WARNING_PAUSE_S = 1.5
+
 
 def _get_local_short_hostname() -> str:
     """Return the short hostname of the local machine (split on '.' and lowercased).
@@ -829,6 +835,23 @@ def _launch_via_tmux(
     except OSError:
         pass
 
+    # #1102 fix-iteration-1 (live human-attended smoke FAILED): printing the
+    # banner is not enough on its own -- the very next statement below
+    # (tmux attach-session / switch-client) switches the terminal to tmux's
+    # alt-screen buffer, which covers the banner before the operator's eyes
+    # can land on it ("it was too fast, I saw something flash by but could
+    # not read it" -- confirmed live; the operator then hit Ctrl-D instead
+    # of Ctrl-b d and the one-pane session was destroyed). Require an
+    # explicit acknowledgment here, mirroring the existing
+    # unverified-injection gate above (lines ~808-822) and the pre-existing
+    # #865 pattern it was modeled on. ``input()`` on a piped/non-interactive
+    # stdin (tests, CI, a scripted caller) raises immediately -- swallow
+    # that so this stays best-effort and never hangs a headless run.
+    try:
+        input("Press Enter to attach (read the warning above first)... ")
+    except (EOFError, KeyboardInterrupt, OSError):
+        pass
+
     # Attach.  ``subprocess.run`` (not ``os.execvp``) is intentional: we
     # need this process to continue after the operator detaches so that
     # the CLI caller (``coord assign``) can check whether the session is
@@ -1141,6 +1164,24 @@ def _launch_via_pty(
     # operator to assume the same Ctrl-b d semantics apply here.
     try:
         os.write(fd_out, PTY_RELAY_NO_DETACH_WARNING.encode("utf-8"))
+    except OSError:
+        pass
+
+    # #1102 follow-up: same visibility risk as the tmux path above -- the
+    # ``pty.fork()`` a few lines down hands the terminal straight to the
+    # child, and a real full-screen TUI (``claude``) typically clears the
+    # screen and starts drawing well inside a second, so this banner can be
+    # gone before the operator reads it. Unlike the tmux path there is no
+    # ``input()`` gate here: this function's ``fd_in`` is sometimes a
+    # script-driven pipe rather than a real keyboard (see the real-pty
+    # relay-loop tests), and a blocking read on a pipe nobody writes to
+    # would hang forever rather than raise. Give the banner a fixed beat of
+    # on-screen time instead, and only when actually attached to a real
+    # terminal -- headless/test callers (stdout is not a tty) proceed
+    # immediately, unaffected.
+    try:
+        if os.isatty(fd_out):
+            time.sleep(_PTY_NO_DETACH_WARNING_PAUSE_S)
     except OSError:
         pass
 

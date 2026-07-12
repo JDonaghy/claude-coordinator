@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from typing import Generator
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -314,3 +316,62 @@ class TestNoDetachWarningPtyRelay:
                 pass
 
         assert b"no detach available" in captured
+
+    # ── #1102 follow-up: warning must actually be visible before the child ────
+    # takes over the terminal. There's no tmux layer to gate on an
+    # ``input()`` ack here (``fd_in`` can be a script-driven pipe that's
+    # never written to — a blocking read would hang forever), so a fixed
+    # on-screen pause is used instead, and only when stdout is a real TTY.
+
+    def test_pause_skipped_when_stdout_not_a_tty(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Pipe-backed stdout (as used by every fixture in this file) is not
+        a TTY -- the fixed pause before ``pty.fork()`` must be skipped so
+        headless/test callers never stall."""
+        import pty  # noqa: PLC0415
+
+        from coord.interactive import launch_human_attended_interactive
+
+        r_fd, w_fd = os.pipe()
+        sleep_mock = MagicMock()
+        try:
+            monkeypatch.setattr(sys, "stdout", _PipedStdout(w_fd))
+            monkeypatch.setattr(sys, "stdin", _PipedStdin(r_fd))
+            monkeypatch.setattr(pty, "fork", _fake_fork_raiser)
+            monkeypatch.setattr(time, "sleep", sleep_mock)
+
+            with pytest.raises(OSError, match="test sentinel"):
+                launch_human_attended_interactive(argv=["claude"], briefing="hi")
+        finally:
+            os.close(w_fd)
+            os.close(r_fd)
+
+        sleep_mock.assert_not_called()
+
+    def test_pause_applied_when_stdout_is_a_tty(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When actually attached to a real terminal, the fixed pause runs
+        so the no-detach banner has time to register before ``pty.fork()``
+        hands control to the child."""
+        import pty  # noqa: PLC0415
+
+        from coord.interactive import launch_human_attended_interactive
+
+        r_fd, w_fd = os.pipe()
+        sleep_mock = MagicMock()
+        try:
+            monkeypatch.setattr(sys, "stdout", _PipedStdout(w_fd))
+            monkeypatch.setattr(sys, "stdin", _PipedStdin(r_fd))
+            monkeypatch.setattr(pty, "fork", _fake_fork_raiser)
+            monkeypatch.setattr(os, "isatty", lambda _fd: True)
+            monkeypatch.setattr(time, "sleep", sleep_mock)
+
+            with pytest.raises(OSError, match="test sentinel"):
+                launch_human_attended_interactive(argv=["claude"], briefing="hi")
+        finally:
+            os.close(w_fd)
+            os.close(r_fd)
+
+        sleep_mock.assert_called_once()
