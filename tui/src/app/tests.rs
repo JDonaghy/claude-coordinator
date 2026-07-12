@@ -1900,6 +1900,32 @@
     }
 
     #[test]
+    fn build_interactive_launch_cmd_continue_mode_emits_rework_of_and_briefing() {
+        // #1104: Continue emits --rework-of <failed_work_aid> AND, unlike
+        // Fix, an explicit --briefing (the CLI hard-requires one for
+        // --rework-of; the TUI seeds a default since the launcher auto-runs
+        // with no chance for the operator to type one first).
+        let cmd = build_interactive_launch_cmd(
+            None,
+            "m",
+            "api",
+            7,
+            InteractiveLaunchMode::Continue,
+            Some("work-failed-1"),
+        );
+        assert!(
+            cmd.contains("--rework-of work-failed-1"),
+            "Continue mode must emit --rework-of <work_aid>, got: {cmd}",
+        );
+        assert!(
+            cmd.contains("--briefing"),
+            "Continue mode must seed a --briefing (--rework-of requires one), got: {cmd}",
+        );
+        assert!(cmd.contains("--interactive"));
+        assert!(cmd.ends_with('\r'), "launcher must auto-run");
+    }
+
+    #[test]
     fn build_interactive_launch_cmd_test_mode_emits_smoke_of() {
         let cmd = build_interactive_launch_cmd(
             None,
@@ -2239,6 +2265,146 @@
             app.completed_work_aid_for("api", 751).as_deref(),
             Some("id-751-done"),
             "a done mock-author assignment with a branch must resolve just like a work one"
+        );
+    }
+
+    // ── #1104: Continue — failed-with-branch work-attempt detection ───────
+
+    #[test]
+    fn failed_work_aid_with_branch_for_finds_the_failed_branched_attempt() {
+        let mut app = make_test_app(BoardData::default());
+        let mut a = make_assignment_typed("failed", 42, "api", Some("work"));
+        a.branch = Some("issue-42-work".to_string());
+        app.data.assignments.push(a);
+        assert_eq!(
+            app.failed_work_aid_with_branch_for("api", 42).as_deref(),
+            Some("id-42-failed"),
+            "a failed work assignment with a branch must resolve as the Continue target"
+        );
+    }
+
+    #[test]
+    fn failed_work_aid_with_branch_for_none_when_no_branch() {
+        // A worker that failed before ever committing/pushing has nothing to
+        // continue — Continue must not offer a branch-less attempt.
+        let mut app = make_test_app(BoardData::default());
+        let a = make_assignment_typed("failed", 42, "api", Some("work"));
+        app.data.assignments.push(a);
+        assert!(
+            app.failed_work_aid_with_branch_for("api", 42).is_none(),
+            "a failed work assignment with NO branch must not be a Continue target"
+        );
+    }
+
+    #[test]
+    fn failed_work_aid_with_branch_for_none_when_nothing_dispatched() {
+        let app = make_test_app(BoardData::default());
+        assert!(app.failed_work_aid_with_branch_for("api", 42).is_none());
+    }
+
+    #[test]
+    fn failed_work_aid_with_branch_for_none_once_a_later_rework_succeeds() {
+        // #1104: `--rework-of` continues the SAME branch as a NEW type="work"
+        // row (`_dispatch_rework_of`). Once that rework lands `done`, it
+        // becomes the latest work attempt and Continue must stop offering
+        // the now-superseded original failure — "no subsequent successful
+        // work/rework on that branch" per the issue's acceptance criteria.
+        let mut app = make_test_app(BoardData::default());
+        let mut failed = make_assignment_typed("failed", 42, "api", Some("work"));
+        failed.id = "work-1".to_string();
+        failed.branch = Some("issue-42-work".to_string());
+        failed.dispatched_at = Some(100.0);
+        let mut reworked = make_assignment_typed("done", 42, "api", Some("work"));
+        reworked.id = "work-2".to_string();
+        reworked.branch = Some("issue-42-work".to_string());
+        reworked.dispatched_at = Some(200.0);
+        app.data.assignments.push(failed);
+        app.data.assignments.push(reworked);
+        assert!(
+            app.failed_work_aid_with_branch_for("api", 42).is_none(),
+            "a later successful rework must retire the Continue offer for the earlier failure"
+        );
+    }
+
+    #[test]
+    fn failed_work_aid_with_branch_for_ignores_non_work_assignment_types() {
+        // A failed REVIEW or SMOKE row must never be mistaken for a
+        // continuable work attempt.
+        let mut app = make_test_app(BoardData::default());
+        let mut a = make_assignment_typed("failed", 42, "api", Some("review"));
+        a.branch = Some("issue-42-work".to_string());
+        app.data.assignments.push(a);
+        assert!(app.failed_work_aid_with_branch_for("api", 42).is_none());
+    }
+
+    #[test]
+    fn context_menu_shows_continue_only_when_latest_work_attempt_failed_with_branch() {
+        // #1104: additive next to Work/Plan in Start (interactive) — Fix's
+        // precedent, gated the same way.
+        let mut app = make_test_app(BoardData::default());
+        let mut a = make_assignment_typed("failed", 42, "api", Some("work"));
+        a.branch = Some("issue-42-work".to_string());
+        app.data.assignments.push(a);
+        // `selected_failed_work_aid_with_branch` (like `selected_test_failed_
+        // work_aid`, Fix's equivalent) reads the SELECTED Pipeline row —
+        // `active_view` must be Pipeline (not the `Board` default) or
+        // `selected_issue_repo_and_key` resolves via the Board selection
+        // instead, not `pipeline_sel`. Keep this in sync with the
+        // `issue_number`/`repo_name` params below, as the real right-click
+        // handler does.
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 42,
+            title: "t".to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: false,
+        }];
+        app.pipeline_repo_names = vec!["api".to_string()];
+        app.pipeline_sel = Some(0);
+        let items = app.context_menu_items_for_pipeline_row(
+            Some(42),
+            &PipelineRowLifecycle::InProgress,
+            Some("api"),
+        );
+        let start_interactive = items
+            .iter()
+            .find(|i| i.label == "Start (interactive)")
+            .expect("Start (interactive) submenu must be present");
+        assert!(
+            start_interactive
+                .submenu
+                .as_ref()
+                .expect("Start (interactive) must be a submenu parent")
+                .iter()
+                .any(|c| c.label == "Continue"),
+            "Continue must be offered when the latest work attempt failed with a branch"
+        );
+    }
+
+    #[test]
+    fn context_menu_hides_continue_when_no_failed_branched_attempt() {
+        let app = make_test_app(BoardData::default());
+        let items = app.context_menu_items_for_pipeline_row(
+            Some(42),
+            &PipelineRowLifecycle::New,
+            Some("api"),
+        );
+        let start_interactive = items
+            .iter()
+            .find(|i| i.label == "Start (interactive)")
+            .expect("Start (interactive) submenu must be present");
+        assert!(
+            !start_interactive
+                .submenu
+                .as_ref()
+                .expect("Start (interactive) must be a submenu parent")
+                .iter()
+                .any(|c| c.label == "Continue"),
+            "Continue must NOT be offered with no failed-with-branch work attempt"
         );
     }
 
@@ -12470,6 +12636,8 @@
         assert_eq!(interactive_mode_verb(InteractiveLaunchMode::Plan), "plan");
         assert_eq!(interactive_mode_verb(InteractiveLaunchMode::Review), "review");
         assert_eq!(interactive_mode_verb(InteractiveLaunchMode::Fix), "fix");
+        // #1104: Continue's verb, used in the machine-picker prompt/dialog title.
+        assert_eq!(interactive_mode_verb(InteractiveLaunchMode::Continue), "continue");
         assert_eq!(
             interactive_mode_verb(InteractiveLaunchMode::Troubleshoot),
             "troubleshoot"
@@ -12489,6 +12657,12 @@
         // --fix-of continues the work branch as type="work" (cli.py), so a Fix
         // launch must reattach only to a running work session, never a review.
         assert_eq!(interactive_mode_assignment_type(InteractiveLaunchMode::Fix), "work");
+        // #1104: --rework-of continues the work branch as type="work" too
+        // (dispatch_workers.py `_dispatch_rework_of`), same reattach story as Fix.
+        assert_eq!(
+            interactive_mode_assignment_type(InteractiveLaunchMode::Continue),
+            "work"
+        );
         assert_eq!(interactive_mode_assignment_type(InteractiveLaunchMode::Work), "work");
         assert_eq!(interactive_mode_assignment_type(InteractiveLaunchMode::Plan), "work");
         assert_eq!(interactive_mode_assignment_type(InteractiveLaunchMode::Review), "review");
@@ -23126,6 +23300,43 @@
         assert!(
             driver.screen_contains("Start (interactive)"),
             "the interactive launcher menu must render for a done work row:\n{}",
+            driver.screen()
+        );
+    }
+
+    // ── #1104: Continue — failed-with-branch work-attempt menu item ───────
+
+    /// #1104 black-box (TuiDriver): a work row that FAILED outright (not a
+    /// test/review gate) while leaving a real branch behind must still
+    /// render the "Start (interactive)" launcher menu end-to-end through
+    /// the real event → render path against the headless `TestBackend` —
+    /// the same render-pipeline sanity check the `Fix`/`Testing` gates use
+    /// (see `tuidriver_done_work_row_renders_interactive_menu` above). The
+    /// exact gating logic (Continue shown/hidden) is covered by the
+    /// builder-level `context_menu_shows_continue_only_when_latest_work_
+    /// attempt_failed_with_branch` / `context_menu_hides_continue_when_no_
+    /// failed_branched_attempt` tests.
+    #[test]
+    fn tuidriver_failed_work_row_with_branch_renders_interactive_menu() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_pipeline_app_with_test_gate();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+
+        // Worker-reported failure (no test/review gate) that left a real
+        // branch behind — the shape #1104's Continue targets.
+        let mut row = _work_assignment("w1", 100.0, "failed", None);
+        row.branch = Some("issue-42-add-cool-thing".to_string());
+        app.data.assignments.push(row);
+
+        let opened = app.open_context_menu(Point::new(4.0, 4.0), pipeline_target(Some(42)));
+        assert!(opened, "context menu should open for the pipeline row");
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        assert!(
+            driver.screen_contains("Start (interactive)"),
+            "the interactive launcher menu must render for a failed-with-branch work row:\n{}",
             driver.screen()
         );
     }

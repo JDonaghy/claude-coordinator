@@ -589,6 +589,18 @@ impl CoordApp {
                     "start-plan-interactive",
                     "Plan",
                 ));
+                // #1104: Continue shown only when the issue's LATEST work
+                // attempt failed outright (worker-reported, no test/review
+                // gate — that's Fix's territory) while leaving a real branch
+                // behind. Additive, mirroring the Fix precedent: Work is left
+                // unchanged (always forks fresh) rather than auto-swapping its
+                // behavior based on hidden state.
+                if self.selected_failed_work_aid_with_branch().is_some() {
+                    interactive_children.push(ContextMenuItem::action(
+                        "start-continue-interactive",
+                        "Continue",
+                    ));
+                }
                 // #539: Review gated on a completed work assignment.
                 let mut review_item = ContextMenuItem::action("start-review-interactive", "Review");
                 review_item.disabled = self.selected_completed_work_aid().is_none();
@@ -5726,6 +5738,13 @@ impl CoordApp {
             "start-fix-interactive" => {
                 self.pipeline_detail_tab = PipelineDetailTab::Terminal;
                 self.launch_interactive_session_for_selected_issue(InteractiveLaunchMode::Fix);
+                true
+            }
+            // #1104: human-attended CONTINUE of a work assignment that
+            // failed outright, on its existing branch (`--rework-of`).
+            "start-continue-interactive" => {
+                self.pipeline_detail_tab = PipelineDetailTab::Terminal;
+                self.launch_interactive_session_for_selected_issue(InteractiveLaunchMode::Continue);
                 true
             }
             // #569: Troubleshoot — human-attended diagnostic session for a

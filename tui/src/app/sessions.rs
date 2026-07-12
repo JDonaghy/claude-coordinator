@@ -1883,6 +1883,50 @@ impl CoordApp {
             .map(|a| a.id.clone())
     }
 
+    /// #1104: the id of the SELECTED issue's most-recent `type="work"`
+    /// assignment when it (a) is the LATEST work/rework attempt on the issue
+    /// (by `dispatched_at`) and (b) failed outright (`status == "failed"`,
+    /// a worker-reported failure — NOT a test/review gate, which `Fix`
+    /// already covers) while leaving a real branch behind. `None` otherwise.
+    ///
+    /// Deliberately keyed on the *latest* work row rather than "any failed
+    /// row ever": a `--rework-of` that later succeeds becomes a NEW `type=
+    /// "work"` row on the SAME branch (`_dispatch_rework_of`,
+    /// `coord/commands/dispatch_workers.py`) with a later `dispatched_at`,
+    /// so once a rework lands `done` it naturally becomes the latest row and
+    /// this stops matching — "no subsequent successful work/rework on that
+    /// branch" falls out of the ordering for free, no separate bookkeeping.
+    ///
+    /// Drives the "Continue" context-menu item (interactive-only, #1104) and
+    /// supplies the `--rework-of <aid>` argument when it fires.
+    pub(crate) fn selected_failed_work_aid_with_branch(&self) -> Option<String> {
+        let (repo, issue_key) = self.selected_issue_repo_and_key()?;
+        self.failed_work_aid_with_branch_for(&repo, issue_key.1)
+    }
+
+    pub(crate) fn failed_work_aid_with_branch_for(
+        &self,
+        coord_repo: &str,
+        issue_num: u64,
+    ) -> Option<String> {
+        let latest = self
+            .data
+            .assignments
+            .iter()
+            .filter(|a| a.issue_number == issue_num && a.repo == coord_repo)
+            .filter(|a| a.assignment_type.as_deref().unwrap_or("work") == "work")
+            .max_by(|a, b| {
+                a.dispatched_at
+                    .partial_cmp(&b.dispatched_at)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })?;
+        if latest.status == "failed" && latest.branch.as_deref().map(|b| !b.is_empty()).unwrap_or(false) {
+            Some(latest.id.clone())
+        } else {
+            None
+        }
+    }
+
     /// Leg 3c / A3 (#517): scan armed interactive testing sessions for a
     /// freshly-recorded test verdict on the WORK row and route it (Test
     /// precedes Review): `failed` → fail→fix confirm prompt (same action a
@@ -2264,6 +2308,19 @@ impl CoordApp {
                     return;
                 }
             },
+            // #1104: Continue carries the FAILED WORK id (worker-reported
+            // failure, no test/review gate — that's Fix's territory).
+            InteractiveLaunchMode::Continue => match self.selected_failed_work_aid_with_branch() {
+                Some(aid) => Some(aid),
+                None => {
+                    self.push_toast(
+                        "Continue",
+                        "No failed work assignment with a branch found for this issue — nothing to continue.",
+                        ToastSeverity::Warning,
+                    );
+                    return;
+                }
+            },
             // Leg 3c / A3 (#517): Test + Merge both operate on the completed
             // work assignment's branch.
             InteractiveLaunchMode::Test => match self.selected_completed_work_aid() {
@@ -2490,6 +2547,7 @@ impl CoordApp {
                     InteractiveLaunchMode::Work
                     | InteractiveLaunchMode::Plan
                     | InteractiveLaunchMode::Fix
+                    | InteractiveLaunchMode::Continue
                     | InteractiveLaunchMode::Troubleshoot
                     | InteractiveLaunchMode::Chat => {
                         let prior_done_ids = self.done_work_aids_for(&repo, issue_num);
@@ -2502,9 +2560,13 @@ impl CoordApp {
                                 prior_done_ids,
                             },
                         );
-                        // A Fix consumes the request-changes verdict that
-                        // triggered it — stop verdict-routing from re-firing.
-                        if matches!(mode, InteractiveLaunchMode::Fix) {
+                        // A Fix/Continue consumes the request-changes verdict
+                        // or failed attempt that triggered it — stop
+                        // verdict-routing from re-firing.
+                        if matches!(
+                            mode,
+                            InteractiveLaunchMode::Fix | InteractiveLaunchMode::Continue
+                        ) {
                             self.armed_for_verdict.remove(&issue_key);
                         }
                     }
@@ -2559,6 +2621,7 @@ impl CoordApp {
                         InteractiveLaunchMode::Plan => "plan→work",
                         InteractiveLaunchMode::Review => "review",
                         InteractiveLaunchMode::Fix => "fix",
+                        InteractiveLaunchMode::Continue => "continue",
                         InteractiveLaunchMode::Troubleshoot => "troubleshoot",
                         InteractiveLaunchMode::Test => "testing",
                         InteractiveLaunchMode::Merge => "merge",
@@ -2801,6 +2864,15 @@ pub(crate) enum InteractiveLaunchMode {
     /// emits `coord assign --interactive --fix-of <aid> …`.  `work_aid` carries
     /// the REVIEW id (request-changes path) or the WORK id (test-fail path).
     Fix,
+    /// #1104: human-attended CONTINUE of a work assignment that FAILED
+    /// outright (worker-reported, no test/review gate involved — that's
+    /// `Fix`'s territory) while leaving a real branch behind. Continues the
+    /// existing branch (no orphan branch); emits `coord assign --interactive
+    /// --rework-of <aid> --briefing <text> …`. `work_aid` carries the FAILED
+    /// WORK id. Unlike `Fix`, `--rework-of` requires an explicit `--briefing`
+    /// (CLI-enforced), so the TUI seeds a default one (like `Plan`'s seeded
+    /// briefing) rather than leaving it to the backend to derive.
+    Continue,
     /// #569: human-attended diagnostic session for a stalled pipeline item.
     /// Superseded by `Chat` (#628), which subsumes diagnosis — the TUI no longer
     /// constructs this. Retained because the `coord assign --troubleshoot` CLI
@@ -2852,6 +2924,7 @@ pub(crate) fn interactive_mode_verb(mode: InteractiveLaunchMode) -> &'static str
         InteractiveLaunchMode::Plan => "plan",
         InteractiveLaunchMode::Review => "review",
         InteractiveLaunchMode::Fix => "fix",
+        InteractiveLaunchMode::Continue => "continue",
         InteractiveLaunchMode::Troubleshoot => "troubleshoot",
         InteractiveLaunchMode::Test => "testing",
         InteractiveLaunchMode::Merge => "merge",
@@ -2863,14 +2936,16 @@ pub(crate) fn interactive_mode_verb(mode: InteractiveLaunchMode) -> &'static str
 
 /// The board assignment TYPE a given interactive launch mode produces or
 /// continues — used to keep the reattach decision mode-aware so a `Fix` launch
-/// never reattaches into a running `review` session.  `--fix-of` continues the
-/// work branch as a `type="work"` row (coord/cli.py), so Fix maps to "work".
+/// never reattaches into a running `review` session.  `--fix-of`/`--rework-of`
+/// both continue the work branch as a `type="work"` row (coord/cli.py), so
+/// Fix and Continue (#1104) both map to "work".
 /// Troubleshoot never reattaches (callers guard); its sentinel matches nothing.
 pub(crate) fn interactive_mode_assignment_type(mode: InteractiveLaunchMode) -> &'static str {
     match mode {
         InteractiveLaunchMode::Work
         | InteractiveLaunchMode::Plan
-        | InteractiveLaunchMode::Fix => "work",
+        | InteractiveLaunchMode::Fix
+        | InteractiveLaunchMode::Continue => "work",
         InteractiveLaunchMode::Review => "review",
         InteractiveLaunchMode::Test => "smoke",
         InteractiveLaunchMode::Merge => "merge",
@@ -2892,6 +2967,22 @@ pub(crate) fn interactive_plan_briefing(issue_num: u64) -> String {
     format!(
         "Plan-then-implement for issue #{n} in this session. First read it with `gh issue view {n}`, then propose a concise implementation plan and ask me to confirm it. Once I approve, implement the plan here in this same session — do not stop after planning.",
         n = issue_num,
+    )
+}
+
+/// #1104: default briefing seeded into a `Continue` interactive session —
+/// `--rework-of` requires an explicit `--briefing` (CLI-enforced), and the
+/// launcher line auto-submits with no chance for the operator to type one
+/// first, so the TUI supplies a sensible default (same pattern as
+/// [`interactive_plan_briefing`]). `prior_aid` is the failed work
+/// assignment id being continued, so the worker can look up its own
+/// prior commits/context. Apostrophe-free so [`shell_quote_arg`] wraps it
+/// cleanly in single quotes.
+pub(crate) fn interactive_continue_briefing(issue_num: u64, prior_aid: &str) -> String {
+    format!(
+        "Continue the prior attempt on this branch for issue #{n} — the previous work assignment ({aid}) failed before finishing (not a test or review gate — a worker-reported failure). Start by reviewing the existing commits on this branch (`git log`) and the prior failure via `coord log {aid}`, pick up where that attempt left off, and finish the work.",
+        n = issue_num,
+        aid = prior_aid,
     )
 }
 
@@ -2982,6 +3073,22 @@ pub(crate) fn build_interactive_launch_cmd(
             format!(
                 "coord assign {}--interactive --fix-of {} {} {} {}\r",
                 cfg, aid, m, r, issue_num,
+            )
+        }
+        InteractiveLaunchMode::Continue => {
+            // #1104: `coord assign --interactive --rework-of <aid> --briefing
+            // <text>` continues the existing failed-attempt branch with write
+            // tools. work_aid carries the FAILED WORK id (always Some — the
+            // caller guards it). Unlike `--fix-of`, `--rework-of` requires an
+            // explicit `--briefing` — seed the TUI's default one.
+            let aid = shell_quote_arg(work_aid.unwrap_or(""));
+            let briefing = shell_quote_arg(&interactive_continue_briefing(
+                issue_num,
+                work_aid.unwrap_or(""),
+            ));
+            format!(
+                "coord assign {}--interactive --rework-of {} --briefing {} {} {} {}\r",
+                cfg, aid, briefing, m, r, issue_num,
             )
         }
         // #569: Troubleshoot is dispatched by the right-click handler via a
