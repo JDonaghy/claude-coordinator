@@ -376,13 +376,22 @@ def _reap_merged_sessions_tick(config: Config) -> list[str]:
        :func:`coord.interactive.list_coord_tmux_sessions`).  Attached sessions
        are skipped; the next tick reaps them once the operator detaches.
 
-    **Scope = MERGE SESSIONS ONLY.**  Filters on ``type='merge'`` and
-    ``provider_name='claude-pty'`` to avoid touching work/review/test sessions.
+    **Scope = INTERACTIVE MERGE SESSIONS ONLY.**  Interactive merge-prep
+    sessions are dispatched with ``type="conflict-fix"`` — the same type the
+    automated #241 conflict-fix worker uses — so this filters on
+    :func:`coord.reconcile.is_interactive_merge_session` (``type="conflict-fix"``
+    **and** ``provider_name="claude-pty"`` **and** ``review_of_assignment_id``
+    set) to avoid touching work/review/test sessions *and* automated
+    conflict-fix workers (which never set ``provider_name="claude-pty"``).
 
     For each reaped session the function:
 
-    1. Calls :func:`coord.interactive.finalize_interactive_exit` (the #466
-       git-floor backstop) to clean the worktree.  The assignment is already
+    1. Calls :func:`coord.interactive.finalize_interactive_exit` (local
+       sessions) or :func:`coord.interactive.finalize_remote_interactive_exit`
+       (remote sessions, #1110 fix — the local finalize's worktree removal is
+       a pure local filesystem/subprocess call with no SSH awareness, so a
+       merge session dispatched to a remote machine would otherwise leak its
+       worktree there) to clean the worktree.  The assignment is already
        recorded (status='merged'), so ``finalize`` skips the DB write and only
        removes the worktree.
     2. Calls :func:`coord.diagnose._kill_session` to ``tmux kill-session``.
@@ -402,8 +411,10 @@ def _reap_merged_sessions_tick(config: Config) -> list[str]:
         list_coord_tmux_sessions,
         tmux_session_name,
         finalize_interactive_exit,
+        finalize_remote_interactive_exit,
     )
     from coord.diagnose import _kill_session, _ssh_target_for  # noqa: PLC0415
+    from coord.reconcile import is_interactive_merge_session  # noqa: PLC0415
 
     if not config.merge.auto_reap_merged:
         return []
@@ -418,8 +429,7 @@ def _reap_merged_sessions_tick(config: Config) -> list[str]:
         a
         for a in board.active + board.completed
         if a.status == "merged"
-        and a.type == "merge"
-        and a.provider_name == "claude-pty"
+        and is_interactive_merge_session(a)
         and a.assignment_id
     ]
 
@@ -474,6 +484,7 @@ def _reap_merged_sessions_tick(config: Config) -> list[str]:
         base_branch = (repo_cfg.default_branch if repo_cfg else None) or "main"
         repo_github = repo_cfg.github if repo_cfg else (a.repo_name or "")
         repo_path: str | None = None
+        raw_repo_path: str | None = None
         machine = next(
             (m for m in config.machines if m.name == (a.machine_name or "")), None
         )
@@ -482,26 +493,72 @@ def _reap_merged_sessions_tick(config: Config) -> list[str]:
 
             rp = machine.repo_path(a.repo_name)
             if rp:
+                raw_repo_path = rp
                 repo_path = str(_Path(rp).expanduser())
 
         worktree = str(COORD_DIR / "worktrees" / aid)
 
         # Step 1: finalize (cleans worktree; skips DB write because the
-        # assignment is already in 'merged' terminal state).
+        # assignment is already in 'merged' terminal state).  #1110 fix: a
+        # merge session dispatched to a REMOTE machine must be finalized via
+        # the SSH-aware remote path — the local ``finalize_interactive_exit``
+        # only ever touches paths on the daemon's own filesystem
+        # (:func:`coord.interactive._remove_worktree` is a plain local
+        # ``subprocess.run``/``Path.exists()`` check), so calling it for a
+        # remote session's worktree silently no-ops (the daemon-local path
+        # never existed) and leaks the real worktree on the remote host.
         try:
-            finalize_interactive_exit(
-                assignment_id=aid,
-                repo_name=a.repo_name or "",
-                repo_github=repo_github,
-                issue_number=a.issue_number,
-                machine_name=a.machine_name or "unknown",
-                worktree_path=worktree,
-                base_branch=base_branch,
-                exit_code=0,
-                started_at=a.dispatched_at,
-                repo_path=repo_path,
-                ssh_target=ssh_target,
-            )
+            if ssh_target is None:
+                finalize_interactive_exit(
+                    assignment_id=aid,
+                    repo_name=a.repo_name or "",
+                    repo_github=repo_github,
+                    issue_number=a.issue_number,
+                    machine_name=a.machine_name or "unknown",
+                    worktree_path=worktree,
+                    base_branch=base_branch,
+                    exit_code=0,
+                    started_at=a.dispatched_at,
+                    repo_path=repo_path,
+                    ssh_target=ssh_target,
+                )
+            elif a.branch and raw_repo_path:
+                # Mirror coord.interactive.reap_stale_interactive_sessions'
+                # path construction: convert the machine's ``~/…`` repo path
+                # to the ``$HOME/…`` form the *remote* shell (not the
+                # coordinator's local shell) expands correctly.
+                remote_repo_sh = (
+                    "$HOME/" + raw_repo_path[2:]
+                    if raw_repo_path.startswith("~/")
+                    else ("$HOME" if raw_repo_path == "~" else raw_repo_path)
+                )
+                remote_worktree_sh = "$HOME/.coord/worktrees/" + aid
+                finalize_remote_interactive_exit(
+                    assignment_id=aid,
+                    repo_name=a.repo_name or "",
+                    repo_github=repo_github,
+                    issue_number=a.issue_number,
+                    machine_name=a.machine_name or "unknown",
+                    ssh_target=ssh_target,
+                    remote_worktree_sh=remote_worktree_sh,
+                    remote_repo_sh=remote_repo_sh,
+                    branch=a.branch,
+                    base_branch=base_branch,
+                    exit_code=0,
+                    started_at=a.dispatched_at,
+                )
+            else:
+                # Can't resolve enough to safely reach the remote worktree —
+                # skip cleanup rather than guess.  The session is still
+                # killed below; the worktree needs a manual sweep.
+                log.warning(
+                    "reap-merged: %s is remote (%s) but branch or repo path "
+                    "is unavailable — skipping worktree cleanup to avoid a "
+                    "wrong-host action; manual cleanup on %s may be needed",
+                    aid,
+                    ssh_target,
+                    a.machine_name,
+                )
         except Exception:  # noqa: BLE001
             log.warning("reap-merged: finalize failed for %s", aid, exc_info=True)
 

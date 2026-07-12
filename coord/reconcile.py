@@ -829,6 +829,30 @@ def close_stale_prs(
     return actions
 
 
+def is_interactive_merge_session(a: object) -> bool:
+    """True when *a* is an interactive ``--merge-of`` session (#1110).
+
+    Interactive merge-prep sessions are dispatched with ``type="conflict-fix"``
+    — the same type the automated #241 conflict-fix worker uses — so a bare
+    ``type`` check can't tell them apart.  What distinguishes them:
+
+    * ``provider_name == "claude-pty"`` — the automated #241 worker runs
+      headless ``claude -p`` and never sets this.
+    * ``review_of_assignment_id`` is set — both share this, but combined with
+      the provider check above it's unambiguous.
+
+    Used by :func:`reconcile_board_merges` (sweep b) and
+    :func:`coord.serve_app._reap_merged_sessions_tick` to scope terminal-state
+    detection / reaping to interactive merge sessions only, without touching
+    automated conflict-fix workers or ordinary work/review/smoke rows.
+    """
+    return (
+        getattr(a, "type", None) == "conflict-fix"
+        and getattr(a, "provider_name", None) == "claude-pty"
+        and getattr(a, "review_of_assignment_id", None) is not None
+    )
+
+
 def reconcile_board_merges(
     board: Board,
     config: Config,
@@ -853,9 +877,10 @@ def reconcile_board_merges(
         matches ``issue-{N}-*`` for the issue, the branch is backfilled via
         :func:`state.update_assignment_branch`.  More than one candidate (or
         none) is left untouched and logged.  ``test-author`` is included here
-        only — sweep (b) below stays ``type='work'``-only since the
-        out-of-band-merge / review-settlement semantics it encodes are
-        specific to the Work → Test → Review → Merge pipeline.
+        only — sweep (b) below stays ``type='work'``-only (plus interactive
+        merge sessions, #1110) since the out-of-band-merge / review-settlement
+        semantics it encodes are specific to the Work → Test → Review → Merge
+        pipeline.
 
     (b) #609/#951 record out-of-band merges — work merged directly on GitHub,
         or a ``merge_queue`` row that drained without flipping the board, is
@@ -897,7 +922,7 @@ def reconcile_board_merges(
     candidates = [
         a
         for a in board.active + board.completed
-        if a.type in ("work", "test-author", "merge")
+        if (a.type in ("work", "test-author") or is_interactive_merge_session(a))
         and a.status == "done"
         and (repo is None or a.repo_name == repo)
         and (issue is None or a.issue_number == issue)
@@ -954,13 +979,18 @@ def reconcile_board_merges(
         # (b) #609/#951 — flip done work whose branch is merged on GitHub, OR
         # whose issue is closed even when no branch could be resolved above
         # (work_is_terminal's issue-closed check needs no branch).  #1083:
-        # scoped to type='work' and type='merge' — test-author rows were added
-        # to `candidates` above for sweep (a)'s branch backfill alone; the
-        # merged/review-settled semantics here are pipeline-specific and out
-        # of scope for this fix.  Interactive merge sessions (type='merge')
-        # reach 'done' the same way work sessions do, so they get the same
-        # terminal-detection sweep so the auto-reaper can pick them up.
-        if a.type in ("work", "merge") and github_ops.work_is_terminal(
+        # scoped to type='work' — test-author rows were added to `candidates`
+        # above for sweep (a)'s branch backfill alone; the merged/review-
+        # settled semantics here are pipeline-specific and out of scope for
+        # that fix.  #1110: interactive merge sessions (type='conflict-fix',
+        # provider_name='claude-pty', review_of_assignment_id set — see
+        # :func:`is_interactive_merge_session`) reach 'done' the same way work
+        # sessions do, so they get the same terminal-detection sweep so the
+        # auto-reaper can pick them up.  Automated #241 conflict-fix workers
+        # are deliberately excluded (they never set provider_name='claude-pty').
+        if (
+            a.type == "work" or is_interactive_merge_session(a)
+        ) and github_ops.work_is_terminal(
             repo_cfg.github, a.issue_number, a.branch, cache=terminal_cache
         ):
             actions.append(

@@ -363,6 +363,79 @@ def test_test_author_not_marked_merged_by_sweep_b(monkeypatch, config) -> None:
     assert ("merged", "ta2") not in writes
 
 
+# ── #1110 interactive merge session terminal detection ─────────────────────
+#
+# Interactive `--merge-of` sessions are dispatched with type="conflict-fix"
+# — the same type the automated #241 conflict-fix worker uses — so sweep (b)
+# must discriminate on `is_interactive_merge_session` (provider_name +
+# review_of_assignment_id) rather than type alone, or it would either miss
+# merge sessions entirely or wrongly start flipping automated conflict-fix
+# workers to 'merged' too.
+
+
+def test_interactive_merge_session_marked_merged_by_sweep_b(
+    monkeypatch, config
+) -> None:
+    """An interactive merge-of session (type='conflict-fix',
+    provider_name='claude-pty', review_of_assignment_id set) is flipped to
+    'merged' by sweep (b) when the underlying issue/PR is terminal — this is
+    what lets #1110's auto-reaper pick it up."""
+    a = _done_work(
+        assignment_id="merge1", issue_number=42, branch="issue-42-fix"
+    )
+    a.type = "conflict-fix"
+    a.provider_name = "claude-pty"
+    a.review_of_assignment_id = "work1"
+    board = Board(completed=[a])
+    writes = _patch_probes(monkeypatch, terminal=True)
+
+    reconcile_board_merges(board, config)
+
+    assert a.status == "merged"
+    assert ("merged", "merge1") in writes
+
+
+def test_automated_conflict_fix_worker_not_marked_merged_by_sweep_b(
+    monkeypatch, config
+) -> None:
+    """The automated #241 conflict-fix worker also uses type='conflict-fix'
+    and sets review_of_assignment_id, but never provider_name='claude-pty' —
+    it must NOT be swept into 'merged' by the #1110 interactive-merge-session
+    carve-out."""
+    a = _done_work(
+        assignment_id="cf1", issue_number=42, branch="issue-42-fix"
+    )
+    a.type = "conflict-fix"
+    a.review_of_assignment_id = "work1"
+    board = Board(completed=[a])
+    writes = _patch_probes(monkeypatch, terminal=True)
+
+    reconcile_board_merges(board, config)
+
+    assert a.status == "done"
+    assert ("merged", "cf1") not in writes
+
+
+def test_interactive_merge_session_without_review_of_not_marked_merged(
+    monkeypatch, config
+) -> None:
+    """provider_name='claude-pty' alone (e.g. an interactive review/fix
+    session of some other type) is not enough — review_of_assignment_id must
+    also be set for the row to count as an interactive merge session."""
+    a = _done_work(
+        assignment_id="cf2", issue_number=42, branch="issue-42-fix"
+    )
+    a.type = "conflict-fix"
+    a.provider_name = "claude-pty"
+    board = Board(completed=[a])
+    writes = _patch_probes(monkeypatch, terminal=True)
+
+    reconcile_board_merges(board, config)
+
+    assert a.status == "done"
+    assert ("merged", "cf2") not in writes
+
+
 # ── #721 close stale PRs ──────────────────────────────────────────────────────
 
 

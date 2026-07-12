@@ -52,7 +52,7 @@ STAGE_ASSIGNMENT_TYPES: dict[str, tuple[str, ...]] = {
     "work": ("work", "plan"),
     "review": ("review",),
     "test": ("work", "plan"),
-    "merge": ("work", "plan", "merge"),
+    "merge": ("work", "plan"),
 }
 
 

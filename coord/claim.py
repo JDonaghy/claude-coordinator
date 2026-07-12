@@ -157,7 +157,7 @@ def has_active_work_followup(
     Called from both the reconcile review-dispatch loop and ``dispatch_review``
     for defence in depth.
     """
-    _WORK_TYPES = frozenset({"work", "conflict-fix", "merge"})
+    _WORK_TYPES = frozenset({"work", "conflict-fix"})
     for a in board.active:
         if a.type not in _WORK_TYPES:
             continue
