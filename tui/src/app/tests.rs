@@ -30831,6 +30831,77 @@ Milestone tracking issue.
         assert!(app.audit_fetch_rx.is_none());
     }
 
+    /// #1039 review fix: `AuditFetchOutcome::NoBoardService` must be
+    /// surfaced distinctly from "not fetched yet" / "genuinely empty page"
+    /// — the smoke-test report this fixes could not tell those apart from
+    /// the empty-state text alone. Drives `run_periodic_work`'s poll-drain
+    /// with a synthetic outcome (no live daemon) exactly like a real
+    /// `spawn_audit_fetch` completion would.
+    #[test]
+    fn no_board_service_outcome_sets_hint_and_redraws() {
+        let mut app = make_test_app(BoardData::default());
+        app.switch_active_view(SidebarView::Audit);
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(AuditFetchOutcome::NoBoardService).unwrap();
+        app.audit_fetch_rx = Some(rx);
+
+        let needs_redraw = app.run_periodic_work();
+
+        assert!(
+            needs_redraw,
+            "NoBoardService must trigger a redraw so the hint actually \
+             paints (previously the only one of the three outcomes that \
+             didn't)"
+        );
+        assert!(app.audit_no_service);
+        assert!(app.audit_fetch_error.is_none());
+        assert!(app.audit_fetch_rx.is_none());
+    }
+
+    /// A `Page` outcome (even an empty one) must clear any stale
+    /// `audit_no_service` flag from a previous NoBoardService attempt —
+    /// otherwise a board service that comes back after being briefly
+    /// unconfigured would keep showing the stale "not configured" hint.
+    #[test]
+    fn page_outcome_clears_no_service_flag() {
+        let mut app = make_test_app(BoardData::default());
+        app.switch_active_view(SidebarView::Audit);
+        app.audit_no_service = true;
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(AuditFetchOutcome::Page(AuditPage::default()))
+            .unwrap();
+        app.audit_fetch_rx = Some(rx);
+
+        app.run_periodic_work();
+
+        assert!(!app.audit_no_service);
+    }
+
+    /// The empty-state message renders the "no board service configured"
+    /// qualifier (contract §4b still requires the exact "No audit events
+    /// yet." prefix — this is an appended substring, not a replacement).
+    /// Drives the real render path via `TuiDriver`, same pattern as the
+    /// sealed acceptance suite's `empty_state_message` test.
+    #[test]
+    fn empty_state_shows_no_service_hint() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(BoardData::default());
+        app.audit_no_service = true;
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "§");
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("No audit events yet."),
+            "contract §4b prefix must still be present:\n{screen}"
+        );
+        assert!(
+            screen.contains("no board service configured"),
+            "NoBoardService must append a diagnostic hint:\n{screen}"
+        );
+    }
+
     #[test]
     fn audit_row_at_maps_position_to_flat_index() {
         let app = make_app_with_audit_json(BoardData::default(), &audit_page_json_two_entries());

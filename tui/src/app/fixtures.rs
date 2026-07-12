@@ -250,6 +250,7 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         audit_sel: 0,
         audit_detail_open: false,
         audit_fetch_error: None,
+        audit_no_service: false,
         // #217: use the default dark palette for test helpers.
         active_theme: crate::settings::Theme::Dark.to_quadraui_theme(),
         // #728: default 2h window for tests (can be overridden per test).

@@ -173,13 +173,19 @@ impl CoordApp {
         let entries = self.audit_entries();
         if entries.is_empty() {
             // Contract §4b — treated identically whether the fetch hasn't
-            // completed yet or genuinely returned zero rows. When the most
-            // recent fetch actually failed (vs. "nothing fetched yet" or
-            // "no board service configured"), append the reason — the
-            // message still starts with the exact contract-required string.
-            let message = match &self.audit_fetch_error {
-                Some(reason) => format!("  No audit events yet.  (last fetch failed: {reason})"),
-                None => "  No audit events yet.".to_string(),
+            // completed yet or genuinely returned zero rows: the message
+            // always STARTS with the exact contract-required string. When
+            // the most recent fetch actually failed, or resolved to "no
+            // board service configured" (#1039 review fix — previously
+            // indistinguishable from a genuinely empty page, which made a
+            // live-daemon smoke-test failure impossible to diagnose from
+            // the UI alone), a qualifier is appended.
+            let message = if let Some(reason) = &self.audit_fetch_error {
+                format!("  No audit events yet.  (last fetch failed: {reason})")
+            } else if self.audit_no_service {
+                "  No audit events yet.  (no board service configured)".to_string()
+            } else {
+                "  No audit events yet.".to_string()
             };
             backend.draw_list(rect, &plain_list("audit-empty", &message, 0));
             return;

@@ -959,6 +959,7 @@ impl CoordApp {
                     Ok(AuditFetchOutcome::Page(page)) => {
                         self.audit_page = Some(page);
                         self.audit_fetch_error = None;
+                        self.audit_no_service = false;
                         self.audit_last_fetched = Some(Instant::now());
                         self.audit_fetch_rx = None;
                         needs_redraw = true;
@@ -968,9 +969,26 @@ impl CoordApp {
                         // from (local-SQLite-mode). Leave any previously
                         // cached page as-is; stop retrying until the TTL
                         // elapses again.
+                        //
+                        // #1039 review fix: this used to be a silent no-op
+                        // that left the empty state indistinguishable from
+                        // "fetch not yet completed" or "genuinely empty
+                        // board" — a live-daemon smoke test that hit this
+                        // path (`resolve_board_service()` unexpectedly
+                        // returning `None`, e.g. a stale/unreadable
+                        // `~/.coord/client.toml`) had no way to tell that
+                        // apart from a real empty page short of attaching a
+                        // debugger. `audit_no_service` surfaces it directly
+                        // in the panel (see `audit.rs`). Also needed
+                        // `needs_redraw = true` (missing before, unlike the
+                        // other two arms) so the hint actually paints on
+                        // the next frame instead of waiting for an
+                        // unrelated redraw to happen to fire.
                         self.audit_fetch_error = None;
+                        self.audit_no_service = true;
                         self.audit_last_fetched = Some(Instant::now());
                         self.audit_fetch_rx = None;
+                        needs_redraw = true;
                     }
                     Ok(AuditFetchOutcome::Unreachable(reason)) => {
                         // Genuine failure — surfaced via `audit_fetch_error`
@@ -979,6 +997,7 @@ impl CoordApp {
                         // the TTL elapses again so a down daemon doesn't
                         // spin threads.
                         self.audit_fetch_error = Some(reason);
+                        self.audit_no_service = false;
                         self.audit_last_fetched = Some(Instant::now());
                         self.audit_fetch_rx = None;
                         needs_redraw = true;

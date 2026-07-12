@@ -2750,6 +2750,20 @@ pub struct CoordApp {
     /// to fetch from). Appended to the empty-state message so a genuinely
     /// unreachable daemon reads differently from "nothing fetched yet".
     audit_fetch_error: Option<String>,
+    /// `true` when the most recently *completed* `/audit` fetch attempt
+    /// resolved `AuditFetchOutcome::NoBoardService` — i.e.
+    /// `resolve_board_service()` found neither `COORD_SERVICE_URL` nor a
+    /// usable `board_service` in `~/.coord/client.toml`. Distinct from
+    /// `audit_fetch_error` (a genuine network/parse failure) and from the
+    /// pre-first-fetch `None` state: surfaced as a targeted hint in the
+    /// empty-state message (§4b) so "board service isn't configured on
+    /// this box" is immediately visible instead of looking identical to a
+    /// live daemon that simply has zero audit rows (#1039 review fix —
+    /// a live-daemon smoke test that always showed the bare empty state
+    /// with no diagnostic could not be told apart from this case without
+    /// live instrumentation; this makes the distinction visible in the UI
+    /// itself, no debug build required).
+    audit_no_service: bool,
 
     // ── #541: global Telescope-style issue fuzzy finder ──────────────────────
     /// Active state of the issue fuzzy-finder overlay.  `None` when the
@@ -3179,6 +3193,7 @@ impl CoordApp {
             audit_sel: 0,
             audit_detail_open: false,
             audit_fetch_error: None,
+            audit_no_service: false,
             // #217: resolved theme palette — computed from settings + optional
             // ~/.coord/theme.toml override file.
             active_theme: {
