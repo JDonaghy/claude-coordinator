@@ -111,10 +111,23 @@ def reconcile_completed_assignments(
         if terminal is None:
             continue
 
+        # #1083: prefer the board's already-known branch, but fall back to
+        # the agent's live ``completed`` entry (populated by AgentServer._reap
+        # from the worktree's checked-out HEAD — see agent.py) when the board
+        # doesn't have one yet. This is almost always the FIRST place a
+        # freshly-completed assignment is observed (the daemon runs this tick
+        # on a short interval, well ahead of any human-triggered `coord
+        # notify`), so passing the board's stale (usually still-None) branch
+        # here — as this used to do unconditionally — let status flip to
+        # "done" with branch left NULL. For `type="work"` that NULL branch is
+        # later patched by the #611 remote-branch-listing backfill sweep in
+        # `reconcile()`, but that sweep is scoped to `type="work"` only, so
+        # every other write-capable type (mock-author, test-author, ...) had
+        # no path back to a correct branch once this tick got there first.
         update_state_fn(
             assignment_id=aid,
             terminal_status=terminal,
-            branch=a.branch,
+            branch=a.branch or entry.get("branch"),
             review_state=None,
         )
 
@@ -746,16 +759,23 @@ def reconcile_board_merges(
 ) -> list[str]:
     """Reconcile done work assignments against git/GitHub reality.
 
-    Two conservative sweeps over ``type='work'`` ``status='done'`` assignments,
-    returning a list of human-readable action (and skip) strings:
+    Two conservative sweeps, returning a list of human-readable action (and
+    skip) strings:
 
-    (a) #611 branch backfill — a remote interactive work session can finish
-        ``status=done`` with ``branch=None`` even though it pushed
+    (a) #611/#1083 branch backfill — runs over ``status='done'`` rows of
+        ``type='work'`` *or* ``type='test-author'``.  A remote interactive
+        work session (or a headless ``test-author`` session finalized by the
+        #625 passive reconcile tick before its branch was known — #1083) can
+        finish ``status=done`` with ``branch=None`` even though it pushed
         ``issue-{N}-*`` to origin, which greys the TUI Start review/test/merge
-        buttons (they require a done work assignment WITH a branch).  When
-        exactly one remote branch matches ``issue-{N}-*`` for the issue, the
-        branch is backfilled via :func:`state.update_assignment_branch`.  More
-        than one candidate (or none) is left untouched and logged.
+        buttons (they require a done work assignment WITH a branch) and makes
+        ``coord pr <aid>`` refuse outright.  When exactly one remote branch
+        matches ``issue-{N}-*`` for the issue, the branch is backfilled via
+        :func:`state.update_assignment_branch`.  More than one candidate (or
+        none) is left untouched and logged.  ``test-author`` is included here
+        only — sweep (b) below stays ``type='work'``-only since the
+        out-of-band-merge / review-settlement semantics it encodes are
+        specific to the Work → Test → Review → Merge pipeline.
 
     (b) #609/#951 record out-of-band merges — work merged directly on GitHub,
         or a ``merge_queue`` row that drained without flipping the board, is
@@ -797,7 +817,7 @@ def reconcile_board_merges(
     candidates = [
         a
         for a in board.active + board.completed
-        if a.type == "work"
+        if a.type in ("work", "test-author")
         and a.status == "done"
         and (repo is None or a.repo_name == repo)
         and (issue is None or a.issue_number == issue)
@@ -812,7 +832,7 @@ def reconcile_board_merges(
             )
             continue
 
-        # (a) #611 — backfill a missing branch from origin.
+        # (a) #611/#1083 — backfill a missing branch from origin.
         if not a.branch:
             if repo_cfg.github not in branches_by_repo:
                 branches_by_repo[repo_cfg.github] = (
@@ -853,8 +873,12 @@ def reconcile_board_merges(
 
         # (b) #609/#951 — flip done work whose branch is merged on GitHub, OR
         # whose issue is closed even when no branch could be resolved above
-        # (work_is_terminal's issue-closed check needs no branch).
-        if github_ops.work_is_terminal(
+        # (work_is_terminal's issue-closed check needs no branch).  #1083:
+        # scoped to type='work' only — test-author rows were added to
+        # `candidates` above for sweep (a)'s branch backfill alone; the
+        # merged/review-settled semantics here are pipeline-specific and out
+        # of scope for this fix.
+        if a.type == "work" and github_ops.work_is_terminal(
             repo_cfg.github, a.issue_number, a.branch, cache=terminal_cache
         ):
             actions.append(

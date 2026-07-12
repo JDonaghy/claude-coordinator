@@ -121,14 +121,20 @@ def _latest(assignments: list["Assignment"]) -> "Assignment | None":
     return assignments[0] if assignments else None
 
 
-# Stage ordering used to resolve the "current" stage when none is given.
-_STAGE_ORDER = ["plan", "work", "test", "review", "merge"]
-
-
 def current_stage(board: "Board", repo_name: str, issue_number: int) -> str:
     """The stage of the most-recently-dispatched assignment for the issue
     (what ``coord diagnose <repo> <issue>`` targets when ``--stage`` is
-    omitted).  Falls back to ``work`` when the issue has no assignments."""
+    omitted).  Falls back to ``work`` when the issue has no assignments.
+
+    #1083: previously coerced any assignment ``type`` this module doesn't
+    recognize (e.g. ``test-author``, ``mock-author``, ``smoke``) to
+    ``"work"`` — which then had ``diagnose_stage`` recover/report on
+    whatever unrelated ``work``/``plan`` row happened to exist for the issue,
+    *silently* presenting it as if it were a diagnosis of the real (ignored)
+    assignment. Now the actual type is returned verbatim; ``diagnose_stage``
+    explicitly reports "no diagnosis available" for types outside
+    :data:`STAGE_ASSIGNMENT_TYPES` instead of guessing.
+    """
     rows = [
         a
         for a in (board.active + board.completed)
@@ -137,8 +143,7 @@ def current_stage(board: "Board", repo_name: str, issue_number: int) -> str:
     if not rows:
         return "work"
     newest = max(rows, key=lambda a: (a.dispatched_at or 0.0))
-    t = newest.type or "work"
-    return t if t in _STAGE_ORDER else "work"
+    return newest.type or "work"
 
 
 # ── monkeypatchable side-effecting wrappers ─────────────────────────────────
@@ -380,6 +385,39 @@ def diagnose_stage(
     so after this returns) — consistent with ``reconcile_board_merges``.
     """
     res = DiagnoseResult(repo_name=repo_name, issue_number=issue_number, stage=stage)
+
+    # #1083: `stage` came either from an explicit `--stage` or from
+    # `current_stage()`'s newest-assignment lookup. `current_stage()` now
+    # surfaces a non-standard assignment type (e.g. "test-author",
+    # "mock-author", "smoke") verbatim instead of silently mapping it to
+    # "work" — so a type this module has no recovery logic for lands here as
+    # `stage` rather than being guessed at. Report that plainly instead of
+    # running `_recover_work_like` against it (which was never validated for
+    # these types) or, worse, silently returning an unrelated `work`/`plan`
+    # row's status as if it were this stage's diagnosis (the bug reported in
+    # #1083: `coord diagnose` picked an unrelated, already-merged assignment
+    # instead of flagging the real problem).
+    if stage not in STAGE_ASSIGNMENT_TYPES:
+        assignments = stage_assignments(board, repo_name, issue_number, stage)
+        latest = _latest(assignments)
+        known = ", ".join(sorted(STAGE_ASSIGNMENT_TYPES))
+        if latest is None:
+            res.findings.append(
+                f"no diagnosis available for assignment type {stage!r} — "
+                f"coord diagnose only understands: {known} (and no {stage!r} "
+                f"assignment exists for #{issue_number} either)"
+            )
+        else:
+            res.findings.append(
+                f"no diagnosis available for assignment type {stage!r} — "
+                f"coord diagnose only understands: {known}. Latest {stage!r} "
+                f"assignment: {latest.assignment_id} status={latest.status} "
+                f"branch={latest.branch or '(none)'} machine={latest.machine_name}"
+            )
+        res.recovered = False
+        res.needs_reset = False
+        return res
+
     assignments = stage_assignments(board, repo_name, issue_number, stage)
     latest = _latest(assignments)
 

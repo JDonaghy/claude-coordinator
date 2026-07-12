@@ -364,6 +364,63 @@ def test_stage_assignments_newest_first(config) -> None:
     assert [a.assignment_id for a in rows] == ["r-new", "r-old"]
 
 
+# ── #1083: current_stage / diagnose_stage on assignment types the doctor
+# doesn't understand (test-author, mock-author, smoke, ...) ────────────────
+
+
+def test_current_stage_returns_unrecognized_type_verbatim(config) -> None:
+    """Before #1083, `current_stage` silently coerced any type outside
+    plan/work/test/review/merge to "work" — so `coord diagnose` on a
+    test-author assignment would resolve to the "work" stage and recover/
+    report on a completely unrelated work row for the same issue instead of
+    flagging the real (ignored) test-author assignment."""
+    a = _assign(aid="ta1", typ="test-author", status="done", issue=1041)
+    board = Board(completed=[a])
+    assert diagnose.current_stage(board, "api", 1041) == "test-author"
+
+
+def test_current_stage_still_defaults_to_work_with_no_assignments(config) -> None:
+    board = Board()
+    assert diagnose.current_stage(board, "api", 999) == "work"
+
+
+def test_diagnose_stage_reports_no_diagnosis_for_unrecognized_type_with_row(
+    monkeypatch, config,
+) -> None:
+    """`diagnose_stage` on an unrecognized type must explicitly say so —
+    never silently fall through to `_recover_work_like` (untested for these
+    types) or claim a healthy/recovered outcome it didn't actually check."""
+    _stub(monkeypatch, session="dead")
+    a = _assign(
+        aid="ta1", typ="test-author", status="done", issue=1041,
+        branch="issue-1041-test-author-ms-33-acceptance-suite",
+    )
+    board = Board(completed=[a])
+    res = diagnose.diagnose_stage(board, config, "api", 1041, "test-author")
+    assert res.recovered is False
+    assert res.needs_reset is False
+    assert any(
+        "no diagnosis available for assignment type 'test-author'" in f
+        for f in res.findings
+    )
+    # The real assignment must be named, not silently ignored.
+    assert any("ta1" in f for f in res.findings)
+
+
+def test_diagnose_stage_reports_no_diagnosis_for_unrecognized_type_no_row(
+    monkeypatch, config,
+) -> None:
+    _stub(monkeypatch, session="dead")
+    board = Board()
+    res = diagnose.diagnose_stage(board, config, "api", 1041, "test-author")
+    assert res.recovered is False
+    assert res.needs_reset is False
+    assert any(
+        "no diagnosis available for assignment type 'test-author'" in f
+        for f in res.findings
+    )
+
+
 # ── #618: active_assignment_ids_for_repo ────────────────────────────────────
 
 
