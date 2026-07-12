@@ -2764,6 +2764,20 @@ pub struct CoordApp {
     /// live instrumentation; this makes the distinction visible in the UI
     /// itself, no debug build required).
     audit_no_service: bool,
+    /// #1040: current time-range filter (contract §8), cycled by `t`.
+    /// Persists across panel navigation (contract §11); resets to `All` on
+    /// TUI restart (in-memory only, like `done_window`).
+    audit_time_range: AuditTimeRange,
+    /// #1040: current category filter (contract §9), cycled by `Tab`.
+    /// Persists across panel navigation; resets to `All` on restart.
+    audit_category: AuditCategory,
+    /// #1040: free-text filter on the `/audit` `type` (`event_type`) param
+    /// — reuses the same `SidebarFilter` widget Board/Pipeline embed for
+    /// their issue filters (deliverable 1). Toggled into edit mode with
+    /// `f`; `Enter` commits the typed value and re-arms the fetch; `Esc`
+    /// while focused clears it back to empty (mirrors `board_search`'s
+    /// Escape-while-focused semantics — see `events.rs`).
+    audit_type_filter: SidebarFilter,
 
     // ── #541: global Telescope-style issue fuzzy finder ──────────────────────
     /// Active state of the issue fuzzy-finder overlay.  `None` when the
@@ -3194,6 +3208,11 @@ impl CoordApp {
             audit_detail_open: false,
             audit_fetch_error: None,
             audit_no_service: false,
+            // #1040: no filter applied on startup — matches contract §8/§9
+            // defaults ("All" time-range, "all" category, empty type text).
+            audit_time_range: AuditTimeRange::All,
+            audit_category: AuditCategory::All,
+            audit_type_filter: SidebarFilter::default(),
             // #217: resolved theme palette — computed from settings + optional
             // ~/.coord/theme.toml override file.
             active_theme: {
@@ -6832,11 +6851,22 @@ impl CoordApp {
             // scoped to the Sessions-tree's selected leaf.
             " j/k=nav  r=reattach  K=kill  f=stop  q=quit ".to_string()
         } else if self.active_view == SidebarView::Audit {
-            // #1039 contract §7: list-mode vs detail-mode hint sets.
+            // #1039 contract §7 / #1040 contract §10: list-mode vs
+            // detail-mode vs type-filter-editing hint sets.
             if self.audit_detail_open {
                 " Esc=close detail  q=quit ".to_string()
+            } else if self.audit_type_filter.focused {
+                // No `q=quit` here — typed characters (including 'q') go
+                // into the filter text while it's focused (events.rs), so
+                // advertising it as a quit key would be wrong.
+                " type to filter (event_type)  Enter=apply  Esc=clear ".to_string()
             } else {
-                " j/k=nav  Enter=detail  r=refresh  q=quit ".to_string()
+                format!(
+                    " j/k=nav  Enter=detail  r=refresh  t=time-range ({})  \
+                     Tab=category ({})  f=filter  Esc=clear  q=quit ",
+                    self.audit_time_range.label(),
+                    self.audit_category.label(),
+                )
             }
         } else {
             // #192: `p` / `a` / `A` retired alongside the PROPOSALS

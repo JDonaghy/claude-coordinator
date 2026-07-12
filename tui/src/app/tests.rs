@@ -30925,3 +30925,311 @@ Milestone tracking issue.
         let main_b = Rect::new(0.0, 0.0, 100.0, 20.0);
         assert_eq!(app.audit_row_at(Point::new(5.0, 0.4), main_b, 1.0), None);
     }
+
+    // ── #1040: Audit panel filters (time-range / category / type) ──────────
+    //
+    // No sealed acceptance slice exists for #1040 yet (the ms-33 manifest
+    // only maps `audit_1039::*` test-ids — `coord acceptance run --issue
+    // 1040` reports "no acceptance slice in the manifest yet" as of this
+    // PR); per this repo's convention, this worker owns full in-crate
+    // coverage of the contract §8/§9/§10/§11 behaviours it implements.
+
+    #[test]
+    fn audit_time_range_since_bounds() {
+        let now = 1_000_000.0_f64;
+        assert_eq!(AuditTimeRange::LastHour.since(now), Some(now - 3_600.0));
+        assert_eq!(AuditTimeRange::D7.since(now), Some(now - 604_800.0));
+        assert_eq!(AuditTimeRange::All.since(now), None);
+        assert_eq!(
+            AuditTimeRange::Today.since(now),
+            Some(now - now.rem_euclid(86_400.0)),
+            "Today must be the UTC-day boundary at or before `now`"
+        );
+    }
+
+    #[test]
+    fn audit_time_range_cycles_in_contract_order() {
+        // contract §8: Last hour -> Today -> 7d -> All -> Last hour.
+        assert_eq!(AuditTimeRange::LastHour.next(), AuditTimeRange::Today);
+        assert_eq!(AuditTimeRange::Today.next(), AuditTimeRange::D7);
+        assert_eq!(AuditTimeRange::D7.next(), AuditTimeRange::All);
+        assert_eq!(AuditTimeRange::All.next(), AuditTimeRange::LastHour);
+    }
+
+    #[test]
+    fn audit_category_cycles_in_contract_order() {
+        // contract §9: all -> dispatch -> test -> review -> merge ->
+        // override -> plan -> error -> all.
+        assert_eq!(AuditCategory::All.next(), AuditCategory::Dispatch);
+        assert_eq!(AuditCategory::Dispatch.next(), AuditCategory::Test);
+        assert_eq!(AuditCategory::Test.next(), AuditCategory::Review);
+        assert_eq!(AuditCategory::Review.next(), AuditCategory::Merge);
+        assert_eq!(AuditCategory::Merge.next(), AuditCategory::Override);
+        assert_eq!(AuditCategory::Override.next(), AuditCategory::Plan);
+        assert_eq!(AuditCategory::Plan.next(), AuditCategory::Error);
+        assert_eq!(AuditCategory::Error.next(), AuditCategory::All);
+    }
+
+    #[test]
+    fn audit_category_query_value_none_for_all() {
+        assert_eq!(AuditCategory::All.query_value(), None);
+        assert_eq!(AuditCategory::Dispatch.query_value(), Some("dispatch"));
+        assert_eq!(AuditCategory::Error.query_value(), Some("error"));
+    }
+
+    #[test]
+    fn audit_t_key_cycles_time_range_and_updates_hints() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_test_app(BoardData::default());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "§");
+        driver.render();
+        assert!(
+            driver.screen_contains("t=time-range (All)"),
+            "default time-range must show 'All':\n{}",
+            driver.screen()
+        );
+
+        driver.type_char('t');
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("t=time-range (Last hour)"),
+            "contract §8: first 't' press must cycle All -> Last hour:\n{screen}"
+        );
+        assert!(
+            screen.contains("Time: Last hour"),
+            "sidebar must show the current time-range selection:\n{screen}"
+        );
+
+        driver.type_char('t');
+        driver.render();
+        assert!(
+            driver.screen_contains("t=time-range (Today)"),
+            "contract §8: second 't' press must cycle Last hour -> Today:\n{}",
+            driver.screen()
+        );
+    }
+
+    #[test]
+    fn audit_tab_key_cycles_category_and_updates_hints() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_test_app(BoardData::default());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "§");
+        driver.render();
+
+        driver.press_named(NamedKey::Tab);
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Tab=category (dispatch)"),
+            "contract §9: first Tab press must cycle all -> dispatch:\n{screen}"
+        );
+        assert!(
+            screen.contains("Category: dispatch"),
+            "sidebar must show the current category selection:\n{screen}"
+        );
+        assert!(
+            screen.contains("(filtered)"),
+            "sidebar count line must flag as filtered once a non-default \
+             category is selected:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn audit_filter_change_resets_selection_and_rearms_fetch() {
+        let mut app = make_test_app(BoardData::default());
+        app.audit_sel = 3;
+        app.audit_detail_open = true;
+        app.audit_last_fetched = Some(Instant::now());
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.audit_fetch_rx = Some(rx);
+
+        app.on_audit_filters_changed();
+
+        assert_eq!(app.audit_sel, 0);
+        assert!(!app.audit_detail_open);
+        assert!(
+            app.audit_last_fetched.is_none(),
+            "contract §11: a filter change must re-arm the /audit fetch"
+        );
+        assert!(app.audit_fetch_rx.is_none());
+    }
+
+    #[test]
+    fn audit_f_key_opens_type_filter_and_types_visibly() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_test_app(BoardData::default());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "§");
+        driver.render();
+
+        driver.type_char('f');
+        driver.render();
+        driver.type_char('d');
+        driver.type_char('o');
+        driver.type_char('n');
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Type: don"),
+            "typed characters must appear in the sidebar type-filter row:\n{screen}"
+        );
+        assert!(
+            !screen.contains("j/k=nav"),
+            "the list-mode hint set must not show while the type filter is \
+             focused (typed 'j'/'k' must go into the field, not navigate):\n{screen}"
+        );
+    }
+
+    #[test]
+    fn audit_typing_while_focused_does_not_leak_into_time_range_cycle() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        // Typing while the filter is focused must never fall through to
+        // other Audit keybinds — even 't' (time-range cycle), which is
+        // also a plain printable char. `driver.app()` isn't `CoordApp`
+        // (`driver_with_shell` wraps it in an opaque `ShellAdapter`), so
+        // this asserts purely on rendered text, same as every other
+        // TuiDriver-based test in this suite.
+        let app = make_test_app(BoardData::default());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "§");
+        driver.render();
+        driver.type_char('f');
+        for ch in ['t', 'e', 's', 't'] {
+            driver.type_char(ch);
+        }
+        driver.press_named(NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Type: test"),
+            "typed chars (including 't') must land in the type filter:\n{screen}"
+        );
+        assert!(
+            screen.contains("t=time-range (All)"),
+            "typing 't' while focused must not cycle the time-range dial \
+             away from its default:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn audit_enter_commits_type_filter_and_returns_to_list_mode_hints() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_test_app(BoardData::default());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "§");
+        driver.render();
+
+        driver.type_char('f');
+        driver.type_char('x');
+        driver.render();
+        assert!(
+            driver.screen_contains("type to filter"),
+            "editing-mode hint must show while the type filter is focused:\n{}",
+            driver.screen()
+        );
+
+        driver.press_named(NamedKey::Enter);
+        driver.render();
+        let screen = driver.screen();
+        assert!(screen.contains("Type: x"), "committed value must remain visible:\n{screen}");
+        assert!(
+            !screen.contains('\u{2588}'),
+            "the edit cursor must disappear once the filter is unfocused:\n{screen}"
+        );
+        assert!(
+            screen.contains("j/k=nav"),
+            "list-mode hints must return once Enter commits the filter:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn audit_esc_while_focused_clears_type_filter_without_quitting() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_test_app(BoardData::default());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "§");
+        driver.render();
+        driver.type_char('f');
+        driver.type_char('x');
+        let reaction = driver.press_named(NamedKey::Escape);
+        driver.render();
+
+        assert!(
+            !matches!(reaction, Reaction::Exit),
+            "Esc while the type filter is focused must blur it, not quit \
+             the app — got {reaction:?}"
+        );
+        assert!(
+            driver.screen_contains("Type: (f to filter)"),
+            "the typed value must be cleared:\n{}",
+            driver.screen()
+        );
+    }
+
+    #[test]
+    fn audit_esc_clears_all_active_filters_when_not_focused() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(BoardData::default());
+        app.audit_time_range = AuditTimeRange::D7;
+        app.audit_category = AuditCategory::Test;
+        app.audit_type_filter.set_value("dispatched");
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "§");
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Time: 7d")
+                && screen.contains("Category: test")
+                && screen.contains("(filtered)"),
+            "filters must be visibly active before Esc:\n{screen}"
+        );
+
+        let reaction = driver.press_named(NamedKey::Escape);
+        driver.render();
+
+        assert!(
+            !matches!(reaction, Reaction::Exit),
+            "Esc must clear active filters rather than quit — got {reaction:?}"
+        );
+        let screen = driver.screen();
+        assert!(screen.contains("Time: All"), "time-range must reset:\n{screen}");
+        assert!(screen.contains("Category: all"), "category must reset:\n{screen}");
+        assert!(!screen.contains("(filtered)"), "no filter must remain active:\n{screen}");
+        assert!(
+            screen.contains("Type: (f to filter)"),
+            "the type text must be cleared too:\n{screen}"
+        );
+        assert!(
+            screen.contains("t=time-range (All)"),
+            "hints must reflect the cleared defaults:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn audit_esc_quits_when_no_filters_active() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_test_app(BoardData::default());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "§");
+        driver.render();
+
+        let reaction = driver.press_named(NamedKey::Escape);
+        assert!(
+            matches!(reaction, Reaction::Exit),
+            "Esc on an unfiltered Audit panel (no detail pane, no focused \
+             filter) must fall through to the global quit — got {reaction:?}"
+        );
+    }

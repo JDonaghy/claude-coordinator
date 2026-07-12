@@ -1140,9 +1140,10 @@ pub struct AuditPage {
     #[serde(default)]
     pub entries: Vec<AuditEntry>,
     /// Keyset cursor for the next page (contract §6). Unread in this slice:
-    /// `spawn_audit_fetch` only ever requests the first page (filters/
-    /// pagination are #1040+); kept on the wire-shape type now so a later
-    /// "load more" doesn't need another deserializer change.
+    /// `spawn_audit_fetch` only ever requests the first page — #1040 wires
+    /// `since`/`category`/`type` filters onto that first-page request, but
+    /// "load more" pagination is still a later issue; kept on the
+    /// wire-shape type now so that doesn't need another deserializer change.
     #[serde(default)]
     #[allow(dead_code)]
     pub next_cursor: Option<String>,
@@ -1151,6 +1152,124 @@ pub struct AuditPage {
     #[serde(default)]
     #[allow(dead_code)]
     pub has_more: bool,
+}
+
+/// #1040: time-range filter for the Audit panel, cycled forward by the `t`
+/// key (contract §8, `tests/acceptance/ms-33/contract.md`). Maps to the
+/// `/audit` endpoint's `since` query param — there is deliberately no
+/// `until` side, matching contract §8's param table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum AuditTimeRange {
+    /// Last 60 minutes.
+    LastHour,
+    /// Since the start of the current UTC day. (No timezone crate is
+    /// available in this workspace — see `since()` below.)
+    Today,
+    /// Last 7 days.
+    D7,
+    /// No lower bound — the default (contract §8: "Default: All").
+    #[default]
+    All,
+}
+
+impl AuditTimeRange {
+    /// Cycle forward: `LastHour -> Today -> D7 -> All -> LastHour`.
+    pub(crate) fn next(self) -> Self {
+        match self {
+            AuditTimeRange::LastHour => AuditTimeRange::Today,
+            AuditTimeRange::Today => AuditTimeRange::D7,
+            AuditTimeRange::D7 => AuditTimeRange::All,
+            AuditTimeRange::All => AuditTimeRange::LastHour,
+        }
+    }
+
+    /// Exact display string pinned by contract §8 — shown in the sidebar
+    /// and the `t=time-range (…)` status-bar hint.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            AuditTimeRange::LastHour => "Last hour",
+            AuditTimeRange::Today => "Today",
+            AuditTimeRange::D7 => "7d",
+            AuditTimeRange::All => "All",
+        }
+    }
+
+    /// The `/audit` `since=` lower bound (epoch seconds) for this range, or
+    /// `None` for "All" (no param sent). `now` is epoch seconds, passed in
+    /// by the caller (rather than read here via `SystemTime::now()`) so
+    /// this stays a pure function callers can unit-test deterministically.
+    ///
+    /// "Today" uses the UTC calendar day boundary (`now` truncated to the
+    /// nearest 86400s), not the operator's local timezone — this workspace
+    /// has no timezone crate, and UTC-day is a reasonable, unambiguous
+    /// approximation of contract §8's "start_of_today_epoch".
+    pub(crate) fn since(self, now: f64) -> Option<f64> {
+        match self {
+            AuditTimeRange::LastHour => Some(now - 3_600.0),
+            AuditTimeRange::Today => Some(now - now.rem_euclid(86_400.0)),
+            AuditTimeRange::D7 => Some(now - 604_800.0),
+            AuditTimeRange::All => None,
+        }
+    }
+}
+
+/// #1040: category filter for the Audit panel, cycled forward by `Tab`
+/// (contract §9). Maps to the `/audit` endpoint's `category` query param.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum AuditCategory {
+    /// No category filter applied — the default (contract §9).
+    #[default]
+    All,
+    Dispatch,
+    Test,
+    Review,
+    Merge,
+    Override,
+    Plan,
+    Error,
+}
+
+impl AuditCategory {
+    /// Cycle forward through the exact enum-value order pinned by contract
+    /// §9: `all -> dispatch -> test -> review -> merge -> override -> plan
+    /// -> error -> all`.
+    pub(crate) fn next(self) -> Self {
+        match self {
+            AuditCategory::All => AuditCategory::Dispatch,
+            AuditCategory::Dispatch => AuditCategory::Test,
+            AuditCategory::Test => AuditCategory::Review,
+            AuditCategory::Review => AuditCategory::Merge,
+            AuditCategory::Merge => AuditCategory::Override,
+            AuditCategory::Override => AuditCategory::Plan,
+            AuditCategory::Plan => AuditCategory::Error,
+            AuditCategory::Error => AuditCategory::All,
+        }
+    }
+
+    /// Exact lowercase string (contract §9) — both the display label (shown
+    /// in the sidebar / status-bar hint) and the `/audit` `category=` query
+    /// value for every variant except `All`.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            AuditCategory::All => "all",
+            AuditCategory::Dispatch => "dispatch",
+            AuditCategory::Test => "test",
+            AuditCategory::Review => "review",
+            AuditCategory::Merge => "merge",
+            AuditCategory::Override => "override",
+            AuditCategory::Plan => "plan",
+            AuditCategory::Error => "error",
+        }
+    }
+
+    /// The `/audit` `category=` query value, or `None` for `All` (contract
+    /// §9: "no category filter applied").
+    pub(crate) fn query_value(self) -> Option<&'static str> {
+        match self {
+            AuditCategory::All => None,
+            other => Some(other.label()),
+        }
+    }
 }
 
 /// CI check status for one PR, fetched in the background via `gh pr checks`.

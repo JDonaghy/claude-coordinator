@@ -1018,7 +1018,23 @@ impl CoordApp {
                     Some(t) => t.elapsed() >= AUDIT_FETCH_TTL,
                 };
                 if needs_fetch {
-                    self.audit_fetch_rx = Some(spawn_audit_fetch());
+                    // #1040: build the request from the panel's current
+                    // filter selection (contract §8/§9/§11) — `since` is
+                    // computed fresh on every fetch (not cached) so a
+                    // `LastHour`/`Today`/`D7` window keeps sliding forward
+                    // across the 15s refresh cadence, exactly like it would
+                    // on a fresh `t` cycle.
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs_f64();
+                    let since = self.audit_time_range.since(now);
+                    let category = self.audit_category.query_value();
+                    let type_filter = self.audit_type_filter.query.trim();
+                    let type_filter =
+                        if type_filter.is_empty() { None } else { Some(type_filter) };
+                    self.audit_fetch_rx =
+                        Some(spawn_audit_fetch(since, category, type_filter));
                 }
             }
         }

@@ -448,25 +448,46 @@ pub(crate) enum AuditFetchOutcome {
 /// slower cadence than the 5 s machine-metrics poll is plenty responsive.
 pub(crate) const AUDIT_FETCH_TTL: Duration = Duration::from_secs(15);
 
-/// #1039: spawn a background thread that fetches the first page of
-/// `GET /audit` (no filters — filters are #1040) from the configured board
-/// service (`resolve_board_service`), mirroring `spawn_artifact_fetch`'s
-/// thread-per-request pattern. Armed by the caller only while
-/// `active_view == SidebarView::Audit` (see the poll loop in
-/// `settings_ui.rs`), same gating discipline as the Machines-panel metrics
-/// poll above.
-pub(crate) fn spawn_audit_fetch() -> std::sync::mpsc::Receiver<AuditFetchOutcome> {
+/// #1039/#1040: spawn a background thread that fetches the first page of
+/// `GET /audit` from the configured board service (`resolve_board_service`),
+/// mirroring `spawn_artifact_fetch`'s thread-per-request pattern. Armed by
+/// the caller only while `active_view == SidebarView::Audit` (see the poll
+/// loop in `settings_ui.rs`), same gating discipline as the Machines-panel
+/// metrics poll above.
+///
+/// `since`/`category`/`event_type` are the Audit panel's current filter
+/// selection (contract §8/§9/§11, `tests/acceptance/ms-33/contract.md`) —
+/// `None`/empty means "no filter", matching `/audit`'s own optional-param
+/// semantics (#1037). Values ride as `ureq` query params (not manually
+/// interpolated into the URL) so free-text `event_type` input never needs
+/// its own percent-encoding.
+pub(crate) fn spawn_audit_fetch(
+    since: Option<f64>,
+    category: Option<&str>,
+    event_type: Option<&str>,
+) -> std::sync::mpsc::Receiver<AuditFetchOutcome> {
     let (tx, rx) = std::sync::mpsc::channel();
     let Some((url, token)) = resolve_board_service() else {
         let _ = tx.send(AuditFetchOutcome::NoBoardService);
         return rx;
     };
+    let category = category.map(|s| s.to_string());
+    let event_type = event_type.map(|s| s.to_string());
     std::thread::spawn(move || {
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(8))
             .build();
         let mut req = agent.get(&format!("{url}/audit"));
+        if let Some(since) = since {
+            req = req.query("since", &since.to_string());
+        }
+        if let Some(category) = &category {
+            req = req.query("category", category);
+        }
+        if let Some(event_type) = &event_type {
+            req = req.query("type", event_type);
+        }
         if let Some(t) = &token {
             req = req.set("Authorization", &format!("Bearer {t}"));
         }
