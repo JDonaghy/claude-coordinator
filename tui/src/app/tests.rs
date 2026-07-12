@@ -4276,6 +4276,29 @@
     }
 
     #[test]
+    fn interactive_running_assignment_without_tmux_stays_idle() {
+        // #1097: an interactive/chat assignment with status="running" but no
+        // matching live_tmux_sessions entry (e.g. the session crashed
+        // uncleanly and nothing ever revisited its DB status) must NOT be
+        // treated as Live via the #897 headless fallback — that fallback is
+        // headless-only. Interactive liveness comes solely from
+        // has_tmux_session, which self-corrects when tmux discovery stops
+        // finding the session.
+        let mut app = make_pipeline_app();
+        let mut a = make_assignment_typed("running", 42, "api", Some("work"));
+        a.is_interactive = true;
+        app.data.assignments.push(a);
+
+        assert!(app.live_tmux_sessions.is_empty());
+        let groups = app.pipeline_active_by_liveness();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].0, "idle",
+            "dead interactive session with a stale running status must not pin the issue Live"
+        );
+    }
+
+    #[test]
     fn in_progress_no_running_assignment_stays_idle() {
         // An in-progress issue whose work assignment is done (not running)
         // and has no live tmux session must remain in Idle — we must not
