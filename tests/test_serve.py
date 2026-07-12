@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import dataclasses
+import os
 import sqlite3
 from pathlib import Path
 
@@ -12,7 +15,7 @@ from coord import client as coord_client
 from coord.config import load as load_config
 from coord.dao import SqliteStore
 from coord.db import _ensure_schema
-from coord.serve_app import build_app
+from coord.serve_app import _reload_config_if_stale, build_app
 
 
 def _make_file_db(path: Path) -> None:
@@ -138,6 +141,121 @@ def test_serve_merge_passes_show_plan_to_callback(file_db: Path, valid_config_pa
         err = resp.json().get("error") or ""
         assert "show_plan" not in err, f"merge handler regressed on show_plan: {err}"
         assert "missing 1 required positional argument" not in err
+
+
+# ── #1081: daemon-side config reload-on-write ───────────────────────────────
+
+def _bump_mtime(path: Path, seconds_ahead: float = 5.0) -> None:
+    """Force the on-disk mtime forward so a same-second rewrite is still detected.
+
+    Some filesystems have 1s mtime resolution, so a write immediately followed
+    by another write in the same test can produce an identical mtime — which
+    would make ``_reload_config_if_stale`` (correctly) treat it as unchanged.
+    Tests that rewrite the file mid-test call this to make the "on-disk
+    change" unambiguous, mirroring a real hand-edit that happens well after
+    the daemon's initial load.
+    """
+    new_time = path.stat().st_mtime + seconds_ahead
+    os.utime(path, (new_time, new_time))
+
+
+def _disable_reviews(path: Path) -> None:
+    """Append a ``reviews: enabled: false`` override onto *path*'s current YAML.
+
+    Reads the fixture's existing content rather than depending on the
+    ``VALID_CONFIG`` constant directly (that lives in ``conftest.py`` and
+    isn't imported here), so this stays correct if the fixture body changes.
+    """
+    path.write_text(path.read_text() + "\nreviews:\n  enabled: false\n")
+
+
+def test_reload_config_if_stale_picks_up_on_disk_change(valid_config_path: Path):
+    cfg = load_config(valid_config_path)
+    mtime = valid_config_path.stat().st_mtime
+
+    _disable_reviews(valid_config_path)
+    _bump_mtime(valid_config_path)
+
+    reloaded, new_mtime = _reload_config_if_stale(cfg, mtime)
+    assert reloaded is not cfg
+    assert reloaded.reviews.enabled is False
+    assert new_mtime > mtime
+
+
+def test_reload_config_if_stale_noop_when_unchanged(valid_config_path: Path):
+    cfg = load_config(valid_config_path)
+    mtime = valid_config_path.stat().st_mtime
+
+    same, same_mtime = _reload_config_if_stale(cfg, mtime)
+    assert same is cfg  # no stat()-detected change → no reparse, same object
+    assert same_mtime == mtime
+
+
+def test_reload_config_if_stale_noop_when_no_path(valid_config_path: Path):
+    cfg = dataclasses.replace(load_config(valid_config_path), path=None)
+    same, same_mtime = _reload_config_if_stale(cfg, None)
+    assert same is cfg
+    assert same_mtime is None
+
+
+def test_reload_config_if_stale_keeps_last_good_on_invalid_yaml(
+    valid_config_path: Path, caplog: pytest.LogCaptureFixture
+):
+    cfg = load_config(valid_config_path)
+    mtime = valid_config_path.stat().st_mtime
+
+    valid_config_path.write_text("not: [valid, yaml, :::")
+    _bump_mtime(valid_config_path)
+
+    with caplog.at_level("WARNING", logger="coord.serve"):
+        kept, new_mtime = _reload_config_if_stale(cfg, mtime)
+    assert kept is cfg  # last-good config preserved, not raised into the caller
+    assert new_mtime > mtime  # advances so a bad edit isn't re-parsed every call
+    assert "failed to reload" in caplog.text
+
+
+def test_serve_board_picks_up_config_hand_edit(
+    file_db: Path, valid_config_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Integration check: a hand-edit to coordinator.yml (no daemon restart) must
+    reach the daemon's own internal decisions — not just GET /config's raw
+    bytes — the next time ``/board`` runs its merge-plan computation (#1081).
+
+    Invokes the ``/board`` route's endpoint function directly (via
+    ``asyncio.run`` in this test's own thread) rather than through
+    ``TestClient``: ``TestClient`` dispatches into a worker thread, and
+    ``board()``'s ``_build_board()`` call opens the ``coord_db`` fixture's
+    ``:memory:`` sqlite connection created in *this* thread — a pre-existing,
+    unrelated cross-thread sqlite restriction that would make the merge-plan
+    branch silently no-op (caught by its own fail-open ``except``) regardless
+    of this change. Calling the endpoint directly keeps everything on one
+    thread and still exercises the real closure, including the new
+    ``_refresh_config()`` call added for #1081.
+    """
+    cfg = load_config(valid_config_path)
+    assert cfg.reviews.enabled is True  # sanity: default is on
+    app = build_app(SqliteStore(file_db), cfg)
+    board_route = next(r for r in app.routes if getattr(r, "path", None) == "/board")
+
+    seen_configs = []
+
+    def _spy_plan(board, config, ci_store=None):  # noqa: ANN001, ARG001
+        seen_configs.append(config)
+        return []
+
+    monkeypatch.setattr("coord.merge_queue.plan", _spy_plan)
+
+    asyncio.run(board_route.endpoint(None))  # request param is unused (# noqa: ARG001)
+    assert seen_configs, "merge_queue.plan was never called — board() didn't reach it"
+    assert seen_configs[-1].reviews.enabled is True
+
+    _disable_reviews(valid_config_path)
+    _bump_mtime(valid_config_path)
+
+    asyncio.run(board_route.endpoint(None))
+    assert seen_configs[-1].reviews.enabled is False, (
+        "daemon's internal config did not pick up the on-disk hand-edit"
+    )
 
 
 # ── Client ────────────────────────────────────────────────────────────────────
