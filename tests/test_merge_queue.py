@@ -36,6 +36,7 @@ def _q(
     size: int | None = None,
     state: str = PENDING,
     pr: int | None = None,
+    assignment_type: str = "work",
 ) -> QueuedMerge:
     return QueuedMerge(
         assignment_id=aid,
@@ -48,6 +49,7 @@ def _q(
         state=state,
         size=size,
         pr_number=pr,
+        assignment_type=assignment_type,
     )
 
 
@@ -104,6 +106,14 @@ class TestPersistence:
         items = load_queue()
         assert [x.assignment_id for x in items] == ["new1", "new2"]
 
+    def test_roundtrip_preserves_assignment_type(self, coord_db) -> None:
+        # #1077: assignment_type must survive a save/load cycle so the merge
+        # processor can still tell a mock-author entry apart after a daemon
+        # restart re-reads the queue from disk.
+        save_queue([_q("a", assignment_type="mock-author"), _q("b")])
+        again = {x.assignment_id: x.assignment_type for x in load_queue()}
+        assert again == {"a": "mock-author", "b": "work"}
+
 
 class TestEnqueue:
     def _assignment(self, *, branch: str | None = "worker/foo") -> Assignment:
@@ -116,6 +126,19 @@ class TestEnqueue:
         entry = enqueue(self._assignment(), repo_github="acme/api", target_branch="main")
         assert entry is not None
         assert load_queue()[0].assignment_id == "abc"
+
+    def test_enqueue_carries_assignment_type(self, coord_db) -> None:
+        # #1077: the queued entry must remember the originating assignment's
+        # type so `process()` can decide whether merging closes the issue.
+        a = Assignment(
+            machine_name="m", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="ga", branch="worker/ga", status="done",
+            type="mock-author",
+        )
+        entry = enqueue(a, repo_github="acme/api", target_branch="main")
+        assert entry is not None
+        assert entry.assignment_type == "mock-author"
+        assert load_queue()[0].assignment_type == "mock-author"
 
     def test_idempotent(self, coord_db) -> None:
         enqueue(self._assignment(), repo_github="acme/api", target_branch="main")
@@ -236,6 +259,35 @@ class TestProcess:
         items = [_q("a")]
         process(items, gh := FakeGh(), dry_run=True)
         assert gh.close_calls == []
+
+    def test_mock_author_merge_does_not_close_tracking_issue(self) -> None:
+        # #1077: a "mock-author" (Gate A) entry's issue_number is the
+        # milestone's tracking issue, not something the PR resolves — merging
+        # it must NOT close that issue, unlike a "work" entry (#806 above).
+        items = [_q("a", assignment_type="mock-author")]
+        events = process(items, gh := FakeGh())
+        assert items[0].state == MERGED
+        assert gh.close_calls == []
+        merged = [e for e in events if e.kind == "merged"]
+        assert merged and "left open" in merged[0].message
+
+    def test_briefing_body_uses_refs_for_mock_author(self) -> None:
+        # #1077: the fallback create_pr body (when no PR was opened upstream)
+        # must use the non-closing "Refs #N" for mock-author entries.
+        from coord.merge_queue import _briefing_body
+
+        entry = _q("a", assignment_type="mock-author")
+        body = _briefing_body(entry)
+        assert "Refs #1" in body
+        assert "Closes #1" not in body
+
+    def test_briefing_body_uses_closes_for_work(self) -> None:
+        # #1077: "work" entries keep the #806 closing-keyword behavior.
+        from coord.merge_queue import _briefing_body
+
+        entry = _q("a", assignment_type="work")
+        body = _briefing_body(entry)
+        assert body.startswith("Closes #1\n\n")
 
     def test_conflict_does_not_halt_other_repo_groups(self) -> None:
         """A conflict in one (repo, target) group must not touch other groups."""

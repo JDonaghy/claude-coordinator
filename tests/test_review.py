@@ -956,6 +956,77 @@ def test_find_or_open_pr_body_includes_closes_keyword() -> None:
     assert captured["body"].startswith("Closes #42\n\n")
 
 
+def test_find_or_open_pr_uses_refs_for_mock_author() -> None:
+    """#1077: a mock-author (Gate A) PR's issue_number is the milestone's
+    tracking issue, not something this PR resolves — the body must use the
+    non-closing 'Refs #N' so merging doesn't auto-close the tracking issue.
+    """
+    from coord.review import _find_or_open_pr
+    import coord.github_ops as github_ops_mod
+
+    captured: dict = {}
+
+    def _fake_find_pr(repo_github, branch):
+        return None
+
+    def _fake_create_pr(repo_github, *, base, head, title, body):
+        captured["body"] = body
+        return {"number": 56, "url": "https://github.com/acme/api/pull/56", "existed": False}
+
+    import unittest.mock as mock
+    with (
+        mock.patch.object(github_ops_mod, "find_pr_for_branch", _fake_find_pr),
+        mock.patch.object(github_ops_mod, "create_pr", _fake_create_pr),
+    ):
+        result = _find_or_open_pr(
+            "acme/api",
+            branch="ms-33-gate-a",
+            default_branch="main",
+            issue_number=1041,
+            issue_title="Milestone #33 tracking issue",
+            assignment_type="mock-author",
+        )
+
+    assert result is not None
+    assert captured["body"].startswith("Refs #1041\n\n")
+    assert "Closes #1041" not in captured["body"]
+
+
+def test_dispatch_review_passes_assignment_type_to_pr_lookup(
+    two_machine_config: Config,
+) -> None:
+    """#1077: dispatch_review must forward the completed assignment's type
+    so pr_lookup (``_find_or_open_pr``) can decide the Closes-vs-Refs
+    keyword — otherwise a mock-author PR's body would always default to the
+    closing form and merging it would wrongly close the tracking issue."""
+    board = Board()
+    captured: dict = {}
+    completed = replace(
+        _completed_assignment(),
+        type="mock-author",
+        assignment_id="ga-1",
+        branch="ms-33-gate-a",
+        issue_number=1041,
+    )
+    client = _FakeHTTPClient({"id": "review-id-ga"})
+
+    def _pr_lookup(repo_github, **kw):
+        captured.update(kw)
+        return {"number": 1, "url": "u", "existed": True}
+
+    dispatch_review(
+        completed, board, two_machine_config,
+        http_client=client,
+        pr_lookup=_pr_lookup,
+        claude_md_reader=lambda p: "# Project rules\n",
+        issue_body_fetcher=lambda repo, num: "issue body text",
+        now=123.0,
+        remote_branch_checker=lambda repo, branch: True,
+    )
+
+    assert captured.get("assignment_type") == "mock-author"
+
+
 # ── Reviewer system prompt ──────────────────────────────────────────────────
 
 

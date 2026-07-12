@@ -154,7 +154,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             size INTEGER,
             last_attempt REAL,
             error TEXT,
-            enqueued_at REAL
+            enqueued_at REAL,
+            assignment_type TEXT DEFAULT 'work'
         );
 
         CREATE TABLE IF NOT EXISTS plans (
@@ -364,6 +365,13 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         "ALTER TABLE assignments ADD COLUMN audit_goals_json TEXT",
         "ALTER TABLE assignments ADD COLUMN audit_bottom_line TEXT",
         "ALTER TABLE assignments ADD COLUMN audit_run_number INTEGER",
+        # #1077: the originating assignment's `type` (e.g. "work",
+        # "mock-author"), so the merge processor can tell whether merging
+        # this entry's PR should deterministically close `issue_number` —
+        # see coord.models.CLOSES_ISSUE_TYPES. Existing rows default to
+        # 'work', preserving the prior always-close behavior for entries
+        # enqueued before this column existed.
+        "ALTER TABLE merge_queue ADD COLUMN assignment_type TEXT DEFAULT 'work'",
     ]
     for sql in migrations:
         try:
