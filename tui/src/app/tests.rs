@@ -31026,28 +31026,194 @@ Milestone tracking issue.
         );
     }
 
+    // ── #1094: Audit panel row list migrated to a `DataTable` ───────────────
+    //
+    // No Gate-A mock/contract amendment for #1094 has been authored yet
+    // (see the durable finding recorded on the issue) — this in-crate suite
+    // is the only coverage of the populated-list `DataTable` rendering,
+    // header/divider/row hit-testing, and column-resize behaviour this
+    // issue adds.
+
     #[test]
-    fn audit_row_at_maps_position_to_flat_index() {
-        let app = make_app_with_audit_json(BoardData::default(), &audit_page_json_two_entries());
+    fn audit_table_hit_returns_none_on_empty_list() {
+        // No render has happened (nothing cached in `audit_table_layout`),
+        // but the empty-list check short-circuits before that matters.
+        let app = make_test_app(BoardData::default());
         let main_b = Rect::new(0.0, 0.0, 100.0, 20.0);
-        let lh = 1.0;
-        assert_eq!(
-            app.audit_row_at(Point::new(5.0, 0.4), main_b, lh),
-            Some(0)
-        );
-        assert_eq!(
-            app.audit_row_at(Point::new(5.0, 1.4), main_b, lh),
-            Some(1)
-        );
-        // Past the last entry (only 2 entries seeded) → no row.
-        assert_eq!(app.audit_row_at(Point::new(5.0, 2.4), main_b, lh), None);
+        assert_eq!(app.audit_table_hit(Point::new(5.0, 0.4), main_b), None);
     }
 
     #[test]
-    fn audit_row_at_returns_none_on_empty_list() {
-        let app = make_test_app(BoardData::default());
-        let main_b = Rect::new(0.0, 0.0, 100.0, 20.0);
-        assert_eq!(app.audit_row_at(Point::new(5.0, 0.4), main_b, 1.0), None);
+    fn audit_columns_render_as_headers() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_app_with_audit_json(BoardData::default(), &audit_page_json_two_entries());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "§");
+        driver.render();
+
+        let screen = driver.screen();
+        for needle in ["Time", "Category", "Actor", "Repo#Issue", "Summary"] {
+            assert!(
+                screen.contains(needle),
+                "#1094: DataTable header row must show column {needle:?}:\n{screen}"
+            );
+        }
+    }
+
+    #[test]
+    fn audit_row_click_selects_it() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        // `driver.app()` isn't `CoordApp` (`driver_with_shell` wraps it in
+        // an opaque `ShellAdapter`), so this asserts purely on rendered
+        // text, same as every other `TuiDriver`-based test in this suite.
+        // The NEWEST entry (default selection, index 0) has a non-null
+        // `assignment_id`/`machine`; the OLDEST entry (index 1) has both
+        // `null` — their presence/absence in the detail pane after Enter
+        // is the observable proxy for which row got selected.
+        let app = make_app_with_audit_json(BoardData::default(), &audit_page_json_two_entries());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "§");
+        driver.render();
+
+        let (x, y) = driver.find("OLDEST_MARKER").unwrap_or_else(|| {
+            panic!("OLDEST_MARKER row not rendered:\n{}", driver.screen())
+        });
+        driver.click(x, y);
+        driver.press_named(NamedKey::Enter);
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("OLDEST_MARKER"),
+            "detail pane must show the clicked (oldest) entry's summary:\n{screen}"
+        );
+        assert!(
+            !screen.contains("a1b2c3d4") && !screen.contains("laptop"),
+            "detail pane must show the OLDEST entry (whose assignment_id/ \
+             machine are both null), not the NEWEST entry's — their \
+             absence proves the click moved selection to index 1:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn audit_header_click_is_a_noop_sort_deferred() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_app_with_audit_json(BoardData::default(), &audit_page_json_two_entries());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "§");
+        driver.render();
+
+        // Move selection off the default (index 0 / NEWEST) first, so a
+        // header click resetting it back would be observable.
+        let (x, y) = driver.find("OLDEST_MARKER").unwrap_or_else(|| {
+            panic!("OLDEST_MARKER row not rendered:\n{}", driver.screen())
+        });
+        driver.click(x, y);
+        driver.render();
+
+        // Summary is the rightmost column — its header text starts well
+        // clear of the Repo#Issue/Summary divider's grab zone, so this can
+        // only resolve to `DataTableHit::Header`, not a resize drag.
+        let (sx, sy) = driver.find("Summary").unwrap_or_else(|| {
+            panic!("Summary header not rendered:\n{}", driver.screen())
+        });
+        driver.click(sx, sy);
+        driver.render();
+
+        driver.press_named(NamedKey::Enter);
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("OLDEST_MARKER") && !screen.contains("a1b2c3d4"),
+            "clicking a column header (sort explicitly deferred, #1094) \
+             must not change row selection — detail pane must still show \
+             the previously-selected OLDEST entry:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn audit_header_divider_drag_resizes_column() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        // `driver.app()` isn't `CoordApp`, so this proves the resize took
+        // effect by re-measuring where the NEXT column's header now
+        // starts on screen, rather than reading `audit_column_overrides`
+        // directly.
+        let app = make_app_with_audit_json(BoardData::default(), &audit_page_json_two_entries());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "§");
+        driver.render();
+
+        let (time_x, header_y) = driver.find("Time").unwrap_or_else(|| {
+            panic!("Time column header not rendered:\n{}", driver.screen())
+        });
+        let (category_x_before, _) = driver.find("Category").unwrap_or_else(|| {
+            panic!("Category column header not rendered:\n{}", driver.screen())
+        });
+        assert_eq!(
+            category_x_before,
+            time_x + 11.0,
+            "sanity check: Category must start exactly at Time's \
+             Fixed(11) right edge before any resize"
+        );
+
+        // The divider between Time (col 0) and Category (col 1) sits
+        // right at Category's current left edge — drag it 4 cells right.
+        // `find()` returns cell-CENTER coordinates (`col + 0.5`, see
+        // `TuiDriver::find`); use the integer cell boundary itself
+        // (`category_x_before - 0.5`) for the click so the extra 0.5
+        // doesn't leak into the resize math and throw off the resulting
+        // width by a rounded cell.
+        let divider_x = category_x_before - 0.5;
+        driver.mouse_down(divider_x, header_y);
+        driver.mouse_move(divider_x + 4.0, header_y);
+        driver.mouse_up(divider_x + 4.0, header_y);
+        driver.render();
+
+        let (category_x_after, _) = driver.find("Category").unwrap_or_else(|| {
+            panic!(
+                "Category column header not rendered after resize:\n{}",
+                driver.screen()
+            )
+        });
+        assert_eq!(
+            category_x_after,
+            category_x_before + 4.0,
+            "dragging the Time/Category divider 4 cells right must widen \
+             column 0 by 4, pushing Category's header start right by 4:\n{}",
+            driver.screen()
+        );
+    }
+
+    #[test]
+    fn audit_table_engages_h_scrollbar_below_min_width() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        // #1094 "Narrow-terminal capacity": at 80 cols the main panel is
+        // narrower than `min_total_width` (75) once the sidebar + activity
+        // bar overhead (~38 cols) is subtracted, so the table must engage
+        // its built-in horizontal scrollbar ('▄'/'▁' glyphs, `tui/
+        // scrollbar.rs`) rather than squeeze the fixed columns below
+        // legible widths. The sealed 120×40 baseline never exercises this
+        // path, so it needs its own narrow-width check.
+        let app = make_app_with_audit_json(BoardData::default(), &audit_page_json_two_entries());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 80, 24);
+        click_activity_icon(&mut driver, "§");
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Time") && screen.contains("Category"),
+            "leftmost fixed columns must still render at the narrow width:\n{screen}"
+        );
+        assert!(
+            screen.contains('▄') || screen.contains('▁'),
+            "the table content must overflow the 80-col viewport and show \
+             the horizontal scrollbar, rather than squeezing every column \
+             into an illegible width:\n{screen}"
+        );
     }
 
     // ── #1040: Audit panel filters (time-range / category / type) ──────────

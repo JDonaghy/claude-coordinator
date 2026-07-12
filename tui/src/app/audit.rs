@@ -1,14 +1,23 @@
 //! Audit ActivityBar panel (#1039).
 //!
 //! Newest-first list of the audit trail (`/audit`, #1037) with an inline
-//! entry-detail view — modeled on the Plans panel (`plans.rs`): a plain
-//! `ListView`/`draw_list` main panel (no `SidebarSystem`/tree), a simple
-//! `usize` selection index clamped on navigation, and a background fetch
-//! gated to only run while this panel is the active view (mirrors
-//! `spawn_artifact_fetch`'s Pipeline-only gating in `data.rs`).
+//! entry-detail view — modeled on the Plans panel (`plans.rs`): no
+//! `SidebarSystem`/tree in the main panel, a simple `usize` selection index
+//! clamped on navigation, and a background fetch gated to only run while
+//! this panel is the active view (mirrors `spawn_artifact_fetch`'s
+//! Pipeline-only gating in `data.rs`).
 //!
 //! **Read-only in this slice.** Filters (time-range `t`, category `Tab`)
 //! are #1040 — out of scope here per the #1039 issue body.
+//!
+//! **#1094 update:** the main-panel row list was migrated from a joined-
+//! string `ListView`/`draw_list` to a quadraui `DataTable`/`draw_data_table`
+//! — real columns (Time/Category/Actor/Repo#Issue/Summary) with user-driven
+//! column resize (drag a header divider). Column **sort** is explicitly
+//! deferred (`/audit` is server-paginated newest-first; a client-side sort
+//! would only reorder whatever page happens to be loaded — see the #1094
+//! issue body). The detail pane below (`audit_detail_items`, a bordered
+//! `ListView`) is unchanged by #1094 — this only touches the list pane.
 //!
 //! **Contract:** `tests/acceptance/ms-33/contract.md` (Gate A, mock-authored
 //! before this issue dispatched) pins the exact panel registration, screen
@@ -17,7 +26,10 @@
 //! audit_1039.rs`) currently covers only the no-seeding-required behaviours
 //! (panel registration, sidebar header, empty state, list-mode hints); the
 //! populated-list/detail-pane/badge assertions are deferred there pending a
-//! seeding seam — see `app::fixtures::make_app_with_audit_json`.
+//! seeding seam — see `app::fixtures::make_app_with_audit_json`. **#1094
+//! note:** no Gate-A mock/contract amendment for #1094 itself has been
+//! authored yet (see the durable finding on issue #1094) — this module's
+//! populated-list rendering is covered only by the in-crate tests below.
 #[allow(unused_imports)]
 use super::*;
 
@@ -134,40 +146,93 @@ impl CoordApp {
             || !self.audit_type_filter.is_empty()
     }
 
-    /// One main-panel row's display text (contract §4a): relative time,
-    /// category, actor, `repo#issue`, summary — verbatim except the
-    /// summary, which is truncated to keep rows readable.
-    fn audit_row_text(entry: &AuditEntry) -> String {
-        let time_ago = format_unix_time(entry.ts);
-        let repo_issue = match (&entry.repo, entry.issue) {
+    /// #1094 column set for the main-panel `DataTable` (issue body "Column
+    /// widths (decided)"). Widths are `Fixed` for the closed-vocabulary
+    /// columns (Category: `dispatch/test/review/merge/override/plan/error`,
+    /// max 8 chars; Actor: `coordinator/daemon/worker/user`, max 11 chars)
+    /// plus Time (relative-time string, no benefit from flexing) — `Content`
+    /// is deliberately NOT used here even though it looks tempting, because
+    /// every rasteriser's `Content{min,max}` measurer only sizes off the
+    /// column *title*'s character count, never row data (verified across
+    /// `tui/`, `gtk/`, `macos/data_table.rs`), so it would just collapse to
+    /// `min` for every one of these titles. Repo#Issue and Summary are
+    /// `Flex` (genuinely unbounded width, no small vocabulary) so Summary —
+    /// the primary content — gets the lion's share of whatever's left after
+    /// the three fixed columns.
+    fn audit_columns() -> Vec<Column> {
+        vec![
+            Column {
+                title: "Time".to_string(),
+                width: ColumnWidth::Fixed(11.0),
+                align: ColumnAlign::Left,
+            },
+            Column {
+                title: "Category".to_string(),
+                width: ColumnWidth::Fixed(9.0),
+                align: ColumnAlign::Left,
+            },
+            Column {
+                title: "Actor".to_string(),
+                width: ColumnWidth::Fixed(12.0),
+                align: ColumnAlign::Left,
+            },
+            Column {
+                title: "Repo#Issue".to_string(),
+                width: ColumnWidth::Flex(1.0),
+                align: ColumnAlign::Left,
+            },
+            Column {
+                title: "Summary".to_string(),
+                width: ColumnWidth::Flex(3.0),
+                align: ColumnAlign::Left,
+            },
+        ]
+    }
+
+    /// Minimum total table width (#1094 "Narrow-terminal capacity"): the
+    /// three fixed columns alone are 11+9+12 = 32 cells, and the sidebar +
+    /// activity-bar overhead (~38 cols) leaves as little as ~42 cols of
+    /// main-panel width at a plain 80-col terminal. Below this floor,
+    /// `DataTable`'s built-in horizontal scrollbar takes over instead of the
+    /// columns (and their text) being squeezed below legible widths.
+    const AUDIT_TABLE_MIN_WIDTH: f32 = 75.0;
+
+    /// `repo#issue` cell text — unchanged from the pre-#1094 joined-string
+    /// format (contract §4a); still a single combined cell, not split into
+    /// two columns (matches what #1039/#1040 already shipped and the sealed
+    /// contract's existing mocks).
+    fn audit_repo_issue(entry: &AuditEntry) -> String {
+        match (&entry.repo, entry.issue) {
             (Some(repo), Some(n)) => format!("{repo}#{n}"),
             (Some(repo), None) => repo.clone(),
             (None, Some(n)) => format!("#{n}"),
             (None, None) => String::new(),
-        };
-        format!(
-            "  {}  {}  {}  {}  {}",
-            time_ago,
-            entry.category,
-            entry.actor,
-            repo_issue,
-            trunc(&entry.summary, 60),
-        )
+        }
     }
 
-    /// Build the flat `ListItem` row list for the populated main panel.
-    fn audit_row_items(entries: &[AuditEntry]) -> Vec<ListItem> {
+    /// One styled cell — same foreground colour every row used under the
+    /// old joined-string `ListItem` rendering.
+    fn audit_cell(text: impl Into<String>) -> StyledText {
+        StyledText {
+            spans: vec![StyledSpan::with_fg(text.into(), Color::rgb(200, 200, 200))],
+        }
+    }
+
+    /// Build the `DataTable` row list for the populated main panel. No
+    /// manual truncation here (contract §4a's old `trunc(&entry.summary,
+    /// 60)` is dropped, #1094 deliverable 5) — `draw_data_table` already
+    /// clips each cell to its resolved column width.
+    fn audit_data_rows(entries: &[AuditEntry]) -> Vec<DataRow> {
         entries
             .iter()
-            .map(|entry| ListItem {
-                text: StyledText {
-                    spans: vec![StyledSpan::with_fg(
-                        Self::audit_row_text(entry),
-                        Color::rgb(200, 200, 200),
-                    )],
-                },
-                icon: None,
-                detail: None,
+            .map(|entry| DataRow {
+                cells: vec![
+                    Self::audit_cell(format_unix_time(entry.ts)),
+                    Self::audit_cell(entry.category.clone()),
+                    Self::audit_cell(entry.actor.clone()),
+                    Self::audit_cell(Self::audit_repo_issue(entry)),
+                    Self::audit_cell(entry.summary.clone()),
+                ],
                 decoration: Decoration::Normal,
             })
             .collect()
@@ -245,21 +310,27 @@ impl CoordApp {
             (rect, None)
         };
 
-        backend.draw_list(
-            list_rect,
-            &ListView {
-                id: WidgetId::new("audit-list"),
-                title: None,
-                items: Self::audit_row_items(entries),
-                selected_idx: sel,
-                scroll_offset: 0,
-                has_focus: true,
-                bordered: false,
-                h_scroll: 0,
-                max_content_width: None,
-                show_v_scrollbar: true,
-            },
-        );
+        // #1094: the main-panel row list is a `DataTable` (was a plain
+        // `ListView`) — real columns with user-driven resize. The resolved
+        // layout is cached in `audit_table_layout` so mouse hit-testing
+        // (`audit_table_hit`, called from `events.rs` with no `Backend`
+        // handle in scope) can reuse the exact geometry that was painted,
+        // same render-then-hit-test pattern `kanban_layout` already uses.
+        let table = DataTable {
+            id: WidgetId::new("audit-list"),
+            columns: Self::audit_columns(),
+            rows: Self::audit_data_rows(entries),
+            selected_idx: Some(sel),
+            scroll_offset: 0,
+            sort: None,
+            has_focus: true,
+            show_scrollbar: true,
+            min_total_width: Some(Self::AUDIT_TABLE_MIN_WIDTH),
+            h_scroll: 0.0,
+            column_overrides: self.audit_column_overrides.clone(),
+        };
+        let layout = backend.draw_data_table(list_rect, &table, None);
+        *self.audit_table_layout.borrow_mut() = Some(layout);
 
         if let Some(detail_rect) = detail_rect {
             if let Some(entry) = self.audit_selected() {
@@ -282,26 +353,64 @@ impl CoordApp {
         }
     }
 
-    /// Map a click position in the main panel to an entry index (flat list,
-    /// no header rows — unlike `plans_row_at`, which must skip repo-header
-    /// and "+N without a work order" rows). Returns `None` outside the list
-    /// rows, when the detail pane is open (the list is out of hit-test
-    /// scope while it's collapsed above the detail pane — the caller only
-    /// invokes this in list-only mode), or on an empty list.
-    pub(crate) fn audit_row_at(&self, pos: Point, main_b: Rect, lh: f32) -> Option<usize> {
+    /// #1094: hit-test a click position against the last-rendered
+    /// `DataTable` layout (`audit_table_layout`, cached by
+    /// `render_audit_panel` — same render-then-hit-test pattern
+    /// `kanban_layout`/`BoardLayout::hit_test` already use elsewhere in this
+    /// crate). `None` when the list is empty, or nothing was cached yet
+    /// (no render since navigating to the panel — shouldn't happen in
+    /// practice since a render always precedes a click, but a stale click
+    /// should fail closed rather than hit-test against a missing layout).
+    /// The caller only invokes this in list-only mode — the table isn't
+    /// rendered at all while `audit_detail_open` (see `render_audit_panel`),
+    /// so there is no layout to hit-test against in that state either way.
+    pub(crate) fn audit_table_hit(&self, pos: Point, main_b: Rect) -> Option<DataTableHit> {
         let n = self.audit_entries().len();
-        if n == 0 || lh <= 0.0 {
+        if n == 0 {
             return None;
         }
-        if pos.y < main_b.y {
-            return None;
+        let layout_ref = self.audit_table_layout.borrow();
+        let layout = layout_ref.as_ref()?;
+        let x = pos.x - main_b.x;
+        let y = pos.y - main_b.y;
+        // `scroll_offset: 0` matches what `render_audit_panel` always builds
+        // the table with — this panel doesn't track its own scroll offset
+        // (pre-existing limitation, unchanged by #1094).
+        Some(layout.hit_test(x, y, 0, n))
+    }
+
+    /// Minimum width (cells) a column may be dragged down to — keeps a
+    /// resize drag from collapsing a column to zero/negative width.
+    const AUDIT_MIN_COLUMN_WIDTH: f32 = 4.0;
+
+    /// #1094 deliverable 4: continue an in-progress column-resize drag on
+    /// the Audit `DataTable`, started by a `MouseDown` on a
+    /// `DataTableHit::HeaderDivider` (`audit_resize_col` set by the caller —
+    /// see `mouse_main_click` in `events.rs`). Computes the new width for
+    /// the dragged column from the cursor's current x position relative to
+    /// that column's left edge (per the last-cached `audit_table_layout`)
+    /// and stores it in `audit_column_overrides` — session-only
+    /// persistence, matching how the panel's filters and scroll position
+    /// already work (no cross-restart UI-state store exists in this
+    /// codebase yet). Returns `true` (redraw needed) only while a drag is
+    /// actually in progress and the cached layout still has that column.
+    pub(crate) fn audit_update_resize_drag(&mut self, pos: Point, main_b: Rect) -> bool {
+        let Some(col) = self.audit_resize_col else {
+            return false;
+        };
+        let col_x = {
+            let layout_ref = self.audit_table_layout.borrow();
+            match layout_ref.as_ref().and_then(|l| l.columns.get(col)) {
+                Some(rc) => rc.x,
+                None => return false,
+            }
+        };
+        let x = pos.x - main_b.x;
+        let new_w = (x - col_x).max(Self::AUDIT_MIN_COLUMN_WIDTH);
+        if let Some(slot) = self.audit_column_overrides.get_mut(col) {
+            *slot = Some(new_w);
         }
-        let row = ((pos.y - main_b.y) / lh).floor() as usize;
-        if row < n {
-            Some(row)
-        } else {
-            None
-        }
+        true
     }
 
     /// Force the next `run_periodic_work` tick to re-fetch `/audit`

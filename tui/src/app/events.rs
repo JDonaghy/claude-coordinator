@@ -4104,6 +4104,14 @@ impl CoordApp {
                     // drag doesn't accidentally escape to the PTY.
                     let char_w = backend.char_width();
                     let main_b = ctx.main_bounds();
+                    // #1094: continue an in-progress Audit column-resize
+                    // drag before any other main-panel motion handling.
+                    // `active_view == Audit` already implies the terminal
+                    // paths below are no-ops, but checking explicitly keeps
+                    // the precedence self-documenting.
+                    if self.active_view == SidebarView::Audit && buttons.left {
+                        redraw |= self.audit_update_resize_drag(pos, main_b);
+                    }
                     if self.terminal_host_sel_dragging && buttons.left {
                         if let Some((col, row)) =
                             self.active_terminal_pixel_to_cell(pos, main_b, lh, char_w)
@@ -4201,6 +4209,14 @@ impl CoordApp {
             UiEvent::MouseUp { button, position, .. } => {
                 let pos = *position;
                 let btn = *button;
+                // #1094: release an in-progress Audit column-resize drag
+                // (started by a `MouseDown` on a `DataTableHit::
+                // HeaderDivider`) before any other `MouseUp` handling —
+                // mirrors the #464 host-selection-drag finalize priority
+                // just below.
+                if btn == MouseButton::Left && self.audit_resize_col.take().is_some() {
+                    return true;
+                }
                 if let Some(sidebar_b) = ctx.sidebar_bounds() {
                     match self.active_view {
                         SidebarView::Board => {
@@ -4913,17 +4929,28 @@ impl CoordApp {
             }
             return false;
         }
-        // #1039: Audit panel list is also a raw `ListView` painted straight
-        // into the main panel. Clicking a row while the detail pane is
-        // closed selects it; the detail pane itself isn't a selectable-row
-        // target (it has no rows of its own to pick), so `audit_row_at`
-        // isn't consulted while `audit_detail_open`.
+        // #1039/#1094: Audit panel main list is a `DataTable` (was a plain
+        // `ListView`) painted straight into the main panel. While the
+        // detail pane is closed: a row hit selects it (unchanged from
+        // #1039), a header-divider hit begins a column-resize drag (#1094
+        // deliverable 3/4 — continued in the `MouseMoved` arm above and
+        // released on `MouseUp`), and a plain header hit is a no-op (sort
+        // is explicitly deferred, see `audit.rs` module docs). The detail
+        // pane itself isn't a selectable-row target (it has no rows of its
+        // own to pick), so the table isn't hit-tested at all while
+        // `audit_detail_open`.
         if self.active_view == SidebarView::Audit && !self.audit_detail_open {
-            if let Some(idx) = self.audit_row_at(pos, main_b, lh) {
-                self.audit_sel = idx;
-                return true;
-            }
-            return false;
+            return match self.audit_table_hit(pos, main_b) {
+                Some(DataTableHit::Row { idx }) => {
+                    self.audit_sel = idx;
+                    true
+                }
+                Some(DataTableHit::HeaderDivider { col }) => {
+                    self.audit_resize_col = Some(col);
+                    true
+                }
+                Some(DataTableHit::Header { .. }) | Some(DataTableHit::Empty) | None => false,
+            };
         }
         false
     }

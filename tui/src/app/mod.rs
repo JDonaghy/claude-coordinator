@@ -68,6 +68,8 @@ use quadraui::{
     ToolbarButton, ToolbarHoverTracker, ToolbarItemMeasure, TreeRow, UiEvent, WidgetId,
     BadgeStatus, BoardCard, BoardColumn, BoardHit, BoardLayout, BoardModel, MoveDir,
     Stage,
+    // #1094: Audit panel row list — first `DataTable` use in coord-tui.
+    Column, ColumnAlign, ColumnWidth, DataRow, DataTable, DataTableHit, DataTableLayout,
     // #953: Terminal-view left-pane machine tree — the app's first direct
     // `backend.draw_tree` sidebar (bypassing `SidebarSystem`).
     SelectionMode, TreePath, TreeStyle, TreeView,
@@ -2778,6 +2780,27 @@ pub struct CoordApp {
     /// while focused clears it back to empty (mirrors `board_search`'s
     /// Escape-while-focused semantics — see `events.rs`).
     audit_type_filter: SidebarFilter,
+    /// #1094: per-column width overrides from a user's header-divider drag on
+    /// the Audit `DataTable`. Always length-5 (matching `audit_columns()`'s
+    /// column count) or empty; a `Some(w)` entry replaces that column's
+    /// `ColumnWidth` strategy with `Fixed(w)` for the rest of the session.
+    /// Session-only persistence — matches how filters/scroll position
+    /// already work (no cross-restart UI-state store exists in this
+    /// codebase yet).
+    audit_column_overrides: Vec<Option<f32>>,
+    /// #1094: the most recently rendered Audit `DataTable`'s resolved
+    /// layout, cached by `render_audit_panel` so mouse hit-testing
+    /// (`audit_table_hit`/`audit_update_resize_drag`) can reuse the exact
+    /// column geometry that was painted, without a `Backend` handle at
+    /// click time. Mirrors the `kanban_layout` render-then-hit-test pattern
+    /// (`RefCell` because `render_audit_panel` takes `&self`). `None` until
+    /// the panel has rendered at least once with rows present.
+    audit_table_layout: std::cell::RefCell<Option<DataTableLayout>>,
+    /// #1094: index of the column being resized (the column to the LEFT of
+    /// the divider being dragged), set by a `MouseDown` on a
+    /// `DataTableHit::HeaderDivider` and cleared on `MouseUp`. `None` when no
+    /// resize drag is in progress.
+    audit_resize_col: Option<usize>,
 
     // ── #541: global Telescope-style issue fuzzy finder ──────────────────────
     /// Active state of the issue fuzzy-finder overlay.  `None` when the
@@ -3213,6 +3236,12 @@ impl CoordApp {
             audit_time_range: AuditTimeRange::All,
             audit_category: AuditCategory::All,
             audit_type_filter: SidebarFilter::default(),
+            // #1094: no column-width overrides / active resize drag / cached
+            // layout on startup — all populated by the first render + user
+            // drag, same lifecycle as the fields above.
+            audit_column_overrides: vec![None; 5],
+            audit_table_layout: std::cell::RefCell::new(None),
+            audit_resize_col: None,
             // #217: resolved theme palette — computed from settings + optional
             // ~/.coord/theme.toml override file.
             active_theme: {
