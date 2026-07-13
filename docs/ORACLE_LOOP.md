@@ -196,6 +196,43 @@ Legend: **[indep]** zero-worker-context agent · **[worker]** implementer · **[
 11. **[human] UAT:** a **confirmation**, not a discovery. A residual failure → amend the contract
     (feeds Gate A) + file an issue. That delta measures how far below 100% the oracle sits.
 
+## TUI menu surface (coord-tui)
+
+Phase 0 steps 1–2 and Phase 1 step 6 above are also reachable by right-clicking a Pipeline row in
+`coord-tui` — no CLI required. Implemented in `tui/src/app/{dialogs,pipeline}.rs` (#1059/#1060).
+
+**On the epic/tracking-issue row** (the row carrying the `epic` label — gated on
+`all_labels.contains("epic")`):
+- **"Dispatch Gate A mock"** 🎭 → `coord acceptance mock <repo> <tracking_issue>` — headless (a
+  `type=mock-author` `claude -p` worker, dispatched the same way `coord assign` dispatches Work,
+  not a live session). The CLI's own claim-detection refuses a duplicate dispatch while one is
+  already in flight. This *is* Phase 0 step 1.
+- **"View Gate A mock (PR)"** 👁 → opens that worker's PR in the browser so a human can read
+  `contract.md` + the rendered mock(s) and sign off — merging that PR is what satisfies Gate A.
+  Disabled until a PR exists.
+
+**On any ordinary member-issue row of a milestone's `## Work order`** (resolved via
+`milestone_tracking_issue_for`; **not** epic-gated — applies per-issue, independent of the
+row's lifecycle):
+- **"Author acceptance tests"** → `coord acceptance author <repo> <tracking_issue> --issue <N>` —
+  the JIT test-author slice for that one issue (Phase 0 step 2, run per-issue rather than once
+  up front). Disabled until `tests/acceptance/ms-NN/contract.md` exists on the local checkout —
+  i.e. until Gate A's mock PR above is merged.
+- **"Record acceptance"** → `coord acceptance record --repo <repo> --issue <N> --sha <sha>` — the
+  external trust-gate re-run (Phase 1 step 6). Disabled until there's a completed (`done`)
+  `work`/`mock-author` assignment with a branch to resolve a SHA from; the SHA itself is read
+  directly off the local checkout's git refs, so the operator never types a commit hash by hand.
+
+The in-session worker loop (Phase 1 steps 4–5, `coord acceptance run --issue N`) has **no** menu
+item — it runs inside the worker's own session, not from the operator's TUI.
+
+**Follow-on, blocked — do not treat as ready:** once the reusable `?` cheatsheet/command-palette
+help layer lands (quadraui #431 → TUI CC-4 #1124, milestone #38 "Plans panel → rich client"), the
+Pipeline panel's help overlay should surface this same right-click sequence so it's discoverable
+without reading `tui/src/app/{dialogs,pipeline}.rs`. This is *not* wired as an `after:` DAG edge on
+any milestone (cross-milestone edges are rejected by this repo's convention) — it's a plain
+prose follow-on, to be picked up only once #1124 has actually shipped.
+
 ## ToS posture — "done" is observed as "green," never scraped
 
 The completion signal is **not** "the session ended" or "the model said done" — it is **"the oracle
