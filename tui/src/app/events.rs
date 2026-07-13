@@ -4709,9 +4709,18 @@ impl CoordApp {
             // #771: Milestone DAG sidebar is a placeholder; the milestone
             // list + DAG both live in the main panel (`mouse_main_click`).
             SidebarView::MilestoneDag => false,
-            // #975: Plans sidebar is a placeholder; the plan-roster list lives
-            // in the main panel (`mouse_main_click`).
-            SidebarView::Plans => false,
+            // #1121: the Plans-view tree is a raw `TreeView` (not
+            // `SidebarSystem`), so — like Terminal/Sessions above — click
+            // dispatch uses flat pixel-row math rather than a
+            // `SidebarEvent`. No title row, so row 0 maps directly to the
+            // first tree row.
+            SidebarView::Plans => {
+                if pos.y < sidebar_b.y {
+                    return false;
+                }
+                let row = ((pos.y - sidebar_b.y) / lh).floor() as usize + self.plans_tree_scroll;
+                self.plans_tree_click_row(row)
+            }
             // #1032: the Sessions-view tree is a raw `TreeView` (not
             // `SidebarSystem`), so — like Terminal above — click dispatch
             // uses flat pixel-row math rather than a `SidebarEvent`. No

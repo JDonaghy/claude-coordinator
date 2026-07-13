@@ -251,6 +251,10 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         plans_sel: 0,
         // #1001
         plans_expanded_repos: std::collections::HashSet::new(),
+        // #1121
+        plans_tree_expanded: std::collections::HashMap::new(),
+        plans_tree_selected: None,
+        plans_tree_scroll: 0,
         // #1039: Audit panel — nothing seeded by default; use
         // `make_app_with_audit_json` to pre-populate `audit_page`.
         audit_page: None,

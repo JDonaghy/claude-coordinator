@@ -45,6 +45,22 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// One row's identity in the flattened Plans sidebar tree, in the SAME order
+/// as the `TreeRow`s returned by [`CoordApp::plans_tree_rows`] — index
+/// parity is what lets a flat pixel-row index resolve back to "All repos", a
+/// repo, or a milestone without re-deriving tree structure at the call site.
+/// Mirrors `SessionsTreeRow` / `TerminalTreeRow` (#1121).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlansTreeRow {
+    /// The root "All repos" leaf — no scoping.
+    AllRepos,
+    /// Index into `plans_repo_list()`.
+    Repo(usize),
+    /// `(repo index into `plans_repo_list()`, milestone index within that
+    /// repo's `plans_entries()` group)`.
+    Milestone(usize, usize),
+}
+
 // ─── impl CoordApp — sidebar/main-panel rendering + actions ──────────────────
 
 impl CoordApp {
@@ -64,15 +80,61 @@ impl CoordApp {
         out
     }
 
+    /// Canonical repo order for the Plans sidebar tree (#1121): the
+    /// `pipeline_repos` configured order (so "one node per configured repo"
+    /// holds even for a repo with zero plans right now), plus any repo that
+    /// appears in `plan_roster` but is missing from `pipeline_repos` —
+    /// defensive, so a plan can never become unreachable from the sidebar
+    /// just because config drifted from the roster.
+    pub(crate) fn plans_repo_list(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.data.pipeline_repos.iter().map(|(n, _)| n.clone()).collect();
+        for e in &self.data.plan_roster {
+            if !out.contains(&e.repo) {
+                out.push(e.repo.clone());
+            }
+        }
+        out
+    }
+
+    /// Resolve the Plans sidebar tree's current selection (`plans_tree_selected`)
+    /// down to a scoping repo name, or `None` for "All repos" — the default
+    /// (nothing selected, or the root "All repos" leaf) that reproduces the
+    /// pre-#1121 unfiltered behaviour. An out-of-range path (stale after a
+    /// board refresh dropped a repo) also falls back to `None` rather than
+    /// scoping to nothing.
+    pub(crate) fn plans_scope_repo(&self) -> Option<String> {
+        let path = self.plans_tree_selected.as_ref()?;
+        let repo_idx = *path.first()?;
+        if repo_idx == 0 {
+            return None;
+        }
+        self.plans_repo_list().get(repo_idx as usize - 1).cloned()
+    }
+
+    /// The full plan-roster (`plans_entries()`), narrowed to the sidebar
+    /// tree's current scope (#1121). Most callers that used to read
+    /// `plans_entries()` directly for main-panel display now go through
+    /// this instead — `plans_entries()` itself stays the true unfiltered
+    /// roster for callers that need repo-wide aggregates regardless of
+    /// scope (the sidebar tree's own per-repo counts, the global attention
+    /// badge).
+    pub(crate) fn plans_scoped_entries(&self) -> Vec<PlanRosterEntry> {
+        match self.plans_scope_repo() {
+            Some(repo) => self.plans_entries().into_iter().filter(|e| e.repo == repo).collect(),
+            None => self.plans_entries(),
+        }
+    }
+
     /// The plan-roster entries that are actually *selectable/rendered* right
-    /// now (#1001): every `has_work_order` milestone, plus `no_work_order`
-    /// milestones only for repos in `plans_expanded_repos`. Collapsed
-    /// untracked milestones are summarised by a non-selectable "+N without a
-    /// work order" line drawn separately in `render_plans_panel` — they
-    /// don't occupy a slot here, so `plans_sel` (which indexes into this
-    /// list) never lands on noise the operator hasn't asked to see.
+    /// now, within the current sidebar scope (#1121): every `has_work_order`
+    /// milestone, plus `no_work_order` milestones only for repos in
+    /// `plans_expanded_repos` (#1001). Collapsed untracked milestones are
+    /// summarised by a non-selectable "+N without a work order" line drawn
+    /// separately in `render_plans_panel` — they don't occupy a slot here,
+    /// so `plans_sel` (which indexes into this list) never lands on noise
+    /// the operator hasn't asked to see.
     pub(crate) fn plans_visible_entries(&self) -> Vec<PlanRosterEntry> {
-        self.plans_entries()
+        self.plans_scoped_entries()
             .into_iter()
             .filter(|e| e.has_work_order || self.plans_expanded_repos.contains(&e.repo))
             .collect()
@@ -140,7 +202,7 @@ impl CoordApp {
         let repo = match self
             .plans_selected()
             .map(|e| e.repo)
-            .or_else(|| self.plans_entries().first().map(|e| e.repo.clone()))
+            .or_else(|| self.plans_scoped_entries().first().map(|e| e.repo.clone()))
         {
             Some(repo) => repo,
             None => {
@@ -179,36 +241,208 @@ impl CoordApp {
         );
     }
 
-    /// Sidebar placeholder for the Plans view — plan count + "attention"
-    /// hint (any entry with a `needs_you` signal).  All content lives in the
-    /// main panel; mirrors `merge_queue_sidebar` / `milestone_dag_sidebar`.
-    pub(crate) fn plans_sidebar(&self) -> ListView {
-        let entries = self.plans_entries();
-        let n = entries.len();
-        let attn_count = self.plans_needing_attention_count();
-        let attn = if attn_count > 0 {
-            format!(" ⚠ {} need attention", attn_count)
+    /// Whether `repo`'s milestones should paint expanded in the Plans
+    /// sidebar tree, absent an explicit `plans_tree_expanded` override:
+    /// collapsed by default (mirrors the main panel's own #1001
+    /// collapsed-by-default convention for untracked milestones) so a
+    /// milestone title never shows up on screen — in either pane — until
+    /// the operator asks for it. Toggled by clicking the repo row.
+    fn plans_tree_repo_expanded(&self, repo: &str) -> bool {
+        *self.plans_tree_expanded.get(repo).unwrap_or(&false)
+    }
+
+    /// Build the Plans sidebar tree (#1121): a root "All repos" leaf (no
+    /// scoping — the pre-#1121 behaviour) followed by one row per
+    /// `plans_repo_list()` entry, each carrying a plan-count badge (amber
+    /// when the repo has ≥1 *loud* attention signal, see
+    /// `has_loud_attention`) and — when expanded — that repo's milestones as
+    /// leaves. Returns the `TreeRow`s alongside a same-length/same-order
+    /// `PlansTreeRow` index so click/keyboard-nav handlers can map a flat
+    /// row index back to what it represents, mirroring
+    /// `sessions_tree_rows`.
+    pub(crate) fn plans_tree_rows(&self) -> (Vec<TreeRow>, Vec<PlansTreeRow>) {
+        let all_entries = self.plans_entries();
+        let repos = self.plans_repo_list();
+        let total = all_entries.len();
+        let total_attn = self.plans_needing_attention_count();
+
+        let mut rows = Vec::with_capacity(repos.len() + 4);
+        let mut index = Vec::with_capacity(repos.len() + 4);
+
+        let all_badge = if total_attn > 0 {
+            Badge::colored(format!("{total} ⚠{total_attn}"), Color::rgb(220, 190, 120))
         } else {
-            String::new()
+            Badge::plain(format!("{total}"))
         };
-        let hint = format!(
-            "  {} plan{}{}",
-            n,
-            if n == 1 { "" } else { "s" },
-            attn,
-        );
-        ListView {
-            id: WidgetId::new("plans-sidebar"),
-            title: Some(StyledText::plain(" PLANS ")),
-            items: vec![activity_item(&hint, Color::rgb(160, 160, 160))],
-            selected_idx: 0,
-            scroll_offset: 0,
-            has_focus: false,
-            bordered: false,
-            h_scroll: 0,
-            max_content_width: None,
-            show_v_scrollbar: false,
+        rows.push(TreeRow {
+            path: vec![0],
+            indent: 0,
+            icon: None,
+            text: StyledText {
+                spans: vec![StyledSpan::with_fg(
+                    "All repos".to_string(),
+                    Color::rgb(210, 210, 220),
+                )],
+            },
+            badge: Some(all_badge),
+            is_expanded: None,
+            decoration: Decoration::Normal,
+            edit: None,
+        });
+        index.push(PlansTreeRow::AllRepos);
+
+        for (ri, repo) in repos.iter().enumerate() {
+            let group: Vec<&PlanRosterEntry> =
+                all_entries.iter().filter(|e| &e.repo == repo).collect();
+            let has_plans = !group.is_empty();
+            let attn = group.iter().filter(|e| Self::has_loud_attention(e)).count();
+            let expanded = has_plans && self.plans_tree_repo_expanded(repo);
+
+            let name_col = if has_plans {
+                Color::rgb(220, 220, 220)
+            } else {
+                Color::rgb(120, 120, 120)
+            };
+            let badge = if attn > 0 {
+                Some(Badge::colored(
+                    format!("{} ⚠{attn}", group.len()),
+                    Color::rgb(220, 190, 120),
+                ))
+            } else {
+                Some(Badge::plain(format!("{}", group.len())))
+            };
+            rows.push(TreeRow {
+                path: vec![(ri + 1) as u16],
+                indent: 0,
+                icon: None,
+                text: StyledText {
+                    // "◇ " marker distinguishes this from the main panel's
+                    // "▾ {repo}  (N tracked) ..." group header — the two
+                    // panes otherwise both render the bare repo name, which
+                    // would make on-screen text lookups (tests, "find the
+                    // repo row") ambiguous between sidebar and main content.
+                    spans: vec![StyledSpan::with_fg(
+                        format!("◇ {repo}"),
+                        name_col,
+                    )],
+                },
+                badge,
+                is_expanded: if has_plans { Some(expanded) } else { None },
+                decoration: Decoration::Normal,
+                edit: None,
+            });
+            index.push(PlansTreeRow::Repo(ri));
+
+            if !expanded {
+                continue;
+            }
+            for (mi, entry) in group.iter().enumerate() {
+                let marker = if entry.has_work_order { "●" } else { "○" };
+                let marker_col = if Self::has_loud_attention(entry) {
+                    Color::rgb(220, 190, 120)
+                } else if entry.has_work_order {
+                    Color::rgb(120, 190, 150)
+                } else {
+                    Color::rgb(120, 120, 130)
+                };
+                rows.push(TreeRow {
+                    path: vec![(ri + 1) as u16, mi as u16],
+                    indent: 1,
+                    icon: None,
+                    text: StyledText {
+                        spans: vec![
+                            StyledSpan::with_fg(format!("{marker} "), marker_col),
+                            StyledSpan::with_fg(
+                                format!("#{} {}", entry.milestone_number, trunc(&entry.title, 24)),
+                                Color::rgb(190, 190, 200),
+                            ),
+                        ],
+                    },
+                    badge: None,
+                    is_expanded: None,
+                    decoration: Decoration::Normal,
+                    edit: None,
+                });
+                index.push(PlansTreeRow::Milestone(ri, mi));
+            }
         }
+
+        (rows, index)
+    }
+
+    /// Build the `TreeView` widget for `render.rs`'s `SidebarView::Plans`
+    /// sidebar branch (#1121). Replaces the pre-#1121 `plans_sidebar()`
+    /// placeholder `ListView`.
+    pub(crate) fn plans_tree_view(&self) -> TreeView {
+        let (rows, _) = self.plans_tree_rows();
+        TreeView {
+            id: WidgetId::new("plans-tree"),
+            rows,
+            selection_mode: SelectionMode::Single,
+            selected_path: self.plans_tree_selected.clone(),
+            scroll_offset: self.plans_tree_scroll,
+            style: TreeStyle::default(),
+            has_focus: true,
+        }
+    }
+
+    /// Handle a click at flattened row `row_idx` (0-based, already
+    /// accounting for `plans_tree_scroll` — matching how
+    /// `mouse_sidebar_click` derives it from pixel position for the
+    /// Terminal/Sessions trees). Sets the scoping selection and, for a repo
+    /// row that hosts plans, toggles its tree expansion. Selecting a
+    /// milestone leaf scopes to its repo AND — expanding
+    /// `plans_expanded_repos` first if the milestone is untracked, so it's
+    /// actually visible — points `plans_sel` at the matching row in the
+    /// now-scoped `plans_visible_entries()`, so the main panel's existing
+    /// row highlight lands on the plan that was clicked. Always resets
+    /// `plans_sel` to 0 first since a scope change can shrink or grow the
+    /// visible list out from under the old index. Returns `true` when a
+    /// redraw is needed; `false` when `row_idx` is out of range.
+    pub(crate) fn plans_tree_click_row(&mut self, row_idx: usize) -> bool {
+        let (_, index) = self.plans_tree_rows();
+        let Some(entry) = index.get(row_idx).copied() else {
+            return false;
+        };
+        self.plans_sel = 0;
+        match entry {
+            PlansTreeRow::AllRepos => {
+                self.plans_tree_selected = Some(vec![0]);
+            }
+            PlansTreeRow::Repo(ri) => {
+                self.plans_tree_selected = Some(vec![(ri + 1) as u16]);
+                if let Some(repo) = self.plans_repo_list().get(ri).cloned() {
+                    let has_plans = self.plans_entries().iter().any(|e| e.repo == repo);
+                    if has_plans {
+                        let cur = self.plans_tree_repo_expanded(&repo);
+                        self.plans_tree_expanded.insert(repo, !cur);
+                    }
+                }
+            }
+            PlansTreeRow::Milestone(ri, mi) => {
+                self.plans_tree_selected = Some(vec![(ri + 1) as u16, mi as u16]);
+                if let Some(repo) = self.plans_repo_list().get(ri).cloned() {
+                    let group: Vec<PlanRosterEntry> = self
+                        .plans_entries()
+                        .into_iter()
+                        .filter(|e| e.repo == repo)
+                        .collect();
+                    if let Some(target) = group.get(mi).cloned() {
+                        if !target.has_work_order {
+                            self.plans_expanded_repos.insert(repo);
+                        }
+                        if let Some(idx) = self
+                            .plans_visible_entries()
+                            .iter()
+                            .position(|e| e.repo == target.repo && e.milestone_number == target.milestone_number)
+                        {
+                            self.plans_sel = idx;
+                        }
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// Map one `needs_you` signal to its health-chip `(icon+label, color)`
@@ -276,18 +510,20 @@ impl CoordApp {
             rect
         };
 
-        let entries = self.plans_entries();
-        if entries.is_empty() {
-            // #976: an empty roster is ambiguous on its own — it means either
-            // "genuinely zero milestones" (rare but real) or "not currently
-            // receiving plan-roster data at all" (no daemon connected, or a
-            // daemon older than #975 that never computes it). Silently
-            // showing the same "no plans yet" placeholder in the second case
-            // is exactly the review finding this fixes: a stale/pre-#975
-            // daemon rendered indistinguishable from a genuinely empty board.
-            // `plan_roster_supported` (from `BoardPayload`/`BoardData`, see
-            // types.rs) is the authoritative signal — trust it over guessing
-            // from the empty Vec.
+        // #976: an empty *unscoped* roster is ambiguous on its own — it means
+        // either "genuinely zero milestones" (rare but real) or "not
+        // currently receiving plan-roster data at all" (no daemon connected,
+        // or a daemon older than #975 that never computes it). Silently
+        // showing the same "no plans yet" placeholder in the second case is
+        // exactly the review finding this fixes: a stale/pre-#975 daemon
+        // rendered indistinguishable from a genuinely empty board.
+        // `plan_roster_supported` (from `BoardPayload`/`BoardData`, see
+        // types.rs) is the authoritative signal — trust it over guessing
+        // from the empty Vec. This check must run against the *unscoped*
+        // roster (`plans_entries()`), not the sidebar-scoped one, so it
+        // never misfires just because the operator scoped to a repo with no
+        // plans (#1121 — see the scoped-but-empty branch below for that).
+        if self.plans_entries().is_empty() {
             let message = if self.data.plan_roster_supported {
                 "  No plans yet.  Milestones with a `## Work order` block will appear here."
             } else {
@@ -296,6 +532,17 @@ impl CoordApp {
                  ~/.coord/client.toml, or upgrade + restart the daemon if already connected."
             };
             backend.draw_list(list_rect, &plain_list("plans-empty", message, 0));
+            return;
+        }
+
+        let entries = self.plans_scoped_entries();
+        if entries.is_empty() {
+            // #1121: the board has plans overall, but the sidebar-selected
+            // repo has none — distinct from the two `plan_roster_supported`
+            // states above, which are about the board as a whole.
+            let repo = self.plans_scope_repo().unwrap_or_default();
+            let message = format!("  No plans for {repo}.");
+            backend.draw_list(list_rect, &plain_list("plans-empty-scoped", &message, 0));
             return;
         }
 
@@ -549,7 +796,10 @@ impl CoordApp {
     /// strip, goal header, a header/summary row, empty tail, or an empty
     /// roster).
     pub(crate) fn plans_row_at(&self, pos: Point, main_b: Rect, lh: f32) -> Option<usize> {
-        let entries = self.plans_entries();
+        // #1121: must match `render_plans_panel`'s `entries` exactly — the
+        // sidebar-scoped roster, not the full unfiltered one — or a click
+        // would hit-test against rows that were never painted.
+        let entries = self.plans_scoped_entries();
         if entries.is_empty() {
             return None;
         }

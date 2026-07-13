@@ -2751,6 +2751,25 @@ pub struct CoordApp {
     /// `u` on the repo of the currently-selected row.
     plans_expanded_repos: std::collections::HashSet<String>,
 
+    // ── #1121: Plans sidebar repo→plan tree + repo scoping ──────────────────
+    /// Per-repo expand state for the Plans sidebar `TreeView`, keyed by repo
+    /// name. Absent entries default to collapsed (mirrors the main panel's
+    /// own #1001 collapsed-by-default convention — see
+    /// `plans_tree_repo_expanded` in `plans.rs`). Distinct from
+    /// `plans_expanded_repos` above: that one controls whether *untracked*
+    /// milestones show inline in the main panel; this one controls whether
+    /// the *sidebar tree* shows a repo's milestone children at all.
+    plans_tree_expanded: std::collections::HashMap<String, bool>,
+    /// Selected-node cursor for the Plans sidebar tree: `None`/`[0]` = "All
+    /// repos" (no scoping — the pre-#1121 unfiltered behaviour), `[i+1]` =
+    /// the repo at index `i` of `plans_repo_list()`, `[i+1, j]` = the `j`th
+    /// milestone of that repo's `plans_entries()` group. Drives
+    /// `plans_scope_repo()` / `plans_scoped_entries()`, which every
+    /// main-panel rendering/selection path now reads through.
+    plans_tree_selected: Option<TreePath>,
+    /// Scroll offset (in flattened tree rows) for the Plans sidebar tree.
+    plans_tree_scroll: usize,
+
     // ── #1039: Audit ActivityBar panel ───────────────────────────────────────
     /// Cached first page of `/audit` (#1037), fetched by `spawn_audit_fetch`
     /// (`data.rs`) and armed only while `active_view == SidebarView::Audit`
@@ -3283,6 +3302,11 @@ impl CoordApp {
             // #1001: no repo starts expanded — untracked milestones default
             // to collapsed everywhere.
             plans_expanded_repos: std::collections::HashSet::new(),
+            // #1121: sidebar tree — nothing scoped yet ("All repos"), no
+            // explicit expand overrides (falls back to collapsed).
+            plans_tree_expanded: std::collections::HashMap::new(),
+            plans_tree_selected: None,
+            plans_tree_scroll: 0,
             // #1039: Audit panel — nothing fetched yet; the first tick with
             // active_view == Audit arms spawn_audit_fetch (settings_ui.rs).
             audit_page: None,
