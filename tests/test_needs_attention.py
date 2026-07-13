@@ -125,6 +125,26 @@ class TestAttentionSignal:
         )
         assert reason == "wall_clock"
 
+    def test_chat_type_never_wall_clock_flags_even_after_hours(self, config: Config) -> None:
+        """#1133: this is the exact false positive that was reported — a
+        `chat` assignment still `status="running"` (a human mid-conversation)
+        for hours must not trip the wall-clock signal, even though the
+        fixture's `config` only overrides "work" (so `chat` would have
+        fallen back to that 60s threshold pre-fix).
+        """
+        reason, detail = notify_mod.attention_signal(
+            assignment_type="chat", status="running", dispatched_at=0.0,
+            review_iteration=0, config=config, now=6 * 60 * 60.0,
+        )
+        assert (reason, detail) == (None, None)
+
+    def test_troubleshoot_type_never_wall_clock_flags(self, config: Config) -> None:
+        reason, _ = notify_mod.attention_signal(
+            assignment_type="troubleshoot", status="running", dispatched_at=0.0,
+            review_iteration=0, config=config, now=6 * 60 * 60.0,
+        )
+        assert reason is None
+
 
 # ── detect_needs_attention ──────────────────────────────────────────────────
 
