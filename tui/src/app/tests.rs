@@ -29821,6 +29821,121 @@ Milestone tracking issue.
         );
     }
 
+    // ── #1121: sidebar repo->plan tree + repo scoping ─────────────────────
+
+    /// Two-repo `BoardData` fixture for the #1121 sidebar tree tests —
+    /// distinct from `make_plan_roster_board_data` (single "api" repo, used
+    /// by the large pre-#1121 test block above) so this new fixture never
+    /// disturbs that existing coverage's exact shape/content.
+    fn make_two_repo_plan_roster_board_data() -> BoardData {
+        BoardData {
+            pipeline_repos: vec![
+                ("api".to_string(), "acme/api".to_string()),
+                ("web".to_string(), "acme/web".to_string()),
+            ],
+            plan_roster_supported: true,
+            plan_roster: vec![
+                PlanRosterEntry {
+                    repo: "api".to_string(),
+                    title: "Substrate".to_string(),
+                    milestone_number: 5,
+                    tracking_issue: Some(500),
+                    has_work_order: true,
+                    ready_frontier: 1,
+                    blocked: 0,
+                    in_flight: 0,
+                    done: 0,
+                    total: 1,
+                    needs_you: vec![],
+                    outcome_run_number: None,
+                    outcome_met: None,
+                    outcome_partial: None,
+                    outcome_gap: None,
+                    outcome_bottom_line: None,
+                    outcome_diff_summary: None,
+                },
+                PlanRosterEntry {
+                    repo: "web".to_string(),
+                    title: "Frontend".to_string(),
+                    milestone_number: 10,
+                    tracking_issue: Some(1000),
+                    has_work_order: true,
+                    ready_frontier: 1,
+                    blocked: 0,
+                    in_flight: 0,
+                    done: 0,
+                    total: 1,
+                    needs_you: vec![],
+                    outcome_run_number: None,
+                    outcome_met: None,
+                    outcome_partial: None,
+                    outcome_gap: None,
+                    outcome_bottom_line: None,
+                    outcome_diff_summary: None,
+                },
+            ],
+            ..BoardData::default()
+        }
+    }
+
+    /// Acceptance test (#1121): the Plans sidebar lists each configured
+    /// repo as its own tree row, and clicking one scopes the main panel's
+    /// plan-roster list down to just that repo's plans — the other repo's
+    /// milestone disappears from the main panel entirely.
+    #[test]
+    fn plans_sidebar_tree_lists_repos_and_scopes_main_panel_on_selection() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_test_app(make_two_repo_plan_roster_board_data());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "◆");
+
+        // Sidebar lists every configured repo (plus the "All repos" root).
+        let screen = driver.screen();
+        assert!(
+            screen.contains("All repos"),
+            "#1121: sidebar tree must have an 'All repos' root node:\n{screen}",
+        );
+        assert!(
+            screen.contains("◇ api"),
+            "#1121: sidebar tree must list the 'api' repo:\n{screen}",
+        );
+        assert!(
+            screen.contains("◇ web"),
+            "#1121: sidebar tree must list the 'web' repo:\n{screen}",
+        );
+
+        // Unscoped (default "All repos"): both milestones render in the main panel.
+        assert!(
+            screen.contains("Substrate") && screen.contains("Frontend"),
+            "#1121: with no repo scoped, the main panel must show every \
+             repo's plans:\n{screen}",
+        );
+
+        // Click the 'web' sidebar row — the "◇ " marker makes this
+        // unambiguous against the main panel's own "▾ web ..." header text.
+        let (x, y) = driver.find("◇ web").unwrap_or_else(|| {
+            panic!("#1121: could not find the 'web' sidebar tree row:\n{}", driver.screen())
+        });
+        driver.click(x, y);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Frontend"),
+            "#1121: scoping to 'web' must still show its own plan 'Frontend':\n{screen}",
+        );
+        assert!(
+            !screen.contains("Substrate"),
+            "#1121: scoping to 'web' must hide 'api's plan 'Substrate' from \
+             the main panel:\n{screen}",
+        );
+        assert!(
+            !screen.contains("▾ api"),
+            "#1121: scoping to 'web' must drop the 'api' repo header from \
+             the main panel entirely:\n{screen}",
+        );
+    }
+
     // ── #1001: repo grouping + severity-split attention badge ────────────
 
     /// `plans_needing_attention_count` — the shared basis for the sidebar

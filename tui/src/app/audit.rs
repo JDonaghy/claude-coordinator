@@ -66,7 +66,8 @@ impl CoordApp {
     /// Sidebar content (#1039 contract §3; #1040 contract §8/§9): the panel
     /// title (" AUDIT ", rendered by `ShellConfig.with_status_bar()` from
     /// `shell_config()`'s `PanelDefinition.title`, mirrored here on the
-    /// `ListView` itself same as `plans_sidebar()`) plus an entry-count line
+    /// `ListView` itself same as the other list-backed sidebars) plus an
+    /// entry-count line
     /// (suffixed `" (filtered)"` — mock `audit-panel-filters.screen` —
     /// whenever any filter is non-default), an optional "N recent" badge
     /// sourced from `/board`'s `audit_recent_count` (kept separate from the

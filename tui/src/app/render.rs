@@ -94,9 +94,13 @@ impl ShellApp for CoordApp {
                 SidebarView::MilestoneDag => {
                     backend.draw_list(sidebar_rect, &self.milestone_dag_sidebar());
                 }
-                // #975: Plans sidebar — plan-count + attention hint.
+                // #1121: Plans sidebar — repo->plan tree (All repos + one
+                // node per configured repo, expandable to milestones), same
+                // raw-`TreeView` pattern as the #953 Terminal / #1032
+                // Sessions trees. Was a static plan-count `ListView`
+                // placeholder (#975) before this.
                 SidebarView::Plans => {
-                    backend.draw_list(sidebar_rect, &self.plans_sidebar());
+                    backend.draw_tree(sidebar_rect, &self.plans_tree_view());
                 }
                 // #1032: Sessions sidebar — machine → repo → session tree,
                 // same raw-`TreeView` pattern as the #953 Terminal tree.
