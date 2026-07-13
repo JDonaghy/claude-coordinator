@@ -5045,7 +5045,12 @@ impl CoordApp {
                     self.audit_resize_col = Some(col);
                     true
                 }
-                Some(DataTableHit::Header { .. }) | Some(DataTableHit::Empty) | None => false,
+                // The audit table has no footer, so `Footer` can't occur —
+                // treat it (and the other non-actionable hits) as a no-op.
+                Some(DataTableHit::Header { .. })
+                | Some(DataTableHit::Footer)
+                | Some(DataTableHit::Empty)
+                | None => false,
             };
         }
         false
