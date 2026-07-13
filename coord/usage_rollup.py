@@ -451,3 +451,222 @@ def rollup_by_stage(
     need to know the dimension's string key.
     """
     return rollup(rows, group_by="stage", window=window, pricing=pricing)
+
+
+# ── Public contract API (Gate-A / ms-37 acceptance surface) ───────────────────
+# Stable, sealed names consumed by tests/acceptance/**, CLI-1 (#1115),
+# CLI-2 (#1119), and TUI (#1116).  The internal names above (TimeWindow,
+# leg_cost, normalize_model, leg_in_window) remain unchanged so existing
+# callers don't break.
+
+canonical_model = normalize_model
+"""Alias for :func:`normalize_model` — public Gate-A name."""
+
+in_window = leg_in_window
+"""Alias for :func:`leg_in_window` — public Gate-A name."""
+
+
+@dataclass(frozen=True)
+class Window(TimeWindow):
+    """Half-open ``[start, end)`` interval — public API alias for :class:`TimeWindow`.
+
+    ``Window(start, end)`` constructs a plain interval.  The two class methods
+    below add preset constructors with *bounded* semantics — both ``start`` and
+    ``end`` are always set, which is why ``Window.since("2d")`` differs from the
+    module-level :func:`window_since` (which leaves ``end=None``).
+    """
+
+    @classmethod
+    def since(cls, spec: str, now: float | None = None) -> "Window":
+        """Half-open ``[start, now)`` window.
+
+        *spec* is a relative duration (``Nd`` / ``Nh``) or an ISO-8601 instant
+        for ``start``; ``end`` is always anchored to *now* (unlike the
+        module-level :func:`window_since` which leaves ``end`` unbounded).
+        """
+        dt_now = _resolve_now(now)
+        now_ts = dt_now.timestamp()
+        match = _SINCE_RELATIVE_RE.match(spec.strip())
+        if match:
+            amount = int(match.group(1))
+            unit = match.group(2).lower()
+            delta = timedelta(days=amount) if unit == "d" else timedelta(hours=amount)
+            start_ts = (dt_now - delta).timestamp()
+        else:
+            parsed = parse_timestamp(spec)
+            if parsed is None:
+                raise ValueError(
+                    f"invalid 'since' spec: {spec!r} (expected ISO date, 'Nd', or 'Nh')"
+                )
+            start_ts = parsed
+        return cls(start=start_ts, end=now_ts, label=f"since {spec}")
+
+    @classmethod
+    def today(cls, now: float | None = None) -> "Window":
+        """Preset: current local calendar day ``[midnight, midnight+1d)``."""
+        base = window_today(now)
+        return cls(start=base.start, end=base.end, label=base.label)
+
+
+def estimate_leg_cost(row: dict, pricing: dict) -> float | None:
+    """Estimate the token-based cost of one leg.
+
+    *pricing* is a plain ``dict`` keyed by canonical model name, e.g.::
+
+        {"sonnet": {"input": 3.00, "output": 15.00,
+                    "cache_read": 0.30, "cache_creation": 3.75}, ...}
+
+    Rates are per 1 M tokens.  Returns the estimated cost as a ``float``
+    (possibly ``0.0`` for a mapped model with zero tokens), or ``None`` when
+    the leg's model is not a key in *pricing* — never a silent ``$0`` for an
+    unmapped model.  Captured ``cost_usd`` is **not** consulted here; the
+    caller decides whether to use captured or estimated cost.
+    """
+    key = canonical_model(row.get("model"))
+    rates = pricing.get(key)
+    if rates is None:
+        return None
+    return (
+        _to_int(row.get("input_tokens")) * rates["input"]
+        + _to_int(row.get("output_tokens")) * rates["output"]
+        + _to_int(row.get("cache_read_tokens")) * rates["cache_read"]
+        + _to_int(row.get("cache_creation_tokens")) * rates["cache_creation"]
+    ) / 1_000_000.0
+
+
+# ── aggregate() helpers ───────────────────────────────────────────────────────
+
+
+def _agg_key(row: dict, by: str) -> Any:
+    """Group key for :func:`aggregate`.
+
+    For ``by="issue"`` the key is the bare ``issue_number`` integer (unlike
+    the internal :func:`rollup` which uses an :class:`IssueKey` named-tuple so
+    it can distinguish the same number across repos).  All other dimensions
+    delegate to :func:`_group_key_for`.
+    """
+    if by == "issue":
+        return _to_int(row.get("issue_number"))
+    return _group_key_for(row, by)
+
+
+def _empty_agg_group(key: Any) -> dict:
+    return {
+        "key": key,
+        "legs": 0,
+        "cost_captured": 0.0,
+        "cost_est": 0.0,
+        "cost_total": 0.0,
+        "tokens": {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0},
+        "duration_secs": 0.0,
+        "open_legs": 0,
+        "unknown_models": 0,
+        "rows": [],
+    }
+
+
+def _accumulate_agg(group: dict, row: dict, pricing: dict) -> None:
+    """Accumulate one *row* into *group* and update all numeric fields."""
+    raw_cost = row.get("cost_usd")
+    try:
+        captured = float(raw_cost) if raw_cost not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        captured = 0.0
+
+    if captured:
+        group["cost_captured"] += captured
+    else:
+        est = estimate_leg_cost(row, pricing)
+        if est is not None:
+            group["cost_est"] += est
+        else:
+            # Unmapped model + tokens → flag; neither captured nor estimated.
+            total_tok = (
+                _to_int(row.get("input_tokens"))
+                + _to_int(row.get("output_tokens"))
+                + _to_int(row.get("cache_read_tokens"))
+                + _to_int(row.get("cache_creation_tokens"))
+            )
+            if total_tok > 0:
+                group["unknown_models"] += 1
+
+    # Token sums include ALL in-window legs regardless of model mapping.
+    group["tokens"]["input"] += _to_int(row.get("input_tokens"))
+    group["tokens"]["output"] += _to_int(row.get("output_tokens"))
+    group["tokens"]["cache_read"] += _to_int(row.get("cache_read_tokens"))
+    group["tokens"]["cache_creation"] += _to_int(row.get("cache_creation_tokens"))
+
+    dur, is_open = leg_duration(row)
+    group["duration_secs"] += dur
+    if is_open:
+        group["open_legs"] += 1
+
+    group["legs"] += 1
+    group["rows"].append(row)
+
+
+def aggregate(
+    rows: Iterable[dict],
+    *,
+    by: str,
+    window: TimeWindow,
+    pricing: dict,
+) -> dict:
+    """Aggregate *rows* into a plain rollup dict — the Gate-A public surface.
+
+    Parameters
+    ----------
+    rows:
+        Iterable of assignment row dicts (daemon ``/board`` wire format).
+    by:
+        Grouping dimension: ``"issue"``, ``"repo"``, ``"day"``, ``"week"``,
+        ``"month"``, or ``"stage"``.
+    window:
+        Half-open ``[start, end)`` interval.  Any :class:`TimeWindow` (or
+        :class:`Window`) is accepted.  Only rows whose ``dispatched_at``
+        **or** ``finished_at`` falls inside are counted.
+    pricing:
+        Plain ``dict`` keyed by canonical model name with per-1M-token rates,
+        e.g. ``{"sonnet": {"input": 3.00, "output": 15.00,
+        "cache_read": 0.30, "cache_creation": 3.75}}``.
+
+    Returns
+    -------
+    dict
+        ``"by"``:  the *by* dimension string.
+        ``"groups"``:  list of group dicts sorted **descending** by
+        ``cost_total`` (``cost_captured + cost_est``).  Each group dict has
+        keys ``key``, ``legs``, ``cost_captured``, ``cost_est``,
+        ``cost_total``, ``tokens`` (dict), ``duration_secs``, ``open_legs``,
+        ``unknown_models``, ``rows``.
+        ``"totals"``:  a single dict with the same numeric keys summed across
+        all in-window legs.
+    """
+    if by not in _VALID_GROUP_BY:
+        raise ValueError(f"unknown 'by': {by!r} (expected one of {_VALID_GROUP_BY})")
+
+    groups: dict[Any, dict] = {}
+    totals = _empty_agg_group(None)
+
+    for row in rows:
+        if not in_window(row, window):
+            continue
+        key = _agg_key(row, by)
+        if key is None:
+            continue
+        if key not in groups:
+            groups[key] = _empty_agg_group(key)
+        _accumulate_agg(groups[key], row, pricing)
+        _accumulate_agg(totals, row, pricing)
+
+    # Sort groups descending by total cost and materialise the derived field.
+    sorted_groups = sorted(
+        groups.values(),
+        key=lambda g: g["cost_captured"] + g["cost_est"],
+        reverse=True,
+    )
+    for g in sorted_groups:
+        g["cost_total"] = g["cost_captured"] + g["cost_est"]
+    totals["cost_total"] = totals["cost_captured"] + totals["cost_est"]
+
+    return {"by": by, "groups": sorted_groups, "totals": totals}
