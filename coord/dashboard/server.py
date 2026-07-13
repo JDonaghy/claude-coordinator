@@ -125,6 +125,8 @@ async def _poll_once(
                 review_iteration=assignment.review_iteration,
                 config=config,
                 now=now,
+                provider_name=assignment.provider_name,
+                review_of_assignment_id=assignment.review_of_assignment_id,
             )
             if reason is None:
                 continue

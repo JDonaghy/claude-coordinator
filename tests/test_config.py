@@ -475,6 +475,66 @@ def test_pipeline_attention_thresholds_explicit_override_wins_over_interactive_e
     assert cfg.attention_threshold_for("troubleshoot") == float("inf")
 
 
+def test_pipeline_attention_thresholds_interactive_fix_session_gets_conflict_fix_threshold() -> None:
+    """#1137: an interactive ``--fix-of``/``--rework-of`` session shares
+    ``type="work"`` with headless coding workers, so it's recognized by the
+    compound discriminator (``provider_name="claude-pty"`` +
+    ``review_of_assignment_id`` set) instead of a dedicated type — mirroring
+    ``coord.reconcile.is_interactive_merge_session`` — and reuses
+    ``conflict-fix``'s 60m threshold rather than plain ``work``'s 45m.
+    """
+    cfg = PipelineConfig()
+    assert cfg.attention_threshold_for(
+        "work", provider_name="claude-pty", review_of_assignment_id="rev-1",
+    ) == 60 * 60.0
+
+
+def test_pipeline_attention_thresholds_plain_work_unaffected_by_discriminator_kwargs() -> None:
+    """A headless work assignment (no provider_name / no review_of_assignment_id)
+    still gets plain ``work``'s 45m threshold — only the compound match bumps it.
+    """
+    cfg = PipelineConfig()
+    # Headless — no provider_name at all.
+    assert cfg.attention_threshold_for("work") == 45 * 60.0
+    # Interactive but a FRESH session (#437), not continuing existing work.
+    assert cfg.attention_threshold_for(
+        "work", provider_name="claude-pty", review_of_assignment_id=None,
+    ) == 45 * 60.0
+    # review_of_assignment_id set but NOT the interactive provider (e.g. a
+    # headless auto-loop fix dispatch, which also sets review_of_assignment_id).
+    assert cfg.attention_threshold_for(
+        "work", provider_name=None, review_of_assignment_id="rev-1",
+    ) == 45 * 60.0
+
+
+def test_pipeline_attention_thresholds_interactive_fix_explicit_conflict_fix_override_wins() -> None:
+    """An explicit user-configured ``conflict-fix`` threshold applies to an
+    interactive fix session too, since #1137 delegates to
+    ``attention_threshold_for("conflict-fix")``. Mirrors #1133's
+    ``INTERACTIVE_SESSION_TYPES`` precedent: overriding plain ``work`` does
+    NOT re-arm/change the fix-session bump (it's checked first, exactly like
+    the interactive-type exemption), only overriding the type it defers to
+    does.
+    """
+    cfg = PipelineConfig(attention_thresholds={"conflict-fix": 5.0})
+    assert cfg.attention_threshold_for(
+        "work", provider_name="claude-pty", review_of_assignment_id="rev-1",
+    ) == 5.0
+
+    # Overriding "work" alone (leaving conflict-fix at its built-in default)
+    # has no effect on the interactive-fix bump — same precedence rule as
+    # the #1133 interactive-type exemption: only an override of the type
+    # actually consulted (conflict-fix) changes the outcome.
+    cfg2 = PipelineConfig(
+        attention_thresholds={"work": 5.0, "conflict-fix": 60 * 60.0}
+    )
+    assert cfg2.attention_threshold_for(
+        "work", provider_name="claude-pty", review_of_assignment_id="rev-1",
+    ) == 60 * 60.0
+    # Plain headless "work" (no discriminator match) still honors the override.
+    assert cfg2.attention_threshold_for("work") == 5.0
+
+
 def test_pipeline_attention_thresholds_parsed_from_yaml(tmp_path: Path) -> None:
     p = tmp_path / "coordinator.yml"
     p.write_text(

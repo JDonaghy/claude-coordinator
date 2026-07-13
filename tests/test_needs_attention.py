@@ -125,6 +125,61 @@ class TestAttentionSignal:
         )
         assert reason == "wall_clock"
 
+    def test_interactive_fix_session_gets_conflict_fix_threshold(self) -> None:
+        """#1137: an interactive --fix-of/--rework-of session (type="work",
+        provider_name="claude-pty", review_of_assignment_id set) is
+        recognized by the compound discriminator and gets conflict-fix's
+        wider threshold instead of plain work's — same fixture shape as
+        conflict-fix's own dual-purpose handling.
+        """
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api", default_branch="main")],
+            machines=[
+                Machine(
+                    name="laptop", host="laptop.tailnet", repos=["api"],
+                    repo_paths={"api": "/tmp/api"},
+                ),
+            ],
+            pipeline=PipelineConfig(),  # built-in defaults: work=45m, conflict-fix=60m
+        )
+        # 50 minutes: past plain work's 45m, under conflict-fix's 60m.
+        reason, _ = notify_mod.attention_signal(
+            assignment_type="work", status="running", dispatched_at=0.0,
+            review_iteration=0, config=cfg, now=50 * 60.0,
+            provider_name="claude-pty", review_of_assignment_id="work-1",
+        )
+        assert reason is None
+
+        # 65 minutes: past conflict-fix's 60m too.
+        reason, _ = notify_mod.attention_signal(
+            assignment_type="work", status="running", dispatched_at=0.0,
+            review_iteration=0, config=cfg, now=65 * 60.0,
+            provider_name="claude-pty", review_of_assignment_id="work-1",
+        )
+        assert reason == "wall_clock"
+
+    def test_plain_interactive_work_session_not_bumped(self) -> None:
+        """A fresh human-attended work session (#437 --interactive, no
+        review_of_assignment_id) is NOT the same as an interactive fix — it
+        keeps plain work's 45m threshold.
+        """
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api", default_branch="main")],
+            machines=[
+                Machine(
+                    name="laptop", host="laptop.tailnet", repos=["api"],
+                    repo_paths={"api": "/tmp/api"},
+                ),
+            ],
+            pipeline=PipelineConfig(),
+        )
+        reason, _ = notify_mod.attention_signal(
+            assignment_type="work", status="running", dispatched_at=0.0,
+            review_iteration=0, config=cfg, now=50 * 60.0,
+            provider_name="claude-pty", review_of_assignment_id=None,
+        )
+        assert reason == "wall_clock"
+
     def test_chat_type_never_wall_clock_flags_even_after_hours(self, config: Config) -> None:
         """#1133: this is the exact false positive that was reported — a
         `chat` assignment still `status="running"` (a human mid-conversation)
@@ -201,6 +256,57 @@ class TestDetectNeedsAttention:
         state_mod.mark_notified("abc123", "completion")
         results = notify_mod.detect_needs_attention(config, now=_time.time() + 3600)
         assert results == []
+
+    def test_interactive_fix_session_not_flagged_at_plain_work_threshold(
+        self, coord_dir: Path, config: Config
+    ) -> None:
+        """#1137: an interactive --fix-of session recorded via
+        record_dispatched_assignment (provider_name="claude-pty",
+        review_of_assignment_id set) must surface provider_name through
+        load_dispatched()'s dict shape (previously dropped, see
+        coord.state._row_to_dispatched_dict) so detect_needs_attention's
+        dict-based path applies the conflict-fix bump, not plain work's.
+        """
+        import time as _time
+
+        cfg = Config(
+            repos=config.repos,
+            machines=config.machines,
+            pipeline=PipelineConfig(),  # built-in defaults: work=45m, conflict-fix=60m
+        )
+        # dispatched_at=0.0 is falsy, so record_dispatched_assignment's
+        # `assignment.dispatched_at or time.time()` would silently
+        # substitute "now" — use a real epoch baseline instead, mirroring
+        # _record()'s use of time.time() at dispatch.
+        dispatched_at = _time.time()
+        state_mod.record_dispatched_assignment(
+            assignment=Assignment(
+                assignment_id="fix-1",
+                machine_name="laptop",
+                repo_name="api",
+                issue_number=42,
+                issue_title="[fix-1] Add feature X",
+                status="running",
+                type="work",
+                provider_name="claude-pty",
+                review_of_assignment_id="work-orig",
+                dispatched_at=dispatched_at,
+            ),
+            repo_github="acme/api",
+        )
+        # 50 minutes in: past plain work's 45m, under conflict-fix's 60m —
+        # must NOT be flagged if provider_name reached attention_signal
+        # correctly.
+        assert notify_mod.detect_needs_attention(
+            cfg, now=dispatched_at + 50 * 60.0
+        ) == []
+
+        # 65 minutes in: past conflict-fix's 60m too — now it should flag.
+        results = notify_mod.detect_needs_attention(
+            cfg, now=dispatched_at + 65 * 60.0
+        )
+        assert len(results) == 1
+        assert results[0][0].reason == "wall_clock"
 
     def test_no_double_notify_across_two_runs(self, coord_dir: Path, config: Config) -> None:
         import time as _time

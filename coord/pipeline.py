@@ -330,6 +330,8 @@ def compute_pipeline(
         dispatched_at=assignment.dispatched_at,
         review_iteration=assignment.review_iteration,
         config=config,
+        provider_name=assignment.provider_name,
+        review_of_assignment_id=assignment.review_of_assignment_id,
     )
 
     return PipelineView(
