@@ -334,6 +334,8 @@ impl CoordApp {
             min_total_width: Some(Self::AUDIT_TABLE_MIN_WIDTH),
             h_scroll: self.audit_h_scroll,
             column_overrides: self.audit_column_overrides.clone(),
+            // #1094: the audit table has no pinned summary row.
+            footer: None,
         };
         let layout = backend.draw_data_table(list_rect, &table, None);
         *self.audit_table_layout.borrow_mut() = Some(layout);
