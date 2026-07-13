@@ -551,6 +551,59 @@ class AuditConfig:
 
 
 @dataclass
+class ModelRates:
+    """Per-1M-token USD rates for one canonical model (#1118 ``pricing:`` block).
+
+    Consumed by :mod:`coord.usage_rollup`'s cost estimator for legs that have
+    no captured ``cost_usd``. All four fields default to ``0.0`` so a
+    partially-specified override (e.g. only ``input``) still produces a
+    valid (if incomplete) rate rather than raising.
+    """
+
+    input: float = 0.0
+    output: float = 0.0
+    cache_read: float = 0.0
+    cache_creation: float = 0.0
+
+
+def _default_pricing() -> dict[str, ModelRates]:
+    """Built-in per-1M-token rates for the three canonical model tiers.
+
+    Approximate official Anthropic pricing at time of writing (Sonnet/Opus/
+    Haiku input+output list price; cache_read ~= 0.1x input, cache_creation
+    ~= 1.25x input, the standard 5-minute-TTL cache economics) — the issue
+    calls for the coordinator to verify these against the live price list at
+    review rather than re-deriving them here. A ``pricing:`` block in
+    coordinator.yml overrides or extends any of these.
+    """
+    return {
+        "sonnet": ModelRates(input=3.00, output=15.00, cache_read=0.30, cache_creation=3.75),
+        "opus": ModelRates(input=5.00, output=25.00, cache_read=0.50, cache_creation=6.25),
+        "haiku": ModelRates(input=1.00, output=5.00, cache_read=0.10, cache_creation=1.25),
+    }
+
+
+@dataclass
+class PricingConfig:
+    """``pricing:`` block (#1118) — per-canonical-model per-1M-token USD rates.
+
+    ``models`` maps a canonical model key (``"sonnet"``, ``"opus"``,
+    ``"haiku"``, or any operator-added key) to its :class:`ModelRates`. An
+    absent ``pricing:`` block in coordinator.yml still yields the built-in
+    defaults via :func:`_default_pricing`. A model key with no entry here
+    (e.g. ``"(unknown)"``, or a genuinely unrecognized model string) has no
+    rate — :mod:`coord.usage_rollup` treats that as "no estimate possible"
+    and flags the group rather than silently reporting $0.
+    """
+
+    models: dict[str, ModelRates] = field(default_factory=_default_pricing)
+
+    def rates_for(self, canonical_model: str) -> ModelRates | None:
+        """Look up rates for a canonical model key, or ``None`` if unpriced."""
+        return self.models.get(canonical_model)
+
+
+@dataclass
 class ProviderDef:
     """Definition of a single named worker-command provider.
 
@@ -628,6 +681,7 @@ class Config:
     milestone: MilestoneConfig = field(default_factory=MilestoneConfig)
     providers: ProvidersConfig = field(default_factory=ProvidersConfig)
     audit: AuditConfig = field(default_factory=AuditConfig)
+    pricing: PricingConfig = field(default_factory=PricingConfig)
     path: Path | None = None
 
     def repo(self, name: str) -> Repo | None:
@@ -676,6 +730,7 @@ def load(path: str | Path | None = None) -> Config:
     milestone = _parse_milestone(raw.get("milestone"))
     providers = _parse_providers(raw.get("providers"))
     audit = _parse_audit(raw.get("audit"))
+    pricing = _parse_pricing(raw.get("pricing"))
 
     return Config(
         repos=repos,
@@ -693,6 +748,7 @@ def load(path: str | Path | None = None) -> Config:
         milestone=milestone,
         providers=providers,
         audit=audit,
+        pricing=pricing,
         path=p,
     )
 
@@ -1474,6 +1530,54 @@ def _parse_audit(raw: Any) -> AuditConfig:
             )
         cfg.level = value
     return cfg
+
+
+_PRICING_RATE_FIELDS = ("input", "output", "cache_read", "cache_creation")
+
+
+def _parse_pricing(raw: Any) -> PricingConfig:
+    """Parse the optional ``pricing:`` block from coordinator.yml (#1118).
+
+    An absent block returns ``PricingConfig()`` — the built-in sonnet/opus/
+    haiku defaults from :func:`_default_pricing`. Each entry under
+    ``pricing:`` overrides or extends a canonical model key; unspecified
+    rate fields on an *existing* key (e.g. ``opus``) keep the built-in
+    default rather than being zeroed, so an operator can bump just
+    ``pricing.opus.output`` without restating the other three rates. A
+    wholly new model key starts from ``ModelRates()`` (all zero) and is
+    filled in from whatever fields are given.
+    """
+    models = _default_pricing()
+    if raw is None:
+        return PricingConfig(models=models)
+    if not isinstance(raw, dict):
+        raise ConfigError("'pricing' must be a mapping of model name -> rates")
+
+    for model_key, entry in raw.items():
+        if not isinstance(model_key, str) or not model_key:
+            raise ConfigError("pricing keys must be non-empty strings")
+        if not isinstance(entry, dict):
+            raise ConfigError(f"pricing[{model_key!r}] must be a mapping")
+
+        base = models.get(model_key, ModelRates())
+        rates = ModelRates(
+            input=base.input,
+            output=base.output,
+            cache_read=base.cache_read,
+            cache_creation=base.cache_creation,
+        )
+        for rate_field in _PRICING_RATE_FIELDS:
+            if rate_field not in entry:
+                continue
+            value = entry[rate_field]
+            if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+                raise ConfigError(
+                    f"pricing[{model_key!r}].{rate_field} must be a non-negative number"
+                )
+            setattr(rates, rate_field, float(value))
+        models[model_key] = rates
+
+    return PricingConfig(models=models)
 
 
 _ENV_VAR_RE = re.compile(r"\$\{([^}]+)\}")
