@@ -789,6 +789,47 @@ def test_dispatch_review_flags_sealed_acceptance_dir_when_driver_configured(
     assert "tests/acceptance/" in payload["briefing"]
 
 
+def test_dispatch_review_flags_sealed_acceptance_dir_when_driver_is_routed(
+    two_machine_config: Config,
+) -> None:
+    """#1125 review finding 1: same as
+    test_dispatch_review_flags_sealed_acceptance_dir_when_driver_configured,
+    but the repo's driver is routed rather than flat — sealing must still
+    trigger since `driver_for(repo_name)` (no path) can't select a route and
+    would otherwise silently return None here."""
+    from coord.config import AcceptanceConfig, AcceptanceDriverConfig
+    from dataclasses import replace as _replace
+
+    cfg = _replace(
+        two_machine_config,
+        acceptance=AcceptanceConfig(drivers={
+            "api": AcceptanceDriverConfig(routes=[
+                AcceptanceDriverConfig(match="**", kind="cli-pytest", run="pytest"),
+            ]),
+        }),
+    )
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    client = _FakeHTTPClient({"id": "review-id-1"})
+
+    dispatch_review(
+        completed, board, cfg,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {
+            "number": 42, "url": "https://github.com/acme/api/pull/42", "existed": True,
+        },
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+        now=123.0,
+        remote_branch_checker=lambda repo, branch: True,
+    )
+
+    assert len(client.calls) == 1
+    _, payload = client.calls[0]
+    assert "Sealed paths (do not touch)" in payload["briefing"]
+    assert "tests/acceptance/" in payload["briefing"]
+
+
 def test_dispatch_review_captures_branch_sha(
     two_machine_config: Config,
 ) -> None:

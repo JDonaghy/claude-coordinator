@@ -170,7 +170,86 @@ class TestAcceptanceRun:
         assert "no acceptance slice" in result.output
 
 
-def _init_git_repo(path: Path, *, manifest: dict[str, int] | None = None) -> str:
+ROUTED_CONFIG_YAML = """\
+repos:
+  - name: coord-tui
+    github: acme/coord-tui
+machines:
+  - name: laptop
+    host: laptop.tail
+    repos: [coord-tui]
+    repo_paths:
+      coord-tui: {repo_path}
+acceptance:
+  drivers:
+    coord-tui:
+      routes:
+        - match: "coord/**"
+          kind: cli-pytest
+          run: "pytest tests/acceptance/{{ms}}"
+"""
+
+
+def _write_routed_config(tmp_path: Path, *, repo_path: str) -> Path:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(ROUTED_CONFIG_YAML.format(repo_path=repo_path))
+    return p
+
+
+class TestAcceptanceRunRouted:
+    """#1125 review findings 1/2: `coord acceptance run` against a routed
+    repo (acceptance.drivers.<repo>.routes) must (a) require --for-path to
+    resolve a route rather than falling back to the generic "not
+    configured" error, and (b) substitute the `{ms}` template from the
+    issue's manifest-mapped ms-NN dir before running."""
+
+    def test_run_without_for_path_errors_actionably(self, tmp_path: Path) -> None:
+        cwd = tmp_path / "repo"
+        cwd.mkdir()
+        config_path = _write_routed_config(tmp_path, repo_path=str(cwd))
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "run", "--repo", "coord-tui", "--all",
+            "--path", str(cwd), "--config", str(config_path),
+        ])
+        assert result.exit_code == 1
+        assert "no route matched" in result.output
+        assert "--for-path" in result.output
+
+    def test_run_substitutes_ms_template_from_manifest(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        cwd = tmp_path / "repo"
+        cwd.mkdir()
+        ms_dir = cwd / "tests" / "acceptance" / "ms-37"
+        ms_dir.mkdir(parents=True)
+        (ms_dir / "manifest.yml").write_text("tests:\n  ms-37::a: 944\n")
+        config_path = _write_routed_config(tmp_path, repo_path=str(cwd))
+
+        captured = {}
+
+        def fake_run_driver(kind, run_command, cwd, **kwargs):
+            captured["kind"] = kind
+            captured["run_command"] = run_command
+            captured["ms"] = kwargs.get("ms")
+            from coord.acceptance_drivers import DriverResult
+            return DriverResult(exit_code=0, tests=[{"id": "ms-37::a", "status": "pass"}])
+
+        monkeypatch.setattr("coord.commands.acceptance.run_driver", fake_run_driver)
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "run", "--repo", "coord-tui", "--issue", "944",
+            "--for-path", "coord/acceptance.py",
+            "--path", str(cwd), "--config", str(config_path),
+        ])
+        assert result.exit_code == 0, result.output
+        assert captured["kind"] == "cli-pytest"
+        assert captured["ms"] == "ms-37"
+
+
+def _init_git_repo(
+    path: Path, *, manifest: dict[str, int] | None = None, manifest_ms_dir: str = "ms01",
+) -> str:
     """Create a minimal git repo (with a real "origin" remote — a bare repo
     alongside it) and one commit pushed to origin; returns the commit SHA.
 
@@ -178,11 +257,11 @@ def _init_git_repo(path: Path, *, manifest: dict[str, int] | None = None) -> str
     before checking out the worktree, so the test repo needs an actual
     origin remote, not just local history.
 
-    When *manifest* is given, ``tests/acceptance/ms01/manifest.yml`` mapping
-    each test id to its issue number is committed too — ``record`` checks
-    out this exact SHA in a throwaway worktree, so the manifest must be part
-    of history at the SHA being recorded, not just sitting in the base
-    checkout's working tree.
+    When *manifest* is given, ``tests/acceptance/<manifest_ms_dir>/manifest.
+    yml`` mapping each test id to its issue number is committed too —
+    ``record`` checks out this exact SHA in a throwaway worktree, so the
+    manifest must be part of history at the SHA being recorded, not just
+    sitting in the base checkout's working tree.
     """
     bare = path.parent / f"{path.name}-origin.git"
     subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
@@ -194,7 +273,10 @@ def _init_git_repo(path: Path, *, manifest: dict[str, int] | None = None) -> str
     subprocess.run(["git", "remote", "add", "origin", str(bare)], cwd=path, check=True)
     (path / "README.md").write_text("hello\n")
     if manifest:
-        _write_manifest(path / "tests" / "acceptance", manifest)
+        ms = path / "tests" / "acceptance" / manifest_ms_dir
+        ms.mkdir(parents=True, exist_ok=True)
+        tests_yaml = "\n".join(f"  {k}: {v}" for k, v in manifest.items())
+        (ms / "manifest.yml").write_text(f"tests:\n{tests_yaml}\n")
     subprocess.run(["git", "add", "."], cwd=path, check=True)
     subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=path, check=True)
     branch = subprocess.run(
@@ -301,6 +383,66 @@ class TestAcceptanceRecord:
         # #603: a failure is recorded as durable per-issue context too.
         entries = state.list_issue_context("coord-tui", 944)
         assert any("Acceptance FAILED" in e["body"] for e in entries)
+
+    def test_record_routed_driver_without_for_path_errors_actionably(
+        self, tmp_path: Path, coord_db,
+    ) -> None:
+        """#1125 review findings 1/2: `coord acceptance record` against a
+        routed repo needs --for-path to resolve a driver at all."""
+        repo_dir = tmp_path / "repo"
+        sha = _init_git_repo(repo_dir, manifest={"ms-37::a": 944}, manifest_ms_dir="ms-37")
+        config_path = _write_routed_config(tmp_path, repo_path=str(repo_dir))
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "record", "--repo", "coord-tui", "--issue", "944",
+            "--sha", sha, "--config", str(config_path),
+        ])
+        assert result.exit_code == 1
+        assert "no route matched" in result.output
+        assert "--for-path" in result.output
+
+    def test_record_routed_driver_substitutes_ms_and_writes_verdict(
+        self, tmp_path: Path, coord_db, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """#1125 review findings 1/2: with --for-path resolving the route,
+        record must also substitute `{ms}` from the checked-out worktree's
+        manifest before running the driver."""
+        from coord import state
+
+        repo_dir = tmp_path / "repo"
+        sha = _init_git_repo(repo_dir, manifest={"ms-37::a": 944}, manifest_ms_dir="ms-37")
+        config_path = _write_routed_config(tmp_path, repo_path=str(repo_dir))
+
+        state.record_dispatched(
+            assignment_id="aid-routed",
+            proposal=Proposal(
+                id=1, machine_name="laptop", repo_name="coord-tui",
+                issue_number=944, issue_title="oracle loop runner", rationale="",
+            ),
+            repo_github="acme/coord-tui",
+        )
+
+        captured = {}
+
+        def fake_run_driver(kind, run_command, cwd, **kwargs):
+            captured["kind"] = kind
+            captured["ms"] = kwargs.get("ms")
+            from coord.acceptance_drivers import DriverResult
+            return DriverResult(exit_code=0, tests=[{"id": "ms-37::a", "status": "pass"}])
+
+        monkeypatch.setattr("coord.commands.acceptance.run_driver", fake_run_driver)
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "record", "--repo", "coord-tui", "--issue", "944",
+            "--sha", sha, "--for-path", "coord/acceptance.py",
+            "--config", str(config_path),
+        ])
+        assert result.exit_code == 0, result.output
+        assert captured["kind"] == "cli-pytest"
+        assert captured["ms"] == "ms-37"
+
+        row = _acceptance_row(coord_db, "aid-routed")
+        assert row["acceptance_state"] == "passed"
 
     def test_record_no_work_assignment_errors(self, tmp_path: Path, coord_db) -> None:
         repo_dir = tmp_path / "repo"
@@ -615,7 +757,10 @@ class TestAcceptanceAuthor:
         config_path = self._config_no_driver(tmp_path)
         calls = {}
 
-        def fake_dispatch(repo, tracking_issue, cfg, *, issue_number=None, machine_override=None):
+        def fake_dispatch(
+            repo, tracking_issue, cfg, *,
+            issue_number=None, machine_override=None, path=None,
+        ):
             calls.update(
                 repo=repo, tracking_issue=tracking_issue,
                 issue_number=issue_number, machine_override=machine_override,
@@ -642,7 +787,10 @@ class TestAcceptanceAuthor:
         config_path = self._config_no_driver(tmp_path)
         calls = {}
 
-        def fake_dispatch(repo, tracking_issue, cfg, *, issue_number=None, machine_override=None):
+        def fake_dispatch(
+            repo, tracking_issue, cfg, *,
+            issue_number=None, machine_override=None, path=None,
+        ):
             calls.update(issue_number=issue_number, machine_override=machine_override)
             return ("aid-7", "dellserver")
 
@@ -656,6 +804,28 @@ class TestAcceptanceAuthor:
         assert result.exit_code == 0, result.output
         assert "issue #101 slice" in result.output
         assert calls == {"issue_number": 101, "machine_override": "dellserver"}
+
+    def test_for_path_forwarded_to_dispatch(self, tmp_path: Path, monkeypatch) -> None:
+        """#1125: --for-path (routed-driver resolution) reaches
+        dispatch_test_author as `path=`."""
+        config_path = self._config_no_driver(tmp_path)
+        calls = {}
+
+        def fake_dispatch(
+            repo, tracking_issue, cfg, *,
+            issue_number=None, machine_override=None, path=None,
+        ):
+            calls["path"] = path
+            return ("aid-99", "laptop")
+
+        monkeypatch.setattr("coord.test_author.dispatch_test_author", fake_dispatch)
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "author", "coord-tui", "947",
+            "--for-path", "coord/acceptance.py", "--config", str(config_path),
+        ])
+        assert result.exit_code == 0, result.output
+        assert calls["path"] == "coord/acceptance.py"
 
     def test_dispatch_error_surfaces_nonzero_exit(self, tmp_path: Path, monkeypatch) -> None:
         config_path = self._config_no_driver(tmp_path)
@@ -714,6 +884,27 @@ class TestAcceptanceMock:
         assert proposal.type == "mock-author"
         assert proposal.target_branch == "ms-9-gate-a"
         mock_record.assert_called_once()
+
+    def test_for_path_forwarded_to_dispatch(self, tmp_path: Path, monkeypatch) -> None:
+        """#1125: --for-path (routed-driver resolution) reaches
+        dispatch_acceptance_mock as `path=`."""
+        config_path = _write_config(
+            tmp_path, repo_path=str(tmp_path / "repo"), run_cmd="echo {}",
+        )
+        calls = {}
+
+        def fake_dispatch(repo, tracking_issue, cfg, *, machine_override=None, path=None):
+            calls["path"] = path
+            return ("mock-asg-2", "laptop")
+
+        monkeypatch.setattr("coord.mock_author.dispatch_acceptance_mock", fake_dispatch)
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "mock", "coord-tui", "100",
+            "--for-path", "coord/acceptance.py", "--config", str(config_path),
+        ])
+        assert result.exit_code == 0, result.output
+        assert calls["path"] == "coord/acceptance.py"
 
     def test_unknown_repo_errors(self, tmp_path: Path) -> None:
         config_path = _write_config(

@@ -149,6 +149,49 @@ class TestDispatchTestAuthor:
         with pytest.raises(RuntimeError, match="no acceptance driver configured"):
             dispatch_test_author("coord-tui", 947, cfg)
 
+    def _routed_config(self, machines: list[Machine]) -> Config:
+        repo = Repo(name="coord-tui", github="acme/coord-tui")
+        acceptance = AcceptanceConfig(drivers={
+            "coord-tui": AcceptanceDriverConfig(routes=[
+                AcceptanceDriverConfig(
+                    match="coord/**", kind="cli-pytest",
+                    run="pytest tests/acceptance/{ms}",
+                ),
+            ]),
+        })
+        return Config(repos=[repo], machines=machines, acceptance=acceptance)
+
+    def test_routed_driver_without_path_raises_actionable_error(self) -> None:
+        """#1125 review finding 1: a routed repo with no --for-path must not
+        get the generic "no acceptance driver configured" message (it DOES
+        have one — just no path to resolve it) — the error should point at
+        --for-path instead."""
+        cfg = self._routed_config([_machine("laptop", ["coord-tui"])])
+        with pytest.raises(RuntimeError, match="no route matched"):
+            dispatch_test_author("coord-tui", 947, cfg)
+
+    def test_routed_driver_with_matching_path_resolves(self) -> None:
+        """#1125 review finding 1/2: with a path that matches a route, the
+        test-author dispatches using that route's kind/run (e.g. reaching
+        the briefing, which embeds driver_kind/driver_run)."""
+        cfg = self._routed_config([_machine("laptop", ["coord-tui"])])
+        fake_client = MagicMock()
+        fake_resp = MagicMock()
+        fake_resp.json.return_value = {"id": "routed-1"}
+        fake_client.post.return_value = fake_resp
+
+        with patch("coord.test_author.fetch_milestone_context", return_value=self._ctx()), \
+             patch("coord.state.record_dispatched_assignment"):
+            assignment_id, machine_name = dispatch_test_author(
+                "coord-tui", 947, cfg, path="coord/acceptance.py",
+                http_client=fake_client,
+            )
+
+        assert assignment_id == "routed-1"
+        payload = fake_client.post.call_args.kwargs["json"]
+        assert "cli-pytest" in payload["briefing"]
+        assert "pytest tests/acceptance/{ms}" in payload["briefing"]
+
     def test_milestone_fetch_failure_raises(self) -> None:
         cfg = _config([_machine("laptop", ["coord-tui"])], driver=self._driver())
         with patch(

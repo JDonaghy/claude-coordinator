@@ -287,6 +287,62 @@ def test_dispatch_success_records_assignment(tmp_path):
     mock_record.assert_called_once()
 
 
+def _cfg_with_routed_driver(tmp_path) -> Config:
+    repo = Repo(name="api", github="acme/api", default_branch="main")
+    machine = _make_machine("laptop", ["api"], str(tmp_path))
+    return Config(
+        repos=[repo],
+        machines=[machine],
+        models=ModelsConfig(default=None),
+        acceptance=AcceptanceConfig(drivers={
+            "api": AcceptanceDriverConfig(routes=[
+                AcceptanceDriverConfig(
+                    match="coord/**", kind="cli-pytest",
+                    run="pytest tests/acceptance/{ms}", mock="*.out",
+                ),
+            ]),
+        }),
+    )
+
+
+def test_dispatch_raises_actionable_error_when_routed_driver_has_no_path(tmp_path):
+    """#1125 review finding 1: a routed repo with no --for-path must not get
+    the generic "no acceptance driver configured" message (it DOES have
+    one — just no path to resolve it)."""
+    cfg = _cfg_with_routed_driver(tmp_path)
+    try:
+        mock_author.dispatch_acceptance_mock("api", 100, cfg)
+        assert False, "expected RuntimeError"
+    except RuntimeError as e:
+        assert "no route matched" in str(e)
+
+
+def test_dispatch_success_with_routed_driver_and_matching_path(tmp_path):
+    """#1125 review finding 1/2: a matching path resolves the routed driver
+    and its kind/mock glob flow into the briefing."""
+    from coord.models import Board
+
+    cfg = _cfg_with_routed_driver(tmp_path)
+    issue_data = {
+        "number": 100, "title": "Milestone tracker", "body": "",
+        "milestone": {"number": 9, "title": "Q3"},
+    }
+    with patch("coord.github_ops.get_issue", return_value=issue_data), \
+         patch("coord.github_ops.get_open_issues", return_value=[]), \
+         patch("coord.board_service.read_board", return_value=Board()), \
+         patch("coord.dispatch.dispatch_with_retry", return_value={"id": "asg-routed"}) as mock_dispatch, \
+         patch("coord.dispatch.post_briefing"), \
+         patch("coord.state.record_dispatched"):
+        assignment_id, machine_name = mock_author.dispatch_acceptance_mock(
+            "api", 100, cfg, path="coord/acceptance.py",
+        )
+
+    assert assignment_id == "asg-routed"
+    proposal = mock_dispatch.call_args[0][0]
+    assert "cli-pytest" in proposal.briefing
+    assert "*.out" in proposal.briefing
+
+
 def test_dispatch_machine_override_must_claim_repo(tmp_path):
     from coord.models import Board
 

@@ -224,6 +224,17 @@ class AcceptanceConfig:
           entry can't select a route, so it returns ``None`` rather than
           guessing one — callers that know they're driving a specific file
           (or an issue's manifest-mapped path) must pass it.
+
+        Resolution rule when a milestone/issue's slice spans more than one
+        route (#1125 review finding 4): this method makes no attempt to
+        detect or merge across routes for a single call — it resolves
+        exactly one *path* to exactly one route (or ``None``). A caller
+        whose work spans multiple routes (e.g. a full-stack issue touching
+        both ``coord/**`` and ``tui/**``) must pick ONE representative path
+        for the invocation (or invoke once per route) rather than expect
+        this method to fan out; callers driving a whole repo/milestone with
+        no single path in hand (Gate A, sealing, briefing-injection) should
+        use :meth:`has_driver` instead, which is path-independent by design.
         """
         entry = self.drivers.get(repo_name)
         if entry is None:
@@ -236,6 +247,22 @@ class AcceptanceConfig:
             if fnmatch.fnmatch(path, route.match):
                 return route
         return None
+
+    def has_driver(self, repo_name: str) -> bool:
+        """Path-independent "does this repo participate in the oracle loop
+        at all" predicate (#1125 review finding 1).
+
+        True when *repo_name* has ANY acceptance driver configured — flat
+        or routed — regardless of which route a given path would resolve
+        to. Use this for existence-only checks that must not silently flip
+        the moment a repo adopts ``routes:`` — Gate A
+        (``coord.milestone_dispatch.gate_a_status``), the ``tests/acceptance/``
+        sealing/forbid list (``coord.dispatch.dispatch``), and the
+        oracle-loop briefing-contract injection (``coord.dispatch.dispatch``)
+        all only need "yes/no", never a concrete driver to run — use
+        :meth:`driver_for` (with a *path*) for that.
+        """
+        return repo_name in self.drivers
 
 
 @dataclass
@@ -1060,6 +1087,21 @@ def _parse_acceptance(raw: Any) -> AcceptanceConfig:
 
         routes_raw = entry.get("routes")
         if routes_raw is not None:
+            # #1125 review finding 5: a routed entry's flat kind/run/mock/
+            # capability fields are unused (each route carries its own) — an
+            # operator who sets both almost certainly meant one or the
+            # other, so reject it rather than silently discarding the flat
+            # fields.
+            flat_fields = [
+                f for f in ("kind", "run", "mock", "capability") if entry.get(f)
+            ]
+            if flat_fields:
+                raise ConfigError(
+                    f"acceptance.drivers[{repo_name!r}] sets both 'routes' "
+                    f"and flat field(s) {flat_fields!r} — a routed entry's "
+                    "driver is entirely per-route; remove the flat fields "
+                    "(they would otherwise be silently ignored)"
+                )
             drivers[repo_name] = AcceptanceDriverConfig(
                 routes=_parse_acceptance_routes(repo_name, routes_raw),
             )

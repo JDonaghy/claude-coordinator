@@ -1054,7 +1054,7 @@ def dispatch_review(
     # oracle-loop acceptance driver configured — the reviewer must reject any
     # diff that touches it (docs/ORACLE_LOOP.md).
     sealed_paths: list[str] = []
-    if config.acceptance.driver_for(completed.repo_name) is not None:
+    if config.acceptance.has_driver(completed.repo_name):
         sealed_paths.append("tests/acceptance/")
 
     client = http_client or httpx

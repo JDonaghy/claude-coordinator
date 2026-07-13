@@ -217,6 +217,39 @@ class TestDispatch:
         assert "tests/acceptance/" in payload["files_forbidden"]
 
     @patch("coord.dispatch.httpx.post")
+    def test_payload_auto_seals_acceptance_dir_when_driver_is_routed(
+        self, mock_post: MagicMock, proposal: Proposal,
+    ) -> None:
+        """#1125 review finding 1: a REPO's acceptance driver may be routed
+        (acceptance.drivers.<repo>.routes) rather than flat — sealing must
+        still trigger, since `driver_for(repo_name)` (no path) can't select
+        a route and would otherwise return None here, silently un-sealing
+        tests/acceptance/ the instant a repo adopts routes."""
+        from coord.config import AcceptanceConfig, AcceptanceDriverConfig
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+            )],
+            acceptance=AcceptanceConfig(drivers={
+                "api": AcceptanceDriverConfig(routes=[
+                    AcceptanceDriverConfig(
+                        match="coord/**", kind="cli-pytest", run="pytest",
+                    ),
+                ]),
+            }),
+        )
+        dispatch(proposal, cfg)
+        payload = mock_post.call_args.kwargs["json"]
+        assert "tests/acceptance/" in payload["files_forbidden"]
+
+    @patch("coord.dispatch.httpx.post")
     def test_payload_mock_author_exempt_from_acceptance_seal(
         self, mock_post: MagicMock, proposal: Proposal,
     ) -> None:
@@ -353,6 +386,45 @@ class TestDispatch:
             )],
             acceptance=AcceptanceConfig(drivers={
                 "api": AcceptanceDriverConfig(kind="tui-tuidriver", run="cargo test"),
+            }),
+        )
+        dispatch(proposal, cfg)
+        briefing = mock_post.call_args.kwargs["json"]["briefing"]
+        assert "## 🔒 Oracle-loop acceptance contract" in briefing
+        assert "tests/acceptance/ms01/contract.md" in briefing
+
+    @patch("coord.dispatch.httpx.post")
+    def test_payload_prepends_oracle_loop_contract_when_driver_is_routed(
+        self, mock_post: MagicMock, proposal: Proposal, tmp_path, coord_db,
+    ) -> None:
+        """#1125 review finding 1: the same as
+        test_payload_prepends_oracle_loop_contract_when_slice_authored, but
+        the repo's driver is routed rather than flat — the injection guard
+        (`config.acceptance.has_driver(...)`) must still fire, since a bare
+        `driver_for(repo_name)` (no path) can't resolve a route and would
+        otherwise return None here, silently dropping the contract block."""
+        from coord.config import AcceptanceConfig, AcceptanceDriverConfig
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        acceptance_dir = tmp_path / "tests" / "acceptance" / "ms01"
+        acceptance_dir.mkdir(parents=True)
+        (acceptance_dir / "manifest.yml").write_text("tests:\n  ms01::a: 10\n")
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": str(tmp_path)},
+            )],
+            acceptance=AcceptanceConfig(drivers={
+                "api": AcceptanceDriverConfig(routes=[
+                    AcceptanceDriverConfig(
+                        match="**", kind="cli-pytest", run="pytest",
+                    ),
+                ]),
             }),
         )
         dispatch(proposal, cfg)

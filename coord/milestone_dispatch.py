@@ -199,7 +199,7 @@ def gate_a_status(
     human-readable block reason otherwise, naming the missing path and the
     command that produces it.
     """
-    if config.acceptance.driver_for(repo_cfg.name) is None:
+    if not config.acceptance.has_driver(repo_cfg.name):
         return None
 
     from coord.acceptance import gate_a_contract_path  # noqa: PLC0415

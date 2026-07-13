@@ -87,7 +87,7 @@ def dispatch(
     # gets the same exemption when it lands.
     if (
         proposal.type != "mock-author"
-        and config.acceptance.driver_for(proposal.repo_name) is not None
+        and config.acceptance.has_driver(proposal.repo_name)
     ):
         if "tests/acceptance/" not in files_forbidden:
             files_forbidden.append("tests/acceptance/")
@@ -143,7 +143,7 @@ def dispatch(
         from coord.state import issue_context_block  # noqa: PLC0415
 
         oracle_contract = ""
-        if config.acceptance.driver_for(proposal.repo_name) is not None:
+        if config.acceptance.has_driver(proposal.repo_name):
             from coord.acceptance import (  # noqa: PLC0415
                 ACCEPTANCE_DIRNAME,
                 oracle_loop_contract_block,
