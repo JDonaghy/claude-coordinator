@@ -435,9 +435,44 @@ def test_pipeline_attention_thresholds_default() -> None:
     assert cfg.attention_threshold_for("work") == 45 * 60.0
     assert cfg.attention_threshold_for("review") == 15 * 60.0
     assert cfg.attention_threshold_for("smoke") == 20 * 60.0
-    # Unknown type falls back to the "work" default.
-    assert cfg.attention_threshold_for("mock-author") == 45 * 60.0
+    # #1133: headless types now have their own explicit defaults rather
+    # than silently inheriting "work"'s threshold.
+    assert cfg.attention_threshold_for("mock-author") == 30 * 60.0
+    assert cfg.attention_threshold_for("test-author") == 30 * 60.0
+    assert cfg.attention_threshold_for("plan") == 30 * 60.0
+    assert cfg.attention_threshold_for("conflict-fix") == 60 * 60.0
+    # A genuinely unlisted headless type still falls back to "work".
+    assert cfg.attention_threshold_for("some-future-headless-type") == 45 * 60.0
     assert cfg.convergence_rounds == 3
+
+
+def test_pipeline_attention_thresholds_interactive_types_exempt() -> None:
+    """#1133: human-attended chat-style sessions never trip the wall-clock
+    signal by default — they have no headless-convergence concept, so a
+    multi-hour live session (the exact scenario that motivated #1133) must
+    not be flagged as stuck.
+    """
+    cfg = PipelineConfig()
+    for assignment_type in (
+        "chat",
+        "troubleshoot",
+        "audit",
+        "milestone-chat",
+        "refinement",
+        "new-issue-chat",
+        "test-chat",
+    ):
+        assert cfg.attention_threshold_for(assignment_type) == float("inf")
+
+
+def test_pipeline_attention_thresholds_explicit_override_wins_over_interactive_exemption() -> None:
+    """An explicit user-configured threshold for an interactive type still
+    applies — the #1133 exemption is a default, not unconditional.
+    """
+    cfg = PipelineConfig(attention_thresholds={"chat": 120.0})
+    assert cfg.attention_threshold_for("chat") == 120.0
+    # Other interactive types remain exempt.
+    assert cfg.attention_threshold_for("troubleshoot") == float("inf")
 
 
 def test_pipeline_attention_thresholds_parsed_from_yaml(tmp_path: Path) -> None:

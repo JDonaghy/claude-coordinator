@@ -344,11 +344,50 @@ class DispatchConfig:
 # `type` may run before `coord.notify.detect_needs_attention` flags it.
 # Deliberately generous — this is a "human should glance at this" signal,
 # not a kill switch (detection + surfacing only, see issue #846).
+#
+# These are all *headless* types — a `claude -p` worker converging toward a
+# result with no one attending it live, so "running way longer than usual"
+# is a meaningful stuck signal. `plan`/`mock-author`/`test-author` are
+# lighter-weight than `work` (no code-writing convergence loop) but still
+# headless, so they get their own explicit (rather than work-fallback)
+# tuning. `conflict-fix` is dual-purpose — the automated #241 worker *and*
+# the interactive `--merge-of` session share this type (see
+# `coord.reconcile.is_interactive_merge_session`) — so it gets a little more
+# headroom than `work` to cover a human resolving a semantic conflict.
 _DEFAULT_ATTENTION_THRESHOLDS: dict[str, float] = {
     "work": 45 * 60.0,
     "review": 15 * 60.0,
     "smoke": 20 * 60.0,
+    "plan": 30 * 60.0,
+    "mock-author": 30 * 60.0,
+    "test-author": 30 * 60.0,
+    "conflict-fix": 60 * 60.0,
 }
+
+# #1133: assignment types that are human-attended interactive sessions — a
+# developer reading/thinking/typing at a live `claude` TTY (driven via
+# `POST /inject/{id}` from the TUI), not a headless worker converging toward
+# a result. These have no wall-clock "stuck" concept: a human legitimately
+# spending hours reading an issue, chatting through a plan, or validating a
+# diff is normal, not stalled (the #846 wall-clock check exists to catch a
+# headless worker silently burning budget — see `attention_signal`'s
+# docstring for the #448 motivation, which doesn't apply here). Exempt from
+# the wall-clock signal unconditionally in `attention_threshold_for` —
+# *not* merely by omission from `_DEFAULT_ATTENTION_THRESHOLDS` — so a user
+# who overrides `pipeline.attention_thresholds.work` in `coordinator.yml`
+# can't accidentally re-arm this check for a chat session via the
+# fallback-to-"work" behaviour (see that method's docstring). A user who
+# explicitly configures a threshold for one of these types still wins —
+# this is a default exemption, not an unconditional one.
+INTERACTIVE_SESSION_TYPES: frozenset[str] = frozenset({
+    "chat",
+    "troubleshoot",
+    "audit",
+    "milestone-chat",
+    "refinement",
+    "new-issue-chat",
+    "test-chat",
+})
 
 
 @dataclass
@@ -381,7 +420,13 @@ class PipelineConfig:
     ``"review"``, ``"smoke"``, ...) to a wall-clock duration (seconds) that
     an assignment may sit in ``status="running"`` before
     ``coord.notify.detect_needs_attention`` flags it. A type not present in
-    the mapping falls back to ``_DEFAULT_ATTENTION_THRESHOLDS``.
+    the mapping falls back to ``_DEFAULT_ATTENTION_THRESHOLDS``, *unless*
+    it's a human-attended interactive type (#1133,
+    :data:`INTERACTIVE_SESSION_TYPES` — ``"chat"``, ``"troubleshoot"``,
+    ``"audit"``, ``"milestone-chat"``, ``"refinement"``,
+    ``"new-issue-chat"``, ``"test-chat"``), which is exempt from the
+    wall-clock check entirely by default — see
+    :meth:`attention_threshold_for`.
 
     ``convergence_rounds`` (#846) is the number of fix/review rounds
     (``Assignment.review_iteration``) an assignment may accumulate without
@@ -402,14 +447,28 @@ class PipelineConfig:
     def attention_threshold_for(self, assignment_type: str) -> float:
         """Wall-clock threshold (seconds) for *assignment_type*.
 
-        Falls back to this config's own ``"work"`` entry when *assignment_type*
-        has no explicit override (so a user who only overrides ``work`` gets
-        that value applied to unlisted types too, not the hardcoded
-        default) — and only reaches for the hardcoded default when even
-        ``"work"`` was never configured.
+        An explicit ``attention_thresholds`` entry (built-in default or
+        user-configured override) always wins. Failing that,
+        ``assignment_type`` is checked against :data:`INTERACTIVE_SESSION_TYPES`
+        (#1133) — human-attended chat/troubleshoot/review-style sessions with
+        no headless-convergence concept — and exempted (``inf``, never
+        flagged) rather than inheriting a headless-worker threshold.
+
+        Only *then* does it fall back to this config's own ``"work"`` entry
+        (so a user who only overrides ``work`` gets that value applied to
+        unlisted *headless* types too, not the hardcoded default) — and only
+        reaches for the hardcoded default when even ``"work"`` was never
+        configured. This fallback is deliberately scoped to headless types
+        by the ``INTERACTIVE_SESSION_TYPES`` check above it: unlike an
+        unlisted headless type (probably work-like), an unlisted interactive
+        type has no wall-clock-stuck concept at all, so silently reusing
+        ``"work"``'s threshold for it would be a category error, not a
+        reasonable guess.
         """
         if assignment_type in self.attention_thresholds:
             return self.attention_thresholds[assignment_type]
+        if assignment_type in INTERACTIVE_SESSION_TYPES:
+            return float("inf")
         return self.attention_thresholds.get(
             "work", _DEFAULT_ATTENTION_THRESHOLDS["work"]
         )
