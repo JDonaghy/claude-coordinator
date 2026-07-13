@@ -80,6 +80,45 @@ class TestPrIsMerged:
             assert github_ops.pr_is_merged("acme/api", "issue-1-fix") is False
 
 
+class TestGetIssue:
+    """#1138 review: `enforce_oracle_readiness` derives the `oracle:exempt`
+    escape hatch from `get_issue(...).get("labels")`. That silently always
+    returned `[]` in production because `get_issue()`'s `--json` field list
+    omitted `labels` — masked by tests that mocked `get_issue()` itself
+    (handing back a `labels` key the real function never produced). These
+    tests mock only `_gh` (the `gh` subprocess boundary) so the real
+    `get_issue()` — field list included — is what's under test."""
+
+    def test_json_field_list_requests_labels(self) -> None:
+        with patch(
+            "coord.github_ops._gh",
+            return_value=json.dumps({
+                "number": 1, "title": "t", "body": "b", "state": "OPEN",
+                "milestone": None, "labels": [],
+            }),
+        ) as mock_gh:
+            github_ops.get_issue("acme/api", 1)
+
+        args = mock_gh.call_args.args
+        assert args[0] == "issue" and args[1] == "view"
+        json_fields = args[args.index("--json") + 1].split(",")
+        assert "labels" in json_fields
+
+    def test_returns_labels_from_real_gh_payload(self) -> None:
+        with patch(
+            "coord.github_ops._gh",
+            return_value=json.dumps({
+                "number": 1, "title": "t", "body": "b", "state": "OPEN",
+                "milestone": {"number": 37},
+                "labels": [{"name": "oracle:exempt"}, {"name": "coord"}],
+            }),
+        ):
+            issue = github_ops.get_issue("acme/api", 1)
+
+        label_names = [lbl.get("name", "") for lbl in issue.get("labels") or []]
+        assert label_names == ["oracle:exempt", "coord"]
+
+
 class TestWorkIsTerminal:
     """The #522 chokepoint guard: terminal == issue closed OR PR merged.
 

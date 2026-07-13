@@ -51,14 +51,19 @@ def get_closed_epics(repo: str, *, label: str = "epic") -> list[dict]:
 def get_issue(repo: str, issue_number: int) -> dict:
     """Fetch a single issue by number.
 
-    Returns ``{number, title, body, state, milestone, ...}``. ``milestone``
-    is ``None`` when the issue has none, else ``{"number": ..., "title":
-    ...}`` — used by ``coord milestone order`` (#768) to resolve a tracking
-    issue's milestone and validate node membership without a second call.
+    Returns ``{number, title, body, state, milestone, labels, ...}``.
+    ``milestone`` is ``None`` when the issue has none, else ``{"number":
+    ..., "title": ...}`` — used by ``coord milestone order`` (#768) to
+    resolve a tracking issue's milestone and validate node membership
+    without a second call. ``labels`` is a list of ``{"name": ..., ...}``
+    dicts — #1138's ``enforce_oracle_readiness`` reads issue labels (e.g.
+    ``oracle:exempt``) off this same call, so it must be requested here
+    too, not just on the list endpoints (``get_open_issues``,
+    ``get_closed_epics``).
     """
     raw = _gh(
         "issue", "view", str(issue_number), "--repo", repo,
-        "--json", "number,title,body,state,milestone",
+        "--json", "number,title,body,state,milestone,labels",
     )
     return json.loads(raw)
 
