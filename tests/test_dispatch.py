@@ -608,19 +608,27 @@ class TestOracleReadinessGate:
 
     @patch("coord.dispatch.httpx.post")
     @patch("coord.github_ops.get_repo_file")
-    @patch("coord.github_ops.get_issue")
+    @patch("coord.github_ops._gh")
     def test_exempt_label_allows_dispatch_with_no_slice(
-        self, mock_get_issue, mock_get_repo_file, mock_post,
+        self, mock_gh, mock_get_repo_file, mock_post,
     ) -> None:
+        """Mocks `_gh` (the `gh` subprocess boundary), not `get_issue`
+        itself, so the real `get_issue()` — including its `--json` field
+        list — runs. A test that mocks `get_issue()` directly would pass
+        even if `get_issue()` never requested `labels` from `gh`, exactly
+        the gap that made the `oracle:exempt` escape hatch dead code in
+        production (review finding on #1138)."""
+        import json as _json
+
         cfg = self._cfg()
         p = Proposal(
             id=1, machine_name="laptop", repo_name="api",
             issue_number=1125, issue_title="test-author driver",
             rationale="", type="work",
         )
-        mock_get_issue.return_value = {
+        mock_gh.return_value = _json.dumps({
             "milestone": {"number": 37}, "labels": [{"name": "oracle:exempt"}],
-        }
+        })
         mock_get_repo_file.side_effect = lambda repo, path, branch=None: (
             "contract body" if path.endswith("contract.md") else (_ for _ in ()).throw(RuntimeError("404"))
         )
@@ -630,6 +638,13 @@ class TestOracleReadinessGate:
 
         dispatch(p, cfg)
         mock_post.assert_called_once()
+
+        # The `gh issue view` call must actually request `labels` — this is
+        # the exact field-list regression the review caught.
+        gh_args = mock_gh.call_args.args
+        assert "issue" in gh_args and "view" in gh_args
+        json_fields = gh_args[gh_args.index("--json") + 1]
+        assert "labels" in json_fields.split(",")
 
     def test_enforce_oracle_readiness_direct_no_op_for_review_type(self) -> None:
         cfg = self._cfg()
