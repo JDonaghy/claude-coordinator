@@ -152,10 +152,14 @@ class Machine:
 # docstring/system-prompt promise it dispatches through the *same* pipeline
 # as any other branch — so every completion-side filter that only matched
 # ``type == "work"`` must also match this set, or a mock-author branch can
-# never actually reach a review or the merge queue. Keep this set — not a
-# bare string check — as the single source of truth so a future work-like
-# type only needs to be added here.
-WORK_LIKE_TYPES: frozenset[str] = frozenset({"work", "mock-author"})
+# never actually reach a review or the merge queue. "test-author" (#931,
+# #1141) is structurally identical — it commits only
+# `tests/acceptance/ms-NN/**` and needs a `skipped` test verdict — but was
+# never added when mock-author landed, so every per-issue JIT acceptance
+# slice silently stalled before review/merge with no error (confirmed live,
+# #1141). Keep this set — not a bare string check — as the single source of
+# truth so a future work-like type only needs to be added here.
+WORK_LIKE_TYPES: frozenset[str] = frozenset({"work", "mock-author", "test-author"})
 
 # #1077: subset of WORK_LIKE_TYPES whose ``issue_number`` is the issue the PR
 # actually *resolves* — i.e. merging it should auto-close that issue. "work"
@@ -168,7 +172,12 @@ WORK_LIKE_TYPES: frozenset[str] = frozenset({"work", "mock-author"})
 # source of truth for both the PR-body "Closes #N" vs "Refs #N" keyword
 # choice (``coord/review.py``, ``coord/merge_queue.py``'s ``_briefing_body``)
 # and the deterministic post-merge ``close_issue`` call
-# (``coord/merge_queue.py``'s ``process``).
+# (``coord/merge_queue.py``'s ``process``). "test-author" (#1141) deliberately
+# stays OUT of this set too — its ``issue_number`` is likewise always the
+# milestone's tracking issue (see ``for_issue_number`` below for the actual
+# per-slice issue), never something the contract/fixture PR resolves.
+# Verified against confirmed-live behaviour (PR #1139 correctly used
+# "Refs #1117"), not merely assumed.
 CLOSES_ISSUE_TYPES: frozenset[str] = frozenset({"work"})
 
 

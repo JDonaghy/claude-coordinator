@@ -982,6 +982,31 @@ class TestSmokeGate:
         board = self._board(completed=[mock_author])
         assert mq.has_smoke_verdict(_q("ma1", branch="ms-5-gate-a"), board) is True
 
+    def test_has_smoke_verdict_test_author_none_returns_false(self) -> None:
+        """#1141 fix: a ``type="test-author"`` (#931, per-issue JIT
+        acceptance-slice authoring) entry with no test verdict must correctly
+        fail the gate (``False``), not silently fail open — mirrors the
+        mock-author fix from #930, which test-author never got."""
+        test_author = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="ta1", type="test-author", status="done",
+            branch="ms-37-test-author", test_state=None,
+        )
+        board = self._board(completed=[test_author])
+        assert mq.has_smoke_verdict(_q("ta1", branch="ms-37-test-author"), board) is False
+
+    def test_has_smoke_verdict_test_author_skipped(self) -> None:
+        """#1141 fix: same as above but with a ``skipped`` verdict — the
+        expected verdict for a fixtures/tests-only test-author diff (nothing
+        to smoke) — must correctly return True."""
+        test_author = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="ta1", type="test-author", status="done",
+            branch="ms-37-test-author", test_state="skipped",
+        )
+        board = self._board(completed=[test_author])
+        assert mq.has_smoke_verdict(_q("ta1", branch="ms-37-test-author"), board) is True
+
     def test_has_smoke_verdict_no_matching_work_fails_open(self) -> None:
         """When no work assignment for the branch is found on the board, the
         gate fails open (returns True) — can't block without evidence."""
@@ -1359,6 +1384,30 @@ class TestEnqueueApprovedWork:
         assert len(items) == 1
         assert items[0].assignment_id == "ma1"
         assert items[0].branch == "ms-5-gate-a"
+
+    def test_enqueues_test_author_completion(self, coord_db) -> None:
+        """#1141 fix: a completed ``type="test-author"`` (#931, per-issue JIT
+        acceptance-slice authoring) assignment with an approved review +
+        skipped test must be enqueued the same as ordinary work — previously
+        the scan didn't recognize ``test-author`` so a JIT slice could never
+        reach the merge queue through any coord command (confirmed live on
+        PR #1139, epic #1117/ms-37 retrofit)."""
+        cfg = self._config()
+        test_author = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="ta1", type="test-author", status="done",
+            branch="ms-37-test-author", test_state="skipped",
+        )
+        rev = self._review("ta1", verdict="approve")
+        board = self._board(completed=[test_author, rev])
+
+        changed = mq.enqueue_approved_work(cfg, board)
+
+        assert changed == ["ta1"]
+        items = load_queue()
+        assert len(items) == 1
+        assert items[0].assignment_id == "ta1"
+        assert items[0].branch == "ms-37-test-author"
 
     def test_enqueues_when_test_state_is_skipped(self, coord_db) -> None:
         """test_state='skipped' also satisfies the smoke gate."""
@@ -2192,6 +2241,26 @@ class TestStagingItems:
         items = mq.staging_items(board, cfg)
         assert len(items) == 1
         assert items[0].assignment_id == "ma1"
+        assert items[0].status == mq.STAGING_READY
+
+    def test_ready_when_test_author_approved_and_smoke_skipped(self, coord_db) -> None:
+        """#1141 fix: a ``type="test-author"`` (#931, per-issue JIT
+        acceptance-slice authoring) completion is a staging item too —
+        mirrors ordinary work/mock-author, since it must flow through the
+        same Work -> Test -> Review -> Merge pipeline. Uses a skipped test
+        verdict, the expected verdict for a fixtures/tests-only diff."""
+        work = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1117,
+            issue_title="ms-37 acceptance slice", assignment_id="ta1",
+            type="test-author", status="done", branch="ms-37-test-author",
+            test_state="skipped",
+        )
+        rev = self._review("ta1")
+        board = self._board(completed=[work, rev])
+        cfg = self._config()
+        items = mq.staging_items(board, cfg)
+        assert len(items) == 1
+        assert items[0].assignment_id == "ta1"
         assert items[0].status == mq.STAGING_READY
 
     def test_ready_when_approved_and_smoke_skipped(self, coord_db) -> None:

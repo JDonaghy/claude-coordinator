@@ -659,6 +659,44 @@ def test_dispatch_review_dispatches_for_mock_author_type(
     assert board.active == [result]
 
 
+def test_dispatch_review_dispatches_for_test_author_type(
+    two_machine_config: Config,
+) -> None:
+    """#1141 fix: a completed ``type="test-author"`` (#931, per-issue JIT
+    acceptance-slice authoring) assignment must be eligible for review
+    dispatch, not just ``type="work"``/``"mock-author"`` — otherwise a
+    test-author branch can never reach a review through any `coord` command
+    (`coord pr`, `coord notify`, the daemon tick), the exact silent stall
+    confirmed live on PR #1139 (epic #1117/ms-37 retrofit)."""
+    board = Board()
+    completed = replace(
+        _completed_assignment(),
+        type="test-author",
+        assignment_id="ta-1",
+        branch="ms-37-test-author",
+    )
+    client = _FakeHTTPClient({"id": "review-id-ta"})
+
+    result = dispatch_review(
+        completed, board, two_machine_config,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {
+            "number": 44,
+            "url": "https://github.com/acme/api/pull/44",
+            "existed": True,
+        },
+        claude_md_reader=lambda p: "# Project rules\n",
+        issue_body_fetcher=lambda repo, num: "issue body text",
+        now=123.0,
+        remote_branch_checker=lambda repo, branch: True,
+    )
+
+    assert result is not None
+    assert result.type == "review"
+    assert result.review_of_assignment_id == "ta-1"
+    assert board.active == [result]
+
+
 def test_dispatch_review_skipped_when_work_terminal(
     two_machine_config: Config, monkeypatch
 ) -> None:
@@ -1719,6 +1757,36 @@ def test_dispatch_pending_reviews_includes_mock_author(fake_dispatch) -> None:
     assert len(out) == 1
     assert fake_dispatch == ["ma-2"]
     assert mock_author.review_state == "dispatched"
+
+
+def test_dispatch_pending_reviews_includes_test_author(fake_dispatch) -> None:
+    """#1141 fix: the bulk/auto dispatch path (`coord notify`, `reconcile()`)
+    must pick up a completed `type="test-author"` (#931, per-issue JIT
+    acceptance-slice authoring) row the same as ordinary work — previously
+    the ``eligible`` filter didn't include ``test-author`` so a JIT slice
+    could never get an automatic review, the silent stall confirmed live on
+    PR #1139 (epic #1117/ms-37 retrofit)."""
+    test_author = Assignment(
+        machine_name="laptop",
+        repo_name="api",
+        issue_number=1117,
+        issue_title="ms-37 acceptance slice",
+        assignment_id="ta-2",
+        status="done",
+        branch="ms-37-test-author",
+        type="test-author",
+        review_state=None,
+        dispatched_at=0.0,
+        finished_at=1.0,
+    )
+    board = Board(completed=[test_author])
+    cfg = _flood_config(max_auto_dispatch_per_pass=5, flood_threshold=12)
+
+    out = dispatch_pending_reviews(board, cfg)
+
+    assert len(out) == 1
+    assert fake_dispatch == ["ta-2"]
+    assert test_author.review_state == "dispatched"
 
 
 def test_dispatch_pending_reviews_skips_interactive_work(fake_dispatch) -> None:
