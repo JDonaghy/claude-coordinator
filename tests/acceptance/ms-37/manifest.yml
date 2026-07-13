@@ -1,0 +1,50 @@
+# Acceptance manifest for milestone ms-37 (Spend & Time Observability, epic #1117).
+# Maps each acceptance test-id -> the work-order issue it covers.
+#
+# Test-ids are the pytest junit nodeid `{classname}::{name}` emitted by the
+# cli-pytest driver (`pytest --junit-xml`) — e.g.
+# `tests.acceptance.ms-37.test_usage_core_1118::test_by_issue_leg_counts`.
+#
+# Merged (never clobbered) across issues by coord.acceptance.load_manifest —
+# other issues' slices (#1115 CLI-1, #1119 CLI-2, #1116 TUI) append their own
+# entries here against the SAME conftest fixtures.
+
+tests:
+  # ── #1118 Core: pure cost/token/duration aggregation + estimator ──
+  # by-issue rollup (numbers behind contract Mock 1)
+  tests.acceptance.ms-37.test_usage_core_1118::test_by_issue_leg_counts: 1118
+  tests.acceptance.ms-37.test_usage_core_1118::test_by_issue_captured_cost: 1118
+  tests.acceptance.ms-37.test_usage_core_1118::test_by_issue_estimated_cost: 1118
+  tests.acceptance.ms-37.test_usage_core_1118::test_by_issue_total_cost: 1118
+  tests.acceptance.ms-37.test_usage_core_1118::test_by_issue_token_sums: 1118
+  tests.acceptance.ms-37.test_usage_core_1118::test_by_issue_duration_sums: 1118
+  tests.acceptance.ms-37.test_usage_core_1118::test_by_issue_open_leg_count: 1118
+  tests.acceptance.ms-37.test_usage_core_1118::test_by_issue_unknown_model_flag: 1118
+  tests.acceptance.ms-37.test_usage_core_1118::test_by_issue_sort_desc_by_total: 1118
+  tests.acceptance.ms-37.test_usage_core_1118::test_by_issue_totals_line: 1118
+  # issue drill / per-stage (rows behind contract Mock 2)
+  tests.acceptance.ms-37.test_usage_core_1118::test_issue_drill_retains_all_legs_in_order: 1118
+  tests.acceptance.ms-37.test_usage_core_1118::test_issue_drill_per_leg_estimates: 1118
+  tests.acceptance.ms-37.test_usage_core_1118::test_issue_drill_per_leg_duration_and_running: 1118
+  # estimator
+  tests.acceptance.ms-37.test_usage_core_1118::test_estimator_exact_sonnet_l2: 1118
+  tests.acceptance.ms-37.test_usage_core_1118::test_estimator_exact_sonnet_l4: 1118
+  tests.acceptance.ms-37.test_usage_core_1118::test_estimator_includes_cache_creation: 1118
+  tests.acceptance.ms-37.test_usage_core_1118::test_estimator_opus_all_dimensions: 1118
+  tests.acceptance.ms-37.test_usage_core_1118::test_estimator_unknown_model_returns_none: 1118
+  tests.acceptance.ms-37.test_usage_core_1118::test_estimator_empty_model_returns_none: 1118
+  tests.acceptance.ms-37.test_usage_core_1118::test_estimator_alias_normalizes_to_sonnet: 1118
+  tests.acceptance.ms-37.test_usage_core_1118::test_estimator_no_double_count_when_cost_captured: 1118
+  tests.acceptance.ms-37.test_usage_core_1118::test_canonical_model_alias_normalization: 1118
+  tests.acceptance.ms-37.test_usage_core_1118::test_canonical_model_unknown_and_empty_not_a_priced_key: 1118
+  # window predicate + presets
+  tests.acceptance.ms-37.test_usage_core_1118::test_window_predicate_dispatched_in_finished_out: 1118
+  tests.acceptance.ms-37.test_usage_core_1118::test_window_predicate_finished_in_dispatched_out: 1118
+  tests.acceptance.ms-37.test_usage_core_1118::test_window_predicate_both_outside: 1118
+  tests.acceptance.ms-37.test_usage_core_1118::test_window_boundary_is_half_open: 1118
+  tests.acceptance.ms-37.test_usage_core_1118::test_window_running_leg_matches_on_dispatch: 1118
+  tests.acceptance.ms-37.test_usage_core_1118::test_window_explicit_bounded_range_filters_aggregate: 1118
+  tests.acceptance.ms-37.test_usage_core_1118::test_since_preset_relative_duration_days: 1118
+  tests.acceptance.ms-37.test_usage_core_1118::test_since_preset_relative_duration_hours: 1118
+  tests.acceptance.ms-37.test_usage_core_1118::test_since_preset_iso_start: 1118
+  tests.acceptance.ms-37.test_usage_core_1118::test_preset_today_is_half_open_interval: 1118
