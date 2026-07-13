@@ -2737,6 +2737,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                         repo=body.get("repo"),
                         issue_number=int(body.get("issue")),
                         sha=body.get("sha"),
+                        route_path=body.get("for_path"),
                         config_path=config.path,
                     )
             except SystemExit as e:  # click commands sys.exit() on some paths

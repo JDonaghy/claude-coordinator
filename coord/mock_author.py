@@ -95,22 +95,37 @@ def dispatch_acceptance_mock(
     config: Config,
     *,
     machine_override: str | None = None,
+    path: str | None = None,
 ) -> tuple[str, str]:
     """End-to-end: resolve the milestone, pick a machine, seed the
     briefing, dispatch a ``type="mock-author"`` assignment.
 
+    *path* (#1125, repo-root-relative, e.g. ``"coord/foo.py"``) resolves
+    which driver to use when the repo's acceptance config is routed
+    (``acceptance.drivers.<repo>.routes``) — pass the milestone's
+    representative subtree (see `AcceptanceConfig.driver_for` for the
+    single-path-per-call resolution rule). Unused when the repo has a flat,
+    unrouted driver.
+
     Returns ``(assignment_id, machine_name)``. Raises ``RuntimeError`` when
-    the repo is unknown, has no acceptance driver configured, the tracking
-    issue can't be fetched or has no milestone, the milestone's Gate A is
-    already claimed, no machine claims the repo, or the agent rejects the
-    dispatch.
+    the repo is unknown, has no acceptance driver configured (or, for a
+    routed repo, no driver resolves for *path*), the tracking issue can't be
+    fetched or has no milestone, the milestone's Gate A is already claimed,
+    no machine claims the repo, or the agent rejects the dispatch.
     """
     repo_cfg = config.repo(repo_name)
     if repo_cfg is None:
         raise RuntimeError(f"repo {repo_name!r} not in coordinator.yml")
 
-    driver_cfg = config.acceptance.driver_for(repo_name)
+    driver_cfg = config.acceptance.driver_for(repo_name, path)
     if driver_cfg is None:
+        if config.acceptance.has_driver(repo_name):
+            raise RuntimeError(
+                f"repo {repo_name!r} has a routed acceptance driver "
+                "(acceptance.drivers routes) but no route matched — pass "
+                "--for-path to select the milestone's subtree (e.g. "
+                "'coord/**')"
+            )
         raise RuntimeError(
             f"repo {repo_name!r} has no acceptance driver configured — add "
             "it under acceptance.drivers in coordinator.yml before running "

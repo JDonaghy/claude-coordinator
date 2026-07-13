@@ -207,6 +207,33 @@ class TestGateAStatus:
         repo = cfg.repo("api")
         assert gate_a_status(repo, cfg, 9, file_exists=lambda *a: False) is None
 
+    def _routed_cfg(self) -> Config:
+        from coord.config import AcceptanceConfig, AcceptanceDriverConfig
+
+        drivers = {
+            "api": AcceptanceDriverConfig(routes=[
+                AcceptanceDriverConfig(match="**", kind="cli-pytest", run="pytest"),
+            ]),
+        }
+        return Config(
+            repos=[Repo(name="api", github="acme/api", default_branch="main")],
+            machines=[_machine("laptop", ["api"])],
+            acceptance=AcceptanceConfig(drivers=drivers),
+        )
+
+    def test_blocked_when_driver_is_routed_and_contract_missing(self) -> None:
+        """#1125 review finding 1: a routed driver (acceptance.drivers.<repo>
+        .routes) must still gate Gate A — `driver_for(repo_cfg.name)` (no
+        path) can't select a route and would otherwise silently return
+        None, making gate_a_status wrongly report "dispatch may proceed"
+        for every milestone the instant this repo's driver becomes routed.
+        """
+        cfg = self._routed_cfg()
+        repo = cfg.repo("api")
+        reason = gate_a_status(repo, cfg, 9, file_exists=lambda *a: False)
+        assert reason is not None
+        assert "tests/acceptance/ms-9/contract.md" in reason
+
     def test_blocked_when_contract_missing(self) -> None:
         cfg = self._cfg(with_driver=True)
         repo = cfg.repo("api")

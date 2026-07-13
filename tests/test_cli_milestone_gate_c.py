@@ -107,6 +107,68 @@ class TestMilestoneGateC:
         assert result.exit_code == 1
         assert "no acceptance driver configured" in result.output
 
+    def test_routed_driver_without_for_path_errors_actionably(self, tmp_path: Path) -> None:
+        """#1125 review findings 1/2: gate-c against a routed repo needs
+        --for-path to resolve a driver at all."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        p = tmp_path / "coordinator.yml"
+        p.write_text(
+            "repos:\n  - name: coord-tui\n    github: acme/coord-tui\n"
+            "machines:\n  - name: laptop\n    host: laptop.tail\n"
+            "    repos: [coord-tui]\n    repo_paths:\n"
+            f"      coord-tui: {repo_dir}\n"
+            "acceptance:\n  drivers:\n    coord-tui:\n      routes:\n"
+            "        - match: 'coord/**'\n          kind: cli-pytest\n"
+            "          run: 'pytest tests/acceptance/{ms}'\n"
+        )
+        with patch("coord.github_ops.get_issue", side_effect=_get_issue):
+            result = CliRunner().invoke(
+                main, ["milestone", "gate-c", "coord-tui", "100", "--config", str(p)]
+            )
+        assert result.exit_code == 1
+        assert "no route matched" in result.output
+        assert "--for-path" in result.output
+
+    def test_routed_driver_substitutes_ms_from_milestone_number(
+        self, tmp_path: Path, coord_db, monkeypatch,
+    ) -> None:
+        """#1125 review finding 2: gate-c already knows the milestone number
+        directly (no manifest lookup needed) — `{ms}` must be substituted
+        from it once --for-path resolves the route."""
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        p = tmp_path / "coordinator.yml"
+        p.write_text(
+            "repos:\n  - name: coord-tui\n    github: acme/coord-tui\n"
+            "machines:\n  - name: laptop\n    host: laptop.tail\n"
+            "    repos: [coord-tui]\n    repo_paths:\n"
+            f"      coord-tui: {repo_dir}\n"
+            "acceptance:\n  drivers:\n    coord-tui:\n      routes:\n"
+            "        - match: 'coord/**'\n          kind: cli-pytest\n"
+            "          run: 'pytest tests/acceptance/{ms}'\n"
+        )
+
+        captured = {}
+
+        def fake_run_driver(kind, run_command, cwd, **kwargs):
+            captured["kind"] = kind
+            captured["ms"] = kwargs.get("ms")
+            from coord.acceptance_drivers import DriverResult
+            return DriverResult(exit_code=0, tests=[{"id": "ms01::a", "status": "pass"}])
+
+        monkeypatch.setattr("coord.acceptance_drivers.run_driver", fake_run_driver)
+
+        with patch("coord.github_ops.get_issue", side_effect=_get_issue), \
+             patch("coord.github_ops.get_open_issues", return_value=[]):
+            result = CliRunner().invoke(main, [
+                "milestone", "gate-c", "coord-tui", "100",
+                "--for-path", "coord/acceptance.py", "--config", str(p),
+            ])
+        assert result.exit_code == 0, result.output
+        assert captured["kind"] == "cli-pytest"
+        assert captured["ms"] == "ms-9"  # milestone number from _get_issue's default
+
     def test_full_suite_green_reports_gate_c_green_and_rollup(self, tmp_path: Path, coord_db) -> None:
         repo_dir = tmp_path / "repo"
         repo_dir.mkdir()

@@ -36,6 +36,7 @@ from coord.acceptance import (
     dump_manifest_error_hint,
     failure_summary,
     load_manifest,
+    ms_dir_for_issue,
     test_ids_for_issue,
 )
 from coord.acceptance_drivers import DriverError, run_driver
@@ -55,14 +56,33 @@ def acceptance_group() -> None:
     """
 
 
-def _resolve_driver(cfg, repo: str):
-    driver_cfg = cfg.acceptance.driver_for(repo)
+def _resolve_driver(cfg, repo: str, route_path: str | None = None):
+    """Resolve *repo*'s acceptance driver, exit(1) with a clear message when
+    none resolves.
+
+    *route_path* (#1125, repo-root-relative — e.g. ``"coord/foo.py"``)
+    selects a route when the repo's driver is routed
+    (``acceptance.drivers.<repo>.routes``); it's ignored for a flat
+    (unrouted) driver. When the repo IS routed but *route_path* doesn't
+    resolve to a route (including ``None``), the error names the missing
+    ``--for-path`` rather than the generic "not configured at all" message,
+    since those are different operator mistakes.
+    """
+    driver_cfg = cfg.acceptance.driver_for(repo, route_path)
     if driver_cfg is None:
-        click.echo(
-            f"error: no acceptance driver configured for repo {repo!r} "
-            "(add it under acceptance.drivers in coordinator.yml)",
-            err=True,
-        )
+        if cfg.acceptance.has_driver(repo):
+            click.echo(
+                f"error: repo {repo!r} has a routed acceptance driver "
+                "(acceptance.drivers routes) but no route matched — pass "
+                "--for-path to select the subtree (e.g. 'coord/**')",
+                err=True,
+            )
+        else:
+            click.echo(
+                f"error: no acceptance driver configured for repo {repo!r} "
+                "(add it under acceptance.drivers in coordinator.yml)",
+                err=True,
+            )
         sys.exit(1)
     return driver_cfg
 
@@ -121,12 +141,22 @@ def _scoped_verdict(tests: list[dict], acceptance_root: Path, issue_number: int)
     "--path", "path_opt", type=click.Path(file_okay=False), default=None,
     help="Repo checkout to run the driver in (default: current directory).",
 )
+@click.option(
+    "--for-path", "route_path", default=None,
+    help=(
+        "Repo-relative path (e.g. 'coord/foo.py') used to resolve a "
+        "routed acceptance driver (acceptance.drivers.<repo>.routes) — "
+        "required when the repo's driver is routed; unused/ignored for a "
+        "flat (unrouted) driver. NOT the same as --path (the checkout dir)."
+    ),
+)
 @_CONFIG_OPTION
 def acceptance_run(
     repo: str,
     issue_number: int | None,
     run_all: bool,
     path_opt: str | None,
+    route_path: str | None,
     config_path: Path,
 ) -> None:
     """Run REPO's sealed acceptance suite and print a structured verdict.
@@ -144,12 +174,25 @@ def acceptance_run(
         sys.exit(1)
 
     cfg = _load_config(config_path)
-    driver_cfg = _resolve_driver(cfg, repo)
+    driver_cfg = _resolve_driver(cfg, repo, route_path)
     _check_local_capability(driver_cfg, repo, cfg)
     cwd = Path(path_opt).expanduser() if path_opt else Path.cwd()
 
+    # #1125 review finding 2: resolve the `{ms}` template (e.g. a routed
+    # `run: "pytest tests/acceptance/{ms}"`) from the issue's manifest-mapped
+    # ms-NN dir *before* running, when scoped to one issue. Fails soft to
+    # `ms=None` on any manifest read hiccup (malformed YAML, not authored
+    # yet) — `_scoped_verdict` below still surfaces a clear error for that
+    # case; this must not turn into a crash on its own.
+    ms: str | None = None
+    if issue_number is not None:
+        try:
+            ms = ms_dir_for_issue(cwd / ACCEPTANCE_DIRNAME, issue_number)
+        except Exception:  # noqa: BLE001
+            ms = None
+
     try:
-        result = run_driver(driver_cfg.kind, driver_cfg.run, cwd=str(cwd))
+        result = run_driver(driver_cfg.kind, driver_cfg.run, cwd=str(cwd), ms=ms)
     except DriverError as e:
         click.echo(f"error: {e}", err=True)
         sys.exit(1)
@@ -245,12 +288,22 @@ def _acceptance_record_via_daemon(svc, params: dict) -> None:
     "--machine", "machine_override", default=None,
     help="Force a specific machine instead of auto-picking one.",
 )
+@click.option(
+    "--for-path", "route_path", default=None,
+    help=(
+        "Repo-relative path (e.g. 'coord/foo.py') used to resolve a "
+        "routed acceptance driver (acceptance.drivers.<repo>.routes) — "
+        "required when the repo's driver is routed; unused/ignored for a "
+        "flat (unrouted) driver."
+    ),
+)
 @_CONFIG_OPTION
 def acceptance_author(
     repo: str,
     tracking_issue: int,
     issue_number: int | None,
     machine_override: str | None,
+    route_path: str | None,
     config_path: Path,
 ) -> None:
     """Dispatch the independent test-author for REPO's milestone."""
@@ -264,6 +317,7 @@ def acceptance_author(
             cfg,
             issue_number=issue_number,
             machine_override=machine_override,
+            path=route_path,
         )
     except RuntimeError as e:
         click.echo(f"error: {e}", err=True)
@@ -283,11 +337,21 @@ def acceptance_author(
     "--sha", "sha", required=True,
     help="Commit SHA to check out and re-run the sealed suite against — the trust gate.",
 )
+@click.option(
+    "--for-path", "route_path", default=None,
+    help=(
+        "Repo-relative path (e.g. 'coord/foo.py') used to resolve a "
+        "routed acceptance driver (acceptance.drivers.<repo>.routes) — "
+        "required when the repo's driver is routed; unused/ignored for a "
+        "flat (unrouted) driver."
+    ),
+)
 @_CONFIG_OPTION
 def acceptance_record(
     repo: str,
     issue_number: int,
     sha: str,
+    route_path: str | None,
     config_path: Path,
 ) -> None:
     """Re-run REPO's issue-N acceptance slice externally against SHA and
@@ -308,20 +372,28 @@ def acceptance_record(
     svc = daemon_reroute_target("COORD_ACCEPTANCE_ON_DAEMON")
     if svc is not None:
         _acceptance_record_via_daemon(
-            svc, {"repo": repo, "issue": issue_number, "sha": sha},
+            svc,
+            {
+                "repo": repo, "issue": issue_number, "sha": sha,
+                "for_path": route_path,
+            },
         )
         return
 
-    _acceptance_record_local(repo, issue_number, sha, config_path)
+    _acceptance_record_local(repo, issue_number, sha, config_path, route_path)
 
 
 def _acceptance_record_local(
-    repo: str, issue_number: int, sha: str, config_path: Path,
+    repo: str,
+    issue_number: int,
+    sha: str,
+    config_path: Path,
+    route_path: str | None = None,
 ) -> None:
     from coord.test_orchestrator import find_local_repo_path  # noqa: PLC0415
 
     cfg = _load_config(config_path)
-    driver_cfg = _resolve_driver(cfg, repo)
+    driver_cfg = _resolve_driver(cfg, repo, route_path)
     _check_local_capability(driver_cfg, repo, cfg)
 
     repo_dir = find_local_repo_path(repo, cfg)
@@ -361,8 +433,17 @@ def _acceptance_record_local(
         )
         sys.exit(1)
 
+    # #1125 review finding 2: resolve `{ms}` from the issue's manifest-mapped
+    # ms-NN dir (the worktree just checked out at `sha`) before running —
+    # same fail-soft-to-None rationale as `acceptance_run` above.
+    ms: str | None = None
     try:
-        result = run_driver(driver_cfg.kind, driver_cfg.run, cwd=str(wt_path))
+        ms = ms_dir_for_issue(wt_path / ACCEPTANCE_DIRNAME, issue_number)
+    except Exception:  # noqa: BLE001
+        ms = None
+
+    try:
+        result = run_driver(driver_cfg.kind, driver_cfg.run, cwd=str(wt_path), ms=ms)
     except DriverError as e:
         click.echo(f"error: {e}", err=True)
         _remove_acceptance_worktree(repo_dir, wt_path)
@@ -566,9 +647,22 @@ def acceptance_stall(
     default=None,
     help="Override machine selection (default: first idle machine that lists the repo).",
 )
+@click.option(
+    "--for-path", "route_path", default=None,
+    help=(
+        "Repo-relative path (e.g. 'coord/foo.py') used to resolve a "
+        "routed acceptance driver (acceptance.drivers.<repo>.routes) — "
+        "required when the repo's driver is routed; unused/ignored for a "
+        "flat (unrouted) driver."
+    ),
+)
 @_CONFIG_OPTION
 def acceptance_mock_cmd(
-    repo: str, tracking_issue: int, machine: str | None, config_path: Path
+    repo: str,
+    tracking_issue: int,
+    machine: str | None,
+    route_path: str | None,
+    config_path: Path,
 ) -> None:
     cfg = _load_config(config_path)
     repo_entry = cfg.repo(repo)
@@ -584,6 +678,7 @@ def acceptance_mock_cmd(
             tracking_issue,
             cfg,
             machine_override=machine,
+            path=route_path,
         )
     except RuntimeError as exc:
         click.echo(f"error: {exc}", err=True)

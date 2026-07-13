@@ -1113,11 +1113,24 @@ def milestone_chat_cmd(
     "--path", "path_opt", type=click.Path(file_okay=False), default=None,
     help="Repo checkout to run the driver in (default: repo_paths in coordinator.yml).",
 )
+@click.option(
+    "--for-path", "route_path", default=None,
+    help=(
+        "Repo-relative path (e.g. 'coord/foo.py') used to resolve a "
+        "routed acceptance driver (acceptance.drivers.<repo>.routes) — "
+        "required when the repo's driver is routed; unused/ignored for a "
+        "flat (unrouted) driver. NOT the same as --path (the checkout dir)."
+    ),
+)
 @_CONFIG_OPTION
 def milestone_gate_c_cmd(
-    repo: str, tracking_issue: int, path_opt: str | None, config_path: Path
+    repo: str,
+    tracking_issue: int,
+    path_opt: str | None,
+    route_path: str | None,
+    config_path: Path,
 ) -> None:
-    from coord.acceptance import build_verdict
+    from coord.acceptance import build_verdict, ms_dirname
     from coord.acceptance_drivers import DriverError, run_driver
 
     cfg = _load_config(config_path)
@@ -1126,13 +1139,21 @@ def milestone_gate_c_cmd(
         click.echo(f"error: unknown repo {repo!r}", err=True)
         sys.exit(2)
 
-    driver_cfg = cfg.acceptance.driver_for(repo)
+    driver_cfg = cfg.acceptance.driver_for(repo, route_path)
     if driver_cfg is None:
-        click.echo(
-            f"error: no acceptance driver configured for repo {repo!r} "
-            "(add it under acceptance.drivers in coordinator.yml)",
-            err=True,
-        )
+        if cfg.acceptance.has_driver(repo):
+            click.echo(
+                f"error: repo {repo!r} has a routed acceptance driver "
+                "(acceptance.drivers routes) but no route matched — pass "
+                "--for-path to select the subtree (e.g. 'coord/**')",
+                err=True,
+            )
+        else:
+            click.echo(
+                f"error: no acceptance driver configured for repo {repo!r} "
+                "(add it under acceptance.drivers in coordinator.yml)",
+                err=True,
+            )
         sys.exit(1)
 
     if path_opt is not None:
@@ -1160,8 +1181,14 @@ def milestone_gate_c_cmd(
         f"Gate C for #{tracking_issue} (milestone #{ctx.milestone_number}) "
         f"— running the full accumulated acceptance suite in {repo_dir}..."
     )
+    # #1125 review finding 2: gate-c already knows the milestone number
+    # directly (no manifest lookup needed, unlike the per-issue `run`/
+    # `record` commands) — resolve `{ms}` from it so a routed
+    # `run: "pytest tests/acceptance/{ms}"` driver actually runs the right
+    # suite dir for Gate C's "full accumulated suite" semantics.
+    ms = ms_dirname(ctx.milestone_number)
     try:
-        result = run_driver(driver_cfg.kind, driver_cfg.run, cwd=str(repo_dir))
+        result = run_driver(driver_cfg.kind, driver_cfg.run, cwd=str(repo_dir), ms=ms)
     except DriverError as e:
         click.echo(f"error: {e}", err=True)
         sys.exit(1)

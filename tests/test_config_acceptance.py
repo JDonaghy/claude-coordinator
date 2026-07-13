@@ -373,3 +373,84 @@ acceptance:
     )
     with pytest.raises(ConfigError, match="routes must be a non-empty list"):
         load(p)
+
+
+# ── has_driver (#1125 review finding 1) ──────────────────────────────────────
+#
+# Path-independent "does this repo participate in the oracle loop at all"
+# predicate — Gate A / sealing / briefing-injection call sites must not
+# silently flip from "yes" to "no" the moment a repo's driver becomes routed.
+
+
+def test_has_driver_false_for_unconfigured_repo(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(BASE)
+    cfg = load(p)
+    assert cfg.acceptance.has_driver("coord-tui") is False
+
+
+def test_has_driver_true_for_flat_driver(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE
+        + """\
+acceptance:
+  drivers:
+    coord-tui:
+      kind: tui-tuidriver
+      run: "cargo test"
+"""
+    )
+    cfg = load(p)
+    assert cfg.acceptance.has_driver("coord-tui") is True
+
+
+def test_has_driver_true_for_routed_driver_with_no_path(tmp_path: Path) -> None:
+    # The whole point of #1125 review finding 1: driver_for(repo) with no
+    # path returns None for a routed repo (by design — it can't pick a
+    # route), but has_driver must still say True, since the repo plainly
+    # DOES participate in the oracle loop.
+    cfg = _routed_cfg(tmp_path)
+    assert cfg.acceptance.driver_for("claude-coordinator") is None
+    assert cfg.acceptance.has_driver("claude-coordinator") is True
+
+
+# ── double-config footgun (#1125 review finding 5) ───────────────────────────
+
+
+def test_acceptance_routes_and_flat_kind_raises(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE.replace("coord-tui", "claude-coordinator")
+        + """\
+acceptance:
+  drivers:
+    claude-coordinator:
+      kind: cli-pytest
+      routes:
+        - match: "coord/**"
+          kind: cli-pytest
+          run: "pytest tests/acceptance/{ms}"
+"""
+    )
+    with pytest.raises(ConfigError, match="sets both 'routes' and flat field"):
+        load(p)
+
+
+def test_acceptance_routes_and_flat_run_raises(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE.replace("coord-tui", "claude-coordinator")
+        + """\
+acceptance:
+  drivers:
+    claude-coordinator:
+      run: "pytest ."
+      routes:
+        - match: "coord/**"
+          kind: cli-pytest
+          run: "pytest tests/acceptance/{ms}"
+"""
+    )
+    with pytest.raises(ConfigError, match="sets both 'routes' and flat field"):
+        load(p)
