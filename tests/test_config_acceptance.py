@@ -177,3 +177,199 @@ acceptance:
     )
     with pytest.raises(ConfigError, match="capability must be a string"):
         load(p)
+
+
+# --- #1125: in-repo path routing -------------------------------------------
+
+ROUTED_CONFIG = """\
+acceptance:
+  drivers:
+    claude-coordinator:
+      routes:
+        - match: "coord/**"
+          kind: cli-pytest
+          run: "pytest tests/acceptance/{ms}"
+          mock: "*.out"
+          capability: python
+        - match: "tui/**"
+          kind: tui-tuidriver
+          run: "cargo test --test acceptance -- --format json"
+          mock: "*.screen"
+          capability: rust
+"""
+
+
+def _routed_cfg(tmp_path: Path):
+    p = tmp_path / "coordinator.yml"
+    p.write_text(BASE.replace("coord-tui", "claude-coordinator") + ROUTED_CONFIG)
+    return load(p)
+
+
+def test_driver_for_routes_python_path_to_cli_pytest(tmp_path: Path) -> None:
+    cfg = _routed_cfg(tmp_path)
+    driver = cfg.acceptance.driver_for("claude-coordinator", "coord/acceptance.py")
+    assert driver.kind == "cli-pytest"
+    assert driver.match == "coord/**"
+    assert driver.mock == "*.out"
+    assert driver.capability == "python"
+
+
+def test_driver_for_routes_rust_path_to_tui_tuidriver(tmp_path: Path) -> None:
+    cfg = _routed_cfg(tmp_path)
+    driver = cfg.acceptance.driver_for("claude-coordinator", "tui/src/app.rs")
+    assert driver.kind == "tui-tuidriver"
+    assert driver.match == "tui/**"
+    assert driver.mock == "*.screen"
+    assert driver.capability == "rust"
+
+
+def test_driver_for_routes_first_match_wins(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE.replace("coord-tui", "claude-coordinator")
+        + """\
+acceptance:
+  drivers:
+    claude-coordinator:
+      routes:
+        - match: "**"
+          kind: cli-pytest
+          run: "pytest ."
+        - match: "tui/**"
+          kind: tui-tuidriver
+          run: "cargo test"
+"""
+    )
+    cfg = load(p)
+    driver = cfg.acceptance.driver_for("claude-coordinator", "tui/src/app.rs")
+    # The catch-all "**" is listed first, so it wins even though "tui/**"
+    # would also match — first-match, not most-specific-match.
+    assert driver.kind == "cli-pytest"
+
+
+def test_driver_for_routes_no_match_returns_none(tmp_path: Path) -> None:
+    cfg = _routed_cfg(tmp_path)
+    assert cfg.acceptance.driver_for("claude-coordinator", "docs/README.md") is None
+
+
+def test_driver_for_routes_without_path_returns_none(tmp_path: Path) -> None:
+    cfg = _routed_cfg(tmp_path)
+    # No path given -> can't select a route; not a guess.
+    assert cfg.acceptance.driver_for("claude-coordinator") is None
+    assert cfg.acceptance.driver_for("claude-coordinator", None) is None
+
+
+def test_driver_for_no_routes_falls_back_to_flat_form_with_path(tmp_path: Path) -> None:
+    # Back-compat: an existing flat (non-routed) config ignores `path`
+    # entirely and returns its one driver, exactly like before #1125.
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE
+        + """\
+acceptance:
+  drivers:
+    coord-tui:
+      kind: tui-tuidriver
+      run: "cargo test --test acceptance -- --format json"
+"""
+    )
+    cfg = load(p)
+    driver = cfg.acceptance.driver_for("coord-tui", "anything/at/all.py")
+    assert driver.kind == "tui-tuidriver"
+
+
+def test_acceptance_routes_empty_list_raises(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE.replace("coord-tui", "claude-coordinator")
+        + """\
+acceptance:
+  drivers:
+    claude-coordinator:
+      routes: []
+"""
+    )
+    with pytest.raises(ConfigError, match="routes must be a non-empty list"):
+        load(p)
+
+
+def test_acceptance_route_missing_match_raises(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE.replace("coord-tui", "claude-coordinator")
+        + """\
+acceptance:
+  drivers:
+    claude-coordinator:
+      routes:
+        - kind: cli-pytest
+          run: "pytest ."
+"""
+    )
+    with pytest.raises(ConfigError, match=r"routes\[0\]\.match is required"):
+        load(p)
+
+
+def test_acceptance_route_missing_kind_raises(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE.replace("coord-tui", "claude-coordinator")
+        + """\
+acceptance:
+  drivers:
+    claude-coordinator:
+      routes:
+        - match: "coord/**"
+          run: "pytest ."
+"""
+    )
+    with pytest.raises(ConfigError, match=r"routes\[0\]\.kind is required"):
+        load(p)
+
+
+def test_acceptance_route_missing_run_raises(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE.replace("coord-tui", "claude-coordinator")
+        + """\
+acceptance:
+  drivers:
+    claude-coordinator:
+      routes:
+        - match: "coord/**"
+          kind: cli-pytest
+"""
+    )
+    with pytest.raises(ConfigError, match=r"routes\[0\]\.run is required"):
+        load(p)
+
+
+def test_acceptance_route_entry_not_a_mapping_raises(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE.replace("coord-tui", "claude-coordinator")
+        + """\
+acceptance:
+  drivers:
+    claude-coordinator:
+      routes:
+        - "not-a-mapping"
+"""
+    )
+    with pytest.raises(ConfigError, match=r"routes\[0\] must be a mapping"):
+        load(p)
+
+
+def test_acceptance_routes_not_a_list_raises(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE.replace("coord-tui", "claude-coordinator")
+        + """\
+acceptance:
+  drivers:
+    claude-coordinator:
+      routes: "not-a-list"
+"""
+    )
+    with pytest.raises(ConfigError, match="routes must be a non-empty list"):
+        load(p)

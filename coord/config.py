@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import os
 import re
 from dataclasses import dataclass, field
@@ -156,18 +157,33 @@ class SmokeTestsConfig:
 @dataclass
 class AcceptanceDriverConfig:
     """One entry under ``acceptance.drivers.<repo_name>`` in coordinator.yml
-    (#944, docs/ORACLE_LOOP.md).
+    (#944, docs/ORACLE_LOOP.md), OR one entry in that repo's ``routes:`` list
+    (#1125, in-repo path routing — see :class:`AcceptanceConfig.driver_for`).
 
     ``kind`` selects the framework-specific adapter that knows how to launch,
-    drive, and parse a repo's sealed acceptance suite (only ``tui-tuidriver``
-    is implemented; other kinds are declared here but rejected at run time by
-    :mod:`coord.acceptance_drivers` until their issues land). ``run`` is the
-    shell command that executes the suite and must print structured (JSON)
-    verdicts to stdout. ``mock`` is a glob (relative to the acceptance dir)
-    for the viewable mock/assertion fixtures — informational today, consumed
-    by the future mock-author (#930). ``capability`` is the machine
-    capability required to run this driver, intended to be routed the same
-    way ``smoke_tests.capability_rules`` routes smoke tests.
+    drive, and parse a repo's sealed acceptance suite (``tui-tuidriver`` and
+    ``cli-pytest`` are implemented; other kinds are declared here but
+    rejected at run time by :mod:`coord.acceptance_drivers` until their
+    issues land). ``run`` is the shell command that executes the suite and
+    must print structured (JSON) verdicts to stdout — it may reference the
+    ``{ms}`` template (substituted with the ``ms-NN`` milestone dirname by
+    :func:`coord.acceptance_drivers.render_run_command`) to point at a
+    milestone-scoped suite dir. ``mock`` is a glob (relative to the
+    acceptance dir) for the viewable mock/assertion fixtures — ``*.screen``
+    for ``tui-tuidriver``, ``*.out`` (expected CLI stdout) for
+    ``cli-pytest`` — informational today, consumed by the future mock-author
+    (#930). ``capability`` is the machine capability required to run this
+    driver, intended to be routed the same way ``smoke_tests.capability_rules``
+    routes smoke tests.
+
+    ``match`` and ``routes`` implement #1125's in-repo path routing: a repo
+    entry with a non-empty ``routes`` list is a *router* — its own
+    ``kind``/``run``/``mock``/``capability`` are unused and each element of
+    ``routes`` is itself an ``AcceptanceDriverConfig`` with ``match`` set (a
+    repo-root-relative glob, e.g. ``"coord/**"``). A route entry's own
+    ``routes`` is always empty — nesting one level is the whole feature, not
+    a recursive router. See :meth:`AcceptanceConfig.driver_for` for the
+    resolution rule.
 
     NOTE (#944 review): parsed and validated here, but not yet *consulted* —
     ``coord acceptance record``'s daemon-routed run (#944) always executes on
@@ -182,6 +198,8 @@ class AcceptanceDriverConfig:
     run: str = ""
     mock: str = ""
     capability: str = ""
+    match: str = ""
+    routes: list["AcceptanceDriverConfig"] = field(default_factory=list)
 
 
 @dataclass
@@ -190,8 +208,34 @@ class AcceptanceConfig:
 
     drivers: dict[str, AcceptanceDriverConfig] = field(default_factory=dict)
 
-    def driver_for(self, repo_name: str) -> AcceptanceDriverConfig | None:
-        return self.drivers.get(repo_name)
+    def driver_for(
+        self, repo_name: str, path: str | None = None,
+    ) -> AcceptanceDriverConfig | None:
+        """Resolve *repo_name*'s acceptance driver, optionally routed by
+        *path* (#1125, repo-root-relative — e.g. ``"coord/acceptance.py"``).
+
+        - Unknown repo -> ``None``.
+        - Repo entry has no ``routes`` (today's flat single-driver form,
+          back-compat) -> the entry itself, regardless of *path*.
+        - Repo entry has ``routes`` -> the **first** route whose ``match``
+          glob matches *path* (``fnmatch`` semantics, e.g. ``"coord/**"``
+          matches ``"coord/acceptance.py"``); first-match wins when more
+          than one route's glob matches. ``path=None`` against a routed
+          entry can't select a route, so it returns ``None`` rather than
+          guessing one — callers that know they're driving a specific file
+          (or an issue's manifest-mapped path) must pass it.
+        """
+        entry = self.drivers.get(repo_name)
+        if entry is None:
+            return None
+        if not entry.routes:
+            return entry
+        if path is None:
+            return None
+        for route in entry.routes:
+            if fnmatch.fnmatch(path, route.match):
+                return route
+        return None
 
 
 @dataclass
@@ -1014,6 +1058,13 @@ def _parse_acceptance(raw: Any) -> AcceptanceConfig:
         if not isinstance(entry, dict):
             raise ConfigError(f"acceptance.drivers[{repo_name!r}] must be a mapping")
 
+        routes_raw = entry.get("routes")
+        if routes_raw is not None:
+            drivers[repo_name] = AcceptanceDriverConfig(
+                routes=_parse_acceptance_routes(repo_name, routes_raw),
+            )
+            continue
+
         kind = entry.get("kind")
         if not kind or not isinstance(kind, str):
             raise ConfigError(f"acceptance.drivers[{repo_name!r}].kind is required")
@@ -1037,6 +1088,67 @@ def _parse_acceptance(raw: Any) -> AcceptanceConfig:
         )
 
     return AcceptanceConfig(drivers=drivers)
+
+
+def _parse_acceptance_routes(
+    repo_name: str, routes_raw: Any,
+) -> list[AcceptanceDriverConfig]:
+    """Parse ``acceptance.drivers.<repo_name>.routes`` (#1125) into a list of
+    ``AcceptanceDriverConfig`` route entries, each with ``match`` set.
+
+    Each element is validated the same way as a flat driver entry
+    (``kind``/``run`` required, ``mock``/``capability`` optional strings),
+    plus a required ``match`` glob.
+    """
+    if not isinstance(routes_raw, list) or not routes_raw:
+        raise ConfigError(
+            f"acceptance.drivers[{repo_name!r}].routes must be a non-empty list"
+        )
+
+    routes: list[AcceptanceDriverConfig] = []
+    for i, route_entry in enumerate(routes_raw):
+        if not isinstance(route_entry, dict):
+            raise ConfigError(
+                f"acceptance.drivers[{repo_name!r}].routes[{i}] must be a mapping"
+            )
+
+        match = route_entry.get("match")
+        if not match or not isinstance(match, str):
+            raise ConfigError(
+                f"acceptance.drivers[{repo_name!r}].routes[{i}].match is required"
+            )
+
+        kind = route_entry.get("kind")
+        if not kind or not isinstance(kind, str):
+            raise ConfigError(
+                f"acceptance.drivers[{repo_name!r}].routes[{i}].kind is required"
+            )
+
+        run = route_entry.get("run")
+        if not run or not isinstance(run, str):
+            raise ConfigError(
+                f"acceptance.drivers[{repo_name!r}].routes[{i}].run is required"
+            )
+
+        mock = route_entry.get("mock", "") or ""
+        if not isinstance(mock, str):
+            raise ConfigError(
+                f"acceptance.drivers[{repo_name!r}].routes[{i}].mock must be a string"
+            )
+
+        capability = route_entry.get("capability", "") or ""
+        if not isinstance(capability, str):
+            raise ConfigError(
+                f"acceptance.drivers[{repo_name!r}].routes[{i}].capability must be a string"
+            )
+
+        routes.append(
+            AcceptanceDriverConfig(
+                kind=kind, run=run, mock=mock, capability=capability, match=match,
+            )
+        )
+
+    return routes
 
 
 def _parse_models(raw: Any) -> ModelsConfig:
