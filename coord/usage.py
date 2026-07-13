@@ -271,6 +271,44 @@ def build_session_usage(
     return SessionUsage(started_at=started_at, assignments=assignments)
 
 
+# ── Rollup fetch (#1118) ──────────────────────────────────────────────────────
+
+
+def fetch_usage_rows(
+    *,
+    flag_url: str | None = None,
+    flag_token: str | None = None,
+    timeout: float = 5.0,
+) -> list[dict]:
+    """Fetch board assignment rows as plain dicts for :mod:`coord.usage_rollup`.
+
+    This is the thin *fetch* caller the pure aggregator's docstring promises:
+    it mirrors :func:`coord.board_service.read_board`'s local-vs-remote
+    branch, but returns raw wire-shape ``dict`` rows rather than
+    :class:`~coord.models.Assignment` instances — the aggregator consumes the
+    daemon ``/board`` ``assignments`` shape directly, including
+    ``is_interactive``, which is a real DB/wire column but (deliberately,
+    #748/#632 — see :mod:`coord.board_bool_guard`) not an ``Assignment``
+    dataclass field, so converting through ``Assignment`` would silently
+    drop it.
+
+    Remote reads the same ``/board`` endpoint ``coord status`` polls. Local
+    reads the sqlite DB directly via ``SqliteStore.list_assignments()``
+    rather than ``board_projection()["assignments"]`` — a usage rollup wants
+    full history, not the retention-capped set ``/board`` serves the TUI.
+    """
+    from coord.client import fetch_board_payload, resolve_board_service  # noqa: PLC0415
+
+    svc = resolve_board_service(flag_url, flag_token)
+    if svc is not None:
+        payload = fetch_board_payload(svc, timeout=timeout)
+        return list(payload.get("assignments") or [])
+
+    from coord.dao import SqliteStore  # noqa: PLC0415
+
+    return SqliteStore().list_assignments()
+
+
 # ── Formatting ────────────────────────────────────────────────────────────────
 
 
