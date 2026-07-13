@@ -15,9 +15,67 @@ from coord.comments import (
     format_failure,
 )
 from coord.config import Config
-from coord.models import Proposal
+from coord.models import Proposal, Repo
 
 AGENT_PORT = 7433
+
+
+def enforce_oracle_readiness(
+    *, proposal_type: str, repo: Repo | None, config: Config, issue_number: int,
+) -> None:
+    """#1138: hard-gate a ``type="work"`` dispatch on the issue-level oracle
+    gate (:func:`coord.milestone_dispatch.issue_oracle_ready`) — refuses an
+    issue that belongs to an oracle-opted-in milestone (Gate A already
+    satisfied) but has no JIT-authored acceptance slice yet, or whose repo
+    declares a driver ``kind`` this install doesn't implement.
+
+    Raises :class:`ValueError` on refusal — the same exception type every
+    existing dispatch-time check (missing ``repo_path``, the #437 TOS gate)
+    already raises, so callers get "refuse cleanly" for free via their
+    existing ``except ValueError`` handling (``coord approve``, ``coord
+    assign``, ``coord milestone dispatch``) with zero CLI-layer changes.
+
+    Cheap no-op — no network call — for every dispatch outside #1138's
+    scope: non-work proposal types (``plan``, ``review``, ``smoke``, ...),
+    an unknown repo, or a repo with no ``acceptance.drivers`` entry
+    configured (``has_driver`` is a local dict lookup). Shared by the
+    headless ``dispatch()`` POST below and the ``--interactive``
+    human-attended work launcher (``_dispatch_interactive_work``, which
+    never calls ``dispatch()``) so both flavours of Work dispatch are
+    covered, not just the unattended one.
+
+    Fails OPEN (proceeds, doesn't gate) if the issue itself can't be
+    fetched — mirroring the fail-soft posture the rest of the oracle-loop
+    machinery already uses (``oracle_loop_contract_block``, #945: "never let
+    a [...] read break dispatch"). By the time ``dispatch()`` runs, the
+    caller has already successfully fetched this same issue once (for its
+    title/briefing) moments earlier, so a failure here is a genuine
+    transient blip, not a sign the issue doesn't exist — treating it as a
+    hard stop would turn a GitHub hiccup into a fleet-wide outage for every
+    oracle-configured repo, which is a worse failure mode than the gap
+    #1138 closes.
+    """
+    if proposal_type != "work" or repo is None:
+        return
+    if not config.acceptance.has_driver(repo.name):
+        return
+
+    from coord import github_ops  # noqa: PLC0415
+    from coord.milestone_dispatch import issue_oracle_ready  # noqa: PLC0415
+
+    try:
+        issue_data = github_ops.get_issue(repo.github, issue_number)
+    except RuntimeError:
+        return
+
+    milestone_number = (issue_data.get("milestone") or {}).get("number")
+    issue_labels = [lbl.get("name", "") for lbl in (issue_data.get("labels") or [])]
+
+    readiness = issue_oracle_ready(
+        repo, config, milestone_number, issue_number, issue_labels,
+    )
+    if readiness.reason is not None:
+        raise ValueError(readiness.reason)
 
 
 def dispatch(
@@ -47,6 +105,17 @@ def dispatch(
 
     # Resolve deny-list from the repo's worker_permissions config.
     repo = config.repo(proposal.repo_name)
+
+    # #1138: STRUCTURAL ORACLE-LOOP GATE — refuse a `type="work"` dispatch
+    # for an issue inside an oracle-opted-in milestone (Gate A satisfied)
+    # that has no JIT-authored acceptance slice yet, or whose repo declares
+    # a driver kind this install doesn't implement. Placed early / before
+    # the TOS gate below so a refusal never depends on provider resolution
+    # succeeding first.
+    enforce_oracle_readiness(
+        proposal_type=proposal.type, repo=repo, config=config,
+        issue_number=proposal.issue_number,
+    )
 
     # #437: STRUCTURAL TOS-COMPLIANCE GATE — refuse to route an
     # unattended dispatch through a provider whose capabilities mark it

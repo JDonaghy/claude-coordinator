@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from coord.acceptance import (
+    ManifestData,
     ManifestError,
     acceptance_capability_gap,
     build_verdict,
@@ -16,6 +17,7 @@ from coord.acceptance import (
     load_manifest,
     ms_dir_for_issue,
     oracle_loop_contract_block,
+    parse_manifest_text,
 )
 # Aliased on import: pytest treats any module-level `test_*` name as a
 # collectible test function, and `test_ids_for_issue` takes required
@@ -164,6 +166,38 @@ class TestMsDirForIssue:
         (root / "ms01" / "manifest.yml").write_text("tests: [not, a, mapping\n")
         with pytest.raises(ManifestError):
             ms_dir_for_issue(root, 945)
+
+
+class TestParseManifestText:
+    """#1138: parse_manifest_text is the shared parser behind both
+    _parse_manifest_file (local disk) and the dispatch-time GitHub-fetch
+    reader in coord.milestone_dispatch — exercise its ManifestData.exempt
+    output directly rather than only through _parse_manifest_file's
+    tests-only view."""
+
+    def test_no_exempt_key_is_empty_frozenset(self) -> None:
+        data = parse_manifest_text("tests:\n  a: 944\n")
+        assert data == ManifestData(tests={"a": 944}, exempt=frozenset())
+
+    def test_exempt_list_parsed(self) -> None:
+        data = parse_manifest_text("tests:\n  a: 944\nexempt: [1125, 1130]\n")
+        assert data.exempt == frozenset({1125, 1130})
+        assert data.tests == {"a": 944}
+
+    def test_non_list_exempt_ignored(self) -> None:
+        data = parse_manifest_text("exempt: 1125\n")
+        assert data.exempt == frozenset()
+
+    def test_empty_text_returns_empty_data(self) -> None:
+        assert parse_manifest_text("") == ManifestData()
+
+    def test_malformed_yaml_raises_manifest_error(self) -> None:
+        with pytest.raises(ManifestError):
+            parse_manifest_text("tests: [not, a, mapping\n")
+
+    def test_non_mapping_raises(self) -> None:
+        with pytest.raises(ManifestError, match="must be a mapping"):
+            parse_manifest_text("- a\n- b\n")
 
 
 class TestOracleLoopContractBlock:

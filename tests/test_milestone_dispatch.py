@@ -24,6 +24,7 @@ from coord.milestone_dispatch import (
     fetch_milestone_context,
     gate_a_status,
     is_milestone_complete,
+    issue_oracle_ready,
     pick_machine,
     plan_dispatch,
 )
@@ -272,6 +273,220 @@ class TestGateAStatus:
         with patch("coord.github_ops.get_repo_file", return_value="contract body"):
             reason = gate_a_status(repo, cfg, 9)
         assert reason is None
+
+
+# ── issue_oracle_ready (#1138, docs/ORACLE_LOOP.md issue-level gate) ─────────
+
+
+def _oracle_cfg(*, kind: str = "cli-pytest", routes: list | None = None) -> Config:
+    from coord.config import AcceptanceConfig, AcceptanceDriverConfig
+
+    if routes is not None:
+        entry = AcceptanceDriverConfig(routes=routes)
+    else:
+        entry = AcceptanceDriverConfig(kind=kind, run="pytest")
+    return Config(
+        repos=[Repo(name="api", github="acme/api", default_branch="main")],
+        machines=[_machine("laptop", ["api"])],
+        acceptance=AcceptanceConfig(drivers={"api": entry}),
+    )
+
+
+def _manifest_fetch(mapping: dict[str, str | None]):
+    """Build a ManifestFetch stub: {path: content_or_None}. Any path not in
+    *mapping* returns None (file doesn't exist), matching the real
+    GitHub-fetch semantics."""
+
+    def _fetch(repo_github: str, path: str, branch: str) -> str | None:
+        return mapping.get(path)
+
+    return _fetch
+
+
+class TestIssueOracleReady:
+    def test_not_applicable_when_no_milestone(self) -> None:
+        cfg = _oracle_cfg()
+        repo = cfg.repo("api")
+        readiness = issue_oracle_ready(
+            repo, cfg, None, 1118, file_exists=lambda *a: True,
+        )
+        assert readiness.applies is False
+        assert readiness.reason is None
+
+    def test_not_applicable_when_no_driver_configured(self) -> None:
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[_machine("laptop", ["api"])],
+        )
+        repo = cfg.repo("api")
+        readiness = issue_oracle_ready(
+            repo, cfg, 37, 1118, file_exists=lambda *a: True,
+        )
+        assert readiness.applies is False
+        assert readiness.reason is None
+
+    def test_not_applicable_when_gate_a_not_satisfied(self) -> None:
+        """Gate A itself (contract.md missing) is a separate, already-
+        surfaced refusal — issue_oracle_ready must not double-block with a
+        confusing "no slice" message before the contract even exists."""
+        cfg = _oracle_cfg()
+        repo = cfg.repo("api")
+        readiness = issue_oracle_ready(
+            repo, cfg, 37, 1118, file_exists=lambda *a: False,
+        )
+        assert readiness.applies is False
+        assert readiness.reason is None
+
+    def test_blocked_when_no_slice_authored(self) -> None:
+        cfg = _oracle_cfg()
+        repo = cfg.repo("api")
+        fetch = _manifest_fetch({})  # no manifest at all
+        readiness = issue_oracle_ready(
+            repo, cfg, 37, 1118,
+            file_exists=lambda *a: True, fetch_manifest=fetch,
+        )
+        assert readiness.applies is True
+        assert readiness.has_slice is False
+        assert readiness.reason is not None
+        assert "#1118" in readiness.reason
+        assert "ms-37" in readiness.reason
+        assert "coord acceptance author api <tracking_issue> --issue 1118" in readiness.reason
+
+    def test_ok_when_slice_authored_and_kind_supported(self) -> None:
+        cfg = _oracle_cfg(kind="cli-pytest")
+        repo = cfg.repo("api")
+        fetch = _manifest_fetch({
+            "tests/acceptance/ms-37/manifest.yml": "tests:\n  ms37::a: 1118\n",
+        })
+        readiness = issue_oracle_ready(
+            repo, cfg, 37, 1118,
+            file_exists=lambda *a: True, fetch_manifest=fetch,
+        )
+        assert readiness.applies is True
+        assert readiness.has_slice is True
+        assert readiness.unsupported_kinds == ()
+        assert readiness.reason is None
+
+    def test_slice_mapped_to_different_issue_is_no_slice(self) -> None:
+        cfg = _oracle_cfg()
+        repo = cfg.repo("api")
+        fetch = _manifest_fetch({
+            "tests/acceptance/ms-37/manifest.yml": "tests:\n  ms37::a: 999\n",
+        })
+        readiness = issue_oracle_ready(
+            repo, cfg, 37, 1118,
+            file_exists=lambda *a: True, fetch_manifest=fetch,
+        )
+        assert readiness.has_slice is False
+        assert readiness.reason is not None
+
+    def test_exempt_via_manifest_list_bypasses_no_slice(self) -> None:
+        cfg = _oracle_cfg()
+        repo = cfg.repo("api")
+        fetch = _manifest_fetch({
+            "tests/acceptance/ms-37/manifest.yml": "exempt: [1118]\n",
+        })
+        readiness = issue_oracle_ready(
+            repo, cfg, 37, 1118,
+            file_exists=lambda *a: True, fetch_manifest=fetch,
+        )
+        assert readiness.applies is True
+        assert readiness.exempt is True
+        assert readiness.reason is None
+
+    def test_exempt_via_label_bypasses_no_slice(self) -> None:
+        cfg = _oracle_cfg()
+        repo = cfg.repo("api")
+        fetch = _manifest_fetch({})
+        readiness = issue_oracle_ready(
+            repo, cfg, 37, 1118, ["oracle:exempt"],
+            file_exists=lambda *a: True, fetch_manifest=fetch,
+        )
+        assert readiness.exempt is True
+        assert readiness.reason is None
+
+    def test_blocked_when_driver_kind_unsupported(self) -> None:
+        cfg = _oracle_cfg(kind="web-playwright")
+        repo = cfg.repo("api")
+        fetch = _manifest_fetch({
+            "tests/acceptance/ms-37/manifest.yml": "tests:\n  ms37::a: 1118\n",
+        })
+        readiness = issue_oracle_ready(
+            repo, cfg, 37, 1118,
+            file_exists=lambda *a: True, fetch_manifest=fetch,
+        )
+        assert readiness.has_slice is True
+        assert readiness.unsupported_kinds == ("web-playwright",)
+        assert readiness.reason is not None
+        assert "web-playwright" in readiness.reason
+
+    def test_exempt_bypasses_unsupported_kind_check(self) -> None:
+        cfg = _oracle_cfg(kind="web-playwright")
+        repo = cfg.repo("api")
+        fetch = _manifest_fetch({
+            "tests/acceptance/ms-37/manifest.yml": "exempt: [1118]\n",
+        })
+        readiness = issue_oracle_ready(
+            repo, cfg, 37, 1118,
+            file_exists=lambda *a: True, fetch_manifest=fetch,
+        )
+        assert readiness.exempt is True
+        assert readiness.reason is None
+
+    def test_routed_driver_checks_every_route_kind(self) -> None:
+        from coord.config import AcceptanceDriverConfig
+
+        cfg = _oracle_cfg(routes=[
+            AcceptanceDriverConfig(match="coord/**", kind="cli-pytest", run="pytest"),
+            AcceptanceDriverConfig(match="tui/**", kind="tui-tuidriver", run="cargo test"),
+        ])
+        repo = cfg.repo("api")
+        fetch = _manifest_fetch({
+            "tests/acceptance/ms-37/manifest.yml": "tests:\n  ms37::a: 1118\n",
+        })
+        readiness = issue_oracle_ready(
+            repo, cfg, 37, 1118,
+            file_exists=lambda *a: True, fetch_manifest=fetch,
+        )
+        assert readiness.unsupported_kinds == ()
+        assert readiness.reason is None
+
+    def test_fetch_manifest_tries_yml_yaml_json_in_order(self) -> None:
+        cfg = _oracle_cfg()
+        repo = cfg.repo("api")
+        calls: list[str] = []
+
+        def _fetch(repo_github: str, path: str, branch: str) -> str | None:
+            calls.append(path)
+            if path.endswith(".json"):
+                return '{"tests": {"a": 1118}}'
+            return None
+
+        readiness = issue_oracle_ready(
+            repo, cfg, 37, 1118,
+            file_exists=lambda *a: True, fetch_manifest=_fetch,
+        )
+        assert calls == [
+            "tests/acceptance/ms-37/manifest.yml",
+            "tests/acceptance/ms-37/manifest.yaml",
+            "tests/acceptance/ms-37/manifest.json",
+        ]
+        assert readiness.has_slice is True
+
+    def test_default_fetch_manifest_uses_github_ops(self) -> None:
+        cfg = _oracle_cfg()
+        repo = cfg.repo("api")
+        with patch(
+            "coord.github_ops.get_repo_file",
+            return_value="tests:\n  ms37::a: 1118\n",
+        ) as mock_fetch:
+            readiness = issue_oracle_ready(
+                repo, cfg, 37, 1118, file_exists=lambda *a: True,
+            )
+        assert readiness.has_slice is True
+        mock_fetch.assert_any_call(
+            "acme/api", "tests/acceptance/ms-37/manifest.yml", branch="main",
+        )
 
 
 # ── fetch_milestone_context ──────────────────────────────────────────────────

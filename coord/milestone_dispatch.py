@@ -29,7 +29,7 @@ Three call sites share this module:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Iterable
 
 import httpx
 
@@ -45,7 +45,7 @@ from coord.milestone_order import (
 from coord.models import Assignment, Board, Machine, Proposal, Repo
 
 if TYPE_CHECKING:
-    from coord.config import Config
+    from coord.config import AcceptanceDriverConfig, Config
 
 __all__ = [
     "MilestoneDispatchError",
@@ -53,6 +53,9 @@ __all__ = [
     "fetch_milestone_context",
     "GateAFileExists",
     "gate_a_status",
+    "ManifestFetch",
+    "OracleReadiness",
+    "issue_oracle_ready",
     "pick_machine",
     "MachinePick",
     "NoMachineAvailable",
@@ -213,6 +216,166 @@ def gate_a_status(
         f"{repo_cfg.default_branch!r}. Run `coord acceptance mock {repo_cfg.name} "
         "<tracking_issue>` (docs/ORACLE_LOOP.md) to render the mock + write "
         "the contract before dispatching this milestone's issues."
+    )
+
+
+# (repo_github, path, branch) -> file content, or None if it doesn't exist.
+# Injected so tests never hit `gh` — mirrors GateAFileExists above.
+ManifestFetch = Callable[[str, str, str], "str | None"]
+
+
+def _default_fetch_repo_file(repo_github: str, path: str, branch: str) -> str | None:
+    from coord import github_ops  # noqa: PLC0415
+
+    try:
+        return github_ops.get_repo_file(repo_github, path, branch=branch)
+    except RuntimeError:
+        return None
+
+
+def _fetch_manifest_data(
+    repo_github: str, milestone_number: int, branch: str, fetch: ManifestFetch,
+):
+    from coord.acceptance import (  # noqa: PLC0415
+        ACCEPTANCE_DIRNAME,
+        ManifestData,
+        ManifestError,
+        ms_dirname,
+        parse_manifest_text,
+    )
+
+    ms_dir = ms_dirname(milestone_number)
+    for ext in (".yml", ".yaml", ".json"):
+        path = f"{ACCEPTANCE_DIRNAME}/{ms_dir}/manifest{ext}"
+        content = fetch(repo_github, path, branch)
+        if content is None:
+            continue
+        try:
+            return parse_manifest_text(content, source=path)
+        except ManifestError:
+            # Malformed manifest degrades to "no slice authored" rather
+            # than crashing dispatch — same fail-soft posture as
+            # oracle_loop_contract_block (#945).
+            return ManifestData()
+    return ManifestData()
+
+
+def _unsupported_driver_kinds(entry: "AcceptanceDriverConfig") -> tuple[str, ...]:
+    """Every driver ``kind`` *entry* declares (its own flat ``kind``, or —
+    for a routed entry (#1125) — every ``routes[].kind``) that isn't in
+    :data:`coord.acceptance_drivers.SUPPORTED_KINDS` yet.
+
+    This is the "live check against the currently-installed coord package"
+    #1138 asks for: a repo can declare a driver kind in ``coordinator.yml``
+    ahead of the code that implements it (exactly what happened with
+    ``cli-pytest``/#1125 landing 48 minutes after v0.4.68 shipped) and
+    nothing previously noticed before dispatching an issue into it.
+    """
+    from coord.acceptance_drivers import SUPPORTED_KINDS  # noqa: PLC0415
+
+    kinds = {route.kind for route in entry.routes} if entry.routes else {entry.kind}
+    return tuple(sorted(k for k in kinds if k and k not in SUPPORTED_KINDS))
+
+
+@dataclass(frozen=True)
+class OracleReadiness:
+    """Issue-level oracle-loop dispatch readiness (#1138), layered on top of
+    the milestone-level :func:`gate_a_status`.
+
+    ``applies`` is ``False`` — a no-op, dispatch proceeds exactly as before
+    #1138 — for every issue outside this gate's scope: no milestone, no
+    ``acceptance.drivers`` entry configured for the repo, or Gate A itself
+    not yet satisfied for this milestone (that's a distinct, already-
+    surfaced refusal — see :func:`gate_a_status` — firing a confusing
+    "no slice yet" message before the contract even exists would be worse,
+    not better). When ``applies`` is ``True``, ``reason`` is ``None`` iff
+    dispatch may proceed: either the issue is ``exempt``, or it has an
+    authored slice (``has_slice``) AND every driver kind its repo declares
+    is implemented by this install (``unsupported_kinds`` empty).
+    """
+
+    applies: bool = False
+    exempt: bool = False
+    has_slice: bool = False
+    unsupported_kinds: tuple[str, ...] = ()
+    reason: str | None = None
+
+
+def issue_oracle_ready(
+    repo_cfg: Repo,
+    config: "Config",
+    milestone_number: int | None,
+    issue_number: int,
+    issue_labels: Iterable[str] = (),
+    *,
+    file_exists: GateAFileExists | None = None,
+    fetch_manifest: ManifestFetch | None = None,
+) -> OracleReadiness:
+    """The #1138 hard gate: refuse Work dispatch for an issue that belongs
+    to an oracle-opted-in milestone (Gate A satisfied — ``contract.md``
+    exists) but has no JIT-authored acceptance slice yet, or whose repo
+    declares an acceptance driver ``kind`` this ``coord`` install doesn't
+    implement — the exact gap that let #1118 dispatch and merge through the
+    ordinary Work→Test→Review→Merge pipeline despite ms-37's Gate A already
+    being satisfied (2026-07-13 incident, see #1138).
+
+    Scenarios (b) non-opted-in milestones/epics and (c) plain issues with no
+    milestone are unaffected: this only activates when
+    ``tests/acceptance/ms-N/contract.md`` exists for *issue_number*'s
+    milestone — the same signal :func:`gate_a_status` checks, no new config
+    surface. An issue may opt out of the sealed suite (e.g. it builds the
+    driver rather than consuming it, like #1125) via an explicit
+    ``exempt:`` list in the milestone's manifest or an ``oracle:exempt``
+    label — a declared, reviewable decision rather than tribal knowledge.
+    """
+    if milestone_number is None or not config.acceptance.has_driver(repo_cfg.name):
+        return OracleReadiness()
+
+    if gate_a_status(repo_cfg, config, milestone_number, file_exists=file_exists) is not None:
+        return OracleReadiness()
+
+    from coord.acceptance import test_ids_for_issue  # noqa: PLC0415
+    from coord.acceptance_drivers import SUPPORTED_KINDS  # noqa: PLC0415
+
+    fetch = fetch_manifest or _default_fetch_repo_file
+    manifest = _fetch_manifest_data(
+        repo_cfg.github, milestone_number, repo_cfg.default_branch, fetch,
+    )
+    has_slice = bool(test_ids_for_issue(manifest.tests, issue_number))
+    exempt = issue_number in manifest.exempt or "oracle:exempt" in set(issue_labels)
+
+    entry = config.acceptance.drivers.get(repo_cfg.name)
+    unsupported = _unsupported_driver_kinds(entry) if entry is not None else ()
+
+    if exempt:
+        return OracleReadiness(
+            applies=True, exempt=True, has_slice=has_slice,
+            unsupported_kinds=unsupported,
+        )
+
+    reason: str | None = None
+    if not has_slice:
+        reason = (
+            f"Issue #{issue_number} is part of oracle-opted-in milestone "
+            f"ms-{milestone_number} (Gate A satisfied) but has no acceptance "
+            "slice yet — run `coord acceptance author "
+            f"{repo_cfg.name} <tracking_issue> --issue {issue_number}` first. "
+            "Already covered by its own unit tests instead (e.g. it builds "
+            f"the driver rather than consuming it)? Add {issue_number} to "
+            f"tests/acceptance/ms-{milestone_number}/manifest.yml's `exempt:` "
+            "list, or label the issue `oracle:exempt`."
+        )
+    elif unsupported:
+        reason = (
+            f"Issue #{issue_number}'s repo {repo_cfg.name!r} declares "
+            f"acceptance driver kind(s) {', '.join(unsupported)} that this "
+            f"coord install doesn't implement yet (supported: "
+            f"{', '.join(SUPPORTED_KINDS)}) — update coord "
+            "(`coord agent update`) before dispatching."
+        )
+    return OracleReadiness(
+        applies=True, exempt=False, has_slice=has_slice,
+        unsupported_kinds=unsupported, reason=reason,
     )
 
 

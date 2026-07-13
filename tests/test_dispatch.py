@@ -7,8 +7,14 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-from coord.config import Config, ProviderDef, ProvidersConfig
-from coord.dispatch import dispatch, post_briefing
+from coord.config import (
+    AcceptanceConfig,
+    AcceptanceDriverConfig,
+    Config,
+    ProviderDef,
+    ProvidersConfig,
+)
+from coord.dispatch import dispatch, enforce_oracle_readiness, post_briefing
 from coord.models import Machine, Proposal, Repo
 
 
@@ -489,6 +495,150 @@ class TestDispatch:
         )
         with pytest.raises(ValueError, match="repo_path"):
             dispatch(p, cfg)
+
+
+class TestOracleReadinessGate:
+    """#1138: `dispatch()` hard-gates a `type="work"` dispatch on the
+    issue-level oracle gate (`coord.milestone_dispatch.issue_oracle_ready`)
+    for issues in an oracle-opted-in milestone (Gate A satisfied) with no
+    authored acceptance slice yet — the exact gap that let #1118 slip
+    through the ordinary pipeline despite ms-37's Gate A being satisfied."""
+
+    def _cfg(self, *, kind: str = "cli-pytest") -> Config:
+        return Config(
+            repos=[Repo(name="api", github="acme/api", default_branch="main")],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+            )],
+            acceptance=AcceptanceConfig(
+                drivers={"api": AcceptanceDriverConfig(kind=kind, run="pytest")}
+            ),
+        )
+
+    @patch("coord.dispatch.httpx.post")
+    @patch("coord.github_ops.get_repo_file")
+    @patch("coord.github_ops.get_issue")
+    def test_refuses_work_dispatch_with_no_slice(
+        self, mock_get_issue, mock_get_repo_file, mock_post,
+    ) -> None:
+        cfg = self._cfg()
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=1118, issue_title="Usage Core",
+            rationale="", type="work",
+        )
+        mock_get_issue.return_value = {"milestone": {"number": 37}, "labels": []}
+        # contract.md exists (Gate A satisfied); no manifest -> no slice.
+        mock_get_repo_file.side_effect = lambda repo, path, branch=None: (
+            "contract body" if path.endswith("contract.md") else (_ for _ in ()).throw(RuntimeError("404"))
+        )
+
+        with pytest.raises(ValueError, match="no acceptance slice yet"):
+            dispatch(p, cfg)
+        mock_post.assert_not_called()
+
+    @patch("coord.dispatch.httpx.post")
+    @patch("coord.github_ops.get_repo_file")
+    @patch("coord.github_ops.get_issue")
+    def test_dispatches_when_slice_authored(
+        self, mock_get_issue, mock_get_repo_file, mock_post,
+    ) -> None:
+        cfg = self._cfg()
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=1118, issue_title="Usage Core",
+            rationale="", type="work",
+        )
+        mock_get_issue.return_value = {"milestone": {"number": 37}, "labels": []}
+
+        def _repo_file(repo, path, branch=None):
+            if path.endswith("contract.md"):
+                return "contract body"
+            if path.endswith("manifest.yml"):
+                return "tests:\n  ms37::a: 1118\n"
+            raise RuntimeError("404")
+
+        mock_get_repo_file.side_effect = _repo_file
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        result = dispatch(p, cfg)
+        assert result["ok"] is True
+        mock_post.assert_called_once()
+
+    @patch("coord.dispatch.httpx.post")
+    @patch("coord.github_ops.get_repo_file")
+    @patch("coord.github_ops.get_issue")
+    def test_no_gate_when_repo_has_no_acceptance_driver(
+        self, mock_get_issue, mock_get_repo_file, mock_post, config, proposal,
+    ) -> None:
+        """Scenario (b)/(c): repos with no acceptance.drivers entry dispatch
+        exactly as before #1138 — no extra GitHub calls, no refusal."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        dispatch(proposal, config)
+        mock_post.assert_called_once()
+        mock_get_issue.assert_not_called()
+
+    @patch("coord.dispatch.httpx.post")
+    @patch("coord.github_ops.get_repo_file")
+    @patch("coord.github_ops.get_issue")
+    def test_no_gate_for_plan_type(
+        self, mock_get_issue, mock_get_repo_file, mock_post,
+    ) -> None:
+        """Read-only plan-only dispatches aren't gated — only `type="work"`
+        creates code-writing sessions the gate exists to guard."""
+        cfg = self._cfg()
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=1118, issue_title="Usage Core",
+            rationale="", type="plan",
+        )
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        dispatch(p, cfg)
+        mock_post.assert_called_once()
+        mock_get_issue.assert_not_called()
+
+    @patch("coord.dispatch.httpx.post")
+    @patch("coord.github_ops.get_repo_file")
+    @patch("coord.github_ops.get_issue")
+    def test_exempt_label_allows_dispatch_with_no_slice(
+        self, mock_get_issue, mock_get_repo_file, mock_post,
+    ) -> None:
+        cfg = self._cfg()
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=1125, issue_title="test-author driver",
+            rationale="", type="work",
+        )
+        mock_get_issue.return_value = {
+            "milestone": {"number": 37}, "labels": [{"name": "oracle:exempt"}],
+        }
+        mock_get_repo_file.side_effect = lambda repo, path, branch=None: (
+            "contract body" if path.endswith("contract.md") else (_ for _ in ()).throw(RuntimeError("404"))
+        )
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        dispatch(p, cfg)
+        mock_post.assert_called_once()
+
+    def test_enforce_oracle_readiness_direct_no_op_for_review_type(self) -> None:
+        cfg = self._cfg()
+        repo = cfg.repo("api")
+        # No mocking needed — "review" isn't "work", so this must short
+        # circuit before any GitHub call.
+        enforce_oracle_readiness(
+            proposal_type="review", repo=repo, config=cfg, issue_number=1,
+        )
 
 
 class TestPostBriefing:

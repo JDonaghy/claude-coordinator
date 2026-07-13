@@ -3752,6 +3752,22 @@ def _dispatch_interactive_work(
             )
             sys.exit(1)
 
+    # #1138: the oracle-loop issue-level gate applies to --interactive work
+    # dispatch too, not just headless — a human at the keyboard can miss the
+    # same gap a `claude -p` worker would. Deliberately NOT bypassed by
+    # --force (that flag is documented as an infra-retry/claim escape hatch,
+    # not a way around the acceptance-authoring requirement).
+    from coord.dispatch import enforce_oracle_readiness  # noqa: PLC0415
+
+    try:
+        enforce_oracle_readiness(
+            proposal_type="plan" if effective_plan_only else "work",
+            repo=repo_cfg, config=cfg, issue_number=issue,
+        )
+    except ValueError as e:
+        click.echo(f"  skipping: {e}", err=True)
+        sys.exit(1)
+
     from coord.agent import AssignmentSpec  # noqa: PLC0415
     from coord.models import Proposal  # noqa: PLC0415
 
