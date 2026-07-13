@@ -199,6 +199,114 @@ def test_rollup_by_stage_matches_contract_mock4() -> None:
     assert result.total.duration_secs == pytest.approx(2700.0)
 
 
+# ── Grouping: day/week/month buckets ─────────────────────────────────────────
+#
+# The Contract lists day/week/month (alongside issue/repo/stage) as grouping
+# dimensions `_group_key_for` must support (see the module docstring). These
+# were previously untested -- flagged by review as the trickiest date math in
+# this module (ISO week numbering, year-end week/month rollover).
+
+
+def _leg_at(
+    dt: datetime, *, issue_number: int = 900, repo_name: str = "gamma", duration_secs: float = 600.0
+) -> dict:
+    """A minimal leg dispatched (and finished ``duration_secs`` later) at *dt*
+    -- for pinning day/week/month bucket keys, not cost/token totals."""
+    dispatched = dt.timestamp()
+    return _leg(
+        issue_number=issue_number, repo_name=repo_name, type="work", model="sonnet",
+        is_interactive=False, cost_usd=1.0, input_tokens=1_000, output_tokens=1_000,
+        cache_read_tokens=0, dispatched_at=dispatched, finished_at=dispatched + duration_secs,
+    )
+
+
+def test_rollup_by_day_week_month_on_fixture_single_bucket() -> None:
+    # All 6 fixture legs are dispatched on the same calendar day (REF_DAY, a
+    # Monday), so day/week/month grouping each produce exactly one bucket
+    # holding the same totals as the by-issue grand total asserted above.
+    window = window_today(now=NOW)
+    for group_by, expected_key in (
+        ("day", "2026-07-13"),
+        ("week", "2026-W29"),
+        ("month", "2026-07"),
+    ):
+        result = rollup(ALL_LEGS, group_by=group_by, window=window, pricing=FIXTURE_PRICING)
+        assert set(result.groups) == {expected_key}
+        bucket = result.groups[expected_key]
+        assert bucket.legs == 6
+        assert bucket.cost_total == pytest.approx(4.8580)
+        assert bucket.duration_secs == pytest.approx(2700.0)
+
+
+def test_group_by_day_buckets_by_calendar_date() -> None:
+    leg_a = _leg_at(datetime(2026, 7, 13, 9, 0))
+    leg_b = _leg_at(datetime(2026, 7, 14, 9, 0))
+    window = TimeWindow(
+        start=datetime(2026, 7, 13).timestamp(), end=datetime(2026, 7, 15).timestamp()
+    )
+    result = rollup([leg_a, leg_b], group_by="day", window=window)
+    assert set(result.groups) == {"2026-07-13", "2026-07-14"}
+    assert result.groups["2026-07-13"].legs == 1
+    assert result.groups["2026-07-14"].legs == 1
+    assert result.total.legs == 2
+
+
+def test_group_by_week_buckets_by_iso_week() -> None:
+    # 2026-07-13 (Mon) is ISO week 2026-W29; 8 days later crosses into the
+    # next ISO week.
+    leg_a = _leg_at(datetime(2026, 7, 13, 9, 0))
+    leg_b = _leg_at(datetime(2026, 7, 21, 9, 0))
+    window = TimeWindow(
+        start=datetime(2026, 7, 1).timestamp(), end=datetime(2026, 8, 1).timestamp()
+    )
+    result = rollup([leg_a, leg_b], group_by="week", window=window)
+    assert set(result.groups) == {"2026-W29", "2026-W30"}
+    assert result.groups["2026-W29"].legs == 1
+    assert result.groups["2026-W30"].legs == 1
+
+
+def test_group_by_month_buckets_by_calendar_month() -> None:
+    leg_a = _leg_at(datetime(2026, 7, 31, 9, 0))
+    leg_b = _leg_at(datetime(2026, 8, 1, 9, 0))
+    window = TimeWindow(
+        start=datetime(2026, 7, 1).timestamp(), end=datetime(2026, 9, 1).timestamp()
+    )
+    result = rollup([leg_a, leg_b], group_by="month", window=window)
+    assert set(result.groups) == {"2026-07", "2026-08"}
+    assert result.groups["2026-07"].legs == 1
+    assert result.groups["2026-08"].legs == 1
+
+
+def test_group_by_day_week_month_year_end_rollover() -> None:
+    """Boundary case: Dec 31 2025 -> Jan 1 2026 crosses a day, a month, AND a
+    calendar-year boundary -- but per ISO 8601 both timestamps fall in the
+    SAME ISO week (2026-W01), since ISO week 1 of a year is the Mon-Sun week
+    containing that year's first Thursday, and Dec 29 2025 - Jan 4 2026 is a
+    single such week. This pins the (correct, non-obvious) behavior that a
+    day/month rollover doesn't necessarily imply a week rollover -- exactly
+    the kind of date math review flagged as needing a pinned test.
+    """
+    leg_a = _leg_at(datetime(2025, 12, 31, 23, 0), issue_number=901)
+    leg_b = _leg_at(datetime(2026, 1, 1, 1, 0), issue_number=902)
+    window = TimeWindow(
+        start=datetime(2025, 12, 31).timestamp(), end=datetime(2026, 1, 2).timestamp()
+    )
+
+    by_day = rollup([leg_a, leg_b], group_by="day", window=window)
+    assert set(by_day.groups) == {"2025-12-31", "2026-01-01"}
+    assert by_day.groups["2025-12-31"].legs == 1
+    assert by_day.groups["2026-01-01"].legs == 1
+
+    by_month = rollup([leg_a, leg_b], group_by="month", window=window)
+    assert set(by_month.groups) == {"2025-12", "2026-01"}
+    assert by_month.groups["2025-12"].legs == 1
+    assert by_month.groups["2026-01"].legs == 1
+
+    by_week = rollup([leg_a, leg_b], group_by="week", window=window)
+    assert set(by_week.groups) == {"2026-W01"}
+    assert by_week.groups["2026-W01"].legs == 2
+
+
 def test_leg_rows_retained_for_drill_down() -> None:
     window = window_today(now=NOW)
     result = rollup(ALL_LEGS, group_by="issue", window=window, pricing=FIXTURE_PRICING)
