@@ -19,6 +19,7 @@ Layout this module expects (docs/ORACLE_LOOP.md "Layout"):
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -63,22 +64,42 @@ def _manifest_paths(acceptance_root: Path) -> list[Path]:
     )
 
 
-def _parse_manifest_file(path: Path) -> dict[str, int]:
-    """Parse one manifest file into ``{test_id: issue_number}``.
+@dataclass(frozen=True)
+class ManifestData:
+    """One manifest file's parsed contents: the test-id -> issue-number
+    mapping, plus the #1138 issue-level ``exempt:`` list (issues in an
+    oracle-opted-in milestone that are deliberately validated by their own
+    unit tests instead of the sealed suite — e.g. the driver-building issue
+    itself, #1125 — declared here instead of living only as tribal knowledge
+    in an issue body)."""
 
-    Two on-disk shapes are accepted:
+    tests: dict[str, int] = field(default_factory=dict)
+    exempt: frozenset[int] = field(default_factory=frozenset)
+
+
+def parse_manifest_text(text: str, *, source: str = "<manifest>") -> ManifestData:
+    """Pure parse of one manifest file's YAML/JSON text into
+    :class:`ManifestData`. Shared by the local-disk loader
+    (:func:`_parse_manifest_file`, used by ``coord acceptance run``/
+    ``record`` on a worker's own checkout) and the dispatch-time GitHub-fetch
+    reader (:func:`coord.milestone_dispatch.issue_oracle_ready`, #1138) so
+    both agree on the manifest schema.
+
+    Three on-disk shapes are accepted:
 
     - ``tests: {<test-id>: <issue-number>, ...}`` — flat, one issue per test.
     - ``issues: {<issue-number>: [<test-id>, ...], ...}`` — grouped by issue.
+    - ``exempt: [<issue-number>, ...]`` — issues exempted from the #1138
+      issue-level oracle gate (no slice required before Work dispatch).
     """
     try:
-        raw = yaml.safe_load(path.read_text())
-    except (yaml.YAMLError, OSError) as e:
-        raise ManifestError(f"failed to parse manifest {path}: {e}") from e
+        raw = yaml.safe_load(text)
+    except yaml.YAMLError as e:
+        raise ManifestError(f"failed to parse manifest {source}: {e}") from e
     if raw is None:
-        return {}
+        return ManifestData()
     if not isinstance(raw, dict):
-        raise ManifestError(f"manifest {path} must be a mapping")
+        raise ManifestError(f"manifest {source} must be a mapping")
 
     mapping: dict[str, int] = {}
     tests_raw = raw.get("tests")
@@ -94,7 +115,27 @@ def _parse_manifest_file(path: Path) -> dict[str, int]:
             for test_id in test_ids:
                 mapping[str(test_id)] = int(issue)
 
-    return mapping
+    exempt: frozenset[int] = frozenset()
+    exempt_raw = raw.get("exempt")
+    if isinstance(exempt_raw, list):
+        exempt = frozenset(int(x) for x in exempt_raw)
+
+    return ManifestData(tests=mapping, exempt=exempt)
+
+
+def _parse_manifest_file(path: Path) -> dict[str, int]:
+    """Parse one manifest file into ``{test_id: issue_number}`` (the
+    ``exempt:`` list, if any, is dropped — callers that need it use
+    :func:`parse_manifest_text` directly). Two on-disk shapes are accepted:
+
+    - ``tests: {<test-id>: <issue-number>, ...}`` — flat, one issue per test.
+    - ``issues: {<issue-number>: [<test-id>, ...], ...}`` — grouped by issue.
+    """
+    try:
+        text = path.read_text()
+    except OSError as e:
+        raise ManifestError(f"failed to parse manifest {path}: {e}") from e
+    return parse_manifest_text(text, source=str(path)).tests
 
 
 def load_manifest(acceptance_root: Path) -> dict[str, int]:
