@@ -400,6 +400,11 @@ def _row_to_dispatched_dict(row: object) -> dict:
         # #846: needed by coord.notify.detect_needs_attention's non-convergence
         # check (>= pipeline.convergence_rounds fix/review rounds).
         "review_iteration": d.get("review_iteration", 0) or 0,
+        # #1137: needed by attention_signal's interactive-fix-session
+        # discriminator (type="work" + provider_name="claude-pty" +
+        # review_of_assignment_id set) — was previously absent from this
+        # dict even though the column is populated at dispatch time.
+        "provider_name": d.get("provider_name"),
     }
 
 

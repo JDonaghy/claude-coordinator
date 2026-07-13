@@ -354,6 +354,22 @@ class DispatchConfig:
 # the interactive `--merge-of` session share this type (see
 # `coord.reconcile.is_interactive_merge_session`) — so it gets a little more
 # headroom than `work` to cover a human resolving a semantic conflict.
+#
+# #1137 audit note: the #1133 follow-up asked whether `merge`/`fix` (the two
+# types named in the original #846 ask but left unhandled by #1133) need
+# their own entry. `merge` does NOT — there is no literal `type="merge"`
+# (a dedicated value was tried and reverted, see
+# `is_interactive_merge_session`'s docstring / tests/test_reap_merged_sessions.py
+# DISCRIMINATOR NOTE); the interactive `--merge-of` session already shares
+# `conflict-fix` above and is covered by its 60m threshold. `fix` (the
+# interactive `--fix-of`/`--rework-of` human-attended session) DOES need
+# handling — it shares `type="work"` with headless coding workers, so it
+# can't get its own entry here either. Instead `attention_threshold_for`
+# recognizes it via the same compound discriminator shape as
+# `is_interactive_merge_session` — `provider_name="claude-pty"` +
+# `review_of_assignment_id` set on a `type="work"` row — and reuses
+# `conflict-fix`'s threshold (the same "human resolving someone else's
+# feedback" scenario).
 _DEFAULT_ATTENTION_THRESHOLDS: dict[str, float] = {
     "work": 45 * 60.0,
     "review": 15 * 60.0,
@@ -426,7 +442,11 @@ class PipelineConfig:
     ``"audit"``, ``"milestone-chat"``, ``"refinement"``,
     ``"new-issue-chat"``, ``"test-chat"``), which is exempt from the
     wall-clock check entirely by default — see
-    :meth:`attention_threshold_for`.
+    :meth:`attention_threshold_for`. An interactive ``--fix-of``/
+    ``--rework-of`` session (#1137) is also recognized there, by
+    ``provider_name``/``review_of_assignment_id`` rather than ``type``
+    (it shares ``type="work"`` with headless coding workers), and reuses
+    ``conflict-fix``'s threshold.
 
     ``convergence_rounds`` (#846) is the number of fix/review rounds
     (``Assignment.review_iteration``) an assignment may accumulate without
@@ -444,27 +464,62 @@ class PipelineConfig:
     )
     convergence_rounds: int = 3
 
-    def attention_threshold_for(self, assignment_type: str) -> float:
+    def attention_threshold_for(
+        self,
+        assignment_type: str,
+        *,
+        provider_name: str | None = None,
+        review_of_assignment_id: str | None = None,
+    ) -> float:
         """Wall-clock threshold (seconds) for *assignment_type*.
 
-        An explicit ``attention_thresholds`` entry (built-in default or
-        user-configured override) always wins. Failing that,
-        ``assignment_type`` is checked against :data:`INTERACTIVE_SESSION_TYPES`
-        (#1133) — human-attended chat/troubleshoot/review-style sessions with
-        no headless-convergence concept — and exempted (``inf``, never
-        flagged) rather than inheriting a headless-worker threshold.
+        Checked in order:
 
-        Only *then* does it fall back to this config's own ``"work"`` entry
-        (so a user who only overrides ``work`` gets that value applied to
-        unlisted *headless* types too, not the hardcoded default) — and only
-        reaches for the hardcoded default when even ``"work"`` was never
-        configured. This fallback is deliberately scoped to headless types
-        by the ``INTERACTIVE_SESSION_TYPES`` check above it: unlike an
-        unlisted headless type (probably work-like), an unlisted interactive
-        type has no wall-clock-stuck concept at all, so silently reusing
-        ``"work"``'s threshold for it would be a category error, not a
-        reasonable guess.
+        1. **Interactive fix session** (#1137): ``assignment_type == "work"``
+           with ``provider_name == "claude-pty"`` and
+           ``review_of_assignment_id`` set (the optional keyword-only args,
+           passed by callers that have the full assignment record; both
+           default to ``None`` so existing callers that only know the type
+           are unaffected). This mirrors
+           :func:`coord.reconcile.is_interactive_merge_session`'s compound
+           discriminator — a dedicated ``type="fix"`` was deliberately not
+           introduced, for the same reason a dedicated ``type="merge"`` was
+           reverted (see that function's docstring). A matching row defers
+           to ``attention_threshold_for("conflict-fix")`` — the same "human
+           resolving someone else's feedback, not writing from scratch"
+           scenario that earned conflict-fix its extra headroom in #1133 —
+           so an explicit user override of ``conflict-fix`` (but *not* of
+           plain ``work``) still applies. Checked *before* the plain
+           ``attention_thresholds`` lookup below for the same reason
+           :data:`INTERACTIVE_SESSION_TYPES` is: ``attention_thresholds``
+           always carries a built-in ``"work"`` entry (the dataclass default
+           copies the whole ``_DEFAULT_ATTENTION_THRESHOLDS`` dict), so
+           checking that dict first would make this branch unreachable.
+        2. **Explicit override** — an ``attention_thresholds`` entry for
+           *this exact* ``assignment_type`` (built-in default or
+           user-configured) always wins.
+        3. **Interactive session type** (#1133,
+           :data:`INTERACTIVE_SESSION_TYPES`) — human-attended
+           chat/troubleshoot/review-style sessions with no
+           headless-convergence concept — exempted (``inf``, never flagged)
+           rather than inheriting a headless-worker threshold.
+        4. **Fallback to this config's own ``"work"`` entry** (so a user who
+           only overrides ``work`` gets that value applied to unlisted
+           *headless* types too, not the hardcoded default) — and only
+           reaches for the hardcoded default when even ``"work"`` was never
+           configured. This fallback is deliberately scoped to headless
+           types by the ``INTERACTIVE_SESSION_TYPES`` check above it: unlike
+           an unlisted headless type (probably work-like), an unlisted
+           interactive type has no wall-clock-stuck concept at all, so
+           silently reusing ``"work"``'s threshold for it would be a
+           category error, not a reasonable guess.
         """
+        if (
+            assignment_type == "work"
+            and provider_name == "claude-pty"
+            and review_of_assignment_id is not None
+        ):
+            return self.attention_threshold_for("conflict-fix")
         if assignment_type in self.attention_thresholds:
             return self.attention_thresholds[assignment_type]
         if assignment_type in INTERACTIVE_SESSION_TYPES:
