@@ -252,6 +252,15 @@ class TestDispatchTestAuthor:
             assert cmd in payload["deny_commands"]
         record_mock.assert_called_once()
 
+        # #1171: milestone mode keeps the single shared-branch behavior —
+        # no target_branch override, and the recorded Assignment.branch is
+        # the tracking-issue-keyed derivation (mirrors AgentServer's
+        # `issue-{N}-{slug(title)}` formula) so repeated Gate-A calls land
+        # on the same branch/PR.
+        assert "target_branch" not in payload
+        recorded = record_mock.call_args.kwargs["assignment"]
+        assert recorded.branch == "issue-947-test-author-ms-25-acceptance-suite"
+
     def test_happy_path_jit_mode_fetches_issue(self) -> None:
         cfg = _config([_machine("laptop", ["coord-tui"])], driver=self._driver())
         fake_client = MagicMock()
@@ -274,6 +283,104 @@ class TestDispatchTestAuthor:
         payload = fake_client.post.call_args.kwargs["json"]
         assert "Add foo" in payload["briefing"]
         assert "Body text" in payload["briefing"]
+
+    def test_jit_slice_gets_its_own_branch_outside_issue_namespace(self) -> None:
+        """#1171: a JIT slice must NOT collapse onto the milestone's shared
+        `issue-{tracking_issue}-*` branch — the previous behavior meant a
+        squash-merged first slice's PR silently stranded every later slice
+        pushed to the same branch. The per-slice branch must also avoid the
+        `issue-{issue_number}-*` namespace (the member issue's OWN prefix) or
+        `coord.claim`'s remote-branch check would false-positive against
+        that issue's Work dispatch if the branch survives the merge."""
+        cfg = _config([_machine("laptop", ["coord-tui"])], driver=self._driver())
+        fake_client = MagicMock()
+        fake_resp = MagicMock()
+        fake_resp.json.return_value = {"id": "xyz789"}
+        fake_client.post.return_value = fake_resp
+
+        with patch("coord.test_author.fetch_milestone_context", return_value=self._ctx()), \
+             patch(
+                 "coord.test_author.github_ops.get_issue",
+                 return_value={"title": "Add foo", "body": "Body text"},
+             ), \
+             patch("coord.state.record_dispatched_assignment") as record_mock:
+            dispatch_test_author(
+                "coord-tui", 947, cfg, issue_number=101, http_client=fake_client,
+            )
+
+        payload = fake_client.post.call_args.kwargs["json"]
+        target_branch = payload["target_branch"]
+        assert not target_branch.startswith("issue-101-")
+        assert not target_branch.startswith("issue-947-")
+        recorded = record_mock.call_args.kwargs["assignment"]
+        assert recorded.branch == target_branch
+
+    def test_jit_slices_for_different_issues_get_different_branches(self) -> None:
+        """The whole point of #1171: two JIT slices for the SAME milestone
+        but DIFFERENT member issues must not collide on one branch, or the
+        second slice strands behind the first slice's already-merged PR."""
+        cfg = _config([_machine("laptop", ["coord-tui"])], driver=self._driver())
+
+        def _dispatch(issue_number: int) -> str:
+            fake_client = MagicMock()
+            fake_resp = MagicMock()
+            fake_resp.json.return_value = {"id": f"id-{issue_number}"}
+            fake_client.post.return_value = fake_resp
+            with patch(
+                "coord.test_author.fetch_milestone_context", return_value=self._ctx(),
+            ), patch(
+                "coord.test_author.github_ops.get_issue",
+                return_value={"title": "t", "body": "b"},
+            ), patch("coord.state.record_dispatched_assignment"):
+                dispatch_test_author(
+                    "coord-tui", 947, cfg, issue_number=issue_number,
+                    http_client=fake_client,
+                )
+            payload = fake_client.post.call_args.kwargs["json"]
+            return payload["target_branch"]
+
+        assert _dispatch(101) != _dispatch(102)
+
+    def test_jit_slice_retry_reuses_same_branch(self) -> None:
+        """A retry/continuation for the SAME (tracking_issue, issue_number)
+        pair must resolve to the same branch name so it keeps extending its
+        own slice's still-open PR instead of forking a new one each time."""
+        cfg = _config([_machine("laptop", ["coord-tui"])], driver=self._driver())
+
+        def _dispatch() -> str:
+            fake_client = MagicMock()
+            fake_resp = MagicMock()
+            fake_resp.json.return_value = {"id": "abc"}
+            fake_client.post.return_value = fake_resp
+            with patch(
+                "coord.test_author.fetch_milestone_context", return_value=self._ctx(),
+            ), patch(
+                "coord.test_author.github_ops.get_issue",
+                return_value={"title": "t", "body": "b"},
+            ), patch("coord.state.record_dispatched_assignment"):
+                dispatch_test_author(
+                    "coord-tui", 947, cfg, issue_number=101, http_client=fake_client,
+                )
+            payload = fake_client.post.call_args.kwargs["json"]
+            return payload["target_branch"]
+
+        assert _dispatch() == _dispatch()
+
+    def test_milestone_mode_branch_unaffected_by_jit_change(self) -> None:
+        """Milestone mode (no --issue) must keep deriving the single shared
+        branch from the fixed title — unchanged by the JIT per-slice fix."""
+        cfg = _config([_machine("laptop", ["coord-tui"])], driver=self._driver())
+        fake_client = MagicMock()
+        fake_resp = MagicMock()
+        fake_resp.json.return_value = {"id": "abc123"}
+        fake_client.post.return_value = fake_resp
+
+        with patch("coord.test_author.fetch_milestone_context", return_value=self._ctx()), \
+             patch("coord.state.record_dispatched_assignment"):
+            dispatch_test_author("coord-tui", 947, cfg, http_client=fake_client)
+
+        payload = fake_client.post.call_args.kwargs["json"]
+        assert "target_branch" not in payload
 
     def test_repo_deny_commands_merged(self) -> None:
         cfg = _config(
