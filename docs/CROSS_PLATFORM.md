@@ -62,6 +62,47 @@ per-OS session mechanism.
 Under this model **tmux demotes to a Unix-only optimization / power-user convenience**, not the
 backbone. That dissolves "there is no tmux on Windows" structurally instead of per-platform.
 
+### What we're giving up (and must rebuild)
+
+WS-PTY's edge is portability and a unified client (Windows-native; phone / GUI / TUI / laptop all one
+path; board-driven and ToS-clean by construction). But ssh/tmux is decades-hardened, and demoting it
+is not free. Be explicit about what the substrate must *earn back*, or the port is a **regression vs.
+today's tmux sessions on Unix**:
+
+- **Session survival must decouple from the coordinator's lifetime — the one real architecture gap, not
+  just maturity.** tmux is a *separate daemon*, so a session outlives the agent crashing, restarting,
+  or self-updating via `os.execv` (this is *why* coord uses tmux today — survive TUI/attach crashes).
+  A naive WS-PTY bridge has the **agent process holding the PTY** → kill the agent, kill the session.
+  To match tmux the agent must (a) spawn sessions in their own process session so they outlive it,
+  (b) **re-adopt** them on restart, and (c) keep a server-side **scrollback ring buffer** to replay on
+  reconnect (a raw PTY has no history; tmux's scrollback is free). **This is the real work hidden
+  inside "reuse the #1064 bridge as the universal substrate"** — a *phone* feature may not need any of
+  it; the *universal substrate* does. It belongs in the #1064 design review, not discovered mid-build.
+- **Terminal correctness for free.** resize/reflow, SGR, UTF-8 width, copy-mode, every escape
+  sequence. With WS-PTY we own the emulator end-to-end (xterm.js in the browser, the ratatui embedded
+  pane) *and* the reconnect/replay logic.
+- **Native multi-client attach / sharing.** Two people `tmux attach` to one session (pairing /
+  over-the-shoulder) with worked-out shared-resize semantics. WS-PTY can fan out, but we build the
+  multiplexing and decide whose window size wins.
+- **Out-of-band recovery when coord itself is broken.** `ssh host; tmux attach` needs only sshd +
+  tmux — neither is coord — so it reaches a stuck session **even when the agent is wedged**. WS-PTY
+  requires a *healthy agent*: if the daemon is the thing that failed, your only interactive path failed
+  with it. **This is the strongest reason to keep ssh/tmux as the tier-3 Unix path even after WS-PTY is
+  the default** — don't let the recovery tool be the same process that broke.
+- **Encryption/auth off-tailnet.** Today's agent HTTP is *plain HTTP over Tailscale*
+  (`coord/network.py`) — WS-PTY's security model is "trust the tailnet." ssh brings its own
+  authenticated, key-based, encrypted layer and works to machines not on the tailnet; WS-PTY there
+  would need TLS + auth we haven't built.
+- **Scope reminder — not apples-to-apples.** WS-PTY replaces exactly *one* slice of ssh (interactive
+  attach). ssh *also* does the remote git-worktree ops, log fetch, and rsync (§2), for free, today.
+  Those move to agent HTTP endpoints under this plan — real code we'd be writing, not a like-for-like
+  swap.
+
+**Net:** two requirements fall out of this. (1) Keep ssh/tmux as the optional tier-3 Unix path,
+principally for out-of-band recovery. (2) The WS-PTY substrate must **explicitly** ship
+detached-survival + scrollback replay — treat it as an acceptance requirement of #1064, not a later
+enhancement, or Unix users trade "survives a daemon restart" for "dies with the daemon."
+
 ## The two seams
 
 Everything portable-vs-POSIX flows through two interfaces.
