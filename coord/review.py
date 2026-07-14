@@ -1281,26 +1281,30 @@ def dispatch_pending_reviews(board, config, *, test_gate_active: bool = False, n
         and config.pipeline.test_precedes_review()
     )
 
-    # #1076: a `type="mock-author"` (Gate A) completion is a contract/fixture
-    # -only diff (tests/acceptance/ms-NN/contract.md + .screen mocks) — it
-    # matches no `smoke_tests.capability_rules` rule by construction, so
-    # nothing ever produces a Test-gate verdict for it and `test_state` stays
-    # NULL forever. Under an active test gate that means the row is silently
-    # and permanently excluded from `eligible` below — no error, no stuck
+    # #1076/#1152: a `type="mock-author"` (Gate A contract/fixture diff) or
+    # `type="test-author"` (per-issue JIT acceptance-slice authoring, #931)
+    # completion is a fixture/test-only diff — it matches no
+    # `smoke_tests.capability_rules` rule by construction, so nothing ever
+    # produces a Test-gate verdict for it and `test_state` stays NULL forever.
+    # Under an active test gate that means the row is silently and
+    # permanently excluded from `eligible` below — no error, no stuck
     # indicator, just a row that never gets reviewed (the #1076 repro,
-    # assignment 9960b957ff3f). There is nothing to smoke-test for a
-    # mock-author branch, so "skipped" is always the correct verdict, not a
-    # judgment call — backfill it here, the single choke point both
-    # reconcile() and `coord notify` (`_dispatch_board_pending_reviews`)
-    # route bulk review dispatch through, so this also retroactively unsticks
-    # any row that went "done" before this fix shipped. `type="work"` rows
-    # are untouched — the test gate still applies to them exactly as before.
+    # assignment 9960b957ff3f; the #1152 repro, assignment 2e93ee72071c).
+    # There is nothing to smoke-test for either shape of completion, so
+    # "skipped" is always the correct verdict, not a judgment call — backfill
+    # it here, the single choke point both reconcile() and `coord notify`
+    # (`_dispatch_board_pending_reviews`) route bulk review dispatch through,
+    # so this also retroactively unsticks any row that went "done" before
+    # this fix shipped. `type="work"` rows are untouched — the test gate
+    # still applies to them exactly as before (do NOT widen this to
+    # `WORK_LIKE_TYPES`, which also contains `"work"`).
+    _AUTO_SKIP_TEST_GATE_TYPES = ("mock-author", "test-author")
     if gate_test:
         from coord.state import record_test_verdict
 
         for c in board.completed:
             if (
-                c.type == "mock-author"
+                c.type in _AUTO_SKIP_TEST_GATE_TYPES
                 and c.review_state in (None, "pending")
                 and c.test_state is None
                 and c.assignment_id is not None
@@ -1309,8 +1313,8 @@ def dispatch_pending_reviews(board, config, *, test_gate_active: bool = False, n
                     assignment_id=c.assignment_id,
                     test_state="skipped",
                     test_reason=(
-                        "Gate A mock-author: contract/fixture-only diff, "
-                        "nothing to smoke-test (#1076)"
+                        f"Gate A {c.type}: contract/fixture-only diff, "
+                        "nothing to smoke-test (#1076/#1152)"
                     ),
                 )
                 c.test_state = "skipped"
