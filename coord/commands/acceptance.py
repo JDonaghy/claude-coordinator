@@ -297,6 +297,22 @@ def _acceptance_record_via_daemon(svc, params: dict) -> None:
         "flat (unrouted) driver."
     ),
 )
+@click.option(
+    "--interactive", is_flag=True,
+    help=(
+        "#1173: run the test-authoring session as a HUMAN-ATTENDED "
+        "`claude` (provider `claude-pty`) instead of dispatching a "
+        "headless `claude -p` worker — same shape as `coord assign "
+        "--interactive`'s --smoke-of/--merge-of/etc flavours. The "
+        "independence contract (zero shared context with the "
+        "implementation, contract-only) is unchanged; only who "
+        "supervises the authoring changes."
+    ),
+)
+@click.option(
+    "--dry-run", "dry_run", is_flag=True,
+    help="With --interactive: resolve everything and print what would run, but don't launch.",
+)
 @_CONFIG_OPTION
 def acceptance_author(
     repo: str,
@@ -304,12 +320,37 @@ def acceptance_author(
     issue_number: int | None,
     machine_override: str | None,
     route_path: str | None,
+    interactive: bool,
+    dry_run: bool,
     config_path: Path,
 ) -> None:
     """Dispatch the independent test-author for REPO's milestone."""
+    cfg = _load_config(config_path)
+
+    if interactive:
+        from coord.test_author import dispatch_test_author_interactive
+
+        try:
+            exit_code = dispatch_test_author_interactive(
+                repo,
+                tracking_issue,
+                cfg,
+                issue_number=issue_number,
+                machine_override=machine_override,
+                path=route_path,
+                dry_run=dry_run,
+            )
+        except RuntimeError as e:
+            click.echo(f"error: {e}", err=True)
+            sys.exit(1)
+        sys.exit(exit_code)
+
+    if dry_run:
+        click.echo("error: --dry-run requires --interactive", err=True)
+        sys.exit(2)
+
     from coord.test_author import dispatch_test_author
 
-    cfg = _load_config(config_path)
     try:
         assignment_id, machine_name = dispatch_test_author(
             repo,

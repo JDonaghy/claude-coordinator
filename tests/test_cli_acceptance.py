@@ -842,6 +842,164 @@ class TestAcceptanceAuthor:
         assert "no acceptance driver configured" in result.output
 
 
+class TestAcceptanceAuthorInteractive:
+    """#1173: `coord acceptance author --interactive` — thin CLI glue over
+    `coord.test_author.dispatch_test_author_interactive`. Mirrors
+    TestAcceptanceAuthor's split: the dispatch logic itself (branch
+    continuation, board row shape, local/remote launch) is unit-tested in
+    tests/test_test_author.py; these just check the CLI wiring — the
+    `--interactive`/`--dry-run` flags reach the right function with the
+    right arguments, and it is the interactive function that runs, never
+    the headless one."""
+
+    def _config_no_driver(self, tmp_path: Path) -> Path:
+        p = tmp_path / "coordinator.yml"
+        p.write_text(
+            "repos:\n"
+            "  - name: coord-tui\n"
+            "    github: acme/coord-tui\n"
+            "machines:\n"
+            "  - name: laptop\n"
+            "    host: laptop.tail\n"
+            "    repos: [coord-tui]\n"
+            "    repo_paths:\n"
+            "      coord-tui: /tmp/repo\n"
+        )
+        return p
+
+    def test_interactive_dispatches_interactive_function_not_headless(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        config_path = self._config_no_driver(tmp_path)
+        calls = {}
+
+        def fake_interactive(
+            repo, tracking_issue, cfg, *,
+            issue_number=None, machine_override=None, path=None, dry_run=False,
+        ):
+            calls.update(
+                repo=repo, tracking_issue=tracking_issue,
+                issue_number=issue_number, machine_override=machine_override,
+                path=path, dry_run=dry_run,
+            )
+            return 0
+
+        def fake_headless(*a, **kw):
+            raise AssertionError("--interactive must not fall through to headless dispatch")
+
+        monkeypatch.setattr(
+            "coord.test_author.dispatch_test_author_interactive", fake_interactive,
+        )
+        monkeypatch.setattr("coord.test_author.dispatch_test_author", fake_headless)
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "author", "coord-tui", "947", "--interactive",
+            "--issue", "101", "--machine", "dellserver",
+            "--for-path", "coord/acceptance.py",
+            "--config", str(config_path),
+        ])
+        assert result.exit_code == 0, result.output
+        assert calls == {
+            "repo": "coord-tui", "tracking_issue": 947,
+            "issue_number": 101, "machine_override": "dellserver",
+            "path": "coord/acceptance.py", "dry_run": False,
+        }
+
+    def test_interactive_dry_run_forwarded(self, tmp_path: Path, monkeypatch) -> None:
+        config_path = self._config_no_driver(tmp_path)
+        calls = {}
+
+        def fake_interactive(repo, tracking_issue, cfg, **kw):
+            calls.update(kw)
+            return 0
+
+        monkeypatch.setattr(
+            "coord.test_author.dispatch_test_author_interactive", fake_interactive,
+        )
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "author", "coord-tui", "947",
+            "--interactive", "--dry-run", "--config", str(config_path),
+        ])
+        assert result.exit_code == 0, result.output
+        assert calls["dry_run"] is True
+
+    def test_interactive_nonzero_exit_code_propagates(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        config_path = self._config_no_driver(tmp_path)
+        monkeypatch.setattr(
+            "coord.test_author.dispatch_test_author_interactive",
+            lambda *a, **kw: 1,
+        )
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "author", "coord-tui", "947", "--interactive",
+            "--config", str(config_path),
+        ])
+        assert result.exit_code == 1
+
+    def test_interactive_error_surfaces_nonzero_exit(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        config_path = self._config_no_driver(tmp_path)
+
+        def fake_interactive(*a, **kw):
+            raise RuntimeError("no machine claims repo 'coord-tui'")
+
+        monkeypatch.setattr(
+            "coord.test_author.dispatch_test_author_interactive", fake_interactive,
+        )
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "author", "coord-tui", "947", "--interactive",
+            "--config", str(config_path),
+        ])
+        assert result.exit_code == 1
+        assert "no machine claims repo" in result.output
+
+    def test_dry_run_without_interactive_errors(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        config_path = self._config_no_driver(tmp_path)
+
+        def fake_headless(*a, **kw):
+            raise AssertionError("--dry-run without --interactive must not dispatch anything")
+
+        monkeypatch.setattr("coord.test_author.dispatch_test_author", fake_headless)
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "author", "coord-tui", "947", "--dry-run",
+            "--config", str(config_path),
+        ])
+        assert result.exit_code == 2
+        assert "--dry-run requires --interactive" in result.output
+
+    def test_non_interactive_still_uses_headless_dispatch(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Without --interactive the pre-#1173 headless behavior is
+        unchanged — no regression from adding the new flag."""
+        config_path = self._config_no_driver(tmp_path)
+
+        def fake_headless(repo, tracking_issue, cfg, **kw):
+            return ("aid-1", "laptop")
+
+        def fake_interactive(*a, **kw):
+            raise AssertionError("must not run the interactive path by default")
+
+        monkeypatch.setattr("coord.test_author.dispatch_test_author", fake_headless)
+        monkeypatch.setattr(
+            "coord.test_author.dispatch_test_author_interactive", fake_interactive,
+        )
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "author", "coord-tui", "947", "--config", str(config_path),
+        ])
+        assert result.exit_code == 0, result.output
+        assert "aid-1" in result.output
+
+
 class TestAcceptanceMock:
     """#930 (Gate A): `coord acceptance mock <repo> <tracking_issue>`
     dispatches the mock-author. Mocks `coord.github_ops`, `coord.

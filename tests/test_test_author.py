@@ -10,18 +10,22 @@ ever happens.
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from coord.agent import _slugify
 from coord.config import AcceptanceConfig, AcceptanceDriverConfig, Config
 from coord.milestone_dispatch import MilestoneContext, MilestoneDispatchError
 from coord.milestone_order import WorkOrder, WorkOrderNode
 from coord.models import Machine, Repo, WorkerPermissionsConfig
 from coord.test_author import (
     TEST_AUTHOR_DENY_COMMANDS,
+    TEST_AUTHOR_INTERACTIVE_SYSTEM_PROMPT,
     build_test_author_briefing,
     dispatch_test_author,
+    dispatch_test_author_interactive,
     pick_test_author_machine,
 )
 
@@ -476,3 +480,241 @@ class TestDispatchTestAuthor:
         payload = fake_client.post.call_args.kwargs["json"]
         assert "Bash(rm -rf *)" in payload["deny_commands"]
         assert "Bash(gh *)" in payload["deny_commands"]
+
+
+class TestDispatchTestAuthorInteractive:
+    """#1173: `dispatch_test_author_interactive` — the human-attended
+    counterpart to `dispatch_test_author`, reusing `coord.interactive` /
+    `coord.commands.dispatch._build_interactive_launch_setup` /
+    `coord.agent.setup_interactive_worktree` instead of POSTing to an
+    agent's `/assign`. Only the git/tmux/PTY primitives are mocked here —
+    `record_dispatched_assignment` runs for real against the autouse
+    in-memory DB (see conftest.coord_db) so assertions read the resulting
+    board row back, the same black-box shape as tests/test_cli_assign.py's
+    interactive flavours."""
+
+    def _driver(self, capability: str = "") -> AcceptanceDriverConfig:
+        return AcceptanceDriverConfig(
+            kind="tui-tuidriver", run="cargo test --test acceptance", capability=capability,
+        )
+
+    def _ctx(self, milestone_number: int = 25) -> MilestoneContext:
+        return MilestoneContext(
+            tracking_issue=947, milestone_number=milestone_number, work_order=WORK_ORDER,
+        )
+
+    def _expected_branch(self, milestone_number: int = 25, tracking_issue: int = 947) -> str:
+        title = f"[test-author] ms-{milestone_number} acceptance suite"
+        return f"issue-{tracking_issue}-{_slugify(title)}"
+
+    # ── resolution failures — same failure modes as dispatch_test_author ──
+
+    def test_unknown_repo_raises(self) -> None:
+        cfg = _config([_machine("laptop", ["coord-tui"])], driver=self._driver())
+        with pytest.raises(RuntimeError, match="not in coordinator.yml"):
+            dispatch_test_author_interactive("nope", 947, cfg)
+
+    def test_missing_driver_raises(self) -> None:
+        cfg = _config([_machine("laptop", ["coord-tui"])], driver=None)
+        with pytest.raises(RuntimeError, match="no acceptance driver configured"):
+            dispatch_test_author_interactive("coord-tui", 947, cfg)
+
+    def test_issue_not_in_work_order_raises(self) -> None:
+        cfg = _config([_machine("laptop", ["coord-tui"])], driver=self._driver())
+        with patch("coord.test_author.fetch_milestone_context", return_value=self._ctx()):
+            with pytest.raises(RuntimeError, match="not a member"):
+                dispatch_test_author_interactive("coord-tui", 947, cfg, issue_number=999)
+
+    def test_no_capable_machine_raises(self) -> None:
+        cfg = _config(
+            [_machine("laptop", ["coord-tui"], caps=[])],
+            driver=self._driver(capability="gtk"),
+        )
+        with patch("coord.test_author.fetch_milestone_context", return_value=self._ctx()):
+            with pytest.raises(RuntimeError, match="no machine claims repo"):
+                dispatch_test_author_interactive("coord-tui", 947, cfg)
+
+    # ── dry run ─────────────────────────────────────────────────────────
+
+    def test_dry_run_does_not_persist_or_launch(self) -> None:
+        cfg = _config([_machine("laptop", ["coord-tui"])], driver=self._driver())
+        setup_spy = MagicMock()
+        launch_spy = MagicMock()
+        with patch("coord.test_author.fetch_milestone_context", return_value=self._ctx()), \
+             patch("socket.gethostname", return_value="laptop"), \
+             patch("coord.agent.setup_interactive_worktree", setup_spy), \
+             patch("coord.interactive.launch_human_attended_interactive", launch_spy):
+            exit_code = dispatch_test_author_interactive(
+                "coord-tui", 947, cfg, dry_run=True,
+            )
+
+        assert exit_code == 0
+        assert setup_spy.call_count == 0
+        assert launch_spy.call_count == 0
+
+        from coord.state import build_board
+        b = build_board()
+        assert b.active == []
+        assert b.completed == []
+
+    # ── local: creates the row, launches, and finalizes ────────────────
+
+    def test_local_creates_test_author_row_with_claude_pty(self) -> None:
+        """Core #1173 acceptance bar: the row that lands on the board is
+        `type="test-author"` + `provider_name="claude-pty"`, and the
+        session ran through the human-attended launcher — never the
+        headless POST-to-/assign path."""
+        cfg = _config([_machine("laptop", ["coord-tui"])], driver=self._driver())
+        fake_finalize = MagicMock(
+            already_recorded=False, terminal_status="done",
+            commits_ahead=1, push_ok=True,
+        )
+        setup_spy = MagicMock(return_value=(Path("/tmp/wt-1"), self._expected_branch()))
+        launch_spy = MagicMock(return_value=0)
+        finalize_spy = MagicMock(return_value=fake_finalize)
+        headless_spy = MagicMock(side_effect=AssertionError("must not fall through to headless"))
+
+        with patch("coord.test_author.fetch_milestone_context", return_value=self._ctx()), \
+             patch("socket.gethostname", return_value="laptop"), \
+             patch("coord.agent.setup_interactive_worktree", setup_spy), \
+             patch("coord.interactive.launch_human_attended_interactive", launch_spy), \
+             patch("coord.interactive.finalize_interactive_exit", finalize_spy), \
+             patch("coord.interactive.tmux_available", return_value=False), \
+             patch("coord.test_author.dispatch_test_author", headless_spy):
+            exit_code = dispatch_test_author_interactive("coord-tui", 947, cfg)
+
+        assert exit_code == 0
+        assert setup_spy.call_count == 1
+        assert launch_spy.call_count == 1
+        assert finalize_spy.call_count == 1
+        assert headless_spy.call_count == 0, "must not dispatch the headless worker"
+
+        # setup_interactive_worktree got the SAME branch name the record used
+        # (continuation-safe: a later JIT/retry dispatch derives identically).
+        assert setup_spy.call_args.kwargs["existing_branch"] == self._expected_branch()
+
+        # The independence contract is preserved verbatim (plus the
+        # human-attended note) in the argv the launcher actually ran.
+        launched_argv = launch_spy.call_args.args[0]
+        prompt_idx = launched_argv.index("--system-prompt") + 1
+        launched_prompt = launched_argv[prompt_idx]
+        assert "ZERO shared context" in launched_prompt
+        assert "HUMAN-ATTENDED" in launched_prompt
+        assert launched_prompt.startswith(TEST_AUTHOR_INTERACTIVE_SYSTEM_PROMPT.split("\n\n")[0])
+
+        from coord.state import build_board
+        rows = [
+            a for a in build_board().active + build_board().completed
+            if a.type == "test-author"
+        ]
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.provider_name == "claude-pty"
+        assert row.branch == self._expected_branch()
+        assert row.for_issue_number is None
+        assert row.issue_number == 947
+
+    def test_local_jit_mode_sets_for_issue_number(self) -> None:
+        cfg = _config([_machine("laptop", ["coord-tui"])], driver=self._driver())
+        fake_finalize = MagicMock(
+            already_recorded=False, terminal_status="done",
+            commits_ahead=1, push_ok=True,
+        )
+        with patch("coord.test_author.fetch_milestone_context", return_value=self._ctx()), \
+             patch(
+                 "coord.test_author.github_ops.get_issue",
+                 return_value={"title": "Add foo", "body": "Body text"},
+             ), \
+             patch("socket.gethostname", return_value="laptop"), \
+             patch(
+                 "coord.agent.setup_interactive_worktree",
+                 return_value=(Path("/tmp/wt-2"), self._expected_branch()),
+             ), \
+             patch("coord.interactive.launch_human_attended_interactive", return_value=0), \
+             patch("coord.interactive.finalize_interactive_exit", return_value=fake_finalize), \
+             patch("coord.interactive.tmux_available", return_value=False):
+            dispatch_test_author_interactive("coord-tui", 947, cfg, issue_number=101)
+
+        from coord.state import build_board
+        rows = [
+            a for a in build_board().active + build_board().completed
+            if a.type == "test-author"
+        ]
+        assert len(rows) == 1
+        assert rows[0].for_issue_number == 101
+        assert "Add foo" in rows[0].briefing
+
+    def test_local_worktree_failure_raises_and_marks_failure_reason(self) -> None:
+        from coord.agent import _GitError
+
+        cfg = _config([_machine("laptop", ["coord-tui"])], driver=self._driver())
+        with patch("coord.test_author.fetch_milestone_context", return_value=self._ctx()), \
+             patch("socket.gethostname", return_value="laptop"), \
+             patch(
+                 "coord.agent.setup_interactive_worktree",
+                 side_effect=_GitError("boom"),
+             ):
+            with pytest.raises(RuntimeError, match="worktree-add failed"):
+                dispatch_test_author_interactive("coord-tui", 947, cfg)
+
+        from coord.state import build_board
+        rows = [a for a in build_board().active + build_board().completed if a.type == "test-author"]
+        assert len(rows) == 1
+        assert rows[0].status == "failed"
+        assert rows[0].failure_reason and "boom" in rows[0].failure_reason
+
+    # ── remote: named-branch continuation over ssh+tmux ────────────────
+
+    def test_remote_creates_test_author_row_via_tmux(self) -> None:
+        cfg = _config([_machine("dellserver", ["coord-tui"])], driver=self._driver())
+        fake_finalize = MagicMock(
+            already_recorded=False, terminal_status="done",
+            commits_ahead=2, push_ok=True,
+        )
+        tmux_spy = MagicMock(return_value=0)
+        finalize_spy = MagicMock(return_value=fake_finalize)
+        headless_spy = MagicMock(side_effect=AssertionError("must not fall through to headless"))
+
+        with patch("coord.test_author.fetch_milestone_context", return_value=self._ctx()), \
+             patch(
+                 "coord.test_author.github_ops.get_issue",
+                 return_value={"title": "Add foo", "body": "Body text"},
+             ), \
+             patch("socket.gethostname", return_value="operator-laptop"), \
+             patch("coord.interactive._launch_via_tmux", tmux_spy), \
+             patch("coord.interactive.tmux_session_alive", return_value=False), \
+             patch("coord.interactive.finalize_remote_interactive_exit", finalize_spy), \
+             patch("coord.test_author.dispatch_test_author", headless_spy):
+            exit_code = dispatch_test_author_interactive(
+                "coord-tui", 947, cfg, issue_number=101,
+            )
+
+        assert exit_code == 0
+        assert tmux_spy.call_count == 1
+        assert finalize_spy.call_count == 1
+        assert headless_spy.call_count == 0
+
+        from coord.state import build_board
+        rows = [
+            a for a in build_board().active + build_board().completed
+            if a.type == "test-author"
+        ]
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.provider_name == "claude-pty"
+        assert row.for_issue_number == 101
+        assert row.branch == self._expected_branch()
+
+    def test_remote_session_still_alive_skips_finalize(self) -> None:
+        cfg = _config([_machine("dellserver", ["coord-tui"])], driver=self._driver())
+        finalize_spy = MagicMock()
+
+        with patch("coord.test_author.fetch_milestone_context", return_value=self._ctx()), \
+             patch("socket.gethostname", return_value="operator-laptop"), \
+             patch("coord.interactive._launch_via_tmux", return_value=0), \
+             patch("coord.interactive.tmux_session_alive", return_value=True), \
+             patch("coord.interactive.finalize_remote_interactive_exit", finalize_spy):
+            exit_code = dispatch_test_author_interactive("coord-tui", 947, cfg)
+
+        assert exit_code == 0
+        assert finalize_spy.call_count == 0
