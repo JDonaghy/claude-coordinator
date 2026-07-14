@@ -535,6 +535,77 @@ def test_pipeline_attention_thresholds_interactive_fix_explicit_conflict_fix_ove
     assert cfg2.attention_threshold_for("work") == 5.0
 
 
+@pytest.mark.parametrize("assignment_type", ["review", "smoke"])
+def test_pipeline_attention_thresholds_interactive_session_gets_conflict_fix_threshold(
+    assignment_type: str,
+) -> None:
+    """#1144: an interactive ``--review-of``/``--smoke-of`` session shares
+    ``type="review"``/``type="smoke"`` with headless auto-review/smoke, so
+    it's recognized by the same compound discriminator
+    (``provider_name="claude-pty"`` + ``review_of_assignment_id`` set) that
+    #1137 gave the interactive fix session — mirroring
+    ``coord.reconcile.is_interactive_merge_session`` — and reuses
+    ``conflict-fix``'s 60m threshold rather than plain review's 15m or
+    smoke's 20m.
+    """
+    cfg = PipelineConfig()
+    assert cfg.attention_threshold_for(
+        assignment_type, provider_name="claude-pty", review_of_assignment_id="rev-1",
+    ) == 60 * 60.0
+
+
+@pytest.mark.parametrize("assignment_type", ["review", "smoke"])
+def test_pipeline_attention_thresholds_plain_review_smoke_unaffected_by_discriminator_kwargs(
+    assignment_type: str,
+) -> None:
+    """A headless review/smoke assignment (no provider_name / no
+    review_of_assignment_id) still gets its own plain threshold — only the
+    compound match bumps it to conflict-fix's.
+    """
+    cfg = PipelineConfig()
+    plain_threshold = cfg.attention_threshold_for(assignment_type)
+    assert plain_threshold in (15 * 60.0, 20 * 60.0)
+    # Headless — no provider_name at all.
+    assert cfg.attention_threshold_for(assignment_type) == plain_threshold
+    # review_of_assignment_id set (headless auto-review/smoke also set this
+    # to link back to the work assignment) but NOT the interactive provider.
+    assert cfg.attention_threshold_for(
+        assignment_type, provider_name=None, review_of_assignment_id="rev-1",
+    ) == plain_threshold
+    # Interactive provider but no review_of_assignment_id (shouldn't happen
+    # in practice for review/smoke, but the discriminator requires both).
+    assert cfg.attention_threshold_for(
+        assignment_type, provider_name="claude-pty", review_of_assignment_id=None,
+    ) == plain_threshold
+
+
+@pytest.mark.parametrize("assignment_type", ["review", "smoke"])
+def test_pipeline_attention_thresholds_interactive_review_smoke_explicit_conflict_fix_override_wins(
+    assignment_type: str,
+) -> None:
+    """An explicit user-configured ``conflict-fix`` threshold applies to an
+    interactive review/smoke session too, since #1144 delegates to
+    ``attention_threshold_for("conflict-fix")`` the same way #1137 did for
+    the interactive fix session. Overriding plain ``review``/``smoke`` alone
+    does NOT change the interactive bump — only overriding the type it
+    defers to (conflict-fix) does.
+    """
+    cfg = PipelineConfig(attention_thresholds={"conflict-fix": 5.0})
+    assert cfg.attention_threshold_for(
+        assignment_type, provider_name="claude-pty", review_of_assignment_id="rev-1",
+    ) == 5.0
+
+    cfg2 = PipelineConfig(
+        attention_thresholds={assignment_type: 5.0, "conflict-fix": 60 * 60.0}
+    )
+    assert cfg2.attention_threshold_for(
+        assignment_type, provider_name="claude-pty", review_of_assignment_id="rev-1",
+    ) == 60 * 60.0
+    # Plain headless review/smoke (no discriminator match) still honors the
+    # override of its own type.
+    assert cfg2.attention_threshold_for(assignment_type) == 5.0
+
+
 def test_pipeline_attention_thresholds_parsed_from_yaml(tmp_path: Path) -> None:
     p = tmp_path / "coordinator.yml"
     p.write_text(
