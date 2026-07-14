@@ -28,9 +28,13 @@ the same path rather than embedding the contract text.
 
 from __future__ import annotations
 
+import os
+import sys
 import time
 import uuid
+from pathlib import Path
 
+import click
 import httpx
 
 from coord import github_ops
@@ -93,6 +97,23 @@ guess: write the test with a `// TODO(test-author): contract doesn't specify
 X` comment (or the language's equivalent) rather than inventing behavior, \
 and call it out in your final summary.
 """
+
+# #1173: the human-attended (`coord acceptance author --interactive`) variant
+# of the system prompt above. The independence contract is UNCHANGED — same
+# rules, same STOP-on-missing-contract, same "don't peek at the work branch"
+# — this only tells the model an operator is attached, since that's a
+# material fact about the session it would otherwise have no way to know.
+TEST_AUTHOR_INTERACTIVE_SYSTEM_PROMPT = (
+    TEST_AUTHOR_SYSTEM_PROMPT
+    + "\n\nThis session is HUMAN-ATTENDED: an operator is at the keyboard "
+    "with you, watching your output and able to redirect you. That does "
+    "NOT relax anything above — you still author from the contract alone, "
+    "with zero shared context with the implementation. The operator is "
+    "here to catch a bad contract/mock read, a stuck session, or an "
+    "ambiguous case worth discussing out loud — not to hand you "
+    "implementation details or steer you toward a specific test shape "
+    "beyond what the contract says.\n"
+)
 
 
 def pick_test_author_machine(
@@ -425,3 +446,434 @@ def dispatch_test_author(
     record_dispatched_assignment(assignment=asg, repo_github=repo_cfg.github)
 
     return assignment_id, machine.name
+
+
+def dispatch_test_author_interactive(
+    repo_name: str,
+    tracking_issue: int,
+    config: Config,
+    *,
+    issue_number: int | None = None,
+    machine_override: str | None = None,
+    path: str | None = None,
+    dry_run: bool = False,
+) -> int:
+    """Human-attended counterpart to :func:`dispatch_test_author` (#1173,
+    ``coord acceptance author --interactive``).
+
+    Reuses the SAME interactive-launch machinery every other attended stage
+    uses, instead of rebuilding any of it:
+
+    * :func:`coord.commands.dispatch._build_interactive_launch_setup` for the
+      shared ``ClaudePtyProvider`` / local-vs-remote detection / per-issue
+      context digest (#603) that every ``coord assign --interactive`` flavour
+      shares.
+    * :func:`coord.agent.setup_interactive_worktree` (local) / a raw
+      ``git worktree add`` shell command over ssh+tmux (remote) — the same
+      primitives :func:`~coord.commands.dispatch_workers._dispatch_rework_of`
+      uses to land on a NAMED branch rather than a fresh one.
+    * :func:`coord.interactive.launch_human_attended_interactive` /
+      :func:`~coord.interactive.finalize_interactive_exit` /
+      :func:`~coord.interactive.finalize_remote_interactive_exit` for the
+      actual PTY/tmux attach and the #466 git-floor completion backstop.
+
+    The session lands on the EXACT same derived branch a headless dispatch
+    of the same milestone/JIT slice would use — ``issue-{tracking_issue}-
+    {slug(assignment_title)}``, the same derivation
+    :meth:`coord.agent.AgentServer._setup_worktree` uses for
+    ``type="test-author"`` — so headless and interactive test-author
+    dispatches continue the SAME branch/PR rather than forking one each.
+
+    Keeps the independence seal unchanged: the briefing content is built by
+    the SAME :func:`build_test_author_briefing` the headless path uses, and
+    the system prompt is :data:`TEST_AUTHOR_INTERACTIVE_SYSTEM_PROMPT` — the
+    headless prompt plus a one-paragraph "an operator is watching" note.
+    ``--interactive`` changes who supervises the authoring, never who writes
+    the tests or what they may read.
+
+    Records a ``type="test-author"`` :class:`~coord.models.Assignment` with
+    ``provider_name="claude-pty"`` BEFORE launching (mirrors every other
+    interactive flavour) so the board always reflects the in-flight session.
+    That field is also what keeps this row out of automatic headless review
+    dispatch (#555's generic ``provider_name != "claude-pty"`` guard in
+    :func:`coord.review.dispatch_pending_reviews` — ``test-author`` is
+    already in :data:`coord.models.WORK_LIKE_TYPES`, so no type-specific
+    exclusion was needed). The explicit human-attended handoffs
+    (``coord review``, ``coord assign --interactive --review-of/--merge-of``)
+    pick this row up exactly like an interactive ``work`` completion — same
+    board membership, same ``.branch`` — so there's no new stall to plumb
+    around, only the same "human drives Test→Review→Merge" path #1173 asks
+    for.
+
+    Returns the child process's exit code (``0`` on a clean exit, or on a
+    dry run). Raises :class:`RuntimeError` on any resolution failure — the
+    same failure modes as :func:`dispatch_test_author` (unknown repo/driver/
+    milestone/issue-membership/machine), plus a worktree/remote-launch setup
+    failure (mirrors ``--rework-of``'s #618 failure-reason backstop: the
+    reason is recorded on the assignment row before the error is raised, so
+    the TUI can explain a red box with no log file).
+    """
+    from coord.agent import (  # noqa: PLC0415
+        AssignmentSpec,
+        _GitError,
+        _slugify,
+        setup_interactive_worktree,
+    )
+    from coord.interactive import (  # noqa: PLC0415
+        TmuxHost,
+        _launch_via_tmux,
+        finalize_interactive_exit,
+        finalize_remote_interactive_exit,
+        launch_human_attended_interactive,
+        tmux_available,
+        tmux_session_alive,
+        tmux_session_name,
+    )
+    from coord.state import (  # noqa: PLC0415
+        record_dispatched_assignment,
+        set_assignment_failure_reason,
+    )
+
+    repo_cfg = config.repo(repo_name)
+    if repo_cfg is None:
+        raise RuntimeError(f"repo {repo_name!r} not in coordinator.yml")
+
+    driver_cfg = config.acceptance.driver_for(repo_name, path)
+    if driver_cfg is None:
+        if config.acceptance.has_driver(repo_name):
+            raise RuntimeError(
+                f"repo {repo_name!r} has a routed acceptance driver "
+                "(acceptance.drivers routes) but no route matched — pass "
+                "--for-path to select the milestone's subtree (e.g. "
+                "'coord/**')"
+            )
+        raise RuntimeError(
+            f"no acceptance driver configured for repo {repo_name!r} "
+            "(add it under acceptance.drivers in coordinator.yml)"
+        )
+
+    try:
+        ctx = fetch_milestone_context(repo_cfg, tracking_issue)
+    except MilestoneDispatchError as e:
+        raise RuntimeError(str(e)) from e
+
+    if issue_number is not None and ctx.work_order.node(issue_number) is None:
+        raise RuntimeError(
+            f"issue #{issue_number} is not a member of milestone "
+            f"#{ctx.milestone_number}'s work order (tracking issue #{tracking_issue})"
+        )
+
+    if machine_override:
+        machine = next(
+            (m for m in config.machines if m.name == machine_override), None
+        )
+        if machine is None:
+            raise RuntimeError(f"machine {machine_override!r} not in coordinator.yml")
+        if not machine.can_work_on(repo_name):
+            raise RuntimeError(
+                f"machine {machine_override!r} does not list repo {repo_name!r}"
+            )
+    else:
+        machine = pick_test_author_machine(config, repo_name, driver_cfg.capability)
+        if machine is None:
+            cap_note = (
+                f" with capability {driver_cfg.capability!r}"
+                if driver_cfg.capability else ""
+            )
+            raise RuntimeError(
+                f"no machine claims repo {repo_name!r}{cap_note} — "
+                "test-author needs a machine with the repo cloned"
+                + (" and the driver's required capability" if cap_note else "")
+            )
+
+    repo_path_cfg = machine.repo_path(repo_name)
+    if repo_path_cfg is None:
+        raise RuntimeError(
+            f"machine {machine.name!r} has no repo_path for {repo_name!r}"
+        )
+
+    issue_title: str | None = None
+    issue_body: str | None = None
+    if issue_number is not None:
+        try:
+            issue_data = github_ops.get_issue(repo_cfg.github, issue_number)
+        except RuntimeError as e:
+            raise RuntimeError(f"could not fetch #{issue_number}: {e}") from e
+        issue_title = issue_data.get("title") or ""
+        issue_body = issue_data.get("body") or ""
+
+    ms_dir = f"ms-{ctx.milestone_number}"
+    briefing = build_test_author_briefing(
+        repo_name=repo_name,
+        repo_github=repo_cfg.github,
+        ms_dir=ms_dir,
+        tracking_issue=tracking_issue,
+        milestone_number=ctx.milestone_number,
+        milestone_issue_numbers=list(ctx.work_order.issue_numbers),
+        driver_kind=driver_cfg.kind,
+        driver_run=driver_cfg.run,
+        issue_number=issue_number,
+        issue_title=issue_title,
+        issue_body=issue_body,
+    )
+
+    # Same FIXED title as the headless dispatch (see dispatch_test_author's
+    # comment above `assignment_title`) so both modes derive the SAME
+    # branch name and continue the same branch/PR across repeated dispatches.
+    assignment_title = f"[test-author] ms-{ctx.milestone_number} acceptance suite"
+    repo_deny = repo_cfg.worker_permissions.deny if repo_cfg.worker_permissions else []
+    deny_commands = list(dict.fromkeys(list(repo_deny) + TEST_AUTHOR_DENY_COMMANDS))
+    default_branch = repo_cfg.default_branch or "main"
+    branch_name = f"issue-{tracking_issue}-{_slugify(assignment_title)}"
+
+    from coord.commands.dispatch import _build_interactive_launch_setup  # noqa: PLC0415
+
+    setup = _build_interactive_launch_setup(
+        machine=machine.name, repo=repo_name, issue=tracking_issue, machine_obj=machine,
+    )
+    provider = setup.provider
+    is_local = setup.is_local
+    issue_ctx = setup.issue_ctx
+
+    if is_local:
+        ta_repo_path = str(Path(repo_path_cfg).expanduser())
+    else:
+        ta_repo_path = repo_path_cfg
+
+    resolved_model = config.models.default
+    assignment_id = uuid.uuid4().hex[:12]
+
+    scope = f"issue #{issue_number} slice" if issue_number is not None else "full milestone"
+    report_reminder = (
+        f"[Coordinator test-author assignment {assignment_id}] HUMAN-ATTENDED "
+        f"interactive test-authoring ({scope}) for {repo_cfg.github} milestone "
+        f"#{ctx.milestone_number} (tracking issue #{tracking_issue}). Before "
+        f"you exit, run `coord report-result --assignment {assignment_id} "
+        "--status <done|blocked> --summary <text>` so the coordinator "
+        "records the result.\n\n"
+    )
+    effective_briefing = issue_ctx + report_reminder + briefing
+
+    spec = AssignmentSpec(
+        repo_name=repo_name,
+        repo_path=ta_repo_path,
+        issue_number=tracking_issue,
+        issue_title=assignment_title,
+        briefing=effective_briefing,
+        model=resolved_model,
+        type="test-author",
+        provider="claude-pty",
+        system_prompt=TEST_AUTHOR_INTERACTIVE_SYSTEM_PROMPT,
+        deny_commands=deny_commands,
+    )
+    argv = provider.build_command(spec, resolved_model=resolved_model)
+    # Remote: a bare "claude" is not on the SSH login PATH (#424/#425).
+    if not is_local:
+        argv = ["~/.local/bin/claude"] + list(argv)[1:]
+
+    location = "local TTY" if is_local else f"{machine.host} (remote tmux)"
+    click.echo(
+        f"{machine.name} ({location}) → TEST-AUTHOR for {repo_cfg.github} "
+        f"milestone #{ctx.milestone_number} (tracking issue #{tracking_issue}, "
+        f"{scope})"
+    )
+    click.echo("  mode: HUMAN-ATTENDED interactive test-authoring (#1173)")
+    click.echo(f"  assignment id: {assignment_id}  (branch: {branch_name})")
+
+    if dry_run:
+        click.echo("  (dry run — not launched)")
+        click.echo(f"  would exec: {argv}")
+        return 0
+
+    ta_assignment = Assignment(
+        machine_name=machine.name,
+        repo_name=repo_name,
+        issue_number=tracking_issue,
+        issue_title=assignment_title,
+        briefing=effective_briefing,
+        assignment_id=assignment_id,
+        status="running",
+        branch=branch_name,
+        dispatched_at=time.time(),
+        type="test-author",
+        for_issue_number=issue_number,
+        model=resolved_model,
+        provider_name="claude-pty",
+    )
+    record_dispatched_assignment(assignment=ta_assignment, repo_github=repo_cfg.github)
+    os.environ["COORD_ASSIGNMENT_ID"] = assignment_id
+
+    if is_local:
+        try:
+            wt_path, _ = setup_interactive_worktree(
+                Path(ta_repo_path),
+                issue_number=tracking_issue,
+                issue_title=assignment_title,
+                assignment_id=assignment_id,
+                default_branch=default_branch,
+                existing_branch=branch_name,
+            )
+            worktree_path = str(wt_path)
+        except (_GitError, OSError) as wt_err:
+            reason = f"worktree-add failed for branch {branch_name}: {wt_err}"
+            click.echo(f"  error: {reason}", err=True)
+            set_assignment_failure_reason(assignment_id, reason)
+            raise RuntimeError(reason) from wt_err
+        click.echo(f"  worktree: {worktree_path} (branch: {branch_name})")
+
+        started_at = time.time()
+        exit_code = launch_human_attended_interactive(
+            argv, effective_briefing, assignment_id=assignment_id, cwd=worktree_path,
+        )
+        if exit_code != 0:
+            click.echo(f"  claude exited with status {exit_code}", err=True)
+
+        sname = tmux_session_name(assignment_id) if tmux_available() else None
+        if sname and tmux_session_alive(sname):
+            click.echo(
+                f"  session still running in tmux: {sname}\n"
+                f"  reattach with:  coord reattach {assignment_id}"
+            )
+            return 0
+
+        try:
+            finalize_result = finalize_interactive_exit(
+                assignment_id=assignment_id,
+                repo_name=repo_name,
+                repo_github=repo_cfg.github,
+                issue_number=tracking_issue,
+                machine_name=machine.name,
+                worktree_path=worktree_path,
+                base_branch=default_branch,
+                exit_code=exit_code,
+                started_at=started_at,
+                log_path=None,
+                repo_path=ta_repo_path,
+                branch=branch_name,
+            )
+            if finalize_result.already_recorded:
+                click.echo(
+                    "  result recorded via `coord report-result`; backstop "
+                    "did not overwrite"
+                )
+            else:
+                click.echo(
+                    f"  backstop: status={finalize_result.terminal_status} "
+                    f"commits_ahead={finalize_result.commits_ahead}"
+                )
+                if not finalize_result.push_ok:
+                    click.echo(
+                        f"  warning: git push failed: {finalize_result.push_error}",
+                        err=True,
+                    )
+        except Exception as exc:  # noqa: BLE001 — best-effort backstop
+            click.echo(
+                f"  warning: backstop failed to record test-author exit: {exc}",
+                err=True,
+            )
+        return exit_code
+
+    # ── REMOTE (#1173) ──────────────────────────────────────────────────
+    # Mirrors _dispatch_rework_of's remote shape (named-branch continuation
+    # + finalize_remote_interactive_exit) but WITHOUT its holder-detection
+    # retry maze (#759/#814) — test-author dispatch is a low-frequency Gate-A
+    # / JIT call, not the hot auto-loop path, so a branch/worktree collision
+    # is far less likely than for --rework-of's "resume a specific in-flight
+    # session" case. Lift that block from dispatch_workers._dispatch_rework_of
+    # if this turns out to need it.
+    import shlex
+
+    remote_wt = "$HOME/.coord/worktrees/" + assignment_id
+    rp_sh = (
+        "$HOME/" + ta_repo_path[2:]
+        if ta_repo_path.startswith("~/")
+        else ("$HOME" if ta_repo_path == "~" else ta_repo_path)
+    )
+    claude_args = shlex.join(list(argv)[1:])
+    br_q = shlex.quote(branch_name)
+    orig_ref = shlex.quote(f"origin/{branch_name}")
+    remote_cmd = (
+        f"mkdir -p $HOME/.coord/worktrees"
+        f" && cd {rp_sh}"
+        f" && git fetch origin --prune 2>/dev/null || true"
+        f" && git worktree prune 2>/dev/null || true"
+        f" && (git worktree add -B {br_q} {remote_wt} {orig_ref} 2>/dev/null"
+        f" || git worktree add -b {br_q} {remote_wt} origin/{default_branch})"
+        f" && cd {remote_wt}"
+        f" && COORD_ASSIGNMENT_ID={assignment_id} {argv[0]} {claude_args}"
+    )
+    tmux_host = TmuxHost(ssh_target=machine.host)
+    sname = tmux_session_name(assignment_id)
+    click.echo(
+        f"  remote worktree: $HOME/.coord/worktrees/{assignment_id} on "
+        f"{machine.host} (branch: {branch_name})"
+    )
+
+    if effective_briefing.strip():
+        hdr = (
+            "--- seeded briefing -- review below; "
+            "submit the pre-filled input in Claude to send ---"
+        )
+        ftr = "-" * len(hdr)
+        preview = f"\n{hdr}\n{effective_briefing.rstrip()}\n{ftr}\n\n"
+        try:
+            os.write(sys.stdout.fileno(), preview.encode("utf-8"))
+        except OSError:
+            pass
+
+    started_at = time.time()
+    rc = _launch_via_tmux(
+        argv, effective_briefing, sname, cwd=None, host=tmux_host,
+        raw_shell_cmd=remote_cmd,
+    )
+    if rc is None:
+        reason = f"could not create remote tmux session on {machine.host}"
+        click.echo(f"  error: {reason}", err=True)
+        set_assignment_failure_reason(assignment_id, reason)
+        raise RuntimeError(reason)
+    exit_code = rc
+
+    if tmux_session_alive(sname, host=tmux_host):
+        click.echo(
+            f"  session still running in remote tmux: {sname}\n"
+            f"  reattach with:  ssh -t {machine.host} tmux attach-session -t {sname}"
+        )
+        return 0
+
+    try:
+        remote_result = finalize_remote_interactive_exit(
+            assignment_id=assignment_id,
+            repo_name=repo_name,
+            repo_github=repo_cfg.github,
+            issue_number=tracking_issue,
+            machine_name=machine.name,
+            ssh_target=machine.host,
+            remote_worktree_sh=remote_wt,
+            remote_repo_sh=rp_sh,
+            branch=branch_name,
+            base_branch=default_branch,
+            exit_code=exit_code,
+            started_at=started_at,
+        )
+        if remote_result.already_recorded:
+            click.echo(
+                "  result recorded via `coord report-result`; remote "
+                "backstop did not overwrite"
+            )
+        else:
+            click.echo(
+                f"  remote backstop: status={remote_result.terminal_status} "
+                f"commits_ahead={remote_result.commits_ahead} "
+                f"pushed={remote_result.push_ok}"
+            )
+            if not remote_result.push_ok:
+                click.echo(
+                    f"  warning: remote push failed: {remote_result.push_error}",
+                    err=True,
+                )
+    except Exception as exc:  # noqa: BLE001 — best-effort backstop
+        click.echo(
+            f"  warning: remote backstop failed to record test-author exit: {exc}",
+            err=True,
+        )
+    return exit_code
