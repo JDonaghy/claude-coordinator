@@ -614,6 +614,45 @@ class TestDispatchTestAuthorInteractive:
         assert row.for_issue_number is None
         assert row.issue_number == 947
 
+    def test_local_dispatch_bootstraps_board_initialized(self) -> None:
+        """Review finding (fix iteration 1/5): every sibling interactive-
+        dispatch flavour in coord.commands.dispatch_workers follows
+        `record_dispatched_assignment(...)` with `if svc is None:
+        save_board(build_board())` so `board_meta.board_initialized` gets
+        set. Without it, `load_board()` (used directly by coord/commands/
+        merge.py's #821 fail-open gate checks) returns None even though the
+        assignment row exists — `build_board()` papers over it by querying
+        `assignments` directly, but `load_board()` does not. Assert the
+        thin-client-visible surface (`load_board()`), not just
+        `build_board()`, so this regresses loudly if the bootstrap call is
+        ever dropped again."""
+        cfg = _config([_machine("laptop", ["coord-tui"])], driver=self._driver())
+        fake_finalize = MagicMock(
+            already_recorded=False, terminal_status="done",
+            commits_ahead=1, push_ok=True,
+        )
+        with patch("coord.test_author.fetch_milestone_context", return_value=self._ctx()), \
+             patch("socket.gethostname", return_value="laptop"), \
+             patch(
+                 "coord.agent.setup_interactive_worktree",
+                 return_value=(Path("/tmp/wt-3"), self._expected_branch()),
+             ), \
+             patch("coord.interactive.launch_human_attended_interactive", return_value=0), \
+             patch("coord.interactive.finalize_interactive_exit", return_value=fake_finalize), \
+             patch("coord.interactive.tmux_available", return_value=False):
+            exit_code = dispatch_test_author_interactive("coord-tui", 947, cfg)
+
+        assert exit_code == 0
+
+        from coord.state import load_board
+        board = load_board()
+        assert board is not None, (
+            "load_board() returned None after dispatch_test_author_interactive — "
+            "board_meta.board_initialized was never set, which fail-opens "
+            "coord/commands/merge.py's #821 gate checks"
+        )
+        assert any(a.type == "test-author" for a in board.active + board.completed)
+
     def test_local_jit_mode_sets_for_issue_number(self) -> None:
         cfg = _config([_machine("laptop", ["coord-tui"])], driver=self._driver())
         fake_finalize = MagicMock(
