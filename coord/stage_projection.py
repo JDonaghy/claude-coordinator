@@ -33,6 +33,8 @@ from __future__ import annotations
 
 from typing import Any, Protocol, runtime_checkable
 
+from coord.models import CLOSES_ISSUE_TYPES
+
 # ── Stage-status vocabulary — mirrors tui/src/app/pipeline.rs::StageStatus ──
 PENDING = "pending"
 ACTIVE = "active"
@@ -289,7 +291,12 @@ def merge_stage_status_for(
     # #775: the daemon's merge-reconcile tick prunes the queue row after
     # flipping the work assignment to status="merged" — fall back to the
     # assignment itself as evidence the Merge stage is Done.
-    if any(a.type == "work" and a.status == "merged" for a in assignments_for_issue):
+    # #1142: gate on CLOSES_ISSUE_TYPES, not a bare `type == "work"` — a
+    # merged assignment whose type doesn't actually resolve this issue (e.g.
+    # a `coord pr` PR-opening helper for a test-author/mock-author original,
+    # whose issue_number is a milestone tracking issue) must not be read as
+    # this issue's own work merging. See `coord.models.PR_HELPER_TYPE`.
+    if any(a.type in CLOSES_ISSUE_TYPES and a.status == "merged" for a in assignments_for_issue):
         return DONE
 
     return SKIPPED if is_closed else PENDING
@@ -356,7 +363,13 @@ def issue_has_any_approved_review(
     assignment for the *issue* so a bounce-created fix worker's approval is
     found even when a merge-queue entry is still keyed to the original work.
     """
-    work_ids = {a.assignment_id for a in assignments_for_issue if a.type == "work" and a.assignment_id}
+    # #1142: CLOSES_ISSUE_TYPES, not a bare `type == "work"` — see the same
+    # rationale in `merge_stage_status_for` above.
+    work_ids = {
+        a.assignment_id
+        for a in assignments_for_issue
+        if a.type in CLOSES_ISSUE_TYPES and a.assignment_id
+    }
     if seed_work_id:
         work_ids.add(seed_work_id)
 

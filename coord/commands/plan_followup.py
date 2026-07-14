@@ -299,11 +299,12 @@ def pr(assignment_id: str, config_path: Path, no_review: bool) -> None:
     # it on merge would wrongly flip the epic to "done" while its real
     # sub-issues are untouched. Only "work"-type PRs get the closing
     # keyword; everything else gets a non-closing reference.
-    from coord.models import CLOSES_ISSUE_TYPES  # noqa: PLC0415
+    from coord.models import CLOSES_ISSUE_TYPES, PR_HELPER_TYPE  # noqa: PLC0415
 
+    closes_issue = assignment.type in CLOSES_ISSUE_TYPES
     ref_keyword = (
         f"Closes #{assignment.issue_number}"
-        if assignment.type in CLOSES_ISSUE_TYPES
+        if closes_issue
         else f"Refs #{assignment.issue_number}"
     )
     briefing = (
@@ -315,8 +316,17 @@ def pr(assignment_id: str, config_path: Path, no_review: bool) -> None:
         f"Do NOT modify any code — only create the PR."
     )
 
+    # #1142: only give the PR-opening helper `type="work"` when the original
+    # assignment's own type actually resolves `issue_number` (mirrors the
+    # Closes/Refs split above). Otherwise (test-author/mock-author/etc, whose
+    # issue_number is a milestone tracking issue) the helper gets a distinct
+    # `PR_HELPER_TYPE` so it can never be mistaken for that tracking issue's
+    # own merged work by `coord.stage_projection.merge_stage_status_for` (or
+    # any other heuristic keyed on `type == "work"` / `CLOSES_ISSUE_TYPES`).
+    followup_type = "work" if closes_issue else PR_HELPER_TYPE
+
     try:
-        new_id = _dispatch_followup(cfg, assignment, briefing)
+        new_id = _dispatch_followup(cfg, assignment, briefing, type=followup_type)
     except httpx.HTTPError as e:
         click.echo(f"error: dispatch failed: {e}", err=True)
         sys.exit(1)
