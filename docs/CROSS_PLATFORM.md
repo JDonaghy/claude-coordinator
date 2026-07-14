@@ -247,7 +247,37 @@ vision the whole tool is built around).
 
 ## Issue map
 
-Not yet decomposed. When picked up, this becomes a milestone epic with (rough) children:
-guard-imports + single-node `transport: local`; `SessionBackend` seam + `WsPtyBackend`; agent
-ConPTY + Job Objects; ssh-ops → agent endpoints; `platformdirs` + junctions + binary resolution;
-CI matrix + `os:*` capability routing; per-OS live-smoke playbook.
+Decomposed 2026-07-13 into **two milestones** — Phase 1 (mac + portable core, independent of #1064)
+ships first; Phase 2 (Windows-native attended sessions) follows, gated on #1064. Children are planned,
+not yet dispatched.
+
+### Milestone #39 — Cross-Platform Core + macOS · epic #1160
+
+```
+CP-1 #1156 ─┬─► CP-2 #1157 ─┐
+            └─► CP-3 #1158 ─┴─► CP-4 #1159
+```
+
+- **#1156 CP-1** — guard POSIX imports (`interactive.py:72-88`) + `platformdirs` state dirs → package
+  imports + read/plan surface run on Win/mac. The foundation.
+- **#1157 CP-2** — single-node `transport: local` topology (localhost, no ssh/Tailscale; `coord up`). `{after: #1156}`
+- **#1158 CP-3** — macOS runtime parity (launchd + `shutil.which("claude")` binary resolution). `{after: #1156}`
+- **#1159 CP-4** — CI matrix (ubuntu/macos/windows) + `os:*` `capability_rules` + live-smoke playbook. `{after: #1157, #1158}`
+
+### Milestone #40 — Windows-native attended sessions · epic #1165
+
+```
+CP-5 #1161 ─┬─► CP-6 #1162   (+ cross-milestone #1064)
+            └─► CP-7 #1163
+CP-8 #1164   (independent root)
+```
+
+- **#1161 CP-5** — `SessionBackend` seam (generalize `TmuxHost`); ToS contract baked in. Refactor, no Unix behavior change.
+- **#1164 CP-8** — ssh-ops → agent HTTP endpoints; ssh demoted to tier-3. Independent root.
+- **#1162 CP-6** — WS-PTY as the universal `SessionBackend`; **verify detached-survival + scrollback** (the regression-guard). `{after: #1161}` + cross-milestone **#1064**.
+- **#1163 CP-7** — Windows agent runtime: ConPTY (`pywinpty`) + Job Objects + worktree junctions. `{after: #1161}`
+
+**Cross-milestone / cross-repo edges (prose, not work-order `after:`):** #1064 gates CP-6 (it builds
+the survival-capable bridge; CP-6 consumes + Windows-integrates + verifies it); milestone #27
+(coord-ui GTK / multi-backend) is the downstream consumer of CP-6's WS-PTY substrate. Phase 2 also
+assumes Phase 1's CP-1 (#1156) has landed.
