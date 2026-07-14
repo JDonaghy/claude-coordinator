@@ -129,6 +129,26 @@ def test_merge_stage_pruned_entry_falls_back_to_merged_work_assignment():
     assert sp.merge_stage_status_for(a, None, is_closed=False) == sp.DONE
 
 
+def test_merge_stage_merged_pr_helper_for_tracking_issue_is_not_done():
+    """#1142: a merged `coord pr` helper (type="pr-helper", #1142) tied to a
+    milestone tracking issue must NOT be mistaken for that issue's own
+    merged work — regression for epic #1117 showing "Done" prematurely from
+    a merged test-author/mock-author PR-opening helper whose issue_number is
+    the tracking issue, not something it resolves."""
+    a = [
+        Assignment(
+            machine_name="m",
+            repo_name="api",
+            issue_number=1117,
+            issue_title="[test-author] ms-37 acceptance suite",
+            type="pr-helper",
+            status="merged",
+            branch="issue-1117-test-author-ms-37-acceptance-suite",
+        )
+    ]
+    assert sp.merge_stage_status_for(a, None, is_closed=False) == sp.PENDING
+
+
 def test_merge_stage_no_entry_open_issue_is_pending():
     assert sp.merge_stage_status_for([], None, is_closed=False) == sp.PENDING
 
@@ -253,6 +273,21 @@ def test_approved_review_self_stamped_on_work():
     """#331: verdict stamped directly on the work row (no separate review worker)."""
     a = [_work(assignment_id="w1", status="done", review_verdict="approve")]
     assert sp.issue_has_any_approved_review(a) is True
+
+
+def test_approved_review_self_stamped_on_pr_helper_does_not_count():
+    """#1142: a review verdict stamped on a `pr-helper`-type row (a `coord
+    pr` helper for a non-closes-issue original) must not count as an
+    approved review of the *tracking issue's own* work — same
+    CLOSES_ISSUE_TYPES rationale as merge_stage_status_for above."""
+    a = [
+        Assignment(
+            machine_name="m", repo_name="api", issue_number=1117, issue_title="t",
+            assignment_id="pr-helper-1", type="pr-helper", status="done",
+            review_verdict="approve",
+        )
+    ]
+    assert sp.issue_has_any_approved_review(a) is False
 
 
 def test_approved_review_seed_work_id_covers_pruned_row():

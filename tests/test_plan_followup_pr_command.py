@@ -89,3 +89,62 @@ class TestPrBriefingKeyword:
         briefing = disp.call_args[0][2]
         assert 'Refs #42' in briefing
         assert 'Closes #42' not in briefing
+
+
+class TestPrHelperAssignmentType:
+    """#1142: the PR-opening helper's own `type` must not be a bare "work"
+    default when the original assignment doesn't itself resolve the issue —
+    otherwise a merged helper for a test-author/mock-author original (whose
+    issue_number is a milestone tracking issue) gets mistaken for that
+    tracking issue's own merged work by
+    `coord.stage_projection.merge_stage_status_for`'s #775 fallback.
+    """
+
+    def test_work_original_dispatches_work_helper(self, config_file: Path, coord_db) -> None:
+        a = _make_assignment("work-001", type="work")
+        board = Board(active=[], completed=[a])
+        state_mod.save_board(board)
+
+        with patch(
+            "coord.commands.plan_followup._dispatch_followup", return_value="pr-001"
+        ) as disp:
+            result = CliRunner().invoke(
+                main, ["pr", "work-001", "--config", str(config_file)]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert disp.call_args.kwargs["type"] == "work"
+
+    def test_test_author_original_dispatches_pr_helper_type(
+        self, config_file: Path, coord_db
+    ) -> None:
+        a = _make_assignment("ta-001", type="test-author")
+        board = Board(active=[], completed=[a])
+        state_mod.save_board(board)
+
+        with patch(
+            "coord.commands.plan_followup._dispatch_followup", return_value="pr-002"
+        ) as disp:
+            result = CliRunner().invoke(
+                main, ["pr", "ta-001", "--config", str(config_file)]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert disp.call_args.kwargs["type"] == "pr-helper"
+
+    def test_mock_author_original_dispatches_pr_helper_type(
+        self, config_file: Path, coord_db
+    ) -> None:
+        a = _make_assignment("mock-002", type="mock-author")
+        board = Board(active=[], completed=[a])
+        state_mod.save_board(board)
+
+        with patch(
+            "coord.commands.plan_followup._dispatch_followup", return_value="pr-003"
+        ) as disp:
+            result = CliRunner().invoke(
+                main, ["pr", "mock-002", "--config", str(config_file)]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert disp.call_args.kwargs["type"] == "pr-helper"

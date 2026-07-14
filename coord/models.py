@@ -171,6 +171,22 @@ WORK_LIKE_TYPES: frozenset[str] = frozenset({"work", "mock-author"})
 # (``coord/merge_queue.py``'s ``process``).
 CLOSES_ISSUE_TYPES: frozenset[str] = frozenset({"work"})
 
+# #1142: the assignment `type` `coord pr` gives its PR-opening helper session
+# when the *original* assignment it's opening a PR for is NOT itself in
+# ``CLOSES_ISSUE_TYPES`` (e.g. "test-author"/"mock-author", whose
+# ``issue_number`` is the milestone's tracking issue, not something this PR
+# resolves — see ``CLOSES_ISSUE_TYPES`` above). Before #1142, `coord pr`
+# unconditionally dispatched its helper with the default `type="work"`,
+# which made ``coord.stage_projection.merge_stage_status_for``'s #775
+# fallback (and ``issue_has_any_approved_review``) mistake a merged
+# PR-helper for the *tracking issue's own* merged work, showing an open epic
+# as "Done". Giving the helper this distinct type keeps it out of both
+# ``WORK_LIKE_TYPES`` and ``CLOSES_ISSUE_TYPES`` (and therefore out of every
+# heuristic keyed on either) while still being dispatched exactly like a
+# normal "work" session otherwise — see ``coord.agent.WRITE_CAPABLE_SPEC_TYPES``,
+# which must also list it since it mutates GitHub via `gh pr create`.
+PR_HELPER_TYPE = "pr-helper"
+
 
 @dataclass
 class Assignment:

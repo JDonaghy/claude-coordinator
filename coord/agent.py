@@ -1937,7 +1937,11 @@ def _user_message_line(text: str) -> bytes:
 # docs/ORACLE_LOOP.md) writes the sealed acceptance suite under
 # ``tests/acceptance/`` and pushes a branch — a real git worktree + a
 # push, same mutation shape as ``work``/``smoke``/``conflict-fix``, so it
-# must be gated the same way.
+# must be gated the same way. ``pr-helper`` (#1142, see
+# ``coord.models.PR_HELPER_TYPE``) is `coord pr`'s PR-opening follow-up for
+# a non-closes-issue original (test-author/mock-author/...) — it gets a
+# worktree and runs `gh pr create`, the same GitHub-mutating shape as
+# `type="work"` had before #1142 gave it its own type, so it must stay here.
 WRITE_CAPABLE_SPEC_TYPES: frozenset[str] = frozenset({
     "work",
     "review",
@@ -1946,6 +1950,7 @@ WRITE_CAPABLE_SPEC_TYPES: frozenset[str] = frozenset({
     "milestone-chat",
     "mock-author",
     "test-author",
+    "pr-helper",
 })
 
 
