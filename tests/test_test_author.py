@@ -55,6 +55,18 @@ def _config(
 WORK_ORDER = WorkOrder(nodes=(WorkOrderNode(101), WorkOrderNode(102)))
 
 
+@pytest.fixture(autouse=True)
+def _pr_not_merged(monkeypatch):
+    """#1172: default the merged-branch dispatch guard to "not merged" so
+    the existing happy-path tests below (which don't care about this check)
+    don't shell out to a real ``gh`` subprocess via
+    ``coord.github_ops.pr_is_merged``. Tests exercising the guard itself
+    re-patch it to opt in — mirrors conftest.py's module-attr-stub
+    convention for ``work_is_terminal``, scoped locally to this file since
+    the guard is specific to ``dispatch_test_author``."""
+    monkeypatch.setattr("coord.test_author.github_ops.pr_is_merged", lambda *a, **k: False)
+
+
 # ── pick_test_author_machine ────────────────────────────────────────────────
 
 
@@ -381,6 +393,70 @@ class TestDispatchTestAuthor:
 
         payload = fake_client.post.call_args.kwargs["json"]
         assert "target_branch" not in payload
+
+    def test_merged_branch_refuses_milestone_mode(self) -> None:
+        """#1172: a stale milestone-mode dispatch after Gate A's shared-suite
+        branch already has a merged PR must fail loudly instead of pushing a
+        new commit onto a dead branch with nothing to review/merge it."""
+        cfg = _config([_machine("laptop", ["coord-tui"])], driver=self._driver())
+        fake_client = MagicMock()
+
+        with patch("coord.test_author.fetch_milestone_context", return_value=self._ctx()), \
+             patch("coord.test_author.github_ops.pr_is_merged", return_value=True) as pr_merged_mock, \
+             patch("coord.state.record_dispatched_assignment") as record_mock:
+            with pytest.raises(RuntimeError, match="already has a merged PR"):
+                dispatch_test_author("coord-tui", 947, cfg, http_client=fake_client)
+
+        # Refused BEFORE dispatching — no HTTP call, no board row recorded.
+        fake_client.post.assert_not_called()
+        record_mock.assert_not_called()
+        pr_merged_mock.assert_called_once_with(
+            "acme/coord-tui", "issue-947-test-author-ms-25-acceptance-suite",
+        )
+
+    def test_merged_branch_refuses_jit_mode_retry(self) -> None:
+        """#1172 defence-in-depth: even with #1171's branch-per-slice fix, a
+        RETRY of the same (tracking_issue, issue_number) pair after that
+        slice's own PR already merged (e.g. via #1138's oracle gate) must
+        refuse rather than silently stranding the retry's commit."""
+        cfg = _config([_machine("laptop", ["coord-tui"])], driver=self._driver())
+        fake_client = MagicMock()
+
+        with patch("coord.test_author.fetch_milestone_context", return_value=self._ctx()), \
+             patch(
+                 "coord.test_author.github_ops.get_issue",
+                 return_value={"title": "Add foo", "body": "Body text"},
+             ), \
+             patch("coord.test_author.github_ops.pr_is_merged", return_value=True), \
+             patch("coord.state.record_dispatched_assignment") as record_mock:
+            with pytest.raises(RuntimeError, match="already has a merged PR"):
+                dispatch_test_author(
+                    "coord-tui", 947, cfg, issue_number=101, http_client=fake_client,
+                )
+
+        fake_client.post.assert_not_called()
+        record_mock.assert_not_called()
+
+    def test_open_pr_on_branch_does_not_block_dispatch(self) -> None:
+        """The guard must only fire on a MERGED PR — a branch with a still-
+        open PR (the normal "extend the same in-flight suite" case) must
+        keep dispatching exactly as before."""
+        cfg = _config([_machine("laptop", ["coord-tui"])], driver=self._driver())
+        fake_client = MagicMock()
+        fake_resp = MagicMock()
+        fake_resp.json.return_value = {"id": "abc123"}
+        fake_client.post.return_value = fake_resp
+
+        with patch("coord.test_author.fetch_milestone_context", return_value=self._ctx()), \
+             patch("coord.test_author.github_ops.pr_is_merged", return_value=False), \
+             patch("coord.state.record_dispatched_assignment") as record_mock:
+            assignment_id, machine_name = dispatch_test_author(
+                "coord-tui", 947, cfg, http_client=fake_client,
+            )
+
+        assert assignment_id == "abc123"
+        fake_client.post.assert_called_once()
+        record_mock.assert_called_once()
 
     def test_repo_deny_commands_merged(self) -> None:
         cfg = _config(

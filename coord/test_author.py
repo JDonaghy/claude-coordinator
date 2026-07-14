@@ -331,6 +331,36 @@ def dispatch_test_author(
         )
         target_branch = f"test-author-ms-{ctx.milestone_number}-slice-{issue_number}"
 
+    # #1172: resolve the branch this dispatch would push onto UP FRONT (same
+    # formula `AgentServer._setup_worktree` / the post-dispatch recording
+    # below use) and fail loudly if its PR has already merged, instead of
+    # silently dispatching a worker whose commits would land on a dead
+    # branch with no open PR for review/merge to ever pick up (#947/#1115 —
+    # a day-long invisible strand). This is defence-in-depth on top of
+    # #1171's branch-per-slice fix: it also catches a *retry* of the SAME
+    # (tracking_issue, issue_number) pair after that slice's own PR already
+    # merged (e.g. via #1138's oracle gate), and a stale milestone-mode
+    # dispatch after Gate A's shared-suite PR merged out from under it.
+    from coord.agent import _slugify  # noqa: PLC0415
+
+    branch = target_branch or f"issue-{tracking_issue}-{_slugify(assignment_title)}"
+
+    if github_ops.pr_is_merged(repo_cfg.github, branch):
+        raise RuntimeError(
+            f"branch {branch!r} already has a merged PR — dispatching would "
+            "push new commits onto a dead branch with nothing left to open "
+            "a PR against them (#1172). "
+            + (
+                f"Issue #{issue_number}'s JIT slice already landed; if it "
+                "needs more tests, this needs a fresh branch (not "
+                "auto-forked yet) — do not retry as-is."
+                if issue_number is not None else
+                "The milestone's Gate-A suite PR already merged; if the "
+                "suite needs more work, open a fresh branch by hand — do "
+                "not retry as-is."
+            )
+        )
+
     repo_deny = repo_cfg.worker_permissions.deny if repo_cfg.worker_permissions else []
     deny_commands = list(dict.fromkeys(list(repo_deny) + TEST_AUTHOR_DENY_COMMANDS))
 
@@ -364,10 +394,9 @@ def dispatch_test_author(
     # `reconcile.py`'s `issue-{tracking_issue}-*` backfill sweep (#1083) to
     # guess later — that sweep's prefix search can never find a JIT slice's
     # `target_branch` (deliberately outside the `issue-{N}-*` namespace, see
-    # above), so the branch must be known at dispatch time here.
-    from coord.agent import _slugify  # noqa: PLC0415
-
-    branch = target_branch or f"issue-{tracking_issue}-{_slugify(assignment_title)}"
+    # above), so the branch must be known at dispatch time here. (`branch`
+    # itself was already resolved above, ahead of the POST, for the #1172
+    # merged-PR guard.)
 
     asg = Assignment(
         machine_name=machine.name,
