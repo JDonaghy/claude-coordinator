@@ -48,3 +48,20 @@ tests:
   tests.acceptance.ms-37.test_usage_core_1118::test_since_preset_relative_duration_hours: 1118
   tests.acceptance.ms-37.test_usage_core_1118::test_since_preset_iso_start: 1118
   tests.acceptance.ms-37.test_usage_core_1118::test_preset_today_is_half_open_interval: 1118
+
+  # ── #1115 CLI-1: `coord usage` per-issue rendering (Mock 1 --by-issue, Mock 2 --issue N) ──
+  # by-issue rollup view (rendered stdout behind contract Mock 1)
+  tests.acceptance.ms-37.test_usage_cli_1115::test_by_issue_cli_window_header: 1115
+  tests.acceptance.ms-37.test_usage_cli_1115::test_by_issue_cli_groups_desc_by_total: 1115
+  tests.acceptance.ms-37.test_usage_cli_1115::test_by_issue_cli_row_502_values: 1115
+  tests.acceptance.ms-37.test_usage_cli_1115::test_by_issue_cli_row_501_values: 1115
+  tests.acceptance.ms-37.test_usage_cli_1115::test_by_issue_cli_estimate_distinct_from_captured: 1115
+  tests.acceptance.ms-37.test_usage_cli_1115::test_by_issue_cli_unknown_model_flag_rendered: 1115
+  tests.acceptance.ms-37.test_usage_cli_1115::test_by_issue_cli_grand_total_footer: 1115
+  # per-issue drill (rendered stdout behind contract Mock 2)
+  tests.acceptance.ms-37.test_usage_cli_1115::test_issue_drill_cli_header_captured_and_est: 1115
+  tests.acceptance.ms-37.test_usage_cli_1115::test_issue_drill_cli_stage_rows_in_order: 1115
+  tests.acceptance.ms-37.test_usage_cli_1115::test_issue_drill_cli_work_opus_captured_no_est: 1115
+  tests.acceptance.ms-37.test_usage_cli_1115::test_issue_drill_cli_smoke_sonnet_estimated: 1115
+  tests.acceptance.ms-37.test_usage_cli_1115::test_issue_drill_cli_unknown_model_marker: 1115
+  tests.acceptance.ms-37.test_usage_cli_1115::test_issue_drill_cli_running_leg: 1115
