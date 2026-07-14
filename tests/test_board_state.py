@@ -704,6 +704,52 @@ class TestSaveConfigSnapshot:
         assert row is not None
         assert row["value"] == "0"
 
+    def test_writes_pipeline_acceptance_routes_for_routed_repos_only(self, coord_db) -> None:
+        """#1151: board_meta['pipeline_acceptance_routes'] carries repo ->
+        route `match` globs, but ONLY for repos whose acceptance driver is
+        routed (a non-empty `routes` list, #1125). A repo with a flat
+        (unrouted) driver, or no driver at all, must be omitted entirely —
+        the TUI's `acceptance_for_path_arg` (tui/src/app/pipeline.rs) treats
+        an absent key as "no --for-path needed", so a routed repo that's
+        wrongly included as e.g. an empty list would silently regress to
+        the pre-#1151 unconditional-dispatch bug.
+        """
+        from coord.cli import _save_config_snapshot
+        from coord.config import (
+            AcceptanceConfig,
+            AcceptanceDriverConfig,
+            Config,
+        )
+        from coord.models import Machine, Repo
+
+        cfg = Config(
+            repos=[
+                Repo(name="routed-repo", github="acme/routed-repo"),
+                Repo(name="flat-repo", github="acme/flat-repo"),
+                Repo(name="no-driver-repo", github="acme/no-driver-repo"),
+            ],
+            machines=[Machine(name="m1", host="m1.tailnet",
+                               repos=["routed-repo", "flat-repo", "no-driver-repo"])],
+            acceptance=AcceptanceConfig(drivers={
+                "routed-repo": AcceptanceDriverConfig(routes=[
+                    AcceptanceDriverConfig(match="coord/**", kind="cli-pytest"),
+                    AcceptanceDriverConfig(match="tui/**", kind="tui-tuidriver"),
+                ]),
+                "flat-repo": AcceptanceDriverConfig(kind="cli-pytest", run="pytest"),
+            }),
+        )
+        _save_config_snapshot(cfg)
+
+        import json as _json
+        row = coord_db.execute(
+            "SELECT value FROM board_meta WHERE key = 'pipeline_acceptance_routes'"
+        ).fetchone()
+        assert row is not None
+        routes = _json.loads(row["value"])
+        assert routes == {"routed-repo": ["coord/**", "tui/**"]}
+        assert "flat-repo" not in routes, "an unrouted (flat) driver must be omitted"
+        assert "no-driver-repo" not in routes, "a repo with no driver at all must be omitted"
+
 
 # ── upsert_open_issues ──────────────────────────────────────────────────────
 
