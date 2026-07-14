@@ -446,6 +446,141 @@ def test_diff_touched_sealed_paths_no_match() -> None:
     assert _diff_touched_sealed_paths(diff, ["tests/acceptance/"]) == []
 
 
+# ── #1175: test-author/mock-author inverse tamper check ────────────────────
+
+
+def test_diff_paths_outside_sealed_returns_non_sealed_files() -> None:
+    from coord.review import _diff_paths_outside_sealed
+
+    diff = (
+        "diff --git a/tests/acceptance/ms01/foo.rs b/tests/acceptance/ms01/foo.rs\n"
+        "diff --git a/coord/review.py b/coord/review.py\n"
+    )
+    assert _diff_paths_outside_sealed(diff, ["tests/acceptance/"]) == ["coord/review.py"]
+
+
+def test_diff_paths_outside_sealed_empty_when_fully_contained() -> None:
+    from coord.review import _diff_paths_outside_sealed
+
+    diff = "diff --git a/tests/acceptance/ms01/foo.rs b/tests/acceptance/ms01/foo.rs\n"
+    assert _diff_paths_outside_sealed(diff, ["tests/acceptance/"]) == []
+
+
+def test_briefing_test_author_touching_only_sealed_path_no_tamper() -> None:
+    """#1175 acceptance criterion 1: a type="test-author" PR that touches only
+    tests/acceptance/ms-NN/ must NOT trip mandatory request-changes — writing
+    there is the assignment's entire job."""
+    diff = (
+        "diff --git a/tests/acceptance/ms37/foo.rs b/tests/acceptance/ms37/foo.rs\n"
+        "--- a/tests/acceptance/ms37/foo.rs\n"
+        "+++ b/tests/acceptance/ms37/foo.rs\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+added_case = 1\n"
+    )
+    briefing = build_review_briefing(
+        pr_number=42, pr_url=None, repo_github="acme/coord-tui", repo_name="coord-tui",
+        issue_number=1175, issue_title="X", issue_body="",
+        branch="my-branch", worker_machine="laptop", same_as_worker=False,
+        reviews_cfg=ReviewsConfig(enabled=True), repo_claude_md=None,
+        diff_text=diff,
+        sealed_paths=["tests/acceptance/"],
+        assignment_type="test-author",
+    )
+    assert "SCOPE VIOLATION" not in briefing
+    assert "TAMPER DETECTED" not in briefing
+    assert "request-changes is mandatory" not in briefing
+    assert "expected writes for type='test-author'" in briefing
+
+
+def test_briefing_test_author_touching_outside_sealed_path_trips_tamper() -> None:
+    """#1175 acceptance criterion 2: a type="test-author" PR that touches a
+    file OUTSIDE tests/acceptance/ms-NN/ must trip mandatory request-changes —
+    the inverse of the normal rule."""
+    diff = (
+        "diff --git a/tests/acceptance/ms37/foo.rs b/tests/acceptance/ms37/foo.rs\n"
+        "diff --git a/coord/review.py b/coord/review.py\n"
+        "--- a/coord/review.py\n"
+        "+++ b/coord/review.py\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+cheated = True\n"
+    )
+    briefing = build_review_briefing(
+        pr_number=42, pr_url=None, repo_github="acme/coord-tui", repo_name="coord-tui",
+        issue_number=1175, issue_title="X", issue_body="",
+        branch="my-branch", worker_machine="laptop", same_as_worker=False,
+        reviews_cfg=ReviewsConfig(enabled=True), repo_claude_md=None,
+        diff_text=diff,
+        sealed_paths=["tests/acceptance/"],
+        assignment_type="test-author",
+    )
+    assert "SEALED ORACLE SCOPE VIOLATION" in briefing
+    assert "coord/review.py" in briefing
+    assert "request-changes is mandatory" in briefing
+
+
+def test_briefing_mock_author_touching_only_sealed_path_no_tamper() -> None:
+    """#1175: mock-author gets the same exemption as test-author (contract.md
+    + mocks under the same sealed tree)."""
+    diff = "diff --git a/tests/acceptance/ms05/contract.md b/tests/acceptance/ms05/contract.md\n"
+    briefing = build_review_briefing(
+        pr_number=42, pr_url=None, repo_github="acme/coord-tui", repo_name="coord-tui",
+        issue_number=1175, issue_title="X", issue_body="",
+        branch="my-branch", worker_machine="laptop", same_as_worker=False,
+        reviews_cfg=ReviewsConfig(enabled=True), repo_claude_md=None,
+        diff_text=diff,
+        sealed_paths=["tests/acceptance/"],
+        assignment_type="mock-author",
+    )
+    assert "SCOPE VIOLATION" not in briefing
+    assert "TAMPER DETECTED" not in briefing
+
+
+def test_briefing_mock_author_touching_outside_sealed_path_trips_tamper() -> None:
+    diff = (
+        "diff --git a/tests/acceptance/ms05/contract.md b/tests/acceptance/ms05/contract.md\n"
+        "diff --git a/coord/agent.py b/coord/agent.py\n"
+    )
+    briefing = build_review_briefing(
+        pr_number=42, pr_url=None, repo_github="acme/coord-tui", repo_name="coord-tui",
+        issue_number=1175, issue_title="X", issue_body="",
+        branch="my-branch", worker_machine="laptop", same_as_worker=False,
+        reviews_cfg=ReviewsConfig(enabled=True), repo_claude_md=None,
+        diff_text=diff,
+        sealed_paths=["tests/acceptance/"],
+        assignment_type="mock-author",
+    )
+    assert "SEALED ORACLE SCOPE VIOLATION" in briefing
+    assert "coord/agent.py" in briefing
+
+
+def test_briefing_work_type_still_trips_tamper_on_sealed_touch() -> None:
+    """#1175 acceptance criterion 3 (regression guard): a type="work" PR
+    touching tests/acceptance/** must still trip the original mandatory
+    request-changes rule, unaffected by the test-author/mock-author
+    exemption. Same fixture as
+    test_briefing_flags_tamper_when_diff_touches_sealed_path but explicit
+    about assignment_type (defaults to "work")."""
+    diff = (
+        "diff --git a/tests/acceptance/ms01/foo.rs b/tests/acceptance/ms01/foo.rs\n"
+        "--- a/tests/acceptance/ms01/foo.rs\n"
+        "+++ b/tests/acceptance/ms01/foo.rs\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+cheated = True\n"
+    )
+    briefing = build_review_briefing(
+        pr_number=42, pr_url=None, repo_github="acme/coord-tui", repo_name="coord-tui",
+        issue_number=944, issue_title="X", issue_body="",
+        branch="my-branch", worker_machine="laptop", same_as_worker=False,
+        reviews_cfg=ReviewsConfig(enabled=True), repo_claude_md=None,
+        diff_text=diff,
+        sealed_paths=["tests/acceptance/"],
+        assignment_type="work",
+    )
+    assert "SEALED ORACLE TAMPER DETECTED" in briefing
+    assert "request-changes is mandatory" in briefing
+    assert "SCOPE VIOLATION" not in briefing
+
+
 def test_pr_diff_truncates_at_max_chars(monkeypatch) -> None:
     """#612: github_ops.pr_diff caps a huge diff and appends a truncation note."""
     from coord import github_ops
@@ -825,6 +960,49 @@ def test_dispatch_review_flags_sealed_acceptance_dir_when_driver_configured(
     _, payload = client.calls[0]
     assert "Sealed paths (do not touch)" in payload["briefing"]
     assert "tests/acceptance/" in payload["briefing"]
+
+
+def test_dispatch_review_threads_assignment_type_for_test_author_exemption(
+    two_machine_config: Config,
+) -> None:
+    """#1175: dispatch_review must pass the completed assignment's own type
+    (not a hardcoded "work") into build_review_briefing, or a real
+    type="test-author" completion would still get the blanket tamper rule
+    even though the fix above exists."""
+    from coord.config import AcceptanceConfig, AcceptanceDriverConfig
+    from dataclasses import replace as _replace
+
+    cfg = _replace(
+        two_machine_config,
+        acceptance=AcceptanceConfig(drivers={
+            "api": AcceptanceDriverConfig(kind="tui-tuidriver", run="cargo test"),
+        }),
+    )
+    board = Board()
+    completed = replace(
+        _completed_assignment(machine="laptop"),
+        type="test-author",
+        assignment_id="ta-1",
+        branch="ms-37-test-author",
+    )
+    client = _FakeHTTPClient({"id": "review-id-1"})
+
+    dispatch_review(
+        completed, board, cfg,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {
+            "number": 42, "url": "https://github.com/acme/api/pull/42", "existed": True,
+        },
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+        now=123.0,
+        remote_branch_checker=lambda repo, branch: True,
+    )
+
+    assert len(client.calls) == 1
+    _, payload = client.calls[0]
+    assert "expected writes for type='test-author'" in payload["briefing"]
+    assert "TAMPER DETECTED" not in payload["briefing"]
 
 
 def test_dispatch_review_flags_sealed_acceptance_dir_when_driver_is_routed(

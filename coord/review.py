@@ -36,7 +36,14 @@ import httpx
 from coord import github_ops
 from coord.config import Config, ReviewsConfig
 from coord.dispatch import AGENT_PORT
-from coord.models import CLOSES_ISSUE_TYPES, WORK_LIKE_TYPES, Assignment, Board, Machine
+from coord.models import (
+    CLOSES_ISSUE_TYPES,
+    SEALED_PATH_AUTHOR_TYPES,
+    WORK_LIKE_TYPES,
+    Assignment,
+    Board,
+    Machine,
+)
 
 log = logging.getLogger(__name__)
 
@@ -536,15 +543,18 @@ def _read_repo_claude_md(repo_path: Path) -> str | None:
         return None
 
 
-def _diff_touched_sealed_paths(diff_text: str, sealed_paths: list[str]) -> list[str]:
-    """Return the sealed path prefixes actually touched by *diff_text*.
+def _diff_file_paths(diff_text: str) -> list[str]:
+    """Return every file path touched by *diff_text*, deduped, order-preserving.
 
     Scans unified-diff file-header lines (``diff --git a/X b/Y``, ``---
-    a/X``, ``+++ b/X``) for a path that starts with one of *sealed_paths* —
-    cheap, dependency-free tamper detection (#944 sealing v1) ahead of a real
-    diff parser. Pure function, easy to test.
+    a/X``, ``+++ b/X``) — cheap, dependency-free (#944 sealing v1) ahead of a
+    real diff parser. Shared by :func:`_diff_touched_sealed_paths` (which
+    sealed prefixes) and :func:`_diff_paths_outside_sealed` (which actual
+    paths, #1175 — the test-author/mock-author inverse tamper check needs
+    the offending files, not just which prefixes matched).
     """
-    touched: set[str] = set()
+    paths: list[str] = []
+    seen: set[str] = set()
     for line in diff_text.splitlines():
         candidates: list[str] = []
         if line.startswith("diff --git "):
@@ -556,10 +566,39 @@ def _diff_touched_sealed_paths(diff_text: str, sealed_paths: list[str]) -> list[
         elif line.startswith("+++ b/"):
             candidates.append(line[len("+++ b/"):])
         for c in candidates:
-            for sealed in sealed_paths:
-                if c.startswith(sealed):
-                    touched.add(sealed)
+            if c not in seen:
+                seen.add(c)
+                paths.append(c)
+    return paths
+
+
+def _diff_touched_sealed_paths(diff_text: str, sealed_paths: list[str]) -> list[str]:
+    """Return the sealed path prefixes actually touched by *diff_text*.
+
+    Cheap, dependency-free tamper detection (#944 sealing v1). Pure function,
+    easy to test.
+    """
+    touched: set[str] = set()
+    for c in _diff_file_paths(diff_text):
+        for sealed in sealed_paths:
+            if c.startswith(sealed):
+                touched.add(sealed)
     return sorted(touched)
+
+
+def _diff_paths_outside_sealed(diff_text: str, sealed_paths: list[str]) -> list[str]:
+    """Return diff file paths that fall OUTSIDE every sealed prefix.
+
+    #1175: for a ``type="test-author"``/``"mock-author"`` PR, writing under
+    *sealed_paths* (``tests/acceptance/ms-NN/**``) is the assignment's entire
+    job, not a violation — the oracle-tamper rule inverts for these types, so
+    the reviewer needs the paths touched OUTSIDE the sealed prefix instead of
+    the ones inside it.
+    """
+    return sorted(
+        p for p in _diff_file_paths(diff_text)
+        if not any(p.startswith(sealed) for sealed in sealed_paths)
+    )
 
 
 def build_review_briefing(
@@ -580,6 +619,7 @@ def build_review_briefing(
     review_iteration: int = 0,
     diff_text: str | None = None,
     sealed_paths: list[str] | None = None,
+    assignment_type: str = "work",
 ) -> str:
     """Assemble the reviewer's prompt. Pure function — easy to test.
 
@@ -604,6 +644,15 @@ def build_review_briefing(
     actually touches one of the paths, a blocking "TAMPER DETECTED" banner is
     prepended instead of a soft reminder — this is the "reviewer flags any
     diff that touches tests/acceptance/**" tamper-detection policy.
+
+    *assignment_type* (#1175) gates which direction that rule runs. For
+    :data:`coord.models.SEALED_PATH_AUTHOR_TYPES` (``"test-author"``,
+    ``"mock-author"``) — whose entire job IS to write under *sealed_paths* —
+    the rule inverts: mandatory ``request-changes`` fires only when the diff
+    touches something OUTSIDE *sealed_paths*; touching only the sealed area
+    is expected and non-blocking. Every other type (default ``"work"``) keeps
+    the original rule unchanged: any touch to *sealed_paths* is mandatory
+    ``request-changes``.
     """
 
     lines: list[str] = []
@@ -680,29 +729,62 @@ def build_review_briefing(
         lines.append("```")
 
     if sealed_paths:
-        touched = _diff_touched_sealed_paths(diff_text, sealed_paths) if diff_text else []
         lines.append("")
-        if touched:
-            lines.append("## \U0001f6a8 SEALED ORACLE TAMPER DETECTED")
-            lines.append("")
-            lines.append(
-                "The diff modifies a path SEALED by this repo's acceptance "
-                "oracle (docs/ORACLE_LOOP.md sealing v1): "
-                + ", ".join(f"`{p}`" for p in touched)
-                + ". The suite under these paths is authored independently — "
-                "workers may only RUN it (`coord acceptance run`), never read "
-                "or edit it. **request-changes is mandatory here**, regardless "
-                "of anything else in this diff."
-            )
+        if assignment_type in SEALED_PATH_AUTHOR_TYPES:
+            # #1175: for test-author/mock-author, writing under sealed_paths
+            # IS the job — the tamper rule inverts. Flag only a touch OUTSIDE
+            # the sealed area; a diff confined to it is expected, not tamper.
+            outside = _diff_paths_outside_sealed(diff_text, sealed_paths) if diff_text else []
+            if outside:
+                lines.append("## \U0001f6a8 SEALED ORACLE SCOPE VIOLATION")
+                lines.append("")
+                lines.append(
+                    f"This is a `type={assignment_type!r}` assignment — its entire "
+                    "job is authoring under this repo's sealed acceptance oracle "
+                    + ", ".join(f"`{p}`" for p in sealed_paths)
+                    + " (docs/ORACLE_LOOP.md), so touching those paths is expected "
+                    "and NOT tamper. But this diff ALSO touches path(s) OUTSIDE the "
+                    "sealed area: " + ", ".join(f"`{p}`" for p in outside) + ". "
+                    "**request-changes is mandatory here**, regardless of anything "
+                    "else in this diff — this assignment type must touch ONLY the "
+                    "sealed acceptance tree and nothing else."
+                )
+            else:
+                lines.append(
+                    f"## Sealed paths (expected writes for type={assignment_type!r})"
+                )
+                lines.append("")
+                lines.append(
+                    f"This is a `type={assignment_type!r}` assignment: writing under "
+                    + ", ".join(f"`{p}`" for p in sealed_paths)
+                    + " (docs/ORACLE_LOOP.md) is its entire job, not a tamper "
+                    "violation. Do **not** request-changes solely because this "
+                    "diff touches the sealed acceptance tree — only flag it if the "
+                    "diff also touches anything outside that tree."
+                )
         else:
-            lines.append("## Sealed paths (do not touch)")
-            lines.append("")
-            lines.append(
-                "This repo's acceptance oracle is sealed by policy: "
-                + ", ".join(f"`{p}`" for p in sealed_paths)
-                + ". If the diff modifies any of them, **request-changes** — "
-                "this is a hard rule, not a suggestion (docs/ORACLE_LOOP.md)."
-            )
+            touched = _diff_touched_sealed_paths(diff_text, sealed_paths) if diff_text else []
+            if touched:
+                lines.append("## \U0001f6a8 SEALED ORACLE TAMPER DETECTED")
+                lines.append("")
+                lines.append(
+                    "The diff modifies a path SEALED by this repo's acceptance "
+                    "oracle (docs/ORACLE_LOOP.md sealing v1): "
+                    + ", ".join(f"`{p}`" for p in touched)
+                    + ". The suite under these paths is authored independently — "
+                    "workers may only RUN it (`coord acceptance run`), never read "
+                    "or edit it. **request-changes is mandatory here**, regardless "
+                    "of anything else in this diff."
+                )
+            else:
+                lines.append("## Sealed paths (do not touch)")
+                lines.append("")
+                lines.append(
+                    "This repo's acceptance oracle is sealed by policy: "
+                    + ", ".join(f"`{p}`" for p in sealed_paths)
+                    + ". If the diff modifies any of them, **request-changes** — "
+                    "this is a hard rule, not a suggestion (docs/ORACLE_LOOP.md)."
+                )
 
     lines.append("")
     lines.append("## What to do")
@@ -1113,6 +1195,7 @@ def dispatch_review(
             review_iteration=getattr(completed, "review_iteration", 0) or 0,
             diff_text=diff_text,
             sealed_paths=sealed_paths,
+            assignment_type=completed.type,
         )
 
         payload = {

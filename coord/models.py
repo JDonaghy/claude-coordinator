@@ -161,6 +161,20 @@ class Machine:
 # truth so a future work-like type only needs to be added here.
 WORK_LIKE_TYPES: frozenset[str] = frozenset({"work", "mock-author", "test-author"})
 
+# #1175: subset of WORK_LIKE_TYPES whose entire job is writing under a
+# repo's sealed acceptance paths (docs/ORACLE_LOOP.md — today just
+# `tests/acceptance/`). `coord.review`'s oracle-tamper rule normally treats
+# ANY diff touching a sealed path as a mandatory `request-changes` — correct
+# for a `type="work"` PR (a worker must never edit the suite it's graded
+# against) but a guaranteed false positive for these types, since authoring
+# `tests/acceptance/ms-NN/**` (contract.md + mocks for "mock-author", the
+# acceptance slice itself for "test-author") *is* the assignment. For these
+# types the rule inverts: the violation is touching anything OUTSIDE the
+# sealed path, not touching it. Keep this as a set here (not a bare string
+# check in coord/review.py) so a future sealed-path-authoring type only
+# needs to be added in one place.
+SEALED_PATH_AUTHOR_TYPES: frozenset[str] = frozenset({"test-author", "mock-author"})
+
 # #1077: subset of WORK_LIKE_TYPES whose ``issue_number`` is the issue the PR
 # actually *resolves* — i.e. merging it should auto-close that issue. "work"
 # qualifies. "mock-author" (Gate A) is WORK_LIKE (it flows through the same
