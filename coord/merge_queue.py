@@ -476,7 +476,13 @@ def enqueue_approved_work(config, board=None) -> list[str]:
        work assignment carries a ``test_state in ('passed', 'skipped')``
        verdict (``has_smoke_verdict``).
     3. Not terminal on GitHub — ``work_is_terminal`` returns False (issue still
-       open and PR not yet merged).
+       open, or the PR that merged is not this branch's *current* commit —
+       #1150: a historical merge on a reused branch, e.g. from ``--fix-of``
+       continuing on the same branch, must not block enqueue of new commits
+       pushed on top of it). This is checked directly against GitHub per
+       assignment rather than via a queue-derived "already merged" shortcut,
+       since a MERGED entry for the same ``(repo, issue)`` pair may belong to
+       an entirely different branch/commit than the one being considered here.
 
     …calls :func:`refresh_entry_assignment` so the entry is **created** (when
     the work was never enqueued) or **re-keyed** to the latest fix assignment
@@ -506,15 +512,7 @@ def enqueue_approved_work(config, board=None) -> list[str]:
     terminal_cache: dict = {}
 
     completed = list(getattr(board, "completed", []) or [])
-
-    # Build the "already merged" set so we skip issues whose prior work attempt
-    # was already merged (avoids spawning a second PR on a retry/fix chain).
     existing_queue = load_queue()
-    already_merged: set[tuple[str, int]] = {
-        (x.repo_name, x.issue_number)
-        for x in existing_queue
-        if x.state == MERGED
-    }
 
     for a in completed:
         if getattr(a, "type", None) not in WORK_LIKE_TYPES:
@@ -529,10 +527,6 @@ def enqueue_approved_work(config, board=None) -> list[str]:
         repo_name = getattr(a, "repo_name", None)
         repo_cfg = config.repo(repo_name)
         if repo_cfg is None:
-            continue
-
-        # Skip issues already represented by a MERGED queue entry.
-        if (repo_name, getattr(a, "issue_number", 0)) in already_merged:
             continue
 
         # Skip if the assignment is already in the queue under its own ID.

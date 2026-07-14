@@ -42,7 +42,64 @@ class TestIssueIsClosed:
             assert github_ops.issue_is_closed("acme/api", 1) is False
 
 
+def _gh_pr_and_branch(pr_list_json: str, branch_json: str | None):
+    """Build a ``_gh`` ``side_effect`` that answers ``pr list`` with
+    *pr_list_json* and ``api .../branches/<name>`` with *branch_json* (or
+    raises ``RuntimeError`` when *branch_json* is ``None``, simulating a
+    deleted/unresolvable branch — see :func:`coord.github_ops.get_branch_sha`).
+    """
+
+    def _dispatch(*args, **kwargs):
+        if args and args[0] == "pr":
+            return pr_list_json
+        if branch_json is None:
+            raise RuntimeError("gh api branches: 404 not found")
+        return branch_json
+
+    return _dispatch
+
+
 class TestPrIsMerged:
+    """#1150: a historical merge on a *reused* branch name must not be
+    confused with "this branch's current commits are merged" —
+    ``--fix-of``/``--rework-of``/``--force`` all legitimately continue on an
+    existing branch. ``pr_is_merged`` now requires the branch's *current* tip
+    (via ``get_branch_sha``) to match the merged PR's ``headRefOid``.
+    """
+
+    def test_true_when_current_tip_matches_merged_pr(self) -> None:
+        """The exact commit now on the branch is what merged -> True."""
+        pr_payload = json.dumps([
+            {"number": 42, "state": "MERGED", "mergedAt": "2026-06-09T00:00:00Z",
+             "headRefOid": "deadbeef"},
+        ])
+        branch_payload = json.dumps({"commit": {"sha": "deadbeef"}})
+        with patch("coord.github_ops._gh", side_effect=_gh_pr_and_branch(pr_payload, branch_payload)):
+            assert github_ops.pr_is_merged("acme/api", "issue-1-fix") is True
+
+    def test_false_when_new_commits_pushed_after_historical_merge(self) -> None:
+        """#1150 core case: branch reused (--fix-of/--force) after a prior
+        merge, with new commits on top -> the current tip is NOT the SHA that
+        merged, so this must NOT be reported as merged."""
+        pr_payload = json.dumps([
+            {"number": 42, "state": "MERGED", "mergedAt": "2026-06-09T00:00:00Z",
+             "headRefOid": "oldsha1"},
+        ])
+        branch_payload = json.dumps({"commit": {"sha": "newsha2"}})
+        with patch("coord.github_ops._gh", side_effect=_gh_pr_and_branch(pr_payload, branch_payload)):
+            assert github_ops.pr_is_merged("acme/api", "issue-1-fix") is False
+
+    def test_true_when_branch_deleted_after_merge(self) -> None:
+        """Tip unresolvable (branch deleted post-merge, the common case) ->
+        falls back to the pre-#1150 'any historical merge counts' behavior,
+        since a deleted branch cannot have gained new commits since."""
+        pr_payload = json.dumps([
+            {"number": 42, "state": "MERGED", "mergedAt": "2026-06-09T00:00:00Z",
+             "headRefOid": "oldsha1"},
+        ])
+        with patch("coord.github_ops._gh", side_effect=_gh_pr_and_branch(pr_payload, None)):
+            assert github_ops.pr_is_merged("acme/api", "issue-1-fix") is True
+
     def test_true_when_merged_at_present(self) -> None:
         payload = json.dumps(
             [{"number": 42, "state": "MERGED", "mergedAt": "2026-06-09T00:00:00Z"}]

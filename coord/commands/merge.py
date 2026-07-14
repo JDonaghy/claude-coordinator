@@ -670,7 +670,7 @@ def merge(
     from coord import github_ops as gh_ops
     from coord import merge_queue as mq
     from coord.ci_store import build_ci_store
-    from coord.merge_queue import CONFLICT, MERGED, PENDING
+    from coord.merge_queue import CONFLICT, PENDING
     from coord.state import load_board
 
     # #780: --only is a surgical single-entry merge that leaves all other queue
@@ -760,14 +760,6 @@ def merge(
     _raw_board = load_board()
     board = _raw_board if _raw_board is not None else _Board(active=[], completed=[])
     open_by_repo, known_by_repo = _load_issue_states()
-    # Set of (repo_name, issue_number) for which a `merged` entry already
-    # exists.  Avoids spawning a fresh PR for an issue that was already
-    # merged via a prior work attempt (multiple work assignments per issue
-    # can happen with retries / fix iterations).
-    already_merged: set[tuple[str, int]] = set()
-    for existing in mq.load_queue():
-        if existing.state == MERGED:
-            already_merged.add((existing.repo_name, existing.issue_number))
 
     auto_enqueued: list[str] = []
     # Per-repo cache of branches that still exist on origin.  Lets us skip
@@ -803,10 +795,6 @@ def merge(
             known_issues = known_by_repo.get(a.repo_name, set())
             open_issues = open_by_repo.get(a.repo_name, set())
             if a.issue_number in known_issues and a.issue_number not in open_issues:
-                continue
-            # Skip issues whose latest work was already merged (via any
-            # prior assignment_id).
-            if (a.repo_name, a.issue_number) in already_merged:
                 continue
             # Skip work whose branch no longer exists on origin (already
             # merged + deleted).  Fail OPEN: only skip when we got a real
