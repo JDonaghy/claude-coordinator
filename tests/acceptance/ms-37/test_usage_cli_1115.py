@@ -122,13 +122,11 @@ def _run_usage(monkeypatch, tmp_path, valid_config_yaml, board_rows, pricing, *a
     """
     shifted = _shift_into_today(board_rows)
     fake_fetch = lambda *a, **k: [dict(r) for r in shifted]  # noqa: E731
-    # Primary seam: Core's fetch. Belt-and-suspenders: the name possibly bound
-    # into the command module at import time. raising=False so whichever the
-    # implementation actually uses, the fixture rows flow through.
+    # Patch the canonical definition. This works because the `usage` command
+    # follows the project's deferred-import pattern (imports coord.usage inside
+    # the function body, not at module level), so the patch is in-place before
+    # the import resolves.
     monkeypatch.setattr("coord.usage.fetch_usage_rows", fake_fetch, raising=False)
-    monkeypatch.setattr(
-        "coord.commands.status.fetch_usage_rows", fake_fetch, raising=False
-    )
     cfg = _config_with_pricing(tmp_path, valid_config_yaml, pricing)
     result = CliRunner().invoke(main, ["usage", "--config", str(cfg), *args])
     return result
@@ -270,9 +268,15 @@ def test_issue_drill_cli_stage_rows_in_order(monkeypatch, tmp_path, valid_config
     result = _run_usage(monkeypatch, tmp_path, valid_config_yaml, board_rows, pricing, "--issue", "502")
     assert result.exit_code == 0, _text(result)
     out = _text(result)
-    i_work_opus = out.index("opus")
-    i_smoke = out.index("smoke")
-    i_chat = out.index("chat")
+    # Locate each stage's actual row (not any incidental header/footer mention
+    # of the same word) via `_line_with`, then compare line positions.
+    line_work_opus = _line_with(out, "work", "opus")
+    line_smoke = _line_with(out, "smoke")
+    line_chat = _line_with(out, "chat")
+    lines = out.splitlines()
+    i_work_opus = lines.index(line_work_opus)
+    i_smoke = lines.index(line_smoke)
+    i_chat = lines.index(line_chat)
     assert i_work_opus < i_smoke < i_chat
 
 
@@ -320,7 +324,10 @@ def test_issue_drill_cli_running_leg(monkeypatch, tmp_path, valid_config_yaml, b
     assert result.exit_code == 0, _text(result)
     out = _text(result)
     assert "running" in out
-    running_line = _line_with(out, "running")
+    # Scope to the actual work/sonnet/running stage row (not any incidental
+    # header/summary line that happens to also mention "running") by requiring
+    # the additional tokens that uniquely identify it.
+    running_line = _line_with(out, "running", "sonnet", "work")
     # A running/0-token leg is neither captured nor estimated (Mock 2: dashes).
     assert "~$" not in running_line   # no estimate for a 0-token leg
     assert "$" not in running_line    # no captured cost either
