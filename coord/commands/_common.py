@@ -137,6 +137,29 @@ def _save_config_snapshot(config: Config) -> None:
             "('pipeline_repo_paths', ?)",
             (json.dumps(repo_paths_map),),
         )
+        # #1151: repo_name -> route `match` globs, for repos whose acceptance
+        # driver is *routed* (acceptance.drivers.<repo>.routes non-empty,
+        # #1125). Unrouted repos (flat driver or no driver at all) are
+        # omitted entirely. The TUI's Pipeline right-click acceptance actions
+        # (`dispatch_gate_a_mock_for_selected_pipeline_row` /
+        # `dispatch_acceptance_author_for_selected_pipeline_row` /
+        # `dispatch_acceptance_record_for_selected_pipeline_row`, all in
+        # tui/src/app/pipeline.rs) were firing `coord acceptance mock/author/
+        # record` with no `--for-path`, which those CLI commands reject with
+        # "no route matched" the moment a repo's driver becomes routed. This
+        # lets the TUI auto-resolve the unambiguous (single-route) case and
+        # surface a clear, actionable warning — instead of a raw CLI error —
+        # when more than one route exists and it can't tell which applies.
+        acceptance_routes_map: dict[str, list[str]] = {
+            repo_name: [route.match for route in driver.routes]
+            for repo_name, driver in config.acceptance.drivers.items()
+            if driver.routes
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO board_meta (key, value) VALUES "
+            "('pipeline_acceptance_routes', ?)",
+            (json.dumps(acceptance_routes_map),),
+        )
         conn.commit()
     except Exception:  # noqa: BLE001 — non-critical, don't abort CLI
         if conn is not None:

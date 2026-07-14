@@ -1341,6 +1341,7 @@ pub(crate) fn load_data() -> BoardData {
         pipeline_repo_run_cmds,
         pipeline_repo_paths,
         pipeline_models,
+        pipeline_acceptance_routes,
     ) = load_pipeline_meta(&conn);
 
     // ── Query cached structured plans ──────────────────────────────────────
@@ -1391,6 +1392,7 @@ pub(crate) fn load_data() -> BoardData {
         pipeline_repos,
         pipeline_repo_run_cmds,
         pipeline_repo_paths,
+        pipeline_acceptance_routes,
         pipeline_require_plan,
         merge_staging,
         pipeline_models,
@@ -1445,6 +1447,7 @@ pub(crate) fn assemble_board_data(
     pipeline_repos: Vec<(String, String)>,
     pipeline_repo_run_cmds: std::collections::HashMap<String, String>,
     pipeline_repo_paths: std::collections::HashMap<String, String>,
+    pipeline_acceptance_routes: std::collections::HashMap<String, Vec<String>>,
     pipeline_require_plan: bool,
     merge_staging: Vec<StagingEntry>,
     pipeline_models: Option<PipelineModels>,
@@ -1561,6 +1564,7 @@ pub(crate) fn assemble_board_data(
         pipeline_require_plan,
         pipeline_repo_run_cmds,
         pipeline_repo_paths,
+        pipeline_acceptance_routes,
         plans,
         merge_staging,
         pipeline_models,
@@ -1752,6 +1756,7 @@ pub(crate) fn parse_pipeline_meta_from_map(
     std::collections::HashMap<String, String>,
     std::collections::HashMap<String, String>,
     Option<PipelineModels>,
+    std::collections::HashMap<String, Vec<String>>,
 ) {
     fn read_map(
         meta: &std::collections::HashMap<String, String>,
@@ -1763,6 +1768,33 @@ pub(crate) fn parse_pipeline_meta_from_map(
                 serde_json::Value::Object(map) => Some(
                     map.into_iter()
                         .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    // #1151: repo_name -> list of route `match` globs (only present for
+    // repos with a routed acceptance driver, #1125). Mirrors
+    // `load_pipeline_meta`'s `read_map_of_lists` (the SQLite reader).
+    fn read_map_of_lists(
+        meta: &std::collections::HashMap<String, String>,
+        key: &str,
+    ) -> std::collections::HashMap<String, Vec<String>> {
+        meta.get(key)
+            .and_then(|v| serde_json::from_str::<serde_json::Value>(v).ok())
+            .and_then(|val| match val {
+                serde_json::Value::Object(map) => Some(
+                    map.into_iter()
+                        .filter_map(|(k, v)| {
+                            let list = v.as_array()?;
+                            let strs: Vec<String> = list
+                                .iter()
+                                .filter_map(|e| e.as_str().map(str::to_string))
+                                .collect();
+                            Some((k, strs))
+                        })
                         .collect(),
                 ),
                 _ => None,
@@ -1806,6 +1838,10 @@ pub(crate) fn parse_pipeline_meta_from_map(
         .get("pipeline_models")
         .and_then(|v| serde_json::from_str::<PipelineModels>(v).ok());
 
+    // #1151: repo_name → route match globs — empty when the daemon predates
+    // this field.
+    let acceptance_routes = read_map_of_lists(meta, "pipeline_acceptance_routes");
+
     (
         default_gates,
         tracked_labels,
@@ -1814,6 +1850,7 @@ pub(crate) fn parse_pipeline_meta_from_map(
         repo_run_cmds,
         repo_paths,
         pipeline_models,
+        acceptance_routes,
     )
 }
 
@@ -1884,6 +1921,7 @@ pub(crate) fn load_data_remote(url: &str, token: Option<&str>) -> BoardData {
         pipeline_repo_run_cmds,
         pipeline_repo_paths,
         pipeline_models,
+        pipeline_acceptance_routes,
     ) = parse_pipeline_meta_from_map(&payload.board_meta);
 
     // #778: prefer the server-computed staging list from the /board payload;
@@ -1912,6 +1950,7 @@ pub(crate) fn load_data_remote(url: &str, token: Option<&str>) -> BoardData {
         pipeline_repos,
         pipeline_repo_run_cmds,
         pipeline_repo_paths,
+        pipeline_acceptance_routes,
         pipeline_require_plan,
         merge_staging,
         pipeline_models,
@@ -2785,6 +2824,7 @@ pub(crate) fn load_pipeline_meta(
     std::collections::HashMap<String, String>,
     std::collections::HashMap<String, String>,
     Option<PipelineModels>,
+    std::collections::HashMap<String, Vec<String>>,
 ) {
     fn read_key(conn: &Connection, key: &str) -> Option<String> {
         conn.query_row(
@@ -2802,6 +2842,32 @@ pub(crate) fn load_pipeline_meta(
                 serde_json::Value::Object(map) => Some(
                     map.into_iter()
                         .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    // #1151: repo_name -> list of route `match` globs (only present for
+    // repos with a routed acceptance driver, #1125).
+    fn read_map_of_lists(
+        conn: &Connection,
+        key: &str,
+    ) -> std::collections::HashMap<String, Vec<String>> {
+        read_key(conn, key)
+            .and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok())
+            .and_then(|val| match val {
+                serde_json::Value::Object(map) => Some(
+                    map.into_iter()
+                        .filter_map(|(k, v)| {
+                            let list = v.as_array()?;
+                            let strs: Vec<String> = list
+                                .iter()
+                                .filter_map(|e| e.as_str().map(str::to_string))
+                                .collect();
+                            Some((k, strs))
+                        })
                         .collect(),
                 ),
                 _ => None,
@@ -2843,6 +2909,10 @@ pub(crate) fn load_pipeline_meta(
     let pipeline_models: Option<PipelineModels> = read_key(conn, "pipeline_models")
         .and_then(|v| serde_json::from_str::<PipelineModels>(&v).ok());
 
+    // #1151: repo_name → route match globs, for repos with a routed
+    // acceptance driver.
+    let acceptance_routes = read_map_of_lists(conn, "pipeline_acceptance_routes");
+
     (
         default_gates,
         tracked_labels,
@@ -2851,6 +2921,7 @@ pub(crate) fn load_pipeline_meta(
         repo_run_cmds,
         repo_paths,
         pipeline_models,
+        acceptance_routes,
     )
 }
 

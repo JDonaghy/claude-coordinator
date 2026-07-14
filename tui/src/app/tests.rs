@@ -2820,6 +2820,261 @@
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    // ── #1151: --for-path resolution for routed acceptance drivers ────────
+    //
+    // Before this, all three acceptance dispatch call sites fired `coord
+    // acceptance mock/author/record` unconditionally with no `--for-path`,
+    // which those CLI commands reject the moment a repo's acceptance driver
+    // becomes *routed* (`acceptance.drivers.<repo>.routes`, #1125) — the
+    // moment that happened for `claude-coordinator` (epic #1117), the three
+    // Pipeline right-click actions silently broke for that repo. Coverage
+    // below drives each action against a routed-repo fixture
+    // (`BoardData.pipeline_acceptance_routes`, populated by
+    // `_save_config_snapshot`/`load_pipeline_meta` from
+    // `board_meta['pipeline_acceptance_routes']`) and asserts it either
+    // resolves the single unambiguous route automatically, or surfaces the
+    // designed warning toast (never a raw CLI error string) when more than
+    // one candidate route exists.
+
+    #[test]
+    fn acceptance_for_path_arg_outcomes() {
+        // Pure unit coverage of the three outcomes documented on
+        // `acceptance_for_path_arg` itself.
+        let mut app = make_test_app(BoardData::default());
+
+        // Repo absent from the map (unrouted, or daemon predates #1151).
+        assert_eq!(app.acceptance_for_path_arg("api"), Ok(None));
+
+        // Exactly one route: unambiguous auto-resolve.
+        app.data
+            .pipeline_acceptance_routes
+            .insert("api".to_string(), vec!["coord/**".to_string()]);
+        assert_eq!(
+            app.acceptance_for_path_arg("api"),
+            Ok(Some("coord/**".to_string()))
+        );
+
+        // More than one route: no signal for which applies -> Err, not a guess.
+        app.data.pipeline_acceptance_routes.insert(
+            "api".to_string(),
+            vec!["coord/**".to_string(), "tui/**".to_string()],
+        );
+        let err = app
+            .acceptance_for_path_arg("api")
+            .expect_err("ambiguous routing must be an Err, not a guessed path");
+        assert!(
+            err.contains("coord/**") && err.contains("tui/**"),
+            "error must name the candidate globs so the operator knows what \
+             to pass on the CLI, got: {err}"
+        );
+        assert!(
+            err.contains("--for-path"),
+            "error must point at the CLI escape hatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn dispatch_gate_a_mock_auto_appends_for_path_when_repo_has_one_route() {
+        let mut app = make_pipeline_app_for_audit_menu_test(0);
+        app.data
+            .pipeline_acceptance_routes
+            .insert("api".to_string(), vec!["coord/**".to_string()]);
+        let target = ContextMenuTarget::PipelineRow {
+            issue_number: Some(751),
+            repo_name: Some("api".to_string()),
+            lifecycle: PipelineRowLifecycle::New,
+        };
+        let handled = app.dispatch_context_menu_action("dispatch-gate-a-mock", &target);
+        assert!(handled);
+        assert_eq!(
+            app.command_runner.spawned_calls.len(),
+            1,
+            "the single unambiguous route must auto-resolve, not block dispatch"
+        );
+        assert_eq!(
+            app.command_runner.spawned_calls[0],
+            vec![
+                "acceptance".to_string(),
+                "mock".to_string(),
+                "api".to_string(),
+                "751".to_string(),
+                "--for-path".to_string(),
+                "coord/**".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn dispatch_gate_a_mock_toasts_instead_of_dispatching_when_repo_has_multiple_routes() {
+        let mut app = make_pipeline_app_for_audit_menu_test(0);
+        app.data.pipeline_acceptance_routes.insert(
+            "api".to_string(),
+            vec!["coord/**".to_string(), "tui/**".to_string()],
+        );
+        let target = ContextMenuTarget::PipelineRow {
+            issue_number: Some(751),
+            repo_name: Some("api".to_string()),
+            lifecycle: PipelineRowLifecycle::New,
+        };
+        let toasts_before = app.toasts.len();
+        let handled = app.dispatch_context_menu_action("dispatch-gate-a-mock", &target);
+        assert!(handled);
+        assert!(
+            app.command_runner.spawned_calls.is_empty(),
+            "must NOT dispatch a command the CLI's routing gate will reject anyway"
+        );
+        assert!(
+            app.toasts.len() > toasts_before,
+            "must show the designed warning toast instead of a silent no-op"
+        );
+        let (toast, _, _) = app.toasts.last().unwrap();
+        assert_eq!(toast.title, "Dispatch Gate A mock");
+        assert!(
+            toast.body.contains("--for-path"),
+            "toast must be the designed actionable message, not a raw CLI \
+             error string, got: {}",
+            toast.body,
+        );
+    }
+
+    #[test]
+    fn author_acceptance_tests_auto_appends_for_path_when_repo_has_one_route() {
+        let mut app = make_pipeline_app_for_acceptance_menu_test(0, "/nonexistent/api-repo");
+        app.data
+            .pipeline_acceptance_routes
+            .insert("api".to_string(), vec!["coord/**".to_string()]);
+        let target = ContextMenuTarget::PipelineRow {
+            issue_number: Some(42),
+            repo_name: Some("api".to_string()),
+            lifecycle: PipelineRowLifecycle::New,
+        };
+        let handled = app.dispatch_context_menu_action("author-acceptance-tests", &target);
+        assert!(handled);
+        assert_eq!(app.command_runner.spawned_calls.len(), 1);
+        assert_eq!(
+            app.command_runner.spawned_calls[0],
+            vec![
+                "acceptance".to_string(),
+                "author".to_string(),
+                "api".to_string(),
+                "751".to_string(),
+                "--issue".to_string(),
+                "42".to_string(),
+                "--for-path".to_string(),
+                "coord/**".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn author_acceptance_tests_toasts_instead_of_dispatching_when_repo_has_multiple_routes() {
+        let mut app = make_pipeline_app_for_acceptance_menu_test(0, "/nonexistent/api-repo");
+        app.data.pipeline_acceptance_routes.insert(
+            "api".to_string(),
+            vec!["coord/**".to_string(), "tui/**".to_string()],
+        );
+        let target = ContextMenuTarget::PipelineRow {
+            issue_number: Some(42),
+            repo_name: Some("api".to_string()),
+            lifecycle: PipelineRowLifecycle::New,
+        };
+        let toasts_before = app.toasts.len();
+        let handled = app.dispatch_context_menu_action("author-acceptance-tests", &target);
+        assert!(handled);
+        assert!(
+            app.command_runner.spawned_calls.is_empty(),
+            "must NOT dispatch a command the CLI's routing gate will reject anyway"
+        );
+        assert!(app.toasts.len() > toasts_before);
+        let (toast, _, _) = app.toasts.last().unwrap();
+        assert_eq!(toast.title, "Author acceptance tests");
+        assert!(
+            toast.body.contains("--for-path"),
+            "toast must be the designed actionable message, not a raw CLI \
+             error string, got: {}",
+            toast.body,
+        );
+    }
+
+    #[test]
+    fn record_acceptance_auto_appends_for_path_when_repo_has_one_route() {
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let tmp = std::env::temp_dir().join(format!("coord-tui-test-acceptance-record-routed-{}", tid));
+        let refs_dir = tmp.join(".git").join("refs").join("heads");
+        std::fs::create_dir_all(&refs_dir).unwrap();
+        let sha = "cafebabe1234567890abcdef1234567890abcdef";
+        std::fs::write(refs_dir.join("issue-42-fix"), format!("{}\n", sha)).unwrap();
+
+        let mut app = make_pipeline_app_for_acceptance_menu_test(0, tmp.to_str().unwrap());
+        app.data
+            .pipeline_acceptance_routes
+            .insert("api".to_string(), vec!["coord/**".to_string()]);
+        let mut a = make_assignment_typed("done", 42, "api", Some("work"));
+        a.branch = Some("issue-42-fix".to_string());
+        app.data.assignments.push(a);
+
+        let target = ContextMenuTarget::PipelineRow {
+            issue_number: Some(42),
+            repo_name: Some("api".to_string()),
+            lifecycle: PipelineRowLifecycle::New,
+        };
+        let handled = app.dispatch_context_menu_action("record-acceptance", &target);
+        assert!(handled);
+        assert_eq!(app.command_runner.spawned_calls.len(), 1);
+        assert_eq!(
+            app.command_runner.spawned_calls[0],
+            vec![
+                "acceptance".to_string(),
+                "record".to_string(),
+                "--repo".to_string(),
+                "api".to_string(),
+                "--issue".to_string(),
+                "42".to_string(),
+                "--sha".to_string(),
+                sha.to_string(),
+                "--for-path".to_string(),
+                "coord/**".to_string(),
+            ],
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn record_acceptance_toasts_instead_of_dispatching_when_repo_has_multiple_routes() {
+        let mut app = make_pipeline_app_for_acceptance_menu_test(0, "/nonexistent/api-repo");
+        app.data.pipeline_acceptance_routes.insert(
+            "api".to_string(),
+            vec!["coord/**".to_string(), "tui/**".to_string()],
+        );
+        let mut a = make_assignment_typed("done", 42, "api", Some("work"));
+        a.branch = Some("issue-42-fix".to_string());
+        app.data.assignments.push(a);
+
+        let target = ContextMenuTarget::PipelineRow {
+            issue_number: Some(42),
+            repo_name: Some("api".to_string()),
+            lifecycle: PipelineRowLifecycle::New,
+        };
+        let toasts_before = app.toasts.len();
+        let handled = app.dispatch_context_menu_action("record-acceptance", &target);
+        assert!(handled);
+        assert!(
+            app.command_runner.spawned_calls.is_empty(),
+            "must NOT dispatch a command the CLI's routing gate will reject anyway \
+             — the ambiguous-route check must run BEFORE the SHA lookup"
+        );
+        assert!(app.toasts.len() > toasts_before);
+        let (toast, _, _) = app.toasts.last().unwrap();
+        assert_eq!(toast.title, "Record acceptance");
+        assert!(
+            toast.body.contains("--for-path"),
+            "toast must be the designed actionable message, not a raw CLI \
+             error string, got: {}",
+            toast.body,
+        );
+    }
+
     // ── Leg 3c / A3 (#517, #581): test-verdict routing ────────────────────
 
     fn done_work_with_test_state(issue: u64, repo: &str, state: &str) -> Assignment {
@@ -10446,7 +10701,8 @@
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE board_meta (key TEXT PRIMARY KEY, value TEXT);")
             .unwrap();
-        let (gates, labels, repos, require_plan, run_cmds, repo_paths, _models) = load_pipeline_meta(&conn);
+        let (gates, labels, repos, require_plan, run_cmds, repo_paths, _models, acceptance_routes) =
+            load_pipeline_meta(&conn);
         assert_eq!(gates, vec!["review".to_string(), "merge".to_string()]);
         assert_eq!(labels, vec!["coord".to_string()]);
         assert!(repos.is_empty());
@@ -10455,6 +10711,10 @@
         assert!(
             repo_paths.is_empty(),
             "no repo_paths configured → empty map"
+        );
+        assert!(
+            acceptance_routes.is_empty(),
+            "#1151: no pipeline_acceptance_routes configured → empty map"
         );
     }
 
@@ -10469,10 +10729,12 @@
               ('pipeline_repos', '{\"api\":\"acme/api\"}'), \
               ('pipeline_repo_run_cmds', '{\"api\":\"cargo run --example gtk_panel\"}'), \
               ('pipeline_repo_paths', '{\"api\":\"/home/user/src/api\"}'), \
+              ('pipeline_acceptance_routes', '{\"api\":[\"coord/**\",\"tui/**\"]}'), \
               ('pipeline_require_plan', '1');",
         )
         .unwrap();
-        let (gates, labels, repos, require_plan, run_cmds, repo_paths, _models) = load_pipeline_meta(&conn);
+        let (gates, labels, repos, require_plan, run_cmds, repo_paths, _models, acceptance_routes) =
+            load_pipeline_meta(&conn);
         assert_eq!(gates, vec!["plan", "work", "smoke"]);
         assert_eq!(labels, vec!["hotfix", "feature"]);
         assert_eq!(repos, vec![("api".to_string(), "acme/api".to_string())]);
@@ -10486,6 +10748,11 @@
             repo_paths.get("api").map(|s| s.as_str()),
             Some("/home/user/src/api"),
             "repo_paths parsed from board_meta",
+        );
+        assert_eq!(
+            acceptance_routes.get("api").map(|v| v.as_slice()),
+            Some(["coord/**".to_string(), "tui/**".to_string()].as_slice()),
+            "#1151: acceptance_routes parsed from board_meta",
         );
     }
 

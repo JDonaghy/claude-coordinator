@@ -1591,6 +1591,20 @@ pub struct BoardData {
     /// `board_meta['pipeline_repo_paths']`.  Used by the TUI to read git
     /// branch HEAD SHAs for test-plan staleness detection.
     pub(crate) pipeline_repo_paths: std::collections::HashMap<String, String>,
+    /// #1151: coord-local repo name → list of `acceptance.drivers.<repo>
+    /// .routes[*].match` globs (#1125 in-repo path routing), for repos whose
+    /// acceptance driver is *routed*. Absent (no key) for an unrouted repo,
+    /// or when the daemon predates this field. Populated by
+    /// `_save_config_snapshot` and stored in
+    /// `board_meta['pipeline_acceptance_routes']`. Used by
+    /// `dispatch_gate_a_mock_for_selected_pipeline_row` /
+    /// `dispatch_acceptance_author_for_selected_pipeline_row` /
+    /// `dispatch_acceptance_record_for_selected_pipeline_row` to decide
+    /// whether a `--for-path` is needed before firing `coord acceptance
+    /// mock/author/record` — those CLI commands 500 with "no route matched"
+    /// when the repo is routed and `--for-path` is omitted, which the TUI
+    /// used to do unconditionally, every time.
+    pub(crate) pipeline_acceptance_routes: std::collections::HashMap<String, Vec<String>>,
     /// Mirror of `dispatch.require_plan` from coordinator.yml.  When true,
     /// the pipeline prepends a Plan stage before Work, and Work [Go]
     /// becomes "approve the plan and dispatch work" rather than fresh

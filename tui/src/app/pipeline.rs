@@ -1910,6 +1910,44 @@ impl CoordApp {
         }
     }
 
+    /// #1151: resolve the `--for-path` argument to append (if any) to a
+    /// `coord acceptance mock/author/record` dispatch for `repo`, based on
+    /// `self.data.pipeline_acceptance_routes` (repo → route `match` globs,
+    /// populated by `_save_config_snapshot` only for repos whose acceptance
+    /// driver is *routed*, #1125 — see `AcceptanceConfig.driver_for` in
+    /// `coord/config.py`). Before this, all three dispatch call sites fired
+    /// the CLI with no `--for-path` unconditionally, which those commands
+    /// reject once a repo's driver is routed
+    /// (`coord/commands/acceptance.py`'s "no route matched" error).
+    ///
+    /// Three outcomes:
+    /// - repo absent from the map (unrouted repo, or the daemon predates
+    ///   #1151) → `Ok(None)`, dispatch exactly as before.
+    /// - exactly one candidate route → `Ok(Some(glob))`, unambiguous: the
+    ///   caller appends `--for-path <glob>` and the dispatch succeeds
+    ///   transparently instead of hitting the CLI's routing gate at all.
+    /// - more than one candidate route → `Err(reason)`: the TUI has no
+    ///   per-issue signal today for which subtree an issue's work belongs to
+    ///   (no file-path/manifest mapping on `PipelineIssue`), so it can't
+    ///   guess. The caller must show `reason` as a toast and skip dispatch
+    ///   rather than fire a command that the CLI will reject anyway.
+    pub(crate) fn acceptance_for_path_arg(&self, repo: &str) -> Result<Option<String>, String> {
+        match self.data.pipeline_acceptance_routes.get(repo) {
+            None => Ok(None),
+            Some(routes) if routes.is_empty() => Ok(None),
+            Some(routes) if routes.len() == 1 => Ok(Some(routes[0].clone())),
+            Some(routes) => Err(format!(
+                "Repo '{repo}' has a routed acceptance driver with {} candidate \
+                 subtrees ({}) — the TUI can't tell which one this issue's work \
+                 belongs to yet. Dispatch from the CLI instead, e.g. `coord \
+                 acceptance ... --for-path {}`.",
+                routes.len(),
+                routes.join(", "),
+                routes.first().map(String::as_str).unwrap_or("<glob>"),
+            )),
+        }
+    }
+
     /// #1059 (docs/ORACLE_LOOP.md, #930): dispatch Gate A for the selected
     /// epic/tracking-issue Pipeline row — `coord acceptance mock <repo>
     /// <tracking_issue>`. Headless, like `coord assign`: the mock-author is
@@ -1919,6 +1957,9 @@ impl CoordApp {
     /// own claim-detection refuses a duplicate dispatch (Gate A already in
     /// flight) with a clear stderr message; the command runner surfaces
     /// that as a toast via its usual failure path.
+    ///
+    /// #1151: resolves `--for-path` via `acceptance_for_path_arg` first —
+    /// see that method's doc for the three outcomes.
     pub(crate) fn dispatch_gate_a_mock_for_selected_pipeline_row(&mut self) -> bool {
         let Some(idx) = self.pipeline_sel else {
             return false;
@@ -1934,20 +1975,31 @@ impl CoordApp {
             );
             return false;
         };
+        let for_path = match self.acceptance_for_path_arg(&repo) {
+            Ok(p) => p,
+            Err(reason) => {
+                self.push_toast("Dispatch Gate A mock", &reason, ToastSeverity::Warning);
+                return false;
+            }
+        };
         let issue_str = issue.number.to_string();
-        let cmd_strs: Vec<String> = vec![
+        let mut cmd_strs: Vec<String> = vec![
             "acceptance".to_string(),
             "mock".to_string(),
             repo.clone(),
             issue_str,
         ];
+        if let Some(p) = for_path {
+            cmd_strs.push("--for-path".to_string());
+            cmd_strs.push(p);
+        }
         let cmd_refs: Vec<&str> = cmd_strs.iter().map(|s| s.as_str()).collect();
         use crate::commands::SpawnQueuedOutcome;
         match self.command_runner.spawn_queued(&cmd_refs) {
             SpawnQueuedOutcome::Started => {
                 self.push_toast(
                     "Gate A mock dispatched",
-                    &format!("coord acceptance mock {} {}", repo, issue.number),
+                    &format!("coord {}", cmd_strs.join(" ")),
                     ToastSeverity::Info,
                 );
                 true
@@ -2040,7 +2092,16 @@ impl CoordApp {
             );
             return false;
         };
-        let cmd_strs: Vec<String> = vec![
+        // #1151: resolve --for-path before dispatching — see
+        // `acceptance_for_path_arg`'s doc for the three outcomes.
+        let for_path = match self.acceptance_for_path_arg(&repo) {
+            Ok(p) => p,
+            Err(reason) => {
+                self.push_toast("Author acceptance tests", &reason, ToastSeverity::Warning);
+                return false;
+            }
+        };
+        let mut cmd_strs: Vec<String> = vec![
             "acceptance".to_string(),
             "author".to_string(),
             repo.clone(),
@@ -2048,16 +2109,17 @@ impl CoordApp {
             "--issue".to_string(),
             issue.number.to_string(),
         ];
+        if let Some(p) = for_path {
+            cmd_strs.push("--for-path".to_string());
+            cmd_strs.push(p);
+        }
         let cmd_refs: Vec<&str> = cmd_strs.iter().map(|s| s.as_str()).collect();
         use crate::commands::SpawnQueuedOutcome;
         match self.command_runner.spawn_queued(&cmd_refs) {
             SpawnQueuedOutcome::Started => {
                 self.push_toast(
                     "Acceptance author dispatched",
-                    &format!(
-                        "coord acceptance author {} {} --issue {}",
-                        repo, tracking_issue, issue.number
-                    ),
+                    &format!("coord {}", cmd_strs.join(" ")),
                     ToastSeverity::Info,
                 );
                 true
@@ -2097,6 +2159,17 @@ impl CoordApp {
                 ToastSeverity::Warning,
             );
             return false;
+        };
+        // #1151: resolve --for-path (or bail with the designed toast) BEFORE
+        // the branch/SHA lookup below — no point reading git refs for a
+        // dispatch the CLI's routing gate will reject anyway. See
+        // `acceptance_for_path_arg`'s doc for the three outcomes.
+        let for_path = match self.acceptance_for_path_arg(&repo) {
+            Ok(p) => p,
+            Err(reason) => {
+                self.push_toast("Record acceptance", &reason, ToastSeverity::Warning);
+                return false;
+            }
         };
         let Some(work) = self
             .data
@@ -2142,7 +2215,7 @@ impl CoordApp {
             );
             return false;
         };
-        let cmd_strs: Vec<String> = vec![
+        let mut cmd_strs: Vec<String> = vec![
             "acceptance".to_string(),
             "record".to_string(),
             "--repo".to_string(),
@@ -2152,18 +2225,22 @@ impl CoordApp {
             "--sha".to_string(),
             sha.clone(),
         ];
+        if let Some(p) = for_path {
+            cmd_strs.push("--for-path".to_string());
+            cmd_strs.push(p);
+        }
         let cmd_refs: Vec<&str> = cmd_strs.iter().map(|s| s.as_str()).collect();
         use crate::commands::SpawnQueuedOutcome;
         match self.command_runner.spawn_queued(&cmd_refs) {
             SpawnQueuedOutcome::Started => {
+                let short_sha = &sha[..sha.len().min(8)];
+                let display_cmd: Vec<&str> = cmd_strs
+                    .iter()
+                    .map(|s| if s == &sha { short_sha } else { s.as_str() })
+                    .collect();
                 self.push_toast(
                     "Acceptance record dispatched",
-                    &format!(
-                        "coord acceptance record --repo {} --issue {} --sha {}",
-                        repo,
-                        issue.number,
-                        &sha[..sha.len().min(8)]
-                    ),
+                    &format!("coord {}", display_cmd.join(" ")),
                     ToastSeverity::Info,
                 );
                 true
