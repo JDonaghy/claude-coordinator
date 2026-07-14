@@ -530,7 +530,9 @@ def dispatch_test_author_interactive(
         tmux_session_name,
     )
     from coord.state import (  # noqa: PLC0415
+        build_board,
         record_dispatched_assignment,
+        save_board,
         set_assignment_failure_reason,
     )
 
@@ -634,6 +636,7 @@ def dispatch_test_author_interactive(
     provider = setup.provider
     is_local = setup.is_local
     issue_ctx = setup.issue_ctx
+    svc = setup.svc
 
     if is_local:
         ta_repo_path = str(Path(repo_path_cfg).expanduser())
@@ -701,6 +704,8 @@ def dispatch_test_author_interactive(
         provider_name="claude-pty",
     )
     record_dispatched_assignment(assignment=ta_assignment, repo_github=repo_cfg.github)
+    if svc is None:
+        save_board(build_board())
     os.environ["COORD_ASSIGNMENT_ID"] = assignment_id
 
     if is_local:
