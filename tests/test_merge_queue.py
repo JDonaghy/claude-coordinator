@@ -1499,20 +1499,49 @@ class TestEnqueueApprovedWork:
 
         assert changed == []
 
-    def test_skips_already_merged_issue(self, coord_db) -> None:
-        """When a MERGED entry already exists for the issue, skip re-enqueueing."""
+    def test_stale_merged_entry_for_different_branch_does_not_block_enqueue(
+        self, coord_db
+    ) -> None:
+        """#1150: a MERGED queue entry from a *prior* work attempt on a
+        different branch (same issue) must NOT block enqueue of fresh work —
+        the old issue-level ``already_merged`` shortcut conflated "this issue
+        has ever had a merge" with "this exact branch/commit is already
+        merged". Termination is now decided solely by Gate 3's commit-aware
+        ``work_is_terminal`` (stubbed non-terminal by the autouse fixture)."""
+        cfg = self._config()
+        work = self._work("w1", test_state="passed")  # branch "issue-1-w1"
+        rev = self._review("w1", verdict="approve")
+        board = self._board(completed=[work, rev])
+        # Seed a MERGED entry for the SAME issue but a DIFFERENT branch — e.g.
+        # the issue's original, already-shipped PR from a prior cycle.
+        mq.save_queue([_q("orig", state=mq.MERGED, repo="api", branch="worker/orig")])
+
+        changed = mq.enqueue_approved_work(cfg, board)
+
+        assert changed == ["w1"]
+        branches = {x.branch for x in load_queue()}
+        assert "issue-1-w1" in branches
+        # The historical MERGED entry is untouched.
+        merged = [x for x in load_queue() if x.assignment_id == "orig"]
+        assert merged and merged[0].state == mq.MERGED
+
+    def test_still_skips_when_work_is_terminal_reports_true(
+        self, coord_db, monkeypatch
+    ) -> None:
+        """When Gate 3 (``work_is_terminal``, commit-aware post-#1150) genuinely
+        reports this branch as terminal, enqueue is still correctly skipped."""
+        from coord import github_ops
+
         cfg = self._config()
         work = self._work("w1", test_state="passed")
         rev = self._review("w1", verdict="approve")
         board = self._board(completed=[work, rev])
-        # Seed a MERGED queue entry for the same issue.
-        mq.save_queue([_q("w1", state=mq.MERGED, repo="api")])
+        monkeypatch.setattr(github_ops, "work_is_terminal", lambda *a, **k: True)
 
         changed = mq.enqueue_approved_work(cfg, board)
 
         assert changed == []
-        # The existing MERGED entry is untouched.
-        assert load_queue()[0].state == mq.MERGED
+        assert load_queue() == []
 
     def test_skips_unknown_repo(self, coord_db) -> None:
         """Assignments for a repo not in config are silently skipped."""

@@ -650,17 +650,24 @@ class TestMergeAutoEnqueue:
         assert "#280" in result.output
         create.assert_called_once()
 
-    def test_skips_issues_already_merged_via_other_assignment(
+    def test_stale_merged_entry_on_different_branch_does_not_block_enqueue(
         self, config_file: Path, coord_dir: Path, coord_db
     ) -> None:
-        """An issue with a prior merged queue entry should not get a fresh
-        enqueue even if board.completed has a different assignment for it
-        (e.g. an old failed attempt).  Avoids duplicate PRs per issue."""
+        """#1150: a MERGED queue entry from a prior, *different* assignment
+        on a *different* branch for the same issue must not permanently
+        block a fresh assignment from being enqueued — the old issue-level
+        ``already_merged`` shortcut conflated "this issue has ever had a
+        merge" with "this exact branch/commit is already merged", which
+        silently blocked legitimate re-merges on a reused branch
+        (``--fix-of``/``--force``). Whether the *new* assignment's own
+        branch is actually terminal is decided later by the commit-aware
+        ``work_is_terminal`` gate (#525), not by this issue-level history."""
         self._seed_board_with_done_work(
-            coord_db, issue_number=55, assignment_id="newer-attempt"
+            coord_db, issue_number=55, assignment_id="newer-attempt",
+            branch="issue-55-newer-attempt",
         )
         self._seed_issue_state(coord_db, number=55, state="open")
-        # Existing merged entry for #55 from a prior assignment.
+        # Existing MERGED entry for #55 from a prior, unrelated assignment/branch.
         mq.save_queue([_entry("older-attempt", state=mq.MERGED)])
         # Patch the issue number on the seeded merged entry to 55.
         coord_db.execute(
@@ -669,12 +676,19 @@ class TestMergeAutoEnqueue:
         coord_db.commit()
 
         with patch("coord.github_ops.create_pr") as create, \
-             patch("coord.github_ops.merge_pr"):
+             patch("coord.github_ops.merge_pr") as merge_fn, \
+             patch("coord.github_ops.get_pr_size", return_value=10):
+            create.return_value = {"number": 100, "url": "u/100", "existed": False}
+            merge_fn.return_value = (True, "ok")
             result = CliRunner().invoke(main, ["merge", "--config", str(config_file)])
 
         assert result.exit_code == 0, result.output
-        assert "auto-enqueued" not in result.output
-        create.assert_not_called()
+        assert "auto-enqueued" in result.output
+        assert "#55" in result.output
+        create.assert_called_once()
+        # The historical MERGED entry is untouched.
+        states = {x.assignment_id: x.state for x in mq.load_queue()}
+        assert states["older-attempt"] == mq.MERGED
 
     def test_clear_message_when_truly_nothing_to_merge(
         self, config_file: Path, coord_dir: Path, coord_db

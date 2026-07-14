@@ -162,6 +162,49 @@ def test_does_not_mark_merged_when_not_terminal(monkeypatch, config) -> None:
     assert writes == []
 
 
+def test_reused_branch_with_new_commits_not_marked_merged(monkeypatch, config) -> None:
+    """#1150 end-to-end: exercises the REAL ``work_is_terminal`` ->
+    ``pr_is_merged`` chain (only ``_gh``/``issue_is_closed`` are stubbed, not
+    ``work_is_terminal`` itself) for a branch that has a historical merged PR
+    *plus* new, unmerged commits pushed on top of it (the ``--fix-of``/
+    ``--force`` branch-reuse pattern). Sweep (b) must NOT flip this row to
+    'merged' — the branch's current tip does not match what actually merged.
+    """
+    from coord import github_ops, state
+
+    a = _done_work(issue_number=42, branch="issue-42-fix")
+    board = Board(completed=[a])
+
+    monkeypatch.setattr(github_ops, "issue_is_closed", lambda repo, n: False)
+    monkeypatch.setattr(github_ops, "list_open_prs", lambda repo: [])
+
+    def _gh_stub(*args, **kwargs):
+        if args and args[0] == "pr":
+            import json as _json
+            return _json.dumps([
+                {"number": 7, "state": "MERGED", "mergedAt": "2026-06-01T00:00:00Z",
+                 "headRefOid": "oldshaFromFirstMerge"},
+            ])
+        if args and args[0] == "api" and "branches" in args[1]:
+            import json as _json
+            return _json.dumps({"commit": {"sha": "newshaFromFixCommit"}})
+        raise AssertionError(f"unexpected gh call: {args}")
+
+    monkeypatch.setattr(github_ops, "_gh", _gh_stub)
+
+    writes: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        state, "mark_assignment_merged",
+        lambda aid: writes.append(("merged", aid)),
+    )
+
+    actions = reconcile_board_merges(board, config)
+
+    assert a.status == "done"
+    assert writes == []
+    assert not any("mark merged" in s for s in actions)
+
+
 def test_backfill_then_mark_merged_in_one_sweep(monkeypatch, config) -> None:
     """A done-no-branch row that is also merged: backfill then flip in one pass."""
     a = _done_work(issue_number=42, branch=None)

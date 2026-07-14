@@ -189,7 +189,7 @@ def issue_is_closed(repo: str, issue_number: int) -> bool:
 
 
 def pr_is_merged(repo: str, branch: str) -> bool:
-    """True when a PR whose head is ``branch`` has been merged on ``repo``.
+    """True when ``branch``'s *current* tip is a commit that actually merged on ``repo``.
 
     Uses ``gh pr list --head <branch> --state all`` rather than ``pr view`` so
     the result survives **branch deletion after merge** and the quadraui case
@@ -197,13 +197,28 @@ def pr_is_merged(repo: str, branch: str) -> bool:
     :func:`issue_is_closed` would miss it).  Best-effort and **fail-open**:
     returns ``False`` when there is no PR, the PR is still open, or ``gh``
     errors — never blocks a legitimate dispatch on a transient failure.
+
+    #1150: branch reuse across merge cycles is a designed pattern
+    (``--fix-of``/``--rework-of`` continue on the same branch; ``--force`` can
+    re-target a branch name with prior history) — so "a PR with this head ref
+    name merged *at some point*" is not proof that the branch's *current*
+    commits are merged. To distinguish those cases, once a merged PR is found
+    we resolve the branch's current tip via :func:`get_branch_sha` (the same
+    GitHub-API SHA lookup #821 uses for stale-review detection) and require it
+    to match the merged PR's ``headRefOid`` — the exact commit that landed.
+    When the tip can't be resolved (most commonly: the branch was deleted
+    after merging, which also means no further commits could have been
+    pushed to it) we fall back to the pre-#1150 "any historical merge counts"
+    behavior, since that case can't have the staleness problem this guards
+    against.
     """
     if not branch:
         return False
     try:
         raw = _gh(
             "pr", "list", "--repo", repo, "--head", branch,
-            "--state", "all", "--json", "number,state,mergedAt", "--limit", "10",
+            "--state", "all", "--json", "number,state,mergedAt,headRefOid",
+            "--limit", "10",
         )
     except RuntimeError:
         return False
@@ -211,9 +226,17 @@ def pr_is_merged(repo: str, branch: str) -> bool:
         prs = json.loads(raw)
     except json.JSONDecodeError:
         return False
-    return any(
-        p.get("mergedAt") or p.get("state", "").upper() == "MERGED" for p in prs
-    )
+    merged = [
+        p for p in prs
+        if p.get("mergedAt") or p.get("state", "").upper() == "MERGED"
+    ]
+    if not merged:
+        return False
+
+    current_sha = get_branch_sha(repo, branch)
+    if current_sha is None:
+        return True  # branch gone — no new commits possible; trust the history
+    return any(p.get("headRefOid") == current_sha for p in merged)
 
 
 def work_is_terminal(
