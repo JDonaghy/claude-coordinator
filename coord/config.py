@@ -683,16 +683,18 @@ class ModelRates:
 def _default_pricing() -> dict[str, ModelRates]:
     """Built-in per-1M-token rates for the three canonical model tiers.
 
-    Approximate official Anthropic pricing at time of writing (Sonnet/Opus/
-    Haiku input+output list price; cache_read ~= 0.1x input, cache_creation
-    ~= 1.25x input, the standard 5-minute-TTL cache economics) — the issue
-    calls for the coordinator to verify these against the live price list at
-    review rather than re-deriving them here. A ``pricing:`` block in
-    coordinator.yml overrides or extends any of these.
+    Official Anthropic list pricing at time of writing (Sonnet/Opus/Haiku
+    input+output list price; cache_read = 0.1x input, cache_creation = 1.25x
+    input, the standard 5-minute-TTL cache economics) — verified against the
+    live price list at review (#1118 review: the shipped Opus row previously
+    regressed to 1/3 of the correct value; pinned exactly by
+    ``test_pricing_absent_defaults_to_builtin_rates`` in
+    ``tests/test_config_pricing.py`` so it can't silently drift again). A
+    ``pricing:`` block in coordinator.yml overrides or extends any of these.
     """
     return {
         "sonnet": ModelRates(input=3.00, output=15.00, cache_read=0.30, cache_creation=3.75),
-        "opus": ModelRates(input=5.00, output=25.00, cache_read=0.50, cache_creation=6.25),
+        "opus": ModelRates(input=15.00, output=75.00, cache_read=1.50, cache_creation=18.75),
         "haiku": ModelRates(input=1.00, output=5.00, cache_read=0.10, cache_creation=1.25),
     }
 

@@ -18,10 +18,11 @@ degrade gracefully rather than raising): ``issue_number``, ``issue_title``,
 ``cost_usd``, ``input_tokens``, ``output_tokens``, ``cache_read_tokens``,
 ``cache_creation_tokens``, ``dispatched_at``, ``finished_at``.
 
-Grouping dimensions (``group_by=``): ``"issue"`` (keyed by repo+issue number),
-``"repo"``, ``"day"``, ``"week"`` (ISO week), ``"month"``, and ``"stage"``
-(keyed by ``type`` — the per-stage-type sub-rollup for the time view, see
-:func:`rollup_by_stage`).
+Grouping dimensions (``group_by=``): ``"issue"`` (keyed by repo+issue number
+in the internal :func:`rollup` path — see :func:`_agg_key` for how the
+sealed :func:`aggregate` entry point differs), ``"repo"``, ``"day"``,
+``"week"`` (ISO week), ``"month"``, and ``"stage"`` (keyed by ``type`` — the
+per-stage-type sub-rollup for the time view, see :func:`rollup_by_stage`).
 
 Time window: a resolved half-open ``[start, end)`` interval (see
 :class:`TimeWindow`). ``today``/``week``/``month``/``since=<ISO|Nd|Nh>`` are
@@ -544,6 +545,20 @@ def _agg_key(row: dict, by: str) -> Any:
     the internal :func:`rollup` which uses an :class:`IssueKey` named-tuple so
     it can distinguish the same number across repos).  All other dimensions
     delegate to :func:`_group_key_for`.
+
+    KNOWN LIMITATION (#1118 review, tracked, not fixed here): because the key
+    is a bare int, two different repos' issue ``#N`` collide into one
+    ``"by issue"`` group — GitHub issue numbers are per-repo, not globally
+    unique, and ``coordinator.yml`` is explicitly multi-repo. This matches
+    the sealed Gate-A acceptance contract's mock output shape
+    (``tests/acceptance/ms-37/contract.md``, a single ``issue`` column) and
+    the fixture's issue numbers (501/502) happen not to collide, so it isn't
+    caught by the sealed suite. Each group's ``"rows"`` list still carries
+    each row's real ``repo_name``, so a caller (CLI-1/#1115, CLI-2/#1119,
+    TUI/#1116) that cares about repo scoping for ``by="issue"`` can recover
+    it from there today; a real fix would need a repo-qualified key (e.g.
+    ``f"{repo_name}#{issue_number}"``) *and* a matching sealed-contract
+    update, which is out of scope for this PR.
     """
     if by == "issue":
         return _to_int(row.get("issue_number"))
