@@ -22,6 +22,7 @@ from coord.usage_rollup import (
     GroupRollup,
     IssueKey,
     TimeWindow,
+    aggregate,
     leg_cost,
     leg_duration,
     leg_in_window,
@@ -555,3 +556,36 @@ def test_group_rollup_default_pricing_when_omitted() -> None:
     result = rollup(ALL_LEGS, group_by="repo", window=window_today(now=NOW))
     assert isinstance(result.total, GroupRollup)
     assert result.total.legs == 6
+
+
+def test_aggregate_by_issue_collides_across_repos_tracked_limitation() -> None:
+    """KNOWN LIMITATION (#1118 review, tracked not fixed): ``aggregate()``'s
+    ``by="issue"`` key is the bare ``issue_number`` int, unlike the internal
+    :func:`rollup` path which scopes by :class:`IssueKey` (repo + issue).
+    GitHub issue numbers are per-repo, not globally unique, and
+    ``coordinator.yml`` is explicitly multi-repo, so two different repos'
+    issue ``#N`` silently merge into one group here.
+
+    This pins the *current, intentional-per-sealed-contract* behavior (see
+    ``_agg_key``'s docstring in ``coord/usage_rollup.py``) so it's visible
+    and won't be "fixed" by accident without also updating the sealed
+    Gate-A acceptance contract (``tests/acceptance/ms-37/contract.md``,
+    which is read-only for workers) that pins bare-int keys.
+    """
+    same_number_other_repo = dict(L1, issue_number=502, repo_name="gamma")
+    rows = [L1, L3, same_number_other_repo]  # L1: alpha#501, L3: beta#502
+    result = aggregate(
+        rows,
+        by="issue",
+        window=window_today(now=NOW),
+        pricing={"sonnet": {"input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_creation": 3.75},
+                 "opus": {"input": 15.0, "output": 75.0, "cache_read": 1.5, "cache_creation": 18.75}},
+    )
+    groups_by_key = {g["key"]: g for g in result["groups"]}
+    # alpha#501 stays isolated (no collision)...
+    assert groups_by_key[501]["legs"] == 1
+    # ...but beta#502 and gamma#502 are merged into a single "502" group,
+    # even though they're different repos' issues -- the tracked bug.
+    assert groups_by_key[502]["legs"] == 2
+    repos_in_502_group = {row["repo_name"] for row in groups_by_key[502]["rows"]}
+    assert repos_in_502_group == {"beta", "gamma"}

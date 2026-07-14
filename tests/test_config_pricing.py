@@ -34,6 +34,29 @@ def test_pricing_absent_defaults_to_builtin_rates(tmp_path: Path) -> None:
         assert rates.output > 0
 
 
+def test_pricing_builtin_defaults_match_official_anthropic_rates(
+    tmp_path: Path,
+) -> None:
+    """Pin the exact shipped per-1M-token defaults (not just ``> 0``).
+
+    #1118 review: the shipped Opus default had silently regressed to 1/3 of
+    the correct value (``5.00/25.00/0.50/6.25`` instead of
+    ``15.00/75.00/1.50/18.75``) while ``> 0``-only assertions let it ship.
+    Pin every field for every canonical tier so a future edit can't
+    silently drift again the same way.
+    """
+    p = tmp_path / "coordinator.yml"
+    p.write_text(BASE)
+    cfg = load(p)
+    expected = {
+        "sonnet": ModelRates(input=3.00, output=15.00, cache_read=0.30, cache_creation=3.75),
+        "opus": ModelRates(input=15.00, output=75.00, cache_read=1.50, cache_creation=18.75),
+        "haiku": ModelRates(input=1.00, output=5.00, cache_read=0.10, cache_creation=1.25),
+    }
+    for model, rates in expected.items():
+        assert cfg.pricing.rates_for(model) == rates
+
+
 def test_pricing_unmapped_model_has_no_rates(tmp_path: Path) -> None:
     p = tmp_path / "coordinator.yml"
     p.write_text(BASE)
