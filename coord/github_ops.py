@@ -206,11 +206,21 @@ def pr_is_merged(repo: str, branch: str) -> bool:
     we resolve the branch's current tip via :func:`get_branch_sha` (the same
     GitHub-API SHA lookup #821 uses for stale-review detection) and require it
     to match the merged PR's ``headRefOid`` — the exact commit that landed.
-    When the tip can't be resolved (most commonly: the branch was deleted
-    after merging, which also means no further commits could have been
-    pushed to it) we fall back to the pre-#1150 "any historical merge counts"
-    behavior, since that case can't have the staleness problem this guards
-    against.
+
+    When the tip can't be resolved via ``get_branch_sha`` (it fails closed to
+    ``None`` on *any* error, transient or not — see its docstring), we do
+    **not** blindly trust the historical merge, because that would reintroduce
+    this same issue's bug class under a transient-failure trigger: a rate
+    limit or network blip at the wrong moment would read as "already merged"
+    and callers (``reconcile``'s merge sweep, ``prune_stale_queue_entries``)
+    would permanently mark live, unmerged work as done or delete its queue
+    entry. Trusting history is only actually safe in the one case where it's
+    *structurally* impossible for new commits to exist: the branch was
+    positively confirmed deleted (a 404, via :func:`branch_exists_on_remote`,
+    which distinguishes "GitHub said not found" from any other failure).
+    Every other unresolved case — auth hiccup, timeout, rate limit — fails
+    open toward ``False`` ("not yet merged"), matching this function's and
+    ``prune_stale_queue_entries``'s documented fail-open convention.
     """
     if not branch:
         return False
@@ -234,9 +244,15 @@ def pr_is_merged(repo: str, branch: str) -> bool:
         return False
 
     current_sha = get_branch_sha(repo, branch)
-    if current_sha is None:
-        return True  # branch gone — no new commits possible; trust the history
-    return any(p.get("headRefOid") == current_sha for p in merged)
+    if current_sha is not None:
+        return any(p.get("headRefOid") == current_sha for p in merged)
+    # SHA lookup failed. Only trust the historical merge if we can positively
+    # confirm the branch is gone (a 404 means no further commits could have
+    # been pushed to it). Any other failure (transient network/auth/rate
+    # limit) fails open toward False — see docstring.
+    if not branch_exists_on_remote(repo, branch):
+        return True  # confirmed deleted — no new commits possible; trust history
+    return False
 
 
 def work_is_terminal(

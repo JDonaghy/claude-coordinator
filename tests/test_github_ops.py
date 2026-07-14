@@ -90,9 +90,13 @@ class TestPrIsMerged:
             assert github_ops.pr_is_merged("acme/api", "issue-1-fix") is False
 
     def test_true_when_branch_deleted_after_merge(self) -> None:
-        """Tip unresolvable (branch deleted post-merge, the common case) ->
-        falls back to the pre-#1150 'any historical merge counts' behavior,
-        since a deleted branch cannot have gained new commits since."""
+        """Tip unresolvable AND the branch is positively confirmed gone (404,
+        the common case: branch deleted post-merge) -> falls back to the
+        pre-#1150 'any historical merge counts' behavior, since a deleted
+        branch cannot have gained new commits since. The shared
+        ``_gh_pr_and_branch`` stub raises a 404-shaped RuntimeError for any
+        non-``pr`` call, which satisfies both the ``get_branch_sha`` lookup
+        and the follow-up ``branch_exists_on_remote`` confirmation check."""
         pr_payload = json.dumps([
             {"number": 42, "state": "MERGED", "mergedAt": "2026-06-09T00:00:00Z",
              "headRefOid": "oldsha1"},
@@ -100,16 +104,50 @@ class TestPrIsMerged:
         with patch("coord.github_ops._gh", side_effect=_gh_pr_and_branch(pr_payload, None)):
             assert github_ops.pr_is_merged("acme/api", "issue-1-fix") is True
 
+    def test_false_when_sha_lookup_fails_for_non_404_reason(self) -> None:
+        """#1150 review: a transient gh/network failure that leaves the SHA
+        unresolved must NOT be treated the same as 'branch confirmed gone'.
+        Conflating the two reintroduces this issue's exact bug class under a
+        transient-failure trigger -- a rate limit or auth blip at the wrong
+        moment would read as 'already merged', and callers (reconcile's merge
+        sweep, prune_stale_queue_entries) act on a single True reading by
+        permanently marking live, unmerged work as done/deleting its queue
+        entry. Only a positively-confirmed-absent branch (404) may fall back
+        to trusting history; every other failure must fail open toward
+        False, per this module's documented convention."""
+        pr_payload = json.dumps([
+            {"number": 42, "state": "MERGED", "mergedAt": "2026-06-09T00:00:00Z",
+             "headRefOid": "oldsha1"},
+        ])
+
+        def _dispatch(*args, **kwargs):
+            if args and args[0] == "pr":
+                return pr_payload
+            # Not a "not found" / 4xx signal -- a generic transient failure.
+            raise RuntimeError("gh: connection timed out")
+
+        with patch("coord.github_ops._gh", side_effect=_dispatch):
+            assert github_ops.pr_is_merged("acme/api", "issue-1-fix") is False
+
     def test_true_when_merged_at_present(self) -> None:
-        payload = json.dumps(
-            [{"number": 42, "state": "MERGED", "mergedAt": "2026-06-09T00:00:00Z"}]
-        )
-        with patch("coord.github_ops._gh", return_value=payload):
+        # Current tip matches the merged PR's headRefOid, so the #1150
+        # commit-aware check passes on its own merits (not via the
+        # unresolvable-SHA fallback).
+        pr_payload = json.dumps([
+            {"number": 42, "state": "MERGED", "mergedAt": "2026-06-09T00:00:00Z",
+             "headRefOid": "deadbeef"},
+        ])
+        branch_payload = json.dumps({"commit": {"sha": "deadbeef"}})
+        with patch("coord.github_ops._gh", side_effect=_gh_pr_and_branch(pr_payload, branch_payload)):
             assert github_ops.pr_is_merged("acme/api", "issue-1-fix") is True
 
     def test_true_when_state_merged_without_merged_at(self) -> None:
-        payload = json.dumps([{"number": 42, "state": "MERGED", "mergedAt": None}])
-        with patch("coord.github_ops._gh", return_value=payload):
+        pr_payload = json.dumps([
+            {"number": 42, "state": "MERGED", "mergedAt": None,
+             "headRefOid": "deadbeef"},
+        ])
+        branch_payload = json.dumps({"commit": {"sha": "deadbeef"}})
+        with patch("coord.github_ops._gh", side_effect=_gh_pr_and_branch(pr_payload, branch_payload)):
             assert github_ops.pr_is_merged("acme/api", "issue-1-fix") is True
 
     def test_false_when_open(self) -> None:
