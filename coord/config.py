@@ -370,6 +370,21 @@ class DispatchConfig:
 # `review_of_assignment_id` set on a `type="work"` row — and reuses
 # `conflict-fix`'s threshold (the same "human resolving someone else's
 # feedback" scenario).
+#
+# #1144 audit note: the same dual-purpose shape exists for `review` and
+# `smoke`. Headless auto-review (`coord.review`, no `provider_name`) and
+# headless smoke (`coord.smoke`, no `provider_name`) share their types with
+# the interactive `--review-of`/`--smoke-of` sessions
+# (`coord.commands.dispatch_workers`, `provider_name="claude-pty"` +
+# `review_of_assignment_id` set) - plain `review`/`smoke` are only 15m/20m,
+# so a human reading a diff or babysitting a smoke run for that long is
+# normal, not stuck. `attention_threshold_for` extends the same compound
+# discriminator to `assignment_type in ("work", "review", "smoke")` and
+# defers all three to `conflict-fix`'s 60m threshold rather than giving
+# review/smoke their own tuned value - one interactive threshold for every
+# "human attending a claude-pty session tied to an earlier assignment" case
+# is easier to reason about than three, and 60m is already generous enough
+# to cover a human reading a diff or watching a smoke run.
 _DEFAULT_ATTENTION_THRESHOLDS: dict[str, float] = {
     "work": 45 * 60.0,
     "review": 15 * 60.0,
@@ -446,7 +461,10 @@ class PipelineConfig:
     ``--rework-of`` session (#1137) is also recognized there, by
     ``provider_name``/``review_of_assignment_id`` rather than ``type``
     (it shares ``type="work"`` with headless coding workers), and reuses
-    ``conflict-fix``'s threshold.
+    ``conflict-fix``'s threshold. The interactive ``--review-of`` and
+    ``--smoke-of`` sessions (#1144) are recognized the same way for
+    ``type="review"``/``type="smoke"`` and also reuse ``conflict-fix``'s
+    threshold, rather than plain review's 15m or smoke's 20m.
 
     ``convergence_rounds`` (#846) is the number of fix/review rounds
     (``Assignment.review_iteration``) an assignment may accumulate without
@@ -475,26 +493,32 @@ class PipelineConfig:
 
         Checked in order:
 
-        1. **Interactive fix session** (#1137): ``assignment_type == "work"``
-           with ``provider_name == "claude-pty"`` and
+        1. **Interactive session sharing a headless type** (#1137/#1144):
+           ``assignment_type in ("work", "review", "smoke")`` with
+           ``provider_name == "claude-pty"`` and
            ``review_of_assignment_id`` set (the optional keyword-only args,
            passed by callers that have the full assignment record; both
            default to ``None`` so existing callers that only know the type
            are unaffected). This mirrors
            :func:`coord.reconcile.is_interactive_merge_session`'s compound
-           discriminator — a dedicated ``type="fix"`` was deliberately not
-           introduced, for the same reason a dedicated ``type="merge"`` was
-           reverted (see that function's docstring). A matching row defers
-           to ``attention_threshold_for("conflict-fix")`` — the same "human
-           resolving someone else's feedback, not writing from scratch"
+           discriminator — a dedicated ``type="fix"``/``type="review-of"``/
+           ``type="smoke-of"`` was deliberately not introduced, for the same
+           reason a dedicated ``type="merge"`` was reverted (see that
+           function's docstring): each of these three shares its type with
+           a headless counterpart (``work`` with headless coding workers,
+           ``review`` with headless auto-review, ``smoke`` with headless
+           smoke). A matching row defers to
+           ``attention_threshold_for("conflict-fix")`` — the same "human
+           attending a live session, not a worker silently converging"
            scenario that earned conflict-fix its extra headroom in #1133 —
            so an explicit user override of ``conflict-fix`` (but *not* of
-           plain ``work``) still applies. Checked *before* the plain
-           ``attention_thresholds`` lookup below for the same reason
-           :data:`INTERACTIVE_SESSION_TYPES` is: ``attention_thresholds``
-           always carries a built-in ``"work"`` entry (the dataclass default
-           copies the whole ``_DEFAULT_ATTENTION_THRESHOLDS`` dict), so
-           checking that dict first would make this branch unreachable.
+           plain ``work``/``review``/``smoke``) still applies. Checked
+           *before* the plain ``attention_thresholds`` lookup below for the
+           same reason :data:`INTERACTIVE_SESSION_TYPES` is:
+           ``attention_thresholds`` always carries built-in ``"work"``/
+           ``"review"``/``"smoke"`` entries (the dataclass default copies
+           the whole ``_DEFAULT_ATTENTION_THRESHOLDS`` dict), so checking
+           that dict first would make this branch unreachable.
         2. **Explicit override** — an ``attention_thresholds`` entry for
            *this exact* ``assignment_type`` (built-in default or
            user-configured) always wins.
@@ -515,7 +539,7 @@ class PipelineConfig:
            category error, not a reasonable guess.
         """
         if (
-            assignment_type == "work"
+            assignment_type in ("work", "review", "smoke")
             and provider_name == "claude-pty"
             and review_of_assignment_id is not None
         ):

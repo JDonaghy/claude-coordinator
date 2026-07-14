@@ -180,6 +180,67 @@ class TestAttentionSignal:
         )
         assert reason == "wall_clock"
 
+    @pytest.mark.parametrize("assignment_type", ["review", "smoke"])
+    def test_interactive_review_smoke_session_gets_conflict_fix_threshold(
+        self, assignment_type: str
+    ) -> None:
+        """#1144: an interactive --review-of/--smoke-of session
+        (type="review"/type="smoke", provider_name="claude-pty",
+        review_of_assignment_id set) is recognized by the same compound
+        discriminator #1137 introduced for the interactive fix session and
+        gets conflict-fix's 60m threshold instead of plain review's 15m or
+        smoke's 20m.
+        """
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api", default_branch="main")],
+            machines=[
+                Machine(
+                    name="laptop", host="laptop.tailnet", repos=["api"],
+                    repo_paths={"api": "/tmp/api"},
+                ),
+            ],
+            pipeline=PipelineConfig(),  # built-in defaults: review=15m, smoke=20m, conflict-fix=60m
+        )
+        # 50 minutes: past plain review's 15m / smoke's 20m, under
+        # conflict-fix's 60m.
+        reason, _ = notify_mod.attention_signal(
+            assignment_type=assignment_type, status="running", dispatched_at=0.0,
+            review_iteration=0, config=cfg, now=50 * 60.0,
+            provider_name="claude-pty", review_of_assignment_id="work-1",
+        )
+        assert reason is None
+
+        # 65 minutes: past conflict-fix's 60m too.
+        reason, _ = notify_mod.attention_signal(
+            assignment_type=assignment_type, status="running", dispatched_at=0.0,
+            review_iteration=0, config=cfg, now=65 * 60.0,
+            provider_name="claude-pty", review_of_assignment_id="work-1",
+        )
+        assert reason == "wall_clock"
+
+    @pytest.mark.parametrize("assignment_type", ["review", "smoke"])
+    def test_plain_headless_review_smoke_not_bumped(self, assignment_type: str) -> None:
+        """A headless auto-review/auto-smoke assignment (no provider_name)
+        is NOT the same as an interactive review/smoke session — it keeps
+        its own plain threshold (15m/20m) even past 20 minutes.
+        """
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api", default_branch="main")],
+            machines=[
+                Machine(
+                    name="laptop", host="laptop.tailnet", repos=["api"],
+                    repo_paths={"api": "/tmp/api"},
+                ),
+            ],
+            pipeline=PipelineConfig(),
+        )
+        reason, _ = notify_mod.attention_signal(
+            assignment_type=assignment_type, status="running", dispatched_at=0.0,
+            review_iteration=0, config=cfg, now=25 * 60.0,
+            provider_name=None, review_of_assignment_id="work-1",
+        )
+        assert reason == "wall_clock"
+
     def test_chat_type_never_wall_clock_flags_even_after_hours(self, config: Config) -> None:
         """#1133: this is the exact false positive that was reported — a
         `chat` assignment still `status="running"` (a human mid-conversation)
@@ -297,6 +358,59 @@ class TestDetectNeedsAttention:
         # 50 minutes in: past plain work's 45m, under conflict-fix's 60m —
         # must NOT be flagged if provider_name reached attention_signal
         # correctly.
+        assert notify_mod.detect_needs_attention(
+            cfg, now=dispatched_at + 50 * 60.0
+        ) == []
+
+        # 65 minutes in: past conflict-fix's 60m too — now it should flag.
+        results = notify_mod.detect_needs_attention(
+            cfg, now=dispatched_at + 65 * 60.0
+        )
+        assert len(results) == 1
+        assert results[0][0].reason == "wall_clock"
+
+    @pytest.mark.parametrize("assignment_type", ["review", "smoke"])
+    def test_interactive_review_smoke_session_not_flagged_at_plain_threshold(
+        self, coord_dir: Path, config: Config, assignment_type: str
+    ) -> None:
+        """#1144: an interactive --review-of/--smoke-of session recorded via
+        record_dispatched_assignment (provider_name="claude-pty",
+        review_of_assignment_id set) must surface provider_name through
+        load_dispatched()'s dict shape so detect_needs_attention's
+        dict-based path applies the conflict-fix bump, not plain review's
+        15m or smoke's 20m — same end-to-end shape as #1137's fix-session
+        test.
+        """
+        import time as _time
+
+        cfg = Config(
+            repos=config.repos,
+            machines=config.machines,
+            pipeline=PipelineConfig(),  # built-in defaults: review=15m, smoke=20m, conflict-fix=60m
+        )
+        # dispatched_at=0.0 is falsy, so record_dispatched_assignment's
+        # `assignment.dispatched_at or time.time()` would silently
+        # substitute "now" — use a real epoch baseline instead, mirroring
+        # _record()'s use of time.time() at dispatch.
+        dispatched_at = _time.time()
+        state_mod.record_dispatched_assignment(
+            assignment=Assignment(
+                assignment_id=f"{assignment_type}-1",
+                machine_name="laptop",
+                repo_name="api",
+                issue_number=42,
+                issue_title=f"[{assignment_type}] Add feature X",
+                status="running",
+                type=assignment_type,
+                provider_name="claude-pty",
+                review_of_assignment_id="work-orig",
+                dispatched_at=dispatched_at,
+            ),
+            repo_github="acme/api",
+        )
+        # 50 minutes in: past plain review's 15m / smoke's 20m, under
+        # conflict-fix's 60m — must NOT be flagged if provider_name reached
+        # attention_signal correctly.
         assert notify_mod.detect_needs_attention(
             cfg, now=dispatched_at + 50 * 60.0
         ) == []
