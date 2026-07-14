@@ -212,6 +212,12 @@ def dispatch_test_author(
     for a routed repo, no driver resolves for *path*), bad tracking issue,
     `issue_number` not a member of the milestone's work order, no qualified
     machine, or the agent rejecting the dispatch).
+
+    Branch: milestone mode (`issue_number=None`) shares one branch/PR across
+    repeated calls, keyed on *tracking_issue*. JIT mode (`issue_number` set)
+    gets its own per-slice branch keyed on `(tracking_issue, issue_number)`
+    — required so each member issue's slice can merge independently without
+    stranding the next slice on an already-closed PR (#1171).
     """
     repo_cfg = config.repo(repo_name)
     if repo_cfg is None:
@@ -296,12 +302,34 @@ def dispatch_test_author(
         issue_body=issue_body,
     )
 
-    # Fixed assignment title regardless of mode (milestone vs. JIT slice) so
-    # repeated dispatches for the same milestone derive the SAME branch name
+    # #1171: milestone-mode dispatches (issue_number is None) keep a single
+    # FIXED assignment title so repeated calls derive the SAME shared branch
     # (issue-{tracking_issue}-{slug(title)}, see AgentServer._setup_worktree)
-    # — JIT extensions continue the same branch/PR instead of forking a new
-    # one each time.
-    assignment_title = f"[test-author] ms-{ctx.milestone_number} acceptance suite"
+    # — that's Gate A's "extend the same in-flight suite" case, and the
+    # branch's PR does not merge until the whole milestone's suite is ready.
+    #
+    # JIT slices (issue_number set) must NOT reuse that shared branch: each
+    # member issue's slice needs its own PR because #1138's oracle gate
+    # merges it to unblock that issue's own Work — so the shared branch's PR
+    # is guaranteed closed before the next slice is authored, silently
+    # stranding it (#1171). Key the branch on (milestone, member issue)
+    # instead via an explicit `target_branch`, deliberately OUTSIDE the
+    # `issue-{N}-*` namespace: if this PR is squash-merged (ancestry breaks)
+    # and deleteBranchOnMerge=false lets the branch survive, an
+    # `issue-{issue_number}-*` name would false-positive `coord.claim`'s
+    # remote-branch check for that same member issue's own Work dispatch —
+    # re-wedging the exact stall this fix removes. A retry/continuation for
+    # the SAME (tracking_issue, issue_number) pair still resolves to the
+    # same branch name, so extending an already-authored slice keeps
+    # pushing to its own still-open PR rather than forking a new one.
+    if issue_number is None:
+        assignment_title = f"[test-author] ms-{ctx.milestone_number} acceptance suite"
+        target_branch: str | None = None
+    else:
+        assignment_title = (
+            f"[test-author] ms-{ctx.milestone_number} slice #{issue_number}"
+        )
+        target_branch = f"test-author-ms-{ctx.milestone_number}-slice-{issue_number}"
 
     repo_deny = repo_cfg.worker_permissions.deny if repo_cfg.worker_permissions else []
     deny_commands = list(dict.fromkeys(list(repo_deny) + TEST_AUTHOR_DENY_COMMANDS))
@@ -320,6 +348,8 @@ def dispatch_test_author(
         "deny_commands": deny_commands,
         "branch": repo_cfg.default_branch or "main",
     }
+    if target_branch:
+        payload["target_branch"] = target_branch
 
     url = f"http://{machine.host}:{AGENT_PORT}/assign"
     client = http_client or httpx
@@ -328,6 +358,16 @@ def dispatch_test_author(
     agent_response = resp.json()
 
     assignment_id = agent_response.get("id") or uuid.uuid4().hex[:12]
+
+    # #1171: record the deterministic branch name up front (mirrors #706's
+    # `state._record_dispatched_local`) instead of leaving it NULL for
+    # `reconcile.py`'s `issue-{tracking_issue}-*` backfill sweep (#1083) to
+    # guess later — that sweep's prefix search can never find a JIT slice's
+    # `target_branch` (deliberately outside the `issue-{N}-*` namespace, see
+    # above), so the branch must be known at dispatch time here.
+    from coord.agent import _slugify  # noqa: PLC0415
+
+    branch = target_branch or f"issue-{tracking_issue}-{_slugify(assignment_title)}"
 
     asg = Assignment(
         machine_name=machine.name,
@@ -340,6 +380,7 @@ def dispatch_test_author(
         assignment_id=assignment_id,
         status="running",
         dispatched_at=time.time(),
+        branch=branch,
         type="test-author",
         # #1084: correlate this JIT dispatch back to the specific member
         # issue it's extending, so the TUI's per-issue Acceptance-Authoring
