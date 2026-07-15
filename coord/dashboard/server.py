@@ -12,11 +12,17 @@ import httpx
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
-from starlette.routing import Mount, Route
+from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from coord import __version__
 from coord.config import Config
+from coord.dashboard.terminal import (
+    SessionAttacher,
+    TmuxSessionAttacher,
+    resolve_session_target,
+)
 from coord.dispatch import AGENT_PORT
 from coord.events import (
     ASSIGNMENT_COMPLETED,
@@ -447,8 +453,25 @@ def _dashboard_path_param(name: str, description: str = "") -> dict:
     }
 
 
-def build_app(config: Config) -> Starlette:
-    """Build the dashboard Starlette app bound to a Config."""
+def build_app(
+    config: Config,
+    *,
+    token: str | None = None,
+    session_attacher: SessionAttacher | None = None,
+) -> Starlette:
+    """Build the dashboard Starlette app bound to a Config.
+
+    ``token``: the ``/ws/terminal/{session_id}`` bridge's bearer token
+    (see :func:`coord.dashboard.terminal.resolve_web_token`). ``None`` means
+    the endpoint runs open (dev default) -- fine on a tailnet-only box, but
+    the production dashboard should set one, same convention as `coord
+    serve`'s ``resolve_serve_token``.
+
+    ``session_attacher``: injectable seam for the ssh/tmux PTY spawn behind
+    the terminal bridge (#1065 acceptance) -- defaults to the real
+    :class:`~coord.dashboard.terminal.TmuxSessionAttacher`; tests pass a fake.
+    """
+    attacher: SessionAttacher = session_attacher or TmuxSessionAttacher()
 
     # ── Real-time event bus ────────────────────────────────────────────────
     event_source = EventSource()
@@ -1059,6 +1082,87 @@ def build_app(config: Config) -> Starlette:
                 {"error": f"unknown action: {action!r}"}, status_code=400
             )
 
+    async def terminal_ws(websocket: WebSocket) -> None:
+        """Human-attended PTY<->WebSocket bridge for a live tmux session (#1065).
+
+        ToS §3.7 / #437: relays a live human only -- browser keystrokes (binary
+        frames) to the PTY's stdin, PTY stdout back as binary frames, plus a
+        JSON ``{"type": "resize", "cols": .., "rows": ..}`` text control
+        message. No autonomous injection or scraping happens here.
+
+        Auth: requires ``?token=`` to match the dashboard's configured bearer
+        token (browsers can't set custom headers on a WS upgrade, so it can't
+        travel as an ``Authorization`` header like the REST API's). No token
+        configured on the server => open, matching `coord serve`'s
+        ``resolve_serve_token`` convention. A token is configured but missing
+        / wrong on the request => the upgrade is rejected before accept.
+        """
+        # Consume the ASGI "websocket.connect" event before we can validate
+        # and either accept() or close() the handshake.
+        await websocket.receive()
+
+        if token and websocket.query_params.get("token") != token:
+            await websocket.close(code=4401)
+            return
+
+        session_id = websocket.path_params["session_id"]
+        board = read_board()
+        target = resolve_session_target(session_id, board, config)
+        if target is None:
+            await websocket.close(code=4404)
+            return
+        host, session_name = target
+
+        await websocket.accept()
+
+        try:
+            attached = await attacher.attach(host, session_name)
+        except Exception:
+            await websocket.close(code=1011)
+            return
+
+        async def _pump_output() -> None:
+            try:
+                while True:
+                    chunk = await attached.read()
+                    if not chunk:
+                        break
+                    await websocket.send_bytes(chunk)
+            except Exception:
+                pass
+
+        reader_task = asyncio.create_task(_pump_output())
+        try:
+            while True:
+                message = await websocket.receive()
+                if message["type"] == "websocket.disconnect":
+                    break
+                data = message.get("bytes")
+                if data is not None:
+                    attached.write(data)
+                    continue
+                text = message.get("text")
+                if text is None:
+                    continue
+                try:
+                    payload = json.loads(text)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if payload.get("type") == "resize":
+                    try:
+                        cols = int(payload.get("cols", 0))
+                        rows = int(payload.get("rows", 0))
+                    except (TypeError, ValueError):
+                        continue
+                    if cols > 0 and rows > 0:
+                        attached.resize(cols, rows)
+        except WebSocketDisconnect:
+            pass
+        finally:
+            reader_task.cancel()
+            # Detach only -- NEVER kill the underlying tmux session (#1065).
+            attached.detach()
+
     routes = [
         Route("/", index, methods=["GET"]),
         Route("/api/board", api_board, methods=["GET"]),
@@ -1071,6 +1175,7 @@ def build_app(config: Config) -> Starlette:
         Route("/api/pipeline", api_pipeline, methods=["GET"]),
         Route("/api/pipeline/action", api_pipeline_action, methods=["POST"]),
         build_events_route(event_source),
+        WebSocketRoute("/ws/terminal/{session_id}", terminal_ws),
     ]
     # #757: served OpenAPI 3 spec + Swagger UI docs page.
     routes.extend(openapi_and_docs_routes(_openapi_spec()))
