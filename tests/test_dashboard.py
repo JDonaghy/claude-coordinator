@@ -123,6 +123,123 @@ class TestMachinesAPI:
         assert data[0]["state"] == "online"
 
 
+class TestSessionsAPI:
+    """Tests for GET /api/sessions (#1066)."""
+
+    def _board(self) -> Board:
+        return Board(
+            active=[
+                Assignment(
+                    machine_name="laptop", repo_name="api",
+                    issue_number=42, issue_title="Fix auth",
+                    assignment_id="abc123", status="running", type="work",
+                ),
+                Assignment(
+                    machine_name="laptop", repo_name="api",
+                    issue_number=7, issue_title="Add logging",
+                    assignment_id="def456", status="running", type="review",
+                ),
+            ],
+        )
+
+    def test_no_sessions_returns_empty_list(self) -> None:
+        client = _client()
+        with (
+            patch("coord.interactive.list_coord_tmux_sessions", return_value=[]),
+            patch("coord.dashboard.server.read_board", return_value=Board()),
+        ):
+            r = client.get("/api/sessions")
+        assert r.status_code == 200
+        assert r.json() == []
+
+    def test_seeds_two_live_sessions_and_asserts_json_shape(self) -> None:
+        raw = [
+            {"session_name": "coord-abc123", "pane_dead": "0", "attached": True},
+            {"session_name": "coord-def456", "pane_dead": "1", "attached": False},
+        ]
+        client = _client()
+        with (
+            patch("coord.interactive.list_coord_tmux_sessions", return_value=raw),
+            patch("coord.dashboard.server.read_board", return_value=self._board()),
+        ):
+            r = client.get("/api/sessions")
+        assert r.status_code == 200
+        data = r.json()
+        assert len(data) == 2
+        by_id = {s["session_id"]: s for s in data}
+
+        s1 = by_id["abc123"]
+        assert s1["session_name"] == "coord-abc123"
+        assert s1["machine"] == "laptop"
+        assert s1["host"] == "laptop.tailnet"
+        assert s1["repo"] == "api"
+        assert s1["issue"] == 42
+        assert s1["issue_title"] == "Fix auth"
+        assert s1["stage"] == "work"
+        assert s1["status"] == "running"
+        assert s1["attached"] is True
+        assert s1["pane_dead"] is False
+
+        s2 = by_id["def456"]
+        assert s2["issue"] == 7
+        assert s2["stage"] == "review"
+        assert s2["attached"] is False
+        assert s2["pane_dead"] is True
+
+    def test_unmatched_session_has_null_metadata(self) -> None:
+        """A tmux session with no matching board assignment still appears,
+        with everything but the tmux-derived fields set to null (mirrors the
+        `coord sessions --json` nulls-when-no-db-match behaviour)."""
+        raw = [{"session_name": "coord-unknown-aid"}]
+        client = _client()
+        with (
+            patch("coord.interactive.list_coord_tmux_sessions", return_value=raw),
+            patch("coord.dashboard.server.read_board", return_value=Board()),
+        ):
+            r = client.get("/api/sessions")
+        assert r.status_code == 200
+        data = r.json()
+        assert len(data) == 1
+        s = data[0]
+        assert s["session_id"] == "unknown-aid"
+        assert s["session_name"] == "coord-unknown-aid"
+        assert s["machine"] is None
+        assert s["host"] is None
+        assert s["repo"] is None
+        assert s["issue"] is None
+        assert s["stage"] is None
+        assert s["status"] is None
+        assert s["attached"] is False
+        assert s["pane_dead"] is False
+
+    def test_matches_completed_assignment_too(self) -> None:
+        """A session for a just-finished assignment (still tmux-live, e.g. the
+        operator hasn't detached yet) resolves off board.completed as well as
+        board.active."""
+        board = Board(
+            completed=[
+                Assignment(
+                    machine_name="laptop", repo_name="api",
+                    issue_number=9, issue_title="Done thing",
+                    assignment_id="fin789", status="done", type="work",
+                    finished_at=1.0,
+                ),
+            ],
+        )
+        raw = [{"session_name": "coord-fin789", "pane_dead": "1", "attached": False}]
+        client = _client()
+        with (
+            patch("coord.interactive.list_coord_tmux_sessions", return_value=raw),
+            patch("coord.dashboard.server.read_board", return_value=board),
+        ):
+            r = client.get("/api/sessions")
+        assert r.status_code == 200
+        data = r.json()
+        assert len(data) == 1
+        assert data[0]["repo"] == "api"
+        assert data[0]["status"] == "done"
+
+
 class TestProposalsAPI:
     def test_returns_proposals(self, tmp_path: Path) -> None:
         proposals = [

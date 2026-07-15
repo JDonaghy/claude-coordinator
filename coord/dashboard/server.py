@@ -265,6 +265,22 @@ def _openapi_spec() -> dict:
         },
     }
     ok_response = {"type": "object", "properties": {"ok": {"type": "boolean"}}}
+    session_response = {
+        "type": "object",
+        "properties": {
+            "session_id": {"type": "string", "description": "assignment_id (== the /ws/terminal/{session_id} path param)"},
+            "session_name": {"type": "string", "description": "the tmux session name, coord-<session_id>"},
+            "machine": {"type": ["string", "null"], "description": "machine name from coordinator.yml"},
+            "host": {"type": ["string", "null"], "description": "the machine's Tailscale host"},
+            "repo": {"type": ["string", "null"]},
+            "issue": {"type": ["integer", "null"]},
+            "issue_title": {"type": ["string", "null"]},
+            "stage": {"type": ["string", "null"], "description": "assignment type — work/review/smoke/fix/plan/merge/..."},
+            "status": {"type": ["string", "null"], "description": "assignment status — running/done/failed/advisory/..."},
+            "attached": {"type": "boolean", "description": "is a client currently attached to the tmux session"},
+            "pane_dead": {"type": "boolean", "description": "claude has exited but the tmux session is still up"},
+        },
+    }
     paths = {
         "/": {
             "get": {
@@ -372,6 +388,24 @@ def _openapi_spec() -> dict:
                 "responses": {
                     "200": {"description": "text/event-stream"},
                     "400": {"description": "message required / unsupported provider"},
+                },
+            }
+        },
+        "/api/sessions": {
+            "get": {
+                "summary": (
+                    "Live coord-* interactive tmux sessions the phone can attach "
+                    "to via GET /ws/terminal/{session_id} (#1066)"
+                ),
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {
+                            "application/json": {
+                                "schema": {"type": "array", "items": session_response}
+                            }
+                        },
+                    }
                 },
             }
         },
@@ -546,6 +580,64 @@ def build_app(
                     machine_data["status_error"] = status_result.error
             result.append(machine_data)
         return JSONResponse(result)
+
+    async def api_sessions(request: Request) -> JSONResponse:
+        """GET /api/sessions — live coord-* interactive sessions the phone can
+        attach to via GET /ws/terminal/{session_id} (#1066).
+
+        Sources the roster from the same fleet session substrate `coord
+        sessions` itself reads — :func:`coord.interactive.list_coord_tmux_sessions`
+        (milestone #32 / substrate #28) — rather than inventing a parallel tmux
+        discovery path, then enriches each session against the board, the same
+        source :func:`~coord.dashboard.terminal.resolve_session_target` (#1065)
+        uses to route the actual WS attach, so the two paths can't drift.
+
+        Local-only for now (mirrors `coord sessions`'s own default) — a
+        fleet-wide sweep would mean shelling out over ssh to every configured
+        machine on every phone poll; `coord sessions --remote` already proves
+        that pattern (`TmuxHost(ssh_target=..., batch=True)` fan-out) if a
+        later issue wants to extend this endpoint the same way.
+
+        tmux discovery shells out (bounded by a 5s timeout inside
+        ``list_coord_tmux_sessions``) so it runs off the event loop thread via
+        ``run_in_executor``, matching this file's ``_fetch_agent_status``
+        pattern used by the background poller.
+        """
+        from coord.interactive import TMUX_SESSION_PREFIX, list_coord_tmux_sessions
+
+        loop = asyncio.get_running_loop()
+        raw_sessions = await loop.run_in_executor(None, list_coord_tmux_sessions)
+
+        board = read_board()
+        assignments_by_id = {
+            a.assignment_id: a
+            for a in (*board.active, *board.completed)
+            if a.assignment_id
+        }
+        machines_by_name = {m.name: m for m in config.machines}
+
+        sessions = []
+        for s in raw_sessions:
+            session_name = s.get("session_name", "")
+            session_id = session_name[len(TMUX_SESSION_PREFIX):]
+            assignment = assignments_by_id.get(session_id)
+            machine_cfg = (
+                machines_by_name.get(assignment.machine_name) if assignment else None
+            )
+            sessions.append({
+                "session_id": session_id,
+                "session_name": session_name,
+                "machine": assignment.machine_name if assignment else None,
+                "host": machine_cfg.host if machine_cfg else None,
+                "repo": assignment.repo_name if assignment else None,
+                "issue": assignment.issue_number if assignment else None,
+                "issue_title": assignment.issue_title if assignment else None,
+                "stage": assignment.type if assignment else None,
+                "status": assignment.status if assignment else None,
+                "attached": bool(s.get("attached", False)),
+                "pane_dead": s.get("pane_dead") == "1",
+            })
+        return JSONResponse(sessions)
 
     async def api_proposals(request: Request) -> JSONResponse:
         proposals = load_proposals()
@@ -1167,6 +1259,7 @@ def build_app(
         Route("/", index, methods=["GET"]),
         Route("/api/board", api_board, methods=["GET"]),
         Route("/api/machines", api_machines, methods=["GET"]),
+        Route("/api/sessions", api_sessions, methods=["GET"]),
         Route("/api/proposals", api_proposals, methods=["GET"]),
         Route("/api/approve", api_approve, methods=["POST"]),
         Route("/api/reject", api_reject, methods=["POST"]),
