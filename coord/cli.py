@@ -123,6 +123,59 @@ from coord.commands.plan_followup import (
 )
 
 
+# #1182: thresholds past which a stale non-editable install escalates from the
+# mild "edits won't reach the CLI" note to a loud STALE INSTALL banner.
+_STALE_COMMITS_THRESHOLD = 3
+_STALE_DAYS_THRESHOLD = 2.0
+
+
+def _compute_install_staleness(repo_root: Path, installed_version: str) -> dict | None:
+    """Best-effort: how far *installed_version* trails ``repo_root``'s HEAD.
+
+    Returns ``{"commits_behind": int, "days_behind": float | None, "tag": str}``
+    when a ``v{installed_version}`` tag exists in the checkout and HEAD has
+    moved past it, or ``None`` when there's no matching tag, the checkout
+    isn't a git repo, HEAD hasn't moved, or anything else goes wrong (never
+    raises — this is a nice-to-have signal, not something that should ever
+    break the CLI, per #1182).
+    """
+    import subprocess  # noqa: PLC0415
+    import time  # noqa: PLC0415
+
+    if not installed_version:
+        return None
+    try:
+        if not (repo_root / ".git").exists():
+            return None
+        tag = f"v{installed_version}"
+
+        def _git(*args: str) -> str | None:
+            result = subprocess.run(
+                ["git", "-C", str(repo_root), *args],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode != 0:
+                return None
+            return result.stdout.strip()
+
+        if _git("rev-parse", "-q", "--verify", f"refs/tags/{tag}") is None:
+            return None  # no matching tag — can't quantify drift
+        count_raw = _git("rev-list", "--count", f"{tag}..HEAD")
+        if count_raw is None or not count_raw.isdigit():
+            return None
+        commits_behind = int(count_raw)
+        if commits_behind <= 0:
+            return None  # installed version is at least as new as HEAD
+
+        days_behind = None
+        ts_raw = _git("log", "-1", "--format=%ct", tag)
+        if ts_raw and ts_raw.isdigit():
+            days_behind = (time.time() - int(ts_raw)) / 86400.0
+        return {"commits_behind": commits_behind, "days_behind": days_behind, "tag": tag}
+    except Exception:  # noqa: BLE001 — best-effort, never break the CLI
+        return None
+
+
 def _warn_if_source_install_drift() -> None:
     """Warn when the CLI is running from a non-editable install of a package
     whose source checkout is the current working directory.
@@ -135,6 +188,14 @@ def _warn_if_source_install_drift() -> None:
 
     Heuristic: ``coord.__file__`` lives in ``site-packages`` AND the cwd has
     a sibling ``coord/`` package — that's exactly the drift case.
+
+    #1182: that plain warning shipped in #222 turned out to read as
+    boilerplate noise — it fired identically whether the install was a day
+    stale or, as happened on elitebook, many releases behind `main` (silently
+    evaluating retired logic and causing a false merge-gate block). When the
+    checkout has a tag matching the installed version, we now also quantify
+    how many commits/days HEAD has moved past it and escalate to a much
+    louder banner past ``_STALE_COMMITS_THRESHOLD`` / ``_STALE_DAYS_THRESHOLD``.
     """
     import os  # noqa: PLC0415
 
@@ -147,6 +208,37 @@ def _warn_if_source_install_drift() -> None:
         local_init = Path(os.getcwd()) / "coord" / "__init__.py"
         if not local_init.exists():
             return  # Not running from a source checkout.
+
+        staleness = _compute_install_staleness(Path(os.getcwd()), _coord.__version__ or "")
+        if staleness is not None and (
+            staleness["commits_behind"] >= _STALE_COMMITS_THRESHOLD
+            or (
+                staleness["days_behind"] is not None
+                and staleness["days_behind"] >= _STALE_DAYS_THRESHOLD
+            )
+        ):
+            days_note = (
+                f", ~{staleness['days_behind']:.1f} day(s)"
+                if staleness["days_behind"] is not None
+                else ""
+            )
+            banner = "⚠" * 24
+            click.echo(
+                f"{banner}\n"
+                f"⚠⚠⚠  STALE INSTALL: coord CLI is {staleness['commits_behind']} "
+                f"commit(s){days_note} behind the checkout's HEAD  ⚠⚠⚠\n"
+                f"Installed: {_coord.__version__} (tag {staleness['tag']}) — the source "
+                f"checkout at {local_init.parent} has moved past that release.\n"
+                "This install may be silently evaluating RETIRED logic (#1182 — this is "
+                "how a false merge-gate block slipped through).  Fix:\n"
+                "  pip install --upgrade claude-coordinator   "
+                "(if a release covers those commits)\n"
+                "  pip install -e .                           (to run live source instead)\n"
+                f"{banner}",
+                err=True,
+            )
+            return
+
         # Inside a source checkout but CLI uses snapshot copy → drift possible.
         click.echo(
             "warning: coord CLI is running from a non-editable install "
