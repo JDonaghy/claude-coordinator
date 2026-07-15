@@ -874,7 +874,10 @@ def _usage_resolve_window(today: bool, since_spec: str | None):
     if today:
         return Window.today()
     if since_spec:
-        return Window.since(since_spec)
+        try:
+            return Window.since(since_spec)
+        except ValueError as e:
+            raise click.BadParameter(str(e), param_hint="'--since'") from e
 
     from coord.state import load_session
 

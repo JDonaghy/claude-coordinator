@@ -746,3 +746,40 @@ class TestUsageCommandByIssueAndDrillFlags:
         result = runner.invoke(main, ["usage"])
         assert result.exit_code == 0
         assert "No assignments found" in result.output
+
+    def test_bad_since_spec_raises_clean_usage_error(
+        self, coord_dir: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, valid_config_yaml: str
+    ) -> None:
+        """Review finding #1: a malformed --since must not leak a raw
+        traceback — it should render as a one-line click.BadParameter error,
+        matching the established audit.py convention."""
+        import coord.usage as usage_mod
+
+        monkeypatch.setattr(usage_mod, "fetch_usage_rows", lambda *a, **k: [])
+        cfg_path = tmp_path / "coordinator.yml"
+        cfg_path.write_text(valid_config_yaml)
+
+        result = CliRunner().invoke(
+            main, ["usage", "--config", str(cfg_path), "--since", "3days", "--by-issue"]
+        )
+        assert result.exit_code == 2
+        assert "Traceback" not in result.output
+        assert "invalid 'since' spec" in result.output
+        assert "--since" in result.output
+
+    def test_bad_since_spec_raises_clean_usage_error_for_issue_drill(
+        self, coord_dir: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, valid_config_yaml: str
+    ) -> None:
+        """Same malformed --since guard, exercised via the --issue drill path."""
+        import coord.usage as usage_mod
+
+        monkeypatch.setattr(usage_mod, "fetch_usage_rows", lambda *a, **k: [])
+        cfg_path = tmp_path / "coordinator.yml"
+        cfg_path.write_text(valid_config_yaml)
+
+        result = CliRunner().invoke(
+            main, ["usage", "--config", str(cfg_path), "--since", "bogus", "--issue", "5"]
+        )
+        assert result.exit_code == 2
+        assert "Traceback" not in result.output
+        assert "invalid 'since' spec" in result.output
