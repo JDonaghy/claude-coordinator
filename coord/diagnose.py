@@ -770,7 +770,10 @@ def _do_reset(
         return
 
     if stage == "review":
-        _reset_review_stage(config, repo_name, issue_number, res, dry_run=dry_run)
+        _reset_review_stage(
+            config, repo_name, issue_number, res,
+            dry_run=dry_run, assignment_id=latest.assignment_id,
+        )
         return
     if stage == "test":
         _reset_test_stage(repo_name, issue_number, res, dry_run=dry_run)
@@ -798,12 +801,22 @@ def _do_reset(
 
 
 def _reset_review_stage(
-    config, repo_name: str, issue_number: int, res: DiagnoseResult, *, dry_run: bool
+    config, repo_name: str, issue_number: int, res: DiagnoseResult, *,
+    dry_run: bool, assignment_id: str,
 ) -> None:
     """Wipe a completed review so the stage returns to grey + re-reviewable:
     delete the ``type='review'`` rows, reset the work's ``review_state``, and
     purge the #603 ``source='review'`` context entries (the operator's
-    'completely cleared out' choice).  No branch/commits touched."""
+    'completely cleared out' choice).  No branch/commits touched.
+
+    #1180: ``assignment_id`` (the stage's ``latest`` row) is threaded through
+    to both the delete and the reset so a milestone tracking issue with
+    multiple ``test-author``/``mock-author`` slices only has the *targeted*
+    slice's review data touched — see ``state.delete_assignments_for_issue``
+    and ``state.reset_work_review_state`` docstrings for the aliasing hazard
+    this guards against. ``work``/``plan`` behavior is unchanged (still
+    issue-wide, which is safe for those types).
+    """
     from coord import state  # noqa: PLC0415
 
     if dry_run:
@@ -813,9 +826,14 @@ def _reset_review_stage(
         )
         res.needs_reset = True
         return
-    deleted = state.delete_assignments_for_issue(repo_name, issue_number, types=("review",))
+    deleted = state.delete_assignments_for_issue(
+        repo_name, issue_number, types=("review",),
+        review_of_assignment_id=assignment_id,
+    )
     res.actions_taken.append(f"deleted {deleted} review row(s) → stage grey")
-    updated = state.reset_work_review_state(repo_name, issue_number)
+    updated = state.reset_work_review_state(
+        repo_name, issue_number, assignment_id=assignment_id
+    )
     res.actions_taken.append(f"reset review_state→pending on {updated} work row(s) (re-reviewable)")
     purged = state.clear_issue_context_by_source(repo_name, issue_number, "review")
     res.actions_taken.append(f"purged {purged} #603 review note(s)")

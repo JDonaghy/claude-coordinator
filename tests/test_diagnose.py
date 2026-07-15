@@ -336,11 +336,17 @@ def test_reset_review_wipes_rows_state_and_context(monkeypatch, config) -> None:
     calls: dict = {}
     monkeypatch.setattr(
         "coord.state.delete_assignments_for_issue",
-        lambda repo, issue, *, types: calls.setdefault("delete", (repo, issue, types)) or 2,
+        lambda repo, issue, *, types, review_of_assignment_id=None: calls.setdefault(
+            "delete", (repo, issue, types, review_of_assignment_id)
+        )
+        or 2,
     )
     monkeypatch.setattr(
         "coord.state.reset_work_review_state",
-        lambda repo, issue: calls.setdefault("reset_state", (repo, issue)) or 1,
+        lambda repo, issue, *, assignment_id=None: calls.setdefault(
+            "reset_state", (repo, issue, assignment_id)
+        )
+        or 1,
     )
     monkeypatch.setattr(
         "coord.state.clear_issue_context_by_source",
@@ -350,8 +356,11 @@ def test_reset_review_wipes_rows_state_and_context(monkeypatch, config) -> None:
     board = Board(completed=[a])
     res = diagnose.diagnose_stage(board, config, "api", 42, "review", reset=True)
     assert res.reset_performed and res.recovered and res.branch_preserved
-    assert calls["delete"] == ("api", 42, ("review",))
-    assert calls["reset_state"] == ("api", 42)
+    # #1180: assignment_id (the stage's latest row) is threaded through to
+    # both calls so a multi-slice tracking issue only touches the targeted
+    # slice's review data.
+    assert calls["delete"] == ("api", 42, ("review",), "r1")
+    assert calls["reset_state"] == ("api", 42, "r1")
     assert calls["purge"] == ("api", 42, "review")
 
 
