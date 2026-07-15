@@ -322,6 +322,14 @@ pub(crate) fn build_acceptance_author_interactive_launch_cmd(
     issue_num: u64,
     for_path: Option<&str>,
 ) -> String {
+    // `--config` is registered on the leaf `acceptance author` command
+    // (coord/commands/acceptance.py), not on the root `coord` click.group —
+    // unlike `coord assign` in sessions.rs::build_interactive_launch_cmd,
+    // where `--config` IS a root-group option. Placing it before the
+    // `acceptance author` subcommand makes Click's root group reject it
+    // with "No such option '--config'" before the subcommand ever sees it
+    // (#1174 smoke-test failure). So `cfg` goes AFTER "acceptance author",
+    // alongside the other options.
     let cfg = match config_path {
         Some(p) if !p.is_empty() => format!("--config {} ", shell_quote_arg(p)),
         _ => String::new(),
@@ -331,7 +339,7 @@ pub(crate) fn build_acceptance_author_interactive_launch_cmd(
         _ => String::new(),
     };
     format!(
-        "coord {}acceptance author {} {} --issue {}{} --interactive\r",
+        "coord acceptance author {}{} {} --issue {}{} --interactive\r",
         cfg,
         shell_quote_arg(repo),
         tracking_issue,
