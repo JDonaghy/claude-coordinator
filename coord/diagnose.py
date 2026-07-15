@@ -770,9 +770,26 @@ def _do_reset(
         return
 
     if stage == "review":
+        # #1180: `_reset_review_stage`'s `assignment_id` means "the id of the
+        # assignment BEING reviewed" — that's the FK the review rows carry and
+        # the id the test-author/mock-author review_state reset keys on. But
+        # STAGE_ASSIGNMENT_TYPES["review"] matches ('review','test-author',
+        # 'mock-author'), so `latest` is EITHER:
+        #   - the reviewed row itself (test-author/mock-author wedged before a
+        #     review was ever dispatched — the JIT-slice case), or
+        #   - a type='review' row, whose OWN id is meaningless here; the
+        #     reviewed assignment is its `review_of_assignment_id` FK
+        #     (set at review.py: review_of_assignment_id=completed.assignment_id).
+        # Passing the review row's own id would match no FK, silently resetting
+        # nothing — resolve the reviewed id explicitly.
+        target_id = (
+            latest.review_of_assignment_id
+            if latest.type == "review" and latest.review_of_assignment_id
+            else latest.assignment_id
+        )
         _reset_review_stage(
             config, repo_name, issue_number, res,
-            dry_run=dry_run, assignment_id=latest.assignment_id,
+            dry_run=dry_run, assignment_id=target_id,
         )
         return
     if stage == "test":
@@ -809,13 +826,20 @@ def _reset_review_stage(
     purge the #603 ``source='review'`` context entries (the operator's
     'completely cleared out' choice).  No branch/commits touched.
 
-    #1180: ``assignment_id`` (the stage's ``latest`` row) is threaded through
-    to both the delete and the reset so a milestone tracking issue with
-    multiple ``test-author``/``mock-author`` slices only has the *targeted*
-    slice's review data touched — see ``state.delete_assignments_for_issue``
-    and ``state.reset_work_review_state`` docstrings for the aliasing hazard
-    this guards against. ``work``/``plan`` behavior is unchanged (still
-    issue-wide, which is safe for those types).
+    #1180: ``assignment_id`` is **the id of the assignment being reviewed** —
+    NOT the id of a ``type='review'`` row. It is threaded through to both the
+    delete and the reset so a milestone tracking issue with multiple
+    ``test-author``/``mock-author`` slices only has the *targeted* slice's
+    review data touched — see ``state.delete_assignments_for_issue`` and
+    ``state.reset_work_review_state`` docstrings for the aliasing hazard this
+    guards against. ``work``/``plan`` behavior is unchanged (still issue-wide,
+    which is safe for those types).
+
+    Callers must resolve this themselves: the review stage's ``latest`` row can
+    be either the reviewed assignment (test-author/mock-author, no review
+    dispatched yet) or a ``type='review'`` row pointing at it via
+    ``review_of_assignment_id`` — the two cases need different resolution. See
+    ``_do_reset``.
     """
     from coord import state  # noqa: PLC0415
 

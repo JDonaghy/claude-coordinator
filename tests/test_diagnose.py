@@ -36,6 +36,7 @@ def _assign(
     review_state: str | None = None,
     dispatched_at: float | None = None,
     failure_reason: str | None = None,
+    review_of: str | None = None,
 ) -> Assignment:
     return Assignment(
         machine_name="precision",
@@ -50,6 +51,7 @@ def _assign(
         review_state=review_state,
         dispatched_at=dispatched_at if dispatched_at is not None else time.time(),
         failure_reason=failure_reason,
+        review_of_assignment_id=review_of,
     )
 
 
@@ -352,16 +354,139 @@ def test_reset_review_wipes_rows_state_and_context(monkeypatch, config) -> None:
         "coord.state.clear_issue_context_by_source",
         lambda repo, issue, source: calls.setdefault("purge", (repo, issue, source)) or 3,
     )
-    a = _assign(aid="r1", typ="review", status="done", verdict="request-changes")
+    a = _assign(
+        aid="r1", typ="review", status="done", verdict="request-changes", review_of="w1",
+    )
     board = Board(completed=[a])
     res = diagnose.diagnose_stage(board, config, "api", 42, "review", reset=True)
     assert res.reset_performed and res.recovered and res.branch_preserved
-    # #1180: assignment_id (the stage's latest row) is threaded through to
-    # both calls so a multi-slice tracking issue only touches the targeted
-    # slice's review data.
-    assert calls["delete"] == ("api", 42, ("review",), "r1")
-    assert calls["reset_state"] == ("api", 42, "r1")
+    # #1180: the id threaded through is the id of the assignment BEING REVIEWED
+    # ("w1" via the review row's FK), never the review row's own id ("r1") —
+    # that's what the review rows' FK and the test-author review_state reset
+    # both key on.  See _do_reset.
+    assert calls["delete"] == ("api", 42, ("review",), "w1")
+    assert calls["reset_state"] == ("api", 42, "w1")
     assert calls["purge"] == ("api", 42, "review")
+
+
+def _record(a: Assignment) -> None:
+    """Insert a real DB row.  ``record_dispatched_assignment`` is a dispatch-time
+    insert (status='running', no verdict columns), so the completed review
+    state is applied afterwards by UPDATE — mirroring how these rows actually
+    reach this shape in production (dispatch, then finalize/review writeback)."""
+    from coord.db import get_connection
+    from coord.state import record_dispatched_assignment
+
+    record_dispatched_assignment(assignment=a, repo_github="acme/api")
+    conn = get_connection()
+    conn.execute(
+        "UPDATE assignments SET status=?, review_state=?, review_verdict=? "
+        "WHERE assignment_id=?",
+        (a.status, a.review_state, a.review_verdict, a.assignment_id),
+    )
+    conn.commit()
+
+
+def test_reset_review_real_db_deletes_review_when_latest_is_the_review_row(
+    monkeypatch, config, coord_db
+) -> None:
+    """#1180 regression: when the stage's `latest` row is the type='review'
+    row itself (the ordinary, non-JIT #607 case), the reviewed-assignment id
+    must be resolved from its `review_of_assignment_id` FK — NOT its own id.
+
+    Passing the review's own id makes the FK filter match nothing, so the
+    stale request-changes row silently survives while the reset still reports
+    reset_performed=True.  This drives the REAL state layer (no monkeypatched
+    delete/reset) so the FK semantics are actually exercised — the mocked
+    test above cannot catch this.
+    """
+    _stub(monkeypatch, session="dead")
+    _record(_assign(
+        aid="w1", typ="work", status="done", review_state="done",
+        verdict="request-changes", dispatched_at=100.0,
+    ))
+    _record(_assign(
+        aid="rv1", typ="review", status="done", verdict="request-changes",
+        dispatched_at=200.0, review_of="w1",  # FK → the work row it reviewed
+    ))
+    board = Board(completed=[
+        _assign(aid="w1", typ="work", status="done", dispatched_at=100.0),
+        _assign(
+            aid="rv1", typ="review", status="done", verdict="request-changes",
+            dispatched_at=200.0, review_of="w1",
+        ),
+    ])
+
+    res = diagnose.diagnose_stage(board, config, "api", 42, "review", reset=True)
+
+    assert res.reset_performed is True
+    conn = coord_db
+    # The stale review row is actually gone (pre-fix: deleted 0, row survives).
+    assert conn.execute(
+        "SELECT COUNT(*) FROM assignments WHERE type='review'"
+    ).fetchone()[0] == 0
+    # ...and the work it reviewed is genuinely re-reviewable again.
+    row = conn.execute(
+        "SELECT review_state, review_verdict FROM assignments WHERE assignment_id='w1'"
+    ).fetchone()
+    assert row[0] == "pending"
+    assert row[1] is None
+
+
+def test_reset_review_real_db_resets_test_author_via_review_fk_sparing_sibling(
+    monkeypatch, config, coord_db
+) -> None:
+    """#1180: the same conflation on the JIT-slice path once a slice's review
+    HAS been dispatched — `latest` is the review row, so the test-author
+    review_state reset must key on its FK to find slice A's row, while slice
+    B's approved review + row stay untouched (they alias issue_number=42)."""
+    _stub(monkeypatch, session="dead")
+    _record(_assign(
+        aid="ta-wedged", typ="test-author", status="done", review_state="done",
+        verdict="request-changes", branch="test-author-ms-37-slice-1115",
+        dispatched_at=100.0,
+    ))
+    _record(_assign(
+        aid="ta-approved", typ="test-author", status="done", review_state="done",
+        verdict="approve", branch="test-author-ms-37-slice-1116",
+        dispatched_at=110.0,
+    ))
+    _record(_assign(
+        aid="rv-approved", typ="review", status="done", verdict="approve",
+        branch="test-author-ms-37-slice-1116", dispatched_at=120.0,
+        review_of="ta-approved",
+    ))
+    _record(_assign(
+        aid="rv-wedged", typ="review", status="done", verdict="request-changes",
+        branch="test-author-ms-37-slice-1115", dispatched_at=300.0,
+        review_of="ta-wedged",
+    ))
+    board = Board(completed=[
+        _assign(
+            aid="rv-wedged", typ="review", status="done", verdict="request-changes",
+            dispatched_at=300.0, review_of="ta-wedged",
+        ),
+    ])
+
+    res = diagnose.diagnose_stage(board, config, "api", 42, "review", reset=True)
+
+    assert res.reset_performed is True
+    conn = coord_db
+    # Targeted slice: wedged review deleted, its test-author row re-reviewable.
+    assert [r[0] for r in conn.execute(
+        "SELECT assignment_id FROM assignments WHERE type='review' ORDER BY assignment_id"
+    ).fetchall()] == ["rv-approved"]
+    wedged = conn.execute(
+        "SELECT review_state, review_verdict FROM assignments WHERE assignment_id='ta-wedged'"
+    ).fetchone()
+    assert wedged[0] == "pending"
+    assert wedged[1] is None
+    # Sibling slice's genuine approval survives untouched.
+    sibling = conn.execute(
+        "SELECT review_state, review_verdict FROM assignments WHERE assignment_id='ta-approved'"
+    ).fetchone()
+    assert sibling[0] == "done"
+    assert sibling[1] == "approve"
 
 
 def test_reset_review_dry_run_does_not_wipe(monkeypatch, config) -> None:
