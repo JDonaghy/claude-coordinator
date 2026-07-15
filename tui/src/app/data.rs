@@ -1718,6 +1718,42 @@ pub(crate) fn is_remote_board_service() -> bool {
     *CACHE.get_or_init(|| resolve_board_service().is_some())
 }
 
+/// #1012: shared JSON-POST-and-parse call to the board daemon, factored out
+/// of `record_test_verdict_remote` (#590) so every subsequent direct-POST
+/// mutation — starting with `apply_issue_labels_remote` — shares one
+/// ureq agent/timeout/auth call site instead of hand-rolling it per
+/// endpoint. Callers already resolved `url`/`token` via
+/// [`resolve_board_service`] (they need the `Option` to decide whether to
+/// fall back to a `coord` subprocess at all, so resolving here too would
+/// just duplicate that branch).
+///
+/// `path` is appended verbatim to `url` (e.g. `"/issue-label"`); `body` is
+/// serialized as the request JSON. Returns the parsed JSON response, or a
+/// display-ready error string on any network/parse/non-2xx failure — `ureq`
+/// (built without the `json` feature crate-wide here) already includes the
+/// status code and a body snippet in its `Display` for non-2xx responses.
+pub(crate) fn post_daemon_json(
+    url: &str,
+    token: Option<&str>,
+    path: &str,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let body_str = serde_json::to_string(body).map_err(|e| format!("{e}"))?;
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(30))
+        .build();
+    let mut req = agent
+        .post(&format!("{url}{path}"))
+        .set("Content-Type", "application/json");
+    if let Some(t) = token {
+        req = req.set("Authorization", &format!("Bearer {t}"));
+    }
+    let resp = req.send_string(&body_str).map_err(|e| format!("{e}"))?;
+    let text = resp.into_string().map_err(|e| format!("{e}"))?;
+    serde_json::from_str(&text).map_err(|e| format!("{path}: invalid JSON response ({e}): {text}"))
+}
+
 /// #584: a thin client has no local `coordinator.yml`.  Fetch it from the daemon
 /// (`GET /config`) once at startup and cache it to
 /// `~/.coord/coordinator.remote.yml`, so the "coordinator.yml not found" status

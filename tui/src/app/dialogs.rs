@@ -5434,6 +5434,59 @@ impl CoordApp {
                 return false;
             }
         };
+
+        // #1012: when a board service is configured *and* this subcommand
+        // maps to a known label change, POST straight to the daemon's
+        // `/issue-label` seam instead of spawning a `coord` subprocess — the
+        // daemon endpoint is exactly what `coord <subcommand>` itself calls
+        // under the hood (`_apply_label_change` →
+        // `state.apply_issue_labels` → `POST /issue-label`), so this removes
+        // a redundant Python cold-start + import hop on the common path.
+        // Falls back to the subprocess spawn below, unchanged, when no
+        // board service is configured or the subcommand has no label
+        // mapping (`label_change_for_subcommand` returns `None`).
+        if let Some((url, token)) = resolve_board_service() {
+            if let Some((add, remove)) = label_change_for_subcommand(subcommand) {
+                let repo_github = self
+                    .data
+                    .pipeline_repos
+                    .iter()
+                    .find(|(name, _)| name == &repo)
+                    .map(|(_, gh)| gh.as_str());
+                return match apply_issue_labels_remote(
+                    &url,
+                    token.as_deref(),
+                    &repo,
+                    num,
+                    add,
+                    remove,
+                    repo_github,
+                ) {
+                    Ok((_labels, changed)) => {
+                        if changed {
+                            let body = body_template.replace("{}", &num.to_string());
+                            self.push_toast(toast_title, &body, ToastSeverity::Success);
+                        } else {
+                            self.push_toast(
+                                toast_title,
+                                &format!("#{}: no change (labels already match).", num),
+                                ToastSeverity::Info,
+                            );
+                        }
+                        true
+                    }
+                    Err(e) => {
+                        self.push_toast(
+                            &format!("{} failed", toast_title),
+                            &format!("#{}: {}", num, e),
+                            ToastSeverity::Error,
+                        );
+                        true
+                    }
+                };
+            }
+        }
+
         let num_str = num.to_string();
         use crate::commands::SpawnQueuedOutcome;
         let outcome = self
