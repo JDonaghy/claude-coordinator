@@ -1150,4 +1150,52 @@ def reconcile_board_merges(
                 a.review_state = "done"
                 state.mark_sibling_review_done(a.assignment_id or "")
 
+    # (f) #1180 — un-wedge a test-author/mock-author row whose review_state
+    # was stamped 'done' by a `work_is_terminal` false positive (pre-#1150:
+    # test-author assignments carry issue_number = the milestone's *tracking*
+    # issue — the JIT-slice aliasing convention, #1142/#1150 — so a tracking
+    # issue with ANY historical merged PR could satisfy the then-issue-only
+    # terminal check for an unrelated, still-open slice sharing that number).
+    # #1150 fixed the check going forward (branch/commit-scoped) but did not
+    # repair rows it had already corrupted: a row stuck at
+    # review_state='done' with no verdict and no type='review' assignment
+    # ever dispatched against its branch is invisible to
+    # dispatch_pending_reviews (only review_state in (None, 'pending') is
+    # eligible) AND to the merge gate (requires a real approved type='review'
+    # row) — a permanent deadlock between the two subsystems. Reset
+    # review_state -> 'pending' so the (now-fixed) auto-loop retries a real
+    # review. This is safe even if the branch genuinely IS terminal by now:
+    # the very next dispatch_pending_reviews pass re-checks
+    # work_is_terminal (correctly branch-scoped post-#1150) and re-settles
+    # the row.
+    wedged_review_candidates = [
+        a
+        for a in board.active + board.completed
+        if a.type in ("test-author", "mock-author")
+        and a.review_state == "done"
+        and a.review_verdict is None
+        and a.branch
+        and (repo is None or a.repo_name == repo)
+        and (issue is None or a.issue_number == issue)
+    ]
+    for a in wedged_review_candidates:
+        has_review = any(
+            r.type == "review"
+            and r.repo_name == a.repo_name
+            and r.branch == a.branch
+            and r.status == "done"
+            for r in board.active + board.completed
+        )
+        if has_review:
+            continue
+        actions.append(
+            f"repair wedged review_state {a.assignment_id} "
+            f"({a.repo_name} #{a.issue_number}, branch={a.branch}): "
+            "done -> pending (#1180)"
+            + (" [dry-run]" if dry_run else "")
+        )
+        if not dry_run:
+            a.review_state = "pending"
+            state.reset_wedged_test_author_review(a.assignment_id or "")
+
     return actions

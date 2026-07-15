@@ -88,6 +88,12 @@ def _patch_probes(
         state, "mark_work_review_settled",
         lambda aid: writes.append(("work_review_settled", aid)),
     )
+    # #1180: stub the wedged test-author/mock-author review_state repair so
+    # sweep (f) never touches the DB in these tests.
+    monkeypatch.setattr(
+        state, "reset_wedged_test_author_review",
+        lambda aid: writes.append(("wedged_review_reset", aid)),
+    )
     return writes
 
 
@@ -930,3 +936,148 @@ def test_sibling_already_merged_branch_used_for_terminality(monkeypatch, config)
     assert "issue-42-fix" in probed_branches, (
         f"Expected 'issue-42-fix' in probed branches; got {probed_branches}"
     )
+
+
+# ── #1180 wedged test-author/mock-author review_state repair ────────────────
+
+
+def _wedged_test_author(
+    *,
+    assignment_id: str = "ta-wedged",
+    issue_number: int = 1117,
+    branch: str = "test-author-ms-37-slice-1115",
+    typ: str = "test-author",
+    review_state: str | None = "done",
+    review_verdict: str | None = None,
+) -> Assignment:
+    return Assignment(
+        machine_name="laptop",
+        repo_name="api",
+        issue_number=issue_number,
+        issue_title="t",
+        status="done",
+        assignment_id=assignment_id,
+        branch=branch,
+        type=typ,
+        review_state=review_state,
+        review_verdict=review_verdict,
+    )
+
+
+def test_repairs_wedged_test_author_review_when_no_review_ran(monkeypatch, config) -> None:
+    """The #1180 repro: a test-author row false-positived work_is_terminal
+    pre-#1150 and got stamped review_state='done' with no verdict, and no
+    type='review' assignment ever ran against its branch. The row must be
+    reset to review_state='pending' so the (now-fixed) auto-loop retries it."""
+    a = _wedged_test_author()
+    board = Board(completed=[a])
+    writes = _patch_probes(monkeypatch, terminal=False)
+
+    actions = reconcile_board_merges(board, config)
+
+    assert a.review_state == "pending"
+    assert ("wedged_review_reset", "ta-wedged") in writes
+    assert any("repair wedged review_state" in s and "ta-wedged" in s for s in actions)
+
+
+def test_mock_author_wedged_review_also_repaired(monkeypatch, config) -> None:
+    a = _wedged_test_author(assignment_id="ma-wedged", typ="mock-author")
+    board = Board(completed=[a])
+    writes = _patch_probes(monkeypatch, terminal=False)
+
+    reconcile_board_merges(board, config)
+
+    assert a.review_state == "pending"
+    assert ("wedged_review_reset", "ma-wedged") in writes
+
+
+def test_wedged_review_left_alone_when_a_review_actually_ran(monkeypatch, config) -> None:
+    """A completed type='review' assignment on the SAME branch means a review
+    genuinely happened — do not touch review_state (it's not wedged)."""
+    a = _wedged_test_author()
+    review = Assignment(
+        machine_name="laptop",
+        repo_name="api",
+        issue_number=1117,
+        issue_title="t",
+        status="done",
+        assignment_id="rev-real",
+        branch=a.branch,
+        type="review",
+        review_verdict="approve",
+    )
+    board = Board(completed=[a, review])
+    writes = _patch_probes(monkeypatch, terminal=False)
+
+    actions = reconcile_board_merges(board, config)
+
+    assert a.review_state == "done"
+    assert ("wedged_review_reset", "ta-wedged") not in writes
+    assert not any("repair wedged review_state" in s for s in actions)
+
+
+def test_wedged_review_left_alone_when_review_state_not_done(monkeypatch, config) -> None:
+    """review_state='pending' is already the eligible/healthy state for the
+    normal dispatch loop — sweep (f) only repairs review_state='done'."""
+    a = _wedged_test_author(review_state="pending")
+    board = Board(completed=[a])
+    writes = _patch_probes(monkeypatch, terminal=False)
+
+    reconcile_board_merges(board, config)
+
+    assert a.review_state == "pending"
+    assert ("wedged_review_reset", "ta-wedged") not in writes
+
+
+def test_wedged_review_left_alone_when_verdict_present(monkeypatch, config) -> None:
+    """A captured review_verdict means a real review ran (or its verdict was
+    recovered) — not the #1180 false-positive shape."""
+    a = _wedged_test_author(review_verdict="approve")
+    board = Board(completed=[a])
+    writes = _patch_probes(monkeypatch, terminal=False)
+
+    reconcile_board_merges(board, config)
+
+    assert a.review_state == "done"
+    assert ("wedged_review_reset", "ta-wedged") not in writes
+
+
+def test_wedged_review_repair_skipped_without_branch(monkeypatch, config) -> None:
+    """No branch means nothing to key the review-existence check on — leave
+    it for the branch-backfill sweep (a) instead."""
+    a = _wedged_test_author(branch=None)
+    board = Board(completed=[a])
+    writes = _patch_probes(monkeypatch, terminal=False)
+
+    reconcile_board_merges(board, config)
+
+    assert a.review_state == "done"
+    assert ("wedged_review_reset", "ta-wedged") not in writes
+
+
+def test_wedged_review_repair_dry_run_makes_no_writes(monkeypatch, config) -> None:
+    a = _wedged_test_author()
+    board = Board(completed=[a])
+    writes = _patch_probes(monkeypatch, terminal=False)
+
+    actions = reconcile_board_merges(board, config, dry_run=True)
+
+    assert a.review_state == "done"  # unchanged
+    assert ("wedged_review_reset", "ta-wedged") not in writes
+    assert any(
+        "repair wedged review_state" in s and "[dry-run]" in s for s in actions
+    )
+
+
+def test_wedged_review_repair_respects_issue_filter(monkeypatch, config) -> None:
+    a1 = _wedged_test_author(assignment_id="ta-1117", issue_number=1117, branch="b-1117")
+    a2 = _wedged_test_author(assignment_id="ta-2000", issue_number=2000, branch="b-2000")
+    board = Board(completed=[a1, a2])
+    writes = _patch_probes(monkeypatch, terminal=False)
+
+    reconcile_board_merges(board, config, issue=1117)
+
+    assert a1.review_state == "pending"
+    assert a2.review_state == "done"
+    assert ("wedged_review_reset", "ta-1117") in writes
+    assert ("wedged_review_reset", "ta-2000") not in writes

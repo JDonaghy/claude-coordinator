@@ -1152,14 +1152,25 @@ def delete_assignments_for_issue(
 
 
 def reset_work_review_state(repo_name: str, issue_number: int) -> int:
-    """Make an issue's work re-reviewable: reset the work/plan rows'
-    ``review_state`` → 'pending' and clear ``review_verdict`` /
-    ``review_posted_at``.  Returns rows updated."""
+    """Make an issue's work re-reviewable: reset the work/plan/test-author/
+    mock-author rows' ``review_state`` → 'pending' and clear
+    ``review_verdict`` / ``review_posted_at``.  Returns rows updated.
+
+    #1180: ``coord diagnose --stage review --reset`` routes here regardless
+    of which type the stage's ``latest`` row happened to be (this reset is
+    issue-scoped, not assignment-scoped — see the module docstring). Once
+    ``test-author``/``mock-author`` joined ``STAGE_ASSIGNMENT_TYPES["review"]``
+    so the doctor can *find* a wedged test-author row, the reset action has to
+    actually clear it too — the type list here was originally ``work``/
+    ``plan`` only, which silently no-opped on a wedged test-author row and
+    left ``coord diagnose --reset`` claiming success without fixing anything.
+    """
     conn = get_connection()
     cur = conn.execute(
         "UPDATE assignments SET review_state='pending', review_verdict=NULL, "
         "review_posted_at=NULL "
-        "WHERE repo_name=? AND issue_number=? AND type IN ('work','plan')",
+        "WHERE repo_name=? AND issue_number=? "
+        "AND type IN ('work','plan','test-author','mock-author')",
         (repo_name, issue_number),
     )
     conn.commit()
@@ -1540,6 +1551,45 @@ def mark_work_review_settled(assignment_id: str) -> None:
     conn.execute(
         "UPDATE assignments SET review_state='done' WHERE assignment_id=? "
         "AND type='work' AND review_state='pending'",
+        (assignment_id,),
+    )
+    conn.commit()
+
+
+def reset_wedged_test_author_review(assignment_id: str) -> None:
+    """#1180: un-wedge a ``test-author``/``mock-author`` row whose
+    ``review_state`` was stamped ``'done'`` by a ``work_is_terminal``
+    false-positive but never actually went through a real ``type='review'``
+    assignment.
+
+    Before #1150, ``work_is_terminal``/``pr_is_merged`` asked "has this issue
+    *ever* had a merged PR" instead of "is *this specific commit/branch*
+    merged". Test-author assignments carry ``issue_number`` = the milestone's
+    tracking issue (the JIT-slice aliasing convention, #1142/#1150), so any
+    tracking issue with *any* historical merged PR could false-positive
+    ``work_is_terminal`` for an unrelated, still-open slice sharing that issue
+    number — :func:`coord.review.dispatch_pending_reviews` stamped
+    ``review_state='done'`` and returned without ever dispatching a review.
+    #1150 fixed the check going forward (branch/commit-scoped) but did not
+    repair rows it had already corrupted: a row stuck at
+    ``review_state='done'`` with no verdict and no ``type='review'``
+    assignment ever run against its branch is invisible to
+    ``dispatch_pending_reviews`` (only ``review_state in (None, 'pending')``
+    is eligible) *and* to the merge gate (which requires a real approved
+    ``type='review'`` row) — a permanent deadlock between the two
+    subsystems.
+
+    Idempotent: only transitions rows of these types that still carry
+    ``review_state='done'`` and ``review_verdict IS NULL``.  Silently no-ops
+    when the row doesn't exist or has already been repaired/reviewed.
+    """
+    if not assignment_id:
+        return
+    conn = get_connection()
+    conn.execute(
+        "UPDATE assignments SET review_state='pending' WHERE assignment_id=? "
+        "AND type IN ('test-author','mock-author') "
+        "AND review_state='done' AND review_verdict IS NULL",
         (assignment_id,),
     )
     conn.commit()

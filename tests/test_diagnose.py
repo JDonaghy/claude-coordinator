@@ -33,6 +33,7 @@ def _assign(
     issue: int = 42,
     branch: str | None = "issue-42-foo",
     verdict: str | None = None,
+    review_state: str | None = None,
     dispatched_at: float | None = None,
     failure_reason: str | None = None,
 ) -> Assignment:
@@ -46,6 +47,7 @@ def _assign(
         status=status,
         branch=branch,
         review_verdict=verdict,
+        review_state=review_state,
         dispatched_at=dispatched_at if dispatched_at is not None else time.time(),
         failure_reason=failure_reason,
     )
@@ -204,6 +206,74 @@ def test_done_review_without_verdict_dry_run_does_not_write(monkeypatch, config)
     # dry_run: no actual writes; transcript recovery is skipped
     assert "r812c" not in calls["recover"]
     assert res.needs_reset is True
+
+
+# ── #1180: review stage must see wedged test-author/mock-author rows ────────
+
+
+def test_stage_assignment_types_includes_test_author_and_mock_author() -> None:
+    """#1180(b): before this, `coord diagnose --stage review` only ever
+    looked at type='review' rows, so a wedged test-author/mock-author row
+    (review_state='done' via a work_is_terminal false positive, but no
+    type='review' assignment ever dispatched) was invisible — the tool would
+    report on whatever unrelated type='review' row happened to share the
+    tracking issue number instead of flagging the real wedge."""
+    assert "test-author" in diagnose.STAGE_ASSIGNMENT_TYPES["review"]
+    assert "mock-author" in diagnose.STAGE_ASSIGNMENT_TYPES["review"]
+    assert "review" in diagnose.STAGE_ASSIGNMENT_TYPES["review"]
+
+
+def test_review_stage_flags_wedged_test_author_row(monkeypatch, config) -> None:
+    """The #1180 repro: a test-author row false-positived work_is_terminal
+    pre-#1150 (tracking-issue aliasing) and got stamped review_state='done'
+    with no verdict, and no type='review' assignment ever ran for the issue.
+    `coord diagnose <repo> <tracking-issue> --stage review` must find this
+    row and flag it — not silently report "healthy" or "no review
+    assignment"."""
+    calls = _stub(monkeypatch, session="dead", recover_verdict=None)
+    monkeypatch.setattr(
+        "coord.state.load_assignment_review_findings", lambda aid: None
+    )
+    a = _assign(
+        aid="ta-wedged", typ="test-author", status="done", issue=1117,
+        branch="test-author-ms-37-slice-1115", verdict=None,
+        review_state="done",
+    )
+    board = Board(completed=[a])
+    res = diagnose.diagnose_stage(board, config, "api", 1117, "review")
+    assert res.needs_reset is True
+    assert res.recovered is False
+    assert "ta-wedged" in calls["recover"]
+    assert any("ta-wedged" in f for f in res.findings)
+
+
+def test_review_stage_prefers_newer_real_review_over_wedged_test_author(
+    monkeypatch, config,
+) -> None:
+    """When a genuine, more-recently-dispatched type='review' row also
+    exists for the tracking issue, the doctor's "latest wins" heuristic picks
+    that row — matching its pre-existing behavior for ordinary work/plan
+    stages."""
+    calls = _stub(monkeypatch, session="dead")
+    monkeypatch.setattr(
+        "coord.state.load_assignment_review_findings",
+        lambda aid: ("approve", "looks good"),
+    )
+    wedged = _assign(
+        aid="ta-wedged", typ="test-author", status="done", issue=1117,
+        branch="test-author-ms-37-slice-1115", verdict=None,
+        review_state="done", dispatched_at=100.0,
+    )
+    real_review = _assign(
+        aid="rev-real", typ="review", status="done", issue=1117,
+        branch="issue-1117-other-slice", verdict="approve",
+        dispatched_at=200.0,
+    )
+    board = Board(completed=[wedged, real_review])
+    res = diagnose.diagnose_stage(board, config, "api", 1117, "review")
+    assert any("rev-real" in f for f in res.findings)
+    assert res.recovered is True
+    assert calls["recover"] == []  # healthy path — no transcript recovery needed
 
 
 # ── stale-but-live → needs reset ─────────────────────────────────────────────
