@@ -1129,7 +1129,11 @@ def _update_assignment_review_findings_local(
 
 
 def delete_assignments_for_issue(
-    repo_name: str, issue_number: int, *, types: tuple[str, ...]
+    repo_name: str,
+    issue_number: int,
+    *,
+    types: tuple[str, ...],
+    review_of_assignment_id: str | None = None,
 ) -> int:
     """Delete assignment rows of the given *types* for an issue.
 
@@ -1137,42 +1141,86 @@ def delete_assignments_for_issue(
     ``type='review'`` rows makes the Review stage show no verdict (grey /
     Pending in the TUI) and removes the request-changes the merge gate keys on.
     Returns the number of rows deleted.  Runs against the canonical DB (the
-    daemon executes diagnose), so no save_board is involved."""
+    daemon executes diagnose), so no save_board is involved.
+
+    #1180: ``review_of_assignment_id``, when given, additionally restricts
+    ``type='review'`` rows to reviews of that *one* assignment (matched via
+    the review's own ``review_of_assignment_id`` FK) instead of every review
+    sharing ``(repo_name, issue_number)``. Needed because ``test-author``/
+    ``mock-author`` assignments alias ``issue_number`` to the milestone's
+    tracking issue (JIT-slice convention, #1142/#1150) — a milestone with
+    slices for #1115/#1116/#1120 all sharing tracking issue #1117 has one
+    ``type='review'`` row per slice, all with ``issue_number=1117``. Without
+    this filter, resetting slice #1115's wedged review would delete slice
+    #1116's already-approved review row outright — see
+    :func:`reset_work_review_state`'s docstring for the sibling bug this
+    mirrors. Other *types* are unaffected — only ``type='review'`` rows carry
+    a meaningful ``review_of_assignment_id``.
+    """
     if not types:
         return 0
     conn = get_connection()
     placeholders = ",".join("?" for _ in types)
+    params: list[object] = [repo_name, issue_number, *types]
+    extra_sql = ""
+    if review_of_assignment_id is not None:
+        extra_sql = " AND (type != 'review' OR review_of_assignment_id = ?)"
+        params.append(review_of_assignment_id)
     cur = conn.execute(
         f"DELETE FROM assignments WHERE repo_name=? AND issue_number=? "  # noqa: S608 — placeholders are literal '?'
-        f"AND type IN ({placeholders})",
-        (repo_name, issue_number, *types),
+        f"AND type IN ({placeholders})" + extra_sql,
+        params,
     )
     conn.commit()
     return cur.rowcount
 
 
-def reset_work_review_state(repo_name: str, issue_number: int) -> int:
+def reset_work_review_state(
+    repo_name: str, issue_number: int, *, assignment_id: str | None = None
+) -> int:
     """Make an issue's work re-reviewable: reset the work/plan/test-author/
     mock-author rows' ``review_state`` → 'pending' and clear
     ``review_verdict`` / ``review_posted_at``.  Returns rows updated.
 
     #1180: ``coord diagnose --stage review --reset`` routes here regardless
-    of which type the stage's ``latest`` row happened to be (this reset is
-    issue-scoped, not assignment-scoped — see the module docstring). Once
-    ``test-author``/``mock-author`` joined ``STAGE_ASSIGNMENT_TYPES["review"]``
-    so the doctor can *find* a wedged test-author row, the reset action has to
-    actually clear it too — the type list here was originally ``work``/
-    ``plan`` only, which silently no-opped on a wedged test-author row and
-    left ``coord diagnose --reset`` claiming success without fixing anything.
+    of which type the stage's ``latest`` row happened to be. For ``work``/
+    ``plan``, ``(repo_name, issue_number)`` uniquely identifies one issue's
+    work chain, so blasting every matching row is safe and intentional —
+    that part stays issue-scoped, not assignment-scoped.
+
+    ``test-author``/``mock-author`` are different: every JIT-slice
+    assignment for a milestone shares ``issue_number`` = the milestone's
+    *tracking* issue (#1142/#1150), so a milestone with slices for
+    #1115/#1116/#1120 (tracking #1117) has multiple ``test-author`` rows all
+    carrying ``issue_number=1117``, distinguished only by
+    ``for_issue_number``/``branch``/``assignment_id``. Blasting by
+    ``issue_number`` alone would silently wipe a sibling slice's genuinely
+    approved review (``review_verdict='approve'``) right along with the one
+    wedged row the caller actually meant to fix. So for these two types the
+    reset additionally requires ``assignment_id`` to match the *specific*
+    row being diagnosed — passing ``assignment_id=None`` (the default)
+    leaves ``test-author``/``mock-author`` rows untouched entirely rather
+    than risk a multi-slice blast; callers that know which row they're
+    resetting (``coord/diagnose.py``) must pass it.
     """
     conn = get_connection()
-    cur = conn.execute(
-        "UPDATE assignments SET review_state='pending', review_verdict=NULL, "
-        "review_posted_at=NULL "
-        "WHERE repo_name=? AND issue_number=? "
-        "AND type IN ('work','plan','test-author','mock-author')",
-        (repo_name, issue_number),
-    )
+    if assignment_id is not None:
+        cur = conn.execute(
+            "UPDATE assignments SET review_state='pending', review_verdict=NULL, "
+            "review_posted_at=NULL "
+            "WHERE repo_name=? AND issue_number=? AND ("
+            "type IN ('work','plan') OR "
+            "(type IN ('test-author','mock-author') AND assignment_id=?)"
+            ")",
+            (repo_name, issue_number, assignment_id),
+        )
+    else:
+        cur = conn.execute(
+            "UPDATE assignments SET review_state='pending', review_verdict=NULL, "
+            "review_posted_at=NULL "
+            "WHERE repo_name=? AND issue_number=? AND type IN ('work','plan')",
+            (repo_name, issue_number),
+        )
     conn.commit()
     return cur.rowcount
 

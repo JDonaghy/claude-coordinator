@@ -423,7 +423,9 @@ class TestReconcileBoardWriteHelpers:
     def test_reset_work_review_state_covers_test_author(self, coord_db) -> None:
         """#1180: coord diagnose --stage review --reset routes through here
         regardless of which type the stage's `latest` row was — a wedged
-        test-author row must actually get reset, not silently no-op."""
+        test-author row must actually get reset, not silently no-op. The
+        caller (coord/diagnose.py) always knows the specific row being
+        diagnosed, so it passes assignment_id for test-author/mock-author."""
         from coord.db import get_connection
         from coord.state import reset_work_review_state
 
@@ -434,7 +436,7 @@ class TestReconcileBoardWriteHelpers:
             review_state="done",
             assignment_type="test-author",
         )
-        updated = reset_work_review_state("myrepo", 42)
+        updated = reset_work_review_state("myrepo", 42, assignment_id="ta-reset")
 
         assert updated == 1
         conn = get_connection()
@@ -457,7 +459,7 @@ class TestReconcileBoardWriteHelpers:
             review_state="done",
             assignment_type="mock-author",
         )
-        reset_work_review_state("myrepo", 42)
+        reset_work_review_state("myrepo", 42, assignment_id="ma-reset")
 
         conn = get_connection()
         row = conn.execute(
@@ -480,7 +482,7 @@ class TestReconcileBoardWriteHelpers:
             review_state="done",
             assignment_type="review",
         )
-        reset_work_review_state("myrepo", 42)
+        reset_work_review_state("myrepo", 42, assignment_id="rv-untouched")
 
         conn = get_connection()
         row = conn.execute(
@@ -488,6 +490,157 @@ class TestReconcileBoardWriteHelpers:
             ("rv-untouched",),
         ).fetchone()
         assert row[0] == "done"
+
+    def test_reset_work_review_state_without_assignment_id_ignores_test_author(
+        self, coord_db
+    ) -> None:
+        """Backward-compat default: no assignment_id given → test-author/
+        mock-author rows are left untouched entirely (never issue-wide
+        blasted) rather than risk wiping a sibling slice's approval."""
+        from coord.db import get_connection
+        from coord.state import reset_work_review_state
+
+        self._insert_done_work(
+            assignment_id="ta-noid",
+            branch="test-author-ms-37-slice-1115",
+            status="done",
+            review_state="done",
+            assignment_type="test-author",
+        )
+        updated = reset_work_review_state("myrepo", 42)
+
+        assert updated == 0
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT review_state FROM assignments WHERE assignment_id=?",
+            ("ta-noid",),
+        ).fetchone()
+        assert row[0] == "done"
+
+    def test_reset_work_review_state_multi_slice_does_not_wipe_sibling_approval(
+        self, coord_db
+    ) -> None:
+        """#1180 review finding: a milestone tracking issue with multiple
+        test-author slices (sharing issue_number) must only have the
+        *targeted* slice's review reset — a sibling's genuinely approved
+        review_verdict must survive untouched."""
+        from coord.db import get_connection
+        from coord.state import reset_work_review_state
+
+        self._insert_done_work(
+            assignment_id="ta-wedged",
+            branch="test-author-ms-37-slice-1115",
+            status="done",
+            review_state="done",
+            assignment_type="test-author",
+        )
+        self._insert_done_work(
+            assignment_id="ta-approved",
+            branch="test-author-ms-37-slice-1116",
+            status="done",
+            review_state="done",
+            assignment_type="test-author",
+        )
+        conn = get_connection()
+        conn.execute(
+            "UPDATE assignments SET review_verdict='approve' WHERE assignment_id=?",
+            ("ta-approved",),
+        )
+        conn.commit()
+
+        updated = reset_work_review_state("myrepo", 42, assignment_id="ta-wedged")
+
+        assert updated == 1
+        wedged = conn.execute(
+            "SELECT review_state, review_verdict FROM assignments WHERE assignment_id=?",
+            ("ta-wedged",),
+        ).fetchone()
+        assert wedged[0] == "pending"
+        assert wedged[1] is None
+        sibling = conn.execute(
+            "SELECT review_state, review_verdict FROM assignments WHERE assignment_id=?",
+            ("ta-approved",),
+        ).fetchone()
+        assert sibling[0] == "done"
+        assert sibling[1] == "approve"
+
+    def _insert_review_row(
+        self, *, assignment_id: str, branch: str, review_of_assignment_id: str
+    ) -> None:
+        from coord.models import Assignment
+        from coord.state import record_dispatched_assignment
+
+        review = Assignment(
+            machine_name="laptop",
+            repo_name="myrepo",
+            issue_number=42,
+            issue_title="t",
+            assignment_id=assignment_id,
+            status="done",
+            branch=branch,
+            type="review",
+            dispatched_at=0.0,
+            review_of_assignment_id=review_of_assignment_id,
+        )
+        record_dispatched_assignment(assignment=review, repo_github="acme/myrepo")
+
+    def test_delete_assignments_for_issue_scopes_review_by_review_of_assignment_id(
+        self, coord_db
+    ) -> None:
+        """#1180: same aliasing hazard as reset_work_review_state — a
+        milestone tracking issue with multiple test-author slices has one
+        type='review' row per slice, all sharing issue_number. Deleting one
+        slice's wedged review must not delete a sibling's already-approved
+        review row."""
+        from coord.db import get_connection
+        from coord.state import delete_assignments_for_issue
+
+        self._insert_review_row(
+            assignment_id="rv-wedged",
+            branch="test-author-ms-37-slice-1115",
+            review_of_assignment_id="ta-wedged",
+        )
+        self._insert_review_row(
+            assignment_id="rv-approved",
+            branch="test-author-ms-37-slice-1116",
+            review_of_assignment_id="ta-approved",
+        )
+
+        deleted = delete_assignments_for_issue(
+            "myrepo", 42, types=("review",), review_of_assignment_id="ta-wedged"
+        )
+
+        assert deleted == 1
+        conn = get_connection()
+        remaining = conn.execute(
+            "SELECT assignment_id FROM assignments WHERE type='review' ORDER BY assignment_id"
+        ).fetchall()
+        assert [r[0] for r in remaining] == ["rv-approved"]
+
+    def test_delete_assignments_for_issue_without_filter_deletes_all(
+        self, coord_db
+    ) -> None:
+        """Backward compat: omitting review_of_assignment_id preserves the
+        original issue-wide blast (the pre-#1180 behavior for plain
+        work/plan issues, where it's safe)."""
+        from coord.db import get_connection
+        from coord.state import delete_assignments_for_issue
+
+        self._insert_review_row(
+            assignment_id="rv-a", branch="issue-42-fix", review_of_assignment_id="w1",
+        )
+        self._insert_review_row(
+            assignment_id="rv-b", branch="issue-42-fix", review_of_assignment_id="w1",
+        )
+
+        deleted = delete_assignments_for_issue("myrepo", 42, types=("review",))
+
+        assert deleted == 2
+        conn = get_connection()
+        remaining = conn.execute(
+            "SELECT assignment_id FROM assignments WHERE type='review'"
+        ).fetchall()
+        assert remaining == []
 
 
 class TestResetWedgedTestAuthorReview:
