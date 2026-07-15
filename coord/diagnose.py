@@ -50,7 +50,17 @@ if TYPE_CHECKING:  # avoid import cycles / heavy imports at module load
 STAGE_ASSIGNMENT_TYPES: dict[str, tuple[str, ...]] = {
     "plan": ("plan",),
     "work": ("work", "plan"),
-    "review": ("review",),
+    # #1180: a `type="test-author"`/`"mock-author"` completion carries its own
+    # `review_state`/`review_verdict` (they're in WORK_LIKE_TYPES and go
+    # through the same review chokepoint as `work`) but never spawns a
+    # dedicated `type="review"` row when it's wedged — before this fix,
+    # `coord diagnose --stage review` looked at `type="review"` rows only, so
+    # a test-author row stuck at `review_state="done"` with no verdict and no
+    # review assignment was invisible: the tool would report on whatever
+    # unrelated `type="review"` row happened to share the tracking issue
+    # number (false "stage looks healthy"/wrong-row confidence) instead of
+    # flagging the real wedge.
+    "review": ("review", "test-author", "mock-author"),
     "test": ("work", "plan"),
     "merge": ("work", "plan"),
 }

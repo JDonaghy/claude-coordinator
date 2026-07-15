@@ -420,6 +420,194 @@ class TestReconcileBoardWriteHelpers:
 
         mark_work_review_settled("")  # must not raise
 
+    def test_reset_work_review_state_covers_test_author(self, coord_db) -> None:
+        """#1180: coord diagnose --stage review --reset routes through here
+        regardless of which type the stage's `latest` row was — a wedged
+        test-author row must actually get reset, not silently no-op."""
+        from coord.db import get_connection
+        from coord.state import reset_work_review_state
+
+        self._insert_done_work(
+            assignment_id="ta-reset",
+            branch="test-author-ms-37-slice-1115",
+            status="done",
+            review_state="done",
+            assignment_type="test-author",
+        )
+        updated = reset_work_review_state("myrepo", 42)
+
+        assert updated == 1
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT review_state, review_verdict FROM assignments "
+            "WHERE assignment_id=?",
+            ("ta-reset",),
+        ).fetchone()
+        assert row[0] == "pending"
+        assert row[1] is None
+
+    def test_reset_work_review_state_covers_mock_author(self, coord_db) -> None:
+        from coord.db import get_connection
+        from coord.state import reset_work_review_state
+
+        self._insert_done_work(
+            assignment_id="ma-reset",
+            branch="mock-author-ms-1",
+            status="done",
+            review_state="done",
+            assignment_type="mock-author",
+        )
+        reset_work_review_state("myrepo", 42)
+
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT review_state FROM assignments WHERE assignment_id=?",
+            ("ma-reset",),
+        ).fetchone()
+        assert row[0] == "pending"
+
+    def test_reset_work_review_state_still_ignores_review_type(self, coord_db) -> None:
+        """The reset is issue-scoped over work/plan/test-author/mock-author —
+        the type='review' rows themselves are handled by the sibling
+        delete_assignments_for_issue call, not this function."""
+        from coord.db import get_connection
+        from coord.state import reset_work_review_state
+
+        self._insert_done_work(
+            assignment_id="rv-untouched",
+            branch="issue-42-fix",
+            status="done",
+            review_state="done",
+            assignment_type="review",
+        )
+        reset_work_review_state("myrepo", 42)
+
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT review_state FROM assignments WHERE assignment_id=?",
+            ("rv-untouched",),
+        ).fetchone()
+        assert row[0] == "done"
+
+
+class TestResetWedgedTestAuthorReview:
+    """#1180: repairs a test-author/mock-author row whose review_state was
+    stamped 'done' by a pre-#1150 work_is_terminal false positive (tracking-
+    issue aliasing), leaving it permanently invisible to both
+    dispatch_pending_reviews (which only reconsiders review_state in (None,
+    'pending')) and the merge gate (which requires a real approved
+    type='review' row)."""
+
+    def _insert(
+        self,
+        *,
+        assignment_id: str,
+        assignment_type: str = "test-author",
+        review_state: str | None = "done",
+        review_verdict: str | None = None,
+    ) -> None:
+        from coord.db import get_connection
+        from coord.models import Assignment
+        from coord.state import record_dispatched_assignment
+
+        assignment = Assignment(
+            machine_name="laptop",
+            repo_name="myrepo",
+            issue_number=1117,
+            issue_title="t",
+            assignment_id=assignment_id,
+            status="done",
+            branch="test-author-ms-37-slice-1115",
+            type=assignment_type,
+            dispatched_at=0.0,
+        )
+        record_dispatched_assignment(assignment=assignment, repo_github="acme/myrepo")
+        conn = get_connection()
+        conn.execute(
+            "UPDATE assignments SET status='done', review_state=?, review_verdict=? "
+            "WHERE assignment_id=?",
+            (review_state, review_verdict, assignment_id),
+        )
+        conn.commit()
+
+    def test_resets_wedged_test_author_row(self, coord_db) -> None:
+        from coord.db import get_connection
+        from coord.state import reset_wedged_test_author_review
+
+        self._insert(assignment_id="ta-w1")
+        reset_wedged_test_author_review("ta-w1")
+
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT review_state FROM assignments WHERE assignment_id=?",
+            ("ta-w1",),
+        ).fetchone()
+        assert row[0] == "pending"
+
+    def test_resets_wedged_mock_author_row(self, coord_db) -> None:
+        from coord.db import get_connection
+        from coord.state import reset_wedged_test_author_review
+
+        self._insert(assignment_id="ma-w1", assignment_type="mock-author")
+        reset_wedged_test_author_review("ma-w1")
+
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT review_state FROM assignments WHERE assignment_id=?",
+            ("ma-w1",),
+        ).fetchone()
+        assert row[0] == "pending"
+
+    def test_ignores_row_with_a_captured_verdict(self, coord_db) -> None:
+        """A non-NULL review_verdict means a real review ran — not wedged."""
+        from coord.db import get_connection
+        from coord.state import reset_wedged_test_author_review
+
+        self._insert(assignment_id="ta-w2", review_verdict="approve")
+        reset_wedged_test_author_review("ta-w2")
+
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT review_state FROM assignments WHERE assignment_id=?",
+            ("ta-w2",),
+        ).fetchone()
+        assert row[0] == "done"
+
+    def test_ignores_row_not_review_state_done(self, coord_db) -> None:
+        from coord.db import get_connection
+        from coord.state import reset_wedged_test_author_review
+
+        self._insert(assignment_id="ta-w3", review_state="pending")
+        reset_wedged_test_author_review("ta-w3")
+
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT review_state FROM assignments WHERE assignment_id=?",
+            ("ta-w3",),
+        ).fetchone()
+        assert row[0] == "pending"
+
+    def test_ignores_non_test_author_type(self, coord_db) -> None:
+        """type='work' rows are out of scope — this helper is scoped to the
+        JIT test-author/mock-author aliasing bug shape only."""
+        from coord.db import get_connection
+        from coord.state import reset_wedged_test_author_review
+
+        self._insert(assignment_id="wk-w1", assignment_type="work")
+        reset_wedged_test_author_review("wk-w1")
+
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT review_state FROM assignments WHERE assignment_id=?",
+            ("wk-w1",),
+        ).fetchone()
+        assert row[0] == "done"
+
+    def test_noop_on_empty_id(self, coord_db) -> None:
+        from coord.state import reset_wedged_test_author_review
+
+        reset_wedged_test_author_review("")  # must not raise
+
 
 class TestRecordDispatchedBranch:
     """#706: _record_dispatched_local must persist the branch column so
