@@ -86,6 +86,8 @@ def _work_assignment(
     assignment_id: str = "work-abc",
     branch: str = "issue-1-fix",
     review_iteration: int = 0,
+    type: str = "work",  # noqa: A002 - matches Assignment's field name
+    for_issue_number: int | None = None,
 ) -> Assignment:
     return Assignment(
         machine_name="laptop",
@@ -99,9 +101,10 @@ def _work_assignment(
         pr_url="https://github.com/acme/api/pull/42",
         dispatched_at=0.0,
         finished_at=1.0,
-        type="work",
+        type=type,
         review_state="dispatched",
         review_iteration=review_iteration,
+        for_issue_number=for_issue_number,
     )
 
 
@@ -672,6 +675,59 @@ class TestBuildFixBriefing:
         findings = _request_changes_findings()
         briefing = _build_fix_briefing(work, findings, iteration=1, max_iter=3)
         assert "do not change the branch name" in briefing.lower()
+
+
+class TestBuildFixBriefingTestAuthor:
+    """#1176: a type="test-author" source row gets test-authoring-flavored
+    fix instructions instead of the generic "implement + make tests pass"
+    briefing — an oracle must stay RED, not turn green."""
+
+    def test_contains_reviewer_findings(self) -> None:
+        work = _work_assignment(type="test-author")
+        findings = _request_changes_findings()
+        briefing = _build_fix_briefing(work, findings, iteration=1, max_iter=3)
+        assert "Missing test coverage for edge case X" in briefing
+
+    def test_does_not_instruct_making_tests_pass(self) -> None:
+        """The generic fix briefing's "ensure all tests pass" is actively
+        wrong guidance for an oracle that must stay RED until the real
+        implementation lands — must not leak into the test-author variant."""
+        work = _work_assignment(type="test-author")
+        findings = _request_changes_findings()
+        briefing = _build_fix_briefing(work, findings, iteration=1, max_iter=3)
+        assert "ensure all tests pass" not in briefing.lower()
+
+    def test_instructs_staying_red(self) -> None:
+        work = _work_assignment(type="test-author")
+        findings = _request_changes_findings()
+        briefing = _build_fix_briefing(work, findings, iteration=1, max_iter=3)
+        assert "red" in briefing.lower()
+
+    def test_contains_branch_name(self) -> None:
+        work = _work_assignment(type="test-author", branch="test-author-ms-3-slice-9")
+        findings = _request_changes_findings()
+        briefing = _build_fix_briefing(work, findings, iteration=1, max_iter=3)
+        assert "test-author-ms-3-slice-9" in briefing
+
+    def test_contains_do_not_change_branch_instruction(self) -> None:
+        work = _work_assignment(type="test-author")
+        findings = _request_changes_findings()
+        briefing = _build_fix_briefing(work, findings, iteration=1, max_iter=3)
+        assert "do not change the branch name" in briefing.lower()
+
+    def test_contains_original_briefing(self) -> None:
+        work = _work_assignment(type="test-author")
+        findings = _request_changes_findings()
+        briefing = _build_fix_briefing(work, findings, iteration=1, max_iter=3)
+        assert "Original briefing text." in briefing
+
+    def test_work_type_still_gets_generic_briefing(self) -> None:
+        """Regression guard: a plain type="work" bounce keeps today's
+        wording unchanged."""
+        work = _work_assignment(type="work")
+        findings = _request_changes_findings()
+        briefing = _build_fix_briefing(work, findings, iteration=1, max_iter=3)
+        assert "ensure all tests pass" in briefing.lower()
 
 
 # ── Unit tests: _fix_model_for_iteration ─────────────────────────────────────
@@ -1838,3 +1894,126 @@ class TestDispatchFixRemoteBranchGuard:
 
         assert result is not None
         assert result.machine_name == "server"
+
+
+# ── #1176: test-author bounce gets a type="test-author" fix, not "work" ─────
+
+
+class TestDispatchFixTestAuthorType:
+    """A review bounce of a type="test-author" row must dispatch a
+    type="test-author" fix (with TEST_AUTHOR_SYSTEM_PROMPT + its deny-list
+    and permission to touch tests/acceptance/**), not a plain type="work"
+    fix that is forbidden from the exact files it needs to fix."""
+
+    def _dispatch(
+        self, config: Config, *, work_type: str, for_issue_number: int | None = None
+    ) -> tuple[dict, Assignment]:
+        work = _work_assignment(
+            assignment_id="ta-work-1",
+            branch="test-author-ms-3-slice-9",
+            type=work_type,
+            for_issue_number=for_issue_number,
+        )
+        board = Board(completed=[work])
+        mock_http = MagicMock()
+        mock_http.post.return_value.json.return_value = {"id": "fix-ta-1"}
+        mock_http.post.return_value.raise_for_status = MagicMock()
+
+        with patch("coord.auto_loop.record_dispatched_assignment"):
+            result = _dispatch_fix(
+                work, "Fix briefing.", board, config, iteration=1,
+                http_client=mock_http,
+            )
+
+        assert result is not None
+        sent_payload = mock_http.post.call_args.kwargs["json"]
+        return sent_payload, result
+
+    def test_payload_type_is_test_author(self, config: Config) -> None:
+        payload, _ = self._dispatch(config, work_type="test-author")
+        assert payload["type"] == "test-author"
+
+    def test_assignment_type_is_test_author(self, config: Config) -> None:
+        _, fix = self._dispatch(config, work_type="test-author")
+        assert fix.type == "test-author"
+
+    def test_payload_carries_test_author_system_prompt(self, config: Config) -> None:
+        from coord.test_author import TEST_AUTHOR_SYSTEM_PROMPT
+
+        payload, _ = self._dispatch(config, work_type="test-author")
+        assert payload["system_prompt"] == TEST_AUTHOR_SYSTEM_PROMPT
+
+    def test_payload_carries_test_author_deny_commands(self, config: Config) -> None:
+        payload, _ = self._dispatch(config, work_type="test-author")
+        assert "Bash(gh *)" in payload["deny_commands"]
+
+    def test_files_forbidden_does_not_block_acceptance_path(
+        self, config: Config
+    ) -> None:
+        """The source test-author row carries files_forbidden=[] (#931) —
+        confirm the fix dispatch doesn't add tests/acceptance/ to it."""
+        payload, _ = self._dispatch(config, work_type="test-author")
+        assert not any(
+            "tests/acceptance" in f for f in payload["files_forbidden"]
+        )
+
+    def test_for_issue_number_carried_over(self, config: Config) -> None:
+        """#1084 JIT-slice correlation survives the bounce so the TUI still
+        recognizes this fix as the same member issue's slice."""
+        _, fix = self._dispatch(config, work_type="test-author", for_issue_number=42)
+        assert fix.for_issue_number == 42
+
+    def test_work_type_bounce_is_unchanged(self, config: Config) -> None:
+        """Regression guard: a type="work" bounce still gets a plain "work"
+        fix with no test-author system prompt or deny-list injected."""
+        payload, fix = self._dispatch(config, work_type="work")
+        assert payload["type"] == "work"
+        assert fix.type == "work"
+        assert "system_prompt" not in payload
+        assert "deny_commands" not in payload
+
+
+class TestProcessReviewCompletionTestAuthorType:
+    """End-to-end: a `coord bounce` (via process_review_completion) of a
+    request-changes review on a type="test-author" work row dispatches a
+    type="test-author" fix carrying the reviewer's findings."""
+
+    def test_full_cycle_dispatches_test_author_fix(
+        self, config: Config, tmp_path
+    ) -> None:
+        log_file = tmp_path / "review.log"
+        log_file.write_text(
+            "REVIEW_VERDICT: request-changes\n"
+            "REVIEW_BODY:\n"
+            "- Dead monkeypatch.setattr on a non-existent attribute\n"
+            "- Fragile assertion would false-fail a correct implementation\n"
+            "END_REVIEW\n"
+        )
+        work = _work_assignment(
+            assignment_id="ta-work-2",
+            branch="test-author-ms-3-slice-9",
+            type="test-author",
+        )
+        review = _review_assignment(assignment_id="ta-review-2", review_of="ta-work-2")
+        board = _board_with(work, review)
+
+        mock_http = MagicMock()
+        mock_http.post.return_value.json.return_value = {"id": "fix-ta-2"}
+        mock_http.post.return_value.raise_for_status = MagicMock()
+
+        with patch("coord.auto_loop.record_dispatched_assignment"):
+            actions = process_review_completion(
+                review, board, config,
+                log_path=str(log_file),
+                http_client=mock_http,
+            )
+
+        assert any(a.kind == "fix_dispatched" for a in actions)
+        sent_payload = mock_http.post.call_args.kwargs["json"]
+        fix = board.active[0]
+
+        assert sent_payload["type"] == "test-author"
+        assert fix.type == "test-author"
+        assert "Dead monkeypatch.setattr" in sent_payload["briefing"]
+        assert "Fragile assertion" in sent_payload["briefing"]
+        assert "ensure all tests pass" not in sent_payload["briefing"].lower()

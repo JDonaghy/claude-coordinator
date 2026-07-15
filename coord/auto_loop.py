@@ -53,6 +53,7 @@ from coord.review import (
 )
 from coord.board_service import read_board, write_board
 from coord.state import record_dispatched_assignment
+from coord.test_author import TEST_AUTHOR_DENY_COMMANDS, TEST_AUTHOR_SYSTEM_PROMPT
 
 log = logging.getLogger(__name__)
 
@@ -522,7 +523,16 @@ def _build_fix_briefing(
     iteration: int,
     max_iter: int,
 ) -> str:
-    """Assemble the briefing for the fix worker.  Pure function — easy to test."""
+    """Assemble the briefing for the fix worker.  Pure function — easy to test.
+
+    #1176: a ``type="test-author"`` source row gets test-authoring-flavored
+    instructions instead — "make the acceptance suite pass" is actively
+    wrong guidance for an oracle that must stay RED until the real
+    implementation lands.
+    """
+    if work.type == "test-author":
+        return _build_test_author_fix_briefing(work, findings, iteration, max_iter)
+
     lines: list[str] = [
         f"# Fix assignment (iteration {iteration}/{max_iter}): {work.issue_title}",
         "",
@@ -560,6 +570,92 @@ def _build_fix_briefing(
     return "\n".join(lines)
 
 
+def _build_test_author_fix_briefing(
+    work: Assignment,
+    findings,
+    iteration: int,
+    max_iter: int,
+) -> str:
+    """Fix briefing for a ``type="test-author"`` slice (#1176).
+
+    Findings here are almost always test-quality issues (a dead
+    ``monkeypatch.setattr``, a fragile assertion that would false-fail a
+    correct implementation) — not a request to implement anything. The
+    acceptance suite must stay RED until the real implementation lands, so
+    "run tests, make them pass" (the generic fix instruction) is actively
+    wrong guidance and is deliberately NOT used here. The dispatcher pairs
+    this briefing with ``TEST_AUTHOR_SYSTEM_PROMPT`` (independence rules,
+    RED verification) — see ``_dispatch_fix``.
+    """
+    lines: list[str] = [
+        f"# Test-author fix (iteration {iteration}/{max_iter}): {work.issue_title}",
+        "",
+        f"You are the independent acceptance-test author fixing review findings "
+        f"against the acceptance suite for issue #{work.issue_number}.",
+        (
+            f"Work on branch `{work.branch or '(check your git branches)'}` — "
+            "**do not change the branch name**."
+        ),
+        "",
+        "## Reviewer findings to address",
+        "",
+        findings.body.strip(),
+        "",
+        "## Instructions",
+        "",
+        (
+            "1. Read the reviewer findings above carefully — they are almost "
+            "always test-quality issues (fragile assertions, stale/dead mocks, "
+            "tests that would false-fail a correct implementation), not a "
+            "request to implement anything."
+        ),
+        (
+            "2. Fix **every** issue identified by the reviewer, in the "
+            "acceptance suite under `tests/acceptance/` only."
+        ),
+        "3. Stay on the **same branch** — push your fixes to the existing branch.",
+        (
+            "4. Your tests MUST remain RED. Do NOT touch any implementation to "
+            "make them pass. Run the driver's run command yourself and confirm "
+            "the fixed tests still fail cleanly (not error out from a broken "
+            "framework hookup)."
+        ),
+        (
+            "5. Update the manifest if you added, removed, or renamed any test "
+            "ids — merge with the existing manifest, don't clobber it."
+        ),
+        (
+            f"6. This is fix iteration {iteration} of {max_iter} allowed. "
+            "Address all findings completely so the next review can approve."
+        ),
+        "",
+        "STATUS: reading review findings → fixing acceptance suite → confidence: high",
+        "",
+    ]
+    if work.briefing and work.briefing.strip():
+        lines += [
+            "## Original test-author briefing",
+            "",
+            work.briefing.strip(),
+            "",
+        ]
+    return "\n".join(lines)
+
+
+def _test_author_deny_commands(config: Config, work: Assignment) -> list[str]:
+    """Merge the repo's configured deny-list with the test-author base
+    deny-list, same de-dup pattern as ``test_author.dispatch_test_author``
+    (#1176 — a test-author fix session needs the same guardrails as the
+    original dispatch, since it POSTs directly to ``/assign`` the same way)."""
+    repo_cfg = config.repo(work.repo_name)
+    repo_deny = (
+        repo_cfg.worker_permissions.deny
+        if repo_cfg and repo_cfg.worker_permissions
+        else []
+    )
+    return list(dict.fromkeys(list(repo_deny) + TEST_AUTHOR_DENY_COMMANDS))
+
+
 def _dispatch_fix(
     work: Assignment,
     briefing: str,
@@ -575,6 +671,12 @@ def _dispatch_fix(
 
     Prefers the same machine as the original worker (the branch is already
     checked out there).  Falls back to any capable machine.
+
+    #1176: the dispatched type mirrors ``work.type`` for ``"test-author"``
+    (with ``TEST_AUTHOR_SYSTEM_PROMPT`` + its deny-list, since the fix needs
+    the same acceptance-path authorization and independence rules as the
+    original test-author dispatch); every other source type still gets the
+    long-standing plain ``"work"`` fix.
 
     Returns the new Assignment (already added to ``board.active``), or None
     on failure.
@@ -633,6 +735,13 @@ def _dispatch_fix(
     if repo is None:
         return None
 
+    # #1176: preserve the source row's type for a test-author slice fix —
+    # dispatching `type="work"` sends a plain worker that is forbidden from
+    # (and never given the system prompt authorizing) exactly the
+    # `tests/acceptance/**` path it needs to fix. Every other source type
+    # (including today's "work") keeps the long-standing "work" fix.
+    fix_type = "test-author" if work.type == "test-author" else "work"
+
     payload = {
         "repo_name": work.repo_name,
         "repo_path": repo_path,
@@ -642,7 +751,7 @@ def _dispatch_fix(
         "files_allowed": work.files_allowed,
         "files_forbidden": work.files_forbidden,
         "pull_repos": [],
-        "type": "work",
+        "type": fix_type,
         # #255: fix-loop dispatches inherit the repo's configured default
         # branch so the agent branches from origin/<default> rather than
         # any local-only ref.
@@ -654,6 +763,16 @@ def _dispatch_fix(
         # commits (quadraui#166 hit this hard).
         "target_branch": work.branch,
     }
+    if fix_type == "test-author":
+        # `agent.py`'s dispatch table has no `elif spec.type == "test-author"`
+        # branch — it relies on the caller supplying `system_prompt`
+        # explicitly (mirrors `test_author.dispatch_test_author`). Without
+        # this the fix worker gets the generic WORKER_SYSTEM_PROMPT, which
+        # is what #1176 is about: it never authorizes editing
+        # `tests/acceptance/**` and doesn't carry the independence /
+        # stay-RED rules a test-author session needs.
+        payload["system_prompt"] = TEST_AUTHOR_SYSTEM_PROMPT
+        payload["deny_commands"] = _test_author_deny_commands(config, work)
     # Escalated model per bounce iteration (None when pipeline
     # .escalate_fix_model is disabled — preserves today's no-model behaviour).
     # The board record keeps the alias for legibility; the wire payload is
@@ -685,7 +804,7 @@ def _dispatch_fix(
         branch=work.branch,
         pr_url=work.pr_url,
         dispatched_at=time.time(),
-        type="work",
+        type=fix_type,
         # Link back so the next review can find the work chain.
         review_of_assignment_id=work.assignment_id,
         # Iteration counter so the loop knows when to stop.
@@ -693,6 +812,11 @@ def _dispatch_fix(
         # Escalated model for this bounce iteration (None preserves the
         # legacy behaviour where the agent picks claude -p's default).
         model=model,
+        # #1176: carry over the JIT-slice correlation so the TUI's
+        # per-issue Acceptance-Authoring mini-pipeline still recognizes
+        # this fix as the same member issue's slice (None for every other
+        # type, matching `test_author.dispatch_test_author`).
+        for_issue_number=work.for_issue_number,
     )
     board.active.append(fix_assignment)
 
