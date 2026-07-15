@@ -119,7 +119,9 @@ Pressing **Enter** on a selected entry opens an inline detail view within the ma
 - The fetch is **armed only while `active_view == SidebarView::Audit`**.
 - Navigating away stops/drops the receiver; navigating back re-arms.
 - The fetch hits `GET /audit` with no filters (first page, default limit).
-- The fetched `AuditPage` is cached on `CoordApp` (field name TBD by implementor; modeled on `pending_metrics`/`artifact` pattern in `data.rs`).
+- The fetched `AuditPage` is cached on `CoordApp` as `audit_page: Option<AuditPage>` — **resolved 2026-07-12 (#1095, amendment, was "TBD by implementor")**. `AuditPage`/`AuditEntry` (`tui/src/app/types.rs`) deserialize verbatim from the contract §6 wire shape.
+
+**Test-support seeding seam (pinned, #1095):** `coord_tui::fixtures::make_app_with_audit_json(data: BoardData, audit_json: &str) -> CoordApp` (feature `test-support`, same visibility/reachability as `make_test_app`) builds a `CoordApp` with `audit_page` pre-populated by deserializing `audit_json` (a raw §6-shaped `/audit` response body) — no live daemon, no background fetch thread. Malformed JSON is a silent no-op (`audit_page` stays `None`). This is the seam for the §3 (count/badge), §4a (populated list), §4c (entry-detail), and §7-detail-mode acceptance assertions that were deferred pending this resolution — a test-author extending `tests/acceptance/ms-33/audit_1039.rs` for issue #1039 should use it directly rather than treating the seam as unresolved.
 
 ---
 
@@ -270,3 +272,5 @@ All mocks: 120 × 40 terminal, `driver_with_shell(app, CoordApp::shell_config(),
 4. **Time-range display location (#1040).** The mock shows the current selection in both the sidebar and the status bar. The contract requires it appears *somewhere* visible; location is implementor's choice. The status bar variant (`"t=time-range (Today)"`) is the minimum required string.
 
 5. **Backfill / pre-deploy entries.** Per the epic: no backfill, starts fresh. An empty state on first deploy is expected and tested.
+
+6. **§5 seam amendment (2026-07-12, #1095).** #1039 landed `audit_page: Option<AuditPage>` on `CoordApp` plus the test-support seeding helper `coord_tui::fixtures::make_app_with_audit_json(data, audit_json)` — exactly the shape this contract originally left "TBD by implementor". A JIT test-author round (#1095) declined to use it without an explicit contract pin, reasonably reading §5's original wording as reserving the seam to the implementor. §5 above now pins it; the §3/§4a/§4c/§7-detail assertions deferred in `audit_1039.rs`'s TODO block should be authored against it in the next JIT round.

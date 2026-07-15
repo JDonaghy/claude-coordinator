@@ -348,6 +348,7 @@ mod audit_1039 {
             "event_type:",
             "actor:",
             "summary:",
+            "details:",
         ] {
             assert!(
                 screen.contains(needle),
