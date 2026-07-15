@@ -22850,6 +22850,13 @@
         // #1151: --for-path must thread through the interactive flavour
         // exactly like the headless dispatch, or a routed repo's CLI-side
         // gate rejects the launch silently once it's typed into the PTY.
+        //
+        // #1174 fix-iteration-1: `--config` is registered on the leaf
+        // `acceptance author` command (coord/commands/acceptance.py), not
+        // on the root `coord` click.group, so it MUST come after the
+        // subcommand tokens — putting it before them (as coord's root
+        // group parses options) produced "Error: No such option
+        // '--config'" in the live smoke test.
         let cmd = build_acceptance_author_interactive_launch_cmd(
             Some("/home/john/src/claude-coordinator/coordinator.yml"),
             "api",
@@ -22859,8 +22866,29 @@
         );
         assert_eq!(
             cmd,
-            "coord --config /home/john/src/claude-coordinator/coordinator.yml \
-             acceptance author api 751 --issue 42 --for-path 'coord/**' --interactive\r",
+            "coord acceptance author --config /home/john/src/claude-coordinator/coordinator.yml \
+             api 751 --issue 42 --for-path 'coord/**' --interactive\r",
+        );
+    }
+
+    #[test]
+    fn build_acceptance_author_interactive_launch_cmd_config_comes_after_subcommand() {
+        // Regression for #1174: assert the token ordering directly (not
+        // just full-string equality above) so a future refactor that
+        // reintroduces `--config` before `acceptance author` fails loudly.
+        let cmd = build_acceptance_author_interactive_launch_cmd(
+            Some("/tmp/coordinator.yml"),
+            "api",
+            751,
+            42,
+            None,
+        );
+        let subcommand_pos = cmd.find("acceptance author").expect("subcommand present");
+        let config_pos = cmd.find("--config").expect("--config present");
+        assert!(
+            config_pos > subcommand_pos,
+            "--config must come after 'acceptance author', not before \
+             (Click's root group rejects it there); got: {cmd:?}",
         );
     }
 
