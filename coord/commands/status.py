@@ -760,9 +760,55 @@ def _diagnose_orphan_worktrees(config_path: Path, *, dry_run: bool) -> None:
     type=float,
     help="Per-machine HTTP timeout for --remote lookups (seconds).",
 )
+@click.option(
+    "--today",
+    is_flag=True,
+    help="Limit --by-issue / --issue to the local calendar day (#1115).",
+)
+@click.option(
+    "--since",
+    "since_spec",
+    default=None,
+    help="Limit --by-issue / --issue to legs since <ISO date | Nd | Nh> (#1115).",
+)
+@click.option(
+    "--by-issue",
+    "by_issue",
+    is_flag=True,
+    help="Group daemon-board usage by GitHub issue for the time window, sorted desc (#1115).",
+)
+@click.option(
+    "--issue",
+    "issue_number",
+    type=int,
+    default=None,
+    help="Per-stage drill-down for one issue number — all legs, oldest-first (#1115).",
+)
+@click.option(
+    "--sort",
+    "sort_by",
+    type=click.Choice(["cost", "tokens"]),
+    default="cost",
+    show_default=True,
+    help="Sort order for --by-issue (always descending).",
+)
+def usage(
+    config_path: Path,
+    remote: bool,
+    timeout: float,
+    today: bool,
+    since_spec: str | None,
+    by_issue: bool,
+    issue_number: int | None,
+    sort_by: str,
+) -> None:
+    if issue_number is not None:
+        _usage_issue_drill(config_path, issue_number, today=today, since_spec=since_spec)
+        return
+    if by_issue:
+        _usage_by_issue(config_path, today=today, since_spec=since_spec, sort_by=sort_by)
+        return
 
-
-def usage(config_path: Path, remote: bool, timeout: float) -> None:
     from coord.board_service import read_board
     from coord.state import load_session
     from coord.usage import build_session_usage, format_usage_report
@@ -815,3 +861,72 @@ def usage(config_path: Path, remote: bool, timeout: float) -> None:
         started_at=started_at,
     )
     click.echo(format_usage_report(session))
+
+
+def _usage_resolve_window(today: bool, since_spec: str | None):
+    """Resolve the ``--today``/``--since`` flags to a
+    :class:`coord.usage_rollup.Window` for the daemon-sourced rollup views
+    (#1115). Neither flag given falls back to the current session's start
+    time (open-ended); no session at all falls back to an unbounded window.
+    """
+    from coord.usage_rollup import Window
+
+    if today:
+        return Window.today()
+    if since_spec:
+        return Window.since(since_spec)
+
+    from coord.state import load_session
+
+    sess = load_session()
+    if sess and sess.get("started_at"):
+        import datetime
+        try:
+            dt = datetime.datetime.fromisoformat(
+                sess["started_at"].rstrip("Z").replace("Z", "+00:00")
+            )
+            started_at = dt.replace(tzinfo=datetime.timezone.utc).timestamp()
+            return Window(start=started_at, end=None, label="session")
+        except (ValueError, AttributeError):
+            pass
+    return Window(start=None, end=None, label="all")
+
+
+def _usage_by_issue(config_path: Path, *, today: bool, since_spec: str | None, sort_by: str) -> None:
+    """``coord usage --by-issue`` (contract Mock 1, #1115) — daemon-board-
+    sourced per-issue cost/token rollup for the resolved time window."""
+    from coord.usage import fetch_usage_rows, format_usage_by_issue, pricing_dict_from_config
+    from coord.usage_rollup import aggregate
+
+    cfg = _load_config(config_path)
+    window = _usage_resolve_window(today, since_spec)
+    rows = fetch_usage_rows()
+    pricing = pricing_dict_from_config(cfg.pricing)
+    result = aggregate(rows, by="issue", window=window, pricing=pricing)
+
+    if sort_by == "tokens":
+        def _total_tokens(group: dict) -> int:
+            t = group["tokens"]
+            return t["input"] + t["output"] + t["cache_read"] + t["cache_creation"]
+
+        result["groups"].sort(key=_total_tokens, reverse=True)
+
+    click.echo(format_usage_by_issue(result, window.label))
+
+
+def _usage_issue_drill(config_path: Path, issue_number: int, *, today: bool, since_spec: str | None) -> None:
+    """``coord usage --issue N`` (contract Mock 2, #1115) — per-stage drill
+    for one issue's legs. Unbounded (all history) unless --today/--since is
+    also given."""
+    from coord.usage import fetch_usage_rows, format_usage_issue_drill
+    from coord.usage_rollup import leg_in_window
+
+    cfg = _load_config(config_path)
+    window = _usage_resolve_window(today, since_spec) if (today or since_spec) else None
+    rows = [
+        row
+        for row in fetch_usage_rows()
+        if int(row.get("issue_number") or 0) == issue_number
+        and (window is None or leg_in_window(row, window))
+    ]
+    click.echo(format_usage_issue_drill(rows, issue_number, cfg.pricing))

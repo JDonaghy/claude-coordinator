@@ -413,6 +413,163 @@ def format_usage_report(session: SessionUsage) -> str:
     return "\n".join(lines)
 
 
+# ── Per-issue rollup rendering (#1115 CLI-1) ─────────────────────────────────
+#
+# Consumes coord.usage_rollup.aggregate() (#1118 Core) — this module only
+# renders the plain dict it returns. Distinct 4-decimal cost formatting and
+# compact token/duration formatting are used here (vs. the 2-decimal
+# _fmt_cost/duration_str above) to match the sealed contract mocks exactly
+# (tests/acceptance/ms-37/contract.md, Mocks 1 & 2).
+
+
+def pricing_dict_from_config(pricing) -> dict:
+    """Convert a :class:`~coord.config.PricingConfig` to the plain
+    ``{model: {"input": ..., "output": ..., "cache_read": ..., "cache_creation": ...}}``
+    dict :func:`coord.usage_rollup.aggregate` expects."""
+    return {
+        model: {
+            "input": rates.input,
+            "output": rates.output,
+            "cache_read": rates.cache_read,
+            "cache_creation": rates.cache_creation,
+        }
+        for model, rates in pricing.models.items()
+    }
+
+
+def _fmt_cost4(usd: float) -> str:
+    """Captured-cost formatting for the rollup views: always 4 decimals."""
+    return f"${usd:.4f}"
+
+
+def _fmt_est4(usd: float) -> str:
+    """Estimated-cost formatting: ``~$`` prefix, always visually distinct
+    from a captured figure (see :func:`_fmt_cost4`)."""
+    return f"~${usd:.4f}"
+
+
+def _fmt_tokens_compact(n: int) -> str:
+    """Compact token count: ``k`` below 1M, one-decimal ``M`` at/above."""
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{round(n / 1_000)}k"
+    return str(n)
+
+
+def _fmt_duration_hms(secs: float | None, *, is_open: bool) -> str:
+    """``NmSSs`` duration (e.g. ``20m00s``); ``—`` for an open/unknown leg."""
+    if is_open or secs is None:
+        return "—"
+    total = int(round(secs))
+    m, s = divmod(total, 60)
+    return f"{m}m{s:02d}s"
+
+
+def format_usage_by_issue(result: dict, window_label: str) -> str:
+    """Render the ``coord usage --by-issue`` view (contract Mock 1) from an
+    :func:`coord.usage_rollup.aggregate` result (``by="issue"``).
+
+    *window_label* is the resolved :class:`~coord.usage_rollup.Window`'s
+    ``label`` (e.g. ``"today"``) — printed in the header, not consumed by
+    the aggregator itself.
+    """
+    lines = [f"USAGE — by issue — window: {window_label}"]
+    lines.append(
+        f"{'issue':<8}{'repo':<10}{'legs':>4}   {'cost':<10} {'est(~)':<11} "
+        f"{'out / cache':<20}{'time':<10}note"
+    )
+    for g in result["groups"]:
+        issue_no = g["key"]
+        repo = g["rows"][0].get("repo_name", "") if g["rows"] else ""
+        cost_str = _fmt_cost4(g["cost_captured"]) if g["cost_captured"] > 0 else "—"
+        est_str = _fmt_est4(g["cost_est"]) if g["cost_est"] > 0 else "—"
+        out_str = _fmt_tokens_compact(g["tokens"]["output"])
+        cache_str = _fmt_tokens_compact(g["tokens"]["cache_read"])
+        tok_str = f"{out_str} / {cache_str}"
+        dur_str = _fmt_duration_hms(g["duration_secs"], is_open=False)
+        note = f"⚠ unknown-model:{g['unknown_models']}" if g["unknown_models"] else ""
+        lines.append(
+            f"#{issue_no:<7}{repo:<10}{g['legs']:>4}   {cost_str:<10} {est_str:<11} "
+            f"{tok_str:<20}{dur_str:<10}{note}"
+        )
+
+    lines.append("─" * 80)
+    t = result["totals"]
+    total_out = _fmt_tokens_compact(t["tokens"]["output"])
+    total_cache = _fmt_tokens_compact(t["tokens"]["cache_read"])
+    total_dur = _fmt_duration_hms(t["duration_secs"], is_open=False)
+    progress = f" · {t['open_legs']} in progress" if t["open_legs"] else ""
+    lines.append(
+        f"Σ  captured {_fmt_cost4(t['cost_captured'])} · est {_fmt_est4(t['cost_est'])} · "
+        f"total {_fmt_cost4(t['cost_total'])} · {total_out} out / {total_cache} cache · "
+        f"{total_dur}{progress}"
+    )
+    return "\n".join(lines)
+
+
+def format_usage_issue_drill(rows: list[dict], issue_number: int, pricing) -> str:
+    """Render the ``coord usage --issue N`` per-stage drill (contract Mock 2).
+
+    *rows* are the raw board-row dicts for this one issue (any window
+    filtering already applied by the caller); *pricing* is a
+    :class:`~coord.config.PricingConfig`. Rows are rendered oldest-first by
+    ``dispatched_at`` (falling back to ``finished_at``).
+    """
+    from coord.usage_rollup import leg_cost, leg_duration, parse_timestamp
+
+    if not rows:
+        return f"No usage data for issue #{issue_number}."
+
+    def _sort_ts(row: dict) -> float:
+        ts = parse_timestamp(row.get("dispatched_at"))
+        if ts is None:
+            ts = parse_timestamp(row.get("finished_at"))
+        return ts if ts is not None else float("inf")
+
+    ordered = sorted(rows, key=_sort_ts)
+    repo = rows[0].get("repo_name", "")
+
+    total_captured = 0.0
+    total_est = 0.0
+    for row in rows:
+        captured, est, _unknown = leg_cost(row, pricing)
+        total_captured += captured
+        total_est += est
+
+    lines = [
+        f"#{issue_number}  {repo}   {_fmt_cost4(total_captured)} captured  +  "
+        f"{_fmt_est4(total_est)} est"
+    ]
+    lines.append(
+        f"{'stage':<9}{'model':<11}{'int':<5}{'cost':<11}{'est(~)':<11}"
+        f"{'out':<7}{'cache':<8}{'time':<10}status"
+    )
+    for row in ordered:
+        captured, est, unknown_model = leg_cost(row, pricing)
+        duration, is_open = leg_duration(row)
+        stage = str(row.get("type") or "")
+        model = str(row.get("model") or "(unknown)")
+        interactive = "I" if row.get("is_interactive") else "-"
+        cost_col = _fmt_cost4(captured) if captured > 0 else "—"
+        if est > 0:
+            est_col = _fmt_est4(est)
+        elif unknown_model:
+            est_col = "n/a*"
+        else:
+            est_col = "—"
+        out_col = _fmt_tokens_compact(int(row.get("output_tokens") or 0))
+        cache_col = _fmt_tokens_compact(int(row.get("cache_read_tokens") or 0))
+        time_col = _fmt_duration_hms(duration, is_open=is_open)
+        status = str(row.get("status") or "")
+        note = "  *unknown model" if unknown_model else ""
+        lines.append(
+            f"{stage:<9}{model:<11}{interactive:<5}{cost_col:<11}{est_col:<11}"
+            f"{out_col:<7}{cache_col:<8}{time_col:<10}{status}{note}"
+        )
+    return "\n".join(lines)
+
+
 def format_burn_rate_line(session: SessionUsage) -> str | None:
     """One-line burn-rate summary for ``coord status``.
 

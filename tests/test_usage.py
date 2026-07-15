@@ -19,8 +19,11 @@ from coord.usage import (
     build_session_usage,
     collect_usage,
     format_burn_rate_line,
+    format_usage_by_issue,
+    format_usage_issue_drill,
     format_usage_report,
     parse_usage_from_log,
+    pricing_dict_from_config,
 )
 from coord.worker_events import WorkerSummary, update_summary, WorkerEvent
 
@@ -538,3 +541,208 @@ class TestUsageCommand:
         assert result.exit_code == 0
         assert "Per-model" in result.output
         assert "claude-haiku-4-5" in result.output
+
+
+# ── Per-issue rollup (#1115 CLI-1) ───────────────────────────────────────────
+#
+# The sealed acceptance suite (tests/acceptance/ms-37/test_usage_cli_1115.py)
+# pins the exact contract mocks. These unit tests instead cover the rendering
+# helpers and flag-wiring directly, with small ad hoc fixtures — not a
+# duplicate of the sealed suite's fixture/assertions.
+
+
+class TestPricingDictFromConfig:
+    def test_converts_all_four_rate_fields_per_model(self) -> None:
+        from coord.config import ModelRates, PricingConfig
+
+        cfg = PricingConfig(
+            models={"sonnet": ModelRates(input=3.0, output=15.0, cache_read=0.3, cache_creation=3.75)}
+        )
+        assert pricing_dict_from_config(cfg) == {
+            "sonnet": {"input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_creation": 3.75},
+        }
+
+
+class TestFormatUsageByIssue:
+    _ROWS = [
+        {
+            "issue_number": 10, "repo_name": "r1", "type": "work", "model": "sonnet",
+            "is_interactive": False, "status": "merged", "cost_usd": 1.0,
+            "input_tokens": 1_000, "output_tokens": 2_000,
+            "cache_read_tokens": 3_000, "cache_creation_tokens": 0,
+            "dispatched_at": 1_000.0, "finished_at": 1_600.0,
+        },
+        {
+            "issue_number": 11, "repo_name": "r2", "type": "review", "model": "opus",
+            "is_interactive": True, "status": "done", "cost_usd": None,
+            "input_tokens": 500, "output_tokens": 1_000,
+            "cache_read_tokens": 2_000, "cache_creation_tokens": 0,
+            "dispatched_at": 2_000.0, "finished_at": 2_300.0,
+        },
+    ]
+
+    def test_groups_desc_by_total_cost_with_header_and_footer(self) -> None:
+        from coord.config import PricingConfig
+        from coord.usage_rollup import Window, aggregate
+
+        window = Window(start=0.0, end=10_000.0, label="test")
+        result = aggregate(
+            self._ROWS, by="issue", window=window, pricing=pricing_dict_from_config(PricingConfig())
+        )
+        out = format_usage_by_issue(result, window.label)
+
+        assert "USAGE — by issue — window: test" in out
+        assert "#10" in out and "#11" in out
+        # #10: $1.0000 captured, no estimate needed → higher total than #11's
+        # small interactive-only estimate, so #10 sorts first (desc).
+        assert out.index("#10") < out.index("#11")
+        assert "$1.0000" in out
+        assert "Σ" in out and "captured" in out and "total" in out
+
+    def test_unknown_model_flags_only_the_affected_group(self) -> None:
+        from coord.config import PricingConfig
+        from coord.usage_rollup import Window, aggregate
+
+        rows = [dict(self._ROWS[0]), dict(self._ROWS[1], model="some-unmapped-model")]
+        window = Window(start=0.0, end=10_000.0, label="test")
+        result = aggregate(
+            rows, by="issue", window=window, pricing=pricing_dict_from_config(PricingConfig())
+        )
+        out = format_usage_by_issue(result, window.label)
+        row_11 = next(line for line in out.splitlines() if "#11" in line)
+        row_10 = next(line for line in out.splitlines() if "#10" in line)
+        assert "unknown-model:1" in row_11
+        assert "unknown-model" not in row_10
+
+
+class TestFormatUsageIssueDrill:
+    def test_no_rows_returns_a_clear_message(self) -> None:
+        from coord.config import PricingConfig
+
+        out = format_usage_issue_drill([], 42, PricingConfig())
+        assert "No usage data for issue #42" in out
+
+    def test_oldest_first_and_captured_vs_estimate(self) -> None:
+        from coord.config import PricingConfig
+
+        rows = [
+            {  # dispatched later — must render second
+                "issue_number": 5, "repo_name": "r1", "type": "smoke", "model": "sonnet",
+                "is_interactive": True, "status": "done", "cost_usd": None,
+                "input_tokens": 100, "output_tokens": 200,
+                "cache_read_tokens": 300, "cache_creation_tokens": 0,
+                "dispatched_at": 2_000.0, "finished_at": 2_100.0,
+            },
+            {  # dispatched earlier — must render first
+                "issue_number": 5, "repo_name": "r1", "type": "work", "model": "sonnet",
+                "is_interactive": False, "status": "merged", "cost_usd": 0.5,
+                "input_tokens": 100, "output_tokens": 200,
+                "cache_read_tokens": 300, "cache_creation_tokens": 0,
+                "dispatched_at": 1_000.0, "finished_at": 1_500.0,
+            },
+        ]
+        out = format_usage_issue_drill(rows, 5, PricingConfig())
+        assert out.index("work") < out.index("smoke")
+        assert "$0.5000" in out
+        assert "captured" in out and "est" in out
+
+    def test_unknown_model_gets_na_marker_never_silent_zero(self) -> None:
+        from coord.config import PricingConfig
+
+        rows = [{
+            "issue_number": 7, "repo_name": "r1", "type": "chat", "model": "some-custom-model",
+            "is_interactive": True, "status": "done", "cost_usd": None,
+            "input_tokens": 10, "output_tokens": 20,
+            "cache_read_tokens": 30, "cache_creation_tokens": 0,
+            "dispatched_at": 1_000.0, "finished_at": 1_010.0,
+        }]
+        out = format_usage_issue_drill(rows, 7, PricingConfig())
+        assert "n/a" in out
+        assert "unknown model" in out.lower()
+
+    def test_running_leg_has_no_dollar_signs(self) -> None:
+        from coord.config import PricingConfig
+
+        rows = [{
+            "issue_number": 9, "repo_name": "r1", "type": "work", "model": "sonnet",
+            "is_interactive": False, "status": "running", "cost_usd": None,
+            "input_tokens": 0, "output_tokens": 0,
+            "cache_read_tokens": 0, "cache_creation_tokens": 0,
+            "dispatched_at": 1_000.0, "finished_at": None,
+        }]
+        out = format_usage_issue_drill(rows, 9, PricingConfig())
+        row_line = next(line for line in out.splitlines() if "running" in line)
+        assert "$" not in row_line
+
+
+class TestUsageCommandByIssueAndDrillFlags:
+    """CLI-level wiring: ``coord usage --today --by-issue`` / ``--issue N``."""
+
+    @pytest.fixture
+    def coord_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, coord_db) -> Path:
+        import coord.usage as usage_mod
+        monkeypatch.setattr(usage_mod, "COORD_DIR", tmp_path)
+        monkeypatch.setattr(usage_mod, "LOGS_DIR", tmp_path / "logs")
+        return tmp_path
+
+    def test_by_issue_and_today_render_and_exit_zero(
+        self, coord_dir: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, valid_config_yaml: str
+    ) -> None:
+        import datetime as _dt
+
+        import coord.usage as usage_mod
+
+        now = _dt.datetime.now()
+        row = {
+            "issue_number": 77, "issue_title": "x", "repo_name": "demo",
+            "type": "work", "model": "sonnet", "is_interactive": False, "status": "done",
+            "cost_usd": 0.42,
+            "input_tokens": 100, "output_tokens": 200, "cache_read_tokens": 300,
+            "cache_creation_tokens": 0,
+            "dispatched_at": now.timestamp(), "finished_at": now.timestamp() + 60,
+        }
+        monkeypatch.setattr(usage_mod, "fetch_usage_rows", lambda *a, **k: [dict(row)])
+        cfg_path = tmp_path / "coordinator.yml"
+        cfg_path.write_text(valid_config_yaml)
+
+        result = CliRunner().invoke(
+            main, ["usage", "--config", str(cfg_path), "--today", "--by-issue"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "#77" in result.output
+        assert "$0.4200" in result.output
+
+    def test_issue_drill_unknown_issue_reports_no_data(
+        self, coord_dir: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, valid_config_yaml: str
+    ) -> None:
+        import coord.usage as usage_mod
+
+        monkeypatch.setattr(usage_mod, "fetch_usage_rows", lambda *a, **k: [])
+        cfg_path = tmp_path / "coordinator.yml"
+        cfg_path.write_text(valid_config_yaml)
+
+        result = CliRunner().invoke(main, ["usage", "--config", str(cfg_path), "--issue", "999"])
+        assert result.exit_code == 0, result.output
+        assert "No usage data for issue #999" in result.output
+
+    def test_issue_flag_takes_precedence_over_by_issue(
+        self, coord_dir: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, valid_config_yaml: str
+    ) -> None:
+        import coord.usage as usage_mod
+
+        monkeypatch.setattr(usage_mod, "fetch_usage_rows", lambda *a, **k: [])
+        cfg_path = tmp_path / "coordinator.yml"
+        cfg_path.write_text(valid_config_yaml)
+
+        result = CliRunner().invoke(
+            main, ["usage", "--config", str(cfg_path), "--by-issue", "--issue", "5"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "No usage data for issue #5" in result.output
+
+    def test_existing_default_view_still_works_unflagged(self, coord_dir: Path) -> None:
+        """#1115 requirement 5: the pre-existing default output must not regress."""
+        runner = CliRunner()
+        result = runner.invoke(main, ["usage"])
+        assert result.exit_code == 0
+        assert "No assignments found" in result.output
