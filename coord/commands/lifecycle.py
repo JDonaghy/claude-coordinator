@@ -328,13 +328,35 @@ def done(config_path: Path) -> None:
 @_CONFIG_OPTION
 @click.option("--host", "bind_host", default="0.0.0.0", show_default=True)
 @click.option("--port", "bind_port", default=7434, show_default=True, type=int)
-def web(config_path: Path, bind_host: str, bind_port: int) -> None:
+@click.option(
+    "--token",
+    "token",
+    default=None,
+    envvar="COORD_WEB_TOKEN",
+    help=(
+        "Bearer token gating the /ws/terminal PTY bridge (#1065); clients "
+        "connect with ?token=<token> (browsers can't set custom WS upgrade "
+        "headers). Resolves flag > $COORD_WEB_TOKEN > ~/.coord/web_token. "
+        "Prefer the file/env (a --token on the command line leaks via `ps`). "
+        "Unset -> open (tailnet ACL only)."
+    ),
+)
+def web(config_path: Path, bind_host: str, bind_port: int, token: str | None) -> None:
     import uvicorn
     from coord.dashboard.server import build_app
+    from coord.dashboard.terminal import resolve_web_token
 
     cfg = _load_config(config_path)
-    app = build_app(cfg)
+    token = resolve_web_token(token)
+    app = build_app(cfg, token=token)
     click.echo(f"coord web: dashboard at http://{bind_host}:{bind_port}")
+    if not token:
+        click.echo(
+            "  warning: no bearer token — the /ws/terminal PTY bridge is open "
+            "to anyone who can reach this port. Fine for dev; set one for a "
+            "production dashboard (echo <secret> > ~/.coord/web_token).",
+            err=True,
+        )
     uvicorn.run(app, host=bind_host, port=bind_port, log_level="info")
 
 
