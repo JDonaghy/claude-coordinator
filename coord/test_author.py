@@ -116,6 +116,24 @@ TEST_AUTHOR_INTERACTIVE_SYSTEM_PROMPT = (
 )
 
 
+def test_author_deny_commands(config: Config, repo_name: str) -> list[str]:
+    """Merge the repo's configured deny-list with :data:`TEST_AUTHOR_DENY_COMMANDS`.
+
+    Shared by :func:`dispatch_test_author` (the original dispatch) and
+    ``coord.auto_loop._dispatch_fix`` (a bounced test-author fix, #1176) so
+    the two call sites can't drift — a fix session POSTs `type="test-author"`
+    directly to `/assign` the same way the original dispatch does, and needs
+    the identical guardrails.
+    """
+    repo_cfg = config.repo(repo_name)
+    repo_deny = (
+        repo_cfg.worker_permissions.deny
+        if repo_cfg and repo_cfg.worker_permissions
+        else []
+    )
+    return list(dict.fromkeys(list(repo_deny) + TEST_AUTHOR_DENY_COMMANDS))
+
+
 def pick_test_author_machine(
     config: Config, repo_name: str, required_capability: str = ""
 ) -> Machine | None:
@@ -382,8 +400,7 @@ def dispatch_test_author(
             )
         )
 
-    repo_deny = repo_cfg.worker_permissions.deny if repo_cfg.worker_permissions else []
-    deny_commands = list(dict.fromkeys(list(repo_deny) + TEST_AUTHOR_DENY_COMMANDS))
+    deny_commands = test_author_deny_commands(config, repo_name)
 
     payload = {
         "repo_name": repo_name,

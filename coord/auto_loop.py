@@ -53,9 +53,17 @@ from coord.review import (
 )
 from coord.board_service import read_board, write_board
 from coord.state import record_dispatched_assignment
-from coord.test_author import TEST_AUTHOR_DENY_COMMANDS, TEST_AUTHOR_SYSTEM_PROMPT
+from coord.test_author import TEST_AUTHOR_SYSTEM_PROMPT, test_author_deny_commands
 
 log = logging.getLogger(__name__)
+
+
+# #1176 review: every assignment ``type`` value ``_dispatch_fix`` can emit,
+# kept in sync with the ``fix_type`` mapping in that function. Exposed so
+# ``coord.notify``'s fix-completion detector doesn't hardcode ``"work"`` and
+# silently miss a newer fix-dispatch type — the same class of bug as #1141
+# ("test-author was never added to WORK_LIKE_TYPES").
+FIX_DISPATCH_TYPES: frozenset[str] = frozenset({"work", "test-author"})
 
 
 # ── Action reporting ──────────────────────────────────────────────────────────
@@ -642,20 +650,6 @@ def _build_test_author_fix_briefing(
     return "\n".join(lines)
 
 
-def _test_author_deny_commands(config: Config, work: Assignment) -> list[str]:
-    """Merge the repo's configured deny-list with the test-author base
-    deny-list, same de-dup pattern as ``test_author.dispatch_test_author``
-    (#1176 — a test-author fix session needs the same guardrails as the
-    original dispatch, since it POSTs directly to ``/assign`` the same way)."""
-    repo_cfg = config.repo(work.repo_name)
-    repo_deny = (
-        repo_cfg.worker_permissions.deny
-        if repo_cfg and repo_cfg.worker_permissions
-        else []
-    )
-    return list(dict.fromkeys(list(repo_deny) + TEST_AUTHOR_DENY_COMMANDS))
-
-
 def _dispatch_fix(
     work: Assignment,
     briefing: str,
@@ -772,7 +766,7 @@ def _dispatch_fix(
         # `tests/acceptance/**` and doesn't carry the independence /
         # stay-RED rules a test-author session needs.
         payload["system_prompt"] = TEST_AUTHOR_SYSTEM_PROMPT
-        payload["deny_commands"] = _test_author_deny_commands(config, work)
+        payload["deny_commands"] = test_author_deny_commands(config, work.repo_name)
     # Escalated model per bounce iteration (None when pipeline
     # .escalate_fix_model is disabled — preserves today's no-model behaviour).
     # The board record keeps the alias for legibility; the wire payload is
