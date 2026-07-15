@@ -1694,7 +1694,7 @@ pub(crate) fn record_test_verdict_conn(
 /// #590 Phase 2: POST the verdict to the daemon when a board service is set
 /// (the thin client's local coord.db is the wrong DB). Mirrors the smoke_test
 /// derivation in [`record_test_verdict_conn`] so the daemon writes the same
-/// columns. ureq is built without the `json` feature, so serialize + send_string.
+/// columns. Built on the shared [`post_daemon_json`] helper (#1012).
 pub(crate) fn record_test_verdict_remote(
     assignment_id: &str,
     verdict: &str,
@@ -1713,19 +1713,80 @@ pub(crate) fn record_test_verdict_remote(
         "smoke_test": smoke_test,
         "smoke_test_reason": smoke_reason,
     });
-    let body_str = serde_json::to_string(&body).map_err(|e| format!("{e}"))?;
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(std::time::Duration::from_secs(5))
-        .timeout(std::time::Duration::from_secs(30))
-        .build();
-    let mut req = agent
-        .post(&format!("{url}/test-verdict"))
-        .set("Content-Type", "application/json");
-    if let Some(t) = token.as_deref() {
-        req = req.set("Authorization", &format!("Bearer {t}"));
-    }
-    req.send_string(&body_str).map_err(|e| format!("{e}"))?;
+    post_daemon_json(&url, token.as_deref(), "/test-verdict", &body)?;
     Ok(())
+}
+
+/// #1012: (add, remove) label sets for each `dispatch_board_row_command`
+/// subcommand — the shared entry point behind the Board row-menu actions
+/// Refine, Send-to-Pipeline (`track`), Mark Refined (`ready`), and
+/// Drop-to-Backlog/Drop-to-Refining (`backlog`/`refine`). These mirror the
+/// Python `_apply_label_change` call sites **exactly**:
+/// `coord/commands/chat.py` (`ready`, `refine`) and
+/// `coord/commands/issues.py` (`track`, `backlog`). Any drift here silently
+/// desyncs the Rust direct-POST path from the `coord` CLI fallback, so keep
+/// these lists byte-for-byte in sync with those functions.
+///
+/// Returns `None` for a subcommand this seam doesn't know how to translate
+/// to a label change — the caller falls back to the `coord` subprocess for
+/// those (e.g. any future subcommand added to `dispatch_board_row_command`
+/// without also updating this table).
+pub(crate) fn label_change_for_subcommand(
+    subcommand: &str,
+) -> Option<(&'static [&'static str], &'static [&'static str])> {
+    match subcommand {
+        // coord/commands/chat.py::ready
+        "ready" => Some((&["status:ready"], &["status:refining", "status:backlog"])),
+        // coord/commands/chat.py::refine
+        "refine" => Some((&["status:refining"], &["status:ready"])),
+        // coord/commands/issues.py::track
+        "track" => Some((
+            &["coord", "status:ready"],
+            &["status:refining", "status:backlog"],
+        )),
+        // coord/commands/issues.py::backlog
+        "backlog" => Some((&[], &["status:refining", "status:ready"])),
+        _ => None,
+    }
+}
+
+/// #1012: POST an add/remove label change straight to the daemon's
+/// `/issue-label` seam (mirrors Python `state.apply_issue_labels` /
+/// `_apply_label_change`), built on the shared [`post_daemon_json`] helper.
+/// Returns `(new_labels, changed)` — `changed` is `false` when every `add`
+/// label was already present and every `remove` label was already absent
+/// (the daemon computes this the same way the CLI's no-op detection does).
+pub(crate) fn apply_issue_labels_remote(
+    url: &str,
+    token: Option<&str>,
+    repo_name: &str,
+    issue_number: u64,
+    add: &[&str],
+    remove: &[&str],
+    repo_github: Option<&str>,
+) -> Result<(Vec<String>, bool), String> {
+    let body = serde_json::json!({
+        "repo_name": repo_name,
+        "issue_number": issue_number,
+        "add": add,
+        "remove": remove,
+        "repo_github": repo_github,
+    });
+    let resp = post_daemon_json(url, token, "/issue-label", &body)?;
+    let labels = resp
+        .get("labels")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let changed = resp
+        .get("changed")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    Ok((labels, changed))
 }
 
 pub(crate) fn record_test_verdict_db(

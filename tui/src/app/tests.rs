@@ -32303,6 +32303,251 @@ Milestone tracking issue.
         );
     }
 
+    // ── #1012: direct daemon POST for board row-menu label mutations ───────
+
+    /// `label_change_for_subcommand` mirrors the Python `_apply_label_change`
+    /// call sites in `coord/commands/chat.py` (`ready`, `refine`) and
+    /// `coord/commands/issues.py` (`track`, `backlog`) — this pins the exact
+    /// add/remove label sets so a future edit to either side is caught here
+    /// instead of silently desyncing the Rust direct-POST path from the CLI.
+    #[test]
+    fn label_change_for_subcommand_matches_python_label_sets() {
+        assert_eq!(
+            label_change_for_subcommand("ready"),
+            Some((
+                ["status:ready"].as_slice(),
+                ["status:refining", "status:backlog"].as_slice()
+            ))
+        );
+        assert_eq!(
+            label_change_for_subcommand("refine"),
+            Some((["status:refining"].as_slice(), ["status:ready"].as_slice()))
+        );
+        assert_eq!(
+            label_change_for_subcommand("track"),
+            Some((
+                ["coord", "status:ready"].as_slice(),
+                ["status:refining", "status:backlog"].as_slice()
+            ))
+        );
+        assert_eq!(
+            label_change_for_subcommand("backlog"),
+            Some((
+                [].as_slice(),
+                ["status:refining", "status:ready"].as_slice()
+            ))
+        );
+        assert_eq!(
+            label_change_for_subcommand("some-unmapped-subcommand"),
+            None,
+            "an unmapped subcommand must fall back to the coord subprocess, not panic/guess",
+        );
+    }
+
+    /// #1012: with no board service configured (the default in tests —
+    /// `resolve_board_service()` returns `None`), `dispatch_board_row_command`
+    /// must keep spawning the `coord` subprocess unchanged — the acceptance
+    /// criterion that behavior is identical to today when no daemon is
+    /// configured.
+    #[test]
+    fn dispatch_board_row_command_falls_back_to_subprocess_without_board_service() {
+        let mut app = make_app_default();
+        app.data.open_issues.push(OpenIssue {
+            repo_name: "repo-a".to_string(),
+            number: 42,
+            title: "Issue 42".to_string(),
+            body: String::new(),
+            state: "open".to_string(),
+            labels: Vec::new(),
+            milestone_number: None,
+            milestone_title: None,
+        });
+        let target = ContextMenuTarget::BoardRow {
+            issue_number: Some(42),
+            repo_name: Some("repo-a".to_string()),
+            lifecycle: BoardRowLifecycle::Backlog,
+        };
+        let handled =
+            app.dispatch_board_row_command(&target, "track", "Send to Pipeline", "#{} → Pipeline");
+        assert!(handled);
+        assert_eq!(
+            app.command_runner.spawned_calls,
+            vec![vec![
+                "track".to_string(),
+                "repo-a".to_string(),
+                "42".to_string(),
+            ]],
+            "no board service configured — must fall back to the coord subprocess unchanged"
+        );
+    }
+
+    /// #1012 core acceptance: this is the black-box TuiDriver coverage the
+    /// issue requires — right-click a real Backlog board row, click "Send to
+    /// Pipeline" in the rendered context menu, and prove the action reached
+    /// the daemon's `/issue-label` seam directly (an HTTP POST landed on the
+    /// mock server) while spawning **zero** `coord` subprocesses. Mirrors the
+    /// full right-click event chain from `tuidriver_right_click_opens_board_context_menu`
+    /// (#741) rather than calling `dispatch_context_menu_action` directly.
+    #[test]
+    fn tuidriver_send_to_pipeline_posts_directly_to_daemon_no_subprocess() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_app_default();
+        app.data.open_issues.push(OpenIssue {
+            repo_name: "repo-a".to_string(),
+            number: 42,
+            title: "Issue 42".to_string(),
+            body: String::new(),
+            state: "open".to_string(),
+            labels: Vec::new(),
+            milestone_number: None,
+            milestone_title: None,
+        });
+        app.data.pipeline_repos = vec![("repo-a".to_string(), "org/repo-a".to_string())];
+        app.rebuild_board_sidebar();
+
+        let mock = MockBoardService::start(r#"{"labels": ["coord", "status:ready"], "changed": true}"#);
+        let _guard = set_test_board_service(mock.url(), None);
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+
+        // #857: a non-in-flight ("No milestone") group starts collapsed —
+        // click its header to reveal the issue row underneath (same click
+        // flow as `tuidriver_board_milestone_click_expands_collapsed_milestone`).
+        let (mex, mey) = driver.find("No milestone").unwrap_or_else(|| {
+            panic!(
+                "#1012: 'No milestone' group header not found on initial render:\n{}",
+                driver.screen()
+            )
+        });
+        driver.click(mex, mey);
+
+        let (x, y) = driver.find("#42").or_else(|| driver.find("Issue 42")).unwrap_or_else(|| {
+            panic!(
+                "#1012: could not find Backlog board row '#42' / 'Issue 42' after expanding \
+                 'No milestone':\n{}",
+                driver.screen()
+            )
+        });
+
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: MouseButton::Right,
+            position: Point::new(x, y),
+            modifiers: Modifiers::default(),
+        });
+        let menu_screen = driver.screen();
+        assert!(
+            menu_screen.contains("Send to Pipeline"),
+            "#1012: right-click on a Backlog row must offer 'Send to Pipeline':\n{}",
+            menu_screen
+        );
+
+        // Activate the pre-selected first item ("Send to Pipeline") via
+        // Enter rather than a second mouse click on the menu — a mouse
+        // click on context-menu item rows hits a pre-existing quadraui
+        // hit-test/paint offset (menu item hit-regions don't account for
+        // the border row the TUI rasteriser draws around them), same
+        // caveat documented on
+        // `tuidriver_open_milestone_chat_updates_activity_chrome_not_just_content`.
+        // `context_menu_activate_selected` (driven by Enter) acts on
+        // `selected_idx` directly and isn't affected by that offset.
+        driver.press_named(NamedKey::Enter);
+
+        let requests = mock.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "expected exactly one request to reach the daemon; got {:?}",
+            requests
+        );
+        assert!(
+            requests[0].starts_with("POST /issue-label"),
+            "'Send to Pipeline' must POST /issue-label directly to the daemon; got {:?}",
+            requests[0]
+        );
+        // The zero-subprocess-spawns assertion is checked directly against
+        // `command_runner.spawned_calls` in the direct-app unit test
+        // `dispatch_board_row_command_posts_direct_no_subprocess_with_board_service`
+        // below — the TuiDriver shell adapter here doesn't expose the wrapped
+        // `CoordApp` for a typed field check, only the rendered screen (same
+        // limitation documented on `sessions_panel_stop_running_session_shows_feedback_toast`).
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("adding coord label"),
+            "expected the 'Send to Pipeline' success toast body \
+             ('#42 → Pipeline (adding coord label…)'), got:\n{}",
+            screen
+        );
+    }
+
+    /// #1012: companion to the TuiDriver test above — asserts the
+    /// zero-subprocess-spawns half of the acceptance criterion directly
+    /// against `command_runner.spawned_calls`, which the TuiDriver shell
+    /// adapter doesn't expose (see the comment in the TuiDriver test).
+    /// Drives `dispatch_board_row_command` directly against the same
+    /// in-process mock server.
+    #[test]
+    fn dispatch_board_row_command_posts_direct_no_subprocess_with_board_service() {
+        let mut app = make_app_default();
+        app.data.open_issues.push(OpenIssue {
+            repo_name: "repo-a".to_string(),
+            number: 42,
+            title: "Issue 42".to_string(),
+            body: String::new(),
+            state: "open".to_string(),
+            labels: Vec::new(),
+            milestone_number: None,
+            milestone_title: None,
+        });
+        app.data.pipeline_repos = vec![("repo-a".to_string(), "org/repo-a".to_string())];
+
+        let mock = MockBoardService::start(r#"{"labels": ["coord", "status:ready"], "changed": true}"#);
+        let _guard = set_test_board_service(mock.url(), None);
+
+        let target = ContextMenuTarget::BoardRow {
+            issue_number: Some(42),
+            repo_name: Some("repo-a".to_string()),
+            lifecycle: BoardRowLifecycle::Backlog,
+        };
+        let handled = app.dispatch_board_row_command(
+            &target,
+            "track",
+            "Send to Pipeline",
+            "#{} → Pipeline (adding coord label…)",
+        );
+        assert!(handled);
+
+        assert!(
+            app.command_runner.spawned_calls.is_empty(),
+            "a board service is configured — must NOT fall back to the coord subprocess; got {:?}",
+            app.command_runner.spawned_calls,
+        );
+
+        let requests = mock.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "expected exactly one request to reach the daemon; got {:?}",
+            requests
+        );
+        assert!(
+            requests[0].starts_with("POST /issue-label"),
+            "must POST /issue-label directly; got {:?}",
+            requests[0]
+        );
+
+        assert!(
+            app.toasts
+                .last()
+                .map(|t| t.0.body.contains("adding coord label"))
+                .unwrap_or(false),
+            "expected the success toast body, got: {:?}",
+            app.toasts.last().map(|t| &t.0.body)
+        );
+    }
+
     // ── #1094: Audit panel row list migrated to a `DataTable` ───────────────
     //
     // No Gate-A mock/contract amendment for #1094 has been authored yet
