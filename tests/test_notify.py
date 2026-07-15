@@ -1328,3 +1328,100 @@ class TestSmokeCompletionVerdict:
             "test-mode:smoke must suppress auto-certification; "
             f"test_state should be None but got {row['test_state']!r}"
         )
+
+
+# ── #1176 review: fix-completion → re-review handoff type coverage ─────────
+
+
+class TestFixCompletionDispatchTypes:
+    """``notify.run()``'s fix-completion detector must recognize every
+    assignment ``type`` that ``auto_loop._dispatch_fix`` can emit
+    (``coord.auto_loop.FIX_DISPATCH_TYPES``), not a hardcoded ``"work"`` —
+    otherwise a completed fix of a different type never reaches
+    ``run_for_fix_transition`` and the ``max_review_iterations``
+    terminal-iteration stop is skipped for it. Same bug shape as #1141
+    ("test-author was never added to WORK_LIKE_TYPES")."""
+
+    def _record_fix_assignment(
+        self, assignment_id: str, *, fix_type: str, parent_id: str = "review-parent-1",
+    ) -> None:
+        """Insert a completed-bounce-fix assignment directly into the DB, as
+        ``auto_loop._dispatch_fix`` would have recorded it: review_of_assignment_id
+        set, issue_title starting with "[fix-"."""
+        from coord.models import Assignment
+        from coord.state import record_dispatched_assignment
+
+        assignment = Assignment(
+            assignment_id=assignment_id,
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=42,
+            issue_title="[fix-1] Fix the thing",
+            briefing="fix briefing",
+            type=fix_type,
+            review_of_assignment_id=parent_id,
+            dispatched_at=1000.0,
+        )
+        record_dispatched_assignment(assignment=assignment, repo_github="acme/api")
+
+    def test_test_author_fix_completion_triggers_fix_transition(
+        self, coord_dir: Path, config: Config
+    ) -> None:
+        """Regression guard for the review finding: a completed type="test-author"
+        fix (the new type this PR introduced) must reach run_for_fix_transition,
+        not silently fall through to the generic bulk review sweep only."""
+        self._record_fix_assignment("fix-ta-1", fix_type="test-author")
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("fix-ta-1", "done")],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment"), \
+             patch(
+                 "coord.auto_loop.run_for_fix_transition", return_value=[]
+             ) as mock_fix:
+            notify_mod.run(config)
+
+        mock_fix.assert_called_once()
+        assert mock_fix.call_args.args[0] == "fix-ta-1"
+
+    def test_work_fix_completion_still_triggers_fix_transition(
+        self, coord_dir: Path, config: Config
+    ) -> None:
+        """Regression guard: the long-standing type="work" fix path is unchanged
+        by switching the check to FIX_DISPATCH_TYPES."""
+        self._record_fix_assignment("fix-w-1", fix_type="work")
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("fix-w-1", "done")],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment"), \
+             patch(
+                 "coord.auto_loop.run_for_fix_transition", return_value=[]
+             ) as mock_fix:
+            notify_mod.run(config)
+
+        mock_fix.assert_called_once()
+        assert mock_fix.call_args.args[0] == "fix-w-1"
+
+    def test_review_type_completion_does_not_trigger_fix_transition(
+        self, coord_dir: Path, config: Config
+    ) -> None:
+        """A completed type="review" assignment (not a fix bounce) must never
+        be treated as a fix completion, even if it happens to carry
+        review_of_assignment_id / a "[fix-" title."""
+        self._record_fix_assignment("rev-not-fix", fix_type="review")
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("rev-not-fix", "done")],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.dispatch.github_ops.post_issue_comment"), \
+             patch("coord.notify._try_parse_and_post_review", return_value=True), \
+             patch(
+                 "coord.auto_loop.run_for_fix_transition", return_value=[]
+             ) as mock_fix:
+            notify_mod.run(config)
+
+        mock_fix.assert_not_called()

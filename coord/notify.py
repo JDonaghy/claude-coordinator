@@ -1254,15 +1254,23 @@ def run(
         posted.append(transition)
         # Track completed reviews for auto-loop processing below.
         from coord.comments import EVENT_COMPLETION  # noqa: PLC0415
+        from coord.auto_loop import FIX_DISPATCH_TYPES  # noqa: PLC0415
         if (
             record.get("type") == "review"
             and transition.event == EVENT_COMPLETION
         ):
             review_completions.append((transition, record, entry))
-        # Track completed fix workers (type="work", review_of_assignment_id set,
-        # title starts with "[fix-") for auto-loop re-review dispatch.
+        # Track completed fix workers (type in FIX_DISPATCH_TYPES,
+        # review_of_assignment_id set, title starts with "[fix-") for
+        # auto-loop re-review dispatch. #1176 review: this used to hardcode
+        # type == "work", which meant a completed type="test-author" fix
+        # (added by #1176 itself) never reached run_for_fix_transition —
+        # the same class of bug as #1141 ("test-author was never added to
+        # WORK_LIKE_TYPES"). FIX_DISPATCH_TYPES is the single source of
+        # truth for what _dispatch_fix can emit, so a future fix-dispatch
+        # type can't reintroduce this gap silently.
         elif (
-            record.get("type") == "work"
+            record.get("type") in FIX_DISPATCH_TYPES
             and transition.event == EVENT_COMPLETION
             and record.get("review_of_assignment_id")
             and (record.get("issue_title") or "").startswith("[fix-")
