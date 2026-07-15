@@ -2671,6 +2671,80 @@
     }
 
     #[test]
+    fn acceptance_menu_offers_interactive_author_variant_only_for_milestone_work_order_member() {
+        // #1174: the human-attended sibling must appear/disappear exactly
+        // like the headless "Author acceptance tests" item it mirrors —
+        // present on a work-order member row, absent on an ordinary row.
+        let member_app = make_pipeline_app_for_acceptance_menu_test(0, "/nonexistent/api-repo");
+        let items = member_app.context_menu_items_for_pipeline_row(
+            Some(42),
+            &PipelineRowLifecycle::New,
+            Some("api"),
+        );
+        assert!(
+            items
+                .iter()
+                .any(|i| i.action_id.as_deref() == Some("author-acceptance-tests-interactive")),
+            "work-order member row must offer 'Author acceptance tests (interactive)'"
+        );
+
+        let non_member_app = make_pipeline_app_for_acceptance_menu_test(1, "/nonexistent/api-repo");
+        let items = non_member_app.context_menu_items_for_pipeline_row(
+            Some(99),
+            &PipelineRowLifecycle::New,
+            Some("api"),
+        );
+        assert!(
+            !items
+                .iter()
+                .any(|i| i.action_id.as_deref() == Some("author-acceptance-tests-interactive")),
+            "non-member row must NOT offer 'Author acceptance tests (interactive)'"
+        );
+    }
+
+    #[test]
+    fn author_acceptance_tests_interactive_item_disabled_until_contract_exists_on_disk() {
+        // #1174: same on-disk gate as the headless action — the
+        // independent test-author reads the Gate A contract from its own
+        // checkout regardless of who's watching, so JIT authoring against
+        // a missing contract is a guaranteed failure either way.
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let tmp = std::env::temp_dir()
+            .join(format!("coord-tui-test-gate-a-contract-interactive-{}", tid));
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let app = make_pipeline_app_for_acceptance_menu_test(0, tmp.to_str().unwrap());
+        let items = app.context_menu_items_for_pipeline_row(
+            Some(42),
+            &PipelineRowLifecycle::New,
+            Some("api"),
+        );
+        let item = items
+            .iter()
+            .find(|i| i.action_id.as_deref() == Some("author-acceptance-tests-interactive"))
+            .expect("work-order member row must offer the interactive author action");
+        assert!(item.disabled, "must be disabled before contract.md exists on disk");
+
+        let contract_dir = tmp.join("tests").join("acceptance").join("ms-9");
+        std::fs::create_dir_all(&contract_dir).unwrap();
+        std::fs::write(contract_dir.join("contract.md"), "# Gate A contract\n").unwrap();
+
+        let app = make_pipeline_app_for_acceptance_menu_test(0, tmp.to_str().unwrap());
+        let items = app.context_menu_items_for_pipeline_row(
+            Some(42),
+            &PipelineRowLifecycle::New,
+            Some("api"),
+        );
+        let item = items
+            .iter()
+            .find(|i| i.action_id.as_deref() == Some("author-acceptance-tests-interactive"))
+            .expect("work-order member row must offer the interactive author action");
+        assert!(!item.disabled, "must enable once contract.md exists on disk");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn record_acceptance_item_disabled_until_a_completed_work_assignment_exists() {
         // #1060: "Record acceptance" needs a completed work assignment with
         // a branch to resolve the SHA from — same gate Testing/Merge use.
@@ -2994,6 +3068,135 @@
              error string, got: {}",
             toast.body,
         );
+    }
+
+    /// #1174: the interactive action must send `coord acceptance author
+    /// <repo> <tracking_issue> --issue <N> --for-path <p> --interactive`
+    /// into a REAL PTY — not just build the right string in the abstract.
+    /// Spawns a genuine shell (mirrors the established pattern at
+    /// `mouse_main_scroll_terminal_wheel_falls_back_to_local_scrollback`
+    /// and the `coord terminal attach` fleet-terminal tests) and polls its
+    /// echoed output for the exact command line, since the shell reflects
+    /// typed keystrokes back before executing them.
+    #[test]
+    #[cfg(unix)]
+    fn author_acceptance_tests_interactive_action_sends_command_with_for_path() {
+        use std::time::{Duration, Instant};
+
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let tmp = std::env::temp_dir()
+            .join(format!("coord-tui-test-acceptance-author-interactive-{}", tid));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let contract_dir = tmp.join("tests").join("acceptance").join("ms-9");
+        std::fs::create_dir_all(&contract_dir).unwrap();
+        std::fs::write(contract_dir.join("contract.md"), "# Gate A contract\n").unwrap();
+
+        let mut app = make_pipeline_app_for_acceptance_menu_test(0, tmp.to_str().unwrap());
+        app.data
+            .pipeline_acceptance_routes
+            .insert("api".to_string(), vec!["coord/**".to_string()]);
+
+        let target = ContextMenuTarget::PipelineRow {
+            issue_number: Some(42),
+            repo_name: Some("api".to_string()),
+            lifecycle: PipelineRowLifecycle::New,
+        };
+        let handled = app.dispatch_context_menu_action("author-acceptance-tests-interactive", &target);
+        assert!(handled, "author-acceptance-tests-interactive must be a recognised action");
+
+        let sess = app
+            .terminal_session
+            .as_mut()
+            .expect("a real terminal session must be spawned");
+
+        let start = Instant::now();
+        let mut text = String::new();
+        while start.elapsed() < Duration::from_secs(5) {
+            sess.poll();
+            text = sess.full_text();
+            if text.contains("acceptance author") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            text.contains("acceptance author api 751 --issue 42 --for-path 'coord/**' --interactive"),
+            "expected the full interactive author command in the PTY's echoed \
+             output, got:\n{text}",
+        );
+
+        sess.write_input(b"exit\r");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// #1174 TuiDriver black-box: open the context menu for a work-order-
+    /// member Pipeline row via the Menu-key shortcut (`.`, the same
+    /// keyboard path `context_menu_target_for_selection`'s doc describes —
+    /// equivalent to a right-click on the selected row, without depending
+    /// on the row's exact pixel geometry), `find` the "Author acceptance
+    /// tests (interactive)" entry — never a hardcoded coordinate — click
+    /// it, and assert the visible dispatch feedback renders. The exact
+    /// command content (including `--for-path`) is asserted directly
+    /// against the real PTY in the companion direct-app test above; the
+    /// TuiDriver shell adapter doesn't expose the wrapped `CoordApp` for a
+    /// typed field check (see the identical split used by
+    /// `sessions_panel_stop_running_session_shows_feedback_toast`).
+    #[test]
+    fn tuidriver_author_acceptance_tests_interactive_menu_item_dispatches() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let tmp = std::env::temp_dir()
+            .join(format!("coord-tui-test-tuidriver-acceptance-author-interactive-{}", tid));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let contract_dir = tmp.join("tests").join("acceptance").join("ms-9");
+        std::fs::create_dir_all(&contract_dir).unwrap();
+        std::fs::write(contract_dir.join("contract.md"), "# Gate A contract\n").unwrap();
+
+        let app = make_pipeline_app_for_acceptance_menu_test(0, tmp.to_str().unwrap());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+
+        // Open the context menu for the currently-selected Pipeline row via
+        // the keyboard shortcut (`.`) — equivalent to a right-click on the
+        // row without needing to locate its exact pixel position first.
+        driver.press(Key::Char('.'));
+        assert!(
+            driver.screen_contains("Author acceptance tests (interactive)"),
+            "context menu must offer the interactive author action for a \
+             work-order member row with an existing contract.md:\n{}",
+            driver.screen(),
+        );
+
+        let (x, y) = driver
+            .find("Author acceptance tests (interactive)")
+            .unwrap_or_else(|| {
+                panic!(
+                    "#1174: could not find 'Author acceptance tests (interactive)' \
+                     on screen:\n{}",
+                    driver.screen()
+                )
+            });
+        // `find` returns the CENTRE of the matched screen row (row + 0.5).
+        // The `.`/right-click context-menu anchor is itself a half-integer
+        // coordinate (`list_b.y + lh * 1.5`), so every item's hit-test rect
+        // is `[row + 0.5, row + 1.5)` one item-height below where it visibly
+        // renders — clicking at the exact row-centre `find` returns lands on
+        // the *next* item's rect (its upper bound is exclusive). Nudge
+        // upward by less than one row so the click still lands inside the
+        // same visible cell but inside the item's own `[y, y+1)` hit
+        // region — a systemic half-cell quirk of the fractional-anchor menu
+        // layout, not a per-item pixel guess.
+        driver.click(x, y - 0.1);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Launched interactive test-author for"),
+            "clicking the interactive author action must render visible \
+             dispatch feedback:\n{}",
+            screen,
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -22629,6 +22832,69 @@
         assert!(
             cmd2.contains(r"'a'\''b' 2"),
             "embedded single quotes must be escaped; got: {cmd2:?}",
+        );
+    }
+
+    // ── #1174: `coord acceptance author --interactive` launch line ────────
+
+    #[test]
+    fn build_acceptance_author_interactive_launch_cmd_basic() {
+        // No config path, no --for-path: `REPO TRACKING_ISSUE --issue N
+        // --interactive`, single line, auto-submitted.
+        let cmd = build_acceptance_author_interactive_launch_cmd(None, "api", 751, 42, None);
+        assert_eq!(cmd, "coord acceptance author api 751 --issue 42 --interactive\r");
+    }
+
+    #[test]
+    fn build_acceptance_author_interactive_launch_cmd_injects_config_and_for_path() {
+        // #1151: --for-path must thread through the interactive flavour
+        // exactly like the headless dispatch, or a routed repo's CLI-side
+        // gate rejects the launch silently once it's typed into the PTY.
+        let cmd = build_acceptance_author_interactive_launch_cmd(
+            Some("/home/john/src/claude-coordinator/coordinator.yml"),
+            "api",
+            751,
+            42,
+            Some("coord/**"),
+        );
+        assert_eq!(
+            cmd,
+            "coord --config /home/john/src/claude-coordinator/coordinator.yml \
+             acceptance author api 751 --issue 42 --for-path 'coord/**' --interactive\r",
+        );
+    }
+
+    #[test]
+    fn build_acceptance_author_interactive_launch_cmd_ends_with_single_cr() {
+        let cmd = build_acceptance_author_interactive_launch_cmd(None, "api", 751, 42, None);
+        assert!(cmd.ends_with('\r'), "must end with \\r; got: {cmd:?}");
+        assert_eq!(cmd.matches('\r').count(), 1, "exactly one \\r; got: {cmd:?}");
+        assert!(!cmd.contains('\n'), "must not embed newlines: {cmd:?}");
+    }
+
+    #[test]
+    fn build_acceptance_author_interactive_launch_cmd_quotes_repo_with_spaces() {
+        let cmd = build_acceptance_author_interactive_launch_cmd(None, "my repo", 751, 42, None);
+        assert!(
+            cmd.contains("'my repo' 751"),
+            "repo with spaces must be single-quoted; got: {cmd:?}",
+        );
+    }
+
+    #[test]
+    fn build_acceptance_author_interactive_launch_cmd_quotes_for_path_glob() {
+        // A glob like `coord/**` has no shell metachars that need quoting,
+        // but a route with a space must still come through single-quoted.
+        let cmd = build_acceptance_author_interactive_launch_cmd(
+            None,
+            "api",
+            751,
+            42,
+            Some("weird path/**"),
+        );
+        assert!(
+            cmd.contains("--for-path 'weird path/**' --interactive"),
+            "for_path with spaces must be single-quoted; got: {cmd:?}",
         );
     }
 

@@ -736,6 +736,17 @@ impl CoordApp {
                     );
                     author_item.disabled = !self.gate_a_contract_exists_for(iss);
                     items.push(author_item);
+                    // #1174 (docs/ORACLE_LOOP.md, #1173): human-attended
+                    // sibling of the headless dispatch above — same gate
+                    // (contract.md must exist on disk), consumes `coord
+                    // acceptance author --interactive` rather than
+                    // reimplementing any PTY plumbing here.
+                    let mut author_interactive_item = ContextMenuItem::action(
+                        "author-acceptance-tests-interactive",
+                        "Author acceptance tests (interactive)",
+                    );
+                    author_interactive_item.disabled = !self.gate_a_contract_exists_for(iss);
+                    items.push(author_interactive_item);
                     // "Record acceptance" re-runs the sealed suite
                     // externally against the pushed SHA — needs a completed
                     // work assignment with a branch to resolve that SHA
@@ -5808,6 +5819,16 @@ impl CoordApp {
             // `coord acceptance author <repo> <tracking_issue> --issue N`.
             "author-acceptance-tests" => {
                 self.dispatch_acceptance_author_for_selected_pipeline_row();
+                true
+            }
+            // #1174 (docs/ORACLE_LOOP.md, #1173): human-attended
+            // test-authoring session — `coord acceptance author <repo>
+            // <tracking_issue> --issue N --interactive`, launched into the
+            // standalone Terminal pane like Test/Review/Merge's
+            // "(interactive)" actions.
+            "author-acceptance-tests-interactive" => {
+                self.pipeline_detail_tab = PipelineDetailTab::Terminal;
+                self.launch_acceptance_author_interactive_for_selected_pipeline_row();
                 true
             }
             // #1060: external trust-gate re-run against the pushed SHA —

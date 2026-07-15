@@ -296,6 +296,50 @@ pub(crate) fn tui_pipeline_layout(view: &QuiPipelineView, rect: Rect) -> quadrau
     )
 }
 
+/// #1174 (docs/ORACLE_LOOP.md, #1173): build the local launcher line for
+/// the human-attended test-author session — `coord acceptance author
+/// --interactive`'s Pipeline-row-menu counterpart to
+/// `build_interactive_launch_cmd`'s Work/Review/Test/Merge lines (see
+/// `sessions.rs`).
+///
+/// Unlike those, `coord acceptance author` takes `REPO TRACKING_ISSUE`
+/// positionals plus `--issue <N>` (the JIT per-issue slice, #1171) rather
+/// than `MACHINE REPO ISSUE` — there is no work_aid and, unlike the
+/// generic flavours, no explicit machine argument here: the CLI
+/// auto-picks a qualified machine, exactly like the headless
+/// `dispatch_acceptance_author_for_selected_pipeline_row` path already
+/// does (#1060). `for_path` threads `--for-path` through exactly like the
+/// headless dispatch (#1151) — omitting it on a routed repo hits the
+/// CLI's routing-gate rejection instead of a clean dispatch. As with
+/// `build_interactive_launch_cmd`, the trailing `\r` auto-submits the
+/// line so the launcher starts immediately, and `repo`/`for_path` are
+/// shell-quoted via `shell_quote_arg` so values containing spaces or
+/// shell metacharacters can't break the line.
+pub(crate) fn build_acceptance_author_interactive_launch_cmd(
+    config_path: Option<&str>,
+    repo: &str,
+    tracking_issue: u64,
+    issue_num: u64,
+    for_path: Option<&str>,
+) -> String {
+    let cfg = match config_path {
+        Some(p) if !p.is_empty() => format!("--config {} ", shell_quote_arg(p)),
+        _ => String::new(),
+    };
+    let for_path_flag = match for_path {
+        Some(p) if !p.is_empty() => format!(" --for-path {}", shell_quote_arg(p)),
+        _ => String::new(),
+    };
+    format!(
+        "coord {}acceptance author {} {} --issue {}{} --interactive\r",
+        cfg,
+        shell_quote_arg(repo),
+        tracking_issue,
+        issue_num,
+        for_path_flag,
+    )
+}
+
 /// Status badge text + colour for the Pipeline sidebar row.
 ///
 /// Colour mapping (semantic → `quadraui::Theme` field, overridden per palette):
@@ -2060,6 +2104,53 @@ impl CoordApp {
             .is_file()
     }
 
+    /// #1174: resolve `(issue, repo, tracking_issue, for_path)` for the
+    /// selected pipeline row's acceptance-author dispatch — shared by the
+    /// headless (`dispatch_acceptance_author_for_selected_pipeline_row`,
+    /// #1060) and interactive
+    /// (`launch_acceptance_author_interactive_for_selected_pipeline_row`,
+    /// #1173) variants so the gating logic and toast wording live in one
+    /// place rather than being duplicated between the two dispatch shapes.
+    /// `label` is the caller's toast title, pushed on any resolution
+    /// failure. Returns `None` (having already pushed the appropriate
+    /// toast, except for the "no row selected" case which is a silent
+    /// no-op like every other selection-dependent dispatcher here) when
+    /// resolution fails.
+    fn resolve_acceptance_author_target(
+        &mut self,
+        label: &str,
+    ) -> Option<(PipelineIssue, String, u64, Option<String>)> {
+        let idx = self.pipeline_sel?;
+        let issue = self.pipeline_issues.get(idx)?.clone();
+        let Some(repo) = issue.coord_repo.clone() else {
+            self.push_toast(
+                label,
+                "No local repo mapping for this issue — cannot dispatch.",
+                ToastSeverity::Warning,
+            );
+            return None;
+        };
+        let Some(tracking_issue) = self.milestone_tracking_issue_for(&issue) else {
+            self.push_toast(
+                label,
+                "This issue isn't a member of any tracked milestone work order — \
+                 cannot resolve the tracking issue to author against.",
+                ToastSeverity::Warning,
+            );
+            return None;
+        };
+        // #1151: resolve --for-path before dispatching — see
+        // `acceptance_for_path_arg`'s doc for the three outcomes.
+        let for_path = match self.acceptance_for_path_arg(&repo) {
+            Ok(p) => p,
+            Err(reason) => {
+                self.push_toast(label, &reason, ToastSeverity::Warning);
+                return None;
+            }
+        };
+        Some((issue, repo, tracking_issue, for_path))
+    }
+
     /// #1060 (docs/ORACLE_LOOP.md, #931): dispatch `coord acceptance author
     /// <repo> <tracking_issue> --issue <N>` for the selected pipeline row —
     /// the independent test-author's JIT slice for this issue, extending the
@@ -2069,37 +2160,10 @@ impl CoordApp {
     /// The CLI's own validation (contract exists, issue is a work-order
     /// member) surfaces failures via the command runner's usual toast path.
     pub(crate) fn dispatch_acceptance_author_for_selected_pipeline_row(&mut self) -> bool {
-        let Some(idx) = self.pipeline_sel else {
+        let Some((issue, repo, tracking_issue, for_path)) =
+            self.resolve_acceptance_author_target("Author acceptance tests")
+        else {
             return false;
-        };
-        let Some(issue) = self.pipeline_issues.get(idx).cloned() else {
-            return false;
-        };
-        let Some(repo) = issue.coord_repo.clone() else {
-            self.push_toast(
-                "Author acceptance tests",
-                "No local repo mapping for this issue — cannot dispatch.",
-                ToastSeverity::Warning,
-            );
-            return false;
-        };
-        let Some(tracking_issue) = self.milestone_tracking_issue_for(&issue) else {
-            self.push_toast(
-                "Author acceptance tests",
-                "This issue isn't a member of any tracked milestone work order — \
-                 cannot resolve the tracking issue to author against.",
-                ToastSeverity::Warning,
-            );
-            return false;
-        };
-        // #1151: resolve --for-path before dispatching — see
-        // `acceptance_for_path_arg`'s doc for the three outcomes.
-        let for_path = match self.acceptance_for_path_arg(&repo) {
-            Ok(p) => p,
-            Err(reason) => {
-                self.push_toast("Author acceptance tests", &reason, ToastSeverity::Warning);
-                return false;
-            }
         };
         let mut cmd_strs: Vec<String> = vec![
             "acceptance".to_string(),
@@ -2134,6 +2198,126 @@ impl CoordApp {
             }
             SpawnQueuedOutcome::Deduped => false,
         }
+    }
+
+    /// #1174 (docs/ORACLE_LOOP.md, #1173): launch `coord acceptance author
+    /// <repo> <tracking_issue> --issue <N> [--for-path <glob>]
+    /// --interactive` in the standalone Terminal pane for the selected
+    /// Pipeline row — the human-attended counterpart to
+    /// `dispatch_acceptance_author_for_selected_pipeline_row`, giving the
+    /// test-authoring stage the same "(interactive)" sibling that
+    /// Test/Review/Merge already have.
+    ///
+    /// Unlike Work/Review/Fix/Test/Merge, this dispatch has no work_aid to
+    /// key off — it targets a milestone/tracking-issue slice, not an
+    /// existing work assignment — so it does NOT go through
+    /// `InteractiveLaunchMode` / `launch_interactive_session_for_selected_issue`
+    /// (whose machine-picker/reattach machinery is all built around
+    /// `coord assign --interactive --xxx-of <work_aid>`). It instead
+    /// follows the bespoke shape `launch_merge_queue_interactive` /
+    /// `launch_milestone_chat_session` use: build the launch line, spawn
+    /// (or reuse) the standalone Terminal pane, send it. The CLI's
+    /// `--interactive` flag (#1173) does all the PTY/tmux/local-vs-remote
+    /// work itself — this function does not reimplement any of that, only
+    /// the same one-line "auto-run the launcher" trick every other
+    /// interactive flavour uses (see `build_interactive_launch_cmd`'s doc).
+    ///
+    /// Reattach: if a `type="test-author"` session is already running for
+    /// this issue, attach to it instead of launching a second one — the
+    /// same "running session, matching type" gate
+    /// `reattachable_session_aid` applies for the `InteractiveLaunchMode`
+    /// flavours, inlined here since `test-author` isn't one of that enum's
+    /// assignment types.
+    pub(crate) fn launch_acceptance_author_interactive_for_selected_pipeline_row(&mut self) -> bool {
+        let label = "Author acceptance tests (interactive)";
+        let Some((issue, repo, tracking_issue, for_path)) =
+            self.resolve_acceptance_author_target(label)
+        else {
+            return false;
+        };
+
+        // #955: a selected Terminal-tree leaf takes over the main pane —
+        // clear the selection so the bare-shell pane this writes into is
+        // visible (mirrors `launch_merge_queue_interactive` /
+        // `reattach_session_by_aid`).
+        self.terminal_tree_selected = None;
+
+        if let Some(aid) = self
+            .live_tmux_sessions
+            .iter()
+            .filter(|s| {
+                s.issue_number == Some(issue.number) && s.repo_name.as_deref() == Some(repo.as_str())
+            })
+            .map(|s| s.assignment_id.clone())
+            .find(|aid| {
+                self.session_assignment_is_running(aid)
+                    && self.assignment_type_of(aid) == Some("test-author")
+            })
+        {
+            self.reattach_session_by_aid(&aid);
+            return true;
+        }
+
+        let cfg_path = self
+            .command_runner
+            .config_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned());
+        let launch_line = build_acceptance_author_interactive_launch_cmd(
+            cfg_path.as_deref(),
+            &repo,
+            tracking_issue,
+            issue.number,
+            for_path.as_deref(),
+        );
+
+        // #1029 bug A: keep the ActivityBar/header chrome in sync too.
+        self.switch_active_view(SidebarView::Terminal);
+
+        if let Some(ref mut sess) = self.terminal_session {
+            sess.send_str(&launch_line);
+        } else {
+            let cwd: std::path::PathBuf = self
+                .data
+                .pipeline_repo_paths
+                .get(repo.as_str())
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| {
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
+                });
+            let (cols, rows) = self.terminal_pending_dims.get().unwrap_or((80, 24));
+            let shell = quadraui::terminal_engine::default_shell();
+            match quadraui::terminal_engine::TerminalSession::spawn(
+                cols.max(20),
+                rows.max(5),
+                &shell,
+                &cwd,
+                10_000,
+            ) {
+                Ok(mut sess) => {
+                    sess.send_str(&launch_line);
+                    self.terminal_session = Some(sess);
+                    self.terminal_spawn_error = None;
+                }
+                Err(e) => {
+                    self.terminal_spawn_error = Some(e.to_string());
+                    self.push_toast(
+                        "Terminal error",
+                        &format!("Failed to spawn terminal: {}", e),
+                        ToastSeverity::Error,
+                    );
+                    return false;
+                }
+            }
+        }
+
+        self.terminal_focused = true;
+        self.push_toast(
+            label,
+            &format!("Launched interactive test-author for #{}", issue.number),
+            ToastSeverity::Info,
+        );
+        true
     }
 
     /// #1060 (docs/ORACLE_LOOP.md, #932): dispatch `coord acceptance record
