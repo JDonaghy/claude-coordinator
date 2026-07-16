@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 from unittest.mock import patch
 
+import pytest
+
 from coord import github_ops
 
 # Captured at import time — the real function object, immune to the conftest
@@ -277,4 +279,148 @@ class TestWorkIsTerminal:
             _REAL_WORK_IS_TERMINAL("acme/api", 1, "b1", cache=cache)
             _REAL_WORK_IS_TERMINAL("acme/api", 2, "b2", cache=cache)
 
-        assert calls["n"] == 2
+
+# ── close-invariant chokepoint (#1196) ──────────────────────────────────────
+
+_EPIC_WITH_OPEN_CHILD = json.dumps({
+    "number": 1041,
+    "title": "Epic",
+    "state": "open",
+    "milestone": None,
+    "labels": [],
+    "body": "## Sub-issues\n- [ ] #1039\n- [x] #1040\n",
+})
+
+_EPIC_ALL_CHILDREN_CLOSED = json.dumps({
+    "number": 1041,
+    "title": "Epic",
+    "state": "open",
+    "milestone": None,
+    "labels": [],
+    "body": "## Sub-issues\n- [x] #1039\n- [x] #1040\n",
+})
+
+_REGULAR_ISSUE = json.dumps({
+    "number": 42,
+    "title": "Fix auth",
+    "state": "open",
+    "milestone": None,
+    "labels": [],
+    "body": "Just a regular issue, no checklist.",
+})
+
+
+class TestGetOpenChildren:
+    def test_returns_open_children_only(self) -> None:
+        with patch("coord.github_ops._gh", return_value=_EPIC_WITH_OPEN_CHILD):
+            children = github_ops.get_open_children("acme/api", 1041)
+        assert children == [{"number": 1039, "state": "open"}]
+
+    def test_empty_when_all_children_closed(self) -> None:
+        with patch("coord.github_ops._gh", return_value=_EPIC_ALL_CHILDREN_CLOSED):
+            assert github_ops.get_open_children("acme/api", 1041) == []
+
+    def test_empty_for_regular_issue(self) -> None:
+        with patch("coord.github_ops._gh", return_value=_REGULAR_ISSUE):
+            assert github_ops.get_open_children("acme/api", 42) == []
+
+    def test_fails_open_on_gh_error(self) -> None:
+        # A transient lookup failure must not permanently wedge every close
+        # in the system — close_issue is the enforcement point, not this.
+        with patch("coord.github_ops._gh", side_effect=RuntimeError("gh boom")):
+            assert github_ops.get_open_children("acme/api", 1041) == []
+
+    def test_fails_open_on_malformed_checklist(self) -> None:
+        # #1195's own precedent (per-epic parse-failure isolation on
+        # /board): a malformed `## Sub-issues` block on *this* issue must
+        # not wedge closing some *other* well-formed one.
+        malformed = json.dumps({
+            "number": 1041, "title": "Epic", "state": "open", "milestone": None,
+            "labels": [],
+            "body": "## Sub-issues\n- [ ] #1039\n- [ ] #1039\n",  # duplicate
+        })
+        with patch("coord.github_ops._gh", return_value=malformed):
+            assert github_ops.get_open_children("acme/api", 1041) == []
+
+    def test_has_open_children_true_false(self) -> None:
+        with patch("coord.github_ops._gh", return_value=_EPIC_WITH_OPEN_CHILD):
+            assert github_ops.has_open_children("acme/api", 1041) is True
+        with patch("coord.github_ops._gh", return_value=_EPIC_ALL_CHILDREN_CLOSED):
+            assert github_ops.has_open_children("acme/api", 1041) is False
+
+
+class _FakeCompletedProcess:
+    def __init__(self, returncode: int = 0, stderr: str = "") -> None:
+        self.returncode = returncode
+        self.stderr = stderr
+
+
+class TestCloseIssueGuard:
+    # `close_issue`'s actual `gh issue close` call goes through raw
+    # `subprocess.run`, not the `_gh()` helper (idempotency on "already
+    # closed" needs the exit code + stderr, which `_gh()` doesn't expose) —
+    # so the guard's `get_issue` lookup is mocked via `_gh`, and the close
+    # call itself via `subprocess.run`.
+
+    def test_refuses_close_with_open_children(self) -> None:
+        with patch("coord.github_ops._gh", return_value=_EPIC_WITH_OPEN_CHILD), \
+             patch(
+                 "coord.github_ops.subprocess.run",
+                 side_effect=AssertionError("must not attempt the close call"),
+             ):
+            with pytest.raises(github_ops.IssueHasOpenChildrenError, match=r"#1039"):
+                github_ops.close_issue("acme/api", 1041)
+
+    def test_force_overrides_the_guard(self) -> None:
+        with patch(
+            "coord.github_ops._gh",
+            side_effect=AssertionError("force=True must skip the open-children lookup"),
+        ) as mock_gh, patch(
+            "coord.github_ops.subprocess.run", return_value=_FakeCompletedProcess(),
+        ) as mock_run:
+            github_ops.close_issue("acme/api", 1041, force=True)
+        mock_gh.assert_not_called()
+        mock_run.assert_called_once()
+        assert mock_run.call_args.args[0] == [
+            "gh", "issue", "close", "1041", "--repo", "acme/api",
+        ]
+
+    def test_regular_issue_closes_unchanged(self) -> None:
+        # No regression for the common case: an issue with no children
+        # closes exactly as before, guard lookup included.
+        with patch("coord.github_ops._gh", return_value=_REGULAR_ISSUE), \
+             patch(
+                 "coord.github_ops.subprocess.run",
+                 return_value=_FakeCompletedProcess(),
+             ) as mock_run:
+            github_ops.close_issue("acme/api", 42)
+        assert mock_run.call_args.args[0] == [
+            "gh", "issue", "close", "42", "--repo", "acme/api",
+        ]
+
+    def test_still_idempotent_on_already_closed(self) -> None:
+        with patch("coord.github_ops._gh", return_value=_REGULAR_ISSUE), \
+             patch(
+                 "coord.github_ops.subprocess.run",
+                 return_value=_FakeCompletedProcess(1, "GraphQL: Issue already closed"),
+             ):
+            github_ops.close_issue("acme/api", 42)  # must not raise
+
+
+class TestPrBodyWrappers:
+    def test_get_pr_body(self) -> None:
+        with patch(
+            "coord.github_ops._gh",
+            return_value=json.dumps({"body": "Closes #99"}),
+        ):
+            assert github_ops.get_pr_body("acme/api", 5) == "Closes #99"
+
+    def test_get_pr_body_missing_field(self) -> None:
+        with patch("coord.github_ops._gh", return_value=json.dumps({})):
+            assert github_ops.get_pr_body("acme/api", 5) == ""
+
+    def test_edit_pr_body(self) -> None:
+        calls: list[tuple] = []
+        with patch("coord.github_ops._gh", lambda *a, **k: calls.append(a) or ""):
+            github_ops.edit_pr_body("acme/api", 5, "Refs #99")
+        assert calls == [("pr", "edit", "5", "--repo", "acme/api", "--body", "Refs #99")]

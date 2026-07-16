@@ -2897,6 +2897,7 @@ def close_issue(
     *,
     comment: str | None = None,
     repo_github: str | None = None,
+    force: bool = False,
 ) -> None:
     """Close an issue through the issue-tracker seam (#1003, mirrors
     ``edit_issue_content``).
@@ -2906,22 +2907,42 @@ def close_issue(
     today) lives in the ``_local`` impl, so the backend stays behind one
     seam — the "Close / archive plan" Plans-panel action never calls raw
     ``gh``.
+
+    #1196: *force* threads through to ``github_ops.close_issue``'s
+    open-children guard — ``False`` (the default) refuses to close an issue
+    that still has open children; pass ``True`` (CLI: ``--force``) to
+    override, mirroring the ``--force-merge`` precedent. On the daemon path,
+    a refusal comes back as HTTP 409 and is converted back into
+    :class:`coord.github_ops.IssueHasOpenChildrenError` here (mirroring the
+    400/503 conversion in ``coord.issue_store``) so callers see the same
+    clean exception regardless of whether the write happened locally or was
+    routed to the daemon.
     """
     svc = _board_service()
-    resp = _route_write(
-        svc,
-        "/issue-close",
-        {
-            "repo_name": repo_name,
-            "issue_number": issue_number,
-            "comment": comment,
-            "repo_github": repo_github,
-        },
-    )
-    if resp is not None:
+    if svc is not None:
+        from coord.client import post_record  # noqa: PLC0415
+        from coord.github_ops import IssueHasOpenChildrenError  # noqa: PLC0415
+        import httpx  # noqa: PLC0415
+
+        try:
+            post_record(svc, "/issue-close", {
+                "repo_name": repo_name,
+                "issue_number": issue_number,
+                "comment": comment,
+                "repo_github": repo_github,
+                "force": force,
+            })
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 409:
+                try:
+                    detail = exc.response.json().get("detail") or str(exc)
+                except Exception:  # noqa: BLE001
+                    detail = str(exc)
+                raise IssueHasOpenChildrenError(detail) from exc
+            raise
         return
     _close_issue_local(
-        repo_name, issue_number, comment=comment, repo_github=repo_github
+        repo_name, issue_number, comment=comment, repo_github=repo_github, force=force,
     )
 
 
@@ -2931,6 +2952,7 @@ def _close_issue_local(
     *,
     comment: str | None = None,
     repo_github: str | None = None,
+    force: bool = False,
 ) -> None:
     """Backend adapter (GitHub today): close the issue via ``github_ops``.
 
@@ -2944,7 +2966,7 @@ def _close_issue_local(
     from coord import github_ops  # noqa: PLC0415
 
     slug = repo_github or repo_name
-    github_ops.close_issue(slug, issue_number, comment=comment)
+    github_ops.close_issue(slug, issue_number, comment=comment, force=force)
 
 
 def upsert_open_issues(repo_name: str, issues: list[dict]) -> None:

@@ -17,6 +17,7 @@ from typing import Iterable, Protocol
 from coord.ci_store import CiStore, NoOpCi, failed_checks, in_flight_checks, summarize
 from coord.db import get_connection
 from coord.models import CLOSES_ISSUE_TYPES, WORK_LIKE_TYPES, Assignment
+from coord.pr_body_lint import downgrade_closing_keywords, find_closing_references
 from coord.state import COORD_DIR
 
 # Legacy path constant — kept for backward compat with monkeypatch calls in tests.
@@ -330,6 +331,18 @@ class GhOps(Protocol):
     def merge_pr(self, repo: str, number: int, method: str = "rebase") -> tuple[bool, str]: ...
 
     def close_issue(self, repo: str, issue_number: int) -> None: ...
+
+    def get_pr_body(self, repo: str, number: int) -> str:
+        """Return PR *number*'s current body text (#1196, PR-body lint)."""
+        ...
+
+    def edit_pr_body(self, repo: str, number: int, body: str) -> None:
+        """Overwrite PR *number*'s body text (#1196, PR-body lint)."""
+        ...
+
+    def has_open_children(self, repo: str, issue_number: int) -> bool:
+        """True when *issue_number* has an open child (#1196)."""
+        ...
 
     def get_branch_sha(self, repo: str, branch: str) -> str | None:
         """Return the current HEAD SHA for *branch*, or None on failure.
@@ -1290,6 +1303,43 @@ def process(
                     entry.error = msg
                     events.append(MergeEvent(entry, "checks_pending", msg))
                     continue  # #292: skip, don't halt the group
+            # #1196 hole 2: GitHub's own closing-keyword magic reads the PR
+            # body directly at merge time and never calls
+            # `github_ops.close_issue` — that chokepoint's open-children
+            # guard can't stop it. Scan the body for `Closes #N`/`Fixes
+            # #N`/`Resolves #N` and downgrade to `Refs #N` for any N that
+            # currently has open children, before the merge lands. Best
+            # effort throughout: a lint failure must never block a merge.
+            try:
+                pr_body = gh_ops.get_pr_body(entry.repo_github, entry.pr_number)
+            except Exception:  # noqa: BLE001
+                pr_body = ""
+            if pr_body:
+                referenced = find_closing_references(pr_body)
+                blocking: set[int] = set()
+                for n in referenced:
+                    try:
+                        if gh_ops.has_open_children(entry.repo_github, n):
+                            blocking.add(n)
+                    except Exception:  # noqa: BLE001
+                        continue
+                if blocking:
+                    new_body, downgraded = downgrade_closing_keywords(pr_body, blocking)
+                    if downgraded:
+                        try:
+                            gh_ops.edit_pr_body(entry.repo_github, entry.pr_number, new_body)
+                            events.append(MergeEvent(
+                                entry, "pr_body_downgraded",
+                                "downgraded closing keyword to Refs for "
+                                + ", ".join(f"#{n}" for n in downgraded)
+                                + " (open children — #1196)",
+                            ))
+                        except Exception as e:  # noqa: BLE001
+                            events.append(MergeEvent(
+                                entry, "pr_body_downgrade_failed",
+                                f"could not downgrade PR #{entry.pr_number} body "
+                                f"for {', '.join(f'#{n}' for n in downgraded)}: {e}",
+                            ))
             entry.last_attempt = time.time()
             entry.state = MERGING
             ok, msg = gh_ops.merge_pr(entry.repo_github, entry.pr_number, method=method)

@@ -196,12 +196,58 @@ class TestCloseIssueRouting:
         calls: list = []
         monkeypatch.setattr(
             "coord.github_ops.close_issue",
-            lambda repo, issue, comment=None: calls.append((repo, issue, comment)),
+            lambda repo, issue, comment=None, force=False: calls.append(
+                (repo, issue, comment, force)
+            ),
         )
 
         state.close_issue("api", 42, comment="wrapping up", repo_github="acme/api")
 
-        assert calls == [("acme/api", 42, "wrapping up")]
+        assert calls == [("acme/api", 42, "wrapping up", False)]
+
+    def test_local_path_passes_force_through(self, coord_db, monkeypatch) -> None:
+        # #1196: --force threads all the way to github_ops.close_issue's
+        # open-children guard, mirroring --force-merge.
+        from coord import state
+
+        calls: list = []
+        monkeypatch.setattr(
+            "coord.github_ops.close_issue",
+            lambda repo, issue, comment=None, force=False: calls.append(
+                (repo, issue, comment, force)
+            ),
+        )
+
+        state.close_issue("api", 42, repo_github="acme/api", force=True)
+
+        assert calls == [("acme/api", 42, None, True)]
+
+    def test_daemon_409_becomes_open_children_error(self, coord_db, monkeypatch) -> None:
+        # #1196: a guard refusal on the daemon side (HTTP 409) must surface
+        # to the caller as the same IssueHasOpenChildrenError a local close
+        # would raise, not a raw httpx error.
+        import httpx
+        from coord import client as cc
+        from coord import state
+        from coord.github_ops import IssueHasOpenChildrenError
+
+        monkeypatch.setattr(
+            cc, "resolve_board_service", lambda *a, **k: cc.ServiceConfig("http://d:7435")
+        )
+
+        def _raise_409(svc, path, payload, **kw):
+            request = httpx.Request("POST", "http://d:7435/issue-close")
+            response = httpx.Response(
+                409,
+                json={"error": "open children", "detail": "refusing to close: open children #1039"},
+                request=request,
+            )
+            raise httpx.HTTPStatusError("409", request=request, response=response)
+
+        monkeypatch.setattr(cc, "post_record", _raise_409)
+
+        with pytest.raises(IssueHasOpenChildrenError, match="open children #1039"):
+            state.close_issue("api", 1041, repo_github="acme/api")
 
 
 # ── daemon endpoints ───────────────────────────────────────────────────────────
@@ -334,7 +380,9 @@ def test_serve_issue_close_calls_github_ops(
     calls: list = []
     with patch(
         "coord.github_ops.close_issue",
-        lambda repo, issue, comment=None: calls.append((repo, issue, comment)),
+        lambda repo, issue, comment=None, force=False: calls.append(
+            (repo, issue, comment, force)
+        ),
     ):
         app = build_app(SqliteStore(file_db), load_config(p))
         with TestClient(app) as cli:
@@ -349,7 +397,7 @@ def test_serve_issue_close_calls_github_ops(
             )
     assert resp.status_code == 200, resp.json()
     assert resp.json() == {"updated": True}
-    assert calls == [("acme/api", 42, "wrapping up")]
+    assert calls == [("acme/api", 42, "wrapping up", False)]
 
 
 def test_serve_issue_close_missing_field_400(file_db: Path, tmp_path: Path) -> None:
@@ -363,6 +411,61 @@ def test_serve_issue_close_missing_field_400(file_db: Path, tmp_path: Path) -> N
     with TestClient(app) as cli:
         resp = cli.post("/issue-close", json={"repo_name": "api"})
     assert resp.status_code == 400
+
+
+def test_serve_issue_close_open_children_409(file_db: Path, tmp_path: Path) -> None:
+    # #1196: the daemon converts the open-children guard refusal into a 409
+    # (distinct from a generic 503 tracker failure) so state.close_issue can
+    # convert it back into IssueHasOpenChildrenError client-side.
+    from coord.config import load as load_config
+    from coord.dao import SqliteStore
+    from coord.github_ops import IssueHasOpenChildrenError
+    from coord.serve_app import build_app
+
+    p = tmp_path / "coordinator.yml"
+    p.write_text(CONFIG_YAML)
+
+    def _boom(repo, issue, comment=None, force=False):
+        raise IssueHasOpenChildrenError(f"refusing to close #{issue}: open children #1039")
+
+    with patch("coord.github_ops.close_issue", _boom):
+        app = build_app(SqliteStore(file_db), load_config(p))
+        with TestClient(app) as cli:
+            resp = cli.post(
+                "/issue-close",
+                json={"repo_name": "api", "issue_number": 1041, "repo_github": "acme/api"},
+            )
+    assert resp.status_code == 409, resp.json()
+    assert "open children" in resp.json()["detail"]
+
+
+def test_serve_issue_close_force_passthrough(file_db: Path, tmp_path: Path) -> None:
+    from coord.config import load as load_config
+    from coord.dao import SqliteStore
+    from coord.serve_app import build_app
+
+    p = tmp_path / "coordinator.yml"
+    p.write_text(CONFIG_YAML)
+    calls: list = []
+    with patch(
+        "coord.github_ops.close_issue",
+        lambda repo, issue, comment=None, force=False: calls.append(
+            (repo, issue, comment, force)
+        ),
+    ):
+        app = build_app(SqliteStore(file_db), load_config(p))
+        with TestClient(app) as cli:
+            resp = cli.post(
+                "/issue-close",
+                json={
+                    "repo_name": "api",
+                    "issue_number": 1041,
+                    "repo_github": "acme/api",
+                    "force": True,
+                },
+            )
+    assert resp.status_code == 200, resp.json()
+    assert calls == [("acme/api", 1041, None, True)]
 
 
 def test_serve_issue_close_gh_failure_503(file_db: Path, tmp_path: Path) -> None:
@@ -432,7 +535,7 @@ class TestIssueCloseCli:
             )
         assert result.exit_code == 0, result.output
         assert "#42" in result.output
-        mock_close.assert_called_once_with("acme/api", 42, comment=None)
+        mock_close.assert_called_once_with("acme/api", 42, comment=None, force=False)
 
     def test_closes_with_comment(self, config_file: Path) -> None:
         with patch("coord.github_ops.close_issue") as mock_close:
@@ -445,7 +548,7 @@ class TestIssueCloseCli:
                 ],
             )
         assert result.exit_code == 0, result.output
-        mock_close.assert_called_once_with("acme/api", 42, comment="shipped")
+        mock_close.assert_called_once_with("acme/api", 42, comment="shipped", force=False)
 
     def test_gh_failure_exits_1(self, config_file: Path) -> None:
         with patch(
@@ -458,3 +561,37 @@ class TestIssueCloseCli:
             )
         assert result.exit_code == 1
         assert "error" in result.output.lower()
+
+    def test_force_flag_passes_through(self, config_file: Path) -> None:
+        # #1196: --force mirrors `coord merge --force-merge`.
+        with patch("coord.github_ops.close_issue") as mock_close:
+            result = CliRunner().invoke(
+                main,
+                ["issue", "close", "api", "1041", "--force", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        mock_close.assert_called_once_with("acme/api", 1041, comment=None, force=True)
+
+    def test_open_children_refusal_surfaces_clearly(self, config_file: Path) -> None:
+        # #1196: the chokepoint's refusal must exit non-zero with a message
+        # naming the open children — this is the "CLI ... surfaces the
+        # refusal clearly" acceptance bar, exercised through the real
+        # github_ops.close_issue guard (only the `gh` subprocess boundary
+        # is mocked), not a stand-in exception.
+        def fake_gh(*args: str) -> str:
+            if args[:2] == ("issue", "view"):
+                return (
+                    '{"number": 1041, "body": "## Sub-issues\\n- [ ] #1039\\n", '
+                    '"title": "Epic", "state": "open", "milestone": null, '
+                    '"labels": []}'
+                )
+            raise AssertionError(f"unexpected gh call: {args}")
+
+        with patch("coord.github_ops._gh", fake_gh):
+            result = CliRunner().invoke(
+                main,
+                ["issue", "close", "api", "1041", "--config", str(config_file)],
+            )
+        assert result.exit_code == 1
+        assert "open children" in result.output.lower()
+        assert "#1039" in result.output

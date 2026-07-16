@@ -123,8 +123,8 @@ class TestRunHooks:
         assert "Fix auth" in results[0].message
         assert "Add logging" in results[0].message
 
-    @patch("coord.hooks.github_ops._gh")
-    def test_close_merged_issues_hook(self, mock_gh: MagicMock) -> None:
+    @patch("coord.hooks.github_ops.close_issue")
+    def test_close_merged_issues_hook(self, mock_close: MagicMock) -> None:
         config = Config(
             repos=[Repo(name="api", github="acme/api")],
             machines=[Machine(name="m", host="h")],
@@ -138,10 +138,64 @@ class TestRunHooks:
         assert len(results) == 1
         assert results[0].ok
         assert "closed 1" in results[0].message
-        mock_gh.assert_called_once()
-        args = mock_gh.call_args.args
-        assert "close" in args
-        assert "42" in args
+        mock_close.assert_called_once()
+        args, kwargs = mock_close.call_args
+        assert args == ("acme/api", 42)
+        assert "abc" in kwargs["comment"]
+
+    @patch("coord.hooks.github_ops.close_issue")
+    def test_close_merged_issues_skips_non_closes_type(self, mock_close: MagicMock) -> None:
+        # #1196 hole 3: a "mock-author"/"test-author"/"audit" assignment's
+        # issue_number is the milestone's tracking issue (often an epic) —
+        # not something it resolved. The hook must not close it regardless
+        # of `status == "done"`, mirroring CLOSES_ISSUE_TYPES elsewhere.
+        config = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(name="m", host="h")],
+            hooks=HooksConfig(on_round_complete=["close_merged_issues"]),
+        )
+        board = Board(completed=[
+            Assignment(machine_name="m", repo_name="api", issue_number=1041,
+                       issue_title="Epic", status="done", assignment_id="ga",
+                       type="mock-author"),
+        ])
+        results = run_hooks("on_round_complete", config, board)
+        assert len(results) == 1
+        assert results[0].ok
+        assert "no issues to close" in results[0].message
+        mock_close.assert_not_called()
+
+    def test_close_merged_issues_refuses_epic_with_open_children(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # #1196 hole 3 + the chokepoint: even a "work"-type assignment whose
+        # issue_number happens to be an epic with open children must not be
+        # closed — this exercises the real github_ops.close_issue guard
+        # (#1196 hole 1), not a mocked stand-in.
+        config = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(name="m", host="h")],
+            hooks=HooksConfig(on_round_complete=["close_merged_issues"]),
+        )
+        board = Board(completed=[
+            Assignment(machine_name="m", repo_name="api", issue_number=1041,
+                       issue_title="Epic", status="done", assignment_id="w1"),
+        ])
+
+        def fake_gh(*args: str) -> str:
+            if args[:2] == ("issue", "view"):
+                return (
+                    '{"number": 1041, "body": "## Sub-issues\\n- [ ] #1039\\n'
+                    '- [x] #1040\\n", "title": "Epic", "state": "open", '
+                    '"milestone": null, "labels": []}'
+                )
+            raise AssertionError(f"unexpected gh call: {args}")
+
+        monkeypatch.setattr("coord.github_ops._gh", fake_gh)
+        results = run_hooks("on_round_complete", config, board)
+        assert len(results) == 1
+        assert results[0].ok
+        assert "no issues to close" in results[0].message
 
     def test_no_hooks_configured_returns_empty(self) -> None:
         config = Config(
