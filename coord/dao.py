@@ -83,6 +83,7 @@ _JSON_COLUMNS: dict[str, set[str]] = {
         # stay a string on the wire.
     },
     "proposals": {"files_likely", "required_gates"},
+    "merge_queue": {"required_gates"},
     "issues": {"labels"},
     "machines": {"capabilities", "repos"},
 }

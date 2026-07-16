@@ -161,6 +161,7 @@ _JSON_COLUMN_SHAPES: dict[tuple[str, str], dict[str, Any]] = {
     ("assignments", "test_plan"): {"type": "object"},
     ("proposals", "files_likely"): {"type": "array", "items": {"type": "string"}},
     ("proposals", "required_gates"): {"type": "array", "items": {"type": "string"}},
+    ("merge_queue", "required_gates"): {"type": "array", "items": {"type": "string"}},
     ("issues", "labels"): {"type": "array", "items": {"type": "string"}},
     ("machines", "capabilities"): {"type": "array", "items": {"type": "string"}},
     ("machines", "repos"): {"type": "array", "items": {"type": "string"}},

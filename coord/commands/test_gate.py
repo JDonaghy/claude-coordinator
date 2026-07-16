@@ -376,7 +376,7 @@ def _restore_default_branch_after_test(cfg, assignment) -> None:
 @click.option("--passed", "verdict", flag_value="pass", help="Mark Test gate as passed.")
 @click.option("--fail", "verdict", flag_value="fail", help="Mark Test gate as failed.")
 @click.option("--skipped", "verdict", flag_value="skip", help="Mark Test gate as skipped (trivial change).")
-@click.option("--reason", default="", help="Reason for failure (used with --fail).")
+@click.option("--reason", default="", help="Reason for failure or skip (used with --fail/--skipped).")
 @click.option("--output", "output_file", type=click.Path(), default=None,
               help="File with test output to store (used with --fail).")
 
@@ -406,7 +406,12 @@ def test(assignment_id: str, config_path: Path, verdict: str | None, reason: str
         # TUI's Test stage and the reconcile review-gating logic.
         test_state_map = {"pass": "passed", "fail": "failed", "skip": "skipped"}
         assignment.test_state = test_state_map[verdict]
-        assignment.test_reason = reason if verdict == "fail" else None
+        # #1213: a --skipped verdict carries a reason too (e.g. "trivial dep
+        # bump, covered by regression test in the same PR") — that reason IS
+        # the audit trail for why the human test was bypassed, so it must
+        # not be discarded the way --passed's (never has one) is. Only a
+        # bare --passed clears any stale reason from a prior verdict.
+        assignment.test_reason = reason if verdict in ("fail", "skip") else None
         # Mirror to legacy smoke_test for the existing smoke-stage scoring in
         # pipeline.py (which predates the human Test gate).
         if verdict in ("pass", "fail"):
@@ -447,7 +452,7 @@ def test(assignment_id: str, config_path: Path, verdict: str | None, reason: str
             save_board(board)
         verdict_word = {"pass": "PASSED", "fail": "FAILED", "skip": "SKIPPED"}[verdict]
         click.echo(f"Test gate {verdict_word} for {assignment.repo_name} #{assignment.issue_number}")
-        if verdict == "fail" and reason:
+        if verdict in ("fail", "skip") and reason:
             click.echo(f"  reason: {reason}")
         elif verdict == "pass":
             click.echo("  Run: coord merge to proceed")
