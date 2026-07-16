@@ -1950,6 +1950,22 @@ pub struct CoordApp {
     /// already in flight).  Persists across rebuilds once a user toggles a
     /// key.
     pipeline_milestone_expanded: std::collections::HashMap<(String, String, String), bool>,
+    /// #1197: per-epic collapse state for the Pipeline's nested epic rows.
+    /// Key: `(coord_repo, epic_issue_number)` — an epic is independently
+    /// collapsible wherever it renders, so the key deliberately omits the
+    /// section/group/milestone tier that `pipeline_milestone_expanded` uses
+    /// (an epic keeps one collapse state as it moves through lifecycle
+    /// states, rather than resetting on every stage transition).
+    /// Default for an untouched key: `true` (expanded) — an epic's children
+    /// are its whole point, so they're visible until the user hides them.
+    pipeline_epic_expanded: std::collections::HashMap<(String, u64), bool>,
+    /// #1197: maps a rendered epic row's `(section_idx, TreePath)` to its
+    /// `pipeline_epic_expanded` key. Rebuilt by every
+    /// `rebuild_pipeline_sidebar` pass, and read by the `RowToggleExpand`
+    /// handler so it can recognise an epic row without re-deriving path
+    /// shapes (epic rows sit at path len 2 *or* 3 depending on the section
+    /// and whether it's milestone-grouped).
+    pipeline_epic_row_keys: std::collections::HashMap<(usize, TreePath), (String, u64)>,
     /// Tracked issues for the Pipeline panel (loaded asynchronously via gh).
     pipeline_issues: Vec<PipelineIssue>,
     /// Selected issue index into `pipeline_issues`, if any.
@@ -3107,6 +3123,8 @@ impl CoordApp {
             pipeline_search: SidebarFilter::default(),
             pipeline_lifecycle_expanded: std::collections::HashMap::new(),
             pipeline_milestone_expanded: std::collections::HashMap::new(),
+            pipeline_epic_expanded: std::collections::HashMap::new(),
+            pipeline_epic_row_keys: std::collections::HashMap::new(),
             pipeline_issues: Vec::new(),
             pipeline_sel: None,
             pipeline_status: None,

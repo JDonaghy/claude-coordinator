@@ -29533,6 +29533,77 @@ Milestone tracking issue.
     fn tuidriver_pipeline_epic_children_nest_under_epic_row() {
         use quadraui::tui::testing::driver_with_shell;
 
+        let app = make_epic_nesting_app();
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 50);
+        let screen = driver.screen();
+
+        let epic_pos = driver.find("#100").expect(&format!("epic #100 row must render:\n{screen}"));
+        let child_a_pos = driver
+            .find("#101")
+            .expect(&format!("child #101 row must render nested:\n{screen}"));
+        let child_b_pos = driver
+            .find("#102")
+            .expect(&format!("child #102 row must render nested:\n{screen}"));
+        let sibling_pos = driver
+            .find("#105")
+            .expect(&format!("unrelated issue #105 must render unchanged:\n{screen}"));
+
+        assert!(
+            child_a_pos.0 > epic_pos.0,
+            "#101 must be MORE indented (greater column) than its epic #100: epic={epic_pos:?} child={child_a_pos:?}\n{screen}",
+        );
+        assert!(
+            child_b_pos.0 > epic_pos.0,
+            "#102 must be MORE indented (greater column) than its epic #100: epic={epic_pos:?} child={child_b_pos:?}\n{screen}",
+        );
+        assert!(
+            child_a_pos.1 > epic_pos.1 && child_b_pos.1 > epic_pos.1,
+            "both children must render BELOW the epic row: epic={epic_pos:?} a={child_a_pos:?} b={child_b_pos:?}\n{screen}",
+        );
+        assert_eq!(
+            sibling_pos.0, epic_pos.0,
+            "a plain (non-epic) issue in the same bucket must render at the SAME indent as the epic — unchanged by #1197: epic={epic_pos:?} sibling={sibling_pos:?}\n{screen}",
+        );
+
+        // Dedup: #101 must appear exactly once — nested under #100, not
+        // ALSO as a flat sibling in the same milestone bucket.
+        assert_eq!(
+            screen.matches("#101").count(),
+            1,
+            "#101 must render exactly once (nested, not duplicated as a flat sibling):\n{screen}",
+        );
+
+        // Child state badges — Ready (#101, open, no running assignment)
+        // and Done (#102, closed) — reusing `milestone_dag::build_dag_nodes`.
+        // Scoped to each row's own line (rather than a bare `screen.contains`)
+        // since "done"/"ready" could otherwise coincidentally match unrelated
+        // chrome elsewhere on a 140x50 screen.
+        let lines: Vec<&str> = screen.lines().collect();
+        let child_a_line = lines
+            .get(child_a_pos.1 as usize)
+            .unwrap_or_else(|| panic!("no line at #101's row:\n{screen}"));
+        assert!(
+            child_a_line.contains("ready"),
+            "#101's row must show a 'ready' badge: {child_a_line:?}\n{screen}",
+        );
+        let child_b_line = lines
+            .get(child_b_pos.1 as usize)
+            .unwrap_or_else(|| panic!("no line at #102's row:\n{screen}"));
+        assert!(
+            child_b_line.contains("done"),
+            "#102's row must show a 'done' badge: {child_b_line:?}\n{screen}",
+        );
+    }
+
+    /// #1197: shared fixture for the epic-nesting driver tests — a New-section
+    /// milestone bucket holding epic #100 (children #101 open / #102 closed)
+    /// plus an unrelated sibling #105, with the repo + milestone tiers
+    /// pre-expanded so the epic row renders without a click.
+    ///
+    /// #101 is deliberately ALSO present in `pipeline_issues` (as it would be
+    /// if it carried a tracked label of its own) so the dedup path — nested
+    /// once, never a second time as a flat sibling — stays covered.
+    fn make_epic_nesting_app() -> CoordApp {
         let data = BoardData {
             open_issues: vec![
                 OpenIssue {
@@ -29640,66 +29711,146 @@ Milestone tracking issue.
         app.active_view = SidebarView::Pipeline;
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar(None);
+        app
+    }
 
-        let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 50);
+    /// #1197 (smoke-test follow-up): an epic row is INDEPENDENTLY collapsible.
+    ///
+    /// The first cut nested children correctly but gave the epic row no
+    /// collapse affordance of its own (`is_expanded: None`), so the only way
+    /// to hide an epic's children was to collapse the whole milestone — which
+    /// hid the epic row and its unrelated siblings along with them. This
+    /// drives the epic's own chevron and asserts that only its children
+    /// disappear.
+    #[test]
+    fn tuidriver_pipeline_epic_row_collapses_independently_of_milestone() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_epic_nesting_app();
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 50);
+
+        // Untouched epic ⇒ expanded by default, children visible.
         let screen = driver.screen();
+        let epic_pos = driver
+            .find("#100")
+            .expect(&format!("epic #100 row must render:\n{screen}"));
+        assert!(
+            driver.screen_contains("#101") && driver.screen_contains("#102"),
+            "children must be visible before the epic is collapsed:\n{screen}",
+        );
+        let epic_line = screen
+            .lines()
+            .nth(epic_pos.1 as usize)
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            epic_line.contains('▾'),
+            "an expanded epic row must paint the expanded chevron (▾), like the milestone header above it: {epic_line:?}\n{screen}",
+        );
 
-        let epic_pos = driver.find("#100").expect(&format!("epic #100 row must render:\n{screen}"));
-        let child_a_pos = driver
-            .find("#101")
-            .expect(&format!("child #101 row must render nested:\n{screen}"));
-        let child_b_pos = driver
-            .find("#102")
-            .expect(&format!("child #102 row must render nested:\n{screen}"));
+        // Click the epic's own chevron. Its hit region spans
+        // [indent*indent_cells, +chevron_w) — the cell immediately left of the
+        // "#100" text is the chevron's trailing space, always inside it.
+        driver.click(epic_pos.0 - 1.0, epic_pos.1);
+
+        let screen = driver.screen();
+        assert!(
+            !driver.screen_contains("#101"),
+            "child #101 must be hidden once the epic is collapsed:\n{screen}",
+        );
+        assert!(
+            !driver.screen_contains("#102"),
+            "child #102 must be hidden once the epic is collapsed:\n{screen}",
+        );
+        // The whole point: collapsing the EPIC is not collapsing the MILESTONE.
+        assert!(
+            driver.screen_contains("#100"),
+            "the epic row itself must stay visible when collapsed:\n{screen}",
+        );
+        assert!(
+            driver.screen_contains("#105"),
+            "a sibling issue in the same milestone must stay visible — collapsing an epic must not collapse its milestone:\n{screen}",
+        );
+        assert!(
+            driver.screen_contains("v1.0"),
+            "the milestone header must stay visible:\n{screen}",
+        );
+        let epic_pos = driver
+            .find("#100")
+            .expect(&format!("epic #100 row must still render:\n{screen}"));
+        let epic_line = screen
+            .lines()
+            .nth(epic_pos.1 as usize)
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            epic_line.contains('▸'),
+            "a collapsed epic row must paint the collapsed chevron (▸): {epic_line:?}\n{screen}",
+        );
+
+        // Toggle back — the children return.  The sibling click first is
+        // load-bearing, not decoration: quadraui's `translate_injected` folds
+        // two MouseDowns at the same cell within DOUBLE_CLICK_MS into a
+        // `DoubleClick`, and a test's clicks are microseconds apart — so
+        // re-clicking the chevron directly would never emit a second
+        // RowToggleExpand.  Clicking elsewhere resets the detector's position.
         let sibling_pos = driver
             .find("#105")
-            .expect(&format!("unrelated issue #105 must render unchanged:\n{screen}"));
+            .expect(&format!("sibling #105 must render:\n{screen}"));
+        driver.click(sibling_pos.0, sibling_pos.1);
+        driver.click(epic_pos.0 - 1.0, epic_pos.1);
+        let screen = driver.screen();
+        assert!(
+            driver.screen_contains("#101") && driver.screen_contains("#102"),
+            "re-expanding the epic must bring its children back:\n{screen}",
+        );
+    }
 
+    /// #1197: a plain (non-epic) issue row stays a LEAF — no chevron, no
+    /// entry in the epic-row identity map. Guards against the collapse
+    /// affordance leaking onto every issue row.
+    #[test]
+    fn pipeline_non_epic_issue_row_has_no_collapse_chevron() {
+        let app = make_epic_nesting_app();
+        // #105 is an ordinary issue in the same milestone as epic #100.
+        let plain = app
+            .pipeline_issues
+            .iter()
+            .find(|i| i.number == 105)
+            .expect("#105 must be in pipeline_issues");
         assert!(
-            child_a_pos.0 > epic_pos.0,
-            "#101 must be MORE indented (greater column) than its epic #100: epic={epic_pos:?} child={child_a_pos:?}\n{screen}",
+            app.epic_children_for(plain).is_none(),
+            "#105 is not an epic — it must resolve no children",
         );
-        assert!(
-            child_b_pos.0 > epic_pos.0,
-            "#102 must be MORE indented (greater column) than its epic #100: epic={epic_pos:?} child={child_b_pos:?}\n{screen}",
-        );
-        assert!(
-            child_a_pos.1 > epic_pos.1 && child_b_pos.1 > epic_pos.1,
-            "both children must render BELOW the epic row: epic={epic_pos:?} a={child_a_pos:?} b={child_b_pos:?}\n{screen}",
-        );
+        // Exactly one epic row registered (the #100 row), keyed by (repo, num).
+        let keys: Vec<_> = app.pipeline_epic_row_keys.values().cloned().collect();
         assert_eq!(
-            sibling_pos.0, epic_pos.0,
-            "a plain (non-epic) issue in the same bucket must render at the SAME indent as the epic — unchanged by #1197: epic={epic_pos:?} sibling={sibling_pos:?}\n{screen}",
+            keys,
+            vec![("api".to_string(), 100u64)],
+            "only the epic row may register a collapse key",
         );
+    }
 
-        // Dedup: #101 must appear exactly once — nested under #100, not
-        // ALSO as a flat sibling in the same milestone bucket.
-        assert_eq!(
-            screen.matches("#101").count(),
-            1,
-            "#101 must render exactly once (nested, not duplicated as a flat sibling):\n{screen}",
-        );
+    /// #1197: an untouched epic defaults to expanded (children visible), and
+    /// a stored choice wins over that default — mirroring the render path in
+    /// `epic_expand_state`.
+    #[test]
+    fn epic_expand_state_defaults_expanded_and_honours_stored_choice() {
+        let mut app = make_epic_nesting_app();
+        let epic = app
+            .pipeline_issues
+            .iter()
+            .find(|i| i.number == 100)
+            .expect("#100 must be in pipeline_issues")
+            .clone();
 
-        // Child state badges — Ready (#101, open, no running assignment)
-        // and Done (#102, closed) — reusing `milestone_dag::build_dag_nodes`.
-        // Scoped to each row's own line (rather than a bare `screen.contains`)
-        // since "done"/"ready" could otherwise coincidentally match unrelated
-        // chrome elsewhere on a 140x50 screen.
-        let lines: Vec<&str> = screen.lines().collect();
-        let child_a_line = lines
-            .get(child_a_pos.1 as usize)
-            .unwrap_or_else(|| panic!("no line at #101's row:\n{screen}"));
-        assert!(
-            child_a_line.contains("ready"),
-            "#101's row must show a 'ready' badge: {child_a_line:?}\n{screen}",
-        );
-        let child_b_line = lines
-            .get(child_b_pos.1 as usize)
-            .unwrap_or_else(|| panic!("no line at #102's row:\n{screen}"));
-        assert!(
-            child_b_line.contains("done"),
-            "#102's row must show a 'done' badge: {child_b_line:?}\n{screen}",
-        );
+        let (key, expanded) = app.epic_expand_state(&epic).expect("epic must key");
+        assert_eq!(key, ("api".to_string(), 100));
+        assert!(expanded, "an untouched epic must default to EXPANDED");
+
+        app.pipeline_epic_expanded.insert(key.clone(), false);
+        let (_, expanded) = app.epic_expand_state(&epic).expect("epic must key");
+        assert!(!expanded, "a stored collapse choice must win over the default");
     }
 
     /// #795: `work_order_node_for` finds the correct node by (repo, issue_number).
