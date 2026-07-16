@@ -19,11 +19,11 @@
  * local tmux session included, and detach never kills the session (#1065).
  *
  * Layout: the pane occupies the top half of the screen (`h-[50vh]`); the
- * bottom half is left empty, reserved for the mobile key bar (a later issue
- * in the #1064 epic). iOS/Android safe-area insets pad the header so the
- * close control clears the notch/status bar (`index.html` sets
- * `viewport-fit=cover` so `env(safe-area-inset-*)` resolves to something
- * other than 0).
+ * bottom half hosts `MobileKeyBar` (#1070) -- the soft-key row + line-input
+ * for driving the interactive `claude` TUI from a phone. iOS/Android
+ * safe-area insets pad the header so the close control clears the
+ * notch/status bar (`index.html` sets `viewport-fit=cover` so
+ * `env(safe-area-inset-*)` resolves to something other than 0).
  */
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
@@ -31,6 +31,7 @@ import { Terminal as XTerm } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
 import { terminalWebSocketUrl } from '@/api/client'
+import MobileKeyBar from '@/components/MobileKeyBar'
 
 type ConnectionState = 'connecting' | 'open' | 'closed'
 
@@ -121,6 +122,19 @@ export default function Terminal() {
     navigate(-1)
   }
 
+  /**
+   * Write raw bytes (a JS string, one char per terminal byte) down the same
+   * WebSocket path `term.onData` uses for real keystrokes -- the wire format
+   * PTY bridge (#1065) expects for input. Used by `MobileKeyBar` (#1070) for
+   * its soft keys and line-input submit.
+   */
+  const sendRaw = (data: string) => {
+    const ws = wsRef.current
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(new TextEncoder().encode(data))
+    }
+  }
+
   return (
     <div className="flex h-screen flex-col bg-background">
       <header
@@ -143,12 +157,16 @@ export default function Terminal() {
         </button>
       </header>
 
-      {/* Top half: the live pane. Bottom half stays empty -- reserved for
-          the mobile key bar (a later issue in the #1064 epic). */}
+      {/* Top half: the live pane. Bottom half: the mobile key bar (#1070). */}
       <div className="h-[50vh] min-h-0 shrink-0 border-b border-border bg-[#0d1117] px-2 py-2">
         <div ref={containerRef} className="h-full w-full" data-testid="xterm-container" />
       </div>
-      <div className="flex-1" />
+      <div
+        className="min-h-0 flex-1"
+        style={{ paddingBottom: 'env(safe-area-inset-bottom)' }}
+      >
+        <MobileKeyBar onSend={sendRaw} />
+      </div>
     </div>
   )
 }
