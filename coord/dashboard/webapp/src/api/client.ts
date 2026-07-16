@@ -138,20 +138,6 @@ export async function fetchSessions(): Promise<SessionInfo[]> {
 }
 
 /**
- * Build the `/ws/terminal/{session_id}` WebSocket URL for a given session.
- *
- * No `?token=` is appended — the REST client above sends no auth either, and
- * the server's bridge runs open when no `COORD_WEB_TOKEN` is configured
- * (the tailnet-only dev default; see `coord.dashboard.terminal.resolve_web_token`).
- * If a token *is* configured server-side, the attach will fail with 4401 —
- * there is no client-side token entry yet, matching the rest of this API.
- */
-export function terminalWsUrl(sessionId: string): string {
-  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-  return `${proto}//${window.location.host}/ws/terminal/${encodeURIComponent(sessionId)}`
-}
-
-/**
  * Fetch the diff for a completed work assignment.
  * Prefers the GitHub PR diff; falls back to the compare API.
  */
