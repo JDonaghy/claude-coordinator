@@ -123,6 +123,27 @@ class TestSmokeVerdict:
         assert board.completed[0].smoke_test == "fail"
         assert board.completed[0].smoke_test_reason == "UI is broken"
 
+    def test_skipped_records_reason(
+        self, config_file: Path, board_with_done: Board,
+    ) -> None:
+        # #1213: --skipped --reason must persist the reason (previously
+        # discarded — only --fail kept it), since the reason IS the audit
+        # trail for why the human Test gate was bypassed.
+        runner = CliRunner()
+        result = runner.invoke(main, [
+            "test", "abc123", "--skipped",
+            "--reason", "trivial dep bump, covered by regression test",
+            "--config", str(config_file),
+        ])
+        assert result.exit_code == 0
+        assert "SKIPPED" in result.output
+        assert "trivial dep bump" in result.output
+
+        from coord.state import load_board
+        board = load_board()
+        assert board.completed[0].test_state == "skipped"
+        assert board.completed[0].test_reason == "trivial dep bump, covered by regression test"
+
     def test_unknown_assignment_errors(self, config_file: Path, coord_db) -> None:
         save_board(Board())
         runner = CliRunner()

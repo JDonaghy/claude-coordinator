@@ -238,6 +238,7 @@
       "pr_url": "https://github.com/JDonaghy/claude-coordinator/pull/9001",
       "repo_github": "JDonaghy/claude-coordinator",
       "repo_name": "claude-coordinator",
+      "required_gates": null,
       "size": 240,
       "state": "queued",
       "target_branch": "main"

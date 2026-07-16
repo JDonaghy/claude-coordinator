@@ -9,11 +9,13 @@ Two-layer design so the logic is testable without hitting `gh`:
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Protocol
 
+from coord.audit import record_audit
 from coord.ci_store import CiStore, NoOpCi, failed_checks, in_flight_checks, summarize
 from coord.db import get_connection
 from coord.models import CLOSES_ISSUE_TYPES, WORK_LIKE_TYPES, Assignment
@@ -82,20 +84,26 @@ def classify_conflict(error: str | None) -> str:
 def requires_review(entry: "QueuedMerge", config) -> bool:
     """True when *entry* must have an approved review before merging.
 
-    Honours both ``config.reviews.enabled`` (the master switch for the
-    adversarial review feature) and ``config.pipeline.default_gates`` (which
-    pipeline stages are enforced for work assignments).  A label-specific
-    pipeline override on the issue is not consulted here — the merge gate
-    operates on the *default* policy because the merge_queue entry doesn't
-    carry the issue's gate list.  Callers wanting per-issue overrides should
-    set ``--skip-review`` for the eligible entry instead.
+    Honours ``config.reviews.enabled`` (the master switch for the
+    adversarial review feature) and the *effective* gate list: ``entry``'s
+    own ``required_gates`` when set, falling back to
+    ``config.pipeline.default_gates`` otherwise (#1213).  ``entry`` is
+    duck-typed — both ``QueuedMerge`` (``required_gates`` snapshotted at
+    :func:`enqueue` time, commit-bound) and ``Assignment`` (``required_gates``
+    resolved from ``config.pipeline.labels`` at dispatch time, see
+    :func:`coord.brain.resolve_required_gates`) carry the attribute, so
+    ``coord.merge_queue.plan`` can pass either.  Untagged work — the entry
+    has no override — behaves exactly as before this change: the default
+    policy applies. Explicit-only overrides (``--skip-review``) remain
+    available as a manual escape hatch on top of this.
     """
     if not getattr(config, "reviews", None) or not config.reviews.enabled:
         return False
     pipeline = getattr(config, "pipeline", None)
     if pipeline is None:
         return True
-    return "review" in (pipeline.default_gates or [])
+    gates = getattr(entry, "required_gates", None) or (pipeline.default_gates or [])
+    return "review" in gates
 
 
 def has_approved_review(entry: "QueuedMerge", board) -> bool:
@@ -158,14 +166,113 @@ def has_approved_review(entry: "QueuedMerge", board) -> bool:
 def requires_smoke(entry: "QueuedMerge", config) -> bool:
     """True when *entry* must have an interactive smoke verdict before merging.
 
-    Honours ``config.pipeline.default_gates``.  When ``"test"`` is in the
+    Honours the *effective* gate list — ``entry``'s own ``required_gates``
+    when set, falling back to ``config.pipeline.default_gates`` otherwise
+    (#1213; see :func:`requires_review` for the duck-typing/fallback
+    contract shared by both gates).  When ``"test"`` is in the resolved
     gate list the user must record ``coord test --passed`` (or ``--skip``)
     before ``coord merge`` proceeds.  ``"test"`` absent → gate disabled.
     """
     pipeline = getattr(config, "pipeline", None)
     if pipeline is None:
         return False
-    return "test" in (pipeline.default_gates or [])
+    gates = getattr(entry, "required_gates", None) or (pipeline.default_gates or [])
+    return "test" in gates
+
+
+# ── Gate-bypass auditing (#1213) ────────────────────────────────────────────
+
+def _bypassed_gates(entry: "QueuedMerge", config) -> list[str]:
+    """Which of the default pipeline's gates *entry*'s resolved gate list
+    drops.
+
+    Returns ``[]`` when ``entry`` carries no override (``required_gates``
+    empty/absent — falls back to ``config.pipeline.default_gates``, nothing
+    to bypass) or when its resolved gates already match the default list.
+    Only ``"review"`` and ``"test"`` are reported — ``"merge"`` is the
+    terminal action being gated, not a checkpoint that can be "bypassed".
+    """
+    gates = getattr(entry, "required_gates", None)
+    if not gates:
+        return []
+    pipeline = getattr(config, "pipeline", None) if config is not None else None
+    default_gates = list(getattr(pipeline, "default_gates", None) or []) if pipeline else []
+    return [g for g in ("review", "test") if g in default_gates and g not in gates]
+
+
+def _bypass_label(entry: "QueuedMerge", config) -> str | None:
+    """Best-effort reverse lookup of the ``pipeline.labels`` key that
+    produced *entry*'s resolved ``required_gates``, for a readable audit
+    row / CLI message.
+
+    Returns ``None`` when no exact match is found (the label was renamed or
+    removed from config after enqueue time, or ``pipeline.labels`` is
+    empty) — the audit event and CLI note still fire without a name in that
+    case, since the gate list itself is the durable evidence.  Ambiguous
+    when two labels resolve to the same gate list — the first match (dict
+    iteration order) wins; this is display-only and never affects gate
+    enforcement.
+    """
+    pipeline = getattr(config, "pipeline", None) if config is not None else None
+    labels = getattr(pipeline, "labels", None) if pipeline else None
+    gates = getattr(entry, "required_gates", None)
+    if not labels or not gates:
+        return None
+    for label, label_gates in labels.items():
+        if list(label_gates) == list(gates):
+            return label
+    return None
+
+
+def _bypass_note(entry: "QueuedMerge", config) -> str:
+    """Human-readable suffix naming any bypassed gate, or ``""`` when none.
+
+    Appended to the ``coord merge`` "merged" event message (real and
+    dry-run) so a bypass is never silent (#1213).  Side-effect free — the
+    audit row itself is written separately, only on a real (non-dry-run)
+    merge, by the caller in :func:`process`.
+    """
+    bypassed = _bypassed_gates(entry, config)
+    if not bypassed:
+        return ""
+    label = _bypass_label(entry, config)
+    label_desc = f"label {label!r}" if label else "an issue-label override"
+    return f" [gate bypass via {label_desc}: {', '.join(bypassed)} skipped]"
+
+
+def _record_gate_bypass_audit(entry: "QueuedMerge", config) -> list[str]:
+    """Emit one ``gate_bypassed`` business-tier audit row per bypassed gate
+    set, and return the bypassed gate names (``[]`` if none).
+
+    Called once per real merge success in :func:`process` — never in
+    dry-run, so previews never write phantom audit rows.  ``record_audit``
+    is itself best-effort (never raises), matching every other write
+    choke point in :mod:`coord.state`.
+    """
+    bypassed = _bypassed_gates(entry, config)
+    if not bypassed:
+        return []
+    label = _bypass_label(entry, config)
+    label_desc = f"label {label!r}" if label else "an issue-label override"
+    record_audit(
+        tier="business",
+        category="gate",
+        event_type="gate_bypassed",
+        actor="user",
+        summary=(
+            f"Gate bypass via {label_desc}: {', '.join(bypassed)} skipped "
+            f"for {entry.repo_name}#{entry.issue_number}"
+        ),
+        repo=entry.repo_name,
+        issue=entry.issue_number,
+        assignment_id=entry.assignment_id,
+        details={
+            "label": label,
+            "resolved_gates": list(getattr(entry, "required_gates", None) or []),
+            "bypassed_gates": bypassed,
+        },
+    )
+    return bypassed
 
 
 def passes_merge_gates(a, config, board) -> bool:
@@ -317,6 +424,16 @@ class QueuedMerge:
     # created before this field existed (preserves prior close-on-merge
     # behavior for old rows).
     assignment_type: str = "work"
+    # #1213: snapshot of the originating assignment's resolved
+    # required_gates (from config.pipeline.labels via a matching GitHub
+    # issue label, or [] for "no override"), captured at enqueue() time.
+    # requires_review/requires_smoke read this — falling back to
+    # config.pipeline.default_gates when empty — instead of re-resolving
+    # from the live board at merge time, so the effective gate policy for
+    # an entry is commit-bound to when it was enqueued. [] (the default)
+    # means "no override" for both fresh entries and rows predating this
+    # column (NULL decodes to []) — both fall back identically.
+    required_gates: list[str] = field(default_factory=list)
 
 
 class GhOps(Protocol):
@@ -383,6 +500,10 @@ def load_queue() -> list[QueuedMerge]:
             # existed read back as NULL, so fall back to "work" (the
             # pre-existing close-on-merge behavior for those entries).
             assignment_type=row["assignment_type"] or "work",
+            # #1213: column added via migration; NULL (pre-migration rows)
+            # and '[]' (explicit "no override") both decode to [] — the
+            # gate falls back to config.pipeline.default_gates for either.
+            required_gates=json.loads(row["required_gates"]) if row["required_gates"] else [],
         )
         for row in rows
     ]
@@ -399,14 +520,14 @@ def save_queue(items: list[QueuedMerge]) -> None:
                     assignment_id, repo_name, repo_github, branch,
                     target_branch, issue_number, issue_title, state,
                     pr_number, pr_url, size, last_attempt, error, enqueued_at,
-                    assignment_type
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    assignment_type, required_gates
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     item.assignment_id, item.repo_name, item.repo_github,
                     item.branch, item.target_branch, item.issue_number,
                     item.issue_title, item.state, item.pr_number, item.pr_url,
                     item.size, item.last_attempt, item.error, item.enqueued_at,
-                    item.assignment_type,
+                    item.assignment_type, json.dumps(list(item.required_gates or [])),
                 ),
             )
 
@@ -470,6 +591,10 @@ def enqueue(
         size=diff_size,
         enqueued_at=time.time(),
         assignment_type=assignment.type,
+        # #1213: snapshot the resolved gate list at enqueue time (commit-
+        # bound) rather than leaving requires_review/requires_smoke to
+        # re-resolve it from the live board later.
+        required_gates=list(assignment.required_gates or []),
     )
     items.append(entry)
     save_queue(items)
@@ -639,6 +764,8 @@ def refresh_entry_assignment(
             size=diff_size,
             enqueued_at=time.time(),
             assignment_type=assignment.type,
+            # #1213: snapshot the resolved gate list, same as enqueue().
+            required_gates=list(assignment.required_gates or []),
         )
         items.append(entry)
         save_queue(items)
@@ -1197,7 +1324,8 @@ def process(
                     continue
                 events.append(MergeEvent(
                     entry, "merged",
-                    f"(dry run) would merge {entry.branch} → {entry.target_branch}",
+                    f"(dry run) would merge {entry.branch} → {entry.target_branch}"
+                    f"{_bypass_note(entry, config)}",
                 ))
             continue
 
@@ -1346,6 +1474,14 @@ def process(
             if ok:
                 entry.state = MERGED
                 entry.error = None
+                # #1213: audit any gate bypassed by a per-issue label override
+                # BEFORE announcing the merge, so the "merged" event message
+                # already carries the bypass note — a bypass is never silent.
+                # Only fires on a real merge (never dry-run, handled above via
+                # the side-effect-free _bypass_note) so previews can't write
+                # phantom audit rows.
+                _record_gate_bypass_audit(entry, config)
+                bypass_note = _bypass_note(entry, config)
                 # Deterministically close the linked issue.  GitHub's `Closes #N`
                 # auto-close only fires when the PR *body* carries the keyword
                 # AND it merges into the default branch; the worker-created-PR
@@ -1365,20 +1501,21 @@ def process(
                         gh_ops.close_issue(entry.repo_github, entry.issue_number)
                         events.append(MergeEvent(
                             entry, "merged",
-                            f"merged PR #{entry.pr_number}; closed issue #{entry.issue_number}",
+                            f"merged PR #{entry.pr_number}; closed issue #{entry.issue_number}"
+                            f"{bypass_note}",
                         ))
                     except Exception as e:  # noqa: BLE001 — never fail a merge on close
                         events.append(MergeEvent(
                             entry, "merged",
                             f"merged PR #{entry.pr_number} (warning: could not "
-                            f"close issue #{entry.issue_number}: {e})",
+                            f"close issue #{entry.issue_number}: {e}){bypass_note}",
                         ))
                 else:
                     events.append(MergeEvent(
                         entry, "merged",
                         f"merged PR #{entry.pr_number}; issue #{entry.issue_number} "
                         f"left open (assignment type {entry.assignment_type!r} "
-                        "does not close its tracking issue, #1077)",
+                        f"does not close its tracking issue, #1077){bypass_note}",
                     ))
                 continue
             entry.state = CONFLICT

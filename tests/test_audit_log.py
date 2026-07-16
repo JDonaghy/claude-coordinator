@@ -240,6 +240,24 @@ class TestHookedTransitions:
         assert len(rows) == 1
         assert json.loads(rows[0]["details_json"])["test_reason"] == "boom"
 
+    def test_test_verdict_skipped_reason_in_details(self, coord_db) -> None:
+        # #1213: a --skipped verdict's reason is the audit trail for why the
+        # human Test gate was bypassed — it must land in details, same as
+        # --fail's reason does.
+        _dispatch(coord_db, assignment_id="aid-1")
+        record_test_verdict(
+            assignment_id="aid-1", test_state="skipped",
+            test_reason="trivial dep bump, covered by regression test",
+        )
+        rows = [
+            r for r in _audit_rows(coord_db, assignment_id="aid-1")
+            if r["event_type"] == "test_skipped"
+        ]
+        assert len(rows) == 1
+        assert json.loads(rows[0]["details_json"])["test_reason"] == (
+            "trivial dep bump, covered by regression test"
+        )
+
     def test_mark_notified_completion_writes_one_row(self, coord_db) -> None:
         _dispatch(coord_db, assignment_id="aid-1")
         from coord.comments import EVENT_COMPLETION

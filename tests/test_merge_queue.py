@@ -38,6 +38,7 @@ def _q(
     state: str = PENDING,
     pr: int | None = None,
     assignment_type: str = "work",
+    required_gates: list[str] | None = None,
 ) -> QueuedMerge:
     return QueuedMerge(
         assignment_id=aid,
@@ -51,6 +52,7 @@ def _q(
         size=size,
         pr_number=pr,
         assignment_type=assignment_type,
+        required_gates=required_gates if required_gates is not None else [],
     )
 
 
@@ -115,6 +117,13 @@ class TestPersistence:
         again = {x.assignment_id: x.assignment_type for x in load_queue()}
         assert again == {"a": "mock-author", "b": "work"}
 
+    def test_roundtrip_preserves_required_gates(self, coord_db) -> None:
+        # #1213: a label-resolved gate list must survive a save/load cycle
+        # so the merge gate stays commit-bound after a daemon restart.
+        save_queue([_q("a", required_gates=["merge"]), _q("b")])
+        again = {x.assignment_id: x.required_gates for x in load_queue()}
+        assert again == {"a": ["merge"], "b": []}
+
 
 class TestEnqueue:
     def _assignment(self, *, branch: str | None = "worker/foo") -> Assignment:
@@ -140,6 +149,27 @@ class TestEnqueue:
         assert entry is not None
         assert entry.assignment_type == "mock-author"
         assert load_queue()[0].assignment_type == "mock-author"
+
+    def test_enqueue_snapshots_required_gates(self, coord_db) -> None:
+        # #1213: a label-resolved gate list on the assignment must be
+        # snapshotted onto the queue entry at enqueue time (commit-bound).
+        a = Assignment(
+            machine_name="m", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="ga", branch="worker/ga", status="done",
+            required_gates=["merge"],
+        )
+        entry = enqueue(a, repo_github="acme/api", target_branch="main")
+        assert entry is not None
+        assert entry.required_gates == ["merge"]
+        assert load_queue()[0].required_gates == ["merge"]
+
+    def test_enqueue_untagged_work_gets_empty_required_gates(self, coord_db) -> None:
+        # Untagged work (no label override) must snapshot [] — the fallback
+        # sentinel — not None, so requires_review/requires_smoke fall back to
+        # config.pipeline.default_gates unchanged (#1213 compatibility contract).
+        entry = enqueue(self._assignment(), repo_github="acme/api", target_branch="main")
+        assert entry is not None
+        assert entry.required_gates == []
 
     def test_idempotent(self, coord_db) -> None:
         enqueue(self._assignment(), repo_github="acme/api", target_branch="main")
@@ -545,6 +575,27 @@ class TestReviewGate:
         assert mq.requires_review(_q("a"), cfg_off) is False
         cfg_no_gate = self._config(enabled=True, gates=["merge"])
         assert mq.requires_review(_q("a"), cfg_no_gate) is False
+
+    def test_requires_review_entry_override_bypasses_default(self) -> None:
+        # #1213: an entry whose snapshotted required_gates drops "review"
+        # bypasses the gate even though the default policy requires it.
+        cfg = self._config(enabled=True, gates=["review", "merge"])
+        entry = _q("a", required_gates=["merge"])
+        assert mq.requires_review(entry, cfg) is False
+
+    def test_requires_review_entry_override_can_also_require_it(self) -> None:
+        # An override that keeps "review" still gates, same as default.
+        cfg = self._config(enabled=True, gates=["merge"])
+        entry = _q("a", required_gates=["review", "merge"])
+        assert mq.requires_review(entry, cfg) is True
+
+    def test_requires_review_empty_entry_gates_falls_back_to_default(self) -> None:
+        # #1213 compatibility contract: untagged work (entry.required_gates
+        # empty/absent) must behave exactly as before — default policy wins.
+        cfg = self._config(enabled=True, gates=["review", "merge"])
+        assert mq.requires_review(_q("a", required_gates=[]), cfg) is True
+        cfg_without = self._config(enabled=True, gates=["merge"])
+        assert mq.requires_review(_q("a", required_gates=[]), cfg_without) is False
 
     def test_has_approved_review_finds_matching_review(self) -> None:
         work = self._work("w1")
@@ -1062,6 +1113,26 @@ class TestSmokeGate:
             pass
         assert mq.requires_smoke(_q("a"), _NoPipelineCfg()) is False
 
+    def test_requires_smoke_entry_override_bypasses_default(self) -> None:
+        # #1213: an entry whose snapshotted required_gates drops "test"
+        # bypasses the smoke gate even though the default policy requires it.
+        cfg = self._config(gates=["test", "merge"])
+        entry = _q("a", required_gates=["merge"])
+        assert mq.requires_smoke(entry, cfg) is False
+
+    def test_requires_smoke_entry_override_can_also_require_it(self) -> None:
+        cfg = self._config(gates=["merge"])
+        entry = _q("a", required_gates=["test", "merge"])
+        assert mq.requires_smoke(entry, cfg) is True
+
+    def test_requires_smoke_empty_entry_gates_falls_back_to_default(self) -> None:
+        # #1213 compatibility contract: untagged work (entry.required_gates
+        # empty/absent) must behave exactly as before — default policy wins.
+        cfg = self._config(gates=["test", "merge"])
+        assert mq.requires_smoke(_q("a", required_gates=[]), cfg) is True
+        cfg_without = self._config(gates=["merge"])
+        assert mq.requires_smoke(_q("a", required_gates=[]), cfg_without) is False
+
     def test_has_smoke_verdict_passed(self) -> None:
         work = self._work("w1", test_state="passed")
         board = self._board(completed=[work])
@@ -1296,6 +1367,148 @@ class TestSmokeGate:
         assert "merged" in kinds
         assert "smoke_required" not in kinds
         assert items[0].state == PENDING  # dry-run: state untouched
+
+
+class TestGateBypassAudit:
+    """#1213: a per-issue label override honoured by requires_review /
+    requires_smoke merges without the bypassed gate(s), and every bypass
+    writes a ``gate_bypassed`` business-tier audit row + a CLI-visible note
+    on the "merged" event — never silent."""
+
+    @staticmethod
+    def _config(*, default_gates=None, labels=None):
+        from dataclasses import dataclass, field as dc_field
+        @dataclass
+        class _Reviews:
+            enabled: bool = True
+        @dataclass
+        class _Pipeline:
+            default_gates: list[str] | None = None
+            labels: dict = dc_field(default_factory=dict)
+        @dataclass
+        class _Cfg:
+            reviews: _Reviews = dc_field(default_factory=_Reviews)
+            pipeline: _Pipeline = dc_field(default_factory=_Pipeline)
+        cfg = _Cfg()
+        cfg.pipeline.default_gates = (
+            default_gates if default_gates is not None else ["test", "review", "merge"]
+        )
+        cfg.pipeline.labels = labels or {}
+        return cfg
+
+    @staticmethod
+    def _board(completed=None, active=None):
+        from coord.models import Board
+        return Board(active=list(active or []), completed=list(completed or []))
+
+    @staticmethod
+    def _audit_rows(coord_db, event_type: str = "gate_bypassed") -> list:
+        return coord_db.execute(
+            "SELECT * FROM audit_log WHERE event_type = ?", (event_type,)
+        ).fetchall()
+
+    def test_merge_only_label_bypasses_review_and_smoke(self, coord_db) -> None:
+        cfg = self._config(labels={"gate:trivial": ["merge"]})
+        board = self._board()  # no review, no smoke verdict anywhere
+        items = [_q("a", required_gates=["merge"])]
+        events = process(items, FakeGh(), config=cfg, board=board)
+
+        assert items[0].state == MERGED
+        merged = [e for e in events if e.kind == "merged"]
+        assert merged
+        assert "gate bypass" in merged[0].message
+        assert "gate:trivial" in merged[0].message
+
+        rows = self._audit_rows(coord_db)
+        assert len(rows) == 1
+        assert rows[0]["tier"] == "business"
+        assert rows[0]["category"] == "gate"
+        assert rows[0]["actor"] == "user"
+        details = json.loads(rows[0]["details_json"])
+        assert details["label"] == "gate:trivial"
+        assert sorted(details["bypassed_gates"]) == ["review", "test"]
+        assert details["resolved_gates"] == ["merge"]
+
+    def test_untagged_work_is_completely_unaffected(self, coord_db) -> None:
+        # #1213 acceptance: the important regression test — untagged work
+        # (no per-issue override) must still be gated exactly as before.
+        cfg = self._config()
+        board = self._board()  # no review, no smoke verdict
+        items = [_q("a", required_gates=[])]
+        events = process(items, FakeGh(), config=cfg, board=board)
+
+        assert items[0].state == PENDING
+        kinds = [e.kind for e in events]
+        assert "review_required" in kinds
+        assert "merged" not in kinds
+        assert self._audit_rows(coord_db) == []
+
+    def test_label_resolving_to_test_and_merge_still_requires_test(self, coord_db) -> None:
+        # An issue whose label resolves to ["test", "merge"] still requires
+        # a Test verdict, just not a review.  Board carries the matching work
+        # assignment with no verdict yet, so the smoke gate fails closed
+        # (has_smoke_verdict only fails *open* when no matching branch work
+        # is found on the board at all).
+        cfg = self._config(labels={"needs-test": ["test", "merge"]})
+        work = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="a", type="work", status="done", branch="worker/a",
+            test_state=None,
+        )
+        board = self._board(completed=[work])
+        items = [_q("a", required_gates=["test", "merge"])]
+        events = process(items, FakeGh(), config=cfg, board=board)
+
+        assert items[0].state == PENDING
+        kinds = [e.kind for e in events]
+        assert "smoke_required" in kinds
+        assert "review_required" not in kinds
+        assert self._audit_rows(coord_db) == []
+
+    def test_label_resolving_to_test_and_merge_merges_once_tested(self, coord_db) -> None:
+        cfg = self._config(labels={"needs-test": ["test", "merge"]})
+        work = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="a", type="work", status="done", branch="worker/a",
+            test_state="passed",
+        )
+        board = self._board(completed=[work])
+        items = [_q("a", required_gates=["test", "merge"])]
+        events = process(items, FakeGh(), config=cfg, board=board)
+
+        assert items[0].state == MERGED
+        merged = [e for e in events if e.kind == "merged"]
+        assert merged and "review" in merged[0].message
+
+        rows = self._audit_rows(coord_db)
+        assert len(rows) == 1
+        details = json.loads(rows[0]["details_json"])
+        assert details["bypassed_gates"] == ["review"]
+
+    def test_no_audit_row_when_resolved_gates_match_default(self, coord_db) -> None:
+        # An entry carrying required_gates that happens to equal the default
+        # policy isn't a real bypass — no phantom audit row.
+        cfg = self._config(default_gates=["merge"])
+        board = self._board()
+        items = [_q("a", required_gates=["merge"])]
+        events = process(items, FakeGh(), config=cfg, board=board)
+
+        assert items[0].state == MERGED
+        merged = [e for e in events if e.kind == "merged"]
+        assert merged and "gate bypass" not in merged[0].message
+        assert self._audit_rows(coord_db) == []
+
+    def test_dry_run_shows_bypass_note_but_writes_no_audit(self, coord_db) -> None:
+        # #1213: "coord merge output names any bypassed gate" applies to the
+        # dry-run preview too, but a preview must never write an audit row.
+        cfg = self._config(labels={"gate:trivial": ["merge"]})
+        board = self._board()
+        items = [_q("a", required_gates=["merge"])]
+        events = process(items, FakeGh(), config=cfg, board=board, dry_run=True)
+
+        merged = [e for e in events if e.kind == "merged"]
+        assert merged and "gate bypass" in merged[0].message
+        assert self._audit_rows(coord_db) == []
 
 
 class TestRefreshEntryAssignment:

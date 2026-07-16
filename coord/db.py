@@ -155,7 +155,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             last_attempt REAL,
             error TEXT,
             enqueued_at REAL,
-            assignment_type TEXT DEFAULT 'work'
+            assignment_type TEXT DEFAULT 'work',
+            required_gates TEXT
         );
 
         CREATE TABLE IF NOT EXISTS plans (
@@ -378,6 +379,13 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # mode (Gate A) authoring, every other assignment type, and rows
         # predating this column.
         "ALTER TABLE assignments ADD COLUMN for_issue_number INTEGER",
+        # #1213: snapshot of the originating assignment's resolved
+        # required_gates (JSON array; NULL/'[]' = no per-issue override —
+        # callers fall back to config.pipeline.default_gates), captured at
+        # enqueue time so the review/smoke merge gates are commit-bound
+        # rather than re-resolved from the live board at merge time. NULL
+        # for rows predating this column, which fall back the same way.
+        "ALTER TABLE merge_queue ADD COLUMN required_gates TEXT",
     ]
     for sql in migrations:
         try:
