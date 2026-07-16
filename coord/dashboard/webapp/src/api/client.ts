@@ -160,3 +160,39 @@ export async function pipelineAction(
   }
   return data
 }
+
+// ── WS /ws/terminal/{session_id} ────────────────────────────────────────────
+
+/**
+ * Key `coord web`'s optional bearer token (`COORD_WEB_TOKEN` /
+ * `~/.coord/web_token`, see `coord.dashboard.terminal.resolve_web_token`)
+ * is stashed in `localStorage`, when the operator has set one.
+ *
+ * There's no in-app UI to populate this yet (#1068 is the terminal pane
+ * itself, not a settings screen) — for now it's set by hand from the
+ * browser devtools console:
+ *   `localStorage.setItem('coord_web_token', '<token>')`
+ * When unset, the WS connects without `?token=`, which matches the
+ * server's "no token configured => open" convention.
+ */
+const WEB_TOKEN_STORAGE_KEY = 'coord_web_token'
+
+function resolveWebToken(): string | null {
+  try {
+    return window.localStorage.getItem(WEB_TOKEN_STORAGE_KEY)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Build the `/ws/terminal/{session_id}` URL (#1065's PTY<->WebSocket
+ * bridge) for the given session, same-origin, ws/wss matching the page's
+ * http/https scheme, with `?token=` appended when one is configured.
+ */
+export function terminalWebSocketUrl(sessionId: string): string {
+  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  const token = resolveWebToken()
+  const query = token ? `?token=${encodeURIComponent(token)}` : ''
+  return `${proto}//${window.location.host}/ws/terminal/${encodeURIComponent(sessionId)}${query}`
+}
