@@ -4,3 +4,6 @@ dist-ssr
 *.local
 .env
 .env.local
+# Playwright failure artifacts (screenshots, traces)
+test-results/
+playwright-report/
