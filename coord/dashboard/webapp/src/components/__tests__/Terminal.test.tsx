@@ -130,4 +130,29 @@ describe('Terminal', () => {
 
     expect(ws.closed).toBe(true)
   })
+
+  it('wires MobileKeyBar soft keys to the same WebSocket write path as typed input (#1070)', async () => {
+    renderTerminal('work-2')
+    const ws = FakeWebSocket.instances[0]
+    ws.simulateOpen()
+
+    await userEvent.click(screen.getByRole('button', { name: 'Ctrl-C' }))
+
+    // `TextEncoder` (used by both `term.onData` and `MobileKeyBar`'s
+    // wiring) returns a Uint8Array from the environment's own realm, which
+    // isn't always `instanceof` the test file's `Uint8Array` under jsdom --
+    // decode it back instead of asserting the constructor identity.
+    const sent = ws.sent[ws.sent.length - 1] as ArrayBufferLike
+    expect(new TextDecoder().decode(sent)).toBe('\x03')
+  })
+
+  it('does not write to a WebSocket that is not open yet', async () => {
+    renderTerminal('work-2')
+    const ws = FakeWebSocket.instances[0]
+    // Still 'connecting' -- no simulateOpen().
+
+    await userEvent.click(screen.getByRole('button', { name: 'Escape' }))
+
+    expect(ws.sent).toHaveLength(0)
+  })
 })
