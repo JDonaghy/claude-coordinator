@@ -546,6 +546,79 @@ def test_milestone_work_orders_empty_when_no_tracking_issue(file_db: Path, valid
     )
 
 
+# ── #1195: children in /board payload ─────────────────────────────────────────
+
+_SUB_ISSUES_BODY = """\
+Tracking issue for the milestone.
+
+## Sub-issues
+- [ ] #101  {group: A}
+- [x] #102  {group: A}
+
+## Notes
+Not part of the sub-issues block.
+"""
+
+
+def _make_sub_issues_db(path: Path) -> None:
+    """Seed a DB with a tracking issue (label="epic") carrying a
+    ``## Sub-issues`` block referencing an open (#101) and a checked/closed
+    (#102) child."""
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    _ensure_schema(conn)
+    conn.execute("INSERT INTO machines (name, host, capabilities, repos) VALUES (?,?,?,?)",
+                 ("laptop", "laptop.tailnet", '["python"]', '["api"]'))
+    conn.execute(
+        "INSERT INTO issues (repo_name, number, title, body, state, labels, synced_at) "
+        "VALUES (?, ?, ?, ?, 'open', ?, 0)",
+        ("api", 500, "Milestone tracking", _SUB_ISSUES_BODY, '["epic", "coord"]'),
+    )
+    conn.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')")
+    conn.commit()
+    conn.close()
+
+
+@pytest.fixture
+def sub_issues_db(tmp_path: Path) -> Path:
+    p = tmp_path / "coord.db"
+    _make_sub_issues_db(p)
+    return p
+
+
+def test_children_in_board_payload(sub_issues_db: Path, valid_config_path: Path):
+    """#1195: /board payload carries a `children` entry per tracking issue,
+    parsed from the `## Sub-issues` checklist via the coord.parentage seam's
+    MarkdownParentage adapter — #102's checked box reports state='closed',
+    #101's unchecked box reports state='open'."""
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(sub_issues_db), cfg)
+    with TestClient(app) as cli:
+        board = cli.get("/board").json()
+
+    assert "children" in board, "children key missing from /board"
+    entries = board["children"]
+    assert len(entries) == 1, f"expected 1 children entry, got {len(entries)}: {entries}"
+
+    entry = entries[0]
+    assert entry["repo_name"] == "api"
+    assert entry["tracking_issue"] == 500
+
+    by_num = {c["number"]: c for c in entry["children"]}
+    assert set(by_num) == {101, 102}
+    assert by_num[101]["state"] == "open"
+    assert by_num[102]["state"] == "closed"
+
+
+def test_children_empty_when_no_tracking_issue(file_db: Path, valid_config_path: Path):
+    """#1195: fail-open — no epic-labelled issue means children is []."""
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(file_db), cfg)
+    with TestClient(app) as cli:
+        board = cli.get("/board").json()
+    assert board.get("children") == [], "children must be [] when no tracking issue is present"
+
+
 # ── #975: plan_roster in /board payload ──────────────────────────────────────
 
 def _make_plan_roster_db(path: Path) -> None:
@@ -3867,6 +3940,7 @@ def test_board_payload_regression(file_db: Path, valid_config_path: Path):
         "merge_staging",
         "issue_stage_projection",
         "milestone_work_orders",
+        "children",
         "plan_roster",
         "plan_roster_supported",
         "goal_header",
