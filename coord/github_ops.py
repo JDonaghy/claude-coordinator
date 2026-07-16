@@ -68,6 +68,78 @@ def get_issue(repo: str, issue_number: int) -> dict:
     return json.loads(raw)
 
 
+# ── Sub-issues (#1195) ───────────────────────────────────────────────────────
+#
+# The REST sub-issues API is live on GitHub today but used nowhere in this
+# repo before #1195 — every epic->child relation so far is the `## Work
+# order` / `## Sub-issues` markdown checklist `coord.milestone_order` parses.
+# These wrap the raw endpoints; `coord.parentage_github.GitHubParentage` is
+# the adapter that turns them into the backend-agnostic `coord.parentage`
+# seam shape (`Child`/`ParentRef`).
+#
+# Gotcha verified while filing #1195: the write endpoints (POST/DELETE) take
+# the child's internal database `id`, NOT its issue `number` — resolve via
+# `get_issue`'s `--jq .id` before writing (see `_resolve_issue_id`).
+
+
+def get_sub_issues(repo: str, issue_number: int) -> list[dict]:
+    """The live sub-issues of *issue_number* (``GET .../sub_issues``).
+
+    Returns ``[]`` for an issue with no sub-issues (confirmed live: this is
+    the API's normal response, not a 404/410 — see #1195's filing notes).
+    Each item is a full issue object; callers only need ``number``/``state``.
+    """
+    raw = _gh("api", f"repos/{repo}/issues/{issue_number}/sub_issues")
+    return json.loads(raw)
+
+
+def get_issue_parent(repo: str, issue_number: int) -> dict | None:
+    """The parent of *issue_number*, or ``None`` when it has none.
+
+    Reads the ``parent`` field GitHub already includes on ``GET
+    /issues/{n}`` (confirmed live while filing #1195 — no preview header
+    needed). ``None`` covers both "field absent" and the documented
+    ``parent: null`` shape.
+    """
+    raw = _gh("api", f"repos/{repo}/issues/{issue_number}", "--jq", ".parent")
+    stripped = raw.strip()
+    if not stripped or stripped == "null":
+        return None
+    return json.loads(stripped)
+
+
+def _resolve_issue_id(repo: str, issue_number: int) -> int:
+    """Issue `number` -> internal database `id` (#1195's write-path gotcha:
+    the sub-issues POST/DELETE endpoints want the latter, not the former)."""
+    raw = _gh("api", f"repos/{repo}/issues/{issue_number}", "--jq", ".id")
+    return int(raw.strip())
+
+
+def add_sub_issue(repo: str, parent_number: int, child_number: int) -> None:
+    """Make *child_number* a sub-issue of *parent_number* (``POST
+    .../sub_issues``). Resolves *child_number* to its database id first —
+    the endpoint wants ``sub_issue_id`` (a database id), not the issue
+    number, and 422s if the body doesn't shape up."""
+    child_id = _resolve_issue_id(repo, child_number)
+    _gh(
+        "api", f"repos/{repo}/issues/{parent_number}/sub_issues",
+        "--method", "POST",
+        "-F", f"sub_issue_id={child_id}",
+    )
+
+
+def remove_sub_issue(repo: str, parent_number: int, child_number: int) -> None:
+    """Detach *child_number* from *parent_number* (``DELETE
+    .../sub_issue`` — singular, unlike the GET/POST plural; a real GitHub
+    API asymmetry, not a typo here)."""
+    child_id = _resolve_issue_id(repo, child_number)
+    _gh(
+        "api", f"repos/{repo}/issues/{parent_number}/sub_issue",
+        "--method", "DELETE",
+        "-F", f"sub_issue_id={child_id}",
+    )
+
+
 def edit_issue(
     repo: str,
     issue_number: int,

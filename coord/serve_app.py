@@ -1005,6 +1005,38 @@ def _board_response_schema(components: dict) -> dict:
                     "required": ["repo_name", "tracking_issue", "nodes"],
                 },
             },
+            "children": {
+                "type": "array",
+                "description": (
+                    "#1195: per-epic child-issue list (number + open/closed "
+                    "state), published alongside milestone_work_orders so the "
+                    "TUI can nest without a live sub-issues API call per row. "
+                    "Computed server-side via the coord.parentage seam's "
+                    "MarkdownParentage adapter over the tracking issue's `## "
+                    "Sub-issues` checklist (#1008) — coord.parentage_github."
+                    "GitHubParentage is the live-API adapter behind the same "
+                    "seam shape, not used on this per-poll path."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "repo_name": {"type": "string"},
+                        "tracking_issue": {"type": "integer"},
+                        "children": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "number": {"type": "integer"},
+                                    "state": {"type": "string"},
+                                },
+                                "required": ["number", "state"],
+                            },
+                        },
+                    },
+                    "required": ["repo_name", "tracking_issue", "children"],
+                },
+            },
         },
         "required": [
             "schema_version", "round_number", "assignments", "machines",
@@ -2376,6 +2408,41 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 projection["milestone_work_orders"] = _milestone_work_orders
             except Exception:  # noqa: BLE001 — work-order failure must not blank the board
                 projection["milestone_work_orders"] = []
+            # #1195: per-epic child-issue list via the coord.parentage seam's
+            # MarkdownParentage adapter — parses the SAME cached tracking-issue
+            # body milestone_work_orders just read (`## Sub-issues`, #1008), so
+            # no extra `gh` round trip and no live sub-issues API call per row
+            # (see coord.parentage's docstring: not affordable on the board-
+            # payload hot path). coord.parentage_github.GitHubParentage is the
+            # live-API adapter behind the identical seam shape, used elsewhere
+            # (not on this per-poll path). Fail-open: any error produces an
+            # empty list, not a 503.
+            try:
+                from coord.parentage import MarkdownParentage as _MarkdownParentage  # noqa: PLC0415
+
+                _parentage = _MarkdownParentage()
+                _epic_children: list[dict] = []
+                for _ci_ti in projection.get("issues", []):
+                    _ci_labels = _ci_ti.get("labels") or []
+                    if _TRACKING_LABEL not in _ci_labels:
+                        continue
+                    _ci_repo_name = _ci_ti.get("repo_name", "")
+                    if not _ci_repo_name:
+                        continue
+                    _ci_kids = _parentage.children(
+                        "", _ci_ti["number"], body=_ci_ti.get("body") or "",
+                    )
+                    if _ci_kids:
+                        _epic_children.append({
+                            "repo_name": _ci_repo_name,
+                            "tracking_issue": _ci_ti["number"],
+                            "children": [
+                                {"number": c.number, "state": c.state} for c in _ci_kids
+                            ],
+                        })
+                projection["children"] = _epic_children
+            except Exception:  # noqa: BLE001 — children failure must not blank the board
+                projection["children"] = []
             # #975: milestone plan-roster — reuse coord.plans.aggregate_repo_plans
             # server-side so the Plans TUI panel gets one row per milestone/epic
             # (ready / blocked / in-flight / done counts, needs_you attention
