@@ -1,9 +1,13 @@
 # Phone Web Control Center
 
 The Phone Web Control Center is a React PWA served by `coord web` (port 7434).
-It gives you a full pipeline view — and one-tap gate actions — from any device on your Tailscale network, including a phone.
+It gives you a full pipeline view — one-tap gate actions — and, as of **v2**, a
+pop-open terminal to **finish a live session you started at your desk**, from
+any device on your Tailscale network, including a phone.
 
-Part of the **Web: Phone Control Center (v1)** milestone (#700–#703).
+Part of the **Web: Phone Control Center** milestone (#16). v1 (#700–#703) shipped
+the headless pipeline view; v2 (epic #1064, #1065–#1072) added the human-attended
+terminal takeover described below.
 
 ---
 
@@ -11,13 +15,61 @@ Part of the **Web: Phone Control Center (v1)** milestone (#700–#703).
 
 The phone webapp is a **Progressive Web App (PWA)** that:
 
-- Shows every in-flight pipeline item as a tappable card (Home screen).
-- Lets you tap into a Detail screen per item to see stage status, test verdict, review findings, and one-tap actions: Pass / Fail test, Start Review, Approve / Request Changes, Enqueue, Merge, Dispatch Fix, Cancel Stuck.
+- Shows every in-flight pipeline item as a tappable card (Home screen), with
+  **working / in-flight sessions surfaced first** (v2, #1067) — the things
+  you'd actually want to resume from your phone.
+- Lets you tap into a Detail screen per item to see stage status, test verdict,
+  review findings, and one-tap actions: Pass / Fail test, Start Review, Approve
+  / Request Changes, Enqueue, Merge, Dispatch Fix, Cancel Stuck.
+- From an in-progress item with a live interactive session, **pops open a real
+  terminal** (top half of the screen) attached to that session, plus a mobile
+  key bar (bottom half) built for driving `claude`'s TUI from a phone
+  soft-keyboard — see "Terminal takeover (v2)" below.
 - Auto-refreshes every 4 s (React Query polling).
 - Supports pull-to-refresh on mobile.
 - Is installable as a home-screen app ("Add to Home Screen") on iOS and Android — `vite-plugin-pwa` generates the service worker and web manifest.
 
-It is **not** a full coordinator — it does not have a chat interface, a board view, or proposal approval. It is deliberately narrow: pipeline gate actions that you need to do *away from your desk*, from your phone.
+It is still **not** a full coordinator — no chat-driven planning, no board view,
+no proposal approval. It's deliberately narrow: the gate actions and the one
+"finish what I started at my desk" move you need *away from your desk*.
+
+---
+
+## Terminal takeover (v2, epic #1064)
+
+v1 could show you an in-flight item but never let you see or type into the
+live worker behind it. v2 adds exactly one new capability on top: **take over
+a session you left running at your desk, from your phone.**
+
+- **Attachable-sessions API** (`GET /api/sessions`, #1066) lists the live
+  interactive `coord-*` tmux sessions across the fleet — machine, repo, issue,
+  tmux name, whether a bridge is already attached — sourced from the same
+  fleet session roster `coord sessions` itself reads (milestone #32), not a
+  parallel discovery path.
+- **PTY↔WebSocket bridge** (`GET /ws/terminal/{session_id}`, #1065,
+  `coord/dashboard/terminal.py`) `tmux attach`es to that session — over `ssh
+  <host>` when the session's actual host differs from the dashboard host —
+  and relays bytes both ways. On disconnect it **detaches, never kills**: the
+  session keeps running at your desk exactly as if you'd stepped away from
+  the keyboard.
+- **xterm.js terminal pane** (top half, #1068) renders the live byte stream.
+- **Mobile key bar** (bottom half, #1070) gives you Esc, arrows, Enter/submit,
+  Ctrl-C, Tab, and `/` — the keys a phone soft-keyboard makes painful, that
+  `claude`'s TUI needs constantly.
+- **Reconnect resilience** (#1071): mobile networks drop WebSockets
+  constantly (backgrounding, wifi↔cellular handoff). The frontend reopens a
+  fresh WebSocket to the same `session_id` with exponential backoff (1s → 10s
+  cap) without recreating the `xterm.js` instance — `tmux attach`'s own
+  redraw-on-reattach repaints the existing pane. A `4404` close code means the
+  session is genuinely gone (not a transient drop); the UI shows a terminal
+  "ended" state and stops retrying.
+- **Playwright E2E** (#1072, `coord/dashboard/webapp/e2e/terminal.spec.ts`)
+  drives the real open → type → detach flow headless against a seeded fake
+  session + fake PTY bridge — the milestone's browser acceptance bar. Routed
+  to a `browser`-capable machine via `smoke_tests.capability_rules`.
+
+See "ToS posture" below for why this is allowed under §3.7 despite the v1
+doc's original headless-only stance.
 
 ---
 
@@ -134,6 +186,8 @@ systemctl --user daemon-reload && systemctl --user enable --now coord-web
 | `GET  /api/diff/{id}` | Unified diff for an assignment (PR diff or compare API) |
 | `POST /api/chat` | Chat with the coordinator assistant (streaming SSE) |
 | `GET  /events` | SSE: `board_updated`, `assignment_completed`, `assignment_failed`, … |
+| `GET  /api/sessions` | **(v2, #1066)** Live interactive `coord-*` tmux sessions the phone may attach to |
+| `GET  /ws/terminal/{session_id}` | **(v2, #1065)** WebSocket PTY bridge — human-attended only, see "Terminal takeover" above |
 
 ### `GET /api/pipeline` — PipelineView fields
 
@@ -178,18 +232,46 @@ Body: `{"assignment_id": "...", "action": "...", ...extra}`
 
 ## ToS posture
 
-The Phone Web Control Center is **headless-only**. It does not embed a live terminal or any UI element that could display a running `claude -p` session to a remote user.
+ToS §3.7 forbids **unattended TTY-scraping / automation** of the `claude` CLI —
+a program reading or driving a `claude` session with no human in the loop. It
+does **not** forbid a human remotely operating their own session; that's the
+case #437 preserved, and it's what v2's terminal takeover is: **a remote
+keyboard + screen for a session you started yourself, attached only when you
+open it and typed into only by you.**
 
-- Gate actions (`dispatch_review`, `enqueue`, `merge`, `test-verdict`, …) are stateless POST calls — they mutate the DB and/or call agent endpoints, but they do not attach to, display, or control a live worker subprocess.
-- The `/api/diff/{id}` endpoint fetches a static unified diff via the GitHub API — not a live log stream.
-- The `/events` SSE stream emits board-level notifications (`assignment_completed`, `board_updated`) — not raw worker output.
-- The `/api/chat` endpoint opens a **new** headless `claude -p` session scoped to answering one question about the board state. It is a fresh headless invocation, not a relay of an existing session.
+v1 was deliberately headless because the terminal-bridge design work hadn't
+been done yet, not because a human-attended terminal is disallowed. v2 (epic
+#1064) builds exactly that, with the bridge holding the line at "relay a live
+human," never "read or drive autonomously":
 
-**What is explicitly out of scope for v1** (and deferred to prevent ToS exposure):
-- Live terminal / log streaming to the phone (deferred beyond v1).
-- An authoring / scoping view that lets you write and dispatch briefings from the phone (deferred beyond v1).
+- **You open it, you type.** The WS bridge (`GET /ws/terminal/{session_id}`)
+  only exists while a browser tab holds it open; nothing dispatches, injects
+  keystrokes, or reads output on a timer or without your tab connected.
+- **Detach, never kill.** Every code path that ends the bridge connection
+  (clean close, network drop, tab closed) detaches the underlying `tmux
+  attach` — it never sends a kill signal to the session. Your desk session
+  keeps running exactly as you left it whether or not the phone is attached.
+- **No parallel automation path.** The attachable-sessions list (`GET
+  /api/sessions`) and the bridge both read the same fleet session roster
+  `coord sessions` uses — there is no separate "drive this session for me"
+  API; the only way bytes reach the PTY is through the WebSocket a human
+  browser tab is holding open.
+- Everything from the v1 stance still holds for the **non-terminal** parts of
+  the app: gate actions (`dispatch_review`, `enqueue`, `merge`,
+  `test-verdict`, …) are stateless POSTs that never attach to a live worker;
+  `/api/diff/{id}` is a static diff fetch; `/events` emits board-level
+  notifications, not raw worker output; `/api/chat` opens a **new** headless
+  `claude -p` session scoped to one question, never a relay of an existing one.
 
-Both of these require careful design around the human-attended session requirement (ToS §3.7) and are tracked separately.
+**Still out of scope** (and still deferred for the same ToS reason — no human
+necessarily attached at dispatch time): an authoring/scoping view that writes
+and *dispatches* briefings from the phone. Dispatch is a coordinator-approval
+action, not a live-session relay, so it's a separate design problem, tracked
+separately from the terminal takeover above.
+
+**Reviewers of any future change to `coord/dashboard/terminal.py` or the
+terminal frontend: reject any path that reads or drives a session without an
+open, human-held WebSocket connection.**
 
 ---
 
@@ -197,11 +279,11 @@ Both of these require careful design around the human-attended session requireme
 
 The webapp ships with two test tiers:
 
-1. **Vitest unit tests** (`coord/dashboard/webapp/src/components/__tests__/`) — component rendering and filter-logic contracts. Run with `npm test` inside `coord/dashboard/webapp/`.
+1. **Vitest unit tests** (`coord/dashboard/webapp/src/components/__tests__/`) — component rendering and filter-logic contracts, including `Terminal.test.tsx`, `MobileKeyBar.test.tsx`, `SessionCard.test.tsx`, `Home.test.tsx`. Run with `npm test` inside `coord/dashboard/webapp/`.
 
-2. **Python integration tests** (`tests/test_dashboard.py`) — the `build_app()` Starlette server tested via `TestClient`. These run as part of the normal `pytest` suite.
+2. **Python integration tests** (`tests/test_dashboard.py`, `tests/test_dashboard_terminal.py`) — the `build_app()` Starlette server and the PTY↔WS bridge (`SessionAttacher` seam) tested via `TestClient`. These run as part of the normal `pytest` suite.
 
-3. **Playwright E2E tests** — *forthcoming*. The acceptance bar for the webapp requires a browser-driven E2E suite that starts the dashboard server against a seeded board and asserts on the rendered DOM. See `CLAUDE.md` for the planned harness design.
+3. **Playwright E2E tests** (`coord/dashboard/webapp/e2e/terminal.spec.ts`, #1072) — shipped. Drives a real headless browser through open-terminal → type → detach against the dashboard server seeded with a fake attachable session + fake PTY bridge (no real ssh/tmux/claude). Run with `npm run test:e2e` (or `test:e2e:ui`) inside `coord/dashboard/webapp/`. Routed to a `browser`-capable machine at Test-stage time via `smoke_tests.capability_rules` in `coordinator.yml`.
 
 ---
 
@@ -209,14 +291,20 @@ The webapp ships with two test tiers:
 
 | Path | What lives there |
 |---|---|
-| `coord/dashboard/server.py` | Starlette app: all API routes + SPA serving + SSE poller |
+| `coord/dashboard/server.py` | Starlette app: all API routes + SPA serving + SSE poller + the terminal WS route |
+| `coord/dashboard/terminal.py` | **(v2, #1065)** `SessionAttacher` seam — real `tmux attach-session` (local or `ssh <host> -tt` remote) behind a PTY; `resolve_session_target()` maps `session_id` → host/tmux name off the board |
 | `coord/dashboard/webapp/` | React / Vite / TypeScript PWA source |
 | `coord/dashboard/webapp/src/api/client.ts` | Typed API client + all wire types |
 | `coord/dashboard/webapp/src/App.tsx` | React Router root (two routes: `/` Home, `/detail/:id` Detail) |
-| `coord/dashboard/webapp/src/components/Home.tsx` | Pipeline card list + filter tabs + pull-to-refresh |
+| `coord/dashboard/webapp/src/components/Home.tsx` | Pipeline card list + filter tabs + **in-progress/live sessions surfaced first (v2, #1067)** + pull-to-refresh |
 | `coord/dashboard/webapp/src/components/Detail.tsx` | Per-item detail: test gate, review section, merge section, diff viewer |
 | `coord/dashboard/webapp/src/components/PipelineCard.tsx` | Card component for Home screen |
+| `coord/dashboard/webapp/src/components/SessionCard.tsx` | **(v2, #1067)** Live-session card — tap to open the terminal takeover view |
+| `coord/dashboard/webapp/src/components/Terminal.tsx` | **(v2, #1068/#1071)** xterm.js pane + WS client + reconnect/backoff + "ended" state |
+| `coord/dashboard/webapp/src/components/MobileKeyBar.tsx` | **(v2, #1070)** Esc / arrows / Enter / Ctrl-C / Tab / `/` key bar for the terminal pane |
+| `coord/dashboard/webapp/e2e/terminal.spec.ts` | **(v2, #1072)** Playwright E2E for the takeover flow |
 | `coord/dashboard/webapp/vite.config.ts` | Vite + PWA plugin config |
-| `coord/dashboard/webapp/dist/` | **Built output** (gitignored locally; bundled into the PyPI wheel by the release workflow; run `npm run build` locally for editable installs) |
+| `coord/dashboard/webapp/dist/` | **Built output** (gitignored locally; bundled into the PyPI wheel by the release workflow as of 0.4.71, #758; run `npm run build` locally for editable installs) |
 | `coord/pipeline.py` | `PipelineView` / `PipelineGate` / `compute_pipeline()` — pure-computation pipeline state |
 | `tests/test_dashboard.py` | Python-level API integration tests |
+| `tests/test_dashboard_terminal.py` | **(v2, #1065)** PTY↔WS bridge integration tests |
