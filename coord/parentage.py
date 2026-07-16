@@ -33,7 +33,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
-from coord.milestone_order import parse_sub_issues
+from coord.milestone_order import parse_sub_issues, parse_work_order
 
 
 __all__ = [
@@ -102,6 +102,23 @@ class MarkdownParentage:
     (until EP-2 backfills existing epics) the markdown checklist is the only
     populated source of truth anyway.
 
+    #1197 fix-iteration finding: an "epic" tracking issue's ``## Work
+    order`` block (#767/#645 — the milestone's DAG of work items, written by
+    ``coord milestone write-order``) already names the exact same
+    parent->children relationship the newer ``## Sub-issues`` checklist
+    (#1008, written only by the separate, opt-in ``coord milestone
+    add-child``) is meant to encode — but plenty of existing epics (this
+    milestone's own #1200 tracking issue included) predate #1008 and were
+    never additionally seeded with a ``## Sub-issues`` block, so
+    ``parse_sub_issues`` legitimately finds nothing even though the epic
+    unambiguously has children. Pass ``fallback_to_work_order=True`` to
+    treat an empty/absent ``## Sub-issues`` block as "fall back to ``##
+    Work order``" instead of "no children" — this is what the board-payload
+    children projection (the Pipeline nesting feature) opts into; it
+    defaults to ``False`` so the #1196 close-guard (:func:`coord.
+    github_ops.get_open_children`) keeps its narrower, deliberately
+    conservative behavior unchanged.
+
     ``parent()`` has no reverse pointer to walk — the checklist lives on the
     PARENT's body, not the child's — so callers must supply *epics*: every
     candidate tracking issue as ``{"number": int, "state": str, "body":
@@ -116,12 +133,20 @@ class MarkdownParentage:
     """
 
     def children(
-        self, repo_github: str, issue_number: int, *, body: str = "",
+        self,
+        repo_github: str,
+        issue_number: int,
+        *,
+        body: str = "",
+        fallback_to_work_order: bool = False,
     ) -> list[Child]:
         work_order = parse_sub_issues(body)
+        if not work_order.nodes and fallback_to_work_order:
+            work_order = parse_work_order(body)
         return [
             Child(number=n.issue_number, state="closed" if n.checked else "open")
             for n in work_order.nodes
+            if n.issue_number != issue_number  # defensive: never self-nest
         ]
 
     def parent(

@@ -2485,6 +2485,19 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             # live-API adapter behind the identical seam shape, used elsewhere
             # (not on this per-poll path). Fail-open: any error produces an
             # empty list, not a 503.
+            #
+            # #1197 fix-iteration: pass fallback_to_work_order=True — a smoke
+            # test against the live board found epic #1200 (this very
+            # milestone's tracking issue) rendering with NO nested children
+            # despite the Rust nesting logic being correct against synthetic
+            # fixtures. Root cause: #1200 predates the #1008 `## Sub-issues`
+            # convention and was only ever seeded with a `## Work order`
+            # block (via `coord milestone write-order`), never additionally
+            # spliced with `coord milestone add-child`. `## Work order`
+            # already names the same parent->children edges, so falling back
+            # to it when `## Sub-issues` is empty/absent makes existing,
+            # not-yet-migrated epics nest correctly without requiring a
+            # manual backfill first. See coord.parentage.MarkdownParentage.
             try:
                 from coord.parentage import MarkdownParentage as _MarkdownParentage  # noqa: PLC0415
 
@@ -2500,6 +2513,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                     try:
                         _ci_kids = _parentage.children(
                             "", _ci_ti["number"], body=_ci_ti.get("body") or "",
+                            fallback_to_work_order=True,
                         )
                     except Exception:  # noqa: BLE001 — bad sub-issues block: skip this epic only
                         continue

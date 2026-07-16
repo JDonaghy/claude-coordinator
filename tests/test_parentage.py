@@ -61,6 +61,62 @@ class TestMarkdownParentageChildren:
         assert store.children("acme/api", 500) == []
 
 
+_WORK_ORDER_ONLY_BODY = """\
+Tracking issue for the milestone — predates the #1008 `## Sub-issues`
+convention, only ever got a `## Work order` block.
+
+## Work order
+- [ ] #101  {group: A}
+- [x] #102  {group: A}
+- [ ] #103  {after: #101}
+"""
+
+
+class TestMarkdownParentageChildrenWorkOrderFallback:
+    """#1197 fix-iteration: an epic seeded only with `## Work order` (never
+    additionally spliced with `coord milestone add-child`'s `## Sub-issues`
+    checklist) must still report its children when the caller opts in via
+    fallback_to_work_order=True — this is what made epic #1200 render with
+    no nested children on the live board despite the nesting logic itself
+    being correct."""
+
+    def test_falls_back_to_work_order_when_opted_in(self) -> None:
+        store = MarkdownParentage()
+        kids = store.children(
+            "acme/api", 500, body=_WORK_ORDER_ONLY_BODY, fallback_to_work_order=True,
+        )
+        by_num = {c.number: c for c in kids}
+        assert set(by_num) == {101, 102, 103}
+        assert by_num[101] == Child(number=101, state="open")
+        assert by_num[102] == Child(number=102, state="closed")
+        assert by_num[103] == Child(number=103, state="open")
+
+    def test_no_fallback_by_default(self) -> None:
+        """Default behavior (used by the #1196 close-guard) is unchanged:
+        an epic with only `## Work order` and no `## Sub-issues` still
+        reports zero children unless the caller explicitly opts in."""
+        store = MarkdownParentage()
+        assert store.children("acme/api", 500, body=_WORK_ORDER_ONLY_BODY) == []
+
+    def test_sub_issues_block_wins_over_work_order_even_with_fallback(self) -> None:
+        """When a `## Sub-issues` block IS present, it's used as-is — the
+        work-order fallback only kicks in when sub-issues parsing finds
+        nothing."""
+        store = MarkdownParentage()
+        kids = store.children(
+            "acme/api", 500, body=_EPIC_BODY, fallback_to_work_order=True,
+        )
+        assert {c.number for c in kids} == {101, 102, 103}
+
+    def test_self_reference_excluded(self) -> None:
+        """Defensive: a tracking issue must never nest under itself even if
+        its own number somehow appears in the parsed checklist."""
+        store = MarkdownParentage()
+        body = "## Work order\n- [ ] #500  {group: A}\n- [ ] #101  {group: A}\n"
+        kids = store.children("acme/api", 500, body=body, fallback_to_work_order=True)
+        assert {c.number for c in kids} == {101}
+
+
 class TestMarkdownParentageParent:
     def test_finds_owning_epic(self) -> None:
         store = MarkdownParentage()
