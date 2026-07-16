@@ -1,0 +1,5 @@
+# Include the built React webapp bundle (produced by `npm ci && npm run build`
+# in coord/dashboard/webapp/ before `python -m build`).
+# dist/ is gitignored so setuptools' VCS discovery won't find it — this
+# directive force-includes it in both the sdist and wheel.
+recursive-include coord/dashboard/webapp/dist *

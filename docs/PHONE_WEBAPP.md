@@ -45,9 +45,15 @@ The phone webapp calls the same `GET /api/pipeline` + `POST /api/pipeline/action
 
 ---
 
-## Setup: build the React bundle
+## Setup: no manual build needed (PyPI ≥ 0.4.71)
 
-The compiled React bundle (`dist/`) is **not** committed to the repository (it is gitignored). You must build it once from source before `coord web` can serve the SPA. The legacy static `index.html` is served as a fallback if `dist/` does not exist — it shows a plain JSON board view, not the phone app.
+As of **0.4.71** the compiled React bundle (`dist/`) is bundled into the PyPI wheel by the release workflow (`npm ci && npm run build` runs before `python -m build`). A plain `pip install claude-coordinator` or `coord agent update` is all you need — no Node.js, no checkout, no `npm run build` on the dashboard host.
+
+The legacy static `index.html` is served as a fallback if `dist/` does not exist (pre-0.4.71 wheel, or an editable install without a local build) — it shows a plain JSON board view, not the PWA.
+
+### Building from source (contributors / dev installs)
+
+If you are running from an editable checkout, you must build the bundle yourself:
 
 ```bash
 # One-time build (requires Node ≥ 18 + npm)
@@ -55,8 +61,6 @@ cd coord/dashboard/webapp
 npm install
 npm run build          # produces coord/dashboard/webapp/dist/
 ```
-
-After this, `coord web` will automatically serve the React SPA from `dist/`. You do not need to restart the server — the compiled bundle is served as static files.
 
 **Rebuild** whenever you pull upstream changes to `coord/dashboard/webapp/src/`:
 
@@ -78,8 +82,7 @@ coord web --host 127.0.0.1       # localhost-only (if you want a reverse proxy)
 ```
 
 **Run it as a service** so it stays up between sessions. A ready-made systemd
-*user* unit ships at [`deploy/coord-web.service`](../deploy/coord-web.service)
-(with prereqs + the `npm run build` / #703 caveat in its header):
+*user* unit ships at [`deploy/coord-web.service`](../deploy/coord-web.service):
 
 ```bash
 cp deploy/coord-web.service ~/.config/systemd/user/
@@ -214,6 +217,6 @@ The webapp ships with two test tiers:
 | `coord/dashboard/webapp/src/components/Detail.tsx` | Per-item detail: test gate, review section, merge section, diff viewer |
 | `coord/dashboard/webapp/src/components/PipelineCard.tsx` | Card component for Home screen |
 | `coord/dashboard/webapp/vite.config.ts` | Vite + PWA plugin config |
-| `coord/dashboard/webapp/dist/` | **Built output** (gitignored — run `npm run build` to produce) |
+| `coord/dashboard/webapp/dist/` | **Built output** (gitignored locally; bundled into the PyPI wheel by the release workflow; run `npm run build` locally for editable installs) |
 | `coord/pipeline.py` | `PipelineView` / `PipelineGate` / `compute_pipeline()` — pure-computation pipeline state |
 | `tests/test_dashboard.py` | Python-level API integration tests |
