@@ -688,6 +688,66 @@ def test_children_malformed_epic_does_not_blank_other_epics(tmp_path: Path, vali
     assert 600 not in by_tracking_issue
 
 
+_WORK_ORDER_ONLY_TRACKING_BODY = """\
+Tracking issue for the milestone — predates the #1008 `## Sub-issues`
+convention, only ever got a `## Work order` block from `coord milestone
+write-order`. Never additionally spliced with `coord milestone add-child`.
+
+## Work order
+- [ ] #101  {group: A}
+- [x] #102  {group: A}
+"""
+
+
+def _make_work_order_only_db(path: Path) -> None:
+    """Seed a DB with a tracking issue (label="epic") carrying ONLY a
+    ``## Work order`` block — no ``## Sub-issues`` checklist at all. This is
+    the #1197 fix-iteration repro: epic #1200 rendered with no nested
+    children on the live board because it predates the #1008 convention."""
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    _ensure_schema(conn)
+    conn.execute("INSERT INTO machines (name, host, capabilities, repos) VALUES (?,?,?,?)",
+                 ("laptop", "laptop.tailnet", '["python"]', '["api"]'))
+    conn.execute(
+        "INSERT INTO issues (repo_name, number, title, body, state, labels, synced_at) "
+        "VALUES (?, ?, ?, ?, 'open', ?, 0)",
+        ("api", 500, "Milestone tracking", _WORK_ORDER_ONLY_TRACKING_BODY, '["epic", "coord"]'),
+    )
+    conn.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')")
+    conn.commit()
+    conn.close()
+
+
+@pytest.fixture
+def work_order_only_db(tmp_path: Path) -> Path:
+    p = tmp_path / "coord.db"
+    _make_work_order_only_db(p)
+    return p
+
+
+def test_children_falls_back_to_work_order_when_no_sub_issues(
+    work_order_only_db: Path, valid_config_path: Path,
+):
+    """#1197 fix-iteration: an epic with only a `## Work order` block (no
+    `## Sub-issues` checklist) must still surface `children` in the /board
+    payload so the Pipeline nesting feature works on epics that predate the
+    #1008 convention, not just newly-seeded ones."""
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(work_order_only_db), cfg)
+    with TestClient(app) as cli:
+        board = cli.get("/board").json()
+
+    entries = board["children"]
+    assert len(entries) == 1, f"expected 1 children entry, got {len(entries)}: {entries}"
+    entry = entries[0]
+    assert entry["tracking_issue"] == 500
+    by_num = {c["number"]: c for c in entry["children"]}
+    assert set(by_num) == {101, 102}
+    assert by_num[101]["state"] == "open"
+    assert by_num[102]["state"] == "closed"
+
+
 # ── #975: plan_roster in /board payload ──────────────────────────────────────
 
 def _make_plan_roster_db(path: Path) -> None:
