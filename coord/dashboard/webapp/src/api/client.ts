@@ -45,6 +45,37 @@ export interface BoardData {
   completed: Assignment[]
 }
 
+// ── GET /api/sessions ────────────────────────────────────────────────────────
+
+/**
+ * One live `coord-*` interactive tmux session the phone can attach to via
+ * `GET /ws/terminal/{session_id}` (#1066). Hand-written rather than
+ * generated: the server builds this as a plain dict in `api_sessions`
+ * (`coord/dashboard/server.py`), not from a Python dataclass, so it isn't a
+ * `scripts/codegen.py` (#750) target — keep this in sync with the
+ * `session_response` OpenAPI schema in `_openapi_spec()` by hand.
+ */
+export interface SessionInfo {
+  /** == the assignment_id; also the `/ws/terminal/{session_id}` path param. */
+  session_id: string
+  /** The tmux session name, `coord-<session_id>`. */
+  session_name: string
+  machine: string | null
+  /** The machine's Tailscale host. */
+  host: string | null
+  repo: string | null
+  issue: number | null
+  issue_title: string | null
+  /** Assignment type — work/review/smoke/fix/plan/merge/... */
+  stage: string | null
+  /** Assignment status — running/done/failed/advisory/... */
+  status: string | null
+  /** Is a client currently attached to the tmux session. */
+  attached: boolean
+  /** claude has exited but the tmux session is still up. */
+  pane_dead: boolean
+}
+
 // ── GET /api/diff/{id} ────────────────────────────────────────────────────────
 
 export interface DiffResult {
@@ -99,6 +130,25 @@ export async function fetchBoard(): Promise<BoardData> {
 /** Fetch pipeline views for all work-type assignments. */
 export async function fetchPipeline(): Promise<PipelineView[]> {
   return apiFetch<PipelineView[]>('/api/pipeline')
+}
+
+/** Fetch live coord-* interactive sessions the phone can take over (#1066). */
+export async function fetchSessions(): Promise<SessionInfo[]> {
+  return apiFetch<SessionInfo[]>('/api/sessions')
+}
+
+/**
+ * Build the `/ws/terminal/{session_id}` WebSocket URL for a given session.
+ *
+ * No `?token=` is appended — the REST client above sends no auth either, and
+ * the server's bridge runs open when no `COORD_WEB_TOKEN` is configured
+ * (the tailnet-only dev default; see `coord.dashboard.terminal.resolve_web_token`).
+ * If a token *is* configured server-side, the attach will fail with 4401 —
+ * there is no client-side token entry yet, matching the rest of this API.
+ */
+export function terminalWsUrl(sessionId: string): string {
+  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  return `${proto}//${window.location.host}/ws/terminal/${encodeURIComponent(sessionId)}`
 }
 
 /**

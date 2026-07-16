@@ -1,8 +1,14 @@
 /**
  * Home — the main screen of the Phone Control Center.
  *
- * Shows in-flight pipeline items as tappable cards, auto-refreshing every 4 s.
- * Two filter tabs:
+ * A "Live sessions" section (#1067) surfaces live coord-* interactive
+ * sessions (#1066's `GET /api/sessions`) at the TOP of the screen, above
+ * everything else — these are in-progress human-attended sessions the phone
+ * can take over via the `/terminal/:sessionId` view, so they get first
+ * billing over the pipeline list below.
+ *
+ * Below that: in-flight pipeline items as tappable cards, auto-refreshing
+ * every 4 s. Two filter tabs:
  *   Active    — everything currently in the pipeline (not yet merged)
  *   Needs me  — items with at least one available gate action (need human input)
  *
@@ -12,8 +18,9 @@
 import { useCallback, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
-import { fetchPipeline, type PipelineView } from '@/api/client'
+import { fetchPipeline, fetchSessions, type PipelineView, type SessionInfo } from '@/api/client'
 import { PipelineCard } from '@/components/PipelineCard'
+import { SessionCard } from '@/components/SessionCard'
 
 // ── Filter logic ──────────────────────────────────────────────────────────────
 
@@ -120,6 +127,32 @@ function FilterTabs({ active: activeTab, counts, onChange }: FilterTabsProps) {
   )
 }
 
+// ── Live sessions section ───────────────────────────────────────────────────────
+
+interface LiveSessionsProps {
+  sessions: SessionInfo[]
+  onSelect: (sessionId: string) => void
+}
+
+function LiveSessions({ sessions, onSelect }: LiveSessionsProps) {
+  if (sessions.length === 0) return null
+
+  return (
+    <section aria-label="Live sessions" className="mb-5 space-y-3">
+      <h2 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+        Live sessions
+      </h2>
+      {sessions.map((session) => (
+        <SessionCard
+          key={session.session_id}
+          session={session}
+          onClick={() => onSelect(session.session_id)}
+        />
+      ))}
+    </section>
+  )
+}
+
 // ── Home screen ───────────────────────────────────────────────────────────────
 
 export default function Home() {
@@ -129,6 +162,12 @@ export default function Home() {
   const { data, isLoading, isError, isFetching, dataUpdatedAt, refetch } = useQuery({
     queryKey: ['pipeline'],
     queryFn: fetchPipeline,
+    refetchInterval: 4_000,
+  })
+
+  const { data: sessions } = useQuery({
+    queryKey: ['sessions'],
+    queryFn: fetchSessions,
     refetchInterval: 4_000,
   })
 
@@ -170,6 +209,12 @@ export default function Home() {
           )}
         </div>
       </header>
+
+      {/* Live sessions — surfaced above everything else (#1067) */}
+      <LiveSessions
+        sessions={sessions ?? []}
+        onSelect={(sessionId) => navigate(`/terminal/${sessionId}`)}
+      />
 
       {/* Filter tabs */}
       {data && (
