@@ -49,9 +49,9 @@ below. Two surfaces sit outside this PyPI flow entirely:
 - **`coord-tui`** is a Rust binary — rebuild + reinstall locally
   (`cd tui && cargo build && cp target/debug/coord-tui ~/.local/bin/`),
   never PyPI. Don't bump the version for tui-only changes.
-- **The phone webapp** (`coord/dashboard/webapp/`) needs `npm run build`
-  and is not yet bundled in the wheel — see "Web dashboard (`coord web`)"
-  below and #703.
+- **The phone webapp** (`coord/dashboard/webapp/`) is bundled into the
+  PyPI wheel as of 0.4.71 (built by the release workflow). No `npm run build`
+  is needed on the dashboard host after a `pip install` or `coord agent update`.
 
 ## Install a new agent (first time)
 
@@ -238,9 +238,9 @@ The phone is just a browser: open `http://<dellserver-host>:7434` on the tailnet
 and Add to Home Screen (the API is same-origin, so no client config).
 
 **Build, run, and phone access:** see [`docs/PHONE_WEBAPP.md`](PHONE_WEBAPP.md) —
-the PWA bundle is gitignored and not yet bundled in the wheel (#703), so build it
-with `npm run build` from a checkout on the dashboard host, then `coord web`
-serves it automatically.
+as of 0.4.71 the built PWA bundle ships inside the PyPI wheel, so a fresh
+`pip install claude-coordinator` (or `coord agent update`) is all that's needed
+on the dashboard host. No checkout or `npm run build` required.
 
 **Service unit:** [`deploy/coord-web.service`](../deploy/coord-web.service) (full
 unit + prereqs in its header). Install + restart:

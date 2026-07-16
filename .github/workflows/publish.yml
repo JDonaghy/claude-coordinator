@@ -15,6 +15,12 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install build
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Build React webapp
+        working-directory: coord/dashboard/webapp
+        run: npm ci && npm run build
       - run: python -m build
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1

@@ -19,15 +19,12 @@
 #   systemctl --user enable --now coord-web
 #
 # Prereqs on the dashboard host (== the DB host):
-#   - ~/.coord-venv has a coord build whose package includes the BUILT webapp
-#     at coord/dashboard/webapp/dist/. dist/ is gitignored and NOT yet shipped
-#     in the PyPI wheel (#703), so until that lands either:
-#       (a) serve from an editable checkout where you've built the webapp:
-#           cd coord/dashboard/webapp && npm install && npm run build
-#           (and point ExecStart at that checkout's `coord` if it isn't
-#            ~/.coord-venv), or
-#       (b) accept the fallback: with no dist/, the server serves the LEGACY
-#           HTML dashboard, not the React PWA.
+#   - ~/.coord-venv has claude-coordinator >= 0.4.71 installed via PyPI.
+#     As of 0.4.71 the built React webapp (coord/dashboard/webapp/dist/) is
+#     bundled in the wheel — no checkout or `npm run build` needed on the host.
+#     Just `pip install --upgrade claude-coordinator` and restart.
+#     (If dist/ is absent — pre-0.4.71 wheel or editable install without a
+#      build — the server falls back to the legacy HTML dashboard.)
 #   - ~/.coord/coordinator.yml exists (canonical location; same resolution as
 #     the daemon: $COORD_CONFIG → ~/.coord/coordinator.yml → ./coordinator.yml).
 #   - ~/.coord/coord.db exists (this box owns it).
