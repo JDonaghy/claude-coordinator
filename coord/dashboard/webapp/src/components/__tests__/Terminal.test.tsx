@@ -241,6 +241,81 @@ describe('Terminal', () => {
       expect(FakeWebSocket.instances).toHaveLength(3)
     })
 
+    it('keeps climbing backoff when connections flap open-then-immediately-closed (live bug: accept() succeeds, attach fails right after)', async () => {
+      // Reproduces the real-backend failure found in live smoke testing:
+      // the bridge accept()s the WebSocket (so the client's `onopen` fires)
+      // and then closes it almost immediately (e.g. the tmux attach failing
+      // right after accept) -- as opposed to every other test in this file,
+      // which either never reaches 'open' before the next close or stays
+      // open indefinitely. A naive "reset the counter on every onopen"
+      // implementation never backs off here since each cycle reopens and
+      // immediately resets to attempt 0 before closing again.
+      renderTerminal('work-2')
+
+      const first = FakeWebSocket.instances[0]
+      first.simulateOpen()
+      first.simulateClose(1011) // opened, then closed right away -- no time elapses
+
+      // First retry still fires at the base delay (1000ms) -- this is
+      // attempt 0.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000)
+      })
+      expect(FakeWebSocket.instances).toHaveLength(2)
+
+      const second = FakeWebSocket.instances[1]
+      second.simulateOpen()
+      second.simulateClose(1011) // same flap: open then immediately closed
+
+      // If backoff had wrongly reset on `onopen`, this retry would also
+      // fire at 1000ms. Instead it must wait the full 2000ms (attempt 1).
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000)
+      })
+      expect(FakeWebSocket.instances).toHaveLength(2) // not yet -- only 1s of a 2s wait
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000)
+      })
+      expect(FakeWebSocket.instances).toHaveLength(3)
+    })
+
+    it('resets backoff once a connection stays open long enough to be a genuine, working attach', async () => {
+      renderTerminal('work-2')
+
+      // Two rapid flaps climb the backoff ladder to attempt 2 (4000ms next).
+      const first = FakeWebSocket.instances[0]
+      first.simulateOpen()
+      first.simulateClose(1006)
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000)
+      })
+      const second = FakeWebSocket.instances[1]
+      second.simulateOpen()
+      second.simulateClose(1006)
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2000)
+      })
+      expect(FakeWebSocket.instances).toHaveLength(3)
+
+      // This time the connection stays open past the stability threshold
+      // before dropping -- a genuine, working session that later hit a
+      // transient drop, not a flap.
+      const third = FakeWebSocket.instances[2]
+      third.simulateOpen()
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2000)
+      })
+      third.simulateClose(1006)
+
+      // Backoff reset to the base delay (1000ms), not the 8000ms the
+      // unreset ladder (attempt 3) would have demanded.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000)
+      })
+      expect(FakeWebSocket.instances).toHaveLength(4)
+    })
+
     it('shows a session-ended state and never retries when the bridge reports the session is gone (4404)', async () => {
       renderTerminal('work-2')
       const ws = FakeWebSocket.instances[0]
