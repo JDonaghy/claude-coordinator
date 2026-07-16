@@ -1729,6 +1729,10 @@ def _openapi_spec() -> dict:
                                     "issue_number": {"type": "integer"},
                                     "comment": {"type": "string", "nullable": True},
                                     "repo_github": {"type": "string", "nullable": True},
+                                    "force": {
+                                        "type": "boolean",
+                                        "description": "#1196: override the open-children guard.",
+                                    },
                                 },
                                 "required": ["repo_name", "issue_number"],
                             }
@@ -1738,6 +1742,7 @@ def _openapi_spec() -> dict:
                 "responses": {
                     "200": {"description": "OK"},
                     "400": {"description": "Missing field"},
+                    "409": {"description": "#1196: refused — issue has open children (pass force to override)"},
                     "503": {"description": "GitHub write failed"},
                 },
             }
@@ -3240,8 +3245,10 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         # #1003: close an issue (optionally posting a comment first) through
         # the tracker seam — the "Close / archive plan" Plans-panel action's
         # backend, mirroring /issue-edit. Client sends (repo_name,
-        # issue_number, comment?, repo_github?) and gets back {"updated": true}.
+        # issue_number, comment?, repo_github?, force?) and gets back
+        # {"updated": true}.
         from coord import state  # noqa: PLC0415
+        from coord.github_ops import IssueHasOpenChildrenError  # noqa: PLC0415
 
         body = await _read_json(request)
         if body is None:
@@ -3252,9 +3259,19 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 body["issue_number"],
                 comment=body.get("comment"),
                 repo_github=body.get("repo_github"),
+                force=bool(body.get("force", False)),
             )
         except KeyError as e:
             return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        except IssueHasOpenChildrenError as e:
+            # #1196: distinguish "refused — open children" (409, an
+            # intentional guard) from a generic tracker failure (503) so
+            # state.close_issue can convert it back into the same exception
+            # client-side rather than a raw HTTP error.
+            return JSONResponse(
+                {"error": "open children", "detail": str(e)},
+                status_code=409,
+            )
         except Exception as e:  # noqa: BLE001
             return JSONResponse(
                 {"error": "issue-close write failed", "detail": str(e)},

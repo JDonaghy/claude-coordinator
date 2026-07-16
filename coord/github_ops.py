@@ -222,7 +222,64 @@ def edit_milestone(
     return json.loads(raw)
 
 
-def close_issue(repo: str, issue_number: int, *, comment: str | None = None) -> None:
+class IssueHasOpenChildrenError(RuntimeError):
+    """Raised by :func:`close_issue` when *issue_number* has open children and
+    ``force`` was not passed (#1196).
+
+    The close-invariant chokepoint: every deterministic close path in this
+    codebase (``merge_queue``, ``state._close_issue_local``,
+    ``commands/issues``) funnels through :func:`close_issue`, so guarding
+    here is the one place that stops an epic reading as "done" while its
+    sub-issues are still open — see claude-coordinator#1041, the incident
+    that prompted this. A subclass of ``RuntimeError`` so existing
+    ``except RuntimeError`` / ``except Exception`` call sites keep working
+    without modification; catch this specifically to distinguish "refused,
+    has open children" from any other close failure.
+    """
+
+
+def get_open_children(repo: str, issue_number: int) -> list[dict]:
+    """Open children of *issue_number*, per the #1195 parentage seam (#1196).
+
+    Uses :class:`coord.parentage.MarkdownParentage` over the issue's own
+    body (fetched via :func:`get_issue`) — the ``## Sub-issues`` checklist
+    convention (#1008) is the only *populated* parentage source today; the
+    live GitHub sub-issues REST API (:class:`coord.parentage_github.
+    GitHubParentage`) is wired but not yet backfilled onto existing epics
+    (EP-2, unbuilt), so checking it here would silently miss every real
+    epic and defeat the guard.
+
+    Returns ``[{"number": int, "state": "open"}, ...]``. **Fails open**
+    (returns ``[]``) both when the issue lookup itself errors (a transient
+    ``gh`` failure must not permanently wedge every close in the system —
+    :func:`close_issue` is the enforcement point, not this lookup) and when
+    the body's ``## Sub-issues`` block fails to parse (a malformed
+    checklist on *this* issue must not block closing some *other*,
+    well-formed one — the same per-issue fail-isolation #1195 already
+    applies to the ``/board`` children display).
+    """
+    try:
+        issue = get_issue(repo, issue_number)
+    except RuntimeError:
+        return []
+    from coord.parentage import MarkdownParentage  # noqa: PLC0415
+
+    body = issue.get("body") or ""
+    try:
+        children = MarkdownParentage().children(repo, issue_number, body=body)
+    except Exception:  # noqa: BLE001 — malformed checklist: fail open, don't wedge close
+        return []
+    return [{"number": c.number, "state": c.state} for c in children if c.state == "open"]
+
+
+def has_open_children(repo: str, issue_number: int) -> bool:
+    """True when *issue_number* has at least one open child (#1196)."""
+    return bool(get_open_children(repo, issue_number))
+
+
+def close_issue(
+    repo: str, issue_number: int, *, comment: str | None = None, force: bool = False,
+) -> None:
     """Close a GitHub issue, optionally posting *comment* first.
 
     The deterministic counterpart to a ``Closes #N`` keyword in a PR body:
@@ -233,7 +290,22 @@ def close_issue(repo: str, issue_number: int, *, comment: str | None = None) -> 
     Raises RuntimeError on any other ``gh`` failure.  Part of the
     issue-tracker seam (GitHub backend); GitLab / bare-DB adapters slot in
     alongside this later (#806).
+
+    #1196: the close-invariant chokepoint. Refuses (raises
+    :class:`IssueHasOpenChildrenError`) when *issue_number* has open
+    children unless *force* is ``True`` — an epic must not read as "done"
+    while its sub-issues are still open/unstarted. Every deterministic
+    close path in the codebase funnels through here, so this single guard
+    covers all of them.
     """
+    if not force:
+        open_children = get_open_children(repo, issue_number)
+        if open_children:
+            numbers = ", ".join(f"#{c['number']}" for c in open_children)
+            raise IssueHasOpenChildrenError(
+                f"refusing to close {repo}#{issue_number}: open children "
+                f"{numbers} — pass force=True (CLI: --force) to override"
+            )
     if comment:
         post_issue_comment(repo, issue_number, comment)
     result = subprocess.run(
@@ -246,6 +318,17 @@ def close_issue(repo: str, issue_number: int, *, comment: str | None = None) -> 
         raise RuntimeError(
             f"gh issue close #{issue_number} failed: {result.stderr.strip()}"
         )
+
+
+def get_pr_body(repo: str, number: int) -> str:
+    """Return PR *number*'s current body text (empty string if unset)."""
+    raw = _gh("pr", "view", str(number), "--repo", repo, "--json", "body")
+    return json.loads(raw).get("body") or ""
+
+
+def edit_pr_body(repo: str, number: int, body: str) -> None:
+    """Overwrite PR *number*'s body text via ``gh pr edit --body``."""
+    _gh("pr", "edit", str(number), "--repo", repo, "--body", body)
 
 
 def issue_is_closed(repo: str, issue_number: int) -> bool:

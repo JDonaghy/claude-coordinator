@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -197,11 +198,19 @@ class FakeGh:
     close_calls: list[tuple[str, int]] = field(default_factory=list)
     close_raises: bool = False
     next_pr: int = 100
+    # #1196 hole 2 (PR-body lint): PR number -> body text; issue number ->
+    # whether it currently has open children. Defaults keep every prior
+    # test (none of which set these) inert — get_pr_body returns "" so
+    # `process()`'s lint step is a no-op, matching pre-#1196 behavior.
+    pr_bodies: dict[int, str] = field(default_factory=dict)
+    open_children: set[int] = field(default_factory=set)
+    edit_body_calls: list[tuple[str, int, str]] = field(default_factory=list)
 
     def create_pr(self, repo: str, *, base: str, head: str, title: str, body: str) -> dict:
         self.create_calls.append((repo, {"base": base, "head": head, "title": title}))
         pr_num = self.next_pr
         self.next_pr += 1
+        self.pr_bodies.setdefault(pr_num, body)
         return {"number": pr_num, "url": f"https://gh/x/{pr_num}", "existed": False}
 
     def get_pr_size(self, repo: str, number: int) -> int:
@@ -220,6 +229,16 @@ class FakeGh:
         # Tests don't exercise SHA tracking by default; return None so the
         # backward-compatible "no SHA → skip staleness check" path runs.
         return None
+
+    def get_pr_body(self, repo: str, number: int) -> str:
+        return self.pr_bodies.get(number, "")
+
+    def edit_pr_body(self, repo: str, number: int, body: str) -> None:
+        self.edit_body_calls.append((repo, number, body))
+        self.pr_bodies[number] = body
+
+    def has_open_children(self, repo: str, issue_number: int) -> bool:
+        return issue_number in self.open_children
 
 
 class TestProcess:
@@ -348,6 +367,113 @@ class TestProcess:
         process(items, gh)
         # No second call for the already-merged entry
         assert all(c[1] != 1 for c in gh.merge_calls)
+
+    # ── #1196 hole 2: pre-merge PR-body closing-keyword lint ──────────────
+
+    def test_downgrades_worker_pr_body_closes_for_epic_with_open_children(self) -> None:
+        # GitHub's own closing-keyword magic reads the PR body directly at
+        # merge time and never calls github_ops.close_issue — the only
+        # place that can stop it is a pre-merge scan/rewrite.
+        items = [_q("a", pr=100, size=10)]
+        gh = FakeGh(pr_bodies={100: "Closes #1041\n\nWorker-authored PR."}, open_children={1041})
+        events = process(items, gh)
+        assert items[0].state == MERGED
+        assert gh.edit_body_calls == [
+            ("acme/api", 100, "Refs #1041\n\nWorker-authored PR.")
+        ]
+        downgraded = [e for e in events if e.kind == "pr_body_downgraded"]
+        assert downgraded and "#1041" in downgraded[0].message
+
+    def test_leaves_regular_pr_body_untouched(self) -> None:
+        # No regression for the common case: a PR body closing a regular
+        # (childless) issue is never rewritten.
+        items = [_q("a", pr=100, size=10)]
+        gh = FakeGh(pr_bodies={100: "Closes #55"}, open_children=set())
+        process(items, gh)
+        assert gh.edit_body_calls == []
+
+    def test_lint_ignores_pr_body_with_no_closing_keyword(self) -> None:
+        items = [_q("a", pr=100, size=10)]
+        gh = FakeGh(pr_bodies={100: "Refs #1041, unrelated context."}, open_children={1041})
+        process(items, gh)
+        assert gh.edit_body_calls == []
+
+    def test_lint_failure_never_blocks_the_merge(self) -> None:
+        # Best-effort throughout: a get_pr_body/has_open_children/
+        # edit_pr_body failure must not prevent (or revert) a merge.
+        class _BoomOnBody(FakeGh):
+            def get_pr_body(self, repo: str, number: int) -> str:
+                raise RuntimeError("gh pr view failed")
+
+        items = [_q("a", pr=100, size=10)]
+        gh = _BoomOnBody()
+        process(items, gh)
+        assert items[0].state == MERGED
+
+
+class TestProcessRealGithubOpsChokepoint:
+    """#1196 acceptance criterion: 'Dispatching type="work" against an epic
+    with an open child and merging it leaves the epic OPEN' — driven through
+    the REAL `coord.github_ops` module wired in as `gh_ops` (only the `gh`
+    subprocess boundary is faked), not `FakeGh`'s `close_raises` stand-in.
+    This exercises the actual #1196 chokepoint end to end: both hole 1 (a
+    "work" assignment whose issue_number IS the epic) and hole 2 (the PR
+    body's own `Closes #<epic>` keyword) in one pass.
+    """
+
+    def test_type_work_direct_on_epic_with_open_child_stays_open(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from coord import github_ops as real_gh_ops
+
+        epic_json = json.dumps({
+            "number": 1041, "title": "Epic", "state": "open", "milestone": None,
+            "labels": [], "body": "## Sub-issues\n- [ ] #1039\n- [x] #1040\n",
+        })
+
+        def fake_gh(*args: str) -> str:
+            if args[:2] == ("pr", "list"):
+                return "[]"
+            if args[:2] == ("pr", "create"):
+                return "https://github.com/acme/api/pull/500"
+            if args[:2] == ("pr", "view"):
+                return json.dumps({
+                    "body": "Closes #1041\n\nAutomated merge from the coordinator."
+                })
+            if args[:2] == ("issue", "view"):
+                return epic_json
+            if args[:2] == ("pr", "edit"):
+                return ""
+            if args[:2] == ("pr", "merge"):
+                return "merged"
+            raise AssertionError(f"unexpected gh call: {args}")
+
+        monkeypatch.setattr(real_gh_ops, "_gh", fake_gh)
+
+        def _boom_subprocess(*a, **k):
+            raise AssertionError(
+                "must never reach the real `gh issue close` subprocess call "
+                "— the epic has an open child"
+            )
+
+        monkeypatch.setattr(real_gh_ops.subprocess, "run", _boom_subprocess)
+
+        entry = _q("w1", repo="api", repo_github="acme/api", target="main", size=10)
+        entry.issue_number = 1041  # #1196 hole 1: the epic itself, type="work"
+
+        events = process([entry], real_gh_ops)
+
+        # Merge succeeded — the PR itself lands.
+        assert entry.state == MERGED
+        # But the epic was never closed: the chokepoint's guard refused.
+        merged_events = [e for e in events if e.kind == "merged"]
+        assert merged_events
+        assert "could not close" in merged_events[0].message
+        assert "open children" in merged_events[0].message.lower()
+        assert "#1039" in merged_events[0].message
+        # Hole 2: the PR body's own `Closes #1041` was downgraded pre-merge.
+        downgrade_events = [e for e in events if e.kind == "pr_body_downgraded"]
+        assert downgrade_events and "#1041" in downgrade_events[0].message
 
 
 class TestReviewGate:

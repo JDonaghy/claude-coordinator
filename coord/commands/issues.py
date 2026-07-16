@@ -110,7 +110,11 @@ def issue_edit_cmd(
         "— thin wrapper around the already-existing "
         "``github_ops.close_issue()`` (previously only called internally by "
         "``coord merge``), now operator-exposed through the tracker seam. "
-        "Idempotent — closing an already-closed issue is a no-op."
+        "Idempotent — closing an already-closed issue is a no-op. "
+        "#1196: refuses (exit 1, clear message) when the issue still has "
+        "open children — an epic must not read as \"done\" while its "
+        "sub-issues are open/unstarted. Pass --force to override, "
+        "mirroring `coord merge --force-merge`."
     ),
 )
 @click.argument("repo")
@@ -118,11 +122,16 @@ def issue_edit_cmd(
 @click.option(
     "--comment", default=None, help="Comment to post before closing (markdown)."
 )
+@click.option(
+    "--force", is_flag=True, default=False,
+    help="Close even if the issue has open children (#1196).",
+)
 @_CONFIG_OPTION
 def issue_close_cmd(
     repo: str,
     issue: int,
     comment: str | None,
+    force: bool,
     config_path: Path,
 ) -> None:
     cfg = _load_config(config_path)
@@ -131,7 +140,7 @@ def issue_close_cmd(
     from coord.state import close_issue  # noqa: PLC0415
 
     try:
-        close_issue(repo, issue, comment=comment, repo_github=slug)
+        close_issue(repo, issue, comment=comment, repo_github=slug, force=force)
     except Exception as e:  # noqa: BLE001
         click.echo(f"error: issue close failed: {e}", err=True)
         sys.exit(1)
