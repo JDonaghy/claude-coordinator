@@ -30,6 +30,22 @@
  * session itself is gone, not just this connection), so it is surfaced
  * distinctly and never retried.
  *
+ * Backoff-reset guard (live-smoke fix): the WS handshake completing
+ * (`onopen`) does NOT by itself mean the session is usable -- the bridge
+ * `accept()`s before it spawns the tmux attach, so a server-side attach
+ * failure (or anything else that closes the socket a moment after accept)
+ * fires `onopen` immediately followed by `onclose`. Resetting the backoff
+ * counter on every `onopen` -- as an earlier version of this file did --
+ * meant that flapping case never actually backed off: each cycle reopened,
+ * reset the counter to zero, then closed again, so the client hammered the
+ * bridge at the *base* interval indefinitely instead of climbing the
+ * exponential ladder (reproduced live against #1071 iteration 1: 44 reconnect
+ * attempts in ~5-10 minutes). The counter now only resets when a connection
+ * stayed open at least `STABLE_CONNECTION_MS` before dropping -- long enough
+ * to have been a genuine, working attach rather than an accept-then-fail
+ * flap -- so a truly bad/looping backend still gets the full exponential
+ * backoff treatment.
+ *
  * Layout: the pane occupies the top half of the screen (`h-[50vh]`); the
  * bottom half hosts `MobileKeyBar` (#1070) -- the soft-key row + line-input
  * for driving the interactive `claude` TUI from a phone. iOS/Android
@@ -61,6 +77,10 @@ const STATUS_LABEL: Record<ConnectionState, string> = {
 const SESSION_GONE_CODE = 4404
 const RECONNECT_BASE_MS = 1000
 const RECONNECT_MAX_MS = 10000
+// A connection has to survive at least this long after opening before a
+// subsequent drop counts as "was actually working" and resets the backoff
+// counter -- see the backoff-reset guard note above.
+const STABLE_CONNECTION_MS = 2000
 
 export default function Terminal() {
   const { sessionId } = useParams<{ sessionId: string }>()
@@ -94,6 +114,11 @@ export default function Terminal() {
 
     let reconnectAttempt = 0
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+    // Timestamp of the most recent `onopen`, or null while not connected.
+    // Read (and cleared) in `onclose` to tell a stable connection's drop
+    // apart from an accept-then-immediately-fail flap -- see the
+    // backoff-reset guard note above the component docstring.
+    let openedAt: number | null = null
 
     const sendResize = (ws: WebSocket) => {
       if (ws.readyState === WebSocket.OPEN) {
@@ -107,7 +132,7 @@ export default function Terminal() {
       wsRef.current = ws
 
       ws.onopen = () => {
-        reconnectAttempt = 0
+        openedAt = Date.now()
         setState('open')
         sendResize(ws)
       }
@@ -120,6 +145,16 @@ export default function Terminal() {
           setState('ended')
           return
         }
+        // Only treat this as "the connection was actually working" -- and
+        // so reset the backoff ladder -- if it stayed open long enough to
+        // matter. A connection that opened and closed again almost
+        // instantly (accept() succeeded, then the attach failed, or
+        // anything else killed it right away) keeps climbing the backoff
+        // instead of resetting to the base delay every cycle.
+        const wasStable =
+          openedAt !== null && Date.now() - openedAt >= STABLE_CONNECTION_MS
+        openedAt = null
+        if (wasStable) reconnectAttempt = 0
         setState('reconnecting')
         const delay = Math.min(RECONNECT_BASE_MS * 2 ** reconnectAttempt, RECONNECT_MAX_MS)
         reconnectAttempt += 1
