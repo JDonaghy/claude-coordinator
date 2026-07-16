@@ -316,6 +316,16 @@ describe('Terminal', () => {
       expect(FakeWebSocket.instances).toHaveLength(4)
     })
 
+    // The bridge accept()s the handshake and *then* closes 4404 -- it cannot
+    // deliver an application close code any other way (closing pre-accept
+    // aborts the upgrade and reaches the browser as a bare 403 with no code
+    // at all, which is exactly the live #1071 bug: every unknown session
+    // looked like a transient drop and retried forever). So this test opens
+    // first, mirroring the real server. The server half of that contract is
+    // pinned in tests/test_dashboard_terminal.py::
+    // test_unknown_session_accepts_before_closing_4404 -- the two must stay
+    // in sync: if the bridge ever regresses to closing pre-accept, this
+    // component silently falls back into the infinite-retry branch below.
     it('shows a session-ended state and never retries when the bridge reports the session is gone (4404)', async () => {
       renderTerminal('work-2')
       const ws = FakeWebSocket.instances[0]
@@ -331,6 +341,32 @@ describe('Terminal', () => {
         await vi.advanceTimersByTimeAsync(60_000)
       })
       expect(FakeWebSocket.instances).toHaveLength(1)
+    })
+
+    it('treats a codeless handshake rejection as transient and keeps retrying', async () => {
+      // A rejected *upgrade* (HTTP 403 -- e.g. the bridge closing pre-accept,
+      // or a proxy refusing the connection) never fires `open` and surfaces
+      // as an abnormal-closure 1006 with no application code. That is
+      // indistinguishable from a network drop from here, so the only correct
+      // behaviour is to retry with backoff -- which is precisely why the
+      // server must accept() before it can say "session gone" (4404) and be
+      // believed. This test documents the fallback the server-side fix
+      // exists to keep us out of.
+      renderTerminal('gone-forever')
+      const ws = FakeWebSocket.instances[0]
+
+      // No simulateOpen() -- the handshake itself was rejected.
+      ws.simulateClose(1006)
+
+      // Header label only -- the role="status" overlay is exclusive to the
+      // terminal 'ended' state, which this path must NOT reach.
+      expect(screen.getByText(/gone-forever/)).toHaveTextContent('Reconnecting…')
+      expect(screen.queryByRole('status')).toBeNull()
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000)
+      })
+      expect(FakeWebSocket.instances).toHaveLength(2)
     })
 
     it('does not reconnect after a deliberate close (close button)', async () => {

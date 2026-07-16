@@ -4,6 +4,14 @@ Uses Starlette's in-process TestClient.websocket_connect (no real socket) and
 a fake SessionAttacher (no real ssh/tmux) per the issue's acceptance bar:
 "Keep the ssh/tmux attach behind an injectable seam ... so tests need no real
 ssh."
+
+Mind the TestClient's blind spot (#1071): ``websocket_connect`` reports a close
+code whether or not the app ``accept()``ed the handshake first, so a rejection
+test written against it passes even when a real browser gets a bare HTTP 403
+with no code attached -- which is exactly how the 4404 "session gone" signal
+shipped broken. Rejection paths therefore assert on the raw ASGI message
+sequence via ``_raw_ws_messages`` instead; see
+``test_unknown_session_accepts_before_closing_4404``.
 """
 
 from __future__ import annotations
@@ -15,7 +23,6 @@ from unittest.mock import patch
 
 import pytest
 from starlette.testclient import TestClient
-from starlette.websockets import WebSocketDisconnect
 
 from coord.config import Config
 from coord.dashboard.server import build_app
@@ -109,6 +116,52 @@ def _client(*, token: str | None = None, attacher: _FakeSessionAttacher | None =
     return TestClient(build_app(_config(), token=token, session_attacher=attacher))
 
 
+async def _raw_ws_messages(
+    path: str,
+    *,
+    query_string: bytes = b"",
+    token: str | None = None,
+    attacher: _FakeSessionAttacher | None = None,
+) -> list[dict]:
+    """Drive the ASGI app directly and return every ``send`` message, in order.
+
+    ``TestClient.websocket_connect`` surfaces a close code whether or not the
+    app accepted the handshake first, so it *cannot* see the #1071 live bug:
+    the app closed with 4404 pre-accept, the test read 4404 and passed, but a
+    real browser got a plain HTTP 403 with no code and retried forever. Only
+    the raw message sequence distinguishes the two, so assert on that.
+    """
+    app = build_app(_config(), token=token, session_attacher=attacher)
+    scope = {
+        "type": "websocket",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "scheme": "ws",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": query_string,
+        "root_path": "",
+        "headers": [(b"host", b"testserver")],
+        "client": ("testclient", 50000),
+        "server": ("testserver", 80),
+        "subprotocols": [],
+    }
+    incoming: list[dict] = [
+        {"type": "websocket.connect"},
+        {"type": "websocket.disconnect", "code": 1005},
+    ]
+    sent: list[dict] = []
+
+    async def receive() -> dict:
+        return incoming.pop(0) if incoming else {"type": "websocket.disconnect", "code": 1005}
+
+    async def send(message: dict) -> None:
+        sent.append(message)
+
+    await app(scope, receive, send)
+    return sent
+
+
 class TestTerminalBridge:
     def test_bytes_round_trip_both_directions(self) -> None:
         attacher = _FakeSessionAttacher()
@@ -150,24 +203,27 @@ class TestTerminalBridge:
         # requirement).
         assert attacher.live_sessions["coord-abc123"] is True
 
-    def test_missing_token_rejects_upgrade(self) -> None:
+    def test_missing_token_rejects_with_4401(self) -> None:
         attacher = _FakeSessionAttacher()
         client = _client(token="s3cret", attacher=attacher)
         with patch("coord.dashboard.server.read_board", return_value=_board()):
-            with pytest.raises(WebSocketDisconnect) as exc_info:
-                with client.websocket_connect("/ws/terminal/abc123"):
-                    pass
-        assert exc_info.value.code == 4401
+            # The handshake is accepted so the 4401 can actually be delivered
+            # (#1071) -- the rejection lands on the first receive, not on
+            # connect. See test_bad_token_accepts_before_closing_4401.
+            with client.websocket_connect("/ws/terminal/abc123") as ws:
+                message = ws.receive()
+        assert message["type"] == "websocket.close"
+        assert message["code"] == 4401
         assert attacher.attach_calls == []
 
-    def test_wrong_token_rejects_upgrade(self) -> None:
+    def test_wrong_token_rejects_with_4401(self) -> None:
         attacher = _FakeSessionAttacher()
         client = _client(token="s3cret", attacher=attacher)
         with patch("coord.dashboard.server.read_board", return_value=_board()):
-            with pytest.raises(WebSocketDisconnect) as exc_info:
-                with client.websocket_connect("/ws/terminal/abc123?token=wrong"):
-                    pass
-        assert exc_info.value.code == 4401
+            with client.websocket_connect("/ws/terminal/abc123?token=wrong") as ws:
+                message = ws.receive()
+        assert message["type"] == "websocket.close"
+        assert message["code"] == 4401
         assert attacher.attach_calls == []
 
     def test_correct_token_accepts_upgrade(self) -> None:
@@ -181,14 +237,54 @@ class TestTerminalBridge:
                 ws.send_bytes(b"x")
         assert attacher.attach_calls == [(None, "coord-abc123")]
 
-    def test_unknown_session_rejects_upgrade(self) -> None:
+    def test_unknown_session_rejects_with_4404(self) -> None:
         attacher = _FakeSessionAttacher()
         client = _client(attacher=attacher)
         with patch("coord.dashboard.server.read_board", return_value=_board()):
-            with pytest.raises(WebSocketDisconnect) as exc_info:
-                with client.websocket_connect("/ws/terminal/does-not-exist"):
-                    pass
-        assert exc_info.value.code == 4404
+            # Accepted first, then closed 4404 -- the code is what tells the
+            # client this session is gone for good rather than blipped (#1071).
+            with client.websocket_connect("/ws/terminal/does-not-exist") as ws:
+                message = ws.receive()
+        assert message["type"] == "websocket.close"
+        assert message["code"] == 4404
+        assert attacher.attach_calls == []
+
+    def test_unknown_session_accepts_before_closing_4404(self) -> None:
+        """The 4404 must ride an *accepted* connection (#1071 live-smoke fix).
+
+        Closing pre-accept aborts the HTTP upgrade, so the browser sees a bare
+        403 -- no close code -- and `Terminal.tsx`, which keys the terminal
+        "session ended" state off code 4404, treats it as a transient drop and
+        reconnects forever against a session_id that will never resolve.
+        """
+        attacher = _FakeSessionAttacher()
+        with patch("coord.dashboard.server.read_board", return_value=_board()):
+            sent = asyncio.run(
+                _raw_ws_messages("/ws/terminal/does-not-exist", attacher=attacher)
+            )
+
+        assert [m["type"] for m in sent] == ["websocket.accept", "websocket.close"]
+        assert sent[-1]["code"] == 4404
+        assert attacher.attach_calls == []
+
+    def test_bad_token_accepts_before_closing_4401(self) -> None:
+        """Same accept-then-close shape for the auth rejection: a pre-accept
+        close degrades to a bare 403 there too, so the client can never tell
+        "your token is wrong" from "the network blipped". No PTY is attached.
+        """
+        attacher = _FakeSessionAttacher()
+        with patch("coord.dashboard.server.read_board", return_value=_board()):
+            sent = asyncio.run(
+                _raw_ws_messages(
+                    "/ws/terminal/abc123",
+                    query_string=b"token=wrong",
+                    token="s3cret",
+                    attacher=attacher,
+                )
+            )
+
+        assert [m["type"] for m in sent] == ["websocket.accept", "websocket.close"]
+        assert sent[-1]["code"] == 4401
         assert attacher.attach_calls == []
 
     def test_remote_machine_attaches_over_configured_host(self) -> None:

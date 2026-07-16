@@ -1187,11 +1187,27 @@ def build_app(
         travel as an ``Authorization`` header like the REST API's). No token
         configured on the server => open, matching `coord serve`'s
         ``resolve_serve_token`` convention. A token is configured but missing
-        / wrong on the request => the upgrade is rejected before accept.
+        / wrong on the request => the connection is accepted and then closed
+        immediately with 4401 (see the accept-then-close note below); no PTY
+        is ever attached, so nothing is relayed to an unauthenticated client.
+
+        Accept-then-close (#1071 live-smoke fix): both rejection paths below
+        MUST ``accept()`` the handshake before ``close(code=...)``. Per the
+        ASGI/WebSocket spec an application close code can only be delivered
+        over an *accepted* connection -- closing pre-accept aborts the HTTP
+        upgrade instead, which reaches the browser as a plain ``403`` with no
+        code attached. The client (`webapp/src/components/Terminal.tsx`)
+        tells "this session is gone for good" (4404, a terminal state) apart
+        from "transient drop, reconnect with backoff" purely by the close
+        code, so a pre-accept close made every unknown session look like a
+        transient drop and the client retried it forever. Accepting first
+        costs one extra round trip on an already-failing request and makes
+        the close code actually arrive.
         """
-        # Consume the ASGI "websocket.connect" event before we can validate
-        # and either accept() or close() the handshake.
+        # Consume the ASGI "websocket.connect" event before we can accept()
+        # or close() the handshake.
         await websocket.receive()
+        await websocket.accept()
 
         if token and websocket.query_params.get("token") != token:
             await websocket.close(code=4401)
@@ -1204,8 +1220,6 @@ def build_app(
             await websocket.close(code=4404)
             return
         host, session_name = target
-
-        await websocket.accept()
 
         try:
             attached = await attacher.attach(host, session_name)
