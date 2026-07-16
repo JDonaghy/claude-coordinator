@@ -1403,6 +1403,10 @@ pub(crate) fn load_data() -> BoardData {
         // #795: local SQLite path has no daemon to compute the work-order
         // frontier. Pass empty; Pipeline cards show no rank/frontier badges.
         Vec::new(),
+        // #1195/#1197: local SQLite path has no daemon to compute per-epic
+        // children either. Pass empty; the Pipeline tree renders epics as
+        // ordinary flat leaves on this path, same as before #1197.
+        Vec::new(),
         // #975: local SQLite path has no daemon to compute the plan roster.
         // Pass empty; the Plans panel renders a "no plans yet" placeholder.
         Vec::new(),
@@ -1453,6 +1457,7 @@ pub(crate) fn assemble_board_data(
     pipeline_models: Option<PipelineModels>,
     issue_stage_projection: Vec<IssueStageProjection>,
     milestone_work_orders: Vec<MilestoneWorkOrder>,
+    epic_children: Vec<EpicChildren>,
     plan_roster: Vec<PlanRosterEntry>,
     plan_roster_supported: bool,
     goal_header: GoalHeader,
@@ -1570,6 +1575,7 @@ pub(crate) fn assemble_board_data(
         pipeline_models,
         issue_stage_projection,
         milestone_work_orders,
+        epic_children,
         plan_roster,
         plan_roster_supported,
         goal_header,
@@ -1996,6 +2002,10 @@ pub(crate) fn load_data_remote(url: &str, token: Option<&str>) -> BoardData {
         // #795: server-computed work-order rank + frontier; empty when the
         // daemon predates #795.
         payload.milestone_work_orders,
+        // #1195/#1197: server-computed per-epic children; empty when the
+        // daemon predates #1195 (the Pipeline tree renders epics as
+        // ordinary flat leaves in that case).
+        payload.epic_children,
         // #975: server-computed plan roster; empty when the daemon predates
         // #975 (the Plans panel shows a placeholder in that case).
         payload.plan_roster,

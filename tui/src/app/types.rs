@@ -557,6 +557,12 @@ pub(crate) struct BoardPayload {
     /// blocked-on badges on Pipeline milestone cards using this projection.
     #[serde(default)]
     pub(crate) milestone_work_orders: Vec<MilestoneWorkOrder>,
+    /// #1195/#1197: per-epic child-issue lists, published under the wire key
+    /// `children`. Empty on the local-SQLite-mode read path (no daemon to
+    /// compute it) and on daemons older than #1195. The Pipeline view nests
+    /// each epic's children beneath its row using this projection.
+    #[serde(default, rename = "children")]
+    pub(crate) epic_children: Vec<EpicChildren>,
     /// #975: milestone plan-roster — one entry per milestone/epic with
     /// ready / blocked / in-flight / done counts + attention signals,
     /// computed server-side by `coord.plans.aggregate_repo_plans`.  Empty on
@@ -963,6 +969,40 @@ pub(crate) struct MilestoneWorkOrderNode {
     pub(crate) next_up: bool,
     #[serde(default)]
     pub(crate) blocked_on: Vec<u64>,
+}
+
+/// One child of an epic tracking issue, from the `/board` payload's
+/// top-level `children[*].children[*]` (#1195 EP-1 seam).
+///
+/// `state` reflects the tracking issue's `## Sub-issues` checklist checkbox
+/// (`"closed"` when checked, `"open"` otherwise) — an approximation of the
+/// real GitHub issue state, computed server-side by
+/// `coord.parentage.MarkdownParentage` (see its docstring). Good enough for
+/// nesting/display; #1197 additionally cross-references
+/// `data.open_issues`/`data.assignments` via `milestone_dag::build_dag_nodes`
+/// for a live Done/InFlight/Ready badge rather than trusting this checkbox
+/// state directly.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub(crate) struct EpicChild {
+    pub(crate) number: u64,
+    #[allow(dead_code)]
+    pub(crate) state: String,
+}
+
+/// One epic's child-issue list from the `/board` payload (#1195 EP-1 seam,
+/// consumed for Pipeline tree nesting by #1197).
+///
+/// Deserialized from `children[*]` — computed server-side by
+/// `coord/serve_app.py` via `coord.parentage.MarkdownParentage` over the
+/// tracking issue's own already-cached body (the `## Sub-issues` checklist,
+/// #1008), so no extra `gh`/network round trip. Only epics with at least one
+/// child are published. Empty on daemons older than #1195.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub(crate) struct EpicChildren {
+    pub(crate) repo_name: String,
+    pub(crate) tracking_issue: u64,
+    #[serde(default)]
+    pub(crate) children: Vec<EpicChild>,
 }
 
 /// One milestone's work-order data from the `/board` payload (#795 Phase 3b).
@@ -1634,6 +1674,11 @@ pub struct BoardData {
     /// than #795.  The Pipeline view renders rank/next-up/blocked-on badges
     /// on milestone cards using this projection.
     pub(crate) milestone_work_orders: Vec<MilestoneWorkOrder>,
+    /// #1195/#1197: per-epic child-issue lists from `/board`'s `children`
+    /// field.  Empty on the local-SQLite-mode read path and daemons older
+    /// than #1195.  The Pipeline view nests each epic's children beneath its
+    /// row using this projection (`compute_epic_nesting`, `pipeline.rs`).
+    pub(crate) epic_children: Vec<EpicChildren>,
     /// #975: milestone plan-roster — one entry per milestone/epic, sourced
     /// from `/board`'s `plan_roster` field.  Empty on the local-SQLite-mode
     /// read path and daemons older than #975.  The Plans panel renders one

@@ -19794,6 +19794,43 @@
         );
     }
 
+    /// #1197: `resolve_nested_child_index` must resolve a nested-child row
+    /// to the CHILD's own `pipeline_issues` index — never silently fall
+    /// back to the parent epic's index — so a click/nav on a nested row
+    /// acts on the right issue.
+    #[test]
+    fn resolve_nested_child_index_finds_child_own_pipeline_issues_index() {
+        let data = BoardData {
+            epic_children: vec![EpicChildren {
+                repo_name: "api".to_string(),
+                tracking_issue: 100,
+                children: vec![
+                    EpicChild { number: 101, state: "open".to_string() },
+                    EpicChild { number: 102, state: "closed".to_string() },
+                ],
+            }],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        app.pipeline_issues = vec![
+            pipeline_issue_stub(100, "acme/api", "api"), // epic, idx 0
+            // #101 is independently tracked too (e.g. it also carries a
+            // tracked label) — idx 1.
+            pipeline_issue_stub(101, "acme/api", "api"),
+        ];
+
+        // child_pos 0 → #101, which IS in pipeline_issues → its own idx 1,
+        // not the epic's idx 0.
+        assert_eq!(app.resolve_nested_child_index(0, 0), Some(1));
+        // child_pos 1 → #102, which is NOT independently tracked in
+        // pipeline_issues → None (nested-display-only row), never silently
+        // the parent epic's idx 0.
+        assert_eq!(app.resolve_nested_child_index(0, 1), None);
+        // parent_idx pointing at a non-epic issue (#101 has no children of
+        // its own) → None.
+        assert_eq!(app.resolve_nested_child_index(1, 0), None);
+    }
+
     #[test]
     fn pipeline_milestone_collapse_state_persists_across_rebuild() {
         // Collapsing a milestone sub-header must survive the next rebuild_pipeline_sidebar.
@@ -29311,6 +29348,50 @@ Milestone tracking issue.
             "absent milestone_work_orders must default to empty vec");
     }
 
+    /// #1195/#1197: `BoardPayload`'s `children` wire key deserializes into
+    /// `epic_children` cleanly (renamed field — see the `#[serde(rename =
+    /// "children")]` on `BoardPayload::epic_children`).
+    #[test]
+    fn board_payload_epic_children_deserializes() {
+        let json = r#"{
+            "assignments": [],
+            "machines": [],
+            "children": [
+                {
+                    "repo_name": "api",
+                    "tracking_issue": 1197,
+                    "children": [
+                        {"number": 1198, "state": "open"},
+                        {"number": 1199, "state": "closed"}
+                    ]
+                }
+            ]
+        }"#;
+        let payload: BoardPayload = serde_json::from_str(json)
+            .expect("children JSON must deserialize into BoardPayload");
+
+        assert_eq!(payload.epic_children.len(), 1);
+        let ec = &payload.epic_children[0];
+        assert_eq!(ec.repo_name, "api");
+        assert_eq!(ec.tracking_issue, 1197);
+        assert_eq!(ec.children.len(), 2);
+        assert_eq!(ec.children[0].number, 1198);
+        assert_eq!(ec.children[0].state, "open");
+        assert_eq!(ec.children[1].number, 1199);
+        assert_eq!(ec.children[1].state, "closed");
+    }
+
+    /// #1195/#1197: `BoardPayload` without `children` (pre-#1195 daemon)
+    /// deserializes cleanly — the `#[serde(default)]` must kick in.
+    #[test]
+    fn board_payload_epic_children_absent_defaults_to_empty() {
+        let json = r#"{"assignments": [], "machines": []}"#;
+        let payload: BoardPayload = serde_json::from_str(json)
+            .expect("payload missing children must deserialize via default");
+        assert!(payload.epic_children.is_empty(),
+            "absent children must default to empty vec");
+    }
+
     /// #795 TuiDriver black-box: Pipeline milestone cards show work-order badges.
     ///
     /// Seeds a `BoardData` with four issues under milestone "v1.0" and a
@@ -29426,6 +29507,198 @@ Milestone tracking issue.
         assert!(
             !screen.contains("⊘W4"),
             "#104 (claimed) must NOT show a dangling blocked-arrow:\n{screen}",
+        );
+    }
+
+    /// #1197 TuiDriver black-box: an epic's children nest under its Pipeline
+    /// row instead of rendering as flat siblings.
+    ///
+    /// Seeds a `BoardData` with an epic (#100, "Epic tracker") carrying two
+    /// `data.epic_children` entries (#101 open/"Child A", #102 closed/"Child
+    /// B") in the same "v1.0" milestone bucket as an unrelated plain issue
+    /// (#105, "Just a bug"). `pipeline_issues` also lists #101 directly (as
+    /// it would be if it independently carried a tracked label) to prove the
+    /// #1197 dedup: before this fix, #101 would render a second time as a
+    /// flat sibling under the same milestone header.
+    ///
+    /// Asserts, via `find`/`screen()` (never hardcoded coordinates):
+    /// - both children render nested (strictly more indented — greater
+    ///   column) directly beneath the epic row
+    /// - #101 appears exactly once (the dedup — no flat-sibling duplicate)
+    /// - #102 (never itself in `pipeline_issues`) still renders nested,
+    ///   sourced purely from `data.epic_children` + `data.open_issues`
+    /// - the unrelated plain issue #105 renders unchanged: same indent
+    ///   (column) as the epic, not nested under anything
+    #[test]
+    fn tuidriver_pipeline_epic_children_nest_under_epic_row() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let data = BoardData {
+            open_issues: vec![
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 100,
+                    title: "Epic tracker".to_string(),
+                    body: String::new(),
+                    state: "open".to_string(),
+                    labels: vec!["coord".to_string(), "epic".to_string()],
+                    milestone_number: Some(1),
+                    milestone_title: Some("v1.0".to_string()),
+                },
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 101,
+                    title: "Child A".to_string(),
+                    body: String::new(),
+                    state: "open".to_string(),
+                    labels: vec!["coord".to_string()],
+                    milestone_number: Some(1),
+                    milestone_title: Some("v1.0".to_string()),
+                },
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 102,
+                    title: "Child B".to_string(),
+                    body: String::new(),
+                    state: "closed".to_string(),
+                    labels: vec!["coord".to_string()],
+                    milestone_number: Some(1),
+                    milestone_title: Some("v1.0".to_string()),
+                },
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 105,
+                    title: "Just a bug".to_string(),
+                    body: String::new(),
+                    state: "open".to_string(),
+                    labels: vec!["coord".to_string()],
+                    milestone_number: Some(1),
+                    milestone_title: Some("v1.0".to_string()),
+                },
+            ],
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            epic_children: vec![EpicChildren {
+                repo_name: "api".to_string(),
+                tracking_issue: 100,
+                children: vec![
+                    EpicChild { number: 101, state: "open".to_string() },
+                    EpicChild { number: 102, state: "closed".to_string() },
+                ],
+            }],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+
+        app.pipeline_issues = vec![
+            PipelineIssue {
+                number: 100,
+                title: "Epic tracker".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string(), "epic".to_string()],
+                is_closed: false,
+            },
+            // #1197 dedup case: #101 is ALSO independently tracked here (as
+            // it would be if it carried a tracked label of its own) — this
+            // must NOT render a second time as a flat sibling once it's
+            // nested under #100.
+            PipelineIssue {
+                number: 101,
+                title: "Child A".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string()],
+                is_closed: false,
+            },
+            PipelineIssue {
+                number: 105,
+                title: "Just a bug".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string()],
+                is_closed: false,
+            },
+        ];
+
+        // Pre-expand the repo + milestone sections so rows are visible
+        // without a click (same keys `pipeline_milestones_for_issues` uses).
+        app.pipeline_milestone_expanded.insert(
+            ("new".to_string(), "api".to_string(), "1".to_string()),
+            true,
+        );
+        app.pipeline_lifecycle_expanded.insert(
+            ("new".to_string(), "api".to_string()),
+            true,
+        );
+
+        app.active_view = SidebarView::Pipeline;
+        app.rebuild_board_sidebar();
+        app.rebuild_pipeline_sidebar(None);
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 50);
+        let screen = driver.screen();
+
+        let epic_pos = driver.find("#100").expect(&format!("epic #100 row must render:\n{screen}"));
+        let child_a_pos = driver
+            .find("#101")
+            .expect(&format!("child #101 row must render nested:\n{screen}"));
+        let child_b_pos = driver
+            .find("#102")
+            .expect(&format!("child #102 row must render nested:\n{screen}"));
+        let sibling_pos = driver
+            .find("#105")
+            .expect(&format!("unrelated issue #105 must render unchanged:\n{screen}"));
+
+        assert!(
+            child_a_pos.0 > epic_pos.0,
+            "#101 must be MORE indented (greater column) than its epic #100: epic={epic_pos:?} child={child_a_pos:?}\n{screen}",
+        );
+        assert!(
+            child_b_pos.0 > epic_pos.0,
+            "#102 must be MORE indented (greater column) than its epic #100: epic={epic_pos:?} child={child_b_pos:?}\n{screen}",
+        );
+        assert!(
+            child_a_pos.1 > epic_pos.1 && child_b_pos.1 > epic_pos.1,
+            "both children must render BELOW the epic row: epic={epic_pos:?} a={child_a_pos:?} b={child_b_pos:?}\n{screen}",
+        );
+        assert_eq!(
+            sibling_pos.0, epic_pos.0,
+            "a plain (non-epic) issue in the same bucket must render at the SAME indent as the epic — unchanged by #1197: epic={epic_pos:?} sibling={sibling_pos:?}\n{screen}",
+        );
+
+        // Dedup: #101 must appear exactly once — nested under #100, not
+        // ALSO as a flat sibling in the same milestone bucket.
+        assert_eq!(
+            screen.matches("#101").count(),
+            1,
+            "#101 must render exactly once (nested, not duplicated as a flat sibling):\n{screen}",
+        );
+
+        // Child state badges — Ready (#101, open, no running assignment)
+        // and Done (#102, closed) — reusing `milestone_dag::build_dag_nodes`.
+        // Scoped to each row's own line (rather than a bare `screen.contains`)
+        // since "done"/"ready" could otherwise coincidentally match unrelated
+        // chrome elsewhere on a 140x50 screen.
+        let lines: Vec<&str> = screen.lines().collect();
+        let child_a_line = lines
+            .get(child_a_pos.1 as usize)
+            .unwrap_or_else(|| panic!("no line at #101's row:\n{screen}"));
+        assert!(
+            child_a_line.contains("ready"),
+            "#101's row must show a 'ready' badge: {child_a_line:?}\n{screen}",
+        );
+        let child_b_line = lines
+            .get(child_b_pos.1 as usize)
+            .unwrap_or_else(|| panic!("no line at #102's row:\n{screen}"));
+        assert!(
+            child_b_line.contains("done"),
+            "#102's row must show a 'done' badge: {child_b_line:?}\n{screen}",
         );
     }
 
