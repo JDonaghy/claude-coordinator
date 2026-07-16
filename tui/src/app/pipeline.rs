@@ -271,6 +271,30 @@ pub(crate) struct PendingFixForceConfirm {
     pub(crate) max_iterations: Option<u32>,
 }
 
+/// #1197: one resolved child row ready to nest beneath its epic's Pipeline
+/// row — issue number, title, and dispatch state (Done/InFlight/Ready,
+/// reusing `milestone_dag::build_dag_nodes` rather than re-deriving it).
+pub(crate) struct EpicChildRow {
+    pub(crate) number: u64,
+    pub(crate) title: String,
+    pub(crate) state: NodeState,
+}
+
+/// #1197: per-bucket epic-nesting projection, computed once per leaf-row
+/// loop (`issue_idxs`/`mil_issue_idxs`) in `rebuild_pipeline_sidebar`.
+///
+/// `by_epic` maps an epic's `pipeline_issues` index to its resolved child
+/// rows. `nested` is the flat set of every child issue number nested under
+/// some epic in THIS bucket — callers skip those when emitting ordinary
+/// top-level rows, fixing the bug #1197 describes: an epic and its children
+/// previously rendered as flat siblings under the same milestone/repo
+/// bucket (both matched the same milestone/lifecycle grouping).
+#[derive(Default)]
+pub(crate) struct EpicNesting {
+    pub(crate) by_epic: std::collections::HashMap<usize, Vec<EpicChildRow>>,
+    pub(crate) nested: std::collections::HashSet<u64>,
+}
+
 /// Width of one arrow connector between stages, in TUI cells. Mirrors the
 /// constant used by quadraui's `tui_pipeline_view_layout` so host
 /// hit-testing matches the painted geometry.
@@ -1141,6 +1165,145 @@ impl CoordApp {
             }
             mwo.nodes.iter().find(|n| n.issue_number == issue_number)
         })
+    }
+
+    /// #1197: resolve the child-issue list for `issue` when it's an epic
+    /// tracking issue with at least one `## Sub-issues` child (#1195's
+    /// `data.epic_children` seam, published under the wire key `children`).
+    /// Returns `None` for a non-epic or childless issue — callers render it
+    /// as an ordinary flat leaf, unchanged from before #1197.
+    pub(crate) fn epic_children_for(&self, issue: &PipelineIssue) -> Option<&[EpicChild]> {
+        let repo_name = issue.coord_repo.as_deref()?;
+        self.data.epic_children.iter().find_map(|ec| {
+            if ec.repo_name == repo_name
+                && ec.tracking_issue == issue.number
+                && !ec.children.is_empty()
+            {
+                Some(ec.children.as_slice())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// #1197: compute the [`EpicNesting`] for one leaf-row bucket (a
+    /// milestone's `mil_issue_idxs`, a repo's `issue_idxs`, or the flat
+    /// `done_windowed` list). `after`/`group` are always empty for #1195
+    /// API-sourced children (that shape carries no ordering annotation,
+    /// unlike the `## Work order` convention `milestone_dag.rs` also
+    /// parses) — so `build_dag_nodes` only ever resolves Done/InFlight/Ready
+    /// for these, never Blocked. Reuses `build_dag_nodes` rather than
+    /// re-deriving the state computation, per #1197's scope note; its
+    /// "missing from `open_issues` ⇒ presumed Done" heuristic holds
+    /// identically here since `open_issues` is the same cache regardless of
+    /// whether child *membership* came from the `## Work order` block or
+    /// the #1195 API-sourced `children` list.
+    pub(crate) fn compute_epic_nesting(&self, issue_idxs: &[usize]) -> EpicNesting {
+        let mut nesting = EpicNesting::default();
+        for &idx in issue_idxs {
+            let Some(issue) = self.pipeline_issues.get(idx) else {
+                continue;
+            };
+            let Some(children) = self.epic_children_for(issue) else {
+                continue;
+            };
+            let repo_name = issue.coord_repo.clone().unwrap_or_default();
+            let work_order: Vec<WorkOrderNode> = children
+                .iter()
+                .map(|c| WorkOrderNode {
+                    issue_number: c.number,
+                    group: None,
+                    after: Vec::new(),
+                })
+                .collect();
+            let nodes = build_dag_nodes(
+                &work_order,
+                &repo_name,
+                &self.data.open_issues,
+                &self.data.assignments,
+            );
+            if nodes.is_empty() {
+                continue;
+            }
+            let rows: Vec<EpicChildRow> = nodes
+                .into_iter()
+                .map(|n| {
+                    nesting.nested.insert(n.issue_number);
+                    EpicChildRow {
+                        number: n.issue_number,
+                        title: n.title,
+                        state: n.state,
+                    }
+                })
+                .collect();
+            nesting.by_epic.insert(idx, rows);
+        }
+        nesting
+    }
+
+    /// #1197: resolve a nested-child row's own `pipeline_issues` index.
+    /// `parent_idx` is the epic's index (already resolved from the
+    /// selected path's leading segments); `child_pos` is the extra trailing
+    /// path segment identifying which rendered child row was selected.
+    /// Returns `None` when the child isn't independently tracked in
+    /// `pipeline_issues` (e.g. it carries none of `pipeline_tracked_labels`)
+    /// — such a row exists for nested display only, and callers correctly
+    /// get "nothing selected" rather than silently falling back to acting
+    /// on the parent epic instead.
+    pub(crate) fn resolve_nested_child_index(
+        &self,
+        parent_idx: usize,
+        child_pos: usize,
+    ) -> Option<usize> {
+        let issue = self.pipeline_issues.get(parent_idx)?;
+        let children = self.epic_children_for(issue)?;
+        let child_number = children.get(child_pos)?.number;
+        let repo = issue.coord_repo.clone();
+        self.pipeline_issues
+            .iter()
+            .position(|pi| pi.number == child_number && pi.coord_repo == repo)
+    }
+
+    /// #1197: build one nested `TreeRow` for an epic child — `parent_path`
+    /// is the epic's own row path (extended here with `child_idx`), `indent`
+    /// is one greater than the epic row's own indent. Mirrors the plain
+    /// issue-row spans (`#N  title`) plus a small state badge reusing
+    /// `NodeState`, distinct from the milestone-work-order rank badges
+    /// (`work_order_node_for`) — an epic's `## Sub-issues` children carry no
+    /// rank/ordering, just Done/InFlight/Ready.
+    pub(crate) fn epic_child_tree_row(
+        &self,
+        parent_path: &[u16],
+        indent: u16,
+        child_idx: usize,
+        child: &EpicChildRow,
+    ) -> TreeRow {
+        let mut path: TreePath = parent_path.to_vec();
+        path.push(child_idx as u16);
+        let (state_text, state_color) = match child.state {
+            NodeState::Done => ("done", self.active_theme.badge_passed),
+            NodeState::InFlight => ("in-flight", self.active_theme.link_fg),
+            NodeState::Ready => ("ready", self.active_theme.accent_fg),
+            NodeState::Blocked(_) => ("blocked", self.active_theme.badge_request_changes),
+        };
+        TreeRow {
+            path,
+            indent,
+            icon: None,
+            text: StyledText {
+                spans: vec![
+                    StyledSpan::with_fg(
+                        format!("#{:<5}", child.number),
+                        Color::rgb(150, 150, 240),
+                    ),
+                    StyledSpan::with_fg(trunc(&child.title, 18), Color::rgb(180, 180, 180)),
+                ],
+            },
+            badge: Some(Badge::colored(state_text, state_color)),
+            is_expanded: None,
+            decoration: Decoration::Normal,
+            edit: None,
+        }
     }
 
     /// #668: Group a slice of `pipeline_issues` indices by milestone.
@@ -2901,8 +3064,15 @@ impl CoordApp {
                             if !is_mil_expanded {
                                 continue;
                             }
+                            // #1197: nest each epic's children beneath its
+                            // row instead of listing them a second time as
+                            // flat siblings in this same milestone bucket.
+                            let nesting = self.compute_epic_nesting(mil_issue_idxs);
                             for (ii, &issue_idx) in mil_issue_idxs.iter().enumerate() {
                                 let issue = &self.pipeline_issues[issue_idx];
+                                if nesting.nested.contains(&issue.number) {
+                                    continue;
+                                }
                                 let title_color = if issue.coord_repo.is_some() {
                                     Color::rgb(210, 210, 210)
                                 } else {
@@ -2919,8 +3089,9 @@ impl CoordApp {
                                 } else {
                                     None
                                 };
+                                let row_path = vec![gi as u16, mi as u16, ii as u16];
                                 rows.push(TreeRow {
-                                    path: vec![gi as u16, mi as u16, ii as u16],
+                                    path: row_path.clone(),
                                     indent: 3,
                                     icon: None,
                                     text: StyledText {
@@ -2940,6 +3111,13 @@ impl CoordApp {
                                     decoration: Decoration::Normal,
                                     edit: None,
                                 });
+                                if let Some(children) = nesting.by_epic.get(&issue_idx) {
+                                    for (ci, child) in children.iter().enumerate() {
+                                        rows.push(self.epic_child_tree_row(
+                                            &row_path, 4, ci, child,
+                                        ));
+                                    }
+                                }
                             }
                         }
                     }
@@ -2956,8 +3134,15 @@ impl CoordApp {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs_f64();
+                    // #1197: nest each epic's children beneath its row
+                    // instead of listing them a second time as flat
+                    // siblings in the Done window.
+                    let nesting = self.compute_epic_nesting(&done_windowed);
                     for (ii, &issue_idx) in done_windowed.iter().enumerate() {
                         let issue = &self.pipeline_issues[issue_idx];
+                        if nesting.nested.contains(&issue.number) {
+                            continue;
+                        }
                         let title_color = if issue.coord_repo.is_some() {
                             Color::rgb(160, 160, 160)
                         } else {
@@ -3004,8 +3189,9 @@ impl CoordApp {
                         }
                         // Repo tag badge (same as in-progress, for orientation).
                         let tag = Self::repo_tag(Self::pipeline_repo_key(issue), &repos);
+                        let row_path = vec![0u16, ii as u16];
                         rows.push(TreeRow {
-                            path: vec![0u16, ii as u16],
+                            path: row_path.clone(),
                             indent: 2,
                             icon: None,
                             text: StyledText { spans },
@@ -3014,6 +3200,11 @@ impl CoordApp {
                             decoration: Decoration::Normal,
                             edit: None,
                         });
+                        if let Some(children) = nesting.by_epic.get(&issue_idx) {
+                            for (ci, child) in children.iter().enumerate() {
+                                rows.push(self.epic_child_tree_row(&row_path, 3, ci, child));
+                            }
+                        }
                     }
                 }
                 _ => {
@@ -3149,8 +3340,15 @@ impl CoordApp {
                                 if !is_mil_expanded {
                                     continue;
                                 }
+                                // #1197: nest each epic's children beneath
+                                // its row instead of listing them a second
+                                // time as flat siblings in this bucket.
+                                let nesting = self.compute_epic_nesting(mil_issue_idxs);
                                 for (ii, &issue_idx) in mil_issue_idxs.iter().enumerate() {
                                     let issue = &self.pipeline_issues[issue_idx];
+                                    if nesting.nested.contains(&issue.number) {
+                                        continue;
+                                    }
                                     let stage_name = self.derive_current_stage(issue);
                                     let (badge_text, badge_color) = stage_badge(&stage_name, &self.active_theme);
                                     let title_color = if issue.coord_repo.is_some() {
@@ -3213,8 +3411,9 @@ impl CoordApp {
                                             ));
                                         }
                                     }
+                                    let row_path = vec![ri as u16, mi as u16, ii as u16];
                                     rows.push(TreeRow {
-                                        path: vec![ri as u16, mi as u16, ii as u16],
+                                        path: row_path.clone(),
                                         indent: 3,
                                         icon: None,
                                         text: StyledText { spans },
@@ -3223,12 +3422,26 @@ impl CoordApp {
                                         decoration: Decoration::Normal,
                                         edit: None,
                                     });
+                                    if let Some(children) = nesting.by_epic.get(&issue_idx) {
+                                        for (ci, child) in children.iter().enumerate() {
+                                            rows.push(self.epic_child_tree_row(
+                                                &row_path, 4, ci, child,
+                                            ));
+                                        }
+                                    }
                                 }
                             }
                         } else {
                             // Refining / Pending — 2-level tree: repo → issue.
+                            // #1197: nest each epic's children beneath its
+                            // row instead of listing them a second time as
+                            // flat siblings in this bucket.
+                            let nesting = self.compute_epic_nesting(issue_idxs);
                             for (ii, &issue_idx) in issue_idxs.iter().enumerate() {
                                 let issue = &self.pipeline_issues[issue_idx];
+                                if nesting.nested.contains(&issue.number) {
+                                    continue;
+                                }
                                 let stage_name = self.derive_current_stage(issue);
                                 let (badge_text, badge_color) = stage_badge(&stage_name, &self.active_theme);
                                 let title_color = if issue.coord_repo.is_some() {
@@ -3253,8 +3466,9 @@ impl CoordApp {
                                         Color::rgb(60, 200, 80),
                                     ));
                                 }
+                                let row_path = vec![ri as u16, ii as u16];
                                 rows.push(TreeRow {
-                                    path: vec![ri as u16, ii as u16],
+                                    path: row_path.clone(),
                                     indent: 2,
                                     icon: None,
                                     text: StyledText { spans },
@@ -3263,6 +3477,11 @@ impl CoordApp {
                                     decoration: Decoration::Normal,
                                     edit: None,
                                 });
+                                if let Some(children) = nesting.by_epic.get(&issue_idx) {
+                                    for (ci, child) in children.iter().enumerate() {
+                                        rows.push(self.epic_child_tree_row(&row_path, 3, ci, child));
+                                    }
+                                }
                             }
                         }
                     }
@@ -3443,6 +3662,11 @@ impl CoordApp {
     ///
     /// A path shorter than the minimum for the state (header row selected)
     /// returns `None`.
+    ///
+    /// #1197: a path ONE segment longer than the state's base depth selects
+    /// a nested epic-child row rather than the ordinary issue at that depth
+    /// — resolved via [`Self::resolve_nested_child_index`] so Go/dispatch/etc.
+    /// act on the child itself, not silently on the parent epic.
     pub(crate) fn selected_pipeline_index(&self) -> Option<usize> {
         // Section 0 is the FILTER form; state sections start at search_offset.
         let search_offset = 1usize;
@@ -3466,7 +3690,12 @@ impl CoordApp {
             let (_, repo_issue_idxs) = repo_groups.get(ri)?;
             let milestones = self.pipeline_milestones_for_issues(repo_issue_idxs);
             let (_, _, mil_issue_idxs) = milestones.get(mi)?;
-            mil_issue_idxs.get(ii).copied()
+            let parent_idx = mil_issue_idxs.get(ii).copied()?;
+            if path.len() > 3 {
+                self.resolve_nested_child_index(parent_idx, path[3] as usize)
+            } else {
+                Some(parent_idx)
+            }
         } else if state_key == "done" {
             // #728: flat 2-level path [0, issue_idx] — path[0] is the
             // synthetic group (always 0); path[1] is the windowed list index.
@@ -3475,7 +3704,12 @@ impl CoordApp {
             }
             let ii = path[1] as usize;
             let done_windowed = self.pipeline_done_windowed();
-            done_windowed.get(ii).copied()
+            let parent_idx = done_windowed.get(ii).copied()?;
+            if path.len() > 2 {
+                self.resolve_nested_child_index(parent_idx, path[2] as usize)
+            } else {
+                Some(parent_idx)
+            }
         } else if state_key == "in-progress" {
             // #1069: 3-level path [group_idx, milestone_idx, issue_idx].
             if path.len() < 3 {
@@ -3488,7 +3722,12 @@ impl CoordApp {
             let (_, issue_idxs) = groups.get(gi)?;
             let milestones = self.pipeline_milestones_for_issues(issue_idxs);
             let (_, _, mil_issue_idxs) = milestones.get(mi)?;
-            mil_issue_idxs.get(ii).copied()
+            let parent_idx = mil_issue_idxs.get(ii).copied()?;
+            if path.len() > 3 {
+                self.resolve_nested_child_index(parent_idx, path[3] as usize)
+            } else {
+                Some(parent_idx)
+            }
         } else {
             // refining / pending — 2-level [repo_idx, issue_idx].
             if path.len() < 2 {
@@ -3498,7 +3737,12 @@ impl CoordApp {
             let ii = path[1] as usize;
             let groups = self.pipeline_repos_for_state(state_key);
             let (_, issue_idxs) = groups.get(gi)?;
-            issue_idxs.get(ii).copied()
+            let parent_idx = issue_idxs.get(ii).copied()?;
+            if path.len() > 2 {
+                self.resolve_nested_child_index(parent_idx, path[2] as usize)
+            } else {
+                Some(parent_idx)
+            }
         }
     }
 
