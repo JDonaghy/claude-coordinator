@@ -123,7 +123,7 @@ def add_sub_issue(repo: str, parent_number: int, child_number: int) -> None:
     child_id = _resolve_issue_id(repo, child_number)
     _gh(
         "api", f"repos/{repo}/issues/{parent_number}/sub_issues",
-        "--method", "POST",
+        "-X", "POST",
         "-F", f"sub_issue_id={child_id}",
     )
 
@@ -135,7 +135,7 @@ def remove_sub_issue(repo: str, parent_number: int, child_number: int) -> None:
     child_id = _resolve_issue_id(repo, child_number)
     _gh(
         "api", f"repos/{repo}/issues/{parent_number}/sub_issue",
-        "--method", "DELETE",
+        "-X", "DELETE",
         "-F", f"sub_issue_id={child_id}",
     )
 

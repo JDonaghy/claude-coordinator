@@ -2429,9 +2429,12 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                     _ci_repo_name = _ci_ti.get("repo_name", "")
                     if not _ci_repo_name:
                         continue
-                    _ci_kids = _parentage.children(
-                        "", _ci_ti["number"], body=_ci_ti.get("body") or "",
-                    )
+                    try:
+                        _ci_kids = _parentage.children(
+                            "", _ci_ti["number"], body=_ci_ti.get("body") or "",
+                        )
+                    except Exception:  # noqa: BLE001 — bad sub-issues block: skip this epic only
+                        continue
                     if _ci_kids:
                         _epic_children.append({
                             "repo_name": _ci_repo_name,

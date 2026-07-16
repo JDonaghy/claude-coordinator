@@ -184,7 +184,7 @@ class TestGitHubParentageWrites:
         assert resolve_call[:2] == ("api", "repos/acme/api/issues/1039")
         assert write_call[0] == "api"
         assert write_call[1] == "repos/acme/api/issues/500/sub_issues"
-        assert "--method" in write_call and "POST" in write_call
+        assert "-X" in write_call and "POST" in write_call
         assert "sub_issue_id=4856912446" in write_call
 
     def test_remove_child_uses_singular_endpoint(self) -> None:
@@ -202,7 +202,7 @@ class TestGitHubParentageWrites:
 
         write_call = calls[-1]
         assert write_call[1] == "repos/acme/api/issues/500/sub_issue"
-        assert "--method" in write_call and "DELETE" in write_call
+        assert "-X" in write_call and "DELETE" in write_call
         assert "sub_issue_id=4856912446" in write_call
 
 

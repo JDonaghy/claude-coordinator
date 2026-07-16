@@ -619,6 +619,75 @@ def test_children_empty_when_no_tracking_issue(file_db: Path, valid_config_path:
     assert board.get("children") == [], "children must be [] when no tracking issue is present"
 
 
+_MALFORMED_SUB_ISSUES_BODY = """\
+Tracking issue for a different milestone, hand-edited badly.
+
+## Sub-issues
+- [ ] #201  {group: A}
+- fix flaky test
+
+## Notes
+Not part of the sub-issues block.
+"""
+
+
+def _make_sub_issues_db_with_malformed_epic(path: Path) -> None:
+    """Seed a DB with TWO tracking issues (label="epic"): #500 has a
+    well-formed `## Sub-issues` block (per :func:`_make_sub_issues_db`), and
+    #600 has a hand-editing mistake (a stray `- fix flaky test` line under
+    the heading that doesn't match the `- [ ] #N` grammar) that makes
+    `parse_sub_issues` raise ``WorkOrderError``. Used to verify that one
+    malformed epic's parse failure doesn't blank `children` for every epic
+    on the board (review finding #1 on #1195)."""
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    _ensure_schema(conn)
+    conn.execute("INSERT INTO machines (name, host, capabilities, repos) VALUES (?,?,?,?)",
+                 ("laptop", "laptop.tailnet", '["python"]', '["api"]'))
+    conn.execute(
+        "INSERT INTO issues (repo_name, number, title, body, state, labels, synced_at) "
+        "VALUES (?, ?, ?, ?, 'open', ?, 0)",
+        ("api", 500, "Milestone tracking", _SUB_ISSUES_BODY, '["epic", "coord"]'),
+    )
+    conn.execute(
+        "INSERT INTO issues (repo_name, number, title, body, state, labels, synced_at) "
+        "VALUES (?, ?, ?, ?, 'open', ?, 0)",
+        ("api", 600, "Malformed milestone tracking", _MALFORMED_SUB_ISSUES_BODY, '["epic", "coord"]'),
+    )
+    conn.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')")
+    conn.commit()
+    conn.close()
+
+
+def test_children_malformed_epic_does_not_blank_other_epics(tmp_path: Path, valid_config_path: Path):
+    """#1195 review finding #1: a malformed `## Sub-issues` block on one epic
+    (#600) must not blank `children` for a well-formed epic (#500) elsewhere
+    on the board — the per-epic parse failure must be isolated, matching the
+    `milestone_work_orders` block's per-tracking-issue try/except/continue."""
+    db_path = tmp_path / "coord.db"
+    _make_sub_issues_db_with_malformed_epic(db_path)
+
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(db_path), cfg)
+    with TestClient(app) as cli:
+        board = cli.get("/board").json()
+
+    entries = board["children"]
+    by_tracking_issue = {e["tracking_issue"]: e for e in entries}
+
+    # #500's valid children must still be present...
+    assert 500 in by_tracking_issue, (
+        f"well-formed epic #500's children must survive #600's malformed "
+        f"block, got entries: {entries}"
+    )
+    by_num = {c["number"]: c for c in by_tracking_issue[500]["children"]}
+    assert set(by_num) == {101, 102}
+
+    # ...and #600 (the malformed one) must simply be absent, not blank the
+    # whole `children` list.
+    assert 600 not in by_tracking_issue
+
+
 # ── #975: plan_roster in /board payload ──────────────────────────────────────
 
 def _make_plan_roster_db(path: Path) -> None:
