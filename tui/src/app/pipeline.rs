@@ -1241,6 +1241,25 @@ impl CoordApp {
         nesting
     }
 
+    /// #1197: resolve the `pipeline_epic_expanded` key + current expanded
+    /// state for an epic row. Returns `None` when the issue has no
+    /// `coord_repo` (an untracked row can't be keyed, and can't be an epic
+    /// anyway — `epic_children_for` also requires the repo).
+    ///
+    /// Untouched keys default to **expanded**: an epic's children are the
+    /// reason it renders as a parent, so they're visible until the user
+    /// collapses them. This differs from the milestone header's #857
+    /// collapsed-by-default (a milestone is a bucket; an epic is the work).
+    pub(crate) fn epic_expand_state(&self, issue: &PipelineIssue) -> Option<((String, u64), bool)> {
+        let key = (issue.coord_repo.clone()?, issue.number);
+        let expanded = self
+            .pipeline_epic_expanded
+            .get(&key)
+            .copied()
+            .unwrap_or(true);
+        Some((key, expanded))
+    }
+
     /// #1197: resolve a nested-child row's own `pipeline_issues` index.
     /// `parent_idx` is the epic's index (already resolved from the
     /// selected path's leading segments); `child_pos` is the extra trailing
@@ -2955,6 +2974,14 @@ impl CoordApp {
             _ => Color::rgb(140, 140, 160),
         };
 
+        // #1197: (section_idx, path) → epic collapse key, accumulated as the
+        // epic rows are emitted below and published to
+        // `self.pipeline_epic_row_keys` once the loop releases its &self
+        // borrows.  Lets the RowToggleExpand handler recognise an epic row
+        // by identity instead of guessing from the path's shape.
+        let mut epic_row_keys: std::collections::HashMap<(usize, TreePath), (String, u64)> =
+            std::collections::HashMap::new();
+
         // ── Populate rows for each state section ─────────────────────────
         for (state_idx, &(lc_key, _lc_label)) in state_sections.iter().enumerate() {
             let section_idx = state_idx + search_offset;
@@ -3090,6 +3117,15 @@ impl CoordApp {
                                     None
                                 };
                                 let row_path = vec![gi as u16, mi as u16, ii as u16];
+                                // #1197: an epic row is a *branch* — it keeps
+                                // Decoration::Normal (it's real, actionable
+                                // work, not a bucket header) but carries
+                                // `is_expanded`, which is what drives the
+                                // chevron + its hit region in quadraui's tree.
+                                let epic = nesting.by_epic.get(&issue_idx).and_then(|children| {
+                                    self.epic_expand_state(issue)
+                                        .map(|(key, expanded)| (key, expanded, children))
+                                });
                                 rows.push(TreeRow {
                                     path: row_path.clone(),
                                     indent: 3,
@@ -3107,15 +3143,18 @@ impl CoordApp {
                                         ],
                                     },
                                     badge: row_badge,
-                                    is_expanded: None,
+                                    is_expanded: epic.as_ref().map(|(_, e, _)| *e),
                                     decoration: Decoration::Normal,
                                     edit: None,
                                 });
-                                if let Some(children) = nesting.by_epic.get(&issue_idx) {
-                                    for (ci, child) in children.iter().enumerate() {
-                                        rows.push(self.epic_child_tree_row(
-                                            &row_path, 4, ci, child,
-                                        ));
+                                if let Some((key, expanded, children)) = epic {
+                                    epic_row_keys.insert((section_idx, row_path.clone()), key);
+                                    if expanded {
+                                        for (ci, child) in children.iter().enumerate() {
+                                            rows.push(self.epic_child_tree_row(
+                                                &row_path, 4, ci, child,
+                                            ));
+                                        }
                                     }
                                 }
                             }
@@ -3190,19 +3229,27 @@ impl CoordApp {
                         // Repo tag badge (same as in-progress, for orientation).
                         let tag = Self::repo_tag(Self::pipeline_repo_key(issue), &repos);
                         let row_path = vec![0u16, ii as u16];
+                        // #1197: epic branch row — see the in-progress site.
+                        let epic = nesting.by_epic.get(&issue_idx).and_then(|children| {
+                            self.epic_expand_state(issue)
+                                .map(|(key, expanded)| (key, expanded, children))
+                        });
                         rows.push(TreeRow {
                             path: row_path.clone(),
                             indent: 2,
                             icon: None,
                             text: StyledText { spans },
                             badge: Some(Badge::colored(tag, Color::rgb(180, 140, 240))),
-                            is_expanded: None,
+                            is_expanded: epic.as_ref().map(|(_, e, _)| *e),
                             decoration: Decoration::Normal,
                             edit: None,
                         });
-                        if let Some(children) = nesting.by_epic.get(&issue_idx) {
-                            for (ci, child) in children.iter().enumerate() {
-                                rows.push(self.epic_child_tree_row(&row_path, 3, ci, child));
+                        if let Some((key, expanded, children)) = epic {
+                            epic_row_keys.insert((section_idx, row_path.clone()), key);
+                            if expanded {
+                                for (ci, child) in children.iter().enumerate() {
+                                    rows.push(self.epic_child_tree_row(&row_path, 3, ci, child));
+                                }
                             }
                         }
                     }
@@ -3412,21 +3459,32 @@ impl CoordApp {
                                         }
                                     }
                                     let row_path = vec![ri as u16, mi as u16, ii as u16];
+                                    // #1197: epic branch row — see the
+                                    // in-progress site.
+                                    let epic =
+                                        nesting.by_epic.get(&issue_idx).and_then(|children| {
+                                            self.epic_expand_state(issue)
+                                                .map(|(key, expanded)| (key, expanded, children))
+                                        });
                                     rows.push(TreeRow {
                                         path: row_path.clone(),
                                         indent: 3,
                                         icon: None,
                                         text: StyledText { spans },
                                         badge: Some(Badge::colored(&badge_text, badge_color)),
-                                        is_expanded: None,
+                                        is_expanded: epic.as_ref().map(|(_, e, _)| *e),
                                         decoration: Decoration::Normal,
                                         edit: None,
                                     });
-                                    if let Some(children) = nesting.by_epic.get(&issue_idx) {
-                                        for (ci, child) in children.iter().enumerate() {
-                                            rows.push(self.epic_child_tree_row(
-                                                &row_path, 4, ci, child,
-                                            ));
+                                    if let Some((key, expanded, children)) = epic {
+                                        epic_row_keys
+                                            .insert((section_idx, row_path.clone()), key);
+                                        if expanded {
+                                            for (ci, child) in children.iter().enumerate() {
+                                                rows.push(self.epic_child_tree_row(
+                                                    &row_path, 4, ci, child,
+                                                ));
+                                            }
                                         }
                                     }
                                 }
@@ -3467,19 +3525,29 @@ impl CoordApp {
                                     ));
                                 }
                                 let row_path = vec![ri as u16, ii as u16];
+                                // #1197: epic branch row — see the in-progress site.
+                                let epic = nesting.by_epic.get(&issue_idx).and_then(|children| {
+                                    self.epic_expand_state(issue)
+                                        .map(|(key, expanded)| (key, expanded, children))
+                                });
                                 rows.push(TreeRow {
                                     path: row_path.clone(),
                                     indent: 2,
                                     icon: None,
                                     text: StyledText { spans },
                                     badge: Some(Badge::colored(&badge_text, badge_color)),
-                                    is_expanded: None,
+                                    is_expanded: epic.as_ref().map(|(_, e, _)| *e),
                                     decoration: Decoration::Normal,
                                     edit: None,
                                 });
-                                if let Some(children) = nesting.by_epic.get(&issue_idx) {
-                                    for (ci, child) in children.iter().enumerate() {
-                                        rows.push(self.epic_child_tree_row(&row_path, 3, ci, child));
+                                if let Some((key, expanded, children)) = epic {
+                                    epic_row_keys.insert((section_idx, row_path.clone()), key);
+                                    if expanded {
+                                        for (ci, child) in children.iter().enumerate() {
+                                            rows.push(
+                                                self.epic_child_tree_row(&row_path, 3, ci, child),
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -3489,6 +3557,10 @@ impl CoordApp {
             }
             sidebar.set_rows(section_idx, rows);
         }
+        // #1197: publish this pass's epic-row identity map (stale entries
+        // from the previous rebuild are dropped wholesale — paths shift as
+        // issues move between sections).
+        self.pipeline_epic_row_keys = epic_row_keys;
 
         // Default-select the first issue in the first non-empty state section.
         if sidebar.active_section().is_none() && !state_sections.is_empty() {

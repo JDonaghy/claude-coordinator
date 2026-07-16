@@ -4602,6 +4602,34 @@ impl CoordApp {
                         }
                         true
                     }
+                    // #1197: an epic row is a branch too — collapsing it hides
+                    // just its own children, leaving the epic row and its
+                    // milestone siblings visible (previously the only way to
+                    // hide an epic's children was collapsing the whole
+                    // milestone, which hid the epic itself along with them).
+                    // Matched by identity via `pipeline_epic_row_keys` rather
+                    // than by path length: epic rows land at len 2 (Done,
+                    // Refining/Pending) *or* len 3 (New, In-progress) depending
+                    // on whether that section is milestone-grouped.  This arm
+                    // must precede the milestone arm below — a Refining epic
+                    // row and a New milestone header are both len 2.
+                    SidebarEvent::RowToggleExpand { section, ref path }
+                        if self
+                            .pipeline_epic_row_keys
+                            .contains_key(&(section, path.clone())) =>
+                    {
+                        if let Some(key) =
+                            self.pipeline_epic_row_keys.get(&(section, path.clone())).cloned()
+                        {
+                            // Default expanded — mirrors the render-path
+                            // default in `epic_expand_state`.
+                            let entry =
+                                self.pipeline_epic_expanded.entry(key).or_insert(true);
+                            *entry = !*entry;
+                            self.rebuild_pipeline_sidebar(None);
+                        }
+                        true
+                    }
                     SidebarEvent::RowToggleExpand { section, ref path } if path.len() == 2 => {
                         // #668/#1069: A two-level path = a milestone sub-header
                         // was toggled, within either a New section (grouped
