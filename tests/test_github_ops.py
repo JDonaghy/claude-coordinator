@@ -279,6 +279,8 @@ class TestWorkIsTerminal:
             _REAL_WORK_IS_TERMINAL("acme/api", 1, "b1", cache=cache)
             _REAL_WORK_IS_TERMINAL("acme/api", 2, "b2", cache=cache)
 
+        assert calls["n"] == 2
+
 
 # ── close-invariant chokepoint (#1196) ──────────────────────────────────────
 
