@@ -2913,28 +2913,32 @@
     #[test]
     fn acceptance_for_path_arg_outcomes() {
         // Pure unit coverage of the three outcomes documented on
-        // `acceptance_for_path_arg` itself.
+        // `acceptance_for_path_arg` itself. Body is empty throughout — no
+        // `## Files` section to parse — so the >1-route case exercises the
+        // original #1151 fallback unchanged; #1201's body-parse disambiguation
+        // gets its own dedicated test group below.
         let mut app = make_test_app(BoardData::default());
 
         // Repo absent from the map (unrouted, or daemon predates #1151).
-        assert_eq!(app.acceptance_for_path_arg("api"), Ok(None));
+        assert_eq!(app.acceptance_for_path_arg("api", ""), Ok(None));
 
         // Exactly one route: unambiguous auto-resolve.
         app.data
             .pipeline_acceptance_routes
             .insert("api".to_string(), vec!["coord/**".to_string()]);
         assert_eq!(
-            app.acceptance_for_path_arg("api"),
+            app.acceptance_for_path_arg("api", ""),
             Ok(Some("coord/**".to_string()))
         );
 
-        // More than one route: no signal for which applies -> Err, not a guess.
+        // More than one route, no `## Files` section to disambiguate from:
+        // no signal for which applies -> Err, not a guess.
         app.data.pipeline_acceptance_routes.insert(
             "api".to_string(),
             vec!["coord/**".to_string(), "tui/**".to_string()],
         );
         let err = app
-            .acceptance_for_path_arg("api")
+            .acceptance_for_path_arg("api", "")
             .expect_err("ambiguous routing must be an Err, not a guessed path");
         assert!(
             err.contains("coord/**") && err.contains("tui/**"),
@@ -2945,6 +2949,127 @@
             err.contains("--for-path"),
             "error must point at the CLI escape hatch, got: {err}"
         );
+    }
+
+    // ── #1201: --for-path disambiguation via `## Files` / `**Allowed:**` ──
+    //
+    // #1151 left the >1-route case as an unconditional toast+CLI-fallback.
+    // #1201 adds a strict-addition disambiguation pass: when the issue body
+    // has a parseable `**Allowed:**` glob list and exactly one candidate
+    // route overlaps it, auto-resolve; otherwise fall back to the #1151
+    // behavior unchanged. Coverage below drives `acceptance_for_path_arg`
+    // directly (pure unit coverage, mirroring `acceptance_for_path_arg_outcomes`
+    // above) across the fixtures the issue itself calls out: clean match, no
+    // `## Files` section, multiple allowed globs, a glob that doesn't overlap
+    // any route, and backtick/comma formatting variants.
+
+    #[test]
+    fn acceptance_for_path_arg_resolves_via_allowed_globs_when_exactly_one_route_overlaps() {
+        let mut app = make_test_app(BoardData::default());
+        app.data.pipeline_acceptance_routes.insert(
+            "claude-coordinator".to_string(),
+            vec!["coord/**".to_string(), "tui/**".to_string()],
+        );
+        let body = "## Files\n- **Allowed:** `tui/src/app/**` (render/dialogs as needed), in-crate `#[cfg(test)]` tests.\n- **Forbidden:** `coord/**`.\n";
+        assert_eq!(
+            app.acceptance_for_path_arg("claude-coordinator", body),
+            Ok(Some("tui/**".to_string())),
+            "a single Allowed glob under the same subtree as exactly one \
+             route must auto-resolve, not toast"
+        );
+    }
+
+    #[test]
+    fn acceptance_for_path_arg_falls_back_when_body_has_no_files_section() {
+        let mut app = make_test_app(BoardData::default());
+        app.data.pipeline_acceptance_routes.insert(
+            "claude-coordinator".to_string(),
+            vec!["coord/**".to_string(), "tui/**".to_string()],
+        );
+        let body = "## Problem\nSome issue prose with no Files section at all.\n";
+        let err = app
+            .acceptance_for_path_arg("claude-coordinator", body)
+            .expect_err("no Files section -> unchanged #1151 fallback, not a guess");
+        assert!(err.contains("--for-path"));
+    }
+
+    #[test]
+    fn acceptance_for_path_arg_resolves_via_multiple_allowed_globs_same_subtree() {
+        let mut app = make_test_app(BoardData::default());
+        app.data.pipeline_acceptance_routes.insert(
+            "claude-coordinator".to_string(),
+            vec!["coord/**".to_string(), "tui/**".to_string()],
+        );
+        // #1115-style body: several Allowed globs, all under coord/**.
+        let body = "## Files\n- **Allowed:** `coord/usage.py`, `coord/commands/status.py`, `coord/config.py` (pricing block parse), `tests/test_usage*.py` (+ a new test module).\n- **Forbidden:** any docs/README/CHANGELOG, `coord/agent.py`, TUI (`tui/**`).\n";
+        assert_eq!(
+            app.acceptance_for_path_arg("claude-coordinator", body),
+            Ok(Some("coord/**".to_string())),
+            "multiple Allowed globs that all overlap the same single route \
+             must still auto-resolve to that route"
+        );
+    }
+
+    #[test]
+    fn acceptance_for_path_arg_falls_back_when_allowed_glob_overlaps_no_route() {
+        let mut app = make_test_app(BoardData::default());
+        app.data.pipeline_acceptance_routes.insert(
+            "claude-coordinator".to_string(),
+            vec!["coord/**".to_string(), "tui/**".to_string()],
+        );
+        let body = "## Files\n- **Allowed:** `docs/ARCHITECTURE.md`.\n";
+        let err = app
+            .acceptance_for_path_arg("claude-coordinator", body)
+            .expect_err("an Allowed glob that overlaps no route must fall back, not guess");
+        assert!(err.contains("--for-path"));
+    }
+
+    #[test]
+    fn acceptance_for_path_arg_falls_back_when_allowed_globs_span_multiple_routes() {
+        let mut app = make_test_app(BoardData::default());
+        app.data.pipeline_acceptance_routes.insert(
+            "claude-coordinator".to_string(),
+            vec!["coord/**".to_string(), "tui/**".to_string()],
+        );
+        // Allowed globs under BOTH subtrees -> still ambiguous, not a guess.
+        let body = "## Files\n- **Allowed:** `coord/usage.py`, `tui/src/app/pipeline.rs`.\n";
+        let err = app
+            .acceptance_for_path_arg("claude-coordinator", body)
+            .expect_err("Allowed globs spanning >1 route must still fall back");
+        assert!(err.contains("--for-path"));
+    }
+
+    #[test]
+    fn parse_allowed_globs_from_issue_body_tolerates_formatting_variants() {
+        // Direct coverage of the parsing helper: comma lists, trailing
+        // parentheticals, and a non-glob backtick span mixed in (harmless —
+        // it just won't overlap any real route).
+        let body = "## Files\n- **Allowed:** `tui/src/app/**` (render/dialogs/pipeline/types as needed), in-crate `#[cfg(test)]` tests.\n- **Forbidden:** docs/README/CHANGELOG, `coord/**`.\n";
+        let globs = parse_allowed_globs_from_issue_body(body);
+        assert_eq!(
+            globs,
+            vec!["tui/src/app/**".to_string(), "#[cfg(test)]".to_string()],
+            "must capture every backtick span on the Allowed line only, got: {globs:?}"
+        );
+    }
+
+    #[test]
+    fn parse_allowed_globs_from_issue_body_empty_when_no_marker() {
+        assert_eq!(
+            parse_allowed_globs_from_issue_body("## Files\n- Allowed: no backticks here.\n"),
+            Vec::<String>::new()
+        );
+        assert_eq!(parse_allowed_globs_from_issue_body(""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn globs_overlap_recognises_shared_subtree_and_rejects_disjoint() {
+        assert!(globs_overlap("tui/src/app/**", "tui/**"));
+        assert!(globs_overlap("coord/usage.py", "coord/**"));
+        assert!(!globs_overlap("tui/src/app/**", "coord/**"));
+        assert!(!globs_overlap("docs/ARCHITECTURE.md", "tui/**"));
+        // Wildcard on the allowed side also overlaps any route.
+        assert!(globs_overlap("**/*.py", "coord/**"));
     }
 
     #[test]
@@ -3008,6 +3133,46 @@
             "toast must be the designed actionable message, not a raw CLI \
              error string, got: {}",
             toast.body,
+        );
+    }
+
+    /// #1201: end-to-end wiring check — a real dispatch call site (not the
+    /// pure `acceptance_for_path_arg` unit above) auto-resolves `--for-path`
+    /// from the SELECTED ROW's own `issue.body` (not a hardcoded string),
+    /// proving `issue.body` actually threads from `PipelineIssue` through
+    /// `dispatch_gate_a_mock_for_selected_pipeline_row` into
+    /// `acceptance_for_path_arg`.
+    #[test]
+    fn dispatch_gate_a_mock_auto_resolves_for_path_from_issue_body_when_repo_has_multiple_routes() {
+        let mut app = make_pipeline_app_for_audit_menu_test(0);
+        app.data.pipeline_acceptance_routes.insert(
+            "api".to_string(),
+            vec!["coord/**".to_string(), "tui/**".to_string()],
+        );
+        app.pipeline_issues[0].body =
+            "## Files\n- **Allowed:** `tui/src/app/pipeline.rs`.\n".to_string();
+        let target = ContextMenuTarget::PipelineRow {
+            issue_number: Some(751),
+            repo_name: Some("api".to_string()),
+            lifecycle: PipelineRowLifecycle::New,
+        };
+        let handled = app.dispatch_context_menu_action("dispatch-gate-a-mock", &target);
+        assert!(handled);
+        assert_eq!(
+            app.command_runner.spawned_calls.len(),
+            1,
+            "an Allowed glob that overlaps exactly one route must auto-resolve, not toast"
+        );
+        assert_eq!(
+            app.command_runner.spawned_calls[0],
+            vec![
+                "acceptance".to_string(),
+                "mock".to_string(),
+                "api".to_string(),
+                "751".to_string(),
+                "--for-path".to_string(),
+                "tui/**".to_string(),
+            ],
         );
     }
 

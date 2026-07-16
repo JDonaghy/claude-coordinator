@@ -348,6 +348,70 @@ pub(crate) fn build_acceptance_author_interactive_launch_cmd(
     )
 }
 
+/// #1201: parse the glob(s) an issue body's own `## Files` section declares
+/// as allowed, out of the convention (not a schema — see #1201's writeup)
+/// most issues in this repo already follow:
+/// ```text
+/// ## Files
+/// - **Allowed:** `tui/src/app/**` (render/dialogs as needed), `tests/**`.
+/// - **Forbidden:** ...
+/// ```
+/// Scans every line containing the literal marker `**Allowed:**` and
+/// extracts each backtick-quoted span on that line as a candidate glob —
+/// tolerating comma-separated lists and trailing parenthetical notes
+/// (which live outside the backticks and are simply not captured).
+/// Non-path backtick spans that sneak in (e.g. `` `#[cfg(test)]` `` next to
+/// a real glob) are harmless: `globs_overlap` just won't match them against
+/// any real route. Returns an empty vec when the body has no `## Files`
+/// section, or no `**Allowed:**` line — the caller's ambiguous-route
+/// fallback (#1151) is unchanged for those issues.
+pub(crate) fn parse_allowed_globs_from_issue_body(body: &str) -> Vec<String> {
+    const MARKER: &str = "**Allowed:**";
+    let mut globs = Vec::new();
+    for line in body.lines() {
+        let Some(after) = line.find(MARKER).map(|i| &line[i + MARKER.len()..]) else {
+            continue;
+        };
+        let mut in_span = false;
+        for span in after.split('`') {
+            if in_span && !span.trim().is_empty() {
+                globs.push(span.trim().to_string());
+            }
+            in_span = !in_span;
+        }
+    }
+    globs
+}
+
+/// #1201: does an `## Files`-declared allowed glob (`allowed`) plausibly
+/// belong to a routed acceptance driver's candidate subtree (`route`)?
+///
+/// Neither side is a concrete path — both are glob *patterns* (`allowed` is
+/// e.g. `tui/src/app/**`, `route` is e.g. `tui/**`) — so this can't use
+/// `fnmatch(path, pattern)` the way the CLI's own route resolution does
+/// (`AcceptanceConfig.driver_for`). Instead it compares leading `/`-split
+/// path segments pairwise, treating `*`/`**` on *either* side as a wildcard
+/// that matches any segment, and considers the two glob patterns
+/// "overlapping" (same subtree) if every segment pair up to the shorter
+/// pattern's length matches. This correctly recognises `tui/src/app/**`
+/// and `tui/**` as the same subtree (first segment `tui` == `tui`, second
+/// pair `src`/`**` matches via wildcard, comparison stops at the shorter
+/// pattern's 2 segments) while correctly rejecting `tui/src/app/**` against
+/// `coord/**` (first segment `tui` != `coord`).
+pub(crate) fn globs_overlap(allowed: &str, route: &str) -> bool {
+    let a: Vec<&str> = allowed.split('/').filter(|s| !s.is_empty()).collect();
+    let b: Vec<&str> = route.split('/').filter(|s| !s.is_empty()).collect();
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    let len = a.len().min(b.len());
+    (0..len).all(|i| {
+        let sa = a[i];
+        let sb = b[i];
+        sa == sb || sa == "*" || sa == "**" || sb == "*" || sb == "**"
+    })
+}
+
 /// Status badge text + colour for the Pipeline sidebar row.
 ///
 /// Colour mapping (semantic → `quadraui::Theme` field, overridden per palette):
@@ -1978,25 +2042,45 @@ impl CoordApp {
     /// - exactly one candidate route → `Ok(Some(glob))`, unambiguous: the
     ///   caller appends `--for-path <glob>` and the dispatch succeeds
     ///   transparently instead of hitting the CLI's routing gate at all.
-    /// - more than one candidate route → `Err(reason)`: the TUI has no
-    ///   per-issue signal today for which subtree an issue's work belongs to
-    ///   (no file-path/manifest mapping on `PipelineIssue`), so it can't
-    ///   guess. The caller must show `reason` as a toast and skip dispatch
-    ///   rather than fire a command that the CLI will reject anyway.
-    pub(crate) fn acceptance_for_path_arg(&self, repo: &str) -> Result<Option<String>, String> {
+    /// - more than one candidate route → first try to disambiguate (#1201)
+    ///   by parsing `issue_body`'s `## Files` / `**Allowed:**` glob(s) (see
+    ///   `parse_allowed_globs_from_issue_body`) and checking each against
+    ///   every candidate route via `globs_overlap`. Exactly one route
+    ///   overlaps → `Ok(Some(glob))`, resolved transparently just like the
+    ///   single-candidate case. Zero or more than one overlap (no `## Files`
+    ///   section, an allowed glob that matches no route, or one that's
+    ///   ambiguous across routes) → `Err(reason)`, the original #1151
+    ///   fallback: the caller must show `reason` as a toast and skip
+    ///   dispatch rather than fire a command that the CLI will reject
+    ///   anyway.
+    pub(crate) fn acceptance_for_path_arg(
+        &self,
+        repo: &str,
+        issue_body: &str,
+    ) -> Result<Option<String>, String> {
         match self.data.pipeline_acceptance_routes.get(repo) {
             None => Ok(None),
             Some(routes) if routes.is_empty() => Ok(None),
             Some(routes) if routes.len() == 1 => Ok(Some(routes[0].clone())),
-            Some(routes) => Err(format!(
-                "Repo '{repo}' has a routed acceptance driver with {} candidate \
-                 subtrees ({}) — the TUI can't tell which one this issue's work \
-                 belongs to yet. Dispatch from the CLI instead, e.g. `coord \
-                 acceptance ... --for-path {}`.",
-                routes.len(),
-                routes.join(", "),
-                routes.first().map(String::as_str).unwrap_or("<glob>"),
-            )),
+            Some(routes) => {
+                let allowed = parse_allowed_globs_from_issue_body(issue_body);
+                let matching: Vec<&String> = routes
+                    .iter()
+                    .filter(|route| allowed.iter().any(|glob| globs_overlap(glob, route)))
+                    .collect();
+                if matching.len() == 1 {
+                    return Ok(Some(matching[0].clone()));
+                }
+                Err(format!(
+                    "Repo '{repo}' has a routed acceptance driver with {} candidate \
+                     subtrees ({}) — the TUI can't tell which one this issue's work \
+                     belongs to yet. Dispatch from the CLI instead, e.g. `coord \
+                     acceptance ... --for-path {}`.",
+                    routes.len(),
+                    routes.join(", "),
+                    routes.first().map(String::as_str).unwrap_or("<glob>"),
+                ))
+            }
         }
     }
 
@@ -2027,7 +2111,7 @@ impl CoordApp {
             );
             return false;
         };
-        let for_path = match self.acceptance_for_path_arg(&repo) {
+        let for_path = match self.acceptance_for_path_arg(&repo, &issue.body) {
             Ok(p) => p,
             Err(reason) => {
                 self.push_toast("Dispatch Gate A mock", &reason, ToastSeverity::Warning);
@@ -2149,7 +2233,7 @@ impl CoordApp {
         };
         // #1151: resolve --for-path before dispatching — see
         // `acceptance_for_path_arg`'s doc for the three outcomes.
-        let for_path = match self.acceptance_for_path_arg(&repo) {
+        let for_path = match self.acceptance_for_path_arg(&repo, &issue.body) {
             Ok(p) => p,
             Err(reason) => {
                 self.push_toast(label, &reason, ToastSeverity::Warning);
@@ -2356,7 +2440,7 @@ impl CoordApp {
         // the branch/SHA lookup below — no point reading git refs for a
         // dispatch the CLI's routing gate will reject anyway. See
         // `acceptance_for_path_arg`'s doc for the three outcomes.
-        let for_path = match self.acceptance_for_path_arg(&repo) {
+        let for_path = match self.acceptance_for_path_arg(&repo, &issue.body) {
             Ok(p) => p,
             Err(reason) => {
                 self.push_toast("Record acceptance", &reason, ToastSeverity::Warning);
