@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -292,6 +293,91 @@ class TestSessionsAPI:
         assert s["repo"] == "api"
         assert s["issue"] == 1213
         assert s["attached"] is True
+
+
+class TestSessionsFanOutResilience:
+    """#1217 fix iteration 1: a single slow/unreachable machine must not let
+    the fleet tmux sweep back up indefinitely.  Reviewer repro: the phone
+    dashboard polls /api/sessions every 4s; a down machine's SSH probe takes
+    up to ~4-5s (bounded ConnectTimeout inside `list_coord_tmux_sessions`),
+    so a naive re-probe-every-poll design queues sweep tasks faster than they
+    drain — which, on the shared default asyncio executor, eventually starved
+    every other consumer of `run_in_executor(None, ...)` in the process and
+    hung the whole dashboard. The fix: a dedicated executor for this sweep,
+    plus an offline-cooldown cache so a machine that looked unreachable is
+    skipped (not re-probed) for a cooldown window."""
+
+    def test_unreachable_machine_is_cooled_down_after_one_slow_probe(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Tiny thresholds so the test runs fast while still exercising the
+        # real slow-probe-detection + cooldown-skip code path.
+        monkeypatch.setattr("coord.dashboard.server._SESSIONS_SLOW_THRESHOLD", 0.05)
+        monkeypatch.setattr("coord.dashboard.server._SESSIONS_COOLDOWN", 60.0)
+
+        config = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[
+                Machine(name="quick", host="quick.tailnet", repos=["api"]),
+                Machine(name="flaky", host="flaky.tailnet", repos=["api"]),
+            ],
+        )
+
+        calls: list[str | None] = []
+
+        def _fake_list(*, host=None):
+            target = host.ssh_target if host is not None else None
+            calls.append(target)
+            if target == "flaky.tailnet":
+                time.sleep(0.1)  # simulate an SSH probe hitting ConnectTimeout
+            return []
+
+        client = TestClient(build_app(config))
+        with (
+            patch("coord.interactive.list_coord_tmux_sessions", side_effect=_fake_list),
+            patch("coord.dashboard.server.read_board", return_value=Board()),
+        ):
+            r1 = client.get("/api/sessions")
+            r2 = client.get("/api/sessions")
+
+        assert r1.status_code == 200
+        assert r2.status_code == 200
+        # The healthy machine is swept on every poll...
+        assert calls.count("quick.tailnet") == 2
+        # ...but the flaky one is only probed once — the second poll skips it
+        # entirely because it's still within the cooldown window.
+        assert calls.count("flaky.tailnet") == 1
+
+    def test_machine_is_reprobed_once_cooldown_expires(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr("coord.dashboard.server._SESSIONS_SLOW_THRESHOLD", 0.05)
+        monkeypatch.setattr("coord.dashboard.server._SESSIONS_COOLDOWN", 0.05)
+
+        config = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(name="flaky", host="flaky.tailnet", repos=["api"])],
+        )
+
+        calls: list[str | None] = []
+
+        def _fake_list(*, host=None):
+            calls.append(host.ssh_target if host is not None else None)
+            time.sleep(0.1)
+            return []
+
+        client = TestClient(build_app(config))
+        with (
+            patch("coord.interactive.list_coord_tmux_sessions", side_effect=_fake_list),
+            patch("coord.dashboard.server.read_board", return_value=Board()),
+        ):
+            client.get("/api/sessions")
+            time.sleep(0.1)  # let the cooldown window lapse
+            client.get("/api/sessions")
+
+        # Once cooldown has lapsed, the machine is re-probed instead of being
+        # skipped forever.
+        assert calls.count("flaky.tailnet") == 2
 
 
 class TestProposalsAPI:

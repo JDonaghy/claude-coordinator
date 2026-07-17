@@ -6,6 +6,7 @@ import asyncio
 import json
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import httpx
@@ -49,6 +50,15 @@ _POLL_INTERVAL = 30.0
 # How long (seconds) an assignment must be running with no agent record before
 # it is flagged as possibly stuck.
 _STUCK_THRESHOLD = 300.0  # 5 minutes
+
+# #1217 fix iteration 1: api_sessions' per-machine tmux sweep timing knobs.
+# A sweep taking at least this long looks like it hit the SSH ConnectTimeout
+# (i.e. the machine is unreachable) rather than a normal fast tmux query.
+_SESSIONS_SLOW_THRESHOLD = 3.0  # seconds; a healthy sweep is normally <1s
+# Once a machine looks unreachable, skip re-probing it for this long — caps
+# how often we pay the full SSH ConnectTimeout for a chronically down machine
+# on every ~4s dashboard poll.
+_SESSIONS_COOLDOWN = 20.0  # seconds before a down machine is re-probed
 
 # Bug 1 fix: distinct event type for cancelled assignments so they are not
 # bucketed as FAILED on the client.  Not yet in coord.events — defined here
@@ -519,6 +529,33 @@ def build_app(
     # toast, so the live poller doesn't re-publish every _POLL_INTERVAL.
     _needs_attention_seen: set[str] = set()
 
+    # #1217 fix iteration 1: api_sessions' fleet tmux sweep gets its OWN bounded
+    # executor rather than sharing the asyncio loop's default executor (which
+    # `loop.run_in_executor(None, ...)` submits to). The Home.tsx phone client
+    # polls /api/sessions every 4s starting the instant the page loads; each
+    # poll fans out one blocking subprocess call per configured machine
+    # (bounded at 5s inside `list_coord_tmux_sessions`, batch-mode SSH
+    # ConnectTimeout=4). A machine that's down takes the full ~4-5s on EVERY
+    # poll, and 4s < 5s means a new sweep task for that machine can be
+    # submitted before the previous one finishes — so tasks for a chronically
+    # unreachable machine back up faster than they drain. On the shared
+    # default executor that backlog eventually starves every other consumer
+    # of `run_in_executor(None, ...)` in the process (the background agent
+    # poller, the terminal WS PTY-read loop, ...), which is exactly the
+    # dashboard-wide hang the operator hit. A dedicated executor contains the
+    # backlog to this endpoint; the offline-cooldown cache below stops the
+    # backlog from growing in the first place.
+    _sessions_executor = ThreadPoolExecutor(
+        max_workers=max(4, len(config.machines) * 4),
+        thread_name_prefix="coord-sessions-sweep",
+    )
+    # machine name -> monotonic timestamp of the last sweep that looked like a
+    # timeout/unreachable host (took close to the 5s subprocess cap). While a
+    # machine is within cooldown, skip spawning a new sweep thread for it
+    # entirely and report "no sessions" immediately, instead of re-paying the
+    # full SSH ConnectTimeout on every ~4s dashboard poll.
+    _sessions_offline_since: dict[str, float] = {}
+
     async def _background_poller() -> None:
         """Runs forever; polls agents every _POLL_INTERVAL seconds."""
         await asyncio.sleep(10)  # Short initial delay so the server is ready
@@ -542,6 +579,7 @@ def build_app(
     async def _lifespan(app):  # noqa: ANN001
         asyncio.create_task(_background_poller())
         yield
+        _sessions_executor.shutdown(wait=False, cancel_futures=True)
 
     async def index(request: Request) -> HTMLResponse:
         # Serve the built React webapp when available; fall back to the legacy
@@ -618,8 +656,13 @@ def build_app(
 
         tmux discovery shells out (bounded by a 5s timeout inside
         ``list_coord_tmux_sessions``) so each host's sweep runs off the event
-        loop thread via ``run_in_executor``, matching this file's
-        ``_fetch_agent_status`` pattern used by the background poller.
+        loop thread via ``run_in_executor`` — but on a **dedicated** executor
+        (``_sessions_executor``, sized to the fleet) rather than the shared
+        default one, and a machine that recently looked unreachable is
+        skipped for a cooldown window instead of being re-probed every ~4s
+        (see the comment above ``_sessions_executor``'s definition for why:
+        #1217 iteration 1 fixed a dashboard-wide hang caused by exactly this
+        fan-out saturating the process's shared default executor).
         """
         from coord.interactive import (
             TMUX_SESSION_PREFIX,
@@ -631,25 +674,51 @@ def build_app(
         loop = asyncio.get_running_loop()
         local_hn = _get_local_short_hostname()
 
-        def _sweep_one(machine):
-            is_local = (
+        def _is_local_machine(machine) -> bool:
+            return (
                 machine.name.lower() == local_hn
                 or machine.host.split(".")[0].lower() == local_hn
             )
+
+        def _sweep_one(machine):
+            is_local = _is_local_machine(machine)
             host = (
                 TmuxHost(None)
                 if is_local
                 else TmuxHost(ssh_target=machine.host, batch=True)
             )
+            start = time.monotonic()
             try:
                 found = list_coord_tmux_sessions(host=host)
             except Exception:  # noqa: BLE001 — a down/unreachable machine just contributes nothing
                 found = []
+            elapsed = time.monotonic() - start
+            # Only track cooldown for remote machines — the local sweep never
+            # goes over SSH and a slow local tmux call shouldn't suppress it.
+            if not is_local:
+                if elapsed >= _SESSIONS_SLOW_THRESHOLD:
+                    _sessions_offline_since[machine.name] = time.monotonic()
+                else:
+                    _sessions_offline_since.pop(machine.name, None)
             return machine, found, is_local
 
-        sweeps = await asyncio.gather(*(
-            loop.run_in_executor(None, _sweep_one, m) for m in config.machines
-        ))
+        async def _cached_empty(machine, is_local):
+            return machine, [], is_local
+
+        tasks = []
+        for m in config.machines:
+            is_local = _is_local_machine(m)
+            since = _sessions_offline_since.get(m.name)
+            if (
+                not is_local
+                and since is not None
+                and (time.monotonic() - since) < _SESSIONS_COOLDOWN
+            ):
+                tasks.append(_cached_empty(m, is_local))
+            else:
+                tasks.append(loop.run_in_executor(_sessions_executor, _sweep_one, m))
+
+        sweeps = await asyncio.gather(*tasks)
         # Local host(s) first so they win any session-name collision, matching
         # `coord sessions --remote`'s "local always wins" rule. Stable sort
         # preserves config.machines order within each group.
