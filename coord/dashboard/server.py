@@ -592,21 +592,68 @@ def build_app(
         source :func:`~coord.dashboard.terminal.resolve_session_target` (#1065)
         uses to route the actual WS attach, so the two paths can't drift.
 
-        Local-only for now (mirrors `coord sessions`'s own default) — a
-        fleet-wide sweep would mean shelling out over ssh to every configured
-        machine on every phone poll; `coord sessions --remote` already proves
-        that pattern (`TmuxHost(ssh_target=..., batch=True)` fan-out) if a
-        later issue wants to extend this endpoint the same way.
+        Fleet-wide (#1217): sweeps *every* configured machine, not just the
+        local host `coord web` happens to run on — reusing the exact pattern
+        `coord sessions --remote` already proves
+        (``list_coord_tmux_sessions(host=TmuxHost(ssh_target=machine.host,
+        batch=True))`` per machine; ``batch=True`` so a down/unreachable host
+        fails fast instead of hanging on an ssh passphrase prompt). The
+        dashboard host itself is probed with ``TmuxHost(None)`` (a plain local
+        tmux call, no ssh round-trip to itself). Per-host sweeps run
+        concurrently via ``asyncio.gather`` over ``run_in_executor`` calls, so
+        wall-clock is bounded by the slowest single host's timeout, not the
+        sum across the fleet — important since each host sweep already has
+        its own 5s cap inside ``list_coord_tmux_sessions`` and this endpoint
+        is polled every ~4s from the phone. On a session-name collision across
+        hosts (shouldn't happen in practice — session names embed the
+        assignment id) the local host wins, mirroring `coord sessions
+        --remote`'s "local always wins" rule.
+
+        Each session is tagged with the machine it was actually discovered
+        on: the board assignment's `machine_name` when the session matches
+        one (the common case), falling back to the sweep's source machine for
+        orphaned/unmatched sessions (`coord terminal new` panes, stale
+        sessions with no board row) — previously these reported `machine:
+        null` even though the sweep knew exactly which host they came from.
 
         tmux discovery shells out (bounded by a 5s timeout inside
-        ``list_coord_tmux_sessions``) so it runs off the event loop thread via
-        ``run_in_executor``, matching this file's ``_fetch_agent_status``
-        pattern used by the background poller.
+        ``list_coord_tmux_sessions``) so each host's sweep runs off the event
+        loop thread via ``run_in_executor``, matching this file's
+        ``_fetch_agent_status`` pattern used by the background poller.
         """
-        from coord.interactive import TMUX_SESSION_PREFIX, list_coord_tmux_sessions
+        from coord.interactive import (
+            TMUX_SESSION_PREFIX,
+            TmuxHost,
+            _get_local_short_hostname,
+            list_coord_tmux_sessions,
+        )
 
         loop = asyncio.get_running_loop()
-        raw_sessions = await loop.run_in_executor(None, list_coord_tmux_sessions)
+        local_hn = _get_local_short_hostname()
+
+        def _sweep_one(machine):
+            is_local = (
+                machine.name.lower() == local_hn
+                or machine.host.split(".")[0].lower() == local_hn
+            )
+            host = (
+                TmuxHost(None)
+                if is_local
+                else TmuxHost(ssh_target=machine.host, batch=True)
+            )
+            try:
+                found = list_coord_tmux_sessions(host=host)
+            except Exception:  # noqa: BLE001 — a down/unreachable machine just contributes nothing
+                found = []
+            return machine, found, is_local
+
+        sweeps = await asyncio.gather(*(
+            loop.run_in_executor(None, _sweep_one, m) for m in config.machines
+        ))
+        # Local host(s) first so they win any session-name collision, matching
+        # `coord sessions --remote`'s "local always wins" rule. Stable sort
+        # preserves config.machines order within each group.
+        sweeps = sorted(sweeps, key=lambda t: not t[2])
 
         board = read_board()
         assignments_by_id = {
@@ -617,26 +664,32 @@ def build_app(
         machines_by_name = {m.name: m for m in config.machines}
 
         sessions = []
-        for s in raw_sessions:
-            session_name = s.get("session_name", "")
-            session_id = session_name[len(TMUX_SESSION_PREFIX):]
-            assignment = assignments_by_id.get(session_id)
-            machine_cfg = (
-                machines_by_name.get(assignment.machine_name) if assignment else None
-            )
-            sessions.append({
-                "session_id": session_id,
-                "session_name": session_name,
-                "machine": assignment.machine_name if assignment else None,
-                "host": machine_cfg.host if machine_cfg else None,
-                "repo": assignment.repo_name if assignment else None,
-                "issue": assignment.issue_number if assignment else None,
-                "issue_title": assignment.issue_title if assignment else None,
-                "stage": assignment.type if assignment else None,
-                "status": assignment.status if assignment else None,
-                "attached": bool(s.get("attached", False)),
-                "pane_dead": s.get("pane_dead") == "1",
-            })
+        seen_names: set[str] = set()
+        for source_machine, raw_sessions, _is_local in sweeps:
+            for s in raw_sessions:
+                session_name = s.get("session_name", "")
+                if session_name in seen_names:
+                    continue
+                seen_names.add(session_name)
+                session_id = session_name[len(TMUX_SESSION_PREFIX):]
+                assignment = assignments_by_id.get(session_id)
+                machine_name = (
+                    assignment.machine_name if assignment else source_machine.name
+                )
+                machine_cfg = machines_by_name.get(machine_name)
+                sessions.append({
+                    "session_id": session_id,
+                    "session_name": session_name,
+                    "machine": machine_name,
+                    "host": machine_cfg.host if machine_cfg else source_machine.host,
+                    "repo": assignment.repo_name if assignment else None,
+                    "issue": assignment.issue_number if assignment else None,
+                    "issue_title": assignment.issue_title if assignment else None,
+                    "stage": assignment.type if assignment else None,
+                    "status": assignment.status if assignment else None,
+                    "attached": bool(s.get("attached", False)),
+                    "pane_dead": s.get("pane_dead") == "1",
+                })
         return JSONResponse(sessions)
 
     async def api_proposals(request: Request) -> JSONResponse:
