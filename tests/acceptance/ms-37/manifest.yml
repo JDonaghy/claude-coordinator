@@ -65,3 +65,24 @@ tests:
   tests.acceptance.ms-37.test_usage_cli_1115::test_issue_drill_cli_smoke_sonnet_estimated: 1115
   tests.acceptance.ms-37.test_usage_cli_1115::test_issue_drill_cli_unknown_model_marker: 1115
   tests.acceptance.ms-37.test_usage_cli_1115::test_issue_drill_cli_running_leg: 1115
+
+  # ── #1116 TUI: Usage view (per-issue grid + per-stage drill, quadraui TuiDriver) ──
+  # Test-ids are the libtest `name` emitted by `cargo test --test acceptance`
+  # (module-qualified fn path), same convention as tests/acceptance/ms-33/manifest.yml.
+  # The slice file lives in this directory (usage_tui_1116.rs) and is
+  # `include!`d at crate root by tui/tests/acceptance.rs.
+  usage_tui_1116::usage_panel_registered_in_activity_bar: 1116
+  usage_tui_1116::usage_header_shows_title: 1116
+  usage_tui_1116::scope_selector_shows_presets: 1116
+  usage_tui_1116::custom_range_scopes_header_to_resolved_interval: 1116
+  usage_tui_1116::grid_shows_issues_desc_by_total_cost: 1116
+  usage_tui_1116::grid_row_502_values: 1116
+  usage_tui_1116::grid_row_501_values: 1116
+  usage_tui_1116::grid_captured_and_estimated_are_visually_distinct: 1116
+  usage_tui_1116::grid_totals_reflect_grand_total: 1116
+  usage_tui_1116::click_row_expands_to_stage_legs: 1116
+  usage_tui_1116::drill_work_opus_leg_captured_cost: 1116
+  usage_tui_1116::drill_smoke_leg_nonzero_estimate: 1116
+  usage_tui_1116::drill_chat_leg_unknown_model_no_estimate: 1116
+  usage_tui_1116::drill_running_leg_shows_running_status: 1116
+  usage_tui_1116::group_by_repo_shows_repo_rollup: 1116

@@ -36,3 +36,4 @@ fn make_test_app_builds_from_board_data_with_no_live_daemon() {
 // the assertions; this file only pastes them in at crate root. Paths are
 // relative to this file (`tui/tests/`), so `../../` is the repo root.
 include!("../../tests/acceptance/ms-33/audit_1039.rs");
+include!("../../tests/acceptance/ms-37/usage_tui_1116.rs");
