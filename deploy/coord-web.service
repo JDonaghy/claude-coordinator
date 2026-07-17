@@ -46,6 +46,12 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=%h/.coord-venv/bin/coord web --config %h/.coord/coordinator.yml --host 0.0.0.0 --port 7434
+# Belt-and-suspenders for #1229: systemd user units have no controlling TTY so
+# TERM is absent from the process environment.  The terminal bridge code now
+# calls env.setdefault("TERM", "xterm-256color") before spawning tmux, but
+# setting it here too ensures any other subprocess spawned by coord web also
+# has a sane terminal type without requiring a code fix for each callsite.
+Environment=TERM=xterm-256color
 Restart=on-failure
 RestartSec=3
 
