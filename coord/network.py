@@ -198,3 +198,53 @@ def inject_message(
     except Exception:
         body = {"error": "non-json response", "raw": resp.text[:200]}
     return resp.status_code, body
+
+
+def clean_worktrees(
+    machine: Machine,
+    *,
+    recent_secs: float = 300.0,
+    timeout: float = 30.0,
+) -> dict:
+    """POST /worktree-clean to `machine` (#1220).
+
+    Same endpoint the manual ``coord agent clean-worktrees`` CLI hits — this
+    is the helper a fleet-wide *automatic* sweep (``coord.serve_app``'s tick
+    loop) calls per machine.  Never raises: any network/HTTP/decode failure
+    is folded into the returned dict's ``error`` field (``ok=False``) so one
+    unreachable machine can't abort a sweep across the rest of the fleet.
+
+    Returns ``{"ok": bool, "cleaned": int, "kept": int, "bytes_freed": int,
+    "error": str | None}``.
+    """
+    url = f"http://{machine.host}:{AGENT_PORT}/worktree-clean"
+    try:
+        resp = httpx.post(url, json={"recent_secs": recent_secs}, timeout=timeout)
+    except Exception as e:  # noqa: BLE001 — classify uniformly, never propagate
+        _, reason = classify_error(e)
+        return {"ok": False, "cleaned": 0, "kept": 0, "bytes_freed": 0, "error": reason}
+    if resp.status_code != 200:
+        return {
+            "ok": False,
+            "cleaned": 0,
+            "kept": 0,
+            "bytes_freed": 0,
+            "error": f"HTTP {resp.status_code}",
+        }
+    try:
+        data = resp.json()
+    except ValueError:
+        return {
+            "ok": False,
+            "cleaned": 0,
+            "kept": 0,
+            "bytes_freed": 0,
+            "error": "invalid JSON from /worktree-clean",
+        }
+    return {
+        "ok": True,
+        "cleaned": data.get("cleaned", 0),
+        "kept": data.get("kept", 0),
+        "bytes_freed": data.get("bytes_freed", 0),
+        "error": None,
+    }

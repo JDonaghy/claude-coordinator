@@ -162,3 +162,68 @@ class TestFetchLog:
         with patch.object(network.httpx, "get", return_value=resp) as mock_get:
             network.fetch_log(_m(), "abc")
         assert mock_get.call_args.kwargs["params"] is None
+
+
+class TestCleanWorktrees:
+    """#1220: coord.network.clean_worktrees — the per-machine POST /worktree-clean
+    helper the daemon's fleet-wide sweep tick uses."""
+
+    def test_success(self) -> None:
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"cleaned": 3, "kept": 1, "bytes_freed": 12345}
+        with patch.object(network.httpx, "post", return_value=resp) as mock_post:
+            result = network.clean_worktrees(_m())
+        assert result == {
+            "ok": True,
+            "cleaned": 3,
+            "kept": 1,
+            "bytes_freed": 12345,
+            "error": None,
+        }
+        assert "/worktree-clean" in mock_post.call_args.args[0]
+        assert mock_post.call_args.kwargs["json"] == {"recent_secs": 300.0}
+
+    def test_passes_recent_secs(self) -> None:
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"cleaned": 0, "kept": 0, "bytes_freed": 0}
+        with patch.object(network.httpx, "post", return_value=resp) as mock_post:
+            network.clean_worktrees(_m(), recent_secs=0)
+        assert mock_post.call_args.kwargs["json"] == {"recent_secs": 0}
+
+    def test_connection_refused_never_raises(self) -> None:
+        with patch.object(
+            network.httpx,
+            "post",
+            side_effect=httpx.ConnectError("[Errno 111] Connection refused"),
+        ):
+            result = network.clean_worktrees(_m())
+        assert result["ok"] is False
+        assert result["cleaned"] == 0
+        assert "refused" in result["error"]
+
+    def test_timeout_never_raises(self) -> None:
+        with patch.object(
+            network.httpx, "post", side_effect=httpx.ConnectTimeout("slow")
+        ):
+            result = network.clean_worktrees(_m())
+        assert result["ok"] is False
+        assert "timed out" in result["error"]
+
+    def test_non_200_status(self) -> None:
+        resp = MagicMock()
+        resp.status_code = 500
+        with patch.object(network.httpx, "post", return_value=resp):
+            result = network.clean_worktrees(_m())
+        assert result["ok"] is False
+        assert "500" in result["error"]
+
+    def test_invalid_json(self) -> None:
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.side_effect = ValueError("nope")
+        with patch.object(network.httpx, "post", return_value=resp):
+            result = network.clean_worktrees(_m())
+        assert result["ok"] is False
+        assert "invalid JSON" in result["error"]

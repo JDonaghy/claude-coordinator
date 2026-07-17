@@ -288,6 +288,69 @@ def _audit_housekeeping_sweep(swept: dict) -> None:
     )
 
 
+def _audit_worktree_clean(swept: list[dict]) -> None:
+    """One operational row per tick that actually freed disk space sweeping
+    orphaned worktrees (#1220, #1038's audit).  Called only with the subset
+    of per-machine results that reported ``cleaned > 0`` — a tick where every
+    machine came back empty isn't an event worth a row."""
+    from coord.audit import record_audit  # noqa: PLC0415
+
+    total_cleaned = sum(r["cleaned"] for r in swept)
+    total_freed = sum(r["bytes_freed"] for r in swept)
+    record_audit(
+        tier="operational",
+        category="worktree_clean",
+        event_type="swept",
+        actor="daemon",
+        summary=(
+            f"worktree sweep: {total_cleaned} worktree(s) removed, "
+            f"{total_freed / (1024 * 1024):.1f} MB freed across "
+            f"{len(swept)} machine(s)"
+        ),
+        details={"machines": swept},
+    )
+
+
+def _clean_worktrees_tick(config: Config) -> list[dict]:
+    """Sweep every machine's orphaned worktrees for terminal assignments (#1220).
+
+    Calls ``POST /worktree-clean`` on each machine in ``config.machines`` —
+    the same endpoint the manual ``coord agent clean-worktrees --all`` CLI
+    hits (:func:`coord.network.clean_worktrees`).  Per-assignment cleanup
+    (``AgentServer._cleanup_worktree``, run synchronously right after a
+    worker's process exits) is the fast path; this tick is the backstop for
+    whatever it misses — a daemon crash/restart mid-cleanup leaves no
+    "cleanup still owed" marker for anything else to retry, and an
+    assignment can reach 'merged' well after ``finished_at`` with nothing
+    revisiting its now-terminal worktree.  Without this tick nothing calls
+    the sweep automatically and orphaned worktrees (including their
+    `target/`-sized build output) accumulate until a human notices disk
+    pressure and runs it by hand.
+
+    Called on a slow cadence by ``_tick_loop`` (default hourly; env
+    ``COORD_WORKTREE_CLEAN_INTERVAL``, 0 disables).  A machine that's
+    unreachable is recorded as an error entry for that machine only — it
+    never blocks the sweep on the rest of the fleet.
+
+    Returns one result dict per machine: ``{"machine": name, "ok": bool,
+    "cleaned": N, "kept": M, "bytes_freed": B, "error": str | None}``.
+    Extracted as a module-level function so tests can call it directly
+    without wiring up the async ``_tick_loop`` infrastructure (mirrors
+    ``_reconcile_merges_tick`` / ``_sync_issues_tick``).
+    """
+    from coord import network  # noqa: PLC0415
+
+    results: list[dict] = []
+    for machine in config.machines:
+        r = network.clean_worktrees(machine)
+        results.append({"machine": machine.name, **r})
+
+    swept = [r for r in results if r["ok"] and r["cleaned"] > 0]
+    if swept:
+        _audit_worktree_clean(swept)
+    return results
+
+
 def _reconcile_merges_tick(config: Config) -> list[str]:
     """Load the board, run ``reconcile_board_merges``, save the result.
 
@@ -3773,8 +3836,25 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         # merged-but-grey work should resolve immediately, not after 5 minutes.
         last_merge_reconcile = 0.0
 
+        # #1220: fleet-wide orphaned-worktree sweep on its own slow cadence
+        # (default hourly; 0 disables).  Separate timer from housekeeping/
+        # merges above since it's a different kind of maintenance (per-machine
+        # HTTP fan-out, not a local DB sweep).
+        try:
+            worktree_clean_interval = float(
+                os.environ.get("COORD_WORKTREE_CLEAN_INTERVAL", "3600")
+            )
+        except ValueError:
+            worktree_clean_interval = 3600.0
+        # Start at 0 so the very first tick sweeps immediately rather than
+        # waiting a full interval — #1220 is exactly "nothing ever calls the
+        # sweep automatically", so a freshly (re)started daemon should not
+        # leave orphaned worktrees sitting for another hour before its first
+        # pass.
+        last_worktree_clean = 0.0
+
         async def _tick_loop() -> None:
-            nonlocal last_housekeeping, last_merge_reconcile
+            nonlocal last_housekeeping, last_merge_reconcile, last_worktree_clean
             from coord.reconcile import reconcile_completed_assignments  # noqa: PLC0415
             from coord import merge_queue as _mq  # noqa: PLC0415
 
@@ -3945,6 +4025,41 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                             )
                     except Exception:  # noqa: BLE001
                         log.warning("issues sync tick failed", exc_info=True)
+                # Step 7: #1220 sweep orphaned worktrees fleet-wide on its own
+                # slow cadence (default hourly).  Backstops the synchronous
+                # per-assignment cleanup (AgentServer._cleanup_worktree) for
+                # whatever it misses — a daemon crash/restart mid-cleanup, or
+                # an assignment reaching 'merged' well after finished_at with
+                # nothing else revisiting it.  Independent try/except — a
+                # sweep failure must never crash the daemon or silence the
+                # ticks above.
+                if worktree_clean_interval > 0 and (
+                    _time.monotonic() - last_worktree_clean
+                    >= worktree_clean_interval
+                ):
+                    last_worktree_clean = _time.monotonic()
+                    try:
+                        wt_results = await run_in_threadpool(
+                            _clean_worktrees_tick, config
+                        )
+                        for r in wt_results:
+                            if r["error"]:
+                                log.warning(
+                                    "worktree sweep: %s unreachable: %s",
+                                    r["machine"],
+                                    r["error"],
+                                )
+                            elif r["cleaned"]:
+                                log.info(
+                                    "worktree sweep: %s cleaned=%d kept=%d "
+                                    "freed=%.1f MB",
+                                    r["machine"],
+                                    r["cleaned"],
+                                    r["kept"],
+                                    r["bytes_freed"] / (1024 * 1024),
+                                )
+                    except Exception:  # noqa: BLE001
+                        log.warning("worktree clean tick failed", exc_info=True)
 
         @contextlib.asynccontextmanager
         async def _ctx(_a):  # noqa: ANN202
