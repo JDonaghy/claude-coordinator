@@ -586,9 +586,15 @@ class PipelineConfig:
         dispatch waits for a ``passed``/``skipped`` test verdict (see
         ``coord.review.dispatch_pending_reviews``); when ``review`` comes first
         (or either gate is absent) review fires on work completion as before.
-        Consulted on the *default* policy only — mirrors the merge gate's
-        ``requires_smoke``/``requires_review``, which also ignore per-label
-        overrides because they operate on the default gate list.
+        Consulted on the *default* policy only — this governs headless
+        review *dispatch* timing (``coord.review.dispatch_pending_reviews``),
+        which does not consult per-label overrides. This differs from the
+        merge gate's ``requires_smoke``/``requires_review`` (`coord/
+        merge_queue.py`), which *do* honour a work item's resolved
+        ``required_gates`` (falling back to this default list) since #1213 —
+        so a ``["merge"]``-only label can bypass the merge-time review/test
+        gates even though a review may still be auto-dispatched under the
+        default policy here.
         """
         gates = self.default_gates or []
         if "test" not in gates or "review" not in gates:
