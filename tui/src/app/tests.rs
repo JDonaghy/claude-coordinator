@@ -29788,21 +29788,77 @@ Milestone tracking issue.
             "a collapsed epic row must paint the collapsed chevron (▸): {epic_line:?}\n{screen}",
         );
 
-        // Toggle back — the children return.  The sibling click first is
-        // load-bearing, not decoration: quadraui's `translate_injected` folds
-        // two MouseDowns at the same cell within DOUBLE_CLICK_MS into a
-        // `DoubleClick`, and a test's clicks are microseconds apart — so
-        // re-clicking the chevron directly would never emit a second
-        // RowToggleExpand.  Clicking elsewhere resets the detector's position.
-        let sibling_pos = driver
-            .find("#105")
-            .expect(&format!("sibling #105 must render:\n{screen}"));
-        driver.click(sibling_pos.0, sibling_pos.1);
+        // NOTE: the re-expand half of the cycle deliberately lives in its own
+        // test (`tuidriver_pipeline_collapsed_epic_row_expands_on_chevron_click`)
+        // rather than clicking the chevron a second time here.  quadraui's
+        // `DoubleClickDetector` folds a MouseDown into a `DoubleClick` when it
+        // lands within DOUBLE_CLICK_MS (400ms) *and* DOUBLE_CLICK_RADIUS (1.5
+        // cells in both x and y) of the previous one — and a folded event never
+        // reaches the `RowToggleExpand` arm.  Once the epic is collapsed its
+        // children are gone, so sibling #105 sits directly beneath #100: every
+        // other row in this fixture is inside that radius, which makes any
+        // "click elsewhere to reset the detector" trick a wall-clock race (it
+        // resolves one way under 400ms and the other way on a loaded box).  One
+        // click per driver keeps the detector out of the picture entirely.
+    }
+
+    /// #1197: the other half of the collapse cycle — a stored `false` renders
+    /// the epic collapsed, and a chevron click expands it, bringing the
+    /// children back.  Split from the collapse test so each driver takes
+    /// exactly ONE click: two clicks near the same cell are folded into a
+    /// `DoubleClick` by quadraui on a timing-dependent basis, which made the
+    /// former single round-trip test flaky under parallel load.
+    #[test]
+    fn tuidriver_pipeline_collapsed_epic_row_expands_on_chevron_click() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_epic_nesting_app();
+        // Seed the collapsed choice the collapse test produces by clicking.
+        // The fixture already built its rows, so rebuild to pick this up —
+        // exactly what the RowToggleExpand arm does after flipping the entry.
+        app.pipeline_epic_expanded
+            .insert(("api".to_string(), 100), false);
+        app.rebuild_pipeline_sidebar(None);
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 50);
+
+        // A stored `false` must be honoured by the render path.
+        let screen = driver.screen();
+        assert!(
+            !driver.screen_contains("#101") && !driver.screen_contains("#102"),
+            "a stored collapsed choice must hide the epic's children:\n{screen}",
+        );
+        let epic_pos = driver
+            .find("#100")
+            .expect(&format!("epic #100 row must render:\n{screen}"));
+        let epic_line = screen
+            .lines()
+            .nth(epic_pos.1 as usize)
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            epic_line.contains('▸'),
+            "a collapsed epic row must paint the collapsed chevron (▸): {epic_line:?}\n{screen}",
+        );
+
+        // One click on the chevron — the children return.
         driver.click(epic_pos.0 - 1.0, epic_pos.1);
+
         let screen = driver.screen();
         assert!(
             driver.screen_contains("#101") && driver.screen_contains("#102"),
-            "re-expanding the epic must bring its children back:\n{screen}",
+            "expanding the epic must bring its children back:\n{screen}",
+        );
+        let epic_pos = driver
+            .find("#100")
+            .expect(&format!("epic #100 row must still render:\n{screen}"));
+        let epic_line = screen
+            .lines()
+            .nth(epic_pos.1 as usize)
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            epic_line.contains('▾'),
+            "an expanded epic row must paint the expanded chevron (▾): {epic_line:?}\n{screen}",
         );
     }
 
