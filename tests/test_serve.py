@@ -3126,6 +3126,131 @@ def test_sync_issues_tick_marks_issues_closed(
     )
 
 
+# ── #1220: _clean_worktrees_tick — fleet-wide orphaned-worktree sweep ────────
+
+
+def test_clean_worktrees_tick_calls_every_machine(
+    valid_config_path: Path, monkeypatch
+) -> None:
+    """#1220: _clean_worktrees_tick POSTs /worktree-clean to every machine in
+    config.machines and returns one result dict per machine, keyed by name.
+
+    This is the black-box acceptance test for the automatic sweep described
+    in the issue: nothing previously called the existing /worktree-clean
+    endpoint on a schedule, so orphaned worktrees piled up fleet-wide.
+    """
+    from coord import network
+    from coord.config import load as load_config
+    from coord.serve_app import _clean_worktrees_tick
+
+    calls: list[str] = []
+
+    def fake_clean_worktrees(machine, **kwargs):
+        calls.append(machine.name)
+        return {"ok": True, "cleaned": 2, "kept": 1, "bytes_freed": 4096, "error": None}
+
+    monkeypatch.setattr(network, "clean_worktrees", fake_clean_worktrees)
+
+    cfg = load_config(valid_config_path)
+    results = _clean_worktrees_tick(cfg)
+
+    # valid_config_yaml defines two machines: laptop, server.
+    assert sorted(calls) == ["laptop", "server"]
+    assert {r["machine"] for r in results} == {"laptop", "server"}
+    for r in results:
+        assert r["ok"] is True
+        assert r["cleaned"] == 2
+        assert r["bytes_freed"] == 4096
+
+
+def test_clean_worktrees_tick_one_machine_unreachable_does_not_block_others(
+    valid_config_path: Path, monkeypatch
+) -> None:
+    """#1220: one unreachable machine must not abort the sweep on the rest of
+    the fleet — its result is recorded as an error entry, the others still
+    clean normally."""
+    from coord import network
+    from coord.config import load as load_config
+    from coord.serve_app import _clean_worktrees_tick
+
+    def fake_clean_worktrees(machine, **kwargs):
+        if machine.name == "server":
+            return {
+                "ok": False, "cleaned": 0, "kept": 0, "bytes_freed": 0,
+                "error": "connection refused",
+            }
+        return {"ok": True, "cleaned": 5, "kept": 0, "bytes_freed": 999, "error": None}
+
+    monkeypatch.setattr(network, "clean_worktrees", fake_clean_worktrees)
+
+    cfg = load_config(valid_config_path)
+    results = _clean_worktrees_tick(cfg)
+
+    by_name = {r["machine"]: r for r in results}
+    assert by_name["server"]["ok"] is False
+    assert by_name["server"]["error"] == "connection refused"
+    assert by_name["laptop"]["ok"] is True
+    assert by_name["laptop"]["cleaned"] == 5
+
+
+def test_clean_worktrees_tick_writes_operational_audit_row_when_something_cleaned(
+    valid_config_path: Path, rw_db, monkeypatch
+) -> None:
+    """#1220/#1038: a sweep that actually freed disk space on at least one
+    machine writes one operational audit row summarizing the tick."""
+    from coord import network
+    from coord.config import load as load_config
+    from coord.serve_app import _clean_worktrees_tick
+
+    monkeypatch.setenv("COORD_CONFIG", str(valid_config_path))
+
+    def fake_clean_worktrees(machine, **kwargs):
+        if machine.name == "laptop":
+            return {"ok": True, "cleaned": 3, "kept": 0, "bytes_freed": 1024, "error": None}
+        return {"ok": True, "cleaned": 0, "kept": 4, "bytes_freed": 0, "error": None}
+
+    monkeypatch.setattr(network, "clean_worktrees", fake_clean_worktrees)
+
+    cfg = load_config(valid_config_path)
+    _clean_worktrees_tick(cfg)
+
+    rows = rw_db.execute(
+        "SELECT * FROM audit_log WHERE tier='operational' AND category='worktree_clean'"
+    ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["event_type"] == "swept"
+    assert rows[0]["actor"] == "daemon"
+    assert "1" in rows[0]["summary"]  # 1 machine reported non-zero cleanup
+
+
+def test_clean_worktrees_tick_no_audit_row_when_nothing_cleaned(
+    valid_config_path: Path, rw_db, monkeypatch
+) -> None:
+    """#1220: an all-empty sweep (every machine reports cleaned=0) is a no-op
+    tick and must not write an audit row — mirrors the housekeeping-sweep
+    and merge-reconcile ticks' "only log real events" convention."""
+    from coord import network
+    from coord.config import load as load_config
+    from coord.serve_app import _clean_worktrees_tick
+
+    monkeypatch.setenv("COORD_CONFIG", str(valid_config_path))
+    monkeypatch.setattr(
+        network,
+        "clean_worktrees",
+        lambda machine, **kwargs: {
+            "ok": True, "cleaned": 0, "kept": 2, "bytes_freed": 0, "error": None,
+        },
+    )
+
+    cfg = load_config(valid_config_path)
+    _clean_worktrees_tick(cfg)
+
+    rows = rw_db.execute(
+        "SELECT * FROM audit_log WHERE category='worktree_clean'"
+    ).fetchall()
+    assert rows == []
+
+
 # ── #776: merge_plan in /board payload ───────────────────────────────────────
 
 
