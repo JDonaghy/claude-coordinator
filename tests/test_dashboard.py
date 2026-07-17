@@ -186,10 +186,13 @@ class TestSessionsAPI:
         assert s2["attached"] is False
         assert s2["pane_dead"] is True
 
-    def test_unmatched_session_has_null_metadata(self) -> None:
+    def test_unmatched_session_has_null_board_metadata(self) -> None:
         """A tmux session with no matching board assignment still appears,
-        with everything but the tmux-derived fields set to null (mirrors the
-        `coord sessions --json` nulls-when-no-db-match behaviour)."""
+        tagged with the machine it was discovered on during the fleet sweep
+        (#1217), with board-derived fields null (mirrors the `coord sessions
+        --json` nulls-when-no-db-match behaviour). Previously `machine`/`host`
+        were also null here even though the sweep knew exactly which host
+        produced the session."""
         raw = [{"session_name": "coord-unknown-aid"}]
         client = _client()
         with (
@@ -203,8 +206,8 @@ class TestSessionsAPI:
         s = data[0]
         assert s["session_id"] == "unknown-aid"
         assert s["session_name"] == "coord-unknown-aid"
-        assert s["machine"] is None
-        assert s["host"] is None
+        assert s["machine"] == "laptop"
+        assert s["host"] == "laptop.tailnet"
         assert s["repo"] is None
         assert s["issue"] is None
         assert s["stage"] is None
@@ -238,6 +241,57 @@ class TestSessionsAPI:
         assert len(data) == 1
         assert data[0]["repo"] == "api"
         assert data[0]["status"] == "done"
+
+    def test_fan_out_discovers_session_on_non_local_machine(self) -> None:
+        """#1217: /api/sessions must sweep EVERY configured machine, not just
+        the local host `coord web` happens to run on. Fakes a two-machine
+        fleet and a `list_coord_tmux_sessions` that only reports a session for
+        the *second* machine's `TmuxHost(ssh_target=...)` — proving the
+        session surfaces via the per-machine fan-out (the `coord sessions
+        --remote` pattern), correctly tagged with the machine it came from."""
+        config = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[
+                Machine(name="laptop", host="laptop.tailnet", repos=["api"]),
+                Machine(name="precision", host="precision.tailnet", repos=["api"]),
+            ],
+        )
+
+        def _fake_list(*, host=None):
+            # `host` is the TmuxHost the endpoint built for this particular
+            # machine's sweep call; only "precision" has a live session.
+            if host is not None and host.ssh_target == "precision.tailnet":
+                return [
+                    {"session_name": "coord-remote1", "pane_dead": "0", "attached": True},
+                ]
+            return []
+
+        board = Board(
+            active=[
+                Assignment(
+                    machine_name="precision", repo_name="api",
+                    issue_number=1213, issue_title="Fix thing",
+                    assignment_id="remote1", status="running", type="work",
+                ),
+            ],
+        )
+
+        client = TestClient(build_app(config))
+        with (
+            patch("coord.interactive.list_coord_tmux_sessions", side_effect=_fake_list),
+            patch("coord.dashboard.server.read_board", return_value=board),
+        ):
+            r = client.get("/api/sessions")
+        assert r.status_code == 200
+        data = r.json()
+        assert len(data) == 1
+        s = data[0]
+        assert s["session_id"] == "remote1"
+        assert s["machine"] == "precision"
+        assert s["host"] == "precision.tailnet"
+        assert s["repo"] == "api"
+        assert s["issue"] == 1213
+        assert s["attached"] is True
 
 
 class TestProposalsAPI:
