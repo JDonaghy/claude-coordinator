@@ -101,6 +101,8 @@ The phone webapp calls the same `GET /api/pipeline` + `POST /api/pipeline/action
 
 As of **0.4.71** the compiled React bundle (`dist/`) is bundled into the PyPI wheel by the release workflow (`npm ci && npm run build` runs before `python -m build`). A plain `pip install claude-coordinator` or `coord agent update` is all you need — no Node.js, no checkout, no `npm run build` on the dashboard host.
 
+`pyproject.toml` also declares `websockets` directly (#1216) — without it uvicorn silently answers a real WS upgrade with a plain HTTP 200 instead of 101, so the `/ws/terminal` bridge fails only in a real browser, not in `curl`/mocked tests. A plain `pip install` already pulls it in; no separate step needed.
+
 The legacy static `index.html` is served as a fallback if `dist/` does not exist (pre-0.4.71 wheel, or an editable install without a local build) — it shows a plain JSON board view, not the PWA.
 
 ### Building from source (contributors / dev installs)
