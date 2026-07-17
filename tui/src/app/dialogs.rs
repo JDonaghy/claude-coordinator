@@ -685,8 +685,11 @@ impl CoordApp {
             // rows carrying the `epic` label (a milestone's tracking issue).
             let epic_issue: Option<&PipelineIssue> = issue_number
                 .and_then(|n| self.pipeline_issues.iter().find(|iss| iss.number == n));
+            // #1198: case-insensitive — unified via `labels_carry_epic_label`
+            // (was a case-sensitive `== "epic"` that silently dropped these
+            // actions for an `Epic`/`EPIC`-cased label).
             let is_epic_row = epic_issue
-                .map(|iss| iss.all_labels.iter().any(|l| l == "epic"))
+                .map(|iss| labels_carry_epic_label(&iss.all_labels))
                 .unwrap_or(false);
             if is_epic_row {
                 items.push(ContextMenuItem::action("audit-outcomes", "Audit outcomes"));

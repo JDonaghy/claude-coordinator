@@ -2474,7 +2474,10 @@ impl CoordApp {
     /// and for epics where Gate A has never been dispatched, so the panel
     /// stays quiet until there's something to report.
     pub(crate) fn append_gate_a_prereq_guidance_rows(&self, items: &mut Vec<ListItem>, issue: &PipelineIssue) {
-        if !issue.all_labels.iter().any(|l| l == "epic") {
+        // #1198: case-insensitive — unified via `labels_carry_epic_label`
+        // (was a case-sensitive `== "epic"` that silently hid this block for
+        // an `Epic`/`EPIC`-cased label).
+        if !labels_carry_epic_label(&issue.all_labels) {
             return;
         }
         let status = self.gate_a_prereq_status(issue);

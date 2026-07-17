@@ -29595,6 +29595,126 @@ Milestone tracking issue.
         );
     }
 
+    /// #1198: the epic row itself carries a visible marker distinguishing it
+    /// from a regular issue row — reuses the #1197 nesting fixture (epic
+    /// #100 with children, plain sibling #105 in the same milestone bucket)
+    /// so this covers the marker rendering alongside real nesting, not just
+    /// in isolation.
+    #[test]
+    fn tuidriver_pipeline_epic_row_shows_badge_regular_row_does_not() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_epic_nesting_app();
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 50);
+        let screen = driver.screen();
+        let lines: Vec<&str> = screen.lines().collect();
+
+        let epic_pos = driver
+            .find("#100")
+            .expect(&format!("epic #100 row must render:\n{screen}"));
+        let sibling_pos = driver
+            .find("#105")
+            .expect(&format!("plain issue #105 row must render:\n{screen}"));
+
+        let epic_line = lines
+            .get(epic_pos.1 as usize)
+            .unwrap_or_else(|| panic!("no line at #100's row:\n{screen}"));
+        assert!(
+            epic_line.contains("EPIC"),
+            "epic #100's row must carry the EPIC marker: {epic_line:?}\n{screen}",
+        );
+
+        let sibling_line = lines
+            .get(sibling_pos.1 as usize)
+            .unwrap_or_else(|| panic!("no line at #105's row:\n{screen}"));
+        assert!(
+            !sibling_line.contains("EPIC"),
+            "plain issue #105's row must NOT carry the EPIC marker: {sibling_line:?}\n{screen}",
+        );
+    }
+
+    /// #1198: the epic-row badge is driven by the label check alone — it
+    /// must render for a **childless** epic (no `data.epic_children` entry
+    /// at all, so #1197's nesting never applies — a different scenario than
+    /// the sibling test above, which uses an epic *with* nested children)
+    /// and for a **mixed-case** `Epic` label, proving the row-level check
+    /// went through the new case-insensitive `labels_carry_epic_label`
+    /// helper rather than the old exact `== "epic"` comparison.
+    ///
+    /// Both issues classify into the New lifecycle section — per
+    /// `pipeline_lifecycle_section`, an open, not-yet-dispatched issue is
+    /// always "new" (the legacy Pending/Refining buckets are permanently
+    /// empty since #628) — so `status:ready` here is just an incidental
+    /// label, not a routing key.
+    #[test]
+    fn tuidriver_pipeline_epic_badge_is_label_driven_case_insensitive_no_children() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let data = BoardData {
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        app.pipeline_issues = vec![
+            PipelineIssue {
+                number: 200,
+                title: "Mixed-case epic, no children".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string(), "Epic".to_string(), "status:ready".to_string()],
+                is_closed: false,
+            },
+            PipelineIssue {
+                number: 201,
+                title: "Ordinary pending issue".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string(), "status:ready".to_string()],
+                is_closed: false,
+            },
+        ];
+        app.active_view = SidebarView::Pipeline;
+        // #857: New's milestone tier defaults to COLLAPSED (unlike the repo
+        // tier above it) — pre-expand the "no-milestone" bucket both issues
+        // fall into so their rows render without a click.
+        app.pipeline_milestone_expanded.insert(
+            ("new".to_string(), "api".to_string(), "no-milestone".to_string()),
+            true,
+        );
+        app.rebuild_pipeline_sidebar(None);
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 50);
+        let screen = driver.screen();
+        let lines: Vec<&str> = screen.lines().collect();
+
+        let epic_pos = driver
+            .find("#200")
+            .expect(&format!("mixed-case epic #200 row must render:\n{screen}"));
+        let plain_pos = driver
+            .find("#201")
+            .expect(&format!("plain issue #201 row must render:\n{screen}"));
+
+        let epic_line = lines
+            .get(epic_pos.1 as usize)
+            .unwrap_or_else(|| panic!("no line at #200's row:\n{screen}"));
+        assert!(
+            epic_line.contains("EPIC"),
+            "a childless, mixed-case ('Epic') labelled row must still carry the EPIC marker: {epic_line:?}\n{screen}",
+        );
+
+        let plain_line = lines
+            .get(plain_pos.1 as usize)
+            .unwrap_or_else(|| panic!("no line at #201's row:\n{screen}"));
+        assert!(
+            !plain_line.contains("EPIC"),
+            "an ordinary row must NOT carry the EPIC marker: {plain_line:?}\n{screen}",
+        );
+    }
+
     /// #1197: shared fixture for the epic-nesting driver tests — a New-section
     /// milestone bucket holding epic #100 (children #101 open / #102 closed)
     /// plus an unrelated sibling #105, with the repo + milestone tiers
