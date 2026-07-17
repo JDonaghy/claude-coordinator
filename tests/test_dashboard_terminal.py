@@ -13,13 +13,14 @@ shipped broken. Rejection paths therefore assert on the raw ASGI message
 sequence via ``_raw_ws_messages`` instead; see
 ``test_unknown_session_accepts_before_closing_4404``.
 """
+# #1229 regression: TmuxSessionAttacher must always pass TERM to its subprocess
 
 from __future__ import annotations
 
 import asyncio
 import json
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from starlette.testclient import TestClient
@@ -28,6 +29,7 @@ from coord.config import Config
 from coord.dashboard.server import build_app
 from coord.dashboard.terminal import (
     WEB_TOKEN_ENV,
+    TmuxSessionAttacher,
     resolve_session_target,
     resolve_web_token,
 )
@@ -382,3 +384,79 @@ class TestResolveWebToken:
         )
         monkeypatch.delenv(WEB_TOKEN_ENV, raising=False)
         assert resolve_web_token("   ") is None
+
+
+class TestTmuxSessionAttacherTermEnv:
+    """Regression tests for #1229: ``TERM`` must always reach the subprocess.
+
+    The key scenario: ``coord web`` runs as a systemd user service with no
+    controlling TTY, so ``os.environ`` has no ``TERM`` at all.  The spawned
+    ``tmux attach-session`` (or its ssh wrapper) then inherits no ``TERM``,
+    and anything inside the pane that probes terminal capabilities (e.g.
+    ``claude``) immediately fails with "terminal does not support clear".
+
+    We reproduce that condition by clearing ``TERM`` from ``os.environ`` in
+    the test and assert that ``subprocess.Popen`` still receives a non-empty
+    ``TERM`` via the explicit ``env=`` argument -- proving the code no longer
+    silently inherits the process environment.
+    """
+
+    def test_term_injected_when_os_environ_has_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Simulate the systemd-service condition: no TERM in the environment."""
+        monkeypatch.delenv("TERM", raising=False)
+
+        captured_env: dict[str, str] | None = None
+
+        def fake_popen(argv, *, stdin, stdout, stderr, preexec_fn, close_fds, env):
+            nonlocal captured_env
+            captured_env = env
+            mock = MagicMock()
+            mock.pid = 99999
+            return mock
+
+        fake_master, fake_slave = 10, 11
+
+        with (
+            patch("coord.dashboard.terminal.subprocess.Popen", side_effect=fake_popen),
+            patch("coord.dashboard.terminal.os.close"),
+            patch("pty.openpty", return_value=(fake_master, fake_slave)),
+        ):
+            import asyncio
+
+            attacher = TmuxSessionAttacher()
+            asyncio.run(attacher.attach(None, "coord-abc123"))
+
+        assert captured_env is not None, "Popen was not called"
+        assert "TERM" in captured_env, "TERM was not present in env passed to Popen"
+        assert captured_env["TERM"], "TERM was empty"
+
+    def test_term_not_overridden_when_caller_sets_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When the caller's environment already has TERM, preserve it."""
+        monkeypatch.setenv("TERM", "rxvt-unicode-256color")
+
+        captured_env: dict[str, str] | None = None
+
+        def fake_popen(argv, *, stdin, stdout, stderr, preexec_fn, close_fds, env):
+            nonlocal captured_env
+            captured_env = env
+            mock = MagicMock()
+            mock.pid = 99999
+            return mock
+
+        fake_master, fake_slave = 10, 11
+
+        with (
+            patch("coord.dashboard.terminal.subprocess.Popen", side_effect=fake_popen),
+            patch("coord.dashboard.terminal.os.close"),
+            patch("pty.openpty", return_value=(fake_master, fake_slave)),
+        ):
+            attacher = TmuxSessionAttacher()
+            asyncio.run(attacher.attach(None, "coord-abc123"))
+
+        assert captured_env is not None
+        # setdefault must not overwrite a caller-supplied TERM.
+        assert captured_env["TERM"] == "rxvt-unicode-256color"

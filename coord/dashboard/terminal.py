@@ -153,6 +153,14 @@ class TmuxSessionAttacher:
         argv = TmuxHost(ssh_target=host).cmd(
             ["attach-session", "-t", session_name], tty=True
         )
+        # ``TERM`` may be absent when ``coord web`` runs as a systemd user
+        # service (no controlling TTY, no ``Environment=TERM=...`` in the unit
+        # file).  Without it, anything inside the attached pane that probes
+        # terminal capabilities (e.g. ``claude`` on start) fails with "terminal
+        # does not support clear" (#1229).  Mirror the same guard already used
+        # in ``coord/agent.py`` for interactive-launch subprocesses.
+        env = dict(os.environ)
+        env.setdefault("TERM", "xterm-256color")
         try:
             proc = subprocess.Popen(
                 argv,
@@ -161,6 +169,7 @@ class TmuxSessionAttacher:
                 stderr=slave_fd,
                 preexec_fn=os.setsid,
                 close_fds=True,
+                env=env,
             )
         finally:
             os.close(slave_fd)
