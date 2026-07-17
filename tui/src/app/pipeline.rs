@@ -302,6 +302,39 @@ pub(crate) const PIPELINE_ARROW_WIDTH: f32 = 4.0;
 /// Height of the action-button row when any stage has an action.
 pub(crate) const PIPELINE_ACTION_HEIGHT: f32 = 1.0;
 
+/// #1198: gold/amber marker colour for the epic-row badge — distinct from
+/// every other colour already in play on a leaf row (repo-tag purple
+/// `rgb(180, 140, 240)`, queue-depth amber `rgb(220, 160, 40)`, stage
+/// badges, live-stream green) so an epic reads as visually different at a
+/// glance rather than blending into one of those existing signals.
+pub(crate) const EPIC_BADGE_COLOR: Color = Color::rgb(240, 200, 70);
+
+/// #1198: build the marker span for an epic row, or `None` for a regular
+/// issue. Spliced into a leaf row's `spans` right after the `#N` span and
+/// before the title, at every Pipeline row-building site, so the epic
+/// label — checked case-insensitively via `labels_carry_epic_label`,
+/// unifying the split this issue calls out — is visible on the row itself,
+/// independent of whether #1197's child-nesting happens to apply (a
+/// childless epic still gets the badge).
+///
+/// Placement matters: `quadraui`'s TUI tree rasteriser clips `spans` at the
+/// row's right edge and then draws any `TreeRow::badge` right-aligned OVER
+/// whatever text landed there (`draw_tree` in `quadraui/src/tui/tree.rs`).
+/// A marker appended at the *end* of `spans` (after the title, live-stream,
+/// work-order indicators) would be clipped by a long title, or silently
+/// overwritten by the row's own repo-tag/stage badge. Right after `#N` is
+/// the one position guaranteed visible regardless of title length or badge
+/// content — and it doesn't disturb `#N`'s own column, which several
+/// existing TuiDriver tests key off of (chevron hit-testing via
+/// `epic_pos.0 - 1.0`, indent comparisons against nested children).
+pub(crate) fn epic_badge_span(issue: &PipelineIssue) -> Option<StyledSpan> {
+    if labels_carry_epic_label(&issue.all_labels) {
+        Some(StyledSpan::with_fg("◆EPIC ", EPIC_BADGE_COLOR))
+    } else {
+        None
+    }
+}
+
 /// Compute the PipelineView layout that the TUI backend would paint into
 /// `rect`. Lets `mouse_main_click` hit-test without holding a `Backend`.
 ///
@@ -3126,22 +3159,27 @@ impl CoordApp {
                                     self.epic_expand_state(issue)
                                         .map(|(key, expanded)| (key, expanded, children))
                                 });
+                                let mut spans = vec![StyledSpan::with_fg(
+                                    format!("#{:<5}", issue.number),
+                                    Color::rgb(150, 150, 240),
+                                )];
+                                // #1198: epic marker, label-driven — see
+                                // `epic_badge_span`. Spliced between `#N` and
+                                // the title (not appended at the end) so it
+                                // can't be clipped by a long title or
+                                // overwritten by the right-aligned badge.
+                                if let Some(marker) = epic_badge_span(issue) {
+                                    spans.push(marker);
+                                }
+                                spans.push(StyledSpan::with_fg(
+                                    trunc(&issue.title, 20),
+                                    title_color,
+                                ));
                                 rows.push(TreeRow {
                                     path: row_path.clone(),
                                     indent: 3,
                                     icon: None,
-                                    text: StyledText {
-                                        spans: vec![
-                                            StyledSpan::with_fg(
-                                                format!("#{:<5}", issue.number),
-                                                Color::rgb(150, 150, 240),
-                                            ),
-                                            StyledSpan::with_fg(
-                                                trunc(&issue.title, 20),
-                                                title_color,
-                                            ),
-                                        ],
-                                    },
+                                    text: StyledText { spans },
                                     badge: row_badge,
                                     is_expanded: epic.as_ref().map(|(_, e, _)| *e),
                                     decoration: Decoration::Normal,
@@ -3207,18 +3245,24 @@ impl CoordApp {
                             }
                             None => String::new(),
                         };
-                        let mut spans = vec![
-                            StyledSpan::with_fg(
-                                format!("#{:<5}", issue.number),
-                                Color::rgb(150, 150, 240),
-                            ),
-                            StyledSpan::with_fg(trunc(&issue.title, 18), title_color),
-                            StyledSpan::with_fg(
-                                format!("  {}", status_str),
-                                Color::rgb(100, 180, 100),
-                            ),
-                            StyledSpan::with_fg(age_str, Color::rgb(120, 120, 140)),
-                        ];
+                        let mut spans = vec![StyledSpan::with_fg(
+                            format!("#{:<5}", issue.number),
+                            Color::rgb(150, 150, 240),
+                        )];
+                        // #1198: epic marker, label-driven — see
+                        // `epic_badge_span`. Spliced between `#N` and the
+                        // title (not appended at the end) so it can't be
+                        // clipped by a long title or overwritten by the
+                        // right-aligned repo-tag badge.
+                        if let Some(marker) = epic_badge_span(issue) {
+                            spans.push(marker);
+                        }
+                        spans.push(StyledSpan::with_fg(trunc(&issue.title, 18), title_color));
+                        spans.push(StyledSpan::with_fg(
+                            format!("  {}", status_str),
+                            Color::rgb(100, 180, 100),
+                        ));
+                        spans.push(StyledSpan::with_fg(age_str, Color::rgb(120, 120, 140)));
                         // ● session live badge (#728).
                         if self.issue_session_is_live(issue) {
                             spans.push(StyledSpan::with_fg(
@@ -3412,16 +3456,23 @@ impl CoordApp {
                                     let wo_node = issue.coord_repo.as_ref().and_then(|rn| {
                                         self.work_order_node_for(rn, issue.number)
                                     });
-                                    let mut spans = vec![
-                                        StyledSpan::with_fg(
-                                            format!("#{:<5}", issue.number),
-                                            Color::rgb(150, 150, 240),
-                                        ),
-                                        StyledSpan::with_fg(
-                                            trunc(&issue.title, 20),
-                                            title_color,
-                                        ),
-                                    ];
+                                    let mut spans = vec![StyledSpan::with_fg(
+                                        format!("#{:<5}", issue.number),
+                                        Color::rgb(150, 150, 240),
+                                    )];
+                                    // #1198: epic marker, label-driven — see
+                                    // `epic_badge_span`. Spliced between `#N`
+                                    // and the title (not appended at the
+                                    // end) so it can't be clipped by a long
+                                    // title or overwritten by the
+                                    // right-aligned stage badge.
+                                    if let Some(marker) = epic_badge_span(issue) {
+                                        spans.push(marker);
+                                    }
+                                    spans.push(StyledSpan::with_fg(
+                                        trunc(&issue.title, 20),
+                                        title_color,
+                                    ));
                                     if has_live_stream {
                                         spans.push(StyledSpan::with_fg(
                                             " ▶".to_string(),
@@ -3511,13 +3562,20 @@ impl CoordApp {
                                     .watch_pool
                                     .values()
                                     .any(|ctx| ctx.state.issue_number == issue.number && !ctx.sse.done);
-                                let mut spans = vec![
-                                    StyledSpan::with_fg(
-                                        format!("#{:<5}", issue.number),
-                                        Color::rgb(150, 150, 240),
-                                    ),
-                                    StyledSpan::with_fg(trunc(&issue.title, 20), title_color),
-                                ];
+                                let mut spans = vec![StyledSpan::with_fg(
+                                    format!("#{:<5}", issue.number),
+                                    Color::rgb(150, 150, 240),
+                                )];
+                                // #1198: epic marker, label-driven — see
+                                // `epic_badge_span`. Spliced between `#N`
+                                // and the title (not appended at the end)
+                                // so it can't be clipped by a long title or
+                                // overwritten by the right-aligned stage
+                                // badge.
+                                if let Some(marker) = epic_badge_span(issue) {
+                                    spans.push(marker);
+                                }
+                                spans.push(StyledSpan::with_fg(trunc(&issue.title, 20), title_color));
                                 if has_live_stream {
                                     spans.push(StyledSpan::with_fg(
                                         " ▶".to_string(),

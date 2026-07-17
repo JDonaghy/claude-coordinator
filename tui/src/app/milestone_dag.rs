@@ -274,6 +274,22 @@ fn find_key(s: &str, key: &str) -> Option<usize> {
 
 // ─── Tracking-issue discovery + DAG/state computation ────────────────────────
 
+/// Case-insensitive check for the `"epic"` tracking-issue label against an
+/// arbitrary label list (`OpenIssue::labels`, `PipelineIssue::all_labels`, …).
+///
+/// #1198: the single source of truth for "is this issue an epic" — unifies
+/// what used to be three independent checks: this module's own
+/// `eq_ignore_ascii_case`, plus case-sensitive `== "epic"` exact matches in
+/// `dialogs.rs`'s context-menu gate and `render.rs`'s Gate A guidance rows.
+/// An `Epic`/`EPIC`-cased label previously behaved correctly here but lost
+/// its context-menu actions and detail-pane rows — callers should go through
+/// this helper instead of re-deriving the comparison.
+pub(crate) fn labels_carry_epic_label(labels: &[String]) -> bool {
+    labels
+        .iter()
+        .any(|l| l.eq_ignore_ascii_case(TRACKING_ISSUE_LABEL))
+}
+
 /// The open issue in `repo_name`/`milestone_number` carrying the `"epic"`
 /// label — the milestone's tracking issue (mirrors
 /// `coord.milestone_order.TRACKING_ISSUE_LABEL` / the #645 convention).
@@ -285,10 +301,7 @@ pub(crate) fn milestone_tracking_issue<'a>(
     open_issues.iter().find(|oi| {
         oi.repo_name == repo_name
             && oi.milestone_number == Some(milestone_number)
-            && oi
-                .labels
-                .iter()
-                .any(|l| l.eq_ignore_ascii_case(TRACKING_ISSUE_LABEL))
+            && labels_carry_epic_label(&oi.labels)
     })
 }
 
@@ -1309,6 +1322,20 @@ Not part of the block.
         let nodes = parse_work_order(body);
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].issue_number, 5);
+    }
+
+    /// #1198: `labels_carry_epic_label` — the single source of truth every
+    /// call site now delegates to — must accept `epic` in any casing and
+    /// reject everything else, including a merely-similar label.
+    #[test]
+    fn labels_carry_epic_label_is_case_insensitive() {
+        assert!(labels_carry_epic_label(&["epic".to_string()]));
+        assert!(labels_carry_epic_label(&["Epic".to_string()]));
+        assert!(labels_carry_epic_label(&["EPIC".to_string()]));
+        assert!(labels_carry_epic_label(&["coord".to_string(), "EpIc".to_string()]));
+        assert!(!labels_carry_epic_label(&["coord".to_string()]));
+        assert!(!labels_carry_epic_label(&["epics".to_string()]));
+        assert!(!labels_carry_epic_label(&[]));
     }
 
     #[test]
