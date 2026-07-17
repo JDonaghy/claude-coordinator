@@ -35,6 +35,7 @@ function makeView(overrides: Partial<PipelineView> = {}): PipelineView {
     needs_attention: false,
     needs_attention_reason: null,
     needs_attention_detail: null,
+    finished_at: null,
     ...overrides,
   }
 }
