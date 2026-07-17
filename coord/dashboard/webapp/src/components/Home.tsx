@@ -48,6 +48,59 @@ const FILTER_FNS: Record<FilterTab, (v: PipelineView) => boolean> = {
   'needs-me': needsMe,
 }
 
+/**
+ * `current_stage` values that PipelineCard's `stageStatusInfo` renders as a
+ * "done-ish" yellow badge — the work itself has finished, but the item is
+ * waiting on a downstream gate (review/smoke/merge) rather than actively
+ * running. These are the low-signal cards #1218 asked to group + collapse
+ * out of the primary "Active" view by default (e.g. a merged item's
+ * penultimate "work done" state sitting near the top of the list).
+ */
+const DONE_ISH_STAGES = new Set(['done', 'review_done', 'smoke_passed', 'merge_ready'])
+
+function isDoneIsh(view: PipelineView): boolean {
+  return DONE_ISH_STAGES.has(view.current_stage)
+}
+
+/**
+ * `current_stage` values that indicate a subprocess is actively running —
+ * mirrors PipelineCard's RUNNING_STAGES so the "in progress" bucket can
+ * prioritize live work after needs-me items.
+ */
+const RUNNING_STAGES = new Set(['coding', 'review_running', 'smoke_running', 'merging'])
+
+/**
+ * Split the "Active" tab's items into "in progress" (shown expanded) and
+ * "done-ish" (collapsed by default, see DONE_ISH_STAGES). Within "in
+ * progress", items needing human input (available_gates.length > 0) sort
+ * first, then actively-running items, with the incoming order preserved as
+ * the tiebreak (stable sort). "Done-ish" items are returned unsorted here —
+ * the caller sorts them by finished_at descending.
+ */
+function groupActiveItems(views: PipelineView[]): { inProgress: PipelineView[]; done: PipelineView[] } {
+  const inProgress: PipelineView[] = []
+  const done: PipelineView[] = []
+  for (const view of views) {
+    if (isDoneIsh(view)) {
+      done.push(view)
+    } else {
+      inProgress.push(view)
+    }
+  }
+
+  const priority = (view: PipelineView): number => {
+    if (needsMe(view)) return 0
+    if (RUNNING_STAGES.has(view.current_stage)) return 1
+    return 2
+  }
+  inProgress.sort((a, b) => priority(a) - priority(b))
+
+  // Most recently finished first; items with no finished_at yet sort last.
+  done.sort((a, b) => (b.finished_at ?? -Infinity) - (a.finished_at ?? -Infinity))
+
+  return { inProgress, done }
+}
+
 // ── Pull-to-refresh ───────────────────────────────────────────────────────────
 
 const PTR_THRESHOLD_PX = 80
@@ -153,6 +206,50 @@ function LiveSessions({ sessions, onSelect }: LiveSessionsProps) {
   )
 }
 
+// ── Done section (collapsed by default) ─────────────────────────────────────────
+
+interface DoneSectionProps {
+  items: PipelineView[]
+  onSelect: (assignmentId: string) => void
+}
+
+/**
+ * Collapsed-by-default "Work done" section for the Active tab's done-ish
+ * items (#1218) — keeps merged/finished noise out of the primary view while
+ * staying one tap away. Sorted by finished_at descending by the caller
+ * (groupActiveItems), so expanding always shows most-recently-finished first.
+ */
+function DoneSection({ items, onSelect }: DoneSectionProps) {
+  const [expanded, setExpanded] = useState(false)
+
+  if (items.length === 0) return null
+
+  return (
+    <section aria-label="Work done" className="mt-3">
+      <button
+        type="button"
+        onClick={() => setExpanded((v) => !v)}
+        aria-expanded={expanded}
+        className="flex w-full items-center justify-between rounded-lg border border-border bg-card px-4 py-2 text-left text-xs font-medium text-muted-foreground"
+      >
+        <span>Work done ({items.length})</span>
+        <span aria-hidden="true">{expanded ? '▾' : '▸'}</span>
+      </button>
+      {expanded && (
+        <div className="mt-3 space-y-3">
+          {items.map((view) => (
+            <PipelineCard
+              key={view.assignment_id}
+              view={view}
+              onClick={() => onSelect(view.assignment_id)}
+            />
+          ))}
+        </div>
+      )}
+    </section>
+  )
+}
+
 // ── Home screen ───────────────────────────────────────────────────────────────
 
 export default function Home() {
@@ -178,6 +275,12 @@ export default function Home() {
   const { onTouchStart, onTouchEnd } = usePullToRefresh({ onRefresh: handleRefresh })
 
   const filtered = data ? data.filter(FILTER_FNS[filterTab]) : []
+
+  // Active tab only: group into "in progress" (expanded, needs-me-first) and
+  // "done-ish" (collapsed "Work done" section, sorted by recency) — #1218.
+  // The "Needs me" tab stays a flat list; its semantics are unchanged.
+  const { inProgress, done } =
+    filterTab === 'active' ? groupActiveItems(filtered) : { inProgress: filtered, done: [] }
 
   const counts: Record<FilterTab, number> = {
     'active': data ? data.filter(isActive).length : 0,
@@ -249,15 +352,18 @@ export default function Home() {
 
       {/* Card list */}
       {data && filtered.length > 0 && (
-        <section className="space-y-3" aria-label={filterTab === 'active' ? 'Active items' : 'Items needing attention'}>
-          {filtered.map((view) => (
-            <PipelineCard
-              key={view.assignment_id}
-              view={view}
-              onClick={() => navigate(`/detail/${view.assignment_id}`)}
-            />
-          ))}
-        </section>
+        <>
+          <section className="space-y-3" aria-label={filterTab === 'active' ? 'Active items' : 'Items needing attention'}>
+            {inProgress.map((view) => (
+              <PipelineCard
+                key={view.assignment_id}
+                view={view}
+                onClick={() => navigate(`/detail/${view.assignment_id}`)}
+              />
+            ))}
+          </section>
+          <DoneSection items={done} onSelect={(assignmentId) => navigate(`/detail/${assignmentId}`)} />
+        </>
       )}
 
       {/* Empty state */}

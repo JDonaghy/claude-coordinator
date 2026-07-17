@@ -86,6 +86,7 @@ export interface PipelineView {
   needs_attention: boolean
   needs_attention_reason: string | null
   needs_attention_detail: string | null
+  finished_at: number | null
 }
 
 export interface Assignment {

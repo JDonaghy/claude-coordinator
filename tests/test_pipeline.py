@@ -337,6 +337,56 @@ class TestComputePipeline:
         assert "enqueue" in gate_actions
 
 
+# ── #1218: finished_at field (dashboard "Work done" recency sort) ──────────
+
+
+class TestFinishedAtField:
+    def test_still_running_has_no_finished_at(self) -> None:
+        a = _work(status="running")
+        pv = compute_pipeline(a, _board(a), [], _config())
+        assert pv.finished_at is None
+
+    def test_done_no_downstream_uses_work_assignment_finished_at(self) -> None:
+        a = _work(status="done")
+        a.finished_at = 100.0
+        pv = compute_pipeline(a, _board(a), [], _config())
+        assert pv.current_stage == "done"
+        assert pv.finished_at == 100.0
+
+    def test_review_done_uses_review_assignment_finished_at(self) -> None:
+        """review_done should reflect the review finishing later than the
+        work assignment did, not freeze at the work assignment's own time."""
+        a = _work(status="done")
+        a.finished_at = 100.0
+        rev = _review(of_aid="work-1", status="done")
+        rev.finished_at = 200.0
+        board = Board(active=[], completed=[a, rev])
+        pv = compute_pipeline(a, board, [], _config())
+        assert pv.current_stage == "review_done"
+        assert pv.finished_at == 200.0
+
+    def test_smoke_passed_uses_latest_of_work_and_smoke_finished_at(self) -> None:
+        a = _work(status="done", smoke_test="pass", required_gates=["smoke", "merge"])
+        a.finished_at = 100.0
+        smk = _smoke(of_aid="work-1", status="done")
+        smk.finished_at = 300.0
+        board = Board(active=[], completed=[a, smk])
+        pv = compute_pipeline(a, board, [], _config())
+        assert pv.current_stage == "smoke_passed"
+        assert pv.finished_at == 300.0
+
+    def test_missing_downstream_finished_at_falls_back_to_work(self) -> None:
+        """A linked review/smoke assignment with no finished_at recorded yet
+        shouldn't clobber the work assignment's own timestamp."""
+        a = _work(status="done")
+        a.finished_at = 100.0
+        rev = _review(of_aid="work-1", status="done")
+        rev.finished_at = None
+        board = Board(active=[], completed=[a, rev])
+        pv = compute_pipeline(a, board, [], _config())
+        assert pv.finished_at == 100.0
+
+
 # ── #846: needs_attention field ─────────────────────────────────────────────
 
 

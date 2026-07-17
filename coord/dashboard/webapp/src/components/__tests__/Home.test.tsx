@@ -1,5 +1,6 @@
 /**
- * Component tests for the Home screen's "Live sessions" section (#1067).
+ * Component tests for the Home screen's "Live sessions" section (#1067) and
+ * the Active tab's in-progress/done grouping (#1218).
  *
  * Mocks @/api/client entirely; wraps renders in a QueryClientProvider +
  * MemoryRouter so useQuery / useNavigate work correctly, matching
@@ -57,6 +58,7 @@ function makeView(overrides: Partial<PipelineView> = {}): PipelineView {
     needs_attention: false,
     needs_attention_reason: null,
     needs_attention_detail: null,
+    finished_at: null,
     ...overrides,
   }
 }
@@ -142,5 +144,122 @@ describe('Home — live sessions section', () => {
     await userEvent.click(card)
 
     expect(navigateSpy).toHaveBeenCalledWith('/terminal/work-2')
+  })
+})
+
+// ── Active tab: in-progress/done grouping (#1218) ───────────────────────────────
+
+describe('Home — Active tab grouping', () => {
+  it('renders in-progress items expanded, needs-me first then running', async () => {
+    // Incoming (API) order deliberately scrambled: running item first, then
+    // a needs-me (failed, offers retry) item — expect needs-me to sort first.
+    const running = makeView({
+      assignment_id: 'a-running',
+      issue_title: 'Running item',
+      current_stage: 'coding',
+      available_gates: [],
+    })
+    const needsMe = makeView({
+      assignment_id: 'a-needs-me',
+      issue_title: 'Failed item needing retry',
+      current_stage: 'failed',
+      available_gates: [{ action: 'retry', label: 'Retry', endpoint: '/api/pipeline/action' }],
+    })
+    vi.mocked(fetchPipeline).mockResolvedValue([running, needsMe])
+    vi.mocked(fetchSessions).mockResolvedValue([])
+
+    renderHome()
+
+    const needsMeCard = await screen.findByText('Failed item needing retry')
+    const runningCard = screen.getByText('Running item')
+    expect(
+      needsMeCard.compareDocumentPosition(runningCard) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy()
+  })
+
+  it('collapses done-ish items into a "Work done (N)" section by default', async () => {
+    const running = makeView({
+      assignment_id: 'a-running',
+      issue_title: 'Running item',
+      current_stage: 'coding',
+    })
+    const done1 = makeView({
+      assignment_id: 'a-done-1',
+      issue_title: 'Finished thing one',
+      current_stage: 'done',
+      available_gates: [{ action: 'enqueue', label: 'Queue', endpoint: '/api/pipeline/action' }],
+      finished_at: 100,
+    })
+    const done2 = makeView({
+      assignment_id: 'a-done-2',
+      issue_title: 'Finished thing two',
+      current_stage: 'review_done',
+      available_gates: [{ action: 'enqueue', label: 'Queue', endpoint: '/api/pipeline/action' }],
+      finished_at: 200,
+    })
+    vi.mocked(fetchPipeline).mockResolvedValue([running, done1, done2])
+    vi.mocked(fetchSessions).mockResolvedValue([])
+
+    renderHome()
+
+    await waitFor(() => {
+      expect(screen.getByText('Running item')).toBeInTheDocument()
+    })
+
+    // Collapsed by default: header with count shown, done cards not rendered.
+    expect(screen.getByText('Work done (2)')).toBeInTheDocument()
+    expect(screen.queryByText('Finished thing one')).not.toBeInTheDocument()
+    expect(screen.queryByText('Finished thing two')).not.toBeInTheDocument()
+  })
+
+  it('expands the Work done section on tap, sorted by recency descending', async () => {
+    const older = makeView({
+      assignment_id: 'a-done-older',
+      issue_title: 'Older done item',
+      current_stage: 'done',
+      available_gates: [{ action: 'enqueue', label: 'Queue', endpoint: '/api/pipeline/action' }],
+      finished_at: 100,
+    })
+    const newer = makeView({
+      assignment_id: 'a-done-newer',
+      issue_title: 'Newer done item',
+      current_stage: 'smoke_passed',
+      available_gates: [{ action: 'enqueue', label: 'Queue', endpoint: '/api/pipeline/action' }],
+      finished_at: 200,
+    })
+    vi.mocked(fetchPipeline).mockResolvedValue([older, newer])
+    vi.mocked(fetchSessions).mockResolvedValue([])
+
+    renderHome()
+
+    const toggle = await screen.findByText('Work done (2)')
+    await userEvent.click(toggle)
+
+    const newerCard = await screen.findByText('Newer done item')
+    const olderCard = await screen.findByText('Older done item')
+    expect(
+      newerCard.compareDocumentPosition(olderCard) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy()
+  })
+
+  it('keeps the "Needs me" tab as a flat, ungrouped list', async () => {
+    const done = makeView({
+      assignment_id: 'a-done',
+      issue_title: 'Finished needing merge',
+      current_stage: 'done',
+      available_gates: [{ action: 'enqueue', label: 'Queue', endpoint: '/api/pipeline/action' }],
+      finished_at: 100,
+    })
+    vi.mocked(fetchPipeline).mockResolvedValue([done])
+    vi.mocked(fetchSessions).mockResolvedValue([])
+
+    renderHome()
+
+    const tab = await screen.findByRole('tab', { name: /Needs me/i })
+    await userEvent.click(tab)
+
+    // Rendered directly — no collapsed "Work done" wrapper on this tab.
+    expect(await screen.findByText('Finished needing merge')).toBeInTheDocument()
+    expect(screen.queryByText(/Work done \(/)).not.toBeInTheDocument()
   })
 })

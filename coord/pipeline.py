@@ -87,6 +87,13 @@ class PipelineView:
     needs_attention: bool = False
     needs_attention_reason: str | None = None  # "wall_clock" | "non_convergence" | None
     needs_attention_detail: str | None = None
+    # #1218: most-recent completion timestamp available for this pipeline
+    # item, so the dashboard can sort the collapsed "Work done" section by
+    # recency. Mirrors the latest of Assignment.finished_at across the work
+    # assignment and any linked review/smoke assignment (whichever most
+    # recently made progress) — see compute_pipeline for the derivation.
+    # None only when nothing involved has finished yet (still coding).
+    finished_at: float | None = None
 
 
 # ── Stage progression constants ──────────────────────────────────────────────
@@ -334,6 +341,25 @@ def compute_pipeline(
         review_of_assignment_id=assignment.review_of_assignment_id,
     )
 
+    # #1218: most-recent finished_at across the work assignment and any
+    # linked review/smoke assignment — whichever last made progress. This is
+    # what the dashboard sorts the collapsed "Work done" section by, so it
+    # needs to advance as an item moves review_done → smoke_passed →
+    # merge_ready, not freeze at the moment the work assignment itself
+    # finished.
+    finished_at = max(
+        (
+            ts
+            for ts in (
+                assignment.finished_at,
+                review_assignment.finished_at if review_assignment else None,
+                smoke_assignment.finished_at if smoke_assignment else None,
+            )
+            if ts is not None
+        ),
+        default=None,
+    )
+
     return PipelineView(
         assignment_id=aid,
         issue_number=assignment.issue_number,
@@ -351,4 +377,5 @@ def compute_pipeline(
         needs_attention=needs_attention_reason is not None,
         needs_attention_reason=needs_attention_reason,
         needs_attention_detail=needs_attention_detail,
+        finished_at=finished_at,
     )
