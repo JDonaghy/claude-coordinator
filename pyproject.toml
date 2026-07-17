@@ -24,6 +24,11 @@ dependencies = [
     "httpx>=0.27",
     "starlette>=0.37",
     "uvicorn>=0.30",
+    # Required for uvicorn to perform a real WebSocket upgrade (101) rather
+    # than silently answering with a plain HTTP 200 (#1216). Pinned directly
+    # rather than via the `uvicorn[standard]` extra, which also pulls in
+    # httptools/uvloop that /ws/terminal doesn't need.
+    "websockets>=12.0",
     "psutil>=5.9",
 ]
 
