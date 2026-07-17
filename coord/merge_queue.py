@@ -191,13 +191,26 @@ def _bypassed_gates(entry: "QueuedMerge", config) -> list[str]:
     to bypass) or when its resolved gates already match the default list.
     Only ``"review"`` and ``"test"`` are reported — ``"merge"`` is the
     terminal action being gated, not a checkpoint that can be "bypassed".
+
+    ``"review"`` is reported only when ``config.reviews.enabled`` is truthy
+    — mirroring the guard :func:`requires_review` applies first. When review
+    is globally disabled, dropping ``"review"`` from a label's resolved gate
+    list changes nothing (the gate was already off), so it isn't a real
+    bypass and reporting it would produce a misleading audit row / CLI note
+    (#1213 review finding 1).
     """
     gates = getattr(entry, "required_gates", None)
     if not gates:
         return []
     pipeline = getattr(config, "pipeline", None) if config is not None else None
     default_gates = list(getattr(pipeline, "default_gates", None) or []) if pipeline else []
-    return [g for g in ("review", "test") if g in default_gates and g not in gates]
+    reviews_enabled = bool(getattr(config, "reviews", None)) and bool(
+        getattr(config.reviews, "enabled", True)
+    )
+    candidates = [g for g in ("review", "test") if g in default_gates and g not in gates]
+    if not reviews_enabled:
+        candidates = [g for g in candidates if g != "review"]
+    return candidates
 
 
 def _bypass_label(entry: "QueuedMerge", config) -> str | None:

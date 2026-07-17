@@ -1376,7 +1376,7 @@ class TestGateBypassAudit:
     on the "merged" event — never silent."""
 
     @staticmethod
-    def _config(*, default_gates=None, labels=None):
+    def _config(*, default_gates=None, labels=None, reviews_enabled=True):
         from dataclasses import dataclass, field as dc_field
         @dataclass
         class _Reviews:
@@ -1390,6 +1390,7 @@ class TestGateBypassAudit:
             reviews: _Reviews = dc_field(default_factory=_Reviews)
             pipeline: _Pipeline = dc_field(default_factory=_Pipeline)
         cfg = _Cfg()
+        cfg.reviews.enabled = reviews_enabled
         cfg.pipeline.default_gates = (
             default_gates if default_gates is not None else ["test", "review", "merge"]
         )
@@ -1428,6 +1429,33 @@ class TestGateBypassAudit:
         assert details["label"] == "gate:trivial"
         assert sorted(details["bypassed_gates"]) == ["review", "test"]
         assert details["resolved_gates"] == ["merge"]
+
+    def test_reviews_globally_disabled_does_not_report_phantom_review_bypass(
+        self, coord_db
+    ) -> None:
+        # Review finding #1: when config.reviews.enabled is False, review was
+        # never going to be required regardless of the label — requires_review
+        # already returns False unconditionally. A ["merge"]-only label drops
+        # "review" from the resolved gate list too, but that changes nothing
+        # about enforcement, so it must NOT be reported as a bypassed gate
+        # (only "test" is a real bypass here).
+        cfg = self._config(labels={"gate:trivial": ["merge"]}, reviews_enabled=False)
+        board = self._board()  # no review, no smoke verdict anywhere
+        items = [_q("a", required_gates=["merge"])]
+        events = process(items, FakeGh(), config=cfg, board=board)
+
+        assert items[0].state == MERGED
+        merged = [e for e in events if e.kind == "merged"]
+        assert merged
+        assert "gate bypass" in merged[0].message
+        assert "test" in merged[0].message
+        assert "review" not in merged[0].message
+
+        rows = self._audit_rows(coord_db)
+        assert len(rows) == 1
+        details = json.loads(rows[0]["details_json"])
+        assert details["bypassed_gates"] == ["test"]
+        assert "review" not in details["bypassed_gates"]
 
     def test_untagged_work_is_completely_unaffected(self, coord_db) -> None:
         # #1213 acceptance: the important regression test — untagged work
