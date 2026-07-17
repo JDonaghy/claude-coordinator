@@ -29788,18 +29788,62 @@ Milestone tracking issue.
             "a collapsed epic row must paint the collapsed chevron (▸): {epic_line:?}\n{screen}",
         );
 
-        // NOTE: the re-expand half of the cycle deliberately lives in its own
-        // test (`tuidriver_pipeline_collapsed_epic_row_expands_on_chevron_click`)
-        // rather than clicking the chevron a second time here.  quadraui's
+        // ── Toggle back: the children must return ────────────────────────
+        //
+        // Re-clicking the chevron needs a reset click first, because quadraui's
         // `DoubleClickDetector` folds a MouseDown into a `DoubleClick` when it
         // lands within DOUBLE_CLICK_MS (400ms) *and* DOUBLE_CLICK_RADIUS (1.5
-        // cells in both x and y) of the previous one — and a folded event never
-        // reaches the `RowToggleExpand` arm.  Once the epic is collapsed its
-        // children are gone, so sibling #105 sits directly beneath #100: every
-        // other row in this fixture is inside that radius, which makes any
-        // "click elsewhere to reset the detector" trick a wall-clock race (it
-        // resolves one way under 400ms and the other way on a loaded box).  One
-        // click per driver keeps the detector out of the picture entirely.
+        // cells) of the previous one — and a folded event never reaches the
+        // `RowToggleExpand` arm.  The reset MUST be outside that radius on an
+        // axis that does not depend on wall-clock, or the test becomes a race:
+        // the previous cut clicked sibling #105, which sits DIRECTLY beneath
+        // #100 once the children are hidden (Δy = 1, inside the radius), so it
+        // passed under 400ms and failed over it — ~50% flaky under load.
+        //
+        // Reset on X instead, along the epic's own row: the chevron's hit
+        // region is only the leading cells, so a click on the row's title text
+        // is inert (it selects, it does not toggle) — asserted below — while
+        // being far enough away in x that the fold can never happen whatever
+        // the elapsed time.
+        let epic_pos = driver
+            .find("#100")
+            .expect(&format!("epic #100 row must still render:\n{screen}"));
+        let chevron_x = epic_pos.0 - 1.0;
+        let reset_x = epic_pos.0 + 5.0;
+        assert!(
+            (reset_x - chevron_x).abs() > 1.5,
+            "the reset click must sit outside quadraui's DOUBLE_CLICK_RADIUS (1.5) \
+             of the chevron, or this test is a wall-clock race: chevron_x={chevron_x}, \
+             reset_x={reset_x}",
+        );
+        driver.click(reset_x, epic_pos.1);
+        assert!(
+            !driver.screen_contains("#101"),
+            "the reset click must be INERT — clicking a row's title text is not a \
+             chevron click and must not re-expand the epic on its own:\n{}",
+            driver.screen(),
+        );
+
+        driver.click(chevron_x, epic_pos.1);
+        let screen = driver.screen();
+        assert!(
+            driver.screen_contains("#101") && driver.screen_contains("#102"),
+            "re-expanding the epic must bring its children back:\n{screen}",
+        );
+        let epic_line = screen
+            .lines()
+            .nth(
+                driver
+                    .find("#100")
+                    .expect(&format!("epic #100 row must still render:\n{screen}"))
+                    .1 as usize,
+            )
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            epic_line.contains('▾'),
+            "a re-expanded epic row must paint the expanded chevron (▾) again: {epic_line:?}\n{screen}",
+        );
     }
 
     /// #1197: the other half of the collapse cycle — a stored `false` renders
