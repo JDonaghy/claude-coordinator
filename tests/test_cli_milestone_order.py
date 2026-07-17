@@ -194,6 +194,7 @@ class TestMilestoneWriteOrderCmd:
             return {
                 "number": 100, "title": "tracking", "body": tracking_body,
                 "state": "OPEN", "milestone": {"number": 9, "title": "M"},
+                "labels": [{"name": "epic"}],
             }
 
         open_issues = [
@@ -203,6 +204,7 @@ class TestMilestoneWriteOrderCmd:
         new_block = "- [ ] #762  {group: A}\n- [ ] #763  {after: #762}\n"
         with patch("coord.github_ops.get_issue", side_effect=get_issue), \
              patch("coord.github_ops.get_open_issues", return_value=open_issues), \
+             patch("coord.github_ops.add_issue_labels") as mock_add_labels, \
              patch("coord.github_ops.update_issue_body") as mock_update:
             result = CliRunner().invoke(
                 main,
@@ -218,6 +220,8 @@ class TestMilestoneWriteOrderCmd:
         assert "Milestone plan." in call_body
         assert "## Refs\nsome refs" in call_body
         assert "#762" in call_body and "#763" in call_body
+        # #1057: tracking issue already carries `epic` — no-op.
+        mock_add_labels.assert_not_called()
 
     def test_writes_from_file_option(self, config_file: Path, tmp_path: Path) -> None:
         block_file = tmp_path / "order.txt"
@@ -227,11 +231,13 @@ class TestMilestoneWriteOrderCmd:
             return {
                 "number": 100, "title": "tracking", "body": "",
                 "state": "OPEN", "milestone": {"number": 9, "title": "M"},
+                "labels": [{"name": "epic"}],
             }
 
         open_issues = [{"number": 762, "milestone": {"number": 9}}]
         with patch("coord.github_ops.get_issue", side_effect=get_issue), \
              patch("coord.github_ops.get_open_issues", return_value=open_issues), \
+             patch("coord.github_ops.add_issue_labels") as mock_add_labels, \
              patch("coord.github_ops.update_issue_body") as mock_update:
             result = CliRunner().invoke(
                 main,
@@ -242,6 +248,7 @@ class TestMilestoneWriteOrderCmd:
             )
         assert result.exit_code == 0, result.output
         mock_update.assert_called_once()
+        mock_add_labels.assert_not_called()
 
     def test_idempotent_rewrite_is_a_noop(self, config_file: Path) -> None:
         tracking_body = "## Work order\n- [ ] #762  {group: A}\n"
@@ -250,11 +257,13 @@ class TestMilestoneWriteOrderCmd:
             return {
                 "number": 100, "title": "tracking", "body": tracking_body,
                 "state": "OPEN", "milestone": {"number": 9, "title": "M"},
+                "labels": [{"name": "epic"}],
             }
 
         open_issues = [{"number": 762, "milestone": {"number": 9}}]
         with patch("coord.github_ops.get_issue", side_effect=get_issue), \
              patch("coord.github_ops.get_open_issues", return_value=open_issues), \
+             patch("coord.github_ops.add_issue_labels") as mock_add_labels, \
              patch("coord.github_ops.update_issue_body") as mock_update:
             result = CliRunner().invoke(
                 main,
@@ -264,6 +273,64 @@ class TestMilestoneWriteOrderCmd:
         assert result.exit_code == 0, result.output
         assert "unchanged (idempotent no-op)" in result.output
         mock_update.assert_not_called()
+        mock_add_labels.assert_not_called()
+
+    def test_adds_missing_epic_label_even_when_body_unchanged(
+        self, config_file: Path
+    ) -> None:
+        """#1057 repro: #1051 had a valid `## Work order` already written but
+        was still flagged `no_work_order` in `coord plans` because the
+        tracking issue never got the `epic` label. Re-running `write-order`
+        with the same content must self-heal the label even though the body
+        splice itself is a no-op."""
+        tracking_body = "## Work order\n- [ ] #762  {group: A}\n"
+
+        def get_issue(repo, number):
+            return {
+                "number": 100, "title": "tracking", "body": tracking_body,
+                "state": "OPEN", "milestone": {"number": 9, "title": "M"},
+                "labels": [],
+            }
+
+        open_issues = [{"number": 762, "milestone": {"number": 9}}]
+        with patch("coord.github_ops.get_issue", side_effect=get_issue), \
+             patch("coord.github_ops.get_open_issues", return_value=open_issues), \
+             patch("coord.github_ops.add_issue_labels") as mock_add_labels, \
+             patch("coord.github_ops.update_issue_body") as mock_update:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "write-order", "api", "100", "--config", str(config_file)],
+                input="- [ ] #762  {group: A}\n",
+            )
+        assert result.exit_code == 0, result.output
+        assert "added missing 'epic' label" in result.output
+        assert "unchanged (idempotent no-op)" in result.output
+        mock_add_labels.assert_called_once_with("acme/api", 100, ["epic"])
+        mock_update.assert_not_called()
+
+    def test_adds_missing_epic_label_on_a_real_write(self, config_file: Path) -> None:
+        def get_issue(repo, number):
+            return {
+                "number": 100, "title": "tracking", "body": "",
+                "state": "OPEN", "milestone": {"number": 9, "title": "M"},
+                "labels": [{"name": "coord"}],
+            }
+
+        open_issues = [{"number": 762, "milestone": {"number": 9}}]
+        with patch("coord.github_ops.get_issue", side_effect=get_issue), \
+             patch("coord.github_ops.get_open_issues", return_value=open_issues), \
+             patch("coord.github_ops.add_issue_labels") as mock_add_labels, \
+             patch("coord.github_ops.update_issue_body") as mock_update:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "write-order", "api", "100", "--config", str(config_file)],
+                input="- [ ] #762  {group: A}\n",
+            )
+        assert result.exit_code == 0, result.output
+        assert "added missing 'epic' label" in result.output
+        assert "wrote `## Work order` block (1 node(s))" in result.output
+        mock_add_labels.assert_called_once_with("acme/api", 100, ["epic"])
+        mock_update.assert_called_once()
 
     def test_refuses_to_write_a_cycle(self, config_file: Path) -> None:
         def get_issue(repo, number):
