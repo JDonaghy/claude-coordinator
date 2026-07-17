@@ -30,6 +30,7 @@ from coord.milestone_dispatch import (
     plan_dispatch,
 )
 from coord.milestone_order import (
+    TRACKING_ISSUE_LABEL,
     WorkOrder,
     WorkOrderError,
     WorkOrderNode,
@@ -851,7 +852,11 @@ def _resolve_milestone_membership(
         "section — idempotent, never duplicated), re-parses and validates "
         "the result (cycles, unknown `after` targets, milestone membership) "
         "BEFORE writing, then calls `github_ops.update_issue_body` — the "
-        "`coord`, never-raw-`gh` write path #645/#770 require.\n\n"
+        "`coord`, never-raw-`gh` write path #645/#770 require. Also ensures "
+        "the tracking issue carries the `epic` label (#1057) — added if "
+        "missing, even when the checklist body itself is unchanged — since "
+        "`coord plans`/the TUI Plans panel find a milestone's tracking epic "
+        "by that label, not by the presence of a `## Work order` block.\n\n"
         "REPO is the local repo name from coordinator.yml; TRACKING_ISSUE is "
         "the GH issue number of the tracking issue (must carry a milestone)."
     ),
@@ -926,6 +931,24 @@ def milestone_write_order_cmd(
     except WorkOrderError as e:
         click.echo(f"error: {e}", err=True)
         sys.exit(1)
+
+    # #1057: a valid `## Work order` block alone doesn't make this issue
+    # findable as the milestone's tracking epic — `coord plans`/the TUI
+    # Plans panel key off the `epic` label (TRACKING_ISSUE_LABEL). Ensure it
+    # here so promotion is self-consistent, and do it even when the
+    # checklist body below turns out to be an idempotent no-op (the #1051
+    # repro: a valid work order already present, label missing).
+    current_labels = {lbl.get("name") for lbl in issue_data.get("labels") or []}
+    label_added = False
+    if TRACKING_ISSUE_LABEL not in current_labels:
+        github_ops.add_issue_labels(
+            repo_entry.github, tracking_issue, [TRACKING_ISSUE_LABEL]
+        )
+        label_added = True
+        click.echo(
+            f"#{tracking_issue}: added missing '{TRACKING_ISSUE_LABEL}' label "
+            "(tracking issues must carry it to be found as an epic)"
+        )
 
     if candidate_body == old_body:
         click.echo(f"#{tracking_issue}: work order unchanged (idempotent no-op)")
