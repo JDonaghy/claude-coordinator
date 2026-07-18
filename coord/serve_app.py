@@ -409,7 +409,7 @@ def _wal_checkpoint_tick(config: Config) -> dict:  # noqa: ARG001  (config reser
     try:
         row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
         busy, log_pages, checkpointed = (row[0], row[1], row[2]) if row else (0, 0, 0)
-    except Exception:  # noqa: BLE001— a missed checkpoint is not fatal
+    except Exception:  # noqa: BLE001 — a missed checkpoint is not fatal
         log.warning("wal-checkpoint tick failed", exc_info=True)
         return {"busy": -1, "log": 0, "checkpointed": 0, "error": True}
 
@@ -4178,7 +4178,17 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 ):
                     last_wal_checkpoint = _time.monotonic()
                     try:
-                        await run_in_threadpool(_wal_checkpoint_tick, config)
+                        wal_result = await run_in_threadpool(
+                            _wal_checkpoint_tick, config
+                        )
+                        if wal_result["checkpointed"] > 0:
+                            log.info(
+                                "wal-checkpoint: reclaimed %d frame(s) "
+                                "(busy=%d, log=%d)",
+                                wal_result["checkpointed"],
+                                wal_result["busy"],
+                                wal_result["log"],
+                            )
                     except Exception:  # noqa: BLE001
                         log.warning("wal-checkpoint tick failed", exc_info=True)
 
