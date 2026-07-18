@@ -1135,6 +1135,101 @@ def test_narrow_artifact_paths_empty_artifact_paths_returns_empty() -> None:
     assert result == []
 
 
+# ── #1248: narrow_artifact_paths disk-verification tests ─────────────────────
+
+
+def test_narrow_artifact_paths_worktree_falls_back_when_absent(
+    tmp_path: Path,
+) -> None:
+    """When named binary is absent on disk, the original broad glob is kept.
+
+    #1248: text-matching alone is insufficient — if tui_submenu appears in
+    SMOKE_TESTS but hasn't been built yet, pinning the stash to that path
+    produces a 0-copy stash silently.  Passing worktree= forces a disk check.
+    """
+    from coord.agent import narrow_artifact_paths
+
+    # worktree exists but tui_submenu was never built
+    worktree = tmp_path / "worktree"
+    (worktree / "target" / "debug" / "examples").mkdir(parents=True)
+
+    result = narrow_artifact_paths(
+        ["target/debug/examples/tui_*"],
+        ["tui_submenu — run it — menu should appear"],
+        worktree=worktree,
+    )
+    # name matches text but missing on disk → keep broad glob
+    assert result == ["target/debug/examples/tui_*"]
+
+
+def test_narrow_artifact_paths_worktree_narrows_when_present(
+    tmp_path: Path,
+) -> None:
+    """When named binary exists on disk, the glob IS narrowed to that path.
+
+    #1248: the disk check must not block narrowing when the binary is present.
+    """
+    from coord.agent import narrow_artifact_paths
+
+    worktree = tmp_path / "worktree"
+    examples = worktree / "target" / "debug" / "examples"
+    examples.mkdir(parents=True)
+    # build the binary so it's present on disk
+    (examples / "tui_submenu").write_bytes(b"\x7fELF" + b"\x00" * 200)
+
+    result = narrow_artifact_paths(
+        ["target/debug/examples/tui_*"],
+        ["tui_submenu — run it — menu should appear"],
+        worktree=worktree,
+    )
+    assert result == ["target/debug/examples/tui_submenu"]
+    assert "target/debug/examples/tui_*" not in result
+
+
+def test_narrow_artifact_paths_worktree_partial_on_disk(
+    tmp_path: Path,
+) -> None:
+    """Only on-disk names are used when the smoke tests name multiple binaries.
+
+    #1248: if SMOKE_TESTS names tui_submenu and tui_colors but only tui_submenu
+    was actually built, the narrowed result contains only tui_submenu (not the
+    absent tui_colors and not the broad glob).
+    """
+    from coord.agent import narrow_artifact_paths
+
+    worktree = tmp_path / "worktree"
+    examples = worktree / "target" / "debug" / "examples"
+    examples.mkdir(parents=True)
+    (examples / "tui_submenu").write_bytes(b"\x7fELF" + b"\x00" * 200)
+    # tui_colors intentionally NOT created on disk
+
+    result = narrow_artifact_paths(
+        ["target/debug/examples/tui_*"],
+        ["tui_submenu and tui_colors — run them — should render"],
+        worktree=worktree,
+    )
+    # only the on-disk binary is in the result
+    assert result == ["target/debug/examples/tui_submenu"]
+    assert "target/debug/examples/tui_colors" not in result
+    assert "target/debug/examples/tui_*" not in result
+
+
+def test_narrow_artifact_paths_no_worktree_preserves_text_only_behaviour() -> None:
+    """worktree=None (default) keeps the original text-only matching.
+
+    #1248: backward compat — interactive/remote callers that pass no worktree
+    must not be broken by the new parameter.
+    """
+    from coord.agent import narrow_artifact_paths
+
+    # No worktree → text match wins even though no real files exist
+    result = narrow_artifact_paths(
+        ["target/debug/examples/tui_*"],
+        ["tui_submenu — run it — check menu"],
+    )
+    assert result == ["target/debug/examples/tui_submenu"]
+
+
 # ── #982: stash integration tests ────────────────────────────────────────────
 
 def test_stash_artifacts_scoped_spec_stashes_only_named_binary(
@@ -1933,6 +2028,125 @@ def test_stash_artifacts_for_branch_no_warning_under_threshold(tmp_path: Path) -
 
     assert count == 1
     assert "WARNING" not in log_path.read_text()
+
+
+# ── #1248: stash 0-copy robustness tests ─────────────────────────────────────
+
+
+def test_stash_artifacts_for_branch_zero_copy_no_marker(tmp_path: Path) -> None:
+    """A 0-copy stash must not write the .assignment_id marker.
+
+    #1248: writing a marker on an empty stash is misleading — the manifest
+    endpoint would surface a build that copied nothing.
+    """
+    from coord.agent import stash_artifacts_for_branch
+
+    wt = tmp_path / "worktree"
+    wt.mkdir(parents=True)
+    # pattern resolves to nothing — no files in worktree match
+
+    state_dir = tmp_path / "state"
+    count = stash_artifacts_for_branch(
+        worktree_path=wt,
+        branch="issue-1248-zero",
+        repo_name="myrepo",
+        patterns=["target/debug/nonexistent_binary"],
+        state_dir=state_dir,
+        assignment_id="aid-zero",
+    )
+
+    assert count == 0
+    stash_dir = state_dir / "artifacts" / "myrepo" / "issue-1248-zero"
+    # stash dir was created by mkdir(parents=True, exist_ok=True) — that's fine
+    assert not (stash_dir / ".assignment_id").exists(), (
+        ".assignment_id must not be written on a 0-copy stash"
+    )
+
+
+def test_stash_artifacts_for_branch_zero_copy_warning_logged(tmp_path: Path) -> None:
+    """A 0-copy stash appends a '# stash WARNING: 0 files matched' line.
+
+    #1248: the worker log should be loud about a missed stash so the operator
+    can diagnose a mis-configured artifact_paths without digging through the
+    stash directory.
+    """
+    from coord.agent import stash_artifacts_for_branch
+
+    wt = tmp_path / "worktree"
+    wt.mkdir(parents=True)
+
+    log_path = tmp_path / "assignment.log"
+    log_path.write_text("")
+
+    count = stash_artifacts_for_branch(
+        worktree_path=wt,
+        branch="issue-1248-warn",
+        repo_name="myrepo",
+        patterns=["target/debug/ghost_binary"],
+        state_dir=tmp_path / "state",
+        assignment_id="aid-warn",
+        log_path=str(log_path),
+    )
+
+    assert count == 0
+    log_text = log_path.read_text()
+    assert "# stash WARNING" in log_text
+    assert "0 files matched" in log_text
+    assert "ghost_binary" in log_text
+
+
+def test_stash_artifacts_for_branch_nonzero_copy_marker_written(tmp_path: Path) -> None:
+    """When files ARE copied the .assignment_id marker is still written.
+
+    #1248: the >0-copy path must be byte-for-byte identical to before.
+    """
+    from coord.agent import stash_artifacts_for_branch
+
+    wt = tmp_path / "worktree"
+    (wt / "target" / "debug").mkdir(parents=True)
+    (wt / "target" / "debug" / "mybin").write_bytes(b"\x7fELF" + b"\x00" * 200)
+
+    state_dir = tmp_path / "state"
+    count = stash_artifacts_for_branch(
+        worktree_path=wt,
+        branch="issue-1248-ok",
+        repo_name="myrepo",
+        patterns=["target/debug/mybin"],
+        state_dir=state_dir,
+        assignment_id="aid-ok",
+    )
+
+    assert count == 1
+    stash_dir = state_dir / "artifacts" / "myrepo" / "issue-1248-ok"
+    assert (stash_dir / ".assignment_id").read_text() == "aid-ok"
+
+
+def test_stash_artifacts_for_branch_zero_copy_no_warning_without_log(
+    tmp_path: Path,
+) -> None:
+    """A 0-copy stash with no log_path provided must not raise.
+
+    The warning path is only exercised when log_path is set; without it the
+    function should return 0 silently.
+    """
+    from coord.agent import stash_artifacts_for_branch
+
+    wt = tmp_path / "worktree"
+    wt.mkdir(parents=True)
+
+    count = stash_artifacts_for_branch(
+        worktree_path=wt,
+        branch="issue-1248-nolog",
+        repo_name="myrepo",
+        patterns=["target/debug/nobody"],
+        state_dir=tmp_path / "state",
+        assignment_id="aid-nolog",
+    )
+
+    assert count == 0
+    # no exception, no marker
+    stash_dir = tmp_path / "state" / "artifacts" / "myrepo" / "issue-1248-nolog"
+    assert not (stash_dir / ".assignment_id").exists()
 
 
 def test_sanitize_branch_replaces_slashes(tmp_path: Path) -> None:

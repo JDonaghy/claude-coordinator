@@ -742,6 +742,7 @@ def _strip_debug_symbols(path: Path) -> bool:
 def narrow_artifact_paths(
     artifact_paths: list[str],
     smoke_tests: list[str] | None,
+    worktree: Path | None = None,
 ) -> list[str]:
     """Narrow glob-containing *artifact_paths* to the examples named in *smoke_tests*.
 
@@ -757,6 +758,16 @@ def narrow_artifact_paths(
       is internal (``SMOKE_TESTS: (none — change is internal)``).
     * No candidate name extracted from *smoke_tests* matches any glob in the
       list — nothing is named, so narrowing would be wrong.
+
+    When *worktree* is provided, each text-matched candidate path is verified
+    to exist on disk inside *worktree* before narrowing is accepted.  If none
+    of the matched names are present on disk for a given glob, the original
+    broad glob is kept unchanged for that entry — this prevents the stash from
+    being pinned to non-existent paths when the SMOKE_TESTS block names
+    binaries that the build hasn't produced yet (or under a different name).
+    When *worktree* is ``None``, the text-only matching behaviour is preserved
+    for backward compatibility (interactive/remote backstop callers that do
+    not have access to the worktree path).
 
     Token extraction: every word-boundary-delimited token starting with a
     letter (``[a-zA-Z][a-zA-Z0-9_-]*[a-zA-Z0-9]``) is a candidate.  Only
@@ -779,6 +790,10 @@ def narrow_artifact_paths(
     same: the stash captures 1-2 relevant example binaries instead of every
     file matching a broad glob (e.g. ``tui_*`` matching ~72 Cargo debug
     examples).
+
+    #1248: the *worktree* parameter guards against pinning the stash to paths
+    that exist only in SMOKE_TESTS prose but not yet on disk, which caused
+    ``stash_artifacts_for_branch`` to copy 0 files silently.
     """
     if not smoke_tests or not artifact_paths:
         return list(artifact_paths)
@@ -825,9 +840,29 @@ def narrow_artifact_paths(
         )
 
         if matches:
-            any_narrowed = True
-            for m in matches:
-                narrowed.append(f"{dir_part}/{m}" if dir_part else m)
+            if worktree is not None:
+                # #1248: disk-verify each text-matched name.  Only accept the
+                # narrowed set when at least one file actually exists on disk;
+                # if none do, fall back to the broad glob so the stash doesn't
+                # end up empty because of a SMOKE_TESTS name that hasn't been
+                # built yet (wrong spelling, renamed binary, etc.).
+                on_disk = [
+                    name
+                    for name in matches
+                    if (worktree / (f"{dir_part}/{name}" if dir_part else name)).exists()
+                ]
+                if on_disk:
+                    any_narrowed = True
+                    for m in on_disk:
+                        narrowed.append(f"{dir_part}/{m}" if dir_part else m)
+                else:
+                    # No text-matched name exists on disk → keep original glob.
+                    narrowed.append(path_glob)
+            else:
+                # No worktree provided — text-only matching (backward compat).
+                any_narrowed = True
+                for m in matches:
+                    narrowed.append(f"{dir_part}/{m}" if dir_part else m)
         else:
             # No candidate matched this glob — leave it unchanged so the
             # fallback stashes all files for unscoped patterns.
@@ -977,7 +1012,9 @@ def stash_artifacts_for_branch(
 
     # Write the assignment_id marker so the manifest endpoint can surface
     # which build produced this stash without iterating all assignments.
-    if assignment_id is not None:
+    # #1248: skip the marker when nothing was copied — an empty stash must
+    # not be recorded as a valid build artifact set.
+    if assignment_id is not None and copied > 0:
         try:
             (stash_dir / ".assignment_id").write_text(assignment_id)
         except OSError:
@@ -988,6 +1025,16 @@ def stash_artifacts_for_branch(
             log_path,
             f"# stash: {copied} artifact(s) → {stash_dir}\n",
         )
+        # #1248: a 0-copy stash is suspicious — the patterns resolved to
+        # nothing.  Emit a loud WARNING so it's visible in the assignment log
+        # (mirror the oversized-stash WARNING that already lives below).
+        if copied == 0:
+            _append_log_line(
+                log_path,
+                f"# stash WARNING: 0 files matched {patterns!r} in "
+                f"{worktree_path} — check artifact_paths config and that "
+                "the build actually produced the expected outputs.\n",
+            )
         try:
             total_bytes = sum(
                 f.stat().st_size
@@ -2130,7 +2177,9 @@ class AgentServer:
             from coord.progress import parse_smoke_tests_from_log  # noqa: PLC0415
 
             smoke_tests = parse_smoke_tests_from_log(assignment.log_path)
-        patterns = narrow_artifact_paths(patterns, smoke_tests)
+        patterns = narrow_artifact_paths(
+            patterns, smoke_tests, worktree=Path(assignment.worktree_path)
+        )
 
         copied = stash_artifacts_for_branch(
             worktree_path=Path(assignment.worktree_path),
