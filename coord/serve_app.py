@@ -351,6 +351,84 @@ def _clean_worktrees_tick(config: Config) -> list[dict]:
     return results
 
 
+def _wal_checkpoint_tick(config: Config) -> dict:  # noqa: ARG001  (config reserved for future)
+    """Run ``PRAGMA wal_checkpoint(TRUNCATE)`` against the live coord.db.
+
+    SQLite's passive autocheckpoint (triggered automatically when the WAL
+    reaches 1000 pages) transfers frames from the WAL into the main DB but
+    **never truncates** the WAL file back to zero — it merely resets the
+    write position.  Under continuous ``/board`` polling (e.g. the TUI's
+    2-second refresh) there is always an open reader, so the passive
+    checkpoint repeatedly hits its "reader is still active" guard and the
+    WAL grows unboundedly, reaching tens of MB and burning CPU in repeated
+    failed checkpoint attempts.
+
+    ``PRAGMA wal_checkpoint(TRUNCATE)`` waits until no readers are in the
+    WAL, then truncates the file to zero rather than leaving a filled-but-
+    active region.  On a busy daemon a single 2-second polling gap is all
+    that's needed — the TRUNCATE mode succeeds in the tiny window between
+    two consecutive ``/board`` reads.
+
+    Called on a slow cadence by ``_tick_loop`` (default hourly; env
+    ``COORD_WAL_CHECKPOINT_INTERVAL``, 0 disables).  A failure is logged
+    and swallowed — a missed checkpoint only affects disk/CPU, not
+    correctness.
+
+    Returns a dict with keys ``busy`` (1 if blocked by an active reader,
+    0 otherwise), ``log`` (WAL frames written since last checkpoint), and
+    ``checkpointed`` (frames successfully checkpointed), matching the
+    three integers SQLite returns from ``PRAGMA wal_checkpoint``.  On an
+    in-memory DB (tests) WAL mode is not enabled, so the result is
+    ``{"busy": 0, "log": 0, "checkpointed": 0, "skipped": True}``.
+
+    Extracted as a module-level function so tests can call it directly
+    without wiring up the async ``_tick_loop`` infrastructure (mirrors
+    ``_reconcile_merges_tick`` / ``_sync_issues_tick``).
+    """
+    import logging  # noqa: PLC0415
+
+    from coord.db import get_connection  # noqa: PLC0415
+
+    log = logging.getLogger("coord.serve")
+    conn = get_connection()
+
+    # WAL mode is not available on :memory: databases (used in tests).
+    # Detect by querying the current journal mode and skip gracefully.
+    try:
+        journal_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+    except Exception:  # noqa: BLE001
+        journal_mode = "unknown"
+
+    if journal_mode != "wal":
+        log.debug(
+            "wal-checkpoint: journal_mode=%r — skipping (WAL not active)",
+            journal_mode,
+        )
+        return {"busy": 0, "log": 0, "checkpointed": 0, "skipped": True}
+
+    try:
+        row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        busy, log_pages, checkpointed = (row[0], row[1], row[2]) if row else (0, 0, 0)
+    except Exception:  # noqa: BLE001— a missed checkpoint is not fatal
+        log.warning("wal-checkpoint tick failed", exc_info=True)
+        return {"busy": -1, "log": 0, "checkpointed": 0, "error": True}
+
+    if busy:
+        log.debug(
+            "wal-checkpoint: TRUNCATE blocked by active reader "
+            "(log=%d, checkpointed=%d) — will retry next tick",
+            log_pages,
+            checkpointed,
+        )
+    else:
+        log.debug(
+            "wal-checkpoint: TRUNCATE complete (log=%d, checkpointed=%d)",
+            log_pages,
+            checkpointed,
+        )
+    return {"busy": busy, "log": log_pages, "checkpointed": checkpointed, "skipped": False}
+
+
 def _reconcile_merges_tick(config: Config) -> list[str]:
     """Load the board, run ``reconcile_board_merges``, save the result.
 
@@ -3867,8 +3945,18 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         # pass.
         last_worktree_clean = 0.0
 
+        # WAL checkpoint on a slow cadence (default hourly; 0 disables).
+        # Prevents unbounded WAL growth under continuous /board polling.
+        try:
+            wal_checkpoint_interval = float(
+                os.environ.get("COORD_WAL_CHECKPOINT_INTERVAL", "3600")
+            )
+        except ValueError:
+            wal_checkpoint_interval = 3600.0
+        last_wal_checkpoint = _time.monotonic()
+
         async def _tick_loop() -> None:
-            nonlocal last_housekeeping, last_merge_reconcile, last_worktree_clean
+            nonlocal last_housekeeping, last_merge_reconcile, last_worktree_clean, last_wal_checkpoint
             from coord.reconcile import reconcile_completed_assignments  # noqa: PLC0415
             from coord import merge_queue as _mq  # noqa: PLC0415
 
@@ -4074,6 +4162,25 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                                 )
                     except Exception:  # noqa: BLE001
                         log.warning("worktree clean tick failed", exc_info=True)
+                # Step 8: WAL checkpoint on a slow cadence (default hourly;
+                # COORD_WAL_CHECKPOINT_INTERVAL=0 disables).  Keeps the WAL
+                # from growing unboundedly under continuous /board polling —
+                # SQLite's passive autocheckpoint never truncates while an
+                # open reader exists; TRUNCATE mode waits for the next quiet
+                # moment between requests and then zeroes the file.  A
+                # missed checkpoint only affects disk/CPU, not correctness,
+                # so an error is logged and swallowed.  Runs LAST so that
+                # the higher-priority reconcile/drain steps above are never
+                # delayed by I/O here.
+                if wal_checkpoint_interval > 0 and (
+                    _time.monotonic() - last_wal_checkpoint
+                    >= wal_checkpoint_interval
+                ):
+                    last_wal_checkpoint = _time.monotonic()
+                    try:
+                        await run_in_threadpool(_wal_checkpoint_tick, config)
+                    except Exception:  # noqa: BLE001
+                        log.warning("wal-checkpoint tick failed", exc_info=True)
 
         @contextlib.asynccontextmanager
         async def _ctx(_a):  # noqa: ANN202
