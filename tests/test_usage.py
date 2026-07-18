@@ -19,7 +19,9 @@ from coord.usage import (
     build_session_usage,
     collect_usage,
     format_burn_rate_line,
+    format_usage_by_group,
     format_usage_by_issue,
+    format_usage_by_time,
     format_usage_issue_drill,
     format_usage_report,
     parse_usage_from_log,
@@ -783,3 +785,369 @@ class TestUsageCommandByIssueAndDrillFlags:
         assert result.exit_code == 2
         assert "Traceback" not in result.output
         assert "invalid 'since' spec" in result.output
+
+
+# ── #1119 CLI-2: cross-repo spend + weekly/monthly windows + time-spent ─────
+#
+# The rows/pricing below are the ms-37 Gate-A contract fixture
+# (tests/acceptance/ms-37/contract.md "Fixture — seeded board"/"pricing
+# table"), reproduced inline here (this file may not import from
+# tests/acceptance/** — those fixtures are sealed / worker-read-only) so the
+# expected numbers below are traceable straight to the contract's Mocks 3 & 4.
+
+_MS37_PRICING = {
+    "sonnet": {"input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_creation": 3.75},
+    "opus": {"input": 15.00, "output": 75.00, "cache_read": 1.50, "cache_creation": 18.75},
+}
+
+_MS37_ROWS = [
+    {  # L1
+        "issue_number": 501, "issue_title": "Alpha feature", "repo_name": "alpha",
+        "type": "work", "model": "sonnet", "is_interactive": False, "status": "merged",
+        "cost_usd": 0.50,
+        "input_tokens": 10_000, "output_tokens": 100_000,
+        "cache_read_tokens": 1_000_000, "cache_creation_tokens": 0,
+        "dispatched_at": 0.0, "finished_at": 600.0,
+    },
+    {  # L2
+        "issue_number": 501, "issue_title": "Alpha feature", "repo_name": "alpha",
+        "type": "review", "model": "sonnet", "is_interactive": True, "status": "done",
+        "cost_usd": None,
+        "input_tokens": 2_000, "output_tokens": 50_000,
+        "cache_read_tokens": 500_000, "cache_creation_tokens": 0,
+        "dispatched_at": 1_000.0, "finished_at": 1_300.0,
+    },
+    {  # L3
+        "issue_number": 502, "issue_title": "Beta feature", "repo_name": "beta",
+        "type": "work", "model": "opus", "is_interactive": False, "status": "merged",
+        "cost_usd": 2.00,
+        "input_tokens": 20_000, "output_tokens": 200_000,
+        "cache_read_tokens": 2_000_000, "cache_creation_tokens": 0,
+        "dispatched_at": 2_000.0, "finished_at": 3_200.0,
+    },
+    {  # L4
+        "issue_number": 502, "issue_title": "Beta feature", "repo_name": "beta",
+        "type": "smoke", "model": "sonnet", "is_interactive": True, "status": "done",
+        "cost_usd": None,
+        "input_tokens": 4_000, "output_tokens": 80_000,
+        "cache_read_tokens": 800_000, "cache_creation_tokens": 0,
+        "dispatched_at": 4_000.0, "finished_at": 4_400.0,
+    },
+    {  # L5 — unknown model
+        "issue_number": 502, "issue_title": "Beta feature", "repo_name": "beta",
+        "type": "chat", "model": "(unknown)", "is_interactive": True, "status": "done",
+        "cost_usd": None,
+        "input_tokens": 1_000, "output_tokens": 30_000,
+        "cache_read_tokens": 300_000, "cache_creation_tokens": 0,
+        "dispatched_at": 5_000.0, "finished_at": 5_200.0,
+    },
+    {  # L6 — running (no finished_at)
+        "issue_number": 502, "issue_title": "Beta feature", "repo_name": "beta",
+        "type": "work", "model": "sonnet", "is_interactive": False, "status": "running",
+        "cost_usd": None,
+        "input_tokens": 0, "output_tokens": 0,
+        "cache_read_tokens": 0, "cache_creation_tokens": 0,
+        "dispatched_at": 6_000.0, "finished_at": None,
+    },
+]
+
+
+def _ms37_rows() -> list[dict]:
+    return [dict(r) for r in _MS37_ROWS]
+
+
+class TestFormatUsageByGroup:
+    """``format_usage_by_group`` — contract Mock 3 (``coord usage --by repo``)."""
+
+    def test_by_repo_reproduces_mock3_values(self) -> None:
+        from coord.usage_rollup import Window, aggregate
+
+        window = Window(start=0.0, end=100_000.0, label="today")
+        result = aggregate(_ms37_rows(), by="repo", window=window, pricing=_MS37_PRICING)
+        result["groups"].sort(key=lambda g: g["cost_total"], reverse=True)
+        out = format_usage_by_group(result, window.label, "repo")
+
+        assert "USAGE — by repo — window: today" in out
+
+        beta = next(line for line in out.splitlines() if "beta" in line)
+        assert "$2.0000" in beta          # captured (L3)
+        assert "~$1.4520" in beta         # est (L4)
+        assert "$3.4520" in beta          # total
+        assert "310k" in beta and "3.1M" in beta
+        assert "30m00s" in beta
+
+        alpha = next(line for line in out.splitlines() if "alpha" in line)
+        assert "$0.5000" in alpha
+        assert "~$0.9060" in alpha
+        assert "$1.4060" in alpha
+        assert "150k" in alpha and "1.5M" in alpha
+        assert "15m00s" in alpha
+
+        # beta ($3.4520) sorts before alpha ($1.4060) — desc by total.
+        assert out.index("beta") < out.index("alpha")
+
+        # grand-total footer: $4.8580 total, 460k out / 4.6M cache, 45m00s, 1 in progress.
+        assert "$4.8580" in out
+        assert "460k" in out and "4.6M" in out
+        assert "45m00s" in out
+        assert "1 in progress" in out
+
+    def test_by_repo_issue_count_is_distinct_issues_in_group(self) -> None:
+        from coord.usage_rollup import Window, aggregate
+
+        window = Window(start=0.0, end=100_000.0, label="today")
+        result = aggregate(_ms37_rows(), by="repo", window=window, pricing=_MS37_PRICING)
+        beta_group = next(g for g in result["groups"] if g["key"] == "beta")
+        # beta has 4 legs (L3-L6) but they're all issue #502 → 1 distinct issue.
+        assert len({row.get("issue_number") for row in beta_group["rows"]}) == 1
+
+    def test_by_week_or_month_dim_renders_bucket_key_not_repo(self) -> None:
+        from coord.usage_rollup import Window, aggregate
+
+        window = Window(start=0.0, end=100_000.0, label="since 8w")
+        result = aggregate(_ms37_rows(), by="week", window=window, pricing=_MS37_PRICING)
+        out = format_usage_by_group(result, window.label, "week")
+        assert "USAGE — by week — window: since 8w" in out
+        # All six legs share one bucket (they're within the same ~2h span).
+        assert len(result["groups"]) == 1
+
+
+class TestFormatUsageByTime:
+    """``format_usage_by_time`` — contract Mock 4 (``coord usage --by-time``)."""
+
+    def test_by_stage_reproduces_mock4_values(self) -> None:
+        from coord.usage_rollup import Window, aggregate
+
+        window = Window(start=0.0, end=100_000.0, label="today")
+        result = aggregate(_ms37_rows(), by="stage", window=window, pricing=_MS37_PRICING)
+        result["groups"].sort(key=lambda g: g["duration_secs"], reverse=True)
+        out = format_usage_by_time(result, window.label, "stage")
+
+        assert "USAGE — time by stage — window: today" in out
+
+        work = next(line for line in out.splitlines() if line.strip().startswith("work"))
+        assert "30m00s" in work and "66.7%" in work and "1 in progress" in work
+
+        smoke = next(line for line in out.splitlines() if line.strip().startswith("smoke"))
+        assert "6m40s" in smoke and "14.8%" in smoke
+
+        review = next(line for line in out.splitlines() if line.strip().startswith("review"))
+        assert "5m00s" in review and "11.1%" in review
+
+        chat = next(line for line in out.splitlines() if line.strip().startswith("chat"))
+        assert "3m20s" in chat and "7.4%" in chat
+
+        # work (30m) sorts first — desc by time.
+        assert out.index("work") < out.index("smoke") < out.index("review") < out.index("chat")
+
+        assert "total active 45m00s" in out
+        assert "--by-time --by issue" in out
+
+    def test_by_issue_dim_ranks_issues_and_hints_back_to_stage(self) -> None:
+        from coord.usage_rollup import Window, aggregate
+
+        window = Window(start=0.0, end=100_000.0, label="today")
+        result = aggregate(_ms37_rows(), by="issue", window=window, pricing=_MS37_PRICING)
+        result["groups"].sort(key=lambda g: g["duration_secs"], reverse=True)
+        out = format_usage_by_time(result, window.label, "issue")
+
+        assert "USAGE — time by issue — window: today" in out
+        # #502 (L3+L4+L5+L6 = 1800s) outranks #501 (L1+L2 = 900s).
+        assert out.index("#502") < out.index("#501")
+        assert "--by-time → time by stage" in out
+
+
+class TestUsageCommandByRepoAndByTimeFlags:
+    """CLI-level wiring: ``coord usage --by repo`` / ``--by-time`` (#1119)."""
+
+    @pytest.fixture
+    def coord_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, coord_db) -> Path:
+        import coord.usage as usage_mod
+        monkeypatch.setattr(usage_mod, "COORD_DIR", tmp_path)
+        monkeypatch.setattr(usage_mod, "LOGS_DIR", tmp_path / "logs")
+        return tmp_path
+
+    def _cfg(self, tmp_path: Path, valid_config_yaml: str) -> Path:
+        cfg_path = tmp_path / "coordinator.yml"
+        cfg_path.write_text(valid_config_yaml)
+        return cfg_path
+
+    def test_by_repo_cli_reproduces_mock3(
+        self, coord_dir: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, valid_config_yaml: str
+    ) -> None:
+        import coord.usage as usage_mod
+
+        # No --today/--week/--month/--since → unbounded window, so the fixed
+        # (non-"now"-relative) fixture timestamps are all in-window.
+        monkeypatch.setattr(usage_mod, "fetch_usage_rows", lambda *a, **k: _ms37_rows())
+        cfg_path = self._cfg(tmp_path, valid_config_yaml)
+
+        result = CliRunner().invoke(main, ["usage", "--config", str(cfg_path), "--by", "repo"])
+        assert result.exit_code == 0, result.output
+        assert "USAGE — by repo" in result.output
+        assert "$3.4520" in result.output  # beta total
+        assert "$1.4060" in result.output  # alpha total
+        assert result.output.index("beta") < result.output.index("alpha")
+
+    def test_by_time_cli_reproduces_mock4(
+        self, coord_dir: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, valid_config_yaml: str
+    ) -> None:
+        import coord.usage as usage_mod
+
+        monkeypatch.setattr(usage_mod, "fetch_usage_rows", lambda *a, **k: _ms37_rows())
+        cfg_path = self._cfg(tmp_path, valid_config_yaml)
+
+        result = CliRunner().invoke(main, ["usage", "--config", str(cfg_path), "--by-time"])
+        assert result.exit_code == 0, result.output
+        assert "USAGE — time by stage" in result.output
+        assert "66.7%" in result.output
+        assert "total active 45m00s" in result.output
+
+    def test_by_time_by_issue_cli(
+        self, coord_dir: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, valid_config_yaml: str
+    ) -> None:
+        import coord.usage as usage_mod
+
+        monkeypatch.setattr(usage_mod, "fetch_usage_rows", lambda *a, **k: _ms37_rows())
+        cfg_path = self._cfg(tmp_path, valid_config_yaml)
+
+        result = CliRunner().invoke(
+            main, ["usage", "--config", str(cfg_path), "--by-time", "--by", "issue"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "USAGE — time by issue" in result.output
+        assert result.output.index("#502") < result.output.index("#501")
+
+    def test_sort_tokens_reorders_by_repo(
+        self, coord_dir: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, valid_config_yaml: str
+    ) -> None:
+        import coord.usage as usage_mod
+
+        # repoA: high captured cost, low tokens. repoB: no captured cost, huge
+        # token count (so tokens-sort must flip cost-sort's default order).
+        rows = [
+            {
+                "issue_number": 1, "repo_name": "repoA", "type": "work", "model": "sonnet",
+                "is_interactive": False, "status": "merged", "cost_usd": 9.0,
+                "input_tokens": 10, "output_tokens": 10, "cache_read_tokens": 0,
+                "cache_creation_tokens": 0, "dispatched_at": 0.0, "finished_at": 10.0,
+            },
+            {
+                "issue_number": 2, "repo_name": "repoB", "type": "work", "model": "sonnet",
+                "is_interactive": False, "status": "merged", "cost_usd": 0.01,
+                "input_tokens": 5_000_000, "output_tokens": 5_000_000, "cache_read_tokens": 0,
+                "cache_creation_tokens": 0, "dispatched_at": 0.0, "finished_at": 10.0,
+            },
+        ]
+        monkeypatch.setattr(usage_mod, "fetch_usage_rows", lambda *a, **k: rows)
+        cfg_path = self._cfg(tmp_path, valid_config_yaml)
+
+        by_cost = CliRunner().invoke(main, ["usage", "--config", str(cfg_path), "--by", "repo"])
+        assert by_cost.exit_code == 0, by_cost.output
+        assert by_cost.output.index("repoA") < by_cost.output.index("repoB")
+
+        by_tokens = CliRunner().invoke(
+            main, ["usage", "--config", str(cfg_path), "--by", "repo", "--sort", "tokens"]
+        )
+        assert by_tokens.exit_code == 0, by_tokens.output
+        assert by_tokens.output.index("repoB") < by_tokens.output.index("repoA")
+
+    def test_sort_cost_overrides_by_times_default_time_ranking(
+        self, coord_dir: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, valid_config_yaml: str
+    ) -> None:
+        """``--by-time`` defaults to ranking by duration; an explicit
+        ``--sort cost`` must override that default (#1119 requirement 3:
+        "--sort cost|tokens|time selects the ranking key across all
+        views")."""
+        import coord.usage as usage_mod
+
+        # stageLong: long duration, no cost. stageRich: short duration, high
+        # captured cost. Time-ranking puts stageLong first; cost-ranking
+        # flips it.
+        rows = [
+            {
+                "issue_number": 1, "repo_name": "r", "type": "stageLong", "model": "sonnet",
+                "is_interactive": False, "status": "done", "cost_usd": None,
+                "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0,
+                "cache_creation_tokens": 0, "dispatched_at": 0.0, "finished_at": 10_000.0,
+            },
+            {
+                "issue_number": 2, "repo_name": "r", "type": "stageRich", "model": "sonnet",
+                "is_interactive": False, "status": "done", "cost_usd": 50.0,
+                "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0,
+                "cache_creation_tokens": 0, "dispatched_at": 0.0, "finished_at": 10.0,
+            },
+        ]
+        monkeypatch.setattr(usage_mod, "fetch_usage_rows", lambda *a, **k: rows)
+        cfg_path = self._cfg(tmp_path, valid_config_yaml)
+
+        by_time_default = CliRunner().invoke(main, ["usage", "--config", str(cfg_path), "--by-time"])
+        assert by_time_default.exit_code == 0, by_time_default.output
+        assert by_time_default.output.index("stageLong") < by_time_default.output.index("stageRich")
+
+        by_cost = CliRunner().invoke(
+            main, ["usage", "--config", str(cfg_path), "--by-time", "--sort", "cost"]
+        )
+        assert by_cost.exit_code == 0, by_cost.output
+        assert by_cost.output.index("stageRich") < by_cost.output.index("stageLong")
+
+    def test_week_and_month_flags_are_mutually_exclusive(
+        self, coord_dir: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, valid_config_yaml: str
+    ) -> None:
+        import coord.usage as usage_mod
+
+        monkeypatch.setattr(usage_mod, "fetch_usage_rows", lambda *a, **k: [])
+        cfg_path = self._cfg(tmp_path, valid_config_yaml)
+
+        result = CliRunner().invoke(
+            main, ["usage", "--config", str(cfg_path), "--week", "--month", "--by", "repo"]
+        )
+        assert result.exit_code == 2
+        assert "Traceback" not in result.output
+        assert "--today" in result.output or "at most one" in result.output.lower()
+
+    def test_month_by_repo_smoke(
+        self, coord_dir: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, valid_config_yaml: str
+    ) -> None:
+        """Acceptance: ``coord usage --month --by repo`` runs against the
+        current month and groups by repo."""
+        import datetime as _dt
+
+        import coord.usage as usage_mod
+
+        now = _dt.datetime.now()
+        row = dict(_MS37_ROWS[0])
+        row["dispatched_at"] = now.timestamp()
+        row["finished_at"] = now.timestamp() + 60
+        monkeypatch.setattr(usage_mod, "fetch_usage_rows", lambda *a, **k: [row])
+        cfg_path = self._cfg(tmp_path, valid_config_yaml)
+
+        result = CliRunner().invoke(
+            main, ["usage", "--config", str(cfg_path), "--month", "--by", "repo"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "window: month" in result.output
+        assert "alpha" in result.output
+
+    def test_since_8w_by_week_smoke(
+        self, coord_dir: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, valid_config_yaml: str
+    ) -> None:
+        """Acceptance: ``coord usage --since 8w --by week`` produces a
+        per-week spend series."""
+        import datetime as _dt
+
+        import coord.usage as usage_mod
+
+        now = _dt.datetime.now()
+        row = dict(_MS37_ROWS[0])
+        row["dispatched_at"] = now.timestamp()
+        row["finished_at"] = now.timestamp() + 60
+        monkeypatch.setattr(usage_mod, "fetch_usage_rows", lambda *a, **k: [row])
+        cfg_path = self._cfg(tmp_path, valid_config_yaml)
+
+        result = CliRunner().invoke(
+            main, ["usage", "--config", str(cfg_path), "--since", "8w", "--by", "week"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "USAGE — by week" in result.output
+        assert "window: since 8w" in result.output
