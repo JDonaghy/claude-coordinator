@@ -3,6 +3,7 @@ machine reporting. Extracted from coord/cli.py (#747)."""
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -763,13 +764,23 @@ def _diagnose_orphan_worktrees(config_path: Path, *, dry_run: bool) -> None:
 @click.option(
     "--today",
     is_flag=True,
-    help="Limit --by-issue / --issue to the local calendar day (#1115).",
+    help="Limit the view to the local calendar day (#1115).",
+)
+@click.option(
+    "--week",
+    is_flag=True,
+    help="Limit the view to the current ISO week, Monday 00:00 -> next Monday (#1119).",
+)
+@click.option(
+    "--month",
+    is_flag=True,
+    help="Limit the view to the current calendar month (#1119).",
 )
 @click.option(
     "--since",
     "since_spec",
     default=None,
-    help="Limit --by-issue / --issue to legs since <ISO date | Nd | Nh> (#1115).",
+    help="Limit the view to legs since <ISO date | Nd | Nh> (#1115).",
 )
 @click.option(
     "--by-issue",
@@ -785,28 +796,64 @@ def _diagnose_orphan_worktrees(config_path: Path, *, dry_run: bool) -> None:
     help="Per-stage drill-down for one issue number — all legs, oldest-first (#1115).",
 )
 @click.option(
+    "--by",
+    "by_dim",
+    type=click.Choice(["repo", "week", "month", "issue"]),
+    default=None,
+    help="Cross-cut daemon-board usage by dimension: repo (cross-repo rollup), "
+    "week/month (time-bucketed spend series), or issue (same as --by-issue) (#1119).",
+)
+@click.option(
+    "--by-time",
+    "by_time",
+    is_flag=True,
+    help="Time-spent view: rank wall-clock by stage-type, or by issue when combined "
+    "with --by issue (#1119).",
+)
+@click.option(
     "--sort",
     "sort_by",
-    type=click.Choice(["cost", "tokens"]),
-    default="cost",
-    show_default=True,
-    help="Sort order for --by-issue (always descending).",
+    type=click.Choice(["cost", "tokens", "time"]),
+    default=None,
+    help="Sort order (always descending). Default: cost for rollup views, time for --by-time.",
 )
 def usage(
     config_path: Path,
     remote: bool,
     timeout: float,
     today: bool,
+    week: bool,
+    month: bool,
     since_spec: str | None,
     by_issue: bool,
     issue_number: int | None,
-    sort_by: str,
+    by_dim: str | None,
+    by_time: bool,
+    sort_by: str | None,
 ) -> None:
     if issue_number is not None:
-        _usage_issue_drill(config_path, issue_number, today=today, since_spec=since_spec)
+        _usage_issue_drill(config_path, issue_number, today=today, week=week, month=month, since_spec=since_spec)
         return
-    if by_issue:
-        _usage_by_issue(config_path, today=today, since_spec=since_spec, sort_by=sort_by)
+    if by_time:
+        _usage_by_time(
+            config_path,
+            today=today, week=week, month=month, since_spec=since_spec,
+            by_dim=by_dim, sort_by=sort_by,
+        )
+        return
+    if by_issue or by_dim == "issue":
+        _usage_by_issue(
+            config_path,
+            today=today, week=week, month=month, since_spec=since_spec,
+            sort_by=_usage_resolve_sort(sort_by, default="cost"),
+        )
+        return
+    if by_dim in ("repo", "week", "month"):
+        _usage_by_dim(
+            config_path, by_dim,
+            today=today, week=week, month=month, since_spec=since_spec,
+            sort_by=_usage_resolve_sort(sort_by, default="cost"),
+        )
         return
 
     from coord.board_service import read_board
@@ -863,21 +910,61 @@ def usage(
     click.echo(format_usage_report(session))
 
 
-def _usage_resolve_window(today: bool, since_spec: str | None):
-    """Resolve the ``--today``/``--since`` flags to a
-    :class:`coord.usage_rollup.Window` for the daemon-sourced rollup views
-    (#1115). Neither flag given falls back to the current session's start
-    time (open-ended); no session at all falls back to an unbounded window.
+_SINCE_WEEKS_RE = re.compile(r"^(\d+)\s*w$", re.IGNORECASE)
+
+
+def _normalize_since_spec(spec: str) -> str:
+    """Expand a ``Nw`` (weeks) shorthand to ``(N*7)d`` before handing it to
+    Core's ``Window.since`` (#1119 requirement 1 / acceptance example
+    ``--since 8w``). Core's ``since`` regex only knows ``Nd``/``Nh`` (see
+    ``coord.usage_rollup._SINCE_RELATIVE_RE``) — this is a thin CLI-side
+    syntactic convenience, not new window-resolution logic, so it stays here
+    rather than in Core. Anything else (ISO date, ``Nd``, ``Nh``) passes
+    through unchanged for Core to validate.
     """
-    from coord.usage_rollup import Window
+    match = _SINCE_WEEKS_RE.match(spec.strip())
+    if match:
+        return f"{int(match.group(1)) * 7}d"
+    return spec
+
+
+def _usage_resolve_window(today: bool, week: bool, month: bool, since_spec: str | None):
+    """Resolve the ``--today``/``--week``/``--month``/``--since`` flags to a
+    :class:`coord.usage_rollup.TimeWindow` for the daemon-sourced rollup views
+    (#1115/#1119). At most one of the four may be given. None given falls back
+    to the current session's start time (open-ended); no session at all falls
+    back to an unbounded window.
+
+    ``--week``/``--month`` are resolved via :mod:`coord.usage_rollup`'s own
+    ``window_week``/``window_month`` presets — called, not reimplemented,
+    per #1119's "consumes Core, no new aggregation logic" scope.
+    """
+    n_set = sum([bool(today), bool(week), bool(month), bool(since_spec)])
+    if n_set > 1:
+        raise click.BadParameter(
+            "pass at most one of --today, --week, --month, --since",
+            param_hint="'--today'/'--week'/'--month'/'--since'",
+        )
+
+    from coord.usage_rollup import Window, window_month, window_week
 
     if today:
         return Window.today()
+    if week:
+        return window_week()
+    if month:
+        return window_month()
     if since_spec:
         try:
-            return Window.since(since_spec)
+            window = Window.since(_normalize_since_spec(since_spec))
         except ValueError as e:
             raise click.BadParameter(str(e), param_hint="'--since'") from e
+        # Preserve the human-readable spec the user actually typed in the
+        # printed label (e.g. "since 8w"), even though it was expanded to
+        # "56d" for Core's date math above.
+        from dataclasses import replace
+
+        return replace(window, label=f"since {since_spec}")
 
     from coord.state import load_session
 
@@ -895,37 +982,55 @@ def _usage_resolve_window(today: bool, since_spec: str | None):
     return Window(start=None, end=None, label="all")
 
 
-def _usage_by_issue(config_path: Path, *, today: bool, since_spec: str | None, sort_by: str) -> None:
+def _usage_resolve_sort(sort_by: str | None, *, default: str) -> str:
+    """Resolve the ``--sort`` flag: explicit value wins, else *default*
+    (#1119 — different views default to a different natural ranking key)."""
+    return sort_by or default
+
+
+def _usage_sort_key(sort_by: str):
+    """Key function for sorting an :func:`~coord.usage_rollup.aggregate`
+    ``groups`` list by *sort_by* (``cost``/``tokens``/``time``), descending."""
+    if sort_by == "tokens":
+        def _total_tokens(group: dict) -> int:
+            t = group["tokens"]
+            return t["input"] + t["output"] + t["cache_read"] + t["cache_creation"]
+        return _total_tokens
+    if sort_by == "time":
+        return lambda group: group["duration_secs"]
+    return lambda group: group["cost_total"]
+
+
+def _usage_by_issue(
+    config_path: Path, *, today: bool, week: bool, month: bool, since_spec: str | None, sort_by: str
+) -> None:
     """``coord usage --by-issue`` (contract Mock 1, #1115) — daemon-board-
     sourced per-issue cost/token rollup for the resolved time window."""
     from coord.usage import fetch_usage_rows, format_usage_by_issue, pricing_dict_from_config
     from coord.usage_rollup import aggregate
 
     cfg = _load_config(config_path)
-    window = _usage_resolve_window(today, since_spec)
+    window = _usage_resolve_window(today, week, month, since_spec)
     rows = fetch_usage_rows()
     pricing = pricing_dict_from_config(cfg.pricing)
     result = aggregate(rows, by="issue", window=window, pricing=pricing)
-
-    if sort_by == "tokens":
-        def _total_tokens(group: dict) -> int:
-            t = group["tokens"]
-            return t["input"] + t["output"] + t["cache_read"] + t["cache_creation"]
-
-        result["groups"].sort(key=_total_tokens, reverse=True)
+    result["groups"].sort(key=_usage_sort_key(sort_by), reverse=True)
 
     click.echo(format_usage_by_issue(result, window.label))
 
 
-def _usage_issue_drill(config_path: Path, issue_number: int, *, today: bool, since_spec: str | None) -> None:
+def _usage_issue_drill(
+    config_path: Path, issue_number: int, *, today: bool, week: bool, month: bool, since_spec: str | None
+) -> None:
     """``coord usage --issue N`` (contract Mock 2, #1115) — per-stage drill
-    for one issue's legs. Unbounded (all history) unless --today/--since is
-    also given."""
+    for one issue's legs. Unbounded (all history) unless --today/--week/
+    --month/--since is also given."""
     from coord.usage import fetch_usage_rows, format_usage_issue_drill
     from coord.usage_rollup import leg_in_window
 
     cfg = _load_config(config_path)
-    window = _usage_resolve_window(today, since_spec) if (today or since_spec) else None
+    has_window_flag = today or week or month or since_spec
+    window = _usage_resolve_window(today, week, month, since_spec) if has_window_flag else None
     rows = [
         row
         for row in fetch_usage_rows()
@@ -933,3 +1038,61 @@ def _usage_issue_drill(config_path: Path, issue_number: int, *, today: bool, sin
         and (window is None or leg_in_window(row, window))
     ]
     click.echo(format_usage_issue_drill(rows, issue_number, cfg.pricing))
+
+
+def _usage_by_dim(
+    config_path: Path,
+    by_dim: str,
+    *,
+    today: bool,
+    week: bool,
+    month: bool,
+    since_spec: str | None,
+    sort_by: str,
+) -> None:
+    """``coord usage --by repo|week|month`` (#1119) — cross-cut daemon-board
+    usage by *by_dim* for the resolved time window. ``repo`` is the
+    cross-repo rollup (contract Mock 3); ``week``/``month`` are a
+    time-bucketed spend series over a wider window (e.g. ``--since 8w --by
+    week``)."""
+    from coord.usage import fetch_usage_rows, format_usage_by_group, pricing_dict_from_config
+    from coord.usage_rollup import aggregate
+
+    cfg = _load_config(config_path)
+    window = _usage_resolve_window(today, week, month, since_spec)
+    rows = fetch_usage_rows()
+    pricing = pricing_dict_from_config(cfg.pricing)
+    result = aggregate(rows, by=by_dim, window=window, pricing=pricing)
+    result["groups"].sort(key=_usage_sort_key(sort_by), reverse=True)
+
+    click.echo(format_usage_by_group(result, window.label, by_dim))
+
+
+def _usage_by_time(
+    config_path: Path,
+    *,
+    today: bool,
+    week: bool,
+    month: bool,
+    since_spec: str | None,
+    by_dim: str | None,
+    sort_by: str | None,
+) -> None:
+    """``coord usage --by-time`` (contract Mock 4, #1119) — ranks where
+    wall-clock is going: by stage-type (default) or, combined with
+    ``--by issue``, by issue. Defaults to ranking by ``time`` (that's the
+    point of the view) unless ``--sort`` explicitly overrides."""
+    from coord.usage import fetch_usage_rows, format_usage_by_time, pricing_dict_from_config
+    from coord.usage_rollup import aggregate
+
+    dim = "issue" if by_dim == "issue" else "stage"
+    resolved_sort = _usage_resolve_sort(sort_by, default="time")
+
+    cfg = _load_config(config_path)
+    window = _usage_resolve_window(today, week, month, since_spec)
+    rows = fetch_usage_rows()
+    pricing = pricing_dict_from_config(cfg.pricing)
+    result = aggregate(rows, by=dim, window=window, pricing=pricing)
+    result["groups"].sort(key=_usage_sort_key(resolved_sort), reverse=True)
+
+    click.echo(format_usage_by_time(result, window.label, dim))

@@ -570,6 +570,86 @@ def format_usage_issue_drill(rows: list[dict], issue_number: int, pricing) -> st
     return "\n".join(lines)
 
 
+# ── Cross-repo + time-bucketed rollup rendering (#1119 CLI-2) ────────────────
+#
+# Consumes coord.usage_rollup.aggregate() exactly like the #1115 renderers
+# above — same ``~$``/4-decimal conventions, same plain-dict input. Two new
+# views: a cross-cut rollup by repo/week/month (contract Mock 3) and a
+# time-spent ranking by stage-type or issue (contract Mock 4).
+
+
+def format_usage_by_group(result: dict, window_label: str, dim: str) -> str:
+    """Render ``coord usage --by repo|week|month`` (contract Mock 3 for
+    ``dim="repo"``) from an :func:`coord.usage_rollup.aggregate` result.
+
+    Each row is one group (a repo name, or a week/month bucket string) with
+    its issue count (distinct ``issue_number`` across the group's rows),
+    legs, captured/estimated/total cost, tokens, and duration. Groups are
+    rendered in *result*'s given order — callers sort beforehand (see
+    ``coord/commands/status.py``'s ``_usage_sort_key``).
+    """
+    lines = [f"USAGE — by {dim} — window: {window_label}"]
+    lines.append(
+        f"{dim:<8}{'issues':>7}{'legs':>6}   {'cost':<10} {'est(~)':<11} "
+        f"{'total':<11} {'out / cache':<20}time"
+    )
+    for g in result["groups"]:
+        key_str = str(g["key"])
+        issues = len({row.get("issue_number") for row in g["rows"]})
+        cost_str = _fmt_cost4(g["cost_captured"]) if g["cost_captured"] > 0 else "—"
+        est_str = _fmt_est4(g["cost_est"]) if g["cost_est"] > 0 else "—"
+        total_str = _fmt_cost4(g["cost_total"])
+        out_str = _fmt_tokens_compact(g["tokens"]["output"])
+        cache_str = _fmt_tokens_compact(g["tokens"]["cache_read"])
+        tok_str = f"{out_str} / {cache_str}"
+        dur_str = _fmt_duration_hms(g["duration_secs"], is_open=False)
+        lines.append(
+            f"{key_str:<8}{issues:>7}{g['legs']:>6}   {cost_str:<10} {est_str:<11} "
+            f"{total_str:<11} {tok_str:<20}{dur_str}"
+        )
+
+    lines.append("─" * 80)
+    t = result["totals"]
+    total_out = _fmt_tokens_compact(t["tokens"]["output"])
+    total_cache = _fmt_tokens_compact(t["tokens"]["cache_read"])
+    total_dur = _fmt_duration_hms(t["duration_secs"], is_open=False)
+    progress = f" · {t['open_legs']} in progress" if t["open_legs"] else ""
+    lines.append(
+        f"Σ  total {_fmt_cost4(t['cost_total'])} · {total_out} out / {total_cache} cache · "
+        f"{total_dur}{progress}"
+    )
+    return "\n".join(lines)
+
+
+def format_usage_by_time(result: dict, window_label: str, dim: str) -> str:
+    """Render ``coord usage --by-time`` (contract Mock 4) from an
+    :func:`coord.usage_rollup.aggregate` result with ``by="stage"`` (default,
+    ``dim="stage"``) or ``by="issue"`` (``dim="issue"``, via ``--by issue``).
+
+    Ranks groups by share of total in-window active duration — "where is
+    wall-clock going." An open leg (no ``finished_at``) contributes 0
+    duration but is called out via the group's ``(N in progress)`` note.
+    """
+    lines = [f"USAGE — time by {dim} — window: {window_label}"]
+    key_header = "issue" if dim == "issue" else "stage"
+    lines.append(f"{key_header:<14}{'legs':>4}   {'time':<10}share")
+
+    total_dur = result["totals"]["duration_secs"]
+    for g in result["groups"]:
+        key_str = f"#{g['key']}" if dim == "issue" else str(g["key"])
+        dur_str = _fmt_duration_hms(g["duration_secs"], is_open=False)
+        pct = f"{(g['duration_secs'] / total_dur * 100):.1f}%" if total_dur > 0 else "—"
+        note = f"   ({g['open_legs']} in progress)" if g["open_legs"] else ""
+        lines.append(f"{key_str:<14}{g['legs']:>4}   {dur_str:<10}{pct}{note}")
+
+    lines.append(f"── total active {_fmt_duration_hms(total_dur, is_open=False)} ──")
+    if dim == "stage":
+        lines.append("(also available: --by-time --by issue → per-issue duration ranking)")
+    else:
+        lines.append("(also available: --by-time → time by stage)")
+    return "\n".join(lines)
+
+
 def format_burn_rate_line(session: SessionUsage) -> str | None:
     """One-line burn-rate summary for ``coord status``.
 
