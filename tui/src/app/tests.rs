@@ -20012,6 +20012,182 @@
         );
     }
 
+    /// #1199 fix (label "#1031 #1031"): a child that has aged out of the
+    /// `open_issues` cache has no title anywhere — `build_dag_nodes` falls
+    /// back to `title = "#N"`, which the nested row previously rendered
+    /// verbatim after its own `#N` column ("#1031 #1031"). The row must show
+    /// a muted placeholder instead, keeping a single `#N`.
+    #[test]
+    fn epic_child_row_replaces_number_fallback_title_with_placeholder() {
+        let app = make_test_app(BoardData::default());
+        let child = EpicChildRow {
+            number: 1031,
+            // Exactly what build_dag_nodes emits when the issue is absent.
+            title: "#1031".to_string(),
+            state: NodeState::Done,
+        };
+        let row = app.epic_child_tree_row(&[0u16, 0u16], 3, 0, &child);
+        let joined: String = row.text.spans.iter().map(|s| s.text.as_str()).collect();
+        assert!(joined.contains("#1031"), "keeps the #N identity column");
+        assert_eq!(
+            joined.matches("1031").count(),
+            1,
+            "the issue number must NOT be duplicated as the title (the reported '#1031 #1031')",
+        );
+        assert!(
+            joined.contains("(details not cached)"),
+            "an uncached child shows a muted placeholder, got {joined:?}",
+        );
+    }
+
+    /// The placeholder must NOT clobber a child that DOES have a real title
+    /// (the #1097 case — cached, so `build_dag_nodes` found its title).
+    #[test]
+    fn epic_child_row_keeps_a_real_title() {
+        let app = make_test_app(BoardData::default());
+        let child = EpicChildRow {
+            number: 1097,
+            title: "Live/Idle sessions".to_string(),
+            state: NodeState::Done,
+        };
+        let row = app.epic_child_tree_row(&[0u16, 0u16], 3, 0, &child);
+        let joined: String = row.text.spans.iter().map(|s| s.text.as_str()).collect();
+        assert!(joined.contains("Live/Idle sessions"), "got {joined:?}");
+        assert!(!joined.contains("(details not cached)"));
+    }
+
+    /// #1199 fix (selection snaps to the epic on refresh): an OPEN epic
+    /// (#100, "new" bucket) with a CLOSED tracked child (#102, whose own
+    /// lifecycle bucket is "done") — the child renders NESTED under the epic.
+    /// Selecting the child then hitting the periodic refresh
+    /// (`rebuild_pipeline_sidebar`) must KEEP the child selected, never
+    /// snapping the selection to the epic parent (which would replace the
+    /// child's Work/Test/Review lane with the epic's Gate A→D lane).
+    #[test]
+    fn nested_child_selection_survives_refresh_and_does_not_snap_to_epic() {
+        let data = BoardData {
+            pipeline_tracked_labels: vec!["coord".to_string()],
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            open_issues: vec![
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 100,
+                    title: "Epic tracker".to_string(),
+                    body: String::new(),
+                    state: "open".to_string(),
+                    labels: vec!["coord".to_string(), "epic".to_string()],
+                    milestone_number: None,
+                    milestone_title: None,
+                },
+                // Closed, but still cached and independently tracked (#1097's shape).
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 102,
+                    title: "Closed child".to_string(),
+                    body: String::new(),
+                    state: "closed".to_string(),
+                    labels: vec!["coord".to_string()],
+                    milestone_number: None,
+                    milestone_title: None,
+                },
+            ],
+            epic_children: vec![EpicChildren {
+                repo_name: "api".to_string(),
+                tracking_issue: 100,
+                children: vec![EpicChild { number: 102, state: "closed".to_string() }],
+            }],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        app.pipeline_issues = app.pipeline_issues_from_cache();
+        let child_idx = app.pipeline_issues.iter().position(|i| i.number == 102).unwrap();
+        let epic_idx = app.pipeline_issues.iter().position(|i| i.number == 100).unwrap();
+        app.rebuild_pipeline_sidebar(None);
+
+        // Select the nested child row.
+        let (section, path, sel) = app
+            .locate_pipeline_selection("acme/api", 102)
+            .expect("the nested child must be locatable");
+        assert!(path.len() >= 4, "must be a nested path (deeper than a top-level row): {path:?}");
+        assert_eq!(sel, Some(child_idx), "resolves to the child's own index, not the epic's");
+        app.pipeline_sidebar.set_active_section(Some(section));
+        app.pipeline_sidebar.set_selected_path(section, Some(path));
+        app.pipeline_sel = app.selected_pipeline_index();
+        assert_eq!(app.pipeline_sel, Some(child_idx), "sanity: the child is selected");
+
+        // The periodic-refresh path: capture → rebuild → must PRESERVE the child.
+        let prev = app.capture_pipeline_selection_id();
+        assert_eq!(prev, Some(("acme/api".to_string(), 102)));
+        app.rebuild_pipeline_sidebar(prev);
+        assert_eq!(
+            app.pipeline_sel,
+            Some(child_idx),
+            "the nested child selection must survive the refresh",
+        );
+        assert_ne!(app.pipeline_sel, Some(epic_idx), "must not snap to the epic parent");
+    }
+
+    /// #1199 fix: a child ABSENT from `pipeline_issues` (aged out of
+    /// `open_issues`, like #1031/#1032/#1033) can't resolve to a pipeline
+    /// index — but selecting its nested row must still NOT snap the selection
+    /// to the epic parent on refresh. `capture_pipeline_selection_id` recovers
+    /// the child's identity from the tree path, and the rebuild restores the
+    /// nested row (with no resolved index) rather than defaulting to the epic.
+    #[test]
+    fn absent_nested_child_selection_does_not_snap_to_epic() {
+        let data = BoardData {
+            pipeline_tracked_labels: vec!["coord".to_string()],
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            open_issues: vec![OpenIssue {
+                repo_name: "api".to_string(),
+                number: 100,
+                title: "Epic tracker".to_string(),
+                body: String::new(),
+                state: "open".to_string(),
+                labels: vec!["coord".to_string(), "epic".to_string()],
+                milestone_number: None,
+                milestone_title: None,
+            }],
+            // #103 has no cached OpenIssue at all → not backfillable.
+            epic_children: vec![EpicChildren {
+                repo_name: "api".to_string(),
+                tracking_issue: 100,
+                children: vec![EpicChild { number: 103, state: "open".to_string() }],
+            }],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        app.pipeline_issues = app.pipeline_issues_from_cache();
+        assert!(
+            app.pipeline_issues.iter().all(|i| i.number != 103),
+            "precondition: the absent child is NOT in pipeline_issues",
+        );
+        app.rebuild_pipeline_sidebar(None);
+
+        // Select the nested (absent) child row.
+        let (section, path, sel) = app
+            .locate_pipeline_selection("acme/api", 103)
+            .expect("even an absent nested child row is locatable by its path");
+        assert_eq!(sel, None, "an absent child has no resolvable pipeline index");
+        app.pipeline_sidebar.set_active_section(Some(section));
+        app.pipeline_sidebar.set_selected_path(section, Some(path.clone()));
+        app.pipeline_sel = app.selected_pipeline_index();
+        assert_eq!(app.pipeline_sel, None, "sanity: unresolved child → no pipeline index");
+
+        // capture recovers the child id via the nested-child fallback...
+        let prev = app.capture_pipeline_selection_id();
+        assert_eq!(prev, Some(("acme/api".to_string(), 103)));
+
+        // ...and the refresh restores the nested path, never the epic row.
+        app.rebuild_pipeline_sidebar(prev);
+        assert_eq!(app.pipeline_sel, None, "still the absent child, not the epic");
+        assert_eq!(
+            app.pipeline_sidebar.selected_path(section),
+            Some(&path),
+            "the nested child path must be restored, not reset to the epic's row",
+        );
+    }
+
     #[test]
     fn pipeline_milestone_collapse_state_persists_across_rebuild() {
         // Collapsing a milestone sub-header must survive the next rebuild_pipeline_sidebar.
