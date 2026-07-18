@@ -19880,6 +19880,138 @@
         assert_eq!(app.resolve_nested_child_index(1, 0), None);
     }
 
+    /// #1199 fix (review-reported regression): a regular issue nested under
+    /// an epic that does NOT independently carry a tracked label (only its
+    /// parent epic does) was previously absent from `pipeline_issues`
+    /// entirely, so `resolve_nested_child_index` could never resolve a click
+    /// on its nested row — `pipeline_sel` stuck at `None`, no
+    /// Work/Test/Review/Merge lane rendered ("blank"), and the Issue tab fell
+    /// back to "No issue selected". `pipeline_issues_from_cache` must
+    /// backfill such a child from `data.open_issues` so it's independently
+    /// selectable exactly like a directly-tracked sibling.
+    #[test]
+    fn pipeline_issues_from_cache_backfills_untracked_epic_child() {
+        let data = BoardData {
+            pipeline_tracked_labels: vec!["coord".to_string()],
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            pipeline_default_gates: vec!["test".to_string(), "review".to_string(), "merge".to_string()],
+            open_issues: vec![
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 100,
+                    title: "Epic tracker".to_string(),
+                    body: String::new(),
+                    state: "open".to_string(),
+                    labels: vec!["coord".to_string(), "epic".to_string()],
+                    milestone_number: Some(1),
+                    milestone_title: Some("v1.0".to_string()),
+                },
+                // #102 carries NO tracked label of its own — only its parent
+                // epic #100 does. This is the exact shape of the reported
+                // regression (siblings #1031/#1032 blank while #1033/#1097,
+                // independently tracked, rendered fine).
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 102,
+                    title: "Untracked child".to_string(),
+                    body: String::new(),
+                    state: "open".to_string(),
+                    labels: vec![],
+                    milestone_number: Some(1),
+                    milestone_title: Some("v1.0".to_string()),
+                },
+            ],
+            epic_children: vec![EpicChildren {
+                repo_name: "api".to_string(),
+                tracking_issue: 100,
+                children: vec![EpicChild { number: 102, state: "open".to_string() }],
+            }],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        let issues = app.pipeline_issues_from_cache();
+
+        assert!(
+            issues.iter().any(|i| i.number == 100),
+            "tracked epic #100 must still be present",
+        );
+        let child = issues.iter().find(|i| i.number == 102).expect(
+            "untracked epic child #102 must be backfilled into pipeline_issues, \
+             or its nested row can never resolve a selection",
+        );
+        assert_eq!(child.coord_repo.as_deref(), Some("api"));
+        assert_eq!(child.title, "Untracked child");
+        assert!(
+            child.matched_labels.is_empty(),
+            "the child carries no tracked label of its own — matched_labels stays empty",
+        );
+
+        // End-to-end: once backfilled, the nested-child row must resolve to
+        // the child's OWN index (never silently falling back to the epic's).
+        app.pipeline_issues = issues;
+        let epic_idx = app
+            .pipeline_issues
+            .iter()
+            .position(|i| i.number == 100)
+            .unwrap();
+        let child_idx = app
+            .pipeline_issues
+            .iter()
+            .position(|i| i.number == 102)
+            .unwrap();
+        assert_eq!(app.resolve_nested_child_index(epic_idx, 0), Some(child_idx));
+
+        // And the child's own pipeline lane must be the ordinary per-issue
+        // lane (Work/Test/Review — "merge" is retired from this per-issue
+        // strip per #738, living solely in the Merge Queue panel), NOT the
+        // epic gate lane, and NOT suppressed (`build_pipeline_widget`
+        // returning `None`, which is the literal "blank lane" the review
+        // reported).
+        app.pipeline_sel = Some(child_idx);
+        let view = app
+            .build_pipeline_widget()
+            .expect("a regular nested child must render its own pipeline lane, not blank");
+        assert_eq!(
+            view.stages.iter().map(|s| s.label.as_str()).collect::<Vec<_>>(),
+            vec!["Work", "Test", "Review"],
+        );
+    }
+
+    /// A child NOT listed under any tracked epic (no matching
+    /// `EpicChildren.tracking_issue` in `pipeline_issues`) must NOT be
+    /// backfilled — only children of an epic that's itself in the Pipeline
+    /// are in scope.
+    #[test]
+    fn pipeline_issues_from_cache_skips_children_of_untracked_epic() {
+        let data = BoardData {
+            pipeline_tracked_labels: vec!["coord".to_string()],
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            open_issues: vec![OpenIssue {
+                repo_name: "api".to_string(),
+                number: 202,
+                title: "Orphan child".to_string(),
+                body: String::new(),
+                state: "open".to_string(),
+                labels: vec![],
+                milestone_number: None,
+                milestone_title: None,
+            }],
+            // tracking_issue 999 is NOT itself a tracked issue anywhere.
+            epic_children: vec![EpicChildren {
+                repo_name: "api".to_string(),
+                tracking_issue: 999,
+                children: vec![EpicChild { number: 202, state: "open".to_string() }],
+            }],
+            ..BoardData::default()
+        };
+        let app = make_test_app(data);
+        let issues = app.pipeline_issues_from_cache();
+        assert!(
+            issues.iter().all(|i| i.number != 202),
+            "a child of an untracked epic must not be backfilled",
+        );
+    }
+
     #[test]
     fn pipeline_milestone_collapse_state_persists_across_rebuild() {
         // Collapsing a milestone sub-header must survive the next rebuild_pipeline_sidebar.
