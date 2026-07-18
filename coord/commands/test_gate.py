@@ -285,17 +285,32 @@ def _stash_test_artifacts(repo, assignment, wt_path: Path) -> None:
     from coord.agent import stash_artifacts_for_branch  # noqa: PLC0415
     from coord.state import COORD_DIR  # noqa: PLC0415
 
+    patterns = list(repo.artifact_paths)
     copied = stash_artifacts_for_branch(
         worktree_path=wt_path,
         branch=assignment.branch,
         repo_name=assignment.repo_name,
-        patterns=list(repo.artifact_paths),
+        patterns=patterns,
         state_dir=COORD_DIR,
         assignment_id=assignment.assignment_id,
         log_path=None,
     )
     if copied > 0:
         click.echo(f"  stashed {copied} artifact(s) for {assignment.branch!r}.")
+    else:
+        # #1249 review finding #2: the other two call sites
+        # (AgentServer._stash_artifacts, finalize_interactive_exit) pass a
+        # real log_path, so stash_artifacts_for_branch's #1248 "loud 0-copy"
+        # warning lands in the assignment log. This call site has no log
+        # file — `coord test` runs directly in the operator's terminal —
+        # so log_path=None above means that warning is silently swallowed.
+        # Echo it here instead, mirroring the same message.
+        click.echo(
+            f"  warning: 0 artifact(s) matched {patterns!r} in {wt_path} — "
+            "check artifact_paths config and that the build actually "
+            "produced the expected outputs.",
+            err=True,
+        )
 
 
 def _cleanup_test_worktree(cfg, assignment) -> None:

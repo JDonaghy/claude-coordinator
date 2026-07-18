@@ -445,7 +445,20 @@ class TestArtifactStashOnBuild:
         monkeypatch, tmp_path: Path,
     ) -> None:
         """A failed build exits before the stash call — nothing partial
-        gets copied in."""
+        gets copied in.
+
+        `wt` is pre-created (like the passing-build tests above, so the
+        `bin/myapp` fixture file exists) — which means `test()`'s
+        unconditional `_remove_test_worktree(repo_dir, wt_path)` call (to
+        clear any stale worktree from a prior Build) finds `wt_path.exists()`
+        True and issues its own `git worktree remove --force` + `git
+        worktree prune` calls *before* the real `git worktree add`. The
+        side_effect list accounts for all 5 calls in order — fetch, remove,
+        prune, worktree-add, build — so `build_command` is the one that
+        actually fails, rather than an unrelated `StopIteration` from an
+        exhausted mock masking a build step that never ran (#1249 review
+        finding #1).
+        """
         wt = tmp_path / "wt-abc123"
         (wt / "bin").mkdir(parents=True)
         (wt / "bin" / "myapp").write_bytes(b"\x7fELF" + b"\x00" * 200)
@@ -456,6 +469,8 @@ class TestArtifactStashOnBuild:
         coord_dir.mkdir()
         mock_run.side_effect = [
             MagicMock(returncode=0, stdout="", stderr=""),  # git fetch --prune
+            MagicMock(returncode=0, stdout="", stderr=""),  # git worktree remove --force (stale wt)
+            MagicMock(returncode=0, stdout="", stderr=""),  # git worktree prune
             MagicMock(returncode=0, stdout="", stderr=""),  # git worktree add
             MagicMock(returncode=1, stdout="", stderr="build broke"),  # build_command
         ]
@@ -467,6 +482,19 @@ class TestArtifactStashOnBuild:
 
         assert result.exit_code != 0
         assert not (coord_dir / "artifacts").exists()
+        assert "stashed" not in result.output
+
+        # Prove the build-failure guard (not an unrelated mock exhaustion)
+        # is what actually stopped the stash: build_command must have been
+        # invoked exactly once (shell=True, unlike the git list-arg calls),
+        # and test_command must never have run since the build step failed
+        # before it.
+        shell_calls = [c for c in mock_run.call_args_list if c.kwargs.get("shell") is True]
+        assert len(shell_calls) == 1, (
+            f"expected build_command to run exactly once, got {len(shell_calls)} "
+            f"shell=True call(s): {shell_calls}"
+        )
+        assert shell_calls[0].args[0] == "echo build-ok"
 
 
 # ── Help text ───────────────────────────────────────────────────────────────
