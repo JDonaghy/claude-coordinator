@@ -36,7 +36,9 @@ from coord.milestone_order import (
     WorkOrderNode,
     parse_sub_issues,
     parse_work_order,
+    remove_sub_issues_section,
     render_sub_issues,
+    render_work_order,
     replace_sub_issues_section,
     replace_work_order_section,
     validate_milestone_membership,
@@ -432,6 +434,121 @@ def milestone_add_child_cmd(
     click.echo(
         f"#{issue} {action} #{epic}'s ({repo_entry.github}) `## Sub-issues` checklist"
     )
+
+
+@milestone_group.command(
+    "sync",
+    help=(
+        "#1061 (EP-2): backfill the live GitHub sub-issues API from an "
+        "epic's `## Work order` block, and retire the old checkbox-based "
+        "grammar on that body. REPO is the local repo name from "
+        "coordinator.yml; EPIC is the GH issue number of the epic tracking "
+        "issue.\n\n"
+        "For every issue referenced in EPIC's `## Work order`, links it as "
+        "a live sub-issue of EPIC (skipping any already linked — idempotent, "
+        "safe to re-run). Then rewrites `## Work order` to the "
+        "checkbox-free grammar (`- #N {group: ..., after: ...}`, no `[ ]`/"
+        "`[x]` — the box was parsed and rendered but never read for "
+        "readiness) and removes any `## Sub-issues` block entirely — "
+        "membership is now owned by the live API plus `## Work order`, so "
+        "the separate checklist (#1008) is pure duplication. A body already "
+        "in the target shape with nothing left to link is reported "
+        "unchanged, not rewritten."
+    ),
+)
+@click.argument("repo")
+@click.argument("epic", type=int)
+@click.option(
+    "--dry-run", is_flag=True,
+    help="Show what would be linked/rewritten without calling GitHub.",
+)
+@_CONFIG_OPTION
+def milestone_sync_cmd(repo: str, epic: int, dry_run: bool, config_path: Path) -> None:
+    cfg = _load_config(config_path)
+    repo_entry = cfg.repo(repo)
+    if repo_entry is None:
+        click.echo(f"error: unknown repo {repo!r}", err=True)
+        sys.exit(2)
+
+    from coord import github_ops
+    from coord.parentage_github import GitHubParentage
+
+    try:
+        epic_data = github_ops.get_issue(repo_entry.github, epic)
+    except RuntimeError as e:
+        click.echo(f"error: could not fetch epic #{epic}: {e}", err=True)
+        sys.exit(1)
+
+    old_body = epic_data.get("body") or ""
+    try:
+        work_order = parse_work_order(old_body)
+    except WorkOrderError as e:
+        click.echo(f"error: #{epic}'s `## Work order` block is invalid: {e}", err=True)
+        sys.exit(1)
+
+    if not work_order.nodes:
+        click.echo(f"#{epic} ({repo_entry.github}): no `## Work order` block found — nothing to sync")
+        return
+
+    parentage = GitHubParentage()
+    try:
+        already_linked = {c.number for c in parentage.children(repo_entry.github, epic)}
+    except RuntimeError as e:
+        click.echo(
+            f"error: could not fetch #{epic}'s live sub-issues: {e}", err=True
+        )
+        sys.exit(1)
+
+    to_link = [n.issue_number for n in work_order.nodes if n.issue_number not in already_linked]
+
+    new_block = render_work_order(work_order, checkbox=False)
+    candidate_body = replace_work_order_section(old_body, new_block)
+    stripped_body = remove_sub_issues_section(candidate_body)
+    had_sub_issues = stripped_body != candidate_body
+    candidate_body = stripped_body
+    body_changed = candidate_body != old_body
+
+    click.echo(
+        f"#{epic} ({repo_entry.github}): {len(work_order.nodes)} node(s) in "
+        "`## Work order`"
+    )
+    if to_link:
+        verb = "would link" if dry_run else "linking"
+        click.echo(f"  {verb} as live sub-issues: " + ", ".join(f"#{n}" for n in to_link))
+    else:
+        click.echo("  live sub-issues API already up to date (no-op)")
+
+    if body_changed:
+        bits = ["checkbox-free `## Work order`"]
+        if had_sub_issues:
+            bits.append("removed `## Sub-issues`")
+        verb = "would rewrite" if dry_run else "rewriting"
+        click.echo(f"  {verb} body ({', '.join(bits)})")
+    else:
+        click.echo("  body already in the target shape (no-op)")
+
+    if dry_run:
+        click.echo("(dry run — nothing changed)")
+        return
+
+    failed: list[tuple[int, str]] = []
+    for issue_number in to_link:
+        try:
+            parentage.add_child(repo_entry.github, epic, issue_number)
+        except RuntimeError as e:
+            failed.append((issue_number, str(e)))
+
+    for issue_number, err in failed:
+        click.echo(
+            f"  error: could not link #{issue_number} as a sub-issue of #{epic}: {err}",
+            err=True,
+        )
+
+    if body_changed:
+        github_ops.update_issue_body(repo_entry.github, epic, candidate_body)
+
+    if failed:
+        sys.exit(1)
 
 
 _DEFAULT_CAPTURE_BODY = (

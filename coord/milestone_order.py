@@ -49,6 +49,20 @@ milestone add-child`` (:func:`parse_sub_issues` / :func:`render_sub_issues`
 :class:`WorkOrderNode` / :class:`WorkOrder` shapes as the work order — only
 the section heading differs — so the two conventions can coexist in one
 tracking-issue body without either splice helper disturbing the other.
+
+#1061: the `[ ]`/`[x]` checkbox is decorative — parsed into
+:attr:`WorkOrderNode.checked`, preserved, and rendered, but never read for
+readiness (:func:`ready_frontier` keys entirely off live ``terminal_issues``)
+— which is exactly why it silently drifted stale on real epics. Rather than
+sync it, the grammar is migrating to drop it: `- #N {group: ..., after:
+...}`, no checkbox. Both forms parse identically (the checkbox is simply
+optional now) so old bodies keep working during the migration;
+``coord milestone sync`` (:mod:`coord.commands.milestone`) is the write path
+that rewrites an epic's `## Work order` to the checkbox-free form, backfills
+the live GitHub sub-issues API for each referenced child
+(:mod:`coord.parentage_github`), and retires the now-redundant `##
+Sub-issues` section (:func:`remove_sub_issues_section`) — the API + `##
+Work order` together already carry everything that section did.
 """
 
 from __future__ import annotations
@@ -72,6 +86,7 @@ __all__ = [
     "parse_sub_issues",
     "render_sub_issues",
     "replace_sub_issues_section",
+    "remove_sub_issues_section",
     "validate_milestone_membership",
     "FrontierEntry",
     "BlockedNode",
@@ -131,7 +146,13 @@ class WorkOrder:
 _HEADING_RE = re.compile(r"^#{1,6}\s*Work order\s*$", re.IGNORECASE)
 # #1008: the epic's child-issue checklist — same grammar, different heading.
 _SUB_ISSUES_HEADING_RE = re.compile(r"^#{1,6}\s*Sub-issues\s*$", re.IGNORECASE)
-_ITEM_RE = re.compile(r"^-\s*\[([ xX])\]\s*#(\d+)\s*(\{([^}]*)\})?")
+# #1061: the `[ ]`/`[x]` checkbox is now optional — `checked` was parsed,
+# preserved, and rendered but never read for readiness (`ready_frontier`
+# keys entirely off live `terminal_issues`), so it's decorative and the
+# grammar is migrating to drop it (`- #N {...}` instead of `- [ ] #N {...}`).
+# Both forms parse identically during the migration; `coord milestone sync`
+# is what rewrites existing bodies to the checkbox-free form.
+_ITEM_RE = re.compile(r"^-\s*(?:\[([ xX])\]\s*)?#(\d+)\s*(\{([^}]*)\})?")
 # Splits `key: value` pairs on commas that precede the *next* key, so an
 # `after: #762,#763` value (itself comma-separated) isn't cut mid-list.
 _PAIR_RE = re.compile(r"(\w+)\s*:\s*(.*?)(?=,\s*\w+\s*:|$)")
@@ -210,7 +231,7 @@ def _parse_checklist_section(
                     "(expected '- [ ] #N  {annotations}')"
                 )
             continue
-        checked = m.group(1).lower() == "x"
+        checked = m.group(1) is not None and m.group(1).lower() == "x"
         issue_number = int(m.group(2))
         if issue_number in seen:
             raise WorkOrderError(
@@ -281,7 +302,7 @@ def _parse_after_list(
     return items
 
 
-def render_work_order(work_order: WorkOrder) -> str:
+def render_work_order(work_order: WorkOrder, *, checkbox: bool = True) -> str:
     """Render *work_order* back into checklist lines (no `## Work order` heading).
 
     Inverse of the checklist half of :func:`parse_work_order` — round-trips
@@ -292,17 +313,25 @@ def render_work_order(work_order: WorkOrder) -> str:
     Heading-agnostic (renders checklist lines only), so it doubles as the
     render step for the `## Sub-issues` checklist (#1008) too — see the
     :func:`render_sub_issues` alias.
+
+    *checkbox* defaults to ``True`` — preserves every existing caller's
+    output (notably ``coord milestone add-child``'s `## Sub-issues`
+    rendering) byte-for-byte. Pass ``checkbox=False`` for the #1061
+    checkbox-free grammar (`- #N {...}`, no `[ ]`/`[x]`) — what ``coord
+    milestone sync`` writes back, since the box was never read for
+    readiness (see the module docstring) and is being dropped rather than
+    kept in sync.
     """
     lines: list[str] = []
     for n in work_order.nodes:
-        box = "x" if n.checked else " "
         bits: list[str] = []
         if n.group:
             bits.append(f"group: {n.group}")
         if n.after:
             bits.append("after: " + ",".join(f"#{d}" for d in n.after))
         annotation = f"  {{{', '.join(bits)}}}" if bits else ""
-        lines.append(f"- [{box}] #{n.issue_number}{annotation}")
+        box_prefix = f"[{'x' if n.checked else ' '}] " if checkbox else ""
+        lines.append(f"- {box_prefix}#{n.issue_number}{annotation}")
     return "\n".join(lines)
 
 
@@ -344,6 +373,46 @@ def replace_sub_issues_section(body: str, new_block: str) -> str:
     return _splice_checklist_section(
         body, new_block, _SUB_ISSUES_HEADING_RE, "## Sub-issues"
     )
+
+
+def remove_sub_issues_section(body: str) -> str:
+    """Fully retire the `## Sub-issues` section of *body* (#1061).
+
+    The GitHub sub-issues API now owns child membership (:mod:`coord.
+    parentage_github`'s ``GitHubParentage``, backfilled per-epic by ``coord
+    milestone sync``) and `## Work order` already carries the same
+    issue-number list plus the DAG annotations the API can't express — so a
+    separately-maintained `## Sub-issues` checklist (#1008) is pure
+    duplication going forward. Unlike :func:`replace_sub_issues_section`
+    (which always keeps the heading line, even for an empty block, because
+    that function's job is "replace the content"), this drops the heading
+    line too, so nothing is left behind for a later `parse_sub_issues` call
+    to find. No-op — returns *body* unchanged — when there's no `##
+    Sub-issues` heading to remove.
+    """
+    lines = body.splitlines()
+    start = None
+    for i, line in enumerate(lines):
+        if _SUB_ISSUES_HEADING_RE.match(line.strip()):
+            start = i
+            break
+    if start is None:
+        return body
+
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        if lines[i].strip().startswith("#"):
+            end = i
+            break
+
+    # Also swallow one blank separator line immediately before the heading
+    # (the blank line `_splice_checklist_section` inserts between sections)
+    # so removal doesn't leave a stray double-blank gap behind.
+    head_start = start - 1 if start > 0 and not lines[start - 1].strip() else start
+
+    new_lines = lines[:head_start] + lines[end:]
+    result = "\n".join(new_lines).rstrip("\n")
+    return f"{result}\n" if result else ""
 
 
 def _splice_checklist_section(
