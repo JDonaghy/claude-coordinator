@@ -78,6 +78,55 @@ pub(crate) fn format_cost_usd(cost: f64) -> String {
     }
 }
 
+/// #1116: format an ESTIMATED worker cost in USD, visually distinct from a
+/// captured figure (`format_cost_usd`) via a `~$` prefix — matches the CLI's
+/// (#1115) `~$` convention so an interactive-heavy issue never reads as
+/// "no cost data" just because nothing was captured. Zero renders as "—"
+/// (not "~$0.00") since "no estimate" and "estimated zero" are the same
+/// thing here — unlike captured cost, there's no ambiguity to flag.
+pub(crate) fn format_cost_est(cost: f64) -> String {
+    if cost <= 0.0 {
+        "—".to_string()
+    } else if cost < 0.01 {
+        "~< $0.01".to_string()
+    } else {
+        format!("~${cost:.2}")
+    }
+}
+
+/// #1116: render a captured cost for the Usage grid/drill, where a genuine
+/// zero (no captured cost at all — e.g. an interactive-only leg) should read
+/// as "—" rather than `format_cost_usd`'s "$0.00" (which elsewhere means
+/// "captured, and it rounds to zero"). The Usage view always has cost_est
+/// as a companion column, so "—" here is unambiguous: nothing was captured.
+pub(crate) fn format_cost_captured(cost: f64) -> String {
+    if cost <= 0.0 {
+        "—".to_string()
+    } else {
+        format_cost_usd(cost)
+    }
+}
+
+/// #1116: compact `NmSSs` duration for the Usage grid/drill (e.g.
+/// `"45m00s"`), distinct from `fmt_dur`'s coarser `"45m"`/`"1h30m"` (used
+/// elsewhere for elapsed-time display) — the Usage view sums durations
+/// across many legs, so seconds-precision avoids "0m" reading as "no data"
+/// for a short leg. `secs <= 0.0` (no duration recorded, or a still-open
+/// leg with nothing finished yet) renders as "—".
+pub(crate) fn format_duration_usage(secs: f64) -> String {
+    if secs <= 0.0 {
+        return "—".to_string();
+    }
+    let total = secs.round() as u64;
+    let (h, rem) = (total / 3600, total % 3600);
+    let (m, s) = (rem / 60, rem % 60);
+    if h > 0 {
+        format!("{h}h{m:02}m{s:02}s")
+    } else {
+        format!("{m}m{s:02}s")
+    }
+}
+
 /// Collapse all runs of whitespace (including newlines and tabs) into single
 /// spaces and trim the ends. Used to render a multi-line assistant text block
 /// as one horizontally-scrollable Log row (#302) without embedded newlines
