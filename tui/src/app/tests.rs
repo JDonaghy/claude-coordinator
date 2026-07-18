@@ -9901,6 +9901,55 @@
         assert!(view.stages[1].action.is_none());
     }
 
+    /// #1199: an epic/tracking-issue row shows the milestone gate lane
+    /// (Gate A → B → C → D), not the per-issue Work→Test→Review→Merge lane
+    /// it will never run — even before Gate A has ever been dispatched
+    /// (every gate box stays Pending, mirroring `gate_a_prereq_status`'s own
+    /// "never dispatched" default), and no box carries a Go/Retry action.
+    #[test]
+    fn build_pipeline_widget_epic_row_shows_gate_lane() {
+        let mut app = make_pipeline_app();
+        // #1198: case-insensitive — an "epic"-labelled issue #42.
+        app.pipeline_issues[0].all_labels = vec!["coord".to_string(), "Epic".to_string()];
+        let view = app.build_pipeline_widget().unwrap();
+        assert_eq!(
+            view.stages.iter().map(|s| s.label.as_str()).collect::<Vec<_>>(),
+            vec!["Gate A", "Gate B", "Gate C", "Gate D"],
+        );
+        for stage in &view.stages {
+            assert_eq!(
+                stage.status,
+                StageStatus::Pending,
+                "no gate has ever been dispatched — every box stays Pending: {}",
+                stage.label
+            );
+            assert!(
+                stage.action.is_none(),
+                "gate lane must not carry a dispatch action ({}): dispatch is out of scope for this slice",
+                stage.label
+            );
+        }
+    }
+
+    /// #1199: Gate A's box reflects the existing #1084 `gate_a_prereq_status`
+    /// machinery (reused, not recomputed) — an in-flight `mock-author`
+    /// dispatch makes Gate A Active while Gates B/C/D (which have no
+    /// dispatch mechanism yet, #933/#934) stay Pending regardless.
+    #[test]
+    fn build_pipeline_widget_epic_row_gate_a_reflects_mock_author_dispatch() {
+        let mut app = make_pipeline_app();
+        app.pipeline_issues[0].all_labels = vec!["coord".to_string(), "epic".to_string()];
+        app.data
+            .assignments
+            .push(make_assignment_typed("running", 42, "api", Some("mock-author")));
+        let view = app.build_pipeline_widget().unwrap();
+        assert_eq!(view.stages[0].label, "Gate A");
+        assert_eq!(view.stages[0].status, StageStatus::Active);
+        assert_eq!(view.stages[1].status, StageStatus::Pending, "Gate B has no dispatch mechanism yet");
+        assert_eq!(view.stages[2].status, StageStatus::Pending, "Gate C has no board-readable status yet");
+        assert_eq!(view.stages[3].status, StageStatus::Pending, "Gate D has no dispatch mechanism yet");
+    }
+
     #[test]
     fn build_pipeline_widget_no_go_for_unmappable_repo() {
         let mut app = make_pipeline_app();
@@ -25837,6 +25886,60 @@
             !screen.contains("Merge") && !screen.contains("MERGE"),
             "#738: Merge must NOT appear in per-issue pipeline (lives in Merge Queue panel):\n{}",
             screen
+        );
+    }
+
+    /// #1199: driving the full render pipeline (TuiDriver, `find()` —
+    /// no hardcoded coordinates), an epic row's detail stage strip shows the
+    /// milestone gate lane (Gate A → B → C → D) instead of the per-issue
+    /// Work→Test→Review→Merge lane it will never run.
+    #[test]
+    fn tuidriver_pipeline_epic_row_shows_gate_lane_not_work_lane() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_pipeline_app();
+        // #1198: case-insensitive — mark issue #42 (index 0) as the epic.
+        app.pipeline_issues[0].all_labels = vec!["coord".to_string(), "epic".to_string()];
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        let screen = driver.screen();
+
+        assert!(
+            driver.find("Gate A").is_some(),
+            "epic row must show the Gate A box:\n{screen}"
+        );
+        assert!(
+            driver.find("Gate D").is_some(),
+            "epic row's gate lane must go all the way to Gate D:\n{screen}"
+        );
+        assert!(
+            !screen.contains("Work") && !screen.contains("WORK"),
+            "epic row must NOT render the per-issue Work→Test→Review→Merge lane it will never run:\n{screen}"
+        );
+    }
+
+    /// #1199: a regular (non-epic) issue's row is unchanged — it still shows
+    /// the per-issue Work lane, not the epic's gate lane.
+    #[test]
+    fn tuidriver_pipeline_regular_issue_still_shows_work_lane() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        let screen = driver.screen();
+
+        assert!(
+            driver.find("Work").is_some(),
+            "a regular issue's row must still show the Work→Test→Review→Merge lane:\n{screen}"
+        );
+        assert!(
+            !screen.contains("Gate A"),
+            "a regular issue's row must NOT show the epic gate lane:\n{screen}"
         );
     }
 

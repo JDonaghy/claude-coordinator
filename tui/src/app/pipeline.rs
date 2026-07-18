@@ -255,6 +255,27 @@ pub(crate) struct PrereqPipelineStatus {
     pub(crate) stages: [PrereqStage; 4],
 }
 
+/// #1199: collapse a 4-stage [`PrereqPipelineStatus`] (Author→Test→Review→
+/// Merge) into the single overall status a milestone gate lane box shows —
+/// used to render Gate A's box from the existing #1084 `gate_a_prereq_status`
+/// machinery without recomputing anything. Mirrors
+/// `prereq_pipeline_status_from`'s own settling order (each stage only
+/// advances once its predecessor is Done, so Merge Done implies every prior
+/// stage is Done too): Failed wins if any sub-stage failed, Done only when
+/// every sub-stage is Done, Active if any sub-stage is running, else Pending
+/// (covers "never dispatched", where every sub-stage is already Pending).
+pub(crate) fn collapse_prereq_pipeline_status(status: &PrereqPipelineStatus) -> StageStatus {
+    if status.stages.iter().any(|s| s.status == StageStatus::Failed) {
+        StageStatus::Failed
+    } else if status.stages.iter().all(|s| s.status == StageStatus::Done) {
+        StageStatus::Done
+    } else if status.stages.iter().any(|s| s.status == StageStatus::Active) {
+        StageStatus::Active
+    } else {
+        StageStatus::Pending
+    }
+}
+
 /// #863: the iteration cap was hit — awaiting the operator's one-key confirm
 /// to re-dispatch the SAME Fix with `--force` (#862's override).  Raised by
 /// the `PendingFixCapPreflight` completion handler; consumed by
@@ -4733,6 +4754,16 @@ impl CoordApp {
             return None;
         }
 
+        // #1199: an epic/tracking-issue row is gated by the milestone gate
+        // lane (Gate A → B → C → D, docs/PIPELINE_V2.md), not the per-issue
+        // Work → Test → Review → Merge lane it will never run — an epic
+        // doesn't get worked, tested, reviewed or merged, it gets *gated*.
+        // Route it to its own builder before any of the work-lane machinery
+        // below (stage_names/statuses/Go-Retry attachment) ever runs.
+        if labels_carry_epic_label(&issue.all_labels) {
+            return Some(self.build_epic_gate_lane_widget(issue));
+        }
+
         // Use the per-issue stage list so a plan-typed assignment
         // shows up as a Plan stage even when `pipeline_require_plan`
         // is false globally (the #262 right-click → Start with Plan path).
@@ -4858,6 +4889,50 @@ impl CoordApp {
             stages,
             focused_stage,
         })
+    }
+
+    /// #1199: build the epic row's own pipeline — the milestone gate lane
+    /// (Gate A → B → C → D, docs/PIPELINE_V2.md) — rather than the per-issue
+    /// Work → Test → Review → Merge lane, which is meaningless for a
+    /// tracking issue (it is never itself worked/tested/reviewed/merged).
+    ///
+    /// **Gate A** reuses the existing #1084 `gate_a_prereq_status` machinery
+    /// (the mock-author Author→Test→Review→Merge sub-pipeline), collapsed to
+    /// a single stage status via `collapse_prereq_pipeline_status` — no
+    /// recomputation. **Gates B/C/D have no board-readable status yet**: B
+    /// (#933, post-milestone architecture review) and D (#934, the
+    /// `develop` + feature-branch git model) are open in milestone #20 with
+    /// no dispatch mechanism at all; C (`coord milestone gate-c`) exists but
+    /// is a manual CLI check that persists nothing the board can read. All
+    /// three render as a static "not yet available" Pending box rather than
+    /// depending on B/D landing or fabricating a status for C.
+    ///
+    /// No stage carries a Go/Retry `action` — dispatching a gate from this
+    /// row is out of scope for this presentation-only slice, and it also
+    /// closes the latent hazard where the per-issue lane's "Go" on a
+    /// Pending Work stage could otherwise be clicked on an epic row and
+    /// dispatch normal work against the tracking issue.
+    fn build_epic_gate_lane_widget(&self, issue: &PipelineIssue) -> QuiPipelineView {
+        let gate_a_status = collapse_prereq_pipeline_status(&self.gate_a_prereq_status(issue));
+        let stages: Vec<QuiPipelineStage> = [
+            ("Gate A", gate_a_status),
+            ("Gate B", StageStatus::Pending),
+            ("Gate C", StageStatus::Pending),
+            ("Gate D", StageStatus::Pending),
+        ]
+        .into_iter()
+        .map(|(label, status)| QuiPipelineStage {
+            label: label.to_string(),
+            status,
+            action: None,
+        })
+        .collect();
+        let focused_stage = self.pipeline_focused_stage.filter(|&i| i < stages.len());
+        QuiPipelineView {
+            id: WidgetId::new("pipeline:detail"),
+            stages,
+            focused_stage,
+        }
     }
 
     /// Pick the best machine to dispatch `coord_repo` work to.
