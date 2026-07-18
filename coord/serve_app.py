@@ -3258,6 +3258,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
     async def post_issue_labels(request: Request) -> Response:
         # #601: update one issue's cached labels (coord ready/backlog/refine/track).
         from coord import state  # noqa: PLC0415
+        from coord.github_ops import GhNotFound  # noqa: PLC0415
 
         body = await _read_json(request)
         if body is None:
@@ -3268,6 +3269,10 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             )
         except KeyError as e:
             return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        except GhNotFound as e:
+            return JSONResponse(
+                {"error": "label not found", "detail": str(e)}, status_code=422
+            )
         except Exception as e:  # noqa: BLE001
             return JSONResponse(
                 {"error": "issue-labels write failed", "detail": str(e)}, status_code=503
@@ -3441,6 +3446,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         # behind one seam; the client just sends (repo_name, issue_number,
         # add[], remove[]) and gets back (labels[], changed).
         from coord import state  # noqa: PLC0415
+        from coord.github_ops import GhNotFound  # noqa: PLC0415
 
         body = await _read_json(request)
         if body is None:
@@ -3455,6 +3461,14 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             )
         except KeyError as e:
             return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        except GhNotFound as e:
+            # The label doesn't exist in the repo and couldn't be auto-created
+            # (Fix B): a client-side error (4xx) — the label name is wrong,
+            # not a transient backend failure.
+            return JSONResponse(
+                {"error": "label not found", "detail": str(e)},
+                status_code=422,
+            )
         except Exception as e:  # noqa: BLE001
             return JSONResponse(
                 {"error": "issue-label write failed", "detail": str(e)},

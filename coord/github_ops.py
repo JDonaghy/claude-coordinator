@@ -6,6 +6,78 @@ import json
 import subprocess
 
 
+# ── Typed gh errors ─────────────────────────────────────────────────────────
+
+
+class GhError(RuntimeError):
+    """Base class for typed ``gh`` CLI errors.
+
+    Subclass of :class:`RuntimeError` so existing ``except RuntimeError``
+    call sites keep working without modification; catch a subclass specifically
+    to distinguish it from a generic ``gh`` failure.
+    """
+
+
+class GhNotFound(GhError):
+    """Raised when a GitHub resource (e.g. a label) does not exist in the repo.
+
+    Callers (e.g. ``serve_app`` HTTP handlers) that need to distinguish
+    "the resource doesn't exist" (a 4xx-class client error) from transient
+    backend failures (auth, network, rate-limit — which are 5xx) should
+    catch this specifically and return an appropriate HTTP status code.
+    """
+
+
+# Keywords indicating a transient/infra failure that should never trigger
+# label auto-creation.  Checked against the full lowercase error string.
+_TRANSIENT_ERROR_KEYWORDS: tuple[str, ...] = (
+    "http 401",
+    "http 403",
+    "http 429",
+    "authentication required",
+    "bad credentials",
+    "credentials not found",
+    "gh auth login",
+    "api rate limit",
+    "rate limit exceeded",
+    "secondary rate limit",
+    "timed out",
+    "connection refused",
+    "connection reset",
+    "connection error",
+    "could not resolve host",
+    "no such host",
+    "dial tcp",
+)
+
+
+def _is_transient_error(exc: Exception) -> bool:
+    """True when the ``gh`` error suggests an auth, rate-limit, or network failure.
+
+    These failures should never trigger label auto-creation or other
+    retry-with-side-effects logic — the root cause is infra, not a missing
+    resource.
+    """
+    msg = str(exc).lower()
+    return any(kw in msg for kw in _TRANSIENT_ERROR_KEYWORDS)
+
+
+def _is_label_not_found(exc: Exception) -> bool:
+    """True when ``gh`` reported that a label does not exist in the repository.
+
+    Returns ``False`` for transient errors (:func:`_is_transient_error`) so
+    callers never attempt auto-creation on auth/network/rate-limit failures.
+    """
+    if _is_transient_error(exc):
+        return False
+    msg = str(exc).lower()
+    # "could not resolve to a label" — the GraphQL error gh surfaces
+    # "label 'foo' not found" — the REST error in some gh versions
+    return "could not resolve to a label" in msg or (
+        "label" in msg and "not found" in msg
+    )
+
+
 def _gh(*args: str) -> str:
     result = subprocess.run(
         ["gh", *args],
@@ -514,7 +586,31 @@ def change_issue_labels(
             args.extend(["--add-label", lbl])
         for lbl in sorted(to_remove):
             args.extend(["--remove-label", lbl])
-        _gh(*args)
+        try:
+            _gh(*args)
+        except RuntimeError as exc:
+            if to_add and _is_label_not_found(exc):
+                # A label in ``to_add`` doesn't exist in the repo yet.
+                # Auto-create each label and retry the edit once.  Only
+                # triggered on the add path (``to_add`` is non-empty) and
+                # only for label-not-found errors — auth, network, and
+                # rate-limit failures are re-raised immediately without
+                # touching GitHub.  ``gh label create`` errors are swallowed
+                # so an "already exists" race on a concurrent create is
+                # handled gracefully.
+                for lbl in sorted(to_add):
+                    try:
+                        _gh("label", "create", lbl, "--repo", repo)
+                    except RuntimeError:
+                        pass  # idempotent: label may already exist
+                try:
+                    _gh(*args)
+                except RuntimeError as retry_exc:
+                    if _is_label_not_found(retry_exc):
+                        raise GhNotFound(str(retry_exc)) from retry_exc
+                    raise
+            else:
+                raise
 
     new_labels = sorted((current - to_remove) | to_add)
     return new_labels, changed

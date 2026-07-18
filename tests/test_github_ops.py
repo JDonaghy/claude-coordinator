@@ -426,3 +426,227 @@ class TestPrBodyWrappers:
         with patch("coord.github_ops._gh", lambda *a, **k: calls.append(a) or ""):
             github_ops.edit_pr_body("acme/api", 5, "Refs #99")
         assert calls == [("pr", "edit", "5", "--repo", "acme/api", "--body", "Refs #99")]
+
+
+# ── Fix A + B: change_issue_labels auto-create and typed errors ──────────────
+
+_CURRENT_LABELS_JSON = json.dumps({"labels": [{"name": "existing"}]})
+
+
+class TestIsLabelNotFound:
+    """Unit-level coverage for the error-classification helper."""
+
+    def test_graphql_label_error_is_label_not_found(self) -> None:
+        exc = RuntimeError(
+            "gh issue edit 5 --repo x/y failed: "
+            "GraphQL: Could not resolve to a Label with the name 'foo'."
+        )
+        assert github_ops._is_label_not_found(exc) is True
+
+    def test_label_not_found_phrase_matches(self) -> None:
+        exc = RuntimeError(
+            "gh issue edit 5 --repo x/y --add-label missing failed: "
+            "label 'missing' not found in repository x/y"
+        )
+        assert github_ops._is_label_not_found(exc) is True
+
+    def test_auth_error_is_not_label_not_found(self) -> None:
+        exc = RuntimeError(
+            "gh issue edit 5 --repo x/y failed: HTTP 401: Bad credentials"
+        )
+        assert github_ops._is_label_not_found(exc) is False
+
+    def test_rate_limit_error_is_not_label_not_found(self) -> None:
+        exc = RuntimeError(
+            "gh issue edit 5 --repo x/y failed: HTTP 429: API rate limit exceeded"
+        )
+        assert github_ops._is_label_not_found(exc) is False
+
+    def test_network_error_is_not_label_not_found(self) -> None:
+        exc = RuntimeError(
+            "gh issue edit 5 --repo x/y failed: "
+            "dial tcp: lookup api.github.com: no such host"
+        )
+        assert github_ops._is_label_not_found(exc) is False
+
+    def test_connection_refused_is_not_label_not_found(self) -> None:
+        exc = RuntimeError(
+            "gh issue edit 5 --repo x/y failed: connection refused"
+        )
+        assert github_ops._is_label_not_found(exc) is False
+
+    def test_unrelated_not_found_without_label_keyword(self) -> None:
+        # "not found" for an issue, not a label — no "label" keyword in
+        # the error, so this must NOT trigger auto-creation.
+        exc = RuntimeError(
+            "gh issue edit 999 --repo x/y failed: "
+            "GraphQL: Could not resolve to an Issue with the number 999."
+        )
+        assert github_ops._is_label_not_found(exc) is False
+
+
+class TestChangeIssueLabelsAutoCreate:
+    """Fix A: change_issue_labels auto-creates a missing add-label and retries."""
+
+    def _make_gh(self, calls: list, *, first_edit_error: str | None = None) -> None:
+        """Build a ``_gh`` side-effect that records all calls.
+
+        The first ``issue edit`` call raises *first_edit_error* if given.
+        Subsequent calls (``label create`` and the retry edit) succeed.
+        ``issue view`` always returns a single-label set ``[{"name":"x"}]``.
+        """
+        edit_calls = {"n": 0}
+
+        def _dispatch(*args: str) -> str:
+            calls.append(args)
+            if args[0] == "issue" and args[1] == "view":
+                return _CURRENT_LABELS_JSON
+            if args[0] == "issue" and args[1] == "edit":
+                edit_calls["n"] += 1
+                if edit_calls["n"] == 1 and first_edit_error:
+                    raise RuntimeError(first_edit_error)
+            return ""
+
+        return _dispatch
+
+    def test_success_without_auto_create_when_no_error(self) -> None:
+        """Happy path: edit succeeds → no label create call."""
+        calls: list = []
+        with patch("coord.github_ops._gh", side_effect=self._make_gh(calls)):
+            new_labels, changed = github_ops.change_issue_labels(
+                "acme/api", 7, add={"new"}, remove=set()
+            )
+        assert changed is True
+        assert "new" in new_labels
+        # No ``label create`` call should appear
+        create_calls = [c for c in calls if c[0] == "label" and c[1] == "create"]
+        assert create_calls == []
+
+    def test_auto_creates_label_and_retries_on_not_found(self) -> None:
+        """Fix A core: when ``gh issue edit --add-label`` fails with label-not-found,
+        ``gh label create`` is called and the edit is retried."""
+        calls: list = []
+        label_not_found_error = (
+            "gh issue edit 7 --repo acme/api --add-label new failed: "
+            "GraphQL: Could not resolve to a Label with the name 'new'."
+        )
+        with patch(
+            "coord.github_ops._gh",
+            side_effect=self._make_gh(calls, first_edit_error=label_not_found_error),
+        ):
+            new_labels, changed = github_ops.change_issue_labels(
+                "acme/api", 7, add={"new"}, remove=set()
+            )
+
+        assert changed is True
+        assert "new" in new_labels
+        # A ``label create new`` call must have been made.
+        create_calls = [
+            c for c in calls if c[0] == "label" and c[1] == "create" and "new" in c
+        ]
+        assert len(create_calls) == 1
+        # The edit was called twice: the failing first attempt + the successful retry.
+        edit_calls = [c for c in calls if c[0] == "issue" and c[1] == "edit"]
+        assert len(edit_calls) == 2
+
+    def test_raises_gh_not_found_when_retry_still_fails(self) -> None:
+        """If the retry also reports label-not-found, raise GhNotFound (4xx signal)."""
+        not_found_msg = (
+            "gh issue edit 7 --repo acme/api --add-label phantom failed: "
+            "GraphQL: Could not resolve to a Label with the name 'phantom'."
+        )
+
+        def _always_fail(*args: str) -> str:
+            if args[0] == "issue" and args[1] == "view":
+                return _CURRENT_LABELS_JSON
+            if args[0] == "issue" and args[1] == "edit":
+                raise RuntimeError(not_found_msg)
+            return ""  # label create succeeds silently
+
+        with patch("coord.github_ops._gh", side_effect=_always_fail):
+            with pytest.raises(github_ops.GhNotFound):
+                github_ops.change_issue_labels(
+                    "acme/api", 7, add={"phantom"}, remove=set()
+                )
+
+    def test_reraises_non_label_error_without_auto_create(self) -> None:
+        """An auth/network/rate-limit failure must NOT trigger label auto-creation."""
+        auth_error = (
+            "gh issue edit 7 --repo acme/api failed: HTTP 401: Bad credentials"
+        )
+        create_called = {"v": False}
+
+        def _dispatch(*args: str) -> str:
+            if args[0] == "issue" and args[1] == "view":
+                return _CURRENT_LABELS_JSON
+            if args[0] == "label" and args[1] == "create":
+                create_called["v"] = True
+                return ""
+            if args[0] == "issue" and args[1] == "edit":
+                raise RuntimeError(auth_error)
+            return ""
+
+        with patch("coord.github_ops._gh", side_effect=_dispatch):
+            with pytest.raises(RuntimeError, match="401"):
+                github_ops.change_issue_labels(
+                    "acme/api", 7, add={"new"}, remove=set()
+                )
+
+        assert create_called["v"] is False, "auto-create must not fire on auth failure"
+
+    def test_reraises_retry_error_that_is_not_label_not_found(self) -> None:
+        """If the retry fails for a non-label reason (e.g. network), re-raise as
+        plain RuntimeError — not GhNotFound."""
+        label_not_found_msg = (
+            "gh issue edit 7 --repo acme/api --add-label new failed: "
+            "GraphQL: Could not resolve to a Label with the name 'new'."
+        )
+        network_error = "gh issue edit 7 --repo acme/api failed: connection refused"
+        edit_calls = {"n": 0}
+
+        def _dispatch(*args: str) -> str:
+            if args[0] == "issue" and args[1] == "view":
+                return _CURRENT_LABELS_JSON
+            if args[0] == "label" and args[1] == "create":
+                return ""  # auto-create succeeds
+            if args[0] == "issue" and args[1] == "edit":
+                edit_calls["n"] += 1
+                if edit_calls["n"] == 1:
+                    raise RuntimeError(label_not_found_msg)
+                raise RuntimeError(network_error)
+            return ""
+
+        with patch("coord.github_ops._gh", side_effect=_dispatch):
+            with pytest.raises(RuntimeError) as exc_info:
+                github_ops.change_issue_labels(
+                    "acme/api", 7, add={"new"}, remove=set()
+                )
+        # Should be a plain RuntimeError, NOT a GhNotFound
+        assert not isinstance(exc_info.value, github_ops.GhNotFound)
+        assert "connection refused" in str(exc_info.value)
+
+    def test_remove_path_is_unaffected_by_auto_create_logic(self) -> None:
+        """Fix A scope: the auto-create path is only for adds; a remove-only
+        change that fails must propagate the error unchanged."""
+        remove_error = RuntimeError(
+            "gh issue edit 7 --repo acme/api failed: some unexpected error"
+        )
+        create_called = {"v": False}
+
+        def _dispatch(*args: str) -> str:
+            if args[0] == "issue" and args[1] == "view":
+                return json.dumps({"labels": [{"name": "existing"}]})
+            if args[0] == "label" and args[1] == "create":
+                create_called["v"] = True
+                return ""
+            if args[0] == "issue" and args[1] == "edit":
+                raise remove_error
+            return ""
+
+        with patch("coord.github_ops._gh", side_effect=_dispatch):
+            with pytest.raises(RuntimeError, match="some unexpected error"):
+                # to_add is empty — only a remove
+                github_ops.change_issue_labels(
+                    "acme/api", 7, add=set(), remove={"existing"}
+                )
+        assert create_called["v"] is False, "auto-create must not fire for remove-only changes"
