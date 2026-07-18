@@ -207,6 +207,8 @@ impl CoordApp {
             || self.pending_restart.is_some()
             || self.pending_kill_terminal.is_some()
             || self.pending_kill_session.is_some()
+            || self.pending_usage_range_start.is_some()
+            || self.pending_usage_range_end.is_some()
     }
 
     /// an `action_id` of the form `"toolbar:<verb>"` resolved by
@@ -278,7 +280,9 @@ impl CoordApp {
             // MilestoneDag's "Dispatch milestone" is a keybind + context menu (#771);
             // Sessions is read-only nav/select in this slice (#1032); Audit's
             // verbs (nav/detail/refresh) are all keybinds, surfaced in the
-            // status-bar hints (#1039).
+            // status-bar hints (#1039). Usage's verbs (scope/group-by/
+            // sort/expand) are all keybinds + header clicks, same as Audit
+            // (#1116).
             SidebarView::Pipeline
             | SidebarView::Machines
             | SidebarView::Settings
@@ -288,7 +292,8 @@ impl CoordApp {
             | SidebarView::MilestoneDag
             | SidebarView::Plans
             | SidebarView::Sessions
-            | SidebarView::Audit => return None,
+            | SidebarView::Audit
+            | SidebarView::Usage => return None,
         };
 
         Some(Toolbar {

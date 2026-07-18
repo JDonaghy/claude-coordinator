@@ -2514,6 +2514,75 @@ impl CoordApp {
             });
         }
 
+        // ── #1116: "Custom range…" dialog, step 1 (start instant) ────────────
+        if let Some(ref input) = self.pending_usage_range_start {
+            return Some(Dialog {
+                table: None,
+                id: WidgetId::new("dialog:usage-range-start"),
+                title: StyledText::plain("Custom range — start"),
+                body: vec![StyledText::plain("YYYY-MM-DD or YYYY-MM-DD HH:MM (UTC):")],
+                buttons: vec![
+                    DialogButton {
+                        id: WidgetId::new("submit"),
+                        label: "Next".into(),
+                        is_default: true,
+                        is_cancel: false,
+                        tint: None,
+                    },
+                    DialogButton {
+                        id: WidgetId::new("cancel"),
+                        label: "Cancel".into(),
+                        is_default: false,
+                        is_cancel: true,
+                        tint: None,
+                    },
+                ],
+                severity: None,
+                vertical_buttons: false,
+                input: Some(DialogInput::TextInput(DialogTextInput {
+                    value: input.buf.clone(),
+                    placeholder: "2026-07-01".into(),
+                    cursor: Some(input.buf.len()),
+                })),
+            });
+        }
+
+        // ── #1116: "Custom range…" dialog, step 2 (end instant) ──────────────
+        if let Some(ref input) = self.pending_usage_range_end {
+            return Some(Dialog {
+                table: None,
+                id: WidgetId::new("dialog:usage-range-end"),
+                title: StyledText::plain(format!(
+                    "Custom range — end (start: {})",
+                    usage::format_civil_datetime(input.start)
+                )),
+                body: vec![StyledText::plain("YYYY-MM-DD or YYYY-MM-DD HH:MM (UTC):")],
+                buttons: vec![
+                    DialogButton {
+                        id: WidgetId::new("submit"),
+                        label: "Apply".into(),
+                        is_default: true,
+                        is_cancel: false,
+                        tint: None,
+                    },
+                    DialogButton {
+                        id: WidgetId::new("cancel"),
+                        label: "Cancel".into(),
+                        is_default: false,
+                        is_cancel: true,
+                        tint: None,
+                    },
+                ],
+                severity: None,
+                vertical_buttons: false,
+                input: Some(DialogInput::TextInput(DialogTextInput {
+                    value: input.buf.clone(),
+                    placeholder: "2026-07-08".into(),
+                    cursor: Some(input.buf.len()),
+                })),
+            });
+        }
+
         None
     }
 
@@ -2862,6 +2931,28 @@ impl CoordApp {
                 _ => {
                     self.pending_new_terminal = None;
                 }
+            }
+            *self.dialog_layout.borrow_mut() = None;
+            return;
+        }
+
+        // ── #1116: "Custom range…" dialog, step 1 (mouse) ────────────────
+        if self.pending_usage_range_start.is_some() {
+            if id == "submit" {
+                self.submit_usage_range_start();
+            } else {
+                self.pending_usage_range_start = None;
+            }
+            *self.dialog_layout.borrow_mut() = None;
+            return;
+        }
+
+        // ── #1116: "Custom range…" dialog, step 2 (mouse) ────────────────
+        if self.pending_usage_range_end.is_some() {
+            if id == "submit" {
+                self.submit_usage_range_end();
+            } else {
+                self.pending_usage_range_end = None;
             }
             *self.dialog_layout.borrow_mut() = None;
             return;

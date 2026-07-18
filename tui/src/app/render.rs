@@ -111,6 +111,10 @@ impl ShellApp for CoordApp {
                 SidebarView::Audit => {
                     backend.draw_list(sidebar_rect, &self.audit_sidebar());
                 }
+                // #1116: Usage sidebar — scope/group-by + Σ total.
+                SidebarView::Usage => {
+                    backend.draw_list(sidebar_rect, &self.usage_sidebar());
+                }
             }
         }
 
@@ -518,6 +522,11 @@ impl ShellApp for CoordApp {
             SidebarView::Audit => {
                 self.render_audit_panel(backend, m, lh);
             }
+            // #1116: Usage panel — per-issue/repo cost/token grid, or the
+            // per-stage drill while an issue is expanded.
+            SidebarView::Usage => {
+                self.render_usage_panel(backend, m, lh);
+            }
         }
 
         // ── Inject chat overlay — renders over the main panel ───────────
@@ -660,6 +669,8 @@ impl ShellApp for CoordApp {
             "panel:sessions" => SidebarView::Sessions,
             // #1039: Audit panel — newest-first audit-trail list.
             "panel:audit" => SidebarView::Audit,
+            // #1116: Usage panel — per-issue/repo cost/token grid.
+            "panel:usage" => SidebarView::Usage,
             _ => return,
         };
     }

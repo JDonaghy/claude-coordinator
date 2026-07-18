@@ -279,6 +279,19 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         audit_scroll: 0,
         audit_h_scroll: 0.0,
         audit_scrollbar_drag: None,
+        // #1116: Usage panel — today/by-issue/cost-total-desc defaults,
+        // nothing expanded, no custom-range dialog, same as the real
+        // constructor (`CoordApp::new` in `mod.rs`).
+        usage_scope: UsageScope::Today,
+        usage_group_by: UsageGroupBy::Issue,
+        usage_sort_key: UsageSortKey::CostTotal,
+        usage_sort_dir: SortDirection::Descending,
+        usage_sel: 0,
+        usage_scroll: 0,
+        usage_expanded: None,
+        usage_table_layout: std::cell::RefCell::new(None),
+        pending_usage_range_start: None,
+        pending_usage_range_end: None,
         // #217: use the default dark palette for test helpers.
         active_theme: crate::settings::Theme::Dark.to_quadraui_theme(),
         // #728: default 2h window for tests (can be overridden per test).
