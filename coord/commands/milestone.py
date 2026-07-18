@@ -440,20 +440,25 @@ def milestone_add_child_cmd(
     "sync",
     help=(
         "#1061 (EP-2): backfill the live GitHub sub-issues API from an "
-        "epic's `## Work order` block, and retire the old checkbox-based "
-        "grammar on that body. REPO is the local repo name from "
-        "coordinator.yml; EPIC is the GH issue number of the epic tracking "
-        "issue.\n\n"
-        "For every issue referenced in EPIC's `## Work order`, links it as "
-        "a live sub-issue of EPIC (skipping any already linked — idempotent, "
-        "safe to re-run). Then rewrites `## Work order` to the "
-        "checkbox-free grammar (`- #N {group: ..., after: ...}`, no `[ ]`/"
-        "`[x]` — the box was parsed and rendered but never read for "
-        "readiness) and removes any `## Sub-issues` block entirely — "
-        "membership is now owned by the live API plus `## Work order`, so "
-        "the separate checklist (#1008) is pure duplication. A body already "
-        "in the target shape with nothing left to link is reported "
-        "unchanged, not rewritten."
+        "epic's `## Work order` and/or `## Sub-issues` blocks, and retire "
+        "the old checkbox-based grammar on that body. REPO is the local "
+        "repo name from coordinator.yml; EPIC is the GH issue number of "
+        "the epic tracking issue.\n\n"
+        "`## Work order` and `## Sub-issues` are independent, "
+        "not-necessarily-overlapping sources for the same parent->children "
+        "relationship (a standalone `add-child` epic may have only a `## "
+        "Sub-issues` checklist) — sync unions the two before acting, so a "
+        "child listed in either section is never silently dropped. For "
+        "every issue in that union, links it as a live sub-issue of EPIC "
+        "(skipping any already linked — idempotent, safe to re-run). Then "
+        "rewrites `## Work order` to the checkbox-free grammar (`- #N "
+        "{group: ..., after: ...}`, no `[ ]`/`[x]` — the box was parsed and "
+        "rendered but never read for readiness), folding in any `## "
+        "Sub-issues`-only children, and removes the `## Sub-issues` block "
+        "entirely — membership is now owned by the live API plus `## Work "
+        "order`, so the separate checklist (#1008) is pure duplication. A "
+        "body already in the target shape with nothing left to link is "
+        "reported unchanged, not rewritten."
     ),
 )
 @click.argument("repo")
@@ -485,10 +490,47 @@ def milestone_sync_cmd(repo: str, epic: int, dry_run: bool, config_path: Path) -
     except WorkOrderError as e:
         click.echo(f"error: #{epic}'s `## Work order` block is invalid: {e}", err=True)
         sys.exit(1)
+    try:
+        sub_issues = parse_sub_issues(old_body)
+    except WorkOrderError as e:
+        click.echo(f"error: #{epic}'s `## Sub-issues` block is invalid: {e}", err=True)
+        sys.exit(1)
 
-    if not work_order.nodes:
-        click.echo(f"#{epic} ({repo_entry.github}): no `## Work order` block found — nothing to sync")
+    if not work_order.nodes and not sub_issues.nodes:
+        click.echo(
+            f"#{epic} ({repo_entry.github}): no `## Work order` or `## "
+            "Sub-issues` block found — nothing to sync"
+        )
         return
+
+    # #1061 fix-iteration 1: `## Work order` and `## Sub-issues` are
+    # independent, not-necessarily-overlapping sources for the same
+    # parent->children relationship (mirrors the `fallback_to_work_order`
+    # precedent added to `coord/parentage.py` by #1197) — a standalone
+    # `add-child` epic can have only a `## Sub-issues` checklist, and either
+    # section can list a child the other doesn't. Union them before deciding
+    # what to link/render so neither case silently drops a child; a `##
+    # Sub-issues`-only node is folded into the rewritten `## Work order`
+    # (preferred per the issue's resolution: `## Work order` + the live API
+    # own membership going forward) rather than merely linked and discarded.
+    extra_from_sub_issues = [
+        n for n in sub_issues.nodes
+        if n.issue_number not in work_order.issue_numbers
+    ]
+    if extra_from_sub_issues:
+        merged_block = render_work_order(
+            WorkOrder(nodes=tuple(work_order.nodes) + tuple(extra_from_sub_issues)),
+            checkbox=False,
+        )
+        try:
+            work_order = parse_work_order(f"## Work order\n{merged_block}")
+        except WorkOrderError as e:
+            click.echo(
+                f"error: #{epic}'s `## Work order` and `## Sub-issues` "
+                f"blocks conflict when merged: {e}",
+                err=True,
+            )
+            sys.exit(1)
 
     parentage = GitHubParentage()
     try:
@@ -508,9 +550,12 @@ def milestone_sync_cmd(repo: str, epic: int, dry_run: bool, config_path: Path) -
     candidate_body = stripped_body
     body_changed = candidate_body != old_body
 
+    node_source = (
+        "`## Work order` + `## Sub-issues`" if extra_from_sub_issues else "`## Work order`"
+    )
     click.echo(
         f"#{epic} ({repo_entry.github}): {len(work_order.nodes)} node(s) in "
-        "`## Work order`"
+        f"{node_source}"
     )
     if to_link:
         verb = "would link" if dry_run else "linking"
@@ -520,6 +565,12 @@ def milestone_sync_cmd(repo: str, epic: int, dry_run: bool, config_path: Path) -
 
     if body_changed:
         bits = ["checkbox-free `## Work order`"]
+        if extra_from_sub_issues:
+            bits.append(
+                "folded "
+                + ", ".join(f"#{n.issue_number}" for n in extra_from_sub_issues)
+                + " in from `## Sub-issues`"
+            )
         if had_sub_issues:
             bits.append("removed `## Sub-issues`")
         verb = "would rewrite" if dry_run else "rewriting"
@@ -963,7 +1014,7 @@ def _resolve_milestone_membership(
     help=(
         "#770 (Phase 2 of #767): validate and write a `## Work order` block "
         "into a milestone tracking issue.\n\n"
-        "Reads the new checklist lines (e.g. `- [ ] #762  {group: A}`, no "
+        "Reads the new checklist lines (e.g. `- #762  {group: A}`, no "
         "heading) from --file or stdin, splices them into the tracking "
         "issue's current body (replacing any existing `## Work order` "
         "section — idempotent, never duplicated), re-parses and validates "
