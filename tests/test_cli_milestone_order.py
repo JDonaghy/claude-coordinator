@@ -717,6 +717,191 @@ class TestMilestoneAddChildCmd:
         assert "unknown repo" in result.output
 
 
+# ── `coord milestone sync` (#1061 EP-2: backfill the sub-issues API) ───────
+
+
+class TestMilestoneSyncCmd:
+    def test_backfills_children_and_rewrites_body(self, config_file: Path) -> None:
+        epic_body = (
+            "Epic intro.\n\n"
+            "## Work order\n"
+            "- [ ] #1050  {group: A}\n"
+            "- [ ] #1051  {after: #1050}\n"
+        )
+
+        def get_issue(repo, number):
+            assert number == 100
+            return {"number": 100, "title": "epic", "body": epic_body, "state": "OPEN"}
+
+        with patch("coord.github_ops.get_issue", side_effect=get_issue), \
+             patch("coord.github_ops.get_sub_issues", return_value=[]) as mock_get_subs, \
+             patch("coord.github_ops.add_sub_issue") as mock_add, \
+             patch("coord.github_ops.update_issue_body") as mock_update:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "sync", "api", "100", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        mock_get_subs.assert_called_once_with("acme/api", 100)
+        assert mock_add.call_args_list == [
+            (("acme/api", 100, 1050), {}),
+            (("acme/api", 100, 1051), {}),
+        ]
+        mock_update.assert_called_once()
+        call_repo, call_issue, call_body = mock_update.call_args[0]
+        assert call_repo == "acme/api"
+        assert call_issue == 100
+        from coord.milestone_order import parse_work_order
+
+        wo = parse_work_order(call_body)
+        assert wo.issue_numbers == (1050, 1051)
+        assert wo.node(1050).group == "A"
+        assert wo.node(1051).after == (1050,)
+        assert "[ ]" not in call_body and "[x]" not in call_body
+        assert "- #1050" in call_body
+
+    def test_strips_a_coexisting_sub_issues_section(self, config_file: Path) -> None:
+        epic_body = (
+            "## Work order\n"
+            "- [ ] #1050  {group: A}\n\n"
+            "## Sub-issues\n"
+            "- [ ] #1050\n"
+        )
+
+        def get_issue(repo, number):
+            return {"number": 100, "title": "epic", "body": epic_body, "state": "OPEN"}
+
+        with patch("coord.github_ops.get_issue", side_effect=get_issue), \
+             patch("coord.github_ops.get_sub_issues", return_value=[{"number": 1050, "state": "open"}]), \
+             patch("coord.github_ops.add_sub_issue") as mock_add, \
+             patch("coord.github_ops.update_issue_body") as mock_update:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "sync", "api", "100", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        mock_add.assert_not_called()  # already linked live — no-op
+        mock_update.assert_called_once()
+        _repo, _issue, call_body = mock_update.call_args[0]
+        assert "## Sub-issues" not in call_body
+        assert "[ ]" not in call_body
+
+    def test_already_synced_epic_is_a_full_noop(self, config_file: Path) -> None:
+        epic_body = "Epic intro.\n\n## Work order\n- #1050  {group: A}\n"
+
+        def get_issue(repo, number):
+            return {"number": 100, "title": "epic", "body": epic_body, "state": "OPEN"}
+
+        with patch("coord.github_ops.get_issue", side_effect=get_issue), \
+             patch("coord.github_ops.get_sub_issues", return_value=[{"number": 1050, "state": "open"}]), \
+             patch("coord.github_ops.add_sub_issue") as mock_add, \
+             patch("coord.github_ops.update_issue_body") as mock_update:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "sync", "api", "100", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        assert "no-op" in result.output
+        mock_add.assert_not_called()
+        mock_update.assert_not_called()
+
+    def test_dry_run_makes_no_live_calls(self, config_file: Path) -> None:
+        epic_body = "## Work order\n- [ ] #1050  {group: A}\n"
+
+        def get_issue(repo, number):
+            return {"number": 100, "title": "epic", "body": epic_body, "state": "OPEN"}
+
+        with patch("coord.github_ops.get_issue", side_effect=get_issue), \
+             patch("coord.github_ops.get_sub_issues", return_value=[]), \
+             patch("coord.github_ops.add_sub_issue") as mock_add, \
+             patch("coord.github_ops.update_issue_body") as mock_update:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "sync", "api", "100", "--dry-run", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        assert "would link" in result.output
+        assert "would rewrite" in result.output
+        mock_add.assert_not_called()
+        mock_update.assert_not_called()
+
+    def test_partial_link_failure_reports_and_exits_nonzero_but_still_rewrites(
+        self, config_file: Path
+    ) -> None:
+        epic_body = "## Work order\n- [ ] #1050\n- [ ] #1051\n"
+
+        def get_issue(repo, number):
+            return {"number": 100, "title": "epic", "body": epic_body, "state": "OPEN"}
+
+        def add_sub_issue(repo, parent, child):
+            if child == 1051:
+                raise RuntimeError("gh api ... failed: 422")
+
+        with patch("coord.github_ops.get_issue", side_effect=get_issue), \
+             patch("coord.github_ops.get_sub_issues", return_value=[]), \
+             patch("coord.github_ops.add_sub_issue", side_effect=add_sub_issue), \
+             patch("coord.github_ops.update_issue_body") as mock_update:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "sync", "api", "100", "--config", str(config_file)],
+            )
+        assert result.exit_code == 1
+        assert "could not link #1051" in result.output
+        # The body rewrite (grammar migration) still happens even though one
+        # child failed to link — the two concerns are independent.
+        mock_update.assert_called_once()
+
+    def test_no_work_order_block_reports_and_exits_zero(self, config_file: Path) -> None:
+        def get_issue(repo, number):
+            return {"number": 100, "title": "epic", "body": "no work order here", "state": "OPEN"}
+
+        with patch("coord.github_ops.get_issue", side_effect=get_issue), \
+             patch("coord.github_ops.update_issue_body") as mock_update:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "sync", "api", "100", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        assert "nothing to sync" in result.output
+        mock_update.assert_not_called()
+
+    def test_invalid_work_order_errors(self, config_file: Path) -> None:
+        def get_issue(repo, number):
+            return {
+                "number": 100, "title": "epic",
+                "body": "## Work order\n- [ ] #1 {after: #1}\n",
+                "state": "OPEN",
+            }
+
+        with patch("coord.github_ops.get_issue", side_effect=get_issue):
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "sync", "api", "100", "--config", str(config_file)],
+            )
+        assert result.exit_code == 1
+        assert "cycle" in result.output
+
+    def test_unknown_epic_errors(self, config_file: Path) -> None:
+        with patch(
+            "coord.github_ops.get_issue",
+            side_effect=RuntimeError("gh issue view 100 failed: no such issue"),
+        ):
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "sync", "api", "100", "--config", str(config_file)],
+            )
+        assert result.exit_code == 1
+        assert "could not fetch epic #100" in result.output
+
+    def test_unknown_repo_errors(self, config_file: Path) -> None:
+        result = CliRunner().invoke(
+            main,
+            ["milestone", "sync", "nope", "100", "--config", str(config_file)],
+        )
+        assert result.exit_code == 2
+        assert "unknown repo" in result.output
+
+
 # ── `coord milestone chat --new` (#1009 brand-new-milestone dispatch) ───────
 
 

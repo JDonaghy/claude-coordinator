@@ -160,9 +160,13 @@ def build_milestone_chat_briefing(
         "and only after the operator explicitly confirms it, write it with:\n\n"
         f"  coord milestone write-order {repo_name} {tracking_issue_number} "
         "<<'EOF'\n"
-        "  - [ ] #762  {group: A}\n"
+        "  - #762  {group: A}\n"
         "  ...\n"
-        "  EOF\n"
+        "  EOF\n\n"
+        "(#1061: no `[ ]`/`[x]` checkbox — the grammar dropped it since it "
+        "was never read for readiness; the parser still accepts the old "
+        "checkbox form on bodies that already have one, but propose new "
+        "lines checkbox-free.)"
     )
     if milestone_number is not None:
         parts.append(

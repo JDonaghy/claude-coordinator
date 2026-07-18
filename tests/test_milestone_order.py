@@ -19,6 +19,7 @@ from coord.milestone_order import (
     parse_sub_issues,
     parse_work_order,
     ready_frontier,
+    remove_sub_issues_section,
     render_sub_issues,
     render_work_order,
     replace_sub_issues_section,
@@ -86,6 +87,29 @@ class TestParseWorkOrder:
         )
         assert wo.node(1).checked is True
         assert wo.node(2).checked is False
+
+    def test_checkbox_free_grammar_parses(self) -> None:
+        """#1061: the `[ ]`/`[x]` box is now optional — a bare `- #N {...}`
+        line parses identically to its checkbox counterpart, `checked`
+        simply defaulting to False (it's decorative either way)."""
+        wo = parse_work_order(
+            "## Work order\n- #1  {group: A}\n- #2  {after: #1}\n"
+        )
+        assert wo.node(1) == WorkOrderNode(1, group="A", after=())
+        assert wo.node(2) == WorkOrderNode(2, group=None, after=(1,))
+        assert wo.node(1).checked is False
+        assert wo.node(2).checked is False
+
+    def test_checkbox_and_checkbox_free_lines_coexist(self) -> None:
+        """Both grammars are accepted in the same block during the
+        migration — an epic doesn't have to be all-or-nothing."""
+        wo = parse_work_order(
+            "## Work order\n- [x] #1\n- #2  {after: #1}\n"
+        )
+        assert wo.issue_numbers == (1, 2)
+        assert wo.node(1).checked is True
+        assert wo.node(2).checked is False
+        assert wo.node(2).after == (1,)
 
     def test_combined_group_and_after_annotation(self) -> None:
         wo = parse_work_order(
@@ -271,6 +295,38 @@ class TestReadyFrontier:
         )
         assert frontier == Frontier(ready=(), blocked=())
 
+    def test_identical_before_and_after_the_checkbox_migration(self) -> None:
+        """#1061 acceptance criterion: `ready_frontier` already ignores
+        `checked` (it keys entirely off live `terminal_issues`), so
+        migrating a body from the checkbox grammar to the checkbox-free one
+        must produce a byte-identical frontier — proven here by parsing the
+        same DAG in both grammars and asserting equal `Frontier`s across a
+        matrix of terminal-state snapshots, not just the empty-board case."""
+        old_grammar_body = SAMPLE_BODY  # `- [ ] #N {...}` throughout
+        new_grammar_body = (
+            "## Work order\n"
+            "- #762  {group: A}\n"
+            "- #763  {group: A}\n"
+            "- #765  {after: #762,#763}\n"
+            "- #766  {after: #765}\n"
+            "- #767\n"
+        )
+        wo_old = parse_work_order(old_grammar_body)
+        wo_new = parse_work_order(new_grammar_body)
+        assert wo_old.issue_numbers == wo_new.issue_numbers
+
+        board = Board()
+        for terminal_issues in (set(), {762, 763}, {762, 763, 765, 766, 767}):
+            frontier_old = ready_frontier(
+                wo_old, board, repo_name="api", repo_github="acme/api",
+                terminal_issues=terminal_issues, branch_lookup=lambda repo, n: [],
+            )
+            frontier_new = ready_frontier(
+                wo_new, board, repo_name="api", repo_github="acme/api",
+                terminal_issues=terminal_issues, branch_lookup=lambda repo, n: [],
+            )
+            assert frontier_old == frontier_new
+
 
 # ── render_work_order / replace_work_order_section (#770 Phase 2 write path) ─
 
@@ -294,6 +350,41 @@ class TestRenderWorkOrder:
             "- [ ] #2  {after: #1}\n"
             "- [ ] #3"
         )
+
+    def test_checkbox_false_renders_checkbox_free_grammar(self) -> None:
+        """#1061: the write path `coord milestone sync` uses."""
+        wo = WorkOrder(nodes=(
+            WorkOrderNode(1, group="A"),
+            WorkOrderNode(2, after=(1,)),
+            WorkOrderNode(3),
+        ))
+        rendered = render_work_order(wo, checkbox=False)
+        assert rendered == (
+            "- #1  {group: A}\n"
+            "- #2  {after: #1}\n"
+            "- #3"
+        )
+
+    def test_checkbox_false_ignores_the_checked_flag(self) -> None:
+        """Dropping the box means a `checked=True` node still renders
+        without one — there's nowhere left to put it."""
+        wo = WorkOrder(nodes=(WorkOrderNode(1, checked=True),))
+        assert render_work_order(wo, checkbox=False) == "- #1"
+
+    def test_checkbox_false_round_trips_through_parse(self) -> None:
+        wo = parse_work_order(SAMPLE_BODY)
+        rendered = render_work_order(wo, checkbox=False)
+        reparsed = parse_work_order("## Work order\n" + rendered)
+        # checked is always False on the reparsed side (no box to read) —
+        # compare node-by-node on the fields the checkbox-free grammar can
+        # actually carry, matching the acceptance criterion that dropping
+        # the box doesn't change anything readiness cares about.
+        assert reparsed.issue_numbers == wo.issue_numbers
+        for n in wo.nodes:
+            reparsed_node = reparsed.node(n.issue_number)
+            assert reparsed_node.group == n.group
+            assert reparsed_node.after == n.after
+            assert reparsed_node.checked is False
 
     def test_renders_checked_box(self) -> None:
         wo = WorkOrder(nodes=(WorkOrderNode(1, checked=True),))
@@ -480,3 +571,50 @@ class TestReplaceSubIssuesSection:
         newer_body = replace_work_order_section(new_body, "- [ ] #762\n- [ ] #763")
         assert parse_work_order(newer_body).issue_numbers == (762, 763)
         assert parse_sub_issues(newer_body).issue_numbers == (1050, 1051)
+
+
+# ── remove_sub_issues_section (#1061: retiring `## Sub-issues`) ────────────
+
+
+class TestRemoveSubIssuesSection:
+    def test_removes_heading_and_content(self) -> None:
+        body = (
+            "Intro.\n\n"
+            "## Sub-issues\n"
+            "- [ ] #1050\n"
+            "- [x] #1051\n\n"
+            "## Refs\n"
+            "other stuff\n"
+        )
+        new_body = remove_sub_issues_section(body)
+        assert "## Sub-issues" not in new_body
+        assert "#1050" not in new_body
+        assert "Intro." in new_body
+        assert "## Refs\nother stuff" in new_body
+
+    def test_no_heading_is_a_noop(self) -> None:
+        body = "## Work order\n- [ ] #1\n"
+        assert remove_sub_issues_section(body) == body
+
+    def test_leaves_a_coexisting_work_order_section_untouched(self) -> None:
+        body = (
+            "## Work order\n"
+            "- [ ] #762  {group: A}\n\n"
+            "## Sub-issues\n"
+            "- [ ] #1050\n"
+        )
+        new_body = remove_sub_issues_section(body)
+        assert parse_work_order(new_body).issue_numbers == (762,)
+        assert parse_sub_issues(new_body).nodes == ()
+        assert "## Sub-issues" not in new_body
+
+    def test_is_idempotent(self) -> None:
+        body = "## Sub-issues\n- [ ] #1050\n"
+        once = remove_sub_issues_section(body)
+        twice = remove_sub_issues_section(once)
+        assert once == twice
+
+    def test_sole_section_removed_leaves_clean_body(self) -> None:
+        body = "Epic intro.\n\n## Sub-issues\n- [ ] #1050\n"
+        new_body = remove_sub_issues_section(body)
+        assert new_body == "Epic intro.\n"
