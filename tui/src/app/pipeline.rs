@@ -804,10 +804,110 @@ impl CoordApp {
     /// fresh `pipeline_issues` list and gets either the wrong issue or
     /// `None`, defaulting the selection to issue #0.  That's the bug
     /// behind "the 15-second refresh keeps jumping me back to the top".
+    ///
+    /// #1199 fix (selection snaps to the epic on refresh): derive the id
+    /// from the sidebar's *selected tree path* rather than from
+    /// `pipeline_sel`.  A nested epic-child row that carries none of the
+    /// tracked labels (so it's absent from `pipeline_issues`) resolves to
+    /// `pipeline_sel = None` — the old capture then returned `None`, the
+    /// rebuild found nothing to restore, and the default-select snapped the
+    /// selection to the epic parent.  Reading the path lets us capture the
+    /// nested child's own `(epic_repo_slug, child_number)` even when it isn't
+    /// independently tracked, so `rebuild_pipeline_sidebar` can restore the
+    /// nested row (see `locate_pipeline_selection`).  Falls back to the
+    /// `pipeline_sel` mapping when the path can't be decoded.
     pub(crate) fn capture_pipeline_selection_id(&self) -> Option<(String, u64)> {
-        self.pipeline_sel
+        // `pipeline_sel` is authoritative and stays in sync with the tree path
+        // in production (both derive from `selected_pipeline_index`). Use it
+        // first — this preserves the established behaviour for every ordinary
+        // (top-level, or tracked-nested) selection.
+        if let Some(id) = self
+            .pipeline_sel
             .and_then(|i| self.pipeline_issues.get(i))
             .map(|i| (i.repo_slug.clone(), i.number))
+        {
+            return Some(id);
+        }
+        // Fallback (#1199): `pipeline_sel` is `None` even though a row IS
+        // selected — the only production cause is a nested epic-child row that
+        // carries none of the tracked labels, so it's absent from
+        // `pipeline_issues` and `resolve_nested_child_index` returned `None`.
+        // Recover its own `(epic_repo_slug, child_number)` from the tree path
+        // so `rebuild_pipeline_sidebar` can keep the child selected on the
+        // next refresh instead of snapping to the epic parent.
+        self.selected_nested_child_id()
+    }
+
+    /// Resolve the sidebar's current selection to a nested epic-child's own
+    /// `(epic_repo_slug, child_number)` — **only** when the selected row is a
+    /// nested child (its path is one segment deeper than the state's base
+    /// depth). Returns `None` for a plain top-level row, so it's a safe,
+    /// narrowly-scoped fallback for [`Self::capture_pipeline_selection_id`]
+    /// (a top-level row is always covered by `pipeline_sel`).
+    ///
+    /// Mirrors [`Self::selected_pipeline_index`]'s path decoding but yields
+    /// the child's issue *number* (from `epic_children`) rather than a
+    /// `pipeline_issues` index, so it works even for a child absent from
+    /// `pipeline_issues`.
+    pub(crate) fn selected_nested_child_id(&self) -> Option<(String, u64)> {
+        let search_offset = 1usize;
+        let section = self.pipeline_sidebar.active_section()?;
+        if section < search_offset {
+            return None;
+        }
+        let state_idx = section - search_offset;
+        let &state_key = self.pipeline_state_section_names.get(state_idx)?;
+        let path = self.pipeline_sidebar.selected_path(section)?;
+
+        // Resolve the base issue index (the epic at the state's base depth)
+        // plus require the trailing nested-child segment.
+        let (base_depth, parent_idx) = match state_key {
+            "new" => {
+                if path.len() < 3 {
+                    return None;
+                }
+                let repo_groups = self.pipeline_repos_for_state("new");
+                let (_, repo_issue_idxs) = repo_groups.get(path[0] as usize)?;
+                let milestones = self.pipeline_milestones_for_issues(repo_issue_idxs);
+                let (_, _, mil) = milestones.get(path[1] as usize)?;
+                (3usize, mil.get(path[2] as usize).copied()?)
+            }
+            "in-progress" => {
+                if path.len() < 3 {
+                    return None;
+                }
+                let groups = self.pipeline_active_by_liveness();
+                let (_, issue_idxs) = groups.get(path[0] as usize)?;
+                let milestones = self.pipeline_milestones_for_issues(issue_idxs);
+                let (_, _, mil) = milestones.get(path[1] as usize)?;
+                (3usize, mil.get(path[2] as usize).copied()?)
+            }
+            "done" => {
+                if path.len() < 2 {
+                    return None;
+                }
+                let done_windowed = self.pipeline_done_windowed();
+                (2usize, done_windowed.get(path[1] as usize).copied()?)
+            }
+            "refining" | "pending" => {
+                if path.len() < 2 {
+                    return None;
+                }
+                let groups = self.pipeline_repos_for_state(state_key);
+                let (_, issue_idxs) = groups.get(path[0] as usize)?;
+                (2usize, issue_idxs.get(path[1] as usize).copied()?)
+            }
+            _ => return None,
+        };
+
+        // Only a nested child (path deeper than the base) is our concern.
+        if path.len() <= base_depth {
+            return None;
+        }
+        let parent = self.pipeline_issues.get(parent_idx)?;
+        let child_pos = path[base_depth] as usize;
+        let child = self.epic_children_for(parent)?.get(child_pos)?;
+        Some((parent.repo_slug.clone(), child.number))
     }
 
     /// Compute a short uppercase repo tag for display in the Active section.
@@ -1359,6 +1459,26 @@ impl CoordApp {
             NodeState::Ready => ("ready", self.active_theme.accent_fg),
             NodeState::Blocked(_) => ("blocked", self.active_theme.badge_request_changes),
         };
+        // #1199 fix (duplicated-number label): a child that has aged out of
+        // the `open_issues` cache (a closed/old sub-issue no longer synced —
+        // e.g. #1031/#1032/#1033 under epic #1034) has no title anywhere:
+        // the `## Sub-issues` checklist carries only `#N {group/after}`, no
+        // human text, so `build_dag_nodes` falls back to `title = "#N"`.
+        // Rendering that verbatim after the `#N` column produced the reported
+        // "#1031 #1031". Detect the number-only fallback (or an empty title)
+        // and show a muted "(details not cached)" placeholder instead of the
+        // redundant number — the row still identifies itself by its `#N`
+        // column and its state badge.
+        let fallback_title = child.title.trim().is_empty()
+            || child.title.trim() == format!("#{}", child.number);
+        let (title_text, title_color) = if fallback_title {
+            (
+                "(details not cached)".to_string(),
+                Color::rgb(120, 120, 120),
+            )
+        } else {
+            (trunc(&child.title, 18).to_string(), Color::rgb(180, 180, 180))
+        };
         TreeRow {
             path,
             indent,
@@ -1369,7 +1489,7 @@ impl CoordApp {
                         format!("#{:<5}", child.number),
                         Color::rgb(150, 150, 240),
                     ),
-                    StyledSpan::with_fg(trunc(&child.title, 18), Color::rgb(180, 180, 180)),
+                    StyledSpan::with_fg(title_text, title_color),
                 ],
             },
             badge: Some(Badge::colored(state_text, state_color)),
@@ -3670,96 +3790,19 @@ impl CoordApp {
         let prev_issue_num: Option<u64> = prev_sel.as_ref().map(|(_, num)| *num);
 
         // Restore previous selection if the issue still exists in the new
-        // layout.  Search both the flat Active list and the repo-grouped
-        // New/Done lists using the pre-computed buckets.
+        // layout.  `locate_pipeline_selection` is nesting-aware — it finds a
+        // row whether it renders top-level or nested under an epic (#1199),
+        // where the old inline top-level-only search would fail and let the
+        // default-select snap the selection to the epic parent.  A nested
+        // child that isn't independently tracked resolves to `sel = None`:
+        // the row stays visually selected, and `pipeline_sel` is synced from
+        // the sidebar path just below (never left pointing at the epic).
         if let Some((repo, num)) = prev_sel {
-            'outer: for (state_idx, &state_key) in
-                self.pipeline_state_section_names.iter().enumerate()
-            {
-                let section_idx = state_idx + search_offset;
-                if state_key == "in-progress" {
-                    // #1069: Active — liveness-grouped, then milestone-grouped —
-                    // path = [group_idx, milestone_idx, issue_idx].
-                    for (gi, (_gk, issue_idxs)) in active_by_liveness.iter().enumerate() {
-                        let milestones = self.pipeline_milestones_for_issues(issue_idxs);
-                        for (mi, (_, _, mil_issue_idxs)) in milestones.iter().enumerate() {
-                            for (ii, &idx) in mil_issue_idxs.iter().enumerate() {
-                                let issue = &self.pipeline_issues[idx];
-                                if issue.repo_slug == repo && issue.number == num {
-                                    self.pipeline_sel = Some(idx);
-                                    self.pipeline_sidebar.set_active_section(Some(section_idx));
-                                    self.pipeline_sidebar.set_selected_path(
-                                        section_idx,
-                                        Some(vec![gi as u16, mi as u16, ii as u16]),
-                                    );
-                                    break 'outer;
-                                }
-                            }
-                        }
-                    }
-                } else if state_key == "done" {
-                    // #728: Done is now flat [0, issue_idx] — search
-                    // pipeline_done_windowed() directly (no repo/milestone levels).
-                    for (ii, &idx) in done_windowed.iter().enumerate() {
-                        let issue = &self.pipeline_issues[idx];
-                        if issue.repo_slug == repo && issue.number == num {
-                            self.pipeline_sel = Some(idx);
-                            self.pipeline_sidebar.set_active_section(Some(section_idx));
-                            self.pipeline_sidebar.set_selected_path(
-                                section_idx,
-                                Some(vec![0u16, ii as u16]),
-                            );
-                            break 'outer;
-                        }
-                    }
-                } else {
-                    let repo_groups: &Vec<(String, Vec<usize>)> = match state_key {
-                        "new" => &new_by_repo,
-                        "refining" => &refining_by_repo,
-                        "pending" => &pending_by_repo,
-                        // Unknown state key — skip selection restore.
-                        _ => continue,
-                    };
-                    // #668: New uses 3-level paths [ri, mi, ii];
-                    // Refining and Pending remain 2-level [ri, ii].
-                    if state_key == "new" {
-                        for (ri, (_, issue_idxs)) in repo_groups.iter().enumerate() {
-                            // Compute milestones; owned Vec, so no self borrow persists.
-                            let milestones = self.pipeline_milestones_for_issues(issue_idxs);
-                            for (mi, (_, _, mil_issue_idxs)) in milestones.iter().enumerate() {
-                                for (ii, &idx) in mil_issue_idxs.iter().enumerate() {
-                                    let issue = &self.pipeline_issues[idx];
-                                    if issue.repo_slug == repo && issue.number == num {
-                                        self.pipeline_sel = Some(idx);
-                                        self.pipeline_sidebar
-                                            .set_active_section(Some(section_idx));
-                                        self.pipeline_sidebar.set_selected_path(
-                                            section_idx,
-                                            Some(vec![ri as u16, mi as u16, ii as u16]),
-                                        );
-                                        break 'outer;
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        for (ri, (_, issue_idxs)) in repo_groups.iter().enumerate() {
-                            for (ii, &idx) in issue_idxs.iter().enumerate() {
-                                let issue = &self.pipeline_issues[idx];
-                                if issue.repo_slug == repo && issue.number == num {
-                                    self.pipeline_sel = Some(idx);
-                                    self.pipeline_sidebar
-                                        .set_active_section(Some(section_idx));
-                                    self.pipeline_sidebar.set_selected_path(
-                                        section_idx,
-                                        Some(vec![ri as u16, ii as u16]),
-                                    );
-                                    break 'outer;
-                                }
-                            }
-                        }
-                    }
-                }
+            if let Some((section_idx, path, sel)) = self.locate_pipeline_selection(&repo, num) {
+                self.pipeline_sidebar.set_active_section(Some(section_idx));
+                self.pipeline_sidebar
+                    .set_selected_path(section_idx, Some(path));
+                self.pipeline_sel = sel;
             }
         }
         // Sync `pipeline_sel` to the sidebar's actual selection.
@@ -3895,6 +3938,117 @@ impl CoordApp {
                 Some(parent_idx)
             }
         }
+    }
+
+    /// #1199 fix (selection snaps to the epic on refresh): locate the sidebar
+    /// target — `(section_idx, tree_path, resolved pipeline index)` — for a
+    /// previously-selected `(repo_slug, issue#)`, **nesting-aware**.
+    ///
+    /// The pre-existing restore in `rebuild_pipeline_sidebar` only searched
+    /// the *top-level* bucket rows, so it could never re-find a row that is
+    /// rendered **nested under an epic**:
+    /// - a closed child (e.g. #1097) whose own lifecycle bucket is `done` but
+    ///   which renders nested under its still-open epic — the epic lives in a
+    ///   different bucket, so no top-level loop over the epic's bucket, nor
+    ///   the windowed `done` list, ever contained it; and
+    /// - an untracked child (e.g. #1031/#1032/#1033) absent from
+    ///   `pipeline_issues` altogether.
+    /// Unmatched, the restore fell through to the default-select, which
+    /// snapped the selection to the epic parent and replaced the child's own
+    /// pipeline with the epic's gate lane — exactly the reported regression.
+    ///
+    /// This mirrors the row-emission loops (same buckets, same
+    /// `compute_epic_nesting`, same path shapes) and checks, per leaf group,
+    /// (1) a top-level match that is **not** suppressed by nesting, then
+    /// (2) a nested-child match under any epic in the group. The returned
+    /// pipeline index is `None` for an untracked nested child (kept visually
+    /// selected, but with the "no issue" detail placeholder — never snapped
+    /// onto the epic).
+    pub(crate) fn locate_pipeline_selection(
+        &self,
+        repo: &str,
+        num: u64,
+    ) -> Option<(usize, Vec<u16>, Option<usize>)> {
+        let search_offset = 1usize;
+        for (state_idx, &state_key) in self.pipeline_state_section_names.iter().enumerate() {
+            let section_idx = state_idx + search_offset;
+            // Leaf groups for this state as (path_prefix, issue_idxs) — the
+            // same shapes the row-emission and `selected_pipeline_index`
+            // decoders use.
+            let leaves: Vec<(Vec<u16>, Vec<usize>)> = match state_key {
+                "in-progress" => {
+                    let mut out = Vec::new();
+                    for (gi, (_gk, issue_idxs)) in
+                        self.pipeline_active_by_liveness().iter().enumerate()
+                    {
+                        for (mi, (_, _, mil)) in self
+                            .pipeline_milestones_for_issues(issue_idxs)
+                            .into_iter()
+                            .enumerate()
+                        {
+                            out.push((vec![gi as u16, mi as u16], mil));
+                        }
+                    }
+                    out
+                }
+                "new" => {
+                    let mut out = Vec::new();
+                    for (ri, (_, issue_idxs)) in
+                        self.pipeline_repos_for_state("new").iter().enumerate()
+                    {
+                        for (mi, (_, _, mil)) in self
+                            .pipeline_milestones_for_issues(issue_idxs)
+                            .into_iter()
+                            .enumerate()
+                        {
+                            out.push((vec![ri as u16, mi as u16], mil));
+                        }
+                    }
+                    out
+                }
+                "done" => vec![(vec![0u16], self.pipeline_done_windowed())],
+                "refining" | "pending" => self
+                    .pipeline_repos_for_state(state_key)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(ri, (_, idxs))| (vec![ri as u16], idxs))
+                    .collect(),
+                _ => continue,
+            };
+
+            for (prefix, issue_idxs) in &leaves {
+                let nesting = self.compute_epic_nesting(issue_idxs);
+                // (1) top-level row (not suppressed by nesting).
+                for (ii, &idx) in issue_idxs.iter().enumerate() {
+                    let issue = &self.pipeline_issues[idx];
+                    if issue.repo_slug == repo
+                        && issue.number == num
+                        && !nesting.nested.contains(&num)
+                    {
+                        let mut path = prefix.clone();
+                        path.push(ii as u16);
+                        return Some((section_idx, path, Some(idx)));
+                    }
+                }
+                // (2) nested epic-child row.
+                for (ii, &idx) in issue_idxs.iter().enumerate() {
+                    let epic = &self.pipeline_issues[idx];
+                    if epic.repo_slug != repo {
+                        continue;
+                    }
+                    if let Some(children) = nesting.by_epic.get(&idx) {
+                        if let Some(ci) = children.iter().position(|c| c.number == num) {
+                            let mut path = prefix.clone();
+                            path.push(ii as u16);
+                            path.push(ci as u16);
+                            let sel = self.resolve_nested_child_index(idx, ci);
+                            return Some((section_idx, path, sel));
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// #550: look up *stage*'s status for *issue* in the server-computed
