@@ -1963,6 +1963,80 @@ def test_serve_issue_label_writes_backend_and_cache(
     assert json.loads(row["labels"]) == ["bug", "existing"]
 
 
+def test_serve_issue_label_gh_not_found_returns_422(
+    file_db: Path, valid_config_path: Path, rw_db, monkeypatch
+):
+    """Fix B: POST /issue-label returns 422 when GhNotFound is raised (label
+    doesn't exist in the repo after auto-create attempt), not 503."""
+    from coord.github_ops import GhNotFound
+
+    monkeypatch.setattr(
+        "coord.github_ops.change_issue_labels",
+        lambda *a, **k: (_ for _ in ()).throw(
+            GhNotFound(
+                "GraphQL: Could not resolve to a Label with the name 'ghost'."
+            )
+        ),
+    )
+    rw_db.execute(
+        "INSERT INTO issues (repo_name, number, title, body, state, labels, synced_at) "
+        "VALUES (?,?,?,?,?,?,?)",
+        ("api", 8, "an issue", "", "open", '["existing"]', 1.0),
+    )
+    rw_db.commit()
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post(
+            "/issue-label",
+            json={
+                "repo_name": "api",
+                "issue_number": 8,
+                "add": ["ghost"],
+                "remove": [],
+                "repo_github": "owner/api",
+            },
+        )
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["error"] == "label not found"
+    assert "detail" in body
+
+
+def test_serve_issue_label_backend_error_returns_503(
+    file_db: Path, valid_config_path: Path, rw_db, monkeypatch
+):
+    """Fix B: POST /issue-label returns 503 for a genuine backend failure
+    (auth/network/rate-limit), not 422."""
+    monkeypatch.setattr(
+        "coord.github_ops.change_issue_labels",
+        lambda *a, **k: (_ for _ in ()).throw(
+            RuntimeError("gh issue edit 8 failed: HTTP 401: Bad credentials")
+        ),
+    )
+    rw_db.execute(
+        "INSERT INTO issues (repo_name, number, title, body, state, labels, synced_at) "
+        "VALUES (?,?,?,?,?,?,?)",
+        ("api", 8, "an issue", "", "open", '["existing"]', 1.0),
+    )
+    rw_db.commit()
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post(
+            "/issue-label",
+            json={
+                "repo_name": "api",
+                "issue_number": 8,
+                "add": ["coord"],
+                "remove": [],
+                "repo_github": "owner/api",
+            },
+        )
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["error"] == "issue-label write failed"
+    assert "detail" in body
+
+
 def test_serve_issue_create_writes_backend_and_cache(
     file_db: Path, valid_config_path: Path, rw_db, monkeypatch
 ):
