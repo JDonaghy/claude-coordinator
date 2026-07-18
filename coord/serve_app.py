@@ -2101,6 +2101,7 @@ def _openapi_spec() -> dict:
                                     "skip_smoke": {"type": "boolean"},
                                     "drop": {"type": "string", "nullable": True},
                                     "only": {"type": "string", "nullable": True},
+                                    "override_human_required": {"type": "string", "nullable": True},
                                 },
                             }
                         }
@@ -3674,6 +3675,12 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                         skip_smoke=bool(body.get("skip_smoke")),
                         drop_assignment=None,  # already handled above
                         only_assignment=body.get("only"),  # #780: single-entry merge
+                        # #1251: audited HUMAN_REQUIRED override — unlike
+                        # skip_review this is safe to trust from the client
+                        # verbatim: it's gated on --only (one specific entry)
+                        # and always writes its own audit row, so there's no
+                        # blanket-bypass risk analogous to the review gate.
+                        override_human_required=body.get("override_human_required"),
                     )
             except SystemExit as e:  # click commands sys.exit() on some paths
                 code = e.code if isinstance(e.code, int) else (1 if e.code else 0)
