@@ -4574,6 +4574,75 @@ impl CoordApp {
                 })
             })
             .collect();
+
+        // #1199 fix (blank pipeline lane for a regular issue nested under
+        // an epic): an epic's `## Sub-issues` children are real,
+        // dispatchable issues that #1197 nests beneath the epic's row in
+        // the Pipeline tree — but a child that doesn't independently carry
+        // a tracked label was previously absent from `pipeline_issues`
+        // entirely. `resolve_nested_child_index` then had no index to
+        // resolve to, so clicking such a child left `pipeline_sel` at
+        // `None`: no Work/Test/Review/Merge lane rendered, and the Issue
+        // tab fell back to "No issue selected". Backfill any such child
+        // from `data.open_issues` (when still cached) so it's
+        // independently selectable exactly like a directly-tracked
+        // sibling. This can't create a duplicate flat top-level row: the
+        // existing `nesting.nested` de-dup (#1197,
+        // `compute_epic_nesting`) already suppresses a flat row for any
+        // child issue number found under its parent epic within the same
+        // lifecycle bucket, and that check is keyed on issue number alone
+        // — it doesn't care whether the child got here via the tracked-
+        // label filter above or via this backfill.
+        let mut present: std::collections::HashSet<(String, u64)> = issues
+            .iter()
+            .map(|i| (i.coord_repo.clone().unwrap_or_default(), i.number))
+            .collect();
+        for ec in &self.data.epic_children {
+            // Only backfill children of an epic that is itself tracked
+            // (i.e. already made it into `issues` above) — an untracked
+            // epic's children are out of scope for the Pipeline.
+            if !present.contains(&(ec.repo_name.clone(), ec.tracking_issue)) {
+                continue;
+            }
+            for child in &ec.children {
+                let key = (ec.repo_name.clone(), child.number);
+                if present.contains(&key) {
+                    continue;
+                }
+                let Some(oi) = self
+                    .data
+                    .open_issues
+                    .iter()
+                    .find(|oi| oi.repo_name == ec.repo_name && oi.number == child.number)
+                else {
+                    // Aged out of the open_issues cache (#771) — stays
+                    // nested-display-only, same as before this fix.
+                    continue;
+                };
+                let matched: Vec<String> = oi
+                    .labels
+                    .iter()
+                    .filter(|l| tracked.contains(l.as_str()))
+                    .cloned()
+                    .collect();
+                let repo_slug = slug_of
+                    .get(oi.repo_name.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| oi.repo_name.clone());
+                issues.push(PipelineIssue {
+                    number: oi.number,
+                    title: oi.title.clone(),
+                    body: oi.body.clone(),
+                    repo_slug,
+                    coord_repo: Some(oi.repo_name.clone()),
+                    matched_labels: matched,
+                    all_labels: oi.labels.clone(),
+                    is_closed: oi.state == "closed",
+                });
+                present.insert(key);
+            }
+        }
+
         // Stable order: by repo, then issue number (mirrors the old loader).
         issues.sort_by(|a, b| a.repo_slug.cmp(&b.repo_slug).then(a.number.cmp(&b.number)));
         issues
