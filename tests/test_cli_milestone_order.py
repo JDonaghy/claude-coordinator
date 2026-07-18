@@ -851,6 +851,84 @@ class TestMilestoneSyncCmd:
         # child failed to link — the two concerns are independent.
         mock_update.assert_called_once()
 
+    def test_sub_issues_only_epic_is_still_linked_and_folded_in(
+        self, config_file: Path
+    ) -> None:
+        # #1061 fix-iteration 1: an epic created via standalone `add-child`
+        # can have a `## Sub-issues` checklist and *no* `## Work order`
+        # block at all — sync must not bail out as "nothing to sync" in
+        # that case (the original blocking review finding).
+        epic_body = "Epic intro.\n\n## Sub-issues\n- [ ] #1050  {group: A}\n- [ ] #1051\n"
+
+        def get_issue(repo, number):
+            return {"number": 100, "title": "epic", "body": epic_body, "state": "OPEN"}
+
+        with patch("coord.github_ops.get_issue", side_effect=get_issue), \
+             patch("coord.github_ops.get_sub_issues", return_value=[]) as mock_get_subs, \
+             patch("coord.github_ops.add_sub_issue") as mock_add, \
+             patch("coord.github_ops.update_issue_body") as mock_update:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "sync", "api", "100", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        mock_get_subs.assert_called_once_with("acme/api", 100)
+        assert mock_add.call_args_list == [
+            (("acme/api", 100, 1050), {}),
+            (("acme/api", 100, 1051), {}),
+        ]
+        mock_update.assert_called_once()
+        call_repo, call_issue, call_body = mock_update.call_args[0]
+        assert call_repo == "acme/api"
+        assert call_issue == 100
+        from coord.milestone_order import parse_work_order
+
+        wo = parse_work_order(call_body)
+        assert wo.issue_numbers == (1050, 1051)
+        assert wo.node(1050).group == "A"
+        assert "## Sub-issues" not in call_body
+
+    def test_divergent_work_order_and_sub_issues_are_unioned_not_dropped(
+        self, config_file: Path
+    ) -> None:
+        # #1061 fix-iteration 1: `## Sub-issues` lists a child (#1052) not
+        # present in `## Work order` — it must still be linked live and
+        # survive into the rewritten `## Work order`, not be silently
+        # discarded when `## Sub-issues` is removed.
+        epic_body = (
+            "## Work order\n"
+            "- [ ] #1050  {group: A}\n\n"
+            "## Sub-issues\n"
+            "- [ ] #1050\n"
+            "- [ ] #1052\n"
+        )
+
+        def get_issue(repo, number):
+            return {"number": 100, "title": "epic", "body": epic_body, "state": "OPEN"}
+
+        with patch("coord.github_ops.get_issue", side_effect=get_issue), \
+             patch("coord.github_ops.get_sub_issues", return_value=[]) as mock_get_subs, \
+             patch("coord.github_ops.add_sub_issue") as mock_add, \
+             patch("coord.github_ops.update_issue_body") as mock_update:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "sync", "api", "100", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        mock_get_subs.assert_called_once_with("acme/api", 100)
+        assert mock_add.call_args_list == [
+            (("acme/api", 100, 1050), {}),
+            (("acme/api", 100, 1052), {}),
+        ]
+        mock_update.assert_called_once()
+        _repo, _issue, call_body = mock_update.call_args[0]
+        from coord.milestone_order import parse_work_order
+
+        wo = parse_work_order(call_body)
+        assert wo.issue_numbers == (1050, 1052)
+        assert wo.node(1050).group == "A"
+        assert "## Sub-issues" not in call_body
+
     def test_no_work_order_block_reports_and_exits_zero(self, config_file: Path) -> None:
         def get_issue(repo, number):
             return {"number": 100, "title": "epic", "body": "no work order here", "state": "OPEN"}
