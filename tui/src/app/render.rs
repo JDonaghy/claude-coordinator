@@ -1949,9 +1949,18 @@ impl CoordApp {
                     Some(Color::rgb(160, 160, 180)),
                 ));
             }
+            // #1199: an epic row is gated by the milestone gate lane, not
+            // the per-issue Work→Test→Review→Merge stages — keep this
+            // summary line consistent with the lane widget rendered above it
+            // (`build_epic_gate_lane_widget`).
+            let gates_line = if labels_carry_epic_label(&issue.all_labels) {
+                "Gate A → Gate B → Gate C → Gate D".to_string()
+            } else {
+                self.pipeline_stage_names_for_issue(issue).join(" → ")
+            };
             items.push(kv_item(
                 "Gates",
-                &self.pipeline_stage_names_for_issue(issue).join(" → "),
+                &gates_line,
                 Some(Color::rgb(160, 160, 180)),
             ));
             // #546: per-issue cost rollup — sum of metered (claude -p) cost_usd
@@ -1992,7 +2001,14 @@ impl CoordApp {
         }
 
         // ── Focused-stage content ─────────────────────────────────────
-        if let Some(ref issue) = issue {
+        // #1199: an epic row has no per-issue Work/Test/Review/Merge stages
+        // to show content for — its own Gate A content already renders above
+        // via `append_gate_a_prereq_guidance_rows`, and Gates B/C/D have no
+        // content source yet (#933/#934, unpersisted `coord milestone
+        // gate-c`). Showing this section for an epic would otherwise render
+        // a stale "Stage content: Work" heading contradicting the gate lane
+        // above it.
+        if let Some(ref issue) = issue.as_ref().filter(|i| !labels_carry_epic_label(&i.all_labels)) {
             let stage_names = self.pipeline_stage_names_for_issue(issue);
             if let Some(focused_idx) = self
                 .pipeline_focused_stage
