@@ -510,6 +510,149 @@ class TestMergeOnly:
         assert result.exit_code != 0
         assert "pending" in result.output.lower() or "pending" in (result.stderr or "").lower()
 
+    def test_only_not_pending_error_is_not_silent(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """#1251 (ask 3): the "not PENDING" --only failure must actually write
+        to stderr, not just exit 1 with nothing visible there.  Regression for
+        the repro in #1251 where this exact path printed nothing to stderr."""
+        _seed_queue([_entry("m1", state=mq.MERGED)])
+
+        result = CliRunner().invoke(
+            main, ["merge", "--config", str(config_file), "--only", "m1"]
+        )
+        assert result.exit_code != 0
+        assert result.stderr.strip() != "", "expected a non-empty stderr message"
+        assert "pending" in result.stderr.lower()
+
+
+class TestMergeOverrideHumanRequired:
+    """#1251: `coord merge --only <id> --override-human-required "<reason>"` —
+    the explicit, audited escape hatch for a HUMAN_REQUIRED merge-queue entry
+    that no combination of --skip-smoke/--skip-review/--force-merge can
+    touch, since human_required represents "automation gave up", not "a gate
+    wasn't run"."""
+
+    def test_override_clears_flag_and_merges_in_same_run(
+        self, config_file: Path, coord_dir: Path, coord_db, monkeypatch,
+    ) -> None:
+        """A HUMAN_REQUIRED entry is cleared to PENDING and merged in the
+        same invocation, and an audited business-tier row is written."""
+        monkeypatch.setenv("COORD_CONFIG", str(config_file))
+        _seed_queue([_entry("h1", state=mq.HUMAN_REQUIRED)])
+
+        def fake_create_pr(repo, *, base, head, title, body):
+            return {"number": 500, "url": "u/500", "existed": False}
+
+        def fake_merge(repo, number, method="rebase"):
+            return True, "ok"
+
+        with patch("coord.github_ops.create_pr", side_effect=fake_create_pr), \
+             patch("coord.github_ops.get_pr_size", return_value=10), \
+             patch("coord.github_ops.merge_pr", side_effect=fake_merge):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "merge", "--config", str(config_file),
+                    "--only", "h1",
+                    "--override-human-required", "verified clean rebase + green gate",
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "cleared HUMAN_REQUIRED" in result.output
+
+        states = {e.assignment_id: e.state for e in mq.load_queue()}
+        assert states["h1"] == mq.MERGED, f"expected h1 MERGED, got {states['h1']!r}"
+
+        rows = coord_db.execute(
+            "SELECT * FROM audit_log WHERE event_type='human_required_override'"
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["tier"] == "business"
+        assert rows[0]["category"] == "merge"
+        assert rows[0]["actor"] == "user"
+        assert rows[0]["assignment_id"] == "h1"
+        assert "verified clean rebase" in rows[0]["summary"]
+
+    def test_override_rejected_on_non_human_required_entry(
+        self, config_file: Path, coord_dir: Path, coord_db,
+    ) -> None:
+        """The override only applies to HUMAN_REQUIRED entries — a PENDING
+        entry is left untouched and no audit row is written."""
+        _seed_queue([_entry("x1", state=mq.PENDING)])
+
+        result = CliRunner().invoke(
+            main,
+            [
+                "merge", "--config", str(config_file),
+                "--only", "x1",
+                "--override-human-required", "not applicable here",
+            ],
+        )
+        assert result.exit_code != 0
+        assert "human_required" in result.stderr.lower()
+
+        states = {e.assignment_id: e.state for e in mq.load_queue()}
+        assert states["x1"] == mq.PENDING
+
+        rows = coord_db.execute(
+            "SELECT * FROM audit_log WHERE event_type='human_required_override'"
+        ).fetchall()
+        assert rows == []
+
+    def test_override_requires_only(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """--override-human-required without --only is rejected up front —
+        it must never silently apply repo-wide."""
+        _seed_queue([_entry("h1", state=mq.HUMAN_REQUIRED)])
+
+        result = CliRunner().invoke(
+            main,
+            [
+                "merge", "--config", str(config_file),
+                "--override-human-required", "no --only given",
+            ],
+        )
+        assert result.exit_code != 0
+        assert "--only" in result.stderr
+
+        states = {e.assignment_id: e.state for e in mq.load_queue()}
+        assert states["h1"] == mq.HUMAN_REQUIRED
+
+    def test_override_dry_run_does_not_persist_or_audit(
+        self, config_file: Path, coord_dir: Path, coord_db,
+    ) -> None:
+        """--dry-run previews the clear (mirroring the review/smoke gate
+        dry-run convention) but writes neither the state change nor the
+        audit row."""
+        _seed_queue([_entry("h1", state=mq.HUMAN_REQUIRED)])
+
+        with patch("coord.github_ops.create_pr") as create, \
+             patch("coord.github_ops.merge_pr") as merge_fn, \
+             patch("coord.github_ops.get_pr_size", return_value=5):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "merge", "--config", str(config_file),
+                    "--only", "h1", "--dry-run",
+                    "--override-human-required", "dry run preview",
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        merge_fn.assert_not_called()
+        assert "would clear HUMAN_REQUIRED" in result.output
+
+        states = {e.assignment_id: e.state for e in mq.load_queue()}
+        assert states["h1"] == mq.HUMAN_REQUIRED, "dry-run must not persist the clear"
+
+        rows = coord_db.execute(
+            "SELECT * FROM audit_log WHERE event_type='human_required_override'"
+        ).fetchall()
+        assert rows == []
+
 
 class TestMergeAutoEnqueue:
     """#242: `coord merge` must scan board.completed and enqueue eligible

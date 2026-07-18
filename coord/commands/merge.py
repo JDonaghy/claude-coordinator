@@ -579,6 +579,23 @@ def _merge_via_daemon(svc, params: dict) -> None:
 )
 
 
+@click.option(
+    "--override-human-required",
+    "override_human_required",
+    default=None,
+    metavar="REASON",
+    help=(
+        "#1251: explicit, audited override for a HUMAN_REQUIRED entry — clears the "
+        "flag and requeues it as PENDING so this run's other gates (--skip-review, "
+        "--skip-smoke, --force-merge) can still apply normally. Requires --only "
+        "<assignment_id> and a reason string, which is written to the audit trail "
+        "alongside the original conflict_human_required event. Distinct from "
+        "--force-merge on purpose: human_required means an automated process already "
+        "gave up on this entry, not just that a gate wasn't run."
+    ),
+)
+
+
 def merge(
     config_path: Path,
     dry_run: bool,
@@ -591,7 +608,21 @@ def merge(
     skip_smoke: bool,
     drop_assignment: str | None,
     only_assignment: str | None,
+    override_human_required: str | None,
 ) -> None:
+    # #1251: --override-human-required is a surgical single-entry override — it
+    # only makes sense paired with --only, which pins down the one entry it
+    # applies to.  Validate up front (before any daemon round-trip) so a thin
+    # client fails fast instead of silently no-op'ing the flag on the daemon
+    # side (only_assignment gates the block that actually consumes it below).
+    if override_human_required and not only_assignment:
+        click.echo(
+            "error: --override-human-required requires --only <assignment_id> — "
+            "it targets exactly one entry, never a repo-wide scan",
+            err=True,
+        )
+        sys.exit(1)
+
     # #584: the merge queue + board live in the canonical (host-local) DB, so on
     # a thin client `coord merge` (and the TUI 'Go' button, which shells out to
     # it) would silently no-op against an empty local board.  Route the whole
@@ -615,6 +646,7 @@ def merge(
             "force_merge": force_merge, "skip_review": skip_review,
             "skip_smoke": skip_smoke, "drop": drop_assignment,
             "only": only_assignment,
+            "override_human_required": override_human_required,
         })
         return
 
@@ -670,7 +702,7 @@ def merge(
     from coord import github_ops as gh_ops
     from coord import merge_queue as mq
     from coord.ci_store import build_ci_store
-    from coord.merge_queue import CONFLICT, PENDING
+    from coord.merge_queue import CONFLICT, HUMAN_REQUIRED, PENDING
     from coord.state import load_board
 
     # #780: --only is a surgical single-entry merge that leaves all other queue
@@ -692,10 +724,63 @@ def merge(
                 f"merge-queue: no entry found for {only_assignment!r}", err=True
             )
             sys.exit(1)
+        # #1251: --override-human-required is the explicit, audited escape
+        # hatch for an entry an automated conflict-fix (or a permission /
+        # branch-protection classification) already gave up on.  It's a
+        # different class of override from --skip-smoke/--skip-review/
+        # --force-merge — those waive a gate that simply wasn't run; this
+        # clears a flag that says "automation gave up, a human must decide" —
+        # so it gets its own flag, its own validation, and its own audit
+        # row, never bundled into --force-merge.
+        if override_human_required:
+            if only_entry.state != HUMAN_REQUIRED:
+                click.echo(
+                    "error: --override-human-required only applies to a "
+                    f"HUMAN_REQUIRED entry; {only_assignment!r} is in state "
+                    f"{only_entry.state!r}",
+                    err=True,
+                )
+                sys.exit(1)
+            if dry_run:
+                click.echo(
+                    "  --override-human-required: (dry run) would clear "
+                    f"HUMAN_REQUIRED on {only_assignment!r} — "
+                    f"{override_human_required!r}"
+                )
+            else:
+                from coord.audit import record_audit  # noqa: PLC0415
+
+                record_audit(
+                    tier="business",
+                    category="merge",
+                    event_type="human_required_override",
+                    actor="user",
+                    summary=(
+                        f"human_required override: {only_entry.repo_name}"
+                        f"#{only_entry.issue_number} ({only_assignment}) — "
+                        f"{override_human_required}"
+                    ),
+                    repo=only_entry.repo_name,
+                    issue=only_entry.issue_number,
+                    assignment_id=only_entry.assignment_id,
+                    details={"reason": override_human_required},
+                )
+                click.echo(
+                    "  --override-human-required: cleared HUMAN_REQUIRED on "
+                    f"{only_assignment!r} — {override_human_required!r} — "
+                    "requeued as PENDING"
+                )
+            # Reset in-memory state either way so the dry-run event stream
+            # below reflects what a real run would do (matching the review/
+            # smoke gate dry-run convention); actual persistence is still
+            # gated on `not dry_run` in the save block further down.
+            only_entry.state = PENDING
+            only_entry.error = None
         if only_entry.state != PENDING:
             click.echo(
                 f"merge-queue: entry {only_assignment!r} is in state "
-                f"{only_entry.state!r} (not PENDING) — cannot merge"
+                f"{only_entry.state!r} (not PENDING) — cannot merge",
+                err=True,
             )
             sys.exit(1)
         # #821: never pass None to process() — use an empty board so
