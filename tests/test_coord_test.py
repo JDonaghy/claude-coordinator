@@ -357,6 +357,118 @@ class TestBranchCheckout:
         assert "git fetch failed" in result.output
 
 
+# ── #1249: stash artifacts at the Test stage (post-build) ──────────────────
+
+
+class TestArtifactStashOnBuild:
+    """`coord test`'s build step is the ONE stage that reliably runs
+    `build_command` and produces the exact binary the Test-stage `kind:
+    "pull"` step (and a later `--fix-of` re-test on this branch) wants to
+    pull instead of rebuilding. It must stash that artifact right after a
+    successful build — mirroring the interactive `--smoke-of` path's
+    `finalize_interactive_exit` stash (#1249)."""
+
+    @pytest.fixture
+    def config_with_artifacts(self, tmp_path: Path, repo_dir: Path) -> Path:
+        p = tmp_path / "coordinator-artifacts.yml"
+        p.write_text(
+            "repos:\n"
+            "  - name: api\n    github: acme/api\n"
+            "    build_command: 'echo build-ok'\n"
+            "    test_command: 'echo test-ok'\n"
+            "    artifact_paths: ['bin/*']\n"
+            "machines:\n"
+            "  - name: testbox\n    host: testbox.tailnet\n    repos: [api]\n"
+            f"    repo_paths:\n      api: {repo_dir}\n"
+        )
+        return p
+
+    @patch("subprocess.run")
+    def test_stashes_built_artifact_after_successful_build(
+        self, mock_run: MagicMock,
+        config_with_artifacts: Path, board_with_done: Board, repo_dir: Path,
+        monkeypatch, tmp_path: Path,
+    ) -> None:
+        wt = tmp_path / "wt-abc123"
+        (wt / "bin").mkdir(parents=True)
+        (wt / "bin" / "myapp").write_bytes(b"\x7fELF" + b"\x00" * 200)
+        monkeypatch.setattr(
+            "coord.commands.test_gate._test_worktree_path", lambda aid, repo: wt
+        )
+        coord_dir = tmp_path / "coord"
+        coord_dir.mkdir()
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("coord.state.COORD_DIR", coord_dir):
+            result = CliRunner().invoke(main, [
+                "test", "abc123", "--config", str(config_with_artifacts),
+            ])
+
+        assert result.exit_code == 0, result.output
+        assert "stashed 1 artifact" in result.output
+
+        stash_dir = coord_dir / "artifacts" / "api" / "issue-42-fix-auth"
+        assert (stash_dir / "myapp").exists(), "built artifact not stashed"
+        assert (stash_dir / ".assignment_id").read_text() == "abc123"
+
+    @patch("subprocess.run")
+    def test_no_stash_when_artifact_paths_unset(
+        self, mock_run: MagicMock,
+        config_file: Path, board_with_done: Board, repo_dir: Path,
+        monkeypatch, tmp_path: Path,
+    ) -> None:
+        """`config_file` (the default fixture) has no `artifact_paths` —
+        the build must not create a stash directory at all."""
+        wt = tmp_path / "wt-abc123"
+        (wt / "bin").mkdir(parents=True)
+        (wt / "bin" / "myapp").write_bytes(b"\x7fELF" + b"\x00" * 200)
+        monkeypatch.setattr(
+            "coord.commands.test_gate._test_worktree_path", lambda aid, repo: wt
+        )
+        coord_dir = tmp_path / "coord"
+        coord_dir.mkdir()
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("coord.state.COORD_DIR", coord_dir):
+            result = CliRunner().invoke(main, [
+                "test", "abc123", "--config", str(config_file),
+            ])
+
+        assert result.exit_code == 0, result.output
+        assert "stashed" not in result.output
+        assert not (coord_dir / "artifacts").exists()
+
+    @patch("subprocess.run")
+    def test_no_stash_when_build_fails(
+        self, mock_run: MagicMock,
+        config_with_artifacts: Path, board_with_done: Board, repo_dir: Path,
+        monkeypatch, tmp_path: Path,
+    ) -> None:
+        """A failed build exits before the stash call — nothing partial
+        gets copied in."""
+        wt = tmp_path / "wt-abc123"
+        (wt / "bin").mkdir(parents=True)
+        (wt / "bin" / "myapp").write_bytes(b"\x7fELF" + b"\x00" * 200)
+        monkeypatch.setattr(
+            "coord.commands.test_gate._test_worktree_path", lambda aid, repo: wt
+        )
+        coord_dir = tmp_path / "coord"
+        coord_dir.mkdir()
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout="", stderr=""),  # git fetch --prune
+            MagicMock(returncode=0, stdout="", stderr=""),  # git worktree add
+            MagicMock(returncode=1, stdout="", stderr="build broke"),  # build_command
+        ]
+
+        with patch("coord.state.COORD_DIR", coord_dir):
+            result = CliRunner().invoke(main, [
+                "test", "abc123", "--config", str(config_with_artifacts),
+            ])
+
+        assert result.exit_code != 0
+        assert not (coord_dir / "artifacts").exists()
+
+
 # ── Help text ───────────────────────────────────────────────────────────────
 
 

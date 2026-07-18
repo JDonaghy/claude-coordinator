@@ -258,6 +258,46 @@ def _remove_test_worktree(repo_dir: Path, wt_path: Path) -> None:
             pass
 
 
+def _stash_test_artifacts(repo, assignment, wt_path: Path) -> None:
+    """#1249: stash the built artifact right after `coord test`'s build
+    succeeds — the ONE stage that reliably runs `build_command` and produces
+    the exact binary the Test-stage `kind: "pull"` step (and the next
+    `--fix-of` re-test on this branch) wants to pull instead of rebuilding.
+
+    The Work-completion stash (`AgentServer._stash_artifacts`) fires right
+    before that worktree is removed, but a Work session isn't required to
+    run `build_command` — only `coord test` (and the interactive
+    `--smoke-of` path, already covered by `finalize_interactive_exit`) is.
+    Delegates to the same `stash_artifacts_for_branch` helper both of those
+    call, so one filter/copy/GC implementation serves all three call sites.
+
+    Best-effort and silent on the "nothing to do" cases (no configured
+    `artifact_paths`, no branch, no worktree on disk) — mirrors the guard
+    clauses in `AgentServer._stash_artifacts`.
+    """
+    if repo is None or not repo.artifact_paths:
+        return
+    if not assignment.branch:
+        return
+    if not wt_path.exists():
+        return
+
+    from coord.agent import stash_artifacts_for_branch  # noqa: PLC0415
+    from coord.state import COORD_DIR  # noqa: PLC0415
+
+    copied = stash_artifacts_for_branch(
+        worktree_path=wt_path,
+        branch=assignment.branch,
+        repo_name=assignment.repo_name,
+        patterns=list(repo.artifact_paths),
+        state_dir=COORD_DIR,
+        assignment_id=assignment.assignment_id,
+        log_path=None,
+    )
+    if copied > 0:
+        click.echo(f"  stashed {copied} artifact(s) for {assignment.branch!r}.")
+
+
 def _cleanup_test_worktree(cfg, assignment) -> None:
     """Remove the test worktree for *assignment* (called on a pass/skip verdict).
 
@@ -559,6 +599,10 @@ def test(assignment_id: str, config_path: Path, verdict: str | None, reason: str
             click.echo(f"  worktree kept for inspection: {wt_path}")
             sys.exit(1)
         click.echo("Build succeeded.")
+        # #1249: stash immediately after a successful build — regardless of
+        # whether the test step below then passes or fails — so a later
+        # `--fix-of` re-test on this branch can pull instead of rebuilding.
+        _stash_test_artifacts(repo, assignment, wt_path)
 
     if repo and repo.test_command:
         click.echo(f"Running tests: {repo.test_command}")
