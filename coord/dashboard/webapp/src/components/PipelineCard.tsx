@@ -12,14 +12,8 @@ import { type PipelineView, type PipelineStage } from '@/api/client'
 /**
  * Map the internal stage name from pipeline.py to the user-facing label.
  * Work Order matches the TUI: Work → Test → Review → Merge.
- *
- * Exported so `SessionCard` can reuse the same vocabulary for the
- * assignment-type chip (#1276) rather than inventing new labels — the
- * `stage`/`assignment.type` value ("work"/"smoke"/"review"/"merge"/...)
- * falls back to the raw string for anything not in this map (e.g. "fix",
- * "plan").
  */
-export const STAGE_LABEL: Record<string, string> = {
+const STAGE_LABEL: Record<string, string> = {
   coding: 'work',
   smoke:  'test',
   review: 'review',

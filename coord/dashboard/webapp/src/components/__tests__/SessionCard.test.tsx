@@ -76,7 +76,7 @@ describe('SessionCard', () => {
     expect(screen.getByText('work')).toBeInTheDocument()
   })
 
-  it('shows a "test" chip for a smoke session, reusing PipelineCard\'s STAGE_LABEL', () => {
+  it('shows a "test" chip for a smoke session', () => {
     render(<SessionCard session={makeSession({ stage: 'smoke' })} onClick={() => undefined} />)
     expect(screen.getByText('test')).toBeInTheDocument()
   })
@@ -86,12 +86,12 @@ describe('SessionCard', () => {
     expect(screen.getByText('review')).toBeInTheDocument()
   })
 
-  it('shows a "merge" chip for a merge session', () => {
-    render(<SessionCard session={makeSession({ stage: 'merge' })} onClick={() => undefined} />)
+  it('shows a "merge" chip for a real merge session (assignment.type is "conflict-fix", never "merge")', () => {
+    render(<SessionCard session={makeSession({ stage: 'conflict-fix' })} onClick={() => undefined} />)
     expect(screen.getByText('merge')).toBeInTheDocument()
   })
 
-  it('falls back to the raw assignment type when it has no STAGE_LABEL entry', () => {
+  it('falls back to the raw assignment type when it has no ASSIGNMENT_TYPE_LABEL entry', () => {
     render(<SessionCard session={makeSession({ stage: 'fix' })} onClick={() => undefined} />)
     expect(screen.getByText('fix')).toBeInTheDocument()
   })
