@@ -30044,6 +30044,271 @@ Milestone tracking issue.
         );
     }
 
+    // ── #1270: Board panel + Kanban epic nesting ──────────────────────────────
+
+    /// Helper for the #1270 Board/Kanban tests: repo "api", milestone "v1.0"
+    /// (number 1), epic #200 ("Board epic tracker") with two children — #201
+    /// (open, given a `running` assignment so it lands in the Kanban In
+    /// Flight column while its epic stays in Backlog — proving cross-column
+    /// attribution) and #202 (closed, no assignment) — plus an unrelated
+    /// plain issue #205 in the same milestone bucket. Pre-expands the "v1.0"
+    /// milestone (mirrors `make_board_milestone_app`) so rows are visible
+    /// without a click.
+    fn make_board_epic_nesting_app() -> CoordApp {
+        let data = BoardData {
+            open_issues: vec![
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 200,
+                    title: "Board epic tracker".to_string(),
+                    body: String::new(),
+                    state: "open".to_string(),
+                    labels: vec!["coord".to_string(), "epic".to_string()],
+                    milestone_number: Some(1),
+                    milestone_title: Some("v1.0".to_string()),
+                },
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 201,
+                    title: "Board child A".to_string(),
+                    body: String::new(),
+                    state: "open".to_string(),
+                    labels: vec!["coord".to_string()],
+                    milestone_number: Some(1),
+                    milestone_title: Some("v1.0".to_string()),
+                },
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 202,
+                    title: "Board child B".to_string(),
+                    body: String::new(),
+                    state: "closed".to_string(),
+                    labels: vec!["coord".to_string()],
+                    milestone_number: Some(1),
+                    milestone_title: Some("v1.0".to_string()),
+                },
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 205,
+                    title: "Board plain bug".to_string(),
+                    body: String::new(),
+                    state: "open".to_string(),
+                    labels: vec!["coord".to_string()],
+                    milestone_number: Some(1),
+                    milestone_title: Some("v1.0".to_string()),
+                },
+            ],
+            assignments: vec![
+                make_assignment_typed("running", 201, "api", Some("work")),
+                // #202 is closed with a settled ("done") assignment so it
+                // gets its own `IssueGroup` (`issues_by_repo` only
+                // backfills a no-assignment Pending entry for issues still
+                // `state == "open"` — a closed issue with no assignment at
+                // all is invisible to the Board/Kanban cache entirely,
+                // which isn't what this fixture wants to exercise) and
+                // lands in the Kanban Completed column.
+                make_assignment_typed("done", 202, "api", Some("work")),
+            ],
+            epic_children: vec![EpicChildren {
+                repo_name: "api".to_string(),
+                tracking_issue: 200,
+                children: vec![
+                    EpicChild { number: 201, state: "open".to_string() },
+                    EpicChild { number: 202, state: "closed".to_string() },
+                ],
+            }],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        app.board_milestone_expanded
+            .insert(("api".to_string(), "1".to_string()), true);
+        app.rebuild_board_sidebar();
+        app
+    }
+
+    /// #1270 TuiDriver black-box: an epic's children nest under its Board
+    /// row instead of rendering as flat siblings — the Board-panel
+    /// counterpart of #1197's Pipeline nesting.
+    ///
+    /// Asserts, via `find`/`screen()` (never hardcoded coordinates):
+    /// - both children render nested (strictly more indented — greater
+    ///   column) directly beneath the epic row
+    /// - #201 appears exactly once (dedup — no flat-sibling duplicate,
+    ///   despite #201 also being a directly-cached `open_issues` row)
+    /// - the unrelated plain issue #205 renders unchanged: same indent
+    ///   (column) as the epic, not nested under anything
+    /// - the epic row alone carries the "◆EPIC" marker
+    #[test]
+    fn tuidriver_board_epic_children_nest_under_epic_row() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_board_epic_nesting_app();
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 50);
+        let screen = driver.screen();
+
+        let epic_pos = driver
+            .find("#200")
+            .expect(&format!("epic #200 row must render:\n{screen}"));
+        let child_a_pos = driver
+            .find("#201")
+            .expect(&format!("child #201 row must render nested:\n{screen}"));
+        let child_b_pos = driver
+            .find("#202")
+            .expect(&format!("child #202 row must render nested:\n{screen}"));
+        let sibling_pos = driver
+            .find("#205")
+            .expect(&format!("unrelated issue #205 must render unchanged:\n{screen}"));
+
+        assert!(
+            child_a_pos.0 > epic_pos.0,
+            "#201 must be MORE indented (greater column) than its epic #200: epic={epic_pos:?} child={child_a_pos:?}\n{screen}",
+        );
+        assert!(
+            child_b_pos.0 > epic_pos.0,
+            "#202 must be MORE indented (greater column) than its epic #200: epic={epic_pos:?} child={child_b_pos:?}\n{screen}",
+        );
+        assert!(
+            child_a_pos.1 > epic_pos.1 && child_b_pos.1 > epic_pos.1,
+            "both children must render BELOW the epic row: epic={epic_pos:?} a={child_a_pos:?} b={child_b_pos:?}\n{screen}",
+        );
+        assert_eq!(
+            sibling_pos.0, epic_pos.0,
+            "a plain (non-epic) issue in the same milestone bucket must render at the SAME indent as the epic: epic={epic_pos:?} sibling={sibling_pos:?}\n{screen}",
+        );
+
+        // Dedup: #201 must appear exactly once — nested under #200, not
+        // ALSO as a flat sibling in the same milestone bucket.
+        assert_eq!(
+            screen.matches("#201").count(),
+            1,
+            "#201 must render exactly once (nested, not duplicated as a flat sibling):\n{screen}",
+        );
+
+        let lines: Vec<&str> = screen.lines().collect();
+        let epic_line = lines
+            .get(epic_pos.1 as usize)
+            .unwrap_or_else(|| panic!("no line at #200's row:\n{screen}"));
+        assert!(
+            epic_line.contains("EPIC"),
+            "epic #200's row must carry the EPIC marker: {epic_line:?}\n{screen}",
+        );
+        let sibling_line = lines
+            .get(sibling_pos.1 as usize)
+            .unwrap_or_else(|| panic!("no line at #205's row:\n{screen}"));
+        assert!(
+            !sibling_line.contains("EPIC"),
+            "plain issue #205's row must NOT carry the EPIC marker: {sibling_line:?}\n{screen}",
+        );
+    }
+
+    /// #1270 TuiDriver black-box: the Kanban board marks an epic card and
+    /// attributes its children to it via `decision_hint`, instead of every
+    /// issue rendering as an unlabelled loose card.
+    ///
+    /// Reuses `make_board_epic_nesting_app`, where child #201 carries a
+    /// `running` assignment (In Flight) while its epic #200 has none
+    /// (Backlog) — proving column placement stays driven by each card's OWN
+    /// lifecycle status (a child can land in a different column than its
+    /// epic) while the attribution still holds across that split.
+    #[test]
+    fn tuidriver_kanban_epic_card_marked_children_attributed_to_epic() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_board_epic_nesting_app();
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 160, 40);
+        click_activity_icon(&mut driver, "▦"); // switch to Kanban
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Backlog") && screen.contains("In Flight") && screen.contains("Completed"),
+            "all three Kanban columns must render:\n{screen}"
+        );
+        assert!(
+            screen.contains("#200") && screen.contains("#201") && screen.contains("#202"),
+            "epic and both children must render as Kanban cards:\n{screen}"
+        );
+
+        // Exactly one card (the epic, #200) carries the "◆EPIC" marker.
+        assert_eq!(
+            screen.matches("◆EPIC").count(),
+            1,
+            "exactly one card (the epic) must carry the ◆EPIC marker:\n{screen}",
+        );
+        // Both children (#201 in In Flight, #202 in Completed) carry the
+        // parent-epic attribution hint, despite landing in different columns
+        // than each other AND than their epic (which stays in Backlog) —
+        // column placement stays driven by each card's own lifecycle status.
+        assert_eq!(
+            screen.matches("part of epic #200").count(),
+            2,
+            "both children must be attributed to epic #200 via decision_hint, regardless of column:\n{screen}",
+        );
+        // The unrelated plain issue #205 has neither marker.
+        assert!(
+            !screen.contains("part of epic #205"),
+            "plain issue #205 must not be attributed to any epic:\n{screen}"
+        );
+    }
+
+    /// #1270 TuiDriver black-box: a Board epic row is independently
+    /// collapsible via its chevron — full event round-trip (click →
+    /// `RowToggleExpand` → `board_epic_row_keys` lookup →
+    /// `board_epic_expanded` flip → rebuild), mirroring Pipeline's
+    /// `tuidriver_pipeline_collapsed_epic_row_expands_on_chevron_click`.
+    #[test]
+    fn tuidriver_board_collapsed_epic_row_expands_on_chevron_click() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_board_epic_nesting_app();
+        // Seed the collapsed choice a prior click would have produced.
+        app.board_epic_expanded.insert(("api".to_string(), 200), false);
+        app.rebuild_board_sidebar();
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 50);
+
+        // A stored `false` must be honoured by the render path.
+        let screen = driver.screen();
+        assert!(
+            !driver.screen_contains("#201") && !driver.screen_contains("#202"),
+            "a stored collapsed choice must hide the epic's children:\n{screen}",
+        );
+        let epic_pos = driver
+            .find("#200")
+            .expect(&format!("epic #200 row must render:\n{screen}"));
+        let epic_line = screen
+            .lines()
+            .nth(epic_pos.1 as usize)
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            epic_line.contains('▸'),
+            "a collapsed epic row must paint the collapsed chevron (▸): {epic_line:?}\n{screen}",
+        );
+
+        // One click on the chevron — the children return.
+        driver.click(epic_pos.0 - 1.0, epic_pos.1);
+
+        let screen = driver.screen();
+        assert!(
+            driver.screen_contains("#201") && driver.screen_contains("#202"),
+            "expanding the epic must bring its children back:\n{screen}",
+        );
+        // Re-use the epic row's Y from BEFORE the click rather than
+        // re-querying `find("#200")`: clicking the row also selects it,
+        // which now makes the Issue detail pane render its own "#200"
+        // header text — an EARLIER screen match than the sidebar tree row
+        // (whose Y is unchanged by expand/collapse; only rows below it
+        // shift), so a fresh `find` would lock onto the wrong occurrence.
+        let epic_line = screen
+            .lines()
+            .nth(epic_pos.1 as usize)
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            epic_line.contains('▾'),
+            "an expanded epic row must paint the expanded chevron (▾): {epic_line:?}\n{screen}",
+        );
+    }
+
     /// #1198: the epic-row badge is driven by the label check alone — it
     /// must render for a **childless** epic (no `data.epic_children` entry
     /// at all, so #1197's nesting never applies — a different scenario than

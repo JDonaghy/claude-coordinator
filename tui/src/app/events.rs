@@ -4662,6 +4662,30 @@ impl CoordApp {
                         }
                         true
                     }
+                    // #1270: an epic row is a branch too — collapsing it
+                    // hides just its own nested children, leaving the epic
+                    // row and its milestone siblings visible. Matched by
+                    // identity via `board_epic_row_keys` (mirrors Pipeline's
+                    // `pipeline_epic_row_keys` handling) rather than a fixed
+                    // path length, since depth-2 rows are ordinary issue
+                    // rows UNLESS they happen to be an epic with children.
+                    // This arm must precede the generic catch-all below.
+                    SidebarEvent::RowToggleExpand { section, ref path }
+                        if self
+                            .board_epic_row_keys
+                            .contains_key(&(section, path.clone())) =>
+                    {
+                        if let Some(key) =
+                            self.board_epic_row_keys.get(&(section, path.clone())).cloned()
+                        {
+                            // Default expanded — mirrors the render-path
+                            // default in `epic_expand_state_in`.
+                            let entry = self.board_epic_expanded.entry(key).or_insert(true);
+                            *entry = !*entry;
+                            self.rebuild_board_sidebar();
+                        }
+                        true
+                    }
                     SidebarEvent::StateChanged
                     | SidebarEvent::Consumed
                     | SidebarEvent::ScrollChanged { .. }

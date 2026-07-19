@@ -61,6 +61,8 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         issue_sync_last: None,
         board_search: SidebarFilter::default(),
         board_milestone_expanded: std::collections::HashMap::new(),
+        board_epic_expanded: std::collections::HashMap::new(),
+        board_epic_row_keys: std::collections::HashMap::new(),
         pipeline_sidebar,
         pipeline_repo_names: Vec::new(),
         pipeline_state_section_names: Vec::new(),
