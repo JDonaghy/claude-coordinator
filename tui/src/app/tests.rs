@@ -30462,26 +30462,210 @@ Milestone tracking issue.
         );
     }
 
-    /// #1197: an untouched epic defaults to expanded (children visible), and
-    /// a stored choice wins over that default — mirroring the render path in
-    /// `epic_expand_state`.
+    /// #1197: an untouched epic defaults to expanded (children visible) when
+    /// not every child is done, and a stored choice wins over that default —
+    /// mirroring the render path in `epic_expand_state`. `make_epic_nesting_app`'s
+    /// #100 has one open child (#101) and one closed child (#102), so the
+    /// #1253 all-done-collapses-by-default path does NOT apply here — see
+    /// `epic_expand_state_defaults_collapsed_when_all_children_done` for that.
     #[test]
     fn epic_expand_state_defaults_expanded_and_honours_stored_choice() {
         let mut app = make_epic_nesting_app();
+        let epic_idx = app
+            .pipeline_issues
+            .iter()
+            .position(|i| i.number == 100)
+            .expect("#100 must be in pipeline_issues");
+        let epic = app.pipeline_issues[epic_idx].clone();
+        let nesting = app.compute_epic_nesting(&[epic_idx]);
+        let children = nesting.by_epic.get(&epic_idx).expect("#100 must have children");
+
+        let (key, expanded) = app
+            .epic_expand_state(&epic, children)
+            .expect("epic must key");
+        assert_eq!(key, ("api".to_string(), 100));
+        assert!(
+            expanded,
+            "an epic with a not-yet-done child must default to EXPANDED"
+        );
+
+        app.pipeline_epic_expanded.insert(key.clone(), false);
+        let (_, expanded) = app
+            .epic_expand_state(&epic, children)
+            .expect("epic must key");
+        assert!(!expanded, "a stored collapse choice must win over the default");
+    }
+
+    /// #1253: an epic whose children are ALL done defaults to COLLAPSED —
+    /// #1197 shipped an always-expanded default, so a long-finished epic
+    /// just accumulated an ever-growing wall of closed children with no
+    /// windowing (unlike the flat "Done" section's `pipeline_done_windowed`).
+    /// A stored choice still wins over this default, same as the
+    /// not-all-done case above.
+    #[test]
+    fn epic_expand_state_defaults_collapsed_when_all_children_done() {
+        let mut app = make_epic_nesting_app();
+        let epic_idx = app
+            .pipeline_issues
+            .iter()
+            .position(|i| i.number == 100)
+            .expect("#100 must be in pipeline_issues");
+        // Close #101 too so BOTH children (#101, #102) are done.
+        if let Some(oi) = app
+            .data
+            .open_issues
+            .iter_mut()
+            .find(|oi| oi.repo_name == "api" && oi.number == 101)
+        {
+            oi.state = "closed".to_string();
+        }
+        let epic = app.pipeline_issues[epic_idx].clone();
+        let nesting = app.compute_epic_nesting(&[epic_idx]);
+        let children = nesting.by_epic.get(&epic_idx).expect("#100 must have children");
+        assert!(
+            children.iter().all(|c| matches!(c.state, NodeState::Done)),
+            "test setup: both children must resolve to Done",
+        );
+
+        let (key, expanded) = app
+            .epic_expand_state(&epic, children)
+            .expect("epic must key");
+        assert!(
+            !expanded,
+            "an epic whose children are ALL done must default to COLLAPSED"
+        );
+
+        app.pipeline_epic_expanded.insert(key.clone(), true);
+        let (_, expanded) = app
+            .epic_expand_state(&epic, children)
+            .expect("epic must key");
+        assert!(expanded, "a stored expand choice must win over the all-done default");
+    }
+
+    /// #1253 Bug 1: an epic with no children started yet stays "new" — the
+    /// classifier only escapes "new" once some child has actual progress.
+    /// `make_epic_nesting_app`'s #101 defaults to open/unassigned; close
+    /// #102 back to open too so NEITHER child has started.
+    #[test]
+    fn pipeline_lifecycle_section_epic_with_no_started_children_is_new() {
+        let mut app = make_epic_nesting_app();
+        if let Some(oi) = app
+            .data
+            .open_issues
+            .iter_mut()
+            .find(|oi| oi.repo_name == "api" && oi.number == 102)
+        {
+            oi.state = "open".to_string();
+        }
         let epic = app
             .pipeline_issues
             .iter()
             .find(|i| i.number == 100)
             .expect("#100 must be in pipeline_issues")
             .clone();
+        assert_eq!(
+            app.pipeline_lifecycle_section(&epic),
+            "new",
+            "an epic with zero started children must stay New",
+        );
+    }
 
-        let (key, expanded) = app.epic_expand_state(&epic).expect("epic must key");
-        assert_eq!(key, ("api".to_string(), 100));
-        assert!(expanded, "an untouched epic must default to EXPANDED");
+    /// #1253 Bug 1: an epic with at least one child Done or InFlight is
+    /// "in-progress" — the fixture default (#101 open/Ready, #102
+    /// closed/Done) covers the "some progress" case directly.
+    #[test]
+    fn pipeline_lifecycle_section_epic_with_one_done_child_is_in_progress() {
+        let app = make_epic_nesting_app();
+        let epic = app
+            .pipeline_issues
+            .iter()
+            .find(|i| i.number == 100)
+            .expect("#100 must be in pipeline_issues")
+            .clone();
+        assert_eq!(
+            app.pipeline_lifecycle_section(&epic),
+            "in-progress",
+            "an epic with one Done child must be in-progress, not New",
+        );
+    }
 
-        app.pipeline_epic_expanded.insert(key.clone(), false);
-        let (_, expanded) = app.epic_expand_state(&epic).expect("epic must key");
-        assert!(!expanded, "a stored collapse choice must win over the default");
+    /// #1253 Bug 1 — the exact regression reported against #1200: an epic
+    /// whose children are ALL closed, but the epic issue itself is still
+    /// open, must NOT sit in "New" (it previously did — the epic's own
+    /// direct-assignment check is essentially always false, so it stayed
+    /// New for its entire life, including once fully done and just waiting
+    /// on a manual close).
+    #[test]
+    fn pipeline_lifecycle_section_epic_with_all_children_done_is_in_progress_not_new() {
+        let mut app = make_epic_nesting_app();
+        // Close BOTH children — mirrors #1200 (all 7 children closed, epic
+        // itself still open).
+        for n in [101u64, 102u64] {
+            if let Some(oi) = app
+                .data
+                .open_issues
+                .iter_mut()
+                .find(|oi| oi.repo_name == "api" && oi.number == n)
+            {
+                oi.state = "closed".to_string();
+            }
+        }
+        let epic = app
+            .pipeline_issues
+            .iter()
+            .find(|i| i.number == 100)
+            .expect("#100 must be in pipeline_issues")
+            .clone();
+        assert!(
+            !epic.is_closed,
+            "test setup: the epic ISSUE itself must still be open, only its children closed",
+        );
+        assert_eq!(
+            app.pipeline_lifecycle_section(&epic),
+            "in-progress",
+            "#1200 regression: an open epic with ALL children closed must not sit in New",
+        );
+    }
+
+    /// #1253 Bug 1, rendered end-to-end: with both children closed, the
+    /// epic row must appear under the "In-progress" section on screen, not
+    /// "New" — the TuiDriver-level guard for the unit-level assertions
+    /// above (screen position, not just the classifier's return value).
+    #[test]
+    fn tuidriver_pipeline_epic_with_all_children_done_renders_under_in_progress() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_epic_nesting_app();
+        for n in [101u64, 102u64] {
+            if let Some(oi) = app
+                .data
+                .open_issues
+                .iter_mut()
+                .find(|oi| oi.repo_name == "api" && oi.number == n)
+            {
+                oi.state = "closed".to_string();
+            }
+        }
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 50);
+        let screen = driver.screen();
+
+        let in_progress_hdr = driver
+            .find("In-progress")
+            .expect(&format!("In-progress section header must render:\n{screen}"));
+        let new_hdr = driver
+            .find("▾ New")
+            .or_else(|| driver.find("▸ New"))
+            .expect(&format!("New section header must render:\n{screen}"));
+        let epic_pos = driver
+            .find("#100")
+            .expect(&format!("epic #100 row must render:\n{screen}"));
+
+        assert!(
+            epic_pos.1 > in_progress_hdr.1 && epic_pos.1 < new_hdr.1,
+            "epic #100 (all children done, epic still open) must render between the \
+             In-progress header ({in_progress_hdr:?}) and the New header ({new_hdr:?}), \
+             not stuck under New: epic={epic_pos:?}\n{screen}",
+        );
     }
 
     /// #795: `work_order_node_for` finds the correct node by (repo, issue_number).
