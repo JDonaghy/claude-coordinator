@@ -1941,6 +1941,17 @@ pub struct CoordApp {
     /// toggles a key, that choice persists across rebuilds.
     /// milestone_key is the milestone number as a string, or `"no-milestone"`.
     board_milestone_expanded: std::collections::HashMap<(String, String), bool>,
+    /// #1270: per-epic collapse state for the Board panel's nested epic
+    /// rows — the Board-panel counterpart of `pipeline_epic_expanded`.
+    /// Key: `(repo, epic_issue_number)`. Default for an untouched key
+    /// mirrors `epic_expand_state_in`'s rule (collapsed once every child is
+    /// Done, expanded otherwise).
+    board_epic_expanded: std::collections::HashMap<(String, u64), bool>,
+    /// #1270: maps a rendered Board epic row's `(section_idx, TreePath)` to
+    /// its `board_epic_expanded` key. Rebuilt by every
+    /// `rebuild_board_sidebar` pass — the Board-panel counterpart of
+    /// `pipeline_epic_row_keys`.
+    board_epic_row_keys: std::collections::HashMap<(usize, TreePath), (String, u64)>,
     // ── Pipeline panel state ────────────────────────────────────────────
     /// SidebarSystem listing tracked issues grouped by state → (optionally) repo.
     pipeline_sidebar: SidebarSystem,
@@ -3180,6 +3191,8 @@ impl CoordApp {
             issue_sync_last: None,
             board_search: SidebarFilter::default(),
             board_milestone_expanded: std::collections::HashMap::new(),
+            board_epic_expanded: std::collections::HashMap::new(),
+            board_epic_row_keys: std::collections::HashMap::new(),
             pipeline_sidebar,
             pipeline_repo_names: Vec::new(),
             pipeline_state_section_names: Vec::new(),
@@ -5288,6 +5301,72 @@ impl CoordApp {
             .collect()
     }
 
+    /// #1270: every child issue nested under some epic anywhere on the
+    /// Board (mirrors `pipeline_globally_nested_children`) — used to
+    /// suppress the flat top-level row for a child so it renders only once,
+    /// nested under its parent epic's row, instead of a second time as an
+    /// ordinary sibling in its own milestone bucket.
+    ///
+    /// Applies the `board_search` filter to the *parent* before
+    /// contributing its children — same #1253-review rationale as the
+    /// Pipeline version: an epic that's filtered out of view shouldn't
+    /// still suppress a child that DOES match the search, which would
+    /// otherwise vanish from the sidebar entirely (nested under a row that
+    /// isn't rendered, and skipped as "already nested" everywhere else).
+    fn board_globally_nested_children(&self) -> std::collections::HashSet<(String, u64)> {
+        let mut nested = std::collections::HashSet::new();
+        for (repo, issues) in &self.board_issues_cache {
+            for g in issues {
+                if !self.board_search.matches(g.issue_number, &g.issue_title) {
+                    continue;
+                }
+                let Some(children) = self.epic_children_for_repo_issue(repo, g.issue_number)
+                else {
+                    continue;
+                };
+                for child in children {
+                    nested.insert((repo.clone(), child.number));
+                }
+            }
+        }
+        nested
+    }
+
+    /// #1270: true when `g` (in `repo`) is nested under some epic elsewhere
+    /// on the Board (see `board_globally_nested_children`) and should
+    /// therefore be skipped when emitting a flat top-level row.
+    fn board_is_globally_nested(
+        repo: &str,
+        g: &IssueGroup,
+        globally_nested: &std::collections::HashSet<(String, u64)>,
+    ) -> bool {
+        globally_nested.contains(&(repo.to_string(), g.issue_number))
+    }
+
+    /// #1270: maps every child issue number (repo-scoped) to its parent
+    /// epic's issue number, across the whole Board — the Kanban
+    /// counterpart of `board_globally_nested_children`'s suppression set.
+    /// Unlike that set, this is NOT `board_search`-filtered: Kanban builds
+    /// straight from `board_issues_cache` with no search gate of its own
+    /// (`build_kanban_model` doesn't filter today), so filtering here would
+    /// just silently drop attribution with nothing else picking up the
+    /// slack.
+    fn board_epic_child_parents(&self) -> std::collections::HashMap<(String, u64), u64> {
+        let mut parents = std::collections::HashMap::new();
+        for (repo, issues) in &self.board_issues_cache {
+            for g in issues {
+                let Some(children) = self.epic_children_for_repo_issue(repo, g.issue_number)
+                else {
+                    continue;
+                };
+                for child in children {
+                    parents.insert((repo.clone(), child.number), g.issue_number);
+                }
+            }
+        }
+        parents
+    }
+
     /// Rebuild the SidebarSystem from current data.
     ///
     /// Layout:
@@ -5412,6 +5491,18 @@ impl CoordApp {
             );
         }
 
+        // #1270: every child issue nested under some epic, computed once up
+        // front (owned data — no borrow held across the loop below) so the
+        // row-emission loop can skip a child's flat sibling row wherever it
+        // would otherwise render, mirroring `pipeline_globally_nested_children`.
+        let globally_nested = self.board_globally_nested_children();
+        // #1270: rendered epic rows' `(section_idx, path)` → `board_epic_expanded`
+        // key, collected across every repo section then assigned to
+        // `self.board_epic_row_keys` once the loop below releases its &self
+        // borrow (mirrors Pipeline's `epic_row_keys` local-then-assign pattern).
+        let mut epic_row_keys: std::collections::HashMap<(usize, TreePath), (String, u64)> =
+            std::collections::HashMap::new();
+
         // #410: Build per-repo milestone > issue rows (status sub-group removed).
         //
         // Two-phase loop to satisfy the borrow checker:
@@ -5476,24 +5567,62 @@ impl CoordApp {
 
                     if m_is_exp {
                         for (issue_idx, (_flat_idx, g)) in group_issues.iter().enumerate() {
-                            let text = StyledText {
-                                spans: vec![
-                                    StyledSpan::with_fg(
-                                        format!("#{:<5}", g.issue_number),
-                                        Color::rgb(150, 150, 240),
-                                    ),
-                                    StyledSpan::plain(trunc(&g.issue_title, 20)),
-                                ],
+                            // #1270: a child nested under some epic elsewhere
+                            // on the Board renders once, under that epic's
+                            // row — skip the flat sibling here.
+                            if Self::board_is_globally_nested(repo, g, &globally_nested) {
+                                continue;
+                            }
+                            let mut spans = vec![StyledSpan::with_fg(
+                                format!("#{:<5}", g.issue_number),
+                                Color::rgb(150, 150, 240),
+                            )];
+                            // #1270: epic marker, label-driven — see
+                            // `epic_badge_span_for_labels` (shared with the
+                            // Pipeline panel's `epic_badge_span`). Spliced
+                            // between `#N` and the title, same placement
+                            // rationale as the Pipeline row.
+                            if let Some(marker) = epic_badge_span_for_labels(&g.labels) {
+                                spans.push(marker);
+                            }
+                            spans.push(StyledSpan::plain(trunc(&g.issue_title, 20)));
+
+                            // #1270: an epic row is a branch — nest its
+                            // `## Sub-issues` children beneath it instead of
+                            // letting them render a second time as flat
+                            // siblings elsewhere (suppressed above via
+                            // `globally_nested`). Reuses the exact same
+                            // DAG-state computation and row-building the
+                            // Pipeline panel uses, per this issue's "Board
+                            // and Pipeline don't drift" ask.
+                            let children = self.epic_child_rows_for(repo, g.issue_number);
+                            let epic = if children.is_empty() {
+                                None
+                            } else {
+                                let key = (repo.clone(), g.issue_number);
+                                let expanded = Self::epic_expand_state_in(
+                                    &key,
+                                    &children,
+                                    &self.board_epic_expanded,
+                                );
+                                // "N/M done" child-progress summary, visible
+                                // whether expanded or collapsed.
+                                if let Some(span) = Self::epic_progress_span(&children) {
+                                    spans.push(span);
+                                }
+                                Some((key, expanded, children))
                             };
+
                             // #410: per-row status letter badge (R/A/D).
                             let badge = board_row_status_badge(g.lifecycle_section());
+                            let row_path = vec![mi, issue_idx as u16];
                             rows.push(TreeRow {
-                                path: vec![mi, issue_idx as u16],
+                                path: row_path.clone(),
                                 indent: 2,
                                 icon: None,
-                                text,
+                                text: StyledText { spans },
                                 badge,
-                                is_expanded: None,
+                                is_expanded: epic.as_ref().map(|(_, e, _)| *e),
                                 decoration: if g.status_summary == "failed" {
                                     Decoration::Error
                                 } else {
@@ -5501,6 +5630,16 @@ impl CoordApp {
                                 },
                                 edit: None,
                             });
+                            if let Some((key, expanded, children)) = epic {
+                                epic_row_keys.insert((section_idx, row_path.clone()), key);
+                                if expanded {
+                                    for (ci, child) in children.iter().enumerate() {
+                                        rows.push(self.epic_child_tree_row(
+                                            &row_path, 3, ci, child,
+                                        ));
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -5520,6 +5659,7 @@ impl CoordApp {
             }
             self.board_sidebar.set_rows(section_idx, rows);
         }
+        self.board_epic_row_keys = epic_row_keys;
 
         // Activate first non-empty repo section.
         if self.board_sidebar.active_section().is_none() {
@@ -5606,6 +5746,16 @@ impl CoordApp {
         let mut inflight_cards: Vec<BoardCard> = Vec::new();
         let mut completed_cards: Vec<BoardCard> = Vec::new();
 
+        // #1270: a card's containing column is still driven solely by its
+        // OWN lifecycle status (Backlog / In Flight / Completed stay exactly
+        // as before) — an epic and its children can genuinely land in
+        // different columns. What changes is *labelling*: the epic card
+        // gets the same "◆EPIC" marker the Pipeline/Board panel use, and
+        // every child card gets a `decision_hint` naming its parent epic, so
+        // the two no longer read as unrelated loose cards scattered across
+        // columns with zero visual link between them.
+        let epic_parents = self.board_epic_child_parents();
+
         for (repo, groups) in &self.board_issues_cache {
             for g in groups {
                 let card_id = WidgetId::new(&format!("card:{}:{}", repo, g.issue_number));
@@ -5613,14 +5763,21 @@ impl CoordApp {
                 let machine = g.assignments.iter()
                     .find(|a| a.status == "running")
                     .map(|a| a.machine.clone());
+                let mut labels = vec![repo.clone()];
+                if labels_carry_epic_label(&g.labels) {
+                    labels.push("◆EPIC".to_string());
+                }
+                let decision_hint = epic_parents
+                    .get(&(repo.clone(), g.issue_number))
+                    .map(|epic_number| format!("↳ part of epic #{epic_number}"));
                 let card = BoardCard {
                     id: card_id,
                     title: format!("#{} {}", g.issue_number, g.issue_title),
-                    labels: vec![repo.clone()],
+                    labels,
                     stage_badges,
                     assignee: None,
                     machine,
-                    decision_hint: None,
+                    decision_hint,
                 };
                 match g.lifecycle_section() {
                     "in-flight" => inflight_cards.push(card),
@@ -5812,6 +5969,14 @@ impl CoordApp {
     ///
     /// Paths are two-level: `[milestone_idx, issue_idx]`.
     /// A one-level path (milestone header selected) returns `None`.
+    ///
+    /// #1270: a nested epic-child row is depth 3 —
+    /// `[milestone_idx, issue_idx, child_idx]` — and resolves to the CHILD
+    /// issue, not its parent epic (mirrors Pipeline's
+    /// `resolve_nested_child_index`). Returns `None` when the child isn't
+    /// independently present in `board_issues_cache` (no assignment and not
+    /// itself synced into `open_issues`) — such a row exists for nested
+    /// display only, same as the Pipeline equivalent.
     fn board_selected_issue_group(&self) -> Option<&IssueGroup> {
         let section = self.board_sidebar.active_section()?;
         let offset = self.board_repo_offset();
@@ -5830,7 +5995,23 @@ impl CoordApp {
         let (_, _, group_issues) = milestones.get(milestone_idx)?;
         let (flat_idx, _) = group_issues.get(issue_idx)?;
         let (_, all_issues) = self.board_issues_cache.iter().find(|(r, _)| r == repo)?;
-        all_issues.get(*flat_idx)
+        let epic_group = all_issues.get(*flat_idx)?;
+        // A 3rd path segment only means "nested epic child" when `epic_group`
+        // actually has a child at that index — some historical callers set a
+        // stale 3rd segment on an ordinary (non-epic) issue row, and that
+        // must keep resolving to the row itself rather than going `None`.
+        if path.len() >= 3 {
+            let child_idx = path[2] as usize;
+            let children = self.epic_child_rows_for(repo, epic_group.issue_number);
+            if let Some(child_number) = children.get(child_idx).map(|c| c.number) {
+                if let Some(child_group) =
+                    all_issues.iter().find(|g| g.issue_number == child_number)
+                {
+                    return Some(child_group);
+                }
+            }
+        }
+        Some(epic_group)
     }
 
     /// Return the (repo, issue_number) currently selected in the board sidebar.
@@ -5916,6 +6097,20 @@ impl CoordApp {
                     self.board_sidebar.set_selected_path(
                         section_idx,
                         Some(vec![milestone_idx as u16, issue_idx as u16]),
+                    );
+                    return;
+                }
+                // #1270: `issue_number` might be a child nested under this
+                // epic row (suppressed as a flat sibling — see
+                // `board_globally_nested_children`) rather than a flat row
+                // of its own. Fall back to a depth-3 path pointing at the
+                // nested child before giving up on this repo.
+                let children = self.epic_child_rows_for(repo, g.issue_number);
+                if let Some(child_idx) = children.iter().position(|c| c.number == issue_number) {
+                    self.board_sidebar.set_active_section(Some(section_idx));
+                    self.board_sidebar.set_selected_path(
+                        section_idx,
+                        Some(vec![milestone_idx as u16, issue_idx as u16, child_idx as u16]),
                     );
                     return;
                 }

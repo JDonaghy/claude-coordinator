@@ -349,7 +349,15 @@ pub(crate) const EPIC_BADGE_COLOR: Color = Color::rgb(240, 200, 70);
 /// existing TuiDriver tests key off of (chevron hit-testing via
 /// `epic_pos.0 - 1.0`, indent comparisons against nested children).
 pub(crate) fn epic_badge_span(issue: &PipelineIssue) -> Option<StyledSpan> {
-    if labels_carry_epic_label(&issue.all_labels) {
+    epic_badge_span_for_labels(&issue.all_labels)
+}
+
+/// #1270: label-driven core of `epic_badge_span`, factored out so the
+/// Board panel's `IssueGroup` (which carries `labels: Vec<String>` copied
+/// from `open_issues`, not a `PipelineIssue`) can render the identical
+/// "◆EPIC" marker without depending on the Pipeline-only type.
+pub(crate) fn epic_badge_span_for_labels(labels: &[String]) -> Option<StyledSpan> {
+    if labels_carry_epic_label(labels) {
         Some(StyledSpan::with_fg("◆EPIC ", EPIC_BADGE_COLOR))
     } else {
         None
@@ -1454,9 +1462,23 @@ impl CoordApp {
     /// as an ordinary flat leaf, unchanged from before #1197.
     pub(crate) fn epic_children_for(&self, issue: &PipelineIssue) -> Option<&[EpicChild]> {
         let repo_name = issue.coord_repo.as_deref()?;
+        self.epic_children_for_repo_issue(repo_name, issue.number)
+    }
+
+    /// #1270: repo/number-keyed core of `epic_children_for`, factored out
+    /// so the Board panel — whose `IssueGroup` rows carry a bare
+    /// `(repo, issue_number)`, not a `PipelineIssue`/`coord_repo` — can
+    /// resolve the same `data.epic_children` seam without depending on the
+    /// Pipeline-only type. `epic_children_for` is now a thin wrapper over
+    /// this.
+    pub(crate) fn epic_children_for_repo_issue(
+        &self,
+        repo_name: &str,
+        issue_number: u64,
+    ) -> Option<&[EpicChild]> {
         self.data.epic_children.iter().find_map(|ec| {
             if ec.repo_name == repo_name
-                && ec.tracking_issue == issue.number
+                && ec.tracking_issue == issue_number
                 && !ec.children.is_empty()
             {
                 Some(ec.children.as_slice())
@@ -1484,41 +1506,54 @@ impl CoordApp {
             let Some(issue) = self.pipeline_issues.get(idx) else {
                 continue;
             };
-            let Some(children) = self.epic_children_for(issue) else {
+            let Some(repo_name) = issue.coord_repo.as_deref() else {
                 continue;
             };
-            let repo_name = issue.coord_repo.clone().unwrap_or_default();
-            let work_order: Vec<WorkOrderNode> = children
-                .iter()
-                .map(|c| WorkOrderNode {
-                    issue_number: c.number,
-                    group: None,
-                    after: Vec::new(),
-                })
-                .collect();
-            let nodes = build_dag_nodes(
-                &work_order,
-                &repo_name,
-                &self.data.open_issues,
-                &self.data.assignments,
-            );
-            if nodes.is_empty() {
+            let rows = self.epic_child_rows_for(repo_name, issue.number);
+            if rows.is_empty() {
                 continue;
             }
-            let rows: Vec<EpicChildRow> = nodes
-                .into_iter()
-                .map(|n| {
-                    nesting.nested.insert(n.issue_number);
-                    EpicChildRow {
-                        number: n.issue_number,
-                        title: n.title,
-                        state: n.state,
-                    }
-                })
-                .collect();
+            for row in &rows {
+                nesting.nested.insert(row.number);
+            }
             nesting.by_epic.insert(idx, rows);
         }
         nesting
+    }
+
+    /// #1270: DAG-computed child rows (Done/InFlight/Ready state, resolved
+    /// titles) for the epic `issue_number` in `repo_name` — factored out of
+    /// `compute_epic_nesting` so the Board panel (keyed directly by
+    /// `(repo, issue_number)`, not a `pipeline_issues` index) builds on the
+    /// exact same DAG-state computation instead of re-deriving it, per this
+    /// issue's "Board and Pipeline don't drift" ask. Empty when `issue_number`
+    /// isn't an epic or carries no `## Sub-issues` children.
+    pub(crate) fn epic_child_rows_for(&self, repo_name: &str, issue_number: u64) -> Vec<EpicChildRow> {
+        let Some(children) = self.epic_children_for_repo_issue(repo_name, issue_number) else {
+            return Vec::new();
+        };
+        let work_order: Vec<WorkOrderNode> = children
+            .iter()
+            .map(|c| WorkOrderNode {
+                issue_number: c.number,
+                group: None,
+                after: Vec::new(),
+            })
+            .collect();
+        let nodes = build_dag_nodes(
+            &work_order,
+            repo_name,
+            &self.data.open_issues,
+            &self.data.assignments,
+        );
+        nodes
+            .into_iter()
+            .map(|n| EpicChildRow {
+                number: n.issue_number,
+                title: n.title,
+                state: n.state,
+            })
+            .collect()
     }
 
     /// #1269: derive a liveness-partitioned copy of an already-computed
@@ -1653,15 +1688,25 @@ impl CoordApp {
         children: &[EpicChildRow],
     ) -> Option<((String, u64), bool)> {
         let key = (issue.coord_repo.clone()?, issue.number);
+        let expanded = Self::epic_expand_state_in(&key, children, &self.pipeline_epic_expanded);
+        Some((key, expanded))
+    }
+
+    /// #1270: map-agnostic core of `epic_expand_state` — resolves the
+    /// collapse-when-all-done default against whichever
+    /// `pipeline_epic_expanded`-shaped map the caller passes in, so the
+    /// Board panel's own `board_epic_expanded` map gets the identical
+    /// default without duplicating the "all children Done ⇒ start
+    /// collapsed" rule.
+    pub(crate) fn epic_expand_state_in(
+        key: &(String, u64),
+        children: &[EpicChildRow],
+        expanded_map: &std::collections::HashMap<(String, u64), bool>,
+    ) -> bool {
         let all_done = !children.is_empty()
             && children.iter().all(|c| matches!(c.state, NodeState::Done));
         let default_expanded = !all_done;
-        let expanded = self
-            .pipeline_epic_expanded
-            .get(&key)
-            .copied()
-            .unwrap_or(default_expanded);
-        Some((key, expanded))
+        expanded_map.get(key).copied().unwrap_or(default_expanded)
     }
 
     /// #1253: "N/M done" child-progress summary appended to an epic row's
@@ -1672,7 +1717,7 @@ impl CoordApp {
     /// by hand"). Returns `None` for a childless resolution (shouldn't occur
     /// given callers only invoke this from `nesting.by_epic`, but a `0/0`
     /// badge would be noise if it ever did).
-    fn epic_progress_span(children: &[EpicChildRow]) -> Option<StyledSpan> {
+    pub(crate) fn epic_progress_span(children: &[EpicChildRow]) -> Option<StyledSpan> {
         if children.is_empty() {
             return None;
         }
