@@ -19870,14 +19870,14 @@
 
         // child_pos 0 → #101, which IS in pipeline_issues → its own idx 1,
         // not the epic's idx 0.
-        assert_eq!(app.resolve_nested_child_index(0, 0), Some(1));
+        assert_eq!(app.resolve_nested_child_index(0, 0, None), Some(1));
         // child_pos 1 → #102, which is NOT independently tracked in
         // pipeline_issues → None (nested-display-only row), never silently
         // the parent epic's idx 0.
-        assert_eq!(app.resolve_nested_child_index(0, 1), None);
+        assert_eq!(app.resolve_nested_child_index(0, 1, None), None);
         // parent_idx pointing at a non-epic issue (#101 has no children of
         // its own) → None.
-        assert_eq!(app.resolve_nested_child_index(1, 0), None);
+        assert_eq!(app.resolve_nested_child_index(1, 0, None), None);
     }
 
     /// #1199 fix (review-reported regression): a regular issue nested under
@@ -19959,7 +19959,7 @@
             .iter()
             .position(|i| i.number == 102)
             .unwrap();
-        assert_eq!(app.resolve_nested_child_index(epic_idx, 0), Some(child_idx));
+        assert_eq!(app.resolve_nested_child_index(epic_idx, 0, None), Some(child_idx));
 
         // And the child's own pipeline lane must be the ordinary per-issue
         // lane (Work/Test/Review — "merge" is retired from this per-issue
@@ -30758,6 +30758,431 @@ Milestone tracking issue.
         assert_eq!(
             epic_pos.1, progress_pos.1,
             "progress summary '1/2' must render on the same row as epic #100:\n{screen}",
+        );
+    }
+
+    // ── #1269: In-progress Live/Idle epic-liveness partition ────────────────
+
+    /// #1269: shared fixture — epic #100 tracking two children: #101 (a
+    /// running headless worker — LIVE) and #102 (closed — DONE, therefore
+    /// idle). All three issues carry `coord` labels of their own, so #101
+    /// and #102 are ALSO independently present in `pipeline_issues` —
+    /// mirrors `make_epic_nesting_app`'s dedup pattern above, and lets these
+    /// tests exercise both the nested-render partition AND
+    /// `resolve_nested_child_index`'s liveness filtering.
+    ///
+    /// The epic's row-expand state — keyed on `(coord_repo, number)` alone,
+    /// shared across BOTH its Live and Idle row instances — is
+    /// force-expanded so both instances' children render without a click.
+    fn make_epic_liveness_app() -> CoordApp {
+        let data = BoardData {
+            open_issues: vec![
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 100,
+                    title: "Epic tracker".to_string(),
+                    body: String::new(),
+                    state: "open".to_string(),
+                    labels: vec!["coord".to_string(), "epic".to_string()],
+                    milestone_number: None,
+                    milestone_title: None,
+                },
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 101,
+                    title: "Live child".to_string(),
+                    body: String::new(),
+                    state: "open".to_string(),
+                    labels: vec!["coord".to_string()],
+                    milestone_number: None,
+                    milestone_title: None,
+                },
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 102,
+                    title: "Done child".to_string(),
+                    body: String::new(),
+                    state: "closed".to_string(),
+                    labels: vec!["coord".to_string()],
+                    milestone_number: None,
+                    milestone_title: None,
+                },
+            ],
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            epic_children: vec![EpicChildren {
+                repo_name: "api".to_string(),
+                tracking_issue: 100,
+                children: vec![
+                    EpicChild { number: 101, state: "open".to_string() },
+                    EpicChild { number: 102, state: "closed".to_string() },
+                ],
+            }],
+            assignments: vec![make_assignment_typed("running", 101, "api", Some("work"))],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        app.pipeline_issues = vec![
+            PipelineIssue {
+                number: 100,
+                title: "Epic tracker".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string(), "epic".to_string()],
+                is_closed: false,
+            },
+            PipelineIssue {
+                number: 101,
+                title: "Live child".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string()],
+                is_closed: false,
+            },
+            PipelineIssue {
+                number: 102,
+                title: "Done child".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string()],
+                is_closed: true,
+            },
+        ];
+        app.pipeline_epic_expanded.insert(("api".to_string(), 100), true);
+        app.active_view = SidebarView::Pipeline;
+        app.rebuild_pipeline_sidebar(None);
+        app
+    }
+
+    /// #1269 primary scenario: epic + 2 children (one live, one done) — the
+    /// epic renders under BOTH Live and Idle; the live child #101 nests
+    /// ONLY under the Live instance; the done child #102 nests ONLY under
+    /// the Idle instance and never appears under Live.
+    #[test]
+    fn tuidriver_pipeline_epic_live_and_idle_children_partition_across_instances() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_epic_liveness_app();
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 50);
+        let screen = driver.screen();
+
+        let live_hdr = driver
+            .find("Live")
+            .expect(&format!("Live section header must render:\n{screen}"));
+        let idle_hdr = driver
+            .find("Idle")
+            .expect(&format!("Idle section header must render:\n{screen}"));
+        assert!(
+            live_hdr.1 < idle_hdr.1,
+            "Live section must render above Idle: live={live_hdr:?} idle={idle_hdr:?}\n{screen}",
+        );
+
+        // The epic renders TWICE — once per liveness instance.
+        assert_eq!(
+            screen.matches("#100").count(),
+            2,
+            "epic #100 must render once under Live and once under Idle:\n{screen}",
+        );
+
+        // #101 (live) renders exactly once, nested under the Live instance —
+        // never duplicated as a flat sibling (#1253 dedup still holds).
+        assert_eq!(
+            screen.matches("#101").count(),
+            1,
+            "#101 (live) must render exactly once:\n{screen}",
+        );
+        let child_live_pos = driver
+            .find("#101")
+            .expect(&format!("live child #101 must render nested under Live:\n{screen}"));
+        assert!(
+            child_live_pos.1 > live_hdr.1 && child_live_pos.1 < idle_hdr.1,
+            "#101 must render between the Live header ({live_hdr:?}) and the Idle header \
+             ({idle_hdr:?}), i.e. nested under Live: {child_live_pos:?}\n{screen}",
+        );
+
+        // #102 (done) renders exactly once, nested under the Idle instance —
+        // the #1269 bug this test guards: a done child must NEVER render
+        // under Live, regardless of the unfiltered nesting the epic used to
+        // apply to both instances.
+        assert_eq!(
+            screen.matches("#102").count(),
+            1,
+            "#102 (done) must render exactly once:\n{screen}",
+        );
+        let child_done_pos = driver
+            .find("#102")
+            .expect(&format!("done child #102 must render nested under Idle:\n{screen}"));
+        assert!(
+            child_done_pos.1 > idle_hdr.1,
+            "#102 must render below the Idle header ({idle_hdr:?}), i.e. nested under Idle, \
+             never under Live: {child_done_pos:?}\n{screen}",
+        );
+    }
+
+    /// #1269: `resolve_nested_child_index` (the click/selection resolver)
+    /// must apply the SAME per-instance liveness filter the render loop
+    /// used — position 0 under the Live instance resolves to #101, position
+    /// 0 under the Idle instance resolves to #102, not the raw unfiltered
+    /// child-list order.
+    #[test]
+    fn resolve_nested_child_index_uses_the_matching_liveness_filtered_child_list() {
+        let app = make_epic_liveness_app();
+        let epic_idx = app.pipeline_issues.iter().position(|i| i.number == 100).unwrap();
+        let child_101_idx = app.pipeline_issues.iter().position(|i| i.number == 101).unwrap();
+        let child_102_idx = app.pipeline_issues.iter().position(|i| i.number == 102).unwrap();
+
+        assert_eq!(
+            app.resolve_nested_child_index(epic_idx, 0, Some(true)),
+            Some(child_101_idx),
+            "position 0 of the LIVE-filtered child list must resolve to #101",
+        );
+        assert_eq!(
+            app.resolve_nested_child_index(epic_idx, 1, Some(true)),
+            None,
+            "the live-filtered child list has only one entry — position 1 is out of range",
+        );
+        assert_eq!(
+            app.resolve_nested_child_index(epic_idx, 0, Some(false)),
+            Some(child_102_idx),
+            "position 0 of the IDLE-filtered child list must resolve to #102",
+        );
+        assert_eq!(
+            app.resolve_nested_child_index(epic_idx, 1, Some(false)),
+            None,
+            "the idle-filtered child list has only one entry — position 1 is out of range",
+        );
+    }
+
+    /// #1269: fixture for the single-child Live→Idle transition test — epic
+    /// #100 tracking exactly one child #101, whose liveness (a running
+    /// headless worker vs closed-and-idle) is controlled by `child_live`.
+    fn make_epic_single_child_app(child_live: bool) -> CoordApp {
+        let child_state = if child_live { "open" } else { "closed" };
+        let mut assignments = Vec::new();
+        if child_live {
+            assignments.push(make_assignment_typed("running", 101, "api", Some("work")));
+        }
+        let data = BoardData {
+            open_issues: vec![
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 100,
+                    title: "Epic tracker".to_string(),
+                    body: String::new(),
+                    state: "open".to_string(),
+                    labels: vec!["coord".to_string(), "epic".to_string()],
+                    milestone_number: None,
+                    milestone_title: None,
+                },
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 101,
+                    title: "Only child".to_string(),
+                    body: String::new(),
+                    state: child_state.to_string(),
+                    labels: vec!["coord".to_string()],
+                    milestone_number: None,
+                    milestone_title: None,
+                },
+            ],
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            epic_children: vec![EpicChildren {
+                repo_name: "api".to_string(),
+                tracking_issue: 100,
+                children: vec![EpicChild { number: 101, state: child_state.to_string() }],
+            }],
+            assignments,
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 100,
+            title: "Epic tracker".to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string(), "epic".to_string()],
+            is_closed: false,
+        }];
+        app.pipeline_epic_expanded.insert(("api".to_string(), 100), true);
+        app.active_view = SidebarView::Pipeline;
+        app.rebuild_pipeline_sidebar(None);
+        app
+    }
+
+    /// #1269 scenario: when an epic's only live child finishes, the epic
+    /// (and the child) must drop ENTIRELY to Idle — no lingering Live
+    /// section, no duplicate epic row left behind.
+    #[test]
+    fn tuidriver_pipeline_epic_single_live_child_finishing_drops_epic_to_idle_only() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        // Before: the only child is live — Live renders, Idle is absent
+        // (there's nothing idle to show).
+        let app = make_epic_single_child_app(true);
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 50);
+        let screen = driver.screen();
+        assert!(
+            driver.find("Live").is_some(),
+            "Live section must render while the child is live:\n{screen}",
+        );
+        assert!(
+            driver.find("Idle").is_none(),
+            "Idle section must be absent — the epic's only child is live:\n{screen}",
+        );
+        assert_eq!(
+            screen.matches("#100").count(),
+            1,
+            "epic renders once (Live only) while its only child is live:\n{screen}",
+        );
+
+        // After: the child finishes (issue closes, worker no longer
+        // running) — the epic drops to Idle only; Live disappears entirely.
+        let app2 = make_epic_single_child_app(false);
+        let driver2 = driver_with_shell(app2, CoordApp::shell_config(), 140, 50);
+        let screen2 = driver2.screen();
+        assert!(
+            driver2.find("Live").is_none(),
+            "Live section must be ABSENT once the epic's only live child finishes:\n{screen2}",
+        );
+        let idle_hdr2 = driver2
+            .find("Idle")
+            .expect(&format!("Idle section must render once the child finishes:\n{screen2}"));
+        assert_eq!(
+            screen2.matches("#100").count(),
+            1,
+            "epic renders once (Idle only) once its only child finishes:\n{screen2}",
+        );
+        let epic_pos2 = driver2
+            .find("#100")
+            .expect(&format!("epic row must render:\n{screen2}"));
+        let child_pos2 = driver2
+            .find("#101")
+            .expect(&format!("finished child must render nested under Idle:\n{screen2}"));
+        assert!(
+            epic_pos2.1 > idle_hdr2.1,
+            "epic must render under the Idle section: {epic_pos2:?} idle_hdr={idle_hdr2:?}\n{screen2}",
+        );
+        assert!(
+            child_pos2.1 > epic_pos2.1,
+            "child renders below the epic row: epic={epic_pos2:?} child={child_pos2:?}\n{screen2}",
+        );
+    }
+
+    /// #1269 scenario: an epic whose children are ALL idle (one never
+    /// dispatched — Ready — plus one done) must appear ONLY under Idle,
+    /// absent from Live entirely — and BOTH children (not just the Done
+    /// one) must nest under that single Idle instance, proving the
+    /// live/idle partition is keyed on session liveness alone, not on
+    /// `NodeState` (a Ready child is just as "idle" as a Done one).
+    #[test]
+    fn tuidriver_pipeline_epic_with_only_idle_children_absent_from_live() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let data = BoardData {
+            open_issues: vec![
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 100,
+                    title: "Epic tracker".to_string(),
+                    body: String::new(),
+                    state: "open".to_string(),
+                    labels: vec!["coord".to_string(), "epic".to_string()],
+                    milestone_number: None,
+                    milestone_title: None,
+                },
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 101,
+                    title: "Not started".to_string(),
+                    body: String::new(),
+                    state: "open".to_string(),
+                    labels: vec!["coord".to_string()],
+                    milestone_number: None,
+                    milestone_title: None,
+                },
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 102,
+                    title: "Done child".to_string(),
+                    body: String::new(),
+                    state: "closed".to_string(),
+                    labels: vec!["coord".to_string()],
+                    milestone_number: None,
+                    milestone_title: None,
+                },
+            ],
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            epic_children: vec![EpicChildren {
+                repo_name: "api".to_string(),
+                tracking_issue: 100,
+                children: vec![
+                    EpicChild { number: 101, state: "open".to_string() },
+                    EpicChild { number: 102, state: "closed".to_string() },
+                ],
+            }],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 100,
+            title: "Epic tracker".to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string(), "epic".to_string()],
+            is_closed: false,
+        }];
+        app.pipeline_epic_expanded.insert(("api".to_string(), 100), true);
+        app.active_view = SidebarView::Pipeline;
+        app.rebuild_pipeline_sidebar(None);
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 50);
+        let screen = driver.screen();
+
+        assert!(
+            driver.find("Live").is_none(),
+            "Live section must be absent — the epic has no live children:\n{screen}",
+        );
+        let idle_hdr = driver
+            .find("Idle")
+            .expect(&format!("Idle section must render:\n{screen}"));
+
+        assert_eq!(
+            screen.matches("#100").count(),
+            1,
+            "epic renders once (Idle only):\n{screen}",
+        );
+        let epic_pos = driver
+            .find("#100")
+            .expect(&format!("epic row must render:\n{screen}"));
+        assert!(
+            epic_pos.1 > idle_hdr.1,
+            "epic must render under Idle: epic={epic_pos:?} idle_hdr={idle_hdr:?}\n{screen}",
+        );
+
+        // Both the not-yet-started (Ready) child and the Done child nest
+        // under this single Idle instance.
+        let child_ready_pos = driver
+            .find("#101")
+            .expect(&format!("Ready child #101 must render nested under Idle:\n{screen}"));
+        let child_done_pos = driver
+            .find("#102")
+            .expect(&format!("Done child #102 must render nested under Idle:\n{screen}"));
+        assert!(
+            child_ready_pos.1 > epic_pos.1,
+            "Ready child renders below the epic row:\n{screen}",
+        );
+        assert!(
+            child_done_pos.1 > epic_pos.1,
+            "Done child renders below the epic row:\n{screen}",
         );
     }
 
