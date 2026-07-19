@@ -495,9 +495,34 @@ def compute_board_stage_projection(
             continue
         assignments_by_key.setdefault((a.repo_name, a.issue_number), []).append(a)
 
+    # #1203: `assignment_id -> Assignment` so a merge-queue row whose
+    # `assignment_type` is outside `CLOSES_ISSUE_TYPES` (test-author/
+    # mock-author, deliberately keyed to the milestone's *tracking* issue —
+    # #1077/#1084) can be re-attributed to the actual child issue it's for,
+    # via the originating assignment's `for_issue_number`.
+    assignment_by_id: dict[str, Any] = {
+        a.assignment_id: a for a in assignments if a.assignment_id
+    }
+
     merge_by_key: dict[tuple[str, int], Any] = {}
     for m in merge_queue_items:
-        key = (m.repo_name, m.issue_number)
+        assignment_type = getattr(m, "assignment_type", "work") or "work"
+        if assignment_type in CLOSES_ISSUE_TYPES:
+            key = (m.repo_name, m.issue_number)
+        else:
+            # This row's `issue_number` is the milestone's tracking issue, not
+            # something this PR resolves (#1077/#1084) — resolve to the real
+            # per-slice issue via the originating assignment's
+            # `for_issue_number` (test-author's JIT mode sets it). When it
+            # can't be resolved (mock-author, or an assignment we no longer
+            # have), skip the row entirely rather than falsely attributing a
+            # merged test-author/mock-author slice to the tracking issue's
+            # own merge box (claude-coordinator#1203).
+            source = assignment_by_id.get(m.assignment_id)
+            for_issue = getattr(source, "for_issue_number", None) if source else None
+            if for_issue is None:
+                continue
+            key = (m.repo_name, for_issue)
         # First-match-wins, mirroring `.find()` over the id-ordered list —
         # `load_queue()`/`board_projection()` both order by `id` ascending.
         merge_by_key.setdefault(key, m)
