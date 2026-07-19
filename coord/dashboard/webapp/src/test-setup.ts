@@ -26,3 +26,16 @@ if (typeof HTMLCanvasElement !== 'undefined') {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any -- matching the DOM lib's overload surface isn't worth it for a test-only stub
   HTMLCanvasElement.prototype.getContext = (() => null) as any
 }
+
+// jsdom doesn't implement ResizeObserver (https://github.com/jsdom/jsdom/issues/3368).
+// Terminal.tsx uses it to watch the pane container for layout shifts that
+// window.resize misses (e.g. MobileKeyBar height changes, safe-area adjustments).
+// A no-op stub prevents "ResizeObserver is not defined" crashes in every
+// Terminal test while preserving real behaviour in a real browser.
+if (typeof globalThis.ResizeObserver === 'undefined') {
+  globalThis.ResizeObserver = class ResizeObserver {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  }
+}
