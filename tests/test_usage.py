@@ -18,6 +18,7 @@ from coord.usage import (
     SessionUsage,
     build_session_usage,
     collect_usage,
+    filter_assignments_in_window,
     format_burn_rate_line,
     format_usage_by_group,
     format_usage_by_issue,
@@ -56,6 +57,7 @@ def _assignment(
     status: str = "done",
     model: str | None = None,
     dispatched_at: float | None = None,
+    finished_at: float | None = None,
 ) -> Assignment:
     return Assignment(
         machine_name="m1",
@@ -66,6 +68,7 @@ def _assignment(
         status=status,
         model=model,
         dispatched_at=dispatched_at,
+        finished_at=finished_at,
     )
 
 
@@ -1151,3 +1154,170 @@ class TestUsageCommandByRepoAndByTimeFlags:
         assert result.exit_code == 0, result.output
         assert "USAGE — by week" in result.output
         assert "window: since 8w" in result.output
+
+    def test_by_time_with_by_repo_is_rejected(
+        self, coord_dir: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, valid_config_yaml: str
+    ) -> None:
+        """Review finding #2: ``--by-time`` only understands ``issue``/(no
+        ``--by``) as a modifier — ``--by repo``/``week``/``month`` combined
+        with ``--by-time`` must fail loud instead of silently downgrading to
+        the plain stage view."""
+        import coord.usage as usage_mod
+
+        monkeypatch.setattr(usage_mod, "fetch_usage_rows", lambda *a, **k: _ms37_rows())
+        cfg_path = self._cfg(tmp_path, valid_config_yaml)
+
+        result = CliRunner().invoke(
+            main, ["usage", "--config", str(cfg_path), "--by-time", "--by", "repo"]
+        )
+        assert result.exit_code == 2
+        assert "Traceback" not in result.output
+        assert "--by-time" in result.output
+
+
+# ── #1119 review finding #1: bare `coord usage` must honor window flags ─────
+#
+# Before this fix, --today/--week/--month/--since were only wired into the
+# --by/--by-issue/--by-time/--issue branches — the legacy (no routing flag)
+# `coord usage` fell straight through to the unfiltered board report,
+# silently ignoring the window flags (and skipping the mutual-exclusivity
+# validation too). These tests exercise the bare-invocation path directly.
+
+
+class TestFilterAssignmentsInWindow:
+    def test_keeps_assignment_dispatched_in_window(self) -> None:
+        from coord.usage_rollup import Window
+
+        window = Window(start=0.0, end=100.0, label="today")
+        a = _assignment(dispatched_at=50.0)
+        assert filter_assignments_in_window([a], window) == [a]
+
+    def test_keeps_assignment_finished_in_window_even_if_dispatched_before(self) -> None:
+        from coord.usage_rollup import Window
+
+        window = Window(start=100.0, end=200.0, label="today")
+        a = _assignment(dispatched_at=50.0, finished_at=150.0)
+        assert filter_assignments_in_window([a], window) == [a]
+
+    def test_drops_assignment_entirely_outside_window(self) -> None:
+        from coord.usage_rollup import Window
+
+        window = Window(start=100.0, end=200.0, label="today")
+        a = _assignment(dispatched_at=0.0, finished_at=10.0)
+        assert filter_assignments_in_window([a], window) == []
+
+    def test_drops_assignment_with_no_timestamps(self) -> None:
+        from coord.usage_rollup import Window
+
+        window = Window(start=100.0, end=200.0, label="today")
+        a = _assignment()
+        assert filter_assignments_in_window([a], window) == []
+
+
+class TestFormatUsageReportWindowLabel:
+    def _session(self) -> SessionUsage:
+        a = AssignmentUsage(
+            assignment_id="win00001",
+            repo_name="r",
+            issue_number=1,
+            issue_title="t",
+            status="done",
+            model="claude-sonnet-4-6",
+            total_cost_usd=0.10,
+        )
+        return SessionUsage(started_at=None, assignments=[a])
+
+    def test_no_window_label_leaves_report_unchanged(self) -> None:
+        """Default (no window flag) behavior must stay byte-for-byte the
+        same — no header, no footer."""
+        session = self._session()
+        report = format_usage_report(session)
+        assert "USAGE — window" not in report
+        assert "Σ" not in report
+
+    def test_window_label_adds_header_and_footer(self) -> None:
+        session = self._session()
+        report = format_usage_report(session, window_label="week")
+        assert "USAGE — window: week" in report
+        assert "Σ  total" in report
+
+    def test_window_label_with_no_assignments_still_shows_header_and_footer(self) -> None:
+        session = SessionUsage(started_at=None, assignments=[])
+        report = format_usage_report(session, window_label="month")
+        assert "USAGE — window: month" in report
+        assert "No assignments found." in report
+        assert "Σ  total" in report
+
+
+class TestUsageCommandBareViewHonorsWindowFlags:
+    """CLI-level: the legacy ``coord usage`` (no --by/--by-time/--by-issue/
+    --issue) must actually apply --today/--week/--month/--since (#1119
+    review finding #1), not silently ignore them."""
+
+    @pytest.fixture
+    def coord_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, coord_db) -> Path:
+        import coord.usage as usage_mod
+        monkeypatch.setattr(usage_mod, "COORD_DIR", tmp_path)
+        monkeypatch.setattr(usage_mod, "LOGS_DIR", tmp_path / "logs")
+        return tmp_path
+
+    def _write_board(self, assignments: list[Assignment]) -> None:
+        from coord.models import Board
+        from coord.state import save_board
+        active = [a for a in assignments if a.status in ("running", "pending")]
+        completed = [a for a in assignments if a.status in ("done", "failed")]
+        save_board(Board(round_number=1, active=active, completed=completed))
+
+    def test_week_filters_out_stale_assignment_and_prints_window(self, coord_dir: Path) -> None:
+        old = _assignment(
+            assignment_id="oldone01", repo_name="r", status="done",
+            dispatched_at=0.0, finished_at=10.0,
+        )
+        recent = _assignment(
+            assignment_id="recent01", repo_name="r", status="done",
+            dispatched_at=time.time(), finished_at=time.time(),
+        )
+        self._write_board([old, recent])
+
+        result = CliRunner().invoke(main, ["usage", "--week"])
+        assert result.exit_code == 0, result.output
+        assert "USAGE — window: week" in result.output
+        assert "recent01" in result.output
+        assert "oldone01" not in result.output
+        assert "Σ  total" in result.output
+
+    def test_month_with_no_in_window_assignments_shows_no_assignments_and_footer(
+        self, coord_dir: Path
+    ) -> None:
+        old = _assignment(
+            assignment_id="ancient1", repo_name="r", status="done",
+            dispatched_at=0.0, finished_at=10.0,
+        )
+        self._write_board([old])
+
+        result = CliRunner().invoke(main, ["usage", "--month"])
+        assert result.exit_code == 0, result.output
+        assert "USAGE — window: month" in result.output
+        assert "No assignments found." in result.output
+        assert "Σ  total" in result.output
+
+    def test_week_and_month_together_fails_loud_instead_of_silent_legacy_view(
+        self, coord_dir: Path
+    ) -> None:
+        """Previously this fell through to the unvalidated legacy branch and
+        exited 0 with the unfiltered report — must now raise like every
+        other routing branch does."""
+        result = CliRunner().invoke(main, ["usage", "--week", "--month"])
+        assert result.exit_code == 2
+        assert "Traceback" not in result.output
+        assert "at most one" in result.output.lower()
+
+    def test_no_window_flag_bare_view_unchanged(self, coord_dir: Path) -> None:
+        a = _assignment(assignment_id="plain001", repo_name="r", status="done")
+        self._write_board([a])
+
+        result = CliRunner().invoke(main, ["usage"])
+        assert result.exit_code == 0, result.output
+        assert "plain001" in result.output
+        assert "USAGE — window" not in result.output
+        assert "Σ" not in result.output

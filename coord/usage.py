@@ -271,6 +271,24 @@ def build_session_usage(
     return SessionUsage(started_at=started_at, assignments=assignments)
 
 
+def filter_assignments_in_window(assignments: list[Assignment], window) -> list[Assignment]:
+    """Filter *assignments* to those in-window (#1119 review finding #1).
+
+    An assignment is in-window if its ``dispatched_at`` **or** ``finished_at``
+    falls inside *window* (a :class:`~coord.usage_rollup.TimeWindow`/
+    ``Window``) — the same semantics :func:`coord.usage_rollup.leg_in_window`
+    applies to daemon-row dicts, applied here directly to ``Assignment``
+    timestamps (already Unix floats, no ISO parsing needed). This lets the
+    legacy ``coord usage`` view (no ``--by``/``--by-time``/``--by-issue``/
+    ``--issue``) actually honor ``--today``/``--week``/``--month``/``--since``
+    instead of silently ignoring them.
+    """
+    return [
+        a for a in assignments
+        if window.contains(a.dispatched_at) or window.contains(a.finished_at)
+    ]
+
+
 # ── Rollup fetch (#1118) ──────────────────────────────────────────────────────
 
 
@@ -326,9 +344,24 @@ def _fmt_burn_rate(usd_per_hr: float) -> str:
     return f"${usd_per_hr:.2f}/hr"
 
 
-def format_usage_report(session: SessionUsage) -> str:
-    """Return the full multi-section usage report for ``coord usage``."""
+def format_usage_report(session: SessionUsage, window_label: str | None = None) -> str:
+    """Return the full multi-section usage report for ``coord usage``.
+
+    *window_label* is set when the caller resolved one of ``--today``/
+    ``--week``/``--month``/``--since`` and pre-filtered *session*'s
+    assignments to that window (#1119 review finding #1) — when given, a
+    ``USAGE — window: ...`` header and a ``Σ total`` grand-total footer are
+    printed, mirroring the convention :func:`format_usage_by_group`/
+    :func:`format_usage_by_time` already use, so the resolved window is
+    visible even on the legacy (no ``--by``) view. Left as ``None`` (the
+    default — no window flag was given), the report is byte-for-byte
+    unchanged from before #1119.
+    """
     lines: list[str] = []
+
+    if window_label is not None:
+        lines.append(f"USAGE — window: {window_label}")
+        lines.append("")
 
     # ── Session header ────────────────────────────────────────────────────
     burn = session.burn_rate_usd_per_hour()
@@ -363,6 +396,9 @@ def format_usage_report(session: SessionUsage) -> str:
     # ── Per-assignment table ──────────────────────────────────────────────
     if not session.assignments:
         lines.append("No assignments found.")
+        if window_label is not None:
+            lines.append("")
+            lines.append(f"Σ  total {total_str}  •  {counts_str}")
         return "\n".join(lines)
 
     lines.append("Per-assignment:")
@@ -409,6 +445,10 @@ def format_usage_report(session: SessionUsage) -> str:
         pct = f"  ({100 * c / total:.0f}%)" if total > 0 else ""
         noun = "assignment" if n == 1 else "assignments"
         lines.append(f"  {model_name:<{col_model_w}}  {n} {noun:<12}  {_fmt_cost(c)}{pct}")
+
+    if window_label is not None:
+        lines.append("")
+        lines.append(f"Σ  total {total_str}  •  {counts_str}")
 
     return "\n".join(lines)
 
