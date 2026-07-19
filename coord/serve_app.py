@@ -32,8 +32,11 @@ servers, which have no auth). Per-user auth is #282 / team-mode territory.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sqlite3
+import sys
+import threading
 from dataclasses import asdict, fields
 from pathlib import Path
 
@@ -82,6 +85,86 @@ def resolve_serve_token(flag_token: str | None = None) -> str | None:
         if from_file:
             return from_file
     return None
+
+
+class _ThreadLocalCapture:
+    """Per-thread stdout/stderr capture target, installed once as the
+    process's ``sys.stdout``/``sys.stderr`` (#1278).
+
+    Several daemon-write endpoints (``/merge``, ``/notify``,
+    ``/reconcile-merges``, ``/diagnose``, ``/test-plan``,
+    ``/acceptance/record``) invoke a click command's ``callback`` inside a
+    ``run_in_threadpool`` worker THREAD and capture its output for the JSON
+    response. The old idiom did this with ``contextlib.redirect_stdout(buf)``,
+    which rebinds the process-*global* ``sys.stdout`` — fine for one request
+    at a time, but two concurrent requests race on that global: whichever
+    swap lands last "wins" for both, so writes from BOTH callbacks can land
+    in the SAME buffer and each caller's response can contain (or be missing)
+    the other's output. #1278 observed this as a ``--dry-run`` merge response
+    reporting the "opened"/"merged" lines of another, concurrently-running
+    real merge.
+
+    Fix: install ONE stable object as ``sys.stdout``/``sys.stderr`` — its
+    identity never changes, so nothing that caches based on ``sys.stdout``
+    identity (e.g. click's stream wrappers) is disturbed — and route each
+    write through ``threading.local()`` instead of swapping the global.
+    Concurrent worker threads each push/pop their own target via
+    ``capture()``, so they can never share one.
+    """
+
+    def __init__(self, real) -> None:  # noqa: ANN001
+        self._real = real
+        self._local = threading.local()
+
+    def _target(self):  # noqa: ANN202
+        return getattr(self._local, "buf", None) or self._real
+
+    def write(self, s):  # noqa: ANN001, ANN202
+        return self._target().write(s)
+
+    def flush(self) -> None:
+        flush = getattr(self._target(), "flush", None)
+        if flush is not None:
+            flush()
+
+    def isatty(self) -> bool:
+        return False
+
+    def fileno(self) -> int:
+        # Defensive passthrough for code expecting a real fd (e.g.
+        # ``os.get_terminal_size(sys.stdout.fileno())``) when NOT inside an
+        # active capture. Not exercised by the six capturing handlers today,
+        # but keeps this a safe process-wide sys.stdout/sys.stderr swap.
+        return self._real.fileno()
+
+    @contextlib.contextmanager
+    def capture(self, buf):  # noqa: ANN001, ANN202
+        prev = getattr(self._local, "buf", None)
+        self._local.buf = buf
+        try:
+            yield
+        finally:
+            self._local.buf = prev
+
+
+_stdio_capture_install_lock = threading.Lock()
+
+
+def _ensure_stdio_capture_proxies() -> tuple[_ThreadLocalCapture, _ThreadLocalCapture]:
+    """Idempotently install the #1278 thread-local stdout/stderr proxies.
+
+    Call once at the top of any handler that captures a click callback's
+    output, before wrapping the call in ``<proxy>.capture(buf)``. Installs at
+    most once per process — the lock only guards the install itself (two
+    concurrent first-callers can't double-wrap); once installed, the
+    ``isinstance`` check makes every later call a cheap no-op.
+    """
+    with _stdio_capture_install_lock:
+        if not isinstance(sys.stdout, _ThreadLocalCapture):
+            sys.stdout = _ThreadLocalCapture(sys.stdout)
+        if not isinstance(sys.stderr, _ThreadLocalCapture):
+            sys.stderr = _ThreadLocalCapture(sys.stderr)
+    return sys.stdout, sys.stderr  # type: ignore[return-value]
 
 
 class _BearerAuthMiddleware(BaseHTTPMiddleware):
@@ -2951,19 +3034,19 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             return JSONResponse({"error": "invalid JSON body"}, status_code=400)
 
         def _run() -> dict:
-            import contextlib  # noqa: PLC0415
             import io  # noqa: PLC0415
             import os  # noqa: PLC0415
 
             from coord.commands.acceptance import acceptance_record  # noqa: PLC0415
 
+            stdout_proxy, _stderr_proxy = _ensure_stdio_capture_proxies()
             buf = io.StringIO()
             code = 0
             err = None
             prev = os.environ.get("COORD_ACCEPTANCE_ON_DAEMON")
             os.environ["COORD_ACCEPTANCE_ON_DAEMON"] = "1"  # guard against re-routing
             try:
-                with contextlib.redirect_stdout(buf):
+                with stdout_proxy.capture(buf):
                     acceptance_record.callback(
                         repo=body.get("repo"),
                         issue_number=int(body.get("issue")),
@@ -3201,19 +3284,19 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
 
         def _run() -> dict:
-            import contextlib  # noqa: PLC0415
             import io  # noqa: PLC0415
             import os  # noqa: PLC0415
 
             from coord.cli import notify as notify_cmd  # noqa: PLC0415
 
+            stdout_proxy, _stderr_proxy = _ensure_stdio_capture_proxies()
             buf = io.StringIO()
             code = 0
             err = None
             prev = os.environ.get("COORD_NOTIFY_ON_DAEMON")
             os.environ["COORD_NOTIFY_ON_DAEMON"] = "1"
             try:
-                with contextlib.redirect_stdout(buf):
+                with stdout_proxy.capture(buf):
                     notify_cmd.callback(config_path=config.path)
             except SystemExit as e:
                 code = e.code if isinstance(e.code, int) else (1 if e.code else 0)
@@ -3654,12 +3737,12 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             )
 
         def _run() -> dict:
-            import contextlib  # noqa: PLC0415
             import io  # noqa: PLC0415
             import os  # noqa: PLC0415
 
             from coord.cli import merge as merge_cmd  # noqa: PLC0415
 
+            stdout_proxy, stderr_proxy = _ensure_stdio_capture_proxies()
             buf = io.StringIO()
             code = 0
             err = None
@@ -3669,11 +3752,14 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 # #1251-review: fold stderr into the same buffer as stdout.
                 # click.echo(..., err=True) — the "not PENDING" / drop /
                 # --override-human-required usage errors below — resolves
-                # sys.stderr fresh at call time, so without redirect_stderr
-                # those messages vanish into the daemon's own journal instead
-                # of reaching the client: a daemon-routed `coord merge --only`
-                # would exit 1 with zero output, the exact bug #1251 reports.
-                with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                # sys.stderr fresh at call time, so without capturing stderr
+                # too those messages vanish into the daemon's own journal
+                # instead of reaching the client: a daemon-routed `coord merge
+                # --only` would exit 1 with zero output, the exact bug #1251
+                # reports. #1278: both proxies are per-thread (see
+                # _ThreadLocalCapture), so concurrent /merge calls no longer
+                # cross-contaminate each other's buf.
+                with stdout_proxy.capture(buf), stderr_proxy.capture(buf):
                     merge_cmd.callback(
                         config_path=config.path,
                         dry_run=bool(body.get("dry_run")),
@@ -3731,19 +3817,19 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             return JSONResponse({"error": "invalid JSON body"}, status_code=400)
 
         def _run() -> dict:
-            import contextlib  # noqa: PLC0415
             import io  # noqa: PLC0415
             import os  # noqa: PLC0415
 
             from coord.cli import reconcile_merges as reconcile_cmd  # noqa: PLC0415
 
+            stdout_proxy, _stderr_proxy = _ensure_stdio_capture_proxies()
             buf = io.StringIO()
             code = 0
             err = None
             prev = os.environ.get("COORD_RECONCILE_ON_DAEMON")
             os.environ["COORD_RECONCILE_ON_DAEMON"] = "1"  # guard against re-routing
             try:
-                with contextlib.redirect_stdout(buf):
+                with stdout_proxy.capture(buf):
                     reconcile_cmd.callback(
                         config_path=config.path,
                         dry_run=bool(body.get("dry_run")),
@@ -3776,19 +3862,19 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             return JSONResponse({"error": "invalid JSON body"}, status_code=400)
 
         def _run() -> dict:
-            import contextlib  # noqa: PLC0415
             import io  # noqa: PLC0415
             import os  # noqa: PLC0415
 
             from coord.cli import diagnose as diagnose_cmd  # noqa: PLC0415
 
+            stdout_proxy, _stderr_proxy = _ensure_stdio_capture_proxies()
             buf = io.StringIO()
             code = 0
             err = None
             prev = os.environ.get("COORD_DIAGNOSE_ON_DAEMON")
             os.environ["COORD_DIAGNOSE_ON_DAEMON"] = "1"  # guard against re-routing
             try:
-                with contextlib.redirect_stdout(buf):
+                with stdout_proxy.capture(buf):
                     diagnose_cmd.callback(
                         repo=body.get("repo"),
                         issue=int(body.get("issue")),
@@ -3827,19 +3913,19 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             return JSONResponse({"error": "invalid JSON body"}, status_code=400)
 
         def _run() -> dict:
-            import contextlib  # noqa: PLC0415
             import io  # noqa: PLC0415
             import os  # noqa: PLC0415
 
             from coord.cli import test_plan_cmd  # noqa: PLC0415
 
+            stdout_proxy, _stderr_proxy = _ensure_stdio_capture_proxies()
             buf = io.StringIO()
             code = 0
             err = None
             prev = os.environ.get("COORD_TEST_PLAN_ON_DAEMON")
             os.environ["COORD_TEST_PLAN_ON_DAEMON"] = "1"  # guard against re-routing
             try:
-                with contextlib.redirect_stdout(buf):
+                with stdout_proxy.capture(buf):
                     test_plan_cmd.callback(
                         assignment_id=body.get("assignment_id"),
                         refresh=bool(body.get("refresh")),
