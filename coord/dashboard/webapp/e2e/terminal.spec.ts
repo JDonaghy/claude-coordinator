@@ -215,17 +215,24 @@ test.describe('terminal takeover flow (#1072)', () => {
   })
 
   /**
-   * Disconnect path: when the server closes the WebSocket (PTY EOF / session
-   * ended), the status label must flip to "Disconnected".
+   * Session-ended path: when the bridge closes the WebSocket with the
+   * "session is gone for good" code (4404 / SESSION_GONE_CODE — see
+   * coord/dashboard/server.py:terminal_ws, sent when resolve_session_target
+   * no longer finds a live assignment), the status label must flip to
+   * "Session ended".
    *
-   * Guards the ws.onclose → setState('closed') → STATUS_LABEL['closed'] path
-   * in Terminal.tsx — the user should always know when the session has ended
-   * rather than seeing a frozen terminal with no feedback.
+   * Guards the ws.onclose → (event.code === 4404) → setState('ended') →
+   * STATUS_LABEL['ended'] path in Terminal.tsx — the user should always know
+   * when the session has ended for good rather than seeing a frozen terminal
+   * with no feedback. 4404 is a terminal state: unlike other closes it is NOT
+   * retried, so this asserts the deterministic end-of-session feedback (a
+   * plain close, by contrast, is a transient drop → "Reconnecting…").
    */
-  test('terminal shows "Disconnected" when WebSocket closes from server side', async ({
+  test('terminal shows "Session ended" when the bridge closes with 4404', async ({
     page,
   }) => {
-    // Fake PTY that ends the session after delivering one line.
+    // Fake bridge that delivers one line then closes with the session-gone
+    // code (4404), the way server.py signals a session that no longer resolves.
     await page.routeWebSocket(`**/ws/terminal/${SESSION_ID}`, async (ws) => {
       ws.send('session has ended\r\n')
 
@@ -233,7 +240,7 @@ test.describe('terminal takeover flow (#1072)', () => {
       // close frame races it in the browser's event loop.
       await new Promise<void>((resolve) => {
         setTimeout(() => {
-          ws.close()
+          ws.close({ code: 4404 })
           resolve()
         }, 80)
       })
@@ -242,9 +249,14 @@ test.describe('terminal takeover flow (#1072)', () => {
     // Navigate directly to the terminal view (no need to go through Home).
     await page.goto(`/terminal/${SESSION_ID}`)
 
-    // The status label must flip to "Disconnected" once the server-side close
-    // arrives (ws.onclose → setState('closed')).
-    await expect(page.getByText('Disconnected')).toBeVisible({ timeout: 5_000 })
+    // The terminal must surface the end-of-session state once the 4404 close
+    // arrives (ws.onclose → event.code === SESSION_GONE_CODE → setState('ended')):
+    // a role="status" overlay tells the user the session is gone for good
+    // instead of leaving a frozen pane. ("Session ended" also appears in the
+    // header status label, so scope to the overlay to stay unambiguous.)
+    await expect(page.getByRole('status')).toContainText('Session ended', {
+      timeout: 5_000,
+    })
   })
 
   /**

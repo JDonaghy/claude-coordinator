@@ -127,6 +127,14 @@ export default function Terminal() {
     }
 
     const connect = () => {
+      // Opening a connection is always deliberate, so any close that follows
+      // is "unintentional" until the ✕ button / unmount sets the flag again.
+      // Without this reset, React StrictMode's dev mount→cleanup→mount cycle
+      // (cleanup sets the flag true, then a *new* connection is opened) would
+      // leave the flag stuck true, so the live connection's onclose below
+      // would short-circuit and never surface "Reconnecting…" / "Session
+      // ended". Production single-mounts, but the Vite-dev E2E hits this.
+      intentionalCloseRef.current = false
       const ws = new WebSocket(terminalWebSocketUrl(sessionId))
       ws.binaryType = 'arraybuffer'
       wsRef.current = ws
@@ -137,6 +145,13 @@ export default function Terminal() {
         sendResize(ws)
       }
       ws.onclose = (event) => {
+        // Ignore closes from a superseded socket: React StrictMode's
+        // double-invoke opens ws#1, then cleanup closes it *after* ws#2 has
+        // already become the live connection. Only the current connection
+        // drives state transitions and reconnect scheduling — otherwise
+        // ws#1's late close schedules a spurious reconnect (the #1071
+        // reconnect-storm this guard family exists to prevent).
+        if (wsRef.current !== ws) return
         if (intentionalCloseRef.current) return
         if (event.code === SESSION_GONE_CODE) {
           // The worker session itself is gone (not just this connection) --
