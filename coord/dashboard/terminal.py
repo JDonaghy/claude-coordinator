@@ -164,21 +164,36 @@ class TmuxSessionAttacher:
         # The browser's first WS resize frame (sent from onopen) will arrive
         # within milliseconds and TIOCSWINSZ the PTY to the phone's real
         # viewport, which tmux then propagates via SIGWINCH.
+        # Both calls below are blocking (each can be a real ssh round-trip
+        # for a remote host, worst case the full 5s timeout) and this
+        # `attach()` runs directly on the dashboard's single asyncio event
+        # loop (awaited from the WS route handler in server.py) -- calling
+        # `subprocess.run` here would stall every other connection the
+        # dashboard is serving (other attached terminals, other websockets,
+        # REST endpoints) for up to ~10s. Route them through the loop's
+        # executor, matching the existing pattern (server.py's
+        # `loop.run_in_executor(None, _fetch_agent_status, ...)`) instead of
+        # blocking inline.
+        loop = asyncio.get_running_loop()
+
         initial_cols, initial_rows = 80, 24  # safe fallback
         try:
-            result = subprocess.run(
-                host_obj.cmd(
-                    [
-                        "display-message",
-                        "-t",
-                        session_name,
-                        "-p",
-                        "#{window_width} #{window_height}",
-                    ]
+            result = await loop.run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    host_obj.cmd(
+                        [
+                            "display-message",
+                            "-t",
+                            session_name,
+                            "-p",
+                            "#{window_width} #{window_height}",
+                        ]
+                    ),
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
                 ),
-                capture_output=True,
-                text=True,
-                timeout=5,
             )
             parts = result.stdout.strip().split()
             if len(parts) == 2:
@@ -193,18 +208,21 @@ class TmuxSessionAttacher:
         # the new (sole) client's size rather than remaining pinned to a
         # previously-attached smaller client's footprint.
         try:
-            subprocess.run(
-                host_obj.cmd(
-                    [
-                        "set-window-option",
-                        "-t",
-                        session_name,
-                        "aggressive-resize",
-                        "on",
-                    ]
+            await loop.run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    host_obj.cmd(
+                        [
+                            "set-window-option",
+                            "-t",
+                            session_name,
+                            "aggressive-resize",
+                            "on",
+                        ]
+                    ),
+                    capture_output=True,
+                    timeout=5,
                 ),
-                capture_output=True,
-                timeout=5,
             )
         except Exception:
             pass
