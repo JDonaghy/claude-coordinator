@@ -34796,11 +34796,26 @@ Milestone tracking issue.
     /// timestamp (never "today"), so every leg here is explicitly re-anchored
     /// to real "now" — otherwise the default `Today` scope window would
     /// exclude everything and the grid would render empty.
+    ///
+    /// The anchor is **midday UTC of "today"**, not raw wall-clock `now`:
+    /// offsetting straight from `now` (as an earlier version of this fixture
+    /// did) put legs up to 2h in the past, which crosses into *yesterday*
+    /// whenever the suite runs within ~2h of UTC midnight — `Today`'s window
+    /// is `[utc_day_start(now), utc_day_start(now) + 1 day)`, so a leg that
+    /// lands before the boundary silently drops out of the aggregate. That
+    /// produced a real, time-of-day-dependent flake (#1116 fix iteration 1):
+    /// the grid rendered with #502's `work` leg missing entirely, so its Σ
+    /// estimate read as the `review` leg's `~$0.91` alone instead of the
+    /// combined `~$19.2` both tests expect. Anchoring at midday with modest
+    /// (≤2h) offsets keeps every timestamp inside the same UTC calendar day
+    /// no matter what time the test actually runs.
     fn make_usage_grid_assignments() -> Vec<Assignment> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs_f64();
+        let day_start = (now / 86_400.0).floor() * 86_400.0;
+        let anchor = day_start + 43_200.0; // 12:00 UTC "today" — day-boundary-safe
 
         let mut a501 = make_assignment_typed("done", 501, "alpha", Some("work"));
         a501.model = Some("sonnet".to_string());
@@ -34808,8 +34823,8 @@ Milestone tracking issue.
         a501.input_tokens = 1_000;
         a501.output_tokens = 2_000;
         a501.cache_read_tokens = 3_000;
-        a501.dispatched_at = Some(now - 3_600.0);
-        a501.finished_at = Some(now - 3_000.0);
+        a501.dispatched_at = Some(anchor - 3_600.0);
+        a501.finished_at = Some(anchor - 3_000.0);
 
         // Est = (20_000*15 + 200_000*75 + 2_000_000*1.50) / 1e6 = $18.30.
         let mut a502_work = make_assignment_typed("done", 502, "beta", Some("work"));
@@ -34818,8 +34833,8 @@ Milestone tracking issue.
         a502_work.input_tokens = 20_000;
         a502_work.output_tokens = 200_000;
         a502_work.cache_read_tokens = 2_000_000;
-        a502_work.dispatched_at = Some(now - 7_200.0);
-        a502_work.finished_at = Some(now - 6_000.0);
+        a502_work.dispatched_at = Some(anchor - 7_200.0);
+        a502_work.finished_at = Some(anchor - 6_000.0);
 
         // Est = (2_000*3 + 50_000*15 + 500_000*0.30) / 1e6 = $0.906 -> "~$0.91".
         let mut a502_review = make_assignment_typed("done", 502, "beta", Some("review"));
@@ -34828,8 +34843,8 @@ Milestone tracking issue.
         a502_review.input_tokens = 2_000;
         a502_review.output_tokens = 50_000;
         a502_review.cache_read_tokens = 500_000;
-        a502_review.dispatched_at = Some(now - 1_000.0);
-        a502_review.finished_at = Some(now - 500.0);
+        a502_review.dispatched_at = Some(anchor - 1_000.0);
+        a502_review.finished_at = Some(anchor - 500.0);
 
         vec![a501, a502_work, a502_review]
     }
