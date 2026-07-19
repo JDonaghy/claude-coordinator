@@ -5,10 +5,16 @@
  */
 import { cn } from '@/lib/utils'
 import { type SessionInfo } from '@/api/client'
+import { STAGE_LABEL } from '@/components/PipelineCard'
 
 interface StatusInfo {
   label: string
   className: string
+}
+
+/** Human-facing label for the session's assignment type, e.g. "smoke" → "test". */
+function stageLabel(stage: string): string {
+  return STAGE_LABEL[stage] ?? stage
 }
 
 /** Badge reflecting whether the session is live/attached/ended. */
@@ -37,19 +43,26 @@ export function SessionCard({ session, onClick }: SessionCardProps) {
       onClick={onClick}
       className="w-full rounded-lg border border-border bg-card p-4 text-left shadow-sm transition-colors active:bg-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
     >
-      {/* Top row: title + status badge */}
+      {/* Top row: title + assignment-type chip (when resolvable) + status badge */}
       <div className="flex items-start justify-between gap-3">
         <p className="flex-1 truncate text-sm font-medium text-card-foreground">
           {title}
         </p>
-        <span
-          className={cn(
-            'shrink-0 rounded-full px-2 py-0.5 text-xs font-semibold',
-            statusClass,
+        <div className="flex shrink-0 items-center gap-1.5">
+          {session.stage && (
+            <span className="rounded border border-border px-1.5 py-0.5 text-xs font-medium text-muted-foreground">
+              {stageLabel(session.stage)}
+            </span>
           )}
-        >
-          {statusLabel}
-        </span>
+          <span
+            className={cn(
+              'rounded-full px-2 py-0.5 text-xs font-semibold',
+              statusClass,
+            )}
+          >
+            {statusLabel}
+          </span>
+        </div>
       </div>
 
       {/* Second row: repo#N + machine, when the session maps to a tracked assignment */}
