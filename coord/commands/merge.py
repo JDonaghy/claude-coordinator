@@ -615,6 +615,20 @@ def merge(
     # applies to.  Validate up front (before any daemon round-trip) so a thin
     # client fails fast instead of silently no-op'ing the flag on the daemon
     # side (only_assignment gates the block that actually consumes it below).
+    #
+    # #1251-review: both this check and the later `if override_human_required:`
+    # gate treat an empty/whitespace-only reason as falsy, so
+    # `--override-human-required ""` would otherwise skip *every* validation
+    # and *every* effect — no error, no override, no audit row — leaving the
+    # entry stuck HUMAN_REQUIRED with no feedback that the reason was
+    # rejected.  Catch it explicitly first, before the --only check, since an
+    # empty reason is invalid regardless of what else was passed.
+    if override_human_required is not None and not override_human_required.strip():
+        click.echo(
+            "error: --override-human-required requires a non-empty reason string",
+            err=True,
+        )
+        sys.exit(1)
     if override_human_required and not only_assignment:
         click.echo(
             "error: --override-human-required requires --only <assignment_id> — "
