@@ -1461,12 +1461,30 @@ impl CoordApp {
     /// Keyed by `(repo, issue_number)` — `nested` alone (bare `u64`, as
     /// `EpicNesting` uses) risks a false-positive suppression if two repos
     /// happen to share a child issue number.
+    ///
+    /// Applies the same search + dismissal gate every sibling dedup function
+    /// (`pipeline_repos_for_state`, `pipeline_done_windowed`, …) already
+    /// applies before an issue counts toward anything. Without it, an epic
+    /// that is filtered out of every rendered bucket — because it doesn't
+    /// match the search query, or because it was dismissed — would still
+    /// contribute its children to this suppression set, hiding a child that
+    /// *does* match the query (or that lost its only visible parent) with
+    /// nothing left to render it nested. See review findings #1/#2 on #1253.
     pub(crate) fn pipeline_globally_nested_children(&self) -> std::collections::HashSet<(String, u64)> {
         let mut nested = std::collections::HashSet::new();
         for issue in &self.pipeline_issues {
             let Some(repo_name) = issue.coord_repo.as_ref() else {
                 continue;
             };
+            if self
+                .pipeline_dismissed
+                .contains(&(issue.repo_slug.clone(), issue.number))
+            {
+                continue;
+            }
+            if !self.pipeline_search.matches(issue.number, &issue.title) {
+                continue;
+            }
             let Some(children) = self.epic_children_for(issue) else {
                 continue;
             };

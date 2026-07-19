@@ -30245,6 +30245,62 @@ Milestone tracking issue.
         app
     }
 
+    /// #1253 review finding #1: `pipeline_globally_nested_children` must not
+    /// suppress a child's flat row when the search filter hides its epic.
+    ///
+    /// `make_epic_nesting_app`'s epic #100 tracks child #101 ("Child A").
+    /// Searching for "Child A" matches the child but not the epic ("Epic
+    /// tracker") — so the epic never renders in any bucket this frame. If
+    /// the nesting scan still found the epic (ignoring the search filter,
+    /// as it did pre-fix), #101 would stay marked "globally nested" with no
+    /// epic left to render it nested under, vanishing from the Pipeline
+    /// entirely despite matching the query.
+    #[test]
+    fn pipeline_globally_nested_children_respects_search_filter() {
+        let mut app = make_epic_nesting_app();
+
+        // Unfiltered: child #101 is nested under epic #100.
+        let nested = app.pipeline_globally_nested_children();
+        assert!(
+            nested.contains(&("api".to_string(), 101)),
+            "child #101 must be globally nested under epic #100 with no filter active",
+        );
+
+        // Search for the child's own title — a query the epic itself does
+        // not match.
+        app.pipeline_search.set_value("Child A");
+        let nested = app.pipeline_globally_nested_children();
+        assert!(
+            !nested.contains(&("api".to_string(), 101)),
+            "epic filtered out of search results must not suppress its child's flat row",
+        );
+    }
+
+    /// #1253 review finding #2: same root cause as #1, but via dismissal
+    /// ('D') rather than search. Dismissing epic #100 must not leave child
+    /// #101 marked "globally nested" — otherwise the child has no epic left
+    /// to render it nested under and silently disappears from the Pipeline.
+    #[test]
+    fn pipeline_globally_nested_children_respects_dismissal() {
+        let mut app = make_epic_nesting_app();
+
+        let nested = app.pipeline_globally_nested_children();
+        assert!(
+            nested.contains(&("api".to_string(), 101)),
+            "child #101 must be globally nested under epic #100 with no dismissal active",
+        );
+
+        // Dismiss the epic itself — keyed by (repo_slug, number), matching
+        // the 'D' key handler.
+        app.pipeline_dismissed
+            .insert(("acme/api".to_string(), 100));
+        let nested = app.pipeline_globally_nested_children();
+        assert!(
+            !nested.contains(&("api".to_string(), 101)),
+            "dismissed epic must not suppress its child's own flat row",
+        );
+    }
+
     /// #1197 (smoke-test follow-up): an epic row is INDEPENDENTLY collapsible.
     ///
     /// The first cut nested children correctly but gave the epic row no
@@ -30665,6 +30721,43 @@ Milestone tracking issue.
             "epic #100 (all children done, epic still open) must render between the \
              In-progress header ({in_progress_hdr:?}) and the New header ({new_hdr:?}), \
              not stuck under New: epic={epic_pos:?}\n{screen}",
+        );
+    }
+
+    /// #1253 review finding #3: the epic row's "N/M done" progress badge
+    /// (`epic_progress_span`) actually renders, on the epic's own row, with
+    /// the correct done/total count. `make_epic_nesting_app`'s epic #100 has
+    /// two children: #101 open, #102 closed — so the badge must read "1/2".
+    #[test]
+    fn tuidriver_pipeline_epic_row_shows_progress_summary() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_epic_nesting_app();
+        // The sidebar tree column has a fixed cell width
+        // (`shell_config().default_sidebar_width`), independent of the
+        // terminal's total width — so a long title plus the "N/M" badge can
+        // get hard-truncated regardless of how wide the driver is. Shorten
+        // the epic's title so the badge has room; this test is about the
+        // badge rendering and its count, not title-vs-badge layout budget.
+        for issue in app.pipeline_issues.iter_mut() {
+            if issue.number == 100 {
+                issue.title = "Epic".to_string();
+            }
+        }
+        app.rebuild_pipeline_sidebar(None);
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 50);
+        let screen = driver.screen();
+
+        let epic_pos = driver
+            .find("#100")
+            .expect(&format!("epic #100 row must render:\n{screen}"));
+        let progress_pos = driver
+            .find("1/2")
+            .expect(&format!("epic progress summary '1/2' must render:\n{screen}"));
+
+        assert_eq!(
+            epic_pos.1, progress_pos.1,
+            "progress summary '1/2' must render on the same row as epic #100:\n{screen}",
         );
     }
 
