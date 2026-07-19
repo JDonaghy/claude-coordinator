@@ -3230,10 +3230,11 @@ def _dispatch_merge_of(
         _merge_test_cmd = None
 
     INTERACTIVE_MERGE_SYSTEM_PROMPT = (
-        "You are a human-attended merge-prep agent dispatched by the "
-        "coordinator. A human operator is at the keyboard with you. The "
-        "branch has been reviewed/approved; your job is to get it cleanly "
-        "rebased, verified, and MERGED.\n\n"
+        "You are a merge-prep agent dispatched by the coordinator. This "
+        "session may be attended by a human operator or it may be "
+        "unattended — do not assume anyone is watching. The branch has "
+        "been reviewed/approved; your job is to get it cleanly rebased, "
+        "verified, and MERGED.\n\n"
         "Rules:\n"
         "- Stay on the worker's branch. NEVER push to the default branch "
         "directly.\n"
@@ -3260,12 +3261,44 @@ def _dispatch_merge_of(
         "4. Run the project's build/tests to confirm nothing broke.\n"
         "5. `git push --force-with-lease`.\n"
         f"6. Run `coord verify-merge {merge_of}` to self-check the "
-        "result. If it reports `default-ahead != 0` or any FOREIGN "
-        "commits, your rebase is WRONG (stale base or polluted history) "
-        "— fix it before reporting done, or report `--status blocked`. "
-        "The coordinator runs this same check on exit and will record "
-        "`blocked` (not `done`) if it fails, so a botched rebase cannot "
-        "slip through.\n"
+        "result.\n"
+        "   `default-ahead != 0` means the rebase landed on a stale "
+        "base — redo the rebase onto the current `origin/<default_branch>` "
+        "and re-push.\n"
+        "   FOREIGN commits: `coord verify-merge` flags a commit as "
+        "FOREIGN when its *subject line* does not contain the issue "
+        "number. It NEVER reads the diff — only the subject string. "
+        "This means a commit that is this branch's own work can be "
+        "flagged if the subject has a typo'd or omitted issue ref. "
+        "Before treating any FOREIGN flag as a real strand, apply this "
+        "decision procedure for each flagged commit:\n"
+        "   (a) Run `git show <sha>` and read the diff. If the content "
+        "is clearly this issue's own work → reword the commit subject "
+        "to include the issue number (NEVER drop the commit). Verify "
+        "the tree is unchanged: `git rev-parse HEAD^{tree}` before and "
+        "after must be identical. Re-run `coord verify-merge` — it "
+        "should now pass.\n"
+        "   (b) Genuinely unrelated content AND the commit is already an "
+        "ancestor of the base branch → drop it from the branch.\n"
+        "   (c) Genuinely unrelated content AND NOT on the base branch → "
+        "this is a real foreign strand. Escalate to the operator.\n"
+        "   Exhaust-before-blocking checklist (complete this BEFORE "
+        "reporting `--status blocked`):\n"
+        "   [ ] List every FOREIGN-flagged commit\n"
+        "   [ ] Run `git show <sha>` on each to read the diff\n"
+        "   [ ] Categorise each: (a) own-mislabeled, (b) ancestor-on-"
+        "base, (c) genuine strand\n"
+        "   [ ] Resolve (a) and (b) autonomously; only escalate (c)\n"
+        "   A `--status blocked` report MUST state: what you tried, "
+        "which specific commit is the obstacle, and the single decision "
+        "the operator must make. Blocking without that detail is itself "
+        "a prompt violation.\n"
+        "   Blocking cost: the operator must context-switch to this "
+        "session and the branch sits stranded until they do. It is not "
+        "a free exit — exhaust autonomous options first.\n"
+        "   The coordinator also runs this check on exit and will record "
+        "`blocked` (not `done`) if it still fails after you exit, so a "
+        "bad rebase cannot slip through regardless.\n"
         f"7. Complete the merge: run `coord merge --repo {repo}` (it opens "
         "the PR, enforces the gates, and merges in dependency order). "
         "Report the outcome — merged, or which gate blocked.\n"
@@ -3288,10 +3321,13 @@ def _dispatch_merge_of(
         f"`origin/{merge_target_branch}` (#306 proactive rebase), resolve "
         "any conflicts (mechanical additively; semantic with the "
         "operator), run the tests, and `git push --force-with-lease`. "
-        f"Before you report done, run `coord verify-merge {merge_of}` — "
-        f"if `{merge_target_branch}-ahead != 0` or any FOREIGN commits "
-        "are listed, the rebase is wrong (stale base / polluted history); "
-        "fix it or report `--status blocked` (#604). "
+        f"Before you report done, run `coord verify-merge {merge_of}`. "
+        f"If `{merge_target_branch}-ahead != 0`, the rebase is on a "
+        "stale base — redo it. If FOREIGN commits are listed, read the "
+        "system-prompt decision procedure (a/b/c) before deciding whether "
+        "to reword, drop, or escalate — FOREIGN is a subject-string check "
+        "that never reads diffs, so it can fire on this branch's own "
+        "mislabeled commit (#604). "
         f"Once verify-merge passes clean, COMPLETE the merge yourself: "
         f"run `coord merge --repo {repo}` (it re-checks CI/review/smoke "
         "on the coordinator and merges via PR). If it reports a gate "
@@ -3304,8 +3340,10 @@ def _dispatch_merge_of(
         f"merge-prep on branch {work.branch} (rebasing onto "
         f"{merge_target_branch}). Before you exit, run `coord "
         f"report-result --assignment {assignment_id} --status done "
-        "--summary <text>` (use --status blocked if a semantic conflict "
-        "needs the operator).\n\n"
+        "--summary <text>` (use --status blocked only for a semantic "
+        "conflict or genuine foreign strand that needs the operator; "
+        "blocked reports must name what was tried and the single decision "
+        "needed).\n\n"
     )
     effective_briefing = _issue_ctx + report_reminder + merge_briefing
 
@@ -3321,7 +3359,11 @@ def _dispatch_merge_of(
     )
     # Full worker tool set (Read/Edit/Write/Bash) — rebasing and resolving
     # conflicts mutates the checkout.
-    argv = provider.build_command(spec, resolved_model=resolved_model)
+    argv = provider.build_command(
+        spec,
+        resolved_model=resolved_model,
+        system_prompt=INTERACTIVE_MERGE_SYSTEM_PROMPT,
+    )
     # Remote: bare "claude" isn't on the SSH login PATH (#424/#425).
     if not _is_local:
         argv = ["~/.local/bin/claude"] + list(argv)[1:]
