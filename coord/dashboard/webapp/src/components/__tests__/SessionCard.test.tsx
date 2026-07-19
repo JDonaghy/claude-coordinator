@@ -68,4 +68,39 @@ describe('SessionCard', () => {
     await userEvent.click(screen.getByRole('button'))
     expect(onClick).toHaveBeenCalledOnce()
   })
+
+  // ── Assignment-type chip (#1276) ──────────────────────────────────────────
+
+  it('shows a "work" chip for a work session', () => {
+    render(<SessionCard session={makeSession({ stage: 'work' })} onClick={() => undefined} />)
+    expect(screen.getByText('work')).toBeInTheDocument()
+  })
+
+  it('shows a "test" chip for a smoke session, reusing PipelineCard\'s STAGE_LABEL', () => {
+    render(<SessionCard session={makeSession({ stage: 'smoke' })} onClick={() => undefined} />)
+    expect(screen.getByText('test')).toBeInTheDocument()
+  })
+
+  it('shows a "review" chip for a review session', () => {
+    render(<SessionCard session={makeSession({ stage: 'review' })} onClick={() => undefined} />)
+    expect(screen.getByText('review')).toBeInTheDocument()
+  })
+
+  it('shows a "merge" chip for a merge session', () => {
+    render(<SessionCard session={makeSession({ stage: 'merge' })} onClick={() => undefined} />)
+    expect(screen.getByText('merge')).toBeInTheDocument()
+  })
+
+  it('falls back to the raw assignment type when it has no STAGE_LABEL entry', () => {
+    render(<SessionCard session={makeSession({ stage: 'fix' })} onClick={() => undefined} />)
+    expect(screen.getByText('fix')).toBeInTheDocument()
+  })
+
+  it('renders no stage chip when stage is null', () => {
+    render(<SessionCard session={makeSession({ stage: null })} onClick={() => undefined} />)
+    // Only the status badge ("live") should render — no orphan chip for a
+    // session without a resolvable assignment.
+    expect(screen.queryByText('work')).not.toBeInTheDocument()
+    expect(screen.getByText('live')).toBeInTheDocument()
+  })
 })
