@@ -260,6 +260,44 @@ test.describe('terminal takeover flow (#1072)', () => {
   })
 
   /**
+   * Reconnect path: a plain (non-4404) server close is a *transient* drop, so
+   * the client must surface "Reconnecting…" and retry with backoff — never a
+   * terminal state. This is the exact behavior the Terminal.tsx onclose guards
+   * protect (the `intentionalCloseRef` reset in connect() + the superseded-
+   * socket `wsRef.current !== ws` check): before that fix, React StrictMode's
+   * dev remount left the surviving socket's onclose short-circuited, so a real
+   * drop froze the pane at "Live" and never reconnected. Complements the 4404
+   * "Session ended" (terminal, no-retry) test above — this is the transient,
+   * retrying counterpart, and it fails-on-revert of the connect() reset.
+   */
+  test('terminal shows "Reconnecting…" after a plain (transient) server close', async ({
+    page,
+  }) => {
+    // Fake bridge that drops each connection with a plain close shortly after
+    // it opens. A plain close (no 4404) is a transient drop, so the client
+    // keeps cycling into "Reconnecting…" (→ backoff → retry) rather than a
+    // terminal state — reliably observable within the timeout.
+    await page.routeWebSocket(`**/ws/terminal/${SESSION_ID}`, async (ws) => {
+      ws.send(FAKE_PTY_BANNER)
+      await new Promise<void>((resolve) => {
+        setTimeout(() => {
+          ws.close() // plain close (no code) => transient => must reconnect
+          resolve()
+        }, 120)
+      })
+    })
+
+    // Navigate directly to the terminal view (no need to go through Home).
+    await page.goto(`/terminal/${SESSION_ID}`)
+
+    // The status label flips to "Reconnecting…" once the surviving connection's
+    // onclose reaches the transient-drop branch (setState('reconnecting')).
+    // "Reconnecting…" appears only in the header label (no overlay), so a plain
+    // text locator is unambiguous.
+    await expect(page.getByText('Reconnecting…')).toBeVisible({ timeout: 5_000 })
+  })
+
+  /**
    * Key-bar completeness: all four arrow keys must transmit their ANSI escape
    * sequences to the fake PTY.
    *
