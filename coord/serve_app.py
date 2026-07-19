@@ -3652,7 +3652,14 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             prev = os.environ.get("COORD_MERGE_ON_DAEMON")
             os.environ["COORD_MERGE_ON_DAEMON"] = "1"  # guard against re-routing
             try:
-                with contextlib.redirect_stdout(buf):
+                # #1251-review: fold stderr into the same buffer as stdout.
+                # click.echo(..., err=True) — the "not PENDING" / drop /
+                # --override-human-required usage errors below — resolves
+                # sys.stderr fresh at call time, so without redirect_stderr
+                # those messages vanish into the daemon's own journal instead
+                # of reaching the client: a daemon-routed `coord merge --only`
+                # would exit 1 with zero output, the exact bug #1251 reports.
+                with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
                     merge_cmd.callback(
                         config_path=config.path,
                         dry_run=bool(body.get("dry_run")),

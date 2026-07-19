@@ -621,6 +621,34 @@ class TestMergeOverrideHumanRequired:
         states = {e.assignment_id: e.state for e in mq.load_queue()}
         assert states["h1"] == mq.HUMAN_REQUIRED
 
+    def test_override_rejects_empty_reason(
+        self, config_file: Path, coord_dir: Path, coord_db,
+    ) -> None:
+        """#1251-review (minor): an empty/whitespace-only reason is falsy, so
+        it must not silently pass through both the "requires --only" check
+        and the actual override gate (which would leave the entry stuck
+        HUMAN_REQUIRED with zero feedback that the reason was rejected)."""
+        _seed_queue([_entry("h1", state=mq.HUMAN_REQUIRED)])
+
+        result = CliRunner().invoke(
+            main,
+            [
+                "merge", "--config", str(config_file),
+                "--only", "h1",
+                "--override-human-required", "   ",
+            ],
+        )
+        assert result.exit_code != 0
+        assert "non-empty reason" in result.stderr.lower()
+
+        states = {e.assignment_id: e.state for e in mq.load_queue()}
+        assert states["h1"] == mq.HUMAN_REQUIRED
+
+        rows = coord_db.execute(
+            "SELECT * FROM audit_log WHERE event_type='human_required_override'"
+        ).fetchall()
+        assert rows == []
+
     def test_override_dry_run_does_not_persist_or_audit(
         self, config_file: Path, coord_dir: Path, coord_db,
     ) -> None:

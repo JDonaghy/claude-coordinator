@@ -12,6 +12,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from coord import client as coord_client
+from coord import merge_queue as mq
 from coord.config import load as load_config
 from coord.dao import SqliteStore
 from coord.db import _ensure_schema
@@ -141,6 +142,47 @@ def test_serve_merge_passes_show_plan_to_callback(file_db: Path, valid_config_pa
         err = resp.json().get("error") or ""
         assert "show_plan" not in err, f"merge handler regressed on show_plan: {err}"
         assert "missing 1 required positional argument" not in err
+
+
+def test_serve_merge_relays_stderr_usage_errors(
+    file_db: Path, valid_config_path: Path, rw_db
+):
+    """#1251-review blocking finding: ``post_merge``'s ``_run()`` only wrapped
+    the callback in ``contextlib.redirect_stdout`` — any ``click.echo(...,
+    err=True)`` usage error (e.g. ``--only`` on a non-PENDING entry) resolved
+    ``sys.stderr`` fresh and wrote straight into the daemon process's own
+    journal, never into the captured buffer. A daemon-routed thin client (the
+    dominant deployment mode) then saw exit_code=1 with a totally empty
+    output/error — indistinguishable from a crash, and exactly the #1251
+    repro. Assert the message now survives the relay.
+
+    Uses ``rw_db`` (thread-safe, file-backed) rather than the default autouse
+    ``coord_db`` (thread-bound ``:memory:``) because ``post_merge`` runs the
+    callback in a worker thread via ``run_in_threadpool``, mirroring
+    production's ``check_same_thread=False`` connection.
+    """
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(file_db), cfg)
+    mq.save_queue([
+        mq.QueuedMerge(
+            assignment_id="m1",
+            repo_name="api",
+            repo_github="acme/api",
+            branch="worker/m1",
+            target_branch="main",
+            issue_number=1,
+            issue_title="t",
+            size=None,
+            state=mq.MERGED,
+        )
+    ])
+    with TestClient(app) as cli:
+        resp = cli.post("/merge", json={"only": "m1"})
+        body = resp.json()
+        assert body["exit_code"] != 0
+        assert "not PENDING" in body["output"], (
+            f"stderr usage error did not reach the client: {body!r}"
+        )
 
 
 # ── #1081: daemon-side config reload-on-write ───────────────────────────────
