@@ -349,3 +349,64 @@ def test_compute_board_stage_projection_includes_closed_issue_with_assignments_o
     )
     assert len(out) == 1
     assert out[0]["issue_number"] == 1
+
+
+def test_merged_test_author_entry_does_not_mark_tracking_issue_merge_done():
+    """#1203: a merged `test-author` merge-queue row is keyed to the
+    milestone's tracking issue (#1117-style) on `issue_number` — it must not
+    make the tracking issue's own Pipeline card read `merge: done` while the
+    epic itself is still open and untouched."""
+    issues = [{"repo_name": "api", "number": 1117, "title": "epic", "state": "open"}]
+    mq_items = [
+        _entry(
+            assignment_id="ta1",
+            issue_number=1117,
+            state="merged",
+            assignment_type="test-author",
+        )
+    ]
+    out = sp.compute_board_stage_projection(
+        issues=issues,
+        assignments=[],
+        merge_queue_items=mq_items,
+        default_gates=["test", "review", "merge"],
+    )
+    assert len(out) == 1
+    assert out[0]["issue_number"] == 1117
+    assert out[0]["stages"]["merge"] == sp.PENDING
+
+
+def test_merged_test_author_entry_attributes_to_resolved_child_issue():
+    """When the originating assignment's `for_issue_number` is set (the JIT
+    per-slice case), the merged entry should mark the *child* issue's merge
+    box done instead — not the tracking issue's."""
+    issues = [
+        {"repo_name": "api", "number": 1117, "title": "epic", "state": "open"},
+        {"repo_name": "api", "number": 1039, "title": "slice", "state": "open"},
+    ]
+    assignments = [
+        _work(
+            assignment_id="ta1",
+            issue_number=1117,
+            type="test-author",
+            status="done",
+            for_issue_number=1039,
+        ),
+    ]
+    mq_items = [
+        _entry(
+            assignment_id="ta1",
+            issue_number=1117,
+            state="merged",
+            assignment_type="test-author",
+        )
+    ]
+    out = sp.compute_board_stage_projection(
+        issues=issues,
+        assignments=assignments,
+        merge_queue_items=mq_items,
+        default_gates=["test", "review", "merge"],
+    )
+    by_issue = {e["issue_number"]: e for e in out}
+    assert by_issue[1117]["stages"]["merge"] == sp.PENDING
+    assert by_issue[1039]["stages"]["merge"] == sp.DONE
