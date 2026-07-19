@@ -18,6 +18,13 @@ Covers:
 3. Every OTHER interactive flavour (smoke_repo_path omitted, e.g. a
    read-only review) is completely unaffected — the restore step is a
    silent no-op without a matching snapshot marker.
+4. The two automated/operator-recovery finalize paths that exist
+   specifically for a session that died WITHOUT a clean exit —
+   `coord.interactive.reap_stale_interactive_sessions` (the automatic
+   reaper run on every `coord resume`/`coord notify` reconcile pass) and
+   `coord.diagnose._finalize_dead` (the `coord diagnose` phantom-session
+   sweep) — also wire the restore in, not just the clean-exit and
+   `coord reattach` paths.
 """
 
 from __future__ import annotations
@@ -28,11 +35,14 @@ from unittest.mock import patch
 
 import pytest
 
+from coord.config import Config
 from coord.interactive import (
     finalize_interactive_exit,
+    reap_stale_interactive_sessions,
     restore_live_checkout_from_smoke_snapshot,
     snapshot_live_checkout_for_smoke,
 )
+from coord.models import Assignment, Board, Machine, Repo
 from tests.test_issue_store_seam import _seed_running_assignment
 
 
@@ -285,4 +295,236 @@ class TestFinalizeRunsRestore:
 
         mock_restore.assert_not_called()
         assert result.smoke_restored_paths == []
-        assert result.smoke_restore_error is None
+
+
+# ── automated recovery paths: reap_stale_interactive_sessions ──────────────
+#
+# #1256 review finding #1: `--smoke-of` has no worktree, so a dead-session
+# reap for it hits none of the worktree-removal branches — the restore call
+# below is the ONLY cleanup step that applies. This is the reaper invoked
+# automatically from `coord.reconcile.reconcile` on every `coord resume` /
+# `coord notify` pass, i.e. the most likely real-world path for a crashed
+# `--smoke-of` session to actually get cleaned up.
+
+
+def _smoke_config(repo_path: Path) -> Config:
+    return Config(
+        repos=[Repo(name="myrepo", github="acme/myrepo", default_branch="main")],
+        machines=[
+            Machine(
+                name="mymachine",
+                host="mymachine.tailnet",
+                repos=["myrepo"],
+                repo_paths={"myrepo": str(repo_path)},
+            )
+        ],
+    )
+
+
+def _insert_smoke_row(conn, assignment_id: str, *, typ: str, issue_number: int = 1256) -> None:
+    conn.execute(
+        """INSERT INTO assignments
+           (assignment_id, machine_name, repo_name, repo_github,
+            issue_number, issue_title, status, provider_name, type)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (assignment_id, "mymachine", "myrepo", "acme/myrepo", issue_number,
+         "Test issue", "running", "claude-pty", typ),
+    )
+    conn.commit()
+
+
+class TestReapRestoresDeadSmokeSession:
+    def test_dead_smoke_session_restores_live_checkout(
+        self, coord_db, live_checkout: Path
+    ) -> None:
+        aid = "aid-smoke-dead-1256"
+        _insert_smoke_row(coord_db, aid, typ="smoke")
+        a = Assignment(
+            assignment_id=aid,
+            machine_name="mymachine",
+            repo_name="myrepo",
+            issue_number=1256,
+            issue_title="Test issue",
+            status="running",
+            provider_name="claude-pty",
+            type="smoke",
+        )
+        board = Board(active=[a], completed=[])
+        cfg = _smoke_config(live_checkout)
+
+        snapshot_live_checkout_for_smoke(str(live_checkout), aid)
+        _git(live_checkout, "checkout", "feature", "--", "agent.py")
+        assert _porcelain(live_checkout) != "", "checkout should have dirtied the tree"
+
+        with patch("coord.interactive.tmux_available", return_value=True), \
+             patch("coord.interactive.tmux_session_alive", return_value=False), \
+             patch("coord.interactive._get_local_short_hostname", return_value="mymachine"):
+            reaped = reap_stale_interactive_sessions(board, cfg)
+
+        assert aid in reaped
+        assert _porcelain(live_checkout) == "", (
+            "the automatic reaper must restore the live checkout for a dead "
+            "smoke session — the 'agent died mid-run' case #1256 is about"
+        )
+        assert (live_checkout / "agent.py").read_text() == "original\n"
+        done = next(x for x in board.completed if x.assignment_id == aid)
+        assert done.status in ("failed", "advisory")
+
+    def test_non_smoke_dead_session_does_not_invoke_restore(
+        self, coord_db, live_checkout: Path
+    ) -> None:
+        """Regression guard: the restore call is gated on ``type == "smoke"``
+        — a dead ``type == "work"`` session has a worktree instead (handled
+        by the existing removal steps) and must not trigger it."""
+        aid = "aid-work-dead-1256"
+        _insert_smoke_row(coord_db, aid, typ="work")
+        a = Assignment(
+            assignment_id=aid,
+            machine_name="mymachine",
+            repo_name="myrepo",
+            issue_number=1256,
+            issue_title="Test issue",
+            status="running",
+            provider_name="claude-pty",
+            type="work",
+        )
+        board = Board(active=[a], completed=[])
+        cfg = _smoke_config(live_checkout)
+
+        with patch("coord.interactive.tmux_available", return_value=True), \
+             patch("coord.interactive.tmux_session_alive", return_value=False), \
+             patch("coord.interactive._get_local_short_hostname", return_value="mymachine"), \
+             patch("coord.interactive._remove_worktree"), \
+             patch(
+                 "coord.interactive.restore_live_checkout_from_smoke_snapshot"
+             ) as mock_restore:
+            reap_stale_interactive_sessions(board, cfg)
+
+        mock_restore.assert_not_called()
+
+    def test_restore_error_does_not_block_the_reap(
+        self, coord_db, live_checkout: Path
+    ) -> None:
+        """A failing restore must not stop the reap from freeing the claim —
+        it's a best-effort safety net, not a gate."""
+        aid = "aid-smoke-restore-err"
+        _insert_smoke_row(coord_db, aid, typ="smoke")
+        a = Assignment(
+            assignment_id=aid,
+            machine_name="mymachine",
+            repo_name="myrepo",
+            issue_number=1256,
+            issue_title="Test issue",
+            status="running",
+            provider_name="claude-pty",
+            type="smoke",
+        )
+        board = Board(active=[a], completed=[])
+        cfg = _smoke_config(live_checkout)
+
+        with patch("coord.interactive.tmux_available", return_value=True), \
+             patch("coord.interactive.tmux_session_alive", return_value=False), \
+             patch("coord.interactive._get_local_short_hostname", return_value="mymachine"), \
+             patch(
+                 "coord.interactive.restore_live_checkout_from_smoke_snapshot",
+                 return_value=([], "boom"),
+             ):
+            reaped = reap_stale_interactive_sessions(board, cfg)
+
+        assert aid in reaped
+        assert not any(x.assignment_id == aid for x in board.active)
+
+
+# ── automated recovery paths: coord.diagnose._finalize_dead ────────────────
+#
+# #1256 review finding #2: `coord diagnose <repo> <issue> --stage ...`'s
+# trailing `_cleanup_issue` sweep finalizes every dead session for the
+# issue, unfiltered by assignment type — including a phantom smoke row.
+
+
+class TestDiagnoseFinalizeDeadRestoresSmoke:
+    def test_finalize_dead_restores_smoke_live_checkout(
+        self, coord_db, live_checkout: Path
+    ) -> None:
+        from coord import diagnose
+
+        aid = "aid-diagnose-smoke-1256"
+        _seed_running_assignment(
+            aid,
+            repo_name="myrepo",
+            repo_github="acme/myrepo",
+            machine="mymachine",
+            issue_number=1256,
+            assignment_type="smoke",
+        )
+        assignment = Assignment(
+            assignment_id=aid,
+            machine_name="mymachine",
+            repo_name="myrepo",
+            issue_number=1256,
+            issue_title="Test issue",
+            status="running",
+            provider_name="claude-pty",
+            type="smoke",
+        )
+        cfg = _smoke_config(live_checkout)
+
+        snapshot_live_checkout_for_smoke(str(live_checkout), aid)
+        _git(live_checkout, "checkout", "feature", "--", "agent.py")
+        assert _porcelain(live_checkout) != "", "checkout should have dirtied the tree"
+
+        # Force the machine to resolve as LOCAL (matches the reaper's own
+        # local-only scope) so the restore runs a plain subprocess instead
+        # of trying to ssh to "mymachine.tailnet".
+        with patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.diagnose._ssh_target_for", return_value=None):
+            diagnose._finalize_dead(assignment, cfg)
+
+        assert _porcelain(live_checkout) == "", (
+            "coord diagnose's phantom-session finalize must restore the "
+            "live checkout for a smoke session, same as the reaper"
+        )
+        assert (live_checkout / "agent.py").read_text() == "original\n"
+
+    def test_finalize_dead_non_smoke_still_unaffected(
+        self, coord_db, live_checkout: Path
+    ) -> None:
+        """Regression guard: passing ``smoke_repo_path`` unconditionally must
+        stay a no-op for a normal work/review session — no snapshot marker
+        exists for it, so nothing should be reverted."""
+        from coord import diagnose
+
+        aid = "aid-diagnose-review-1256"
+        _seed_running_assignment(
+            aid,
+            repo_name="myrepo",
+            repo_github="acme/myrepo",
+            machine="mymachine",
+            issue_number=1256,
+            assignment_type="review",
+        )
+        assignment = Assignment(
+            assignment_id=aid,
+            machine_name="mymachine",
+            repo_name="myrepo",
+            issue_number=1256,
+            issue_title="Test issue",
+            status="running",
+            provider_name="claude-pty",
+            type="review",
+        )
+        cfg = _smoke_config(live_checkout)
+
+        # Dirty the tree the way an unrelated manual edit would — no
+        # snapshot was ever taken for this assignment_id, so it must survive.
+        (live_checkout / "README").write_text("unrelated manual edit\n")
+
+        with patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.diagnose._ssh_target_for", return_value=None):
+            diagnose._finalize_dead(assignment, cfg)
+
+        assert _porcelain(live_checkout) != "", (
+            "no snapshot marker exists for this assignment — restore must "
+            "be a no-op and leave unrelated dirt untouched"
+        )
+        assert (live_checkout / "README").read_text() == "unrelated manual edit\n"

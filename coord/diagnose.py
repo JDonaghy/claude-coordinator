@@ -305,6 +305,16 @@ def _finalize_dead(assignment: "Assignment", config: "Config") -> str:
         started_at=assignment.dispatched_at,
         repo_path=repo_path,
         ssh_target=_ssh_target_for(assignment, config),
+        # #1256: unconditional — restore_live_checkout_from_smoke_snapshot()
+        # is a documented no-op unless a snapshot marker for this
+        # assignment_id exists in repo_path's .git/ dir, so this is safe for
+        # every assignment type, not just "smoke". `coord diagnose`'s
+        # unfiltered dead-session sweep (_cleanup_issue) is one of the two
+        # automated/operator-recovery paths (the other is
+        # reap_stale_interactive_sessions) that exist specifically to handle
+        # a session that died without a clean exit — exactly when a
+        # --smoke-of session's live-checkout mutation needs reverting.
+        smoke_repo_path=repo_path,
     )
     return fr.terminal_status or "finalized"
 
