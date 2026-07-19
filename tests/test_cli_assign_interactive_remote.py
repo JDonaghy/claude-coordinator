@@ -1443,3 +1443,156 @@ class TestRemoteMergeOf:
         assert result.exit_code == 0, result.output
         mock_local.assert_called_once()
         mock_remote.assert_not_called()
+
+
+# ── #1280: merge-prep prompt — FOREIGN decision procedure ────────────────────
+
+
+def _run_merge_and_capture(
+    config_file: Path, work_id: str = "work-fptest"
+) -> "tuple[str, str]":
+    """Launch a local --merge-of and return (system_prompt, briefing).
+
+    Patches ClaudePtyProvider.build_command to capture the system_prompt kwarg
+    and spec.briefing, stubs the interactive launch so nothing really runs.
+    """
+    from coord.providers.claude_pty import ClaudePtyProvider
+
+    _seed_merge_board(work_id, "issue-1-fix-bug")
+
+    captured: list[dict[str, str]] = []
+
+    def _cap_build(
+        self: Any,
+        spec: Any,
+        *,
+        resolved_model: Any = None,
+        system_prompt: Any = None,
+        allowed_tools: Any = None,
+        **kw: Any,
+    ) -> list[str]:
+        captured.append({
+            "system_prompt": system_prompt or "",
+            "briefing": spec.briefing or "",
+        })
+        # Return a minimal argv so the rest of _dispatch_merge_of can proceed.
+        return ["claude-stub", "--system-prompt", system_prompt or ""]
+
+    with patch("coord.github_ops.get_issue",
+               return_value={"title": "Fix bug", "body": "b"}), \
+         patch.object(ClaudePtyProvider, "build_command", _cap_build), \
+         patch("coord.agent.setup_interactive_worktree",
+               return_value=(Path("/tmp/wt"), "issue-1-fix-bug")), \
+         patch("coord.interactive.launch_human_attended_interactive",
+               return_value=0), \
+         patch("coord.interactive.tmux_available", return_value=False), \
+         patch("coord.interactive.tmux_session_alive", return_value=False), \
+         patch("coord.interactive.finalize_interactive_exit",
+               return_value=_make_finalize_result(push_ok=True)):
+        result = CliRunner().invoke(
+            main,
+            ["assign", _LOCAL_HOST, "api", "1",
+             "--config", str(config_file),
+             "--interactive", "--merge-of", work_id],
+        )
+    assert result.exit_code == 0, result.output
+    assert len(captured) == 1, (
+        f"expected 1 build_command call, got {len(captured)}: {result.output}"
+    )
+    return captured[0]["system_prompt"], captured[0]["briefing"]
+
+
+class TestMergeOfPromptContent:
+    """#1280: merge-prep prompt must contain the FOREIGN decision procedure
+    and exhaust-before-blocking checklist; existing safety rules must survive.
+    """
+
+    def test_foreign_decision_procedure_present(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """System prompt and briefing must carry the FOREIGN diagnosis procedure
+        (all three branches a/b/c) and the exhaust-before-blocking checklist."""
+        syspr, briefing = _run_merge_and_capture(config_file, "work-fp1")
+
+        # FOREIGN check explanation: subject-string match, no diff inspection
+        assert "subject" in syspr.lower(), (
+            "system prompt must explain FOREIGN is a subject-string match"
+        )
+        assert "never" in syspr.lower() and "diff" in syspr.lower(), (
+            "system prompt must state the check never reads the diff"
+        )
+
+        # Branch (a): own-mislabeled — reword, never drop
+        assert "(a)" in syspr, "system prompt must include decision branch (a)"
+        assert "reword" in syspr.lower(), (
+            "branch (a) must instruct rewording the commit subject"
+        )
+
+        # Branch (b): ancestor on base → drop
+        assert "(b)" in syspr, "system prompt must include decision branch (b)"
+        assert "ancestor" in syspr.lower(), (
+            "branch (b) must mention ancestor-of-base as the drop criterion"
+        )
+
+        # Branch (c): genuine strand → escalate
+        assert "(c)" in syspr, "system prompt must include decision branch (c)"
+        assert "escalate" in syspr.lower(), (
+            "branch (c) must instruct escalating to the operator"
+        )
+
+        # Exhaust-before-blocking checklist
+        assert "exhaust" in syspr.lower() or "checklist" in syspr.lower(), (
+            "system prompt must include an exhaust-before-blocking checklist"
+        )
+        assert "--status blocked" in syspr, (
+            "checklist must name --status blocked explicitly"
+        )
+
+        # Briefing must also mention FOREIGN and the subject-string nature
+        assert "FOREIGN" in briefing, "briefing must mention FOREIGN commits"
+        assert "subject" in briefing.lower() or "decision" in briefing.lower(), (
+            "briefing must reference the subject-string nature or the decision procedure"
+        )
+
+    def test_safety_rules_survive(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """All existing safety rules must be preserved in the new prompt."""
+        syspr, _ = _run_merge_and_capture(config_file, "work-fp2")
+
+        # Rule: never push to default branch directly
+        assert "NEVER push to the default branch" in syspr, (
+            "safety rule: never push to default branch must survive"
+        )
+        # Rule: force-with-lease only
+        assert "force-with-lease" in syspr, (
+            "safety rule: must use force-with-lease, not plain --force"
+        )
+        # Rule: no gh; coord merge is the only merge path
+        assert "`gh`" in syspr, "safety rule: never use gh must survive"
+        assert "coord merge --repo" in syspr, (
+            "safety rule: coord merge --repo as the ONLY merge path must survive"
+        )
+        # Rule: never --force-merge / --skip-*
+        assert "--force-merge" in syspr and "--skip-*" in syspr, (
+            "safety rule: no --force-merge / --skip-* must survive"
+        )
+        # Rule: semantic conflicts go to the operator
+        assert "SEMANTIC" in syspr, (
+            "safety rule: semantic conflicts escalate to operator must survive"
+        )
+
+    def test_step6_no_rebase_wrong_sole_claim(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """Step 6 must no longer assert 'your rebase is WRONG' as the sole
+        explanation of a FOREIGN flag.  This assertion must FAIL against main."""
+        syspr, briefing = _run_merge_and_capture(config_file, "work-fp3")
+
+        assert "your rebase is WRONG" not in syspr, (
+            "step 6 must not claim 'your rebase is WRONG' as the only "
+            "explanation for FOREIGN commits (they can be mislabeled own work)"
+        )
+        assert "rebase is wrong" not in briefing.lower(), (
+            "briefing must not assert the rebase is wrong when FOREIGN commits appear"
+        )
