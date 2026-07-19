@@ -1794,6 +1794,8 @@ def _finalize_merge_blocked(
     started_at: float | None,
     log_path: str | None,
     branch: str | None = None,
+    smoke_restored_paths: list[str] | None = None,
+    smoke_restore_error: str | None = None,
 ) -> InteractiveFinalizeResult:
     """Record a botched ``--merge-of`` rebase as blocked → ``failed`` (#604).
 
@@ -1805,6 +1807,14 @@ def _finalize_merge_blocked(
     out of the merge-ready set.  The offending commits ride in the summary,
     posted on the issue, so the operator sees exactly why.  Cleans up the
     worktree afterwards, matching the normal-path discipline.
+
+    *smoke_restored_paths*/*smoke_restore_error* (#1256): this gate is
+    unreachable for a smoke session in practice (every ``smoke_repo_path``
+    caller also passes ``worktree_path=None``, and the gate above requires
+    ``verify_merge and worktree_path``) — but the restore mutation in
+    :func:`finalize_interactive_exit` runs unconditionally before this gate
+    is even checked, so if that invariant ever changes, the result must
+    still be threaded through rather than silently dropped.
     """
     from coord.issue_store import (  # noqa: PLC0415
         STATUS_BLOCKED,
@@ -1857,6 +1867,8 @@ def _finalize_merge_blocked(
         seam_outcome=outcome,
         worktree_removed=worktree_removed,
         merge_verify=merge_verify,
+        smoke_restored_paths=list(smoke_restored_paths or []),
+        smoke_restore_error=smoke_restore_error,
     )
 
 
@@ -2328,6 +2340,8 @@ def finalize_interactive_exit(
                     started_at=started_at,
                     log_path=log_path,
                     branch=branch,
+                    smoke_restored_paths=_smoke_restored,
+                    smoke_restore_error=_smoke_restore_error,
                 )
 
     # Respect an explicit `coord report-result` from the agent.  Without
@@ -3286,6 +3300,14 @@ def reap_stale_interactive_sessions(
     4a. (Dead-pane only) Kills the now-empty tmux session with
        ``tmux kill-session`` (best-effort) so ``coord sessions`` stops
        listing it.
+    4b. (``type == "smoke"`` only, #1256) Runs the live-checkout
+       restore-on-exit safety net via
+       :func:`restore_live_checkout_from_smoke_snapshot`. A ``--smoke-of``
+       session has no worktree (steps 1/1a/2 above are all no-ops for it,
+       since ``wt_path`` never exists) — it runs directly in the live
+       checkout, so a dead tmux session here is exactly the "agent died
+       mid-run" case the snapshot/restore pair exists for. Best-effort and
+       a no-op when no snapshot marker is present.
 
     Returns the assignment IDs that were reaped.  The caller should include
     these in its ``changed`` list so ``save_board`` is triggered.
@@ -3444,6 +3466,30 @@ def reap_stale_interactive_sessions(
                 )
             except Exception:  # noqa: BLE001
                 pass  # non-fatal
+
+        # 4b. (``type == "smoke"`` only, #1256) A --smoke-of session runs
+        #     directly in the live checkout with no worktree, so the
+        #     worktree-removal branches above (1/1a/2) never touch it — this
+        #     is the ONLY cleanup step that applies to a dead smoke session.
+        #     restore_live_checkout_from_smoke_snapshot() is a documented
+        #     no-op when no snapshot marker exists, so it's safe to call
+        #     even if `a.type` classification were ever wrong.
+        if a.type == "smoke" and repo_path_val is not None:
+            _restored, _restore_err = restore_live_checkout_from_smoke_snapshot(
+                repo_path_val, a.assignment_id
+            )
+            if _restore_err:
+                logging.warning(
+                    "reap: live-checkout restore failed for dead smoke "
+                    "session %s (repo=%s): %s",
+                    a.assignment_id, repo_path_val, _restore_err,
+                )
+            elif _restored:
+                logging.info(
+                    "reap: restored live checkout for dead smoke session "
+                    "%s: %s",
+                    a.assignment_id, ", ".join(_restored),
+                )
 
         reaped.append(a.assignment_id)
 
