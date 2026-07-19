@@ -2941,6 +2941,7 @@ def _remote_verify_merge_branch(
     base: str,
     issue_number: int,
     timeout: float = 30.0,
+    closed_issue_numbers: frozenset[int] = frozenset(),
 ) -> MergeVerify:
     """Remote (over ssh) analogue of :func:`coord.agent.verify_merge_branch`
     for a ``--merge-of`` session whose worktree lives on *ssh_target* rather
@@ -2958,10 +2959,17 @@ def _remote_verify_merge_branch(
     (not ``ok``) when the base ref can't be resolved on the remote side, the
     ssh call fails/times out, or the remote worktree directory is gone —
     same conservative "unverifiable ⇒ not ok" fallback as the local function.
+
+    Args:
+        closed_issue_numbers: Mirrors the same parameter in
+            :func:`coord.agent.verify_merge_branch` — issue numbers known to
+            be closed/merged.  Foreign-subject commits referencing only
+            closed issues are downgraded to :attr:`~MergeVerify.advisory_foreign`
+            rather than blocking ``foreign`` (#1279).
     """
     from coord.agent import (  # noqa: PLC0415
         MergeVerify,
-        _subject_references_foreign_issue,
+        _foreign_issue_refs,
     )
 
     base_q = shlex.quote(base)
@@ -3005,12 +3013,22 @@ def _remote_verify_merge_branch(
     if ref_missing or default_ahead is None:
         return MergeVerify(default_ahead=None, added=[], foreign=[])
 
-    foreign = [
-        (sha, subj)
-        for sha, subj in added
-        if _subject_references_foreign_issue(subj, issue_number)
-    ]
-    return MergeVerify(default_ahead=default_ahead, added=added, foreign=foreign)
+    foreign: list[tuple[str, str]] = []
+    advisory_foreign: list[tuple[str, str]] = []
+    for sha, subj in added:
+        foreign_refs = _foreign_issue_refs(subj, issue_number)
+        if not foreign_refs:
+            continue
+        if closed_issue_numbers and foreign_refs.issubset(closed_issue_numbers):
+            advisory_foreign.append((sha, subj))
+        else:
+            foreign.append((sha, subj))
+    return MergeVerify(
+        default_ahead=default_ahead,
+        added=added,
+        foreign=foreign,
+        advisory_foreign=advisory_foreign,
+    )
 
 
 def _finalize_remote_merge_blocked(

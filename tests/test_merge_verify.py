@@ -181,6 +181,118 @@ class TestVerifyMergeBranch:
         assert "foreign" in summary.lower()
         assert "#514" in summary
 
+    # ── #1279 regression tests ────────────────────────────────────────────────
+
+    def test_1272_regression_typo_issue_ref_downgraded_to_advisory(
+        self, local_repo: Path
+    ) -> None:
+        """#1272 regression: worker typo'd the issue number in the commit
+        subject.  The commit's referenced issue (#1073) is *closed* — it
+        cannot be live rebase-pollution.  With ``closed_issue_numbers``
+        supplied, the finding is advisory only and ``ok`` is True.
+
+        Must FAIL against main before this fix is applied.
+        """
+        _git(local_repo, "checkout", "-b", "issue-1272-fix")
+        # Matches the exact commit that blocked merge-prep for #1272:
+        _commit(
+            local_repo,
+            "fix(#1073): terminal mobile resize hardening — convertEol, ResizeObserver, tmux sizing",
+        )
+
+        # Without closed_issue_numbers — old blocking behaviour unchanged.
+        mv_blocking = verify_merge_branch(local_repo, base="main", issue_number=1272)
+        assert mv_blocking.ok is False, (
+            "without closed_issue_numbers the finding must still block "
+            "(conservative default — caller has no GitHub data)"
+        )
+        assert len(mv_blocking.foreign) == 1
+        assert mv_blocking.advisory_foreign == []
+
+        # With the closed issue supplied — downgraded to advisory.
+        mv = verify_merge_branch(
+            local_repo,
+            base="main",
+            issue_number=1272,
+            closed_issue_numbers=frozenset({1073}),
+        )
+        assert mv.ok is True, "#1073 is closed → finding must be advisory, not blocking"
+        assert mv.foreign == [], "blocking foreign list must be empty"
+        assert len(mv.advisory_foreign) == 1
+        _, subj = mv.advisory_foreign[0]
+        assert "#1073" in subj
+
+    def test_advisory_note_is_populated(self, local_repo: Path) -> None:
+        """advisory_note() returns a non-None string when advisory_foreign is
+        non-empty, and None when empty."""
+        _git(local_repo, "checkout", "-b", "issue-1272-note-test")
+        _commit(local_repo, "fix(#1073): something for a closed issue")
+
+        mv = verify_merge_branch(
+            local_repo,
+            base="main",
+            issue_number=1272,
+            closed_issue_numbers=frozenset({1073}),
+        )
+        note = mv.advisory_note()
+        assert note is not None
+        assert "advisory" in note
+        assert "#1073" in note
+
+        # advisory_note is None when advisory_foreign is empty (blocking foreign
+        # commits don't count — the note is for the ok=True advisory-only case).
+        mv_blocking = verify_merge_branch(local_repo, base="main", issue_number=1272)
+        assert mv_blocking.advisory_foreign == []
+        assert mv_blocking.advisory_note() is None
+
+    def test_494_regression_open_issue_ref_stays_blocking(
+        self, local_repo: Path
+    ) -> None:
+        """#494 regression guard: a commit referencing an OPEN (non-closed)
+        issue is still blocking even when ``closed_issue_numbers`` is provided
+        — only *closed* issue refs are downgraded.
+
+        Simulates the original #494 botch: bad rebase dragged in commits from
+        other in-flight branches whose issues were NOT yet closed.
+        """
+        _git(local_repo, "checkout", "-b", "issue-604-fix")
+        _commit(local_repo, "feat(#604): the real fix for this issue")
+        # These simulate commits from other OPEN branches dragged in accidentally:
+        _commit(local_repo, "fix(#514): unrelated in-flight work")
+        _commit(local_repo, "fix(#488): another open issue's commit")
+
+        # Even with a closed_issue_numbers set, #514 and #488 are NOT in it.
+        mv = verify_merge_branch(
+            local_repo,
+            base="main",
+            issue_number=604,
+            closed_issue_numbers=frozenset({1073, 999}),  # different closed issues
+        )
+        assert mv.ok is False, "open-issue foreign commits must remain blocking"
+        assert len(mv.foreign) == 2, "both #514 and #488 commits must block"
+        assert mv.advisory_foreign == []
+
+    def test_partial_closed_set_does_not_downgrade_open_ref(
+        self, local_repo: Path
+    ) -> None:
+        """A commit referencing BOTH a closed issue AND an open issue stays
+        blocking — it is not safe to downgrade unless ALL its foreign refs are
+        closed."""
+        _git(local_repo, "checkout", "-b", "issue-604-mixed")
+        # Single commit referencing both a closed (#1073) and open (#514) issue:
+        _commit(local_repo, "fix(#1073, #514): mixed closed and open refs")
+
+        mv = verify_merge_branch(
+            local_repo,
+            base="main",
+            issue_number=604,
+            closed_issue_numbers=frozenset({1073}),  # only #1073 is closed
+        )
+        # #514 is NOT in closed set → must remain blocking.
+        assert mv.ok is False
+        assert len(mv.foreign) == 1
+        assert mv.advisory_foreign == []
+
 
 # ── finalize_interactive_exit(verify_merge=True) — the coordinator gate ───────
 
@@ -485,6 +597,68 @@ class TestRemoteVerifyMergeBranch:
             )
         assert mv.default_ahead is None
         assert mv.ok is False
+
+    # ── #1279 regression tests (remote) ───────────────────────────────────────
+
+    def test_1272_regression_typo_issue_ref_downgraded_to_advisory_remote(
+        self,
+    ) -> None:
+        """#1279/#1272 remote variant: typo'd closed-issue ref is advisory, not
+        blocking, when ``closed_issue_numbers`` is supplied."""
+        from coord.interactive import _remote_verify_merge_branch
+
+        stdout = (
+            "__DEFAULT_AHEAD=0\n"
+            "__ADDED=deadbeef9999\t"
+            "fix(#1073): terminal mobile resize hardening — convertEol, ResizeObserver\n"
+        )
+        with patch("coord.interactive.subprocess.run",
+                   return_value=_ssh_result(stdout)):
+            # Without closed set — still blocking (conservative default).
+            mv_blocking = _remote_verify_merge_branch(
+                "precision.tailnet", "$HOME/.coord/worktrees/mg6",
+                base="main", issue_number=1272,
+            )
+        assert mv_blocking.ok is False
+        assert len(mv_blocking.foreign) == 1
+        assert mv_blocking.advisory_foreign == []
+
+        with patch("coord.interactive.subprocess.run",
+                   return_value=_ssh_result(stdout)):
+            mv = _remote_verify_merge_branch(
+                "precision.tailnet", "$HOME/.coord/worktrees/mg7",
+                base="main", issue_number=1272,
+                closed_issue_numbers=frozenset({1073}),
+            )
+        assert mv.ok is True
+        assert mv.foreign == []
+        assert len(mv.advisory_foreign) == 1
+        _, subj = mv.advisory_foreign[0]
+        assert "#1073" in subj
+
+    def test_494_regression_open_ref_stays_blocking_remote(self) -> None:
+        """#494 regression guard (remote): open-issue foreign commits remain
+        blocking even when ``closed_issue_numbers`` is provided but does not
+        include the referenced issue."""
+        from coord.interactive import _remote_verify_merge_branch
+
+        stdout = (
+            "__DEFAULT_AHEAD=0\n"
+            "__ADDED=aaa1111\tfeat(#604): the real fix\n"
+            "__ADDED=bbb2222\tfix(#514): open in-flight work dragged in\n"
+        )
+        with patch("coord.interactive.subprocess.run",
+                   return_value=_ssh_result(stdout)):
+            mv = _remote_verify_merge_branch(
+                "precision.tailnet", "$HOME/.coord/worktrees/mg8",
+                base="main", issue_number=604,
+                closed_issue_numbers=frozenset({1073}),  # #514 is NOT closed
+            )
+        assert mv.ok is False
+        assert len(mv.foreign) == 1
+        _, subj = mv.foreign[0]
+        assert "#514" in subj
+        assert mv.advisory_foreign == []
 
 
 # ── finalize_remote_interactive_exit(verify_merge=True) — remote gate ────────
