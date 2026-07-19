@@ -350,7 +350,13 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
         click.echo("")
         click.echo("Completed work assignments:")
         for a in by_time:
-            rs_tag = _REVIEW_STATE_TAGS.get(a.review_state or "", "")
+            # test_state="failed" takes priority: the review gate is correctly
+            # held but "[awaiting review]" would mislead the operator into
+            # thinking the item is queued to move forward (real incident: #1116).
+            if getattr(a, "test_state", None) == "failed":
+                rs_tag = "[✗ test FAILED — needs fix]"
+            else:
+                rs_tag = _REVIEW_STATE_TAGS.get(a.review_state or "", "")
             rs_suffix = f"  {rs_tag}" if rs_tag else ""
             click.echo(
                 f"  #{a.issue_number}: {a.issue_title} ({a.repo_name}){rs_suffix}"
