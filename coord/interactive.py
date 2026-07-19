@@ -1440,6 +1440,15 @@ class InteractiveFinalizeResult:
             successfully removed by the backstop.  ``False`` when no
             *repo_path* was supplied (the caller owns cleanup) or when
             the removal failed.
+        smoke_restored_paths: Human-readable descriptions of what the
+            live-checkout restore-on-exit safety net reverted (#1256) —
+            e.g. a path checked back out to ``HEAD``, or a branch moved
+            back.  Empty for every call that didn't pass
+            ``smoke_repo_path``, or that did but found no snapshot to
+            restore (the overwhelmingly common case).
+        smoke_restore_error: Set when the restore step itself failed
+            outright (as opposed to "nothing to restore").  ``None``
+            otherwise.
     """
 
     terminal_status: str
@@ -1454,6 +1463,10 @@ class InteractiveFinalizeResult:
     # surface the offending commits even after the worktree is removed.  None
     # for every other interactive flavour.
     merge_verify: MergeVerify | None = field(default=None)
+    # #1256: populated only when the caller passed `smoke_repo_path` to
+    # finalize_interactive_exit.  See attribute docs above.
+    smoke_restored_paths: list[str] = field(default_factory=list)
+    smoke_restore_error: str | None = field(default=None)
 
 
 def _git_push(wt_path: Path, *, timeout: float = 60.0) -> tuple[bool, str | None]:
@@ -1497,6 +1510,210 @@ def _current_branch(wt_path: Path) -> str | None:
     if not branch or branch == "HEAD":
         return None
     return branch
+
+
+# ── Live-checkout restore-on-exit for interactive smoke sessions (#1256) ────
+#
+# `--smoke-of` runs the human-attended smoke agent directly in the LIVE
+# checkout (no worktree — #1010), because exercising an *agent-side* file
+# (e.g. `coord/agent.py`, only live via a PyPI release + `coord agent
+# update`) requires that branch's version of the file to actually sit in the
+# editable-install path a scratch worktree elsewhere can't provide.  The
+# operator/agent's only way to do that is a path-scoped
+# `git checkout <branch> -- <path>` in the live tree, which used to be left
+# dirty forever once the session ended.
+#
+# The pair below is the safety net: `snapshot_live_checkout_for_smoke` is
+# called ONCE, right before an interactive smoke session launches, and
+# records the checkout's pre-session branch + dirty-path baseline into two
+# marker files living inside the checkout's own `.git/` dir — keyed by
+# assignment_id.  `restore_live_checkout_from_smoke_snapshot` is called from
+# `finalize_interactive_exit` every time a session finalizes (normal exit,
+# self-report via `coord report-result`, transcript-floor, or a later `coord
+# reattach` from a different operator machine) and, if a matching snapshot
+# exists, moves HEAD back and reverts any path that's dirty now but wasn't
+# in the baseline — leaving any *pre-existing* dirt untouched.  Storing the
+# marker inside `.git/` (rather than under `~/.coord/`) means the restore
+# works identically wherever it happens to run from, with no cross-machine
+# bookkeeping.
+#
+# Both functions are best-effort and never raise: a failure here must never
+# block dispatch or clobber the session's actual test verdict.
+
+def _smoke_snapshot_marker_paths(assignment_id: str) -> tuple[str, str]:
+    """Marker filenames (relative to a checkout's top level) for #1256."""
+    return (
+        f".git/coord-smoke-branch-{assignment_id}",
+        f".git/coord-smoke-status-{assignment_id}",
+    )
+
+
+# Placeholders `__BRANCH_FILE__` / `__STATUS_FILE__` are substituted with the
+# marker paths via plain `.replace()` (not `.format()`/f-string) so the
+# shell's own `${...}` / `$(...)` syntax below needs no brace-escaping.
+_SMOKE_SNAPSHOT_SCRIPT = """\
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 0
+BR=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+if [ -z "$BR" ] || [ "$BR" = "HEAD" ]; then
+    BR="DETACHED:$(git rev-parse HEAD 2>/dev/null)"
+fi
+printf '%s\\n' "$BR" > __BRANCH_FILE__
+git status --porcelain > __STATUS_FILE__
+"""
+
+_SMOKE_RESTORE_SCRIPT = """\
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 0
+if [ ! -f __BRANCH_FILE__ ]; then
+    exit 0
+fi
+ORIG=$(cat __BRANCH_FILE__)
+CUR=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+case "$ORIG" in
+    DETACHED:*) : ;;
+    *)
+        if [ -n "$ORIG" ] && [ "$CUR" != "$ORIG" ]; then
+            if git checkout "$ORIG" >/dev/null 2>&1; then
+                echo "__BRANCH_RESTORED__:$ORIG"
+            else
+                echo "__BRANCH_RESTORE_FAILED__:$ORIG"
+            fi
+        fi
+        ;;
+esac
+git status --porcelain | while IFS= read -r line; do
+    path=${line#?? }
+    [ -z "$path" ] && continue
+    if [ -f __STATUS_FILE__ ] && grep -qxF -- "$line" __STATUS_FILE__; then
+        continue
+    fi
+    if git checkout HEAD -- "$path" >/dev/null 2>&1; then
+        echo "__RESTORED_PATH__:$path"
+    else
+        git rm -f --cached -- "$path" >/dev/null 2>&1
+        rm -f -- "$path"
+        echo "__RESTORED_PATH__:$path"
+    fi
+done
+rm -f __BRANCH_FILE__ __STATUS_FILE__
+echo "__SMOKE_RESTORE_DONE__"
+"""
+
+
+def snapshot_live_checkout_for_smoke(
+    repo_path: str,
+    assignment_id: str,
+    *,
+    ssh_target: str | None = None,
+    timeout: float = 15.0,
+) -> None:
+    """Record *repo_path*'s current branch + dirty-path baseline (#1256).
+
+    Call exactly once, right before an interactive ``--smoke-of`` session
+    launches in the live checkout.  Paired with
+    :func:`restore_live_checkout_from_smoke_snapshot`.
+
+    When *ssh_target* is given, *repo_path* must be a path the REMOTE shell
+    can expand itself (e.g. ``$HOME/src/foo``, unquoted) — mirrors
+    ``remote_repo_sh`` elsewhere in this module.  Best-effort: any failure
+    only means the restore-on-exit safety net won't activate for this
+    session; it must never block dispatch.
+    """
+    branch_file, status_file = _smoke_snapshot_marker_paths(assignment_id)
+    script = _SMOKE_SNAPSHOT_SCRIPT.replace(
+        "__BRANCH_FILE__", branch_file
+    ).replace("__STATUS_FILE__", status_file)
+    try:
+        if ssh_target is None:
+            subprocess.run(
+                ["bash", "-c", script],
+                cwd=repo_path,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        else:
+            remote_cmd = f"cd {repo_path} 2>/dev/null && ( {script} )"
+            subprocess.run(
+                ["ssh", *_SSH_MUX_OPTS, ssh_target, remote_cmd],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+    except (subprocess.SubprocessError, OSError) as exc:
+        logging.warning(
+            "smoke snapshot failed for assignment %s (repo=%s ssh_target=%s): "
+            "%s — the live-checkout restore-on-exit safety net will not run "
+            "for this session (#1256)",
+            assignment_id, repo_path, ssh_target, exc,
+        )
+
+
+def restore_live_checkout_from_smoke_snapshot(
+    repo_path: str,
+    assignment_id: str,
+    *,
+    ssh_target: str | None = None,
+    timeout: float = 20.0,
+) -> tuple[list[str], str | None]:
+    """Best-effort counterpart to :func:`snapshot_live_checkout_for_smoke`.
+
+    A no-op — returns ``([], None)`` — unless a snapshot marker for
+    *assignment_id* exists in *repo_path*'s ``.git/`` dir, so calling this
+    unconditionally from every interactive finalize path is safe: every
+    flavour other than smoke (and a smoke session that already restored
+    once) simply finds no marker and does nothing.
+
+    When a marker IS found: moves HEAD back to the captured branch if it
+    drifted, then reverts any path dirty now but not in the captured
+    baseline — the mutation the smoke session introduced — leaving any
+    dirt that pre-dates the session untouched.  Deletes the marker files
+    when done.
+
+    Returns ``(restored_paths, error)`` — human-readable strings describing
+    what was reverted (or ``[]``), and an error string on outright failure.
+    Never raises.
+    """
+    branch_file, status_file = _smoke_snapshot_marker_paths(assignment_id)
+    script = _SMOKE_RESTORE_SCRIPT.replace(
+        "__BRANCH_FILE__", branch_file
+    ).replace("__STATUS_FILE__", status_file)
+    try:
+        if ssh_target is None:
+            result = subprocess.run(
+                ["bash", "-c", script],
+                cwd=repo_path,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        else:
+            remote_cmd = f"cd {repo_path} 2>/dev/null && ( {script} )"
+            result = subprocess.run(
+                ["ssh", *_SSH_MUX_OPTS, ssh_target, remote_cmd],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+    except (subprocess.SubprocessError, OSError) as exc:
+        return [], str(exc)
+
+    restored: list[str] = []
+    for line in (result.stdout or "").splitlines():
+        if line.startswith("__RESTORED_PATH__:"):
+            restored.append(line.split(":", 1)[1])
+        elif line.startswith("__BRANCH_RESTORED__:"):
+            restored.append(f"(branch restored to {line.split(':', 1)[1]})")
+        elif line.startswith("__BRANCH_RESTORE_FAILED__:"):
+            restored.append(
+                f"(WARNING: failed to restore branch to {line.split(':', 1)[1]})"
+            )
+
+    if result.returncode != 0:
+        err = (result.stderr or "").strip() or (
+            f"restore script exited {result.returncode}"
+        )
+        return restored, err
+    return restored, None
 
 
 def _assignment_status(assignment_id: str) -> str | None:
@@ -2030,6 +2247,7 @@ def finalize_interactive_exit(
     verify_merge: bool = False,
     ssh_target: str | None = None,
     branch: str | None = None,
+    smoke_repo_path: str | None = None,
 ) -> InteractiveFinalizeResult:
     """Git-floor backstop for the interactive launcher exit path (#466).
 
@@ -2056,8 +2274,23 @@ def finalize_interactive_exit(
     it after the worktree-per-session fix), the function removes the
     worktree after recording the terminal state — matching the cleanup
     discipline of :meth:`coord.agent.AgentServer._cleanup_worktree`.
+
+    When *smoke_repo_path* is supplied (the ``--smoke-of`` dispatch/reattach
+    paths only), runs the live-checkout restore-on-exit safety net (#1256)
+    FIRST, unconditionally, before any of the branches below — so it lands
+    regardless of which one ultimately returns.  See
+    :func:`restore_live_checkout_from_smoke_snapshot`.
     """
     _effective_patterns = list(artifact_paths or [])
+
+    _smoke_restored: list[str] = []
+    _smoke_restore_error: str | None = None
+    if smoke_repo_path:
+        _smoke_restored, _smoke_restore_error = (
+            restore_live_checkout_from_smoke_snapshot(
+                smoke_repo_path, assignment_id, ssh_target=ssh_target
+            )
+        )
 
     # ── Merge-prep verification gate (#604) ──────────────────────────────────
     # For the interactive MERGE agent (--merge-of), GIT TRUTH OVERRIDES the
@@ -2133,6 +2366,8 @@ def finalize_interactive_exit(
             seam_outcome=None,
             worktree_removed=worktree_removed,
             merge_verify=merge_verify,
+            smoke_restored_paths=_smoke_restored,
+            smoke_restore_error=_smoke_restore_error,
         )
 
     # ── Transcript-floor (#606): durable review capture ──────────────────────
@@ -2188,6 +2423,8 @@ def finalize_interactive_exit(
                 seam_outcome=None,
                 worktree_removed=_removed,
                 merge_verify=merge_verify,
+                smoke_restored_paths=_smoke_restored,
+                smoke_restore_error=_smoke_restore_error,
             )
 
     # worktree_path is None for a human-attended REVIEW (migration A1): the
@@ -2295,6 +2532,8 @@ def finalize_interactive_exit(
         seam_outcome=outcome,
         worktree_removed=worktree_removed,
         merge_verify=merge_verify,
+        smoke_restored_paths=_smoke_restored,
+        smoke_restore_error=_smoke_restore_error,
     )
 
 

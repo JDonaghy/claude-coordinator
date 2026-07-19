@@ -529,6 +529,7 @@ def _dispatch_smoke_of(
         _launch_via_tmux as _tmux_launch,
         finalize_interactive_exit,
         launch_human_attended_interactive,
+        snapshot_live_checkout_for_smoke,
         tmux_available as _tmux_avail,
         tmux_session_alive as _tmux_alive,
         tmux_session_name as _tmux_name,
@@ -755,6 +756,14 @@ def _dispatch_smoke_of(
     )
 
     if _is_local:
+        # #1256: snapshot the live checkout's branch + dirty-path baseline
+        # BEFORE the agent can mutate it (e.g. a path-scoped
+        # `git checkout <branch> -- <path>` used to exercise an agent-side
+        # file that must actually sit in this editable-install checkout to
+        # take effect).  finalize_interactive_exit's restore-on-exit safety
+        # net reverts anything new dirtied since this point.
+        snapshot_live_checkout_for_smoke(smoke_repo_path, assignment_id)
+
         started_at = _time.time()
         exit_code = launch_human_attended_interactive(
             argv,
@@ -776,8 +785,9 @@ def _dispatch_smoke_of(
         # worktree_path=None: read-only smoke runs in the live checkout, the
         # backstop must never push or remove it.  The verdict that matters
         # is the `coord test` write on the WORK row, not this session's row.
+        # smoke_repo_path=... triggers the #1256 restore-on-exit safety net.
         try:
-            finalize_interactive_exit(
+            _fr = finalize_interactive_exit(
                 assignment_id=assignment_id,
                 repo_name=repo,
                 repo_github=repo_cfg.github,
@@ -789,7 +799,19 @@ def _dispatch_smoke_of(
                 started_at=started_at,
                 log_path=None,
                 repo_path=None,
+                smoke_repo_path=smoke_repo_path,
             )
+            if _fr.smoke_restored_paths:
+                click.echo(
+                    "  live checkout restored (#1256): reverted "
+                    + ", ".join(_fr.smoke_restored_paths)
+                )
+            if _fr.smoke_restore_error:
+                click.echo(
+                    f"  warning: live-checkout restore failed: "
+                    f"{_fr.smoke_restore_error}",
+                    err=True,
+                )
         except Exception as exc:  # noqa: BLE001 — best-effort backstop
             click.echo(
                 f"  warning: backstop failed to record smoke exit: {exc}",
@@ -834,6 +856,11 @@ def _dispatch_smoke_of(
         "$HOME/" + smoke_repo_path[2:]
         if smoke_repo_path.startswith("~/")
         else ("$HOME" if smoke_repo_path == "~" else smoke_repo_path)
+    )
+    # #1256: snapshot the remote live checkout's branch + dirty-path
+    # baseline before launch — same rationale as the local branch above.
+    snapshot_live_checkout_for_smoke(
+        _rp_sh, assignment_id, ssh_target=machine_obj.host
     )
     _claude_args = _shlex_sm.join(list(argv)[1:])
     _remote_cmd = (
@@ -894,7 +921,7 @@ def _dispatch_smoke_of(
     # the local path above.  ssh_target lets any future transcript-floor
     # recovery read the session's OWN host (mirrors the #617 review fix).
     try:
-        finalize_interactive_exit(
+        _fr = finalize_interactive_exit(
             assignment_id=assignment_id,
             repo_name=repo,
             repo_github=repo_cfg.github,
@@ -907,7 +934,19 @@ def _dispatch_smoke_of(
             log_path=None,
             repo_path=None,
             ssh_target=machine_obj.host,
+            smoke_repo_path=_rp_sh,
         )
+        if _fr.smoke_restored_paths:
+            click.echo(
+                "  live checkout restored (#1256): reverted "
+                + ", ".join(_fr.smoke_restored_paths)
+            )
+        if _fr.smoke_restore_error:
+            click.echo(
+                f"  warning: live-checkout restore failed: "
+                f"{_fr.smoke_restore_error}",
+                err=True,
+            )
     except Exception as exc:  # noqa: BLE001 — best-effort backstop
         click.echo(
             f"  warning: backstop failed to record smoke exit: {exc}",
