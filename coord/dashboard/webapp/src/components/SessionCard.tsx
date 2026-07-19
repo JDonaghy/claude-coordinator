@@ -5,16 +5,34 @@
  */
 import { cn } from '@/lib/utils'
 import { type SessionInfo } from '@/api/client'
-import { STAGE_LABEL } from '@/components/PipelineCard'
 
 interface StatusInfo {
   label: string
   className: string
 }
 
-/** Human-facing label for the session's assignment type, e.g. "smoke" → "test". */
+/**
+ * Human-facing label for the session's assignment type
+ * (`session.stage` is literally `Assignment.type`, e.g. "work"/"smoke"/
+ * "review"/"conflict-fix"/"fix"/"plan"/... — see `server.py`'s
+ * `"stage": assignment.type if assignment else None`).
+ *
+ * This is deliberately its own map, not `PipelineCard`'s `STAGE_LABEL` —
+ * that one is keyed by `pipeline.py`'s *derived* stage names ("coding",
+ * "merge", ...), which only accidentally overlap with real `Assignment.type`
+ * values on "smoke" and "review" (#1276 review). There is no literal
+ * `type="merge"`; both the automated #241 rebase-conflict worker and the
+ * interactive `--merge-of` session dispatch as `type="conflict-fix"`, so
+ * that's translated to the "merge" label users expect here.
+ */
+const ASSIGNMENT_TYPE_LABEL: Record<string, string> = {
+  smoke: 'test',
+  review: 'review',
+  'conflict-fix': 'merge',
+}
+
 function stageLabel(stage: string): string {
-  return STAGE_LABEL[stage] ?? stage
+  return ASSIGNMENT_TYPE_LABEL[stage] ?? stage
 }
 
 /** Badge reflecting whether the session is live/attached/ended. */
