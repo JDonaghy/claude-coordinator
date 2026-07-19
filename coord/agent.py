@@ -486,6 +486,17 @@ def _subject_references_foreign_issue(subject: str, issue_number: int) -> bool:
     return issue_number not in refs
 
 
+def _foreign_issue_refs(subject: str, issue_number: int) -> frozenset[int]:
+    """Return the set of *foreign* issue numbers referenced in *subject* —
+    those that are not *issue_number*.  Empty if the subject doesn't reference
+    any foreign issue (mirrors ``_subject_references_foreign_issue`` but
+    returns the actual numbers so callers can look them up)."""
+    refs = {int(m) for m in _ISSUE_REF_RE.findall(subject)}
+    if not refs or issue_number in refs:
+        return frozenset()
+    return frozenset(refs - {issue_number})
+
+
 def _resolve_base_ref(wt_path: Path, base: str) -> str | None:
     """First of ``origin/<base>`` / ``<base>`` that resolves, else ``None``.
 
@@ -520,22 +531,31 @@ class MergeVerify:
             post-hoc record of exactly what would merge.
         foreign: The subset of *added* whose subject references a *different*
             ``#NNN`` than the issue being merged (see
-            :func:`_subject_references_foreign_issue`) — the heuristic for the
-            #494 pollution.
+            :func:`_subject_references_foreign_issue`) **and** whose referenced
+            issues are not known-closed — the heuristic for the #494 pollution.
+            A non-empty ``foreign`` makes :attr:`ok` ``False`` (blocking).
+        advisory_foreign: Like ``foreign`` but downgraded to advisory (#1279):
+            commits whose subject references a foreign ``#NNN`` that is
+            confirmed-closed (passed via ``closed_issue_numbers`` to
+            :func:`verify_merge_branch`).  A worker typo-ing a *closed* issue
+            in the commit subject cannot be live rebase-pollution — these are
+            recorded for the operator but do **not** block the merge.
     """
 
     default_ahead: int | None
     added: list[tuple[str, str]]
     foreign: list[tuple[str, str]]
+    advisory_foreign: list[tuple[str, str]] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
-        """Clean to record ``done``: base fully contained AND no foreign commits."""
+        """Clean to record ``done``: base fully contained AND no *blocking*
+        foreign commits.  Advisory-only foreign commits do not block."""
         return self.default_ahead == 0 and not self.foreign
 
     def block_summary(self, base: str) -> str:
         """Operator-facing reason this branch is NOT merge-ready (for the
-        ``blocked`` summary posted on the issue)."""
+        ``blocked`` summary posted on the issue).  Only called when not ok."""
         parts: list[str] = []
         if self.default_ahead is None:
             parts.append(
@@ -557,9 +577,25 @@ class MergeVerify:
         reason = "; ".join(parts) or "merge verification failed"
         return f"Merge-prep blocked (#604): {reason}."
 
+    def advisory_note(self) -> str | None:
+        """Return a human-readable note about advisory (non-blocking) foreign
+        commits, or ``None`` if there are none.  Surfaced by
+        ``coord verify-merge`` alongside the ✓ line when ``ok`` is ``True``."""
+        if not self.advisory_foreign:
+            return None
+        flist = "; ".join(f"{sha[:9]} {subj}" for sha, subj in self.advisory_foreign)
+        return (
+            f"advisory: {len(self.advisory_foreign)} commit(s) reference "
+            f"other (closed) issues — confirmed safe, not blocking: {flist}"
+        )
+
 
 def verify_merge_branch(
-    wt_path: Path, *, base: str, issue_number: int
+    wt_path: Path,
+    *,
+    base: str,
+    issue_number: int,
+    closed_issue_numbers: frozenset[int] = frozenset(),
 ) -> MergeVerify:
     """Verify a ``--merge-of`` branch before its terminal ``done`` is recorded.
 
@@ -572,6 +608,17 @@ def verify_merge_branch(
 
     Pure ``git rev-list`` / ``rev-parse`` plumbing — no network, no subprocess
     ``claude``, no PTY — so the gate runs as a fast local-only test fixture.
+
+    Args:
+        closed_issue_numbers: Issue numbers that are known to be closed/merged
+            in the upstream repo.  When a commit's subject references *only*
+            issues in this set (and not ``issue_number``), it is downgraded
+            from a **blocking** foreign finding to an **advisory** one (#1279).
+            The rationale: a commit referencing a *closed* issue cannot be
+            live rebase-pollution — it is almost certainly a worker typo in the
+            commit subject.  Pass the empty frozenset (default) to preserve the
+            original all-blocking behaviour when the caller has no closed-issue
+            data available.
     """
     ref = _resolve_base_ref(wt_path, base)
     if ref is None:
@@ -598,12 +645,25 @@ def verify_merge_branch(
     except _GitError:
         added = []
 
-    foreign = [
-        (sha, subj)
-        for sha, subj in added
-        if _subject_references_foreign_issue(subj, issue_number)
-    ]
-    return MergeVerify(default_ahead=default_ahead, added=added, foreign=foreign)
+    foreign: list[tuple[str, str]] = []
+    advisory_foreign: list[tuple[str, str]] = []
+    for sha, subj in added:
+        foreign_refs = _foreign_issue_refs(subj, issue_number)
+        if not foreign_refs:
+            continue  # not flagged — own work or bare message
+        # #1279: downgrade to advisory when ALL referenced foreign issues are
+        # known-closed.  A commit that only references closed issues cannot be
+        # live rebase-pollution dragged in from an open branch.
+        if closed_issue_numbers and foreign_refs.issubset(closed_issue_numbers):
+            advisory_foreign.append((sha, subj))
+        else:
+            foreign.append((sha, subj))
+    return MergeVerify(
+        default_ahead=default_ahead,
+        added=added,
+        foreign=foreign,
+        advisory_foreign=advisory_foreign,
+    )
 
 
 def _safe_realpath(path: str) -> str:

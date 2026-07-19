@@ -135,12 +135,21 @@ def verify_merge(
     click.echo(f"target base:   {base}")
     click.echo(f"{base}-ahead:   {mv.default_ahead}  (must be 0)")
     click.echo(f"adds {len(mv.added)} commit(s) over {base}:")
+    advisory_set = set(mv.advisory_foreign)
     for sha, subj in mv.added:
-        flag = " [FOREIGN]" if (sha, subj) in mv.foreign else ""
+        if (sha, subj) in mv.foreign:
+            flag = " [FOREIGN — BLOCKING]"
+        elif (sha, subj) in advisory_set:
+            flag = " [advisory: references closed issue]"
+        else:
+            flag = ""
         click.echo(f"  {sha[:9]} {subj}{flag}")
 
     if mv.ok:
         click.echo("✓ merge-ready: base fully contained, no foreign commits.")
+        note = mv.advisory_note()
+        if note:
+            click.echo(f"  {note}")
         return
     click.echo(f"✗ NOT merge-ready: {mv.block_summary(base)}", err=True)
     sys.exit(1)
