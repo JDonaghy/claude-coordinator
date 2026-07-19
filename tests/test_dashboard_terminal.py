@@ -18,6 +18,7 @@ sequence via ``_raw_ws_messages`` instead; see
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -460,3 +461,182 @@ class TestTmuxSessionAttacherTermEnv:
         assert captured_env is not None
         # setdefault must not overwrite a caller-supplied TERM.
         assert captured_env["TERM"] == "rxvt-unicode-256color"
+
+
+class TestTmuxSessionAttacherResizeHardening:
+    """Tests for the tmux resize-to-client hardening.
+
+    ``TmuxSessionAttacher.attach()`` now takes three steps before spawning
+    ``tmux attach-session``:
+
+    1. Queries the session's current window dimensions via ``display-message``
+       and stores them as *initial_cols* / *initial_rows*.
+    2. Enables ``aggressive-resize`` for the window so subsequent TIOCSWINSZ
+       calls (the browser's real viewport size) take full effect even when
+       other clients are attached.
+    3. Primes the master PTY via ``TIOCSWINSZ`` to those initial dimensions so
+       tmux sees the correct client size during the attach handshake and does
+       not immediately downsize the running session window.
+
+    All three steps are best-effort: failures (tmux unavailable, session gone,
+    bad fd) are silently swallowed and the attach proceeds with safe fallback
+    values (80×24).
+    """
+
+    # Shared helpers for patching the subprocess / pty / fcntl seams used
+    # by ``TmuxSessionAttacher.attach()``.
+
+    @staticmethod
+    def _fake_run_factory(stdout: str = "120 40\n") -> tuple[list[list[str]], "callable"]:
+        """Return (call_log, fake_run) pair for patching subprocess.run."""
+        run_calls: list[list[str]] = []
+
+        def fake_run(argv, **kwargs):  # noqa: ANN001
+            run_calls.append(list(argv))
+            mock = MagicMock()
+            mock.stdout = stdout
+            mock.returncode = 0
+            return mock
+
+        return run_calls, fake_run
+
+    def _run_attach(
+        self,
+        *,
+        run_side_effect: "callable | None" = None,
+        ioctl_side_effect: "callable | None" = None,
+    ) -> None:
+        fake_master, fake_slave = 10, 11
+        cms = [
+            patch("coord.dashboard.terminal.subprocess.Popen"),
+            patch("coord.dashboard.terminal.os.close"),
+            patch("pty.openpty", return_value=(fake_master, fake_slave)),
+        ]
+        if run_side_effect is not None:
+            cms.append(
+                patch(
+                    "coord.dashboard.terminal.subprocess.run",
+                    side_effect=run_side_effect,
+                )
+            )
+        if ioctl_side_effect is not None:
+            cms.append(
+                patch(
+                    "coord.dashboard.terminal.fcntl.ioctl",
+                    side_effect=ioctl_side_effect,
+                )
+            )
+        with contextlib.ExitStack() as stack:
+            for cm in cms:
+                stack.enter_context(cm)
+            asyncio.run(TmuxSessionAttacher().attach(None, "coord-abc123"))
+
+    def test_display_message_called_before_attach(self) -> None:
+        """attach() queries the session's current window size via display-message."""
+        run_calls, fake_run = self._fake_run_factory("120 40\n")
+        self._run_attach(run_side_effect=fake_run)
+
+        display_calls = [c for c in run_calls if "display-message" in c]
+        assert display_calls, "display-message was not called"
+        call = display_calls[0]
+        assert "coord-abc123" in call, "display-message not targeted at the right session"
+        # The format string for both dimensions must be present.
+        assert any("window_width" in tok and "window_height" in tok for tok in call), (
+            "display-message call missing expected format string"
+        )
+
+    def test_set_window_option_aggressive_resize_called(self) -> None:
+        """attach() enables aggressive-resize on the target window."""
+        run_calls, fake_run = self._fake_run_factory("80 24\n")
+        self._run_attach(run_side_effect=fake_run)
+
+        aggressive_calls = [
+            c
+            for c in run_calls
+            if "set-window-option" in c
+            and "aggressive-resize" in c
+            and "on" in c
+        ]
+        assert aggressive_calls, "set-window-option aggressive-resize on was not called"
+        call = aggressive_calls[0]
+        assert "coord-abc123" in call, "set-window-option not targeted at the right session"
+
+    def test_initial_pty_primed_with_queried_window_size(self) -> None:
+        """TIOCSWINSZ is called with the size returned by display-message."""
+        import struct
+        import termios
+
+        ioctl_calls: list[tuple[int, int, bytes]] = []
+
+        def fake_ioctl(fd: int, request: int, data: bytes) -> None:
+            ioctl_calls.append((fd, request, bytes(data)))
+            raise OSError("fake fd — expected, caught by attach()")
+
+        _, fake_run = self._fake_run_factory("120 40\n")
+        self._run_attach(run_side_effect=fake_run, ioctl_side_effect=fake_ioctl)
+
+        tiocswinsz_calls = [c for c in ioctl_calls if c[1] == termios.TIOCSWINSZ]
+        assert tiocswinsz_calls, "TIOCSWINSZ was not called in attach()"
+
+        # struct.pack("HHHH", rows, cols, 0, 0) — verify the size matches
+        # the 120×40 returned by display-message.
+        _, _, packed = tiocswinsz_calls[0]
+        rows, cols, *_ = struct.unpack("HHHH", packed)
+        assert cols == 120, f"expected cols=120, got {cols}"
+        assert rows == 40, f"expected rows=40, got {rows}"
+
+    def test_falls_back_to_80x24_when_display_message_fails(self) -> None:
+        """A failing display-message silently falls back to 80×24."""
+        import struct
+        import termios
+
+        ioctl_calls: list[tuple[int, int, bytes]] = []
+
+        def fake_ioctl(fd: int, request: int, data: bytes) -> None:
+            ioctl_calls.append((fd, request, bytes(data)))
+            raise OSError("fake fd")
+
+        def bad_run(argv, **kwargs):  # noqa: ANN001
+            raise OSError("tmux not found")
+
+        self._run_attach(run_side_effect=bad_run, ioctl_side_effect=fake_ioctl)
+
+        tiocswinsz_calls = [c for c in ioctl_calls if c[1] == termios.TIOCSWINSZ]
+        assert tiocswinsz_calls, "TIOCSWINSZ was not called"
+        _, _, packed = tiocswinsz_calls[0]
+        rows, cols, *_ = struct.unpack("HHHH", packed)
+        assert cols == 80, f"fallback cols should be 80, got {cols}"
+        assert rows == 24, f"fallback rows should be 24, got {rows}"
+
+    def test_attach_succeeds_even_if_all_pre_attach_steps_fail(self) -> None:
+        """All best-effort steps can fail without preventing the attach itself."""
+        popen_called = False
+
+        def fake_popen(argv, **kwargs):  # noqa: ANN001
+            nonlocal popen_called
+            popen_called = True
+            mock = MagicMock()
+            mock.pid = 99999
+            return mock
+
+        fake_master, fake_slave = 10, 11
+
+        with (
+            patch(
+                "coord.dashboard.terminal.subprocess.run",
+                side_effect=OSError("no tmux"),
+            ),
+            patch(
+                "coord.dashboard.terminal.fcntl.ioctl",
+                side_effect=OSError("bad fd"),
+            ),
+            patch(
+                "coord.dashboard.terminal.subprocess.Popen",
+                side_effect=fake_popen,
+            ),
+            patch("coord.dashboard.terminal.os.close"),
+            patch("pty.openpty", return_value=(fake_master, fake_slave)),
+        ):
+            asyncio.run(TmuxSessionAttacher().attach(None, "coord-abc123"))
+
+        assert popen_called, "Popen was not called — attach aborted unexpectedly"

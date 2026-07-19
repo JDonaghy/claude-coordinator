@@ -12,6 +12,50 @@ import userEvent from '@testing-library/user-event'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import Terminal from '@/components/Terminal'
 
+// ── xterm.js constructor spy ─────────────────────────────────────────────────
+// Wraps @xterm/xterm's Terminal in a transparent subclass that captures:
+//   • the options object passed to the constructor (for convertEol tests)
+//   • every onResize handler registered by the component (so tests can
+//     trigger the callback with arbitrary {cols, rows} without needing a
+//     real layout engine)
+//
+// vi.hoisted() runs before vi.mock() hoisting, so the reference is available
+// inside the factory.  The wrapper calls super() unconditionally, so all real
+// xterm functionality (text rendering, etc.) still works for the existing tests.
+const xtermCapture = vi.hoisted(() => ({
+  lastOptions: undefined as Record<string, unknown> | undefined,
+  onResizeHandlers: [] as Array<(data: { cols: number; rows: number }) => void>,
+}))
+
+vi.mock('@xterm/xterm', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@xterm/xterm')>()
+  return {
+    ...actual,
+    Terminal: class MockTerminal extends actual.Terminal {
+      constructor(opts: ConstructorParameters<typeof actual.Terminal>[0]) {
+        super(opts)
+        xtermCapture.lastOptions = opts as Record<string, unknown>
+        // `onResize` is a getter-only accessor on the prototype (configurable:
+        // true, no setter).  Direct assignment throws "has only a getter".
+        // Shadow it with an OWN data property on this instance so the component
+        // can subscribe via `term.onResize(handler)` while we capture the handler.
+        // `orig` is the IEvent function returned by the getter — it closes over
+        // xterm's internal EventEmitter, so it doesn't need explicit `this` binding.
+        const orig = (this as unknown as { onResize: (h: (d: { cols: number; rows: number }) => void) => { dispose(): void } }).onResize
+        Object.defineProperty(this, 'onResize', {
+          value: (handler: (data: { cols: number; rows: number }) => void): { dispose(): void } => {
+            xtermCapture.onResizeHandlers.push(handler)
+            return orig(handler)
+          },
+          writable: true,
+          configurable: true,
+          enumerable: true,
+        })
+      }
+    },
+  }
+})
+
 // ── Fake WebSocket ───────────────────────────────────────────────────────────
 
 class FakeWebSocket {
@@ -90,9 +134,79 @@ function renderTerminal(sessionId: string) {
 beforeEach(() => {
   FakeWebSocket.instances = []
   vi.stubGlobal('WebSocket', FakeWebSocket)
+  // Reset xterm capture state so tests don't see handlers/options from a
+  // previous test's Terminal instance.
+  xtermCapture.lastOptions = undefined
+  xtermCapture.onResizeHandlers.length = 0
 })
 
 describe('Terminal', () => {
+  // ── Constructor options ────────────────────────────────────────────────────
+
+  it('constructs xterm.js with convertEol: false so tmux CR+LF is not double-converted', () => {
+    // tmux sends real CR+LF (\r\n) sequences.  xterm.js's convertEol:true
+    // converts the \r to a second \n, producing double newlines.  We must
+    // pass convertEol:false and let tmux control line endings.
+    renderTerminal('work-2')
+    expect(xtermCapture.lastOptions?.convertEol).toBe(false)
+  })
+
+  // ── Resize frame emission and deduplication ────────────────────────────────
+
+  it('emits a resize WS frame with the new cols/rows when the terminal size changes', () => {
+    // This exercises the term.onResize → sendResize path that fires when
+    // fit.fit() computes a new terminal size (e.g. after a viewport change).
+    // In jsdom, fit.fit() can't compute real sizes, so we trigger the handler
+    // directly via the captured spy — simulating what xterm fires when the
+    // real DOM has a non-zero layout.
+    renderTerminal('work-2')
+    const ws = FakeWebSocket.instances[0]
+    ws.simulateOpen()
+
+    // After open, lastCols/lastRows are whatever the terminal reported
+    // (80×24 in jsdom).  Trigger onResize with *different* dims so the
+    // dedup guard allows the frame through.
+    act(() => {
+      xtermCapture.onResizeHandlers.forEach((h) => h({ cols: 100, rows: 30 }))
+    })
+
+    const resizeFrames = ws.sent.filter(
+      (f): f is string => typeof f === 'string' && f.includes('"type":"resize"'),
+    )
+    // At minimum: one from onopen, one from the simulated onResize
+    expect(resizeFrames.length).toBeGreaterThanOrEqual(2)
+    const lastFrame = JSON.parse(resizeFrames[resizeFrames.length - 1]) as Record<
+      string,
+      unknown
+    >
+    expect(lastFrame).toMatchObject({ type: 'resize', cols: 100, rows: 30 })
+  })
+
+  it('dedup guard: identical cols/rows after open do not produce a second resize WS frame', () => {
+    // If the layout event fires but the terminal size hasn't changed (common
+    // during rapid window-resize events that don't cross a character-cell
+    // boundary), no duplicate frame should be sent — the bridge would call
+    // TIOCSWINSZ with the same values, and tmux would noop anyway.
+    renderTerminal('work-2')
+    const ws = FakeWebSocket.instances[0]
+    ws.simulateOpen()
+
+    const countAfterOpen = ws.sent.filter(
+      (f): f is string => typeof f === 'string' && f.includes('"type":"resize"'),
+    ).length
+
+    // Trigger onResize with the same size the terminal reported on open
+    // (80×24 is xterm.js's default when jsdom has no real layout).
+    act(() => {
+      xtermCapture.onResizeHandlers.forEach((h) => h({ cols: 80, rows: 24 }))
+    })
+
+    const countAfterDup = ws.sent.filter(
+      (f): f is string => typeof f === 'string' && f.includes('"type":"resize"'),
+    ).length
+    expect(countAfterDup).toBe(countAfterOpen)
+  })
+
   it('mounts and connects a WebSocket to /ws/terminal/{sessionId}', () => {
     renderTerminal('work-2')
 

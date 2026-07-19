@@ -97,7 +97,10 @@ export default function Terminal() {
     if (!sessionId || !containerRef.current) return
 
     const term = new XTerm({
-      convertEol: true,
+      // convertEol: false — tmux sends proper CR+LF sequences; setting this
+      // true causes xterm.js to convert the CR to LF as well, producing
+      // double newlines (\r\n → \n\n).
+      convertEol: false,
       cursorBlink: true,
       fontSize: 13,
       theme: { background: '#0d1117', foreground: '#e6edf3' },
@@ -120,10 +123,42 @@ export default function Terminal() {
     // backoff-reset guard note above the component docstring.
     let openedAt: number | null = null
 
-    const sendResize = (ws: WebSocket) => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }))
-      }
+    // ── Resize deduplication ────────────────────────────────────────────────
+    // Only emit a resize frame when cols or rows actually change.  Without
+    // this guard, rapid layout events (ResizeObserver + visualViewport +
+    // window.resize all firing close together) would send many identical
+    // frames and thrash the PTY's TIOCSWINSZ.
+    let lastCols = 0
+    let lastRows = 0
+
+    // cols/rows default to term's current values so onopen / scheduleFit
+    // paths read from the terminal; the onResize path passes xterm's event
+    // args directly (avoids re-reading a stale value after an async hop).
+    const sendResize = (ws: WebSocket, cols = term.cols, rows = term.rows) => {
+      if (ws.readyState !== WebSocket.OPEN) return
+      if (cols === lastCols && rows === lastRows) return
+      lastCols = cols
+      lastRows = rows
+      ws.send(JSON.stringify({ type: 'resize', cols, rows }))
+    }
+
+    // ── Debounced fit scheduler ──────────────────────────────────────────────
+    // Coalesces rapid layout events (window resize, ResizeObserver,
+    // visualViewport) into a single fit.fit() call 50 ms after the last
+    // event.  fit.fit() calls term.resize() which fires onResize, which then
+    // calls sendResize — so the scheduler doesn't need to call sendResize
+    // directly.
+    let fitDebounce: ReturnType<typeof setTimeout> | null = null
+    const scheduleFit = () => {
+      if (fitDebounce) clearTimeout(fitDebounce)
+      fitDebounce = setTimeout(() => {
+        try {
+          fit.fit()
+        } catch {
+          // layout not ready yet (same situation as the mount-time fit)
+        }
+        fitDebounce = null
+      }, 50)
     }
 
     const connect = () => {
@@ -142,6 +177,22 @@ export default function Terminal() {
       ws.onopen = () => {
         openedAt = Date.now()
         setState('open')
+        // Re-fit now that the WS is open: the layout may have settled since
+        // the mount-time fit (safe-area insets, MobileKeyBar DOM insertion).
+        // This gives us the most accurate terminal size to send as the first
+        // resize frame, which the tmux bridge needs to size the session
+        // correctly (it can't know the phone's viewport until we tell it).
+        try {
+          fit.fit()
+        } catch {
+          // layout not ready (e.g. under test) — term keeps its current size
+        }
+        // Always send a resize on every open (including reconnects): the
+        // server has just accepted a fresh connection and has no size state.
+        // Reset dedup so the frame is guaranteed to go out even when the
+        // terminal size hasn't changed since the last connection.
+        lastCols = 0
+        lastRows = 0
         sendResize(ws)
       }
       ws.onclose = (event) => {
@@ -196,24 +247,38 @@ export default function Terminal() {
         ws.send(new TextEncoder().encode(data))
       }
     })
-    const resizeDisposable = term.onResize(() => {
+    // Use xterm's event args ({cols, rows}) directly rather than re-reading
+    // term.cols/term.rows — avoids any stale-value risk between the resize
+    // and our callback.
+    const resizeDisposable = term.onResize(({ cols, rows }) => {
       const ws = wsRef.current
-      if (ws) sendResize(ws)
+      if (ws) sendResize(ws, cols, rows)
     })
 
-    const handleWindowResize = () => {
-      try {
-        fit.fit()
-      } catch {
-        // see the mount-time try/catch above
-      }
-    }
-    window.addEventListener('resize', handleWindowResize)
+    // ── Layout change listeners ──────────────────────────────────────────────
+    // window.resize catches broad viewport changes (desktop browser resize,
+    // device orientation change).
+    window.addEventListener('resize', scheduleFit)
+
+    // ResizeObserver on the pane container catches layout shifts that
+    // window.resize misses, e.g. the MobileKeyBar growing/shrinking when
+    // the content changes height, or safe-area-inset-* adjustments.
+    const ro = new ResizeObserver(scheduleFit)
+    ro.observe(containerRef.current)
+
+    // visualViewport fires when the mobile soft keyboard appears or
+    // disappears, which shrinks/grows the visual viewport (the area the user
+    // actually sees) without necessarily changing window.innerWidth/Height.
+    // This is the most reliable hook for phone keyboard events.
+    window.visualViewport?.addEventListener('resize', scheduleFit)
 
     return () => {
       intentionalCloseRef.current = true
       if (reconnectTimer) clearTimeout(reconnectTimer)
-      window.removeEventListener('resize', handleWindowResize)
+      if (fitDebounce) clearTimeout(fitDebounce)
+      window.removeEventListener('resize', scheduleFit)
+      window.visualViewport?.removeEventListener('resize', scheduleFit)
+      ro.disconnect()
       dataDisposable.dispose()
       resizeDisposable.dispose()
       wsRef.current?.close()

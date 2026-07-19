@@ -149,10 +149,81 @@ class TmuxSessionAttacher:
     async def attach(self, host: str | None, session_name: str) -> AttachedPty:
         import pty  # stdlib, Unix-only -- deferred for platform safety
 
+        host_obj = TmuxHost(ssh_target=host)
+
+        # ── Resize-to-client hardening ────────────────────────────────────
+        # Without these two steps, attaching from a phone causes a visible
+        # resize glitch: the PTY defaults to 80×24, ``tmux attach-session``
+        # sees an 80×24 client and immediately shrinks the running window
+        # (and the claude process inside it) *before* the browser's first
+        # resize frame arrives.
+        #
+        # Fix 1: query the session's current window size and prime the PTY
+        # at that size so ``tmux attach-session`` registers us as a client
+        # that already matches the window — no downsize on connect.
+        # The browser's first WS resize frame (sent from onopen) will arrive
+        # within milliseconds and TIOCSWINSZ the PTY to the phone's real
+        # viewport, which tmux then propagates via SIGWINCH.
+        initial_cols, initial_rows = 80, 24  # safe fallback
+        try:
+            result = subprocess.run(
+                host_obj.cmd(
+                    [
+                        "display-message",
+                        "-t",
+                        session_name,
+                        "-p",
+                        "#{window_width} #{window_height}",
+                    ]
+                ),
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            parts = result.stdout.strip().split()
+            if len(parts) == 2:
+                w, h = int(parts[0]), int(parts[1])
+                if w > 0 and h > 0:
+                    initial_cols, initial_rows = w, h
+        except Exception:
+            pass
+
+        # Fix 2: enable aggressive-resize for this window so that when
+        # TIOCSWINSZ fires with the phone's viewport, the tmux server adopts
+        # the new (sole) client's size rather than remaining pinned to a
+        # previously-attached smaller client's footprint.
+        try:
+            subprocess.run(
+                host_obj.cmd(
+                    [
+                        "set-window-option",
+                        "-t",
+                        session_name,
+                        "aggressive-resize",
+                        "on",
+                    ]
+                ),
+                capture_output=True,
+                timeout=5,
+            )
+        except Exception:
+            pass
+
         master_fd, slave_fd = pty.openpty()
-        argv = TmuxHost(ssh_target=host).cmd(
-            ["attach-session", "-t", session_name], tty=True
-        )
+
+        # Prime the PTY at the session's current window size.  tmux reads the
+        # client's PTY dimensions when the attach handshake completes; a
+        # correctly-sized PTY prevents the attach from triggering a downsize.
+        try:
+            fcntl.ioctl(
+                master_fd,
+                termios.TIOCSWINSZ,
+                struct.pack("HHHH", initial_rows, initial_cols, 0, 0),
+            )
+        except OSError:
+            pass
+
+        argv = host_obj.cmd(["attach-session", "-t", session_name], tty=True)
         # ``TERM`` may be absent when ``coord web`` runs as a systemd user
         # service (no controlling TTY, no ``Environment=TERM=...`` in the unit
         # file).  Without it, anything inside the attached pane that probes
