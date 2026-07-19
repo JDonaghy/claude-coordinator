@@ -835,6 +835,11 @@ def usage(
         _usage_issue_drill(config_path, issue_number, today=today, week=week, month=month, since_spec=since_spec)
         return
     if by_time:
+        if by_dim in ("repo", "week", "month"):
+            raise click.BadParameter(
+                f"--by-time only supports --by issue (or no --by); got --by {by_dim}",
+                param_hint="'--by'",
+            )
         _usage_by_time(
             config_path,
             today=today, week=week, month=month, since_spec=since_spec,
@@ -858,10 +863,24 @@ def usage(
 
     from coord.board_service import read_board
     from coord.state import load_session
-    from coord.usage import build_session_usage, format_usage_report
+    from coord.usage import build_session_usage, filter_assignments_in_window, format_usage_report
 
     board = read_board()
     all_assignments = list(board.active) + list(board.completed)
+
+    # Resolve + apply the window flags to the legacy (no --by/--by-time/
+    # --by-issue/--issue) view too (#1119 review finding #1) — previously
+    # --today/--week/--month/--since were silently ignored here, with no
+    # validation (even --week --month together fell through to this branch
+    # unchecked). Calling _usage_resolve_window unconditionally means the
+    # existing n_set > 1 guard now fires for the bare case as well. Only set
+    # window_label when a flag was actually given, so the default
+    # (unwindowed) report stays byte-for-byte unchanged.
+    window_label: str | None = None
+    if today or week or month or since_spec:
+        window = _usage_resolve_window(today, week, month, since_spec)
+        window_label = window.label
+        all_assignments = filter_assignments_in_window(all_assignments, window)
 
     # Resolve session start time from session.json
     started_at: float | None = None
@@ -907,7 +926,7 @@ def usage(
         remote_by_id=remote_by_id if remote_by_id else None,
         started_at=started_at,
     )
-    click.echo(format_usage_report(session))
+    click.echo(format_usage_report(session, window_label=window_label))
 
 
 _SINCE_WEEKS_RE = re.compile(r"^(\d+)\s*w$", re.IGNORECASE)
