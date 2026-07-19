@@ -965,13 +965,20 @@ impl CoordApp {
         let parent = self.pipeline_issues.get(parent_idx)?;
         let child_pos = path[base_depth] as usize;
         let child_number = if let Some(want_live) = want_live {
-            // #1269: this parent rendered its liveness-FILTERED child list —
-            // `child_pos` indexes into that filtered subsequence, not the
-            // raw unfiltered `epic_children_for` order.
+            // #1269 / #1281: the parent rendered its In-progress-instance-
+            // FILTERED child list — `child_pos` indexes into that filtered
+            // subsequence, not the raw unfiltered `epic_children_for` order.
+            // Resolve the rows from `epic_child_rows_for` and apply the
+            // same `epic_child_kept_in_progress` predicate the renderer +
+            // `resolve_nested_child_index` both use so the three sites
+            // agree on what child sits at position `child_pos`.
             let repo = parent.coord_repo.as_deref()?;
-            self.epic_children_for(parent)?
-                .iter()
-                .filter(|c| self.child_session_is_live(repo, c.number) == want_live)
+            let rows = self.epic_child_rows_for(repo, parent.number);
+            if rows.is_empty() {
+                return None;
+            }
+            rows.iter()
+                .filter(|row| self.epic_child_kept_in_progress(repo, row, want_live))
                 .nth(child_pos)?
                 .number
         } else {
@@ -1556,19 +1563,69 @@ impl CoordApp {
             .collect()
     }
 
-    /// #1269: derive a liveness-partitioned copy of an already-computed
-    /// [`EpicNesting`] — keeps, per epic, only the children whose live
-    /// session state (`child_session_is_live`) equals `want_live`, dropping
-    /// any epic left with zero matching children entirely.
+    /// #1269 / #1281: shared "keep this child in this In-progress instance"
+    /// predicate. The renderer's [`Self::filter_epic_nesting_by_liveness`]
+    /// and both selection decoders — [`Self::resolve_nested_child_index`]
+    /// and [`Self::selected_nested_child_id`] — call this so the three sites
+    /// stay in exact agreement: `child_pos` in either decoder indexes into
+    /// EXACTLY the same filtered subsequence the renderer emitted rows for.
+    ///
+    /// Two conditions must both hold for a nested-under-In-progress row:
+    /// 1. **Liveness matches this instance** — `child_session_is_live`
+    ///    equals `want_live` (Live or Idle), the #1269 partition.
+    /// 2. **Child is not itself Done** (#1281) — a Done child under an
+    ///    otherwise-in-progress epic is finished work and belongs to the
+    ///    Done section's flow, not under an In-progress → Idle epic row.
+    ///    The epic itself STAYS visible with its `M/M done` summary
+    ///    (`epic_progress_span`, keyed off the unfiltered nesting) — it's
+    ///    just the individual Done child rows that stop nesting there.
+    ///
+    /// Keyed off `EpicChildRow.state` — the [`NodeState`] the renderer
+    /// already resolves via `build_dag_nodes` — rather than the coarse
+    /// [`EpicChild.state`] parentage-checkbox string, so the merged-PR-but-
+    /// GitHub-issue-not-yet-closed case (checkbox still "open",
+    /// [`NodeState::Done`] via the assignment/state cache) agrees with the
+    /// renderer's own display state.
+    pub(crate) fn epic_child_kept_in_progress(
+        &self,
+        epic_repo: &str,
+        row: &EpicChildRow,
+        want_live: bool,
+    ) -> bool {
+        if self.child_session_is_live(epic_repo, row.number) != want_live {
+            return false;
+        }
+        // #1281: a Done child does not nest under either In-progress
+        // instance. The epic itself stays visible with its M/M done badge
+        // (that badge is keyed off the unfiltered `full_nesting`, not the
+        // filtered one, in the render loop).
+        !matches!(row.state, NodeState::Done)
+    }
+
+    /// #1269 / #1281: derive an In-progress-instance projection of an
+    /// already-computed [`EpicNesting`] — keeps, per epic, only the children
+    /// [`Self::epic_child_kept_in_progress`] accepts for this Live/Idle
+    /// instance (liveness matches AND not [`NodeState::Done`]), dropping any
+    /// epic whose filtered child list is empty from `by_epic`.
     ///
     /// Used in the In-progress section to nest an epic's children beneath
     /// its **Live** row instance (`want_live = true`) or its **Idle** row
     /// instance (`want_live = false`) — the same epic can render once per
     /// instance (see `pipeline_active_by_liveness`), each time expanding
-    /// only its matching half of the children. The unfiltered `nesting`
-    /// passed in still backs the "N/M done" progress badge
-    /// (`epic_progress_span`), which intentionally reports against the WHOLE
-    /// child set regardless of which instance is showing.
+    /// only its matching half of the children.
+    ///
+    /// The unfiltered `nesting` passed in still backs the "N/M done"
+    /// progress badge (`epic_progress_span`), which intentionally reports
+    /// against the WHOLE child set regardless of which instance is showing,
+    /// and still backs `nested` (the flat-row suppression set) so a child
+    /// dropped from the filtered per-instance list — for either reason —
+    /// does not suddenly reappear as a duplicate flat sibling elsewhere.
+    ///
+    /// An all-children-done epic keeps its top-level row (the loop over
+    /// `mil_issue_idxs` doesn't consult `by_epic` to decide whether to emit
+    /// the epic — only to decide whether to expand children beneath it),
+    /// so the row stays visible under In-progress → Idle with its `M/M
+    /// done` summary until the epic issue itself closes.
     pub(crate) fn filter_epic_nesting_by_liveness(
         &self,
         nesting: &EpicNesting,
@@ -1586,7 +1643,7 @@ impl CoordApp {
                 .unwrap_or_default();
             let kept: Vec<EpicChildRow> = rows
                 .iter()
-                .filter(|row| self.child_session_is_live(repo, row.number) == want_live)
+                .filter(|row| self.epic_child_kept_in_progress(repo, row, want_live))
                 .map(|row| EpicChildRow {
                     number: row.number,
                     title: row.title.clone(),
@@ -1744,13 +1801,23 @@ impl CoordApp {
     /// get "nothing selected" rather than silently falling back to acting
     /// on the parent epic instead.
     ///
-    /// #1269: `want_live` must mirror whatever liveness filter the row that
-    /// was actually rendered used — `Some(true)`/`Some(false)` for a child
-    /// nested beneath an epic's Live/Idle In-progress instance (`child_pos`
-    /// then indexes into the SAME filtered subsequence
-    /// `filter_epic_nesting_by_liveness` produced, preserving the parent's
-    /// original child order), `None` everywhere else (New/Done/Refining/
-    /// Pending nest the full, unfiltered child list, unchanged from #1197).
+    /// #1269 / #1281: `want_live` must mirror whatever In-progress filter
+    /// the row that was actually rendered used — `Some(true)`/`Some(false)`
+    /// for a child nested beneath an epic's Live/Idle In-progress instance
+    /// (`child_pos` then indexes into the SAME filtered subsequence
+    /// [`Self::filter_epic_nesting_by_liveness`] produced, preserving the
+    /// parent's original child order), `None` everywhere else (New/Done/
+    /// Refining/Pending nest the full, unfiltered child list, unchanged
+    /// from #1197).
+    ///
+    /// The filtered path resolves the child list from [`Self::epic_child_rows_for`]
+    /// (not [`Self::epic_children_for`]) so both branches walk the same
+    /// [`NodeState`]-carrying rows the renderer emitted, and applies
+    /// [`Self::epic_child_kept_in_progress`] — the same predicate — over
+    /// them. Without this, a Done child suppressed by the renderer (#1281)
+    /// but still visible to the decoder's stale `EpicChild.state` view
+    /// would shift the filtered subsequence, and `child_pos` would resolve
+    /// to the wrong `pipeline_issues` index.
     pub(crate) fn resolve_nested_child_index(
         &self,
         parent_idx: usize,
@@ -1758,16 +1825,19 @@ impl CoordApp {
         want_live: Option<bool>,
     ) -> Option<usize> {
         let issue = self.pipeline_issues.get(parent_idx)?;
-        let children = self.epic_children_for(issue)?;
         let repo = issue.coord_repo.clone();
         let child_number = if let Some(want_live) = want_live {
             let repo_key = repo.as_deref()?;
-            children
-                .iter()
-                .filter(|c| self.child_session_is_live(repo_key, c.number) == want_live)
+            let rows = self.epic_child_rows_for(repo_key, issue.number);
+            if rows.is_empty() {
+                return None;
+            }
+            rows.iter()
+                .filter(|row| self.epic_child_kept_in_progress(repo_key, row, want_live))
                 .nth(child_pos)?
                 .number
         } else {
+            let children = self.epic_children_for(issue)?;
             children.get(child_pos)?.number
         };
         self.pipeline_issues
