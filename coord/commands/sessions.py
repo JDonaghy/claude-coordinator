@@ -1328,7 +1328,22 @@ def reattach(assignment_id: str, config_path: Path) -> None:
                     # the #607 failure where a reattach-from-elsewhere dropped
                     # the findings and left only a verdict-less operator prompt.
                     ssh_target=ssh_target_val,
+                    # #1256: a no-op for every type except smoke (it only
+                    # acts when a matching snapshot marker exists) — safe to
+                    # pass unconditionally on the read-only/DB-only branch.
+                    smoke_repo_path=remote_repo_sh,
                 )
+                if fr2.smoke_restored_paths:
+                    click.echo(
+                        "  live checkout restored (#1256): reverted "
+                        + ", ".join(fr2.smoke_restored_paths)
+                    )
+                if fr2.smoke_restore_error:
+                    click.echo(
+                        f"  warning: live-checkout restore failed: "
+                        f"{fr2.smoke_restore_error}",
+                        err=True,
+                    )
                 if fr2.already_recorded:
                     if fr2.terminal_status == "transcript-floor":
                         click.echo(
@@ -1409,7 +1424,7 @@ def reattach(assignment_id: str, config_path: Path) -> None:
                         )
                 return
 
-            # ── LOCAL session (unchanged) ────────────────────────────────
+            # ── LOCAL session ─────────────────────────────────────────────
             finalize_result = finalize_interactive_exit(
                 assignment_id=assignment_id,
                 repo_name=repo_name_val,
@@ -1424,7 +1439,24 @@ def reattach(assignment_id: str, config_path: Path) -> None:
                 repo_path=repo_path_val,
                 artifact_paths=artifact_paths_val,
                 branch=branch_val,
+                # #1256: repo_path_val IS the live checkout for a smoke
+                # session (no worktree — the smoke agent worked directly in
+                # it).  A no-op for every other type: it only acts when a
+                # matching snapshot marker exists, which only smoke dispatch
+                # ever creates.
+                smoke_repo_path=repo_path_val,
             )
+            if finalize_result.smoke_restored_paths:
+                click.echo(
+                    "  live checkout restored (#1256): reverted "
+                    + ", ".join(finalize_result.smoke_restored_paths)
+                )
+            if finalize_result.smoke_restore_error:
+                click.echo(
+                    f"  warning: live-checkout restore failed: "
+                    f"{finalize_result.smoke_restore_error}",
+                    err=True,
+                )
             if finalize_result.already_recorded:
                 click.echo(
                     "  result already recorded via `coord report-result`; "
