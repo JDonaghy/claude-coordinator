@@ -616,10 +616,12 @@ impl CoordApp {
     ///
     /// Priority (highest wins):
     /// 1. `is_closed`            → "done"
-    /// 2. Has any assignment     → "in-progress"
-    /// 3. Has label `status:ready` (no assignments) → "pending"
-    /// 4. Has label `status:refining`               → "refining"
-    /// 5. Otherwise                                 → "new"
+    /// 2. Epic tracking issue (`epic_children_for` is `Some`) → aggregate
+    ///    child state via `epic_lifecycle_section` (#1253)
+    /// 3. Has any assignment     → "in-progress"
+    /// 4. Has label `status:ready` (no assignments) → "pending"
+    /// 5. Has label `status:refining`               → "refining"
+    /// 6. Otherwise                                 → "new"
     pub(crate) fn pipeline_lifecycle_section(&self, issue: &PipelineIssue) -> &'static str {
         if issue.is_closed {
             return "done";
@@ -630,6 +632,15 @@ impl CoordApp {
         // (IssueGroup::lifecycle_section) which already treats merged as done.
         if self.merge_stage_status_for(issue) == StageStatus::Done {
             return "done";
+        }
+        // #1253: an epic's actual work happens on its *children*, not on the
+        // epic issue itself, so it almost never carries a direct assignment
+        // — the `has_work_assignment` check below is essentially always
+        // false for one, and it would sit in "New" for its entire life
+        // (observed: #1200, all 7 children closed, stuck in New until
+        // manually closed). Classify by aggregate child state instead.
+        if let Some(children) = self.epic_children_for(issue) {
+            return self.epic_lifecycle_section(issue, children);
         }
         // Only *workable* assignments make an issue in-progress.  Scoping
         // conversations — `refinement`, `new-issue-chat`, `test-chat`, and the
@@ -659,6 +670,42 @@ impl CoordApp {
         // Refining distinctions were display-only. The empty pending/refining
         // sections auto-hide; the Pipeline is New → In-progress → Done.
         "new"
+    }
+
+    /// #1253: classify an epic tracking issue's lifecycle section by
+    /// aggregate *child* state rather than the epic's own (near-always-
+    /// absent) direct assignment. Reuses `build_dag_nodes` — the same
+    /// Done/InFlight/Ready computation `compute_epic_nesting` uses for the
+    /// nested child rows — so the section bucket and the nested badges never
+    /// disagree.
+    ///
+    /// - Any child `Done` or `InFlight` → "in-progress". This deliberately
+    ///   covers *both* "some children still running" *and* "all children
+    ///   done, epic still open" — the epic is just waiting on a manual close
+    ///   at that point, which is not "new" (the #1253 fix-direction note
+    ///   flagged the latter as arguably still in-progress rather than a new
+    ///   bucket, to avoid growing the lifecycle-section enum for one case).
+    /// - No child started yet (all `Ready`/`Blocked`, or the child list
+    ///   resolved to zero DAG nodes) → "new" stands.
+    fn epic_lifecycle_section(&self, issue: &PipelineIssue, children: &[EpicChild]) -> &'static str {
+        let repo_name = issue.coord_repo.clone().unwrap_or_default();
+        let work_order: Vec<WorkOrderNode> = children
+            .iter()
+            .map(|c| WorkOrderNode {
+                issue_number: c.number,
+                group: None,
+                after: Vec::new(),
+            })
+            .collect();
+        let nodes = build_dag_nodes(&work_order, &repo_name, &self.data.open_issues, &self.data.assignments);
+        let any_progress = nodes
+            .iter()
+            .any(|n| matches!(n.state, NodeState::Done | NodeState::InFlight));
+        if any_progress {
+            "in-progress"
+        } else {
+            "new"
+        }
     }
 
     /// Return true when any assignment in the DB touches this issue.
@@ -1395,23 +1442,110 @@ impl CoordApp {
         nesting
     }
 
+    /// #1253: every child issue nested under *some* epic, across the WHOLE
+    /// `pipeline_issues` list rather than one lifecycle-section bucket.
+    ///
+    /// `compute_epic_nesting`'s `nested` set only sees the epics present in
+    /// whatever `issue_idxs` slice it was given — fine while an epic and its
+    /// children always shared a bucket, but Bug 1's classifier fix (#1253)
+    /// means they can now diverge: an epic moves to "in-progress" the
+    /// instant any child has progress, while a not-yet-started sibling child
+    /// stays in "new". Suppressing flat duplicates per-bucket then misses
+    /// the case entirely — the child renders once nested under the epic in
+    /// the epic's bucket, and once more as a flat top-level row in its own.
+    /// Scanning every epic in `pipeline_issues` up front (independent of
+    /// which section each one currently resolves to) and consulting this
+    /// set wherever a row is about to render flat fixes that regardless of
+    /// which bucket the epic and the child each land in.
+    ///
+    /// Keyed by `(repo, issue_number)` — `nested` alone (bare `u64`, as
+    /// `EpicNesting` uses) risks a false-positive suppression if two repos
+    /// happen to share a child issue number.
+    pub(crate) fn pipeline_globally_nested_children(&self) -> std::collections::HashSet<(String, u64)> {
+        let mut nested = std::collections::HashSet::new();
+        for issue in &self.pipeline_issues {
+            let Some(repo_name) = issue.coord_repo.as_ref() else {
+                continue;
+            };
+            let Some(children) = self.epic_children_for(issue) else {
+                continue;
+            };
+            for child in children {
+                nested.insert((repo_name.clone(), child.number));
+            }
+        }
+        nested
+    }
+
+    /// #1253: true when `issue` is nested under some epic elsewhere in the
+    /// pipeline (see `pipeline_globally_nested_children`) and should
+    /// therefore be skipped when emitting a flat top-level row.
+    fn is_globally_nested(
+        issue: &PipelineIssue,
+        globally_nested: &std::collections::HashSet<(String, u64)>,
+    ) -> bool {
+        issue
+            .coord_repo
+            .as_ref()
+            .map(|r| globally_nested.contains(&(r.clone(), issue.number)))
+            .unwrap_or(false)
+    }
+
     /// #1197: resolve the `pipeline_epic_expanded` key + current expanded
     /// state for an epic row. Returns `None` when the issue has no
     /// `coord_repo` (an untracked row can't be keyed, and can't be an epic
     /// anyway — `epic_children_for` also requires the repo).
     ///
-    /// Untouched keys default to **expanded**: an epic's children are the
-    /// reason it renders as a parent, so they're visible until the user
-    /// collapses them. This differs from the milestone header's #857
+    /// Untouched keys default to **expanded**, UNLESS every child is already
+    /// `Done` (#1253), in which case they default to **collapsed** — a
+    /// finished epic's children are done work, not the reason to keep
+    /// scanning the row, and #1197's always-expanded default meant a
+    /// long-lived epic just accumulated an ever-growing wall of closed
+    /// children (the flat "Done" section gets a time window via
+    /// `pipeline_done_windowed`; nested epic children had no equivalent). A
+    /// manual toggle (a `pipeline_epic_expanded` entry) always wins over
+    /// either default. This differs from the milestone header's #857
     /// collapsed-by-default (a milestone is a bucket; an epic is the work).
-    pub(crate) fn epic_expand_state(&self, issue: &PipelineIssue) -> Option<((String, u64), bool)> {
+    pub(crate) fn epic_expand_state(
+        &self,
+        issue: &PipelineIssue,
+        children: &[EpicChildRow],
+    ) -> Option<((String, u64), bool)> {
         let key = (issue.coord_repo.clone()?, issue.number);
+        let all_done = !children.is_empty()
+            && children.iter().all(|c| matches!(c.state, NodeState::Done));
+        let default_expanded = !all_done;
         let expanded = self
             .pipeline_epic_expanded
             .get(&key)
             .copied()
-            .unwrap_or(true);
+            .unwrap_or(default_expanded);
         Some((key, expanded))
+    }
+
+    /// #1253: "N/M done" child-progress summary appended to an epic row's
+    /// title spans. Rendered unconditionally (not just while collapsed) so
+    /// the count is visible in every lifecycle bucket without requiring a
+    /// click — a collapsed epic that hid its children with no summary was
+    /// exactly the #1253 Bug 2 complaint ("hides everything once you fold it
+    /// by hand"). Returns `None` for a childless resolution (shouldn't occur
+    /// given callers only invoke this from `nesting.by_epic`, but a `0/0`
+    /// badge would be noise if it ever did).
+    fn epic_progress_span(children: &[EpicChildRow]) -> Option<StyledSpan> {
+        if children.is_empty() {
+            return None;
+        }
+        let done = children
+            .iter()
+            .filter(|c| matches!(c.state, NodeState::Done))
+            .count();
+        let total = children.len();
+        let color = if done == total {
+            Color::rgb(100, 180, 100) // matches the Done section's "✓ merged/closed" green
+        } else {
+            Color::rgb(140, 140, 160) // dim — mirrors the muted "new" state color
+        };
+        Some(StyledSpan::with_fg(format!("  {done}/{total}"), color))
     }
 
     /// #1197: resolve a nested-child row's own `pipeline_issues` index.
@@ -3156,6 +3290,18 @@ impl CoordApp {
         let mut epic_row_keys: std::collections::HashMap<(usize, TreePath), (String, u64)> =
             std::collections::HashMap::new();
 
+        // #1253: which children are nested under *some* epic, computed
+        // ONCE across the whole pipeline rather than per-bucket. Bug 1's
+        // classifier fix means an epic and an independently-tracked child
+        // of it can now land in *different* lifecycle sections (e.g. the
+        // epic moves to "in-progress" the moment any child has progress,
+        // while a not-yet-started sibling child stays "new") — #1197's
+        // original per-bucket `EpicNesting::nested` only suppressed a flat
+        // duplicate when the epic and the child shared the same bucket, so
+        // once they diverge the child rendered BOTH nested under the epic
+        // AND flat in its own section. See `pipeline_globally_nested_children`.
+        let globally_nested = self.pipeline_globally_nested_children();
+
         // ── Populate rows for each state section ─────────────────────────
         for (state_idx, &(lc_key, _lc_label)) in state_sections.iter().enumerate() {
             let section_idx = state_idx + search_offset;
@@ -3271,7 +3417,7 @@ impl CoordApp {
                             let nesting = self.compute_epic_nesting(mil_issue_idxs);
                             for (ii, &issue_idx) in mil_issue_idxs.iter().enumerate() {
                                 let issue = &self.pipeline_issues[issue_idx];
-                                if nesting.nested.contains(&issue.number) {
+                                if Self::is_globally_nested(issue, &globally_nested) {
                                     continue;
                                 }
                                 let title_color = if issue.coord_repo.is_some() {
@@ -3296,8 +3442,9 @@ impl CoordApp {
                                 // work, not a bucket header) but carries
                                 // `is_expanded`, which is what drives the
                                 // chevron + its hit region in quadraui's tree.
-                                let epic = nesting.by_epic.get(&issue_idx).and_then(|children| {
-                                    self.epic_expand_state(issue)
+                                let epic_children = nesting.by_epic.get(&issue_idx);
+                                let epic = epic_children.and_then(|children| {
+                                    self.epic_expand_state(issue, children)
                                         .map(|(key, expanded)| (key, expanded, children))
                                 });
                                 let mut spans = vec![StyledSpan::with_fg(
@@ -3316,6 +3463,13 @@ impl CoordApp {
                                     trunc(&issue.title, 20),
                                     title_color,
                                 ));
+                                // #1253: "N/M done" child-progress summary,
+                                // visible whether expanded or collapsed.
+                                if let Some(children) = epic_children {
+                                    if let Some(span) = Self::epic_progress_span(children) {
+                                        spans.push(span);
+                                    }
+                                }
                                 rows.push(TreeRow {
                                     path: row_path.clone(),
                                     indent: 3,
@@ -3358,7 +3512,7 @@ impl CoordApp {
                     let nesting = self.compute_epic_nesting(&done_windowed);
                     for (ii, &issue_idx) in done_windowed.iter().enumerate() {
                         let issue = &self.pipeline_issues[issue_idx];
-                        if nesting.nested.contains(&issue.number) {
+                        if Self::is_globally_nested(issue, &globally_nested) {
                             continue;
                         }
                         let title_color = if issue.coord_repo.is_some() {
@@ -3399,6 +3553,14 @@ impl CoordApp {
                             spans.push(marker);
                         }
                         spans.push(StyledSpan::with_fg(trunc(&issue.title, 18), title_color));
+                        // #1253: "N/M done" child-progress summary, visible
+                        // whether expanded or collapsed.
+                        let epic_children = nesting.by_epic.get(&issue_idx);
+                        if let Some(children) = epic_children {
+                            if let Some(span) = Self::epic_progress_span(children) {
+                                spans.push(span);
+                            }
+                        }
                         spans.push(StyledSpan::with_fg(
                             format!("  {}", status_str),
                             Color::rgb(100, 180, 100),
@@ -3415,8 +3577,8 @@ impl CoordApp {
                         let tag = Self::repo_tag(Self::pipeline_repo_key(issue), &repos);
                         let row_path = vec![0u16, ii as u16];
                         // #1197: epic branch row — see the in-progress site.
-                        let epic = nesting.by_epic.get(&issue_idx).and_then(|children| {
-                            self.epic_expand_state(issue)
+                        let epic = epic_children.and_then(|children| {
+                            self.epic_expand_state(issue, children)
                                 .map(|(key, expanded)| (key, expanded, children))
                         });
                         rows.push(TreeRow {
@@ -3578,7 +3740,7 @@ impl CoordApp {
                                 let nesting = self.compute_epic_nesting(mil_issue_idxs);
                                 for (ii, &issue_idx) in mil_issue_idxs.iter().enumerate() {
                                     let issue = &self.pipeline_issues[issue_idx];
-                                    if nesting.nested.contains(&issue.number) {
+                                    if Self::is_globally_nested(issue, &globally_nested) {
                                         continue;
                                     }
                                     let stage_name = self.derive_current_stage(issue);
@@ -3614,6 +3776,15 @@ impl CoordApp {
                                         trunc(&issue.title, 20),
                                         title_color,
                                     ));
+                                    // #1253: "N/M done" child-progress
+                                    // summary, visible whether expanded or
+                                    // collapsed.
+                                    let epic_children = nesting.by_epic.get(&issue_idx);
+                                    if let Some(children) = epic_children {
+                                        if let Some(span) = Self::epic_progress_span(children) {
+                                            spans.push(span);
+                                        }
+                                    }
                                     if has_live_stream {
                                         spans.push(StyledSpan::with_fg(
                                             " ▶".to_string(),
@@ -3653,11 +3824,10 @@ impl CoordApp {
                                     let row_path = vec![ri as u16, mi as u16, ii as u16];
                                     // #1197: epic branch row — see the
                                     // in-progress site.
-                                    let epic =
-                                        nesting.by_epic.get(&issue_idx).and_then(|children| {
-                                            self.epic_expand_state(issue)
-                                                .map(|(key, expanded)| (key, expanded, children))
-                                        });
+                                    let epic = epic_children.and_then(|children| {
+                                        self.epic_expand_state(issue, children)
+                                            .map(|(key, expanded)| (key, expanded, children))
+                                    });
                                     rows.push(TreeRow {
                                         path: row_path.clone(),
                                         indent: 3,
@@ -3689,7 +3859,7 @@ impl CoordApp {
                             let nesting = self.compute_epic_nesting(issue_idxs);
                             for (ii, &issue_idx) in issue_idxs.iter().enumerate() {
                                 let issue = &self.pipeline_issues[issue_idx];
-                                if nesting.nested.contains(&issue.number) {
+                                if Self::is_globally_nested(issue, &globally_nested) {
                                     continue;
                                 }
                                 let stage_name = self.derive_current_stage(issue);
@@ -3717,6 +3887,14 @@ impl CoordApp {
                                     spans.push(marker);
                                 }
                                 spans.push(StyledSpan::with_fg(trunc(&issue.title, 20), title_color));
+                                // #1253: "N/M done" child-progress summary,
+                                // visible whether expanded or collapsed.
+                                let epic_children = nesting.by_epic.get(&issue_idx);
+                                if let Some(children) = epic_children {
+                                    if let Some(span) = Self::epic_progress_span(children) {
+                                        spans.push(span);
+                                    }
+                                }
                                 if has_live_stream {
                                     spans.push(StyledSpan::with_fg(
                                         " ▶".to_string(),
@@ -3725,8 +3903,8 @@ impl CoordApp {
                                 }
                                 let row_path = vec![ri as u16, ii as u16];
                                 // #1197: epic branch row — see the in-progress site.
-                                let epic = nesting.by_epic.get(&issue_idx).and_then(|children| {
-                                    self.epic_expand_state(issue)
+                                let epic = epic_children.and_then(|children| {
+                                    self.epic_expand_state(issue, children)
                                         .map(|(key, expanded)| (key, expanded, children))
                                 });
                                 rows.push(TreeRow {
@@ -3970,6 +4148,9 @@ impl CoordApp {
         num: u64,
     ) -> Option<(usize, Vec<u16>, Option<usize>)> {
         let search_offset = 1usize;
+        // #1253: mirror the row-emission loops' global (not per-bucket)
+        // nested-child check — see `pipeline_globally_nested_children`.
+        let globally_nested = self.pipeline_globally_nested_children();
         for (state_idx, &state_key) in self.pipeline_state_section_names.iter().enumerate() {
             let section_idx = state_idx + search_offset;
             // Leaf groups for this state as (path_prefix, issue_idxs) — the
@@ -4023,7 +4204,7 @@ impl CoordApp {
                     let issue = &self.pipeline_issues[idx];
                     if issue.repo_slug == repo
                         && issue.number == num
-                        && !nesting.nested.contains(&num)
+                        && !Self::is_globally_nested(issue, &globally_nested)
                     {
                         let mut path = prefix.clone();
                         path.push(ii as u16);
