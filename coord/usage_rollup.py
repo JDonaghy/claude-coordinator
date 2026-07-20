@@ -47,7 +47,7 @@ from coord.config import ModelRates, PricingConfig
 
 # Canonical keys this module recognizes out of the box. Anything else is
 # "(unknown)" — never guessed, never silently priced at $0.
-_KNOWN_CANONICAL = ("sonnet", "opus", "haiku")
+_KNOWN_CANONICAL = ("sonnet", "opus", "haiku", "fable")
 
 UNKNOWN_MODEL = "(unknown)"
 
@@ -55,13 +55,14 @@ UNKNOWN_MODEL = "(unknown)"
 def normalize_model(model: str | None) -> str:
     """Normalize a raw ``model`` field to a canonical pricing key.
 
-    Handles bare aliases (``"sonnet"``, ``"opus"``, ``"haiku"``), versioned
-    ids (``"claude-sonnet-4-6"``, ``"claude-opus-4-7"``, ``"claude-haiku-4-5"``,
-    and future dated variants — matched by substring so a new date suffix
-    doesn't need a code change), and the empty/``None``/``"(unknown)"``
-    cases. Anything that doesn't match one of the three known tiers returns
-    ``"(unknown)"`` — the estimator treats that as "no rate available" and
-    flags it, rather than defaulting to a tier that might be wrong.
+    Handles bare aliases (``"sonnet"``, ``"opus"``, ``"haiku"``, ``"fable"``),
+    versioned ids (``"claude-sonnet-4-6"``, ``"claude-opus-4-7"``,
+    ``"claude-haiku-4-5"``, ``"claude-fable-5"``, and future dated variants —
+    matched by substring so a new date suffix doesn't need a code change),
+    and the empty/``None``/``"(unknown)"`` cases. Anything that doesn't match
+    one of the four known tiers returns ``"(unknown)"`` — the estimator
+    treats that as "no rate available" and flags it, rather than defaulting
+    to a tier that might be wrong.
     """
     if not model:
         return UNKNOWN_MODEL
