@@ -468,29 +468,10 @@ def _commits_ahead(wt_path: Path, base: str) -> int | None:
 _ISSUE_REF_RE = re.compile(r"#(\d+)")
 
 
-def _subject_references_foreign_issue(subject: str, issue_number: int) -> bool:
-    """Cheap, high-signal heuristic for #604: does this commit subject belong
-    to a *different* issue than the one being merged?
-
-    Returns ``True`` only when the subject references at least one ``#NNN`` and
-    *none* of them is ``issue_number`` — so a commit that mentions the issue
-    (even alongside others) is never flagged, and a commit with no ``#NNN`` at
-    all (a fixup/wip with a bare message) is left alone.  This deliberately
-    keeps false positives low: it fired in the vimcode #494 botch because the
-    dragged-in commits were ``fix(#514)`` / ``#488`` / ``#207`` — each
-    referencing only its own, already-merged issue.
-    """
-    refs = {int(m) for m in _ISSUE_REF_RE.findall(subject)}
-    if not refs:
-        return False
-    return issue_number not in refs
-
-
 def _foreign_issue_refs(subject: str, issue_number: int) -> frozenset[int]:
     """Return the set of *foreign* issue numbers referenced in *subject* —
     those that are not *issue_number*.  Empty if the subject doesn't reference
-    any foreign issue (mirrors ``_subject_references_foreign_issue`` but
-    returns the actual numbers so callers can look them up)."""
+    any foreign issue."""
     refs = {int(m) for m in _ISSUE_REF_RE.findall(subject)}
     if not refs or issue_number in refs:
         return frozenset()
@@ -530,9 +511,9 @@ class MergeVerify:
             worktree + reflog are removed on session exit, so this is the only
             post-hoc record of exactly what would merge.
         foreign: The subset of *added* whose subject references a *different*
-            ``#NNN`` than the issue being merged (see
-            :func:`_subject_references_foreign_issue`) **and** whose referenced
-            issues are not known-closed — the heuristic for the #494 pollution.
+            ``#NNN`` than the issue being merged (see :func:`_foreign_issue_refs`)
+            **and** whose referenced issues are not known-closed — the
+            heuristic for the #494 pollution.
             A non-empty ``foreign`` makes :attr:`ok` ``False`` (blocking).
         advisory_foreign: Like ``foreign`` but downgraded to advisory (#1279):
             commits whose subject references a foreign ``#NNN`` that is
@@ -664,6 +645,43 @@ def verify_merge_branch(
         foreign=foreign,
         advisory_foreign=advisory_foreign,
     )
+
+
+def resolve_closed_issue_numbers(
+    repo_github: str | None,
+    foreign_commits: Iterable[tuple[str, str]],
+    issue_number: int,
+) -> frozenset[int]:
+    """Resolve the ``closed_issue_numbers`` corroboration set (#1279) for
+    :func:`verify_merge_branch` / the remote analogue, given the commits a
+    first verify pass already flagged as (blocking) ``foreign``.
+
+    Callers run a cheap pure-git verify pass first; only when it comes back
+    with a non-empty ``foreign`` list is it worth spending a ``gh`` round-trip
+    per referenced issue to see whether any of them are closed (and therefore
+    downgradeable to advisory).  This keeps the common case — zero foreign
+    commits — free of any GitHub call.
+
+    Uses :func:`coord.github_ops.issue_is_closed`, which is best-effort and
+    **fail-open** (returns ``False`` on any ``gh`` error) — a transient
+    GitHub/CLI failure never silently downgrades a genuinely-foreign commit;
+    it just stays blocking, same as before #1279.
+
+    Returns an empty frozenset immediately when *repo_github* is falsy or
+    *foreign_commits* is empty, so callers can skip the second verify pass
+    entirely (``if closed: ...``) without an extra branch.
+    """
+    foreign_commits = list(foreign_commits)
+    if not repo_github or not foreign_commits:
+        return frozenset()
+
+    from coord import github_ops  # noqa: PLC0415
+
+    candidates: set[int] = set()
+    for _sha, subj in foreign_commits:
+        candidates |= _foreign_issue_refs(subj, issue_number)
+    closed = {n for n in candidates if github_ops.issue_is_closed(repo_github, n)}
+    return frozenset(closed)
 
 
 def _safe_realpath(path: str) -> str:

@@ -2321,11 +2321,27 @@ def finalize_interactive_exit(
     if verify_merge and worktree_path:
         wt_v = Path(worktree_path)
         if wt_v.exists():
-            from coord.agent import verify_merge_branch  # noqa: PLC0415
+            from coord.agent import (  # noqa: PLC0415
+                resolve_closed_issue_numbers,
+                verify_merge_branch,
+            )
 
             merge_verify = verify_merge_branch(
                 wt_v, base=base_branch, issue_number=issue_number
             )
+            # #1279: corroborate blocking foreign commits against GitHub's
+            # closed-issue state before deciding — a typo'd reference to an
+            # already-closed issue is downgraded to advisory, not blocking.
+            closed = resolve_closed_issue_numbers(
+                repo_github, merge_verify.foreign, issue_number
+            )
+            if closed:
+                merge_verify = verify_merge_branch(
+                    wt_v,
+                    base=base_branch,
+                    issue_number=issue_number,
+                    closed_issue_numbers=closed,
+                )
             if not merge_verify.ok:
                 return _finalize_merge_blocked(
                     merge_verify=merge_verify,
@@ -3151,10 +3167,24 @@ def finalize_remote_interactive_exit(
     # re-derive the truth from git on the remote worktree and let it override.
     merge_verify = None
     if verify_merge and remote_worktree_exists(ssh_target, remote_worktree_sh):
+        from coord.agent import resolve_closed_issue_numbers  # noqa: PLC0415
+
         merge_verify = _remote_verify_merge_branch(
             ssh_target, remote_worktree_sh,
             base=base_branch, issue_number=issue_number,
         )
+        # #1279: same corroboration as the local finalize path — re-verify
+        # with the closed-issue downgrade signal only when the first (cheap,
+        # git-only) pass actually found blocking foreign commits.
+        closed = resolve_closed_issue_numbers(
+            repo_github, merge_verify.foreign, issue_number
+        )
+        if closed:
+            merge_verify = _remote_verify_merge_branch(
+                ssh_target, remote_worktree_sh,
+                base=base_branch, issue_number=issue_number,
+                closed_issue_numbers=closed,
+            )
         if not merge_verify.ok:
             return _finalize_remote_merge_blocked(
                 merge_verify=merge_verify,

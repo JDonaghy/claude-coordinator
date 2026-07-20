@@ -96,7 +96,10 @@ def verify_merge(
     fallback, supply ``--repo`` and ``--issue-number`` explicitly so the check
     can run even when the board lookup returns nothing.
     """
-    from coord.agent import verify_merge_branch  # noqa: PLC0415
+    from coord.agent import (  # noqa: PLC0415
+        resolve_closed_issue_numbers,
+        verify_merge_branch,
+    )
     from coord.board_service import read_board  # noqa: PLC0415
 
     cfg = _load_config(config_path)
@@ -125,11 +128,18 @@ def verify_merge(
 
     repo_cfg = cfg.repo(repo_name)
     base = (repo_cfg.default_branch if repo_cfg else None) or "main"
+    repo_github = repo_cfg.github if repo_cfg else None
     wt_path = Path(path_opt).expanduser() if path_opt else Path.cwd()
 
-    mv = verify_merge_branch(
-        wt_path, base=base, issue_number=issue_num
-    )
+    mv = verify_merge_branch(wt_path, base=base, issue_number=issue_num)
+    # #1279: only worth a `gh` round-trip when the cheap git-only pass above
+    # actually found blocking foreign commits — corroborate against GitHub's
+    # closed-issue state and re-verify with the downgrade signal populated.
+    closed = resolve_closed_issue_numbers(repo_github, mv.foreign, issue_num)
+    if closed:
+        mv = verify_merge_branch(
+            wt_path, base=base, issue_number=issue_num, closed_issue_numbers=closed
+        )
 
     click.echo(f"branch:        {branch_display}")
     click.echo(f"target base:   {base}")

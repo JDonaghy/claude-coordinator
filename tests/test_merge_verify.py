@@ -294,6 +294,69 @@ class TestVerifyMergeBranch:
         assert mv.advisory_foreign == []
 
 
+# ── resolve_closed_issue_numbers (#1279) — the caller-side GitHub lookup ─────
+
+
+class TestResolveClosedIssueNumbers:
+    """Unit tests for the small helper the three real call sites use to
+    populate ``closed_issue_numbers`` from GitHub, closing the #1279 review's
+    blocking finding that the parameter was plumbed but never fed real data."""
+
+    def test_no_foreign_commits_skips_gh_entirely(self) -> None:
+        from coord.agent import resolve_closed_issue_numbers
+
+        with patch("coord.github_ops.issue_is_closed") as mock_closed:
+            result = resolve_closed_issue_numbers("acme/api", [], 604)
+
+        assert result == frozenset()
+        mock_closed.assert_not_called()
+
+    def test_no_repo_github_skips_gh_entirely(self) -> None:
+        from coord.agent import resolve_closed_issue_numbers
+
+        with patch("coord.github_ops.issue_is_closed") as mock_closed:
+            result = resolve_closed_issue_numbers(
+                None, [("a1", "fix(#514): unrelated")], 604
+            )
+
+        assert result == frozenset()
+        mock_closed.assert_not_called()
+
+    def test_closed_foreign_issue_is_returned(self) -> None:
+        from coord.agent import resolve_closed_issue_numbers
+
+        with patch("coord.github_ops.issue_is_closed", return_value=True) as mock_closed:
+            result = resolve_closed_issue_numbers(
+                "acme/api", [("a1", "fix(#514): unrelated")], 604
+            )
+
+        mock_closed.assert_called_once_with("acme/api", 514)
+        assert result == frozenset({514})
+
+    def test_open_foreign_issue_is_not_returned(self) -> None:
+        from coord.agent import resolve_closed_issue_numbers
+
+        with patch("coord.github_ops.issue_is_closed", return_value=False):
+            result = resolve_closed_issue_numbers(
+                "acme/api", [("a1", "fix(#514): unrelated")], 604
+            )
+
+        assert result == frozenset()
+
+    def test_gh_failure_fails_open_leaving_issue_treated_as_not_closed(self) -> None:
+        """``issue_is_closed`` itself fails open (returns False on any `gh`
+        error) — this helper must not swallow that and must not crash on a
+        transient GitHub/CLI failure."""
+        from coord.agent import resolve_closed_issue_numbers
+
+        with patch("coord.github_ops.issue_is_closed", return_value=False):
+            result = resolve_closed_issue_numbers(
+                "acme/api", [("a1", "fix(#514): unrelated")], 604
+            )
+
+        assert result == frozenset()
+
+
 # ── finalize_interactive_exit(verify_merge=True) — the coordinator gate ───────
 
 
@@ -463,6 +526,55 @@ class TestFinalizeMergeGate:
         assert len(result.merge_verify.foreign) == 1
         assert result.terminal_status == "failed"
         assert _read_status("mg-foreign") == "failed"
+
+    def test_foreign_commit_referencing_closed_issue_is_advisory_not_blocking(
+        self, repo_with_remote: tuple[Path, Path], tmp_path: Path
+    ) -> None:
+        """#1279 end-to-end: the coordinator gate itself (not just the pure
+        primitive) must corroborate a foreign #NNN against GitHub and
+        downgrade to advisory when that issue is closed — this is the exact
+        wiring gap the #1279 review flagged (closed_issue_numbers was plumbed
+        but never populated by any real caller)."""
+        from coord.interactive import finalize_interactive_exit
+        from tests.test_issue_store_seam import _seed_running_assignment
+
+        clone, _ = repo_with_remote
+        state_dir = tmp_path / "state"
+        wt_path, _ = setup_interactive_worktree(
+            clone,
+            issue_number=604,
+            issue_title="merge gate foreign-but-closed",
+            assignment_id="mg-foreign-closed",
+            default_branch="main",
+            state_dir=state_dir,
+        )
+        _commit(wt_path, "feat(#604): the fix")
+        _commit(wt_path, "fix(#514): unrelated already-merged work")
+
+        _seed_running_assignment("mg-foreign-closed", issue_number=604)
+        with patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.github_ops.issue_is_closed", return_value=True) as mock_closed:
+            result = finalize_interactive_exit(
+                assignment_id="mg-foreign-closed",
+                repo_name="api",
+                repo_github="acme/api",
+                issue_number=604,
+                machine_name="laptop",
+                worktree_path=str(wt_path),
+                base_branch="main",
+                exit_code=0,
+                started_at=None,
+                repo_path=str(clone),
+                verify_merge=True,
+            )
+
+        mock_closed.assert_called_once_with("acme/api", 514)
+        assert result.merge_verify is not None
+        assert result.merge_verify.ok is True, "closed-issue corroboration must downgrade to advisory"
+        assert result.merge_verify.foreign == []
+        assert len(result.merge_verify.advisory_foreign) == 1
+        assert result.terminal_status == "done"
+        assert _read_status("mg-foreign-closed") == "done"
 
     def test_verify_merge_off_leaves_review_path_untouched(self) -> None:
         """Without verify_merge, a 0-commit review session (already-recorded)
@@ -762,6 +874,60 @@ class TestFinalizeRemoteMergeGate:
         mock_rm.assert_called_once()
         post.assert_called()
 
+    def test_foreign_commit_referencing_closed_issue_is_advisory_not_blocking(
+        self,
+    ) -> None:
+        """#1279 end-to-end on the remote path: the first (git-only) pass
+        finds a blocking foreign commit; the gate must corroborate against
+        GitHub and re-verify with the downgrade signal, landing ``done``
+        rather than ``failed``."""
+        from coord.agent import MergeVerify
+        from coord.interactive import finalize_remote_interactive_exit
+        from tests.test_issue_store_seam import _seed_running_assignment
+
+        _seed_running_assignment("mg-remote-foreign-closed", issue_number=604)
+        first_pass = MergeVerify(
+            default_ahead=0,
+            added=[("a1", "feat(#604): fix"), ("a2", "fix(#514): unrelated")],
+            foreign=[("a2", "fix(#514): unrelated")],
+        )
+        second_pass = MergeVerify(
+            default_ahead=0,
+            added=[("a1", "feat(#604): fix"), ("a2", "fix(#514): unrelated")],
+            foreign=[],
+            advisory_foreign=[("a2", "fix(#514): unrelated")],
+        )
+        with patch("coord.interactive.remote_worktree_exists", return_value=True), \
+             patch("coord.interactive._remote_verify_merge_branch",
+                   side_effect=[first_pass, second_pass]) as mock_verify, \
+             patch("coord.github_ops.issue_is_closed", return_value=True) as mock_closed, \
+             patch("coord.interactive._remote_push_and_count",
+                   return_value=(True, None, 1, "issue-604-fix")), \
+             patch("coord.interactive._remote_worktree_remove", return_value=True), \
+             patch("coord.github_ops.post_issue_comment"):
+            result = finalize_remote_interactive_exit(
+                assignment_id="mg-remote-foreign-closed",
+                repo_name="api",
+                repo_github="acme/api",
+                issue_number=604,
+                machine_name="precision",
+                ssh_target="precision.tailnet",
+                remote_worktree_sh="$HOME/.coord/worktrees/mg-remote-foreign-closed",
+                remote_repo_sh="$HOME/src/api",
+                branch="issue-604-fix",
+                base_branch="main",
+                exit_code=0,
+                started_at=None,
+                verify_merge=True,
+            )
+
+        mock_closed.assert_called_once_with("acme/api", 514)
+        assert mock_verify.call_count == 2, "must re-verify with closed_issue_numbers populated"
+        assert result.merge_verify is not None
+        assert result.merge_verify.ok is True
+        assert result.terminal_status == "done"
+        assert _read_status("mg-remote-foreign-closed") == "done"
+
     def test_worktree_missing_skips_verify(self) -> None:
         """When the remote worktree was never created (a #560 setup
         failure), the verify step must be SKIPPED — mirrors the local
@@ -918,6 +1084,57 @@ class TestVerifyMergeCli:
         assert captured["issue_number"] == 681
         assert captured["base"] == "main"  # resolved from config for repo "api"
         assert "✓ merge-ready" in result.output
+
+    def test_closed_issue_corroboration_downgrades_to_advisory(
+        self, config_file: Path, monkeypatch
+    ) -> None:
+        """#1279: ``coord verify-merge`` itself must wire the closed-issue
+        corroboration through to ``verify_merge_branch`` — it is the command
+        literally named in the issue's symptom, so this is the front door
+        that must stop blocking on a closed-issue typo."""
+        from click.testing import CliRunner
+
+        from coord import client as cc
+        from coord.agent import MergeVerify
+        from coord.cli import main
+        from coord.models import Board
+
+        monkeypatch.setattr(cc, "resolve_board_service", lambda *a, **k: None)
+        monkeypatch.setattr("coord.state.build_board", lambda: Board())
+
+        foreign_commit = ("deadbeef", "fix(#514): unrelated already-merged work")
+        calls: list[dict] = []
+
+        def fake_verify(wt_path, *, base, issue_number, closed_issue_numbers=frozenset()):
+            calls.append({"closed_issue_numbers": closed_issue_numbers})
+            if not closed_issue_numbers:
+                return MergeVerify(
+                    default_ahead=0, added=[foreign_commit], foreign=[foreign_commit]
+                )
+            return MergeVerify(
+                default_ahead=0,
+                added=[foreign_commit],
+                foreign=[],
+                advisory_foreign=[foreign_commit],
+            )
+
+        with patch("coord.agent.verify_merge_branch", side_effect=fake_verify), \
+             patch("coord.github_ops.issue_is_closed", return_value=True) as mock_closed:
+            result = CliRunner().invoke(
+                main,
+                [
+                    "verify-merge", "mg-missing",
+                    "--repo", "api",
+                    "--issue-number", "604",
+                    "--config", str(config_file),
+                ],
+            )
+
+        mock_closed.assert_called_once_with("acme/api", 514)
+        assert len(calls) == 2, "must re-verify once closed issues are resolved"
+        assert result.exit_code == 0, result.output
+        assert "✓ merge-ready" in result.output
+        assert "advisory" in result.output
 
     def test_no_board_no_flags_exits_with_error(
         self, config_file: Path, monkeypatch
