@@ -112,7 +112,12 @@ def fetch_issue_milestone_number(
         issue_data = github_ops.get_issue(repo_github, issue_number)
         milestone = issue_data.get("milestone") or {}
         result = milestone.get("number") if isinstance(milestone, dict) else None
-    except RuntimeError:
+    except Exception:  # noqa: BLE001 — fail-open: a transient gh error (incl.
+        # subprocess.TimeoutExpired on a `gh` hang, json.JSONDecodeError on
+        # truncated output — neither is a RuntimeError) must never abort a
+        # whole dispatch/review/merge/reconcile batch pass over one bad
+        # milestone lookup. Mirrors github_ops.get_branch_diff_size's broad
+        # "fail open, unknown is not blocking" catch.
         result = None
     if cache is not None:
         cache[key] = result
@@ -148,7 +153,12 @@ def ensure_feature_branch_exists(
     Raises ``ValueError`` if *repo* hasn't opted into the git model
     (``develop_branch`` unset) — callers should only invoke this after
     confirming ``repo.develop_branch`` is set (mirrors the guard in
-    :func:`resolve_base_branch`).
+    :func:`resolve_base_branch`). Raises ``RuntimeError`` if *create* reports
+    failure (e.g. ``github_ops.create_remote_branch`` returning ``False`` on
+    a permissions error, transient API failure, or branch-protection
+    rejecting a direct ref-create) — callers must not treat the returned
+    branch name as guaranteed to exist on the remote unless this call
+    returns normally.
     """
     if not repo.develop_branch:
         raise ValueError(
@@ -159,5 +169,16 @@ def ensure_feature_branch_exists(
     if exists(repo.github, branch):
         return branch
     sha = get_sha(repo.github, repo.develop_branch)
-    create(repo.github, branch, sha)
+    if not create(repo.github, branch, sha):
+        # github_ops.create_remote_branch catches its own RuntimeError and
+        # returns False on failure rather than raising (permissions,
+        # transient API error, a race, branch-protection requiring a PR
+        # instead of a direct ref-create) — check the return value and raise
+        # here so callers (e.g. milestone_dispatch.dispatch_entry's
+        # `except (ValueError, RuntimeError)`) actually catch it, instead of
+        # silently returning a branch name that doesn't exist on the remote.
+        raise RuntimeError(
+            f"failed to create feature branch {branch!r} for repo "
+            f"{repo.name!r} off {repo.develop_branch!r}"
+        )
     return branch

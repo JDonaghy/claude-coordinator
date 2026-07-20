@@ -102,6 +102,35 @@ class TestFetchIssueMilestoneNumber:
         with patch.object(bm.github_ops, "get_issue", boom):
             assert fetch_issue_milestone_number("acme/api", 7) is None
 
+    def test_fails_open_on_gh_timeout(self) -> None:
+        """Review finding #2: a `gh` hang past the 30s subprocess timeout
+        raises subprocess.TimeoutExpired, NOT RuntimeError — the fail-open
+        contract must cover this too, or one slow issue lookup aborts an
+        entire dispatch/review/merge/reconcile batch pass."""
+        import subprocess
+        import coord.branch_model as bm
+        from unittest.mock import patch
+
+        def boom(*a):
+            raise subprocess.TimeoutExpired(cmd="gh", timeout=30)
+
+        with patch.object(bm.github_ops, "get_issue", boom):
+            assert fetch_issue_milestone_number("acme/api", 7) is None
+
+    def test_fails_open_on_malformed_json(self) -> None:
+        """Review finding #2: truncated/malformed `gh` output raises
+        json.JSONDecodeError from inside github_ops.get_issue — also not a
+        RuntimeError, also must fail open."""
+        import json
+        import coord.branch_model as bm
+        from unittest.mock import patch
+
+        def boom(*a):
+            raise json.JSONDecodeError("Expecting value", "", 0)
+
+        with patch.object(bm.github_ops, "get_issue", boom):
+            assert fetch_issue_milestone_number("acme/api", 7) is None
+
     def test_cache_avoids_second_call(self) -> None:
         calls = []
 
@@ -151,3 +180,23 @@ class TestEnsureFeatureBranchExists:
         )
         assert result == "feature/ms-42"
         assert created == [("acme/api", "feature/ms-42", "deadbeef")]
+
+    def test_raises_when_create_reports_failure(self) -> None:
+        """Review finding #1: github_ops.create_remote_branch catches its
+        own RuntimeError and returns False on failure rather than raising.
+        ensure_feature_branch_exists must check that return value and raise
+        itself — otherwise it silently returns a branch name that doesn't
+        exist on the remote, and callers relying on `except (ValueError,
+        RuntimeError)` (e.g. milestone_dispatch.dispatch_entry) never catch
+        the failure."""
+        repo = _repo(default_branch="main", develop_branch="develop")
+        try:
+            ensure_feature_branch_exists(
+                repo, 42,
+                exists=lambda gh, b: False,
+                get_sha=lambda gh, b: "deadbeef",
+                create=lambda gh, b, sha: False,
+            )
+            raise AssertionError("expected RuntimeError")
+        except RuntimeError:
+            pass
