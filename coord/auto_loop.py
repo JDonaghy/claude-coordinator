@@ -326,10 +326,25 @@ def _advance_pipeline(
                 from coord import merge_queue as mq  # noqa: PLC0415
                 repo_cfg = config.repo(work.repo_name)
                 if repo_cfg is not None and work.branch:
+                    # #934: target `feature/ms-NN` when this issue belongs
+                    # to a milestone and the repo opted into the git model —
+                    # the milestone lookup itself is skipped (no `gh` call)
+                    # when it hasn't, falling back to `default_branch`.
+                    target_branch = repo_cfg.default_branch
+                    if repo_cfg.develop_branch:
+                        from coord.branch_model import (  # noqa: PLC0415
+                            fetch_issue_milestone_number,
+                            resolve_base_branch,
+                        )
+
+                        milestone_number = fetch_issue_milestone_number(
+                            repo_cfg.github, work.issue_number,
+                        )
+                        target_branch = resolve_base_branch(repo_cfg, milestone_number)
                     mq.refresh_entry_assignment(
                         work,
                         repo_github=repo_cfg.github,
-                        target_branch=repo_cfg.default_branch,
+                        target_branch=target_branch,
                     )
             except Exception as exc:  # noqa: BLE001 — best-effort; merge gate still works
                 log.warning(
