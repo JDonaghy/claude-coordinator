@@ -590,3 +590,72 @@ class TestDispatchEntry:
         assert outcome.ok is False
         assert "already claimed" in outcome.error
         disp.assert_not_called()
+
+    def test_opted_in_repo_ensures_feature_branch_and_threads_milestone_number(
+        self, coord_db,
+    ) -> None:
+        """#934: a repo with develop_branch set + an issue that belongs to a
+        milestone should call branch_model.ensure_feature_branch_exists and
+        thread milestone_number onto the Proposal — the actual integration
+        point the review flagged as untested (only dispatch()'s own base-
+        branch resolution had coverage, not dispatch_entry's derivation of
+        milestone_number from the fetched issue or its call to
+        ensure_feature_branch_exists)."""
+        cfg = _config([_machine("laptop", ["api"])], repos=[
+            Repo(name="api", github="acme/api", develop_branch="develop"),
+        ])
+        board = Board()
+        pick = self._pick(cfg, board)
+        repo = cfg.repo("api")
+
+        proposals = []
+
+        def fake_dispatch(proposal, config):
+            proposals.append(proposal)
+            return {"id": "asn-1"}
+
+        with patch(
+            "coord.github_ops.get_issue",
+            return_value={"title": "Fix X", "body": "b", "labels": [],
+                          "milestone": {"number": 9, "title": "M9"}},
+        ), \
+             patch("coord.dispatch.dispatch", side_effect=fake_dispatch), \
+             patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.github_ops.check_branch_exists", return_value=False), \
+             patch("coord.branch_model.ensure_feature_branch_exists",
+                   return_value="feature/ms-9") as ensure_mock:
+            outcome = dispatch_entry(pick, repo, cfg, board, tracking_issue=100)
+
+        assert outcome.ok is True
+        ensure_mock.assert_called_once_with(repo, 9)
+        assert len(proposals) == 1
+        assert proposals[0].milestone_number == 9
+
+    def test_feature_branch_creation_failure_fails_dispatch_loudly(
+        self, coord_db,
+    ) -> None:
+        """#934 review finding #1: ensure_feature_branch_exists raising
+        RuntimeError (e.g. the remote branch-create call failed) must fail
+        dispatch_entry with a clear error at dispatch time, not silently
+        proceed to dispatch a worker whose branch payload names a ref that
+        doesn't exist on the remote."""
+        cfg = _config([_machine("laptop", ["api"])], repos=[
+            Repo(name="api", github="acme/api", develop_branch="develop"),
+        ])
+        board = Board()
+        pick = self._pick(cfg, board)
+        repo = cfg.repo("api")
+
+        with patch(
+            "coord.github_ops.get_issue",
+            return_value={"title": "Fix X", "body": "b", "labels": [],
+                          "milestone": {"number": 9, "title": "M9"}},
+        ), \
+             patch("coord.dispatch.dispatch") as disp, \
+             patch("coord.branch_model.ensure_feature_branch_exists",
+                   side_effect=RuntimeError("failed to create feature branch")):
+            outcome = dispatch_entry(pick, repo, cfg, board, tracking_issue=100)
+
+        assert outcome.ok is False
+        assert "could not ensure feature/ms-9 exists" in outcome.error
+        disp.assert_not_called()
