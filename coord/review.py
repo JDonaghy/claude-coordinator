@@ -966,6 +966,7 @@ def dispatch_review(
     remote_branch_checker=None,
     branch_sha_fetcher=None,
     health_checker=None,
+    milestone_fetcher=None,
 ) -> Assignment | None:
     """Open a PR for `completed` and dispatch a review assignment.
 
@@ -1048,10 +1049,25 @@ def dispatch_review(
         print(f"[review] skipping auto-dispatch review: {exc}")
         return None
 
+    # #934: resolve this issue's base branch — `feature/ms-NN` when it
+    # belongs to a milestone and the repo opted into the git model,
+    # `repo.default_branch` (today's behavior) otherwise. Resolved once and
+    # reused for the PR base, the diff-command text in the briefing, and the
+    # `branch` payload field below, so they never disagree. The milestone
+    # lookup itself is skipped entirely (no `gh` call) when the repo hasn't
+    # opted in — a non-opted-in repo pays zero extra cost.
+    base_branch = repo.default_branch
+    if repo.develop_branch:
+        from coord.branch_model import resolve_base_branch  # noqa: PLC0415
+
+        fetch_milestone = milestone_fetcher or _fetch_issue_milestone_number
+        milestone_number = fetch_milestone(repo.github, completed.issue_number)
+        base_branch = resolve_base_branch(repo, milestone_number)
+
     pr = pr_lookup(
         repo.github,
         branch=completed.branch,
-        default_branch=repo.default_branch,
+        default_branch=base_branch,
         issue_number=completed.issue_number,
         issue_title=completed.issue_title,
         assignment_type=completed.type,
@@ -1189,7 +1205,7 @@ def dispatch_review(
             same_as_worker=same_as_worker,
             reviews_cfg=config.reviews,
             repo_claude_md=claude_md,
-            default_branch=repo.default_branch,
+            default_branch=base_branch,
             # #476: a fix worker carries review_iteration > 0; its re-review is
             # scoped to the fix delta rather than re-reviewing the whole PR.
             review_iteration=getattr(completed, "review_iteration", 0) or 0,
@@ -1214,7 +1230,7 @@ def dispatch_review(
             # #255: review checkout uses the PR branch, but the agent's worktree
             # setup still consults `branch` as the integration base when no PR
             # branch exists locally yet.  Match the work-dispatch path.
-            "branch": repo.default_branch or "main",
+            "branch": base_branch or "main",
         }
 
         url = f"http://{machine.host}:{AGENT_PORT}/assign"
@@ -1483,6 +1499,18 @@ def _fetch_issue_body(repo_github: str, issue_number: int) -> str:
         return json.loads(raw).get("body", "") or ""
     except (RuntimeError, ValueError):
         return ""
+
+
+def _fetch_issue_milestone_number(repo_github: str, issue_number: int) -> int | None:
+    """Best-effort fetch of the issue's GitHub Milestone number, or ``None``
+    if it has none or the fetch fails (fail-open: #934's ``resolve_base_branch``
+    falls back to ``default_branch`` when the milestone is unknown, same as
+    when it's genuinely absent). Delegates to ``coord.branch_model.
+    fetch_issue_milestone_number`` so every call site fails open the same way.
+    """
+    from coord.branch_model import fetch_issue_milestone_number  # noqa: PLC0415
+
+    return fetch_issue_milestone_number(repo_github, issue_number)
 
 
 # ── Headless fix dispatch (dashboard / phone API) ────────────────────────────

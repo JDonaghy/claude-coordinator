@@ -576,6 +576,28 @@ def dispatch_entry(
             required_gates = list(config.pipeline.labels[lbl])
             break
 
+    # #934: this issue's GitHub Milestone number, when it has one —
+    # `issue_data` already carries it (`coord.github_ops.get_issue`'s
+    # `milestone` field), so no extra fetch is needed. Threaded onto the
+    # Proposal so `coord.dispatch.dispatch()` can resolve the worker's base
+    # branch via `coord.branch_model.resolve_base_branch` (`feature/ms-NN`
+    # for a repo that opted into the git model, `default_branch` otherwise).
+    issue_milestone = issue_data.get("milestone") or {}
+    milestone_number = issue_milestone.get("number") if isinstance(issue_milestone, dict) else None
+
+    if milestone_number is not None and repo_cfg.develop_branch:
+        from coord.branch_model import ensure_feature_branch_exists  # noqa: PLC0415
+
+        try:
+            ensure_feature_branch_exists(repo_cfg, milestone_number)
+        except (ValueError, RuntimeError) as e:
+            return DispatchOutcome(
+                issue_number=issue_number,
+                machine_name=machine.name,
+                ok=False,
+                error=f"could not ensure feature/ms-{milestone_number} exists: {e}",
+            )
+
     proposal = Proposal(
         id=0,
         machine_name=machine.name,
@@ -587,6 +609,7 @@ def dispatch_entry(
         model=config.models.default,
         type="plan" if config.dispatch.require_plan else "work",
         required_gates=required_gates,
+        milestone_number=milestone_number,
     )
 
     try:

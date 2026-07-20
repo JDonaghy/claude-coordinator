@@ -172,7 +172,20 @@ def dispatch(
     # silently routed around `default_branch: develop` repos like quadraui
     # and let local-only commits on the default branch slip into worker
     # branches.
-    default_branch = (repo.default_branch if repo is not None else None) or "main"
+    #
+    # #934: when the target issue belongs to a milestone (`proposal.
+    # milestone_number`, set by callers like `coord.milestone_dispatch.
+    # dispatch_entry` that already fetched the issue) and the repo has
+    # opted into the develop + feature-branch-per-milestone git model
+    # (`repo.develop_branch` set), branch off `feature/ms-NN` instead —
+    # `coord.branch_model.resolve_base_branch` falls back to today's flat
+    # `default_branch` behavior for every other repo/proposal.
+    from coord.branch_model import resolve_base_branch  # noqa: PLC0415
+
+    if repo is not None:
+        default_branch = resolve_base_branch(repo, proposal.milestone_number)
+    else:
+        default_branch = "main"
 
     # #305: artifact_paths are only relevant for work assignments.  Skip for
     # review, smoke, refinement, and other non-work types.
