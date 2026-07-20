@@ -36,7 +36,13 @@ pub(crate) struct WorkOrderNode {
 pub(crate) enum NodeState {
     /// Issue closed — this node has reached a terminal state.
     Done,
-    /// An assignment for this issue currently has `status == "running"`.
+    /// Any **workable** assignment (work, review, smoke, conflict-fix, fix-*)
+    /// exists for this issue — regardless of whether it is currently running.
+    /// An open issue whose work has completed but is still awaiting
+    /// Test/Review/Merge (no live session, but with a settled work row) lands
+    /// here rather than `Ready`.  `refinement`, `chat`, `new-issue-chat`, and
+    /// `test-chat` assignments do NOT promote a node out of `Ready` — the same
+    /// `is_workable_type` predicate used by the Pipeline lifecycle classifier.
     InFlight,
     /// Not done, not in flight, and at least one `after` dependency hasn't
     /// reached `Done` yet. Carries the still-unmet dependency issue numbers.
@@ -349,10 +355,19 @@ pub(crate) fn build_dag_nodes(
                 .find(|oi| oi.repo_name == repo_name && oi.number == n.issue_number);
             let state = if terminal.contains(&n.issue_number) {
                 NodeState::Done
-            } else if assignments
-                .iter()
-                .any(|a| a.repo == repo_name && a.issue_number == n.issue_number && a.status == "running")
-            {
+            } else if assignments.iter().any(|a| {
+                // #1287: widen InFlight from "has a *running* assignment" to "has
+                // ANY workable assignment" — a child whose work has completed but
+                // whose issue is still open (Test/Review/Merge pending, no live
+                // session) must not fall back to Ready.  Scoping conversations
+                // (refinement, chat, new-issue-chat, test-chat) are NOT pipeline
+                // execution and do NOT promote a node out of Ready — same
+                // is_workable_type predicate as the Pipeline lifecycle classifier.
+                // None assignment_type defaults to true (treated as "work").
+                a.repo == repo_name
+                    && a.issue_number == n.issue_number
+                    && a.assignment_type.as_deref().map(is_workable_type).unwrap_or(true)
+            }) {
                 NodeState::InFlight
             } else {
                 let unmet: Vec<u64> = n
@@ -1235,6 +1250,15 @@ mod pure_tests {
     }
 
     fn make_assignment(repo: &str, issue_number: u64, status: &str) -> Assignment {
+        make_assignment_typed(repo, issue_number, status, None)
+    }
+
+    fn make_assignment_typed(
+        repo: &str,
+        issue_number: u64,
+        status: &str,
+        atype: Option<&str>,
+    ) -> Assignment {
         Assignment {
             id: "a1".to_string(),
             repo: repo.to_string(),
@@ -1247,7 +1271,7 @@ mod pure_tests {
             dispatched_at: None,
             finished_at: None,
             exit_code: None,
-            assignment_type: None,
+            assignment_type: atype.map(|s| s.to_string()),
             test_state: None,
             review_verdict: None,
             review_of_assignment_id: None,
@@ -1401,6 +1425,102 @@ Not part of the block.
         let nodes = build_dag_nodes(&work_order, "repo", &open_issues, &[]);
         assert_eq!(nodes[0].state, NodeState::Done);
         assert_eq!(nodes[1].state, NodeState::Ready);
+    }
+
+    // ── #1287: completed-assignment ⇒ InFlight, not Ready ────────────────────
+
+    /// #1287: a child whose work assignment has FINISHED (status="done") but
+    /// whose issue is still OPEN (Test/Review/Merge still pending) must be
+    /// `InFlight`, not `Ready`.  Before this fix, the `InFlight` arm only
+    /// checked `status == "running"`, so a settled work row fell through to
+    /// `Ready`, dragging the parent epic into "New".
+    #[test]
+    fn build_dag_nodes_completed_work_assignment_is_inflight() {
+        let work_order = vec![WorkOrderNode { issue_number: 10, group: None, after: vec![] }];
+        let open_issues = vec![issue("repo", 10, "Worked child", "open", &[])];
+        // status="done", type="work" — completed but issue still open
+        let assignments = vec![make_assignment_typed("repo", 10, "done", Some("work"))];
+        let nodes = build_dag_nodes(&work_order, "repo", &open_issues, &assignments);
+        assert_eq!(
+            nodes[0].state,
+            NodeState::InFlight,
+            "an open issue with a settled work assignment must be InFlight, not Ready",
+        );
+    }
+
+    /// #1287: a child with ONLY a refinement assignment (not workable) must
+    /// stay `Ready` — scoping conversations are NOT pipeline execution.
+    #[test]
+    fn build_dag_nodes_refinement_assignment_stays_ready() {
+        let work_order = vec![WorkOrderNode { issue_number: 11, group: None, after: vec![] }];
+        let open_issues = vec![issue("repo", 11, "Refining child", "open", &[])];
+        let assignments = vec![make_assignment_typed("repo", 11, "done", Some("refinement"))];
+        let nodes = build_dag_nodes(&work_order, "repo", &open_issues, &assignments);
+        assert_eq!(
+            nodes[0].state,
+            NodeState::Ready,
+            "a refinement assignment must NOT promote a node out of Ready",
+        );
+    }
+
+    /// #1287: same for other non-workable assignment types: `chat`,
+    /// `new-issue-chat`, and `test-chat` must all leave the node at `Ready`.
+    #[test]
+    fn build_dag_nodes_chat_assignments_stay_ready() {
+        for ty in ["chat", "new-issue-chat", "test-chat"] {
+            let work_order = vec![WorkOrderNode { issue_number: 12, group: None, after: vec![] }];
+            let open_issues = vec![issue("repo", 12, "Chat child", "open", &[])];
+            let assignments = vec![make_assignment_typed("repo", 12, "done", Some(ty))];
+            let nodes = build_dag_nodes(&work_order, "repo", &open_issues, &assignments);
+            assert_eq!(
+                nodes[0].state,
+                NodeState::Ready,
+                "assignment_type={ty:?} must NOT promote a node out of Ready",
+            );
+        }
+    }
+
+    /// #1287: a running work assignment (the original `status == "running"` case)
+    /// must still be `InFlight` — the fix must not regress the pre-existing path.
+    #[test]
+    fn build_dag_nodes_running_work_assignment_still_inflight() {
+        let work_order = vec![WorkOrderNode { issue_number: 13, group: None, after: vec![] }];
+        let open_issues = vec![issue("repo", 13, "Running child", "open", &[])];
+        let assignments = vec![make_assignment_typed("repo", 13, "running", Some("work"))];
+        let nodes = build_dag_nodes(&work_order, "repo", &open_issues, &assignments);
+        assert_eq!(
+            nodes[0].state,
+            NodeState::InFlight,
+            "a running work assignment must still be InFlight",
+        );
+    }
+
+    /// #1287: "Dispatch next…" uses the first `NodeState::Ready` node.  A
+    /// child with a completed work assignment must NOT be `Ready`, so it can
+    /// no longer be incorrectly re-dispatched.
+    #[test]
+    fn build_dag_nodes_dispatch_next_skips_worked_child() {
+        // Node 20 has a done work assignment — must be InFlight, not picked.
+        // Node 21 has no assignment — must be Ready, picked first.
+        let work_order = vec![
+            WorkOrderNode { issue_number: 20, group: None, after: vec![] },
+            WorkOrderNode { issue_number: 21, group: None, after: vec![] },
+        ];
+        let open_issues = vec![
+            issue("repo", 20, "Worked", "open", &[]),
+            issue("repo", 21, "Not yet started", "open", &[]),
+        ];
+        let assignments = vec![make_assignment_typed("repo", 20, "done", Some("work"))];
+        let nodes = build_dag_nodes(&work_order, "repo", &open_issues, &assignments);
+        assert_eq!(nodes[0].state, NodeState::InFlight);
+        assert_eq!(nodes[1].state, NodeState::Ready);
+        // Simulate "Dispatch next…" — first Ready wins.
+        let next = nodes.iter().find(|n| n.state == NodeState::Ready).map(|n| n.issue_number);
+        assert_eq!(
+            next,
+            Some(21),
+            "Dispatch next must skip the worked child (#20 is InFlight) and pick #21",
+        );
     }
 
     #[test]
