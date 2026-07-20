@@ -394,6 +394,45 @@ def _audit_worktree_clean(swept: list[dict]) -> None:
     )
 
 
+def _live_assignment_ids_per_machine(config: Config) -> dict[str, list[str]]:
+    """Return, per machine, the assignment_ids the board considers non-terminal.
+
+    Used by :func:`_clean_worktrees_tick` (#1295) to build the ``protect``
+    list forwarded to each agent's ``POST /worktree-clean``.  "Non-terminal"
+    is anything ``coord._board_mapping._ACTIVE_STATUSES`` classifies as
+    still-in-flight — i.e. ``pending`` (dispatched, worker not yet started)
+    and ``running`` (worker live).  Reads from ``Board.active`` so we track
+    the same active-status set the rest of the coordinator uses.  A row
+    without an ``assignment_id`` is silently dropped — nothing on disk
+    keys off it.
+
+    Fail-open: on any exception (DB missing, sqlite hiccup, unexpected
+    row shape) the return is an empty dict — the tmux guard on the agent
+    side is still load-bearing, so a coordinator-side glitch degrades to
+    "old behaviour" instead of blocking the sweep.  Machine names not
+    present in the returned dict simply get no protect list forwarded.
+    """
+    from coord.state import build_board  # noqa: PLC0415
+
+    live: dict[str, list[str]] = {}
+    try:
+        board = build_board()
+    except Exception:  # noqa: BLE001 — never propagate out of the tick
+        return {}
+    # ``Board.active`` already carries exactly the "pending | running" set
+    # (see :data:`coord._board_mapping._ACTIVE_STATUSES`).  Iterating it
+    # keeps the coordinator-side notion of "still in-flight" in one place.
+    for a in getattr(board, "active", []) or []:
+        aid = getattr(a, "assignment_id", None)
+        if not aid:
+            continue
+        machine = getattr(a, "machine_name", None)
+        if not machine:
+            continue
+        live.setdefault(machine, []).append(aid)
+    return live
+
+
 def _clean_worktrees_tick(config: Config) -> list[dict]:
     """Sweep every machine's orphaned worktrees for terminal assignments (#1220).
 
@@ -415,6 +454,16 @@ def _clean_worktrees_tick(config: Config) -> list[dict]:
     unreachable is recorded as an error entry for that machine only — it
     never blocks the sweep on the rest of the fleet.
 
+    #1295: forwards a per-machine ``protect`` list of board-known-live
+    assignment_ids (computed via :func:`_live_assignment_ids_per_machine`)
+    as a coordinator-side belt-and-braces guard.  The agent's own
+    ``tmux has-session -t coord-<aid>`` check in
+    :meth:`AgentServer.clean_worktrees` remains the primary defence — the
+    coordinator's board-view is authoritative for "is this dispatch still
+    known to the system", but only tmux knows whether an operator is
+    actually attached right now.  We do NOT rely on board status alone,
+    for exactly the reason the issue calls out.
+
     Returns one result dict per machine: ``{"machine": name, "ok": bool,
     "cleaned": N, "kept": M, "bytes_freed": B, "error": str | None}``.
     Extracted as a module-level function so tests can call it directly
@@ -423,9 +472,12 @@ def _clean_worktrees_tick(config: Config) -> list[dict]:
     """
     from coord import network  # noqa: PLC0415
 
+    live_per_machine = _live_assignment_ids_per_machine(config)
+
     results: list[dict] = []
     for machine in config.machines:
-        r = network.clean_worktrees(machine)
+        protect = live_per_machine.get(machine.name)
+        r = network.clean_worktrees(machine, protect=protect)
         results.append({"machine": machine.name, **r})
 
     swept = [r for r in results if r["ok"] and r["cleaned"] > 0]

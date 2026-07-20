@@ -411,6 +411,53 @@ def test_worktree_clean_respects_recent_secs(tmp_path: Path) -> None:
     assert not fresh.exists()
 
 
+def test_worktree_clean_accepts_optional_protect_field(tmp_path: Path) -> None:
+    """#1295: POST /worktree-clean accepts an optional ``protect`` list of
+    assignment IDs the coordinator considers non-terminal, and preserves
+    them across the sweep even when ``recent_secs=0``.
+
+    Compatibility: the field is fully optional (existing callers pass only
+    ``recent_secs``), and unknown/extra keys must NOT 400 — verified by
+    the ``xtra`` filler below.
+    """
+    client, server = _client(tmp_path)
+    protected = server.state_dir / "worktrees" / "coord-known-live-aid"
+    other = server.state_dir / "worktrees" / "genuinely-orphaned"
+    for wt in (protected, other):
+        wt.mkdir(parents=True)
+        (wt / "data.txt").write_text("x")
+
+    r = client.post(
+        "/worktree-clean",
+        json={
+            "recent_secs": 0,
+            "protect": ["coord-known-live-aid"],
+            # Extra unknown field must be silently ignored (backward-compat
+            # invariant: older callers may send new fields to newer agents
+            # and newer callers may send old fields to older agents).
+            "xtra": "ignored-please",
+        },
+    )
+    assert r.status_code == 200
+    body = r.json()
+    # Return shape is unchanged and protected entry counts as kept.
+    assert set(body) == {"cleaned", "kept", "bytes_freed"}
+    assert body["cleaned"] == 1
+    assert body["kept"] == 1
+    assert protected.exists()
+    assert not other.exists()
+
+
+def test_worktree_clean_no_body_still_works(tmp_path: Path) -> None:
+    """#1295 compat: an older client that POSTs no body (or an empty body)
+    to a new agent must still work — the ``protect`` field is optional."""
+    client, _ = _client(tmp_path)
+    # Empty body → default recent_secs, no protect list.
+    r = client.post("/worktree-clean", json={})
+    assert r.status_code == 200
+    assert set(r.json()) == {"cleaned", "kept", "bytes_freed"}
+
+
 # ── GET /artifact/{repo}/{branch} ─────────────────────────────────────────────
 
 

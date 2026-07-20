@@ -252,7 +252,21 @@ def _openapi_spec() -> dict:
                         "application/json": {
                             "schema": {
                                 "type": "object",
-                                "properties": {"recent_secs": {"type": "number"}},
+                                "properties": {
+                                    "recent_secs": {"type": "number"},
+                                    "protect": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                        "description": (
+                                            "#1295: assignment IDs the caller "
+                                            "considers non-terminal; the agent "
+                                            "keeps their worktrees regardless "
+                                            "of its own state.  Optional — an "
+                                            "older agent without this field "
+                                            "behaves exactly as before."
+                                        ),
+                                    },
+                                },
                             }
                         }
                     },
@@ -610,8 +624,19 @@ def build_app(
         and those finished within the last 5 minutes.  Returns a JSON
         summary: ``{"cleaned": N, "kept": M, "bytes_freed": B}``.
 
-        Optional JSON body: ``{"recent_secs": 300}`` to override the
-        recency window (default 300 s).
+        Optional JSON body::
+
+            {
+                "recent_secs": 300,           # override recency window (s)
+                "protect": ["aid1", "aid2"]   # #1295: never sweep these AIDs
+            }
+
+        ``protect`` is optional and free-form — unknown/extra keys in the
+        body are ignored, so a coordinator sending the new field to an
+        older agent that ignores it, and a coordinator omitting the field
+        entirely against a new agent, both work.  A protected entry is
+        counted as ``kept`` in the response; the return shape is
+        unchanged.
         """
         body: dict = {}
         try:
@@ -619,7 +644,17 @@ def build_app(
         except Exception:
             pass
         recent_secs = float(body.get("recent_secs", 300.0))
-        result = server.clean_worktrees(recent_secs=recent_secs)
+        # #1295: accept "protect" as either a list or omitted.  Anything
+        # non-list-like (a string, a dict, garbage) is dropped rather
+        # than 400ing — we prefer to sweep what we can over rejecting an
+        # otherwise-valid request because of a malformed side field.
+        raw_protect = body.get("protect")
+        protect: list[str] | None
+        if isinstance(raw_protect, list):
+            protect = [str(x) for x in raw_protect if isinstance(x, str)]
+        else:
+            protect = None
+        result = server.clean_worktrees(recent_secs=recent_secs, protect=protect)
         return JSONResponse(result)
 
     async def restart(request: Request) -> JSONResponse:
