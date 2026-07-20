@@ -711,21 +711,25 @@ class ModelRates:
 
 
 def _default_pricing() -> dict[str, ModelRates]:
-    """Built-in per-1M-token rates for the three canonical model tiers.
+    """Built-in per-1M-token rates for the four canonical model tiers.
 
-    Official Anthropic list pricing at time of writing (Sonnet/Opus/Haiku
-    input+output list price; cache_read = 0.1x input, cache_creation = 1.25x
-    input, the standard 5-minute-TTL cache economics) — verified against the
-    live price list at review (#1118 review: the shipped Opus row previously
-    regressed to 1/3 of the correct value; pinned exactly by
-    ``test_pricing_absent_defaults_to_builtin_rates`` in
-    ``tests/test_config_pricing.py`` so it can't silently drift again). A
+    Official Anthropic list pricing at time of writing (Sonnet/Opus/Haiku/
+    Fable input+output list price; cache_read = 0.1x input, cache_creation =
+    1.25x input, the standard 5-minute-TTL cache economics) — pinned exactly
+    by ``test_pricing_absent_defaults_to_builtin_rates`` in
+    ``tests/test_config_pricing.py`` so it can't silently drift again. A
     ``pricing:`` block in coordinator.yml overrides or extends any of these.
+
+    #1290: the Opus row previously carried ``15.00/75.00`` (Opus 3 / 4.0 /
+    4.1 era pricing, mistakenly pinned as "verified" at #1118 review).
+    Current Opus (4.6 through 4.8) list price is ``5.00/25.00`` — corrected
+    here. Sonnet and Haiku were already correct.
     """
     return {
         "sonnet": ModelRates(input=3.00, output=15.00, cache_read=0.30, cache_creation=3.75),
-        "opus": ModelRates(input=15.00, output=75.00, cache_read=1.50, cache_creation=18.75),
+        "opus": ModelRates(input=5.00, output=25.00, cache_read=0.50, cache_creation=6.25),
         "haiku": ModelRates(input=1.00, output=5.00, cache_read=0.10, cache_creation=1.25),
+        "fable": ModelRates(input=10.00, output=50.00, cache_read=1.00, cache_creation=12.50),
     }
 
 

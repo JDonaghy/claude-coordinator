@@ -147,6 +147,12 @@ class TestNextModel:
         assert mc.next_model("small") == "big"
         assert mc.next_model("big") == "big"
 
+    def test_opus_to_fable_four_rung_ladder(self) -> None:
+        """#1290: with fable added as the top rung, opus escalates to it."""
+        mc = ModelsConfig(escalation=["haiku", "sonnet", "opus", "fable"])
+        assert mc.next_model("opus") == "fable"
+        assert mc.next_model("fable") == "fable"
+
 
 # ── Worker command --model flag ────────────────────────────────────────────
 
