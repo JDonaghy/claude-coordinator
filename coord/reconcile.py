@@ -237,7 +237,9 @@ def _capture_tokens_best_effort(assignment_id: str, entry: dict) -> None:
         pass
 
 
-def _build_retry_briefing(failed: Assignment, repo_cfg) -> str:
+def _build_retry_briefing(
+    failed: Assignment, repo_cfg, *, default_branch: str | None = None,
+) -> str:
     """#1101: reconstruct a real briefing for a retried assignment.
 
     ``failed.briefing`` is frequently empty or unhelpful by the time a
@@ -274,7 +276,24 @@ def _build_retry_briefing(failed: Assignment, repo_cfg) -> str:
 
     sections: list[str] = []
     if failed.branch:
-        default_branch = (repo_cfg.default_branch if repo_cfg is not None else None) or "main"
+        # #934: point the retry's diff/log instructions at `feature/ms-NN`
+        # when this issue belongs to a milestone and the repo opted into the
+        # git model — falls back to `default_branch` (today's behavior)
+        # otherwise. Callers that already resolved this (``_reassign``) pass
+        # it in via *default_branch*; otherwise resolve it here, but only
+        # perform the milestone lookup (a `gh` call) when the repo opted in.
+        if default_branch is None:
+            default_branch = (repo_cfg.default_branch if repo_cfg is not None else None) or "main"
+            if repo_cfg is not None and repo_cfg.develop_branch:
+                from coord.branch_model import (  # noqa: PLC0415
+                    fetch_issue_milestone_number,
+                    resolve_base_branch,
+                )
+
+                milestone_number = fetch_issue_milestone_number(
+                    repo_cfg.github, failed.issue_number,
+                )
+                default_branch = resolve_base_branch(repo_cfg, milestone_number)
         sections.append(
             "## Retry — continuing existing work\n"
             f"This is a retry of a previously failed assignment "
@@ -371,7 +390,26 @@ def _reassign(
     retry_model_wire = config.models.resolve(retry_model)
 
     repo_cfg = config.repo(failed.repo_name)
-    retry_briefing = _build_retry_briefing(failed, repo_cfg)
+    # #934: retry inherits `feature/ms-NN` as its integration base when this
+    # issue belongs to a milestone and the repo opted into the git model —
+    # falls back to `default_branch` (today's behavior) otherwise. Resolved
+    # once and reused for both the briefing's diff instructions and the
+    # `branch` payload field below, so they never disagree. The milestone
+    # lookup itself is skipped (no `gh` call) when the repo hasn't opted in.
+    retry_default_branch = (repo_cfg.default_branch if repo_cfg is not None else None) or "main"
+    if repo_cfg is not None and repo_cfg.develop_branch:
+        from coord.branch_model import (  # noqa: PLC0415
+            fetch_issue_milestone_number,
+            resolve_base_branch,
+        )
+
+        milestone_number = fetch_issue_milestone_number(
+            repo_cfg.github, failed.issue_number,
+        )
+        retry_default_branch = resolve_base_branch(repo_cfg, milestone_number)
+    retry_briefing = _build_retry_briefing(
+        failed, repo_cfg, default_branch=retry_default_branch,
+    )
     payload = {
         "repo_name": failed.repo_name,
         "repo_path": repo_path,
@@ -385,7 +423,7 @@ def _reassign(
         "model": retry_model_wire,
         # #255: retry inherits the repo's configured default branch as the
         # worker's integration base (the start point / rebase target).
-        "branch": (repo_cfg.default_branch if repo_cfg is not None else None) or "main",
+        "branch": retry_default_branch,
     }
     # #1101: continue the failed assignment's actual branch instead of
     # silently forking a fresh one off the repo default — any real work it
@@ -783,6 +821,11 @@ def close_stale_prs(
             continue
 
         default_branch = repo_cfg.default_branch or "main"
+        # #934: per-run cache for the issue -> milestone-number lookup, since
+        # this loop re-derives the base branch per-PR below (a milestone
+        # issue's stale-PR base is `feature/ms-NN`, not the repo's flat
+        # `default_branch`). Only populated when the repo opted in.
+        milestone_cache: dict = {}
 
         for pr in open_prs:
             branch = pr.get("headRefName") or ""
@@ -799,12 +842,29 @@ def close_stale_prs(
             # Fail-safe classification: when uncertain, leave the PR open.
             stale_reason: str | None = None
 
+            # #934: this issue's actual base — `feature/ms-NN` when it
+            # belongs to a milestone and the repo opted into the git model,
+            # `repo_cfg.default_branch` (today's behavior) otherwise. The
+            # milestone lookup itself is skipped (no `gh` call) when the
+            # repo hasn't opted in.
+            pr_base = default_branch
+            if repo_cfg.develop_branch:
+                from coord.branch_model import (  # noqa: PLC0415
+                    fetch_issue_milestone_number,
+                    resolve_base_branch,
+                )
+
+                milestone_number = fetch_issue_milestone_number(
+                    repo_cfg.github, issue_number, cache=milestone_cache,
+                )
+                pr_base = resolve_base_branch(repo_cfg, milestone_number)
+
             if github_ops.issue_is_closed(repo_cfg.github, issue_number):
                 stale_reason = f"issue #{issue_number} is closed"
             elif github_ops.branch_is_fully_merged(
-                repo_cfg.github, branch, default_branch
+                repo_cfg.github, branch, pr_base
             ):
-                stale_reason = f"all commits already on {default_branch}"
+                stale_reason = f"all commits already on {pr_base}"
 
             if stale_reason is None:
                 continue  # live PR — leave it alone
