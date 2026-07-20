@@ -128,6 +128,17 @@ def verify_merge(
 
     repo_cfg = cfg.repo(repo_name)
     base = (repo_cfg.default_branch if repo_cfg else None) or "main"
+    if repo_cfg is not None and repo_cfg.develop_branch:
+        # #934: verify against `feature/ms-NN` when this issue belongs to a
+        # milestone and the repo opted into the git model — falls back to
+        # `default_branch` (above) for everything else.
+        from coord.branch_model import (  # noqa: PLC0415
+            fetch_issue_milestone_number,
+            resolve_base_branch,
+        )
+
+        milestone_number = fetch_issue_milestone_number(repo_cfg.github, issue_num)
+        base = resolve_base_branch(repo_cfg, milestone_number)
     repo_github = repo_cfg.github if repo_cfg else None
     wt_path = Path(path_opt).expanduser() if path_opt else Path.cwd()
 
@@ -892,6 +903,9 @@ def merge(
     # auto-enqueue loop so one gh round-trip covers every repeated
     # (repo, issue, branch) triple.
     terminal_cache: dict = {}
+    # #934: per-run cache for the issue -> milestone-number lookup, mirroring
+    # terminal_cache above.
+    milestone_cache: dict = {}
     if board is not None:
         for a in board.completed:
             if a.type not in WORK_LIKE_TYPES or a.status != "done":
@@ -945,14 +959,30 @@ def merge(
             # when the original assignment_id no longer matches.  Dedup by
             # (repo_github, branch) is preserved — refresh_entry_assignment is a
             # no-op when the entry is already correctly keyed.
+            # #934: target `feature/ms-NN` when this issue belongs to a
+            # milestone and the repo opted into the git model — the
+            # milestone lookup itself is skipped (no `gh` call) when it
+            # hasn't, falling back to `default_branch` unchanged.
+            target_branch = repo_cfg.default_branch
+            if repo_cfg.develop_branch:
+                from coord.branch_model import (  # noqa: PLC0415
+                    fetch_issue_milestone_number,
+                    resolve_base_branch,
+                )
+
+                milestone_number = fetch_issue_milestone_number(
+                    repo_cfg.github, a.issue_number, cache=milestone_cache,
+                )
+                target_branch = resolve_base_branch(repo_cfg, milestone_number)
+
             if mq.refresh_entry_assignment(
                 a,
                 repo_github=repo_cfg.github,
-                target_branch=repo_cfg.default_branch,
+                target_branch=target_branch,
             ):
                 auto_enqueued.append(
                     f"  auto-enqueued: {a.repo_name} #{a.issue_number} "
-                    f"({a.branch} → {repo_cfg.default_branch})"
+                    f"({a.branch} → {target_branch})"
                 )
     for line in auto_enqueued:
         click.echo(line)

@@ -661,6 +661,7 @@ def enqueue_approved_work(config, board=None) -> list[str]:
 
     changed: list[str] = []
     terminal_cache: dict = {}
+    milestone_cache: dict = {}
 
     completed = list(getattr(board, "completed", []) or [])
     existing_queue = load_queue()
@@ -706,10 +707,28 @@ def enqueue_approved_work(config, board=None) -> list[str]:
         ):
             continue
 
+        # #934: target the milestone's `feature/ms-NN` branch, not
+        # `default_branch`, when this issue belongs to a milestone and the
+        # repo opted into the develop + feature-branch-per-milestone git
+        # model. The milestone lookup itself is skipped entirely (no `gh`
+        # call) when the repo hasn't opted in — fails open to
+        # `default_branch`, today's behavior, unchanged.
+        target_branch = getattr(repo_cfg, "default_branch", None) or "main"
+        if getattr(repo_cfg, "develop_branch", None):
+            from coord.branch_model import (  # noqa: PLC0415
+                fetch_issue_milestone_number,
+                resolve_base_branch,
+            )
+
+            milestone_number = fetch_issue_milestone_number(
+                repo_cfg.github, getattr(a, "issue_number", 0), cache=milestone_cache,
+            )
+            target_branch = resolve_base_branch(repo_cfg, milestone_number)
+
         if refresh_entry_assignment(
             a,
             repo_github=repo_cfg.github,
-            target_branch=repo_cfg.default_branch,
+            target_branch=target_branch,
         ):
             changed.append(aid)
 
