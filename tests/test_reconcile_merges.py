@@ -588,6 +588,103 @@ def test_non_coord_branch_skipped(monkeypatch, config) -> None:
     assert not any("close PR" in s for s in actions)
 
 
+def test_stale_pr_sweep_uses_feature_branch_base_for_opted_in_milestone(
+    monkeypatch,
+) -> None:
+    """#934 review should-fix: close_stale_prs's milestone-aware `pr_base`
+    (coord/reconcile.py:845-860) shipped with no test. A repo that opted
+    into the git model, on a PR whose issue belongs to a milestone, must
+    check branch_is_fully_merged against feature/ms-NN — not the flat
+    default_branch — or a live in-milestone branch could be misclassified
+    as stale and closed."""
+    from coord import github_ops
+
+    cfg = Config(
+        repos=[Repo(name="api", github="acme/api", default_branch="main",
+                     develop_branch="develop")],
+        machines=[],
+    )
+    prs = [{"number": 77, "headRefName": "issue-10-feature"}]
+    closed = _patch_stale_pr_probes(
+        monkeypatch, open_prs=prs, issue_closed=False, fully_merged=False,
+    )
+    monkeypatch.setattr(
+        github_ops, "get_issue",
+        lambda repo, num: {"milestone": {"number": 9, "title": "M9"}},
+    )
+
+    captured: list[tuple] = []
+    real_fully_merged = github_ops.branch_is_fully_merged
+
+    def _spy(repo, branch, default_branch):
+        captured.append((repo, branch, default_branch))
+        return False
+
+    monkeypatch.setattr(github_ops, "branch_is_fully_merged", _spy)
+
+    close_stale_prs(cfg)
+
+    assert captured == [("acme/api", "issue-10-feature", "feature/ms-9")]
+    assert closed == []
+
+
+def test_stale_pr_closed_against_feature_branch_when_actually_stale(
+    monkeypatch,
+) -> None:
+    """Same milestone setup, but the branch IS fully merged into
+    feature/ms-9 — the PR should be closed with a message naming the
+    feature branch, not `main`."""
+    from coord import github_ops
+
+    cfg = Config(
+        repos=[Repo(name="api", github="acme/api", default_branch="main",
+                     develop_branch="develop")],
+        machines=[],
+    )
+    prs = [{"number": 77, "headRefName": "issue-10-feature"}]
+    closed = _patch_stale_pr_probes(
+        monkeypatch, open_prs=prs, issue_closed=False, fully_merged=True,
+    )
+    monkeypatch.setattr(
+        github_ops, "get_issue",
+        lambda repo, num: {"milestone": {"number": 9, "title": "M9"}},
+    )
+
+    actions = close_stale_prs(cfg)
+
+    assert ("acme/api", 77) in closed
+    assert any(
+        "close PR #77" in s and "already on feature/ms-9" in s for s in actions
+    )
+
+
+def test_stale_pr_sweep_uses_default_branch_when_not_opted_in(
+    monkeypatch,
+) -> None:
+    """A repo without develop_branch never calls get_issue for the
+    milestone lookup at all — zero extra cost for non-opted-in repos."""
+    from coord import github_ops
+
+    cfg = Config(
+        repos=[Repo(name="api", github="acme/api", default_branch="main")],
+        machines=[],
+    )
+    prs = [{"number": 77, "headRefName": "issue-10-feature"}]
+    closed = _patch_stale_pr_probes(
+        monkeypatch, open_prs=prs, issue_closed=False, fully_merged=True,
+    )
+
+    def _boom(repo, num):
+        raise AssertionError("get_issue must not be called for a non-opted-in repo")
+
+    monkeypatch.setattr(github_ops, "get_issue", _boom)
+
+    actions = close_stale_prs(cfg)
+
+    assert ("acme/api", 77) in closed
+    assert any("already on main" in s for s in actions)
+
+
 def test_stale_pr_sweep_integrated_into_reconcile_board_merges(
     monkeypatch, config
 ) -> None:
