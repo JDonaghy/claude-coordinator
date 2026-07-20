@@ -31920,6 +31920,327 @@ Milestone tracking issue.
         );
     }
 
+    // ── #1287: epic stranded in New when a child has a completed assignment ──
+
+    /// Fixture for #1287 tests: epic #300 tracking two children:
+    ///   #301 (open) — has a settled ("done") work assignment, no live session.
+    ///   #302 (open) — no assignment yet.
+    /// Plain issue #305 (open, no assignment) so the "New" section also
+    /// renders on screen, proving the epic is NOT there.
+    fn make_epic_completed_child_app() -> CoordApp {
+        let data = BoardData {
+            open_issues: vec![
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 300,
+                    title: "Epic tracker".to_string(),
+                    body: String::new(),
+                    state: "open".to_string(),
+                    labels: vec!["coord".to_string(), "epic".to_string()],
+                    milestone_number: None,
+                    milestone_title: None,
+                },
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 301,
+                    title: "Worked child".to_string(),
+                    body: String::new(),
+                    state: "open".to_string(), // issue open, but work is done
+                    labels: vec!["coord".to_string()],
+                    milestone_number: None,
+                    milestone_title: None,
+                },
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 302,
+                    title: "Unstarted child".to_string(),
+                    body: String::new(),
+                    state: "open".to_string(),
+                    labels: vec!["coord".to_string()],
+                    milestone_number: None,
+                    milestone_title: None,
+                },
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 305,
+                    title: "Plain new issue".to_string(),
+                    body: String::new(),
+                    state: "open".to_string(),
+                    labels: vec!["coord".to_string()],
+                    milestone_number: None,
+                    milestone_title: None,
+                },
+            ],
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            epic_children: vec![EpicChildren {
+                repo_name: "api".to_string(),
+                tracking_issue: 300,
+                children: vec![
+                    EpicChild { number: 301, state: "open".to_string() },
+                    EpicChild { number: 302, state: "open".to_string() },
+                ],
+            }],
+            // #301 has a settled (done) work assignment — the #1287 bug case.
+            // No assignment for #302 (Ready), no running sessions.
+            assignments: vec![make_assignment_typed("done", 301, "api", Some("work"))],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        app.pipeline_issues = vec![
+            PipelineIssue {
+                number: 300,
+                title: "Epic tracker".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string(), "epic".to_string()],
+                is_closed: false,
+            },
+            PipelineIssue {
+                number: 305,
+                title: "Plain new issue".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string()],
+                is_closed: false,
+            },
+        ];
+        app.pipeline_epic_expanded.insert(("api".to_string(), 300), true);
+        app.active_view = SidebarView::Pipeline;
+        app.rebuild_pipeline_sidebar(None);
+        app
+    }
+
+    /// #1287: `pipeline_lifecycle_section` must classify an epic as
+    /// "in-progress" when one child has a completed (non-running) work
+    /// assignment — the child is `InFlight` in the DAG, not `Ready`.
+    #[test]
+    fn pipeline_lifecycle_section_epic_with_completed_child_assignment_is_in_progress() {
+        let app = make_epic_completed_child_app();
+        let epic = app
+            .pipeline_issues
+            .iter()
+            .find(|i| i.number == 300)
+            .expect("#300 must be in pipeline_issues")
+            .clone();
+        assert_eq!(
+            app.pipeline_lifecycle_section(&epic),
+            "in-progress",
+            "#1287: an epic with one child that has a completed work assignment \
+             must be in-progress, not New",
+        );
+    }
+
+    /// #1287 regression: an epic whose children have ONLY non-workable
+    /// (chat/refinement) assignments must stay "new" — scoping conversations
+    /// are NOT pipeline execution.
+    #[test]
+    fn pipeline_lifecycle_section_epic_chat_only_children_stays_new() {
+        let data = BoardData {
+            open_issues: vec![
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 400,
+                    title: "Epic".to_string(),
+                    body: String::new(),
+                    state: "open".to_string(),
+                    labels: vec!["coord".to_string(), "epic".to_string()],
+                    milestone_number: None,
+                    milestone_title: None,
+                },
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 401,
+                    title: "Refining child".to_string(),
+                    body: String::new(),
+                    state: "open".to_string(),
+                    labels: vec!["coord".to_string()],
+                    milestone_number: None,
+                    milestone_title: None,
+                },
+            ],
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            epic_children: vec![EpicChildren {
+                repo_name: "api".to_string(),
+                tracking_issue: 400,
+                children: vec![EpicChild { number: 401, state: "open".to_string() }],
+            }],
+            // Non-workable types — must NOT promote the epic out of New.
+            assignments: vec![
+                make_assignment_typed("done", 401, "api", Some("refinement")),
+                make_assignment_typed("done", 401, "api", Some("chat")),
+                make_assignment_typed("done", 401, "api", Some("new-issue-chat")),
+                make_assignment_typed("done", 401, "api", Some("test-chat")),
+            ],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 400,
+            title: "Epic".to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string(), "epic".to_string()],
+            is_closed: false,
+        }];
+        app.active_view = SidebarView::Pipeline;
+        app.rebuild_pipeline_sidebar(None);
+        let epic = app
+            .pipeline_issues
+            .iter()
+            .find(|i| i.number == 400)
+            .expect("#400 must be in pipeline_issues")
+            .clone();
+        assert_eq!(
+            app.pipeline_lifecycle_section(&epic),
+            "new",
+            "#1287 regression: chat/refinement-only assignments must NOT pull an epic into in-progress",
+        );
+    }
+
+    /// #1287 TuiDriver black-box: an epic with one open child that has a
+    /// completed (non-running) work assignment must render under
+    /// **In-progress → Idle**, NOT under New.  The worked child's nested
+    /// badge must show "in-flight" (not "ready"); the unstarted sibling
+    /// child must still show "ready".
+    ///
+    /// This is the primary rendered regression guard for #1287.
+    #[test]
+    fn tuidriver_pipeline_epic_with_completed_child_is_in_progress_idle() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_epic_completed_child_app();
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 50);
+        let screen = driver.screen();
+
+        // The "In-progress" section header must render — the epic moved out of New.
+        let in_progress_hdr = driver.find("In-progress").expect(&format!(
+            "#1287: In-progress section must render — epic with a completed child \
+             must not be stranded in New:\n{screen}"
+        ));
+        // The "Idle" sub-header must render (no live session, so this is Idle).
+        assert!(
+            driver.screen_contains("Idle"),
+            "#1287: Idle sub-bucket must render (no live session):\n{screen}",
+        );
+
+        // Epic #300 must appear BELOW the In-progress header.
+        let epic_pos = driver
+            .find("#300")
+            .expect(&format!("epic #300 must render:\n{screen}"));
+        assert!(
+            epic_pos.1 > in_progress_hdr.1,
+            "#1287: epic #300 must render below the In-progress header (not stuck in New): \
+             epic={epic_pos:?} hdr={in_progress_hdr:?}\n{screen}",
+        );
+
+        // Plain issue #305 (no assignment) gives us a "New" section; the epic
+        // must NOT be there.
+        let new_hdr = driver
+            .find("▾ New")
+            .or_else(|| driver.find("▸ New"))
+            .or_else(|| driver.find("New"))
+            .expect(&format!(
+                "New section must render for the plain unworked issue #305:\n{screen}"
+            ));
+        // In the Pipeline sidebar In-progress renders ABOVE New.
+        assert!(
+            in_progress_hdr.1 < new_hdr.1,
+            "In-progress header must be above the New header: in_progress={in_progress_hdr:?} new={new_hdr:?}\n{screen}",
+        );
+        assert!(
+            epic_pos.1 < new_hdr.1,
+            "#1287: epic #300 must appear above the New section header (it is in In-progress, not New): \
+             epic={epic_pos:?} new={new_hdr:?}\n{screen}",
+        );
+
+        // Nested child badges — #301 (worked, open) must be "in-flight";
+        // #302 (no assignment) must be "ready".
+        let lines: Vec<&str> = screen.lines().collect();
+
+        let child301_pos = driver
+            .find("#301")
+            .expect(&format!("worked child #301 must render nested under the epic:\n{screen}"));
+        let child301_line = lines
+            .get(child301_pos.1 as usize)
+            .unwrap_or_else(|| panic!("no screen line at #301's row:\n{screen}"));
+        assert!(
+            child301_line.contains("in-flight"),
+            "#1287: child #301 (completed work assignment, open issue) must show \
+             'in-flight' badge, not 'ready': {child301_line:?}\n{screen}",
+        );
+
+        let child302_pos = driver
+            .find("#302")
+            .expect(&format!("unstarted child #302 must render nested under the epic:\n{screen}"));
+        let child302_line = lines
+            .get(child302_pos.1 as usize)
+            .unwrap_or_else(|| panic!("no screen line at #302's row:\n{screen}"));
+        assert!(
+            child302_line.contains("ready"),
+            "#302 (no assignment) must still show 'ready' badge: \
+             {child302_line:?}\n{screen}",
+        );
+    }
+
+    /// #1287 regression: #1253 invariant — an epic with ALL children closed
+    /// (Done) must still land In-progress, not New.  The `terminal` (Done)
+    /// check in `build_dag_nodes` runs before the workable-assignment check
+    /// added by #1287, so Done still wins.
+    #[test]
+    fn pipeline_lifecycle_section_1253_all_children_done_still_in_progress() {
+        // Re-use make_epic_nesting_app but close both children — mirrors
+        // the original #1253 regression test.
+        let mut app = make_epic_nesting_app();
+        for n in [101u64, 102u64] {
+            if let Some(oi) = app
+                .data
+                .open_issues
+                .iter_mut()
+                .find(|oi| oi.repo_name == "api" && oi.number == n)
+            {
+                oi.state = "closed".to_string();
+            }
+        }
+        let epic = app
+            .pipeline_issues
+            .iter()
+            .find(|i| i.number == 100)
+            .expect("#100 must be in pipeline_issues")
+            .clone();
+        assert!(!epic.is_closed, "epic itself must still be open");
+        assert_eq!(
+            app.pipeline_lifecycle_section(&epic),
+            "in-progress",
+            "#1253 regression via #1287: an open epic with ALL children closed \
+             must still be in-progress",
+        );
+    }
+
+    /// #1287 regression: an epic with a RUNNING child must still land under
+    /// In-progress → Live (not regressed by the is_workable_type predicate).
+    #[test]
+    fn pipeline_lifecycle_section_epic_running_child_is_in_progress() {
+        // make_epic_liveness_app already has #101 with status="running" work.
+        let app = make_epic_liveness_app();
+        let epic = app
+            .pipeline_issues
+            .iter()
+            .find(|i| i.number == 100)
+            .expect("#100 must be in pipeline_issues")
+            .clone();
+        assert_eq!(
+            app.pipeline_lifecycle_section(&epic),
+            "in-progress",
+            "#1287 regression: an epic with a running child must still be in-progress",
+        );
+    }
+
     /// #795: `work_order_node_for` finds the correct node by (repo, issue_number).
     #[test]
     fn work_order_node_for_returns_correct_node() {
