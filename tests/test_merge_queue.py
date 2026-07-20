@@ -6,6 +6,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
+from unittest.mock import patch
 
 import pytest
 
@@ -2007,6 +2008,96 @@ class TestEnqueueApprovedWork:
 
         assert changed == []  # already correct — no change
         assert load_queue()[0].assignment_id == "fix1"
+
+    # ── #934 milestone-aware target_branch ──────────────────────────────────
+
+    @staticmethod
+    def _config_with_develop_branch(*, develop_branch: str | None = "develop"):
+        """Same shape as ``_config`` but the repo stand-in also carries
+        ``develop_branch`` — #934's opt-in git model."""
+        from dataclasses import dataclass, field as dc_field
+
+        @dataclass
+        class _Reviews:
+            enabled: bool = True
+
+        @dataclass
+        class _Pipeline:
+            default_gates: list[str] | None = None
+
+        @dataclass
+        class _Repo:
+            name: str = "api"
+            github: str = "acme/api"
+            default_branch: str = "main"
+            develop_branch: str | None = None
+
+        @dataclass
+        class _Cfg:
+            reviews: _Reviews = dc_field(default_factory=_Reviews)
+            pipeline: _Pipeline = dc_field(default_factory=_Pipeline)
+            _repos: list = dc_field(default_factory=lambda: [_Repo(develop_branch=develop_branch)])
+
+            def repo(self, name: str):
+                return next((r for r in self._repos if r.name == name), None)
+
+        cfg = _Cfg()
+        cfg.pipeline.default_gates = ["review", "test", "merge"]
+        return cfg
+
+    def test_targets_feature_branch_for_opted_in_repo_with_milestone(self, coord_db) -> None:
+        """#934 review should-fix: the "merge targets the right base" seam
+        the issue explicitly asked for — enqueue_approved_work must resolve
+        target_branch to feature/ms-NN when the repo opted into the git
+        model and the issue belongs to a milestone, not hardcode
+        default_branch."""
+        cfg = self._config_with_develop_branch(develop_branch="develop")
+        work = self._work("w1", test_state="passed")
+        rev = self._review("w1", verdict="approve")
+        board = self._board(completed=[work, rev])
+
+        with patch(
+            "coord.github_ops.get_issue",
+            return_value={"milestone": {"number": 9, "title": "M9"}},
+        ):
+            changed = mq.enqueue_approved_work(cfg, board)
+
+        assert changed == ["w1"]
+        items = load_queue()
+        assert len(items) == 1
+        assert items[0].target_branch == "feature/ms-9"
+
+    def test_targets_default_branch_when_issue_has_no_milestone(self, coord_db) -> None:
+        """Opted-in repo, but this issue isn't tagged to any milestone —
+        falls back to default_branch, same as an un-opted-in repo."""
+        cfg = self._config_with_develop_branch(develop_branch="develop")
+        work = self._work("w1", test_state="passed")
+        rev = self._review("w1", verdict="approve")
+        board = self._board(completed=[work, rev])
+
+        with patch("coord.github_ops.get_issue", return_value={"milestone": None}):
+            changed = mq.enqueue_approved_work(cfg, board)
+
+        assert changed == ["w1"]
+        items = load_queue()
+        assert items[0].target_branch == "main"
+
+    def test_targets_default_branch_when_repo_not_opted_in(self, coord_db) -> None:
+        """No develop_branch configured → default_branch, and the milestone
+        `gh` lookup must never even happen (zero extra cost for repos that
+        haven't opted in)."""
+        cfg = self._config_with_develop_branch(develop_branch=None)
+        work = self._work("w1", test_state="passed")
+        rev = self._review("w1", verdict="approve")
+        board = self._board(completed=[work, rev])
+
+        with patch("coord.github_ops.get_issue") as get_issue:
+            changed = mq.enqueue_approved_work(cfg, board)
+
+        get_issue.assert_not_called()
+        assert changed == ["w1"]
+        items = load_queue()
+        assert items[0].target_branch == "main"
 
 
 class TestPendingSummary:
