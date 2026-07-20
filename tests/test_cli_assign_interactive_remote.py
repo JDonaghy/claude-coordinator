@@ -1084,6 +1084,132 @@ class TestRemoteStashArtifactsPathExpansion:
         )
 
 
+# ── #1295: _remote_stash_artifacts surfaces the copied count + stderr ───────
+
+
+class TestRemoteStashArtifactsCopiedCount:
+    """Review findings #2/#3 on #1295: the remote stash path used to swallow
+    ALL stderr (both branches of the interpreter fallback redirected to
+    ``/dev/null``) and return a bare ``bool`` fed only by an unconditional
+    ``echo __STASH_DONE`` — so a 0-copy stash on a remote host was
+    indistinguishable from a fully successful one, and the new
+    ``_log.warning("stash: 0 files matched ...")`` inside
+    ``stash_artifacts_for_branch`` never reached anyone because its stderr
+    was thrown away. These tests drive ``_remote_stash_artifacts`` with a
+    mocked ``subprocess.run`` (no real ssh) and assert the new contract:
+    an ``int | None`` return, and stderr preserved for the caller to see.
+    """
+
+    def _fake_result(self, *, stdout: str = "", stderr: str = "", returncode: int = 0):
+        result = MagicMock()
+        result.stdout = stdout
+        result.stderr = stderr
+        result.returncode = returncode
+        return result
+
+    def test_returns_copied_count_from_sentinel(self) -> None:
+        """A successful remote run reports the real copied count, not just True."""
+        from coord.interactive import _remote_stash_artifacts
+
+        with patch(
+            "coord.interactive.subprocess.run",
+            return_value=self._fake_result(stdout="__STASH_COPIED:3\n"),
+        ) as mock_run:
+            copied = _remote_stash_artifacts(
+                "remotebox.tailnet", "$HOME/.coord/worktrees/aid1",
+                "api", "issue-1-x", ["target/debug/foo"], "aid1",
+            )
+        assert copied == 3
+        mock_run.assert_called_once()
+
+    def test_zero_copied_is_not_none_and_is_logged(self, caplog) -> None:
+        """A 0-copy stash is a REAL, meaningful result — distinct from a
+        failed/unconfirmed ssh call — and must be logged so it isn't
+        silently swallowed the way it was before #1295 (stderr → /dev/null).
+        """
+        from coord.interactive import _remote_stash_artifacts
+
+        with patch(
+            "coord.interactive.subprocess.run",
+            return_value=self._fake_result(
+                stdout="__STASH_COPIED:0\n",
+                stderr="WARNING:coord.agent:stash: 0 files matched ['*.bin']\n",
+            ),
+        ):
+            with caplog.at_level("WARNING"):
+                copied = _remote_stash_artifacts(
+                    "remotebox.tailnet", "$HOME/.coord/worktrees/aid2",
+                    "api", "issue-2-x", ["*.bin"], "aid2",
+                )
+        assert copied == 0
+        assert copied is not None
+        assert any("0 files matched" in rec.message for rec in caplog.records)
+
+    def test_returns_none_and_logs_on_ssh_failure(self, caplog) -> None:
+        """An outright ssh/subprocess failure returns None (unconfirmed),
+        never conflated with a real 0-copy result, and is logged.
+        """
+        import subprocess as _subprocess
+
+        from coord.interactive import _remote_stash_artifacts
+
+        with patch(
+            "coord.interactive.subprocess.run",
+            side_effect=_subprocess.TimeoutExpired(cmd="ssh", timeout=60),
+        ):
+            with caplog.at_level("WARNING"):
+                copied = _remote_stash_artifacts(
+                    "remotebox.tailnet", "$HOME/.coord/worktrees/aid3",
+                    "api", "issue-3-x", ["*.bin"], "aid3",
+                )
+        assert copied is None
+        assert any("ssh to remotebox.tailnet failed" in rec.message for rec in caplog.records)
+
+    def test_missing_sentinel_returns_none(self) -> None:
+        """If the remote command produced no __STASH_COPIED sentinel at all
+        (e.g. the interpreter itself crashed before printing it), the result
+        is None — not silently coerced to 0.
+        """
+        from coord.interactive import _remote_stash_artifacts
+
+        with patch(
+            "coord.interactive.subprocess.run",
+            return_value=self._fake_result(stdout="", stderr="Traceback...\n"),
+        ):
+            copied = _remote_stash_artifacts(
+                "remotebox.tailnet", "$HOME/.coord/worktrees/aid4",
+                "api", "issue-4-x", ["*.bin"], "aid4",
+            )
+        assert copied is None
+
+    def test_remote_command_does_not_blanket_redirect_stderr(self) -> None:
+        """Structural regression guard for the root cause: the old command
+        wrapped BOTH interpreter attempts in an unconditional ``2>/dev/null``
+        around the ACTUAL snippet invocation, which is exactly what hid the
+        agent-side warning on this path. A ``2>/dev/null`` on the leading
+        ``command -v`` interpreter *probe* is fine (it only silences "not
+        found", never the stash snippet's own output) — what must NOT
+        recur is a redirect on the ``"$PYBIN" -c <snippet>`` invocation
+        itself, which is where the warning we care about would be printed.
+        """
+        from coord.interactive import _remote_stash_artifacts
+
+        with patch(
+            "coord.interactive.subprocess.run",
+            return_value=self._fake_result(stdout="__STASH_COPIED:1\n"),
+        ) as mock_run:
+            _remote_stash_artifacts(
+                "remotebox.tailnet", "$HOME/.coord/worktrees/aid5",
+                "api", "issue-5-x", ["*.bin"], "aid5",
+            )
+        remote_cmd = mock_run.call_args[0][0][-1]
+        # The snippet invocation is the `"$PYBIN" -c ...` segment — split on
+        # it and confirm nothing downstream of it redirects stderr.
+        assert '"$PYBIN" -c ' in remote_cmd
+        invocation_and_after = remote_cmd.split('"$PYBIN" -c ', 1)[1]
+        assert "2>/dev/null" not in invocation_and_after
+
+
 # ── #560: remote interactive setup-failure detection ─────────────────────────
 
 
