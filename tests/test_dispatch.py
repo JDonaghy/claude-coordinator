@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import replace as dataclasses_replace
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -135,6 +136,45 @@ class TestDispatch:
         mock_resp.json.return_value = {"ok": True}
         mock_post.return_value = mock_resp
         dispatch(proposal, config)
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["branch"] == "main"
+
+    @patch("coord.dispatch.httpx.post")
+    def test_payload_branch_uses_feature_branch_for_opted_in_milestone(
+        self, mock_post: MagicMock, proposal: Proposal,
+    ) -> None:
+        """#934: a repo that opted into the git model (develop_branch set)
+        dispatches milestone work off `feature/ms-NN`, not `default_branch`."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        cfg = Config(
+            repos=[Repo(
+                name="api", github="acme/api",
+                default_branch="main", develop_branch="develop",
+            )],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+            )],
+        )
+        milestone_proposal = dataclasses_replace(proposal, milestone_number=42)
+        dispatch(milestone_proposal, cfg)
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["branch"] == "feature/ms-42"
+
+    @patch("coord.dispatch.httpx.post")
+    def test_payload_branch_ignores_milestone_when_repo_not_opted_in(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal,
+    ) -> None:
+        """#934: a repo without develop_branch configured is unaffected even
+        when the proposal carries a milestone_number — today's behavior."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+        milestone_proposal = dataclasses_replace(proposal, milestone_number=42)
+        dispatch(milestone_proposal, config)
         payload = mock_post.call_args.kwargs["json"]
         assert payload["branch"] == "main"
 

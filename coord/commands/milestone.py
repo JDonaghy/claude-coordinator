@@ -1541,3 +1541,200 @@ def milestone_gate_b_cmd(
         sys.exit(1)
 
     click.echo(f"dispatched: assignment {assignment.assignment_id} on {machine.name}")
+
+
+@milestone_group.command(
+    "ship",
+    help=(
+        "Gate D (docs/PIPELINE_V2.md, #934): ship a milestone's "
+        "`feature/ms-NN` branch to `develop` — the last step of the "
+        "develop + feature-branch-per-milestone git model. Refuses unless "
+        "the repo has opted in (`develop_branch` set in coordinator.yml) "
+        "AND both Gate B (an `approve` verdict — `coord milestone gate-b`) "
+        "AND Gate C (the full acceptance suite, re-run live here, the same "
+        "check `coord milestone gate-c` performs) are green. On success, "
+        "opens (or reuses) and merges a PR from `feature/ms-NN` into "
+        "`develop_branch`."
+    ),
+)
+@click.argument("repo")
+@click.argument("tracking_issue", type=int)
+@click.option(
+    "--path", "path_opt", type=click.Path(file_okay=False), default=None,
+    help="Repo checkout to run Gate C's driver in (default: repo_paths in coordinator.yml).",
+)
+@click.option(
+    "--for-path", "route_path", default=None,
+    help="Repo-relative path used to resolve a routed acceptance driver (mirrors `gate-c`).",
+)
+@click.option(
+    "--method", "merge_method", default="merge",
+    type=click.Choice(["merge", "squash", "rebase"]),
+    help=(
+        "PR merge method for feature/ms-NN -> develop (default: 'merge' — "
+        "a real merge commit, so the milestone's own commit history is "
+        "preserved as a unit rather than flattened/replayed onto develop)."
+    ),
+)
+@click.option(
+    "--dry-run", is_flag=True,
+    help="Check both gates and report the ship plan without opening/merging a PR.",
+)
+@_CONFIG_OPTION
+def milestone_ship_cmd(
+    repo: str,
+    tracking_issue: int,
+    path_opt: str | None,
+    route_path: str | None,
+    merge_method: str,
+    dry_run: bool,
+    config_path: Path,
+) -> None:
+    from coord import board_service, github_ops
+    from coord.acceptance import build_verdict, ms_dirname
+    from coord.acceptance_drivers import DriverError, run_driver
+    from coord.branch_model import feature_branch_name
+    from coord.gate_b import latest_gate_b_verdict
+
+    cfg = _load_config(config_path)
+    repo_entry = cfg.repo(repo)
+    if repo_entry is None:
+        click.echo(f"error: unknown repo {repo!r}", err=True)
+        sys.exit(2)
+
+    if not repo_entry.develop_branch:
+        click.echo(
+            f"error: repo {repo!r} has not opted into the develop + "
+            "feature-branch-per-milestone git model (#934) — set "
+            "develop_branch in coordinator.yml to ship",
+            err=True,
+        )
+        sys.exit(1)
+
+    try:
+        ctx = fetch_milestone_context(repo_entry, tracking_issue)
+    except MilestoneDispatchError as e:
+        click.echo(f"error: {e}", err=True)
+        sys.exit(1)
+
+    if not is_milestone_complete(ctx):
+        incomplete = [
+            n.issue_number
+            for n in ctx.work_order.nodes
+            if n.issue_number not in ctx.terminal_issues
+        ]
+        click.echo(
+            "error: cannot ship — still open: "
+            + ", ".join(f"#{n}" for n in incomplete),
+            err=True,
+        )
+        sys.exit(1)
+
+    feature_branch = feature_branch_name(ctx.milestone_number)
+
+    # ── Gate B ────────────────────────────────────────────────────────────
+    board = board_service.read_board()
+    gate_b_verdict = latest_gate_b_verdict(
+        board, repo_entry.name, tracking_issue, ctx.milestone_number
+    )
+    if gate_b_verdict != "approve":
+        seen = gate_b_verdict or "no Gate B review found"
+        click.echo(
+            f"error: Gate B is not green ({seen}) — run `coord milestone "
+            f"gate-b {repo} {tracking_issue}` first",
+            err=True,
+        )
+        sys.exit(1)
+    click.echo(f"Gate B: approve (milestone #{ctx.milestone_number})")
+
+    # ── Gate C — re-run live, same as `coord milestone gate-c` ─────────────
+    driver_cfg = cfg.acceptance.driver_for(repo, route_path)
+    if driver_cfg is None:
+        if cfg.acceptance.has_driver(repo):
+            click.echo(
+                f"error: repo {repo!r} has a routed acceptance driver "
+                "(acceptance.drivers routes) but no route matched — pass "
+                "--for-path to select the subtree (e.g. 'coord/**')",
+                err=True,
+            )
+        else:
+            click.echo(
+                f"error: no acceptance driver configured for repo {repo!r} "
+                "(add it under acceptance.drivers in coordinator.yml)",
+                err=True,
+            )
+        sys.exit(1)
+
+    if path_opt is not None:
+        repo_dir = Path(path_opt).expanduser()
+    else:
+        from coord.test_orchestrator import find_local_repo_path
+
+        found = find_local_repo_path(repo, cfg)
+        if found is None:
+            click.echo(
+                f"error: no local repo checkout found for {repo!r} "
+                "(repo_paths in coordinator.yml) — pass --path",
+                err=True,
+            )
+            sys.exit(1)
+        repo_dir = found
+
+    click.echo(f"Gate C: running the full accumulated acceptance suite in {repo_dir}...")
+    ms = ms_dirname(ctx.milestone_number)
+    try:
+        result = run_driver(driver_cfg.kind, driver_cfg.run, cwd=str(repo_dir), ms=ms)
+    except DriverError as e:
+        click.echo(f"error: {e}", err=True)
+        sys.exit(1)
+
+    if not result.tests and result.exit_code != 0:
+        click.echo(result.raw_output, err=True)
+
+    verdict = build_verdict(result.tests, scope="all")
+    if verdict["total"] == 0 or not verdict["green"]:
+        click.echo(
+            f"error: Gate C is RED for #{tracking_issue} — milestone is not ready to ship",
+            err=True,
+        )
+        sys.exit(1)
+    click.echo(f"Gate C: GREEN ({verdict['passed']}/{verdict['total']})")
+
+    # ── Ship: feature/ms-NN -> develop ──────────────────────────────────────
+    if dry_run:
+        click.echo(
+            f"(dry run) would open/merge a PR: {feature_branch} -> "
+            f"{repo_entry.develop_branch} (method={merge_method})"
+        )
+        return
+
+    if not github_ops.branch_exists_on_remote(repo_entry.github, feature_branch):
+        click.echo(
+            f"error: {feature_branch} does not exist on {repo_entry.github} — "
+            "nothing to ship (no issue in this milestone ever dispatched?)",
+            err=True,
+        )
+        sys.exit(1)
+
+    pr = github_ops.create_pr(
+        repo_entry.github,
+        base=repo_entry.develop_branch,
+        head=feature_branch,
+        title=f"Ship milestone #{ctx.milestone_number}: {feature_branch} -> {repo_entry.develop_branch}",
+        body=(
+            f"Gate B + Gate C both green for milestone #{ctx.milestone_number} "
+            f"(tracking issue #{tracking_issue}). Opened by `coord milestone ship`."
+        ),
+    )
+    ok, message = github_ops.merge_pr(repo_entry.github, pr["number"], method=merge_method)
+    if not ok:
+        click.echo(
+            f"error: PR #{pr['number']} ({pr['url']}) opened but merge failed: {message}",
+            err=True,
+        )
+        sys.exit(1)
+
+    click.echo(
+        f"shipped: {feature_branch} -> {repo_entry.develop_branch} "
+        f"(PR #{pr['number']}, {pr['url']})"
+    )

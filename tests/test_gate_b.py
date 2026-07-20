@@ -13,10 +13,11 @@ from unittest.mock import patch
 from coord.gate_b import (
     build_gate_b_briefing,
     dispatch_gate_b_review,
+    latest_gate_b_verdict,
     review_target_for,
 )
 from coord.milestone_order import WorkOrder, WorkOrderNode
-from coord.models import Board, Machine, Repo
+from coord.models import Assignment, Board, Machine, Repo
 from coord.review import REVIEWER_SYSTEM_PROMPT
 
 
@@ -259,3 +260,62 @@ class TestDispatchGateBReview:
                 issue_fetch=_issue_fetch,
             )
         assert "No Gate-A contract found" in assignment.briefing
+
+
+def _gate_b_review(
+    *, verdict: str | None, dispatched_at: float = 0.0, status: str = "done",
+) -> Assignment:
+    return Assignment(
+        machine_name="m1", repo_name="coord-tui", issue_number=929,
+        issue_title="[gate-b] tracking", assignment_id=f"gb-{dispatched_at}",
+        type="review", status=status, review_target=review_target_for(17),
+        review_verdict=verdict, dispatched_at=dispatched_at,
+    )
+
+
+class TestLatestGateBVerdict:
+    """#934: `coord milestone ship` (Gate D) consults this to refuse
+    shipping until Gate B is green."""
+
+    def test_no_review_found_returns_none(self) -> None:
+        board = Board()
+        assert latest_gate_b_verdict(board, "coord-tui", 929, 17) is None
+
+    def test_finds_approved_verdict_on_completed(self) -> None:
+        board = Board(completed=[_gate_b_review(verdict="approve")])
+        assert latest_gate_b_verdict(board, "coord-tui", 929, 17) == "approve"
+
+    def test_finds_request_changes_verdict(self) -> None:
+        board = Board(completed=[_gate_b_review(verdict="request-changes")])
+        assert latest_gate_b_verdict(board, "coord-tui", 929, 17) == "request-changes"
+
+    def test_also_scans_active_board(self) -> None:
+        """A verdict just posted may still be on `active` for a tick before
+        reconcile moves it to `completed`."""
+        board = Board(active=[_gate_b_review(verdict="approve")])
+        assert latest_gate_b_verdict(board, "coord-tui", 929, 17) == "approve"
+
+    def test_ignores_unrelated_reviews(self) -> None:
+        """A per-issue review (different review_target) must not be mistaken
+        for the Gate B review."""
+        unrelated = Assignment(
+            machine_name="m1", repo_name="coord-tui", issue_number=929,
+            issue_title="t", assignment_id="rev-1", type="review",
+            status="done", review_target="42", review_verdict="approve",
+        )
+        board = Board(completed=[unrelated])
+        assert latest_gate_b_verdict(board, "coord-tui", 929, 17) is None
+
+    def test_ignores_gate_b_for_a_different_milestone(self) -> None:
+        other_ms = _gate_b_review(verdict="approve")
+        other_ms.review_target = review_target_for(18)
+        board = Board(completed=[other_ms])
+        assert latest_gate_b_verdict(board, "coord-tui", 929, 17) is None
+
+    def test_most_recent_wins_after_redispatch(self) -> None:
+        """A request-changes verdict followed by a re-dispatched, approved
+        Gate B — the LATER one (by dispatched_at) must win."""
+        older = _gate_b_review(verdict="request-changes", dispatched_at=1.0)
+        newer = _gate_b_review(verdict="approve", dispatched_at=2.0)
+        board = Board(completed=[older, newer])
+        assert latest_gate_b_verdict(board, "coord-tui", 929, 17) == "approve"

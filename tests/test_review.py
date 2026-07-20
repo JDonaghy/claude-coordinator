@@ -926,6 +926,73 @@ def test_dispatch_review_sends_to_different_machine_and_appends_to_board(
     assert "# Project rules" in payload["briefing"]
 
 
+def test_dispatch_review_uses_feature_branch_for_opted_in_milestone(
+    two_machine_config: Config,
+) -> None:
+    """#934: a repo that opted into the git model (develop_branch set)
+    diffs/opens the PR against `feature/ms-NN`, not `default_branch`, when
+    the completed work's issue belongs to that milestone."""
+    from dataclasses import replace as _replace
+
+    cfg = _replace(
+        two_machine_config,
+        repos=[_replace(two_machine_config.repos[0], develop_branch="develop")],
+    )
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    client = _FakeHTTPClient({"id": "review-id-1"})
+    pr_lookup_calls = []
+
+    def _pr_lookup(repo_github, **kw):
+        pr_lookup_calls.append(kw)
+        return {"number": 42, "url": "https://github.com/acme/api/pull/42", "existed": True}
+
+    dispatch_review(
+        completed, board, cfg,
+        http_client=client,
+        pr_lookup=_pr_lookup,
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+        now=123.0,
+        remote_branch_checker=lambda repo, branch: True,
+        milestone_fetcher=lambda repo_github, issue_number: 42,
+    )
+
+    assert pr_lookup_calls[0]["default_branch"] == "feature/ms-42"
+    _, payload = client.calls[0]
+    assert payload["branch"] == "feature/ms-42"
+
+
+def test_dispatch_review_milestone_fetcher_not_consulted_when_not_opted_in(
+    two_machine_config: Config,
+) -> None:
+    """#934: a repo without develop_branch stays on default_branch even if
+    the milestone_fetcher would return one — it must not even be called,
+    since a non-opted-in repo pays zero extra `gh` calls."""
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    client = _FakeHTTPClient({"id": "review-id-1"})
+
+    def _boom_fetcher(repo_github, issue_number):
+        raise AssertionError("milestone_fetcher must not be called for a non-opted-in repo")
+
+    dispatch_review(
+        completed, board, two_machine_config,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {
+            "number": 42, "url": "https://github.com/acme/api/pull/42", "existed": True,
+        },
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+        now=123.0,
+        remote_branch_checker=lambda repo, branch: True,
+        milestone_fetcher=_boom_fetcher,
+    )
+
+    _, payload = client.calls[0]
+    assert payload["branch"] == "main"
+
+
 def test_dispatch_review_flags_sealed_acceptance_dir_when_driver_configured(
     two_machine_config: Config,
 ) -> None:
