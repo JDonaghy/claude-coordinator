@@ -938,6 +938,13 @@ def _parse_repos(raw: Any) -> list[Repo]:
         if not isinstance(default_branch, str):
             raise ConfigError(f"repos[{i}].default_branch must be a string")
 
+        # #934: develop_branch — opt-in to the develop + feature-branch-
+        # per-milestone git model (docs/PIPELINE_V2.md "Git model"). Absent
+        # (None) by default so existing repos are unaffected.
+        develop_branch = entry.get("develop_branch")
+        if develop_branch is not None and not isinstance(develop_branch, str):
+            raise ConfigError(f"repos[{i}].develop_branch must be a string")
+
         build_command = entry.get("build_command")
         if build_command is not None and not isinstance(build_command, str):
             raise ConfigError(f"repos[{i}].build_command must be a string")
@@ -994,6 +1001,7 @@ def _parse_repos(raw: Any) -> list[Repo]:
                 github=github,
                 depends_on=depends_on,
                 default_branch=default_branch,
+                develop_branch=develop_branch,
                 build_command=build_command,
                 test_command=test_command,
                 run_cmd=run_cmd,

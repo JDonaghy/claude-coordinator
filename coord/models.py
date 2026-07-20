@@ -41,6 +41,17 @@ class Repo:
     github: str
     depends_on: list[str] = field(default_factory=list)
     default_branch: str = "main"
+    # #934 (Pipeline v2 Phase 4, docs/PIPELINE_V2.md "Git model"): when set,
+    # this repo has opted into the develop + feature-branch-per-milestone
+    # git model — `develop` is the integration branch (`default_branch`
+    # becomes the release branch) and milestone issues branch off
+    # `feature/ms-NN` (see coord/branch_model.py) instead of
+    # `default_branch` directly. `None` (the default) means the repo is
+    # unaffected: every branch-resolution call site falls back to today's
+    # flat `default_branch` behavior. This is the opt-in guard that keeps
+    # in-flight work on `main` from breaking when `develop` appears for
+    # repos that adopt the new model.
+    develop_branch: str | None = None
     build_command: str | None = None
     test_command: str | None = None
     # #296: optional shell command to interactively run the app for manual
@@ -402,6 +413,16 @@ class Proposal:
     # brain when a repo's configured provider should be overridden for this
     # specific dispatch.
     provider: str | None = None
+    # #934: the GitHub Milestone number the target issue belongs to, when
+    # known. Set by callers that already fetched the issue (e.g.
+    # ``coord.milestone_dispatch.dispatch_entry``) so ``coord.dispatch.
+    # dispatch()`` can resolve the worker's base branch via
+    # ``coord.branch_model.resolve_base_branch`` — `feature/ms-NN` for a repo
+    # that opted into the #934 git model, otherwise the existing
+    # `default_branch` behavior. `None` (the default) preserves today's
+    # behavior exactly: brain-proposed and other non-milestone-aware
+    # dispatches are unaffected.
+    milestone_number: int | None = None
 
 
 @dataclass
