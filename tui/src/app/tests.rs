@@ -6176,6 +6176,61 @@
         assert!(!f.matches(7, "boring"), "no title substring → no match");
     }
 
+    /// #1301: a leading `#` scopes the query to the issue number only,
+    /// dropping the title clause. This is the exact regression reported —
+    /// a title containing a digit (e.g. "...pin 4 (...)") must not surface
+    /// under `#4` even though it does under a bare `4`.
+    #[test]
+    fn sidebar_filter_hash_prefix_scopes_to_number_only() {
+        let mut f = SidebarFilter::default();
+
+        // The reported case: #1292's title contains "4" but its number does
+        // not. Bare "4" matches on the title; "#4" must not.
+        f.set_value("4");
+        assert!(
+            f.matches(1292, "contract + coord usage CLI pin 4 ($0.50 vs $0.5000)"),
+            "bare digit still matches via title substring (unchanged behaviour)"
+        );
+        f.set_value("#4");
+        assert!(
+            !f.matches(1292, "contract + coord usage CLI pin 4 ($0.50 vs $0.5000)"),
+            "#-scoped digit must not match on title"
+        );
+
+        // #-scoped digit still matches issue numbers containing it, as a
+        // substring — partial typing (e.g. hunting for #448 by typing "#4"
+        // first) keeps working.
+        assert!(f.matches(448, "unrelated title"), "#4 substring-matches 448");
+        assert!(f.matches(460, "unrelated title"), "#4 substring-matches 460");
+        assert!(f.matches(934, "unrelated title"), "#4 substring-matches 934");
+        assert!(
+            !f.matches(1292, "unrelated title"),
+            "#4 does not match 1292 (no '4' in the number)"
+        );
+
+        // A full number after the sigil is still a substring match, not an
+        // exact match — "#48" should keep matching 448 while the user is
+        // still typing towards it.
+        f.set_value("#48");
+        assert!(f.matches(448, "anything"), "#48 substring-matches 448");
+        assert!(!f.matches(934, "anything"), "#48 does not match 934");
+
+        // Case-insensitivity still applies to the sigil form (query is
+        // lowercased before the '#' check either way).
+        f.set_value("#4");
+        assert!(f.matches(448, "ANYTHING"));
+    }
+
+    /// Bare "#" (no digits typed yet) behaves like an empty query — show
+    /// everything rather than hiding every row mid-keystroke.
+    #[test]
+    fn sidebar_filter_bare_hash_matches_all() {
+        let mut f = SidebarFilter::default();
+        f.set_value("#");
+        assert!(f.matches(1, "anything"));
+        assert!(f.matches(999, "anything else"));
+    }
+
     #[test]
     fn sidebar_filter_edit_ops_track_cursor() {
         let mut f = SidebarFilter::default();
@@ -6334,6 +6389,81 @@
         assert!(
             app.pipeline_groups_for_repo("api").is_empty(),
             "non-matching repo section has no visible lifecycle groups",
+        );
+    }
+
+    /// Black-box coverage for #1301: typing "#4" into the Pipeline FILTER
+    /// box must exclude an issue whose *title* contains "4" but whose
+    /// *number* does not, while a bare "4" still surfaces it (unchanged
+    /// substring-on-title behaviour) — this mirrors the #1292 regression
+    /// reported in the issue. Drives the full `event → handle → render`
+    /// path via `TuiDriver`, not a direct call into `matches` or
+    /// `rebuild_pipeline_sidebar`.
+    #[test]
+    fn pipeline_filter_hash_prefix_scopes_to_number_black_box() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_pipeline_app();
+        // #77's number has no "4" in it; its title does — the exact shape
+        // of the reported #1292 false-positive.
+        app.pipeline_issues.push(PipelineIssue {
+            number: 77,
+            title: "Bump pin to 4 replicas".to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string(), "status:ready".to_string()],
+            is_closed: false,
+        });
+        app.active_view = SidebarView::Pipeline;
+        // #857: "New" milestone groups default collapsed, so drill the
+        // "no milestone" bucket (both #42 and #77 land there) open — the
+        // issue rows must be on screen for this test to see their titles.
+        app.pipeline_milestone_expanded.insert(
+            ("new".to_string(), "api".to_string(), "no-milestone".to_string()),
+            true,
+        );
+        app.rebuild_pipeline_sidebar(None);
+
+        // Assert on the issue number rather than the full title text — the
+        // narrow sidebar column truncates long titles (`trunc(..)` in
+        // pipeline.rs), so "Bump pin to 4 replicas" isn't reliably intact
+        // on screen even once the row is visible.
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        driver.render();
+        assert!(
+            driver.screen_contains("#77"),
+            "sanity: #77's row must be visible before filtering:\n{}",
+            driver.screen(),
+        );
+
+        // Focus the FILTER box ('/') and type a bare "4": #77 surfaces via
+        // its title substring, same as today.
+        driver.type_char('/');
+        driver.type_char('4');
+        driver.render();
+        assert!(
+            driver.screen_contains("#77"),
+            "bare '4' must still match on title substring:\n{}",
+            driver.screen(),
+        );
+
+        // Clear and retype scoped to "#4": #77 must now be excluded (its
+        // number, 77, has no '4'), while #42 (number contains '4') stays.
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.type_char('/');
+        driver.type_char('#');
+        driver.type_char('4');
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("#77"),
+            "#-scoped '#4' must exclude a title-only digit match:\n{screen}",
+        );
+        assert!(
+            screen.contains("#42"),
+            "#-scoped '#4' must still match #42 on its number:\n{screen}",
         );
     }
 
