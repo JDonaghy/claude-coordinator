@@ -3546,6 +3546,60 @@ def test_clean_worktrees_tick_no_audit_row_when_nothing_cleaned(
     assert rows == []
 
 
+def test_clean_worktrees_tick_forwards_protect_list_from_board(
+    valid_config_path: Path, rw_db, monkeypatch
+) -> None:
+    """#1295: the tick must forward a per-machine ``protect`` list of
+    board-known-live assignment_ids to each agent's /worktree-clean POST.
+
+    Seeds a running ``work42`` assignment on ``laptop`` and a done
+    ``work99`` on ``server``; the tick should send ``protect=["work42"]``
+    to laptop and ``protect=None`` (nothing to protect) to server.  This
+    guards the coordinator-side belt-and-braces defense that keeps a
+    live worker's worktree even if the agent lost its local record.
+    """
+    from coord import network
+    from coord.config import load as load_config
+    from coord.serve_app import _clean_worktrees_tick
+
+    monkeypatch.setenv("COORD_CONFIG", str(valid_config_path))
+
+    # Seed one running (non-terminal) assignment on laptop and one done
+    # (terminal) on server — only the running one should be forwarded.
+    rw_db.execute(
+        "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+        "repo_github, issue_number, issue_title, status, type) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        ("work42", "laptop", "api", "owner/api", 42, "live", "running", "work"),
+    )
+    rw_db.execute(
+        "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+        "repo_github, issue_number, issue_title, status, type) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        ("work99", "server", "api", "owner/api", 99, "done", "done", "work"),
+    )
+    rw_db.commit()
+
+    seen: dict[str, list[str] | None] = {}
+
+    def fake_clean_worktrees(machine, *, protect=None, **kw):
+        seen[machine.name] = list(protect) if protect else None
+        return {"ok": True, "cleaned": 0, "kept": 0, "bytes_freed": 0, "error": None}
+
+    monkeypatch.setattr(network, "clean_worktrees", fake_clean_worktrees)
+
+    cfg = load_config(valid_config_path)
+    _clean_worktrees_tick(cfg)
+
+    assert seen.get("laptop") == ["work42"], (
+        f"laptop should have received protect=['work42'], got: {seen.get('laptop')}"
+    )
+    # server had only a terminal assignment → no protect list forwarded.
+    assert seen.get("server") is None, (
+        f"server should have received no protect list, got: {seen.get('server')}"
+    )
+
+
 # ── #776: merge_plan in /board payload ───────────────────────────────────────
 
 

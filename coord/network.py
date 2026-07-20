@@ -204,6 +204,7 @@ def clean_worktrees(
     machine: Machine,
     *,
     recent_secs: float = 300.0,
+    protect: list[str] | None = None,
     timeout: float = 30.0,
 ) -> dict:
     """POST /worktree-clean to `machine` (#1220).
@@ -214,12 +215,23 @@ def clean_worktrees(
     is folded into the returned dict's ``error`` field (``ok=False``) so one
     unreachable machine can't abort a sweep across the rest of the fleet.
 
+    #1295: an optional *protect* list of assignment IDs the coordinator
+    knows are still live (interactive sessions, dispatched-but-not-yet-
+    finished work) is forwarded to the agent so those worktrees are kept
+    even when the agent's own record has been lost (agent restart, DB
+    reload race).  A None / empty *protect* is omitted from the request
+    body so an older agent that doesn't know about the field sees the
+    same wire shape as before.
+
     Returns ``{"ok": bool, "cleaned": int, "kept": int, "bytes_freed": int,
     "error": str | None}``.
     """
     url = f"http://{machine.host}:{AGENT_PORT}/worktree-clean"
+    payload: dict[str, object] = {"recent_secs": recent_secs}
+    if protect:
+        payload["protect"] = list(protect)
     try:
-        resp = httpx.post(url, json={"recent_secs": recent_secs}, timeout=timeout)
+        resp = httpx.post(url, json=payload, timeout=timeout)
     except Exception as e:  # noqa: BLE001 — classify uniformly, never propagate
         _, reason = classify_error(e)
         return {"ok": False, "cleaned": 0, "kept": 0, "bytes_freed": 0, "error": reason}

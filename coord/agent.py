@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import logging
 import os
 import re
 import shlex
@@ -34,6 +35,11 @@ if TYPE_CHECKING:
 
 DEFAULT_STATE_DIR = Path.home() / ".coord"
 DEFAULT_WORKER_BINARY = "claude"
+
+# Module logger — surfaced in the daemon / agent server logs so agent-side
+# events (e.g. #1295 "sweep would touch a live worktree", "stash copied 0
+# files") are visible without having to open the per-assignment log file.
+_log = logging.getLogger(__name__)
 
 
 def _dir_size(path: Path) -> int:
@@ -991,8 +997,16 @@ def stash_artifacts_for_branch(
         return 0
     sanitized = _sanitize_branch(branch)
     stash_dir = state_dir / "artifacts" / repo_name / sanitized
-    stash_dir.mkdir(parents=True, exist_ok=True)
 
+    # #1295: do NOT create the stash directory before we know there's
+    # something to put in it.  The previous unconditional
+    # ``mkdir(parents=True, exist_ok=True)`` up top left an empty stash
+    # dir on disk whenever the worktree was missing (or a re-stash of a
+    # cleaned-up branch was attempted) — which then fooled
+    # ``stash_dir.exists()``-style checks into thinking a stash existed
+    # even though ``_stash_has_content`` would report False, and it
+    # counted against ``artifact_bytes`` inode overhead for nothing.
+    # Bail out before we create anything if the source worktree is gone.
     if not worktree_path.exists():
         return 0
 
@@ -1026,6 +1040,14 @@ def stash_artifacts_for_branch(
     # prune anything left over from a prior, broader stash of this branch.
     kept_names: set[str] = set()
 
+    # #1295: create the stash directory lazily.  If nothing matches the
+    # globs (0 candidates, or every candidate skipped by the intermediate/
+    # tiny-file filters below), we never touch the filesystem — no empty
+    # stash dir left behind for ``_stash_has_content`` to report as
+    # "present but empty" and no phantom entry under
+    # ``state_dir/artifacts/<repo>/<branch>/``.
+    stash_dir_created = stash_dir.exists()
+
     for src in candidates:
         # Skip build-intermediate files (.d, .o, .rlib, .rmeta, .rcgu).
         if src.suffix in _STASH_SKIP_SUFFIXES:
@@ -1048,6 +1070,12 @@ def stash_artifacts_for_branch(
             if canonical_name in canonical_names:
                 continue
         kept_names.add(src.name)
+        if not stash_dir_created:
+            try:
+                stash_dir.mkdir(parents=True, exist_ok=True)
+                stash_dir_created = True
+            except OSError:
+                continue
         dst = stash_dir / src.name
         try:
             shutil.copy2(src, dst)
@@ -1065,28 +1093,29 @@ def stash_artifacts_for_branch(
     # in the stash directory that isn't among this run's kept names is
     # stale for the *current* pattern set and gets removed.  Marker files
     # (dotfiles, e.g. ``.assignment_id``) are left alone.
-    try:
-        for existing in stash_dir.iterdir():
-            if existing.name.startswith("."):
-                continue
-            if not existing.is_file():
-                continue
-            if existing.name not in kept_names:
-                try:
-                    existing.unlink()
-                except OSError:
-                    pass
-    except OSError:
-        pass
+    if stash_dir_created:
+        try:
+            for existing in stash_dir.iterdir():
+                if existing.name.startswith("."):
+                    continue
+                if not existing.is_file():
+                    continue
+                if existing.name not in kept_names:
+                    try:
+                        existing.unlink()
+                    except OSError:
+                        pass
+        except OSError:
+            pass
 
-    # Touch the stash directory so its mtime reflects this stash run.
-    # mkdir(exist_ok=True) is a no-op when the directory already exists, so
-    # a re-stash would leave the original Day-1 mtime — causing _gc_artifacts
-    # to evict the refreshed stash prematurely.
-    try:
-        stash_dir.touch()
-    except OSError:
-        pass
+        # Touch the stash directory so its mtime reflects this stash run.
+        # mkdir(exist_ok=True) is a no-op when the directory already exists,
+        # so a re-stash would leave the original Day-1 mtime — causing
+        # _gc_artifacts to evict the refreshed stash prematurely.
+        try:
+            stash_dir.touch()
+        except OSError:
+            pass
 
     # Write the assignment_id marker so the manifest endpoint can surface
     # which build produced this stash without iterating all assignments.
@@ -1097,6 +1126,47 @@ def stash_artifacts_for_branch(
             (stash_dir / ".assignment_id").write_text(assignment_id)
         except OSError:
             pass
+
+    # #1295: if the pruning above left the directory with no real content
+    # (only dotfiles at most), remove it so ``_stash_has_content`` /
+    # manifest checks see a clean absence rather than "present but empty".
+    # A prior stash for this branch may have existed and just been fully
+    # pruned by this narrower run — dropping the empty shell makes the
+    # sweep idempotent.
+    if stash_dir_created and copied == 0:
+        try:
+            leftover = [
+                p for p in stash_dir.iterdir()
+                if p.is_file() and not p.name.startswith(".")
+            ]
+        except OSError:
+            leftover = []
+        if not leftover:
+            # rmtree tolerates dotfile-only content; safe even if a stale
+            # ``.assignment_id`` marker was left over from a prior run.
+            try:
+                shutil.rmtree(stash_dir, ignore_errors=True)
+            except OSError:
+                pass
+
+    # #1295: a 0-copy stash is loud regardless of whether a per-assignment
+    # log_path is available.  Previously the warning only reached the
+    # assignment log — an hourly sweep that stashed nothing and then
+    # removed the worktree left no trace anywhere the operator could see.
+    # Now we also emit through Python logging so the daemon/agent log
+    # captures it, which is the surface a human actually consults when
+    # diagnosing "the worktree is gone and there are no artifacts".
+    if copied == 0:
+        _log.warning(
+            "stash: 0 files matched %r in %s (repo=%s branch=%s aid=%s) — "
+            "check artifact_paths config and that the build actually "
+            "produced the expected outputs",
+            patterns,
+            worktree_path,
+            repo_name,
+            branch,
+            assignment_id,
+        )
 
     if log_path:
         _append_log_line(
@@ -2363,6 +2433,46 @@ class AgentServer:
         return None
 
     @staticmethod
+    def _tmux_session_alive(assignment_id: str) -> bool:
+        """Return True when a ``coord-<assignment_id>`` tmux session is up.
+
+        Load-bearing guard for :meth:`clean_worktrees` (#1295): an
+        interactive Test/Review/Merge/Work pane keeps its tmux session
+        alive for as long as the operator is attached, but the
+        ``AgentAssignment`` record can already be in a terminal state
+        (or absent, if the agent restarted).  Consulting tmux directly
+        is the only reliable "someone is still using this worktree"
+        signal.
+
+        Uses ``tmux has-session -t coord-<assignment_id>``; exit 0 means
+        the session exists.  Delegates to
+        :func:`coord.interactive.tmux_session_alive` so a single
+        implementation handles the subprocess and error-swallowing
+        semantics.  When ``tmux`` is not installed / not running / the
+        subprocess errors, we return ``False`` — "no live session, keep
+        sweeping" — rather than raising, so one broken tmux install
+        never aborts a fleet sweep across the rest of an agent's
+        worktrees.
+        """
+        # Deferred import to keep AgentServer's top-level import graph
+        # free of coord.interactive (which pulls in curses/tty helpers
+        # the agent process may not want at import time).
+        try:
+            from coord.interactive import (  # noqa: PLC0415
+                tmux_available,
+                tmux_session_alive,
+                tmux_session_name,
+            )
+        except Exception:  # noqa: BLE001 — defensive; module missing → no guard
+            return False
+        try:
+            if not tmux_available():
+                return False
+            return tmux_session_alive(tmux_session_name(assignment_id))
+        except Exception:  # noqa: BLE001 — never propagate out of the sweep
+            return False
+
+    @staticmethod
     def _stash_has_content(stash_dir: Path) -> bool:
         """True when *stash_dir* holds at least one real (non-dotfile) file.
 
@@ -2419,10 +2529,22 @@ class AgentServer:
                 "tmux killed, or `coord done` never ran), and re-running the "
                 "build or checking the artifact_paths globs may help."
             )
+        # #1295: be honest about the possibilities.  The previous wording
+        # ("merged and pruned, or nothing was ever built here") quietly
+        # skipped the case that motivated this fix: the hourly worktree
+        # sweep may have removed a worktree that was still live in a tmux
+        # session, in which case the branch was never merged and something
+        # WAS being built.  Surface all three plausible causes so
+        # `coord pull-artifact`'s error message stops implying a single
+        # explanation the agent can't actually distinguish.
         return (
-            f"no stash and no live worktree for branch {branch!r} on this host — "
-            "the branch was likely already merged and its worktree pruned, or "
-            "nothing was ever built here."
+            f"no stash and no live worktree for branch {branch!r} on this host. "
+            "possible causes: (1) the branch was already merged and its "
+            "worktree pruned; (2) nothing was ever built for this branch on "
+            "this host; or (3) the worktree-clean sweep removed a worktree "
+            "whose interactive session was still up (see #1295) — check "
+            f"`tmux ls | grep coord-` for a live session, and the agent log "
+            "for any recent `stash: 0 files matched` warning."
         )
 
     def artifact_manifest(self, repo: str, branch: str) -> dict | None:
@@ -2489,7 +2611,12 @@ class AgentServer:
         total_bytes = sum(item["size"] for item in files)
         return {"files": files, "total_bytes": total_bytes, "built_by_assignment_id": built_by}
 
-    def clean_worktrees(self, *, recent_secs: float = 300.0) -> dict:
+    def clean_worktrees(
+        self,
+        *,
+        recent_secs: float = 300.0,
+        protect: Iterable[str] | None = None,
+    ) -> dict:
         """Remove git worktrees for assignments in terminal states.
 
         Idempotent — safe to call multiple times.  Skips worktrees for:
@@ -2504,14 +2631,41 @@ class AgentServer:
           that snapshots ``_assignments`` mid-spawn would treat the
           freshly-created tree as orphaned and ``git worktree remove`` it
           out from under the worker.
+        - Worktrees whose ``coord-<assignment_id>`` tmux session is still
+          alive on this host (#1295, agent-local live-session guard).  An
+          interactive session (Test/Review/Merge/Work) can outlive its
+          assignment record in ``self._assignments`` — the record's
+          ``finished_at`` reflects the *dispatch subprocess* finishing,
+          not the operator detaching — so ``finished_at`` alone is not a
+          reliable "worker is done with this tree" signal.  The tmux
+          session, on the other hand, is only up while the pane is being
+          used; querying it is ground truth.  If ``tmux`` is not
+          installed or ``has-session`` fails, we treat that as "no live
+          session" and continue the sweep — the check must never abort
+          the sweep for other entries.
+        - Assignment IDs in the optional *protect* iterable (#1295,
+          coordinator-supplied second-tier guard).  The board daemon
+          passes a snapshot of every non-terminal assignment_id it knows
+          about so a live worker whose record has been lost from
+          ``self._assignments`` (agent restart before reload,
+          coord.db-only record) is still preserved on the agent side.
+          The tmux guard above is the primary defence; *protect* is
+          belt-and-braces for cases the local check can't see.
+        - Directories that are symlinks (#1295) — we never chase a
+          symlink out of the worktree base and delete something else on
+          disk.  A symlink in ``state_dir/worktrees/`` is not something
+          the agent creates; treat it as opaque and skip.
 
-        Returns ``{"cleaned": N, "kept": M, "bytes_freed": B}``.
+        Returns ``{"cleaned": N, "kept": M, "bytes_freed": B}``.  A
+        protected entry counts as ``kept`` — the return shape is
+        unchanged so existing callers keep working.
         """
         worktree_base = self.state_dir / "worktrees"
         if not worktree_base.exists():
             return {"cleaned": 0, "kept": 0, "bytes_freed": 0}
 
         now = time.time()
+        protect_set: set[str] = set(protect) if protect else set()
 
         with self._lock:
             assignments = dict(self._assignments)
@@ -2535,10 +2689,43 @@ class AgentServer:
         bytes_freed = 0
 
         for entry in worktree_base.iterdir():
+            # #1295: never chase symlinks out of state_dir/worktrees/.
+            # `Path.is_dir()` follows symlinks, so a bare `not is_dir()`
+            # would still admit a symlink-to-directory into the sweep and
+            # the eventual `shutil.rmtree(entry, ignore_errors=True)` /
+            # `git worktree remove --force` could touch whatever the
+            # symlink pointed at.  Excluding symlinks up front is the
+            # simplest correct guard — the agent never creates them here.
+            if entry.is_symlink():
+                kept += 1
+                continue
             if not entry.is_dir():
                 continue
             assignment_id = entry.name
             a = assignments.get(assignment_id)
+
+            # #1295: coordinator-supplied second-tier guard.  Any
+            # assignment id the board considers non-terminal is off-limits
+            # regardless of what the local assignments dict says — the
+            # agent may have restarted and lost its in-memory record for a
+            # worker whose interactive session is still up.
+            if assignment_id in protect_set:
+                kept += 1
+                continue
+
+            # #1295: agent-local live-session guard.  If a tmux session
+            # named `coord-<assignment_id>` exists on this host, someone
+            # is (still) interactively using this worktree — an operator
+            # in a Test/Review/Merge/Work pane whose session outlived the
+            # dispatch subprocess.  The tmux probe is ground truth and
+            # cheap; consult it BEFORE any other decision so a stale
+            # `finished_at`/absent record can't sweep out a live pane.
+            # Failures inside `_tmux_session_alive` (tmux not installed,
+            # server not running, subprocess/OS errors) collapse to
+            # False so the check never raises out of this loop.
+            if self._tmux_session_alive(assignment_id):
+                kept += 1
+                continue
 
             # Never touch worktrees for running/pending assignments.
             if a is not None and a.status in (RUNNING, PENDING):

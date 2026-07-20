@@ -577,6 +577,202 @@ def test_clean_worktrees_removes_stale_done(tmp_path: Path) -> None:
     server.shutdown()
 
 
+# ── #1295: hourly worktree sweep must not delete live worktrees ─────────────
+
+
+def test_clean_worktrees_skips_when_tmux_session_alive(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """#1295 (load-bearing): a worktree with a live ``coord-<aid>`` tmux session
+    on this host must NOT be swept, even when the AgentServer's local
+    ``self._assignments`` map has no record of it (agent restart, interactive
+    session outliving the dispatch subprocess, etc.).
+
+    Without this guard the hourly sweep would ``git worktree remove`` an
+    interactive Test/Review/Merge pane out from under the operator (the
+    incident that motivated the issue).
+    """
+    server = _server(tmp_path)
+    live_id = "live-interactive-aid"
+    live_wt = server.state_dir / "worktrees" / live_id
+    live_wt.mkdir(parents=True)
+    (live_wt / "artifact.bin").write_bytes(b"X" * 4096)
+    # Back-date so the recent_secs guard is NOT what saves it — we want to
+    # prove the tmux guard is what's doing the work.
+    old = time.time() - 3600
+    os.utime(live_wt, (old, old))
+
+    # Simulate a live tmux session for this assignment_id by monkey-patching
+    # the class-level probe.  Real tmux is not available in CI; the guard's
+    # contract is "consult _tmux_session_alive and skip when it says yes".
+    called_with: list[str] = []
+
+    def fake_alive(aid: str) -> bool:
+        called_with.append(aid)
+        return aid == live_id
+
+    monkeypatch.setattr(
+        AgentServer, "_tmux_session_alive", staticmethod(fake_alive)
+    )
+
+    result = server.clean_worktrees(recent_secs=0)
+    assert live_id in called_with
+    assert result["cleaned"] == 0
+    assert result["kept"] == 1
+    assert live_wt.exists()
+
+
+def test_clean_worktrees_tmux_probe_failure_does_not_abort_sweep(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """#1295: when the tmux probe raises (tmux not installed / server dead /
+    subprocess crash) the guard degrades to ``False`` and the sweep continues
+    on OTHER worktrees — a broken tmux install must not orphan disk fleet-wide.
+    """
+    from coord import interactive as _interactive  # noqa: PLC0415
+
+    server = _server(tmp_path)
+    old = time.time() - 3600
+    for name in ("aid-a", "aid-b"):
+        wt = server.state_dir / "worktrees" / name
+        wt.mkdir(parents=True)
+        (wt / "leftover.txt").write_text("x")
+        os.utime(wt, (old, old))
+
+    # Make the underlying probe raise as if tmux itself blew up.  The
+    # ``_tmux_session_alive`` wrapper on AgentServer must catch this and
+    # return False so the sweep proceeds normally on both orphans.
+    def _boom(*args, **kwargs):
+        raise RuntimeError("tmux server not responding")
+
+    monkeypatch.setattr(_interactive, "tmux_available", lambda: True)
+    monkeypatch.setattr(_interactive, "tmux_session_alive", _boom)
+
+    # Wrapper itself must not raise.
+    assert server._tmux_session_alive("any-aid") is False
+
+    # And the sweep must complete for BOTH entries even though every probe
+    # would raise if the exception weren't swallowed.
+    result = server.clean_worktrees(recent_secs=0)
+    assert result["cleaned"] == 2
+    assert result["kept"] == 0
+    assert not (server.state_dir / "worktrees" / "aid-a").exists()
+    assert not (server.state_dir / "worktrees" / "aid-b").exists()
+
+
+def test_clean_worktrees_respects_protect_list(tmp_path: Path) -> None:
+    """#1295: a coordinator-supplied ``protect`` list of assignment_ids is
+    honoured even when the agent has no local record of them and no tmux
+    session is up.  Belt-and-braces guard against agent-restart-lost state.
+    """
+    server = _server(tmp_path)
+    protected_id = "coord-known-live"
+    other_id = "unrelated-orphan"
+    for name in (protected_id, other_id):
+        wt = server.state_dir / "worktrees" / name
+        wt.mkdir(parents=True)
+        (wt / "data.txt").write_text("x")
+        old = time.time() - 3600
+        os.utime(wt, (old, old))
+
+    result = server.clean_worktrees(recent_secs=0, protect=[protected_id])
+    assert result["cleaned"] == 1
+    assert result["kept"] == 1
+    # Return shape unchanged.
+    assert set(result) == {"cleaned", "kept", "bytes_freed"}
+    assert (server.state_dir / "worktrees" / protected_id).exists()
+    assert not (server.state_dir / "worktrees" / other_id).exists()
+
+
+def test_clean_worktrees_skips_symlinks(tmp_path: Path) -> None:
+    """#1295: a symlink under ``state_dir/worktrees/`` is never followed or
+    removed by the sweep.  A real orphan sitting next to it must still be
+    cleaned up — one symlink can't stop the whole sweep.
+    """
+    server = _server(tmp_path)
+    worktree_base = server.state_dir / "worktrees"
+    worktree_base.mkdir(parents=True, exist_ok=True)
+
+    # Create a real target directory well OUTSIDE the worktree base — if
+    # the sweep follows the symlink and rmtrees, this loses data.
+    target = tmp_path / "somewhere-else"
+    target.mkdir()
+    (target / "precious.txt").write_text("do not delete")
+
+    sym = worktree_base / "sneaky-symlink"
+    sym.symlink_to(target, target_is_directory=True)
+
+    # A genuine orphan sibling.
+    orphan = worktree_base / "real-orphan"
+    orphan.mkdir()
+    (orphan / "junk.bin").write_text("junk")
+    old = time.time() - 3600
+    os.utime(orphan, (old, old))
+
+    result = server.clean_worktrees(recent_secs=0)
+    # Symlink counted as kept (skipped), orphan cleaned.
+    assert result["cleaned"] == 1
+    assert not orphan.exists()
+    # Symlink still there, target untouched.
+    assert sym.is_symlink()
+    assert target.exists()
+    assert (target / "precious.txt").read_text() == "do not delete"
+
+
+def test_stash_against_nonexistent_worktree_creates_no_directory(
+    tmp_path: Path,
+) -> None:
+    """#1295 (current live bug): stashing artifacts against a worktree that
+    no longer exists must NOT leave an empty stash directory behind.
+
+    Before the fix, ``stash_artifacts_for_branch`` called
+    ``stash_dir.mkdir(parents=True, exist_ok=True)`` before checking whether
+    the source worktree existed — so a missed race (worktree removed just
+    before the stash step) left ``state_dir/artifacts/<repo>/<branch>/`` as
+    a phantom entry that fooled downstream ``.exists()`` checks.
+    """
+    from coord.agent import stash_artifacts_for_branch  # noqa: PLC0415
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    missing_worktree = tmp_path / "no-such-worktree"
+    assert not missing_worktree.exists()
+
+    copied = stash_artifacts_for_branch(
+        worktree_path=missing_worktree,
+        branch="issue-1295-nothing-here",
+        repo_name="myrepo",
+        patterns=["target/**/foo"],
+        state_dir=state_dir,
+    )
+    assert copied == 0
+
+    stash_dir = state_dir / "artifacts" / "myrepo" / "issue-1295-nothing-here"
+    assert not stash_dir.exists(), (
+        f"stash directory should NOT be created when the source worktree is "
+        f"missing, but {stash_dir} was left on disk"
+    )
+
+
+def test_artifact_absence_reason_names_worktree_sweep_possibility(
+    tmp_path: Path,
+) -> None:
+    """#1295: when there's no stash and no live worktree, the absence-reason
+    string must mention the worktree-sweep-during-live-session possibility
+    alongside "already merged" and "never built here".  Previously the
+    wording implied only two causes, hiding the exact bug the issue fixes.
+    """
+    server = _server(tmp_path)
+    reason = server.artifact_absence_reason("api", "issue-1295-honest-wording")
+    lower = reason.lower()
+    # It must at least reference the sweep as one of the possibilities.
+    assert (
+        "sweep" in lower or "worktree-clean" in lower or "#1295" in reason
+    ), reason
+    # And still name the pre-existing hypotheses so we haven't regressed.
+    assert "merged" in lower or "pruned" in lower, reason
+
+
 # ── #315: resume_session_id / claude_session_id ────────────────────────────
 
 
