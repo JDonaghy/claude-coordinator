@@ -156,13 +156,25 @@ struct SidebarFilter {
 
 impl SidebarFilter {
     /// True if an issue matches the current query (empty query → all match).
-    /// Case-insensitive substring on the decimal issue number or the title.
+    /// Case-insensitive substring on the decimal issue number or the title —
+    /// unless the query starts with `#` (issue-number scope, #1301): the `#`
+    /// is stripped and only the number is checked (still substring, so
+    /// partial typing like `#44` keeps working), dropping the title clause
+    /// entirely. That's the whole point — a bare `4` used to also pull in
+    /// any issue whose *title* happened to contain a "4" (e.g. #1292's
+    /// "...pin 4 ($0.50 vs $0.5000)"), which `#4` now avoids by construction.
     fn matches(&self, num: u64, title: &str) -> bool {
         if self.query.is_empty() {
             return true;
         }
         let query = self.query.to_lowercase();
         let num_str = num.to_string();
+        if let Some(number_only) = query.strip_prefix('#') {
+            // Bare "#" (no digits yet) behaves like an empty query — the user
+            // has opted into number scope but hasn't typed a digit, so don't
+            // hide every row while they're mid-keystroke.
+            return number_only.is_empty() || num_str.contains(number_only);
+        }
         num_str.contains(&query) || title.to_lowercase().contains(&query)
     }
 
@@ -5442,7 +5454,11 @@ impl CoordApp {
 
         // Populate search form (section 0).
         self.board_sidebar
-            .set_form(0, self.board_search.form("board-search", "Filter issues…"));
+            .set_form(
+                0,
+                self.board_search
+                    .form("board-search", "Filter issues… (#4 = number only)"),
+            );
 
         let offset = search_offset + if self.has_proposals_section { 1 } else { 0 };
 

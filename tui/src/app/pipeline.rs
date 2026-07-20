@@ -3546,7 +3546,7 @@ impl CoordApp {
         sidebar.set_form(
             0,
             self.pipeline_search
-                .form("pipeline-search", "Filter issues…"),
+                .form("pipeline-search", "Filter issues… (#4 = number only)"),
         );
 
         // Colour palette per lifecycle state — mirrors the Board's
