@@ -466,6 +466,18 @@ class PipelineConfig:
     ``type="review"``/``type="smoke"`` and also reuse ``conflict-fix``'s
     threshold, rather than plain review's 15m or smoke's 20m.
 
+    ``escalate_semantic_conflicts`` (#1291) controls whether a conflict-fix
+    worker that gives up on a **semantic** conflict (it emits the
+    ``coord:conflict=semantic`` marker on its ``STUCK:`` line) gets ONE
+    second attempt from a stronger model
+    (``semantic_conflict_model``, default ``"fable"``) before the merge
+    entry is parked ``HUMAN_REQUIRED``.  **Defaults to ``False``** — this
+    ships dark until it earns trust on real conflicts.  The escalated
+    attempt consumes the existing one-per-entry conflict-fix retry cap, so
+    a second semantic failure goes to ``HUMAN_REQUIRED`` exactly as today;
+    there is no loop.  It is still subject to every merge gate (tests,
+    ``coord verify-merge``, CI, review) — nothing is force-merged.
+
     ``convergence_rounds`` (#846) is the number of fix/review rounds
     (``Assignment.review_iteration``) an assignment may accumulate without
     reaching a green test verdict + approved review before it is flagged as
@@ -477,6 +489,9 @@ class PipelineConfig:
     auto_loop: bool = True
     max_review_iterations: int = 5
     escalate_fix_model: bool = True
+    # #1291 — DEFAULT OFF. See the class docstring.
+    escalate_semantic_conflicts: bool = False
+    semantic_conflict_model: str = "fable"
     attention_thresholds: dict[str, float] = field(
         default_factory=lambda: dict(_DEFAULT_ATTENTION_THRESHOLDS)
     )
@@ -1494,6 +1509,18 @@ def _parse_pipeline(raw: Any) -> PipelineConfig:
         if not isinstance(value, bool):
             raise ConfigError("pipeline.escalate_fix_model must be a boolean")
         cfg.escalate_fix_model = value
+
+    if "escalate_semantic_conflicts" in raw:
+        value = raw["escalate_semantic_conflicts"]
+        if not isinstance(value, bool):
+            raise ConfigError("pipeline.escalate_semantic_conflicts must be a boolean")
+        cfg.escalate_semantic_conflicts = value
+
+    if "semantic_conflict_model" in raw:
+        value = raw["semantic_conflict_model"]
+        if not isinstance(value, str) or not value.strip():
+            raise ConfigError("pipeline.semantic_conflict_model must be a non-empty string")
+        cfg.semantic_conflict_model = value.strip()
 
     if "attention_thresholds" in raw:
         value = raw["attention_thresholds"]

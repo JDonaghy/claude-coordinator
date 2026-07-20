@@ -601,7 +601,10 @@ def reconcile(board: Board, config: Config) -> list[str]:
                             orig.review_state = "done"
                 elif done.type == "conflict-fix":
                     # A conflict-fix with 0 commits didn't resolve anything.
-                    _on_conflict_fix_done(done, succeeded=False)
+                    _on_conflict_fix_done(
+                        done, succeeded=False,
+                        agent_entry=entry, board=board, config=config,
+                    )
             # NOTE: do NOT add to newly_failed — prevents auto_reassign loop.
         else:
             # Defensive: don't downgrade a DB-done assignment to failed when
@@ -618,8 +621,12 @@ def reconcile(board: Board, config: Config) -> list[str]:
             if failed is not None:
                 newly_failed.append(failed)
                 if failed.type == "conflict-fix":
-                    # #241: the auto-fix didn't work — escalate to the user.
-                    _on_conflict_fix_done(failed, succeeded=False)
+                    # #241: the auto-fix didn't work — escalate.  #1291: a
+                    # SEMANTIC give-up buys one stronger attempt first.
+                    _on_conflict_fix_done(
+                        failed, succeeded=False,
+                        agent_entry=entry, board=board, config=config,
+                    )
         changed.append(a.assignment_id)
 
     # Dispatch pending reviews for all completed work assignments.
@@ -714,12 +721,96 @@ def _post_human_required_comment_raw(
         )
 
 
+def _post_semantic_escalation_comment(
+    entry: QueuedMerge,
+    *,
+    model: str,
+    escalated_assignment_id: str,
+    machine_name: str,
+) -> None:
+    """#1291: tell the operator a SEMANTIC merge is being attempted.
+
+    A semantic auto-resolution is higher-trust than a mechanical rebase, so
+    it is announced up front — the point is that the human reviews the diff
+    rather than discovering it after the merge.
+    """
+    from coord import github_ops  # noqa: PLC0415
+
+    body = (
+        "## Semantic conflict — escalated for one stronger attempt\n\n"
+        f"The conflict-fix worker judged the conflict on `{entry.branch}` → "
+        f"`{entry.target_branch}` **semantic** and stopped rather than "
+        f"guess.  The coordinator has dispatched ONE escalated attempt with "
+        f"model `{model}` (assignment `{escalated_assignment_id}` on "
+        f"`{machine_name}`).\n\n"
+        f"**Last error:** `{entry.error or 'unknown'}`\n\n"
+        "⚠️ **Review this diff before it merges.** A semantic resolution "
+        "reconciles two different intents — it is a judgement call, not a "
+        "mechanical rebase.  Every gate still applies (tests, CI, "
+        "`verify-merge`, review); nothing is force-merged.  If this attempt "
+        "fails, the merge entry goes to `HUMAN_REQUIRED` — there is no "
+        "second escalation."
+    )
+    try:
+        github_ops.post_issue_comment(entry.repo_github, entry.issue_number, body)
+    except Exception as exc:  # noqa: BLE001 — best-effort notification
+        import logging  # noqa: PLC0415
+        logging.warning(
+            "could not post semantic-escalation comment on %s#%d: %s",
+            entry.repo_github, entry.issue_number, exc,
+        )
+
+
+def _try_semantic_escalation(
+    entry: QueuedMerge,
+    *,
+    board: Board | None,
+    config: Config | None,
+    machine_name: str,
+    stuck_summary: str | None,
+) -> "Assignment | None":
+    """Dispatch the one escalated (semantic) conflict-fix attempt, if allowed.
+
+    Returns the escalated assignment, or ``None`` when the feature is off,
+    the plumbing isn't available, this entry already had its one escalation,
+    or dispatch failed — in every ``None`` case the caller falls through to
+    today's HUMAN_REQUIRED behaviour.
+    """
+    if board is None or config is None:
+        return None
+    pipeline = getattr(config, "pipeline", None)
+    if pipeline is None or not getattr(pipeline, "escalate_semantic_conflicts", False):
+        return None
+
+    from coord.conflict_fix import dispatch_conflict_fix  # noqa: PLC0415
+
+    model = getattr(pipeline, "semantic_conflict_model", None) or "fable"
+    try:
+        return dispatch_conflict_fix(
+            entry,
+            board,
+            config,
+            prefer_machine=machine_name or None,
+            semantic=True,
+            model=model,
+            stuck_summary=stuck_summary,
+        )
+    except Exception as exc:  # noqa: BLE001 — never break reconcile on this
+        import logging  # noqa: PLC0415
+        logging.warning("semantic escalation dispatch failed: %s", exc)
+        return None
+
+
 def on_conflict_fix_done(
     *,
     parent_assignment_id: str,
     fix_assignment_id: str,
     machine_name: str,
     succeeded: bool,
+    semantic: bool = False,
+    board: Board | None = None,
+    config: Config | None = None,
+    stuck_summary: str | None = None,
 ) -> None:
     """Update the parent merge entry after a conflict-fix worker finishes.
 
@@ -737,6 +828,7 @@ def on_conflict_fix_done(
     items = mq.load_queue()
     changed = False
     failed_entry: mq.QueuedMerge | None = None
+    escalated: tuple[mq.QueuedMerge, str, str, str] | None = None
     for entry in items:
         if entry.assignment_id != parent_assignment_id:
             continue
@@ -745,16 +837,56 @@ def on_conflict_fix_done(
             entry.error = None
             entry.last_attempt = None
         else:
-            entry.state = mq.HUMAN_REQUIRED
             existing_error = entry.error or "conflict-fix failed"
-            entry.error = (
-                f"{existing_error}; conflict-fix worker did not resolve. "
-                "Manual rebase required."
+            # #1291: a SEMANTIC give-up gets ONE escalated attempt from a
+            # stronger model before the entry is parked.  Everything else —
+            # and a second semantic failure (the escalated attempt is itself
+            # a conflict-fix row, so `has_prior_semantic_escalation` blocks
+            # it) — behaves exactly as before.
+            fix = (
+                _try_semantic_escalation(
+                    entry,
+                    board=board,
+                    config=config,
+                    machine_name=machine_name,
+                    stuck_summary=stuck_summary,
+                )
+                if semantic
+                else None
             )
-            failed_entry = entry
+            if fix is not None:
+                # Stay in CONFLICT, not HUMAN_REQUIRED — the escalated worker
+                # is in flight.  If it fails, this hook runs again and the
+                # escalation guard sends the entry to HUMAN_REQUIRED.
+                entry.state = mq.CONFLICT
+                model = fix.model or "escalated model"
+                entry.error = (
+                    f"{existing_error}; semantic conflict escalated to "
+                    f"{model} (assignment {fix.assignment_id}) — review the "
+                    "resolution diff before merge."
+                )
+                escalated = (
+                    entry, model, fix.assignment_id or "", fix.machine_name or "",
+                )
+            else:
+                entry.state = mq.HUMAN_REQUIRED
+                entry.error = (
+                    f"{existing_error}; conflict-fix worker did not resolve. "
+                    "Manual rebase required."
+                )
+                failed_entry = entry
         changed = True
     if changed:
         mq.save_queue(items)
+
+    if escalated is not None:
+        esc_entry, esc_model, esc_id, esc_machine = escalated
+        _post_semantic_escalation_comment(
+            esc_entry,
+            model=esc_model,
+            escalated_assignment_id=esc_id,
+            machine_name=esc_machine,
+        )
 
     if failed_entry is not None:
         _post_human_required_comment_raw(
@@ -764,17 +896,80 @@ def on_conflict_fix_done(
         )
 
 
-def _on_conflict_fix_done(fix_assignment: Assignment, *, succeeded: bool) -> None:
-    """Thin wrapper used by the reconcile() loop."""
+def _on_conflict_fix_done(
+    fix_assignment: Assignment,
+    *,
+    succeeded: bool,
+    agent_entry: dict | None = None,
+    board: Board | None = None,
+    config: Config | None = None,
+) -> None:
+    """Thin wrapper used by the reconcile() loop.
+
+    On failure it also asks the worker's log whether the give-up was a
+    SEMANTIC conflict (the ``coord:conflict=semantic`` marker), which — with
+    ``pipeline.escalate_semantic_conflicts`` on — buys one escalated attempt
+    instead of an immediate HUMAN_REQUIRED (#1291).
+    """
     parent_id = fix_assignment.review_of_assignment_id
     if not parent_id:
         return
+
+    semantic = False
+    stuck_summary: str | None = None
+    if not succeeded and board is not None and config is not None:
+        semantic, stuck_summary = _semantic_verdict(
+            fix_assignment, agent_entry, config,
+        )
+
     on_conflict_fix_done(
         parent_assignment_id=parent_id,
         fix_assignment_id=fix_assignment.assignment_id or "",
         machine_name=fix_assignment.machine_name or "",
         succeeded=succeeded,
+        semantic=semantic,
+        board=board,
+        config=config,
+        stuck_summary=stuck_summary,
     )
+
+
+def _semantic_verdict(
+    fix_assignment: Assignment,
+    agent_entry: dict | None,
+    config: Config,
+) -> tuple[bool, str | None]:
+    """(is_semantic, stuck line) for a finished conflict-fix worker.
+
+    Best-effort — any failure to read the log means "not semantic", which
+    preserves the pre-#1291 HUMAN_REQUIRED path.
+    """
+    from coord.conflict_fix import detect_semantic_conflict  # noqa: PLC0415
+
+    log_path = (agent_entry or {}).get("log_path")
+    machine = next(
+        (m for m in config.machines if m.name == fix_assignment.machine_name), None,
+    )
+    try:
+        semantic = detect_semantic_conflict(
+            log_path=log_path,
+            host=machine.host if machine is not None else None,
+            assignment_id=fix_assignment.assignment_id,
+        )
+    except Exception:  # noqa: BLE001 — never break reconcile on a log read
+        return False, None
+
+    stuck_summary: str | None = None
+    if semantic:
+        progress = (agent_entry or {}).get("progress") or {}
+        stuck_summary = progress.get("stuck")
+        if not stuck_summary and log_path:
+            try:
+                from coord.progress import parse_progress  # noqa: PLC0415
+                stuck_summary = parse_progress(log_path).stuck
+            except Exception:  # noqa: BLE001
+                stuck_summary = None
+    return semantic, stuck_summary
 
 
 def _extract_issue_number(branch: str) -> int | None:
