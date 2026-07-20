@@ -28,11 +28,34 @@ reviews:
   enabled: false
 """
 
+DEVELOP_BRANCH_CONFIG_YAML = """\
+repos:
+  - name: api
+    github: acme/api
+    default_branch: main
+    develop_branch: develop
+machines:
+  - name: laptop
+    host: laptop.tailnet
+    repos: [api]
+    repo_paths:
+      api: /tmp/api
+reviews:
+  enabled: false
+"""
+
 
 @pytest.fixture
 def config_file(tmp_path: Path) -> Path:
     p = tmp_path / "coordinator.yml"
     p.write_text(CONFIG_YAML)
+    return p
+
+
+@pytest.fixture
+def develop_branch_config_file(tmp_path: Path) -> Path:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(DEVELOP_BRANCH_CONFIG_YAML)
     return p
 
 
@@ -773,6 +796,58 @@ class TestMergeAutoEnqueue:
         assert "#930" in result.output
         create.assert_called_once()
         merge_fn.assert_called_once()
+
+    def test_auto_enqueues_targeting_feature_branch_for_opted_in_milestone(
+        self, develop_branch_config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        """#934 review should-fix: `coord merge`'s auto-enqueue milestone-
+        aware target_branch (coord/commands/merge.py:966-976) had no test —
+        the "merge targets the right base" seam the issue explicitly named.
+        Repo opted into the git model + issue tagged to a milestone → PR
+        opened against feature/ms-NN, not default_branch."""
+        self._seed_board_with_done_work(coord_db, issue_number=934)
+        self._seed_issue_state(coord_db, number=934, state="open")
+
+        with patch("coord.github_ops.create_pr") as create, \
+             patch("coord.github_ops.merge_pr") as merge_fn, \
+             patch("coord.github_ops.get_pr_size", return_value=10), \
+             patch(
+                 "coord.github_ops.get_issue",
+                 return_value={"milestone": {"number": 9, "title": "M9"}},
+             ):
+            create.return_value = {"number": 99, "url": "u/99", "existed": False}
+            merge_fn.return_value = (True, "ok")
+            result = CliRunner().invoke(
+                main, ["merge", "--config", str(develop_branch_config_file)]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "auto-enqueued" in result.output
+        assert "feature/ms-9" in result.output
+        create.assert_called_once()
+        assert create.call_args.kwargs["base"] == "feature/ms-9"
+
+    def test_auto_enqueues_targeting_default_branch_when_no_milestone(
+        self, develop_branch_config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        """Opted-in repo, but this issue isn't tagged to a milestone — falls
+        back to default_branch, same as an un-opted-in repo."""
+        self._seed_board_with_done_work(coord_db, issue_number=935)
+        self._seed_issue_state(coord_db, number=935, state="open")
+
+        with patch("coord.github_ops.create_pr") as create, \
+             patch("coord.github_ops.merge_pr") as merge_fn, \
+             patch("coord.github_ops.get_pr_size", return_value=10), \
+             patch("coord.github_ops.get_issue", return_value={"milestone": None}):
+            create.return_value = {"number": 99, "url": "u/99", "existed": False}
+            merge_fn.return_value = (True, "ok")
+            result = CliRunner().invoke(
+                main, ["merge", "--config", str(develop_branch_config_file)]
+            )
+
+        assert result.exit_code == 0, result.output
+        create.assert_called_once()
+        assert create.call_args.kwargs["base"] == "main"
 
     def test_skips_closed_issues(
         self, config_file: Path, coord_dir: Path, coord_db

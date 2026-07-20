@@ -981,6 +981,23 @@ reviews:
   enabled: false
 """
 
+DEVELOP_BRANCH_CONFIG_YAML = """\
+repos:
+  - name: api
+    github: acme/api
+    default_branch: main
+    develop_branch: develop
+machines:
+  - name: laptop
+    host: laptop.tailnet
+    repos: [api]
+    repo_paths:
+      api: /tmp/api
+reviews:
+  enabled: false
+"""
+
+
 class TestVerifyMergeCli:
     """CLI routing tests for ``coord verify-merge`` (#681)."""
 
@@ -1158,3 +1175,88 @@ class TestVerifyMergeCli:
         assert result.exit_code == 2
         assert "mg-gone" in result.output
         assert "--repo" in result.output  # error message mentions the fallback flags
+
+    def test_verifies_against_feature_branch_for_opted_in_milestone(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """#934 review should-fix: ``coord verify-merge``'s milestone-aware
+        base resolution (``coord/commands/merge.py:131-141``) was added with
+        no accompanying test. Repo opted into the git model + issue tagged
+        to a milestone → verify against ``feature/ms-NN``, not
+        ``default_branch``."""
+        from click.testing import CliRunner
+
+        from coord import client as cc
+        from coord.cli import main
+        from coord.models import Board
+
+        config_file = tmp_path / "coordinator.yml"
+        config_file.write_text(DEVELOP_BRANCH_CONFIG_YAML)
+
+        monkeypatch.setattr(cc, "resolve_board_service", lambda *a, **k: None)
+        monkeypatch.setattr("coord.state.build_board", lambda: Board())
+
+        captured: dict = {}
+
+        def fake_verify(wt_path, *, base, issue_number):
+            captured["base"] = base
+            from coord.agent import MergeVerify
+            return MergeVerify(default_ahead=0, added=[], foreign=[])
+
+        with patch("coord.agent.verify_merge_branch", side_effect=fake_verify), \
+             patch(
+                 "coord.github_ops.get_issue",
+                 return_value={"milestone": {"number": 9, "title": "M9"}},
+             ):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "verify-merge", "mg-missing",
+                    "--repo", "api",
+                    "--issue-number", "681",
+                    "--config", str(config_file),
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert captured["base"] == "feature/ms-9"
+        assert "target base:   feature/ms-9" in result.output
+
+    def test_verifies_against_default_branch_when_issue_has_no_milestone(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Opted-in repo, but this issue isn't tagged to a milestone — falls
+        back to default_branch, same as an un-opted-in repo."""
+        from click.testing import CliRunner
+
+        from coord import client as cc
+        from coord.cli import main
+        from coord.models import Board
+
+        config_file = tmp_path / "coordinator.yml"
+        config_file.write_text(DEVELOP_BRANCH_CONFIG_YAML)
+
+        monkeypatch.setattr(cc, "resolve_board_service", lambda *a, **k: None)
+        monkeypatch.setattr("coord.state.build_board", lambda: Board())
+
+        captured: dict = {}
+
+        def fake_verify(wt_path, *, base, issue_number):
+            captured["base"] = base
+            from coord.agent import MergeVerify
+            return MergeVerify(default_ahead=0, added=[], foreign=[])
+
+        with patch("coord.agent.verify_merge_branch", side_effect=fake_verify), \
+             patch("coord.github_ops.get_issue", return_value={"milestone": None}):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "verify-merge", "mg-missing",
+                    "--repo", "api",
+                    "--issue-number", "681",
+                    "--config", str(config_file),
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert captured["base"] == "main"
