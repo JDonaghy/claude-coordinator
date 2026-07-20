@@ -115,6 +115,70 @@ class TestReassign:
         )
         assert _reassign(failed, Board(), config) is None
 
+    def test_retry_targets_feature_branch_for_opted_in_milestone(self) -> None:
+        """#934 review should-fix: _reassign's milestone-aware retry base
+        (coord/reconcile.py:392-409) shipped with no test. A repo that
+        opted into the git model, retrying an issue that belongs to a
+        milestone, must post `branch: feature/ms-NN` to the agent — not
+        default_branch — so the retry's own base matches where the
+        original work branched from."""
+        config = Config(
+            repos=[Repo(name="api", github="a/a", default_branch="main",
+                        develop_branch="develop")],
+            machines=[
+                Machine(name="laptop", host="l", repos=["api"], repo_paths={"api": "/tmp/a"}),
+                Machine(name="server", host="s", repos=["api"], repo_paths={"api": "/tmp/a"}),
+            ],
+        )
+        failed = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=42,
+            issue_title="Fix auth", assignment_id="a1", status="failed",
+            briefing="do the thing",
+        )
+        board = Board()
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "retry1"}
+        mock_resp.raise_for_status = lambda: None
+
+        with patch("coord.reconcile.httpx.post", return_value=mock_resp) as mock_post, \
+             patch("coord.github_ops.get_issue",
+                   return_value={"milestone": {"number": 9, "title": "M9"}}):
+            result = _reassign(failed, board, config)
+
+        assert result is not None
+        posted_payload = mock_post.call_args.kwargs["json"]
+        assert posted_payload["branch"] == "feature/ms-9"
+
+    def test_retry_targets_default_branch_when_not_opted_in(self) -> None:
+        """No develop_branch configured → default_branch, unchanged behavior."""
+        config = Config(
+            repos=[Repo(name="api", github="a/a", default_branch="main")],
+            machines=[
+                Machine(name="laptop", host="l", repos=["api"], repo_paths={"api": "/tmp/a"}),
+                Machine(name="server", host="s", repos=["api"], repo_paths={"api": "/tmp/a"}),
+            ],
+        )
+        failed = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=42,
+            issue_title="Fix auth", assignment_id="a1", status="failed",
+            briefing="do the thing",
+        )
+        board = Board()
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "retry1"}
+        mock_resp.raise_for_status = lambda: None
+
+        with patch("coord.reconcile.httpx.post", return_value=mock_resp) as mock_post, \
+             patch("coord.github_ops.get_issue") as get_issue:
+            result = _reassign(failed, board, config)
+
+        get_issue.assert_not_called()
+        assert result is not None
+        posted_payload = mock_post.call_args.kwargs["json"]
+        assert posted_payload["branch"] == "main"
+
 
 # ── Auto-reassign from reconcile ────────────────────────────────────────────
 
