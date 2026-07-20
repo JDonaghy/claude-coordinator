@@ -734,6 +734,25 @@ def delete_remote_branch(repo: str, branch: str) -> bool:
         return False
 
 
+def create_remote_branch(repo: str, branch: str, sha: str) -> bool:
+    """Create a remote branch (a ``refs/heads/{branch}`` ref) pointing at
+    *sha*. Returns True on success, False on failure.
+
+    #934: used by ``coord.branch_model.ensure_feature_branch_exists`` to
+    create ``feature/ms-NN`` off ``develop`` on demand, idempotently (the
+    caller checks ``branch_exists_on_remote`` first).
+    """
+    try:
+        _gh(
+            "api", "-X", "POST", f"repos/{repo}/git/refs",
+            "-f", f"ref=refs/heads/{branch}",
+            "-f", f"sha={sha}",
+        )
+        return True
+    except RuntimeError:
+        return False
+
+
 def get_default_branch_head(repo: str, branch: str) -> str:
     """Return the full commit SHA at the tip of `branch` on `repo` (owner/name)."""
     raw = _gh("api", f"repos/{repo}/branches/{branch}")
