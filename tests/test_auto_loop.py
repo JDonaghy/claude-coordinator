@@ -241,6 +241,77 @@ class TestProcessReviewCompletion:
 
         assert actions[0].kind == "approved"  # should not raise
 
+    def test_approve_verdict_targets_feature_branch_for_opted_in_milestone(
+        self, tmp_path, coord_db,
+    ) -> None:
+        """#934 review should-fix: _advance_pipeline's milestone-aware
+        target_branch (coord/auto_loop.py:329-343) shipped with no test.
+        A repo that opted into the git model, approving work on an issue
+        that belongs to a milestone, must refresh the merge-queue entry
+        with target_branch=feature/ms-NN, not default_branch."""
+        from coord import merge_queue as mq
+
+        opted_in_repo = Repo(
+            name="api", github="acme/api", default_branch="main",
+            develop_branch="develop",
+        )
+        opted_in_config = Config(
+            repos=[opted_in_repo],
+            machines=[Machine(
+                name="laptop", host="laptop.tail", capabilities=["python"],
+                repos=["api"], repo_paths={"api": "/work/api"},
+            )],
+            reviews=ReviewsConfig(enabled=True, auto_dispatch=True),
+            pipeline=PipelineConfig(auto_loop=True, max_review_iterations=3),
+        )
+
+        log_file = tmp_path / "review.log"
+        log_file.write_text(
+            "REVIEW_VERDICT: approve\nREVIEW_BODY:\nLGTM.\nEND_REVIEW\n"
+        )
+        review = _review_assignment()
+        work = _work_assignment()
+        board = _board_with(work, review)
+
+        with patch("coord.github_ops.get_issue",
+                   return_value={"milestone": {"number": 9, "title": "M9"}}), \
+             patch("coord.github_ops.get_branch_diff_size", return_value=0):
+            actions = process_review_completion(
+                review, board, opted_in_config, log_path=str(log_file)
+            )
+
+        assert actions[0].kind == "approved"
+        items = mq.load_queue()
+        assert len(items) == 1
+        assert items[0].target_branch == "feature/ms-9"
+
+    def test_approve_verdict_targets_default_branch_when_no_milestone(
+        self, config: Config, tmp_path, coord_db,
+    ) -> None:
+        """Default `config` fixture's repo has no develop_branch — the
+        existing (un-opted-in) behavior is unchanged."""
+        from coord import merge_queue as mq
+
+        log_file = tmp_path / "review.log"
+        log_file.write_text(
+            "REVIEW_VERDICT: approve\nREVIEW_BODY:\nLGTM.\nEND_REVIEW\n"
+        )
+        review = _review_assignment()
+        work = _work_assignment()
+        board = _board_with(work, review)
+
+        with patch("coord.github_ops.get_issue") as get_issue, \
+             patch("coord.github_ops.get_branch_diff_size", return_value=0):
+            actions = process_review_completion(
+                review, board, config, log_path=str(log_file)
+            )
+
+        get_issue.assert_not_called()
+        assert actions[0].kind == "approved"
+        items = mq.load_queue()
+        assert len(items) == 1
+        assert items[0].target_branch == "main"
+
     def test_request_changes_dispatches_fix_worker(
         self, config: Config, tmp_path
     ) -> None:
