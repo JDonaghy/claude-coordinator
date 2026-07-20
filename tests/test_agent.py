@@ -719,6 +719,63 @@ def test_clean_worktrees_skips_symlinks(tmp_path: Path) -> None:
     assert (target / "precious.txt").read_text() == "do not delete"
 
 
+def test_clean_worktrees_stashes_orphaned_worktree_with_no_assignment_record(
+    tmp_path: Path,
+) -> None:
+    """#1295 fix item #2: a worktree with NO assignment record at all — the
+    interactive session that built it ended without ever running finalize
+    (crash, `tmux kill-session`, network drop before `coord done`) — must
+    still get its configured artifacts stashed before the sweep destroys it.
+
+    The tmux/protect guards (tested above) only catch a session that is
+    STILL alive; this is the narrower "already dead, never finalized" gap
+    the issue's fix item #2 explicitly called out, and which the plain
+    ``if a is not None: self._stash_artifacts(a)`` guard left unhandled
+    (there's no ``AgentAssignment`` to hand to it) before this fix.
+    """
+    repo = _init_repo(tmp_path / "repo")
+    server = _server(tmp_path, repo_path=repo, artifact_paths={"api": ["built.bin"]})
+
+    assignment_id = "orphaned-no-record"
+    wt_dir = server.state_dir / "worktrees" / assignment_id
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "issue-1295-orphan", str(wt_dir)],
+        cwd=str(repo),
+        check=True,
+        capture_output=True,
+    )
+    (wt_dir / "built.bin").write_bytes(b"X" * 4096)
+    old = time.time() - 3600
+    os.utime(wt_dir, (old, old))
+
+    result = server.clean_worktrees(recent_secs=0)
+
+    assert result["cleaned"] == 1
+    assert not wt_dir.exists()
+    stash_dir = server.state_dir / "artifacts" / "api" / "issue-1295-orphan"
+    assert (stash_dir / "built.bin").exists()
+
+
+def test_clean_worktrees_orphan_stash_noop_for_plain_directory(
+    tmp_path: Path,
+) -> None:
+    """A plain (non-git) orphaned directory — as created by races/tests —
+    must still be removed cleanly; the new orphan-stash attempt degrades
+    to a silent no-op (``git rev-parse`` fails) rather than raising and
+    aborting the sweep.
+    """
+    server = _server(tmp_path, artifact_paths={"api": ["*.bin"]})
+    orphan = server.state_dir / "worktrees" / "not-a-git-dir"
+    orphan.mkdir(parents=True)
+    (orphan / "file.txt").write_text("data")
+    old = time.time() - 3600
+    os.utime(orphan, (old, old))
+
+    result = server.clean_worktrees(recent_secs=0)
+    assert result["cleaned"] == 1
+    assert not orphan.exists()
+
+
 def test_stash_against_nonexistent_worktree_creates_no_directory(
     tmp_path: Path,
 ) -> None:
@@ -1917,6 +1974,45 @@ def test_artifact_absence_reason_genuinely_absent(tmp_path: Path) -> None:
     server = _server(tmp_path, artifact_paths={"api": ["target/debug/foo"]})
     reason = server.artifact_absence_reason("api", "issue-1-never-existed")
     assert "already merged" in reason or "nothing was ever built" in reason
+
+
+def test_artifact_absence_reason_distinguishes_empty_stash_dir(
+    tmp_path: Path,
+) -> None:
+    """#1295 fix item #5: an existing-but-EMPTY stash directory must get
+    DIFFERENT wording than "no stash and no live worktree at all" — the
+    former means a stash attempt DID run (worker, interactive finalize, or
+    the sweep's own orphan-stash) and matched 0 files (an artifact_paths /
+    build problem); the latter means nothing ever tried.  Before this fix
+    both cases produced the identical generic message, and the only test
+    covering the string (`..._names_worktree_sweep_possibility`) never
+    exercised a stash directory that actually existed.
+    """
+    server = _server(tmp_path)
+    stash_dir = server.state_dir / "artifacts" / "api" / "issue-1295-empty"
+    stash_dir.mkdir(parents=True)
+    # Directory exists but holds no real (non-dotfile) content.
+
+    reason = server.artifact_absence_reason("api", "issue-1295-empty")
+    assert "empty" in reason.lower()
+    assert str(stash_dir) in reason
+
+
+def test_artifact_absence_reason_empty_vs_no_stash_dir_are_distinct(
+    tmp_path: Path,
+) -> None:
+    """Sanity check the two wordings introduced by fix item #5 don't collapse
+    back into the same generic string for two genuinely different states.
+    """
+    server = _server(tmp_path)
+    empty_dir = server.state_dir / "artifacts" / "api" / "issue-1295-empty2"
+    empty_dir.mkdir(parents=True)
+
+    reason_empty = server.artifact_absence_reason("api", "issue-1295-empty2")
+    reason_absent = server.artifact_absence_reason("api", "issue-1295-truly-absent")
+    assert reason_empty != reason_absent
+    assert "empty" in reason_empty.lower()
+    assert "empty" not in reason_absent.lower()
 
 
 def test_artifact_absence_reason_rejects_bad_path_components(
