@@ -1449,6 +1449,14 @@ class InteractiveFinalizeResult:
         smoke_restore_error: Set when the restore step itself failed
             outright (as opposed to "nothing to restore").  ``None``
             otherwise.
+        artifacts_stashed: Number of files copied by the artifact stash
+            step (#1295), or ``None`` when no stash was attempted at all
+            (no ``artifact_paths`` configured, no worktree present, or —
+            on the remote path — the ssh call couldn't be confirmed).
+            ``0`` is a real result: the stash ran but nothing matched the
+            configured globs, which is exactly the silent-failure mode the
+            issue's fix items #2/#3 asked to stop hiding — callers should
+            treat ``0`` as worth a warning, not as "nothing happened".
     """
 
     terminal_status: str
@@ -1467,6 +1475,7 @@ class InteractiveFinalizeResult:
     # finalize_interactive_exit.  See attribute docs above.
     smoke_restored_paths: list[str] = field(default_factory=list)
     smoke_restore_error: str | None = field(default=None)
+    artifacts_stashed: int | None = field(default=None)
 
 
 def _git_push(wt_path: Path, *, timeout: float = 60.0) -> tuple[bool, str | None]:
@@ -2366,6 +2375,7 @@ def finalize_interactive_exit(
     # the instant the human closed the TTY.
     if _assignment_already_recorded(assignment_id):
         worktree_removed = False
+        _artifacts_stashed: int | None = None
         wt_p = Path(worktree_path) if worktree_path else None
         if wt_p is not None and wt_p.exists():
             # #562: stash before removing — `coord report-result` never stashes.
@@ -2374,7 +2384,7 @@ def finalize_interactive_exit(
                     stash_artifacts_for_branch as _stash_fn,
                 )
                 from coord.state import COORD_DIR as _CD  # noqa: PLC0415
-                _stash_fn(
+                _artifacts_stashed = _stash_fn(
                     worktree_path=wt_p,
                     branch=_current_branch(wt_p) or "",
                     repo_name=repo_name,
@@ -2398,6 +2408,7 @@ def finalize_interactive_exit(
             merge_verify=merge_verify,
             smoke_restored_paths=_smoke_restored,
             smoke_restore_error=_smoke_restore_error,
+            artifacts_stashed=_artifacts_stashed,
         )
 
     # ── Transcript-floor (#606): durable review capture ──────────────────────
@@ -2531,10 +2542,11 @@ def finalize_interactive_exit(
     # for every interactive work session.  Same discipline as the agent-side
     # stash: best-effort, runs regardless of outcome.status so partially
     # built artifacts on a failed session are still captured.
+    artifacts_stashed: int | None = None
     if _effective_patterns and wt_path is not None and wt_path.exists():
         from coord.agent import stash_artifacts_for_branch as _stash_fn  # noqa: PLC0415
         from coord.state import COORD_DIR as _COORD_DIR  # noqa: PLC0415
-        _stash_fn(
+        artifacts_stashed = _stash_fn(
             worktree_path=wt_path,
             branch=branch_now or "",
             repo_name=repo_name,
@@ -2564,6 +2576,7 @@ def finalize_interactive_exit(
         merge_verify=merge_verify,
         smoke_restored_paths=_smoke_restored,
         smoke_restore_error=_smoke_restore_error,
+        artifacts_stashed=artifacts_stashed,
     )
 
 
@@ -2879,7 +2892,7 @@ def _remote_stash_artifacts(
     assignment_id: str,
     *,
     timeout: float = 60.0,
-) -> bool:
+) -> int | None:
     """Run :func:`coord.agent.stash_artifacts_for_branch` on the remote machine.
 
     SSHes into *ssh_target* and invokes the standalone stash function via the
@@ -2891,8 +2904,18 @@ def _remote_stash_artifacts(
     are passed as ``sys.argv`` positional arguments so no shell-within-shell
     quoting is needed — the outer ssh call handles quoting of the argv list.
 
-    Returns ``True`` when the remote command echoed ``__STASH_DONE``.
-    Best-effort: SSH/import failures are silently ignored by the caller.
+    Returns the number of files copied (the same int
+    :func:`~coord.agent.stash_artifacts_for_branch` returns), or ``None``
+    when the remote call could not be confirmed at all (ssh transport
+    failure, or the sentinel line never came back). ``0`` is a real,
+    meaningful result — the stash ran but nothing matched
+    ``artifact_paths`` — and callers must not conflate it with ``None``.
+    Previously this returned a bare ``bool`` fed only by an unconditional
+    ``echo __STASH_DONE``, so a 0-copy stash and a fully successful one
+    were indistinguishable to every caller (#1295).
+
+    Best-effort: SSH/import failures are silently ignored (``None``) by
+    the caller.
     """
     patterns_json = json.dumps(patterns)
     # The Python snippet reads all inputs from argv — no interpolation of
@@ -2905,20 +2928,23 @@ def _remote_stash_artifacts(
     # ``$HOME``.  ``Path.expanduser()`` only handles ``~``, not ``$HOME``.
     # Use ``os.path.expandvars()`` in the snippet to resolve ``$HOME`` on the
     # remote machine before constructing the Path.
+    #
+    # #1295: the snippet now prints its own result (``__STASH_COPIED:<n>``)
+    # instead of relying purely on the outer shell's unconditional
+    # ``&& echo __STASH_DONE`` — that old sentinel fired even when 0 files
+    # were copied, which is exactly the silent-failure the issue reported.
     py_snippet = (
         "import sys,json,os; from pathlib import Path; "
         "from coord.agent import stash_artifacts_for_branch; "
-        "stash_artifacts_for_branch("
+        "n = stash_artifacts_for_branch("
         "worktree_path=Path(os.path.expandvars(sys.argv[1])),"
         "branch=sys.argv[2],"
         "repo_name=sys.argv[3],"
         "patterns=json.loads(sys.argv[4]),"
         "state_dir=Path.home()/'.coord',"
         "assignment_id=sys.argv[5]"
-        ")"
+        "); print(f'__STASH_COPIED:{n}')"
     )
-    # Try the coord venv Python first; fall back to plain python3.
-    # Both invocations pass the same argv so the snippet is identical.
     argv_tail = [
         remote_worktree_sh,
         branch,
@@ -2926,17 +2952,24 @@ def _remote_stash_artifacts(
         patterns_json,
         assignment_id,
     ]
-    # Build a single shell command:
-    #   ( ~/.coord-venv/bin/python3 -c SNIPPET ARGS || python3 -c SNIPPET ARGS )
-    #   && echo __STASH_DONE
-    # The final echo is a reliable sentinel even if the snippet's own print()
-    # is swallowed by 2>/dev/null.
     snippet_q = shlex.quote(py_snippet)
     args_q = " ".join(shlex.quote(a) for a in argv_tail)
+    # #1295: the previous version ran
+    #   ( ~/.coord-venv/bin/python3 -c SNIPPET ARGS 2>/dev/null
+    #     || python3 -c SNIPPET ARGS 2>/dev/null ) && echo __STASH_DONE
+    # — both branches of the `||` unconditionally redirected stderr to
+    # /dev/null, which is where Python's default logging handler sends
+    # `stash_artifacts_for_branch`'s new `_log.warning("stash: 0 files
+    # matched ...")` (no handler is configured in this bare `python3 -c`
+    # process, so it falls back to `logging.lastResort`, a stderr
+    # StreamHandler). The warning was therefore invisible on exactly this
+    # path. Probing for the venv python with `command -v` first — instead
+    # of trying it and swallowing whatever it prints on failure — means
+    # only ONE interpreter ever actually runs the snippet, so its stderr
+    # can be captured intact and surfaced below rather than discarded.
     remote_cmd = (
-        f"( ~/.coord-venv/bin/python3 -c {snippet_q} {args_q} 2>/dev/null"
-        f" || python3 -c {snippet_q} {args_q} 2>/dev/null )"
-        " && echo __STASH_DONE"
+        "PYBIN=$(command -v ~/.coord-venv/bin/python3 2>/dev/null || command -v python3); "
+        f"\"$PYBIN\" -c {snippet_q} {args_q}"
     )
     try:
         result = subprocess.run(
@@ -2946,8 +2979,38 @@ def _remote_stash_artifacts(
             timeout=timeout,
         )
     except (subprocess.SubprocessError, OSError):
-        return False
-    return "__STASH_DONE" in (result.stdout or "")
+        logging.warning(
+            "remote stash: ssh to %s failed for repo=%s branch=%s aid=%s "
+            "— could not confirm artifact stash",
+            ssh_target, repo_name, branch, assignment_id,
+        )
+        return None
+
+    copied: int | None = None
+    for line in (result.stdout or "").splitlines():
+        if line.startswith("__STASH_COPIED:"):
+            try:
+                copied = int(line.split(":", 1)[1])
+            except ValueError:
+                copied = None
+            break
+
+    # #1295: a 0-copy or unconfirmed remote stash used to vanish silently
+    # (stderr → /dev/null, and the caller only ever saw a bare `True`/`False`
+    # it didn't act on). Surface it through the coordinator's own log —
+    # this runs on the coordinator/dispatcher host, so it's a different
+    # log than the agent-side `_log.warning` inside
+    # `stash_artifacts_for_branch`, but it's the log a human debugging a
+    # *remote* interactive finalize will actually be looking at.
+    if copied is None or copied == 0:
+        logging.warning(
+            "remote stash: %s (repo=%s branch=%s aid=%s target=%s) "
+            "remote stderr=%r",
+            "could not confirm result" if copied is None else "0 files matched",
+            repo_name, branch, assignment_id, ssh_target,
+            (result.stderr or "").strip()[:2000],
+        )
+    return copied
 
 
 def _remote_verify_merge_branch(
@@ -3205,8 +3268,9 @@ def finalize_remote_interactive_exit(
         # #562: stash artifacts before removing the worktree, even when the
         # agent already recorded via `coord report-result` — that path never
         # stashes on its own.
+        _artifacts_stashed: int | None = None
         if _effective_patterns:
-            _remote_stash_artifacts(
+            _artifacts_stashed = _remote_stash_artifacts(
                 ssh_target, remote_worktree_sh, repo_name, branch,
                 _effective_patterns, assignment_id,
             )
@@ -3222,6 +3286,7 @@ def finalize_remote_interactive_exit(
             seam_outcome=None,
             worktree_removed=removed,
             merge_verify=merge_verify,
+            artifacts_stashed=_artifacts_stashed,
         )
 
     push_ok, push_error, commits, branch_now = _remote_push_and_count(
@@ -3258,8 +3323,9 @@ def finalize_remote_interactive_exit(
     # survive cleanup — same discipline as the agent-side stash on workers.
     # Stash regardless of push_ok (the worktree files are still present even
     # when the push failed) so a failed-push session doesn't lose its build.
+    artifacts_stashed: int | None = None
     if _effective_patterns:
-        _remote_stash_artifacts(
+        artifacts_stashed = _remote_stash_artifacts(
             ssh_target, remote_worktree_sh, repo_name, branch,
             _effective_patterns, assignment_id,
         )
@@ -3281,6 +3347,7 @@ def finalize_remote_interactive_exit(
         seam_outcome=outcome,
         worktree_removed=worktree_removed,
         merge_verify=merge_verify,
+        artifacts_stashed=artifacts_stashed,
     )
 
 
