@@ -36608,3 +36608,379 @@ Milestone tracking issue.
              (sidebar / status-bar hint):\n{screen}"
         );
     }
+
+    // ── #1300: Done section badge count vs. rendered rows ────────────────────
+
+    /// Build a fixture where epic #200 is still open (in In-progress) and its
+    /// children #201 + #202 are closed (Done), plus two standalone closed
+    /// issues #203 and #204. This is the exact shape of the #448/#934 live bug:
+    /// children whose epic is in another section.
+    ///
+    /// `done_window` is set to `All` so the time filter doesn't interfere.
+    fn make_1300_open_epic_done_children_app() -> CoordApp {
+        let data = BoardData {
+            open_issues: vec![
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 200,
+                    title: "Open epic".to_string(),
+                    body: String::new(),
+                    state: "open".to_string(),
+                    labels: vec!["coord".to_string(), "epic".to_string()],
+                    milestone_number: None,
+                    milestone_title: None,
+                },
+                // Children: closed so the DAG sees them as Done and the
+                // epic's lifecycle section is "in-progress".
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 201,
+                    title: "Done child A".to_string(),
+                    body: String::new(),
+                    state: "closed".to_string(),
+                    labels: vec!["coord".to_string()],
+                    milestone_number: None,
+                    milestone_title: None,
+                },
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 202,
+                    title: "Done child B".to_string(),
+                    body: String::new(),
+                    state: "closed".to_string(),
+                    labels: vec!["coord".to_string()],
+                    milestone_number: None,
+                    milestone_title: None,
+                },
+                // Standalone (no epic) closed issues.
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 203,
+                    title: "Done standalone C".to_string(),
+                    body: String::new(),
+                    state: "closed".to_string(),
+                    labels: vec!["coord".to_string()],
+                    milestone_number: None,
+                    milestone_title: None,
+                },
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 204,
+                    title: "Done standalone D".to_string(),
+                    body: String::new(),
+                    state: "closed".to_string(),
+                    labels: vec!["coord".to_string()],
+                    milestone_number: None,
+                    milestone_title: None,
+                },
+            ],
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            epic_children: vec![EpicChildren {
+                repo_name: "api".to_string(),
+                tracking_issue: 200,
+                children: vec![
+                    EpicChild { number: 201, state: "closed".to_string() },
+                    EpicChild { number: 202, state: "closed".to_string() },
+                ],
+            }],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        app.pipeline_issues = vec![
+            // Epic #200 (open) — renders in In-progress.
+            PipelineIssue {
+                number: 200,
+                title: "Open epic".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string(), "epic".to_string()],
+                is_closed: false,
+            },
+            // Children #201, #202 — closed → Done.
+            PipelineIssue {
+                number: 201,
+                title: "Done child A".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string()],
+                is_closed: true,
+            },
+            PipelineIssue {
+                number: 202,
+                title: "Done child B".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string()],
+                is_closed: true,
+            },
+            // Standalone closed issues — no epic.
+            PipelineIssue {
+                number: 203,
+                title: "Done standalone C".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string()],
+                is_closed: true,
+            },
+            PipelineIssue {
+                number: 204,
+                title: "Done standalone D".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string()],
+                is_closed: true,
+            },
+        ];
+        app.done_window = DoneWindow::All;
+        app.active_view = SidebarView::Pipeline;
+        app.rebuild_pipeline_sidebar(None);
+        // #815: Done defaults to collapsed; expand it so TuiDriver tests
+        // can assert on rendered rows without clicking the header first.
+        if let Some(pos) = app.pipeline_state_section_names.iter().position(|&k| k == "done") {
+            app.pipeline_sidebar.set_collapsed(pos + 1, false); // +1 for FILTER section
+        }
+        app
+    }
+
+    /// #1300 case 1: an epic child whose epic is in In-progress (not Done)
+    /// must render as a flat row in the Done section — the pre-fix global
+    /// nesting suppressed it.
+    ///
+    /// Also asserts the count-equals-rows invariant: every issue tracked in
+    /// `done_windowed` renders on screen (either flat or nested under an epic
+    /// that is also in Done — in this fixture all are flat).
+    #[test]
+    fn tuidriver_pipeline_1300_done_child_of_open_epic_renders_flat() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_1300_open_epic_done_children_app();
+
+        // Confirm the Done section counts all 4 closed issues.
+        let done_windowed = app.pipeline_done_windowed();
+        assert_eq!(
+            done_windowed.len(),
+            4,
+            "#1300: done_windowed must include all 4 closed issues (the badge count)\n\
+             windowed: {:?}",
+            done_windowed
+                .iter()
+                .map(|&i| app.pipeline_issues[i].number)
+                .collect::<Vec<_>>(),
+        );
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 50);
+        let screen = driver.screen();
+
+        // All 4 Done items must be visible as rows — including #201 and #202
+        // whose epic #200 is open (in In-progress, not in Done). Before the
+        // #1300 fix, #201 and #202 were globally-nested and suppressed.
+        assert!(
+            driver.screen_contains("#201"),
+            "#1300: done child #201 (epic in another section) must render flat in Done:\n{screen}",
+        );
+        assert!(
+            driver.screen_contains("#202"),
+            "#1300: done child #202 (epic in another section) must render flat in Done:\n{screen}",
+        );
+        assert!(
+            driver.screen_contains("#203"),
+            "#1300: standalone done issue #203 must render in Done:\n{screen}",
+        );
+        assert!(
+            driver.screen_contains("#204"),
+            "#1300: standalone done issue #204 must render in Done:\n{screen}",
+        );
+
+        // Badge must say "(4)" — done_windowed.len() == rendered rows when
+        // no epics are in the Done window.
+        assert!(
+            driver.screen_contains("(4)"),
+            "#1300: Done section badge must read (4) — one per rendered row:\n{screen}",
+        );
+    }
+
+    /// #1300 case 2: when an epic is itself inside the Done window (both epic
+    /// and child are closed), the child stays nested under the epic row and
+    /// does NOT appear as a flat sibling — preserving #1197/#1253's
+    /// no-duplicate invariant within the Done window itself.
+    ///
+    /// The epic defaults to collapsed (all children done → #1253 rule), so
+    /// the child row is not visible. The badge counts both items.
+    #[test]
+    fn tuidriver_pipeline_1300_done_child_with_done_epic_stays_nested() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let data = BoardData {
+            open_issues: vec![
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 300,
+                    title: "Closed epic".to_string(),
+                    body: String::new(),
+                    // Epic is also closed — both epic and child are in Done.
+                    state: "closed".to_string(),
+                    labels: vec!["coord".to_string(), "epic".to_string()],
+                    milestone_number: None,
+                    milestone_title: None,
+                },
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 301,
+                    title: "Closed child".to_string(),
+                    body: String::new(),
+                    state: "closed".to_string(),
+                    labels: vec!["coord".to_string()],
+                    milestone_number: None,
+                    milestone_title: None,
+                },
+                // A standalone closed issue so the Done section isn't just
+                // the epic+child (makes the fixture more realistic).
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 302,
+                    title: "Standalone done".to_string(),
+                    body: String::new(),
+                    state: "closed".to_string(),
+                    labels: vec!["coord".to_string()],
+                    milestone_number: None,
+                    milestone_title: None,
+                },
+            ],
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            epic_children: vec![EpicChildren {
+                repo_name: "api".to_string(),
+                tracking_issue: 300,
+                children: vec![EpicChild { number: 301, state: "closed".to_string() }],
+            }],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        app.pipeline_issues = vec![
+            PipelineIssue {
+                number: 300,
+                title: "Closed epic".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string(), "epic".to_string()],
+                is_closed: true,
+            },
+            PipelineIssue {
+                number: 301,
+                title: "Closed child".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string()],
+                is_closed: true,
+            },
+            PipelineIssue {
+                number: 302,
+                title: "Standalone done".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string()],
+                is_closed: true,
+            },
+        ];
+        app.done_window = DoneWindow::All;
+        app.active_view = SidebarView::Pipeline;
+        app.rebuild_pipeline_sidebar(None);
+        // Expand the Done section (collapses by default per #815).
+        if let Some(pos) = app.pipeline_state_section_names.iter().position(|&k| k == "done") {
+            app.pipeline_sidebar.set_collapsed(pos + 1, false); // +1 for FILTER section
+        }
+
+        // done_windowed = [300, 301, 302] — badge says "(3)".
+        let done_windowed = app.pipeline_done_windowed();
+        assert_eq!(
+            done_windowed.len(),
+            3,
+            "#1300 case 2: done_windowed must include epic + child + standalone",
+        );
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 50);
+        let screen = driver.screen();
+
+        // Epic #300 must render as a row (it's in Done).
+        assert!(
+            driver.screen_contains("#300"),
+            "#1300 case 2: epic #300 must render in Done:\n{screen}",
+        );
+
+        // #301 must NOT appear as a flat sibling of #300 — it is nested under
+        // the epic. The epic defaults to collapsed (all children done), so
+        // #301 isn't visible at all in the initial render.
+        assert!(
+            !driver.screen_contains("#301"),
+            "#1300 case 2: child #301 must not appear as a flat row \
+             (nested under epic #300, collapsed by default):\n{screen}",
+        );
+
+        // Standalone #302 renders flat.
+        assert!(
+            driver.screen_contains("#302"),
+            "#1300 case 2: standalone #302 must render flat in Done:\n{screen}",
+        );
+
+        // Badge "(3)" — the count tracks all items logically in Done,
+        // even those nested under (or hidden inside) a collapsed epic.
+        assert!(
+            driver.screen_contains("(3)"),
+            "#1300 case 2: Done badge must say (3):\n{screen}",
+        );
+    }
+
+    /// #1300 invariant: Done section badge count = items in `done_windowed`
+    /// regardless of nesting. Asserts the mixed scenario (open epic in
+    /// another section + standalone done items) all render and the count
+    /// shown in the header matches what `pipeline_done_windowed` returns.
+    #[test]
+    fn pipeline_1300_done_badge_count_equals_done_windowed_len() {
+        // Reuse the open-epic fixture from case 1.
+        let app = make_1300_open_epic_done_children_app();
+
+        let done_windowed = app.pipeline_done_windowed();
+        let expected = done_windowed.len();
+
+        // Sanity: the fixture has 4 closed issues.
+        assert_eq!(
+            expected,
+            4,
+            "#1300 invariant: fixture must have 4 done issues",
+        );
+
+        // The Done section badge is set to `format!("({})", done_windowed.len())`.
+        // Find the Done section index and check the stored badge text.
+        let done_section_idx = app
+            .pipeline_state_section_names
+            .iter()
+            .position(|&k| k == "done")
+            .map(|i| i + 1) // +1 for the search section at index 0
+            .expect("#1300 invariant: Done section must be present");
+        let badge = app
+            .pipeline_sidebar
+            .section_badge(done_section_idx)
+            .expect("#1300 invariant: Done section must have a badge");
+        let badge_text: String = badge.spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(
+            badge_text,
+            format!("({})", expected),
+            "#1300 invariant: badge text must equal done_windowed.len()\n\
+             badge_text={badge_text:?}  expected=\"({expected})\"",
+        );
+    }

@@ -3803,10 +3803,23 @@ impl CoordApp {
                     // #1197: nest each epic's children beneath its row
                     // instead of listing them a second time as flat
                     // siblings in the Done window.
+                    //
+                    // #1300: use per-bucket nesting (children of epics also
+                    // in THIS Done window), NOT the global set. An epic child
+                    // whose parent is still open (in In-progress or another
+                    // section) must render flat here — Done is a recency view
+                    // orthogonal to the lifecycle-nesting hierarchy in other
+                    // sections. A child whose parent is also in Done stays
+                    // nested under that parent row (preserving #1197/#1253's
+                    // no-duplicate invariant). The accepted trade-off: such a
+                    // child can appear twice — nested under its still-running
+                    // epic in In-progress AND flat in Done — because Done shows
+                    // "what completed recently", an axis independent of
+                    // lifecycle state.
                     let nesting = self.compute_epic_nesting(&done_windowed);
                     for (ii, &issue_idx) in done_windowed.iter().enumerate() {
                         let issue = &self.pipeline_issues[issue_idx];
-                        if Self::is_globally_nested(issue, &globally_nested) {
+                        if nesting.nested.contains(&issue.number) {
                             continue;
                         }
                         let title_color = if issue.coord_repo.is_some() {
