@@ -23,11 +23,13 @@ the tracking issue), and ``coord.notify._try_parse_and_post_review`` already
 falls back to posting a plain issue comment whenever ``int(review_target)``
 fails.
 
-Like ``coord milestone gate-c`` (#932), this is a **manual, non-automated**
-gate: dispatching Gate B is an explicit operator action, and a
-request-changes verdict is surfaced (as a tracking-issue comment) rather than
-driving any ``feature/ms-NN -> develop`` ship automation, which does not
-exist yet (#934, Phase 4 of the git model in docs/PIPELINE_V2.md).
+Like ``coord milestone gate-c`` (#932), dispatching Gate B is an explicit
+manual operator action, and a request-changes verdict is surfaced (as a
+tracking-issue comment) rather than driving anything automatically. Its
+verdict IS consulted, read-only, by ``coord milestone ship`` (#934, Gate D,
+``coord/commands/milestone.py``) via :func:`latest_gate_b_verdict` — ship
+refuses ``feature/ms-NN -> develop`` until this review is ``"approve"``, but
+shipping itself is still a separate, explicit operator action.
 """
 
 from __future__ import annotations
@@ -55,6 +57,7 @@ __all__ = [
     "review_target_for",
     "build_gate_b_briefing",
     "dispatch_gate_b_review",
+    "latest_gate_b_verdict",
 ]
 
 
@@ -362,3 +365,37 @@ def dispatch_gate_b_review(
         pass
 
     return assignment
+
+
+def latest_gate_b_verdict(
+    board: Board, repo_name: str, tracking_issue: int, milestone_number: int,
+) -> str | None:
+    """The most recent Gate B verdict for this milestone, or ``None`` if no
+    Gate B review has completed yet.
+
+    Scans both ``board.completed`` and ``board.active`` (mirrors ``coord.
+    merge_queue.has_approved_review``'s posture: a verdict just posted by
+    ``coord.notify`` may still be on ``active`` for a tick before reconcile
+    moves it) for the ``type="review"`` assignment dispatched by
+    :func:`dispatch_gate_b_review` — identified by ``issue_number ==
+    tracking_issue`` and ``review_target == review_target_for(milestone_
+    number)`` (the ``gate-b-ms-N`` sentinel, unambiguous across milestones
+    and repos on the same board). When more than one exists (a re-dispatched
+    Gate B after `request-changes`), the most recently dispatched one wins.
+
+    Used by ``coord milestone ship`` (#934, Gate D) to refuse shipping
+    ``feature/ms-NN -> develop`` until Gate B is ``"approve"``.
+    """
+    target = review_target_for(milestone_number)
+    pool = list(getattr(board, "completed", []) or []) + list(getattr(board, "active", []) or [])
+    candidates = [
+        a for a in pool
+        if getattr(a, "type", None) == "review"
+        and getattr(a, "repo_name", None) == repo_name
+        and getattr(a, "issue_number", None) == tracking_issue
+        and getattr(a, "review_target", None) == target
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda a: getattr(a, "dispatched_at", 0) or 0)
+    return candidates[-1].review_verdict
