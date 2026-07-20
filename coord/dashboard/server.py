@@ -1300,9 +1300,18 @@ def build_app(
         """Human-attended PTY<->WebSocket bridge for a live tmux session (#1065).
 
         ToS §3.7 / #437: relays a live human only -- browser keystrokes (binary
-        frames) to the PTY's stdin, PTY stdout back as binary frames, plus a
-        JSON ``{"type": "resize", "cols": .., "rows": ..}`` text control
-        message. No autonomous injection or scraping happens here.
+        frames) to the PTY's stdin, PTY stdout back as binary frames, plus
+        JSON text control messages:
+
+        * ``{"type": "resize", "cols": .., "rows": ..}`` -- propagate a
+          terminal resize to the PTY (``TIOCSWINSZ``).
+        * ``{"type": "copy-mode", "action": "enter"|"exit"|"page-up"|\
+          "page-down"|"top"|"bottom"}`` -- drive tmux copy-mode via
+          ``tmux send-keys -X`` / ``tmux copy-mode`` so the phone's Scroll
+          button can reach pane history without knowing the user's prefix
+          key or mode-keys setting (#1299).
+
+        No autonomous injection or scraping happens here.
 
         Auth: requires ``?token=`` to match the dashboard's configured bearer
         token (browsers can't set custom headers on a WS upgrade, so it can't
@@ -1384,6 +1393,10 @@ def build_app(
                         continue
                     if cols > 0 and rows > 0:
                         attached.resize(cols, rows)
+                elif payload.get("type") == "copy-mode":
+                    action = payload.get("action")
+                    if isinstance(action, str):
+                        await attached.copy_mode(action)
         except WebSocketDisconnect:
             pass
         finally:

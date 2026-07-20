@@ -125,6 +125,32 @@ class AttachedPty(Protocol):
         """End *this* client's attach. MUST NOT kill the tmux session."""
         ...
 
+    async def copy_mode(self, action: str) -> None:
+        """Drive tmux copy-mode server-side via ``tmux send-keys -X`` (#1299).
+
+        This is prefix- and mode-key-agnostic: ``send-keys -X`` targets the
+        tmux *server* directly, so the client does not need to know the user's
+        ``prefix`` binding or whether ``mode-keys`` is set to ``vi`` or
+        ``emacs``.
+
+        ToS §3.7 / #437: every action here is a *human tapping a button* in
+        their own attached session. No autonomous injection, scraping, or
+        decision-making -- same guarantee as the ``write`` relay path.
+
+        Supported *action* values::
+
+            "enter"     -- enter copy-mode (``copy-mode -t <session>``)
+            "exit"      -- leave copy-mode (``send-keys -X cancel``)
+            "page-up"   -- scroll a page up
+            "page-down" -- scroll a page down
+            "top"       -- jump to oldest history line
+            "bottom"    -- jump to newest line (live pane)
+
+        Unknown or unmapped *action* values are silently ignored -- never
+        raise.
+        """
+        ...
+
 
 class SessionAttacher(Protocol):
     """Seam over the ssh/tmux attach spawn (#1065 acceptance: injectable so
@@ -262,13 +288,35 @@ class TmuxSessionAttacher:
             )
         finally:
             os.close(slave_fd)
-        return _RealAttachedPty(proc, master_fd)
+        return _RealAttachedPty(proc, master_fd, host_obj=host_obj, session_name=session_name)
+
+
+# Maps the wire ``action`` value from a copy-mode control frame to the tmux
+# argument list (the ``-t <session_name>`` target is inserted at call time so
+# the mapping itself stays tidy and session-agnostic).
+_COPY_MODE_TMUX_ARGS: dict[str, list[str]] = {
+    "enter":      ["copy-mode"],
+    "exit":       ["send-keys", "-X", "cancel"],
+    "page-up":    ["send-keys", "-X", "page-up"],
+    "page-down":  ["send-keys", "-X", "page-down"],
+    "top":        ["send-keys", "-X", "history-top"],
+    "bottom":     ["send-keys", "-X", "history-bottom"],
+}
 
 
 class _RealAttachedPty:
-    def __init__(self, proc: subprocess.Popen, master_fd: int) -> None:
+    def __init__(
+        self,
+        proc: subprocess.Popen,
+        master_fd: int,
+        *,
+        host_obj: "TmuxHost",
+        session_name: str,
+    ) -> None:
         self._proc = proc
         self._master_fd = master_fd
+        self._host_obj = host_obj
+        self._session_name = session_name
 
     async def read(self) -> bytes:
         loop = asyncio.get_running_loop()
@@ -303,3 +351,29 @@ class _RealAttachedPty:
             os.close(self._master_fd)
         except OSError:
             pass
+
+    async def copy_mode(self, action: str) -> None:
+        """See :meth:`AttachedPty.copy_mode`."""
+        tmux_fragment = _COPY_MODE_TMUX_ARGS.get(action)
+        if tmux_fragment is None:
+            return  # unknown action -- no-op, never raise
+
+        # Insert the target flag immediately after the tmux sub-command so the
+        # command reads: ``copy-mode -t <session>`` or
+        # ``send-keys -t <session> -X <action>``.
+        sub_cmd = tmux_fragment[0]
+        rest = tmux_fragment[1:]
+        tmux_args = [sub_cmd, "-t", self._session_name, *rest]
+
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    self._host_obj.cmd(tmux_args),
+                    capture_output=True,
+                    timeout=5,
+                ),
+            )
+        except Exception:
+            pass  # best-effort; a stale copy-mode state is not fatal

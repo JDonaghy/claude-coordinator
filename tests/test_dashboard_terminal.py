@@ -81,6 +81,7 @@ class _FakeAttachedPty:
         self._session_name = session_name
         self.written = bytearray()
         self.resizes: list[tuple[int, int]] = []
+        self.copy_mode_calls: list[str] = []
         self.detach_called = False
         self._outbox: asyncio.Queue[bytes] = asyncio.Queue()
 
@@ -95,6 +96,9 @@ class _FakeAttachedPty:
 
     def resize(self, cols: int, rows: int) -> None:
         self.resizes.append((cols, rows))
+
+    async def copy_mode(self, action: str) -> None:
+        self.copy_mode_calls.append(action)
 
     def detach(self) -> None:
         self.detach_called = True
@@ -640,3 +644,262 @@ class TestTmuxSessionAttacherResizeHardening:
             asyncio.run(TmuxSessionAttacher().attach(None, "coord-abc123"))
 
         assert popen_called, "Popen was not called — attach aborted unexpectedly"
+
+
+class TestCopyModeControl:
+    """Tests for the copy-mode control frame routing (#1299).
+
+    Exercises the ``{"type": "copy-mode", "action": ...}`` branch that the WS
+    handler in ``server.py`` added alongside the existing ``resize`` branch.
+    Uses the same fake-attacher + TestClient pattern as ``TestTerminalBridge``.
+    """
+
+    def test_copy_mode_control_frame_routed_to_pty(self) -> None:
+        """A copy-mode frame with a valid action reaches ``AttachedPty.copy_mode``."""
+        attacher = _FakeSessionAttacher()
+        client = _client(attacher=attacher)
+        with (
+            patch("coord.dashboard.server.read_board", return_value=_board()),
+            patch("coord.dashboard.terminal._local_short_hostname", return_value="laptop"),
+        ):
+            with client.websocket_connect("/ws/terminal/abc123") as ws:
+                ws.send_text(json.dumps({"type": "copy-mode", "action": "enter"}))
+                # Round-trip a byte to ensure the control frame was processed
+                # before the connection closes.
+                ws.send_bytes(b"x")
+
+        assert attacher.last_pty.copy_mode_calls == ["enter"]
+
+    def test_all_six_actions_routed(self) -> None:
+        """All six documented action values are forwarded to the PTY."""
+        actions = ["enter", "exit", "page-up", "page-down", "top", "bottom"]
+        attacher = _FakeSessionAttacher()
+        client = _client(attacher=attacher)
+        with (
+            patch("coord.dashboard.server.read_board", return_value=_board()),
+            patch("coord.dashboard.terminal._local_short_hostname", return_value="laptop"),
+        ):
+            with client.websocket_connect("/ws/terminal/abc123") as ws:
+                for action in actions:
+                    ws.send_text(json.dumps({"type": "copy-mode", "action": action}))
+                # Sync: round-trip one more byte so all frames are processed.
+                ws.send_bytes(b"x")
+
+        assert attacher.last_pty.copy_mode_calls == actions
+
+    def test_unknown_action_does_not_close_socket(self) -> None:
+        """An unmapped action string is forwarded to copy_mode() (which no-ops
+        it internally) without closing the connection.
+
+        The "unknown → no subprocess" invariant is tested in
+        ``TestRealAttachedPtyCopyMode.test_unknown_action_does_not_call_subprocess``.
+        This test just verifies the WS handler doesn't crash or close the socket.
+        """
+        attacher = _FakeSessionAttacher()
+        client = _client(attacher=attacher)
+        with (
+            patch("coord.dashboard.server.read_board", return_value=_board()),
+            patch("coord.dashboard.terminal._local_short_hostname", return_value="laptop"),
+        ):
+            with client.websocket_connect("/ws/terminal/abc123") as ws:
+                ws.send_text(json.dumps({"type": "copy-mode", "action": "dance"}))
+                # Connection is still open: we can still exchange bytes.
+                ws.send_bytes(b"x")
+                attacher.last_pty.push_output(b"ok")
+                assert ws.receive_bytes() == b"ok"
+        # copy_mode("dance") was called; _RealAttachedPty would silently no-op it.
+        assert attacher.last_pty.copy_mode_calls == ["dance"]
+
+    def test_malformed_json_ignored_does_not_close_socket(self) -> None:
+        """Malformed JSON text frames are silently dropped (same as resize branch)."""
+        attacher = _FakeSessionAttacher()
+        client = _client(attacher=attacher)
+        with (
+            patch("coord.dashboard.server.read_board", return_value=_board()),
+            patch("coord.dashboard.terminal._local_short_hostname", return_value="laptop"),
+        ):
+            with client.websocket_connect("/ws/terminal/abc123") as ws:
+                ws.send_text("not json {{{{")
+                ws.send_bytes(b"ping")
+                attacher.last_pty.push_output(b"pong")
+                assert ws.receive_bytes() == b"pong"
+
+        assert attacher.last_pty.copy_mode_calls == []
+
+    def test_non_string_action_ignored(self) -> None:
+        """A non-string ``action`` field is silently ignored."""
+        attacher = _FakeSessionAttacher()
+        client = _client(attacher=attacher)
+        with (
+            patch("coord.dashboard.server.read_board", return_value=_board()),
+            patch("coord.dashboard.terminal._local_short_hostname", return_value="laptop"),
+        ):
+            with client.websocket_connect("/ws/terminal/abc123") as ws:
+                ws.send_text(json.dumps({"type": "copy-mode", "action": 42}))
+                ws.send_text(json.dumps({"type": "copy-mode", "action": None}))
+                ws.send_bytes(b"x")
+                attacher.last_pty.push_output(b"y")
+                assert ws.receive_bytes() == b"y"
+
+        assert attacher.last_pty.copy_mode_calls == []
+
+    def test_missing_action_ignored(self) -> None:
+        """A copy-mode frame with no ``action`` key is silently ignored."""
+        attacher = _FakeSessionAttacher()
+        client = _client(attacher=attacher)
+        with (
+            patch("coord.dashboard.server.read_board", return_value=_board()),
+            patch("coord.dashboard.terminal._local_short_hostname", return_value="laptop"),
+        ):
+            with client.websocket_connect("/ws/terminal/abc123") as ws:
+                ws.send_text(json.dumps({"type": "copy-mode"}))
+                ws.send_bytes(b"x")
+                attacher.last_pty.push_output(b"y")
+                assert ws.receive_bytes() == b"y"
+
+        assert attacher.last_pty.copy_mode_calls == []
+
+
+class TestRealAttachedPtyCopyMode:
+    """Unit tests for ``_RealAttachedPty.copy_mode`` tmux argument assembly.
+
+    Checks that each action maps to the correct tmux argv and that unknown
+    actions are silently no-ops.
+    """
+
+    def _make_pty(self) -> "_RealAttachedPty":
+        """Return a ``_RealAttachedPty`` wired to a fake host + a stub fd."""
+        from unittest.mock import MagicMock
+
+        from coord.dashboard.terminal import _RealAttachedPty
+        from coord.interactive import TmuxHost
+
+        host_obj = TmuxHost(ssh_target=None)  # local host
+        mock_proc = MagicMock()
+        return _RealAttachedPty(mock_proc, 99, host_obj=host_obj, session_name="coord-test")
+
+    def test_enter_action_uses_copy_mode_subcommand(self) -> None:
+        """``enter`` → ``tmux copy-mode -t <session>``."""
+        pty = self._make_pty()
+        run_calls: list[list[str]] = []
+
+        def fake_run(argv, **kwargs):  # noqa: ANN001
+            run_calls.append(list(argv))
+            from unittest.mock import MagicMock
+            return MagicMock()
+
+        with patch("coord.dashboard.terminal.subprocess.run", side_effect=fake_run):
+            asyncio.run(pty.copy_mode("enter"))
+
+        assert len(run_calls) == 1
+        argv = run_calls[0]
+        assert "copy-mode" in argv
+        assert "-t" in argv
+        assert "coord-test" in argv
+        # Must NOT have ``send-keys`` for the enter action
+        assert "send-keys" not in argv
+
+    def test_exit_action_uses_send_keys_cancel(self) -> None:
+        """``exit`` → ``tmux send-keys -t <session> -X cancel``."""
+        pty = self._make_pty()
+        run_calls: list[list[str]] = []
+
+        def fake_run(argv, **kwargs):  # noqa: ANN001
+            run_calls.append(list(argv))
+            from unittest.mock import MagicMock
+            return MagicMock()
+
+        with patch("coord.dashboard.terminal.subprocess.run", side_effect=fake_run):
+            asyncio.run(pty.copy_mode("exit"))
+
+        argv = run_calls[0]
+        assert "send-keys" in argv
+        assert "-X" in argv
+        assert "cancel" in argv
+        assert "coord-test" in argv
+
+    def test_page_up_action_maps_correctly(self) -> None:
+        pty = self._make_pty()
+        run_calls: list[list[str]] = []
+
+        def fake_run(argv, **kwargs):  # noqa: ANN001
+            run_calls.append(list(argv))
+            from unittest.mock import MagicMock
+            return MagicMock()
+
+        with patch("coord.dashboard.terminal.subprocess.run", side_effect=fake_run):
+            asyncio.run(pty.copy_mode("page-up"))
+
+        argv = run_calls[0]
+        assert "page-up" in argv
+
+    def test_page_down_action_maps_correctly(self) -> None:
+        pty = self._make_pty()
+        run_calls: list[list[str]] = []
+
+        def fake_run(argv, **kwargs):  # noqa: ANN001
+            run_calls.append(list(argv))
+            from unittest.mock import MagicMock
+            return MagicMock()
+
+        with patch("coord.dashboard.terminal.subprocess.run", side_effect=fake_run):
+            asyncio.run(pty.copy_mode("page-down"))
+
+        argv = run_calls[0]
+        assert "page-down" in argv
+
+    def test_top_action_maps_to_history_top(self) -> None:
+        pty = self._make_pty()
+        run_calls: list[list[str]] = []
+
+        def fake_run(argv, **kwargs):  # noqa: ANN001
+            run_calls.append(list(argv))
+            from unittest.mock import MagicMock
+            return MagicMock()
+
+        with patch("coord.dashboard.terminal.subprocess.run", side_effect=fake_run):
+            asyncio.run(pty.copy_mode("top"))
+
+        argv = run_calls[0]
+        assert "history-top" in argv
+
+    def test_bottom_action_maps_to_history_bottom(self) -> None:
+        pty = self._make_pty()
+        run_calls: list[list[str]] = []
+
+        def fake_run(argv, **kwargs):  # noqa: ANN001
+            run_calls.append(list(argv))
+            from unittest.mock import MagicMock
+            return MagicMock()
+
+        with patch("coord.dashboard.terminal.subprocess.run", side_effect=fake_run):
+            asyncio.run(pty.copy_mode("bottom"))
+
+        argv = run_calls[0]
+        assert "history-bottom" in argv
+
+    def test_unknown_action_does_not_call_subprocess(self) -> None:
+        """An unmapped action must silently no-op without calling subprocess."""
+        pty = self._make_pty()
+        run_calls: list[list[str]] = []
+
+        def fake_run(argv, **kwargs):  # noqa: ANN001
+            run_calls.append(list(argv))
+            from unittest.mock import MagicMock
+            return MagicMock()
+
+        with patch("coord.dashboard.terminal.subprocess.run", side_effect=fake_run):
+            asyncio.run(pty.copy_mode("fly"))
+
+        assert run_calls == [], "subprocess.run must not be called for an unknown action"
+
+    def test_subprocess_failure_is_silently_swallowed(self) -> None:
+        """A subprocess error (e.g. tmux not found) must not propagate."""
+        pty = self._make_pty()
+
+        with patch(
+            "coord.dashboard.terminal.subprocess.run",
+            side_effect=OSError("tmux not found"),
+        ):
+            # Must complete without raising.
+            asyncio.run(pty.copy_mode("enter"))

@@ -92,6 +92,10 @@ export default function Terminal() {
   // "the network/tab dropped it out from under us."
   const intentionalCloseRef = useRef(false)
   const [state, setState] = useState<ConnectionState>('connecting')
+  // Incremented on every WebSocket open (initial connect and reconnects).
+  // Passed to MobileKeyBar as `connectionKey` so it can reset its scroll-mode
+  // badge when a reconnect resets server-side copy-mode state (#1299).
+  const [connectionSeq, setConnectionSeq] = useState(0)
 
   useEffect(() => {
     if (!sessionId || !containerRef.current) return
@@ -177,6 +181,10 @@ export default function Terminal() {
       ws.onopen = () => {
         openedAt = Date.now()
         setState('open')
+        // Signal MobileKeyBar to reset its scroll-mode badge: a fresh
+        // `tmux attach-session` starts outside copy-mode, so a stale badge
+        // from the previous connection would misrepresent the server's state.
+        setConnectionSeq((n) => n + 1)
         // Re-fit now that the WS is open: the layout may have settled since
         // the mount-time fit (safe-area insets, MobileKeyBar DOM insertion).
         // This gives us the most accurate terminal size to send as the first
@@ -306,6 +314,23 @@ export default function Terminal() {
     }
   }
 
+  /**
+   * Send a copy-mode control action as a JSON text frame to the bridge
+   * (#1299). The bridge routes it to ``tmux send-keys -X`` / ``tmux
+   * copy-mode`` server-side, which is prefix- and mode-key-agnostic.
+   *
+   * Used by `MobileKeyBar`'s Scroll controls via the `onControl` prop.
+   * Only sends when the WebSocket is open -- called during user interaction,
+   * so an open socket is the normal case; a closed socket just silently
+   * drops the frame (same defensive posture as `sendRaw`).
+   */
+  const sendControl = (action: string) => {
+    const ws = wsRef.current
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'copy-mode', action }))
+    }
+  }
+
   return (
     <div className="flex h-screen flex-col bg-background">
       <header
@@ -344,7 +369,7 @@ export default function Terminal() {
         className="min-h-0 flex-1"
         style={{ paddingBottom: 'env(safe-area-inset-bottom)' }}
       >
-        <MobileKeyBar onSend={sendRaw} />
+        <MobileKeyBar onSend={sendRaw} onControl={sendControl} connectionKey={connectionSeq} />
       </div>
     </div>
   )
