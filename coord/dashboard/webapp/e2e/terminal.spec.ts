@@ -298,6 +298,84 @@ test.describe('terminal takeover flow (#1072)', () => {
   })
 
   /**
+   * Scroll mode flow (#1299): Scroll → Page Up → Exit.
+   *
+   * Guards the full copy-mode round-trip from the phone's perspective:
+   *   1. Tap "Scroll" → fake WS receives `{"type":"copy-mode","action":"enter"}`
+   *   2. Tap "Page Up" → `{"type":"copy-mode","action":"page-up"}`
+   *   3. Tap "Exit Scroll" → `{"type":"copy-mode","action":"exit"}`
+   *
+   * Captures text frames (JSON) separately from binary frames (keystrokes) so
+   * the assertion is unambiguous. The harness runs against Vite dev with React
+   * StrictMode double-mount active; `routeFakePty` already handles that
+   * correctly (see the routeFakePty docstring above).
+   */
+  test('Scroll mode: enter → page-up → exit sends correct copy-mode frames', async ({
+    page,
+  }) => {
+    // Fake PTY that records both binary and text frames.
+    const textFrames: string[] = []
+
+    await page.routeWebSocket(`**/ws/terminal/${SESSION_ID}`, async (ws) => {
+      textFrames.length = 0 // reset per StrictMode re-mount
+
+      ws.send(FAKE_PTY_BANNER)
+      ws.onMessage((msg) => {
+        if (typeof msg === 'string') {
+          textFrames.push(msg)
+        }
+      })
+
+      await new Promise<void>((resolve) => {
+        ws.onClose(() => resolve())
+      })
+    })
+
+    await page.goto(`/terminal/${SESSION_ID}`)
+
+    // Wait for live connection before interacting.
+    await expect(page.getByText('Live')).toBeVisible({ timeout: 5_000 })
+
+    // 1. Tap Scroll — enters copy-mode.
+    await page.getByRole('button', { name: 'Scroll' }).click()
+
+    await expect
+      .poll(
+        () => textFrames.some((f) => f === JSON.stringify({ type: 'copy-mode', action: 'enter' })),
+        { timeout: 2_000, message: 'expected copy-mode enter frame' },
+      )
+      .toBe(true)
+
+    // SCROLL badge must appear.
+    await expect(page.getByRole('status', { name: 'Scroll mode active' })).toBeVisible()
+
+    // 2. Tap Page Up.
+    await page.getByRole('button', { name: 'Page Up' }).click()
+
+    await expect
+      .poll(
+        () =>
+          textFrames.some((f) => f === JSON.stringify({ type: 'copy-mode', action: 'page-up' })),
+        { timeout: 2_000, message: 'expected copy-mode page-up frame' },
+      )
+      .toBe(true)
+
+    // 3. Tap Exit Scroll — exits copy-mode and hides badge.
+    await page.getByRole('button', { name: 'Exit Scroll' }).click()
+
+    await expect
+      .poll(
+        () => textFrames.some((f) => f === JSON.stringify({ type: 'copy-mode', action: 'exit' })),
+        { timeout: 2_000, message: 'expected copy-mode exit frame' },
+      )
+      .toBe(true)
+
+    // Badge must be gone; normal Scroll button is back.
+    await expect(page.getByRole('status', { name: 'Scroll mode active' })).not.toBeVisible()
+    await expect(page.getByRole('button', { name: 'Scroll' })).toBeVisible()
+  })
+
+  /**
    * Key-bar completeness: all four arrow keys must transmit their ANSI escape
    * sequences to the fake PTY.
    *
