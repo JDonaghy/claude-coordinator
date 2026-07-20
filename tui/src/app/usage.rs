@@ -1256,4 +1256,105 @@ mod tests {
         assert_eq!(window.start, Some(days_from_civil(2026, 7, 18) as f64 * SECS_PER_DAY));
         assert_eq!(window.end, Some(days_from_civil(2026, 7, 19) as f64 * SECS_PER_DAY));
     }
+
+    // ── cost formatting — 4 decimal places (ms-37 contract Mock 2) ──────────
+
+    #[test]
+    fn format_cost_captured_renders_four_decimal_places() {
+        // ms-37 contract Mock 2: L1 captured cost $0.5000.
+        assert_eq!(format_cost_captured(0.50), "$0.5000");
+        // Whole-dollar captured costs also get 4 dp.
+        assert_eq!(format_cost_captured(2.00), "$2.0000");
+        assert_eq!(format_cost_captured(2.5), "$2.5000");
+        // Zero / negative → em dash (no captured cost).
+        assert_eq!(format_cost_captured(0.0), "—");
+        assert_eq!(format_cost_captured(-1.0), "—");
+    }
+
+    #[test]
+    fn format_cost_est_renders_four_decimal_places() {
+        // ms-37 contract Mock 2: L2 est ~$0.9060 (NOT ~$0.91).
+        assert_eq!(format_cost_est(0.9060), "~$0.9060");
+        // L4 est ~$1.4520.
+        assert_eq!(format_cost_est(1.4520), "~$1.4520");
+        // Zero → em dash (no estimate).
+        assert_eq!(format_cost_est(0.0), "—");
+        // Sub-0.0001 (pathologically small) → ~< $0.0001.
+        assert_eq!(format_cost_est(0.00005), "~< $0.0001");
+    }
+
+    // ── TuiDriver black-box: Usage grid renders 4-decimal cost strings ────────
+
+    /// Drive the full render pipeline via `TuiDriver`/`TestBackend` and confirm
+    /// the per-issue grid contains the 4-decimal captured and estimated cost
+    /// strings from the ms-37 contract fixture (#501 / alpha).
+    ///
+    /// Uses a `UsageScope::Custom` window that brackets the fixture timestamps
+    /// so the test is not sensitive to the wall-clock date.
+    #[test]
+    fn usage_grid_renders_four_decimal_cost_strings() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        // Build ms-37 fixture legs (contract § "seeded board"):
+        //   L1: #501 alpha  work  sonnet  cost_usd=0.50  → captured $0.5000
+        //   L2: #501 alpha  review sonnet cost_usd=null  2k/50k/500k → est ~$0.9060
+        let base_ts = 1_000_000.0_f64; // arbitrary epoch inside our custom window
+
+        let mut l1 = crate::app::fixtures::make_assignment_typed("done", 501, "alpha", Some("work"));
+        l1.issue_title = "Alpha feature".into();
+        l1.cost_usd = Some(0.50);
+        l1.model = Some("sonnet".into());
+        l1.input_tokens = 10_000;
+        l1.output_tokens = 100_000;
+        l1.cache_read_tokens = 1_000_000;
+        l1.dispatched_at = Some(base_ts);
+        l1.finished_at = Some(base_ts + 600.0);
+
+        let mut l2 = crate::app::fixtures::make_assignment_typed("done", 501, "alpha", Some("review"));
+        l2.issue_title = "Alpha feature".into();
+        l2.cost_usd = None;
+        l2.model = Some("sonnet".into());
+        l2.is_interactive = true;
+        l2.input_tokens = 2_000;
+        l2.output_tokens = 50_000;
+        l2.cache_read_tokens = 500_000;
+        l2.dispatched_at = Some(base_ts + 700.0);
+        l2.finished_at = Some(base_ts + 1_000.0);
+
+        let mut app = crate::app::fixtures::make_app_with_assignments(vec![l1, l2]);
+
+        // Use a custom window that covers our fixture timestamps — avoids
+        // sensitivity to the wall-clock date (Today would miss them).
+        app.usage_scope = UsageScope::Custom {
+            start: base_ts - 1.0,
+            end: base_ts + 10_000.0,
+        };
+        app.usage_group_by = UsageGroupBy::Issue;
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 160, 40);
+
+        // Navigate to the Usage panel via its activity-bar icon "$".
+        let (x, y) = driver.find("$").unwrap_or_else(|| {
+            panic!("Usage activity-bar icon '$' not found:\n{}", driver.screen())
+        });
+        driver.click(x, y);
+
+        let screen = driver.screen();
+
+        // The grid must contain 4-decimal captured cost for L1.
+        assert!(
+            screen.contains("$0.5000"),
+            "grid must render captured cost $0.5000 (4 dp):\n{screen}"
+        );
+
+        // The grid must contain 4-decimal estimated cost for L2
+        // (2k*3 + 50k*15 + 500k*0.30 per-1M = $0.9060).
+        assert!(
+            screen.contains("~$0.9060"),
+            "grid must render estimated cost ~$0.9060 (4 dp):\n{screen}"
+        );
+
+        // Sanity: the issue number must be visible.
+        assert!(screen.contains("#501"), "grid must show issue #501:\n{screen}");
+    }
 }

@@ -36285,7 +36285,7 @@ Milestone tracking issue.
     /// lands before the boundary silently drops out of the aggregate. That
     /// produced a real, time-of-day-dependent flake (#1116 fix iteration 1):
     /// the grid rendered with #502's `work` leg missing entirely, so its Σ
-    /// estimate read as the `review` leg's `~$0.91` alone instead of the
+    /// estimate read as the `review` leg's `~$0.9060` alone instead of the
     /// combined `~$19.2` both tests expect. Anchoring at midday with modest
     /// (≤2h) offsets keeps every timestamp inside the same UTC calendar day
     /// no matter what time the test actually runs.
@@ -36316,7 +36316,7 @@ Milestone tracking issue.
         a502_work.dispatched_at = Some(anchor - 7_200.0);
         a502_work.finished_at = Some(anchor - 6_000.0);
 
-        // Est = (2_000*3 + 50_000*15 + 500_000*0.30) / 1e6 = $0.906 -> "~$0.91".
+        // Est = (2_000*3 + 50_000*15 + 500_000*0.30) / 1e6 = $0.9060 (4 dp).
         let mut a502_review = make_assignment_typed("done", 502, "beta", Some("review"));
         a502_review.model = Some("sonnet".to_string());
         a502_review.is_interactive = true;
@@ -36379,14 +36379,14 @@ Milestone tracking issue.
         assert!(screen.contains("opus"), "the work leg's model must render in the drill:\n{screen}");
         assert!(screen.contains("sonnet"), "the review leg's model must render in the drill:\n{screen}");
         assert!(
-            screen.contains("~$18.30"),
+            screen.contains("~$18.3000"),
             "the work leg (interactive, opus, no captured cost) must show a \
-             non-zero estimate, not a blank/zero cost:\n{screen}"
+             non-zero estimate at 4 dp, not a blank/zero cost:\n{screen}"
         );
         assert!(
-            screen.contains("~$0.91"),
+            screen.contains("~$0.9060"),
             "the review leg (interactive, sonnet, no captured cost) must show \
-             a non-zero estimate:\n{screen}"
+             a non-zero estimate at 4 dp:\n{screen}"
         );
     }
 

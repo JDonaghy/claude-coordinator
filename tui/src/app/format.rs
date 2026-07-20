@@ -84,13 +84,15 @@ pub(crate) fn format_cost_usd(cost: f64) -> String {
 /// "no cost data" just because nothing was captured. Zero renders as "—"
 /// (not "~$0.00") since "no estimate" and "estimated zero" are the same
 /// thing here — unlike captured cost, there's no ambiguity to flag.
+/// Four decimal places so $0.9060 is distinguishable from $0.91 in the Usage
+/// grid (ms-37 contract Mock 2).
 pub(crate) fn format_cost_est(cost: f64) -> String {
     if cost <= 0.0 {
         "—".to_string()
-    } else if cost < 0.01 {
-        "~< $0.01".to_string()
+    } else if cost < 0.0001 {
+        "~< $0.0001".to_string()
     } else {
-        format!("~${cost:.2}")
+        format!("~${cost:.4}")
     }
 }
 
@@ -99,11 +101,12 @@ pub(crate) fn format_cost_est(cost: f64) -> String {
 /// as "—" rather than `format_cost_usd`'s "$0.00" (which elsewhere means
 /// "captured, and it rounds to zero"). The Usage view always has cost_est
 /// as a companion column, so "—" here is unambiguous: nothing was captured.
+/// Four decimal places matches the ms-37 contract Mock 2 ($0.5000).
 pub(crate) fn format_cost_captured(cost: f64) -> String {
     if cost <= 0.0 {
         "—".to_string()
     } else {
-        format_cost_usd(cost)
+        format!("${cost:.4}")
     }
 }
 
