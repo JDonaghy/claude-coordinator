@@ -5266,6 +5266,76 @@
     }
 
     #[test]
+    fn merge_stage_status_for_semantic_escalation_active_then_human_required() {
+        // #1291: a semantic merge conflict buys ONE escalated conflict-fix
+        // attempt (coordinator-side: `_try_semantic_escalation` in
+        // `coord/reconcile.py`) before the merge entry is parked. Verify the
+        // TUI-visible half of that acceptance bar end-to-end: the escalated
+        // attempt renders the Merge stage Active (reusing #241's
+        // `has_active_conflict_fix` overlay — no special-casing needed for
+        // the `[semantic-merge]`-prefixed title), and after the escalated
+        // attempt itself fails the entry lands in `human_required` and the
+        // Merge stage renders Failed.
+        let issue = projection_issue();
+        let mut app = make_app_default();
+
+        // Stage 1: escalated attempt in flight. `on_conflict_fix_done`
+        // (coord/reconcile.py) leaves the merge_queue entry in state
+        // "conflict" with an error string noting the escalation, and
+        // dispatches a new `conflict-fix` assignment carrying the
+        // `[semantic-merge][<model>]`-prefixed title.
+        let mut escalated = make_assignment_typed("running", 900, "api", Some("conflict-fix"));
+        escalated.issue_title = "[semantic-merge][fable] fix merge conflict".to_string();
+        app.data.assignments = vec![escalated];
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "w1".to_string(),
+            issue_number: Some(900),
+            state: "conflict".to_string(),
+            pr_number: None,
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: Some(
+                "conflict-fix worker did not resolve; semantic conflict escalated to fable \
+                 (assignment esc-1) — review the resolution diff before merge."
+                    .to_string(),
+            ),
+            branch: None,
+            milestone_title: None,
+            last_attempt: None,
+        });
+        assert_eq!(
+            app.merge_stage_status_for(&issue),
+            StageStatus::Active,
+            "escalated conflict-fix attempt in flight must render Merge as Active"
+        );
+        let entry = &app.data.merge_queue[0];
+        assert!(
+            app.merge_queue_entry_display_error(entry)
+                .is_some_and(|e| e.contains("escalated to fable")),
+            "escalation reason must surface in the merge-queue entry error text"
+        );
+
+        // Stage 2: the escalated attempt itself fails. `has_prior_semantic_escalation`
+        // blocks a second escalation, so `on_conflict_fix_done` parks the entry
+        // as `human_required` and the conflict-fix assignment is no longer
+        // running/pending.
+        app.data.assignments[0].status = "failed".to_string();
+        app.data.merge_queue[0].state = "human_required".to_string();
+        app.data.merge_queue[0].error = Some(
+            "conflict-fix worker did not resolve; semantic conflict escalated to fable \
+             (assignment esc-1) — review the resolution diff before merge.; conflict-fix \
+             worker did not resolve. Manual rebase required."
+                .to_string(),
+        );
+        assert_eq!(
+            app.merge_stage_status_for(&issue),
+            StageStatus::Failed,
+            "a second (post-escalation) failure must land HUMAN_REQUIRED and render Failed"
+        );
+    }
+
+    #[test]
     fn issue_has_any_approved_review_prefers_server_projection() {
         // No local review assignment at all — a purely local computation
         // would return false. The server projection says true; that must win.
