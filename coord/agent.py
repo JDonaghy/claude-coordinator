@@ -2343,6 +2343,82 @@ class AgentServer:
         if copied > 0:
             self._artifact_bytes_cache = None
 
+    def _stash_orphaned_worktree(self, entry: Path, assignment_id: str) -> None:
+        """Best-effort stash for a worktree with no assignment record (#1295).
+
+        :meth:`clean_worktrees` reaches this when ``a is None`` — the tmux
+        and ``protect`` guards already ruled out a session that is *still*
+        alive, and this is the narrower remaining case: an interactive
+        session that ended without ever running finalize (crash, ``tmux
+        kill-session``, a network drop before ``coord done``).  There is no
+        ``AgentAssignment`` to hand to :meth:`_stash_artifacts`, so the
+        branch and repo are derived straight from git on *entry* itself:
+
+        - The repo is identified by resolving ``git rev-parse
+          --git-common-dir`` (the linked worktree's shared ``.git``) back
+          to one of ``self.repo_paths``' configured checkouts.
+        - The branch is ``git rev-parse --abbrev-ref HEAD``; a detached
+          HEAD (bare ``"HEAD"``) has no stable name to stash under and is
+          skipped.
+
+        Silently no-ops when *entry* isn't a git worktree at all (plain
+        orphaned directories, as created by tests / races), when its repo
+        isn't one this agent knows about, or when the repo has no
+        ``artifact_paths`` configured — none of those are errors worth
+        logging. Never raises: this runs inline in the hourly sweep and
+        must not abort cleanup of the remaining entries.
+        """
+        try:
+            common_dir = _git(entry, "rev-parse", "--git-common-dir")
+        except (_GitError, FileNotFoundError, OSError):
+            return
+        try:
+            repo_root = (entry / common_dir).resolve().parent
+        except OSError:
+            return
+
+        repo_name: str | None = None
+        for name, path_str in self.repo_paths.items():
+            try:
+                if Path(path_str).expanduser().resolve() == repo_root:
+                    repo_name = name
+                    break
+            except OSError:
+                continue
+        if repo_name is None:
+            return
+
+        patterns = self.artifact_paths.get(repo_name, [])
+        if not patterns:
+            return
+
+        try:
+            branch = _git(entry, "rev-parse", "--abbrev-ref", "HEAD")
+        except (_GitError, FileNotFoundError, OSError):
+            return
+        if not branch or branch == "HEAD":
+            # Detached HEAD — no stable branch name to stash artifacts under.
+            return
+
+        try:
+            copied = stash_artifacts_for_branch(
+                worktree_path=entry,
+                branch=branch,
+                repo_name=repo_name,
+                patterns=patterns,
+                state_dir=self.state_dir,
+                assignment_id=assignment_id,
+            )
+        except Exception:  # noqa: BLE001 — never abort the sweep
+            _log.warning(
+                "clean_worktrees: best-effort stash of orphaned worktree "
+                "%s (repo=%s branch=%s) failed",
+                entry, repo_name, branch, exc_info=True,
+            )
+        else:
+            if copied > 0:
+                self._artifact_bytes_cache = None
+
     def _gc_artifacts(self, ttl_days: float = 3.0) -> int:
         """Remove artifact stash directories older than *ttl_days* days.
 
@@ -2528,6 +2604,26 @@ class AgentServer:
                 "artifact_paths — the session likely wasn't finalized (crash, "
                 "tmux killed, or `coord done` never ran), and re-running the "
                 "build or checking the artifact_paths globs may help."
+            )
+        # #1295 fix item #5: distinguish "a stash directory exists but is
+        # empty" from "no stash directory at all".  An empty directory
+        # means some stash attempt DID run (the worker path, the
+        # interactive finalize path, or the sweep's own best-effort stash
+        # of an orphaned worktree) and found 0 matching files — that's a
+        # config/build problem (`artifact_paths` doesn't match what got
+        # built), not a "nothing ever ran" problem, and the two point the
+        # operator in very different directions.
+        stash_dir = self.state_dir / "artifacts" / repo / branch
+        if stash_dir.exists() and not self._stash_has_content(stash_dir):
+            return (
+                f"the stash directory for branch {branch!r} exists "
+                f"({stash_dir}) but is empty — a stash was attempted (by a "
+                "worker's DONE transition, an interactive finalize, or the "
+                "hourly worktree sweep) but 0 files matched artifact_paths. "
+                f"Check that artifact_paths for repo {repo!r} actually "
+                "matches what the build produces, and look for a `stash: 0 "
+                "files matched` warning in the agent log around the time "
+                "the branch's worktree was last active."
             )
         # #1295: be honest about the possibilities.  The previous wording
         # ("merged and pruned, or nothing was ever built here") quietly
@@ -2774,6 +2870,18 @@ class AgentServer:
             # exist or the stash dir is simply overwritten).
             if a is not None:
                 self._stash_artifacts(a)
+            else:
+                # #1295 fix item #2: no assignment record at all — the
+                # tmux/protect guards above only catch a session that is
+                # STILL alive; this is the narrower case they explicitly
+                # don't cover — an interactive session that ended without
+                # ever running finalize (crash, `tmux kill-session`,
+                # network drop before `coord done`).  There is no
+                # AgentAssignment to hand to `_stash_artifacts`, so derive
+                # the branch/repo straight from git on the worktree itself
+                # and attempt a best-effort stash before the tree is
+                # destroyed below.
+                self._stash_orphaned_worktree(entry, assignment_id)
 
             # Try a proper git worktree remove first (updates the main
             # repo's worktree bookkeeping).  Fall back to brute-force rmtree
