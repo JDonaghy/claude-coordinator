@@ -23,6 +23,31 @@ from coord.commands.review import (
 )
 
 
+def _echo_artifact_stash(fr: object) -> None:
+    """Echo the artifact-stash outcome from a remote interactive finalize (#1295).
+
+    ``fr.artifacts_stashed`` is ``None`` when no stash was even attempted
+    (no ``artifact_paths`` configured for the repo) — say nothing in that
+    case, it's not news.  ``0`` means a stash DID run — on the remote host,
+    over ssh — but 0 files matched the configured globs; that's the exact
+    silent failure the issue reported (stderr redirected to ``/dev/null``
+    hid the agent-side warning), so surface it loudly here instead of
+    letting it disappear again on the operator's own terminal.
+    """
+    n = getattr(fr, "artifacts_stashed", None)
+    if n is None:
+        return
+    if n == 0:
+        click.echo(
+            "  warning: remote stash copied 0 artifacts — check "
+            "artifact_paths config and that the build actually produced "
+            "the expected outputs",
+            err=True,
+        )
+    else:
+        click.echo(f"  stashed {n} artifact(s)")
+
+
 def _dispatch_review_of(
     *,
     machine: str,
@@ -2547,6 +2572,7 @@ def _dispatch_fix_of(
                 )
             # else _wt_setup_ok is False: setup never happened; error
             # already printed above — no "commits preserved" noise.
+        _echo_artifact_stash(_fr)
     except Exception as exc:  # noqa: BLE001 — best-effort backstop
         click.echo(
             f"  warning: remote backstop failed to record fix exit: {exc}",
@@ -3097,6 +3123,7 @@ def _dispatch_rework_of(
                 )
             # else _wt_setup_ok_rw is False: setup never happened; error
             # already printed above — no "commits preserved" noise.
+        _echo_artifact_stash(_fr)
     except Exception as exc:  # noqa: BLE001 — best-effort backstop
         click.echo(
             f"  warning: remote backstop failed to record rework exit: {exc}",
@@ -4410,6 +4437,7 @@ def _dispatch_interactive_work(
                     )
                 # else _wt_setup_ok_work is False: setup never happened; error
                 # already printed above — no "commits preserved" noise.
+            _echo_artifact_stash(_fr)
         except Exception as exc:  # noqa: BLE001 — best-effort backstop
             click.echo(
                 f"  warning: remote backstop failed to record work exit: {exc}",
