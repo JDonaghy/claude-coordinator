@@ -333,6 +333,10 @@ def test_leg_rows_retained_for_drill_down() -> None:
         ("claude-opus-4-8", "opus"),
         ("haiku", "haiku"),
         ("claude-haiku-4-5", "haiku"),
+        ("fable", "fable"),
+        ("FABLE", "fable"),
+        (" fable ", "fable"),
+        ("claude-fable-5", "fable"),
         ("(unknown)", "(unknown)"),
         ("", "(unknown)"),
         (None, "(unknown)"),
@@ -368,6 +372,28 @@ def test_estimate_unknown_model_flags_and_produces_no_estimate() -> None:
     assert captured == 0.0
     assert est == 0.0
     assert unknown is True
+
+
+def test_estimate_fable_model_priced_not_flagged() -> None:
+    # Mirrors test_estimate_unknown_model_flags_and_produces_no_estimate but
+    # for the positive case: a fable-attributed leg must be priced using its
+    # rate, not flagged as unknown (#1290 fix — normalize_model previously
+    # returned "(unknown)" for "fable" because _KNOWN_CANONICAL omitted it).
+    pricing = PricingConfig(
+        models={
+            **FIXTURE_PRICING.models,
+            "fable": ModelRates(input=10.00, output=50.00, cache_read=1.00, cache_creation=12.50),
+        }
+    )
+    row = _leg(
+        issue_number=1, repo_name="r", type="work", model="fable", is_interactive=False,
+        cost_usd=None, input_tokens=1_000, output_tokens=1_000, cache_read_tokens=0,
+        dispatched_at=_t(9, 0), finished_at=_t(9, 1),
+    )
+    captured, est, unknown = leg_cost(row, pricing)
+    assert captured == 0.0
+    assert est == pytest.approx(0.01 + 0.05)
+    assert unknown is False
 
 
 def test_captured_cost_never_double_counted_with_estimate() -> None:
