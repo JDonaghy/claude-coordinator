@@ -27,7 +27,7 @@ def test_pricing_absent_defaults_to_builtin_rates(tmp_path: Path) -> None:
     p.write_text(BASE)
     cfg = load(p)
     assert cfg.pricing == PricingConfig()
-    for model in ("sonnet", "opus", "haiku"):
+    for model in ("sonnet", "opus", "haiku", "fable"):
         rates = cfg.pricing.rates_for(model)
         assert rates is not None
         assert rates.input > 0
@@ -39,19 +39,21 @@ def test_pricing_builtin_defaults_match_official_anthropic_rates(
 ) -> None:
     """Pin the exact shipped per-1M-token defaults (not just ``> 0``).
 
-    #1118 review: the shipped Opus default had silently regressed to 1/3 of
-    the correct value (``5.00/25.00/0.50/6.25`` instead of
-    ``15.00/75.00/1.50/18.75``) while ``> 0``-only assertions let it ship.
-    Pin every field for every canonical tier so a future edit can't
-    silently drift again the same way.
+    #1290: the shipped Opus default carried ``15.00/75.00/1.50/18.75`` —
+    Opus 3 / 4.0 / 4.1 era list pricing, mistakenly pinned as "verified" at
+    #1118 review. Current Opus (4.6 through 4.8) list price is
+    ``5.00/25.00/0.50/6.25``, corrected here. Also pins the new Fable row
+    added in the same change. Pin every field for every canonical tier so a
+    future edit can't silently drift again the same way.
     """
     p = tmp_path / "coordinator.yml"
     p.write_text(BASE)
     cfg = load(p)
     expected = {
         "sonnet": ModelRates(input=3.00, output=15.00, cache_read=0.30, cache_creation=3.75),
-        "opus": ModelRates(input=15.00, output=75.00, cache_read=1.50, cache_creation=18.75),
+        "opus": ModelRates(input=5.00, output=25.00, cache_read=0.50, cache_creation=6.25),
         "haiku": ModelRates(input=1.00, output=5.00, cache_read=0.10, cache_creation=1.25),
+        "fable": ModelRates(input=10.00, output=50.00, cache_read=1.00, cache_creation=12.50),
     }
     for model, rates in expected.items():
         assert cfg.pricing.rates_for(model) == rates
