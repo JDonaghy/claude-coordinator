@@ -27,6 +27,7 @@ from coord.milestone_dispatch import (
     fetch_milestone_context,
     gate_a_status,
     is_milestone_complete,
+    pick_machine,
     plan_dispatch,
 )
 from coord.milestone_order import (
@@ -1419,3 +1420,124 @@ def milestone_gate_c_cmd(
         click.echo(f"\nGate C RED for #{tracking_issue} — milestone is not ready to ship.")
         sys.exit(1)
     click.echo(f"\nGate C GREEN for #{tracking_issue}.")
+
+
+@milestone_group.command(
+    "gate-b",
+    help=(
+        "Gate B (docs/PIPELINE_V2.md, #933): after every issue in the "
+        "milestone has landed, dispatch an independent architecture review "
+        "that checks the ASSEMBLED result against the Gate-A contract — "
+        "was it implemented to spec, did the pieces integrate. Routes "
+        "through the review pipeline (type=review, gh access via the "
+        "coordinator posting on the reviewer's behalf) rather than "
+        "`coord assign`, whose workers have `gh` denied. The verdict is "
+        "posted as a comment on TRACKING_ISSUE when the reviewer finishes; "
+        "request-changes means bounce, not ship — this command itself is a "
+        "manual, non-automated gate, same posture as `coord milestone "
+        "gate-c` (no `feature/ms-NN -> develop` ship automation exists yet, "
+        "#934)."
+    ),
+)
+@click.argument("repo")
+@click.argument("tracking_issue", type=int)
+@click.option(
+    "--machine", "machine_name", default=None,
+    help="Dispatch to this machine by name instead of the first idle/capable one.",
+)
+@click.option(
+    "--dry-run", is_flag=True,
+    help="Show the target machine + issue list without dispatching.",
+)
+@_CONFIG_OPTION
+def milestone_gate_b_cmd(
+    repo: str,
+    tracking_issue: int,
+    machine_name: str | None,
+    dry_run: bool,
+    config_path: Path,
+) -> None:
+    from coord import board_service
+    from coord.gate_b import GateBError, dispatch_gate_b_review
+
+    cfg = _load_config(config_path)
+    repo_entry = cfg.repo(repo)
+    if repo_entry is None:
+        click.echo(f"error: unknown repo {repo!r}", err=True)
+        sys.exit(2)
+
+    try:
+        ctx = fetch_milestone_context(repo_entry, tracking_issue)
+    except MilestoneDispatchError as e:
+        click.echo(f"error: {e}", err=True)
+        sys.exit(1)
+
+    # Gate A must already be satisfied — Gate B's rubric IS the Gate-A
+    # contract, so there is nothing to review against otherwise.
+    block_reason = gate_a_status(repo_entry, cfg, ctx.milestone_number)
+    if block_reason:
+        click.echo(f"error: {block_reason}", err=True)
+        sys.exit(1)
+
+    if not ctx.work_order.nodes:
+        click.echo(
+            f"#{tracking_issue}: no `## Work order` block found — nothing for "
+            "Gate B to review",
+            err=True,
+        )
+        sys.exit(1)
+
+    if not is_milestone_complete(ctx):
+        incomplete = [
+            n.issue_number
+            for n in ctx.work_order.nodes
+            if n.issue_number not in ctx.terminal_issues
+        ]
+        click.echo(
+            "error: Gate B runs only after every issue in the milestone has "
+            "landed — still open: "
+            + ", ".join(f"#{n}" for n in incomplete),
+            err=True,
+        )
+        sys.exit(1)
+
+    board = board_service.read_board()
+
+    if machine_name is not None:
+        machine = next((m for m in cfg.machines if m.name == machine_name), None)
+        if machine is None:
+            click.echo(f"error: unknown machine {machine_name!r}", err=True)
+            sys.exit(2)
+    else:
+        machine = pick_machine(repo, board, cfg)
+        if machine is None:
+            click.echo(
+                f"error: no idle, capable, unpaused machine available for {repo!r}",
+                err=True,
+            )
+            sys.exit(1)
+
+    click.echo(
+        f"Gate B for #{tracking_issue} (milestone #{ctx.milestone_number}), "
+        f"{len(ctx.work_order.nodes)} issue(s) -> {machine.name}"
+    )
+
+    if dry_run:
+        click.echo("(dry run — not dispatched)")
+        return
+
+    try:
+        assignment = dispatch_gate_b_review(
+            repo_cfg=repo_entry,
+            config=cfg,
+            machine=machine,
+            tracking_issue=tracking_issue,
+            milestone_number=ctx.milestone_number,
+            work_order=ctx.work_order,
+            board=board,
+        )
+    except GateBError as e:
+        click.echo(f"error: {e}", err=True)
+        sys.exit(1)
+
+    click.echo(f"dispatched: assignment {assignment.assignment_id} on {machine.name}")
