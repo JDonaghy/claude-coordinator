@@ -233,6 +233,7 @@ The deployment picture, end to end:
 | `coord agent` | 7433 | every worker machine | `coord-agent.service` (via `install-agent.sh`) |
 | `coord serve` | 7435 | dellserver only (owns the DB) | `deploy/coord-serve.service` |
 | `coord web` | 7434 | dellserver only (reads the local DB) | `deploy/coord-web.service` |
+| `coord notify` (periodic) | n/a (CLI, not a listener) | dellserver only (owns the DB) | `deploy/coord-notify.service` + `deploy/coord-notify.timer` |
 
 The phone is just a browser: open `http://<dellserver-host>:7434` on the tailnet
 and Add to Home Screen (the API is same-origin, so no client config).
@@ -251,6 +252,72 @@ systemctl --user daemon-reload && systemctl --user enable --now coord-web
 # restart over SSH needs the runtime-dir prefix (same #404 caveat as the agent):
 XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart coord-web
 ```
+
+## Periodic `coord notify` (`coord-notify` timer, #1311)
+
+`coord serve` (above) fronts board **state**; it deliberately does not drive the
+pipeline — its own passive tick (`_lifespan`/`_tick_loop`) only flips a
+finished/crashed assignment's status, with **no dispatch and no GitHub write**
+(a load-bearing invariant: it must never be able to re-introduce the #476/#477
+dispatch flood). The command that actually posts completion/failure comments
+and triggers the auto-loop (review-on-completion, fix-on-request-changes,
+re-review-on-fix-completion) is `coord notify`, and it has to be **fired
+periodically** for that to happen at all.
+
+A full (non-thin-client) `coord`/`coord-tui` on the daemon host itself gets this
+for free — the TUI auto-fires `coord notify` every 30s while something's
+running. But a **thin client** (any machine with `~/.coord/client.toml` pointing
+at `board_service`) deliberately suppresses that auto-fire
+(`is_remote_board_service()`, `tui/src/app/data.rs`) — it must not shell out
+`coord notify` locally against the wrong/absent DB. Net effect without this
+timer: a thin-client-dispatched worker can finish or crash and just sit there,
+unnoticed, until a human happens to run `coord notify` by hand.
+
+**The fix is a systemd user timer on the daemon host** — the same box that runs
+`coord serve`/`coord web` (dellserver in production) — firing `coord notify`
+every few minutes. `coord notify`'s own daemon re-route (#906,
+`daemon_reroute_target`) means this is safe to run from *any* client and it'll
+find the right DB either way, but running it locally on the daemon host (no
+`client.toml` there) is simplest: it just executes directly against the local
+`coord.db`, no HTTP hop.
+
+**THIS TIMER IS THE SANCTIONED SINGLE DRIVER for thin-client setups.** Do not
+also add a hand-rolled `while`/`watch` loop calling `coord notify` alongside it,
+and do not re-enable the TUI's thin-client suppression to "help" — two drivers
+racing each other is exactly the 2026-06-07 incident (a `request-changes`
+verdict got auto-bounced into redundant fix-2/fix-3 workers because two loops
+called `notify` concurrently). See `docs/ARCHITECTURE.md`'s "no orchestration
+daemon" section for the full incident writeup and the #476 (iteration cap) /
+#477 ("TUI owns the loop") fixes that came out of it.
+
+Install (same host as `coord-serve`/`coord-web`):
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp deploy/coord-notify.service deploy/coord-notify.timer ~/.config/systemd/user/
+loginctl enable-linger "$USER"          # survive logout / reboot
+systemctl --user daemon-reload
+systemctl --user enable --now coord-notify.timer
+```
+
+Verify / logs:
+
+```bash
+systemctl --user list-timers coord-notify.timer
+journalctl --user -u coord-notify.service -f
+```
+
+**Known residual gap (not closed by this timer):** the auto-loop's
+interactive-awareness is narrow — it skips a headless review/re-review over
+work whose *own* completion was interactive (`provider_name == "claude-pty"`),
+but nothing checks "is there a live, human-attended `--interactive`/`--chat`/
+`--troubleshoot`/`--fix-of`/`--merge-of` pane open on this same issue right now"
+before this timer's `coord notify` fires an auto-fix. This is the class of race
+#602 fixed narrowly for the TUI's own auto-offer popup, not for `coord notify`'s
+auto-loop dispatch path. Low risk today (flat headless-only dispatch has no
+`--interactive` involved), and deliberately **deferred as a fast-follow** rather
+than blocking this timer — flag it if it ever bites (a fix worker firing while
+someone is mid-`--fix-of` on the same issue).
 
 ## Graphify graph: reseed a machine's local clone
 
