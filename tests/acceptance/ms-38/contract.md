@@ -294,6 +294,7 @@ Optional outcome fields (`outcome_run_number`, `outcome_met`, `outcome_partial`,
 | `mocks/plans-detail-pane.screen` | #38 selected + expanded in sidebar, detail pane open in main area | #1122 CC-2 |
 | `mocks/plans-rightclick-stub.screen` | Right-click on epic-less stub row — "Create work order…" menu | #1123 CC-3 §4b |
 | `mocks/plans-rightclick-header.screen` | Right-click on repo header — "New plan > Quick capture / Guided chat…" menu | #1123 CC-3 §4c |
+| `mocks/plans-rightclick-epic.screen` | Right-click on epic row (#38, has tracking issue) — full CRUD menu | #1123 CC-3 §4d |
 | `mocks/plans-help-overlay.screen` | `?` pressed — help cheatsheet modal with key/chip legend | #1124 CC-4 §5a–5d |
 | `mocks/plans-palette.screen` | Command palette open — Plans actions listed | #1124 CC-4 §5e–5h |
 
@@ -310,7 +311,7 @@ Tests are **in-crate** (`#[cfg(test)]` in `tui/src/app/tests.rs` or a nearby mod
 
 3. **CC-3 status-bar hint set.** The exact post-CC-3 status bar string is: `" right-click=menu  ?=help  c=capture  q=quit "`. If the implementor adds additional hints, the contract's assertions remain satisfied as long as the required substrings appear.
 
-4. **CC-4 palette key binding.** The trigger key for the command palette is left to the implementor (common choices: `/`, `Ctrl+P`, `Ctrl+Shift+P`). The contract requires only that the palette can be opened from Plans and that `driver.screen_contains("command palette")` is `true` while it is open. The test author will need to know the actual binding; if not yet decided at JIT time, this item must be resolved first.
+4. **CC-4 palette key binding.** The trigger key for the command palette is left to the implementor (common choices: `/`, `Ctrl+P`, `Ctrl+Shift+P`). The contract requires only that the palette can be opened from Plans and that `driver.screen_contains("command palette")` is `true` while it is open. The test author will need to know the actual binding; if not yet decided at JIT time, this item must be resolved first. **Note:** `mocks/plans-palette.screen` shows `/=palette` in the status bar — this `/` is a **placeholder** for illustration purposes only, not a locked-in key choice. The actual binding is CC-3's decision; the test author must confirm the real key with the CC-3 implementor before authoring acceptance tests for §5e.
 
 5. **Quadraui help layer (CC-4 dep).** `JDonaghy/quadraui#431` (help registry + `?` modal + Palette integration) is already merged to `develop` as of 2026-07-19. The coord-tui checkout's `~/src/quadraui` must be on the branch carrying it before `cargo build`. See CLAUDE.md §"coord-tui depends on quadraui by a relative path".
 
