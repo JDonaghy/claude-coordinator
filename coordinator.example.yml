@@ -125,9 +125,9 @@ models:
   # version to `claude -p --model <id>` instead of relying on the CLI's
   # latest-by-default. Aliases not listed here fall back to claude -p's pick.
   # versions:
-  #   haiku:  claude-haiku-4-5-20251001
-  #   sonnet: claude-sonnet-4-6
-  #   opus:   claude-opus-4-7
+  #   haiku:  claude-haiku-4-5
+  #   sonnet: claude-sonnet-5
+  #   opus:   claude-opus-4-8
 
 # providers: worker-command backend registry (#322 / #323).
 #

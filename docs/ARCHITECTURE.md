@@ -132,13 +132,46 @@ The most coordinated path through the system is the review/fix/re-review loop. I
 
 If any single link is broken — most often `coord notify` not running — the whole loop stalls. The TUI helps spot this because completed assignments without comments are visible in the pipeline view, but the fix is always "run `coord notify`."
 
-> **Evolving (2026-07-04):** this describes the flat, stage-serial loop that runs *today*. Two
-> redesigns are landing on top of it: **[`PIPELINE_V2.md`](PIPELINE_V2.md)** nests this issue loop
-> inside a milestone tier (Gate A/B/C/D) and makes Merge a driven, bounce-capable box; and
-> **[`ORACLE_LOOP.md`](ORACLE_LOOP.md)** collapses the expensive cold-start Test/Fix cycle above into
-> a **tight in-session loop** — the worker iterates against a sealed, independently-authored
-> acceptance oracle in its own warm session, and the coordinator re-runs it externally as the trust
-> gate. Until those ship, the loop here is authoritative.
+> **Updated (2026-07-20):** the flat, stage-serial loop above is still what runs for a standalone
+> issue. What has since **shipped on top of it** is the milestone tier of
+> **[`PIPELINE_V2.md`](PIPELINE_V2.md)** — this issue loop now nests inside a milestone pipeline with
+> Gates A–D (`coord acceptance mock`, `coord milestone gate-b`/`gate-c`/`ship`), and the develop +
+> feature-branch model (#934) that routes each milestone's issues onto a `feature/ms-NN` branch. See
+> [The milestone tier and the branch model](#the-milestone-tier-and-the-branch-model-934) below.
+> **[`ORACLE_LOOP.md`](ORACLE_LOOP.md)** — the tight in-session loop where the worker iterates against
+> a sealed, independently-authored acceptance oracle and the coordinator re-runs it externally as the
+> trust gate — is available (`coord acceptance author`/`run`/`record`) but is **opt-in**, not the
+> default path for new work.
+
+## The milestone tier and the branch model (#934)
+
+The auto-loop above sequences a *single* issue. For work that spans many issues, that loop **nests inside a milestone pipeline** ([`PIPELINE_V2.md`](PIPELINE_V2.md)) so the expensive gates (architecture review, acceptance authoring) are paid **once per milestone**, not once per issue.
+
+**What an epic is.** A GitHub tracking issue carrying the `epic` label (`TRACKING_ISSUE_LABEL`, `coord/milestone_order.py`) whose body holds a `## Work order` block — a DAG of children written as `- #762 {group: A, after: #761}` (`group` = parallel cohort, `after` = hard dependency). Membership is backed by GitHub's native **sub-issues API** (`coord/parentage_github.py`; the older `## Sub-issues` checklist is migrated by `coord milestone sync`, #1061). The `coord milestone` group (`coord/commands/milestone.py`) drives it: `chat` (steward session to draft the order), `write-order`/`order` (write/read the DAG), `dispatch` (promote the ready frontier into the pipeline, draining as `after` deps clear), and the gate commands below.
+
+**The four gates** wrap the whole milestone (distinct from the per-issue Work → Test → Review → Merge stages):
+
+| Gate | Command | Enforces |
+|---|---|---|
+| **A — contract** | `coord acceptance mock` | A mock-first black-box `contract.md` exists on the default branch before any issue dispatches — checked by `gate_a_status` (`coord/milestone_dispatch.py`) for repos with an `acceptance.drivers` entry; repos without one skip the gate. |
+| **B — architecture** | `coord milestone gate-b` (#933) | An independent `type=review` confirms the *assembled* milestone was built to the Gate-A contract. `request-changes` = bounce, not ship. |
+| **C — acceptance** | `coord milestone gate-c` (#932) | The full accumulated acceptance suite is green (integration gaps *between* issues that per-issue runs miss). |
+| **D — ship** | `coord milestone ship` (#934) | Merges `feature/ms-NN → develop`, gated on Gate B (`approve`) + Gate C (re-run live). |
+
+**The branch model** (`coord/branch_model.py`, opt-in via a repo's `develop_branch:` config, `coord/config.py`). When `develop_branch` is set on a repo *and* an issue belongs to a GitHub Milestone:
+
+- each milestone gets one `feature/ms-NN` integration branch off `develop` (`feature_branch_name` → `feature/ms-{n}`; created idempotently by `ensure_feature_branch_exists` before dispatch);
+- that milestone's issues branch off `feature/ms-NN` and their PRs merge **back into it**, not into `main`;
+- `feature/ms-NN → develop` happens only via Gate D (`coord milestone ship`); `develop → main` is a separate, un-automated release cut.
+
+`resolve_base_branch(repo, milestone_number)` is the single resolver — it returns `feature/ms-NN` only when `develop_branch` is set and a milestone number is present, else `repo.default_branch or "main"`. It is **fail-open**: a repo that never sets `develop_branch`, or an issue with no milestone, resolves to exactly today's single-branch `main` flow, with no extra `gh` call. The resolver is threaded through the five branch-deciding seams — Work dispatch (`coord/dispatch.py`), review/diff base (`coord/review.py`), merge target (`coord/merge_queue.py`, `coord/commands/merge.py`), reconcile (`coord/reconcile.py`), and the auto-loop (`coord/auto_loop.py`) — each guarded on `repo.develop_branch` so the default path is untouched. (The interactive `--review-of`/`--merge-of` surfaces are deliberately **not** yet wired into the milestone base — a documented follow-up.)
+
+## Observability: `coord usage` and `coord audit`
+
+Two read-only commands surface what the fleet did, both routed through the same board seam as `coord status` (daemon when `coord serve` is up, local DB otherwise) so a thin client never opens `~/.coord/coord.db` directly.
+
+- **`coord usage`** (`coord/commands/status.py`, aggregation in `coord/usage_rollup.py`) — per-assignment/model/issue **cost, tokens, and wall-clock time**, over a time window (`--today`/`--week`/`--month`/`--since`) and grouped by issue, repo, or time bucket (`--by-issue`/`--issue N`/`--by repo|week|month`/`--by-time`). Cost is the captured `cost_usd` when real, else estimated from token counts × `PricingConfig` rates.
+- **`coord audit`** (query surface `coord/commands/audit.py`, store `coord/audit.py`) — a durable, append-only, keyset-paginated **event log**: dispatch, verdicts, merges, notifications. `record_audit()` is invoked at the `state._*_local` / `issue_store` **write choke points** (e.g. `_record_test_verdict_local`), so there is one row per real transition regardless of topology, and the write is best-effort — it never raises into the caller (a board mutation must succeed even if the audit write fails). Event names reuse the `coord:event=` vocabulary from `coord/comments.py` so the audit log and the GitHub message bus agree.
 
 ## When a merge isn't happening
 
@@ -202,6 +235,10 @@ The CLI and the TUI are peer clients of the same state. They re-implement the sa
 | `coord/auto_loop.py` | Review → fix dispatch (#243), fix → review dispatch (#278). |
 | `coord/notify.py` | Polls agents, posts GH comments, triggers the auto-loop. |
 | `coord/conflict_fix.py` | Rebase-on-merge-failure worker dispatch (#241). |
+| `coord/branch_model.py` | #934 develop + feature-branch resolver (`resolve_base_branch`, `ensure_feature_branch_exists`); opt-in via a repo's `develop_branch`. |
+| `coord/commands/milestone.py`, `coord/milestone_order.py`, `coord/milestone_dispatch.py`, `coord/milestone_chat.py` | The milestone tier: `## Work order` DAG, frontier dispatch, Gates A–D, steward chat. |
+| `coord/usage_rollup.py`, `coord/usage.py` | `coord usage` cost/token/time aggregation over the board. |
+| `coord/audit.py`, `coord/commands/audit.py` | Durable event log: `record_audit()` at the state write-waist; `coord audit` query surface. |
 | `coord/review.py` | Adversarial review dispatch + verdict parsing. `dispatch_pending_reviews()` is the **bulk** path used by `reconcile()` and `coord notify`: it bounds dispatch with a per-pass cap (`reviews.max_auto_dispatch_per_pass`, default 5) and a **surge gate** (`reviews.flood_threshold`, default 12 — above it, refuse all and require `reviews.allow_review_flood: true` / `COORD_ALLOW_REVIEW_FLOOD=1`). This is the flood guard: a backlog "unmasking" (e.g. dropping a gate that had suppressed reviews) can't fire hundreds of metered reviews at once. See the 2026-06-08 incident. |
 | `coord/state.py`, `coord/db.py` | SQLite schema and access helpers. |
 | `coord/dashboard/` | The web dashboard (`coord web`). Optional. |
