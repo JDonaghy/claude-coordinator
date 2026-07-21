@@ -1293,10 +1293,11 @@ def milestone_chat_cmd(
         "configured local checkout) and reports pass/fail with a "
         "non-zero exit on red, alongside a per-issue rollup of the "
         "milestone's own Acceptance box state (e.g. \"3/7 acceptance "
-        "green\") for visibility. This is a manual check the operator "
-        "runs before treating a milestone as done — no `feature/ms-NN "
-        "→ develop` ship-path automation exists yet (#933/#934), so "
-        "nothing here mutates git state or blocks anything automatically."
+        "green\") for visibility. This is a manual, read-only check the "
+        "operator runs before shipping — it mutates no git state and "
+        "blocks nothing automatically. The ship step itself is `coord "
+        "milestone ship` (Gate D, #934), which merges `feature/ms-NN → "
+        "develop`."
     ),
 )
 @click.argument("repo")
@@ -1435,8 +1436,8 @@ def milestone_gate_c_cmd(
         "posted as a comment on TRACKING_ISSUE when the reviewer finishes; "
         "request-changes means bounce, not ship — this command itself is a "
         "manual, non-automated gate, same posture as `coord milestone "
-        "gate-c` (no `feature/ms-NN -> develop` ship automation exists yet, "
-        "#934)."
+        "gate-c`. The ship step itself is `coord milestone ship` (Gate D, "
+        "#934), which merges `feature/ms-NN -> develop`."
     ),
 )
 @click.argument("repo")
