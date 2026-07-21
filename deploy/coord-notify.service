@@ -1,0 +1,48 @@
+# coord notify — periodic driver for thin-client setups (#1311).
+#
+# A systemd *user* unit (mirrors coord-agent/coord-serve/coord-web), paired
+# with coord-notify.timer. Runs `coord notify` on a schedule: polls each
+# agent for completion, posts the GH completion/failure comments, and
+# triggers the auto-loop (review-on-completion, fix-on-request-changes,
+# re-review-on-fix-completion). Install ONLY on the box that owns
+# ~/.coord/coord.db (dellserver in production — the same host that runs
+# coord-serve/coord-web) — it must NOT run on a thin-client machine, since
+# `coord notify` there would just re-route itself back over HTTP to the
+# daemon anyway (#906, daemon_reroute_target), needlessly.
+#
+# THIS TIMER IS THE SANCTIONED SINGLE DRIVER for thin-client coord-tui/coord
+# setups. Do NOT also hand-roll a `while`/`watch` loop calling `coord notify`
+# alongside it, and do NOT re-enable the TUI's own 30s auto-notify for a
+# thin client (it is deliberately suppressed — `is_remote_board_service()`,
+# tui/src/app/data.rs). Two drivers racing each other is exactly the failure
+# mode that caused the 2026-06-07 incident (duplicate fix workers from a
+# request-changes verdict getting auto-bounced twice) — see #476/#477 and
+# docs/ARCHITECTURE.md's "no orchestration daemon" section.
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/coord-notify.service deploy/coord-notify.timer ~/.config/systemd/user/
+#   loginctl enable-linger "$USER"          # survive logout / reboot
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now coord-notify.timer
+#
+# This is a Type=oneshot service activated BY THE TIMER — do not
+# `systemctl --user enable coord-notify.service` directly (it has no
+# [Install] section; the timer unit is what you enable).
+#
+# Prereqs: same as coord-serve (coordinator.yml at ~/.coord/coordinator.yml,
+# a `gh`-authenticated environment for the GitHub writes `coord notify` makes).
+#
+# See docs/AGENT_OPERATIONS.md → "Periodic coord notify (coord-notify timer)".
+
+[Unit]
+Description=coord notify — periodic pipeline driver (#1311)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.coord-venv/bin/coord notify --config %h/.coord/coordinator.yml
+# Bounded below the timer's 5-minute cadence (coord-notify.timer) so a slow
+# run can't overlap the next fire.
+TimeoutStartSec=280
