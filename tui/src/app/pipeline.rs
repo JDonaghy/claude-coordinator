@@ -305,15 +305,20 @@ pub(crate) struct EpicChildRow {
 /// loop (`issue_idxs`/`mil_issue_idxs`) in `rebuild_pipeline_sidebar`.
 ///
 /// `by_epic` maps an epic's `pipeline_issues` index to its resolved child
-/// rows. `nested` is the flat set of every child issue number nested under
-/// some epic in THIS bucket — callers skip those when emitting ordinary
-/// top-level rows, fixing the bug #1197 describes: an epic and its children
-/// previously rendered as flat siblings under the same milestone/repo
-/// bucket (both matched the same milestone/lifecycle grouping).
+/// rows. `nested` is the flat set of every child issue keyed by
+/// `(epic_repo, child_number)` — nested under some epic in THIS bucket —
+/// callers skip those when emitting ordinary top-level rows, fixing the bug
+/// #1197 describes: an epic and its children previously rendered as flat
+/// siblings under the same milestone/repo bucket (both matched the same
+/// milestone/lifecycle grouping). Keyed by repo (not a bare `u64`) for the
+/// same reason `pipeline_globally_nested_children` is: GitHub issue numbers
+/// are only unique within a repo, so a bare-number set risks suppressing an
+/// unrelated same-numbered issue from a different repo in a multi-repo
+/// bucket like Done (#1300).
 #[derive(Default)]
 pub(crate) struct EpicNesting {
     pub(crate) by_epic: std::collections::HashMap<usize, Vec<EpicChildRow>>,
-    pub(crate) nested: std::collections::HashSet<u64>,
+    pub(crate) nested: std::collections::HashSet<(String, u64)>,
 }
 
 /// Width of one arrow connector between stages, in TUI cells. Mirrors the
@@ -1521,7 +1526,7 @@ impl CoordApp {
                 continue;
             }
             for row in &rows {
-                nesting.nested.insert(row.number);
+                nesting.nested.insert((repo_name.to_string(), row.number));
             }
             nesting.by_epic.insert(idx, rows);
         }
@@ -3819,7 +3824,17 @@ impl CoordApp {
                     let nesting = self.compute_epic_nesting(&done_windowed);
                     for (ii, &issue_idx) in done_windowed.iter().enumerate() {
                         let issue = &self.pipeline_issues[issue_idx];
-                        if nesting.nested.contains(&issue.number) {
+                        // #1300: scope the suppression lookup by repo — see
+                        // `EpicNesting::nested`'s doc comment. A bare-number
+                        // check here would suppress an unrelated same-numbered
+                        // standalone issue from a different repo in this
+                        // multi-repo Done window.
+                        let is_nested = issue
+                            .coord_repo
+                            .as_deref()
+                            .map(|r| nesting.nested.contains(&(r.to_string(), issue.number)))
+                            .unwrap_or(false);
+                        if is_nested {
                             continue;
                         }
                         let title_color = if issue.coord_repo.is_some() {

@@ -36984,3 +36984,148 @@ Milestone tracking issue.
              badge_text={badge_text:?}  expected=\"({expected})\"",
         );
     }
+
+    /// #1300 review follow-up: cross-repo issue-number collision must not
+    /// suppress an unrelated standalone issue.
+    ///
+    /// Repo "api" has a closed epic #300 with closed child #301 (both in
+    /// Done — child correctly nests under the epic, same shape as case 2).
+    /// Repo "web" independently has an unrelated standalone closed issue
+    /// also numbered #301. GitHub issue numbers are only unique within a
+    /// repo, so this is a legitimate same-numbered coexistence in one
+    /// multi-repo Done window (mirrors `pipeline_globally_nested_children`'s
+    /// existing collision-avoidance rationale).
+    ///
+    /// Before the fix, `EpicNesting::nested` was a bare `HashSet<u64>`, so
+    /// "api"'s child #301 registering `301` in the set would *also* match
+    /// "web"'s unrelated standalone #301 and incorrectly suppress it from
+    /// Done — reintroducing the #1300 symptom via a different path. With the
+    /// fix, `nested` is keyed `(repo, number)`, so only "api"'s #301 is
+    /// suppressed (nested, collapsed by default) and "web"'s #301 renders
+    /// flat.
+    #[test]
+    fn tuidriver_pipeline_1300_cross_repo_issue_number_collision_not_suppressed() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let data = BoardData {
+            open_issues: vec![
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 300,
+                    title: "Closed epic".to_string(),
+                    body: String::new(),
+                    state: "closed".to_string(),
+                    labels: vec!["coord".to_string(), "epic".to_string()],
+                    milestone_number: None,
+                    milestone_title: None,
+                },
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 301,
+                    title: "Closed child".to_string(),
+                    body: String::new(),
+                    state: "closed".to_string(),
+                    labels: vec!["coord".to_string()],
+                    milestone_number: None,
+                    milestone_title: None,
+                },
+                // Unrelated repo, unrelated issue — happens to share the
+                // number 301 with "api"'s epic child above.
+                OpenIssue {
+                    repo_name: "web".to_string(),
+                    number: 301,
+                    title: "Unrelated web issue".to_string(),
+                    body: String::new(),
+                    state: "closed".to_string(),
+                    labels: vec!["coord".to_string()],
+                    milestone_number: None,
+                    milestone_title: None,
+                },
+            ],
+            pipeline_repos: vec![
+                ("api".to_string(), "acme/api".to_string()),
+                ("web".to_string(), "acme/web".to_string()),
+            ],
+            epic_children: vec![EpicChildren {
+                repo_name: "api".to_string(),
+                tracking_issue: 300,
+                children: vec![EpicChild { number: 301, state: "closed".to_string() }],
+            }],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        app.pipeline_issues = vec![
+            PipelineIssue {
+                number: 300,
+                title: "Closed epic".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string(), "epic".to_string()],
+                is_closed: true,
+            },
+            PipelineIssue {
+                number: 301,
+                title: "Closed child".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string()],
+                is_closed: true,
+            },
+            PipelineIssue {
+                number: 301,
+                title: "Unrelated web issue".to_string(),
+                body: String::new(),
+                repo_slug: "acme/web".to_string(),
+                coord_repo: Some("web".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string()],
+                is_closed: true,
+            },
+        ];
+        app.done_window = DoneWindow::All;
+        app.active_view = SidebarView::Pipeline;
+        app.rebuild_pipeline_sidebar(None);
+        // Expand the Done section (collapses by default per #815).
+        if let Some(pos) = app.pipeline_state_section_names.iter().position(|&k| k == "done") {
+            app.pipeline_sidebar.set_collapsed(pos + 1, false); // +1 for FILTER section
+        }
+
+        let done_windowed = app.pipeline_done_windowed();
+        assert_eq!(
+            done_windowed.len(),
+            3,
+            "#1300 collision: done_windowed must include epic + child + unrelated web issue",
+        );
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 50);
+        let screen = driver.screen();
+
+        // Epic #300 renders.
+        assert!(
+            driver.screen_contains("#300"),
+            "#1300 collision: epic #300 must render in Done:\n{screen}",
+        );
+
+        // "#301" must appear exactly once — "web"'s unrelated standalone
+        // issue rendering flat. "api"'s child #301 stays correctly nested
+        // (and collapsed, per the all-children-done default) under epic
+        // #300. Before the fix, the bare-number `nested` set would
+        // incorrectly suppress "web"'s #301 too, so "#301" would not appear
+        // on screen at all.
+        assert_eq!(
+            screen.matches("#301").count(),
+            1,
+            "#1300 collision: \"web\"'s unrelated #301 must render flat in Done \
+             exactly once (not suppressed by \"api\"'s same-numbered nested child):\n{screen}",
+        );
+
+        // Badge counts all 3 logical Done members.
+        assert!(
+            driver.screen_contains("(3)"),
+            "#1300 collision: Done badge must say (3):\n{screen}",
+        );
+    }
