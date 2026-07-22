@@ -89,6 +89,52 @@ def build_mock_author_briefing(
     return "\n".join(parts)
 
 
+def build_mock_author_amend_briefing(
+    *,
+    repo_slug: str,
+    milestone_title: str,
+    milestone_number: int,
+    tracking_issue_number: int,
+    amend_text: str,
+) -> str:
+    """#1315: seed briefing for a *targeted* Gate-A contract amendment.
+
+    Unlike :func:`build_mock_author_briefing` (a full fresh render from the
+    milestone's open-issues digest), this skips re-fetching milestone
+    context entirely and hands the mock-author exactly the operator's own
+    description of what to correct in the already-merged
+    ``tests/acceptance/ms-NN/contract.md`` (and/or its ``mocks/``). This is
+    the "properly-typed contract-amend dispatch" #1315 closes the gap for:
+    before this, the only way to land a small, targeted correction to a
+    merged Gate-A contract was a plain ``coord assign`` (defaulting to
+    ``type="work"``) — the root cause of #1314's three-way breakage. Still
+    dispatches as ``type="mock-author"`` (independently-typed, exempt from
+    the ``tests/acceptance/**`` sealing guard — see ``coord/dispatch.py``
+    and #1315's ``_sealed_write_guard_tools`` in ``coord/agent.py``), so a
+    contract correction never needs to fall back to ``type="work"`` again.
+    """
+    ms_dir = f"tests/acceptance/{ms_dirname(milestone_number)}"
+
+    parts: list[str] = []
+    parts.append(
+        f"=== Gate A CONTRACT AMENDMENT for {repo_slug} — milestone "
+        f"{milestone_title!r} (tracking #{tracking_issue_number}) ===\n"
+    )
+    parts.append(
+        f"This is a targeted correction to the ALREADY-MERGED Gate-A "
+        f"contract at `{ms_dir}/contract.md` (and/or its mocks under "
+        f"`{ms_dir}/mocks/`) — NOT a from-scratch render. Read the existing "
+        f"`{ms_dir}/contract.md` first, then apply exactly the correction "
+        "described below. Do not regenerate the document from scratch, and "
+        f"do not touch any file outside `{ms_dir}/`. Commit and push both "
+        "to this branch when done."
+    )
+    parts.append("")
+    parts.append("--- Requested correction ---")
+    parts.append(amend_text.strip())
+    return "\n".join(parts)
+
+
 def dispatch_acceptance_mock(
     repo_name: str,
     tracking_issue_number: int,
@@ -96,6 +142,7 @@ def dispatch_acceptance_mock(
     *,
     machine_override: str | None = None,
     path: str | None = None,
+    amend_briefing: str | None = None,
 ) -> tuple[str, str]:
     """End-to-end: resolve the milestone, pick a machine, seed the
     briefing, dispatch a ``type="mock-author"`` assignment.
@@ -106,6 +153,17 @@ def dispatch_acceptance_mock(
     representative subtree (see `AcceptanceConfig.driver_for` for the
     single-path-per-call resolution rule). Unused when the repo has a flat,
     unrouted driver.
+
+    *amend_briefing* (#1315): when given, skip the full fresh-render
+    briefing (:func:`build_mock_author_briefing`, which re-fetches every
+    open issue under the milestone) in favor of a narrow, targeted
+    amendment briefing (:func:`build_mock_author_amend_briefing`) built
+    from this exact text — the "small, targeted fix to an already-merged
+    contract" case #1314 hit with no properly-typed tool for it. Also
+    leaves ``target_branch`` unset (unlike the fresh-render path's
+    ``ms-{N}-gate-a``) so the worker gets a normal auto-named branch off the
+    milestone's current base — the original gate-a branch was already
+    merged (and likely deleted) by the time an amendment is needed.
 
     Returns ``(assignment_id, machine_name)``. Raises ``RuntimeError`` when
     the repo is unknown, has no acceptance driver configured (or, for a
@@ -181,34 +239,59 @@ def dispatch_acceptance_mock(
             )
         machine = picked
 
-    issues = _fetch_milestone_issues(repo_cfg.github, milestone_number)
-
-    briefing = build_mock_author_briefing(
-        repo_slug=repo_cfg.github,
-        milestone_title=milestone_title,
-        milestone_number=milestone_number,
-        tracking_issue_number=tracking_issue_number,
-        tracking_issue_body=issue_data.get("body") or "",
-        issues=issues,
-        driver_kind=driver_cfg.kind,
-        driver_mock_glob=driver_cfg.mock,
-    )
-
     tracking_title = issue_data.get("title") or f"Milestone #{tracking_issue_number}"
     resolved_model = config.models.default
-    proposal = Proposal(
-        id=0,
-        machine_name=machine.name,
-        repo_name=repo_name,
-        issue_number=tracking_issue_number,
-        issue_title=f"[gate-a] {tracking_title} — mock + contract",
-        rationale="Gate A mock-author dispatch (coord acceptance mock, #930)",
-        briefing=briefing,
-        model=resolved_model,
-        type="mock-author",
-        required_gates=list(config.pipeline.default_gates),
-        target_branch=f"ms-{milestone_number}-gate-a",
-    )
+
+    if amend_briefing is not None:
+        # #1315: targeted amend — skip the full open-issues fetch, the
+        # fresh-render briefing, and reusing the (likely already-merged and
+        # deleted) original gate-a branch name.
+        briefing = build_mock_author_amend_briefing(
+            repo_slug=repo_cfg.github,
+            milestone_title=milestone_title,
+            milestone_number=milestone_number,
+            tracking_issue_number=tracking_issue_number,
+            amend_text=amend_briefing,
+        )
+        proposal = Proposal(
+            id=0,
+            machine_name=machine.name,
+            repo_name=repo_name,
+            issue_number=tracking_issue_number,
+            issue_title=f"[gate-a-amend] {tracking_title} — contract correction",
+            rationale="Gate A contract amendment (coord acceptance mock --amend, #1315)",
+            briefing=briefing,
+            model=resolved_model,
+            type="mock-author",
+            required_gates=list(config.pipeline.default_gates),
+        )
+    else:
+        issues = _fetch_milestone_issues(repo_cfg.github, milestone_number)
+
+        briefing = build_mock_author_briefing(
+            repo_slug=repo_cfg.github,
+            milestone_title=milestone_title,
+            milestone_number=milestone_number,
+            tracking_issue_number=tracking_issue_number,
+            tracking_issue_body=issue_data.get("body") or "",
+            issues=issues,
+            driver_kind=driver_cfg.kind,
+            driver_mock_glob=driver_cfg.mock,
+        )
+
+        proposal = Proposal(
+            id=0,
+            machine_name=machine.name,
+            repo_name=repo_name,
+            issue_number=tracking_issue_number,
+            issue_title=f"[gate-a] {tracking_title} — mock + contract",
+            rationale="Gate A mock-author dispatch (coord acceptance mock, #930)",
+            briefing=briefing,
+            model=resolved_model,
+            type="mock-author",
+            required_gates=list(config.pipeline.default_gates),
+            target_branch=f"ms-{milestone_number}-gate-a",
+        )
 
     from coord.dispatch import dispatch_with_retry, post_briefing  # noqa: PLC0415
     from coord.state import record_dispatched  # noqa: PLC0415

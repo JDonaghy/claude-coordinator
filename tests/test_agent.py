@@ -22,6 +22,7 @@ from coord.agent import (
     AgentServer,
     AssignmentSpec,
     _COMPLETED_HISTORY_CAP,
+    _sealed_write_guard_tools,
     _worker_subprocess_env,
     default_worker_command,
 )
@@ -860,6 +861,84 @@ def test_default_worker_command_resume_flag_present() -> None:
     assert "--resume" in argv
     idx = argv.index("--resume")
     assert argv[idx + 1] == "ses-abc123"
+
+
+# ── #1315: structural sealing enforcement (write-guard) ─────────────────────
+
+
+def test_sealed_write_guard_tools_empty_when_not_forbidden() -> None:
+    assert _sealed_write_guard_tools([]) == []
+    assert _sealed_write_guard_tools(["coord/secrets.py"]) == []
+
+
+def test_sealed_write_guard_tools_blocks_edit_and_write():
+    patterns = _sealed_write_guard_tools(["tests/acceptance/"])
+    assert "Edit(tests/acceptance/**)" in patterns
+    assert "Write(tests/acceptance/**)" in patterns
+
+
+def test_sealed_write_guard_tools_dedupes():
+    patterns = _sealed_write_guard_tools(["tests/acceptance/", "tests/acceptance/"])
+    assert patterns.count("Edit(tests/acceptance/**)") == 1
+    assert patterns.count("Write(tests/acceptance/**)") == 1
+
+
+def test_default_worker_command_omits_disallowed_tools_when_not_sealed() -> None:
+    """A normal work spec with nothing forbidden gets no --disallowedTools —
+    the flag must not appear unconditionally for every worker."""
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path="/tmp/repo",
+        issue_number=1,
+        issue_title="t",
+        briefing="b",
+        files_forbidden=[],
+    )
+    argv = default_worker_command(spec)
+    assert "--disallowedTools" not in argv
+
+
+def test_default_worker_command_blocks_sealed_oracle_writes() -> None:
+    """#1315: a type="work" spec whose files_forbidden carries the sealed
+    oracle prefix (coord/dispatch.py's #944 auto-forbid) gets a real
+    --disallowedTools guard, not just advisory prompt text — the worker
+    literally cannot Edit/Write under tests/acceptance/** regardless of
+    what its briefing says (the gap #1314 hit)."""
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path="/tmp/repo",
+        issue_number=1120,
+        issue_title="t",
+        briefing="please fix tests/acceptance/ms-38/contract.md",
+        files_forbidden=["tests/acceptance/"],
+    )
+    argv = default_worker_command(spec)
+    assert "--disallowedTools" in argv
+    idx = argv.index("--disallowedTools")
+    disallowed = argv[idx + 1]
+    assert "Edit(tests/acceptance/**)" in disallowed
+    assert "Write(tests/acceptance/**)" in disallowed
+    # The worker still has Edit/Write in --allowedTools generally — this is
+    # a path-scoped refinement, not a wholesale removal of edit capability.
+    allowed_idx = argv.index("--allowedTools")
+    assert "Edit" in argv[allowed_idx + 1]
+
+
+def test_default_worker_command_mock_author_not_sealed() -> None:
+    """mock-author's entire job is writing under tests/acceptance/ — dispatch.py
+    never adds it to files_forbidden for that type, so it must get no write
+    guard (mirrors the dispatch-time exemption, not re-derived here)."""
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path="/tmp/repo",
+        issue_number=1120,
+        issue_title="[gate-a] t",
+        briefing="b",
+        type="mock-author",
+        files_forbidden=[],
+    )
+    argv = default_worker_command(spec)
+    assert "--disallowedTools" not in argv
 
 
 def test_reap_captures_claude_session_id(tmp_path: Path) -> None:
