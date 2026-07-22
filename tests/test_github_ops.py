@@ -344,6 +344,34 @@ class TestGetOpenChildren:
         with patch("coord.github_ops._gh", return_value=malformed):
             assert github_ops.get_open_children("acme/api", 1041) == []
 
+    def test_falls_back_to_work_order_when_no_sub_issues(self) -> None:
+        # #1221: epic #1200 (real data) predates the `## Sub-issues`
+        # convention (#1008) and was seeded via `coord milestone write-order`
+        # with only a `## Work order` block. The close-guard must detect
+        # its children via the fallback.
+        work_order_only = json.dumps({
+            "number": 1041, "title": "Epic", "state": "open", "milestone": None,
+            "labels": [],
+            "body": "Tracking issue.\n\n## Work order\n- [ ] #1039\n- [x] #1040\n",
+        })
+        with patch("coord.github_ops._gh", return_value=work_order_only):
+            children = github_ops.get_open_children("acme/api", 1041)
+        assert children == [{"number": 1039, "state": "open"}]
+
+    def test_fails_open_on_malformed_work_order(self) -> None:
+        # #1222 sibling case: a malformed `## Work order` block (e.g.
+        # with invalid syntax that throws during parse_work_order) must
+        # not wedge the close-guard — it must fail open and return [].
+        malformed_work_order = json.dumps({
+            "number": 1041, "title": "Epic", "state": "open", "milestone": None,
+            "labels": [],
+            "body": "Tracking issue.\n\n## Work order\n" + ("- [ ] #invalidnumber\n" * 1000),
+        })
+        with patch("coord.github_ops._gh", return_value=malformed_work_order):
+            # Even if parsing fails, must not raise — must return []
+            children = github_ops.get_open_children("acme/api", 1041)
+        assert children == []
+
     def test_has_open_children_true_false(self) -> None:
         with patch("coord.github_ops._gh", return_value=_EPIC_WITH_OPEN_CHILD):
             assert github_ops.has_open_children("acme/api", 1041) is True
