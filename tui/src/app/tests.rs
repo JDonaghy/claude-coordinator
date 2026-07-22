@@ -31182,6 +31182,66 @@ Milestone tracking issue.
         );
     }
 
+    /// #1314 regression: a `type="work"` assignment dispatched directly
+    /// against a tracking issue's own number (a Gate-A contract correction,
+    /// as happened against epic #1120) merges as a direct `merge_queue`
+    /// "merged" row keyed on the EPIC's own issue number. Before the fix,
+    /// `pipeline_lifecycle_section`'s `merge_stage_status_for(...) == Done`
+    /// short-circuit ran BEFORE the `epic_children_for` aggregate check, so
+    /// the epic sorted straight into "done" even with both real children
+    /// (#101/#102, neither started) untouched. The epic-aware check must
+    /// now win regardless of what the epic's own direct merge stage shows.
+    #[test]
+    fn pipeline_lifecycle_section_epic_with_direct_merge_stays_epic_aware() {
+        let mut app = make_epic_nesting_app();
+        // Neither child has started yet — mirrors #1120 (3 of 4 children
+        // still open/unimplemented) far more closely than the fixture's
+        // default (#102 pre-closed).
+        if let Some(oi) = app
+            .data
+            .open_issues
+            .iter_mut()
+            .find(|oi| oi.repo_name == "api" && oi.number == 102)
+        {
+            oi.state = "open".to_string();
+        }
+        // The corrective PR merged directly against the epic's OWN number
+        // (#100), not against a child — exactly the #1314 scenario.
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "work-against-epic".to_string(),
+            issue_number: Some(100),
+            state: "merged".to_string(),
+            pr_number: Some(1312),
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: None,
+            branch: None,
+            milestone_title: None,
+            last_attempt: None,
+        });
+        let epic = app
+            .pipeline_issues
+            .iter()
+            .find(|i| i.number == 100)
+            .expect("#100 must be in pipeline_issues")
+            .clone();
+        assert_eq!(
+            app.merge_stage_status_for(&epic),
+            StageStatus::Done,
+            "test setup: the epic's OWN direct merge stage must read Done, \
+             mirroring the incorrect type=\"work\" dispatch in #1314",
+        );
+        assert_eq!(
+            app.pipeline_lifecycle_section(&epic),
+            "new",
+            "#1314: an epic with a merged direct assignment against its own \
+             number, but zero started children, must classify via the \
+             epic-aware aggregate check (\"new\"), not short-circuit to \
+             \"done\" off its own merge stage",
+        );
+    }
+
     /// #1253 Bug 1, rendered end-to-end: with both children closed, the
     /// epic row must appear under the "In-progress" section on screen, not
     /// "New" — the TuiDriver-level guard for the unit-level assertions
