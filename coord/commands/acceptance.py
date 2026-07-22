@@ -16,7 +16,10 @@ Subcommands:
   an independent mock-author that renders a viewable mock + writes
   ``tests/acceptance/ms-NN/contract.md``.
   ``coord.milestone_dispatch.gate_a_status`` blocks the milestone's issue
-  dispatch until that contract exists.
+  dispatch until that contract exists. ``--amend``/``--amend-file`` (#1315)
+  instead dispatch a targeted correction to an already-merged contract — the
+  properly-typed tool for that, replacing the ``type="work"`` fallback that
+  caused #1314.
 """
 
 from __future__ import annotations
@@ -678,7 +681,10 @@ def acceptance_stall(
         "local repo name from coordinator.yml; TRACKING_ISSUE is the GH "
         "issue number of the milestone's tracking issue (must carry a "
         "milestone). `coord milestone dispatch` refuses this milestone's "
-        "issues until the contract this produces exists."
+        "issues until the contract this produces exists. Pass --amend (or "
+        "--amend-file) to instead dispatch a targeted correction to an "
+        "ALREADY-MERGED contract — the properly-typed tool for that #1315 "
+        "adds, replacing the type=\"work\" fallback that caused #1314."
     ),
 )
 @click.argument("repo")
@@ -697,14 +703,40 @@ def acceptance_stall(
         "flat (unrouted) driver."
     ),
 )
+@click.option(
+    "--amend", "amend_text", default=None,
+    help=(
+        "#1315: targeted amendment mode — dispatch a narrow mock-author "
+        "session that corrects the ALREADY-MERGED contract.md/mocks under "
+        "tests/acceptance/ms-NN/, using this exact text as the correction "
+        "to make, instead of doing a full fresh render from the "
+        "milestone's open issues. This is the properly-typed replacement "
+        "for falling back to a plain `coord assign` (type=\"work\") to fix "
+        "a small contract mistake (#1314's root cause). Mutually "
+        "exclusive with --amend-file."
+    ),
+)
+@click.option(
+    "--amend-file", "amend_file", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Read the --amend correction text from a file instead of the command line.",
+)
 @_CONFIG_OPTION
 def acceptance_mock_cmd(
     repo: str,
     tracking_issue: int,
     machine: str | None,
     route_path: str | None,
+    amend_text: str | None,
+    amend_file: Path | None,
     config_path: Path,
 ) -> None:
+    if amend_text is not None and amend_file is not None:
+        click.echo("error: --amend and --amend-file are mutually exclusive", err=True)
+        sys.exit(2)
+    if amend_file is not None:
+        amend_text = amend_file.read_text()
+
     cfg = _load_config(config_path)
     repo_entry = cfg.repo(repo)
     if repo_entry is None:
@@ -720,10 +752,12 @@ def acceptance_mock_cmd(
             cfg,
             machine_override=machine,
             path=route_path,
+            amend_briefing=amend_text,
         )
     except RuntimeError as exc:
         click.echo(f"error: {exc}", err=True)
         sys.exit(1)
 
-    click.echo(f"Dispatched mock-author for #{tracking_issue} -> {picked_machine}")
+    verb = "amend" if amend_text is not None else "mock-author"
+    click.echo(f"Dispatched {verb} for #{tracking_issue} -> {picked_machine}")
     click.echo(assignment_id)

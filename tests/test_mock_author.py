@@ -287,6 +287,69 @@ def test_dispatch_success_records_assignment(tmp_path):
     mock_record.assert_called_once()
 
 
+# ── build_mock_author_amend_briefing / --amend dispatch (#1315) ─────────────
+
+
+def test_amend_briefing_includes_correction_text_verbatim():
+    out = mock_author.build_mock_author_amend_briefing(
+        repo_slug="acme/api",
+        milestone_title="Q3 push",
+        milestone_number=9,
+        tracking_issue_number=100,
+        amend_text="the CLI flag is --for-path, not --path",
+    )
+    assert "the CLI flag is --for-path, not --path" in out
+    assert "acme/api" in out
+    assert "#100" in out
+
+
+def test_amend_briefing_names_already_merged_contract_and_scopes_edits():
+    out = mock_author.build_mock_author_amend_briefing(
+        repo_slug="acme/api",
+        milestone_title="M",
+        milestone_number=9,
+        tracking_issue_number=100,
+        amend_text="fix a typo",
+    )
+    assert "tests/acceptance/ms-9/contract.md" in out
+    assert "ALREADY-MERGED" in out
+    assert "from-scratch" in out
+
+
+def test_dispatch_amend_skips_open_issues_fetch_and_uses_amend_briefing(tmp_path):
+    """#1315: --amend must not re-fetch every open milestone issue (that's
+    the "full fresh render" cost the issue closes the gap on) and must
+    dispatch the targeted amend briefing, not the full one."""
+    from coord.models import Board
+
+    cfg = _cfg_with_driver(tmp_path)
+    issue_data = {
+        "number": 100, "title": "Milestone tracker", "body": "",
+        "milestone": {"number": 9, "title": "Q3"},
+    }
+    with patch("coord.github_ops.get_issue", return_value=issue_data), \
+         patch("coord.github_ops.get_open_issues") as mock_open_issues, \
+         patch("coord.board_service.read_board", return_value=Board()), \
+         patch("coord.dispatch.dispatch_with_retry", return_value={"id": "asg-amend"}) as mock_dispatch, \
+         patch("coord.dispatch.post_briefing"), \
+         patch("coord.state.record_dispatched"):
+        assignment_id, machine_name = mock_author.dispatch_acceptance_mock(
+            "api", 100, cfg, amend_briefing="the mock glob should be *.screen",
+        )
+
+    assert assignment_id == "asg-amend"
+    assert machine_name == "laptop"
+    mock_open_issues.assert_not_called()
+    proposal = mock_dispatch.call_args[0][0]
+    assert proposal.type == "mock-author"
+    assert proposal.issue_number == 100
+    assert "the mock glob should be *.screen" in proposal.briefing
+    assert "ALREADY-MERGED" in proposal.briefing
+    # Unlike the fresh-render path, no reuse of the (likely already-merged
+    # and deleted) original gate-a branch name.
+    assert proposal.target_branch is None
+
+
 def _cfg_with_routed_driver(tmp_path) -> Config:
     repo = Repo(name="api", github="acme/api", default_branch="main")
     machine = _make_machine("laptop", ["api"], str(tmp_path))

@@ -148,7 +148,9 @@ def enforce_epic_dispatch_guard(
         "stay open/untouched (#1314). If this is a deliberate meta-level "
         "dispatch against the tracking issue's own number (e.g. a Gate-A "
         "contract correction), label the issue 'oracle:exempt' to override, "
-        "or use a properly-typed dispatch (e.g. mock-author) instead."
+        "or use a properly-typed dispatch instead — e.g. `coord acceptance "
+        "mock <repo> <tracking_issue> --amend '<correction>'` for a "
+        "targeted fix to an already-merged Gate-A contract (#1315)."
     )
 
 

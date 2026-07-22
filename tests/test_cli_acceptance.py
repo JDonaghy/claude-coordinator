@@ -1051,8 +1051,12 @@ class TestAcceptanceMock:
         )
         calls = {}
 
-        def fake_dispatch(repo, tracking_issue, cfg, *, machine_override=None, path=None):
+        def fake_dispatch(
+            repo, tracking_issue, cfg, *,
+            machine_override=None, path=None, amend_briefing=None,
+        ):
             calls["path"] = path
+            calls["amend_briefing"] = amend_briefing
             return ("mock-asg-2", "laptop")
 
         monkeypatch.setattr("coord.mock_author.dispatch_acceptance_mock", fake_dispatch)
@@ -1063,6 +1067,72 @@ class TestAcceptanceMock:
         ])
         assert result.exit_code == 0, result.output
         assert calls["path"] == "coord/acceptance.py"
+
+    def test_amend_forwarded_to_dispatch(self, tmp_path: Path, monkeypatch) -> None:
+        """#1315: --amend reaches dispatch_acceptance_mock as amend_briefing=."""
+        config_path = _write_config(
+            tmp_path, repo_path=str(tmp_path / "repo"), run_cmd="echo {}",
+        )
+        calls = {}
+
+        def fake_dispatch(
+            repo, tracking_issue, cfg, *,
+            machine_override=None, path=None, amend_briefing=None,
+        ):
+            calls["amend_briefing"] = amend_briefing
+            return ("mock-asg-amend", "laptop")
+
+        monkeypatch.setattr("coord.mock_author.dispatch_acceptance_mock", fake_dispatch)
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "mock", "coord-tui", "100",
+            "--amend", "fix the CLI flag name in the contract",
+            "--config", str(config_path),
+        ])
+        assert result.exit_code == 0, result.output
+        assert calls["amend_briefing"] == "fix the CLI flag name in the contract"
+        assert "mock-asg-amend" in result.output
+        assert "amend" in result.output
+
+    def test_amend_file_forwarded_to_dispatch(self, tmp_path: Path, monkeypatch) -> None:
+        """--amend-file reads the correction text from disk."""
+        config_path = _write_config(
+            tmp_path, repo_path=str(tmp_path / "repo"), run_cmd="echo {}",
+        )
+        amend_file = tmp_path / "amend.txt"
+        amend_file.write_text("the mock glob should be *.screen, not *.txt\n")
+        calls = {}
+
+        def fake_dispatch(
+            repo, tracking_issue, cfg, *,
+            machine_override=None, path=None, amend_briefing=None,
+        ):
+            calls["amend_briefing"] = amend_briefing
+            return ("mock-asg-amend-2", "laptop")
+
+        monkeypatch.setattr("coord.mock_author.dispatch_acceptance_mock", fake_dispatch)
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "mock", "coord-tui", "100",
+            "--amend-file", str(amend_file),
+            "--config", str(config_path),
+        ])
+        assert result.exit_code == 0, result.output
+        assert calls["amend_briefing"] == "the mock glob should be *.screen, not *.txt\n"
+
+    def test_amend_and_amend_file_are_mutually_exclusive(self, tmp_path: Path) -> None:
+        config_path = _write_config(
+            tmp_path, repo_path=str(tmp_path / "repo"), run_cmd="echo {}",
+        )
+        amend_file = tmp_path / "amend.txt"
+        amend_file.write_text("text")
+        result = CliRunner().invoke(main, [
+            "acceptance", "mock", "coord-tui", "100",
+            "--amend", "inline text", "--amend-file", str(amend_file),
+            "--config", str(config_path),
+        ])
+        assert result.exit_code == 2
+        assert "mutually exclusive" in result.output
 
     def test_unknown_repo_errors(self, tmp_path: Path) -> None:
         config_path = _write_config(

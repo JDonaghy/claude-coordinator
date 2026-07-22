@@ -2016,6 +2016,48 @@ def build_deny_prompt(deny_commands: list[str]) -> str:
     )
 
 
+# #1315: sealed-oracle path prefix that only an independent authoring type
+# (``"mock-author"``/a future ``"test-author"``) may ever write to
+# (docs/ORACLE_LOOP.md sealing v1). ``coord.dispatch.dispatch`` already
+# auto-adds this exact string to ``AssignmentSpec.files_forbidden`` for
+# every non-``"mock-author"`` type dispatched against a repo with an
+# acceptance driver configured (#944) — but until now that signal was
+# advisory-only: prompt text in ``WORKER_SYSTEM_PROMPT`` ("If the briefing
+# lists forbidden files, do NOT read or modify them") that a worker could
+# still be talked past by its own briefing. #1314 hit exactly that gap: a
+# ``type="work"`` session whose briefing explicitly directed it to correct
+# an already-merged Gate-A contract went ahead and edited
+# ``tests/acceptance/**`` anyway — caught only after the fact by the
+# adversarial reviewer's tamper check (docs/ORACLE_LOOP.md), which a human
+# then chose to override. ``_sealed_write_guard_tools`` turns the same
+# ``files_forbidden`` signal into a real ``--disallowedTools`` restriction
+# on the ``claude -p`` invocation itself, so a non-independent worker
+# literally cannot call Edit/Write under the sealed tree, regardless of
+# what its own briefing says.
+_SEALED_ORACLE_PREFIX = "tests/acceptance/"
+
+
+def _sealed_write_guard_tools(files_forbidden: list[str]) -> list[str]:
+    """Return ``--disallowedTools`` patterns blocking Edit/Write under any
+    sealed-oracle prefix present in *files_forbidden*.
+
+    Pure function, easy to test in isolation. Deliberately scoped to just
+    the sealed-oracle prefix (``tests/acceptance/``) rather than every
+    ``files_forbidden`` entry — coordinator-only files unrelated to the
+    oracle loop (e.g. a doc a worker may legitimately need to *read*) stay
+    advisory-only, same as before #1315; turning every forbidden path into
+    a hard technical block is a separate, larger change with its own risk.
+    """
+    patterns: list[str] = []
+    for f in files_forbidden:
+        if f == _SEALED_ORACLE_PREFIX or f.startswith(_SEALED_ORACLE_PREFIX):
+            prefix = f if f.endswith("/") else f"{f}/"
+            for pattern in (f"Edit({prefix}**)", f"Write({prefix}**)"):
+                if pattern not in patterns:
+                    patterns.append(pattern)
+    return patterns
+
+
 def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER_BINARY) -> list[str]:
     """Build the argv for invoking the worker on this assignment.
 
@@ -2104,6 +2146,10 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
     ]
     if spec.model:
         argv.extend(["--model", spec.model])
+    # #1315: structural sealing enforcement — see _sealed_write_guard_tools.
+    sealed_guard_tools = _sealed_write_guard_tools(spec.files_forbidden)
+    if sealed_guard_tools:
+        argv.extend(["--disallowedTools", ",".join(sealed_guard_tools)])
     # #315: when resuming a prior chat session, load the prior conversation so
     # the model has full context.  The briefing field IS the new user message;
     # claude sees it as the next user turn after the restored history.
