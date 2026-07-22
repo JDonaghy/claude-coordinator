@@ -15,7 +15,12 @@ from coord.config import (
     ProviderDef,
     ProvidersConfig,
 )
-from coord.dispatch import dispatch, enforce_oracle_readiness, post_briefing
+from coord.dispatch import (
+    dispatch,
+    enforce_epic_dispatch_guard,
+    enforce_oracle_readiness,
+    post_briefing,
+)
 from coord.models import Machine, Proposal, Repo
 
 
@@ -694,6 +699,131 @@ class TestOracleReadinessGate:
         enforce_oracle_readiness(
             proposal_type="review", repo=repo, config=cfg, issue_number=1,
         )
+
+
+class TestEpicDispatchGuard:
+    """#1314: `dispatch()` refuses a `type="work"` dispatch aimed directly
+    at a tracking/epic issue's own number (the #1120 Gate-A-correction
+    scenario) — merging would close the epic on GitHub while its real
+    children stay open/untouched. Scoped like `enforce_oracle_readiness` to
+    repos with an acceptance driver configured, so it's a cheap no-op
+    everywhere else."""
+
+    def _cfg(self) -> Config:
+        return Config(
+            repos=[Repo(name="api", github="acme/api", default_branch="main")],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+            )],
+            acceptance=AcceptanceConfig(
+                drivers={"api": AcceptanceDriverConfig(kind="cli-pytest", run="pytest")}
+            ),
+        )
+
+    @patch("coord.dispatch.httpx.post")
+    @patch("coord.github_ops.get_issue")
+    def test_refuses_work_dispatch_against_epic_issue(
+        self, mock_get_issue, mock_post,
+    ) -> None:
+        cfg = self._cfg()
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=1120, issue_title="Milestone 38 tracking issue",
+            rationale="", type="work",
+        )
+        mock_get_issue.return_value = {"labels": [{"name": "epic"}]}
+
+        with pytest.raises(ValueError, match="epic"):
+            dispatch(p, cfg)
+        mock_post.assert_not_called()
+
+    @patch("coord.dispatch.httpx.post")
+    @patch("coord.github_ops.get_issue")
+    def test_oracle_exempt_label_overrides_epic_guard(
+        self, mock_get_issue, mock_post,
+    ) -> None:
+        cfg = self._cfg()
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=1120, issue_title="Milestone 38 tracking issue",
+            rationale="", type="work",
+        )
+        mock_get_issue.return_value = {
+            "labels": [{"name": "epic"}, {"name": "oracle:exempt"}],
+        }
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        dispatch(p, cfg)
+        mock_post.assert_called_once()
+
+    @patch("coord.dispatch.httpx.post")
+    @patch("coord.github_ops.get_issue")
+    def test_ordinary_issue_dispatches_normally(
+        self, mock_get_issue, mock_post,
+    ) -> None:
+        cfg = self._cfg()
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=42, issue_title="Fix a bug",
+            rationale="", type="work",
+        )
+        mock_get_issue.return_value = {"labels": []}
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        dispatch(p, cfg)
+        mock_post.assert_called_once()
+
+    @patch("coord.dispatch.httpx.post")
+    @patch("coord.github_ops.get_issue")
+    def test_no_gate_for_mock_author_type_against_epic(
+        self, mock_get_issue, mock_post,
+    ) -> None:
+        """mock-author's whole job IS to be dispatched against the tracking
+        issue's own number (Gate A) — it must never trip this guard."""
+        cfg = self._cfg()
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=1120, issue_title="Milestone 38 tracking issue",
+            rationale="", type="mock-author",
+        )
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        dispatch(p, cfg)
+        mock_post.assert_called_once()
+        mock_get_issue.assert_not_called()
+
+    @patch("coord.dispatch.httpx.post")
+    @patch("coord.github_ops.get_issue")
+    def test_no_gate_without_acceptance_driver(
+        self, mock_get_issue, mock_post, config, proposal,
+    ) -> None:
+        """A repo with no acceptance driver configured never makes the
+        extra GitHub call — cheap no-op, matches enforce_oracle_readiness's
+        own scoping."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        dispatch(proposal, config)
+        mock_post.assert_called_once()
+        mock_get_issue.assert_not_called()
+
+    def test_fails_open_when_issue_lookup_fails(self) -> None:
+        cfg = self._cfg()
+        repo = cfg.repo("api")
+        with patch(
+            "coord.github_ops.get_issue", side_effect=RuntimeError("gh failed"),
+        ):
+            enforce_epic_dispatch_guard(
+                proposal_type="work", repo=repo, config=cfg, issue_number=1120,
+            )  # must not raise
 
 
 class TestPostBriefing:

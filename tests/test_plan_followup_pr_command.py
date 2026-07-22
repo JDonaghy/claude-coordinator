@@ -61,11 +61,71 @@ class TestPrBriefingKeyword:
         board = Board(active=[], completed=[a])
         state_mod.save_board(board)
 
-        with patch(
-            "coord.commands.plan_followup._dispatch_followup", return_value="pr-001"
-        ) as disp:
+        with (
+            patch(
+                "coord.commands.plan_followup._dispatch_followup", return_value="pr-001"
+            ) as disp,
+            patch("coord.github_ops.get_issue", return_value={"labels": []}) as get_issue,
+        ):
             result = CliRunner().invoke(
                 main, ["pr", "work-001", "--config", str(config_file)]
+            )
+
+        assert result.exit_code == 0, result.output
+        briefing = disp.call_args[0][2]
+        assert 'Closes #42' in briefing
+        assert 'Refs #42' not in briefing
+        get_issue.assert_called_once_with("acme/api", 42)
+
+    def test_uses_refs_for_work_assignment_against_epic_issue(
+        self, config_file: Path, coord_db
+    ) -> None:
+        """#1314: a type="work" assignment dispatched directly against a
+        tracking/epic issue's own number must not get the closing keyword —
+        merging it would wrongly flip the epic to "done" while its real
+        children (untouched by this PR) are still open."""
+        a = _make_assignment("work-002", type="work")
+        board = Board(active=[], completed=[a])
+        state_mod.save_board(board)
+
+        with (
+            patch(
+                "coord.commands.plan_followup._dispatch_followup", return_value="pr-999"
+            ) as disp,
+            patch(
+                "coord.github_ops.get_issue",
+                return_value={"labels": [{"name": "epic"}]},
+            ),
+        ):
+            result = CliRunner().invoke(
+                main, ["pr", "work-002", "--config", str(config_file)]
+            )
+
+        assert result.exit_code == 0, result.output
+        briefing = disp.call_args[0][2]
+        assert 'Refs #42' in briefing
+        assert 'Closes #42' not in briefing
+
+    def test_closes_for_work_assignment_when_issue_lookup_fails(
+        self, config_file: Path, coord_db
+    ) -> None:
+        """Fail-open: a GitHub read error must not block PR creation — fall
+        back to the type-only verdict rather than raise."""
+        a = _make_assignment("work-003", type="work")
+        board = Board(active=[], completed=[a])
+        state_mod.save_board(board)
+
+        with (
+            patch(
+                "coord.commands.plan_followup._dispatch_followup", return_value="pr-998"
+            ) as disp,
+            patch(
+                "coord.github_ops.get_issue",
+                side_effect=RuntimeError("gh issue view failed"),
+            ),
+        ):
+            result = CliRunner().invoke(
+                main, ["pr", "work-003", "--config", str(config_file)]
             )
 
         assert result.exit_code == 0, result.output
@@ -105,9 +165,12 @@ class TestPrHelperAssignmentType:
         board = Board(active=[], completed=[a])
         state_mod.save_board(board)
 
-        with patch(
-            "coord.commands.plan_followup._dispatch_followup", return_value="pr-001"
-        ) as disp:
+        with (
+            patch(
+                "coord.commands.plan_followup._dispatch_followup", return_value="pr-001"
+            ) as disp,
+            patch("coord.github_ops.get_issue", return_value={"labels": []}),
+        ):
             result = CliRunner().invoke(
                 main, ["pr", "work-001", "--config", str(config_file)]
             )

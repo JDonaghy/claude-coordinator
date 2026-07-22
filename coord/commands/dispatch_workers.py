@@ -3865,10 +3865,21 @@ def _dispatch_interactive_work(
     # same gap a `claude -p` worker would. Deliberately NOT bypassed by
     # --force (that flag is documented as an infra-retry/claim escape hatch,
     # not a way around the acceptance-authoring requirement).
-    from coord.dispatch import enforce_oracle_readiness  # noqa: PLC0415
+    from coord.dispatch import (  # noqa: PLC0415
+        enforce_epic_dispatch_guard,
+        enforce_oracle_readiness,
+    )
 
     try:
         enforce_oracle_readiness(
+            proposal_type="plan" if effective_plan_only else "work",
+            repo=repo_cfg, config=cfg, issue_number=issue,
+        )
+        # #1314: same epic-target gate as the headless dispatch() path —
+        # a human at the keyboard can dispatch --interactive directly
+        # against a tracking issue's own number just as easily as a
+        # headless worker.
+        enforce_epic_dispatch_guard(
             proposal_type="plan" if effective_plan_only else "work",
             repo=repo_cfg, config=cfg, issue_number=issue,
         )

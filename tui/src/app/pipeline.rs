@@ -631,19 +631,13 @@ impl CoordApp {
     /// 1. `is_closed`            → "done"
     /// 2. Epic tracking issue (`epic_children_for` is `Some`) → aggregate
     ///    child state via `epic_lifecycle_section` (#1253)
-    /// 3. Has any assignment     → "in-progress"
-    /// 4. Has label `status:ready` (no assignments) → "pending"
-    /// 5. Has label `status:refining`               → "refining"
-    /// 6. Otherwise                                 → "new"
+    /// 3. Direct merge_queue "merged"                → "done"
+    /// 4. Has any assignment     → "in-progress"
+    /// 5. Has label `status:ready` (no assignments) → "pending"
+    /// 6. Has label `status:refining`               → "refining"
+    /// 7. Otherwise                                 → "new"
     pub(crate) fn pipeline_lifecycle_section(&self, issue: &PipelineIssue) -> &'static str {
         if issue.is_closed {
-            return "done";
-        }
-        // An open issue whose merge_queue entry is "merged" is logically
-        // completed — the PR closed the issue via `fixes #N` even before the
-        // brain has synced the GitHub close.  Mirror the Board classifier
-        // (IssueGroup::lifecycle_section) which already treats merged as done.
-        if self.merge_stage_status_for(issue) == StageStatus::Done {
             return "done";
         }
         // #1253: an epic's actual work happens on its *children*, not on the
@@ -652,8 +646,26 @@ impl CoordApp {
         // false for one, and it would sit in "New" for its entire life
         // (observed: #1200, all 7 children closed, stuck in New until
         // manually closed). Classify by aggregate child state instead.
+        //
+        // #1314: this MUST run before the direct `merge_stage_status_for`
+        // check below. A `type="work"` dispatch landed (incorrectly, but
+        // possible in practice — see #1314) directly against a tracking
+        // issue's own number reads as a merged/"done" direct assignment on
+        // that issue, which would otherwise short-circuit an epic straight
+        // to "done" while its real children are still open/unstarted
+        // (observed: epic #1120, 3 of 4 children untouched, sorted into
+        // Done and effectively unfindable). An epic must always defer to
+        // the aggregate child-state classifier, regardless of what its own
+        // direct merge stage shows.
         if let Some(children) = self.epic_children_for(issue) {
             return self.epic_lifecycle_section(issue, children);
+        }
+        // An open issue whose merge_queue entry is "merged" is logically
+        // completed — the PR closed the issue via `fixes #N` even before the
+        // brain has synced the GitHub close.  Mirror the Board classifier
+        // (IssueGroup::lifecycle_section) which already treats merged as done.
+        if self.merge_stage_status_for(issue) == StageStatus::Done {
+            return "done";
         }
         // Only *workable* assignments make an issue in-progress.  Scoping
         // conversations — `refinement`, `new-issue-chat`, `test-chat`, and the

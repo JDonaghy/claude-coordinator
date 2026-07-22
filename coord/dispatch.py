@@ -78,6 +78,80 @@ def enforce_oracle_readiness(
         raise ValueError(readiness.reason)
 
 
+def enforce_epic_dispatch_guard(
+    *, proposal_type: str, repo: Repo | None, config: Config, issue_number: int,
+) -> None:
+    """#1314: refuse a dispatch that would auto-close an epic/tracking issue
+    on merge (``proposal_type`` in :data:`coord.models.CLOSES_ISSUE_TYPES`,
+    e.g. ``"work"``) when *issue_number* itself carries the ``"epic"``
+    label (:data:`coord.milestone_order.TRACKING_ISSUE_LABEL`).
+
+    The #1077/#1142 ``CLOSES_ISSUE_TYPES`` split (see ``coord/models.py``)
+    already assumes only ``mock-author``/``test-author`` are ever dispatched
+    directly against a tracking issue's own number — a small correction to
+    an already-merged Gate-A contract, with no properly-typed tool for it
+    yet, falls back to a plain ``coord assign`` (``type="work"``) instead.
+    That silently breaks the same assumption a ``type="work"`` merge relies
+    on everywhere else: that ``issue_number`` is real, resolvable work, not
+    a milestone's tracking issue. Hit in practice against epic #1120's Gate
+    A contract (PR #1312) — this is the dispatch-time half of the fix;
+    ``coord/commands/plan_followup.py``'s ``pr()`` command independently
+    checks the same label so the PR body never carries the closing keyword
+    even for an already-dispatched assignment.
+
+    Override: label the issue ``oracle:exempt`` (the existing "I know what
+    I'm doing, let this bypass oracle-loop-specific gating" signal — see
+    :func:`enforce_oracle_readiness`) to dispatch anyway. Raises
+    :class:`ValueError` on refusal, same as every other dispatch-time gate
+    here, so callers get "refuse cleanly" for free via their existing
+    ``except ValueError`` handling.
+
+    Fails OPEN (proceeds) if the issue can't be fetched or *repo* is
+    ``None`` — mirrors :func:`enforce_oracle_readiness`'s posture; a
+    transient GitHub read failure must not turn into a fleet-wide dispatch
+    outage.
+
+    Scoped to repos with an ``acceptance.drivers`` entry configured (same
+    cheap no-op test :func:`enforce_oracle_readiness` uses) — a local dict
+    lookup, no network call, for every dispatch outside this scope. #1314's
+    actual failure mode is inherent to the oracle loop's own convention of
+    dispatching ``mock-author``/``test-author`` against a tracking issue's
+    number in the first place; a repo with no acceptance driver has no such
+    convention, so this intentionally does not add a `gh` round-trip to
+    every "work" dispatch fleet-wide for a scenario that can't arise there.
+    A plain (non-oracle) repo whose operator manually dispatches "work"
+    against an epic's own number is a real but separate gap, same as the
+    one #1138's oracle-readiness gate already accepts for the same reason.
+    """
+    from coord.models import CLOSES_ISSUE_TYPES  # noqa: PLC0415
+
+    if proposal_type not in CLOSES_ISSUE_TYPES or repo is None:
+        return
+    if not config.acceptance.has_driver(repo.name):
+        return
+
+    from coord.milestone_order import TRACKING_ISSUE_LABEL  # noqa: PLC0415
+
+    try:
+        issue_data = github_ops.get_issue(repo.github, issue_number)
+    except RuntimeError:
+        return
+
+    issue_labels = {lbl.get("name", "") for lbl in (issue_data.get("labels") or [])}
+    if TRACKING_ISSUE_LABEL not in issue_labels or "oracle:exempt" in issue_labels:
+        return
+
+    raise ValueError(
+        f"refusing type={proposal_type!r} dispatch against #{issue_number}: it "
+        f"carries the {TRACKING_ISSUE_LABEL!r} label (a milestone tracking/epic "
+        "issue) — merging this would close the epic while its real sub-issues "
+        "stay open/untouched (#1314). If this is a deliberate meta-level "
+        "dispatch against the tracking issue's own number (e.g. a Gate-A "
+        "contract correction), label the issue 'oracle:exempt' to override, "
+        "or use a properly-typed dispatch (e.g. mock-author) instead."
+    )
+
+
 def dispatch(
     proposal: Proposal,
     config: Config,
@@ -113,6 +187,15 @@ def dispatch(
     # the TOS gate below so a refusal never depends on provider resolution
     # succeeding first.
     enforce_oracle_readiness(
+        proposal_type=proposal.type, repo=repo, config=config,
+        issue_number=proposal.issue_number,
+    )
+
+    # #1314: STRUCTURAL EPIC-TARGET GATE — refuse a dispatch that would
+    # auto-close a tracking/epic issue on merge (see
+    # `enforce_epic_dispatch_guard`'s docstring). Placed alongside the
+    # oracle-readiness gate above, before the TOS gate, for the same reason.
+    enforce_epic_dispatch_guard(
         proposal_type=proposal.type, repo=repo, config=config,
         issue_number=proposal.issue_number,
     )

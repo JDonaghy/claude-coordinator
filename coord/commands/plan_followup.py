@@ -302,6 +302,30 @@ def pr(assignment_id: str, config_path: Path, no_review: bool) -> None:
     from coord.models import CLOSES_ISSUE_TYPES, PR_HELPER_TYPE  # noqa: PLC0415
 
     closes_issue = assignment.type in CLOSES_ISSUE_TYPES
+
+    # #1314: the #1077 guard above assumed only mock-author/test-author are
+    # ever dispatched directly against a tracking issue's own number — but a
+    # type="work" assignment can land there too (e.g. a Gate-A contract
+    # correction with no properly-typed tool yet, see #1314). Closing an
+    # epic on merge because a single corrective PR touched its number would
+    # wrongly flip it to "done" while its real children sit untouched, so
+    # check the issue's own labels regardless of assignment type. Fail-open
+    # (network hiccup, unknown repo, ...) — keep the type-only verdict
+    # rather than block PR creation on a GitHub read.
+    if closes_issue:
+        try:
+            from coord import github_ops  # noqa: PLC0415
+            from coord.milestone_order import TRACKING_ISSUE_LABEL  # noqa: PLC0415
+
+            issue_data = github_ops.get_issue(repo.github, assignment.issue_number)
+            issue_labels = {
+                lbl.get("name", "") for lbl in (issue_data.get("labels") or [])
+            }
+            if TRACKING_ISSUE_LABEL in issue_labels:
+                closes_issue = False
+        except Exception:  # noqa: BLE001 — fail open, see docstring above
+            pass
+
     ref_keyword = (
         f"Closes #{assignment.issue_number}"
         if closes_issue
