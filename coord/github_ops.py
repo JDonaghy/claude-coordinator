@@ -314,9 +314,13 @@ def get_open_children(repo: str, issue_number: int) -> list[dict]:
     """Open children of *issue_number*, per the #1195 parentage seam (#1196).
 
     Uses :class:`coord.parentage.MarkdownParentage` over the issue's own
-    body (fetched via :func:`get_issue`) — the ``## Sub-issues`` checklist
-    convention (#1008) is the only *populated* parentage source today; the
-    live GitHub sub-issues REST API (:class:`coord.parentage_github.
+    body (fetched via :func:`get_issue`). The ``## Sub-issues`` checklist
+    convention (#1008) is the primary parentage source; with
+    ``fallback_to_work_order=True`` this also falls back to a ``##
+    Work order`` block (#1221) so epics seeded before #1008 — which have
+    only a Work order block, not a Sub-issues checklist — still register
+    their children instead of silently reading as childless. The live
+    GitHub sub-issues REST API (:class:`coord.parentage_github.
     GitHubParentage`) is wired but not yet backfilled onto existing epics
     (EP-2, unbuilt), so checking it here would silently miss every real
     epic and defeat the guard.
@@ -325,10 +329,10 @@ def get_open_children(repo: str, issue_number: int) -> list[dict]:
     (returns ``[]``) both when the issue lookup itself errors (a transient
     ``gh`` failure must not permanently wedge every close in the system —
     :func:`close_issue` is the enforcement point, not this lookup) and when
-    the body's ``## Sub-issues`` block fails to parse (a malformed
-    checklist on *this* issue must not block closing some *other*,
-    well-formed one — the same per-issue fail-isolation #1195 already
-    applies to the ``/board`` children display).
+    the body's ``## Sub-issues`` or ``## Work order`` block fails to parse
+    (a malformed checklist on *this* issue must not block closing some
+    *other*, well-formed one — the same per-issue fail-isolation #1195
+    already applies to the ``/board`` children display).
     """
     try:
         issue = get_issue(repo, issue_number)
@@ -338,7 +342,9 @@ def get_open_children(repo: str, issue_number: int) -> list[dict]:
 
     body = issue.get("body") or ""
     try:
-        children = MarkdownParentage().children(repo, issue_number, body=body)
+        children = MarkdownParentage().children(
+            repo, issue_number, body=body, fallback_to_work_order=True,
+        )
     except Exception:  # noqa: BLE001 — malformed checklist: fail open, don't wedge close
         return []
     return [{"number": c.number, "state": c.state} for c in children if c.state == "open"]
