@@ -40,8 +40,13 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
     pipeline_sidebar.set_navigation_mode(NavigationMode::Selection);
     pipeline_sidebar.set_allow_collapse(true);
     let (inject_fallback_tx, inject_fallback_rx) = std::sync::mpsc::channel();
+    // #1326: derive straight from the fixture's `data` — never touch the
+    // real `~/.coord/workspace.json` from a test fixture (mirrors
+    // `command_runner: CommandRunner::new_for_test()` below: no real I/O).
+    let workspace = Workspace::derive_from_repos(&known_repos(&data));
     CoordApp {
         data,
+        workspace,
         active_view: SidebarView::default(),
         board_sidebar: sidebar,
         board_repo_names: Vec::new(),
