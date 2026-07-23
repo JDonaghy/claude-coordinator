@@ -75,6 +75,7 @@ def _start_agent_server(
     from coord.providers import build_provider as _build_provider
     concurrency = _ConcurrencyConfig()
     artifact_paths_by_repo: dict[str, list[str]] = {}
+    build_commands_by_repo: dict[str, str] = {}
     # #425: providers registry from cfg.providers.definitions.  Empty when
     # there's no config file (config-free mode) — the agent then runs with
     # no providers and the legacy claude -p spawn path, byte-identical to
@@ -99,6 +100,14 @@ def _start_agent_server(
             for r in cfg.repos
             if r.artifact_paths
         }
+        # #1323 (fix #3): collect build_command per repo so _stash_artifacts
+        # can run it in the worktree before globbing, ensuring the binary
+        # exists regardless of the worker's dev-loop feature flags.
+        build_commands_by_repo = {
+            r.name: r.build_command
+            for r in cfg.repos
+            if r.build_command
+        }
         # #425: instantiate each named provider so the agent can dispatch
         # to it when an assignment names it (spec.provider).  An unknown
         # provider type raises ValueError from build_provider — surface
@@ -117,6 +126,7 @@ def _start_agent_server(
         bash_wrap_spawn=concurrency.bash_wrap_spawn,
         first_output_timeout=concurrency.first_output_timeout,
         artifact_paths=artifact_paths_by_repo,
+        build_commands=build_commands_by_repo,
         providers=providers_registry,
     )
     app = build_app(server)
