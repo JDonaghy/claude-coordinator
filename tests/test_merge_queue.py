@@ -1078,6 +1078,49 @@ class TestReviewGate:
         entry = _q("orig", branch="worker/orig")
         assert mq.has_approved_review(entry, board) is False
 
+    # ── #567: chain resolution when a fix worker has branch=NULL ──────────
+
+    def test_has_approved_review_bounce_fix_null_branch_approves(self) -> None:
+        """#567: a fix worker dispatched with branch=NULL (the #557 gap)
+        still counts — the chain is reconstructed via
+        review_of_assignment_id instead of branch equality."""
+        orig_work = self._work("orig")
+        fix_work = Assignment(
+            machine_name="m1",
+            repo_name="api",
+            issue_number=1,
+            issue_title="[fix-1] t",
+            assignment_id="fix1",
+            type="work",
+            status="done",
+            branch=None,  # #557 remote-interactive-rework gap
+            review_of_assignment_id="orig",
+        )
+        re_review = self._review("fix1", verdict="approve")
+        orig_review = self._review("orig", verdict="request-changes")
+        board = self._board(completed=[orig_work, orig_review, fix_work, re_review])
+        entry = _q("orig", branch="worker/orig")
+        assert mq.has_approved_review(entry, board) is True
+
+    def test_has_approved_review_multi_hop_null_branch_chain(self) -> None:
+        """#567: a fix-of-a-fix chain (both branch=NULL) resolves via the
+        fixed-point expansion, not just one hop."""
+        orig_work = self._work("orig")
+        fix1 = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1,
+            issue_title="[fix-1] t", assignment_id="fix1", type="work",
+            status="done", branch=None, review_of_assignment_id="orig",
+        )
+        fix2 = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1,
+            issue_title="[fix-2] t", assignment_id="fix2", type="work",
+            status="done", branch=None, review_of_assignment_id="fix1",
+        )
+        re_review = self._review("fix2", verdict="approve")
+        board = self._board(completed=[orig_work, fix1, fix2, re_review])
+        entry = _q("orig", branch="worker/orig")
+        assert mq.has_approved_review(entry, board) is True
+
     # ── #292 Defect 3: skip-and-proceed instead of group-halt ────────────
 
     def test_process_review_gated_entry_does_not_block_approved_sibling(self) -> None:
@@ -1430,6 +1473,21 @@ class TestSmokeGate:
             machine_name="m1", repo_name="api", issue_number=1, issue_title="[fix] t",
             assignment_id="fix1", type="work", status="done",
             branch="worker/orig",  # same branch as orig_work
+            test_state="passed",
+        )
+        board = self._board(completed=[orig_work, fix_work])
+        entry = _q("orig", branch="worker/orig")
+        assert mq.has_smoke_verdict(entry, board) is True
+
+    def test_has_smoke_verdict_bounce_fix_null_branch_counts(self) -> None:
+        """#567: fix-work with branch=NULL (the #557 gap) still satisfies the
+        gate — resolved via review_of_assignment_id instead of branch."""
+        orig_work = self._work("orig", test_state=None)
+        fix_work = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="[fix] t",
+            assignment_id="fix1", type="work", status="done",
+            branch=None,  # #557 remote-interactive-rework gap
+            review_of_assignment_id="orig",
             test_state="passed",
         )
         board = self._board(completed=[orig_work, fix_work])
