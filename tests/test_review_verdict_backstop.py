@@ -22,6 +22,7 @@ class _Out:
     """Minimal StoreOutcome stub."""
     posted = True
     error = None
+    findings_written = True
 
 
 def _call_relay(monkeypatch, *, assignment_id="rev-877", issue_number=877, **extra):
