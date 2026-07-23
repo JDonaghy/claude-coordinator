@@ -192,13 +192,17 @@ def _dispatch_review_of(
         review_iteration=getattr(work, "review_iteration", 0) or 0,
         diff_text=review_diff_text,
     )
-    # Interactive reviewer reports via report-result, not the
-    # REVIEW_VERDICT block the briefing's tail describes.  Since #590 the
-    # remote path matches local: `coord report-result` routes to the
-    # daemon's shared DB (board_service), so a remote reviewer
-    # self-reports exactly like a local one and the verdict reaches the
-    # merge gate from any machine.  (The host-side finalize
-    # operator-prompt stays as a backstop if nothing is recorded.)
+    # #651: this used to tell the reviewer to report via report-result
+    # "instead of" the REVIEW_VERDICT block the briefing's tail (below)
+    # describes — two conflicting instructions for the same handoff, so
+    # the agent could do neither cleanly.  The block is the PRIMARY
+    # channel: it's PATH-independent (no reliance on `coord` being on the
+    # interactive session's PATH) and it's what the #606 transcript-floor
+    # recovery scans for when nothing was self-reported.  `coord
+    # report-result` is framed as an OPTIONAL fast path on top of it —
+    # since #590 it routes to the daemon's shared DB (board_service) from
+    # any machine, so it's worth doing when `coord` is reachable, but it
+    # is never a substitute for emitting the block.
     _remote_note = (
         ""
         if _is_local
@@ -211,19 +215,25 @@ def _dispatch_review_of(
     report_reminder = (
         f"[Coordinator review assignment {assignment_id}] This is a "
         f"HUMAN-ATTENDED interactive review {_remote_note}When you finish:\n"
-        "  1. Write your FULL findings (every blocking item, with "
-        f"file:line) to a file, e.g. /tmp/review-{assignment_id}.md\n"
-        "  2. Run:\n"
+        "  1. ALWAYS end your session by outputting the "
+        "`REVIEW_VERDICT: / REVIEW_BODY: / END_REVIEW` block described at "
+        "the end of this briefing, with your FULL findings (every "
+        "blocking item, with file:line) in REVIEW_BODY. This is the "
+        "REQUIRED, PATH-independent step — it is recovered from your "
+        "session transcript even if nothing else below runs.\n"
+        "  2. OPTIONALLY, if `coord` is on your PATH, you can ALSO write "
+        f"those same findings to a file (e.g. /tmp/review-{assignment_id}.md) "
+        "and run:\n"
         f"     coord report-result --assignment {assignment_id} "
         "--status done --verdict approve|request-changes "
         f"--summary <one-line summary> --body-file /tmp/review-{assignment_id}.md\n"
-        "The --body-file is IMPORTANT: it is what the fix worker is "
-        "briefed with (the one-line --summary is not enough). Without "
-        "it the fix worker has to re-derive your findings from the "
-        "diff. Your `coord report-result` routes to the coordinator's "
-        "shared board (#590), so the verdict reaches the merge gate from "
-        "here. Do NOT run any `gh` commands; the coordinator posts the "
-        "verdict + findings for you.\n\n"
+        "     as a faster path that skips the operator relay prompt — "
+        "your `coord report-result` routes to the coordinator's shared "
+        "board (#590), so the verdict reaches the merge gate from here. "
+        "This is a shortcut, NOT a substitute for step 1: always emit the "
+        "REVIEW_VERDICT block regardless of whether `coord` is reachable. "
+        "Do NOT run any `gh` commands; the coordinator posts the verdict + "
+        "findings for you.\n\n"
     )
     effective_briefing = _issue_ctx + report_reminder + review_briefing
 
