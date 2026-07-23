@@ -1630,6 +1630,10 @@ class AgentAssignment:
     claude_session_id: str | None = None
     # #448: advisory reason when the worker exited cleanly (exit_code==0) but
     # pushed 0 commits.  None on all other status values.
+    # #1323: also reused (for "work"-type assignments only, see
+    # _ADVISORY_TYPES) to hold a stash-advisory reason when a configured
+    # artifact_paths glob matched 0 files — so this is an opaque "why this
+    # assignment is ADVISORY" string, not always about commit count.
     zero_commit_reason: str | None = None
 
     def to_dict(self) -> dict:
@@ -4434,7 +4438,15 @@ class AgentServer:
         # ADVISORY with a reason that names the specific unmatched glob(s).
         # This reuses the same zero-commit advisory mechanism: update the
         # assignment under the lock, then re-persist so the status is durable.
-        if _stash_unmatched and assignment is not None:
+        # Gated on _ADVISORY_TYPES (same as the zero-commit check above) so
+        # review/smoke/test/merge/conflict-fix workers — which routinely
+        # finish DONE without (re)producing every configured artifact_paths
+        # glob — are never falsely flagged as advisory.
+        if (
+            _stash_unmatched
+            and assignment is not None
+            and assignment.spec.type in _ADVISORY_TYPES
+        ):
             _missed_str = ", ".join(repr(g) for g in _stash_unmatched)
             _stash_advisory_reason = (
                 f"stash: 0 files matched "
