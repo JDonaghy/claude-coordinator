@@ -96,6 +96,7 @@ pub(crate) mod audit;
 pub(crate) mod usage;
 pub(crate) mod fleet_terminals;
 pub(crate) mod fleet_sessions;
+pub(crate) mod workspace;
 #[allow(unused_imports)]
 use self::types::*;
 #[allow(unused_imports)]
@@ -125,6 +126,8 @@ use self::milestone_dag::*;
 use self::fleet_terminals::*;
 #[allow(unused_imports)]
 use self::fleet_sessions::*;
+#[allow(unused_imports)]
+use self::workspace::*;
 
 // ─── Auto-refresh interval ────────────────────────────────────────────────────
 
@@ -1916,6 +1919,14 @@ const CONTENT_REDRAW_MIN: Duration = Duration::from_millis(66);
 /// mutations. No ratatui or GTK types appear here.
 pub struct CoordApp {
     data: BoardData,
+    /// #1326: which repos ("projects") are open + which is active — the
+    /// Project/Workspace model (A-1 of the Project-Scoped Cockpit chassis,
+    /// epic #1325; `docs/COCKPIT.md`). Kept in its own module
+    /// (`app/workspace.rs`) instead of flat fields here, chipping at the
+    /// god-struct (#751). Nothing reads this for rendering yet (that's
+    /// A-2/A-3) — `sync_workspace_repos()` (called from
+    /// `apply_pending_data`) is what keeps it reconciled against `data`.
+    workspace: Workspace,
     /// Which top-level view is currently shown in the content area.
     active_view: SidebarView,
     /// SidebarSystem for the Board view — repo sections with issue rows.
@@ -3187,6 +3198,11 @@ impl CoordApp {
         let (inject_fallback_tx, inject_fallback_rx) = std::sync::mpsc::channel();
         let mut app = Self {
             data: BoardData::default(),
+            // #1326: reload whatever was persisted last session; reconciled
+            // against real board data by `sync_workspace_repos()` once the
+            // first `apply_pending_data` tick lands (see there for why an
+            // empty-data tick must not stomp this).
+            workspace: Workspace::load(),
             active_view: SidebarView::default(),
             board_sidebar: sidebar,
             board_repo_names: Vec::new(),
@@ -4840,6 +4856,11 @@ impl CoordApp {
                     }
                 }
                 self.rebuild_board_sidebar();
+                // #1326: reconcile the Project/Workspace model against the
+                // repos this tick just confirmed exist (drops stale repos,
+                // derives a first-run default) — see `sync_workspace_repos`
+                // in `app/workspace.rs`.
+                self.sync_workspace_repos();
                 // #486: the Pipeline now sources its issue list from the same
                 // DB cache the Board uses (data.open_issues), rebuilt on every
                 // data tick — no live gh search.  Capture the selection first so

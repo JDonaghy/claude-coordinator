@@ -37319,3 +37319,67 @@ Milestone tracking issue.
             "#1300 collision: Done badge must say (3):\n{screen}",
         );
     }
+
+    // ── #1326: Project/Workspace model (A-1) ──────────────────────────────────
+
+    /// Black-box boot check for the new Project/Workspace model: given a
+    /// multi-repo `BoardData`, the app must boot with every known repo open
+    /// and a sane, deterministic `active_project` — asserted via the model
+    /// (`CoordApp::active_project`/`open_projects`), not screen-scraping, per
+    /// the issue's own acceptance note ("no behavior visibly changes yet").
+    /// Driven through the full `TuiDriver` (`driver_with_shell` +
+    /// `ShellApp`) so a real boot pass (event → handle → render) is what's
+    /// under test, not just a bare constructor call.
+    #[test]
+    fn boots_with_sane_default_active_project_for_multi_repo_board() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let data = BoardData {
+            machines: vec![Machine {
+                name: "m1".to_string(),
+                host: String::new(),
+                reachable: true,
+                active_count: 0,
+                repos: vec!["zeta".to_string(), "alpha".to_string()],
+                version: None,
+                worktree_bytes: 0,
+            }],
+            assignments: vec![make_assignment_typed("done", 1, "mid", Some("work"))],
+            ..BoardData::default()
+        };
+        let app = make_test_app(data);
+
+        // Model-level assertions on the plain `CoordApp` — `driver.app()`
+        // isn't `CoordApp` (`driver_with_shell` wraps it in an opaque
+        // `ShellAdapter`, see the other `TuiDriver` tests' comment above),
+        // so the workspace model itself is checked here, before handing
+        // `app` to the driver.
+
+        // Every repo referenced anywhere in BoardData starts open.
+        let mut open = app.open_projects().to_vec();
+        open.sort();
+        assert_eq!(
+            open,
+            vec!["alpha".to_string(), "mid".to_string(), "zeta".to_string()],
+            "all repos known to BoardData must start open",
+        );
+
+        // Active project defaults deterministically to the alphabetically
+        // first repo, independent of the order repos appear in BoardData.
+        assert_eq!(
+            app.active_project(),
+            Some("alpha"),
+            "active_project must default to the first repo in sorted order",
+        );
+
+        // Drive a real boot pass (event -> handle -> render) through the
+        // full `TuiDriver` + `ShellApp` machinery to prove this doesn't
+        // panic / blank-screen with the workspace model wired in — the
+        // black-box half of this test, per the issue's acceptance note
+        // ("no behavior visibly changes yet").
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        assert!(
+            !driver.screen().trim().is_empty(),
+            "app must render a non-empty screen on boot",
+        );
+    }
