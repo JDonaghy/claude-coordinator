@@ -79,6 +79,50 @@ def classify_conflict(error: str | None) -> str:
     return "unknown"
 
 
+# ── Work-chain resolution (#567) ────────────────────────────────────────────
+
+def _chain_work_ids(entry: "QueuedMerge", pool: list) -> set[str]:
+    """Collect every work-assignment id connected to *entry*: by branch
+    equality (pre-#567 behaviour) **or** by the ``review_of_assignment_id``
+    linkage a bounce-fix worker records back to the assignment it fixes.
+
+    #567: a fix worker dispatched under the #557 remote-interactive-rework
+    gap has ``branch=NULL``, so it never matches ``branch == entry.branch``
+    and a verdict recorded on it is invisible to ``has_approved_review`` /
+    ``has_smoke_verdict``. Every ``WORK_LIKE_TYPES`` assignment dispatched as
+    a fix records ``review_of_assignment_id`` pointing at the assignment it
+    fixes (``auto_loop.py`` fix dispatch), so the chain is reconstructable
+    without a branch match. Expansion runs to a fixed point so multi-hop
+    bounce chains (a fix of a fix) are fully covered, not just one hop.
+    """
+    work_ids: set[str] = set()
+    if entry.assignment_id:
+        work_ids.add(entry.assignment_id)
+
+    work_assignments = [a for a in pool if getattr(a, "type", None) in WORK_LIKE_TYPES]
+
+    # Branch equality — the original (#292) expansion.
+    for a in work_assignments:
+        aid = getattr(a, "assignment_id", None)
+        branch = getattr(a, "branch", None)
+        if aid and branch and branch == entry.branch:
+            work_ids.add(aid)
+
+    # review_of_assignment_id chain — covers fix workers with branch=NULL,
+    # and multi-iteration bounce chains via a fixed-point expansion.
+    changed = True
+    while changed:
+        changed = False
+        for a in work_assignments:
+            aid = getattr(a, "assignment_id", None)
+            parent = getattr(a, "review_of_assignment_id", None)
+            if aid and parent in work_ids and aid not in work_ids:
+                work_ids.add(aid)
+                changed = True
+
+    return work_ids
+
+
 # ── Review gate (#253) ──────────────────────────────────────────────────────
 
 def requires_review(entry: "QueuedMerge", config) -> bool:
@@ -118,23 +162,14 @@ def has_approved_review(entry: "QueuedMerge", board) -> bool:
     #292 (Defect 1): after a review bounce the queue entry may be keyed to
     the *original* work assignment while the approved re-review is linked to
     the *fix* work assignment.  To handle this we collect **all** work
-    assignment IDs that share the same branch (including the entry's own ID)
-    and accept any approved review that points to any of them.
+    assignment IDs connected to the entry — by shared branch, or (#567) by
+    the ``review_of_assignment_id`` chain, which also catches fix workers
+    dispatched with ``branch=NULL`` — and accept any approved review that
+    points to any of them.
     """
     pool = list(getattr(board, "completed", []) or []) + list(getattr(board, "active", []) or [])
 
-    # Seed with the entry's own assignment_id, then expand to any work
-    # assignment on the same branch (e.g. fix workers from the auto-loop).
-    branch_work_ids: set[str] = set()
-    if entry.assignment_id:
-        branch_work_ids.add(entry.assignment_id)
-    for a in pool:
-        if getattr(a, "type", None) not in WORK_LIKE_TYPES:
-            continue
-        aid = getattr(a, "assignment_id", None)
-        branch = getattr(a, "branch", None)
-        if aid and branch and branch == entry.branch:
-            branch_work_ids.add(aid)
+    branch_work_ids = _chain_work_ids(entry, pool)
 
     if not branch_work_ids:
         return False
@@ -323,25 +358,16 @@ def has_smoke_verdict(entry: "QueuedMerge", board) -> bool:
     identify the work assignment(s) on the branch and none of them carries a
     ``test_state in ('passed', 'skipped')`` verdict.
 
-    Collects all work assignment IDs that share the same branch (including
-    the entry's own ID) to handle bounce/fix-work chains.
+    Collects all work assignment IDs connected to the entry — by shared
+    branch, or (#567) by the ``review_of_assignment_id`` chain, which also
+    catches fix workers dispatched with ``branch=NULL`` (the #557 remote-
+    interactive-rework gap) — to handle bounce/fix-work chains.
     """
     pool = list(getattr(board, "completed", []) or []) + list(
         getattr(board, "active", []) or []
     )
 
-    # Seed with the entry's own assignment_id, then expand to any work
-    # assignment on the same branch (e.g. fix workers from the auto-loop).
-    branch_work_ids: set[str] = set()
-    if entry.assignment_id:
-        branch_work_ids.add(entry.assignment_id)
-    for a in pool:
-        if getattr(a, "type", None) not in WORK_LIKE_TYPES:
-            continue
-        aid = getattr(a, "assignment_id", None)
-        branch = getattr(a, "branch", None)
-        if aid and branch and branch == entry.branch:
-            branch_work_ids.add(aid)
+    branch_work_ids = _chain_work_ids(entry, pool)
 
     # Collect work assignments that are explicitly present on the board.
     branch_work = [
