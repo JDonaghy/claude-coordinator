@@ -1047,7 +1047,8 @@ def update_assignment_review_findings(
     *,
     verdict: str,
     body: str,
-) -> None:
+    allow_overwrite: bool = False,
+) -> bool:
     """#bounce / #905: persist a parsed `ReviewFindings` on the assignment row.
 
     Stored as JSON ({"verdict": ..., "body": ...}) so the future read
@@ -1059,21 +1060,36 @@ def update_assignment_review_findings(
     Idempotent: silently no-ops when the row doesn't exist (matches the
     other `update_assignment_*` helpers).
 
+    **#650 clobber guard:** when the row already carries a non-empty,
+    *different* ``review_findings`` blob, the write is refused unless
+    *allow_overwrite* is ``True`` — a second capture for the same
+    assignment (a re-run exit prompt, a stray reattach) must never silently
+    stomp a good review with a degraded one.  Returns ``False`` when the
+    guard refused the write, ``True`` otherwise (written, or a no-op
+    because the incoming value already matches).
+
     **Daemon-aware (#905):** routes to ``POST /review-findings`` when a
     ``board_service`` is configured so the verdict lands on the shared DB
     rather than the thin client's empty local one.
     """
     if not assignment_id:
-        return
+        return True
     svc = _board_service()
     resp = _route_write(
         svc,
         "/review-findings",
-        {"assignment_id": assignment_id, "verdict": verdict, "body": body},
+        {
+            "assignment_id": assignment_id,
+            "verdict": verdict,
+            "body": body,
+            "allow_overwrite": allow_overwrite,
+        },
     )
     if resp is not None:
-        return
-    _update_assignment_review_findings_local(assignment_id, verdict=verdict, body=body)
+        return bool(resp.get("written", True))
+    return _update_assignment_review_findings_local(
+        assignment_id, verdict=verdict, body=body, allow_overwrite=allow_overwrite
+    )
 
 
 def _update_assignment_review_findings_local(
@@ -1081,10 +1097,16 @@ def _update_assignment_review_findings_local(
     *,
     verdict: str,
     body: str,
-) -> None:
+    allow_overwrite: bool = False,
+) -> bool:
     """Local-DB write for :func:`update_assignment_review_findings`.
 
     Called directly by the daemon endpoint so it never re-routes back over HTTP.
+
+    Returns ``True`` when the row was written (or the incoming value already
+    matched what was stored — a harmless no-op retry), ``False`` when the
+    #650 clobber guard refused an overwrite of pre-existing, different
+    findings because *allow_overwrite* was not set.
     """
     payload = json.dumps({"verdict": verdict, "body": body})
     conn = get_connection()
@@ -1098,21 +1120,52 @@ def _update_assignment_review_findings_local(
         "SELECT review_verdict, review_findings FROM assignments WHERE assignment_id=?",
         (assignment_id,),
     ).fetchone()
+    prior_findings = prior["review_findings"] if prior is not None else None
+    same_verdict = prior is not None and prior["review_verdict"] == verdict
+    already_recorded = same_verdict and prior_findings == payload
+    row = conn.execute(
+        "SELECT repo_name, issue_number, machine_name FROM assignments WHERE assignment_id=?",
+        (assignment_id,),
+    ).fetchone()
+    # ── #650 clobber guard ───────────────────────────────────────────────────
+    # Refuse to replace already-captured, non-empty findings with a DIFFERENT
+    # blob for the SAME verdict unless the caller explicitly confirms. A
+    # single assignment_id backs exactly one review session, so a second
+    # write carrying the identical verdict but different findings is — by
+    # construction — a re-capture (finishing the exit process twice, a
+    # stray reattach), never a legitimate new review. The real incident
+    # (#650): a 5166-char review got clobbered to a 58-char placeholder this
+    # way, with no way to recover the original. A write with a genuinely
+    # DIFFERENT verdict (e.g. a real re-review reaching a new conclusion) is
+    # always a real transition and is never guarded.
+    if not allow_overwrite and prior_findings and same_verdict and not already_recorded:
+        if row is not None:
+            _record_audit(
+                tier="business",
+                category="review",
+                event_type="review_findings_clobber_blocked",
+                actor="worker",
+                summary=(
+                    f"Refused to overwrite existing review findings for "
+                    f"{row['repo_name']}#{row['issue_number']} "
+                    f"(assignment {assignment_id}) — #650 clobber guard"
+                ),
+                repo=row["repo_name"],
+                issue=row["issue_number"],
+                assignment_id=assignment_id,
+                machine=row["machine_name"],
+                details={
+                    "prior_len": len(prior_findings),
+                    "incoming_len": len(payload),
+                },
+            )
+        return False
     conn.execute(
         "UPDATE assignments SET review_findings=?, review_verdict=? "
         "WHERE assignment_id=?",
         (payload, verdict, assignment_id),
     )
     conn.commit()
-    already_recorded = (
-        prior is not None
-        and prior["review_verdict"] == verdict
-        and prior["review_findings"] == payload
-    )
-    row = conn.execute(
-        "SELECT repo_name, issue_number, machine_name FROM assignments WHERE assignment_id=?",
-        (assignment_id,),
-    ).fetchone()
     if row is not None and not already_recorded:
         _record_audit(
             tier="business",
@@ -1126,6 +1179,7 @@ def _update_assignment_review_findings_local(
             machine=row["machine_name"],
             details={"body_len": len(body)},
         )
+    return True
 
 
 def delete_assignments_for_issue(

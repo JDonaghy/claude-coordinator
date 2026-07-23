@@ -896,6 +896,7 @@ class TestRemoteReviewVerdictRelay:
         class _Out:
             posted = True
             error = None
+            findings_written = True
 
         monkeypatch.setattr(
             "coord.issue_store.post_result",
@@ -958,6 +959,7 @@ class TestRemoteReviewVerdictRelay:
         class _Out:
             posted = True
             error = None
+            findings_written = True
 
         monkeypatch.setattr(
             "coord.issue_store.post_result",

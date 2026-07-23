@@ -602,6 +602,110 @@ class TestPostResult:
         assert hit is not None
         assert hit[0] == "request-changes" and "src/foo.rs:10" in hit[1]
 
+    # ── #650: clobber guard on review_findings re-capture ────────────────────
+
+    def test_second_capture_does_not_clobber_findings(self) -> None:
+        """#650 real incident: a review's findings were already recorded
+        (non-empty `review_findings`), then the exit prompt fired a SECOND
+        time for the same assignment and relayed a degraded body. The write
+        seam must refuse the overwrite by default, preserving the original
+        findings — and must NOT add a second #603 context entry for the
+        duplicate call."""
+        from coord.state import (
+            get_connection,
+            issue_context_block,
+            load_assignment_review_findings,
+        )
+
+        _seed_running_assignment("aid-clobber", assignment_type="review")
+        good = "- src/foo.rs:10 — missing nil guard\n" * 200  # long, real review
+        with patch("coord.github_ops.post_issue_comment"):
+            issue_store.post_result(
+                issue_store.ResultRecord(
+                    assignment_id="aid-clobber",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=7,
+                    status="done",
+                    verdict="request-changes",
+                    summary="first, real capture",
+                    findings_body=good,
+                )
+            )
+            placeholder = "was not captured"
+            outcome = issue_store.post_result(
+                issue_store.ResultRecord(
+                    assignment_id="aid-clobber",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=7,
+                    status="done",
+                    verdict="request-changes",
+                    summary="second, degraded re-capture",
+                    findings_body=placeholder,
+                )
+            )
+
+        assert outcome.findings_written is False
+        cached = load_assignment_review_findings("aid-clobber")
+        assert cached is not None
+        _, body = cached
+        assert body == good.strip()
+        assert placeholder not in body
+
+        # Only one #603 context entry — the duplicate call must not add another.
+        rows = get_connection().execute(
+            "SELECT COUNT(*) AS n FROM issue_context WHERE repo_name=? AND issue_number=?",
+            ("api", 7),
+        ).fetchone()
+        assert rows["n"] == 1
+        assert "first, real capture" in issue_context_block("api", 7) or good[:30] in (
+            issue_context_block("api", 7)
+        )
+
+    def test_second_capture_with_allow_overwrite_replaces_findings(self) -> None:
+        """#650: `allow_overwrite_findings=True` (the `--force` CLI flag) is the
+        explicit-confirmation escape hatch — the write lands."""
+        from coord.state import load_assignment_review_findings
+
+        _seed_running_assignment("aid-clobber-force", assignment_type="review")
+        with patch("coord.github_ops.post_issue_comment"):
+            issue_store.post_result(
+                issue_store.ResultRecord(
+                    assignment_id="aid-clobber-force",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=7,
+                    status="done",
+                    verdict="request-changes",
+                    summary="first capture",
+                    findings_body="original findings",
+                )
+            )
+            outcome = issue_store.post_result(
+                issue_store.ResultRecord(
+                    assignment_id="aid-clobber-force",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=7,
+                    status="done",
+                    verdict="request-changes",
+                    summary="confirmed replacement",
+                    findings_body="corrected findings",
+                    allow_overwrite_findings=True,
+                )
+            )
+
+        assert outcome.findings_written is True
+        cached = load_assignment_review_findings("aid-clobber-force")
+        assert cached is not None
+        _, body = cached
+        assert body == "corrected findings"
+
     def test_invalid_status_raises(self) -> None:
         with pytest.raises(ValueError, match="invalid status"):
             issue_store.post_result(

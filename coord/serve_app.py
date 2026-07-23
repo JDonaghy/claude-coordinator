@@ -3132,10 +3132,11 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         if body is None:
             return JSONResponse({"error": "invalid JSON body"}, status_code=400)
         try:
-            state._update_assignment_review_findings_local(
+            written = state._update_assignment_review_findings_local(
                 body["assignment_id"],
                 verdict=body["verdict"],
                 body=body["body"],
+                allow_overwrite=bool(body.get("allow_overwrite", False)),
             )
         except KeyError as e:
             return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
@@ -3144,7 +3145,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 {"error": "review-findings write failed", "detail": str(e)},
                 status_code=503,
             )
-        return JSONResponse({"ok": True})
+        return JSONResponse({"ok": True, "written": written})
 
     async def post_review_posted(request: Request) -> Response:
         # #905: mark a review assignment as posted (sets review_posted_at) on the

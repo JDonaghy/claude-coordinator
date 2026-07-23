@@ -259,6 +259,19 @@ def _prompt_and_relay_review_verdict(
         click.echo(
             f"  verdict '{verdict}' recorded (posted_to_github={outcome.posted})."
         )
+        if not outcome.findings_written:
+            # #650: this is exactly the shape of the original incident — a
+            # second exit-prompt capture for a review that already has
+            # non-empty findings on the row.  The stored verdict already
+            # matched (or `_persist_review_verdict` would have raised), so
+            # the good findings were preserved — just tell the operator.
+            click.echo(
+                "  note: existing review findings were NOT overwritten "
+                "(#650 clobber guard) — this assignment already had "
+                "different, non-empty findings recorded; they are "
+                "preserved. Use `coord report-result ... --force` if this "
+                "overwrite was intentional."
+            )
         if outcome.error:
             click.echo(f"  github post warning: {outcome.error}", err=True)
         return True
@@ -474,6 +487,21 @@ def _prompt_and_relay_test_verdict(
 )
 
 
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help=(
+        "Confirm overwriting already-captured review findings for this "
+        "assignment (#650). Without it, a --verdict request-changes/--body "
+        "write that would replace non-empty existing review_findings with a "
+        "different body is refused — a second capture for the same "
+        "assignment is, by construction, a re-run (finishing the exit "
+        "process twice, a stray reattach), never a legitimate new review."
+    ),
+)
+
+
 @_CONFIG_OPTION
 def report_result(
     assignment_id_opt: str | None,
@@ -483,6 +511,7 @@ def report_result(
     body_file: str | None,
     body_inline: str | None,
     audit_json_file: str | None,
+    force: bool,
     config_path: Path,
 ) -> None:
     """``coord report-result --assignment <id> --status <s> [--verdict <v>] --summary <text>``
@@ -704,6 +733,7 @@ def report_result(
         findings_body=findings_body,
         audit_goals=audit_goals,
         audit_bottom_line=audit_bottom_line,
+        allow_overwrite_findings=force,
     )
     try:
         outcome = issue_store.post_result(record_obj)
@@ -716,6 +746,9 @@ def report_result(
         # reporting success while the merge-gate-critical review_verdict (or
         # the audit run_number versioning invariant) column never actually
         # landed. Re-running the identical command is the recovery path.
+        # (A #650 clobber-guard refusal is reported below via
+        # `outcome.findings_written`, not as an exception — the verdict
+        # itself still lands cleanly in that case.)
         click.echo(f"error: {exc}", err=True)
         sys.exit(1)
 
@@ -723,6 +756,14 @@ def report_result(
         f"result recorded: status={outcome.status} event={outcome.event} "
         f"posted_to_github={outcome.posted}"
     )
+    if not outcome.findings_written:
+        click.echo(
+            "  note: review findings were NOT overwritten (#650 clobber "
+            "guard) — non-empty findings already existed for this "
+            "assignment and the stored verdict already matches; the "
+            "previously captured findings are preserved. Re-run with "
+            "--force if this overwrite was intentional."
+        )
     if outcome.error:
         click.echo(f"  github post warning: {outcome.error}", err=True)
 
@@ -748,12 +789,25 @@ def report_result(
         "cache on the next `coord assign --fix-of` dispatch."
     ),
 )
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help=(
+        "Confirm overwriting already-captured, non-empty review findings "
+        "for this assignment (#650) — the TUI rework dialog's write is "
+        "otherwise refused when the row already carries a different "
+        "findings body, so a re-run of the dialog can't silently stomp a "
+        "good capture with a placeholder."
+    ),
+)
 
 
 @_CONFIG_OPTION
 def set_review_findings(
     assignment_id: str,
     findings: str,
+    force: bool,
     config_path: Path,
 ) -> None:
     """``coord set-review-findings <id> --findings <text>``
@@ -764,6 +818,11 @@ def set_review_findings(
     ``_load_review_findings`` checks, so the subsequent ``coord assign
     --fix-of`` dispatch will read it and brief the fix worker correctly
     instead of emitting the "(No structured findings were captured)" fallback.
+
+    #650: refuses to replace already-captured, non-empty findings with a
+    different body unless ``--force`` is passed — a single assignment backs
+    exactly one review, so a second, differing write here is a re-run of the
+    dialog, never a legitimate new review.
     """
     from coord.state import update_assignment_review_findings  # noqa: PLC0415
 
@@ -772,11 +831,20 @@ def set_review_findings(
         click.echo("error: --findings must not be empty", err=True)
         sys.exit(2)
 
-    update_assignment_review_findings(
+    written = update_assignment_review_findings(
         assignment_id,
         verdict="request-changes",
         body=findings_text,
+        allow_overwrite=force,
     )
+    if not written:
+        click.echo(
+            f"refused: assignment {assignment_id} already has different, "
+            "non-empty review findings recorded (#650 clobber guard) — "
+            "re-run with --force to overwrite them.",
+            err=True,
+        )
+        sys.exit(1)
     click.echo(f"findings recorded for {assignment_id}")
 
 

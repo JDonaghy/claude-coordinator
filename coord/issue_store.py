@@ -144,6 +144,14 @@ class ResultRecord:
     # comment + #603 context store) instead of the generic done-comment body.
     audit_goals: list[dict] | None = None
     audit_bottom_line: str | None = None
+    # #650: explicit operator confirmation to replace ALREADY non-empty
+    # `review_findings` on this assignment row with a different blob.  A
+    # single assignment_id backs exactly one review session, so a second,
+    # differing write to the same row is — absent this flag — refused by the
+    # clobber guard in `coord.state.update_assignment_review_findings`
+    # (the #650 incident: a 5166-char review clobbered to a 58-char
+    # placeholder by finishing the exit process twice).
+    allow_overwrite_findings: bool = False
 
 
 # ── Resolved terminal state (what the seam writes back) ─────────────────────
@@ -159,6 +167,12 @@ class StoreOutcome:
     event: str   # comments.EVENT_*
     posted: bool  # True iff the GitHub comment post succeeded
     error: str | None = None  # populated when post failed
+    # #650: False when a review-findings write was attempted but the clobber
+    # guard refused it (non-empty findings already on the row, no explicit
+    # `allow_overwrite_findings`).  True for every other outcome, including
+    # when no findings write was attempted at all — callers only need to
+    # react to the one "your write did not land" case.
+    findings_written: bool = True
 
 
 # ── Internal helpers — the ONE place this module touches state/github_ops ──
@@ -522,7 +536,7 @@ def _read_review_verdict_local(assignment_id: str) -> str | None:
     return row["review_verdict"] if hasattr(row, "keys") else row[0]
 
 
-def _persist_review_verdict(record: ResultRecord) -> None:
+def _persist_review_verdict(record: ResultRecord) -> bool:
     """Durably record ``record.verdict`` on the assignment row.
 
     #990: this used to be a bare ``UPDATE ... ; except Exception: pass`` —
@@ -540,6 +554,14 @@ def _persist_review_verdict(record: ResultRecord) -> None:
     ``RuntimeError`` if it still can't confirm the write landed; callers
     MUST NOT swallow this — let it propagate so the CLI exits non-zero and
     the operator knows to retry, instead of trusting a false success.
+
+    Returns ``True`` when the findings write landed (or no findings body was
+    supplied at all), ``False`` when the #650 clobber guard refused to
+    replace already-captured, different findings because
+    ``record.allow_overwrite_findings`` was not set — the verdict column
+    already matches ``record.verdict`` in that case (the common "duplicate
+    re-capture of the same verdict" shape), so this is reported as a
+    guarded no-op, not a failure.
     """
     attempts = 4
     delay = 0.15
@@ -549,11 +571,20 @@ def _persist_review_verdict(record: ResultRecord) -> None:
             if record.findings_body and record.findings_body.strip():
                 from coord.state import update_assignment_review_findings  # noqa: PLC0415
 
-                update_assignment_review_findings(
+                findings_written = update_assignment_review_findings(
                     record.assignment_id,
                     verdict=record.verdict,
                     body=record.findings_body.strip(),
+                    allow_overwrite=record.allow_overwrite_findings,
                 )
+                if not findings_written:
+                    # #650 clobber guard refused the write: the guard only
+                    # ever fires when the stored verdict already equals
+                    # `record.verdict` (a differing verdict is always a real
+                    # transition and is written through unguarded) — so the
+                    # pre-existing findings are exactly what should stay on
+                    # the row. Nothing more to do; no need to retry.
+                    return False
                 bodyless_verdict = False
             else:
                 from coord.state import get_connection  # noqa: PLC0415
@@ -597,7 +628,7 @@ def _persist_review_verdict(record: ResultRecord) -> None:
                             assignment_id=record.assignment_id,
                             machine=row["machine_name"],
                         )
-                return
+                return True
             last_exc = RuntimeError(
                 f"review_verdict readback mismatch for assignment "
                 f"{record.assignment_id!r}: wrote {record.verdict!r}, read back "
@@ -1045,12 +1076,18 @@ def _post_result_local(record: ResultRecord) -> StoreOutcome:
     # findings body was also supplied (--body-file), persist BOTH together via
     # the same JSON column the claude -p path uses, so the fix worker's DB-cache
     # lookup (load_assignment_review_findings) hits on this machine.
+    findings_written = True
     if record.verdict is not None:
-        _persist_review_verdict(record)
+        findings_written = _persist_review_verdict(record)
     # #603: a request-changes verdict is durable context for EVERY future agent
     # on the issue — record a short note in the per-issue digest (local writer;
     # daemon-side on a thin client, so use the _local variant).
-    if record.verdict == VERDICT_REQUEST_CHANGES:
+    #
+    # #650: only when the findings write actually landed. When the clobber
+    # guard refused it (a re-capture of an already-recorded review), this is
+    # a duplicate call for a review the issue already has a context entry
+    # for — adding another one was the second half of the #650 incident.
+    if record.verdict == VERDICT_REQUEST_CHANGES and findings_written:
         try:
             from coord.state import _add_issue_context_entry_local  # noqa: PLC0415
 
@@ -1067,7 +1104,11 @@ def _post_result_local(record: ResultRecord) -> StoreOutcome:
         except Exception:  # noqa: BLE001 — best-effort
             pass
     return StoreOutcome(
-        status="done", event=EVENT_COMPLETION, posted=posted, error=err,
+        status="done",
+        event=EVENT_COMPLETION,
+        posted=posted,
+        error=err,
+        findings_written=findings_written,
     )
 
 

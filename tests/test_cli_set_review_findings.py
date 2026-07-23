@@ -108,8 +108,11 @@ def test_set_review_findings_missing_findings_flag_is_error(runner, config_path)
     assert result.exit_code != 0
 
 
-def test_set_review_findings_overwrites_existing(runner, config_path, coord_db):
-    """A second call replaces the earlier findings (idempotent overwrite)."""
+def test_set_review_findings_refuses_overwrite_without_force(runner, config_path, coord_db):
+    """#650: a second call with a DIFFERENT body is refused (clobber guard) —
+    a single assignment backs exactly one review, so a second, differing
+    write is a re-run of the rework dialog, never a legitimate new review.
+    """
     _seed_assignment(coord_db, "rev-dup", review_verdict="request-changes")
 
     runner.invoke(
@@ -121,7 +124,7 @@ def test_set_review_findings_overwrites_existing(runner, config_path, coord_db):
         ],
         catch_exceptions=False,
     )
-    runner.invoke(
+    result = runner.invoke(
         main,
         [
             "set-review-findings", "--config", str(config_path),
@@ -131,7 +134,42 @@ def test_set_review_findings_overwrites_existing(runner, config_path, coord_db):
         catch_exceptions=False,
     )
 
+    assert result.exit_code != 0
+    combined = result.output + (result.stderr or "")
+    assert "refused" in combined.lower()
+
     row = load_assignment_review_findings("rev-dup")
+    assert row is not None
+    _, body = row
+    assert body == "First draft findings."
+
+
+def test_set_review_findings_force_overwrites_existing(runner, config_path, coord_db):
+    """#650: --force confirms the overwrite explicitly."""
+    _seed_assignment(coord_db, "rev-dup-force", review_verdict="request-changes")
+
+    runner.invoke(
+        main,
+        [
+            "set-review-findings", "--config", str(config_path),
+            "rev-dup-force",
+            "--findings", "First draft findings.",
+        ],
+        catch_exceptions=False,
+    )
+    result = runner.invoke(
+        main,
+        [
+            "set-review-findings", "--config", str(config_path),
+            "rev-dup-force",
+            "--findings", "Revised findings.",
+            "--force",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0, result.output
+    row = load_assignment_review_findings("rev-dup-force")
     assert row is not None
     _, body = row
     assert body == "Revised findings."
