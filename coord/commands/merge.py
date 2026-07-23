@@ -720,6 +720,7 @@ def merge(
     # This local branch runs on the daemon itself (COORD_MERGE_ON_DAEMON set)
     # or when no daemon is configured (standalone dev environment).
     if show_plan:
+        from coord import github_ops as _plan_gh_ops  # noqa: PLC0415
         from coord import merge_queue as _plan_mq  # noqa: PLC0415
         from coord.ci_store import build_ci_store as _build_ci_store  # noqa: PLC0415
         from coord.state import load_board as _load_board  # noqa: PLC0415
@@ -728,7 +729,7 @@ def merge(
         _board = _load_board()
         _ci = _build_ci_store(_cfg.ci_store.type)
 
-        planned = _plan_mq.plan(_board, _cfg, _ci)
+        planned = _plan_mq.plan(_board, _cfg, _ci, gh_ops=_plan_gh_ops)
 
         # --repo scoping
         if repo_filter:

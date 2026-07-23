@@ -852,13 +852,14 @@ def _entry_gate_status(
     board,
     config,
     ci_store: "CiStore | None" = None,
+    gh_ops: "GhOps | None" = None,
 ) -> tuple[str, str | None]:
     """Return *(status, reason)* for a single PENDING merge-queue entry.
 
     Evaluates gates in the same order as :func:`process` — review → smoke →
-    CI — so the plan shown to the operator is byte-for-byte what merge would
-    do.  Both :func:`plan` and :func:`process` delegate to this helper so they
-    can never diverge.
+    CI → epic-closing-keyword-in-commit — so the plan shown to the operator
+    is byte-for-byte what merge would do. Both :func:`plan` and :func:`process`
+    delegate to this helper so they can never diverge.
 
     Returns ``(PLAN_READY, None)`` when all gates pass.
     Returns ``(PLAN_BLOCKED, reason)`` when any gate blocks.
@@ -867,6 +868,14 @@ def _entry_gate_status(
     **and** the entry has a ``pr_number`` (CI is checked per-PR, not per-branch).
     This mirrors the live-merge behaviour: a ``PENDING`` entry with no PR yet
     opened is not blocked on CI — the PR hasn't been created yet.
+
+    The *gh_ops* epic-closing-keyword-in-commit gate (#1318) is likewise only
+    evaluated when both *gh_ops* is provided **and** the entry has a
+    ``pr_number`` — mirroring the CI gate's guard, since commit messages can
+    only be read once a PR exists. This gate is never bypassable via
+    ``force_merge`` here (unlike :func:`process`'s live override) — the plan
+    view has no such flag; an operator who wants to see the override outcome
+    reads the ``coord merge --force-merge`` output itself.
     """
     if config is not None and board is not None:
         if requires_review(entry, config) and not has_approved_review(entry, board):
@@ -883,6 +892,29 @@ def _entry_gate_status(
         if pending:
             summary = ", ".join(c.name for c in pending)
             return PLAN_BLOCKED, f"CI running: {summary}"
+    if gh_ops is not None and entry.pr_number:
+        try:
+            commit_messages = gh_ops.get_pr_commit_messages(
+                entry.repo_github, entry.pr_number
+            )
+        except Exception:  # noqa: BLE001
+            commit_messages = []
+        commit_referenced: set[int] = set()
+        for message in commit_messages:
+            commit_referenced.update(find_closing_references(message))
+        commit_epic_hits: list[int] = []
+        for n in sorted(commit_referenced):
+            try:
+                if gh_ops.is_epic_issue(entry.repo_github, n):
+                    commit_epic_hits.append(n)
+            except Exception:  # noqa: BLE001
+                pass
+        if commit_epic_hits:
+            numbers_str = ", ".join(f"#{n}" for n in commit_epic_hits)
+            return (
+                PLAN_BLOCKED,
+                f"commit message contains closing keyword for epic {numbers_str} (#1318)",
+            )
     return PLAN_READY, None
 
 
@@ -956,6 +988,7 @@ def plan(
     board,
     config,
     ci_store: "CiStore | None" = None,
+    gh_ops: "GhOps | None" = None,
 ) -> "list[PlannedMerge]":
     """Return the **ordered merge plan** — one :class:`PlannedMerge` per queue entry.
 
@@ -974,12 +1007,15 @@ def plan(
     5. For each entry:
        - Derive ``status`` from the raw ``state`` value.
        - For PENDING entries, override with :func:`_entry_gate_status` which
-         evaluates review / smoke / CI gates live against *board* + *config*.
+         evaluates review / smoke / CI / epic-closing-keyword-in-commit gates
+         live against *board* + *config* + *ci_store* + *gh_ops*.
        - Look up the issue's milestone from the ``issues`` table.
 
     The function is intentionally **read-only** — no side effects, no DB writes.
-    Pass ``board=None`` and/or ``config=None`` to skip gate evaluation (useful
-    in test scenarios that only care about ordering).
+    Pass ``board=None`` and/or ``config=None`` to skip the review/smoke gates,
+    ``ci_store=None`` to skip the CI gate, and ``gh_ops=None`` to skip the
+    epic-closing-keyword-in-commit gate (useful in test scenarios that only
+    care about ordering).
     """
     items = load_queue()
     milestones = _load_milestones_for_queue(items)
@@ -1012,7 +1048,7 @@ def plan(
 
             if entry.state == PENDING:
                 base_status, reason = _entry_gate_status(
-                    entry, board, config, ci_store
+                    entry, board, config, ci_store, gh_ops
                 )
 
             result.append(PlannedMerge(

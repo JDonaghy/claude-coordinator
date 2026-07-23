@@ -915,7 +915,7 @@ def _auto_drain_tick(config: Config) -> "list":
         ci_store = None
 
     # Compute the gate-annotated plan — the single source of truth for READY.
-    merge_plan = mq.plan(board, config, ci_store=ci_store)
+    merge_plan = mq.plan(board, config, ci_store=ci_store, gh_ops=github_ops)
     ready_aids = {pm.assignment_id for pm in merge_plan if pm.status == PLAN_READY}
 
     if not ready_aids:
@@ -2502,6 +2502,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             _board = None
             _ci = None
             try:
+                from coord import github_ops as _gh_ops  # noqa: PLC0415
                 from coord import merge_queue as _mq  # noqa: PLC0415
                 from coord.ci_store import build_ci_store as _build_ci_store  # noqa: PLC0415
                 from coord.state import build_board as _build_board  # noqa: PLC0415
@@ -2515,7 +2516,8 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 except Exception:  # noqa: BLE001
                     _ci = None
                 projection["merge_plan"] = [
-                    _asdict(pm) for pm in _mq.plan(_board, _cfg, ci_store=_ci)
+                    _asdict(pm)
+                    for pm in _mq.plan(_board, _cfg, ci_store=_ci, gh_ops=_gh_ops)
                 ]
                 # #778: staging section — approved/done work not yet in the
                 # queue.  Reuses the same _board snapshot built above.

@@ -2724,6 +2724,91 @@ class TestPlan:
         plan = mq.plan(board, cfg, ci_store=AlwaysFailCi())
         assert plan[0].status == mq.PLAN_READY
 
+    # ── #1318: epic-closing-keyword-in-commit gate ─────────────────────────
+
+    def test_blocked_epic_closing_keyword_in_commit(self, coord_db) -> None:
+        """A commit-message closing keyword for an epic shows PLAN_BLOCKED.
+
+        This is the plan()/process() parity gap from #1318 review: an entry
+        that `process()` would refuse to merge (epic auto-close hazard) must
+        also show BLOCKED in the plan the operator checks beforehand, not
+        just fail silently at merge time.
+        """
+        items = [_q("w1", size=50, pr=100)]
+        save_queue(items)
+        board = self._board(completed=[
+            self._work("w1", test_state="passed"),
+            self._review("w1", verdict="approve"),
+        ])
+        cfg = self._config()
+        gh = FakeGh(
+            pr_commit_messages={100: ["fix(#1314): ...\n\nCloses #1120"]},
+            epic_issues={1120},
+        )
+        plan = mq.plan(board, cfg, gh_ops=gh)
+        assert plan[0].status == mq.PLAN_BLOCKED
+        assert "#1120" in (plan[0].reason or "")
+
+    def test_not_blocked_ordinary_closing_keyword_in_commit(self, coord_db) -> None:
+        """An ordinary (non-epic) closing keyword in a commit stays READY."""
+        items = [_q("w1", size=50, pr=100)]
+        save_queue(items)
+        board = self._board(completed=[
+            self._work("w1", test_state="passed"),
+            self._review("w1", verdict="approve"),
+        ])
+        cfg = self._config()
+        gh = FakeGh(
+            pr_commit_messages={100: ["fix(#55): a normal bug fix\n\nCloses #55"]},
+            epic_issues=set(),
+        )
+        plan = mq.plan(board, cfg, gh_ops=gh)
+        assert plan[0].status == mq.PLAN_READY
+
+    def test_epic_commit_gate_not_checked_without_pr_number(self, coord_db) -> None:
+        """No PR yet opened → the commit-message gate is skipped, not blocked."""
+        items = [_q("w1", size=50)]  # pr_number=None by default
+        save_queue(items)
+        board = self._board(completed=[
+            self._work("w1", test_state="passed"),
+            self._review("w1", verdict="approve"),
+        ])
+        cfg = self._config()
+        gh = FakeGh(
+            pr_commit_messages={100: ["Closes #1120"]},
+            epic_issues={1120},
+        )
+        plan = mq.plan(board, cfg, gh_ops=gh)
+        assert plan[0].status == mq.PLAN_READY
+
+    def test_epic_commit_gate_skipped_without_gh_ops(self, coord_db) -> None:
+        """Without gh_ops, the commit-message gate is skipped (backward compat)."""
+        items = [_q("w1", size=50, pr=100)]
+        save_queue(items)
+        board = self._board(completed=[
+            self._work("w1", test_state="passed"),
+            self._review("w1", verdict="approve"),
+        ])
+        cfg = self._config()
+        plan = mq.plan(board, cfg)
+        assert plan[0].status == mq.PLAN_READY
+
+    def test_epic_commit_gate_lint_failure_never_blocks_plan(self, coord_db) -> None:
+        """A get_pr_commit_messages/is_epic_issue failure fails open, not blocked."""
+        class _BoomOnCommits(FakeGh):
+            def get_pr_commit_messages(self, repo: str, number: int) -> list[str]:
+                raise RuntimeError("gh pr view --json commits failed")
+
+        items = [_q("w1", size=50, pr=100)]
+        save_queue(items)
+        board = self._board(completed=[
+            self._work("w1", test_state="passed"),
+            self._review("w1", verdict="approve"),
+        ])
+        cfg = self._config()
+        plan = mq.plan(board, cfg, gh_ops=_BoomOnCommits())
+        assert plan[0].status == mq.PLAN_READY
+
     # ── non-PENDING state mapping ─────────────────────────────────────────
 
     def test_merging_entry_status(self, coord_db) -> None:
@@ -2830,6 +2915,17 @@ class TestPlan:
         status, reason = mq._entry_gate_status(entry, None, None)
         assert status == mq.PLAN_READY
         assert reason is None
+
+    def test_entry_gate_status_blocked_epic_closing_keyword_in_commit(self) -> None:
+        """#1318: a commit-message epic closing keyword → PLAN_BLOCKED."""
+        entry = _q("w1", pr=100)
+        gh = FakeGh(
+            pr_commit_messages={100: ["Closes #1120"]},
+            epic_issues={1120},
+        )
+        status, reason = mq._entry_gate_status(entry, None, None, gh_ops=gh)
+        assert status == mq.PLAN_BLOCKED
+        assert reason is not None and "#1120" in reason
 
 
 # ── #778: staging_items() ─────────────────────────────────────────────────────
