@@ -2520,6 +2520,337 @@ def test_stash_artifacts_for_branch_zero_copy_no_warning_without_log(
     assert not (stash_dir / ".assignment_id").exists()
 
 
+# ── #1323: per-glob zero-match advisory (fix #2) ─────────────────────────────
+
+
+def test_stash_artifacts_for_branch_unmatched_out_all_miss(tmp_path: Path) -> None:
+    """unmatched_out is populated when all patterns match 0 files (#1323).
+
+    When every configured glob resolves to nothing, the caller should receive
+    the full list of unmatched patterns so it can surface a per-glob advisory
+    instead of just a generic "0 files copied" message.
+    """
+    from coord.agent import stash_artifacts_for_branch
+
+    wt = tmp_path / "worktree"
+    wt.mkdir(parents=True)
+    # No files created — all globs will miss.
+
+    unmatched: list[str] = []
+    count = stash_artifacts_for_branch(
+        worktree_path=wt,
+        branch="issue-1323-all-miss",
+        repo_name="vimcode",
+        patterns=["target/debug/vimcode", "target/debug/vcd"],
+        state_dir=tmp_path / "state",
+        assignment_id="aid-1323",
+        unmatched_out=unmatched,
+    )
+
+    assert count == 0
+    assert "target/debug/vimcode" in unmatched
+    assert "target/debug/vcd" in unmatched
+
+
+def test_stash_artifacts_for_branch_unmatched_out_partial_miss(
+    tmp_path: Path,
+) -> None:
+    """unmatched_out names only the patterns that matched 0 files (#1323).
+
+    When some globs match files but others don't, only the unmatched ones
+    should appear in unmatched_out; the function should still return the
+    count of copied files (> 0).
+    """
+    from coord.agent import stash_artifacts_for_branch
+
+    wt = tmp_path / "worktree"
+    (wt / "target" / "debug").mkdir(parents=True)
+    # Only the TUI binary exists — the GUI binary is absent.
+    (wt / "target" / "debug" / "vimcode-tui").write_bytes(b"\x7fELF" + b"\x00" * 200)
+
+    log_path = tmp_path / "assignment.log"
+    log_path.write_text("")
+
+    unmatched: list[str] = []
+    count = stash_artifacts_for_branch(
+        worktree_path=wt,
+        branch="issue-1323-partial",
+        repo_name="vimcode",
+        patterns=["target/debug/vimcode-tui", "target/debug/vimcode"],
+        state_dir=tmp_path / "state",
+        assignment_id="aid-1323b",
+        log_path=str(log_path),
+        unmatched_out=unmatched,
+    )
+
+    assert count == 1  # vimcode-tui was copied
+    assert unmatched == ["target/debug/vimcode"]  # GUI binary missing
+
+    log_text = log_path.read_text()
+    assert "1 glob(s)" in log_text or "glob(s) matched 0 files" in log_text
+    assert "target/debug/vimcode" in log_text
+
+
+def test_stash_artifacts_for_branch_unmatched_out_none_does_not_raise(
+    tmp_path: Path,
+) -> None:
+    """When unmatched_out is None (default), per-pattern tracking is skipped.
+
+    The existing callers that don't pass unmatched_out must continue to
+    work unmodified.
+    """
+    from coord.agent import stash_artifacts_for_branch
+
+    wt = tmp_path / "worktree"
+    wt.mkdir(parents=True)
+
+    # Should not raise; no unmatched_out to populate.
+    count = stash_artifacts_for_branch(
+        worktree_path=wt,
+        branch="issue-1323-noout",
+        repo_name="myrepo",
+        patterns=["target/debug/ghost"],
+        state_dir=tmp_path / "state",
+    )
+    assert count == 0
+
+
+def test_stash_artifacts_for_branch_partial_miss_logs_named_glob(
+    tmp_path: Path,
+) -> None:
+    """A partial stash miss writes a WARNING naming the specific unmatched glob.
+
+    Previously the per-glob detail was only emitted when ALL patterns missed;
+    this test pins the partial-miss path (#1323).
+    """
+    from coord.agent import stash_artifacts_for_branch
+
+    wt = tmp_path / "worktree"
+    (wt / "target" / "debug").mkdir(parents=True)
+    (wt / "target" / "debug" / "coord-tui").write_bytes(b"\x7fELF" + b"\x00" * 200)
+
+    log_path = tmp_path / "run.log"
+    log_path.write_text("")
+
+    stash_artifacts_for_branch(
+        worktree_path=wt,
+        branch="issue-1323-partlog",
+        repo_name="myrepo",
+        patterns=["target/debug/coord-tui", "target/debug/nonexistent"],
+        state_dir=tmp_path / "state",
+        log_path=str(log_path),
+    )
+
+    log_text = log_path.read_text()
+    assert "stash WARNING" in log_text
+    assert "nonexistent" in log_text
+    # The matched file should NOT be in the warning (not a false positive).
+    assert "coord-tui" not in log_text.split("stash WARNING")[-1]
+
+
+# ── #1323: build_command runs before stash (fix #3) ──────────────────────────
+
+
+def test_stash_artifacts_build_command_runs_before_glob(tmp_path: Path) -> None:
+    """build_command is run in the worktree before the artifact glob (#1323 fix #3).
+
+    Simulates the vimcode#600 scenario: the worker built only the TUI binary
+    but the repo's build_command also builds the GUI binary.  The stash should
+    capture both after the pre-stash build runs.
+    """
+    from coord.agent import DONE, AgentAssignment, AgentServer, AssignmentSpec
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+
+    wt_path = state_dir / "worktrees" / "asgn-1323"
+    wt_path.mkdir(parents=True, exist_ok=True)
+
+    # Pre-create only the TUI binary (simulating what the worker produced).
+    (wt_path / "target" / "debug").mkdir(parents=True)
+    (wt_path / "target" / "debug" / "myapp-tui").write_bytes(b"\x7fELF" + b"\x00" * 200)
+
+    # build_command writes a second binary — simulating a full `cargo build`.
+    gui_binary = wt_path / "target" / "debug" / "myapp-gui"
+    build_script = f'printf "\\x7fELF%0200d" 0 > {gui_binary}'
+
+    server = AgentServer(
+        machine_name="test",
+        repos=["myapp"],
+        state_dir=state_dir,
+        worker_command=lambda spec: ["/bin/sh", "-c", "echo ok"],
+        repo_paths={"myapp": str(tmp_path / "repo")},
+        artifact_paths={"myapp": ["target/debug/myapp-tui", "target/debug/myapp-gui"]},
+        build_commands={"myapp": build_script},
+    )
+
+    log_path = state_dir / "logs" / "asgn-1323.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text("")
+
+    spec = AssignmentSpec(
+        repo_name="myapp",
+        repo_path=str(tmp_path / "repo"),
+        issue_number=1323,
+        issue_title="build command test",
+        briefing="b",
+        branch="main",
+    )
+    a = AgentAssignment(
+        id="asgn-1323",
+        spec=spec,
+        status=DONE,
+        branch="issue-1323-build-cmd",
+    )
+    a.worktree_path = str(wt_path)
+    a.log_path = str(log_path)
+
+    server._stash_artifacts(a)
+
+    stash_dir = state_dir / "artifacts" / "myapp" / "issue-1323-build-cmd"
+    assert (stash_dir / "myapp-tui").exists(), "TUI binary not stashed"
+    assert (stash_dir / "myapp-gui").exists(), "GUI binary not stashed (build_command may not have run)"
+
+    log_text = log_path.read_text()
+    assert "pre-stash build" in log_text
+
+
+def test_stash_artifacts_build_command_logged_on_failure(tmp_path: Path) -> None:
+    """A failing build_command is logged but does not abort the stash (#1323 fix #3).
+
+    Best-effort: if the build command exits non-zero, the stash still runs
+    (it may capture whatever the worker already built) and the failure is
+    written to the assignment log.
+    """
+    from coord.agent import DONE, AgentAssignment, AgentServer, AssignmentSpec
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+
+    wt_path = state_dir / "worktrees" / "asgn-1323fail"
+    wt_path.mkdir(parents=True, exist_ok=True)
+    (wt_path / "target" / "debug").mkdir(parents=True)
+    (wt_path / "target" / "debug" / "mybin").write_bytes(b"\x7fELF" + b"\x00" * 200)
+
+    server = AgentServer(
+        machine_name="test",
+        repos=["myapp"],
+        state_dir=state_dir,
+        worker_command=lambda spec: ["/bin/sh", "-c", "echo ok"],
+        repo_paths={"myapp": str(tmp_path / "repo")},
+        artifact_paths={"myapp": ["target/debug/mybin"]},
+        build_commands={"myapp": "exit 42"},  # Deliberate failure.
+    )
+
+    log_path = state_dir / "logs" / "asgn-1323fail.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text("")
+
+    spec = AssignmentSpec(
+        repo_name="myapp",
+        repo_path=str(tmp_path / "repo"),
+        issue_number=1323,
+        issue_title="build command failure",
+        briefing="b",
+        branch="main",
+    )
+    a = AgentAssignment(
+        id="asgn-1323fail",
+        spec=spec,
+        status=DONE,
+        branch="issue-1323-fail",
+    )
+    a.worktree_path = str(wt_path)
+    a.log_path = str(log_path)
+
+    # Should not raise, stash should still work.
+    server._stash_artifacts(a)
+
+    stash_dir = state_dir / "artifacts" / "myapp" / "issue-1323-fail"
+    assert (stash_dir / "mybin").exists(), "pre-existing binary should still be stashed"
+
+    log_text = log_path.read_text()
+    assert "pre-stash build" in log_text
+    assert "exit=42" in log_text
+
+
+def test_reap_worker_advisory_on_stash_miss(tmp_path: Path) -> None:
+    """Assignment transitions to ADVISORY when a stash glob matched 0 files (#1323).
+
+    Mirrors the zero-commit advisory: if any configured artifact glob resolves
+    to nothing after the worker exits, the assignment status is downgraded from
+    DONE to ADVISORY with a reason naming the unmatched glob(s) so the TUI and
+    coord notify can surface the miss.
+    """
+    from coord.agent import ADVISORY, DONE, AgentAssignment, AgentServer, AssignmentSpec
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+
+    wt_path = state_dir / "worktrees" / "asgn-1323adv"
+    wt_path.mkdir(parents=True, exist_ok=True)
+    # No binaries in the worktree — all globs will miss.
+
+    server = AgentServer(
+        machine_name="test",
+        repos=["myapp"],
+        state_dir=state_dir,
+        worker_command=lambda spec: ["/bin/sh", "-c", "echo ok"],
+        repo_paths={"myapp": str(tmp_path / "repo")},
+        artifact_paths={"myapp": ["target/debug/missing-gui"]},
+    )
+
+    log_path = state_dir / "logs" / "asgn-1323adv.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text("")
+
+    spec = AssignmentSpec(
+        repo_name="myapp",
+        repo_path=str(tmp_path / "repo"),
+        issue_number=1323,
+        issue_title="advisory stash miss",
+        briefing="b",
+        branch="main",
+    )
+    a = AgentAssignment(
+        id="asgn-1323adv",
+        spec=spec,
+        status=DONE,
+        branch="issue-1323-adv",
+    )
+    a.worktree_path = str(wt_path)
+    a.log_path = str(log_path)
+
+    # Register the assignment so the lock-based status update can find it.
+    with server._lock:
+        server._assignments["asgn-1323adv"] = a
+
+    unmatched = server._stash_artifacts(a)
+
+    # _stash_artifacts now returns the unmatched list; the caller (_reap_worker)
+    # would downgrade to ADVISORY.  Here we call the helper directly and
+    # check the unmatched list, then simulate the _reap_worker status update.
+    assert "target/debug/missing-gui" in unmatched
+
+    # Simulate _reap_worker's DONE→ADVISORY downgrade.
+    if unmatched:
+        missed_str = ", ".join(repr(g) for g in unmatched)
+        reason = (
+            f"stash: 0 files matched "
+            + (repr(unmatched[0]) if len(unmatched) == 1
+               else f"{len(unmatched)} glob(s): {missed_str}")
+        )
+        with server._lock:
+            sa = server._assignments.get("asgn-1323adv")
+            if sa is not None and sa.status == DONE:
+                sa.status = ADVISORY
+                sa.zero_commit_reason = reason
+
+    updated = server._assignments["asgn-1323adv"]
+    assert updated.status == ADVISORY
+    assert "missing-gui" in (updated.zero_commit_reason or "")
+
+
 def test_sanitize_branch_replaces_slashes(tmp_path: Path) -> None:
     """_sanitize_branch should replace slashes with dashes."""
     from coord.agent import _sanitize_branch

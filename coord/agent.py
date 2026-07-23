@@ -963,6 +963,7 @@ def stash_artifacts_for_branch(
     state_dir: Path,
     assignment_id: str | None = None,
     log_path: str | None = None,
+    unmatched_out: "list[str] | None" = None,
 ) -> int:
     """Copy build artifacts from *worktree_path* into the persistent stash.
 
@@ -991,6 +992,12 @@ def stash_artifacts_for_branch(
     this run, a warning line is appended to *log_path* (#940) — a signal
     that ``artifact_paths`` for this repo is too broad.
 
+    #1323: when *unmatched_out* is a list, each pattern that resolved to zero
+    files on disk is appended to it.  The caller can use this to surface
+    per-glob misses even when the overall copy count is positive (i.e. some
+    patterns matched but at least one didn't).  When not provided the
+    per-pattern tracking is skipped.
+
     Returns the number of files copied (0 for a no-op).
     """
     if not patterns:
@@ -1011,6 +1018,9 @@ def stash_artifacts_for_branch(
         return 0
 
     copied = 0
+    # #1323: collect per-pattern misses (patterns whose glob returned 0 files)
+    # so we can report them individually even when other patterns matched.
+    _unmatched_patterns: list[str] = []
     # Collect every candidate path up-front so we can identify which canonical
     # names are present before deciding whether to skip hash-suffixed duplicates.
     candidates: list[Path] = []
@@ -1019,14 +1029,17 @@ def stash_artifacts_for_branch(
         # Python 3.12+ and can escape the worktree.  artifact_paths comes from
         # trusted config, but an explicit check is cheap insurance.
         if ".." in Path(pattern).parts:
+            _unmatched_patterns.append(pattern)
             continue
         try:
             matches = list(worktree_path.glob(pattern))
         except (ValueError, OSError):
+            _unmatched_patterns.append(pattern)
             continue
-        for src in matches:
-            if src.is_file():
-                candidates.append(src)
+        file_matches = [src for src in matches if src.is_file()]
+        if not file_matches:
+            _unmatched_patterns.append(pattern)
+        candidates.extend(file_matches)
 
     # Build the set of canonical file names: files whose stem does NOT look
     # like `<name>-<16 hex>`.  Used below to skip hash-stamped duplicates.
@@ -1149,6 +1162,13 @@ def stash_artifacts_for_branch(
             except OSError:
                 pass
 
+    # #1323: populate the caller-supplied list with patterns that matched
+    # 0 files.  When all patterns missed (copied == 0) the existing warning
+    # below is sufficient; when SOME matched but at least one didn't, the
+    # caller can surface the specific unmatched glob(s) separately.
+    if unmatched_out is not None:
+        unmatched_out.extend(_unmatched_patterns)
+
     # #1295: a 0-copy stash is loud regardless of whether a per-assignment
     # log_path is available.  Previously the warning only reached the
     # assignment log — an hourly sweep that stashed nothing and then
@@ -1167,6 +1187,21 @@ def stash_artifacts_for_branch(
             branch,
             assignment_id,
         )
+    elif _unmatched_patterns:
+        # #1323: partial miss — some globs matched but at least one didn't.
+        # Log at WARNING so it's visible in the daemon log even without a
+        # log_path.
+        _log.warning(
+            "stash: %d glob(s) matched 0 files in %s (repo=%s branch=%s "
+            "aid=%s): %r — check artifact_paths config and that the build "
+            "produced all expected outputs",
+            len(_unmatched_patterns),
+            worktree_path,
+            repo_name,
+            branch,
+            assignment_id,
+            _unmatched_patterns,
+        )
 
     if log_path:
         _append_log_line(
@@ -1182,6 +1217,17 @@ def stash_artifacts_for_branch(
                 f"# stash WARNING: 0 files matched {patterns!r} in "
                 f"{worktree_path} — check artifact_paths config and that "
                 "the build actually produced the expected outputs.\n",
+            )
+        elif _unmatched_patterns:
+            # #1323: partial miss — name the specific unmatched glob(s) so
+            # the operator can diagnose without guessing which pattern failed.
+            _missed_str = ", ".join(repr(p) for p in _unmatched_patterns)
+            _append_log_line(
+                log_path,
+                f"# stash WARNING: {len(_unmatched_patterns)} glob(s) "
+                f"matched 0 files in {worktree_path}: {_missed_str} — "
+                "check artifact_paths config and that the build produced "
+                "all expected outputs.\n",
             )
         try:
             total_bytes = sum(
@@ -1203,6 +1249,64 @@ def stash_artifacts_for_branch(
             )
 
     return copied
+
+
+def _run_pre_stash_build(
+    build_command: str,
+    worktree: Path,
+    log_path: str | None,
+) -> bool:
+    """Run *build_command* in *worktree* before artifact stash (#1323, fix #3).
+
+    Ensures the configured ``build_command`` from ``coordinator.yml`` is
+    executed so that build artifacts exist in the worktree regardless of which
+    feature flags the worker itself used during development.
+
+    The command is run via ``/bin/sh -c`` in *worktree* with a 10-minute
+    timeout.  stdout and stderr are captured and appended to *log_path* (if
+    set) so the operator can diagnose build failures.  Returns ``True`` on
+    exit code 0, ``False`` on any failure.  Never raises — this is best-effort
+    pre-stash housekeeping.
+    """
+    try:
+        result = subprocess.run(
+            ["/bin/sh", "-c", build_command],
+            cwd=str(worktree),
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        ok = result.returncode == 0
+        if log_path:
+            output = (result.stdout + result.stderr).strip()
+            _append_log_line(
+                log_path,
+                f"# pre-stash build: {build_command!r} "
+                f"(exit={result.returncode})"
+                + (f"\n{output}" if output else "")
+                + "\n",
+            )
+        if not ok:
+            _log.warning(
+                "pre-stash build command %r exited %d in %s",
+                build_command,
+                result.returncode,
+                worktree,
+            )
+        return ok
+    except Exception as exc:  # noqa: BLE001
+        if log_path:
+            _append_log_line(
+                log_path,
+                f"# pre-stash build: {build_command!r} FAILED ({exc})\n",
+            )
+        _log.warning(
+            "pre-stash build command %r failed in %s: %s",
+            build_command,
+            worktree,
+            exc,
+        )
+        return False
 
 
 def _parse_worktree_porcelain(output: str) -> list[dict[str, str]]:
@@ -2212,6 +2316,14 @@ class AgentServer:
         # #305: per-repo artifact glob patterns; repo_name → list of globs.
         # Populated from coordinator.yml Repo.artifact_paths at startup.
         artifact_paths: dict[str, list[str]] | None = None,
+        # #1323 (fix #3): per-repo pre-stash build command; repo_name → shell
+        # command string.  When set for a repo, the command is run via
+        # ``/bin/sh -c`` in the worktree BEFORE the artifact glob is evaluated,
+        # so the expected binary exists even when the worker only exercised a
+        # feature-gated subset of the build (e.g. TUI-only work on a repo that
+        # also ships a GUI binary).  Populated from coordinator.yml
+        # Repo.build_command at startup.
+        build_commands: dict[str, str] | None = None,
         # #425: opt-in provider registry.  Maps provider name → concrete
         # :class:`~coord.providers.base.Provider` instance.  Looked up by
         # :class:`AssignmentSpec.provider`.  When None (or empty), the
@@ -2227,6 +2339,7 @@ class AgentServer:
         self.repos = list(repos)
         self.repo_paths = dict(repo_paths or {})
         self.artifact_paths: dict[str, list[str]] = dict(artifact_paths or {})
+        self.build_commands: dict[str, str] = dict(build_commands or {})
         self.state_dir = Path(state_dir)
         self.log_dir = self.state_dir / "logs"
         self.state_path = self.state_dir / "agent_state.json"
@@ -2329,7 +2442,7 @@ class AgentServer:
         self._artifact_bytes_cache = (now, size)
         return size
 
-    def _stash_artifacts(self, assignment: AgentAssignment) -> None:
+    def _stash_artifacts(self, assignment: AgentAssignment) -> list[str]:
         """Copy build artifacts from a worktree into the persistent stash.
 
         Called immediately before worktree removal so the compiled outputs
@@ -2353,18 +2466,34 @@ class AgentServer:
         shrinks the *first* stash for a repo like quadraui, where a broad
         ``target/debug/examples/tui_*`` glob matched ~72 example binaries
         (issue-406/issue-411, 7.2 GB / 5.2 GB stashes).
+
+        #1323 (fix #3): when a ``build_command`` is configured for this repo,
+        it is run in the worktree BEFORE the artifact glob is evaluated so
+        the expected binary exists regardless of which feature flags the
+        worker itself used during development.
+
+        Returns a (possibly empty) list of glob patterns that matched 0 files
+        on disk so the caller can surface per-glob advisory messages (#1323).
         """
         if assignment.status != DONE:
-            return
+            return []
         if not assignment.worktree_path:
-            return
+            return []
         repo_name = assignment.spec.repo_name
         patterns = assignment.spec.artifact_paths or self.artifact_paths.get(repo_name, [])
         if not patterns:
-            return
+            return []
         branch = assignment.branch or assignment.spec.branch
         if not branch:
-            return
+            return []
+
+        wt_path = Path(assignment.worktree_path)
+
+        # #1323 fix #3: run build_command before globbing so the artifact
+        # exists even when the worker's own dev loop only built a subset.
+        build_cmd = self.build_commands.get(repo_name)
+        if build_cmd and wt_path.exists():
+            _run_pre_stash_build(build_cmd, wt_path, assignment.log_path)
 
         smoke_tests: list[str] | None = None
         if assignment.log_path:
@@ -2372,22 +2501,26 @@ class AgentServer:
 
             smoke_tests = parse_smoke_tests_from_log(assignment.log_path)
         patterns = narrow_artifact_paths(
-            patterns, smoke_tests, worktree=Path(assignment.worktree_path)
+            patterns, smoke_tests, worktree=wt_path
         )
 
+        unmatched: list[str] = []
         copied = stash_artifacts_for_branch(
-            worktree_path=Path(assignment.worktree_path),
+            worktree_path=wt_path,
             branch=branch,
             repo_name=repo_name,
             patterns=patterns,
             state_dir=self.state_dir,
             assignment_id=assignment.id,
             log_path=assignment.log_path,
+            unmatched_out=unmatched,
         )
 
         # Invalidate the artifact_bytes cache so health() picks up the new files.
         if copied > 0:
             self._artifact_bytes_cache = None
+
+        return unmatched
 
     def _stash_orphaned_worktree(self, entry: Path, assignment_id: str) -> None:
         """Best-effort stash for a worktree with no assignment record (#1295).
@@ -4291,8 +4424,37 @@ class AgentServer:
         # #305: stash artifacts BEFORE removing the worktree so the compiled
         # outputs survive cleanup.  Only runs for DONE assignments (workers
         # that exited cleanly) with configured artifact_paths for this repo.
+        # #1323: capture unmatched globs so we can emit a per-glob advisory.
+        _stash_unmatched: list[str] = []
         if assignment is not None:
-            self._stash_artifacts(assignment)
+            _stash_unmatched = self._stash_artifacts(assignment)
+
+        # #1323: if any artifact glob matched 0 files AND the assignment is
+        # still DONE (not already advisory for another reason), downgrade to
+        # ADVISORY with a reason that names the specific unmatched glob(s).
+        # This reuses the same zero-commit advisory mechanism: update the
+        # assignment under the lock, then re-persist so the status is durable.
+        if _stash_unmatched and assignment is not None:
+            _missed_str = ", ".join(repr(g) for g in _stash_unmatched)
+            _stash_advisory_reason = (
+                f"stash: 0 files matched "
+                + (repr(_stash_unmatched[0]) if len(_stash_unmatched) == 1
+                   else f"{len(_stash_unmatched)} glob(s): {_missed_str}")
+            )
+            with self._lock:
+                _sa = self._assignments.get(assignment_id)
+                if _sa is not None and _sa.status == DONE:
+                    _sa.status = ADVISORY
+                    _sa.zero_commit_reason = _stash_advisory_reason
+            self._persist()
+            try:
+                with open(assignment.log_path, "a") as _lf:
+                    _lf.write(
+                        f"# reap: advisory — {_stash_advisory_reason}; "
+                        "status set to advisory\n"
+                    )
+            except (OSError, AttributeError):
+                pass
 
         # Clean up worktree AFTER updating status
         if assignment is not None:
