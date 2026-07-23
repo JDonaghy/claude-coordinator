@@ -2781,74 +2781,52 @@ def test_reap_worker_advisory_on_stash_miss(tmp_path: Path) -> None:
     to nothing after the worker exits, the assignment status is downgraded from
     DONE to ADVISORY with a reason naming the unmatched glob(s) so the TUI and
     coord notify can surface the miss.
+
+    This drives the real `_reap` path via `assign()`/`wait_for()` (rather than
+    re-implementing the downgrade inline) so a regression in `_reap`'s actual
+    logic would be caught here.  The worker makes an empty commit so it clears
+    the *separate* zero-commit advisory check first — isolating this test to
+    the stash-miss path specifically.  `type` defaults to "work", which is in
+    `_ADVISORY_TYPES`, so the downgrade applies.
     """
-    from coord.agent import ADVISORY, DONE, AgentAssignment, AgentServer, AssignmentSpec
-
-    state_dir = tmp_path / "state"
-    state_dir.mkdir(parents=True, exist_ok=True)
-
-    wt_path = state_dir / "worktrees" / "asgn-1323adv"
-    wt_path.mkdir(parents=True, exist_ok=True)
-    # No binaries in the worktree — all globs will miss.
-
-    server = AgentServer(
-        machine_name="test",
-        repos=["myapp"],
-        state_dir=state_dir,
-        worker_command=lambda spec: ["/bin/sh", "-c", "echo ok"],
-        repo_paths={"myapp": str(tmp_path / "repo")},
-        artifact_paths={"myapp": ["target/debug/missing-gui"]},
+    repo = _init_repo(tmp_path / "repo")
+    server = _server(
+        tmp_path,
+        argv=["/bin/sh", "-c", "git commit --allow-empty -m onward >/dev/null; exit 0"],
+        repo_path=repo,
+        artifact_paths={"api": ["target/debug/missing-gui"]},
     )
 
-    log_path = state_dir / "logs" / "asgn-1323adv.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_path.write_text("")
+    a = server.assign(_spec(repo))
+    final = server.wait_for(a.id, timeout=10)
 
-    spec = AssignmentSpec(
-        repo_name="myapp",
-        repo_path=str(tmp_path / "repo"),
-        issue_number=1323,
-        issue_title="advisory stash miss",
-        briefing="b",
-        branch="main",
+    assert final.status == ADVISORY
+    assert "missing-gui" in (final.zero_commit_reason or "")
+    server.shutdown()
+
+
+def test_reap_review_type_not_downgraded_on_stash_miss(tmp_path: Path) -> None:
+    """A type="review" assignment must NOT be downgraded on a stash-glob miss (#1323 review finding #1).
+
+    review/smoke/test/merge/conflict-fix assignments routinely finish DONE
+    without (re)producing every configured artifact_paths glob (e.g. a review
+    session that never runs a full build).  Only "work" assignments (in
+    _ADVISORY_TYPES) should be downgraded to ADVISORY on a stash miss.
+    """
+    repo = _init_repo(tmp_path / "repo")
+    server = _server(
+        tmp_path,
+        argv=["/bin/sh", "-c", "exit 0"],
+        repo_path=repo,
+        artifact_paths={"api": ["target/debug/missing-gui"]},
     )
-    a = AgentAssignment(
-        id="asgn-1323adv",
-        spec=spec,
-        status=DONE,
-        branch="issue-1323-adv",
-    )
-    a.worktree_path = str(wt_path)
-    a.log_path = str(log_path)
 
-    # Register the assignment so the lock-based status update can find it.
-    with server._lock:
-        server._assignments["asgn-1323adv"] = a
+    a = server.assign(_spec(repo, type="review"))
+    final = server.wait_for(a.id, timeout=10)
 
-    unmatched = server._stash_artifacts(a)
-
-    # _stash_artifacts now returns the unmatched list; the caller (_reap_worker)
-    # would downgrade to ADVISORY.  Here we call the helper directly and
-    # check the unmatched list, then simulate the _reap_worker status update.
-    assert "target/debug/missing-gui" in unmatched
-
-    # Simulate _reap_worker's DONE→ADVISORY downgrade.
-    if unmatched:
-        missed_str = ", ".join(repr(g) for g in unmatched)
-        reason = (
-            f"stash: 0 files matched "
-            + (repr(unmatched[0]) if len(unmatched) == 1
-               else f"{len(unmatched)} glob(s): {missed_str}")
-        )
-        with server._lock:
-            sa = server._assignments.get("asgn-1323adv")
-            if sa is not None and sa.status == DONE:
-                sa.status = ADVISORY
-                sa.zero_commit_reason = reason
-
-    updated = server._assignments["asgn-1323adv"]
-    assert updated.status == ADVISORY
-    assert "missing-gui" in (updated.zero_commit_reason or "")
+    assert final.status == DONE
+    assert final.zero_commit_reason is None
+    server.shutdown()
 
 
 def test_sanitize_branch_replaces_slashes(tmp_path: Path) -> None:
