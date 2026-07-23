@@ -566,7 +566,12 @@ def _merge_via_daemon(svc, params: dict) -> None:
 @click.option(
     "--force-merge",
     is_flag=True,
-    help="Skip the CI check gate — merge even if checks failed or are still running.",
+    help=(
+        "Skip the CI check gate — merge even if checks failed or are still running. "
+        "Also overrides the #1318 epic-closing-keyword guard: merge anyway even "
+        "when a commit message on the branch contains a closing keyword targeting "
+        "an epic (the epic WILL auto-close on GitHub)."
+    ),
 )
 
 

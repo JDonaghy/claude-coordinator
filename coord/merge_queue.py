@@ -474,6 +474,14 @@ class GhOps(Protocol):
         """True when *issue_number* has an open child (#1196)."""
         ...
 
+    def is_epic_issue(self, repo: str, issue_number: int) -> bool:
+        """True when *issue_number* carries the tracking/epic label (#1318)."""
+        ...
+
+    def get_pr_commit_messages(self, repo: str, number: int) -> list[str]:
+        """Return every commit message on PR *number* (#1318, epic guard)."""
+        ...
+
     def get_branch_sha(self, repo: str, branch: str) -> str | None:
         """Return the current HEAD SHA for *branch*, or None on failure.
 
@@ -1292,6 +1300,19 @@ def process(
     Dry-run applies both the review and smoke gates so output reflects what
     a real run would do.  CI cannot be checked without a real PR number.
 
+    #1318: before each merge, both the PR body (#1196) and every commit
+    message on the branch are scanned for a GitHub closing keyword
+    (``Closes``/``Fixes``/``Resolves #N``) targeting an epic-labelled issue
+    — free-text prose in a commit message (even a quote explaining the bug)
+    is enough for GitHub's own scanner to auto-close it once the commit
+    lands on the base branch, and no PR-body edit can undo that. A body hit
+    is downgraded to ``Refs #N`` in place, same as #1196. A commit-message
+    hit can't be rewritten here (no local git checkout in this ``gh``-only
+    wire layer) so it **blocks** the merge (``epic_closing_keyword_in_commit``
+    event) unless ``force_merge=True``, in which case the merge proceeds but
+    an ``epic_closing_keyword_in_commit_forced`` warning event is still
+    emitted — the override is never silent.
+
     Mutates `items` in place; the caller saves the queue after.
     """
     events: list[MergeEvent] = []
@@ -1463,13 +1484,31 @@ def process(
                     entry.error = msg
                     events.append(MergeEvent(entry, "checks_pending", msg))
                     continue  # #292: skip, don't halt the group
-            # #1196 hole 2: GitHub's own closing-keyword magic reads the PR
-            # body directly at merge time and never calls
+            # #1318: cache is_epic_issue lookups for this entry — the same
+            # referenced number can show up in both the PR body and one or
+            # more commit messages below, and each lookup is a `gh` round
+            # trip. Best-effort like every check in this block: a lookup
+            # failure just means "not known to be an epic", never a block.
+            _epic_cache: dict[int, bool] = {}
+
+            def _is_epic(n: int) -> bool:
+                if n not in _epic_cache:
+                    try:
+                        _epic_cache[n] = gh_ops.is_epic_issue(entry.repo_github, n)
+                    except Exception:  # noqa: BLE001
+                        _epic_cache[n] = False
+                return _epic_cache[n]
+
+            # #1196 hole 2 / #1318: GitHub's own closing-keyword magic reads
+            # the PR body directly at merge time and never calls
             # `github_ops.close_issue` — that chokepoint's open-children
             # guard can't stop it. Scan the body for `Closes #N`/`Fixes
             # #N`/`Resolves #N` and downgrade to `Refs #N` for any N that
-            # currently has open children, before the merge lands. Best
-            # effort throughout: a lint failure must never block a merge.
+            # either currently has open children (#1196) or carries the
+            # epic/tracking label (#1318 — an epic can have zero open
+            # children today and still be the wrong thing to auto-close),
+            # before the merge lands. Best effort throughout: a lint
+            # failure must never block a merge.
             try:
                 pr_body = gh_ops.get_pr_body(entry.repo_github, entry.pr_number)
             except Exception:  # noqa: BLE001
@@ -1482,7 +1521,9 @@ def process(
                         if gh_ops.has_open_children(entry.repo_github, n):
                             blocking.add(n)
                     except Exception:  # noqa: BLE001
-                        continue
+                        pass
+                    if _is_epic(n):
+                        blocking.add(n)
                 if blocking:
                     new_body, downgraded = downgrade_closing_keywords(pr_body, blocking)
                     if downgraded:
@@ -1492,7 +1533,7 @@ def process(
                                 entry, "pr_body_downgraded",
                                 "downgraded closing keyword to Refs for "
                                 + ", ".join(f"#{n}" for n in downgraded)
-                                + " (open children — #1196)",
+                                + " (open children / epic — #1196/#1318)",
                             ))
                         except Exception as e:  # noqa: BLE001
                             events.append(MergeEvent(
@@ -1500,6 +1541,51 @@ def process(
                                 f"could not downgrade PR #{entry.pr_number} body "
                                 f"for {', '.join(f'#{n}' for n in downgraded)}: {e}",
                             ))
+
+            # #1318: the PR-body scan above can't help with commit messages
+            # — GitHub's closing-keyword scanner reads those too once they
+            # land on the base branch (every original commit, unchanged, for
+            # `--rebase`/`--merge`; and depending on repo settings, squash's
+            # default commit body can pull the same text). There's no local
+            # git checkout in this `gh`-only wire layer to amend and
+            # force-push a rewritten message, so a hit here **blocks** the
+            # merge rather than silently rewriting history. `force_merge`
+            # overrides (same flag `--force-merge` already uses to skip the
+            # CI gate) but the override is never silent — a warning event
+            # still fires so it shows up in `coord merge` output and the
+            # audit trail.
+            try:
+                commit_messages = gh_ops.get_pr_commit_messages(
+                    entry.repo_github, entry.pr_number
+                )
+            except Exception:  # noqa: BLE001
+                commit_messages = []
+            commit_referenced: set[int] = set()
+            for message in commit_messages:
+                commit_referenced.update(find_closing_references(message))
+            commit_epic_hits = sorted(n for n in commit_referenced if _is_epic(n))
+            if commit_epic_hits:
+                numbers_str = ", ".join(f"#{n}" for n in commit_epic_hits)
+                msg = (
+                    f"a commit message on this branch contains a closing keyword "
+                    f"(Closes/Fixes/Resolves) for {numbers_str}, which carries the "
+                    f"'epic' label — GitHub auto-closes it on merge regardless of "
+                    f"the PR body (#1318). Reword the commit message(s) to "
+                    f"'refs #N' / 'epic #N' and push, or pass --force-merge to "
+                    f"merge anyway (the epic WILL still auto-close)."
+                )
+                if force_merge:
+                    events.append(MergeEvent(
+                        entry, "epic_closing_keyword_in_commit_forced", msg,
+                    ))
+                else:
+                    entry.error = msg
+                    events.append(MergeEvent(
+                        entry, "epic_closing_keyword_in_commit", msg,
+                    ))
+                    continue  # #1318: refuse — never merge a branch that will
+                    # auto-close an epic via a commit message we can't rewrite.
+
             entry.last_attempt = time.time()
             entry.state = MERGING
             ok, msg = gh_ops.merge_pr(entry.repo_github, entry.pr_number, method=method)
