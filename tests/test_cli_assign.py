@@ -584,6 +584,55 @@ class TestAssignInteractiveReview:
         ]
         assert review_rows == [], "dry-run must not persist a review assignment"
 
+    def test_review_of_briefing_verdict_block_is_primary_channel(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """#651: the interactive review briefing used to tell the reviewer to
+        report via `coord report-result` *instead of* the REVIEW_VERDICT /
+        END_REVIEW block the briefing's tail describes — two conflicting
+        instructions for the same handoff.  The block must now be framed as
+        the required, PATH-independent primary channel (it's what the #606
+        transcript-floor recovery scans for), with `coord report-result`
+        described as an optional fast path on top of it — never a
+        substitute."""
+        from unittest.mock import MagicMock
+
+        _seed_done_work("work-abc", "issue-1-fix-bug")
+        captured: list[str] = []
+
+        def _fake_local(argv, briefing, **kw):
+            captured.append(briefing or "")
+            return 0
+
+        fake_result = MagicMock(already_recorded=True, terminal_status="report-result")
+        with patch("coord.github_ops.get_issue",
+                   return_value={"title": "Fix bug", "body": "the body"}), \
+             patch("socket.gethostname", return_value="laptop"), \
+             patch("coord.interactive.launch_human_attended_interactive", _fake_local), \
+             patch("coord.interactive._launch_via_tmux"), \
+             patch("coord.interactive.tmux_available", return_value=False), \
+             patch("coord.interactive.tmux_session_alive", return_value=False), \
+             patch("coord.interactive.finalize_interactive_exit", return_value=fake_result):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "1", "--config", str(config_file),
+                 "--interactive", "--review-of", "work-abc"],
+            )
+        assert result.exit_code == 0, result.output
+        assert len(captured) == 1
+        brief = captured[0]
+        # The block is present and described as required, not optional.
+        assert "REVIEW_VERDICT: / REVIEW_BODY: / END_REVIEW" in brief
+        assert "REQUIRED" in brief
+        # report-result is offered, but explicitly framed as a shortcut, not
+        # a replacement for the block.
+        assert "coord report-result" in brief
+        assert "OPTIONALLY" in brief
+        assert "NOT a substitute for step 1" in brief
+        # The old conflicting phrasing telling the reviewer to use
+        # report-result INSTEAD OF the block must be gone.
+        assert "not the" not in brief
+
     def test_review_of_remote_dry_run_builds_remote_dispatch(
         self, config_file: Path, coord_dir: Path
     ) -> None:
