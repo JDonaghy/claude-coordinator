@@ -1149,26 +1149,20 @@ def _work_has_approved_review_a(a, board) -> bool:
 
     Mirrors :func:`has_approved_review` but accepts a raw Assignment rather
     than a QueuedMerge entry, since staging items are not yet in the queue.
-    Handles bounce/fix chains: any work assignment on the same branch counts.
+    Delegates to the shared :func:`_chain_work_ids` fixed-point expansion
+    (#567 follow-up) rather than a standalone branch-only expansion: any work
+    assignment on the same branch, or connected via the
+    ``review_of_assignment_id`` chain — which also catches fix workers
+    dispatched with ``branch=NULL`` (the #557 gap) — counts. ``_chain_work_ids``
+    is duck-typed on ``.assignment_id``/``.branch``, both present on a raw
+    ``Assignment``, so it accepts *a* directly.
     """
     pool = (
         list(getattr(board, "completed", []) or [])
         + list(getattr(board, "active", []) or [])
     )
-    aid = getattr(a, "assignment_id", None)
-    branch = getattr(a, "branch", None)
 
-    # Seed with the entry's own id, then expand to any work assignment sharing
-    # the branch (e.g. a fix worker dispatched after a review bounce).
-    branch_work_ids: set[str] = set()
-    if aid:
-        branch_work_ids.add(aid)
-    for x in pool:
-        if getattr(x, "type", None) not in WORK_LIKE_TYPES:
-            continue
-        x_aid = getattr(x, "assignment_id", None)
-        if x_aid and branch and getattr(x, "branch", None) == branch:
-            branch_work_ids.add(x_aid)
+    branch_work_ids = _chain_work_ids(a, pool)
 
     if not branch_work_ids:
         return False

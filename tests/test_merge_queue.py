@@ -3156,6 +3156,29 @@ class TestStagingItems:
         items = mq.staging_items(board, cfg)
         assert items == []
 
+    # ── #567 follow-up: fix worker with branch=NULL must still be found ────
+
+    def test_ready_when_fix_worker_approved_with_null_branch(self, coord_db) -> None:
+        """#567 follow-up: `_work_has_approved_review_a` (used by
+        staging_items, the /board staging section) must recognize an approved
+        review on a fix worker dispatched with branch=NULL (the #557 gap) via
+        the review_of_assignment_id chain — not just branch-keyed siblings.
+        Mirrors the has_approved_review fix, now sharing `_chain_work_ids`."""
+        orig_work = self._work("orig", branch="worker/orig")
+        fix_work = Assignment(
+            machine_name="m1", repo_name="api", issue_number=42,
+            issue_title="[fix-1] t", assignment_id="fix1", type="work",
+            status="done", branch=None, review_of_assignment_id="orig",
+        )
+        re_review = self._review("fix1", verdict="approve")
+        orig_review = self._review("orig", verdict="request-changes")
+        board = self._board(completed=[orig_work, orig_review, fix_work, re_review])
+        cfg = self._config()
+        items = mq.staging_items(board, cfg)
+        assert len(items) == 1
+        assert items[0].assignment_id == "orig"
+        assert items[0].status == mq.STAGING_READY
+
     # ── exclusion: already in queue ───────────────────────────────────────
 
     def test_excluded_when_already_queued(self, coord_db) -> None:
