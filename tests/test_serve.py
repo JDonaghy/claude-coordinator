@@ -438,7 +438,7 @@ def test_serve_board_picks_up_config_hand_edit(
 
     seen_configs = []
 
-    def _spy_plan(board, config, ci_store=None):  # noqa: ANN001, ARG001
+    def _spy_plan(board, config, ci_store=None, gh_ops=None):  # noqa: ANN001, ARG001
         seen_configs.append(config)
         return []
 
