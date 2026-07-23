@@ -236,6 +236,12 @@ class FakeGh:
     pr_bodies: dict[int, str] = field(default_factory=dict)
     open_children: set[int] = field(default_factory=set)
     edit_body_calls: list[tuple[str, int, str]] = field(default_factory=list)
+    # #1318: PR number -> commit messages on that PR; issue number -> whether
+    # it carries the epic/tracking label. Defaults keep every prior test
+    # (none of which set these) inert — get_pr_commit_messages returns []
+    # and is_epic_issue returns False, matching pre-#1318 behavior.
+    pr_commit_messages: dict[int, list[str]] = field(default_factory=dict)
+    epic_issues: set[int] = field(default_factory=set)
 
     def create_pr(self, repo: str, *, base: str, head: str, title: str, body: str) -> dict:
         self.create_calls.append((repo, {"base": base, "head": head, "title": title}))
@@ -270,6 +276,12 @@ class FakeGh:
 
     def has_open_children(self, repo: str, issue_number: int) -> bool:
         return issue_number in self.open_children
+
+    def is_epic_issue(self, repo: str, issue_number: int) -> bool:
+        return issue_number in self.epic_issues
+
+    def get_pr_commit_messages(self, repo: str, number: int) -> list[str]:
+        return self.pr_commit_messages.get(number, [])
 
 
 class TestProcess:
@@ -441,6 +453,85 @@ class TestProcess:
         process(items, gh)
         assert items[0].state == MERGED
 
+    # ── #1318: pre-merge epic-closing-keyword guard (commit messages) ─────
+
+    def test_epic_closing_keyword_in_commit_blocks_merge(self) -> None:
+        # The #1314 incident: the PR body carries no closing keyword at all,
+        # but a commit message on the branch does — GitHub's own scanner
+        # reads commit messages verbatim once they land on the base branch,
+        # so this must block the merge, not just lint the PR body.
+        items = [_q("a", pr=100, size=10)]
+        gh = FakeGh(
+            pr_commit_messages={100: [
+                "fix(#1314): harden downstream breakages\n\n"
+                "...its body carry \"Closes #1120\", which GitHub's native..."
+            ]},
+            epic_issues={1120},
+        )
+        events = process(items, gh)
+        assert items[0].state == PENDING  # never merged
+        assert gh.merge_calls == []
+        blocked = [e for e in events if e.kind == "epic_closing_keyword_in_commit"]
+        assert blocked and "#1120" in blocked[0].message
+        assert items[0].error is not None and "#1120" in items[0].error
+
+    def test_ordinary_closing_keyword_in_commit_passes_through(self) -> None:
+        # Acceptance criterion from #1318: an ordinary `Closes #<non-epic>`
+        # in a commit message must merge untouched — no epic label, no block.
+        items = [_q("a", pr=100, size=10)]
+        gh = FakeGh(
+            pr_commit_messages={100: ["fix(#55): a normal bug fix\n\nCloses #55"]},
+            epic_issues=set(),
+        )
+        events = process(items, gh)
+        assert items[0].state == MERGED
+        assert not [e for e in events if "epic_closing_keyword" in e.kind]
+
+    def test_force_merge_overrides_but_still_warns(self) -> None:
+        # The override must never be silent — a warning event still fires
+        # even though the merge proceeds.
+        items = [_q("a", pr=100, size=10)]
+        gh = FakeGh(
+            pr_commit_messages={100: ["Closes #1120"]},
+            epic_issues={1120},
+        )
+        events = process(items, gh, force_merge=True)
+        assert items[0].state == MERGED
+        forced = [
+            e for e in events if e.kind == "epic_closing_keyword_in_commit_forced"
+        ]
+        assert forced and "#1120" in forced[0].message
+
+    def test_commit_message_lint_failure_never_blocks_the_merge(self) -> None:
+        # Best-effort: a get_pr_commit_messages/is_epic_issue failure must
+        # not itself prevent a merge.
+        class _BoomOnCommits(FakeGh):
+            def get_pr_commit_messages(self, repo: str, number: int) -> list[str]:
+                raise RuntimeError("gh pr view --json commits failed")
+
+        items = [_q("a", pr=100, size=10)]
+        gh = _BoomOnCommits()
+        process(items, gh)
+        assert items[0].state == MERGED
+
+    def test_pr_body_downgraded_for_epic_label_with_no_open_children(self) -> None:
+        # #1318 widens the existing #1196 body downgrade: a fresh epic with
+        # zero open children yet must still be protected, not just an epic
+        # that already has open sub-issues.
+        items = [_q("a", pr=100, size=10)]
+        gh = FakeGh(
+            pr_bodies={100: "Closes #1120\n\nWorker-authored PR."},
+            open_children=set(),
+            epic_issues={1120},
+        )
+        events = process(items, gh)
+        assert items[0].state == MERGED
+        assert gh.edit_body_calls == [
+            ("acme/api", 100, "Refs #1120\n\nWorker-authored PR.")
+        ]
+        downgraded = [e for e in events if e.kind == "pr_body_downgraded"]
+        assert downgraded and "#1120" in downgraded[0].message
+
 
 class TestProcessRealGithubOpsChokepoint:
     """#1196 acceptance criterion: 'Dispatching type="work" against an epic
@@ -505,6 +596,115 @@ class TestProcessRealGithubOpsChokepoint:
         # Hole 2: the PR body's own `Closes #1041` was downgraded pre-merge.
         downgrade_events = [e for e in events if e.kind == "pr_body_downgraded"]
         assert downgrade_events and "#1041" in downgrade_events[0].message
+
+    def test_commit_message_closes_epic_blocks_merge(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """#1318 acceptance criterion: a branch commit message containing
+        `Closes #<epic>` is caught even though the PR body itself is clean
+        — the #1196 body-lint alone can't see this (the actual #1314/#1120
+        incident: the closing keyword sat in the *commit message*'s
+        explanatory prose, not the PR body)."""
+        from coord import github_ops as real_gh_ops
+
+        epic_json = json.dumps({
+            "number": 1120, "title": "Epic", "state": "open", "milestone": None,
+            "labels": [{"name": "epic"}], "body": "",
+        })
+        calls: list[tuple[str, ...]] = []
+
+        def fake_gh(*args: str) -> str:
+            calls.append(args)
+            if args[:2] == ("pr", "list"):
+                return "[]"
+            if args[:2] == ("pr", "create"):
+                return "https://github.com/acme/api/pull/500"
+            if args[:2] == ("pr", "view"):
+                if args[-1] == "commits":
+                    return json.dumps({"commits": [{
+                        "messageHeadline": 'fix(#1314): harden downstream breakages',
+                        "messageBody": (
+                            "...its body carry \"Closes #1120\", which "
+                            "GitHub's native closing-keyword auto-close "
+                            "used to close the epic..."
+                        ),
+                    }]})
+                return json.dumps({"body": "Automated merge from the coordinator."})
+            if args[:2] == ("issue", "view"):
+                return epic_json
+            raise AssertionError(f"unexpected gh call: {args}")
+
+        monkeypatch.setattr(real_gh_ops, "_gh", fake_gh)
+
+        def _boom_subprocess(*a, **k):
+            raise AssertionError(
+                "must never reach a real `gh` subprocess call — the merge "
+                "is refused before `gh pr merge`/`gh issue close`"
+            )
+
+        monkeypatch.setattr(real_gh_ops.subprocess, "run", _boom_subprocess)
+
+        entry = _q("w1", repo="api", repo_github="acme/api", target="main", size=10)
+        entry.issue_number = 200  # ordinary work issue; the epic only appears in the commit prose
+
+        events = process([entry], real_gh_ops)
+
+        assert entry.state == PENDING  # refused, never merged
+        assert not any(a[:2] == ("pr", "merge") for a in calls)
+        blocked = [e for e in events if e.kind == "epic_closing_keyword_in_commit"]
+        assert blocked and "#1120" in blocked[0].message
+
+    def test_commit_message_closes_ordinary_issue_merges_through(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Counterpart acceptance criterion from #1318: an ordinary `Closes
+        #<non-epic>` in a commit message merges through untouched — the
+        guard only fires for epic-labelled targets."""
+        from coord import github_ops as real_gh_ops
+
+        ordinary_json = json.dumps({
+            "number": 55, "title": "Bug", "state": "open", "milestone": None,
+            "labels": [], "body": "",
+        })
+
+        def fake_gh(*args: str) -> str:
+            if args[:2] == ("pr", "list"):
+                return "[]"
+            if args[:2] == ("pr", "create"):
+                return "https://github.com/acme/api/pull/500"
+            if args[:2] == ("pr", "view"):
+                if args[-1] == "commits":
+                    return json.dumps({"commits": [{
+                        "messageHeadline": "fix(#55): a normal bug fix",
+                        "messageBody": "Closes #55",
+                    }]})
+                return json.dumps({"body": "Automated merge from the coordinator."})
+            if args[:2] == ("issue", "view"):
+                return ordinary_json
+            if args[:2] == ("pr", "merge"):
+                return "merged"
+            raise AssertionError(f"unexpected gh call: {args}")
+
+        monkeypatch.setattr(real_gh_ops, "_gh", fake_gh)
+
+        class _FakeCompleted:
+            returncode = 0
+            stderr = ""
+
+        def _fake_run(cmd, **kwargs):
+            # `gh issue close` (#806's deterministic close path) shells out
+            # via subprocess.run directly, not `_gh`.
+            return _FakeCompleted()
+
+        monkeypatch.setattr(real_gh_ops.subprocess, "run", _fake_run)
+
+        entry = _q("w2", repo="api", repo_github="acme/api", target="main", size=10)
+        entry.issue_number = 55
+
+        events = process([entry], real_gh_ops)
+
+        assert entry.state == MERGED
+        assert not [e for e in events if "epic_closing_keyword" in e.kind]
 
 
 class TestReviewGate:

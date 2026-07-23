@@ -355,6 +355,30 @@ def has_open_children(repo: str, issue_number: int) -> bool:
     return bool(get_open_children(repo, issue_number))
 
 
+def is_epic_issue(repo: str, issue_number: int) -> bool:
+    """True when *issue_number* carries the tracking/epic label (#1318).
+
+    Same label :data:`coord.milestone_order.TRACKING_ISSUE_LABEL` that
+    ``dispatch.enforce_epic_dispatch_guard`` (#1314) and
+    ``plan_followup.pr()`` (#1077/#1314) already check at dispatch/PR-create
+    time. This is the merge-time counterpart used by the pre-merge
+    epic-closing-keyword guard: a closing keyword anywhere in a PR body or
+    commit message that targets an epic must never be allowed to auto-close
+    it on merge.
+
+    Fail-open: any ``gh`` error returns ``False`` — a transient read failure
+    must not itself block a merge; the caller still has its other gates.
+    """
+    from coord.milestone_order import TRACKING_ISSUE_LABEL  # noqa: PLC0415
+
+    try:
+        issue_data = get_issue(repo, issue_number)
+    except RuntimeError:
+        return False
+    labels = {lbl.get("name", "") for lbl in (issue_data.get("labels") or [])}
+    return TRACKING_ISSUE_LABEL in labels
+
+
 def close_issue(
     repo: str, issue_number: int, *, comment: str | None = None, force: bool = False,
 ) -> None:
@@ -407,6 +431,35 @@ def get_pr_body(repo: str, number: int) -> str:
 def edit_pr_body(repo: str, number: int, body: str) -> None:
     """Overwrite PR *number*'s body text via ``gh pr edit --body``."""
     _gh("pr", "edit", str(number), "--repo", repo, "--body", body)
+
+
+def get_pr_commit_messages(repo: str, number: int) -> list[str]:
+    """Return the full commit message (headline + body) of every commit on
+    PR *number*, in commit order (#1318).
+
+    GitHub's closing-keyword scanner reads commit messages verbatim once
+    they land on the base branch — for ``--rebase``/``--merge`` methods
+    that's every original commit, unchanged, so a keyword buried in
+    commit-message prose (e.g. explaining a bug fixed elsewhere, in a
+    quote) can auto-close an issue on merge exactly like a PR-body keyword
+    (#1196) does, and no PR-body edit can neutralize it. Best-effort:
+    returns ``[]`` on any ``gh`` failure or malformed response, same
+    fail-open posture as :func:`get_pr_body`.
+    """
+    try:
+        raw = _gh("pr", "view", str(number), "--repo", repo, "--json", "commits")
+    except RuntimeError:
+        return []
+    try:
+        commits = json.loads(raw).get("commits") or []
+    except (json.JSONDecodeError, AttributeError):
+        return []
+    messages: list[str] = []
+    for c in commits:
+        headline = (c.get("messageHeadline") or "").strip()
+        body = (c.get("messageBody") or "").strip()
+        messages.append(f"{headline}\n\n{body}" if body else headline)
+    return messages
 
 
 def issue_is_closed(repo: str, issue_number: int) -> bool:

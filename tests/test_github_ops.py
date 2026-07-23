@@ -456,6 +456,63 @@ class TestPrBodyWrappers:
         assert calls == [("pr", "edit", "5", "--repo", "acme/api", "--body", "Refs #99")]
 
 
+# ── Pre-merge epic-closing-keyword guard (#1318) ────────────────────────────
+
+_EPIC_ISSUE = json.dumps({
+    "number": 1120, "title": "Epic", "state": "open", "milestone": None,
+    "labels": [{"name": "epic"}], "body": "",
+})
+
+
+class TestIsEpicIssue:
+    def test_true_for_epic_labelled_issue(self) -> None:
+        with patch("coord.github_ops._gh", return_value=_EPIC_ISSUE):
+            assert github_ops.is_epic_issue("acme/api", 1120) is True
+
+    def test_false_for_regular_issue(self) -> None:
+        with patch("coord.github_ops._gh", return_value=_REGULAR_ISSUE):
+            assert github_ops.is_epic_issue("acme/api", 42) is False
+
+    def test_fails_open_on_gh_error(self) -> None:
+        with patch("coord.github_ops._gh", side_effect=RuntimeError("gh boom")):
+            assert github_ops.is_epic_issue("acme/api", 1120) is False
+
+
+class TestGetPrCommitMessages:
+    def test_joins_headline_and_body(self) -> None:
+        raw = json.dumps({"commits": [
+            {"messageHeadline": "fix(#55): a bug", "messageBody": "Closes #55"},
+        ]})
+        with patch("coord.github_ops._gh", return_value=raw):
+            messages = github_ops.get_pr_commit_messages("acme/api", 5)
+        assert messages == ["fix(#55): a bug\n\nCloses #55"]
+
+    def test_headline_only_when_body_empty(self) -> None:
+        raw = json.dumps({"commits": [
+            {"messageHeadline": "fix(#55): a bug", "messageBody": ""},
+        ]})
+        with patch("coord.github_ops._gh", return_value=raw):
+            messages = github_ops.get_pr_commit_messages("acme/api", 5)
+        assert messages == ["fix(#55): a bug"]
+
+    def test_multiple_commits_preserve_order(self) -> None:
+        raw = json.dumps({"commits": [
+            {"messageHeadline": "first", "messageBody": ""},
+            {"messageHeadline": "second", "messageBody": "detail"},
+        ]})
+        with patch("coord.github_ops._gh", return_value=raw):
+            messages = github_ops.get_pr_commit_messages("acme/api", 5)
+        assert messages == ["first", "second\n\ndetail"]
+
+    def test_missing_commits_field_returns_empty(self) -> None:
+        with patch("coord.github_ops._gh", return_value=json.dumps({"body": "x"})):
+            assert github_ops.get_pr_commit_messages("acme/api", 5) == []
+
+    def test_fails_open_on_gh_error(self) -> None:
+        with patch("coord.github_ops._gh", side_effect=RuntimeError("gh boom")):
+            assert github_ops.get_pr_commit_messages("acme/api", 5) == []
+
+
 # ── Fix A + B: change_issue_labels auto-create and typed errors ──────────────
 
 _CURRENT_LABELS_JSON = json.dumps({"labels": [{"name": "existing"}]})
