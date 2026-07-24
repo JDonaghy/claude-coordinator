@@ -1278,6 +1278,8 @@ mod pure_tests {
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 0,

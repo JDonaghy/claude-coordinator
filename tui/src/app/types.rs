@@ -278,6 +278,17 @@ pub struct Assignment {
     /// plain serde deserialization works.
     #[serde(default)]
     pub(crate) review_findings: Option<String>,
+    /// #1337: true when the daemon bounded `review_findings` on the /board
+    /// wire (the collection carries a preview; the full body lives on
+    /// `GET /assignment/{id}`).  Absent (→ false) on pre-#1337 daemons and
+    /// on the local-SQLite path, both of which carry the full text.
+    #[serde(default)]
+    pub(crate) review_findings_truncated: bool,
+    /// #1337: full stored length of `review_findings` when truncated —
+    /// combined with the assignment id as the detail-fetch cache key, so a
+    /// force-overwritten review (different length) re-fetches.
+    #[serde(default)]
+    pub(crate) review_findings_len: Option<i64>,
     /// #349 Phase B: AI-generated smoke-test plan for type="work" assignments.
     /// Parsed from the JSON blob in `assignments.test_plan`.  `None` = not
     /// yet generated (TUI will spawn `coord test-plan` to fill it in).

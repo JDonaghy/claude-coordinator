@@ -257,6 +257,16 @@ pub(crate) struct ArtifactCacheEntry {
     pub(crate) absence_reason: Option<ArtifactAbsence>,
 }
 
+/// #1337: one hydrated (or failed) full-findings detail fetch — see
+/// `CoordApp::findings_detail_cache`.
+pub(crate) struct FindingsDetailEntry {
+    pub(crate) fetched_at: Instant,
+    /// `Some(raw)` = the full `review_findings` JSON string from
+    /// `GET /assignment/{id}`.  `None` = the fetch failed; re-armed after a
+    /// 30 s back-off so a down daemon isn't hammered every tick.
+    pub(crate) full: Option<String>,
+}
+
 /// #336: Sanitize a git branch name for use as a URL path component.
 ///
 /// Mirrors Python's `coord.agent._sanitize_branch`: replaces runs of
@@ -1146,6 +1156,11 @@ pub(crate) fn load_data() -> BoardData {
                 // #546: is_interactive distinguishes Max-subscription sessions from
                 // old automated rows that also have cost_usd=NULL + zero tokens.
                 is_interactive: row.get::<_, i64>(24)? != 0,
+                // #1337: the local-SQLite path reads the DB directly — the
+                // wire-bounding policy applies only to the daemon's /board
+                // payload, so findings here are always complete.
+                review_findings_truncated: false,
+                review_findings_len: None,
                 // #618: short launch-failure reason; NULL for successful launches.
                 // unwrap_or(None) absorbs a row.get() type-conversion error (e.g.
                 // unexpected NULL type); a missing column causes conn.prepare() to
@@ -1896,6 +1911,51 @@ pub(crate) fn parse_pipeline_meta_from_map(
     )
 }
 
+/// #1336: last-known `/board` `(ETag, raw body)` for conditional GETs — see
+/// `load_data_remote`.  Process-wide (one daemon per TUI process); guarded by
+/// a Mutex because refresh ticks run on short-lived background threads.
+static BOARD_ETAG_CACHE: std::sync::Mutex<Option<(String, String)>> =
+    std::sync::Mutex::new(None);
+
+/// #1337: fetch one assignment's FULL `review_findings` raw JSON string from
+/// the daemon's single-assignment detail endpoint (`GET /assignment/{id}`).
+/// The `/board` collection wire carries only a bounded preview
+/// (`review_findings_truncated`); the Review stage pane hydrates the full
+/// body through this.  Thread-per-request + channel, mirroring
+/// [`spawn_artifact_fetch`].  Sends `None` on any HTTP/parse failure (the
+/// pane keeps showing the preview).
+pub(crate) fn spawn_findings_detail_fetch(
+    base_url: String,
+    token: Option<String>,
+    assignment_id: String,
+) -> std::sync::mpsc::Receiver<Option<String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(3))
+            .timeout(std::time::Duration::from_secs(5))
+            .build();
+        let mut req = agent.get(&format!("{base_url}/assignment/{assignment_id}"));
+        if let Some(t) = token {
+            req = req.set("Authorization", &format!("Bearer {t}"));
+        }
+        let out = match req.call() {
+            Ok(resp) => resp
+                .into_string()
+                .ok()
+                .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+                .and_then(|v| {
+                    v.get("review_findings")
+                        .and_then(|f| f.as_str())
+                        .map(|s| s.to_string())
+                }),
+            Err(_) => None,
+        };
+        let _ = tx.send(out);
+    });
+    rx
+}
+
 /// #584: fetch the read-only board projection from the `coord serve` daemon
 /// over HTTP and assemble it into a [`BoardData`] via the shared
 /// [`assemble_board_data`] tail (so the machine probes still run exactly as the
@@ -1913,16 +1973,48 @@ pub(crate) fn load_data_remote(url: &str, token: Option<&str>) -> BoardData {
     if let Some(t) = token {
         req = req.set("Authorization", &format!("Bearer {t}"));
     }
+    // #1336 invariant 5: cache-validated polling.  Send the last ETag as
+    // If-None-Match; a 304 means the board hasn't changed, so re-parse the
+    // cached body instead of re-downloading megabytes over Tailscale every
+    // poll.  (This runs on the background refresh thread — the reparse never
+    // blocks the UI.)
+    let cached: Option<(String, String)> = BOARD_ETAG_CACHE
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone());
+    if let Some((etag, _)) = &cached {
+        req = req.set("If-None-Match", etag);
+    }
     // ureq's `json` feature isn't enabled, so read the body as a string and
     // parse with serde_json (already a dependency).
     let payload: BoardPayload = match req.call() {
-        Ok(resp) => match resp.into_string() {
-            Ok(body) => match serde_json::from_str::<BoardPayload>(&body) {
+        Ok(resp) if resp.status() == 304 => {
+            // Not modified — the daemon validated our cached copy.
+            let Some((_, body)) = cached else {
+                return BoardData::default();
+            };
+            match serde_json::from_str::<BoardPayload>(&body) {
                 Ok(p) => p,
                 Err(_) => return BoardData::default(),
-            },
-            Err(_) => return BoardData::default(),
-        },
+            }
+        }
+        Ok(resp) => {
+            let etag = resp.header("etag").map(|e| e.to_string());
+            match resp.into_string() {
+                Ok(body) => match serde_json::from_str::<BoardPayload>(&body) {
+                    Ok(p) => {
+                        if let Some(etag) = etag {
+                            if let Ok(mut guard) = BOARD_ETAG_CACHE.lock() {
+                                *guard = Some((etag, body));
+                            }
+                        }
+                        p
+                    }
+                    Err(_) => return BoardData::default(),
+                },
+                Err(_) => return BoardData::default(),
+            }
+        }
         Err(_) => return BoardData::default(),
     };
 
