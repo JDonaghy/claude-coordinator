@@ -10,7 +10,15 @@ It mirrors the agent server (``coord/agent_app.py``, port 7433) and the dashboar
 Endpoints:
 
 * ``GET /healthz``  — liveness; no DB access, never auth-gated.
-* ``GET /board``    — the full board projection (``CoordStore.board_projection``).
+* ``GET /board``    — the board projection (``CoordStore.board_projection``),
+  wire-bounded per ``coord.board_wire`` (#1337: unbounded free text is served
+  as previews + ``*_truncated`` flags) and ETag-versioned (#1336: send
+  ``If-None-Match`` for a bodyless 304 while nothing changed).  Makes **no**
+  third-party calls — gh-sourced gate inputs come from the tick-refreshed
+  ``coord.gate_snapshot``.
+* ``GET /assignment/{id}`` — single-assignment detail: the complete row
+  (briefing + full free-text fields).  Point lookups get point endpoints.
+* ``GET /issue/{repo_name}/{number}`` — single-issue detail (full body).
 * ``GET /audit``    — paginated, newest-first read over the append-only
   ``audit_log`` (#1037); keyset cursor, not part of ``/board``.
 * ``GET /config``   — the raw ``coordinator.yml`` bytes the daemon owns, so a
@@ -1133,6 +1141,15 @@ def _board_response_schema(components: dict) -> dict:
         "type": "object",
         "properties": {
             "schema_version": {"type": "integer"},
+            "board_version": {
+                "type": "integer",
+                "description": (
+                    "#1336: monotonically-increasing content version (per "
+                    "daemon lifetime). Every /board response also carries an "
+                    "ETag; send it back as If-None-Match to get a bodyless "
+                    "304 while nothing changed."
+                ),
+            },
             "round_number": {"type": "integer"},
             "assignments": _list_of("BoardAssignment"),
             "machines": _list_of("BoardMachine"),
@@ -1355,8 +1372,14 @@ def _openapi_spec() -> dict:
                 "summary": "The full board projection (CoordStore.board_projection)",
                 "responses": {
                     "200": {
-                        "description": "OK",
+                        "description": "OK (carries an ETag response header)",
                         "content": {"application/json": {"schema": board_schema}},
+                    },
+                    "304": {
+                        "description": (
+                            "Not Modified — If-None-Match matched the current "
+                            "board ETag (#1336 cache-validated polling)"
+                        )
                     },
                     "503": {"description": "Board read failed"},
                 },
@@ -1389,6 +1412,54 @@ def _openapi_spec() -> dict:
                     "503": {"description": "Board write failed"},
                 },
             },
+        },
+        "/assignment/{assignment_id}": {
+            "get": {
+                "summary": (
+                    "Single-assignment detail (#1336/#1337): the complete row, "
+                    "including briefing and the full unbounded text fields the "
+                    "/board collection bounds. Local DB only — no gh calls, no "
+                    "derived board sections."
+                ),
+                "parameters": [
+                    {
+                        "name": "assignment_id",
+                        "in": "path",
+                        "required": True,
+                        "schema": {"type": "string"},
+                    }
+                ],
+                "responses": {
+                    "200": {"description": "OK (one full assignment row)"},
+                    "404": {"description": "Unknown assignment id"},
+                },
+            }
+        },
+        "/issue/{repo_name}/{number}": {
+            "get": {
+                "summary": (
+                    "Single-issue detail (#1337): the complete row including the "
+                    "full body. Local DB only — no gh calls."
+                ),
+                "parameters": [
+                    {
+                        "name": "repo_name",
+                        "in": "path",
+                        "required": True,
+                        "schema": {"type": "string"},
+                    },
+                    {
+                        "name": "number",
+                        "in": "path",
+                        "required": True,
+                        "schema": {"type": "integer"},
+                    },
+                ],
+                "responses": {
+                    "200": {"description": "OK (one full issue row)"},
+                    "404": {"description": "Unknown issue"},
+                },
+            }
         },
         "/config": {
             "get": {
@@ -2414,6 +2485,16 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
     except OSError:
         _config_mtime = None
 
+    # #1336 invariant 1: read endpoints perform no third-party I/O.  All gh-
+    # sourced merge-gate inputs (CI checks, PR commit messages, epic-ness of
+    # closing-keyword targets) are refreshed into this snapshot by the tick
+    # machinery below; /board builds consume the snapshot and NEVER call gh.
+    # Board latency is therefore a function of local DB size only — never of
+    # GitHub's latency or the number of open PRs (the #762/#715/#1336 class).
+    from coord.gate_snapshot import GateSnapshotRefresher  # noqa: PLC0415
+
+    _gate_refresher = GateSnapshotRefresher()
+
     # Short-TTL cache for the computed /board projection so burst polls from the
     # TUI don't each pay the full board_projection + merge-plan + stage-projection
     # recomputation (~465-issue load measured in the issue). Keyed to nothing
@@ -2422,6 +2503,55 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
     # action is visible on the very next poll without waiting out the TTL.
     _board_cache: dict | None = None
     _board_cache_at: float = 0.0
+    # #1336 invariant 5: polling is cache-validated.  The board carries a
+    # monotonically-increasing version (per daemon lifetime; a restart starts
+    # a new ETag lineage so clients simply refetch once) and every /board
+    # response an ETag.  A poller sends If-None-Match and gets a bodyless 304
+    # when nothing changed — which, on a steady board, is nearly every poll.
+    _board_version: int = 0
+    _board_etag: str | None = None
+    _board_hash: str | None = None
+    # Monotonic time the cached build STARTED (its DB snapshot moment).  Two
+    # concurrent cache-miss rebuilds can finish out of order; publishing is
+    # rejected for a build older than the one already cached, so a stale
+    # snapshot can never be stamped with a newer version/ETag and served for
+    # a TTL window (review finding on #1336).
+    _board_cache_built_at: float = 0.0
+    # Guards every read/write of the cache + version/etag/hash quadruple so
+    # they are always published and read as one consistent unit.
+    _board_lock = threading.Lock()
+
+    def _stamp_board_version(result: dict) -> str:
+        """Hash *result*, bump the version when the content changed, stamp
+        ``board_version`` into the payload, and return the ETag.
+
+        Mutates the version/etag/hash triple — callers MUST hold
+        ``_board_lock`` so the stamp and the cache store publish atomically.
+        """
+        nonlocal _board_version, _board_etag, _board_hash
+        import hashlib  # noqa: PLC0415
+        import json as _json  # noqa: PLC0415
+
+        result.pop("board_version", None)  # hash content, not the stamp
+        try:
+            digest = hashlib.sha256(
+                _json.dumps(result, sort_keys=True, default=str).encode()
+            ).hexdigest()[:16]
+        except (TypeError, ValueError):
+            # Unhashable content: treat every build as new (never serve a
+            # stale 304 because versioning failed).
+            digest = f"unhashable-{_time_ns()}"
+        if digest != _board_hash:
+            _board_hash = digest
+            _board_version += 1
+            _board_etag = f'W/"board-{_board_version}-{digest}"'
+        result["board_version"] = _board_version
+        return _board_etag or ""
+
+    def _time_ns() -> int:
+        import time as _t  # noqa: PLC0415
+
+        return _t.monotonic_ns()
 
     def _bust_board_cache() -> None:
         """Invalidate the /board response cache.
@@ -2447,7 +2577,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
     async def healthz(request: Request) -> JSONResponse:  # noqa: ARG001
         return JSONResponse({"status": "ok", "schema_version": SCHEMA_VERSION})
 
-    async def board(request: Request) -> Response:  # noqa: ARG001
+    async def board(request: Request) -> Response:
         # #1081: pick up a hand-edited coordinator.yml before computing the
         # merge plan / staging / stage-projection below, all of which read
         # `config` for real gating decisions (reviews.enabled, default_gates,
@@ -2465,9 +2595,22 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         import time as _time  # noqa: PLC0415
         _ttl = float(os.getenv("COORD_BOARD_CACHE_TTL", "1.5"))
         _now = _time.monotonic()
-        nonlocal _board_cache, _board_cache_at
-        if _board_cache is not None and (_now - _board_cache_at) < _ttl:
-            return JSONResponse(_board_cache)
+        nonlocal _board_cache, _board_cache_at, _board_cache_built_at
+        _client_etag = request.headers.get("if-none-match")
+        # Read the cache + its ETag as one consistent unit — a concurrent
+        # publish must never let a response pair one build's body with
+        # another build's ETag.
+        with _board_lock:
+            _cached = _board_cache
+            _cached_etag = _board_etag
+            _cached_at = _board_cache_at
+        if _cached is not None and (_now - _cached_at) < _ttl:
+            if _client_etag and _cached_etag and _client_etag == _cached_etag:
+                return Response(status_code=304, headers={"ETag": _cached_etag})
+            return JSONResponse(
+                _cached,
+                headers={"ETag": _cached_etag} if _cached_etag else {},
+            )
 
         # Part 1 (threadpool): offload all synchronous computation to a worker
         # thread so the async event loop stays free for /healthz, POST handlers,
@@ -2484,7 +2627,12 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         class _BoardReadError(Exception):
             """Sentinel: board_projection() failed; propagated from threadpool."""
 
-        def _build() -> dict:
+        def _build() -> tuple[float, dict]:
+            # Snapshot-order stamp: captured immediately before the DB read so
+            # the publish step below can reject a build whose snapshot is
+            # older than the one already cached (concurrent rebuilds can
+            # finish out of order).
+            _built_at = _time.monotonic()
             # ── board projection ──────────────────────────────────────────────
             try:
                 projection = store.board_projection()
@@ -2494,30 +2642,27 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             # #776/#778/#550: inject server-side merge plan (ordered, gate-
             # annotated), staging section, and per-issue stage/gate projection
             # so thin clients get status + reason without re-implementing gate
-            # logic.  All three are derived from the same board snapshot + CI
-            # store, built once here and shared below so a concurrent DB write
-            # can't split them across two snapshots and `list_checks_for_pr`
-            # (a real `gh` round trip) isn't paid twice per request.  Computed
-            # after the projection so a plan failure never 503s the board.
+            # logic.  All three are derived from the same board snapshot + the
+            # tick-refreshed gate snapshot, built once here and shared below so
+            # a concurrent DB write can't split them across two snapshots.
+            # Computed after the projection so a plan failure never 503s the
+            # board.
+            #
+            # #1336 invariant 1: the CI store and the epic-closing gh_ops view
+            # are BOTH served from `_gate_refresher`'s snapshot — refreshed on
+            # the tick loop, never fetched here.  A cold /board build makes
+            # zero gh subprocess calls (enforced by
+            # tests/test_board_read_path.py).
             _board = None
-            _ci = None
+            _ci = _gate_refresher.snapshot()
             try:
-                from coord import github_ops as _gh_ops  # noqa: PLC0415
                 from coord import merge_queue as _mq  # noqa: PLC0415
-                from coord.ci_store import build_ci_store as _build_ci_store  # noqa: PLC0415
                 from coord.state import build_board as _build_board  # noqa: PLC0415
                 from dataclasses import asdict as _asdict  # noqa: PLC0415
                 _board = _build_board()
-                # Build ci_store so "CI running" / "CI failed" reasons appear
-                # in the plan.  Fail-open: a construction error returns None
-                # which disables the CI gate without blanking the whole plan.
-                try:
-                    _ci = _build_ci_store(_cfg.ci_store.type)
-                except Exception:  # noqa: BLE001
-                    _ci = None
                 projection["merge_plan"] = [
                     _asdict(pm)
-                    for pm in _mq.plan(_board, _cfg, ci_store=_ci, gh_ops=_gh_ops)
+                    for pm in _mq.plan(_board, _cfg, ci_store=_ci, gh_ops=_ci)
                 ]
                 # #778: staging section — approved/done work not yet in the
                 # queue.  Reuses the same _board snapshot built above.
@@ -2869,18 +3014,83 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 projection["goal_header"] = _read_goal_header()
             except Exception:  # noqa: BLE001 — goal-header failure must not blank the board
                 projection["goal_header"] = {"available": False}
-            return projection
+            # #1337 invariant 2: no collection endpoint returns unbounded text.
+            # Bound the per-row free-text fields LAST — the derived sections
+            # above parse full issue bodies server-side and must see them
+            # unbounded; only the wire is bounded.  Full text lives on the
+            # detail endpoints (GET /assignment/{id}, GET /issue/{r}/{n}).
+            from coord.board_wire import bound_board_payload as _bound  # noqa: PLC0415
+
+            _bound(projection)
+            return _built_at, projection
 
         try:
-            result = await run_in_threadpool(_build)
+            built_at, result = await run_in_threadpool(_build)
         except _BoardReadError as e:
             return JSONResponse(
                 {"error": "board read failed", "detail": str(e)}, status_code=503
             )
-        # Cache the fresh result so burst polls within the TTL don't recompute.
-        _board_cache = result
-        _board_cache_at = _time.monotonic()
-        return JSONResponse(result)
+        # Publish atomically: stamp + cache + built-at move as one unit under
+        # the lock, and a build whose DB snapshot is OLDER than the cached one
+        # is not published at all (concurrent rebuilds finishing out of order
+        # must never stamp a newer version/ETag onto older content — review
+        # finding on #1336).  The losing build's result is still served to its
+        # own requester, but unstamped and uncacheable.
+        etag: str | None = None
+        with _board_lock:
+            if built_at >= _board_cache_built_at:
+                etag = _stamp_board_version(result)
+                _board_cache = result
+                _board_cache_at = _time.monotonic()
+                _board_cache_built_at = built_at
+        if _client_etag and etag and _client_etag == etag:
+            # Freshly rebuilt and STILL identical to what the client holds —
+            # spare the wire (the common steady-board poll).
+            return Response(status_code=304, headers={"ETag": etag})
+        return JSONResponse(result, headers={"ETag": etag} if etag else {})
+
+    async def get_assignment(request: Request) -> Response:
+        """#1336/#1337: single-assignment detail — the point lookup for what the
+        collection wire bounds/previews.
+
+        Serves the complete row (``briefing``, full ``review_findings`` /
+        ``test_plan`` / ``test_reason`` / ``smoke_test_reason``) straight from
+        the local DB.  Performs **no** third-party I/O and computes **none** of
+        the derived board sections (merge plan / staging / stage projection),
+        so its latency is a point SELECT — never a function of board size or
+        GitHub.  This is what lets write paths (``coord report-result``) resolve
+        one assignment's identity without paying for — or being failed by — a
+        full ``/board`` build.
+        """
+        from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
+
+        aid = request.path_params["assignment_id"]
+        row = await run_in_threadpool(store.get_assignment, aid)
+        if row is None:
+            return JSONResponse(
+                {"error": "unknown assignment", "assignment_id": aid},
+                status_code=404,
+            )
+        return JSONResponse(row)
+
+    async def get_issue(request: Request) -> Response:
+        """#1337: single-issue detail — full ``body`` for the row the collection
+        wire previews.  Same contract as ``GET /assignment/{id}``: local DB
+        only, no derived sections, no third-party I/O."""
+        from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
+
+        repo_name = request.path_params["repo_name"]
+        try:
+            number = int(request.path_params["number"])
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "number must be an integer"}, status_code=404)
+        row = await run_in_threadpool(store.get_issue, repo_name, number)
+        if row is None:
+            return JSONResponse(
+                {"error": "unknown issue", "repo_name": repo_name, "number": number},
+                status_code=404,
+            )
+        return JSONResponse(row)
 
     async def serve_config(request: Request) -> Response:  # noqa: ARG001
         # Serve the raw coordinator.yml text the daemon owns; the client caches
@@ -2893,16 +3103,55 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             )
         return PlainTextResponse(path.read_text(), media_type="application/x-yaml")
 
+    def _enrich_result_identity(body: dict) -> None:
+        """#1336: fill missing result-identity fields from the daemon's own DB.
+
+        ``coord report-result`` used to hard-fail (and DISCARD the verdict)
+        when its preliminary board read timed out, because it couldn't resolve
+        ``repo_github``/``repo_name``/``machine_name``/``issue_number`` for the
+        GitHub comment.  The daemon can always resolve those itself from the
+        assignments row (falling back to config for the GitHub slug), so a
+        record arriving with blank identity is completed here rather than
+        rejected.  Best-effort: an unknown assignment id leaves the fields as
+        sent — the DB write is keyed on assignment_id alone and still lands.
+        """
+        aid = body.get("assignment_id")
+        if not aid:
+            return
+        needed = ("machine_name", "repo_name", "repo_github", "issue_number")
+        if all(body.get(k) for k in needed) and body.get("branch"):
+            return
+        try:
+            row = store.get_assignment(str(aid))
+        except Exception:  # noqa: BLE001 — enrichment is best-effort
+            row = None
+        if row is not None:
+            for k in (*needed, "branch"):
+                if not body.get(k) and row.get(k):
+                    body[k] = row[k]
+        if not body.get("repo_github") and body.get("repo_name"):
+            repo_cfg = config.repo(str(body["repo_name"]))
+            if repo_cfg is not None:
+                body["repo_github"] = repo_cfg.github
+
     async def post_result(request: Request) -> Response:
         # #590: record an interactive result against the shared DB. Reconstruct
         # the ResultRecord from JSON (dropping unknown keys so a newer client
         # can't break an older daemon) and run the LOCAL seam path.
+        from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
+
         from coord import issue_store  # noqa: PLC0415
 
         try:
             body = await request.json()
         except Exception:  # noqa: BLE001
             return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        # #1336 invariant: writes never depend on reads.  A thin client whose
+        # identity prefetch failed (a slow /board read must not lose a verdict)
+        # sends the record with blank identity fields — the daemon owns the DB,
+        # so resolve them here from the assignments row + config instead of
+        # requiring the client to have read them first.
+        _enrich_result_identity(body)
         known = {f.name for f in fields(issue_store.ResultRecord)}
         try:
             record = issue_store.ResultRecord(
@@ -2911,7 +3160,9 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         except TypeError as e:
             return JSONResponse({"error": f"bad record: {e}"}, status_code=400)
         try:
-            outcome = issue_store._post_result_local(record)
+            # Threadpool: the seam posts a GitHub comment synchronously; keep
+            # the event loop free for /healthz + board polls while it runs.
+            outcome = await run_in_threadpool(issue_store._post_result_local, record)
         except ValueError as e:  # invalid status / verdict
             return JSONResponse({"error": str(e)}, status_code=400)
         except Exception as e:  # noqa: BLE001
@@ -4124,6 +4375,28 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             wal_checkpoint_interval = 3600.0
         last_wal_checkpoint = _time.monotonic()
 
+        # #1336 invariant 1: refresh the gh-sourced merge-gate snapshot (CI
+        # checks, PR commit messages, epic-closing targets) on its own cadence
+        # so /board builds never talk to GitHub.  Default 30 s; 0 disables
+        # (the board then serves fail-open gates, same as a gh outage).
+        try:
+            gate_refresh_interval = float(
+                os.environ.get("COORD_GATE_REFRESH_INTERVAL", "30")
+            )
+        except ValueError:
+            gate_refresh_interval = 30.0
+
+        async def _gate_refresh_loop() -> None:
+            # Mirrors _tick_loop's shape: sleep first (a fresh daemon serves
+            # the fail-open snapshot instantly rather than blocking startup on
+            # GitHub), refresh, repeat.  A pass must never crash the daemon.
+            while True:
+                await asyncio.sleep(gate_refresh_interval)
+                try:
+                    await run_in_threadpool(_gate_refresher.refresh, config)
+                except Exception:  # noqa: BLE001 — keep serving the old snapshot
+                    log.warning("gate-snapshot refresh failed", exc_info=True)
+
         async def _tick_loop() -> None:
             nonlocal last_housekeeping, last_merge_reconcile, last_worktree_clean, last_wal_checkpoint
             from coord.reconcile import reconcile_completed_assignments  # noqa: PLC0415
@@ -4366,19 +4639,27 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             task = (
                 asyncio.create_task(_tick_loop()) if interval > 0 else None
             )
+            gate_task = (
+                asyncio.create_task(_gate_refresh_loop())
+                if interval > 0 and gate_refresh_interval > 0
+                else None
+            )
             try:
                 yield
             finally:
-                if task is not None:
-                    task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await task
+                for t in (task, gate_task):
+                    if t is not None:
+                        t.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await t
 
         return _ctx(_app)
 
     routes = [
         Route("/healthz", healthz, methods=["GET"]),
         Route("/board", board, methods=["GET"]),
+        Route("/assignment/{assignment_id}", get_assignment, methods=["GET"]),
+        Route("/issue/{repo_name}/{number}", get_issue, methods=["GET"]),
         Route("/audit", get_audit, methods=["GET"]),
         Route("/config", serve_config, methods=["GET"]),
         Route("/result", post_result, methods=["POST"]),

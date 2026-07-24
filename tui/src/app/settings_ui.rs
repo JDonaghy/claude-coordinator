@@ -907,6 +907,42 @@ impl CoordApp {
             }
         }
 
+        // #1337: Poll the in-flight full-findings detail fetch into the cache
+        // (the /board wire carries only a bounded review_findings preview;
+        // the Review pane hydrates the full body from GET /assignment/{id}).
+        if let Some((key, rx)) = &self.findings_fetch_rx {
+            match rx.try_recv() {
+                Ok(full) => {
+                    let got_body = full.is_some();
+                    let entry = FindingsDetailEntry {
+                        fetched_at: Instant::now(),
+                        full,
+                    };
+                    let key_clone = key.clone();
+                    self.findings_detail_cache.insert(key_clone, entry);
+                    self.findings_fetch_rx = None;
+                    if got_body {
+                        needs_redraw = true;
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.findings_fetch_rx = None;
+                }
+            }
+        }
+        // #1337: Arm a fetch when the Pipeline view shows a review whose
+        // findings were wire-truncated and not yet hydrated (the target
+        // helper handles cache hits + failure back-off).
+        if self.findings_fetch_rx.is_none() && self.active_view == SidebarView::Pipeline {
+            if let Some(key) = self.findings_fetch_target() {
+                if let Some((url, token)) = resolve_board_service() {
+                    let rx = spawn_findings_detail_fetch(url, token, key.0.clone());
+                    self.findings_fetch_rx = Some((key, rx));
+                }
+            }
+        }
+
         // #207: Machine metrics polling — only when the Machines panel is
         // visible so we don't burn background threads when the user is on
         // another view.

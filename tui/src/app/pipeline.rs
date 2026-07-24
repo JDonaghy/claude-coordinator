@@ -5827,6 +5827,47 @@ impl CoordApp {
         Some((host, latest.repo.clone(), sanitized, latest.id.clone()))
     }
 
+    /// #1337: the `(assignment_id, stored_len)` cache key of the selected
+    /// pipeline issue's latest review, when its `review_findings` were
+    /// bounded on the /board wire and no usable cache entry exists yet —
+    /// i.e. the Review pane wants a full-findings detail fetch armed.
+    /// `None` when local-mode (wire never truncates), nothing selected, the
+    /// findings arrived whole, hydration already succeeded, or a recent
+    /// failed attempt is still backing off.
+    pub(crate) fn findings_fetch_target(&self) -> Option<(String, i64)> {
+        let issue = self
+            .pipeline_sel
+            .and_then(|i| self.pipeline_issues.get(i))?;
+        let local_repo = issue.coord_repo.as_deref();
+        let review = self
+            .data
+            .assignments
+            .iter()
+            .filter(|a| a.issue_number == issue.number)
+            .filter(|a| match local_repo {
+                Some(r) => a.repo == r,
+                None => true,
+            })
+            .filter(|a| a.assignment_type.as_deref() == Some("review"))
+            .max_by(|a, b| {
+                a.dispatched_at
+                    .partial_cmp(&b.dispatched_at)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })?;
+        if !review.review_findings_truncated {
+            return None;
+        }
+        let len = review.review_findings_len?;
+        let key = (review.id.clone(), len);
+        match self.findings_detail_cache.get(&key) {
+            // Hydrated — nothing to fetch.
+            Some(e) if e.full.is_some() => None,
+            // Failed recently — back off before re-arming.
+            Some(e) if e.fetched_at.elapsed() < Duration::from_secs(30) => None,
+            _ => Some(key),
+        }
+    }
+
     /// #336: True when the selected pipeline issue has a non-empty artifact
     /// manifest in the 30-second TTL cache — i.e. the artifact badge is
     /// currently rendered and the `a` keybind should be live.

@@ -412,7 +412,14 @@ def fix(assignment_id: str, config_path: Path, guidance: str) -> None:
     if test_output_file.exists():
         test_output = test_output_file.read_text()
     elif assignment.smoke_test_reason:
-        test_output = assignment.smoke_test_reason
+        # #1337: the board wire carries a bounded PREVIEW of the reason text;
+        # the briefing quotes it verbatim — prefer the full text via the
+        # detail loader (falls back to the board-carried value).
+        from coord.state import load_assignment_test_reason as _load_tr  # noqa: PLC0415
+
+        test_output = (
+            _load_tr(assignment_id) or assignment.smoke_test_reason
+        )
 
     guidance_text = guidance or "Fix the failing tests and push."
 

@@ -32,6 +32,15 @@ def _seed_local(assignment_id: str, status: str) -> None:
 
 def _use_daemon(monkeypatch, assignments: list[dict]) -> None:
     monkeypatch.setattr(cc, "resolve_board_service", lambda *a, **k: _FakeSvc())
+    # #1336: the status read now prefers the point endpoint (GET
+    # /assignment/{id}); the collection payload is the pre-#1336 fallback.
+    monkeypatch.setattr(
+        cc,
+        "fetch_assignment",
+        lambda svc, aid, **kw: next(
+            (a for a in assignments if a.get("assignment_id") == aid), None
+        ),
+    )
     monkeypatch.setattr(cc, "fetch_board_payload", lambda svc, **kw: {"assignments": assignments})
 
 
@@ -70,6 +79,7 @@ def test_local_fallback_when_daemon_unreachable(monkeypatch, coord_db) -> None:
     def _boom(*a, **k):
         raise RuntimeError("daemon down")
 
+    monkeypatch.setattr(cc, "fetch_assignment", _boom)
     monkeypatch.setattr(cc, "fetch_board_payload", _boom)
     assert _assignment_already_recorded("rev-883") is True
 

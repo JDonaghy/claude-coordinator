@@ -119,6 +119,10 @@ class CoordStore(Protocol):
     def round_number(self) -> int: ...
     def board_projection(self) -> dict: ...
 
+    # ── point reads (#1336/#1337: detail endpoints) ──────────────────────────
+    def get_assignment(self, assignment_id: str) -> dict | None: ...
+    def get_issue(self, repo_name: str, number: int) -> dict | None: ...
+
     # ── writes (declared; implemented in #590) ───────────────────────────────
     def record_result(self, record: Any) -> Any: ...
     def record_completion(self, record: Any) -> Any: ...
@@ -211,11 +215,18 @@ _KEEP_INDEX_COLUMNS = (
 )
 
 
-def _decode_row(table: str, row: sqlite3.Row) -> dict:
-    """sqlite3.Row → plain dict with that table's JSON columns decoded."""
+def _decode_row(table: str, row: sqlite3.Row, *, full: bool = False) -> dict:
+    """sqlite3.Row → plain dict with that table's JSON columns decoded.
+
+    ``full=True`` keeps the :data:`_DROP_COLUMNS` fields (e.g.
+    ``assignments.briefing``) — used by the single-resource *detail* reads
+    (#1336/#1337), which serve the complete row; the collection projection
+    stays slim.
+    """
     d = dict(row)
-    for col in _DROP_COLUMNS.get(table, ()):
-        d.pop(col, None)
+    if not full:
+        for col in _DROP_COLUMNS.get(table, ()):
+            d.pop(col, None)
     for col in _JSON_COLUMNS.get(table, ()):
         val = d.get(col)
         if isinstance(val, (str, bytes, bytearray)):
@@ -328,6 +339,31 @@ class SqliteStore:
     def round_number(self) -> int:
         with closing(self._connect()) as conn:
             return self._round_number(conn)
+
+    # ── point reads (#1336/#1337) ────────────────────────────────────────────
+    def get_assignment(self, assignment_id: str) -> dict | None:
+        """One full assignment row (JSON columns decoded), or ``None``.
+
+        Unlike the collection projection this keeps every column — including
+        ``briefing`` and the unbounded free-text fields the collection wire
+        bounds/previews — because a detail read is one row by definition,
+        so it can never grow with board size.  Zero third-party I/O.
+        """
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT * FROM assignments WHERE assignment_id = ?",
+                (assignment_id,),
+            ).fetchone()
+            return _decode_row("assignments", row, full=True) if row is not None else None
+
+    def get_issue(self, repo_name: str, number: int) -> dict | None:
+        """One full issue row (labels decoded, full ``body``), or ``None``."""
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT * FROM issues WHERE repo_name = ? AND number = ?",
+                (repo_name, number),
+            ).fetchone()
+            return _decode_row("issues", row, full=True) if row is not None else None
 
     def _board_keep_ids(self, conn: sqlite3.Connection, cutoff: float | None) -> set[str]:
         """#762: assignment_ids the projection must carry (see

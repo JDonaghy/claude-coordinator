@@ -2816,7 +2816,21 @@ impl CoordApp {
         // attended review with request-changes (#587), the findings were
         // never written; the rework dialog will capture them when the fix
         // is started.
-        let Some(raw) = review.review_findings.as_deref() else {
+        // #1337: the /board wire carries only a bounded preview of the
+        // findings (review_findings_truncated).  When the background detail
+        // fetch (run_periodic_work → GET /assignment/{id}) has hydrated the
+        // full body, render that instead; until then the preview renders —
+        // its body text ends with an explicit truncation notice.
+        let hydrated: Option<&str> = if review.review_findings_truncated {
+            review.review_findings_len.and_then(|len| {
+                self.findings_detail_cache
+                    .get(&(review.id.clone(), len))
+                    .and_then(|e| e.full.as_deref())
+            })
+        } else {
+            None
+        };
+        let Some(raw) = hydrated.or(review.review_findings.as_deref()) else {
             if review.review_verdict.as_deref() == Some("request-changes") {
                 return vec![
                     kv_item(

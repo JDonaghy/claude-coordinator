@@ -584,30 +584,52 @@ def report_result(
     branch: str | None = None
 
     svc = resolve_board_service()
+    prefetch_failed = False
     if svc is not None:
         # Thin client (#590): no local DB/config — resolve the assignment's
-        # identity from the daemon's board payload (the assignments rows carry
-        # repo_github), then let issue_store.post_result route the write back to
-        # the daemon's shared DB.  This is what lets a remote interactive
-        # session self-report instead of the old "do NOT run report-result"
-        # workaround.
-        from coord.client import fetch_board_payload  # noqa: PLC0415
-
-        try:
-            payload = fetch_board_payload(svc)
-        except Exception as exc:  # noqa: BLE001
-            click.echo(
-                f"error: could not reach board service {svc.url}: {exc}", err=True
-            )
-            sys.exit(1)
-        row = next(
-            (
-                a
-                for a in payload.get("assignments", [])
-                if a.get("assignment_id") == assignment_id
-            ),
-            None,
+        # identity from the daemon, then let issue_store.post_result route the
+        # write back to the daemon's shared DB.  This is what lets a remote
+        # interactive session self-report instead of the old "do NOT run
+        # report-result" workaround.
+        #
+        # #1336: this prefetch is an *enrichment*, not a prerequisite — the
+        # verdict write MUST NOT be discarded because a read was slow.  It
+        # uses the point endpoint (GET /assignment/{id}; falls back to the
+        # full /board payload only for a pre-#1336 daemon), gets the write
+        # timeout (it rides a write operation), and on ANY failure we warn and
+        # proceed with the POST: the daemon owns the DB and resolves the
+        # identity fields server-side.
+        from coord.client import (  # noqa: PLC0415
+            _WRITE_TIMEOUT,
+            fetch_assignment,
+            fetch_board_payload,
         )
+
+        row = None
+        try:
+            row = fetch_assignment(svc, assignment_id, timeout=_WRITE_TIMEOUT)
+            if row is None:
+                # 404: unknown id — or a daemon that predates the point
+                # endpoint (an unmatched route is also a 404).  One
+                # compatibility fallback through the collection payload.
+                payload = fetch_board_payload(svc, timeout=_WRITE_TIMEOUT)
+                row = next(
+                    (
+                        a
+                        for a in payload.get("assignments", [])
+                        if a.get("assignment_id") == assignment_id
+                    ),
+                    None,
+                )
+        except Exception as exc:  # noqa: BLE001
+            prefetch_failed = True
+            click.echo(
+                f"warning: identity prefetch from {svc.url} failed ({exc}).\n"
+                "  This is a slow/failed BOARD READ, not a write failure — "
+                "proceeding to record the verdict; the board service resolves "
+                "the assignment's repo/machine/issue itself (#1336).",
+                err=True,
+            )
         if row is not None:
             repo_github = row.get("repo_github")
             repo_name = row.get("repo_name")
@@ -652,13 +674,23 @@ def report_result(
                 repo_github = repo_cfg.github
 
     if not (repo_github and repo_name and machine_name and issue_number):
-        click.echo(
-            f"error: could not resolve assignment {assignment_id!r} from "
-            "board/dispatched ledger; pass --assignment with a known id "
-            "or run from the originating coordinator machine.",
-            err=True,
-        )
-        sys.exit(1)
+        if svc is not None and prefetch_failed:
+            # #1336 invariant 4: a failed READ must never discard the WRITE.
+            # Post the record with blank identity — the daemon fills it in
+            # from its own assignments row (`_enrich_result_identity`).
+            click.echo(
+                "  identity unresolved locally — the board service will "
+                "resolve it from its own DB.",
+                err=True,
+            )
+        else:
+            click.echo(
+                f"error: could not resolve assignment {assignment_id!r} from "
+                "board/dispatched ledger; pass --assignment with a known id "
+                "or run from the originating coordinator machine.",
+                err=True,
+            )
+            sys.exit(1)
 
     findings_body: str | None = None
     if body_file:
@@ -722,10 +754,13 @@ def report_result(
 
     record_obj = issue_store.ResultRecord(
         assignment_id=assignment_id,
-        machine_name=machine_name,
-        repo_name=repo_name,
-        repo_github=repo_github,
-        issue_number=int(issue_number),
+        machine_name=machine_name or "",
+        repo_name=repo_name or "",
+        repo_github=repo_github or "",
+        # 0 = "unresolved" (only reachable on the prefetch-failed thin-client
+        # path above) — the daemon's identity enrichment treats falsy fields
+        # as blanks to fill from its own assignments row.
+        issue_number=int(issue_number) if issue_number else 0,
         status=status,  # type: ignore[arg-type]
         verdict=verdict,  # type: ignore[arg-type]
         summary=summary,
@@ -901,7 +936,15 @@ def fix_briefing_cmd(aid: str, config_path: Path) -> None:
     next_iteration = (work.review_iteration or 0) + 1
     max_iter = cfg.pipeline.max_review_iterations
     if fix_from_test_fail:
-        story = (getattr(work, "test_reason", None) or "").strip()
+        # #1337: the board wire carries a bounded PREVIEW of test_reason; the
+        # briefing quotes it verbatim — read full text via the detail endpoint.
+        from coord.state import load_assignment_test_reason as _load_tr  # noqa: PLC0415
+
+        story = (
+            _load_tr(work.assignment_id or "")
+            or getattr(work, "test_reason", None)
+            or ""
+        ).strip()
         findings_body = (
             "The manual smoke test FAILED. The operator reported:\n\n"
             f"> {story}\n\nReproduce the failure, fix the root cause, and "

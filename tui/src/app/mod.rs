@@ -2455,6 +2455,21 @@ pub struct CoordApp {
         (String, String),
         std::sync::mpsc::Receiver<ArtifactFetchOutcome>,
     )>,
+    /// #1337: Full `review_findings` bodies hydrated from the daemon's
+    /// `GET /assignment/{id}` detail endpoint, keyed by `(assignment_id,
+    /// stored_len)` — the /board collection wire carries only a bounded
+    /// preview (`review_findings_truncated`).  A successful entry never
+    /// expires (findings for one assignment are effectively immutable —
+    /// #650: one review per id; a force-overwrite changes
+    /// `review_findings_len` and therefore the key, re-fetching naturally).
+    /// A failed entry (`full: None`) backs off for 30 s before re-arming.
+    findings_detail_cache:
+        std::collections::HashMap<(String, i64), FindingsDetailEntry>,
+    /// #1337: In-flight findings detail fetch.  `None` when idle.
+    findings_fetch_rx: Option<(
+        (String, i64),
+        std::sync::mpsc::Receiver<Option<String>>,
+    )>,
     /// #336: Tracks a pending `coord pull-artifact` dispatch.
     /// Contains `(work_id, repo, sanitized_branch)` so we can show the
     /// destination path in a completion dialog.
@@ -3317,6 +3332,8 @@ impl CoordApp {
             file_issue_post_rx: None,
             artifact_cache: std::collections::HashMap::new(),
             artifact_fetch_rx: None,
+            findings_detail_cache: std::collections::HashMap::new(),
+            findings_fetch_rx: None,
             pending_artifact_pull: None,
             last_artifact_pulls: std::collections::HashMap::new(),
             artifact_pull_dialog: None,

@@ -2063,7 +2063,16 @@ def _dispatch_fix_of(
         # The findings ARE the recorded test-failure story (#581).  No
         # reviewer log to consult — the operator's `coord test --fail
         # --reason` text is what the fix worker needs.
-        _test_story = (getattr(work, "test_reason", None) or "").strip()
+        # #1337: the board wire carries only a bounded PREVIEW of test_reason;
+        # the briefing quotes it verbatim, so read the full text through the
+        # detail endpoint (falls back to the board-carried value).
+        from coord.state import load_assignment_test_reason as _load_tr  # noqa: PLC0415
+
+        _test_story = (
+            _load_tr(work.assignment_id or "")
+            or getattr(work, "test_reason", None)
+            or ""
+        ).strip()
         _findings_body = (
             "The manual smoke test FAILED. The operator reported:\n\n"
             f"> {_test_story}\n\n"

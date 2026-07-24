@@ -447,14 +447,19 @@ def test_serve_board_picks_up_config_hand_edit(
     # :memory: connection installed by the coord_db fixture.
     monkeypatch.setattr("coord.state.build_board", lambda: _Board())
 
-    asyncio.run(board_route.endpoint(None))  # request param is unused (# noqa: ARG001)
+    class _Req:
+        # #1336: board() reads If-None-Match for conditional GETs — a bare
+        # headers dict is all this direct-endpoint invocation needs.
+        headers: dict = {}
+
+    asyncio.run(board_route.endpoint(_Req()))
     assert seen_configs, "merge_queue.plan was never called — board() didn't reach it"
     assert seen_configs[-1].reviews.enabled is True
 
     _disable_reviews(valid_config_path)
     _bump_mtime(valid_config_path)
 
-    asyncio.run(board_route.endpoint(None))
+    asyncio.run(board_route.endpoint(_Req()))
     assert seen_configs[-1].reviews.enabled is False, (
         "daemon's internal config did not pick up the on-disk hand-edit"
     )

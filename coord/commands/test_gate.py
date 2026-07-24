@@ -437,15 +437,14 @@ def _restore_default_branch_after_test(cfg, assignment) -> None:
 
 
 def test(assignment_id: str, config_path: Path, verdict: str | None, reason: str, output_file: str | None) -> None:
-    from coord.board_service import read_board, resolve
-    from coord.state import record_test_verdict, save_board
+    from coord.board_service import read_board
+    from coord.state import record_test_verdict
 
     cfg = _load_config(config_path)
-    # #590 Phase 2: a thin client reads the board from the daemon (its local DB
-    # is empty) so the assignment resolves; the verdict is then recorded back
-    # through the daemon via the lighter single-row record_test_verdict (not a
-    # full write_board()). Unset ⇒ unchanged local board + save_board.
-    svc = resolve()
+    # #590 Phase 2 / #1337: a thin client reads the board from the daemon (its
+    # local DB is empty) so the assignment resolves; the verdict is recorded
+    # via the single-row record_test_verdict on BOTH paths (it self-routes:
+    # daemon when board_service is set, direct local UPDATE otherwise).
     board = read_board()
 
     assignment = board.find_by_id(assignment_id)
@@ -493,18 +492,19 @@ def test(assignment_id: str, config_path: Path, verdict: str | None, reason: str
             else:
                 click.echo(f"  warning: output file not found: {output_file}", err=True)
 
-        if svc is not None:
-            # Thin client: record the single-row verdict back through the daemon
-            # (save_board would write the empty local DB).
-            record_test_verdict(
-                assignment_id=assignment_id,
-                test_state=assignment.test_state,
-                test_reason=assignment.test_reason,
-                smoke_test=assignment.smoke_test,
-                smoke_test_reason=assignment.smoke_test_reason,
-            )
-        else:
-            save_board(board)
+        # #1337: single-row verdict write on BOTH paths (record_test_verdict
+        # self-routes: daemon when board_service is set, direct UPDATE
+        # locally).  The old local-path save_board() relied on the whole-board
+        # upsert carrying test_reason/smoke_test_reason — those free-text
+        # columns are now excluded from that upsert so a bounded /board
+        # preview can never round-trip over the full stored text.
+        record_test_verdict(
+            assignment_id=assignment_id,
+            test_state=assignment.test_state,
+            test_reason=assignment.test_reason,
+            smoke_test=assignment.smoke_test,
+            smoke_test_reason=assignment.smoke_test_reason,
+        )
         verdict_word = {"pass": "PASSED", "fail": "FAILED", "skip": "SKIPPED"}[verdict]
         click.echo(f"Test gate {verdict_word} for {assignment.repo_name} #{assignment.issue_number}")
         if verdict in ("fail", "skip") and reason:

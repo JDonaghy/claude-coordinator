@@ -1697,6 +1697,8 @@
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 0,
@@ -3609,6 +3611,8 @@
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 0,
@@ -4915,6 +4919,8 @@
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 0,
@@ -5387,6 +5393,8 @@
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 0,
@@ -5474,6 +5482,8 @@
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 0,
@@ -5680,6 +5690,8 @@
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 0,
@@ -6647,6 +6659,8 @@
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 0,
@@ -9116,6 +9130,8 @@
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 0,
@@ -9175,6 +9191,8 @@
                 cost_usd: Some(cost),
                 smoke_tests: None,
                 review_findings: None,
+                review_findings_truncated: false,
+                review_findings_len: None,
                 test_plan: None,
                 test_plan_branch_head: None,
                 input_tokens: 0,
@@ -9228,6 +9246,8 @@
             cost_usd: Some(0.50),
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 0,
@@ -9270,6 +9290,8 @@
             cost_usd: Some(9.99),
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 0,
@@ -9323,6 +9345,8 @@
             cost_usd: Some(0.25),
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 1000,
@@ -9365,6 +9389,8 @@
             cost_usd: None,  // Max subscription — no per-token billing
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 500,
@@ -9423,6 +9449,8 @@
                 cost_usd: Some(0.10),
                 smoke_tests: None,
                 review_findings: None,
+                review_findings_truncated: false,
+                review_findings_len: None,
                 test_plan: None,
                 test_plan_branch_head: None,
                 input_tokens: inp,
@@ -9475,6 +9503,8 @@
             cost_usd: Some(0.10),
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 1000,
@@ -9517,6 +9547,8 @@
             cost_usd: Some(9.99),
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 9000,
@@ -9578,6 +9610,8 @@
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 0,
@@ -9639,6 +9673,8 @@
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 0,
@@ -9786,6 +9822,8 @@
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 0,
@@ -9868,6 +9906,8 @@
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 0,
@@ -9916,6 +9956,8 @@
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 0,
@@ -9969,6 +10011,8 @@
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 0,
@@ -10011,6 +10055,8 @@
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 0,
@@ -10061,6 +10107,8 @@
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 0,
@@ -10189,6 +10237,8 @@
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 0,
@@ -10248,6 +10298,8 @@
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 0,
@@ -10289,6 +10341,8 @@
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 0,
@@ -10507,6 +10561,8 @@
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 0,
@@ -10860,6 +10916,8 @@
                 cost_usd: None,
                 smoke_tests: None,
                 review_findings: None,
+                review_findings_truncated: false,
+                review_findings_len: None,
                 test_plan: None,
                 test_plan_branch_head: None,
                 input_tokens: 0,
@@ -10926,6 +10984,8 @@
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 0,
@@ -10983,6 +11043,8 @@
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 0,
@@ -11083,6 +11145,8 @@
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 0,
@@ -11139,6 +11203,8 @@
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 0,
@@ -11189,6 +11255,8 @@
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 0,
@@ -15755,6 +15823,126 @@
     }
 
     #[test]
+    fn stage_content_review_prefers_hydrated_full_findings() {
+        // #1337: the /board wire carries only a bounded findings preview
+        // (review_findings_truncated).  When the background detail fetch has
+        // hydrated the full body into findings_detail_cache, the Review pane
+        // must render the full body, not the preview.
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        let mut review = _stage_assignment("rev-hyd", "review", 200.0, "done");
+        review.issue_number = 42;
+        review.review_of_assignment_id = Some("w1".to_string());
+        review.review_verdict = Some("request-changes".to_string());
+        review.review_findings = Some(
+            "{\"verdict\":\"request-changes\",\"body\":\"PREVIEW ONLY…\",\"truncated\":true}"
+                .to_string(),
+        );
+        review.review_findings_truncated = true;
+        review.review_findings_len = Some(5000);
+        app.data.assignments.push(review);
+        app.findings_detail_cache.insert(
+            ("rev-hyd".to_string(), 5000),
+            crate::app::data::FindingsDetailEntry {
+                fetched_at: Instant::now(),
+                full: Some(
+                    "{\"verdict\":\"request-changes\",\"body\":\"FULL BODY with every blocking item\"}"
+                        .to_string(),
+                ),
+            },
+        );
+
+        let rows = app.stage_content_review(&app.pipeline_issues[0].clone());
+        let text: String = rows
+            .iter()
+            .flat_map(|r| r.text.spans.iter().map(|s| s.text.clone()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            text.contains("FULL BODY with every blocking item"),
+            "expected hydrated full findings; got: {text:?}",
+        );
+        assert!(
+            !text.contains("PREVIEW ONLY"),
+            "preview must be replaced once hydrated; got: {text:?}",
+        );
+    }
+
+    #[test]
+    fn stage_content_review_renders_preview_before_hydration() {
+        // #1337: until the detail fetch lands, the wire preview (which ends
+        // with the daemon's truncation notice) renders as-is — degraded but
+        // never blank.
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        let mut review = _stage_assignment("rev-pre", "review", 200.0, "done");
+        review.issue_number = 42;
+        review.review_verdict = Some("request-changes".to_string());
+        review.review_findings = Some(
+            "{\"verdict\":\"request-changes\",\"body\":\"partial… [truncated on the /board wire — full text: detail endpoint]\",\"truncated\":true}"
+                .to_string(),
+        );
+        review.review_findings_truncated = true;
+        review.review_findings_len = Some(9999);
+        app.data.assignments.push(review);
+
+        let rows = app.stage_content_review(&app.pipeline_issues[0].clone());
+        let text: String = rows
+            .iter()
+            .flat_map(|r| r.text.spans.iter().map(|s| s.text.clone()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(text.contains("partial…"), "preview body must render; got: {text:?}");
+        assert!(
+            text.contains("truncated on the /board wire"),
+            "the daemon's truncation notice must be visible; got: {text:?}",
+        );
+        // And the periodic-work arming helper targets exactly this review.
+        assert_eq!(
+            app.findings_fetch_target(),
+            Some(("rev-pre".to_string(), 9999)),
+        );
+    }
+
+    #[test]
+    fn findings_fetch_target_none_when_not_truncated_or_hydrated() {
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        let mut review = _stage_assignment("rev-w", "review", 200.0, "done");
+        review.issue_number = 42;
+        review.review_findings =
+            Some("{\"verdict\":\"approve\",\"body\":\"whole\"}".to_string());
+        app.data.assignments.push(review);
+        // Findings arrived whole → nothing to fetch.
+        assert_eq!(app.findings_fetch_target(), None);
+
+        // Truncated + already hydrated → nothing to fetch.
+        app.data.assignments.last_mut().unwrap().review_findings_truncated = true;
+        app.data.assignments.last_mut().unwrap().review_findings_len = Some(123);
+        app.findings_detail_cache.insert(
+            ("rev-w".to_string(), 123),
+            crate::app::data::FindingsDetailEntry {
+                fetched_at: Instant::now(),
+                full: Some("{\"verdict\":\"approve\",\"body\":\"full\"}".to_string()),
+            },
+        );
+        assert_eq!(app.findings_fetch_target(), None);
+
+        // A recent FAILED attempt backs off (full: None, fresh timestamp).
+        app.findings_detail_cache.insert(
+            ("rev-w".to_string(), 123),
+            crate::app::data::FindingsDetailEntry {
+                fetched_at: Instant::now(),
+                full: None,
+            },
+        );
+        assert_eq!(app.findings_fetch_target(), None);
+    }
+
+    #[test]
     fn stage_content_review_falls_back_when_no_cache() {
         let mut app = make_pipeline_app();
         app.active_view = SidebarView::Pipeline;
@@ -16320,6 +16508,8 @@
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 0,
@@ -16453,6 +16643,8 @@
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 0,
@@ -16629,6 +16821,8 @@
             cost_usd: Some(0.42),
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 0,
@@ -16724,6 +16918,8 @@
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 0,
@@ -17286,6 +17482,8 @@
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 0,
@@ -17659,6 +17857,8 @@
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 0,
@@ -26241,6 +26441,8 @@
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 0,
@@ -26284,6 +26486,8 @@
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 0,
@@ -26365,6 +26569,8 @@
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 0,
@@ -29011,6 +29217,8 @@ Milestone tracking issue.
             cost_usd: None,
             smoke_tests: None,
             review_findings: None,
+            review_findings_truncated: false,
+            review_findings_len: None,
             test_plan: None,
             test_plan_branch_head: None,
             input_tokens: 0,
