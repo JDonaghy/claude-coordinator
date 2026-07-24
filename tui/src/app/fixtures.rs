@@ -142,7 +142,6 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         pending_pr_fetches: std::cell::RefCell::new(std::collections::HashMap::new()),
         fetched_prs_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         pipeline_ci_checks: std::collections::HashMap::new(),
-        pipeline_ci_loader: std::collections::HashMap::new(),
         pipeline_dismissed: std::collections::HashSet::new(),
         pipeline_inflight_merges: std::collections::HashSet::new(),
         pending_refinement_notes_synth: None,

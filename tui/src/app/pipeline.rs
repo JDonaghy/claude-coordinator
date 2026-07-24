@@ -524,32 +524,6 @@ pub(crate) fn stage_badge(stage: &str, theme: &quadraui::Theme) -> (String, Colo
 }
 
 
-/// Compute the cache TTL (seconds) for a CI-check entry, based on the
-/// current CI state and whether the PR is merge-eligible.
-///
-/// Returns `Some(secs)` when a cached entry older than `secs` should trigger
-/// a fresh `gh pr checks` call.  Returns `None` when the entry should **not**
-/// be polled at all (ineligible PR with no cached data — CI state is
-/// irrelevant until the review gate clears).
-///
-/// Tiering:
-/// * `Some(s)` where `s.running > 0` → `Some(30)` — CI still in flight;
-///   needs timely updates.
-/// * `Some(s)` where all checks settled (terminal) → `Some(600)` — CI result
-///   won't change; a 10-minute re-check is conservative enough.
-/// * `None` and `merge_eligible` → `Some(0)` — no prior fetch; eligible PR
-///   needs a result immediately.
-/// * `None` and `!merge_eligible` → `None` — blocked on review; skip until
-///   eligibility changes.
-pub(crate) fn ci_stale_secs(cached: Option<&CiCheckSummary>, merge_eligible: bool) -> Option<u64> {
-    match cached {
-        Some(s) if s.running > 0 => Some(30),
-        Some(_) => Some(600),
-        None if merge_eligible => Some(0),
-        None => None,
-    }
-}
-
 /// #550: map a lowercase status string from the server-computed
 /// `issue_stage_projection` (`coord.stage_projection`, see
 /// `PENDING`/`ACTIVE`/`DONE`/`FAILED`/`STALE`/`SKIPPED`) onto
@@ -6946,147 +6920,63 @@ impl CoordApp {
         self.refresh();
     }
 
-    /// Kick off background `gh pr checks` polls for any PR in the merge
-    /// queue without a fresh CI summary on hand.  No-op outside the Pipeline
-    /// view.
+    /// #1344: rebuild `pipeline_ci_checks` from the just-applied `/board`
+    /// payload's `merge_plan[].ci_summary` — the board daemon computes this
+    /// once per tick from its tick-refreshed gate snapshot (#1336,
+    /// `coord/gate_snapshot.py`) and ships it on the wire, so the TUI no
+    /// longer needs its own perpetual per-PR `gh pr checks` poll loop
+    /// (the old `maybe_kick_ci_check_loaders`/`poll_ci_check_loaders`
+    /// machinery this replaces — sustained high CPU across the fleet, one
+    /// `gh` subprocess loop per running `coord-tui` instance).
     ///
-    /// Three guards prevent the thundering-herd that fired when ~45 PRs all
-    /// went stale at the same 30-second mark:
-    ///
-    /// 1. **Concurrency cap** — at most `CI_MAX_IN_FLIGHT` loaders run at
-    ///    once; excess targets wait for a free slot in a later tick.
-    /// 2. **Per-tick stagger** — at most `CI_MAX_NEW_PER_TICK` new loaders
-    ///    are started per call, spreading bursts across many ticks.
-    /// 3. **TTL tiering** — cache TTL is based on observed CI state (see
-    ///    [`ci_stale_secs`]): running CI → 30s, terminal (pass/fail) → 600s,
-    ///    no cache + eligible → fetch immediately, no cache + ineligible →
-    ///    skip entirely (CI result irrelevant until review clears).
-    pub(crate) fn maybe_kick_ci_check_loaders(&mut self) {
-        if self.active_view != SidebarView::Pipeline {
-            return;
-        }
-
-        /// Maximum concurrent `gh pr checks` subprocesses.
-        const CI_MAX_IN_FLIGHT: usize = 4;
-        /// Maximum new loaders started in a single tick (stagger guard).
-        const CI_MAX_NEW_PER_TICK: usize = 2;
-
-        // Global cap: don't wake any new threads when already at the limit.
-        if self.pipeline_ci_loader.len() >= CI_MAX_IN_FLIGHT {
-            return;
-        }
-
-        // Whether this project has a review gate (if not, every PR is eligible).
-        let has_review_stage = self.pipeline_stage_names().iter().any(|s| s == "review");
-
-        // Snapshot the queue — collect repo/PR pairs plus merge-eligibility so
-        // we don't hold an immutable borrow while mutating pipeline_ci_loader.
-        let targets: Vec<(String, i64, bool)> = self
+    /// Called from `apply_pending_data` on every successful board refresh.
+    /// Returns `true` when at least one summary changed (caller redraws).
+    pub(crate) fn sync_ci_checks_from_board(&mut self) -> bool {
+        // Snapshot into owned data first — `self.push_toast` below needs
+        // `&mut self`, which can't coexist with a live borrow of
+        // `self.data.merge_plan`.
+        let updates: Vec<((String, i64), CiCheckSummary)> = self
             .data
-            .merge_queue
+            .merge_plan
             .iter()
-            .filter_map(|m| {
-                let pr = m.pr_number?;
-                if m.repo_github.is_empty() {
-                    return None;
-                }
-                // A PR is merge-eligible when it has cleared the review gate
-                // (approved verdict on any assignment for the same issue).
-                let merge_eligible = if !has_review_stage {
-                    true
-                } else if let Some(issue_num) = m.issue_number {
-                    self.data.assignments.iter().any(|a| {
-                        a.issue_number == issue_num
-                            && a.review_verdict.as_deref() == Some("approve")
-                    })
-                } else {
-                    false
-                };
-                Some((m.repo_github.clone(), pr, merge_eligible))
+            .filter_map(|pm| {
+                let pr = pm.pr_number?;
+                let ci = pm.ci_summary.as_ref()?;
+                Some((
+                    (pm.repo_github.clone(), pr),
+                    CiCheckSummary {
+                        passed: ci.passed,
+                        failed: ci.failed,
+                        running: ci.running,
+                        failed_names: ci.failed_names.clone(),
+                        first_failed_url: ci.first_failed_url.clone(),
+                    },
+                ))
             })
             .collect();
 
-        let mut kicked = 0;
-        for (repo, pr, merge_eligible) in targets {
-            // Per-tick stagger: never start more than CI_MAX_NEW_PER_TICK
-            // loaders in one call, regardless of how many are due.
-            if kicked >= CI_MAX_NEW_PER_TICK {
-                break;
-            }
-            // Global cap re-check inside the loop (some slots may have been
-            // filled by earlier iterations of this same tick).
-            if self.pipeline_ci_loader.len() >= CI_MAX_IN_FLIGHT {
-                break;
-            }
-            let key = (repo.clone(), pr);
-            if self.pipeline_ci_loader.contains_key(&key) {
-                continue;
-            }
-            // CI-state-based TTL tiering (see `ci_stale_secs`):
-            // - running CI      → 30s  (needs timely updates)
-            // - terminal CI     → 600s (won't change; check rarely)
-            // - no cache + eligible  → fetch now
-            // - no cache + ineligible → skip entirely (blocked on review)
-            let needs_refresh =
-                match ci_stale_secs(self.pipeline_ci_checks.get(&key), merge_eligible) {
-                    None => false,
-                    Some(threshold_secs) => match self.pipeline_ci_checks.get(&key) {
-                        Some(cached) => {
-                            cached.fetched_at.elapsed() >= Duration::from_secs(threshold_secs)
-                        }
-                        None => true, // threshold_secs == 0 for eligible+no-cache → fetch now
-                    },
-                };
-            if !needs_refresh {
-                continue;
-            }
-            let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                let _ = tx.send(fetch_ci_check_summary(&repo, pr));
-            });
-            self.pipeline_ci_loader.insert(key, rx);
-            kicked += 1;
-        }
-    }
-
-    /// Drain completed CI-check fetches into `pipeline_ci_checks`.  Returns
-    /// `true` when at least one summary changed (caller redraws).
-    pub(crate) fn poll_ci_check_loaders(&mut self) -> bool {
-        let keys: Vec<(String, i64)> = self.pipeline_ci_loader.keys().cloned().collect();
         let mut changed = false;
-        for key in keys {
-            let result = self
-                .pipeline_ci_loader
+        for (key, summary) in updates {
+            // Toast only on the *transition* into failure: the new summary
+            // has failures and either there was no prior summary or the
+            // prior summary was clean.  Without the transition guard we'd
+            // re-toast on every tick while CI stays red.
+            let prev_failed = self
+                .pipeline_ci_checks
                 .get(&key)
-                .and_then(|rx| rx.try_recv().ok());
-            let Some(result) = result else {
-                continue;
-            };
-            self.pipeline_ci_loader.remove(&key);
-            if let Ok(summary) = result {
-                // Toast only on the *transition* into failure: the new summary
-                // has failures and either there was no prior summary or the
-                // prior summary was clean.  Without the transition guard we'd
-                // re-toast every 30s poll while CI stays red.
-                let prev_failed = self
-                    .pipeline_ci_checks
-                    .get(&key)
-                    .is_some_and(|s| s.has_failures());
-                if summary.has_failures() && !prev_failed {
-                    let (repo_github, pr) = &key;
-                    let names = summary.failed_names.join(", ");
-                    let body = if names.is_empty() {
-                        format!("{repo_github} #{pr}")
-                    } else {
-                        format!("{repo_github} #{pr} — {names}")
-                    };
-                    self.push_toast("⚠ CI failed", &body, ToastSeverity::Warning);
-                }
-                self.pipeline_ci_checks.insert(key, summary);
-                changed = true;
+                .is_some_and(|s| s.has_failures());
+            if summary.has_failures() && !prev_failed {
+                let (repo_github, pr) = &key;
+                let names = summary.failed_names.join(", ");
+                let body = if names.is_empty() {
+                    format!("{repo_github} #{pr}")
+                } else {
+                    format!("{repo_github} #{pr} — {names}")
+                };
+                self.push_toast("⚠ CI failed", &body, ToastSeverity::Warning);
             }
-            // On error we leave any prior summary in place — a transient
-            // `gh` failure shouldn't blank the row.
+            self.pipeline_ci_checks.insert(key, summary);
+            changed = true;
         }
         changed
     }

@@ -780,12 +780,6 @@ impl CoordApp {
             needs_redraw = true;
         }
 
-        // #240: keep merge-queue CI check summaries fresh on the Pipeline view.
-        self.maybe_kick_ci_check_loaders();
-        if self.poll_ci_check_loaders() {
-            needs_redraw = true;
-        }
-
         // Auto-notify: run `coord notify` when running assignments exist.
         // #584: skip on a thin client — `coord notify` is a host-side control
         // command; running it locally here only errors (no DB/config).

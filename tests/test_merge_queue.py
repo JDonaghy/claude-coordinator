@@ -2761,6 +2761,60 @@ class TestPlan:
         assert plan[0].status == mq.PLAN_BLOCKED
         assert "CI running" in (plan[0].reason or "")
 
+    def test_ci_summary_populated_from_ci_store(self, coord_db) -> None:
+        """#1344: plan() attaches a structured `ci_summary` + `pr_number` so
+        the TUI can render CI badges straight from `/board` instead of
+        shelling out to `gh pr checks` itself."""
+        from types import SimpleNamespace
+
+        class FakeCi:
+            is_available = True
+
+            def list_checks_for_pr(self, repo, number):
+                return [
+                    SimpleNamespace(name="build", status="completed", conclusion="success"),
+                    SimpleNamespace(name="lint", status="completed", conclusion="failure", url="http://x/lint"),
+                    SimpleNamespace(name="test", status="in_progress", conclusion=None),
+                ]
+
+        items = [_q("w1", size=50, pr=99)]
+        save_queue(items)
+        board = self._board(completed=[
+            self._work("w1", test_state="passed"),
+            self._review("w1", verdict="approve"),
+        ])
+        cfg = self._config()
+        plan = mq.plan(board, cfg, ci_store=FakeCi())
+        assert plan[0].pr_number == 99
+        summary = plan[0].ci_summary
+        assert summary is not None
+        assert summary.passed == 1
+        assert summary.failed == 1
+        assert summary.running == 1
+        assert summary.failed_names == ["lint"]
+        assert summary.first_failed_url == "http://x/lint"
+
+    def test_ci_summary_none_without_pr_number(self, coord_db) -> None:
+        """No PR yet opened → no CI summary (mirrors the CI gate's own guard)."""
+        from types import SimpleNamespace
+
+        class FakeCi:
+            is_available = True
+
+            def list_checks_for_pr(self, repo, number):
+                return [SimpleNamespace(name="build", status="completed", conclusion="success")]
+
+        items = [_q("w1", size=50)]  # pr_number=None
+        save_queue(items)
+        board = self._board(completed=[
+            self._work("w1", test_state="passed"),
+            self._review("w1", verdict="approve"),
+        ])
+        cfg = self._config()
+        plan = mq.plan(board, cfg, ci_store=FakeCi())
+        assert plan[0].pr_number is None
+        assert plan[0].ci_summary is None
+
     def test_ci_not_checked_without_pr_number(self, coord_db) -> None:
         """An entry with no PR yet opened is not blocked on CI."""
         from types import SimpleNamespace

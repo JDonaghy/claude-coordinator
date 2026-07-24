@@ -16,6 +16,24 @@ from typing import Protocol, runtime_checkable
 
 
 @dataclass
+class CiCheckSummary:
+    """Structured rollup of a PR's CI checks — the board-wire analogue of the
+    TUI's Rust ``CiCheckSummary`` (``tui/src/app/types.rs``).
+
+    Populated server-side by :func:`summarize_counts` and attached to
+    :class:`coord.merge_queue.PlannedMerge` so the TUI can render its "2✓ 1✗"
+    badges straight from the ``/board`` payload instead of shelling out to
+    ``gh pr checks`` itself (#1344).
+    """
+
+    passed: int
+    failed: int
+    running: int
+    failed_names: list[str]
+    first_failed_url: str | None
+
+
+@dataclass
 class CheckRun:
     """A single CI check run on a PR.
 
@@ -108,3 +126,43 @@ def summarize(checks: list[CheckRun]) -> str:
     if running:
         parts.append(f"{running}⋯")
     return " ".join(parts) if parts else "no checks"
+
+
+def summarize_counts(checks: list[CheckRun]) -> CiCheckSummary:
+    """Structured rollup of *checks*, mirroring the classification the TUI's
+    (now-deleted) ``fetch_ci_check_summary`` used to compute client-side:
+
+    - not yet ``completed`` → running
+    - completed + conclusion in ``_FAILED_CONCLUSIONS`` → failed (name + first
+      URL captured)
+    - completed + any other conclusion (success / skipped / neutral) → passed
+
+    Used to populate :class:`coord.merge_queue.PlannedMerge.ci_summary` so the
+    `/board` payload carries everything the TUI renders as CI badges (#1344).
+    """
+    # `checks` items are `CheckRun` in production but tests commonly pass
+    # lighter duck-typed fakes (see `failed_checks`/`in_flight_checks` above,
+    # which only ever touch `.status`/`.conclusion`) — `getattr` with a
+    # default keeps this function tolerant of fakes that omit `.url`.
+    passed = failed = running = 0
+    failed_names: list[str] = []
+    first_failed_url: str | None = None
+    for c in checks:
+        if c.status != "completed":
+            running += 1
+            continue
+        if c.conclusion in _FAILED_CONCLUSIONS:
+            failed += 1
+            failed_names.append(c.name)
+            url = getattr(c, "url", "") or ""
+            if first_failed_url is None and url:
+                first_failed_url = url
+        else:
+            passed += 1
+    return CiCheckSummary(
+        passed=passed,
+        failed=failed,
+        running=running,
+        failed_names=failed_names,
+        first_failed_url=first_failed_url,
+    )
