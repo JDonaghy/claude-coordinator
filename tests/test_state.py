@@ -1253,3 +1253,222 @@ class TestSetAssignmentFailureReason:
         from coord.state import set_assignment_failure_reason
 
         set_assignment_failure_reason("no-such-id", "reason")  # must not raise
+
+
+# ── Durable issue_comments mirror (#873) ─────────────────────────────────────
+
+class TestRecordIssueCommentCapture:
+    def test_writes_local_row_with_parsed_marker_columns(self, coord_db) -> None:
+        from coord.comments import format_completion
+        from coord.state import record_issue_comment_capture
+
+        body = format_completion(
+            assignment_id="abc123",
+            machine_name="macbook",
+            repo_name="acme/api",
+            issue_number=42,
+            exit_code=0,
+        )
+        record_issue_comment_capture(
+            repo_name="acme/api", issue_number=42, body=body, gh_comment_id=111,
+        )
+        row = coord_db.execute(
+            "SELECT * FROM issue_comments WHERE gh_comment_id=111"
+        ).fetchone()
+        assert row is not None
+        assert row["repo_name"] == "acme/api"
+        assert row["issue_number"] == 42
+        assert row["coord_event"] == "completion"
+        assert row["coord_assignment_id"] == "abc123"
+        assert row["machine"] == "macbook"
+        assert row["body"] == body
+
+    def test_non_coord_body_leaves_marker_columns_null(self, coord_db) -> None:
+        from coord.state import record_issue_comment_capture
+
+        record_issue_comment_capture(
+            repo_name="acme/api", issue_number=1, body="just a human comment",
+            gh_comment_id=222,
+        )
+        row = coord_db.execute(
+            "SELECT * FROM issue_comments WHERE gh_comment_id=222"
+        ).fetchone()
+        assert row["coord_event"] is None
+        assert row["coord_assignment_id"] is None
+
+    def test_upsert_idempotent_on_gh_comment_id(self, coord_db) -> None:
+        from coord.state import record_issue_comment_capture
+
+        record_issue_comment_capture(
+            repo_name="acme/api", issue_number=1, body="v1", gh_comment_id=333,
+        )
+        record_issue_comment_capture(
+            repo_name="acme/api", issue_number=1, body="v2 (edited)", gh_comment_id=333,
+        )
+        rows = coord_db.execute(
+            "SELECT body FROM issue_comments WHERE gh_comment_id=333"
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["body"] == "v2 (edited)"
+
+    def test_null_gh_comment_id_never_dedups(self, coord_db) -> None:
+        """A comment id that couldn't be resolved (rare) still gets a
+        durable row each call — no natural key to upsert against."""
+        from coord.state import record_issue_comment_capture
+
+        record_issue_comment_capture(repo_name="acme/api", issue_number=1, body="a")
+        record_issue_comment_capture(repo_name="acme/api", issue_number=1, body="b")
+        count = coord_db.execute(
+            "SELECT COUNT(*) c FROM issue_comments WHERE gh_comment_id IS NULL"
+        ).fetchone()["c"]
+        assert count == 2
+
+    def test_routes_to_daemon_when_service_set(self, coord_db, monkeypatch) -> None:
+        from coord import client as cc
+        from coord.state import record_issue_comment_capture
+
+        monkeypatch.setattr(
+            cc, "resolve_board_service",
+            lambda *a, **k: cc.ServiceConfig("http://d:7435"),
+        )
+        captured: dict = {}
+        monkeypatch.setattr(
+            cc, "post_record",
+            lambda svc, path, payload, **kw: captured.update(
+                path=path, payload=payload
+            ) or {"ok": True},
+        )
+        record_issue_comment_capture(
+            repo_name="acme/api", issue_number=1, body="x", gh_comment_id=444,
+        )
+        assert captured["path"] == "/issue-comments"
+        assert captured["payload"]["action"] == "capture"
+        assert captured["payload"]["gh_comment_id"] == 444
+        # Routed → no local row created.
+        assert coord_db.execute(
+            "SELECT COUNT(*) c FROM issue_comments"
+        ).fetchone()["c"] == 0
+
+
+class TestSyncIssueComments:
+    def test_sync_upserts_comments_from_github(self, coord_db, monkeypatch) -> None:
+        from coord import github_ops
+        from coord.state import sync_issue_comments
+
+        fetched = [
+            {
+                "url": "https://github.com/acme/api/issues/7#issuecomment-1",
+                "body": "human comment",
+                "author": {"login": "someone"},
+                "createdAt": "2026-07-02T01:27:50Z",
+            },
+            {
+                "url": "https://github.com/acme/api/issues/7#issuecomment-2",
+                "body": "<!-- coord:event=completion assignment=a1 machine=m -->\ndone",
+                "author": {"login": "coord-bot"},
+                "createdAt": "2026-07-02T02:00:00Z",
+            },
+        ]
+        monkeypatch.setattr(github_ops, "get_issue_comments", lambda *a, **k: fetched)
+
+        n = sync_issue_comments("api", 7, repo_github="acme/api")
+        assert n == 2
+        rows = coord_db.execute(
+            "SELECT * FROM issue_comments WHERE repo_name='api' AND issue_number=7 "
+            "ORDER BY gh_comment_id"
+        ).fetchall()
+        assert len(rows) == 2
+        assert rows[0]["gh_comment_id"] == 1
+        assert rows[0]["author"] == "someone"
+        assert rows[0]["coord_event"] is None
+        assert rows[1]["gh_comment_id"] == 2
+        assert rows[1]["coord_event"] == "completion"
+        assert rows[1]["coord_assignment_id"] == "a1"
+
+    def test_sync_idempotent_rerun_no_dupes(self, coord_db, monkeypatch) -> None:
+        from coord import github_ops
+        from coord.state import sync_issue_comments
+
+        fetched = [{
+            "url": "https://github.com/acme/api/issues/7#issuecomment-9",
+            "body": "hi", "author": {"login": "x"}, "createdAt": "2026-07-02T00:00:00Z",
+        }]
+        monkeypatch.setattr(github_ops, "get_issue_comments", lambda *a, **k: fetched)
+
+        sync_issue_comments("api", 7, repo_github="acme/api")
+        sync_issue_comments("api", 7, repo_github="acme/api")
+        count = coord_db.execute(
+            "SELECT COUNT(*) c FROM issue_comments WHERE gh_comment_id=9"
+        ).fetchone()["c"]
+        assert count == 1
+
+    def test_sync_returns_zero_on_github_error(self, coord_db, monkeypatch) -> None:
+        from coord import github_ops
+        from coord.state import sync_issue_comments
+
+        def _boom(*a, **k):
+            raise RuntimeError("gh unreachable")
+
+        monkeypatch.setattr(github_ops, "get_issue_comments", _boom)
+        assert sync_issue_comments("api", 7, repo_github="acme/api") == 0
+
+    def test_sync_routes_to_daemon_when_service_set(self, coord_db, monkeypatch) -> None:
+        from coord import client as cc
+        from coord.state import sync_issue_comments
+
+        monkeypatch.setattr(
+            cc, "resolve_board_service",
+            lambda *a, **k: cc.ServiceConfig("http://d:7435"),
+        )
+        captured: dict = {}
+        monkeypatch.setattr(
+            cc, "post_record",
+            lambda svc, path, payload, **kw: captured.update(
+                path=path, payload=payload
+            ) or {"synced": 3},
+        )
+        assert sync_issue_comments("api", 7, repo_github="acme/api") == 3
+        assert captured["path"] == "/issue-comments"
+        assert captured["payload"]["action"] == "sync"
+        assert captured["payload"]["repo_github"] == "acme/api"
+
+
+class TestListIssueNumbersWithAssignments:
+    def test_local_reads_from_assignments_table(self, coord_db) -> None:
+        from coord.state import list_issue_numbers_with_assignments
+
+        coord_db.execute(
+            "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+            "issue_number, issue_title) VALUES ('a1', 'm', 'api', 7, 't')"
+        )
+        coord_db.execute(
+            "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+            "issue_number, issue_title) VALUES ('a2', 'm', 'other-repo', 9, 't')"
+        )
+        coord_db.commit()
+        assert list_issue_numbers_with_assignments("api") == {7}
+
+    def test_missing_assignments_archive_table_is_tolerated(self, coord_db) -> None:
+        """assignments_archive doesn't exist until housekeeping runs at
+        least once — must not raise."""
+        from coord.state import list_issue_numbers_with_assignments
+
+        assert list_issue_numbers_with_assignments("api") == set()
+
+    def test_routes_to_daemon_via_board_fetch(self, coord_db, monkeypatch) -> None:
+        from coord import client as cc
+        from coord.models import Assignment, Board
+        from coord.state import list_issue_numbers_with_assignments
+
+        monkeypatch.setattr(
+            cc, "resolve_board_service",
+            lambda *a, **k: cc.ServiceConfig("http://d:7435"),
+        )
+        board = Board(
+            active=[Assignment(machine_name="m", repo_name="api", issue_number=5,
+                                issue_title="t")],
+            completed=[Assignment(machine_name="m", repo_name="api", issue_number=6,
+                                   issue_title="t")],
+        )
+        monkeypatch.setattr(cc, "fetch_remote_board", lambda svc, **kw: board)
+        assert list_issue_numbers_with_assignments("api") == {5, 6}

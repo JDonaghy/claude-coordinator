@@ -2159,6 +2159,56 @@ def _openapi_spec() -> dict:
                 },
             },
         },
+        "/issue-comments": {
+            "get": {
+                "summary": "#873: read an issue's captured comments (oldest-first) from the durable mirror",
+                "parameters": [
+                    {
+                        "name": "repo_name", "in": "query", "required": True,
+                        "schema": {"type": "string"},
+                    },
+                    {
+                        "name": "issue_number", "in": "query", "required": True,
+                        "schema": {"type": "integer"},
+                    },
+                ],
+                "responses": {
+                    "200": {"description": "OK"},
+                    "400": {"description": "Missing repo_name/issue_number"},
+                },
+            },
+            "post": {
+                "summary": "#873: capture-at-write / backfill-sync into the durable issue_comments mirror",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "action": {
+                                        "type": "string",
+                                        "enum": ["capture", "sync"],
+                                    },
+                                    "repo_name": {"type": "string"},
+                                    "issue_number": {"type": "integer"},
+                                    "body": {"type": "string"},
+                                    "gh_comment_id": {"type": "integer", "nullable": True},
+                                    "author": {"type": "string", "nullable": True},
+                                    "created_at": {"type": "number", "nullable": True},
+                                    "repo_github": {"type": "string", "nullable": True},
+                                },
+                                "required": ["action", "repo_name", "issue_number"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {"description": "OK"},
+                    "400": {"description": "Missing field / unknown action"},
+                },
+            },
+        },
         "/audit": {
             "get": {
                 "summary": (
@@ -3707,6 +3757,64 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             )
         return JSONResponse({"error": f"unknown action: {action!r}"}, status_code=400)
 
+    async def get_issue_comments(request: Request) -> Response:
+        # #873: read an issue's captured comments (oldest-first) from the
+        # durable mirror.
+        from coord import state  # noqa: PLC0415
+
+        repo_name = request.query_params.get("repo_name")
+        raw_issue = request.query_params.get("issue_number")
+        if not repo_name or raw_issue is None:
+            return JSONResponse(
+                {"error": "repo_name and issue_number are required"}, status_code=400
+            )
+        try:
+            issue_number = int(raw_issue)
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "issue_number must be an int"}, status_code=400)
+        try:
+            comments = state.list_issue_comments(repo_name, issue_number)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "issue-comments read failed", "detail": str(e)}, status_code=503
+            )
+        return JSONResponse({"comments": comments})
+
+    async def post_issue_comments(request: Request) -> Response:
+        # #873: capture-at-write / backfill-sync into the durable
+        # issue_comments mirror on the canonical DB.
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        action = body.get("action")
+        try:
+            if action == "capture":
+                state._record_issue_comment_capture_local(
+                    repo_name=body["repo_name"],
+                    issue_number=body["issue_number"],
+                    body=body["body"],
+                    gh_comment_id=body.get("gh_comment_id"),
+                    author=body.get("author"),
+                    created_at=body.get("created_at"),
+                )
+                return JSONResponse({"ok": True})
+            if action == "sync":
+                n = state._sync_issue_comments_local(
+                    body["repo_name"],
+                    body["issue_number"],
+                    repo_github=body.get("repo_github"),
+                )
+                return JSONResponse({"synced": n})
+        except KeyError as e:
+            return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "issue-comments write failed", "detail": str(e)}, status_code=503
+            )
+        return JSONResponse({"error": f"unknown action: {action!r}"}, status_code=400)
+
     async def get_audit(request: Request) -> Response:
         # #1037: paginated read over audit_log — deliberately its own endpoint
         # (NOT riding /board, which is a bounded current-state snapshot). Keyset
@@ -4416,6 +4524,8 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/milestone-edit", post_milestone_edit, methods=["POST"]),
         Route("/issue-context", get_issue_context, methods=["GET"]),
         Route("/issue-context", post_issue_context, methods=["POST"]),
+        Route("/issue-comments", get_issue_comments, methods=["GET"]),
+        Route("/issue-comments", post_issue_comments, methods=["POST"]),
         Route("/merge", post_merge, methods=["POST"]),
         Route("/reconcile-merges", post_reconcile_merges, methods=["POST"]),
         Route("/diagnose", post_diagnose, methods=["POST"]),

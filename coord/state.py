@@ -3122,6 +3122,249 @@ def _upsert_open_issues_local(repo_name: str, issues: list[dict]) -> None:
     conn.commit()
 
 
+# ── Durable issue_comments mirror (#873) ────────────────────────────────────
+#
+# Two write paths populate the same table, both keyed on gh_comment_id:
+# capture-at-write (record_issue_comment_capture, called from
+# github_ops.post_issue_comment the instant a coord comment posts — the
+# structural fix for the review-capture-recurrence, since it no longer
+# depends on any later reconciliation pass) and the backfill sync
+# (sync_issue_comments, for human + out-of-band comments coord never wrote
+# itself). Both route through the daemon when board_service is set, exactly
+# like issue_context below.
+
+
+def _parse_github_timestamp(value: str | None) -> float | None:
+    """GitHub's ISO-8601 ``createdAt``/``updatedAt`` (e.g.
+    ``"2026-07-02T01:27:50Z"``) -> epoch seconds, matching this schema's
+    REAL timestamp convention. Returns ``None`` for blank/unparseable input."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def record_issue_comment_capture(
+    *,
+    repo_name: str,
+    issue_number: int,
+    body: str,
+    gh_comment_id: int | None = None,
+    author: str | None = None,
+    created_at: float | None = None,
+) -> None:
+    """Capture-at-write mirror of a just-posted comment (#873) — routes to
+    the daemon when ``board_service`` is set, else writes the local DB.
+
+    Best-effort by design: the caller (``github_ops.post_issue_comment``)
+    already wraps this in a try/except, but a DB error here still must never
+    propagate back out as a failure of the (already-successful) GitHub post.
+    """
+    svc = _board_service()
+    resp = _route_write(
+        svc,
+        "/issue-comments",
+        {
+            "action": "capture",
+            "repo_name": repo_name,
+            "issue_number": issue_number,
+            "body": body,
+            "gh_comment_id": gh_comment_id,
+            "author": author,
+            "created_at": created_at,
+        },
+    )
+    if resp is not None:
+        return
+    _record_issue_comment_capture_local(
+        repo_name=repo_name,
+        issue_number=issue_number,
+        body=body,
+        gh_comment_id=gh_comment_id,
+        author=author,
+        created_at=created_at,
+    )
+
+
+def _record_issue_comment_capture_local(
+    *,
+    repo_name: str,
+    issue_number: int,
+    body: str,
+    gh_comment_id: int | None = None,
+    author: str | None = None,
+    created_at: float | None = None,
+) -> None:
+    from coord.comments import parse_coord_comment_marker  # noqa: PLC0415
+
+    conn = get_connection()
+    now = time.time()
+    ts = created_at if created_at is not None else now
+    marker = parse_coord_comment_marker(body)
+    coord_event = marker["event"] if marker else None
+    coord_assignment_id = marker["assignment_id"] if marker else None
+    machine = marker["machine"] if marker else None
+    verdict = marker["verdict"] if marker else None
+
+    if gh_comment_id is not None:
+        # Idempotent upsert keyed on the natural key (the GitHub comment id)
+        # — capture-at-write and the backfill sync converge on the same row
+        # regardless of which wrote it first. COALESCE keeps a real author
+        # captured-at-write time even if a later call (e.g. a race with the
+        # backfill sync) supplies None.
+        conn.execute(
+            """
+            INSERT INTO issue_comments (
+                gh_comment_id, repo_name, issue_number, author, created_at,
+                updated_at, body, coord_event, coord_assignment_id, machine, verdict
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (gh_comment_id) DO UPDATE SET
+                repo_name           = excluded.repo_name,
+                issue_number        = excluded.issue_number,
+                author              = COALESCE(excluded.author, issue_comments.author),
+                updated_at          = excluded.updated_at,
+                body                = excluded.body,
+                coord_event         = excluded.coord_event,
+                coord_assignment_id = excluded.coord_assignment_id,
+                machine             = excluded.machine,
+                verdict             = excluded.verdict
+            """,
+            (
+                gh_comment_id, repo_name, issue_number, author, ts, ts, body,
+                coord_event, coord_assignment_id, machine, verdict,
+            ),
+        )
+    else:
+        # gh didn't hand back a parseable comment id (should be rare — see
+        # github_ops.parse_comment_id) — durability still wins over dedup
+        # here; the row just can't be upserted against by a later sync.
+        conn.execute(
+            """
+            INSERT INTO issue_comments (
+                gh_comment_id, repo_name, issue_number, author, created_at,
+                updated_at, body, coord_event, coord_assignment_id, machine, verdict
+            ) VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                repo_name, issue_number, author, ts, ts, body,
+                coord_event, coord_assignment_id, machine, verdict,
+            ),
+        )
+    conn.commit()
+
+
+def sync_issue_comments(
+    repo_name: str, issue_number: int, *, repo_github: str | None = None
+) -> int:
+    """Backfill *all* of an issue's comments (human + out-of-band, plus a
+    self-heal of any coord comment already captured) into the durable
+    ``issue_comments`` mirror — routes to the daemon when ``board_service``
+    is set, else writes the local DB (#873).
+
+    Idempotent — safe to re-run; every row upserts on ``gh_comment_id``.
+    Returns the number of comments processed.
+    """
+    svc = _board_service()
+    resp = _route_write(
+        svc,
+        "/issue-comments",
+        {
+            "action": "sync",
+            "repo_name": repo_name,
+            "issue_number": issue_number,
+            "repo_github": repo_github,
+        },
+    )
+    if resp is not None:
+        return int(resp.get("synced") or 0)
+    return _sync_issue_comments_local(repo_name, issue_number, repo_github=repo_github)
+
+
+def _sync_issue_comments_local(
+    repo_name: str, issue_number: int, *, repo_github: str | None = None
+) -> int:
+    from coord import github_ops  # noqa: PLC0415
+
+    slug = repo_github or repo_name
+    try:
+        comments = github_ops.get_issue_comments(slug, issue_number)
+    except Exception:  # noqa: BLE001 — best-effort backfill, never blocks callers
+        return 0
+    n = 0
+    for c in comments:
+        gh_id = github_ops.parse_comment_id(c.get("url") or "")
+        if gh_id is None:
+            continue  # can't dedup without the natural key; skip (malformed/missing url)
+        _record_issue_comment_capture_local(
+            repo_name=repo_name,
+            issue_number=issue_number,
+            body=c.get("body") or "",
+            gh_comment_id=gh_id,
+            author=(c.get("author") or {}).get("login"),
+            created_at=_parse_github_timestamp(c.get("createdAt")),
+        )
+        n += 1
+    return n
+
+
+def list_issue_comments(repo_name: str, issue_number: int) -> list[dict]:
+    """Read an issue's captured comments (oldest-first) from the local DB —
+    for `coord.diagnose` / a future Summary tab. Does not route to the
+    daemon (read-only, mirrors ``_list_issue_context_local``'s directness);
+    a thin client reads the daemon's copy via the HTTP endpoint directly."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT id, gh_comment_id, repo_name, issue_number, author, created_at, "
+        "updated_at, body, coord_event, coord_assignment_id, machine, verdict "
+        "FROM issue_comments WHERE repo_name = ? AND issue_number = ? "
+        "ORDER BY COALESCE(created_at, 0), id",
+        (repo_name, issue_number),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_issue_numbers_with_assignments(repo_name: str) -> set[int]:
+    """Issue numbers in *repo_name* with at least one assignment, active or
+    archived (#873) — scopes `coord sync`'s opportunistic issue_comments
+    backfill to issues coord has actually dispatched work on, rather than
+    crawling every open issue's full comment history on every sync.
+
+    Read-only, best-effort: any failure (daemon unreachable, DB error)
+    returns an empty set rather than blocking `coord sync`.
+    """
+    svc = _board_service()
+    if svc is not None:
+        try:
+            from coord.client import fetch_remote_board  # noqa: PLC0415
+
+            board = fetch_remote_board(svc)
+            return {
+                a.issue_number
+                for a in (board.active + board.completed)
+                if a.repo_name == repo_name
+            }
+        except Exception:  # noqa: BLE001 — best-effort scoping, never blocks coord sync
+            return set()
+    return _list_issue_numbers_with_assignments_local(repo_name)
+
+
+def _list_issue_numbers_with_assignments_local(repo_name: str) -> set[int]:
+    conn = get_connection()
+    numbers: set[int] = set()
+    for table in ("assignments", "assignments_archive"):
+        try:
+            rows = conn.execute(
+                f"SELECT DISTINCT issue_number FROM {table} WHERE repo_name = ?",  # noqa: S608
+                (repo_name,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            continue  # assignments_archive may not exist yet (housekeeping never ran)
+        numbers.update(r[0] for r in rows if r[0] is not None)
+    return numbers
+
+
 # ── Per-issue rolling context digest (#603) ─────────────────────────────────────
 
 # Deterministic curation budget for the rendered digest (Phase 1/4).  Pins are

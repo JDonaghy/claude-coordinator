@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 
 
@@ -582,8 +583,78 @@ def work_is_terminal(
     return terminal
 
 
+# ── #873: durable issue_comments mirror — capture-at-write ──────────────────
+
+_COMMENT_ID_RE = re.compile(r"issuecomment-(\d+)")
+
+# Memoized per-process: the authenticated gh identity, used as a best-effort
+# `author` on capture-at-write rows. One extra `gh api user` call the first
+# time a comment is posted in this process; the backfill sync
+# (state.sync_issue_comments) overwrites it with the real per-comment author
+# regardless, so a stale/failed lookup here is harmless.
+_login_cache: dict[str, str | None] = {}
+
+
+def parse_comment_id(url: str) -> int | None:
+    """Extract the numeric REST comment id from a GitHub comment URL
+    (``...#issuecomment-<digits>``) — the format both ``gh issue comment``'s
+    stdout and ``gh issue view --json comments``'s ``url`` field use. Returns
+    ``None`` when *url* doesn't match (e.g. blank, or gh's output format
+    changes)."""
+    m = _COMMENT_ID_RE.search(url or "")
+    return int(m.group(1)) if m else None
+
+
+def _current_gh_login() -> str | None:
+    if "login" not in _login_cache:
+        try:
+            _login_cache["login"] = _gh("api", "user", "--jq", ".login") or None
+        except Exception:  # noqa: BLE001 — best-effort; capture still proceeds without it
+            _login_cache["login"] = None
+    return _login_cache["login"]
+
+
+def get_issue_comments(repo: str, issue_number: int) -> list[dict]:
+    """All comments on *issue_number*, oldest first (gh's default order).
+
+    Each dict carries at least ``id`` (a GraphQL node id — NOT the numeric
+    REST id; use :func:`parse_comment_id` on ``url`` for that), ``url``,
+    ``author`` (``{"login": ...}``), ``body``, ``createdAt``. Used by
+    ``state.sync_issue_comments`` (#873) to backfill the ``issue_comments``
+    mirror with human + out-of-band comments coord never wrote itself.
+    """
+    raw = _gh("issue", "view", str(issue_number), "--repo", repo, "--json", "comments")
+    return json.loads(raw).get("comments", [])
+
+
 def post_issue_comment(repo: str, issue_number: int, body: str):
-    _gh("issue", "comment", str(issue_number), "--repo", repo, "--body", body)
+    url = _gh("issue", "comment", str(issue_number), "--repo", repo, "--body", body)
+    _capture_comment_write(repo, issue_number, body, url)
+
+
+def _capture_comment_write(repo: str, issue_number: int, body: str, url: str) -> None:
+    """Best-effort mirror of a just-posted comment into the durable
+    ``issue_comments`` table (#873).
+
+    Capture-at-write: the coord-authored prose message bus (completion
+    summaries, review bodies, failure reports) becomes durable and
+    machine-independent the instant it posts, rather than depending on a
+    later reconciliation/recovery pass. Never raises — a mirror failure must
+    never undo (or even surface as an error against) a GitHub comment that
+    already landed.
+    """
+    try:
+        from coord import state  # noqa: PLC0415 — avoid a github_ops<->state import cycle
+
+        state.record_issue_comment_capture(
+            repo_name=repo,
+            issue_number=issue_number,
+            body=body,
+            gh_comment_id=parse_comment_id(url),
+            author=_current_gh_login(),
+        )
+    except Exception:  # noqa: BLE001 — fail-open, see docstring
+        pass
 
 
 def add_issue_labels(repo: str, issue_number: int, labels: list[str]) -> None:

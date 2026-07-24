@@ -2311,6 +2311,96 @@ def test_serve_issue_context_unknown_action_400(file_db: Path, valid_config_path
     assert resp.status_code == 400
 
 
+# ── #873: durable issue_comments mirror ─────────────────────────────────────
+
+def test_serve_issue_comments_capture_then_get(file_db: Path, valid_config_path: Path, rw_db):
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        c = cli.post("/issue-comments", json={
+            "action": "capture", "repo_name": "acme/api", "issue_number": 7,
+            "body": "<!-- coord:event=completion assignment=a1 machine=m --> done",
+            "gh_comment_id": 501,
+        })
+        assert c.status_code == 200
+        assert c.json() == {"ok": True}
+        g = cli.get("/issue-comments", params={"repo_name": "acme/api", "issue_number": 7})
+        assert g.status_code == 200
+        comments = g.json()["comments"]
+        assert len(comments) == 1
+        assert comments[0]["gh_comment_id"] == 501
+        assert comments[0]["coord_event"] == "completion"
+        assert comments[0]["coord_assignment_id"] == "a1"
+    assert rw_db.execute(
+        "SELECT COUNT(*) c FROM issue_comments WHERE gh_comment_id=501"
+    ).fetchone()["c"] == 1
+
+
+def test_serve_issue_comments_capture_upsert_idempotent(
+    file_db: Path, valid_config_path: Path, rw_db
+):
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        for body in ("v1", "v2 edited"):
+            r = cli.post("/issue-comments", json={
+                "action": "capture", "repo_name": "acme/api", "issue_number": 7,
+                "body": body, "gh_comment_id": 502,
+            })
+            assert r.status_code == 200
+    rows = rw_db.execute(
+        "SELECT body FROM issue_comments WHERE gh_comment_id=502"
+    ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["body"] == "v2 edited"
+
+
+def test_serve_issue_comments_sync(file_db: Path, valid_config_path: Path, rw_db, monkeypatch):
+    from coord import github_ops
+
+    monkeypatch.setattr(
+        github_ops, "get_issue_comments",
+        lambda *a, **k: [{
+            "url": "https://github.com/acme/api/issues/7#issuecomment-9",
+            "body": "hi", "author": {"login": "x"}, "createdAt": "2026-07-02T00:00:00Z",
+        }],
+    )
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        r = cli.post("/issue-comments", json={
+            "action": "sync", "repo_name": "api", "issue_number": 7,
+            "repo_github": "acme/api",
+        })
+        assert r.status_code == 200
+        assert r.json() == {"synced": 1}
+    assert rw_db.execute(
+        "SELECT COUNT(*) c FROM issue_comments WHERE gh_comment_id=9"
+    ).fetchone()["c"] == 1
+
+
+def test_serve_issue_comments_unknown_action_400(file_db: Path, valid_config_path: Path, rw_db):
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post("/issue-comments", json={
+            "action": "bogus", "repo_name": "api", "issue_number": 7,
+        })
+    assert resp.status_code == 400
+
+
+def test_serve_issue_comments_missing_field_400(file_db: Path, valid_config_path: Path, rw_db):
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post("/issue-comments", json={"action": "capture", "repo_name": "api"})
+    assert resp.status_code == 400
+
+
+def test_serve_issue_comments_get_missing_params_400(
+    file_db: Path, valid_config_path: Path, rw_db
+):
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.get("/issue-comments", params={"repo_name": "api"})
+    assert resp.status_code == 400
+
+
 def test_add_issue_context_entry_routes_when_service_set(coord_db, monkeypatch):
     from coord import client as cc
     from coord import state

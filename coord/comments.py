@@ -193,6 +193,49 @@ def parse_marker(body: str) -> CommentMarker | None:
     return CommentMarker(event=event, fields=fields)
 
 
+# ── Unified parse for durable storage (#873) ─────────────────────────────────
+# coord.review posts a differently-shaped header — `<!-- coord:review
+# verdict=... -->` (no `event=` token) — which parse_marker() above doesn't
+# recognise (it requires `event=`). A self-contained regex is duplicated here
+# rather than importing coord.review, to avoid a circular import: github_ops
+# (the #873 capture-at-write choke point) needs coord.state, and coord.review
+# already imports coord.github_ops.
+_REVIEW_MARKER_RE = re.compile(r"<!--\s*coord:review\s+([^>]+?)\s*-->")
+
+
+def parse_coord_comment_marker(body: str) -> dict[str, str | None] | None:
+    """Unified marker parse across all coord comment grammars, for the
+    ``issue_comments`` durable mirror (#873).
+
+    Tries the generic ``coord:event=...`` marker first (covers
+    briefing/completion/failure/stuck/plan/advisory/needs_attention), then
+    falls back to the ``coord:review verdict=...`` header format used by
+    posted review bodies. Returns ``{"event", "assignment_id", "machine",
+    "verdict"}`` (any value may be ``None``), or ``None`` when *body* carries
+    no recognisable coord marker at all.
+    """
+    marker = parse_marker(body)
+    if marker is not None:
+        return {
+            "event": marker.event,
+            "assignment_id": marker.fields.get("assignment"),
+            "machine": marker.fields.get("machine"),
+            "verdict": marker.fields.get("verdict"),
+        }
+    m = _REVIEW_MARKER_RE.search(body or "")
+    if not m:
+        return None
+    fields = dict(_FIELD_RE.findall(m.group(1)))
+    if "verdict" not in fields:
+        return None
+    return {
+        "event": "review",
+        "assignment_id": fields.get("assignment"),
+        "machine": fields.get("reviewer"),
+        "verdict": fields.get("verdict"),
+    }
+
+
 def _fmt_files(files: Iterable[str]) -> str:
     files = list(files)
     if not files:
