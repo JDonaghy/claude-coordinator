@@ -1744,8 +1744,14 @@ def _assignment_status(assignment_id: str) -> str | None:
         svc = None
     if svc is not None:
         try:
-            from coord.client import fetch_board_payload  # noqa: PLC0415
+            from coord.client import fetch_assignment, fetch_board_payload  # noqa: PLC0415
 
+            # #1336 invariant 3: one row via the point endpoint, not the whole
+            # /board collection.  404 → pre-#1336 daemon (or genuinely absent):
+            # one compatibility pass through the collection payload.
+            row = fetch_assignment(svc, assignment_id)
+            if row is not None:
+                return row.get("status")
             payload = fetch_board_payload(svc)
             for a in payload.get("assignments", []):
                 if a.get("assignment_id") == assignment_id:

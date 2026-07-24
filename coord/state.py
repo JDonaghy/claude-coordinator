@@ -1355,8 +1355,16 @@ def load_assignment_review_findings(
     svc = _board_service()
     if svc is not None:
         try:
-            from coord.client import fetch_board_payload  # noqa: PLC0415
+            from coord.client import fetch_assignment, fetch_board_payload  # noqa: PLC0415
 
+            # #1336 invariant 3: point lookups get point endpoints — one row
+            # via GET /assignment/{id} (which also carries the FULL findings
+            # body; the /board collection only serves a bounded preview).
+            row = fetch_assignment(svc, assignment_id)
+            if row is not None:
+                return _parse_review_findings_blob(row.get("review_findings"))
+            # 404: unknown id — or a pre-#1336 daemon (unmatched route is also
+            # a 404).  One compatibility pass through the collection payload.
             payload = fetch_board_payload(svc)
             for a in payload.get("assignments", []):
                 if a.get("assignment_id") == assignment_id:

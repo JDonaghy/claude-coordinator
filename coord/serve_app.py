@@ -1390,6 +1390,54 @@ def _openapi_spec() -> dict:
                 },
             },
         },
+        "/assignment/{assignment_id}": {
+            "get": {
+                "summary": (
+                    "Single-assignment detail (#1336/#1337): the complete row, "
+                    "including briefing and the full unbounded text fields the "
+                    "/board collection bounds. Local DB only — no gh calls, no "
+                    "derived board sections."
+                ),
+                "parameters": [
+                    {
+                        "name": "assignment_id",
+                        "in": "path",
+                        "required": True,
+                        "schema": {"type": "string"},
+                    }
+                ],
+                "responses": {
+                    "200": {"description": "OK (one full assignment row)"},
+                    "404": {"description": "Unknown assignment id"},
+                },
+            }
+        },
+        "/issue/{repo_name}/{number}": {
+            "get": {
+                "summary": (
+                    "Single-issue detail (#1337): the complete row including the "
+                    "full body. Local DB only — no gh calls."
+                ),
+                "parameters": [
+                    {
+                        "name": "repo_name",
+                        "in": "path",
+                        "required": True,
+                        "schema": {"type": "string"},
+                    },
+                    {
+                        "name": "number",
+                        "in": "path",
+                        "required": True,
+                        "schema": {"type": "integer"},
+                    },
+                ],
+                "responses": {
+                    "200": {"description": "OK (one full issue row)"},
+                    "404": {"description": "Unknown issue"},
+                },
+            }
+        },
         "/config": {
             "get": {
                 "summary": "Raw coordinator.yml bytes the daemon owns",
@@ -2882,6 +2930,46 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         _board_cache_at = _time.monotonic()
         return JSONResponse(result)
 
+    async def get_assignment(request: Request) -> Response:
+        """#1336/#1337: single-assignment detail — the point lookup for what the
+        collection wire bounds/previews.
+
+        Serves the complete row (``briefing``, full ``review_findings`` /
+        ``test_plan`` / ``test_reason`` / ``smoke_test_reason``) straight from
+        the local DB.  Performs **no** third-party I/O and computes **none** of
+        the derived board sections (merge plan / staging / stage projection),
+        so its latency is a point SELECT — never a function of board size or
+        GitHub.  This is what lets write paths (``coord report-result``) resolve
+        one assignment's identity without paying for — or being failed by — a
+        full ``/board`` build.
+        """
+        from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
+
+        aid = request.path_params["assignment_id"]
+        row = await run_in_threadpool(store.get_assignment, aid)
+        if row is None:
+            return JSONResponse(
+                {"error": "unknown assignment", "assignment_id": aid},
+                status_code=404,
+            )
+        return JSONResponse(row)
+
+    async def get_issue(request: Request) -> Response:
+        """#1337: single-issue detail — full ``body`` for the row the collection
+        wire previews.  Same contract as ``GET /assignment/{id}``: local DB
+        only, no derived sections, no third-party I/O."""
+        from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
+
+        repo_name = request.path_params["repo_name"]
+        number = request.path_params["number"]
+        row = await run_in_threadpool(store.get_issue, repo_name, number)
+        if row is None:
+            return JSONResponse(
+                {"error": "unknown issue", "repo_name": repo_name, "number": number},
+                status_code=404,
+            )
+        return JSONResponse(row)
+
     async def serve_config(request: Request) -> Response:  # noqa: ARG001
         # Serve the raw coordinator.yml text the daemon owns; the client caches
         # it and feeds it to the existing coord.config.load() parser (config.py
@@ -2893,16 +2981,55 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             )
         return PlainTextResponse(path.read_text(), media_type="application/x-yaml")
 
+    def _enrich_result_identity(body: dict) -> None:
+        """#1336: fill missing result-identity fields from the daemon's own DB.
+
+        ``coord report-result`` used to hard-fail (and DISCARD the verdict)
+        when its preliminary board read timed out, because it couldn't resolve
+        ``repo_github``/``repo_name``/``machine_name``/``issue_number`` for the
+        GitHub comment.  The daemon can always resolve those itself from the
+        assignments row (falling back to config for the GitHub slug), so a
+        record arriving with blank identity is completed here rather than
+        rejected.  Best-effort: an unknown assignment id leaves the fields as
+        sent — the DB write is keyed on assignment_id alone and still lands.
+        """
+        aid = body.get("assignment_id")
+        if not aid:
+            return
+        needed = ("machine_name", "repo_name", "repo_github", "issue_number")
+        if all(body.get(k) for k in needed) and body.get("branch"):
+            return
+        try:
+            row = store.get_assignment(str(aid))
+        except Exception:  # noqa: BLE001 — enrichment is best-effort
+            row = None
+        if row is not None:
+            for k in (*needed, "branch"):
+                if not body.get(k) and row.get(k):
+                    body[k] = row[k]
+        if not body.get("repo_github") and body.get("repo_name"):
+            repo_cfg = config.repo(str(body["repo_name"]))
+            if repo_cfg is not None:
+                body["repo_github"] = repo_cfg.github
+
     async def post_result(request: Request) -> Response:
         # #590: record an interactive result against the shared DB. Reconstruct
         # the ResultRecord from JSON (dropping unknown keys so a newer client
         # can't break an older daemon) and run the LOCAL seam path.
+        from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
+
         from coord import issue_store  # noqa: PLC0415
 
         try:
             body = await request.json()
         except Exception:  # noqa: BLE001
             return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        # #1336 invariant: writes never depend on reads.  A thin client whose
+        # identity prefetch failed (a slow /board read must not lose a verdict)
+        # sends the record with blank identity fields — the daemon owns the DB,
+        # so resolve them here from the assignments row + config instead of
+        # requiring the client to have read them first.
+        _enrich_result_identity(body)
         known = {f.name for f in fields(issue_store.ResultRecord)}
         try:
             record = issue_store.ResultRecord(
@@ -2911,7 +3038,9 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         except TypeError as e:
             return JSONResponse({"error": f"bad record: {e}"}, status_code=400)
         try:
-            outcome = issue_store._post_result_local(record)
+            # Threadpool: the seam posts a GitHub comment synchronously; keep
+            # the event loop free for /healthz + board polls while it runs.
+            outcome = await run_in_threadpool(issue_store._post_result_local, record)
         except ValueError as e:  # invalid status / verdict
             return JSONResponse({"error": str(e)}, status_code=400)
         except Exception as e:  # noqa: BLE001
@@ -4379,6 +4508,8 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
     routes = [
         Route("/healthz", healthz, methods=["GET"]),
         Route("/board", board, methods=["GET"]),
+        Route("/assignment/{assignment_id}", get_assignment, methods=["GET"]),
+        Route("/issue/{repo_name}/{number:int}", get_issue, methods=["GET"]),
         Route("/audit", get_audit, methods=["GET"]),
         Route("/config", serve_config, methods=["GET"]),
         Route("/result", post_result, methods=["POST"]),

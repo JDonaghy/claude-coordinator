@@ -79,6 +79,52 @@ def fetch_board_payload(svc: ServiceConfig, *, timeout: float = _DEFAULT_TIMEOUT
     return resp.json()
 
 
+def fetch_assignment(
+    svc: ServiceConfig, assignment_id: str, *, timeout: float = _DEFAULT_TIMEOUT
+) -> dict | None:
+    """GET /assignment/{id} → the full single-assignment row (#1336/#1337).
+
+    The point lookup for the fields the ``/board`` collection bounds or omits
+    (``briefing``, full ``review_findings``/``test_plan``/``test_reason``/…).
+    Returns ``None`` on 404 — either the id is genuinely unknown, or the
+    daemon predates the endpoint (an unmatched route is also a 404); callers
+    that must distinguish fall back to :func:`fetch_board_payload`.
+    Raises ``httpx.HTTPError`` on transport failure / other HTTP errors.
+    """
+    resp = httpx.get(
+        f"{svc.url}/assignment/{assignment_id}",
+        headers=_headers(svc),
+        timeout=timeout,
+    )
+    if resp.status_code == 404:
+        return None
+    resp.raise_for_status()
+    return resp.json()
+
+
+def fetch_issue(
+    svc: ServiceConfig,
+    repo_name: str,
+    number: int,
+    *,
+    timeout: float = _DEFAULT_TIMEOUT,
+) -> dict | None:
+    """GET /issue/{repo_name}/{number} → the full single-issue row (#1337).
+
+    Same contract as :func:`fetch_assignment`: ``None`` on 404 (unknown issue
+    OR pre-#1337 daemon), ``httpx.HTTPError`` on transport/HTTP failure.
+    """
+    resp = httpx.get(
+        f"{svc.url}/issue/{repo_name}/{number}",
+        headers=_headers(svc),
+        timeout=timeout,
+    )
+    if resp.status_code == 404:
+        return None
+    resp.raise_for_status()
+    return resp.json()
+
+
 def board_from_payload(payload: dict) -> Board:
     """Reconstruct a :class:`Board` from a ``/board`` payload.
 
