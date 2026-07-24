@@ -10,7 +10,15 @@ It mirrors the agent server (``coord/agent_app.py``, port 7433) and the dashboar
 Endpoints:
 
 * ``GET /healthz``  — liveness; no DB access, never auth-gated.
-* ``GET /board``    — the full board projection (``CoordStore.board_projection``).
+* ``GET /board``    — the board projection (``CoordStore.board_projection``),
+  wire-bounded per ``coord.board_wire`` (#1337: unbounded free text is served
+  as previews + ``*_truncated`` flags) and ETag-versioned (#1336: send
+  ``If-None-Match`` for a bodyless 304 while nothing changed).  Makes **no**
+  third-party calls — gh-sourced gate inputs come from the tick-refreshed
+  ``coord.gate_snapshot``.
+* ``GET /assignment/{id}`` — single-assignment detail: the complete row
+  (briefing + full free-text fields).  Point lookups get point endpoints.
+* ``GET /issue/{repo_name}/{number}`` — single-issue detail (full body).
 * ``GET /audit``    — paginated, newest-first read over the append-only
   ``audit_log`` (#1037); keyset cursor, not part of ``/board``.
 * ``GET /config``   — the raw ``coordinator.yml`` bytes the daemon owns, so a
