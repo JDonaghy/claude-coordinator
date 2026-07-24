@@ -129,9 +129,10 @@ COMMANDS_ALLOWLIST: dict[str, set[tuple[str, str]]] = {
         ("merge", "load_board"),
         ("merge", "save_board"),
     },
-    # #590-routed: local board only used in the `else` branch of
-    # `if svc is not None: record_test_verdict(...) else: save_board(board)`.
-    "test_gate.py": {("test", "save_board")},
+    # #1337: `coord test` no longer calls save_board at all — the verdict is
+    # recorded via the single-row `record_test_verdict` on both paths (it
+    # self-routes to the daemon when board_service is set), so test_gate.py
+    # has no direct BOARD_LOCAL_FUNCS call sites left.
     # #590-routed: build_board + load_dispatched are both in the `else:` branch
     # of `svc = resolve_board_service(); if svc is not None: ...daemon path...
     # else: ...local path...`.  On a thin client `svc` is not None, so neither
