@@ -345,6 +345,17 @@ def test_board_serves_ci_from_gate_snapshot(
     (pm,) = board["merge_plan"]
     assert pm["status"] == "BLOCKED"
     assert "CI failed: pytest" in pm["reason"]
+    # #1344: the granular per-check rollup travels on the wire too, so the
+    # TUI can render "1✗" badges straight from /board without shelling out
+    # to `gh pr checks` itself.
+    assert pm["pr_number"] == 7
+    assert pm["ci_summary"] == {
+        "passed": 0,
+        "failed": 1,
+        "running": 0,
+        "failed_names": ["pytest"],
+        "first_failed_url": None,
+    }
 
 
 def test_gate_refresher_populates_snapshot_from_queue(rw_db, monkeypatch) -> None:
