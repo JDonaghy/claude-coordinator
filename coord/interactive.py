@@ -2524,7 +2524,12 @@ def finalize_interactive_exit(
     # worktree — covers review sessions) keep the original exit_code so:
     #   • exit_code != 0, commits == 0  → still recorded as FAILED
     #   • exit_code == 0, commits == 0  → still recorded as ADVISORY (#448)
-    #   • exit_code == 0, commits is None → still recorded as DONE (unknown-commit heuristic)
+    #   • exit_code == 0, commits is None → still recorded as DONE, UNLESS this
+    #     is an interactive WORK session, in which case issue_store.py's
+    #     _interactive_work_has_pushed_branch does an authoritative `gh`
+    #     branch check and demotes to ADVISORY when GitHub confirms no branch
+    #     was ever pushed (#1155). Non-interactive / non-work sessions keep
+    #     the original unknown-commit heuristic (DONE).
     effective_exit_code = 0 if (commits is not None and commits >= 1) else exit_code
 
     record = CompletionRecord(
@@ -2579,7 +2584,11 @@ def finalize_interactive_exit(
         # the root cause of the unresolved wt_path is never diagnosed.
         from coord.state import COORD_DIR as _COORD_DIR_WT  # noqa: PLC0415
         _canonical_wt = _COORD_DIR_WT / "worktrees" / assignment_id
-        if _canonical_wt != wt_path and _canonical_wt.exists():
+        if (
+            assignment_id
+            and _canonical_wt != wt_path
+            and _canonical_wt.exists()
+        ):
             if _remove_worktree(Path(repo_path), _canonical_wt):
                 worktree_removed = True
 
