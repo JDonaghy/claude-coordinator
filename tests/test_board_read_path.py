@@ -135,6 +135,167 @@ def test_get_assignment_makes_no_gh_calls(
     assert app_client.get("/assignment/work1").status_code == 200
 
 
+# ── Invariant 1: read endpoints perform no third-party I/O ───────────────────
+
+
+def _seed_pending_merge(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "INSERT INTO merge_queue (assignment_id, repo_name, repo_github, "
+        "branch, target_branch, issue_number, issue_title, state, pr_number) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        ("work1", "api", "acme/api", "issue-42-fix", "main", 42,
+         "A work issue", "pending", 7),
+    )
+    conn.commit()
+
+
+@pytest.fixture
+def rw_db(tmp_path: Path):
+    """Thread-safe file-backed coord.db override for TestClient tests
+    (mirrors the established pattern — the autouse ``coord_db`` fixture's
+    thread-bound ``:memory:`` conn is unusable from the ASGI worker thread)."""
+    import coord.db as db_mod
+
+    conn = sqlite3.connect(str(tmp_path / "rw.db"), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    _ensure_schema(conn)
+    db_mod.override_connection(conn)
+    yield conn
+    db_mod.close()
+
+
+def test_board_read_makes_zero_gh_calls(
+    detail_db: Path, valid_config_path: Path, rw_db, monkeypatch
+) -> None:
+    """THE guard for invariant 1 (the #762/#715/#1336 failure class): a cold
+    /board build over a board with pending merge-queue entries (PR numbers
+    present, ci_store=github by default) must spawn no subprocess at all —
+    CI checks and the epic-closing gate are served from the tick-refreshed
+    gate snapshot, never fetched inline."""
+    import subprocess
+
+    spawned: list = []
+
+    def _spy(*args, **kwargs):  # noqa: ANN002, ANN003
+        argv = args[0] if args else kwargs.get("args")
+        spawned.append(argv)
+        raise AssertionError(f"subprocess spawned on board read: {argv!r}")
+
+    monkeypatch.setattr(subprocess, "run", _spy)
+    monkeypatch.setattr(subprocess, "Popen", _spy)
+    monkeypatch.setattr(subprocess, "check_output", _spy)
+
+    _seed_pending_merge(rw_db)
+
+    cfg = load_config(valid_config_path)
+    assert cfg.ci_store.type == "github"  # the gate IS configured on
+    app = build_app(SqliteStore(detail_db), cfg)
+    with TestClient(app) as cli:
+        resp = cli.get("/board")
+    assert resp.status_code == 200
+    board = resp.json()
+    # The plan was genuinely computed over the pending entry (not blanked by
+    # an error path) — it simply carries fail-open gate values until the
+    # tick's next snapshot refresh.
+    assert [pm["assignment_id"] for pm in board["merge_plan"]] == ["work1"]
+    assert spawned == []
+
+
+def test_board_serves_ci_from_gate_snapshot(
+    detail_db: Path, valid_config_path: Path, rw_db, monkeypatch
+) -> None:
+    """The merge plan's CI annotations come from the refreshed snapshot."""
+    from coord.ci_store import CheckRun
+    from coord.gate_snapshot import GateSnapshot, GateSnapshotRefresher
+
+    _seed_pending_merge(rw_db)
+
+    # Pass the review + test gates (they precede CI) so the CI gate is the
+    # one that decides: an approved review row + a passed test verdict.
+    rw_db.execute(
+        "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+        "issue_number, issue_title, status, type, branch, test_state) "
+        "VALUES ('work1','laptop','api',42,'A work issue','done','work',"
+        "'issue-42-fix','passed')"
+    )
+    rw_db.execute(
+        "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+        "issue_number, issue_title, status, type, review_of_assignment_id, "
+        "review_verdict) VALUES ('rev1','server','api',42,'Review of #42',"
+        "'done','review','work1','approve')"
+    )
+    rw_db.commit()
+
+    failed = CheckRun(
+        name="pytest", status="completed", conclusion="failure",
+        url="", run_id="1", started_at=None, completed_at=None,
+    )
+    snap = GateSnapshot(
+        checks={("acme/api", 7): [failed]},
+        ci_available=True,
+        refreshed_at=1.0,
+    )
+    monkeypatch.setattr(GateSnapshotRefresher, "snapshot", lambda self: snap)
+
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(detail_db), cfg)
+    with TestClient(app) as cli:
+        board = cli.get("/board").json()
+    (pm,) = board["merge_plan"]
+    assert pm["status"] == "BLOCKED"
+    assert "CI failed: pytest" in pm["reason"]
+
+
+def test_gate_refresher_populates_snapshot_from_queue(rw_db, monkeypatch) -> None:
+    """refresh() fetches per pending-PR entry and publishes atomically."""
+    import coord.gate_snapshot as gs
+    from coord.ci_store import CheckRun
+    from coord.config import Config
+
+    _seed_pending_merge(rw_db)
+
+    calls: list = []
+
+    class _FakeCi:
+        is_available = True
+
+        def list_checks_for_pr(self, repo: str, number: int):
+            calls.append(("checks", repo, number))
+            return [
+                CheckRun(
+                    name="ci", status="completed", conclusion="success",
+                    url="", run_id="1", started_at=None, completed_at=None,
+                )
+            ]
+
+    monkeypatch.setattr(gs, "build_ci_store", lambda t: _FakeCi())
+
+    import coord.github_ops as github_ops
+
+    monkeypatch.setattr(
+        github_ops,
+        "get_pr_commit_messages",
+        lambda repo, n: [f"fix(#42): thing\n\nCloses #90 (repo={repo} pr={n})"],
+    )
+    monkeypatch.setattr(
+        github_ops, "is_epic_issue", lambda repo, n: n == 90
+    )
+
+    refresher = gs.GateSnapshotRefresher()
+    # Pre-refresh: fail-open empties.
+    assert refresher.snapshot().list_checks_for_pr("acme/api", 7) == []
+    assert refresher.snapshot().is_available is False
+
+    snap = refresher.refresh(Config(repos=[], machines=[]))
+    assert calls == [("checks", "acme/api", 7)]
+    assert snap.is_available is True
+    assert [c.name for c in snap.list_checks_for_pr("acme/api", 7)] == ["ci"]
+    assert snap.get_pr_commit_messages("acme/api", 7)
+    assert snap.is_epic_issue("acme/api", 90) is True
+    assert snap.is_epic_issue("acme/api", 42) is False
+    assert refresher.snapshot() is snap
+
+
 # ── Invariant 4: writes never depend on reads ────────────────────────────────
 
 

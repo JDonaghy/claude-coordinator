@@ -2462,6 +2462,16 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
     except OSError:
         _config_mtime = None
 
+    # #1336 invariant 1: read endpoints perform no third-party I/O.  All gh-
+    # sourced merge-gate inputs (CI checks, PR commit messages, epic-ness of
+    # closing-keyword targets) are refreshed into this snapshot by the tick
+    # machinery below; /board builds consume the snapshot and NEVER call gh.
+    # Board latency is therefore a function of local DB size only — never of
+    # GitHub's latency or the number of open PRs (the #762/#715/#1336 class).
+    from coord.gate_snapshot import GateSnapshotRefresher  # noqa: PLC0415
+
+    _gate_refresher = GateSnapshotRefresher()
+
     # Short-TTL cache for the computed /board projection so burst polls from the
     # TUI don't each pay the full board_projection + merge-plan + stage-projection
     # recomputation (~465-issue load measured in the issue). Keyed to nothing
@@ -2542,30 +2552,27 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             # #776/#778/#550: inject server-side merge plan (ordered, gate-
             # annotated), staging section, and per-issue stage/gate projection
             # so thin clients get status + reason without re-implementing gate
-            # logic.  All three are derived from the same board snapshot + CI
-            # store, built once here and shared below so a concurrent DB write
-            # can't split them across two snapshots and `list_checks_for_pr`
-            # (a real `gh` round trip) isn't paid twice per request.  Computed
-            # after the projection so a plan failure never 503s the board.
+            # logic.  All three are derived from the same board snapshot + the
+            # tick-refreshed gate snapshot, built once here and shared below so
+            # a concurrent DB write can't split them across two snapshots.
+            # Computed after the projection so a plan failure never 503s the
+            # board.
+            #
+            # #1336 invariant 1: the CI store and the epic-closing gh_ops view
+            # are BOTH served from `_gate_refresher`'s snapshot — refreshed on
+            # the tick loop, never fetched here.  A cold /board build makes
+            # zero gh subprocess calls (enforced by
+            # tests/test_board_read_path.py).
             _board = None
-            _ci = None
+            _ci = _gate_refresher.snapshot()
             try:
-                from coord import github_ops as _gh_ops  # noqa: PLC0415
                 from coord import merge_queue as _mq  # noqa: PLC0415
-                from coord.ci_store import build_ci_store as _build_ci_store  # noqa: PLC0415
                 from coord.state import build_board as _build_board  # noqa: PLC0415
                 from dataclasses import asdict as _asdict  # noqa: PLC0415
                 _board = _build_board()
-                # Build ci_store so "CI running" / "CI failed" reasons appear
-                # in the plan.  Fail-open: a construction error returns None
-                # which disables the CI gate without blanking the whole plan.
-                try:
-                    _ci = _build_ci_store(_cfg.ci_store.type)
-                except Exception:  # noqa: BLE001
-                    _ci = None
                 projection["merge_plan"] = [
                     _asdict(pm)
-                    for pm in _mq.plan(_board, _cfg, ci_store=_ci, gh_ops=_gh_ops)
+                    for pm in _mq.plan(_board, _cfg, ci_store=_ci, gh_ops=_ci)
                 ]
                 # #778: staging section — approved/done work not yet in the
                 # queue.  Reuses the same _board snapshot built above.
@@ -4253,6 +4260,28 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             wal_checkpoint_interval = 3600.0
         last_wal_checkpoint = _time.monotonic()
 
+        # #1336 invariant 1: refresh the gh-sourced merge-gate snapshot (CI
+        # checks, PR commit messages, epic-closing targets) on its own cadence
+        # so /board builds never talk to GitHub.  Default 30 s; 0 disables
+        # (the board then serves fail-open gates, same as a gh outage).
+        try:
+            gate_refresh_interval = float(
+                os.environ.get("COORD_GATE_REFRESH_INTERVAL", "30")
+            )
+        except ValueError:
+            gate_refresh_interval = 30.0
+
+        async def _gate_refresh_loop() -> None:
+            # Mirrors _tick_loop's shape: sleep first (a fresh daemon serves
+            # the fail-open snapshot instantly rather than blocking startup on
+            # GitHub), refresh, repeat.  A pass must never crash the daemon.
+            while True:
+                await asyncio.sleep(gate_refresh_interval)
+                try:
+                    await run_in_threadpool(_gate_refresher.refresh, config)
+                except Exception:  # noqa: BLE001 — keep serving the old snapshot
+                    log.warning("gate-snapshot refresh failed", exc_info=True)
+
         async def _tick_loop() -> None:
             nonlocal last_housekeeping, last_merge_reconcile, last_worktree_clean, last_wal_checkpoint
             from coord.reconcile import reconcile_completed_assignments  # noqa: PLC0415
@@ -4495,13 +4524,19 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             task = (
                 asyncio.create_task(_tick_loop()) if interval > 0 else None
             )
+            gate_task = (
+                asyncio.create_task(_gate_refresh_loop())
+                if interval > 0 and gate_refresh_interval > 0
+                else None
+            )
             try:
                 yield
             finally:
-                if task is not None:
-                    task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await task
+                for t in (task, gate_task):
+                    if t is not None:
+                        t.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await t
 
         return _ctx(_app)
 
