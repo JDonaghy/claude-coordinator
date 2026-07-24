@@ -233,6 +233,44 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             details_json  TEXT
         );
 
+        -- #873: durable, queryable mirror of GitHub issue comments — the
+        -- prose message bus (completion summaries, review bodies, failure
+        -- reports) today lives only on GitHub. Populated two ways: (1)
+        -- capture-at-write, instrumented at the single choke point
+        -- coord.github_ops.post_issue_comment (which close_issue/close_pr
+        -- also funnel through), so a coord-authored comment is durable the
+        -- instant it posts, regardless of which machine posted it; (2) the
+        -- backfill sync (coord.state.sync_issue_comments), which upserts
+        -- human + out-of-band comments idempotently keyed on gh_comment_id.
+        -- Retained INDEFINITELY — never pruned on close, unlike the
+        -- short-lived issue_context digest above.
+        --
+        -- repo_name here holds whatever identifier the write site had —
+        -- in practice the GitHub "owner/repo" slug (github_ops functions
+        -- only ever see the slug, never the coordinator's config repo
+        -- key) — which differs from the issues/issue_context tables above
+        -- where repo_name is the coordinator.yml repo key. Documented here
+        -- since it's a real inconsistency a future reader could trip on.
+        --
+        -- created_at/updated_at are epoch seconds (REAL), matching the
+        -- rest of this schema's timestamp columns. body_ref is reserved,
+        -- unused for now — the future Azure-blob offload seam.
+        CREATE TABLE IF NOT EXISTS issue_comments (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            gh_comment_id       INTEGER UNIQUE,
+            repo_name           TEXT    NOT NULL,
+            issue_number        INTEGER NOT NULL,
+            author              TEXT,
+            created_at          REAL,
+            updated_at          REAL,
+            body                TEXT    NOT NULL DEFAULT '',
+            body_ref            TEXT,
+            coord_event         TEXT,
+            coord_assignment_id TEXT,
+            machine             TEXT,
+            verdict             TEXT
+        );
+
         CREATE INDEX IF NOT EXISTS idx_assignments_status ON assignments(status);
         CREATE INDEX IF NOT EXISTS idx_assignments_machine ON assignments(machine_name);
         CREATE INDEX IF NOT EXISTS idx_merge_queue_state ON merge_queue(state);
@@ -240,6 +278,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             ON issue_context(repo_name, issue_number);
         CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log(ts);
         CREATE INDEX IF NOT EXISTS idx_audit_log_assignment ON audit_log(assignment_id);
+        CREATE INDEX IF NOT EXISTS idx_issue_comments_issue
+            ON issue_comments(repo_name, issue_number);
 
         INSERT OR IGNORE INTO schema_version VALUES (1);
     """)

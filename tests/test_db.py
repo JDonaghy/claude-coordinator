@@ -40,6 +40,7 @@ class TestSchemaCreation:
         "sessions",
         "machines",
         "board_meta",
+        "issue_comments",
     }
 
     def test_all_tables_exist(self, isolated_conn: sqlite3.Connection) -> None:
@@ -70,6 +71,61 @@ class TestSchemaCreation:
             "SELECT name FROM sqlite_master WHERE type='table'"
         ).fetchall()
         assert len(rows) >= len(self.EXPECTED_TABLES)
+
+
+# ── issue_comments (#873) ────────────────────────────────────────────────────
+
+class TestIssueCommentsSchema:
+    def test_index_exists(self, isolated_conn: sqlite3.Connection) -> None:
+        rows = isolated_conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'"
+        ).fetchall()
+        names = {r["name"] for r in rows}
+        assert "idx_issue_comments_issue" in names
+
+    def test_gh_comment_id_unique(self, isolated_conn: sqlite3.Connection) -> None:
+        isolated_conn.execute(
+            "INSERT INTO issue_comments (gh_comment_id, repo_name, issue_number, body) "
+            "VALUES (111, 'api', 1, 'first')"
+        )
+        isolated_conn.commit()
+        with pytest.raises(sqlite3.IntegrityError):
+            isolated_conn.execute(
+                "INSERT INTO issue_comments (gh_comment_id, repo_name, issue_number, body) "
+                "VALUES (111, 'api', 1, 'dupe')"
+            )
+
+    def test_multiple_null_gh_comment_ids_allowed(
+        self, isolated_conn: sqlite3.Connection
+    ) -> None:
+        """SQLite treats NULL as distinct under UNIQUE — rows whose comment
+        id couldn't be resolved at capture-at-write time (rare) don't
+        collide with each other."""
+        isolated_conn.execute(
+            "INSERT INTO issue_comments (repo_name, issue_number, body) "
+            "VALUES ('api', 1, 'a')"
+        )
+        isolated_conn.execute(
+            "INSERT INTO issue_comments (repo_name, issue_number, body) "
+            "VALUES ('api', 1, 'b')"
+        )
+        isolated_conn.commit()
+        count = isolated_conn.execute(
+            "SELECT COUNT(*) c FROM issue_comments"
+        ).fetchone()["c"]
+        assert count == 2
+
+    def test_body_ref_column_present_and_unused(
+        self, isolated_conn: sqlite3.Connection
+    ) -> None:
+        """The Azure-blob offload seam column exists but is never populated
+        by current code — reserved for a future body_ref migration."""
+        cols = {
+            r[1] for r in isolated_conn.execute(
+                "PRAGMA table_info(issue_comments)"
+            ).fetchall()
+        }
+        assert "body_ref" in cols
 
 
 # ── override_connection ────────────────────────────────────────────────────────

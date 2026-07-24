@@ -735,3 +735,117 @@ class TestChangeIssueLabelsAutoCreate:
                     "acme/api", 7, add=set(), remove={"existing"}
                 )
         assert create_called["v"] is False, "auto-create must not fire for remove-only changes"
+
+
+# ── #873: durable issue_comments mirror — capture-at-write ──────────────────
+
+class TestParseCommentId:
+    def test_extracts_id_from_issue_comment_url(self) -> None:
+        url = "https://github.com/acme/api/issues/42#issuecomment-4861387759"
+        assert github_ops.parse_comment_id(url) == 4861387759
+
+    def test_returns_none_for_blank(self) -> None:
+        assert github_ops.parse_comment_id("") is None
+        assert github_ops.parse_comment_id(None) is None
+
+    def test_returns_none_for_unrecognized_format(self) -> None:
+        assert github_ops.parse_comment_id("https://github.com/acme/api/issues/42") is None
+
+
+class TestGetIssueComments:
+    def test_returns_comments_list(self) -> None:
+        payload = json.dumps({"comments": [{"body": "hi", "url": "u"}]})
+        with patch("coord.github_ops._gh", return_value=payload) as mock_gh:
+            comments = github_ops.get_issue_comments("acme/api", 42)
+        assert comments == [{"body": "hi", "url": "u"}]
+        mock_gh.assert_called_once_with(
+            "issue", "view", "42", "--repo", "acme/api", "--json", "comments"
+        )
+
+    def test_returns_empty_list_when_no_comments_key(self) -> None:
+        with patch("coord.github_ops._gh", return_value="{}"):
+            assert github_ops.get_issue_comments("acme/api", 42) == []
+
+
+class TestPostIssueCommentCaptureAtWrite:
+    """post_issue_comment (the single choke point close_issue/close_pr also
+    funnel through) must mirror every posted comment into the durable
+    issue_comments table via coord.state.record_issue_comment_capture."""
+
+    def setup_method(self) -> None:
+        github_ops._login_cache.clear()
+
+    def test_posts_comment_and_captures_it(self) -> None:
+        comment_url = "https://github.com/acme/api/issues/42#issuecomment-123456"
+        with patch("coord.github_ops._gh", return_value=comment_url) as mock_gh:
+            with patch("coord.state.record_issue_comment_capture") as mock_capture:
+                github_ops.post_issue_comment("acme/api", 42, "hello world")
+        # First _gh call is the actual comment post; a second (best-effort
+        # `gh api user` login lookup) may follow — see _current_gh_login.
+        assert mock_gh.call_args_list[0].args == (
+            "issue", "comment", "42", "--repo", "acme/api", "--body", "hello world"
+        )
+        mock_capture.assert_called_once()
+        _, kwargs = mock_capture.call_args
+        assert kwargs["repo_name"] == "acme/api"
+        assert kwargs["issue_number"] == 42
+        assert kwargs["body"] == "hello world"
+        assert kwargs["gh_comment_id"] == 123456
+
+    def test_capture_failure_never_raises(self) -> None:
+        """A DB/daemon hiccup while mirroring must never surface as a
+        failure of the (already-successful) GitHub post."""
+        comment_url = "https://github.com/acme/api/issues/42#issuecomment-1"
+        with patch("coord.github_ops._gh", return_value=comment_url):
+            with patch(
+                "coord.state.record_issue_comment_capture",
+                side_effect=RuntimeError("db exploded"),
+            ):
+                github_ops.post_issue_comment("acme/api", 42, "hello")  # must not raise
+
+    def test_capture_with_unresolvable_comment_id(self) -> None:
+        with patch("coord.github_ops._gh", return_value="not a url"):
+            with patch("coord.state.record_issue_comment_capture") as mock_capture:
+                github_ops.post_issue_comment("acme/api", 42, "hello")
+        assert mock_capture.call_args.kwargs["gh_comment_id"] is None
+
+    def test_close_issue_comment_path_also_captures(self) -> None:
+        """close_issue posts its --comment through post_issue_comment, so
+        the capture hook fires for it without any separate instrumentation."""
+
+        def _dispatch(*args: str) -> str:
+            if args[0] == "issue" and args[1] == "comment":
+                return "https://github.com/acme/api/issues/42#issuecomment-99"
+            return ""
+
+        with patch("coord.github_ops._gh", side_effect=_dispatch):
+            with patch(
+                "coord.github_ops.get_open_children", return_value=[]
+            ):
+                with patch(
+                    "coord.github_ops.subprocess.run",
+                    return_value=_FakeCompletedProcess(),
+                ):
+                    with patch(
+                        "coord.state.record_issue_comment_capture"
+                    ) as mock_capture:
+                        github_ops.close_issue(
+                            "acme/api", 42, comment="closing this out"
+                        )
+        mock_capture.assert_called_once()
+        assert mock_capture.call_args.kwargs["body"] == "closing this out"
+
+
+class TestCurrentGhLogin:
+    def setup_method(self) -> None:
+        github_ops._login_cache.clear()
+
+    def test_caches_login_across_calls(self) -> None:
+        with patch("coord.github_ops._gh", return_value="octocat") as mock_gh:
+            assert github_ops._current_gh_login() == "octocat"
+            assert github_ops._current_gh_login() == "octocat"
+        mock_gh.assert_called_once()
+
+    def test_returns_none_on_failure(self) -> None:
+        with patch("coord.github_ops._gh", side_effect=RuntimeError("no auth")):
+            assert github_ops._current_gh_login() is None

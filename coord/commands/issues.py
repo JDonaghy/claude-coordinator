@@ -23,7 +23,11 @@ def sync(config_path: Path, quiet: bool) -> None:
     the TUI which triggers it automatically alongside the data refresh.
     """
     from coord import github_ops
-    from coord.state import upsert_open_issues
+    from coord.state import (
+        list_issue_numbers_with_assignments,
+        sync_issue_comments,
+        upsert_open_issues,
+    )
 
     cfg = _load_config(config_path)
     total = 0
@@ -36,6 +40,26 @@ def sync(config_path: Path, quiet: bool) -> None:
             total += len(issues)
         except Exception as e:  # noqa: BLE001
             click.echo(f"  {repo.name}: sync failed — {e}", err=True)
+            continue
+
+        # #873: opportunistically backfill the durable issue_comments mirror
+        # for issues coord has actually dispatched work on — scoped (not a
+        # crawl of every open issue) to keep this bounded on every sync.
+        assigned_numbers = list_issue_numbers_with_assignments(repo.name)
+        open_numbers = {i["number"] for i in issues}
+        comments_synced = 0
+        for number in sorted(assigned_numbers & open_numbers):
+            try:
+                comments_synced += sync_issue_comments(
+                    repo.name, number, repo_github=repo.github
+                )
+            except Exception:  # noqa: BLE001 — best-effort, never fails `coord sync`
+                pass
+        if not quiet and assigned_numbers & open_numbers:
+            click.echo(
+                f"  {repo.name}: {comments_synced} comment(s) synced across "
+                f"{len(assigned_numbers & open_numbers)} assigned issue(s)"
+            )
     if not quiet:
         click.echo(f"synced {total} open issue(s) across {len(cfg.repos)} repo(s)")
 

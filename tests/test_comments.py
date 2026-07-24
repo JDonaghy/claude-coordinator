@@ -11,6 +11,7 @@ from coord.comments import (
     format_briefing,
     format_completion,
     format_failure,
+    parse_coord_comment_marker,
     parse_marker,
 )
 
@@ -155,3 +156,61 @@ class TestMarkerParsing:
         assert m is not None
         assert m.event == "briefing"
         assert m.fields["assignment"] == "a"
+
+
+class TestParseCoordCommentMarker:
+    """#873: the unified marker parse feeding the durable issue_comments
+    mirror's coord_event/coord_assignment_id/machine/verdict columns."""
+
+    def test_returns_none_for_no_marker(self) -> None:
+        assert parse_coord_comment_marker("just a human comment") is None
+
+    def test_parses_generic_event_marker(self) -> None:
+        body = format_completion(
+            assignment_id="abc123",
+            machine_name="macbook",
+            repo_name="api-gateway",
+            issue_number=42,
+            exit_code=0,
+        )
+        parsed = parse_coord_comment_marker(body)
+        assert parsed == {
+            "event": "completion",
+            "assignment_id": "abc123",
+            "machine": "macbook",
+            "verdict": None,
+        }
+
+    def test_parses_failure_marker(self) -> None:
+        body = format_failure(
+            assignment_id="xyz789",
+            machine_name="dellserver",
+            repo_name="api-gateway",
+            issue_number=7,
+            exit_code=1,
+        )
+        parsed = parse_coord_comment_marker(body)
+        assert parsed is not None
+        assert parsed["event"] == "failure"
+        assert parsed["assignment_id"] == "xyz789"
+        assert parsed["machine"] == "dellserver"
+
+    def test_falls_back_to_review_header(self) -> None:
+        body = (
+            "<!-- coord:review verdict=approve blocking=0 nonblocking=1 "
+            "reviewer=precision assignment=deadbeef -->\n"
+            "### Review\n\nLooks good."
+        )
+        parsed = parse_coord_comment_marker(body)
+        assert parsed == {
+            "event": "review",
+            "assignment_id": "deadbeef",
+            "machine": "precision",
+            "verdict": "approve",
+        }
+
+    def test_review_header_without_verdict_is_not_a_marker(self) -> None:
+        # Malformed/incomplete coord:review header (no verdict token) — the
+        # generic marker also fails (no event=), so the whole comment is
+        # correctly unrecognised rather than half-parsed.
+        assert parse_coord_comment_marker("<!-- coord:review reviewer=x -->") is None
