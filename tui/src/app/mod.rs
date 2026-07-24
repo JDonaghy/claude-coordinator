@@ -2343,17 +2343,11 @@ pub struct CoordApp {
     /// Populated by completed `pending_pr_fetches` rounds; consumed by
     /// the Pipeline detail panel's Test guidance block.
     fetched_prs_cache: std::cell::RefCell<std::collections::HashMap<(String, i64), FetchedPr>>,
-    /// #240: CI check summaries for PRs in the merge queue, keyed by
-    /// `(repo_github, pr_number)`. Populated by background `gh pr checks`
-    /// fetches when the Pipeline view is focused. Cached entries with
-    /// `fetched_at.elapsed() > 30s` are refetched on the next kick.
+    /// #1344: CI check summaries for PRs in the merge queue, keyed by
+    /// `(repo_github, pr_number)`. Synced from `/board`'s `merge_plan[].ci_summary`
+    /// on every board refresh by `sync_ci_checks_from_board` — no client-side
+    /// `gh pr checks` calls (superseded the old `pipeline_ci_loader` poll loop).
     pipeline_ci_checks: std::collections::HashMap<(String, i64), CiCheckSummary>,
-    /// #240: in-flight CI-check fetches keyed by `(repo_github, pr_number)`.
-    /// Drained each tick by `poll_ci_check_loaders`.
-    pipeline_ci_loader: std::collections::HashMap<
-        (String, i64),
-        std::sync::mpsc::Receiver<Result<CiCheckSummary, String>>,
-    >,
     /// Pipeline issues dismissed from the Done section by the user pressing 'D'.
     ///
     /// Keyed by `(repo_slug, issue_number)`.  Dismissed issues are hidden from
@@ -3310,7 +3304,6 @@ impl CoordApp {
             pending_pr_fetches: std::cell::RefCell::new(std::collections::HashMap::new()),
             fetched_prs_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             pipeline_ci_checks: std::collections::HashMap::new(),
-            pipeline_ci_loader: std::collections::HashMap::new(),
             pipeline_dismissed: std::collections::HashSet::new(),
             pipeline_inflight_merges: std::collections::HashSet::new(),
             pending_refinement_notes_synth: None,
@@ -4848,6 +4841,9 @@ impl CoordApp {
                 self.pending_data = None;
                 self.refreshed_at = Instant::now();
                 self.fetch_error = None;
+                // #1344: refresh CI-check badges from the board's own
+                // `merge_plan[].ci_summary` — no client-side `gh pr checks`.
+                self.sync_ci_checks_from_board();
                 // #290: clear optimistic merge-in-flight flags for issues where
                 // the DB has now confirmed a real merge_queue entry (any state).
                 // Once the row exists, merge_stage_status_for reads the real state.

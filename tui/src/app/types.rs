@@ -1,7 +1,7 @@
 //! App data-model types extracted from `app/mod.rs` (#743).
 //!
 //! DTO/enum structs and their pure impls — no I/O, no quadraui rendering.
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use quadraui::{Color, WidgetId};
 use super::format::fmt_dur;
 
@@ -857,7 +857,8 @@ pub(crate) struct MergeQueueEntry {
     pub(crate) pr_number: Option<i64>,
     #[serde(default)]
     pub(crate) pr_url: Option<String>,
-    /// Repo slug (owner/name) — needed to call `gh pr checks --repo <slug>`.
+    /// Repo slug (owner/name) — keys the board-synced CI summary lookup in
+    /// `pipeline_ci_checks` (see [`PlannedMergeEntry::ci_summary`]).
     /// Joined from the `merge_queue.repo_github` column.
     pub(crate) repo_github: String,
     /// Target branch the PR merges into (e.g. "main").  `None` for entries
@@ -933,6 +934,30 @@ pub(crate) struct PlannedMergeEntry {
     #[allow(dead_code)]
     #[serde(default)]
     pub(crate) milestone: Option<String>,
+    /// PR number for this entry, when one is open (mirrors `QueuedMerge.pr_number`
+    /// on the Python side). `None` before a PR exists.
+    #[serde(default)]
+    pub(crate) pr_number: Option<i64>,
+    /// #1344: structured CI rollup computed server-side by
+    /// `coord.merge_queue.plan()` from the tick-refreshed gate snapshot
+    /// (`coord/gate_snapshot.py`, #1336) — replaces the TUI's former
+    /// per-PR `gh pr checks` client-side poll loop. `None` when no PR is
+    /// open yet, or the CI store has no checks recorded for this PR.
+    #[serde(default)]
+    pub(crate) ci_summary: Option<PlannedMergeCiSummary>,
+}
+
+/// Structured CI check rollup for one PR, deserialized from the `ci_summary`
+/// key of a `merge_plan` entry. See [`PlannedMergeEntry::ci_summary`].
+#[derive(Clone, Debug, serde::Deserialize, Default)]
+pub(crate) struct PlannedMergeCiSummary {
+    pub(crate) passed: usize,
+    pub(crate) failed: usize,
+    pub(crate) running: usize,
+    #[serde(default)]
+    pub(crate) failed_names: Vec<String>,
+    #[serde(default)]
+    pub(crate) first_failed_url: Option<String>,
 }
 
 /// One entry in the server-side per-issue stage/gate projection (#550).
@@ -1422,9 +1447,15 @@ pub(crate) enum UsageSortKey {
     Time,
 }
 
-/// CI check status for one PR, fetched in the background via `gh pr checks`.
+/// CI check status for one PR.
 ///
-/// Populated from `fetch_ci_checks_summary` and stored on `CoordApp` keyed by
+/// #1344: previously fetched client-side via a perpetual `gh pr checks`
+/// background poll loop (sustained high CPU across the fleet — one `gh`
+/// subprocess loop per running `coord-tui`). Now synced straight from the
+/// `/board` payload's `merge_plan[].ci_summary` (see
+/// [`PlannedMergeCiSummary`]), which the board daemon computes once per tick
+/// from the tick-refreshed gate snapshot (#1336, `coord/gate_snapshot.py`) —
+/// zero client-side `gh` calls. Stored on `CoordApp` keyed by
 /// `(repo_github, pr_number)`. Drives the "Checks: 2✓ 1✗" line under the
 /// Merge stage in the Pipeline detail tab and the "Checks failed" status bar
 /// hint when Merge is actionable.
@@ -1440,8 +1471,6 @@ pub(crate) struct CiCheckSummary {
     /// per-issue Merge stage rows, now awaiting a Phase-3 panel detail row).
     #[allow(dead_code)]
     pub(crate) first_failed_url: Option<String>,
-    /// When this summary was fetched. Used to TTL the cache.
-    pub(crate) fetched_at: Instant,
 }
 
 impl CiCheckSummary {

@@ -16,7 +16,15 @@ from pathlib import Path
 from typing import Iterable, Protocol
 
 from coord.audit import record_audit
-from coord.ci_store import CiStore, NoOpCi, failed_checks, in_flight_checks, summarize
+from coord.ci_store import (
+    CiCheckSummary,
+    CiStore,
+    NoOpCi,
+    failed_checks,
+    in_flight_checks,
+    summarize,
+    summarize_counts,
+)
 from coord.db import get_connection
 from coord.models import CLOSES_ISSUE_TYPES, WORK_LIKE_TYPES, Assignment
 from coord.pr_body_lint import downgrade_closing_keywords, find_closing_references
@@ -971,6 +979,11 @@ class PlannedMerge:
     enqueued_at: float | None    # unix timestamp when the entry was created
     last_attempt: float | None   # unix timestamp of the last merge attempt
     milestone: str | None        # issue milestone title, or None
+    # #1344: structured CI rollup so the TUI can render "2✓ 1✗" badges straight
+    # from `/board` instead of shelling out to `gh pr checks` itself. `None`
+    # when no PR is open yet, or `ci_store` has no checks for this PR.
+    pr_number: int | None = None
+    ci_summary: "CiCheckSummary | None" = None
 
 
 def _load_milestones_for_queue(
@@ -1077,6 +1090,18 @@ def plan(
                     entry, board, config, ci_store, gh_ops
                 )
 
+            # #1344: structured CI rollup for the TUI's badges — computed for
+            # any queue entry with an open PR (not just PENDING ones being
+            # gate-checked), so a MERGING/MERGED row's last-known CI state
+            # still renders. `list_checks_for_pr` on the request-scoped
+            # `GateSnapshot` is a dict lookup, not a `gh` call, so this never
+            # violates the zero-I/O `/board` read path.
+            ci_summary = None
+            if ci_store is not None and ci_store.is_available and entry.pr_number:
+                checks = ci_store.list_checks_for_pr(entry.repo_github, entry.pr_number)
+                if checks:
+                    ci_summary = summarize_counts(checks)
+
             result.append(PlannedMerge(
                 assignment_id=entry.assignment_id,
                 repo_name=entry.repo_name,
@@ -1089,6 +1114,8 @@ def plan(
                 size=entry.size,
                 status=base_status,
                 reason=reason,
+                pr_number=entry.pr_number,
+                ci_summary=ci_summary,
                 enqueued_at=entry.enqueued_at,
                 last_attempt=entry.last_attempt,
                 milestone=milestones.get((entry.repo_name, entry.issue_number)),
