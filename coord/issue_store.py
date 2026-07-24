@@ -540,8 +540,6 @@ def _interactive_work_has_pushed_branch(record: CompletionRecord) -> bool:
     matching branch exists.  Mirrors :func:`coord.github_ops.branch_exists_on_remote`'s
     fail-open policy.
     """
-    from coord import github_ops  # noqa: PLC0415
-
     if not record.repo_github:
         return True
 

@@ -1573,6 +1573,64 @@ class TestFinalizeBackstop:
         assert result.commits_ahead is None
         assert result.terminal_status == "done"
 
+    def test_backstop_unresolved_worktree_removes_canonical_directory(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """#1155 acceptance criterion: when `worktree_path` doesn't resolve
+        AND `repo_path` is supplied, the canonical-path fallback must still
+        find and remove the worktree at `<COORD_DIR>/worktrees/<assignment_id>`
+        — no orphaned worktree left behind even though the caller-supplied
+        `wt_path` never matched anything on disk."""
+        from coord.interactive import finalize_interactive_exit
+        from coord import state as _state_mod
+
+        # Isolate COORD_DIR so the canonical-fallback lookup (deferred import
+        # of coord.state.COORD_DIR inside finalize_interactive_exit) resolves
+        # under tmp_path rather than the real ~/.coord.
+        fake_coord_dir = tmp_path / "coord-home"
+        monkeypatch.setattr(_state_mod, "COORD_DIR", fake_coord_dir)
+
+        assignment_id = "backstop-7"
+        _seed_running_assignment(assignment_id)
+
+        canonical_wt = fake_coord_dir / "worktrees" / assignment_id
+        canonical_wt.mkdir(parents=True)
+        (canonical_wt / "marker").write_text("orphaned worktree contents\n")
+
+        # A repo dir distinct from the canonical worktree — a plain git repo
+        # is enough for `git worktree remove --force` to run (it will fail
+        # since canonical_wt was never registered as a worktree of it, but
+        # _remove_worktree falls back to shutil.rmtree on that failure).
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        _git(repo_dir, "init", "-b", "main")
+
+        missing_wt = tmp_path / "does-not-exist"
+        with (
+            patch("coord.github_ops.post_issue_comment"),
+            patch(
+                "coord.github_ops.list_remote_branch_names",
+                return_value={"main"},
+            ),
+        ):
+            result = finalize_interactive_exit(
+                assignment_id=assignment_id,
+                repo_name="api",
+                repo_github="acme/api",
+                issue_number=13,
+                machine_name="laptop",
+                worktree_path=str(missing_wt),
+                repo_path=str(repo_dir),
+                base_branch="main",
+                exit_code=0,
+                started_at=None,
+            )
+
+        assert result.commits_ahead is None
+        assert result.terminal_status == "advisory"
+        assert result.worktree_removed is True
+        assert not canonical_wt.exists()
+
 
 # ── reconcile parity: interactive completions dispatch review/smoke ────────
 
