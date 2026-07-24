@@ -17,6 +17,7 @@ from coord.agent import (
     CANCELLED,
     DONE,
     FAILED,
+    PENDING,
     RUNNING,
     AgentAssignment,
     AgentServer,
@@ -3320,9 +3321,10 @@ class TestCompletedHistoryCap:
         )
 
     def test_persist_caps_terminal_assignments(self, tmp_path: Path) -> None:
-        """100 terminal assignments → _persist() keeps only the most recent 50
-        in both memory and on disk; oldest entries are evicted."""
-        N = 100
+        """2x-cap terminal assignments → _persist() keeps only the most
+        recent _COMPLETED_HISTORY_CAP in both memory and on disk; oldest
+        entries are evicted."""
+        N = _COMPLETED_HISTORY_CAP * 2
         repo = _init_repo(tmp_path / "repo")
         server = _server(tmp_path, repo_path=repo)
 
@@ -3348,15 +3350,15 @@ class TestCompletedHistoryCap:
             f"{_COMPLETED_HISTORY_CAP}"
         )
 
-        # The most recent N/2 entries (highest finished_at) must survive.
+        # The most recent (N - cap) entries (highest finished_at) must survive.
         kept_ids = {a.id for a in server._assignments.values()}
-        for i in range(N // 2, N):  # cap0050 … cap0099
+        for i in range(N - _COMPLETED_HISTORY_CAP, N):
             assert f"cap{i:04d}" in kept_ids, (
                 f"recent assignment cap{i:04d} was incorrectly dropped"
             )
 
-        # The oldest N/2 entries must be gone.
-        for i in range(N // 2):  # cap0000 … cap0049
+        # The oldest entries must be gone.
+        for i in range(N - _COMPLETED_HISTORY_CAP):
             assert f"cap{i:04d}" not in kept_ids, (
                 f"old assignment cap{i:04d} was incorrectly retained"
             )
@@ -3368,11 +3370,11 @@ class TestCompletedHistoryCap:
             f"{_COMPLETED_HISTORY_CAP}"
         )
         file_ids = {a["id"] for a in state["assignments"]}
-        for i in range(N // 2, N):
+        for i in range(N - _COMPLETED_HISTORY_CAP, N):
             assert f"cap{i:04d}" in file_ids, (
                 f"recent assignment cap{i:04d} missing from persisted state"
             )
-        for i in range(N // 2):
+        for i in range(N - _COMPLETED_HISTORY_CAP):
             assert f"cap{i:04d}" not in file_ids, (
                 f"old assignment cap{i:04d} should not be in persisted state"
             )
@@ -3492,6 +3494,95 @@ class TestCompletedHistoryCap:
         assert len(listing["completed"]) <= _COMPLETED_HISTORY_CAP, (
             f"list_assignments() returned {len(listing['completed'])} completed items, "
             f"expected ≤ {_COMPLETED_HISTORY_CAP}"
+        )
+
+
+# ── #715: /status payload stays lean regardless of history size ───────────────
+
+
+class TestStatusPayloadSize:
+    """`/status` latency must be decoupled from history size — terminal
+    entries drop their (potentially huge) briefing/system_prompt text, since
+    no coordinator reader consumes it from a terminal entry (#715)."""
+
+    def _make_spec(self, repo_path: Path, *, briefing: str) -> AssignmentSpec:
+        return AssignmentSpec(
+            repo_name="api",
+            repo_path=str(repo_path),
+            issue_number=1,
+            issue_title="t",
+            briefing=briefing,
+            system_prompt="x" * 2_000,
+            branch="main",
+        )
+
+    def test_to_status_dict_strips_briefing_for_terminal_status(self, tmp_path: Path) -> None:
+        repo = _init_repo(tmp_path / "repo")
+        big_briefing = "B" * 20_000
+        spec = self._make_spec(repo, briefing=big_briefing)
+        for status in (DONE, FAILED, CANCELLED, ADVISORY):
+            a = AgentAssignment(
+                id=f"term-{status}", spec=spec, status=status,
+                finished_at=1.0, exit_code=0,
+            )
+            d = a.to_status_dict()
+            assert d["spec"]["briefing"] == "", f"briefing not stripped for status={status}"
+            assert d["spec"]["system_prompt"] is None, (
+                f"system_prompt not stripped for status={status}"
+            )
+            # The live in-memory object must be untouched — only the
+            # serialized copy is slimmed.
+            assert a.spec.briefing == big_briefing
+
+    def test_to_status_dict_keeps_briefing_for_active_status(self, tmp_path: Path) -> None:
+        repo = _init_repo(tmp_path / "repo")
+        big_briefing = "B" * 20_000
+        spec = self._make_spec(repo, briefing=big_briefing)
+        for status in (PENDING, RUNNING):
+            a = AgentAssignment(id=f"active-{status}", spec=spec, status=status, started_at=1.0)
+            d = a.to_status_dict()
+            assert d["spec"]["briefing"] == big_briefing, (
+                f"briefing unexpectedly stripped for status={status}"
+            )
+
+    def test_status_payload_bounded_with_large_history(self, tmp_path: Path) -> None:
+        """200 terminal assignments with a large (20KB) briefing each — the
+        real-world trigger was 50 entries x a full briefing at ~0.9MB / ~3s
+        (#715) — must serialize small and fast now that terminal entries are
+        slimmed, independent of _COMPLETED_HISTORY_CAP (tested separately
+        above; here every entry is injected directly, bypassing _persist(),
+        so this isolates the per-entry size fix)."""
+        N = 200
+        big_briefing = "B" * 20_000
+        repo = _init_repo(tmp_path / "repo")
+        server = _server(tmp_path, repo_path=repo)
+        spec = self._make_spec(repo, briefing=big_briefing)
+
+        for i in range(N):
+            a = AgentAssignment(
+                id=f"big{i:04d}",
+                spec=spec,
+                status=DONE,
+                started_at=float(i),
+                finished_at=float(i),
+                exit_code=0,
+            )
+            server._assignments[a.id] = a
+
+        start = time.perf_counter()
+        listing = server.list_assignments()
+        payload = json.dumps(listing)
+        elapsed = time.perf_counter() - start
+
+        assert len(listing["completed"]) == N
+        assert big_briefing not in payload, "a full briefing leaked into the /status payload"
+        assert len(payload) < 300_000, (
+            f"/status payload too large: {len(payload)} bytes for {N} terminal "
+            "entries — briefing stripping appears to have regressed"
+        )
+        assert elapsed < 1.0, (
+            f"list_assignments() + json.dumps() took {elapsed:.2f}s for {N} "
+            "terminal entries — should be well under the coordinator's poll timeout"
         )
 
 

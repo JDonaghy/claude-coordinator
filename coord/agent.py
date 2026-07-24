@@ -93,7 +93,13 @@ _ADVISORY_TYPES = ("work",)
 # memory and persisted to agent_state.json (#452).  Oldest entries (by
 # finished_at, falling back to started_at) are dropped once this limit is
 # exceeded.  Active (pending/running) assignments are never pruned.
-_COMPLETED_HISTORY_CAP = 50
+# #715: lowered 50 -> 25.  Count-based capping alone wasn't enough — 50
+# terminal entries x a full briefing each still serialized to ~0.9MB and
+# took ~3s, tripping the coordinator's 3s health-poll timeout.  Terminal
+# entries now also drop their briefing/system_prompt text (see
+# AgentAssignment.to_status_dict()), so the smaller cap here is belt-and-
+# suspenders on top of the real, size-based fix.
+_COMPLETED_HISTORY_CAP = 25
 
 
 # ── Reap tuning ───────────────────────────────────────────────────────────────
@@ -1640,6 +1646,31 @@ class AgentAssignment:
         d = asdict(self)
         return d
 
+    def to_status_dict(self) -> dict:
+        """Serialize for `/status` and for on-disk persistence (#715).
+
+        For **terminal** assignments (done/failed/cancelled/advisory), strips
+        the heavy `spec.briefing`/`spec.system_prompt` text — a full briefing
+        can be tens of KB, and no coordinator reader consumes it from a
+        terminal `/status` entry (the briefing already lives on the board /
+        GitHub; `coord/notify.py` only reads small scalar fields like
+        `status`, `exit_code`, `branch`, `claude_session_id`, cost/tokens).
+        `_COMPLETED_HISTORY_CAP` terminal entries × a full briefing each is
+        what made `/status` slow enough to trip the coordinator's 3s
+        health-poll timeout (#452 capped by *count*; this caps by *size*).
+
+        Active (pending/running) assignments are returned unchanged — some
+        callers (`coord status`) still read `spec.type`/`spec.review_target`
+        off in-flight entries to label what's currently running.
+        """
+        d = asdict(self)
+        if self.status not in (PENDING, RUNNING):
+            spec = d.get("spec")
+            if spec is not None:
+                spec["briefing"] = ""
+                spec["system_prompt"] = None
+        return d
+
 
 WORKER_SYSTEM_PROMPT = """\
 You are a Claude Code worker executing an assignment from the coordinator.
@@ -3107,7 +3138,7 @@ class AgentServer:
         active = []
         completed = []
         for a in assignments:
-            d = a.to_dict()
+            d = a.to_status_dict()
             if a.status == RUNNING:
                 try:
                     prog = self.progress(a.id)
@@ -4504,7 +4535,11 @@ class AgentServer:
                 "machine": self.machine_name,
                 "capabilities": self.capabilities,
                 "repos": self.repos,
-                "assignments": [a.to_dict() for a in self._assignments.values()],
+                # #715: to_status_dict() strips spec.briefing/system_prompt
+                # from terminal entries so agent_state.json can't refill back
+                # up to the multi-hundred-KB sizes that caused this issue —
+                # even if a future change relaxes _COMPLETED_HISTORY_CAP.
+                "assignments": [a.to_status_dict() for a in self._assignments.values()],
             }
         try:
             tmp = self.state_path.with_suffix(".json.tmp")
