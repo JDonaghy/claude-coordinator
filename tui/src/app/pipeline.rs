@@ -7461,8 +7461,30 @@ impl CoordApp {
             .data
             .merge_queue
             .iter()
-            .find(|m| m.issue_number == Some(issue.number) && m.repo_github == issue.repo_slug)?;
-        let work_id = entry.assignment_id.clone();
+            .find(|m| m.issue_number == Some(issue.number) && m.repo_github == issue.repo_slug);
+        // #582: a merge_queue row only exists once the review gate has
+        // passed — issues with request-changes reviews that haven't
+        // reached the merge stage yet (or never got a queue row) have no
+        // entry here. Fall back to the same direct-`assignments` lookup
+        // `selected_row_has_request_changes_for` uses for menu visibility,
+        // so the action doesn't unconditionally fail on rows the menu
+        // correctly showed as actionable.
+        let work_id = match entry {
+            Some(entry) => entry.assignment_id.clone(),
+            None => self
+                .data
+                .assignments
+                .iter()
+                .filter(|a| {
+                    a.issue_number == issue.number && a.assignment_type.as_deref() == Some("work")
+                })
+                .max_by(|a, b| {
+                    a.dispatched_at
+                        .partial_cmp(&b.dispatched_at)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|a| a.id.clone())?,
+        };
         // Most-recent review (highest dispatched_at) paired with this
         // work and carrying a request-changes verdict.
         self.data

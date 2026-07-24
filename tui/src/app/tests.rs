@@ -15530,6 +15530,56 @@
     }
 
     #[test]
+    fn dispatch_bounce_works_without_merge_queue_entry() {
+        // #582: a merge_queue row only appears once the review gate has
+        // passed. An issue with request-changes reviews that hasn't reached
+        // the merge stage yet (vimcode #514 in the bug report) has NO
+        // merge_queue entry at all — but the menu correctly shows "Address
+        // review findings" because `selected_row_has_request_changes_for`
+        // queries `assignments` directly. The action must use the same
+        // fallback instead of bailing out on the missing merge_queue row.
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0);
+        assert!(
+            app.data.merge_queue.is_empty(),
+            "precondition: no merge_queue entry for issue 42"
+        );
+        let mut work = _work_assignment("w42", 100.0, "done", None);
+        work.issue_number = 42;
+        app.data.assignments.push(work);
+        let mut review = _stage_assignment("rev-w42", "review", 200.0, "done");
+        review.issue_number = 42;
+        review.review_of_assignment_id = Some("w42".to_string());
+        review.review_verdict = Some("request-changes".to_string());
+        app.data.assignments.push(review);
+
+        assert!(
+            app.selected_row_has_request_changes_for(Some(42)),
+            "menu-visibility check must report a request-changes review"
+        );
+        assert_eq!(
+            app.selected_pipeline_review_id_for_bounce().as_deref(),
+            Some("rev-w42"),
+            "bounce action must find the same review the menu check found, \
+             even with no merge_queue row"
+        );
+
+        let toasts_before = app.toasts.len();
+        let acted = app.dispatch_bounce_for_selected_pipeline_row();
+        assert!(
+            acted,
+            "bounce must dispatch even when the issue has no merge_queue entry"
+        );
+        assert!(app.toasts.len() > toasts_before);
+        let body = app.toasts.last().expect("toast").0.body.to_string();
+        assert!(
+            !body.to_lowercase().contains("no request-changes review found"),
+            "must not toast the 'nothing to address' failure; got {body:?}",
+        );
+    }
+
+    #[test]
     fn dispatch_bounce_toasts_without_spawn_when_no_request_changes() {
         // No review pairing → bounce is a no-op with an explanatory toast.
         let mut app = make_pipeline_app();
