@@ -135,6 +135,58 @@ def test_get_assignment_makes_no_gh_calls(
     assert app_client.get("/assignment/work1").status_code == 200
 
 
+# ── Invariant 5: polling is cache-validated ──────────────────────────────────
+
+
+def test_board_etag_304_roundtrip(app_client: TestClient) -> None:
+    """A poller that sends If-None-Match gets a bodyless 304 while nothing
+    changed — the steady-board poll costs headers, not megabytes."""
+    first = app_client.get("/board")
+    assert first.status_code == 200
+    etag = first.headers.get("etag")
+    assert etag, "every /board response must carry an ETag"
+    assert first.json()["board_version"] >= 1
+
+    second = app_client.get("/board", headers={"If-None-Match": etag})
+    assert second.status_code == 304
+    assert second.headers.get("etag") == etag
+    assert not second.content
+
+    # A stale/foreign ETag still gets the full payload.
+    third = app_client.get("/board", headers={"If-None-Match": 'W/"nope"'})
+    assert third.status_code == 200
+    assert third.json()["round_number"] == 3
+
+
+def test_board_version_bumps_when_content_changes(
+    detail_db: Path, valid_config_path: Path, monkeypatch
+) -> None:
+    """board_version is monotonic and moves exactly when the payload does."""
+    monkeypatch.setenv("COORD_BOARD_CACHE_TTL", "0")  # rebuild every request
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(detail_db), cfg)
+    with TestClient(app) as cli:
+        r1 = cli.get("/board")
+        v1 = r1.json()["board_version"]
+        # Nothing changed: same version, same ETag, and a conditional GET 304s.
+        r2 = cli.get("/board")
+        assert r2.json()["board_version"] == v1
+        assert r2.headers["etag"] == r1.headers["etag"]
+
+        # Change the underlying DB → new version, new ETag; the old ETag no
+        # longer 304s.
+        conn = sqlite3.connect(str(detail_db))
+        conn.execute(
+            "UPDATE assignments SET status='failed' WHERE assignment_id='work1'"
+        )
+        conn.commit()
+        conn.close()
+        r3 = cli.get("/board", headers={"If-None-Match": r1.headers["etag"]})
+        assert r3.status_code == 200
+        assert r3.json()["board_version"] == v1 + 1
+        assert r3.headers["etag"] != r1.headers["etag"]
+
+
 # ── Invariant 1: read endpoints perform no third-party I/O ───────────────────
 
 

@@ -1133,6 +1133,15 @@ def _board_response_schema(components: dict) -> dict:
         "type": "object",
         "properties": {
             "schema_version": {"type": "integer"},
+            "board_version": {
+                "type": "integer",
+                "description": (
+                    "#1336: monotonically-increasing content version (per "
+                    "daemon lifetime). Every /board response also carries an "
+                    "ETag; send it back as If-None-Match to get a bodyless "
+                    "304 while nothing changed."
+                ),
+            },
             "round_number": {"type": "integer"},
             "assignments": _list_of("BoardAssignment"),
             "machines": _list_of("BoardMachine"),
@@ -1355,8 +1364,14 @@ def _openapi_spec() -> dict:
                 "summary": "The full board projection (CoordStore.board_projection)",
                 "responses": {
                     "200": {
-                        "description": "OK",
+                        "description": "OK (carries an ETag response header)",
                         "content": {"application/json": {"schema": board_schema}},
+                    },
+                    "304": {
+                        "description": (
+                            "Not Modified — If-None-Match matched the current "
+                            "board ETag (#1336 cache-validated polling)"
+                        )
                     },
                     "503": {"description": "Board read failed"},
                 },
@@ -2480,6 +2495,42 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
     # action is visible on the very next poll without waiting out the TTL.
     _board_cache: dict | None = None
     _board_cache_at: float = 0.0
+    # #1336 invariant 5: polling is cache-validated.  The board carries a
+    # monotonically-increasing version (per daemon lifetime; a restart starts
+    # a new ETag lineage so clients simply refetch once) and every /board
+    # response an ETag.  A poller sends If-None-Match and gets a bodyless 304
+    # when nothing changed — which, on a steady board, is nearly every poll.
+    _board_version: int = 0
+    _board_etag: str | None = None
+    _board_hash: str | None = None
+
+    def _stamp_board_version(result: dict) -> str:
+        """Hash *result*, bump the version when the content changed, stamp
+        ``board_version`` into the payload, and return the ETag."""
+        nonlocal _board_version, _board_etag, _board_hash
+        import hashlib  # noqa: PLC0415
+        import json as _json  # noqa: PLC0415
+
+        result.pop("board_version", None)  # hash content, not the stamp
+        try:
+            digest = hashlib.sha256(
+                _json.dumps(result, sort_keys=True, default=str).encode()
+            ).hexdigest()[:16]
+        except (TypeError, ValueError):
+            # Unhashable content: treat every build as new (never serve a
+            # stale 304 because versioning failed).
+            digest = f"unhashable-{_time_ns()}"
+        if digest != _board_hash:
+            _board_hash = digest
+            _board_version += 1
+            _board_etag = f'W/"board-{_board_version}-{digest}"'
+        result["board_version"] = _board_version
+        return _board_etag or ""
+
+    def _time_ns() -> int:
+        import time as _t  # noqa: PLC0415
+
+        return _t.monotonic_ns()
 
     def _bust_board_cache() -> None:
         """Invalidate the /board response cache.
@@ -2505,7 +2556,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
     async def healthz(request: Request) -> JSONResponse:  # noqa: ARG001
         return JSONResponse({"status": "ok", "schema_version": SCHEMA_VERSION})
 
-    async def board(request: Request) -> Response:  # noqa: ARG001
+    async def board(request: Request) -> Response:
         # #1081: pick up a hand-edited coordinator.yml before computing the
         # merge plan / staging / stage-projection below, all of which read
         # `config` for real gating decisions (reviews.enabled, default_gates,
@@ -2524,8 +2575,14 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         _ttl = float(os.getenv("COORD_BOARD_CACHE_TTL", "1.5"))
         _now = _time.monotonic()
         nonlocal _board_cache, _board_cache_at
+        _client_etag = request.headers.get("if-none-match")
         if _board_cache is not None and (_now - _board_cache_at) < _ttl:
-            return JSONResponse(_board_cache)
+            if _client_etag and _board_etag and _client_etag == _board_etag:
+                return Response(status_code=304, headers={"ETag": _board_etag})
+            return JSONResponse(
+                _board_cache,
+                headers={"ETag": _board_etag} if _board_etag else {},
+            )
 
         # Part 1 (threadpool): offload all synchronous computation to a worker
         # thread so the async event loop stays free for /healthz, POST handlers,
@@ -2941,9 +2998,14 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 {"error": "board read failed", "detail": str(e)}, status_code=503
             )
         # Cache the fresh result so burst polls within the TTL don't recompute.
+        etag = _stamp_board_version(result)
         _board_cache = result
         _board_cache_at = _time.monotonic()
-        return JSONResponse(result)
+        if _client_etag and etag and _client_etag == etag:
+            # Freshly rebuilt and STILL identical to what the client holds —
+            # spare the wire (the common steady-board poll).
+            return Response(status_code=304, headers={"ETag": etag})
+        return JSONResponse(result, headers={"ETag": etag} if etag else {})
 
     async def get_assignment(request: Request) -> Response:
         """#1336/#1337: single-assignment detail — the point lookup for what the
