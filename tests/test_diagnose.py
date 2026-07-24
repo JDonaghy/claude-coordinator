@@ -913,6 +913,79 @@ def test_launch_failed_no_branch_still_shows_finding(monkeypatch, config) -> Non
     assert res.recovered is True
 
 
+# ── #1155: `done` work row with no branch is never reviewable ───────────────
+
+
+def test_done_work_with_empty_branch_flags_and_downgrades(monkeypatch, config) -> None:
+    """A `done` work assignment with no branch (the #1151 shape) is flagged
+    and downgraded to advisory — it has nothing a reviewer could look at."""
+    _stub(monkeypatch, session="dead")
+    downgrade_calls: list = []
+    monkeypatch.setattr(
+        diagnose,
+        "_downgrade_empty_branch_done",
+        lambda a, c: downgrade_calls.append(a.assignment_id) or "advisory",
+    )
+
+    a = _assign(aid="w-empty-branch", status="done", branch=None)
+    board = Board(completed=[a])
+    res = diagnose.diagnose_stage(board, config, "api", 42, "work")
+
+    assert any("not reviewable" in f for f in res.findings), res.findings
+    assert downgrade_calls == ["w-empty-branch"]
+    assert any("downgraded" in act for act in res.actions_taken), res.actions_taken
+    assert res.recovered is True
+
+
+def test_done_work_with_blank_branch_string_also_flagged(monkeypatch, config) -> None:
+    """An empty string (not just None) branch must trigger the same guard."""
+    _stub(monkeypatch, session="dead")
+    monkeypatch.setattr(
+        diagnose, "_downgrade_empty_branch_done", lambda a, c: "advisory"
+    )
+
+    a = _assign(aid="w-blank-branch", status="done", branch="   ")
+    board = Board(completed=[a])
+    res = diagnose.diagnose_stage(board, config, "api", 42, "work")
+
+    assert any("not reviewable" in f for f in res.findings), res.findings
+    assert res.recovered is True
+
+
+def test_done_work_with_empty_branch_dry_run_does_not_downgrade(
+    monkeypatch, config
+) -> None:
+    """--dry-run reports the problem but never mutates state."""
+    downgrade_calls: list = []
+    monkeypatch.setattr(
+        diagnose,
+        "_downgrade_empty_branch_done",
+        lambda a, c: downgrade_calls.append(a.assignment_id) or "advisory",
+    )
+
+    from coord.diagnose import DiagnoseResult, _recover_work_like
+
+    a = _assign(aid="w-empty-branch-dry", status="done", branch=None)
+    board = Board(completed=[a])
+    res = DiagnoseResult(repo_name="api", issue_number=42, stage="work")
+    _recover_work_like(board, config, a, "dead", res, dry_run=True)
+
+    assert downgrade_calls == []
+    assert any("not reviewable" in f for f in res.findings), res.findings
+    assert res.actions_taken == []
+
+
+def test_done_work_with_real_branch_is_healthy(monkeypatch, config) -> None:
+    """Control case: a `done` work row WITH a branch is unaffected — still
+    reports 'stage looks healthy' as before."""
+    _stub(monkeypatch, session="dead")
+    a = _assign(aid="w-has-branch", status="done", branch="issue-42-real")
+    board = Board(completed=[a])
+    res = diagnose.diagnose_stage(board, config, "api", 42, "work")
+    assert any("looks healthy" in f for f in res.findings), res.findings
+    assert res.recovered is True
+
+
 # ── #618: _prune_orphan_for_failed integration ──────────────────────────────
 
 

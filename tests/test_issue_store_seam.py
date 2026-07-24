@@ -197,6 +197,130 @@ class TestPostCompletion:
             )
         assert outcome.status == "done"
 
+    # ── #1155: interactive WORK sessions get an authoritative branch check
+    # when commits_ahead is None, instead of the headless None→done default.
+
+    def test_interactive_unknown_commits_no_branch_and_no_remote_branch_is_advisory(
+        self,
+    ) -> None:
+        """The #1151 shape: interactive work session, worktree never resolved
+        at finalize (commits_ahead=None, branch=None), and GitHub confirms no
+        issue-<N>-* branch was ever pushed → advisory, not done."""
+        _seed_running_assignment("aid-int-1")
+        with (
+            patch("coord.github_ops.post_issue_comment"),
+            patch(
+                "coord.github_ops.list_remote_branch_names",
+                return_value={"main", "issue-99-unrelated"},
+            ) as list_names,
+        ):
+            outcome = issue_store.post_completion(
+                issue_store.CompletionRecord(
+                    assignment_id="aid-int-1",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=7,
+                    exit_code=0,
+                    commits_ahead=None,
+                    branch=None,
+                    is_interactive=True,
+                )
+            )
+        assert outcome.status == "advisory"
+        list_names.assert_called_once_with("acme/api")
+        row = state_mod.get_connection().execute(
+            "SELECT status, review_state FROM assignments WHERE assignment_id=?",
+            ("aid-int-1",),
+        ).fetchone()
+        assert row["status"] == "advisory"
+        assert row["review_state"] == "advisory"
+
+    def test_interactive_unknown_commits_with_confirmed_remote_branch_is_done(
+        self,
+    ) -> None:
+        """A real git hiccup on a genuinely-pushed interactive branch must
+        NOT be demoted — the #448 policy still applies once GitHub confirms
+        the branch exists."""
+        _seed_running_assignment("aid-int-2")
+        with (
+            patch("coord.github_ops.post_issue_comment"),
+            patch(
+                "coord.github_ops.branch_exists_on_remote", return_value=True
+            ) as exists,
+        ):
+            outcome = issue_store.post_completion(
+                issue_store.CompletionRecord(
+                    assignment_id="aid-int-2",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=7,
+                    exit_code=0,
+                    commits_ahead=None,
+                    branch="issue-7-foo",
+                    is_interactive=True,
+                )
+            )
+        assert outcome.status == "done"
+        exists.assert_called_once_with("acme/api", "issue-7-foo")
+
+    def test_interactive_unknown_commits_no_branch_but_remote_has_issue_branch_is_done(
+        self,
+    ) -> None:
+        """No branch name was captured locally, but GitHub shows an
+        issue-<N>-* branch does exist — treat as a git hiccup, not a no-op."""
+        _seed_running_assignment("aid-int-3")
+        with (
+            patch("coord.github_ops.post_issue_comment"),
+            patch(
+                "coord.github_ops.list_remote_branch_names",
+                return_value={"main", "issue-7-foo"},
+            ),
+        ):
+            outcome = issue_store.post_completion(
+                issue_store.CompletionRecord(
+                    assignment_id="aid-int-3",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=7,
+                    exit_code=0,
+                    commits_ahead=None,
+                    branch=None,
+                    is_interactive=True,
+                )
+            )
+        assert outcome.status == "done"
+
+    def test_interactive_unknown_commits_github_lookup_error_fails_open_to_done(
+        self,
+    ) -> None:
+        """A GitHub lookup failure (network, gh not authenticated, etc.) must
+        never falsely demote a clean exit to advisory — fail open."""
+        _seed_running_assignment("aid-int-4")
+        with (
+            patch("coord.github_ops.post_issue_comment"),
+            patch(
+                "coord.github_ops.branch_exists_on_remote",
+                side_effect=RuntimeError("gh: network error"),
+            ),
+        ):
+            outcome = issue_store.post_completion(
+                issue_store.CompletionRecord(
+                    assignment_id="aid-int-4",
+                    machine_name="laptop",
+                    repo_name="api",
+                    repo_github="acme/api",
+                    issue_number=7,
+                    exit_code=0,
+                    commits_ahead=None,
+                    branch="issue-7-foo",
+                    is_interactive=True,
+                )
+            )
+        assert outcome.status == "done"
+
     def test_nonzero_exit_is_failed_regardless_of_commits(self) -> None:
         _seed_running_assignment("aid-fail-1")
         with patch("coord.github_ops.post_issue_comment"):
@@ -1377,6 +1501,77 @@ class TestFinalizeBackstop:
             ("backstop-4",),
         ).fetchone()
         assert row["status"] == "failed"
+
+    # ── #1155: worktree_path doesn't resolve at finalize (the #1151 shape) ──
+
+    def test_backstop_unresolved_worktree_no_remote_branch_is_advisory(
+        self, tmp_path: Path,
+    ) -> None:
+        """When the worktree can't be found, commits_ahead and branch both
+        stay None/empty. If GitHub confirms no branch was ever pushed for
+        this issue, the session must be advisory, not a done row with an
+        empty branch (#1151)."""
+        from coord.interactive import finalize_interactive_exit
+
+        _seed_running_assignment("backstop-5")
+        missing_wt = tmp_path / "does-not-exist"
+        with (
+            patch("coord.github_ops.post_issue_comment"),
+            patch(
+                "coord.github_ops.list_remote_branch_names",
+                return_value={"main"},
+            ),
+        ):
+            result = finalize_interactive_exit(
+                assignment_id="backstop-5",
+                repo_name="api",
+                repo_github="acme/api",
+                issue_number=11,
+                machine_name="laptop",
+                worktree_path=str(missing_wt),
+                base_branch="main",
+                exit_code=0,
+                started_at=None,
+            )
+        assert result.commits_ahead is None
+        assert result.terminal_status == "advisory"
+        row = state_mod.get_connection().execute(
+            "SELECT status, review_state FROM assignments WHERE assignment_id=?",
+            ("backstop-5",),
+        ).fetchone()
+        assert row["status"] == "advisory"
+        assert row["review_state"] == "advisory"
+
+    def test_backstop_unresolved_worktree_with_remote_branch_is_done(
+        self, tmp_path: Path,
+    ) -> None:
+        """Same unresolved-worktree shape, but GitHub confirms an
+        issue-<N>-* branch WAS pushed (a real git hiccup on real work) — must
+        stay done, matching #448 for a genuinely-pushed branch."""
+        from coord.interactive import finalize_interactive_exit
+
+        _seed_running_assignment("backstop-6")
+        missing_wt = tmp_path / "also-does-not-exist"
+        with (
+            patch("coord.github_ops.post_issue_comment"),
+            patch(
+                "coord.github_ops.list_remote_branch_names",
+                return_value={"main", "issue-12-real-work"},
+            ),
+        ):
+            result = finalize_interactive_exit(
+                assignment_id="backstop-6",
+                repo_name="api",
+                repo_github="acme/api",
+                issue_number=12,
+                machine_name="laptop",
+                worktree_path=str(missing_wt),
+                base_branch="main",
+                exit_code=0,
+                started_at=None,
+            )
+        assert result.commits_ahead is None
+        assert result.terminal_status == "done"
 
 
 # ── reconcile parity: interactive completions dispatch review/smoke ────────

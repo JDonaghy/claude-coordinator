@@ -2473,7 +2473,12 @@ def finalize_interactive_exit(
     # worktree to push from, count commits in, or remove.  Guard every git
     # step on a real worktree path so the review backstop still records a
     # terminal state (commits_ahead=None) without ever touching the checkout.
-    wt_path = Path(worktree_path) if worktree_path else None
+    # #1155: .expanduser() defensively — every known caller already builds
+    # worktree_path from an expanded COORD_DIR, but a `~`-relative string
+    # reaching here would make .exists() silently False even though the
+    # worktree is physically present, skipping push/commit-count/branch
+    # capture below and leaking the worktree.
+    wt_path = Path(worktree_path).expanduser() if worktree_path else None
 
     # Step 1 — push.  Failure is non-fatal but recorded.  Skip the push
     # entirely when there is no worktree (review) or its directory doesn't
@@ -2534,6 +2539,7 @@ def finalize_interactive_exit(
         duration_seconds=duration,
         log_path=log_path,
         summary="",
+        is_interactive=True,
     )
     outcome = post_completion(record)
 
@@ -2561,6 +2567,21 @@ def finalize_interactive_exit(
     worktree_removed = False
     if repo_path is not None and wt_path is not None:
         worktree_removed = _remove_worktree(Path(repo_path), wt_path)
+        # #1155: if wt_path didn't resolve (Steps 1-3 above skipped, so
+        # commits/branch stayed None/empty), _remove_worktree treated the
+        # directory as "already gone" without checking anywhere else. Every
+        # interactive worktree is created at the canonical
+        # <COORD_DIR>/worktrees/<assignment_id> location (see
+        # agent.setup_interactive_worktree), independent of whatever string
+        # the caller passed as worktree_path — so fall back to that fixed
+        # location and remove it too if it's still on disk and wasn't the
+        # path we just handled. Closes the orphaned-worktree leak even when
+        # the root cause of the unresolved wt_path is never diagnosed.
+        from coord.state import COORD_DIR as _COORD_DIR_WT  # noqa: PLC0415
+        _canonical_wt = _COORD_DIR_WT / "worktrees" / assignment_id
+        if _canonical_wt != wt_path and _canonical_wt.exists():
+            if _remove_worktree(Path(repo_path), _canonical_wt):
+                worktree_removed = True
 
     # #546: mark as interactive + capture tokens from the session transcript.
     _persist_interactive_tokens(assignment_id, started_at, worktree_path)
@@ -3316,6 +3337,7 @@ def finalize_remote_interactive_exit(
         duration_seconds=duration,
         log_path=None,
         summary="",
+        is_interactive=True,
     )
     outcome = post_completion(record)
 
