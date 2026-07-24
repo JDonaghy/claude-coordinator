@@ -3046,7 +3046,10 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
 
         repo_name = request.path_params["repo_name"]
-        number = request.path_params["number"]
+        try:
+            number = int(request.path_params["number"])
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "number must be an integer"}, status_code=404)
         row = await run_in_threadpool(store.get_issue, repo_name, number)
         if row is None:
             return JSONResponse(
@@ -4622,7 +4625,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/healthz", healthz, methods=["GET"]),
         Route("/board", board, methods=["GET"]),
         Route("/assignment/{assignment_id}", get_assignment, methods=["GET"]),
-        Route("/issue/{repo_name}/{number:int}", get_issue, methods=["GET"]),
+        Route("/issue/{repo_name}/{number}", get_issue, methods=["GET"]),
         Route("/audit", get_audit, methods=["GET"]),
         Route("/config", serve_config, methods=["GET"]),
         Route("/result", post_result, methods=["POST"]),
