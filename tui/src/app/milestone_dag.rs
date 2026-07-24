@@ -1329,6 +1329,39 @@ Not part of the block.
     }
 
     #[test]
+    fn milestone_dag_complete_for_tracking_body_larger_than_wire_document_cap() {
+        // #1337 review finding: the daemon bounds member-issue bodies on the
+        // /board wire at 16 KB (coord.board_wire.DOCUMENT_CHARS) but must
+        // EXEMPT tracking (epic) bodies, because this view parses
+        // `## Work order` client-side.  Guard the client half: a tracking
+        // body whose work-order items sit past the 16 KB mark must still
+        // yield the complete DAG — every node, edges intact.
+        let prose = "x".repeat(16_384 + 100);
+        let body = format!(
+            "## Work order\n{prose}\n- [ ] #4242 {{group: A}}\n- [ ] #4243 {{after: #4242}}\n"
+        );
+        let mut epic = issue("repo", 4200, "Epic", "open", &["epic"]);
+        epic.milestone_number = Some(5);
+        epic.body = body;
+        let mut m1 = issue("repo", 4242, "member a", "open", &[]);
+        m1.milestone_number = Some(5);
+        let mut m2 = issue("repo", 4243, "member b", "open", &[]);
+        m2.milestone_number = Some(5);
+        let issues = vec![epic, m1, m2];
+
+        let views = milestones_with_work_orders(&issues, &[]);
+        assert_eq!(views.len(), 1, "tracking issue must produce a DAG view");
+        let numbers: Vec<u64> = views[0].nodes.iter().map(|n| n.issue_number).collect();
+        assert_eq!(
+            numbers,
+            vec![4242, 4243],
+            "work-order items past the wire document cap must not be dropped",
+        );
+        // The dependency edge past the cap survives too.
+        assert_eq!(views[0].nodes[1].after, vec![4242]);
+    }
+
+    #[test]
     fn parse_work_order_no_heading_returns_empty() {
         assert!(parse_work_order("just a normal issue body, no work order here").is_empty());
     }

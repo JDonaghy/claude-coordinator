@@ -19,7 +19,11 @@ This module is the single place the per-field wire policy lives:
   cap that today truncates nothing real (issue-body p99 ≈ 9 KB, cap 16 KB)
   but bounds the pathological row, because clients parse these semantically
   (work orders, ``## Files`` globs) and an aggressive prefix cut would break
-  those parses.  Full body: ``GET /issue/{repo}/{number}``.
+  those parses.  **Tracking (epic) issue bodies are exempt entirely** — the
+  TUI's Milestone DAG parses ``## Work order`` client-side out of the full
+  body (see :func:`bound_issue_row`); GitHub's own 64 KB issue-body limit ×
+  the handful of epics per board keeps the exemption bounded.  Full body:
+  ``GET /issue/{repo}/{number}``.
 
 Everything here is wire-only: the DB row, the detail endpoints, and local
 (non-daemon) reads are untouched.  The bounded fields are also excluded from
@@ -117,8 +121,31 @@ def bound_assignment_row(row: dict) -> None:
     _bound_test_plan(row, DOCUMENT_CHARS)
 
 
+def _is_tracking_issue(row: dict) -> bool:
+    """True when the issue carries the milestone-tracking (epic) label."""
+    from coord.milestone_order import TRACKING_ISSUE_LABEL  # noqa: PLC0415
+
+    labels = row.get("labels")
+    return isinstance(labels, list) and TRACKING_ISSUE_LABEL in labels
+
+
 def bound_issue_row(row: dict) -> None:
-    """Apply the wire policy to one ``/board`` issue row (mutates)."""
+    """Apply the wire policy to one ``/board`` issue row (mutates).
+
+    **Tracking (epic) issues are exempt from the body cap.**  The TUI's
+    Milestone DAG parses ``## Work order`` out of the tracking issue's body
+    *client-side* (`milestone_dag.rs::milestones_with_work_orders` — it does
+    NOT consume the server-computed ``milestone_work_orders``, which drops
+    terminal nodes and carries no ``after``-edges), so a cap that cuts
+    work-order items past DOCUMENT_CHARS would silently drop DAG nodes on
+    thin clients — a regression in exactly the failure class #1337 exists to
+    close.  The exemption stays bounded in practice: an epic body is capped
+    at 65,536 chars by GitHub itself and boards carry few epics (~31 today,
+    0.19 MB total).  Member (non-epic) issue bodies keep the DOCUMENT_CHARS
+    cap.
+    """
+    if _is_tracking_issue(row):
+        return
     _bound_text_field(row, "body", DOCUMENT_CHARS)
 
 

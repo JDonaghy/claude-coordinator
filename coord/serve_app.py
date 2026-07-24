@@ -2511,10 +2511,23 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
     _board_version: int = 0
     _board_etag: str | None = None
     _board_hash: str | None = None
+    # Monotonic time the cached build STARTED (its DB snapshot moment).  Two
+    # concurrent cache-miss rebuilds can finish out of order; publishing is
+    # rejected for a build older than the one already cached, so a stale
+    # snapshot can never be stamped with a newer version/ETag and served for
+    # a TTL window (review finding on #1336).
+    _board_cache_built_at: float = 0.0
+    # Guards every read/write of the cache + version/etag/hash quadruple so
+    # they are always published and read as one consistent unit.
+    _board_lock = threading.Lock()
 
     def _stamp_board_version(result: dict) -> str:
         """Hash *result*, bump the version when the content changed, stamp
-        ``board_version`` into the payload, and return the ETag."""
+        ``board_version`` into the payload, and return the ETag.
+
+        Mutates the version/etag/hash triple — callers MUST hold
+        ``_board_lock`` so the stamp and the cache store publish atomically.
+        """
         nonlocal _board_version, _board_etag, _board_hash
         import hashlib  # noqa: PLC0415
         import json as _json  # noqa: PLC0415
@@ -2582,14 +2595,21 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         import time as _time  # noqa: PLC0415
         _ttl = float(os.getenv("COORD_BOARD_CACHE_TTL", "1.5"))
         _now = _time.monotonic()
-        nonlocal _board_cache, _board_cache_at
+        nonlocal _board_cache, _board_cache_at, _board_cache_built_at
         _client_etag = request.headers.get("if-none-match")
-        if _board_cache is not None and (_now - _board_cache_at) < _ttl:
-            if _client_etag and _board_etag and _client_etag == _board_etag:
-                return Response(status_code=304, headers={"ETag": _board_etag})
+        # Read the cache + its ETag as one consistent unit — a concurrent
+        # publish must never let a response pair one build's body with
+        # another build's ETag.
+        with _board_lock:
+            _cached = _board_cache
+            _cached_etag = _board_etag
+            _cached_at = _board_cache_at
+        if _cached is not None and (_now - _cached_at) < _ttl:
+            if _client_etag and _cached_etag and _client_etag == _cached_etag:
+                return Response(status_code=304, headers={"ETag": _cached_etag})
             return JSONResponse(
-                _board_cache,
-                headers={"ETag": _board_etag} if _board_etag else {},
+                _cached,
+                headers={"ETag": _cached_etag} if _cached_etag else {},
             )
 
         # Part 1 (threadpool): offload all synchronous computation to a worker
@@ -2607,7 +2627,12 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         class _BoardReadError(Exception):
             """Sentinel: board_projection() failed; propagated from threadpool."""
 
-        def _build() -> dict:
+        def _build() -> tuple[float, dict]:
+            # Snapshot-order stamp: captured immediately before the DB read so
+            # the publish step below can reject a build whose snapshot is
+            # older than the one already cached (concurrent rebuilds can
+            # finish out of order).
+            _built_at = _time.monotonic()
             # ── board projection ──────────────────────────────────────────────
             try:
                 projection = store.board_projection()
@@ -2997,18 +3022,27 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             from coord.board_wire import bound_board_payload as _bound  # noqa: PLC0415
 
             _bound(projection)
-            return projection
+            return _built_at, projection
 
         try:
-            result = await run_in_threadpool(_build)
+            built_at, result = await run_in_threadpool(_build)
         except _BoardReadError as e:
             return JSONResponse(
                 {"error": "board read failed", "detail": str(e)}, status_code=503
             )
-        # Cache the fresh result so burst polls within the TTL don't recompute.
-        etag = _stamp_board_version(result)
-        _board_cache = result
-        _board_cache_at = _time.monotonic()
+        # Publish atomically: stamp + cache + built-at move as one unit under
+        # the lock, and a build whose DB snapshot is OLDER than the cached one
+        # is not published at all (concurrent rebuilds finishing out of order
+        # must never stamp a newer version/ETag onto older content — review
+        # finding on #1336).  The losing build's result is still served to its
+        # own requester, but unstamped and uncacheable.
+        etag: str | None = None
+        with _board_lock:
+            if built_at >= _board_cache_built_at:
+                etag = _stamp_board_version(result)
+                _board_cache = result
+                _board_cache_at = _time.monotonic()
+                _board_cache_built_at = built_at
         if _client_etag and etag and _client_etag == etag:
             # Freshly rebuilt and STILL identical to what the client holds —
             # spare the wire (the common steady-board poll).

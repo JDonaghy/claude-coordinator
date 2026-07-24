@@ -187,6 +187,55 @@ def test_board_version_bumps_when_content_changes(
         assert r3.headers["etag"] != r1.headers["etag"]
 
 
+def test_stale_concurrent_rebuild_is_never_published(
+    detail_db: Path, valid_config_path: Path, monkeypatch
+) -> None:
+    """Review finding on #1336: two concurrent cache-miss rebuilds can finish
+    out of order.  A build whose DB snapshot is OLDER than the one already
+    cached must not be stamped/cached (it would serve stale content under a
+    newer version/ETag for a TTL window) — it is served to its own requester
+    unstamped and uncacheable."""
+    import starlette.concurrency as sc
+
+    monkeypatch.setenv("COORD_BOARD_CACHE_TTL", "1000")  # cache once published
+
+    # Deterministic out-of-order completion: the first request's build
+    # carries a NEWER snapshot stamp than the second's (as if the second
+    # started earlier but finished later).
+    results = iter([
+        (100.0, {"round_number": 1, "marker": "NEW"}),
+        (50.0, {"round_number": 1, "marker": "STALE"}),
+    ])
+
+    async def _fake_run_in_threadpool(fn, *args):  # noqa: ANN001, ARG001
+        return next(results)
+
+    monkeypatch.setattr(sc, "run_in_threadpool", _fake_run_in_threadpool)
+
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(detail_db), cfg)
+    with TestClient(app) as cli:
+        r1 = cli.get("/board")
+        assert r1.json()["marker"] == "NEW"
+        etag1 = r1.headers.get("etag")
+        assert etag1
+
+        # Force a cache miss for the second request (bust the TTL) without
+        # touching the published version state.
+        monkeypatch.setenv("COORD_BOARD_CACHE_TTL", "0")
+        r2 = cli.get("/board")
+        # The stale build is served to its own requester...
+        assert r2.json()["marker"] == "STALE"
+        # ...but never stamped or cached: no ETag, no board_version.
+        assert "etag" not in r2.headers
+        assert "board_version" not in r2.json()
+
+        # The published cache still holds the NEW build under the old ETag.
+        monkeypatch.setenv("COORD_BOARD_CACHE_TTL", "1000")
+        r3 = cli.get("/board", headers={"If-None-Match": etag1})
+        assert r3.status_code == 304
+
+
 # ── Invariant 1: read endpoints perform no third-party I/O ───────────────────
 
 
@@ -416,6 +465,75 @@ def test_board_wire_short_fields_untouched(
     assert row["test_reason"] == "brief reason"
     assert "review_findings_truncated" not in row
     assert "test_reason_truncated" not in row
+
+
+def test_tracking_issue_work_order_survives_wire_bounding(
+    tmp_path: Path, valid_config_path: Path, rw_db
+) -> None:
+    """Review finding on #1337: the TUI's Milestone DAG parses `## Work order`
+    out of the tracking issue's body CLIENT-side (it does not consume the
+    server-computed `milestone_work_orders`), so a tracking body whose
+    work-order items sit past the DOCUMENT_CHARS cut must NOT be truncated on
+    the wire — every DAG node must survive.  Epic-labeled bodies are exempt
+    from the body cap; member-issue bodies keep it."""
+    from coord.board_wire import DOCUMENT_CHARS
+
+    prose = "x" * (DOCUMENT_CHARS + 100)
+    tracking_body = (
+        "## Work order\n" + prose +
+        "\n- [ ] #4242 {group: A}\n- [ ] #4243 {after: #4242}\n"
+    )
+    p = tmp_path / "dag.db"
+    conn = sqlite3.connect(str(p))
+    _ensure_schema(conn)
+    conn.execute(
+        "INSERT INTO issues (repo_name, number, title, body, state, labels, "
+        "synced_at, milestone_number, milestone_title) VALUES (?,?,?,?,?,?,?,?,?)",
+        ("api", 4200, "Epic: milestone", tracking_body, "open",
+         '["epic"]', 0.0, 5, "v1"),
+    )
+    # The work-order members must be open for the projection to keep them.
+    for n in (4242, 4243):
+        conn.execute(
+            "INSERT INTO issues (repo_name, number, title, body, state, "
+            "labels, synced_at) VALUES (?,?,?,?,?,?,?)",
+            ("api", n, f"member {n}", "B" * (DOCUMENT_CHARS + 100), "open",
+             "[]", 0.0),
+        )
+    conn.commit()
+    conn.close()
+
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(p), cfg)
+    with TestClient(app) as cli:
+        board = cli.get("/board").json()
+
+    # 1. The tracking (epic) body arrives WHOLE — items past the cap intact.
+    epic = next(i for i in board["issues"] if i["number"] == 4200)
+    assert "- [ ] #4243 {after: #4242}" in epic["body"]
+    assert "body_truncated" not in epic
+    # 2. The server-computed work-order projection has the complete DAG too.
+    (wo,) = board["milestone_work_orders"]
+    assert wo["tracking_issue"] == 4200
+    assert {n["issue_number"] for n in wo["nodes"]} == {4242, 4243}
+    # 3. Member (non-epic) bodies keep the document cap.
+    member = next(i for i in board["issues"] if i["number"] == 4242)
+    assert member["body_truncated"] is True
+    assert len(member["body"]) < DOCUMENT_CHARS + 200
+
+
+def test_bound_issue_row_exempts_tracking_issues() -> None:
+    from coord.board_wire import DOCUMENT_CHARS, bound_issue_row
+
+    body = "## Work order\n" + "x" * (DOCUMENT_CHARS + 100) + "\n- [ ] #7\n"
+    epic_row = {"body": body, "labels": ["epic", "coord"]}
+    bound_issue_row(epic_row)
+    assert epic_row["body"] == body
+    assert "body_truncated" not in epic_row
+
+    member_row = {"body": body, "labels": ["bug"]}
+    bound_issue_row(member_row)
+    assert member_row["body_truncated"] is True
 
 
 def test_board_payload_size_budget(
