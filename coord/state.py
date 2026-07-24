@@ -126,21 +126,28 @@ _UPSERT_SQL = """
         pr_url             = excluded.pr_url,
         finished_at        = excluded.finished_at,
         smoke_test         = excluded.smoke_test,
-        smoke_test_reason  = excluded.smoke_test_reason,
+        -- #1337: the unbounded free-text columns (smoke_test_reason,
+        -- test_reason, briefing) are EXCLUDED from this whole-board upsert.
+        -- The /board wire serves bounded previews of them (coord.board_wire)
+        -- and thin-client commands read-modify-write the whole board through
+        -- POST /board — updating them here would round-trip a preview (or,
+        -- for briefing, the mapper's "" default: the wire has never carried
+        -- it) over the full stored text.  Dedicated single-row writers own
+        -- them instead: record_test_verdict (test_reason/smoke_test_reason)
+        -- and the dispatch-time INSERT (briefing) — the insert column list
+        -- above still stores them for NEW rows.
         review_state       = excluded.review_state,
         review_of_assignment_id = excluded.review_of_assignment_id,
         review_target      = excluded.review_target,
         unreachable_count  = excluded.unreachable_count,
         plan               = excluded.plan,
         model              = excluded.model,
-        briefing           = excluded.briefing,
         files_allowed      = excluded.files_allowed,
         files_forbidden    = excluded.files_forbidden,
         required_gates     = excluded.required_gates,
         review_iteration   = excluded.review_iteration,
         review_posted_at   = COALESCE(excluded.review_posted_at, review_posted_at),
         test_state         = excluded.test_state,
-        test_reason        = excluded.test_reason,
         review_verdict     = COALESCE(excluded.review_verdict, review_verdict),
         -- #821: once a review_head_sha is recorded, preserve it; a later
         -- upsert without the SHA (e.g. from an older code path) must not
@@ -1374,6 +1381,46 @@ def load_assignment_review_findings(
         except Exception:  # noqa: BLE001 — daemon unreachable → local fallback
             pass
     return _load_assignment_review_findings_local(assignment_id)
+
+
+def load_assignment_test_reason(assignment_id: str) -> str | None:
+    """#1337: the FULL ``test_reason`` for one assignment.
+
+    The ``/board`` collection wire carries only a bounded preview of
+    ``test_reason`` (coord.board_wire) — but the fail→fix briefing quotes it
+    verbatim as the fix worker's brief, so briefing construction must read the
+    full text.  Thin client → the daemon's single-assignment detail endpoint;
+    daemon host / no service → the local DB.  Returns ``None`` when the row is
+    absent, the column is NULL, or a remote read failed (callers fall back to
+    the board-carried preview — degraded but never blocking, #1336
+    invariant 4).
+    """
+    if not assignment_id:
+        return None
+    svc = _board_service()
+    if svc is not None:
+        try:
+            from coord.client import fetch_assignment  # noqa: PLC0415
+
+            row = fetch_assignment(svc, assignment_id)
+            if row is not None:
+                return row.get("test_reason")
+            # 404: pre-#1336 daemon (no detail route) — its /board wire is
+            # unbounded anyway, so the caller's in-memory value IS full text.
+            return None
+        except Exception:  # noqa: BLE001 — degraded fallback, never blocking
+            return None
+    try:
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT test_reason FROM assignments WHERE assignment_id=?",
+            (assignment_id,),
+        ).fetchone()
+    except Exception:  # noqa: BLE001
+        return None
+    if row is None:
+        return None
+    return row["test_reason"] if hasattr(row, "keys") else row[0]
 
 
 def _load_assignment_review_findings_local(

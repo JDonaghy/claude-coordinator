@@ -296,6 +296,171 @@ def test_gate_refresher_populates_snapshot_from_queue(rw_db, monkeypatch) -> Non
     assert refresher.snapshot() is snap
 
 
+# ── Invariant 2: no collection endpoint returns unbounded text ───────────────
+
+
+def test_board_wire_bounds_assignment_text_fields(app_client: TestClient) -> None:
+    """The collection wire serves bounded previews + explicit flags; the full
+    text stays on the detail endpoint (verified above)."""
+    from coord.board_wire import PREVIEW_CHARS, TRUNCATION_NOTICE
+
+    board = app_client.get("/board").json()
+    work = next(a for a in board["assignments"] if a["assignment_id"] == "work1")
+
+    # review_findings: envelope-aware — verdict intact, body previewed, JSON
+    # still parseable (the TUI parses this raw string).
+    env = json.loads(work["review_findings"])
+    assert env["verdict"] == "request-changes"
+    assert len(env["body"]) <= PREVIEW_CHARS + len(TRUNCATION_NOTICE)
+    assert env["truncated"] is True
+    assert work["review_findings_truncated"] is True
+    assert work["review_findings_len"] > PREVIEW_CHARS
+
+    # test_reason: plain-text preview + flags.
+    assert len(work["test_reason"]) <= PREVIEW_CHARS + len(TRUNCATION_NOTICE)
+    assert work["test_reason"].startswith("t" * 100)
+    assert work["test_reason_truncated"] is True
+    assert work["test_reason_len"] == 6000
+
+
+def test_board_wire_bounds_issue_bodies(app_client: TestClient) -> None:
+    """Issue bodies get the high document cap (semantic parses — work orders,
+    ## Files globs — must survive for every real body; today p99 ≈ 9 KB)."""
+    from coord.board_wire import DOCUMENT_CHARS
+
+    board = app_client.get("/board").json()
+    issue = next(i for i in board["issues"] if i["number"] == 42)
+    # 9 KB body is under the document cap: served whole, no flag.
+    assert issue["body"] == "B" * 9000
+    assert "body_truncated" not in issue
+    assert DOCUMENT_CHARS >= 16384
+
+
+def test_board_wire_short_fields_untouched(
+    tmp_path: Path, valid_config_path: Path
+) -> None:
+    """Fields at/under the caps are byte-identical with no flags — the common
+    case is unchanged on the wire."""
+    p = tmp_path / "short.db"
+    conn = sqlite3.connect(str(p))
+    _ensure_schema(conn)
+    conn.execute(
+        "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+        "issue_number, issue_title, status, type, review_findings, test_reason) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        ("a1", "m", "api", 1, "t", "done", "review",
+         json.dumps({"verdict": "approve", "body": "short"}), "brief reason"),
+    )
+    conn.commit()
+    conn.close()
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(p), cfg)
+    with TestClient(app) as cli:
+        board = cli.get("/board").json()
+    (row,) = board["assignments"]
+    assert json.loads(row["review_findings"]) == {
+        "verdict": "approve", "body": "short",
+    }
+    assert row["test_reason"] == "brief reason"
+    assert "review_findings_truncated" not in row
+    assert "test_reason_truncated" not in row
+
+
+def test_board_payload_size_budget(
+    tmp_path: Path, valid_config_path: Path
+) -> None:
+    """THE growth guard (instance #4 of #762/#715/#1336 must fail here first):
+    a board seeded with pathological per-row text — the exact growth vector
+    that produced the 5.5 MB payload — must stay within a hard wire budget.
+
+    150 assignments x (10 KB findings + 8 KB reasons) + 60 issues x 64 KB
+    bodies was ~5.3 MB of text pre-#1337.  Budget: 3 MB for the whole
+    payload.  If a new unbounded field is ever added to the collection wire,
+    this test is the tripwire.
+    """
+    p = tmp_path / "big.db"
+    conn = sqlite3.connect(str(p))
+    _ensure_schema(conn)
+    findings = json.dumps({"verdict": "request-changes", "body": "F" * 10_000})
+    now = __import__("time").time()
+    for i in range(150):
+        conn.execute(
+            "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+            "issue_number, issue_title, status, type, dispatched_at, "
+            "briefing, review_findings, test_reason, smoke_test_reason) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (f"a{i}", "m", "api", i, f"issue {i}", "running", "work", now,
+             "b" * 20_000, findings, "t" * 8_000, "s" * 8_000),
+        )
+    for i in range(60):
+        conn.execute(
+            "INSERT INTO issues (repo_name, number, title, body, state, "
+            "labels, synced_at) VALUES (?,?,?,?,?,?,?)",
+            ("api", i, f"issue {i}", "B" * 65_536, "open", "[]", now),
+        )
+    conn.commit()
+    conn.close()
+
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(p), cfg)
+    with TestClient(app) as cli:
+        resp = cli.get("/board")
+    assert resp.status_code == 200
+    size = len(resp.content)
+    budget = 3_000_000
+    assert size < budget, (
+        f"/board payload is {size} bytes (> {budget}). An unbounded field is "
+        "back on the collection wire — bound it in coord.board_wire and serve "
+        "the full text from a detail endpoint (#1337)."
+    )
+    # And no row-level field escaped its cap.
+    board = resp.json()
+    for a in board["assignments"]:
+        for fld in ("review_findings", "test_reason", "smoke_test_reason"):
+            val = a.get(fld)
+            assert val is None or len(val) < 25_000, (fld, len(val))
+        assert "briefing" not in a
+    for i in board["issues"]:
+        assert len(i.get("body") or "") <= 17_000
+
+
+def test_post_board_roundtrip_cannot_clobber_full_text(rw_db) -> None:
+    """A thin client that read the BOUNDED wire and posts the whole board back
+    (POST /board → save_board upsert) must not overwrite the stored full
+    text with previews — the free-text columns are excluded from the
+    whole-board upsert's UPDATE clause."""
+    from coord.models import Assignment, Board
+    from coord.state import save_board
+
+    rw_db.execute(
+        "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+        "issue_number, issue_title, status, type, briefing, test_reason, "
+        "smoke_test_reason) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        ("w1", "m", "api", 1, "t", "running", "work",
+         "FULL BRIEFING " * 100, "FULL REASON " * 100, "FULL SMOKE " * 100),
+    )
+    rw_db.commit()
+
+    # The round-tripped assignment carries wire-bounded / defaulted values.
+    a = Assignment(
+        assignment_id="w1", machine_name="m", repo_name="api",
+        issue_number=1, issue_title="t", status="done",
+        briefing="",  # the wire never carries briefing
+    )
+    a.test_reason = "preview…"
+    a.smoke_test_reason = "preview…"
+    save_board(Board(active=[], completed=[a], round_number=0))
+
+    row = rw_db.execute(
+        "SELECT status, briefing, test_reason, smoke_test_reason "
+        "FROM assignments WHERE assignment_id='w1'"
+    ).fetchone()
+    assert row["status"] == "done"  # bounded fields still update
+    assert row["briefing"].startswith("FULL BRIEFING")
+    assert row["test_reason"].startswith("FULL REASON")
+    assert row["smoke_test_reason"].startswith("FULL SMOKE")
+
+
 # ── Invariant 4: writes never depend on reads ────────────────────────────────
 
 

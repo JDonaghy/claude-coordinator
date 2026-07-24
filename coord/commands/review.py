@@ -936,7 +936,15 @@ def fix_briefing_cmd(aid: str, config_path: Path) -> None:
     next_iteration = (work.review_iteration or 0) + 1
     max_iter = cfg.pipeline.max_review_iterations
     if fix_from_test_fail:
-        story = (getattr(work, "test_reason", None) or "").strip()
+        # #1337: the board wire carries a bounded PREVIEW of test_reason; the
+        # briefing quotes it verbatim — read full text via the detail endpoint.
+        from coord.state import load_assignment_test_reason as _load_tr  # noqa: PLC0415
+
+        story = (
+            _load_tr(work.assignment_id or "")
+            or getattr(work, "test_reason", None)
+            or ""
+        ).strip()
         findings_body = (
             "The manual smoke test FAILED. The operator reported:\n\n"
             f"> {story}\n\nReproduce the failure, fix the root cause, and "

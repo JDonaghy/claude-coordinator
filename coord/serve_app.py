@@ -2924,6 +2924,14 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 projection["goal_header"] = _read_goal_header()
             except Exception:  # noqa: BLE001 — goal-header failure must not blank the board
                 projection["goal_header"] = {"available": False}
+            # #1337 invariant 2: no collection endpoint returns unbounded text.
+            # Bound the per-row free-text fields LAST — the derived sections
+            # above parse full issue bodies server-side and must see them
+            # unbounded; only the wire is bounded.  Full text lives on the
+            # detail endpoints (GET /assignment/{id}, GET /issue/{r}/{n}).
+            from coord.board_wire import bound_board_payload as _bound  # noqa: PLC0415
+
+            _bound(projection)
             return projection
 
         try:
