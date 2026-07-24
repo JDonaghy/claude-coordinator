@@ -384,6 +384,36 @@ def _mark_terminal(assignment: "Assignment", config: "Config") -> None:
         pass
 
 
+def _downgrade_empty_branch_done(assignment: "Assignment", config: "Config") -> str:
+    """#1155: flip a wedged ``done``-with-empty-branch work row to ``advisory``
+    via the issue_store seam (same seam :func:`_mark_terminal` uses for its
+    own fallback write).  A ``done`` row with no branch has nothing to review
+    — it must not sit in the Pipeline masquerading as reviewable work.
+    Best-effort: on failure the row is left as-is and the caller's finding
+    still surfaces the problem to the operator."""
+    from coord import issue_store  # noqa: PLC0415
+
+    if not assignment.assignment_id:
+        return "skipped (no assignment_id)"
+    repo_cfg = next((r for r in config.repos if r.name == assignment.repo_name), None)
+    try:
+        outcome = issue_store.post_completion(
+            issue_store.CompletionRecord(
+                assignment_id=assignment.assignment_id,
+                machine_name=assignment.machine_name or "unknown",
+                repo_name=assignment.repo_name,
+                repo_github=(repo_cfg.github if repo_cfg else assignment.repo_name),
+                issue_number=assignment.issue_number,
+                exit_code=0,
+                commits_ahead=0,  # → advisory terminal state (the #448 shape)
+                branch=assignment.branch,
+            )
+        )
+        return outcome.status
+    except Exception as exc:  # noqa: BLE001 — best-effort recovery
+        return f"failed ({exc})"
+
+
 # ── orchestration ───────────────────────────────────────────────────────────
 
 
@@ -603,6 +633,26 @@ def _recover_work_like(
         res.needs_reset = True
     elif state == "live":
         res.findings.append("session is live and recent — left running")
+        res.recovered = True
+    elif (
+        latest.type == "work"
+        and latest.status == "done"
+        and not (latest.branch or "").strip()
+    ):
+        # #1155: a `done` work row with no branch is never legitimately
+        # reviewable — there is no branch to open a PR against. This is
+        # exactly the shape the #448 zero-commit / unresolved-worktree guard
+        # is supposed to catch before it ever reaches `done`; if one slipped
+        # through anyway, downgrade it here rather than leaving it sitting in
+        # the Pipeline indistinguishable from real reviewable work.
+        res.findings.append(
+            "work stage is 'done' but has no branch — not reviewable (#1155)"
+        )
+        if not dry_run:
+            res.actions_taken.append(
+                f"downgraded empty-branch done row to advisory "
+                f"({_downgrade_empty_branch_done(latest, config)})"
+            )
         res.recovered = True
     else:
         res.findings.append("stage looks healthy")

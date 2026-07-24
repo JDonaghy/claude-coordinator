@@ -114,6 +114,17 @@ class CompletionRecord:
     duration_seconds: float | None = None
     log_path: str | None = None
     summary: str = ""
+    # #1155: True when this record came from the interactive launcher's
+    # git-floor backstop (finalize_interactive_exit), False for a headless
+    # claude -p worker.  Distinguishes "commits_ahead is None because a real,
+    # already-pushed branch hit a transient git failure" (headless — keep the
+    # #448 None→done policy) from "commits_ahead is None because the
+    # interactive session's worktree never resolved and nothing was ever
+    # confirmed pushed" (interactive work — must not silently become `done`
+    # with an empty, unreviewable branch).  Defaults False so every existing
+    # headless caller (dispatch.py/notify.py/serve_app.py's /completion route
+    # for older clients) is unaffected.
+    is_interactive: bool = False
 
 
 @dataclass
@@ -441,6 +452,11 @@ def _post_completion_local(record: CompletionRecord) -> StoreOutcome:
     * ``exit_code == 0``, commits >= 1    → ``done``  (eligible for review/smoke)
     * ``exit_code == 0``, commits is None → ``done``  (git failed; do not
       falsely flag advisory — same policy as #448 in agent.py:_reap)
+    * ``exit_code == 0``, commits is None, ``is_interactive`` WORK session →
+      ``done`` UNLESS GitHub confirms no branch was ever pushed, in which
+      case ``advisory`` (#1155 — closes the #448 guard's interactive gap:
+      an unresolved worktree at finalize time must not silently masquerade
+      as reviewable work with an empty branch).
 
     **Exception — chat / troubleshoot sessions (#676):** these are
     non-mutating diagnostics that never produce committed work, so they are
@@ -491,10 +507,66 @@ def _post_completion_local(record: CompletionRecord) -> StoreOutcome:
     if record.commits_ahead == 0:
         return _post_advisory_path(record)
 
-    # commits_ahead is >=1 or None (unknown).  Treat as DONE so the work
-    # is eligible for review/smoke.  Matches #448 policy: a git failure
-    # never demotes a clean exit to advisory.
+    # #1155: commits_ahead is None (git failed / worktree never resolved) on
+    # an interactive WORK session.  Unlike the headless case, we can't trust
+    # that "None" means "a real pushed branch hit a transient hiccup" — it
+    # may equally mean "this session produced nothing at all".  Ask GitHub
+    # directly before defaulting to done; only demote when the remote
+    # authoritatively confirms no branch was ever pushed.
+    if (
+        record.commits_ahead is None
+        and record.is_interactive
+        and atype == "work"
+        and not _interactive_work_has_pushed_branch(record)
+    ):
+        return _post_advisory_path(record)
+
+    # commits_ahead is >=1 or None (unknown, and either non-interactive or
+    # confirmed to have a real pushed branch).  Treat as DONE so the work is
+    # eligible for review/smoke.  Matches #448 policy: a git failure never
+    # demotes a clean exit to advisory.
     return _post_done_path(record)
+
+
+def _interactive_work_has_pushed_branch(record: CompletionRecord) -> bool:
+    """#1155: authoritative remote check for an interactive WORK session whose
+    ``commits_ahead`` is unknown (git failed locally, or the session's
+    worktree path never resolved at finalize time — see #1151).
+
+    Fails OPEN (returns ``True``, i.e. "assume it's there, keep done") on any
+    lookup problem — an unresponsive ``gh``, a network glitch, or an
+    unresolvable ``repo_github`` must never falsely demote real pushed work
+    to advisory.  Only returns ``False`` when GitHub positively confirms no
+    matching branch exists.  Mirrors :func:`coord.github_ops.branch_exists_on_remote`'s
+    fail-open policy.
+    """
+    from coord import github_ops  # noqa: PLC0415
+
+    if not record.repo_github:
+        return True
+
+    branch = (record.branch or "").strip()
+    if branch:
+        try:
+            return github_ops.branch_exists_on_remote(record.repo_github, branch)
+        except Exception:  # noqa: BLE001 — fail open, never demote on a lookup error
+            return True
+
+    # No branch name captured at all (the #1151 shape: branch_now was None
+    # and no branch kwarg was supplied either) — fall back to scanning for
+    # ANY issue-<N>-* branch actually pushed for this issue.
+    try:
+        names = github_ops.list_remote_branch_names(record.repo_github)
+    except Exception:  # noqa: BLE001 — fail open, never demote on a lookup error
+        return True
+    if not names:
+        # list_remote_branch_names already fails OPEN to an empty set on any
+        # gh/network error (see its docstring) — a real repo always has at
+        # least one branch, so an empty result here is itself an error
+        # signal, not "confirmed no branches". Fail open.
+        return True
+    prefix = f"issue-{record.issue_number}-"
+    return any(name.startswith(prefix) for name in names)
 
 
 def _assignment_type_local(assignment_id: str) -> str | None:
