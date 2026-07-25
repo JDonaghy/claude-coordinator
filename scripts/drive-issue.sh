@@ -48,6 +48,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE_TOOL="$HERE/coord_issue_state.py"
 TEST_RUNNER="$HERE/coord-test-runner.sh"
+REVIEW_TOOL="$HERE/coord_dispatch_review.py"
 
 # ── defaults ─────────────────────────────────────────────────────────────────
 
@@ -68,6 +69,7 @@ MERGE_METHOD="rebase"
 DRY_RUN=0
 BRIEFING_FILE=""
 ACCEPT_ADVISORY=0
+FORCE_REVIEW=0
 
 usage() {
     # Print the header comment block: every line from #2 up to (not including)
@@ -107,6 +109,10 @@ Options:
                         demonstrably carries commits. Needed while #1357 is
                         open: every Python-only headless assignment in this
                         repo is falsely downgraded DONE→ADVISORY.
+  --force-review        Explicitly request the review for work completed in an
+                        INTERACTIVE session. coord's #555 guard never
+                        auto-dispatches one for provider=claude-pty, so without
+                        this the run stops at preflight rather than stalling.
   --no-merge            Stop after the review approves; do not merge.
   --merge-method M      rebase|squash|merge (default rebase).
   --dry-run             Print the resolved plan and current state, then exit.
@@ -145,6 +151,7 @@ while [[ $# -gt 0 ]]; do
         --no-merge)         DO_MERGE=0; shift ;;
         --merge-method)     MERGE_METHOD="$2"; shift 2 ;;
         --accept-advisory)  ACCEPT_ADVISORY=1; shift ;;
+        --force-review)     FORCE_REVIEW=1; shift ;;
         --dry-run)          DRY_RUN=1; shift ;;
         -h|--help)          usage; exit 0 ;;
         -*)                 die "unknown option: $1" 2 ;;
@@ -444,6 +451,31 @@ if [[ "${AUTO_LOOP:-0}" != "1" ]]; then
     warn "This script will report the verdict and stop rather than dispatch one itself."
 fi
 
+# INTERACTIVE WORK NEVER GETS AN AUTOMATIC REVIEW.
+#
+# `dispatch_pending_reviews` carries `and c.provider_name != "claude-pty"`
+# (#555): a metered headless review must never silently follow a human-attended
+# session. So for work done interactively, the review is not "late" — it is
+# never coming, and waiting for it is an infinite stall.
+#
+# Checked HERE, at preflight, rather than at the review gate: otherwise a run
+# burns the full test suite (~6 min) before parking on a wait it can never win.
+# That is exactly what happened driving #1357 — test gate passed at 4642/4642,
+# then 90 minutes of nothing.
+if [[ -n "${WORK_AID:-}" && "${WORK_PROVIDER:-}" == "claude-pty" && -z "${REVIEW_AID:-}" ]]; then
+    if [[ "$FORCE_REVIEW" -eq 1 ]]; then
+        warn "work $WORK_AID is INTERACTIVE (claude-pty) — no automatic review (#555)."
+        warn "--force-review set: this run will request the review explicitly."
+    else
+        die "work $WORK_AID was completed INTERACTIVELY (provider=claude-pty).
+   coord's #555 guard permanently excludes interactive work from automatic
+   review dispatch, so waiting for one would stall forever.
+
+   Either drive it unattended:      re-run with --force-review
+   or review it human-attended:     coord assign --interactive --review-of $WORK_AID"
+    fi
+fi
+
 if [[ "$DRY_RUN" -eq 1 ]]; then
     log "current state:"
     python3 "$STATE_TOOL" "$REPO" "$ISSUE" --json
@@ -460,6 +492,7 @@ LAST_CHANGE="$START"
 WORK_RETRIES=0
 NUDGED=0
 MERGE_ATTEMPTS=0
+REVIEW_DISPATCHES=0
 MAX_MERGE_ATTEMPTS=3
 FIX_ROUNDS=0
 
@@ -621,6 +654,23 @@ while true; do
                 die "review $REVIEW_AID finished but recorded NO verdict — the
    REVIEW_VERDICT block failed to parse (#1346/#1348 class).
    Recover: coord post-pending-reviews, or read the transcript directly."
+            fi
+            # No review row at all. For interactive work that is terminal, not
+            # transient (#555) — request one explicitly, once, rather than
+            # waiting on a dispatch that will never happen. Preflight already
+            # refused this case unless --force-review was given.
+            if [[ -z "${REVIEW_AID:-}" && "${WORK_PROVIDER:-}" == "claude-pty" ]]; then
+                if [[ "$FORCE_REVIEW" -ne 1 ]]; then
+                    die "no review for interactive work $WORK_AID and --force-review not set (#555)."
+                fi
+                if (( REVIEW_DISPATCHES >= 1 )); then
+                    die "requested a review for $WORK_AID but none appeared on the board.
+   Check for an eligible reviewer machine: coord status"
+                fi
+                REVIEW_DISPATCHES=$(( REVIEW_DISPATCHES + 1 ))
+                log "REVIEW: requesting explicitly (interactive work, #555)"
+                "$REVIEW_TOOL" "$WORK_AID" 2>&1 | tee -a "$RUN_LOG" || \
+                    die "explicit review dispatch failed for $WORK_AID"
             fi
             sleep "$POLL"; continue
             ;;
