@@ -585,7 +585,7 @@ def dispatch_entry(
     issue_milestone = issue_data.get("milestone") or {}
     milestone_number = issue_milestone.get("number") if isinstance(issue_milestone, dict) else None
 
-    if milestone_number is not None and repo_cfg.develop_branch:
+    if milestone_number is not None and getattr(repo_cfg, "develop_branch", None):
         from coord.branch_model import ensure_feature_branch_exists  # noqa: PLC0415
 
         try:

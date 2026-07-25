@@ -331,7 +331,7 @@ def _advance_pipeline(
                     # the milestone lookup itself is skipped (no `gh` call)
                     # when it hasn't, falling back to `default_branch`.
                     target_branch = repo_cfg.default_branch
-                    if repo_cfg.develop_branch:
+                    if getattr(repo_cfg, "develop_branch", None):
                         from coord.branch_model import (  # noqa: PLC0415
                             fetch_issue_milestone_number,
                             resolve_base_branch,

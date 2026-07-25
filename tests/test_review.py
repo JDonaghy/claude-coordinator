@@ -993,6 +993,47 @@ def test_dispatch_review_milestone_fetcher_not_consulted_when_not_opted_in(
     assert payload["branch"] == "main"
 
 
+def test_dispatch_review_tolerates_repo_stand_in_without_develop_branch(
+    two_machine_config: Config,
+) -> None:
+    """#1388: some Repo-shaped stand-ins (a wire-reconstructed object, or a
+    stale install predating #934) lack ``develop_branch`` entirely — direct
+    attribute access raised ``AttributeError`` and 500'd the dashboard's
+    dispatch-review action. Must fail open to `default_branch`, exactly like
+    a repo that has not opted into the develop/feature-branch model."""
+
+    class _StandInRepo:
+        """Repo-shaped stand-in predating ``develop_branch`` (#934) but
+        carrying the older #323 ``provider`` field, so this isolates the
+        regression to the one attribute review.py failed to guard."""
+
+        name = "api"
+        github = "acme/api"
+        default_branch = "main"
+        provider = None
+
+    cfg = replace(two_machine_config, repos=[_StandInRepo()])
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    client = _FakeHTTPClient({"id": "review-id-1"})
+
+    result = dispatch_review(
+        completed, board, cfg,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {
+            "number": 42, "url": "https://github.com/acme/api/pull/42", "existed": True,
+        },
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+        now=123.0,
+        remote_branch_checker=lambda repo, branch: True,
+    )
+
+    assert result is not None
+    _, payload = client.calls[0]
+    assert payload["branch"] == "main"
+
+
 def test_dispatch_review_flags_sealed_acceptance_dir_when_driver_configured(
     two_machine_config: Config,
 ) -> None:

@@ -284,7 +284,7 @@ def _build_retry_briefing(
         # perform the milestone lookup (a `gh` call) when the repo opted in.
         if default_branch is None:
             default_branch = (repo_cfg.default_branch if repo_cfg is not None else None) or "main"
-            if repo_cfg is not None and repo_cfg.develop_branch:
+            if repo_cfg is not None and getattr(repo_cfg, "develop_branch", None):
                 from coord.branch_model import (  # noqa: PLC0415
                     fetch_issue_milestone_number,
                     resolve_base_branch,
@@ -397,7 +397,7 @@ def _reassign(
     # `branch` payload field below, so they never disagree. The milestone
     # lookup itself is skipped (no `gh` call) when the repo hasn't opted in.
     retry_default_branch = (repo_cfg.default_branch if repo_cfg is not None else None) or "main"
-    if repo_cfg is not None and repo_cfg.develop_branch:
+    if repo_cfg is not None and getattr(repo_cfg, "develop_branch", None):
         from coord.branch_model import (  # noqa: PLC0415
             fetch_issue_milestone_number,
             resolve_base_branch,
@@ -1043,7 +1043,7 @@ def close_stale_prs(
             # milestone lookup itself is skipped (no `gh` call) when the
             # repo hasn't opted in.
             pr_base = default_branch
-            if repo_cfg.develop_branch:
+            if getattr(repo_cfg, "develop_branch", None):
                 from coord.branch_model import (  # noqa: PLC0415
                     fetch_issue_milestone_number,
                     resolve_base_branch,
