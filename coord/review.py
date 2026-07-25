@@ -94,6 +94,132 @@ _VERDICT_ALIASES: dict[str, str] = {
 }
 
 
+# ── #1348: strict-parse failure diagnostic ──────────────────────────────────
+#
+# When `_parse_review_text` / `parse_review_from_log` returns None, the caller
+# cannot distinguish "text contains no review" from "text HAS a review marker
+# but the strict parser rejected it" (e.g. bolded **REVIEW_VERDICT:** from the
+# #1346 incident — a 6.2 KB request-changes review was silently dropped because
+# the trailing `**` made the verdict group fail to match `_REVIEW_BLOCK_RE`).
+#
+# `detect_unparsed_review_marker` is a DIAGNOSTIC ONLY.  It MUST NOT be wired
+# into `_parse_review_text` / `parse_review_from_log`, and MUST NOT be used to
+# auto-record a verdict.  `END_REVIEW` remains the required terminator for a
+# legitimate strict parse.  Call it only AFTER the strict parse has already
+# returned `None` and the calling floor has confirmed attribution.
+
+# Detect a REVIEW_VERDICT: line even when `_REVIEW_BLOCK_RE` cannot extract
+# a clean block.  Captures everything on the marker line so the verdict word
+# can be extracted after stripping Markdown decorators (e.g. "request-changes**"
+# → "request-changes").  No word-boundary constraint before REVIEW_VERDICT: so
+# this also fires on bolded lines like "**REVIEW_VERDICT: request-changes**".
+_REVIEW_MARKER_DETECT_RE = re.compile(
+    r"REVIEW_VERDICT:[^\S\r\n]*([^\r\n]*)",  # [^\S\r\n]* = horizontal whitespace only
+    re.IGNORECASE,
+)
+
+#: Cap on the excerpt captured by :func:`detect_unparsed_review_marker`.  A few
+#: KB is enough to show the operator the malformed block; transcripts can be
+#: multi-MB and we must not hold the whole thing.
+_DIAGNOSTIC_EXCERPT_MAX: int = 4096
+
+
+@dataclass
+class UnparsedReviewMarker:
+    """Diagnostic returned when a transcript contains a ``REVIEW_VERDICT:``
+    marker that the strict parser rejected (#1348).
+
+    A strict-parse failure on a transcript that clearly contains a review must
+    be loud, not silent — the operator cannot distinguish "reviewer forgot
+    ``END_REVIEW``" from "there is nothing to recover" when both paths return
+    ``None``.  This carries the raw excerpt and detected verdict word so the
+    coordinator surface can:
+
+    * Warn the operator with a greppable ``log.warning`` naming the host and
+      transcript path.
+    * Print output clearly distinct from "no verdict reported" — two different
+      failures, two different fixes, and they must not look the same.
+    * Seed the editor with the recovered excerpt so the operator edits /
+      confirms what the reviewer wrote rather than typing from scratch.
+    * Default the verdict prompt to the detected word when it is canonical.
+
+    Attributes:
+        verdict_word: Lowercased, Markdown-stripped word from the
+            ``REVIEW_VERDICT:`` line, or ``None`` when the line was blank.
+            When it matches a canonical verdict (``approve`` /
+            ``request-changes``) or a known alias (``pass`` → approve,
+            ``fail`` → request-changes) the operator prompt defaults to it
+            instead of ``[s]kip``.
+        excerpt: Bounded slice of the raw transcript starting from the
+            ``REVIEW_VERDICT:`` line, capped at :data:`_DIAGNOSTIC_EXCERPT_MAX`
+            chars.  For stream-json logs this may include surrounding JSON
+            scaffolding.  Passed to ``_collect_review_body_via_editor`` as
+            ``pre_body`` so the operator edits the real review text.
+        transcript_path: Filesystem path of the transcript scanned.  For the
+            remote-ssh path this is the path **on the remote host** (useful in
+            a ``ssh <host> cat <path>`` hint).  ``None`` when unknown.
+        host: SSH hostname the transcript was fetched from, or ``None`` for a
+            local transcript.
+    """
+
+    verdict_word: str | None
+    excerpt: str
+    transcript_path: str | None = None
+    host: str | None = None
+
+
+def detect_unparsed_review_marker(
+    text: str,
+    *,
+    transcript_path: str | None = None,
+    host: str | None = None,
+) -> UnparsedReviewMarker | None:
+    """Return diagnostic info when *text* contains a ``REVIEW_VERDICT:`` marker
+    that the strict parser would reject (#1348).
+
+    **Diagnostic only — never a parser.**  Must be called AFTER
+    :func:`parse_review_from_log` has returned ``None``.  Never wire this into
+    :func:`_parse_review_text` / :func:`parse_review_from_log`, and never use
+    its return value to auto-record a verdict.  ``END_REVIEW`` is still the
+    required terminator for a legitimate strict parse.
+
+    Returns ``None`` when:
+
+    * No ``REVIEW_VERDICT:`` marker is present — *text* is genuinely not a
+      review; no false positives.
+    * The strict parse actually SUCCEEDED — a defensive guard so a caller that
+      forgets the "call after strict-parse" contract never double-reports.
+
+    Otherwise returns an :class:`UnparsedReviewMarker` with a bounded excerpt
+    (capped at :data:`_DIAGNOSTIC_EXCERPT_MAX` chars from the marker line) and
+    the detected verdict word with Markdown decorators stripped.
+    """
+    m = _REVIEW_MARKER_DETECT_RE.search(text)
+    if not m:
+        return None
+    # Guard: strict parse succeeded → return None, never double-report (#1348).
+    if _REVIEW_BLOCK_RE.search(text):
+        return None
+    # Extract and normalize the verdict word.  Strip common Markdown decorators
+    # (*_`#) so e.g. "**request-changes**" normalises to "request-changes".
+    raw_line = m.group(1).strip()
+    clean_word = re.sub(r"[*_`#]+", "", raw_line).strip().lower()
+    verdict_word = clean_word if clean_word else None
+    # Bounded excerpt: start at the beginning of the REVIEW_VERDICT: line,
+    # capture up to _DIAGNOSTIC_EXCERPT_MAX chars so the operator can see
+    # the full verdict block without holding the whole (possibly multi-MB) log.
+    line_start = text.rfind("\n", 0, m.start()) + 1  # +1 skips the \n itself
+    start = line_start
+    end = min(len(text), start + _DIAGNOSTIC_EXCERPT_MAX)
+    excerpt = text[start:end]
+    return UnparsedReviewMarker(
+        verdict_word=verdict_word,
+        excerpt=excerpt,
+        transcript_path=transcript_path,
+        host=host,
+    )
+
+
 # ── #248: machine-readable review header ────────────────────────────────────
 #
 # When the coordinator posts a review comment back to GitHub it prepends a

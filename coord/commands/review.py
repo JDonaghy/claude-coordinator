@@ -6,6 +6,7 @@ coord/cli.py (#747)."""
 from __future__ import annotations
 
 import logging
+import shlex
 import sys
 from pathlib import Path
 
@@ -98,10 +99,19 @@ def _prompt_and_relay_review_verdict(
     session's own host before any editor is opened.  Findings recovered here
     also seed the editor so it is never blank.
 
+    **#1348 parse-failure diagnostic**: when neither the board nor the transcript
+    floor recovered a verdict, but a ``REVIEW_VERDICT:`` marker WAS found in a
+    transcript that passes both attribution gates, the operator sees a distinct
+    "REVIEW PARSE FAILED" message (not the generic "no verdict reported"), a
+    greppable ``log.warning`` with host + path, and the editor opens pre-seeded
+    with the recovered excerpt.  When the marker line carries a recognisable
+    verdict word, the prompt defaults to it instead of ``[s]kip``.  The operator
+    still confirms; nothing is auto-recorded.
+
     *started_at*: session start timestamp (epoch).  Passed to the transcript-
     floor so only transcripts active during this session are considered.  When
-    ``None``, the local scan is skipped and the remote scan uses a permissive
-    ``cutoff=0`` (bounded solely by the issue-number gate).
+    ``None``, the remote scan uses a permissive ``cutoff=0`` (bounded solely by
+    the issue-number gate) and the local diagnostic scan is skipped.
 
     *ssh_target*: SSH hostname of the machine where the review session ran.
     ``None`` for local sessions; set to ``machine.host`` for remote reviews.
@@ -117,6 +127,10 @@ def _prompt_and_relay_review_verdict(
     # (auto-relay the captured data without prompting).
     _pre_verdict: str | None = None
     _pre_body: str | None = None
+    # #1348: diagnostic out-parameter.  A non-None list activates unparsed-marker
+    # detection in the transcript scans below; the first matching UnparsedReviewMarker
+    # (newest transcript) is appended when the strict parse failed.
+    _unparsed_markers: list = []
     try:
         from coord.state import load_assignment_review_findings  # noqa: PLC0415
 
@@ -157,13 +171,89 @@ def _prompt_and_relay_review_verdict(
             )
 
             _tf = _review_findings_from_transcript(
-                issue_number, started_at, assignment_id=assignment_id, ssh_target=ssh_target
+                issue_number, started_at, assignment_id=assignment_id,
+                ssh_target=ssh_target,
+                _diagnostic=_unparsed_markers,  # #1348
             )
             if _tf is not None:
                 _pre_verdict = _tf.verdict
                 _pre_body = _tf.body
         except Exception:  # noqa: BLE001 — ssh unavailable → fall through
             pass
+
+    # ── Step 2b: local transcript diagnostic scan (#1348) ───────────────────
+    # For LOCAL sessions (no ssh_target) the transcript-floor already ran in
+    # finalize_interactive_exit without diagnostic collection, so any unparsed
+    # marker was silently missed.  Re-run here with _unparsed_markers to catch
+    # the case — same 2nd-pass rationale as Step 2, same attribution gates,
+    # same "first/newest hit only" semantics.  Skipped when started_at is None
+    # (no bounded window → too likely to match a stale unrelated transcript).
+    if _pre_verdict is None and not ssh_target and started_at is not None:
+        try:
+            from coord.interactive import (  # noqa: PLC0415
+                _review_findings_from_transcript,
+            )
+
+            _tf2 = _review_findings_from_transcript(
+                issue_number, started_at, assignment_id=assignment_id,
+                ssh_target=None,
+                _diagnostic=_unparsed_markers,  # #1348
+            )
+            if _tf2 is not None:
+                _pre_verdict = _tf2.verdict
+                _pre_body = _tf2.body
+        except Exception:  # noqa: BLE001 — scan failed → fall through
+            pass
+
+    # ── #1348: parse-failure diagnostic ─────────────────────────────────────
+    # No verdict recovered, but a REVIEW_VERDICT: marker WAS found in a
+    # transcript that passed both attribution gates.  This is a different failure
+    # from "no verdict reported": the review text IS there; the strict parser
+    # rejected it (e.g. bolded markers, missing END_REVIEW — the #1346 incident).
+    # Make the distinction operator-visible and surface the excerpt so the editor
+    # is never blank.
+    #
+    # _marker_excerpt: excerpt from the unparsed marker, passed to the editor as
+    # pre_body (distinct from _pre_body, which is a fully-captured body that
+    # bypasses the editor — the excerpt must always open the editor so the
+    # operator can clean it up).
+    # _marker_default: normalised verdict for the prompt default.
+    _marker_excerpt: str | None = None
+    _marker_default: str | None = None
+    if _pre_verdict is None and _unparsed_markers:
+        _um = _unparsed_markers[0]
+        _loc = _um.transcript_path or "(unknown path)"
+        _host_desc = f" on {_um.host!r}" if _um.host else ""
+        log.warning(
+            "[#1348] review parse FAILED for assignment %s: "
+            "REVIEW_VERDICT: marker found in transcript %r%s "
+            "but _REVIEW_BLOCK_RE rejected it — surfacing excerpt for operator "
+            "confirmation (detected verdict word: %r)",
+            assignment_id, _loc, _host_desc, _um.verdict_word,
+        )
+        _inspect_hint = (
+            f"ssh {_um.host} cat {shlex.quote(_loc)}" if _um.host
+            else f"cat {shlex.quote(_loc)}"
+        )
+        click.echo(
+            f"\n  ⚠  REVIEW PARSE FAILED\n"
+            f"  Transcript:  {_loc}{_host_desc}\n"
+            "  A REVIEW_VERDICT: marker was found in the above transcript but the\n"
+            "  strict parser could not extract the findings (e.g. bolded markers\n"
+            "  like **REVIEW_VERDICT:** or a missing END_REVIEW terminator).\n"
+            "\n"
+            "  This is NOT 'no verdict reported' — the review text IS present.\n"
+            "  The excerpt has been pre-loaded into the editor for confirmation.\n"
+            f"  To inspect the raw transcript:  {_inspect_hint}"
+        )
+        _marker_excerpt = _um.excerpt
+        # Normalize the detected verdict word: aliases (pass→approve,
+        # fail→request-changes) and canonical forms are both valid defaults.
+        if _um.verdict_word:
+            from coord.review import _VERDICT_ALIASES  # noqa: PLC0415
+            _norm = _VERDICT_ALIASES.get(_um.verdict_word, _um.verdict_word)
+            if _norm in ("approve", "request-changes"):
+                _marker_default = _norm
 
     # ── Surface pre-captured findings ───────────────────────────────────────
     if _pre_verdict is not None:
@@ -177,7 +267,20 @@ def _prompt_and_relay_review_verdict(
     # ── Non-TTY path ─────────────────────────────────────────────────────────
     if not sys.stdin.isatty():
         if _pre_verdict is None:
-            click.echo(f"  no verdict reported — record it with:\n{verdict_cmd_hint}")
+            if _marker_excerpt is not None:
+                # #1348: parse failed — different message from "no verdict".
+                _um = _unparsed_markers[0]
+                _loc = _um.transcript_path or "(unknown path)"
+                _host_desc = f" on {_um.host!r}" if _um.host else ""
+                click.echo(
+                    f"  review parse FAILED (non-TTY): REVIEW_VERDICT: marker found in "
+                    f"{_loc!r}{_host_desc} but strict parser rejected it "
+                    f"(detected verdict: {_um.verdict_word!r}). "
+                    f"Cannot open editor without a TTY. Recover manually with:\n"
+                    f"{verdict_cmd_hint}"
+                )
+            else:
+                click.echo(f"  no verdict reported — record it with:\n{verdict_cmd_hint}")
             return False
         # Headless + pre-captured: auto-relay (no prompt, no editor).
         # Applies to CI / daemon scenarios where both verdict AND body are
@@ -193,8 +296,12 @@ def _prompt_and_relay_review_verdict(
         findings_body: str | None = _pre_body
     else:
         # ── TTY prompt ──────────────────────────────────────────────────────
-        # Default to the captured verdict when we have one (never [s]kip).
-        _default = {"approve": "a", "request-changes": "r"}.get(_pre_verdict or "", "s")
+        # Default: board verdict > detected verdict from unparsed marker > [s]kip.
+        # _pre_verdict is the fully-parsed, confirmed one; _marker_default is the
+        # marker-line word (only used when _pre_verdict is None — #1348).
+        _default = {"approve": "a", "request-changes": "r"}.get(
+            _pre_verdict or _marker_default or "", "s"
+        )
         ans = click.prompt(
             "  Review verdict — [a]pprove / [r]equest-changes / [s]kip",
             type=click.Choice(["a", "r", "s"], case_sensitive=False),
@@ -212,9 +319,10 @@ def _prompt_and_relay_review_verdict(
         # ── Findings body for request-changes ───────────────────────────────
         # #617: request-changes MUST carry the full findings body.
         # #877: when the board/transcript already has the body, use it directly
-        # (no blank editor).  When missing, open the editor — seeded with
-        # whatever partial body we recovered, or blank as a last resort (with a
-        # hint pointing the operator at the session host / transcript path).
+        # (no blank editor).  When missing, open the editor — seeded with:
+        #   * the unparsed-marker excerpt (#1348), when the parse failed but
+        #     we recovered text — so the operator edits what the reviewer wrote;
+        #   * blank as a last resort, with a hint pointing at the transcript.
         findings_body = None
         if verdict == "request-changes":
             if _pre_body:
@@ -225,8 +333,13 @@ def _prompt_and_relay_review_verdict(
                     "board/transcript (editor not opened)."
                 )
             else:
-                # No pre-captured body — open editor.
-                if ssh_target:
+                # No pre-captured body — open editor, seeded with the recovered
+                # marker excerpt if available (#1348), or blank otherwise.
+                if _marker_excerpt:
+                    # Parse-failure case: excerpt already printed above.  Editor
+                    # opens with the recovered text so the operator can clean it up.
+                    pass
+                elif ssh_target:
                     click.echo(
                         f"  Findings not recovered from {ssh_target!r}. "
                         "Opening editor — enter the full review (every blocking "
@@ -244,7 +357,8 @@ def _prompt_and_relay_review_verdict(
                         "editor (every blocking item, file:line)…"
                     )
                 findings_body = _collect_review_body_via_editor(
-                    assignment_id=assignment_id, summary=summary
+                    assignment_id=assignment_id, summary=summary,
+                    pre_body=_marker_excerpt,  # #1348: None when no marker was found
                 )
                 if not findings_body:
                     click.echo(

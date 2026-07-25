@@ -213,7 +213,7 @@ class TestRemoteTranscriptFloor:
         _tf_body = "Blocking: right-on-leaf must be no-op. See app.rs:88."
         monkeypatch.setattr(
             "coord.interactive._review_findings_from_transcript",
-            lambda issue, started_at, *, assignment_id=None, ssh_target=None: (
+            lambda issue, started_at, *, assignment_id=None, ssh_target=None, _diagnostic=None: (
                 self._make_findings("request-changes", _tf_body)
                 if ssh_target == "precision"
                 else None

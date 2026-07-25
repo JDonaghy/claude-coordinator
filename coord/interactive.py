@@ -1931,6 +1931,7 @@ def _fetch_remote_review_findings(
     *,
     assignment_id: str,
     timeout: float = 30.0,
+    _diagnostic: list | None = None,
 ):
     """Remote twin of the transcript-floor: parse the review block from the
     Claude transcript on the SESSION'S OWN host (#617).
@@ -1954,6 +1955,13 @@ def _fetch_remote_review_findings(
     window — no additional per-scan cap is applied (#619: the original
     ``max_candidates=6`` dropped the target transcript under concurrent-session
     load, exactly the condition when reviews run).
+
+    *_diagnostic* (#1348): optional out-parameter.  When a non-``None`` list
+    is provided and a candidate transcript passes the attribution gates but the
+    strict parse fails, :func:`coord.review.detect_unparsed_review_marker` is
+    called and its result (if non-``None``) appended — at most once, for the
+    newest matching transcript.  The happy-path return type is unchanged;
+    callers that don't need diagnostics pass the default ``None``.
     """
     from coord.review import parse_review_from_log  # noqa: PLC0415
 
@@ -2032,6 +2040,26 @@ def _fetch_remote_review_findings(
             and _transcript_names_assignment(cat.stdout, assignment_id)
         ):
             return findings
+        # #1348: strict parse failed — when the caller wants diagnostics and
+        # the attribution gates pass, check whether the transcript contains a
+        # REVIEW_VERDICT: marker that the strict parser rejected.  Only collect
+        # the first (newest) hit so `_diagnostic[0]` is always the most recent
+        # candidate; `not _diagnostic` prevents overwriting with an older one.
+        if (
+            findings is None
+            and _diagnostic is not None
+            and not _diagnostic
+            and _transcript_names_issue(cat.stdout, issue_number)
+            and _transcript_names_assignment(cat.stdout, assignment_id)
+        ):
+            from coord.review import detect_unparsed_review_marker  # noqa: PLC0415
+            _marker = detect_unparsed_review_marker(
+                cat.stdout,
+                transcript_path=remote_path,  # path on the remote host
+                host=ssh_target,
+            )
+            if _marker is not None:
+                _diagnostic.append(_marker)
     return None
 
 
@@ -2127,6 +2155,7 @@ def _review_findings_from_transcript(
     assignment_id: str,
     projects_dir: Path | None = None,
     ssh_target: str | None = None,
+    _diagnostic: list | None = None,
 ):
     """Recover a human-attended review's verdict + findings from the Claude
     session transcript — the **transcript-floor** backstop (#606).
@@ -2161,6 +2190,13 @@ def _review_findings_from_transcript(
     record its verdict against the wrong assignment id). Self-gating — a work
     session's transcript carries no ``REVIEW_VERDICT`` block, so this returns
     ``None`` and the caller falls through to the git-floor.
+
+    *_diagnostic* (#1348): optional out-parameter.  When a non-``None`` list is
+    provided and a candidate transcript passes the attribution gates but the
+    strict parse fails, :func:`coord.review.detect_unparsed_review_marker` is
+    called and the result (if non-``None``) appended — at most once, for the
+    newest qualifying transcript.  The happy-path return type is unchanged;
+    callers that don't need diagnostics pass the default ``None``.
     """
     from coord.review import parse_review_from_log  # noqa: PLC0415
 
@@ -2177,7 +2213,8 @@ def _review_findings_from_transcript(
     # own host over ssh instead.
     if ssh_target is not None:
         result = _fetch_remote_review_findings(
-            issue_number, cutoff, ssh_target, assignment_id=assignment_id
+            issue_number, cutoff, ssh_target, assignment_id=assignment_id,
+            _diagnostic=_diagnostic,  # #1348: thread through so remote floor can surface markers
         )
         if result is None:
             # One settle-and-retry: covers a transcript-flush blip where the
@@ -2186,7 +2223,8 @@ def _review_findings_from_transcript(
             # to avoid annoying the operator on the fast path.
             time.sleep(2.0)
             result = _fetch_remote_review_findings(
-                issue_number, cutoff, ssh_target, assignment_id=assignment_id
+                issue_number, cutoff, ssh_target, assignment_id=assignment_id,
+                _diagnostic=_diagnostic,  # #1348: second pass also collects markers
             )
         return result
     base = projects_dir if projects_dir is not None else (Path.home() / ".claude" / "projects")
@@ -2205,6 +2243,28 @@ def _review_findings_from_transcript(
     for _mtime, p in candidates:
         findings = parse_review_from_log(p)
         if findings is None:
+            # #1348: strict parse failed — detect a REVIEW_VERDICT: marker that
+            # the parser rejected (e.g. bolded markers like **REVIEW_VERDICT:**
+            # or a missing END_REVIEW terminator) when the caller wants
+            # diagnostics and attribution gates pass.  Only the first (newest)
+            # hit is collected; `not _diagnostic` prevents overwriting it with a
+            # marker from an older transcript in a subsequent iteration.
+            if _diagnostic is not None and not _diagnostic:
+                try:
+                    _raw_for_detect = p.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    _raw_for_detect = ""
+                if (
+                    _raw_for_detect
+                    and _transcript_names_issue(_raw_for_detect, issue_number)
+                    and _transcript_names_assignment(_raw_for_detect, assignment_id)
+                ):
+                    from coord.review import detect_unparsed_review_marker  # noqa: PLC0415
+                    _marker = detect_unparsed_review_marker(
+                        _raw_for_detect, transcript_path=str(p)
+                    )
+                    if _marker is not None:
+                        _diagnostic.append(_marker)
             continue
         # Gate on the WHOLE transcript, not just the parsed review prose (the
         # body often never names the issue — the reviewer describes the code;
