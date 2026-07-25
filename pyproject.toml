@@ -41,6 +41,11 @@ Issues = "https://github.com/JDonaghy/claude-coordinator/issues"
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    # Parallel test execution. The suite is the dominant cost of the Test gate
+    # in an unattended run: 5m49s serial vs 1m36s-2m23s under `-n auto`, with
+    # identical results (4642 passed) across repeated runs. Not required —
+    # tooling that runs the suite should fall back to serial when it is absent.
+    "pytest-xdist>=3.5",
 ]
 
 [project.scripts]
