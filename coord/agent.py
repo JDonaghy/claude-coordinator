@@ -3707,6 +3707,10 @@ class AgentServer:
                 if not dep_path_str:
                     msg = f"no repo_path configured for dependency {dep_name!r}"
                     log_fh.write(f"# pull failed: {msg}\n")
+                    # Flush before flipping status: callers synchronize on
+                    # status == FAILED as the barrier for "the log is
+                    # complete" (#1343), so the write must be durable first.
+                    log_fh.flush()
                     self._fail(assignment, msg)
                     return
                 dep_path = Path(dep_path_str).expanduser()
@@ -3716,6 +3720,9 @@ class AgentServer:
                     output = _git(dep_path, "pull", "--ff-only")
                 except _GitError as e:
                     log_fh.write(f"# pull failed for {dep_name}: {e}\n")
+                    # Same ordering requirement as above: flush before the
+                    # status flip so status == FAILED is a valid barrier.
+                    log_fh.flush()
                     self._fail(assignment, f"pull failed for {dep_name}: {e}")
                     return
                 log_fh.write(output + "\n")
