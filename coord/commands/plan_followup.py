@@ -1,4 +1,4 @@
-"""Plan-mode follow-up commands: `pr`, `fix`, `approve-plan`,
+"""Plan-mode follow-up commands: `pr`, `fix`, `review`, `approve-plan`,
 `reject-plan`, `resume-stuck`, `split`. Extracted from coord/cli.py (#747)."""
 
 from __future__ import annotations
@@ -373,6 +373,96 @@ def pr(assignment_id: str, config_path: Path, no_review: bool) -> None:
             click.echo(f"  reviewer: {review.machine_name}")
         else:
             click.echo("  review not dispatched (no eligible machine or reviews disabled)")
+
+
+@click.command(
+    help=(
+        "Deliberately dispatch a headless review for a done work assignment "
+        "(the #555 escape hatch — thin wrapper over dispatch_review)."
+    )
+)
+@click.argument("assignment_id")
+@_CONFIG_OPTION
+def review(assignment_id: str, config_path: Path) -> None:
+    """``coord review <work_assignment_id>``
+
+    The #555 guard in ``dispatch_pending_reviews`` deliberately never
+    auto-dispatches a headless ``claude -p`` review for an *interactive*
+    (``provider_name="claude-pty"``) work completion — that path already had
+    a human attending it. Its comment promises an escape hatch for a human
+    to deliberately request a headless review anyway; this command is it.
+
+    Pure dispatch — no PR worker is spawned. :func:`coord.review.dispatch_review`
+    already opens (or reuses) the PR itself, so unlike ``coord pr`` there is no
+    ``_dispatch_followup`` work session in between.
+    """
+    from coord.board_service import read_board, write_board
+    from coord.claim import has_active_followup
+    from coord.review import dispatch_review
+
+    cfg = _load_config(config_path)
+    board = read_board()
+
+    assignment = board.find_by_id(assignment_id)
+    if assignment is None:
+        click.echo(f"error: assignment {assignment_id!r} not found in board", err=True)
+        sys.exit(1)
+
+    if assignment.status != "done":
+        click.echo(
+            f"error: assignment {assignment_id} is {assignment.status!r}, not "
+            "'done' — nothing to review yet",
+            err=True,
+        )
+        sys.exit(1)
+
+    if not assignment.branch:
+        click.echo(
+            f"error: assignment {assignment_id} has no branch recorded. "
+            "The worker may not have pushed yet.",
+            err=True,
+        )
+        sys.exit(1)
+
+    if has_active_followup(
+        board, of_assignment_id=assignment_id, assignment_type="review"
+    ):
+        click.echo(
+            f"error: a review is already in flight for {assignment_id}",
+            err=True,
+        )
+        sys.exit(1)
+
+    if not cfg.reviews.enabled:
+        click.echo(
+            "error: reviews are disabled (reviews.enabled: false in config)",
+            err=True,
+        )
+        sys.exit(1)
+
+    review_assignment = dispatch_review(assignment, board, cfg)
+    if review_assignment is None:
+        # dispatch_review logs its own reason (no eligible reviewer machine,
+        # branch not on remote, an active fix/work re-run for the same issue,
+        # the work is already terminal on GitHub, ...) — see the coordinator
+        # log for specifics.
+        click.echo(
+            f"error: no review dispatched for {assignment_id} — no eligible "
+            "reviewer machine, or a guard in dispatch_review blocked it "
+            "(see the coordinator log for the specific reason)",
+            err=True,
+        )
+        sys.exit(1)
+
+    # Persist only on success: dispatch_review mutates the board in place
+    # (review_state, pr_url, the new review row).
+    write_board(board)
+    click.echo(
+        f"review dispatched: {review_assignment.assignment_id} on "
+        f"{review_assignment.machine_name}"
+    )
+    if assignment.pr_url:
+        click.echo(f"  pr: {assignment.pr_url}")
 
 
 @click.command(help="Dispatch a fix-up worker for a failed smoke test.")

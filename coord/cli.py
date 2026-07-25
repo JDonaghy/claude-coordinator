@@ -119,6 +119,7 @@ from coord.commands.plan_followup import (
     pr,
     reject_plan,
     resume_stuck,
+    review,
     split,
 )
 
@@ -367,6 +368,7 @@ main.add_command(wait)
 main.add_command(watch)
 main.add_command(pr)
 main.add_command(fix)
+main.add_command(review)
 main.add_command(approve_plan)
 main.add_command(reject_plan)
 main.add_command(resume_stuck)
