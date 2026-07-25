@@ -1373,8 +1373,11 @@ class TestSyncIssueComments:
 
         n = sync_issue_comments("api", 7, repo_github="acme/api")
         assert n == 2
+        # #873 fix: rows must land under the GitHub slug (repo_github), not the
+        # coordinator.yml config key (repo_name) — matching what capture-at-write
+        # always stores, so both write paths agree on one convention.
         rows = coord_db.execute(
-            "SELECT * FROM issue_comments WHERE repo_name='api' AND issue_number=7 "
+            "SELECT * FROM issue_comments WHERE repo_name='acme/api' AND issue_number=7 "
             "ORDER BY gh_comment_id"
         ).fetchall()
         assert len(rows) == 2
@@ -1384,6 +1387,46 @@ class TestSyncIssueComments:
         assert rows[1]["gh_comment_id"] == 2
         assert rows[1]["coord_event"] == "completion"
         assert rows[1]["coord_assignment_id"] == "a1"
+
+    def test_sync_repo_name_matches_capture_at_write_convention(
+        self, coord_db, monkeypatch
+    ) -> None:
+        """Regression for the #873 review finding: capture-at-write always
+        receives the GitHub slug (real call sites pass ``repo.github``), so
+        the backfill-sync path — invoked with the coordinator.yml config key
+        as its first arg, e.g. ``sync_issue_comments(repo.name, ...,
+        repo_github=repo.github)`` — must store rows under the *same* slug,
+        not the config key. Otherwise a row's ``repo_name`` flips depending
+        on which path last touched it (both upsert on ``gh_comment_id``),
+        and callers filtering by exact ``repo_name`` silently see only half
+        the comment history."""
+        from coord import github_ops
+        from coord.state import record_issue_comment_capture, sync_issue_comments
+
+        # Capture-at-write path: always given the slug, per every real call site.
+        record_issue_comment_capture(
+            repo_name="acme/api", issue_number=7, body="from capture-at-write",
+            gh_comment_id=1,
+        )
+
+        # Backfill-sync path: given the config key ("api") as repo_name, plus
+        # the slug separately as repo_github — mirroring issues.py's real call.
+        fetched = [{
+            "url": "https://github.com/acme/api/issues/7#issuecomment-1",
+            "body": "from sync (should self-heal, same gh_comment_id)",
+            "author": {"login": "someone"},
+            "createdAt": "2026-07-02T01:27:50Z",
+        }]
+        monkeypatch.setattr(github_ops, "get_issue_comments", lambda *a, **k: fetched)
+        sync_issue_comments("api", 7, repo_github="acme/api")
+
+        rows = coord_db.execute(
+            "SELECT repo_name FROM issue_comments WHERE gh_comment_id=1"
+        ).fetchall()
+        # Same natural key (gh_comment_id) from both paths → exactly one row,
+        # and it must be stored under the slug both paths agree on.
+        assert len(rows) == 1
+        assert rows[0]["repo_name"] == "acme/api"
 
     def test_sync_idempotent_rerun_no_dupes(self, coord_db, monkeypatch) -> None:
         from coord import github_ops

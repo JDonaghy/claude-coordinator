@@ -3298,7 +3298,7 @@ def _sync_issue_comments_local(
         if gh_id is None:
             continue  # can't dedup without the natural key; skip (malformed/missing url)
         _record_issue_comment_capture_local(
-            repo_name=repo_name,
+            repo_name=slug,
             issue_number=issue_number,
             body=c.get("body") or "",
             gh_comment_id=gh_id,
