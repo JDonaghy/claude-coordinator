@@ -171,17 +171,39 @@ SCRATCH="${TMPDIR:-/tmp}/coord-drive-issue-$(id -u)"
 mkdir -p "$SCRATCH"
 RUN_LOG="$SCRATCH/${REPO}-${ISSUE}.log"
 
-# One issue at a time. Concurrent runs would race for the merge queue and can
-# produce exactly the conflicting-branch pile-up this is meant to avoid; they
-# would also fight over the shared CARGO_TARGET_DIR.
-LOCK="$SCRATCH/drive-issue.lock"
+# PER-ISSUE lock. Two drivers on DIFFERENT issues are fine and now allowed;
+# two drivers on the SAME issue are not — they would double-dispatch work,
+# double-record verdicts, and fight over one scratch worktree.
+#
+# Everything a run touches is already per-issue (worktree, run log, test
+# report, state stderr). The three things that were genuinely shared are
+# handled explicitly: the board cache is now written atomically as one file
+# (coord_issue_state.py), merges are serialized on their own lock below, and
+# CARGO_TARGET_DIR is left shared on purpose — cargo takes its own build lock,
+# so a second run blocks briefly instead of corrupting, and shares the cache.
+LOCK="$SCRATCH/lock-${REPO}-${ISSUE}"
+HOLDER="$SCRATCH/holder-${REPO}-${ISSUE}"
 exec 9>"$LOCK"
 if ! flock -n 9; then
-    holder="$(cat "$SCRATCH/drive-issue.holder" 2>/dev/null || echo "another run")"
-    die "already driving $holder — one issue at a time.
-   Wait for it to finish, or override the lock file at $LOCK" 2
+    holder="$(cat "$HOLDER" 2>/dev/null || echo "another run")"
+    die "already driving $REPO #$ISSUE ($holder).
+   A second driver on the SAME issue would double-dispatch work and corrupt
+   its worktree. Other issues can be driven concurrently.
+   Lock file: $LOCK" 2
 fi
-printf '%s #%s (pid %s)\n' "$REPO" "$ISSUE" "$$" >"$SCRATCH/drive-issue.holder"
+printf '%s #%s (pid %s)\n' "$REPO" "$ISSUE" "$$" >"$HOLDER"
+
+# Merges are serialized FLEET-WIDE even when the runs themselves are parallel.
+# Two reasons, both real:
+#   1. The daemon's POST /merge handler installs a process-global
+#      `redirect_stdout` to capture output. Concurrent merge requests swap each
+#      other's buffers — a documented incident where a --dry-run reported a
+#      merge that another request had actually performed.
+#   2. Serialized merges keep the queue's conflict ordering intelligible; two
+#      branches rebasing onto a moving main at once is how pile-ups start.
+# The lock is held ONLY around `coord merge`, so work/test/review still overlap
+# freely across issues — the expensive stages stay parallel.
+MERGE_LOCK="$SCRATCH/merge.lock"
 
 # Clean up the test worktree on ANY exit — including Ctrl-C and SIGTERM. A
 # worktree left registered in the base checkout makes the NEXT run's `git
@@ -190,7 +212,7 @@ printf '%s #%s (pid %s)\n' "$REPO" "$ISSUE" "$$" >"$SCRATCH/drive-issue.holder"
 CURRENT_WT=""
 cleanup() {
     local rc=$?
-    rm -f "$SCRATCH/drive-issue.holder"
+    rm -f "$HOLDER"
     if [[ -n "$CURRENT_WT" ]]; then
         local base="${REPO_PATH:-$HOME/src/$REPO}"
         git -C "$base" worktree remove --force "$CURRENT_WT" 2>/dev/null || true
@@ -420,9 +442,12 @@ verify_merged() {
 # in the state machine is what bounds it.
 do_merge() {
     local aid="$1"
-    log "MERGE: coord merge --only $aid --method $MERGE_METHOD"
-    if ! coord merge --only "$aid" --method "$MERGE_METHOD" 2>&1 | tee -a "$RUN_LOG"; then
-        warn "coord merge returned non-zero — re-checking the board next poll"
+    log "MERGE: coord merge --only $aid --method $MERGE_METHOD (waiting for merge lock)"
+    # flock serializes this against every other driver; -w bounds the wait so a
+    # wedged peer cannot hang this run forever.
+    if ! flock -w 1800 "$MERGE_LOCK" \
+            coord merge --only "$aid" --method "$MERGE_METHOD" 2>&1 | tee -a "$RUN_LOG"; then
+        warn "coord merge returned non-zero (or the merge lock timed out) — re-checking next poll"
     fi
 }
 

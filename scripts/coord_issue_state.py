@@ -104,26 +104,52 @@ def fetch_board() -> dict:
         return serialize_board(read_board())
 
     key = hashlib.sha256(svc.url.encode()).hexdigest()[:16]
-    body_path = _cache_dir() / f"board-{key}.json"
-    etag_path = _cache_dir() / f"board-{key}.etag"
+    cache_path = _cache_dir() / f"board-{key}.json"
+
+    # The cache is deliberately SHARED across concurrent drivers rather than
+    # split per-issue: the /board payload is identical for every issue, so
+    # sharing means one driver's fetch serves everyone else's 304.
+    cached: dict | None = None
+    try:
+        cached = json.loads(cache_path.read_text())
+    except (OSError, ValueError):
+        cached = None  # absent, unreadable, or a torn write from an old version
 
     headers = dict(_headers(svc))
-    if body_path.exists() and etag_path.exists():
-        headers["if-none-match"] = etag_path.read_text().strip()
+    etag = (cached or {}).get("etag")
+    if etag:
+        headers["if-none-match"] = etag
 
     resp = httpx.get(f"{svc.url}/board", headers=headers, timeout=60.0)
-    if resp.status_code == 304 and body_path.exists():
-        return json.loads(body_path.read_text())
+    if resp.status_code == 304 and cached is not None:
+        return cached["payload"]
     resp.raise_for_status()
     payload = resp.json()
-    # Write body first, then the ETag: a crash between the two costs one extra
-    # full fetch, whereas the reverse order would serve a stale body forever.
-    body_path.write_text(json.dumps(payload))
-    etag = resp.headers.get("etag")
-    if etag:
-        etag_path.write_text(etag)
-    elif etag_path.exists():
-        etag_path.unlink()
+
+    # Store the ETag and the payload TOGETHER in one atomically-replaced file.
+    #
+    # They were two files, written body-then-etag. That is safe for a single
+    # writer, but two concurrent drivers can interleave so that a reader pairs
+    # process A's *newer* etag with process B's *older* body — it then sends
+    # If-None-Match, gets a 304, and confidently serves the WRONG board. A
+    # driver acting on a stale board is precisely the class of silent wrongness
+    # this whole tool exists to avoid.
+    #
+    # One file makes the pair inseparable; os.replace is atomic on POSIX, and
+    # the temp file is created in the same directory so the rename never
+    # crosses a filesystem boundary. The pid suffix keeps two writers from
+    # colliding on the temp name itself.
+    tmp = cache_path.with_suffix(f".{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps({"etag": resp.headers.get("etag"), "payload": payload}))
+        os.replace(tmp, cache_path)
+    except OSError:
+        # The cache is an optimisation, never a correctness dependency — a
+        # failed write just costs the next poll a full fetch.
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
     return payload
 
 
