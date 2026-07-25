@@ -1537,6 +1537,102 @@ END_REVIEW
         assert result.verdict == "request-changes"
         assert "Bug at auth.py:10." in result.body
 
+    def test_markdown_bolded_markers(self, tmp_path: Path) -> None:
+        """#1346: the reviewer wraps the markers in Markdown emphasis.
+
+        This is the exact shape that dropped the #873 review: a complete,
+        correct block with a valid `END_REVIEW` terminator, but written as
+        `**REVIEW_VERDICT: request-changes**` / `**REVIEW_BODY:**`. The single
+        pair of trailing asterisks made the whole block unparseable, so the
+        verdict never reached the board and the operator got a blank prompt.
+        """
+        log = tmp_path / "review.log"
+        _write_plain_log(log, """\
+Now I have everything needed. Let me finalize the review.
+
+**REVIEW_VERDICT: request-changes**
+
+**REVIEW_BODY:**
+
+## Summary
+
+Solid implementation, but one blocking bug.
+
+## Blocking
+
+### 1. `repo_name` stored inconsistently
+
+`coord/state.py:3290` uses the slug on one path and the config key on the
+other, so the mirror is not queryable.
+
+END_REVIEW
+""")
+        result = parse_review_from_log(log)
+        assert result is not None
+        assert result.verdict == "request-changes"
+        assert result.body.startswith("## Summary")
+        assert "repo_name` stored inconsistently" in result.body
+        # Neither marker may leak into the captured body.
+        assert "REVIEW_BODY" not in result.body
+        assert "END_REVIEW" not in result.body
+
+    def test_markdown_bolded_verdict_value_only(self, tmp_path: Path) -> None:
+        """#1346: emphasis around the value alone, markers left bare."""
+        log = tmp_path / "review.log"
+        _write_plain_log(log, """\
+REVIEW_VERDICT: **approve**
+REVIEW_BODY:
+Clean diff, tests pass.
+END_REVIEW
+""")
+        result = parse_review_from_log(log)
+        assert result is not None
+        assert result.verdict == "approve"
+        assert result.body == "Clean diff, tests pass."
+
+    def test_markdown_decorated_markers_stream_json(self, tmp_path: Path) -> None:
+        """#1346: bolded markers in transcript (stream-json) form — the path the
+        #606 transcript-floor actually reads for a human-attended review."""
+        log = tmp_path / "review.log"
+        _write_stream_json_log(log, [
+            "Reading the diff...",
+            "**REVIEW_VERDICT: request-changes**\n\n"
+            "**REVIEW_BODY:**\n\n"
+            "## Blocking\n\n- `auth.py:42` — missing validation\n\n"
+            "**END_REVIEW**",
+        ])
+        result = parse_review_from_log(log)
+        assert result is not None
+        assert result.verdict == "request-changes"
+        assert "missing validation" in result.body
+        assert "REVIEW_VERDICT" not in result.body
+
+    def test_markdown_heading_and_code_span_markers(self, tmp_path: Path) -> None:
+        """#1346: heading / code-span decoration is tolerated too."""
+        log = tmp_path / "review.log"
+        _write_plain_log(log, """\
+## REVIEW_VERDICT: request-changes
+`REVIEW_BODY:`
+Blocker at `cli.py:10`.
+## END_REVIEW
+""")
+        result = parse_review_from_log(log)
+        assert result is not None
+        assert result.verdict == "request-changes"
+        assert result.body == "Blocker at `cli.py:10`."
+
+    def test_decoration_tolerance_still_requires_terminator(
+        self, tmp_path: Path
+    ) -> None:
+        """#1346 must not widen what counts as a review: a decorated verdict
+        line in prose with no `END_REVIEW` terminator is still not a review."""
+        log = tmp_path / "review.log"
+        _write_plain_log(log, """\
+I'll finish by emitting **REVIEW_VERDICT: approve** once I'm done reading,
+but I still have three files to go.
+""")
+        assert parse_review_from_log(log) is None
+
     def test_last_block_wins_without_marker(self, tmp_path: Path) -> None:
         """The optional-marker change must not break 'last block wins' when
         neither block uses the `REVIEW_BODY:` header."""
