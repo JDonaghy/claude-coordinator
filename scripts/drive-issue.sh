@@ -67,6 +67,7 @@ DO_MERGE=1
 MERGE_METHOD="rebase"
 DRY_RUN=0
 BRIEFING_FILE=""
+ACCEPT_ADVISORY=0
 
 usage() {
     # Print the header comment block: every line from #2 up to (not including)
@@ -102,6 +103,10 @@ Options:
                         "two drivers" warning above. To make this fully safe,
                         the systemd unit must take the same lock —
                         ExecStart=/usr/bin/flock ~/.coord/notify.lock %h/.coord-venv/bin/coord notify ...
+  --accept-advisory     Proceed when the work row is ADVISORY but its branch
+                        demonstrably carries commits. Needed while #1357 is
+                        open: every Python-only headless assignment in this
+                        repo is falsely downgraded DONE→ADVISORY.
   --no-merge            Stop after the review approves; do not merge.
   --merge-method M      rebase|squash|merge (default rebase).
   --dry-run             Print the resolved plan and current state, then exit.
@@ -139,6 +144,7 @@ while [[ $# -gt 0 ]]; do
         --notify)           DRIVE_NOTIFY=1; shift ;;
         --no-merge)         DO_MERGE=0; shift ;;
         --merge-method)     MERGE_METHOD="$2"; shift 2 ;;
+        --accept-advisory)  ACCEPT_ADVISORY=1; shift ;;
         --dry-run)          DRY_RUN=1; shift ;;
         -h|--help)          usage; exit 0 ;;
         -*)                 die "unknown option: $1" 2 ;;
@@ -349,6 +355,22 @@ dispatch_test_fix() {
 
 # ── stage: merge ─────────────────────────────────────────────────────────────
 
+# True when *branch* exists on the remote and carries at least one commit the
+# default branch does not. Used to tell a REAL zero-commit advisory apart from
+# the #1357 false positive, where the agent downgrades a good DONE over an
+# artifact glob that matched nothing.
+branch_has_commits() {
+    local branch="$1"
+    local base="${REPO_PATH:-$HOME/src/$REPO}"
+    local target="${REPO_DEFAULT_BRANCH:-main}"
+    [[ -d "$base/.git" ]] || return 1
+    git -C "$base" fetch --quiet origin "$target" 2>/dev/null || return 1
+    git -C "$base" fetch --quiet origin "$branch" 2>/dev/null || return 1
+    local n
+    n="$(git -C "$base" rev-list --count "origin/${target}..FETCH_HEAD" 2>/dev/null || echo 0)"
+    [[ "${n:-0}" -gt 0 ]]
+}
+
 # Confirm the branch actually landed on the target.
 #
 # NOTE: `merge-base --is-ancestor` is the WRONG test here. `coord merge`
@@ -510,13 +532,46 @@ while true; do
         sleep "$POLL"; continue
     fi
 
-    # ---- work still running (board not yet reconciled) ---------------------
-    if [[ "${WORK_STATUS:-}" != "done" ]]; then
-        sleep "$POLL"; continue
-    fi
+    # ---- work reached a terminal state that is not 'done' ------------------
+    #
+    # Every status here is TERMINAL (a non-terminal row would have been caught
+    # by the ACTIVE_COUNT wait above), so none of them may fall through to a
+    # bare `sleep; continue` — that spins silently until the deadline instead
+    # of reporting anything.
+    case "${WORK_STATUS:-}" in
+        done) ;;
+        advisory)
+            # #448 downgrade: the agent flagged a zero-commit / stash-miss exit.
+            # #1357 makes this a FALSE POSITIVE for every Python-only headless
+            # assignment in this repo — claude-coordinator's only artifact glob
+            # is `tui/target/debug/coord-tui`, which a Python diff never
+            # produces, so #1323's stash-miss check downgrades a perfectly good
+            # DONE. Ask git which case this actually is rather than trusting the
+            # status.
+            if [[ -z "${WORK_BRANCH:-}" ]] || ! branch_has_commits "$WORK_BRANCH"; then
+                die "work $WORK_AID exited ADVISORY with no commits on its branch —
+   nothing was pushed, so there is nothing to test, review, or merge.
+   inspect: coord log $WORK_AID --machine ${WORK_MACHINE:-$MACHINE}"
+            fi
+            if [[ "$ACCEPT_ADVISORY" -ne 1 ]]; then
+                die "work $WORK_AID is ADVISORY, but its branch carries real commits.
+   This is the #1357 signature: since v0.4.75 every Python-only headless
+   assignment in this repo is downgraded DONE→ADVISORY by an artifact glob
+   that a Python diff can never match.
+   Proceed anyway with --accept-advisory (and fix #1357 to stop needing it)."
+            fi
+            warn "ADVISORY with commits present — proceeding per --accept-advisory (#1357)"
+            ;;
+        cancelled)
+            die "work $WORK_AID was cancelled — re-dispatch with: coord assign $MACHINE $REPO $ISSUE --force"
+            ;;
+        *)
+            die "unexpected terminal work status '${WORK_STATUS}' for $WORK_AID —
+   refusing to guess. Inspect: coord log $WORK_AID --machine ${WORK_MACHINE:-$MACHINE}"
+            ;;
+    esac
 
-    # A 'done' work row with no branch never pushed anything (the #448
-    # zero-commit advisory).  There is nothing to test, review, or merge.
+    # A 'done' row with no branch never pushed anything either.
     if [[ -z "${WORK_BRANCH:-}" ]]; then
         die "work $WORK_AID finished with no branch — nothing was pushed (0-commit advisory).
    inspect: coord log $WORK_AID --machine ${WORK_MACHINE:-$MACHINE}"
