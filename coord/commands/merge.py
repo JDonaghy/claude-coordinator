@@ -128,7 +128,7 @@ def verify_merge(
 
     repo_cfg = cfg.repo(repo_name)
     base = (repo_cfg.default_branch if repo_cfg else None) or "main"
-    if repo_cfg is not None and repo_cfg.develop_branch:
+    if repo_cfg is not None and getattr(repo_cfg, "develop_branch", None):
         # #934: verify against `feature/ms-NN` when this issue belongs to a
         # milestone and the repo opted into the git model — falls back to
         # `default_branch` (above) for everything else.
@@ -970,7 +970,7 @@ def merge(
             # milestone lookup itself is skipped (no `gh` call) when it
             # hasn't, falling back to `default_branch` unchanged.
             target_branch = repo_cfg.default_branch
-            if repo_cfg.develop_branch:
+            if getattr(repo_cfg, "develop_branch", None):
                 from coord.branch_model import (  # noqa: PLC0415
                     fetch_issue_milestone_number,
                     resolve_base_branch,

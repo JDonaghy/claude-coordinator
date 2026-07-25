@@ -1090,7 +1090,7 @@ def dispatch_review(
     # lookup itself is skipped entirely (no `gh` call) when the repo hasn't
     # opted in — a non-opted-in repo pays zero extra cost.
     base_branch = repo.default_branch
-    if repo.develop_branch:
+    if getattr(repo, "develop_branch", None):
         from coord.branch_model import resolve_base_branch  # noqa: PLC0415
 
         fetch_milestone = milestone_fetcher or _fetch_issue_milestone_number
