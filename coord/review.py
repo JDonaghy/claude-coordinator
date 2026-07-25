@@ -67,9 +67,23 @@ class ReviewFindings:
 # the `REVIEW_BODY:` header. When it's absent the body is everything between the
 # verdict line and `END_REVIEW`. `END_REVIEW` stays the required terminator, so a
 # stray "REVIEW_VERDICT:" in prose (with no terminator) still won't match.
+#
+# Markdown decoration around the markers is TOLERATED (#1346): reviewers write
+# prose, and a non-trivial fraction of them emit the block as Markdown —
+# `**REVIEW_VERDICT: request-changes**` / `**REVIEW_BODY:**` / `## END_REVIEW`,
+# or bold only the value (`REVIEW_VERDICT: **approve**`). The original pattern
+# required the verdict token to be followed by nothing but whitespace and a
+# newline, so a single pair of trailing asterisks made a complete, correct
+# review with a valid `END_REVIEW` terminator parse as "no review at all" — the
+# verdict was then silently dropped on every consumer of this regex (the #606
+# transcript-floor, `notify`, the auto-loop) and the operator was left with a
+# blank verdict prompt. `_MD` absorbs emphasis/code-span/heading punctuation and
+# surrounding whitespace on either side of each marker; `END_REVIEW` remains the
+# required terminator, so the tolerance does not widen what counts as a review.
+_MD = r"[*_`#\s]*"
 _REVIEW_BLOCK_RE = re.compile(
-    r"REVIEW_VERDICT:\s*(approve|request-changes|pass|fail)\s*[\r\n]+"
-    r"(?:REVIEW_BODY:\s*[\r\n]+)?(.*?)[\r\n]*END_REVIEW",
+    rf"REVIEW_VERDICT:{_MD}(approve|request-changes|pass|fail){_MD}[\r\n]+"
+    rf"(?:{_MD}REVIEW_BODY:{_MD}[\r\n]+)?(.*?)[\r\n]*{_MD}END_REVIEW",
     re.DOTALL | re.IGNORECASE,
 )
 
