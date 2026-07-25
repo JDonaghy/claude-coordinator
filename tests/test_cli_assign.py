@@ -1429,6 +1429,32 @@ class TestAssignInteractiveSmoke:
         smoke_rows = [a for a in b.active + b.completed if a.type == "smoke"]
         assert smoke_rows == [], "dry-run must not persist a smoke assignment"
 
+    def test_smoke_reminder_states_the_verdict_obligation(self) -> None:
+        """#1349: the smoke briefing must carry the terminal reporting contract.
+
+        A test verdict has no transcript-recoverable fallback channel the way a
+        review's `REVIEW_VERDICT` block does — if `coord test` never runs, the
+        verdict is lost and the operator is re-prompted on exit. The briefing
+        is the only thing making that happen, so pin its load-bearing parts:
+        the obligation, both commands with the WORK assignment id, the
+        confirm-don't-assume rule, and the honesty rule.
+        """
+        from coord.commands.dispatch_workers import _smoke_report_reminder
+
+        text = _smoke_report_reminder(
+            assignment_id="smoke-aid", smoke_of="work-aid"
+        )
+        assert "REQUIRED terminal step" in text
+        # Both commands, keyed to the WORK assignment — not the smoke session.
+        assert "coord test --passed work-aid" in text
+        assert "coord test --fail work-aid" in text
+        assert "smoke-aid" not in text.split("coord test")[1].split("\n")[0]
+        # Confirm-don't-assume, and don't claim success you haven't seen.
+        assert "CHECK THE OUTPUT" in text
+        assert "do NOT report the verdict as recorded" in text
+        # Say out loud that there is no safety net.
+        assert "no automatic recovery" in text
+
     def test_smoke_of_thin_client_resolves_target_from_daemon(
         self, config_file: Path, coord_dir: Path, monkeypatch
     ) -> None:

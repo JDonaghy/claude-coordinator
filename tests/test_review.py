@@ -1420,6 +1420,37 @@ def test_briefing_contains_structured_output_instructions() -> None:
     assert "do NOT run any `gh` commands" in briefing
 
 
+def test_briefing_forbids_markdown_decoration_on_markers() -> None:
+    """#1346: the briefing must state the marker lines are a machine contract.
+
+    The block is shown inside a Markdown briefing whose body placeholder
+    invites Markdown, and reviewers duly emitted
+    `**REVIEW_VERDICT: request-changes**` — a complete review the parser
+    rejected. PR #1347 made the parser tolerant; this is the other half, at
+    the source. The negative example is the part that actually stops the
+    drift, so assert it is present verbatim.
+    """
+    briefing = build_review_briefing(
+        pr_number=42,
+        pr_url=None,
+        repo_github="acme/api",
+        repo_name="api",
+        issue_number=7,
+        issue_title="Fix login",
+        issue_body="",
+        branch="issue-7",
+        worker_machine="laptop",
+        same_as_worker=False,
+        reviews_cfg=ReviewsConfig(enabled=True),
+        repo_claude_md=None,
+    )
+    assert "`**REVIEW_VERDICT: request-changes**` is WRONG" in briefing
+    assert "no `**bold**`" in briefing
+    # The BODY must stay explicitly Markdown-friendly — the constraint is on
+    # the marker lines only, and over-reading it would cost review quality.
+    assert "may be Markdown" in briefing
+
+
 # ── parse_review_from_log ───────────────────────────────────────────────────
 
 
