@@ -413,3 +413,235 @@ class TestDbRoundTrip:
         )
         assert ok2 is True
         assert len(prompt_calls) == 0  # no second prompt
+
+
+# ── #1349: point lookup instead of the full GET /board collection ─────────────
+#
+# Real incident: `read_board()` (GET /board, 4.4 MB, 0.7-1.2s to build on a
+# quiet daemon) was used to check ONE field on ONE row, against a 5s client
+# timeout — and a read failure was swallowed by a bare `except Exception:
+# pass`, indistinguishable from "board genuinely has no verdict". An operator
+# was re-prompted for a verdict 5s after `coord test --passed` had already
+# succeeded, and nothing in the logs explained why.
+#
+# These tests exercise the thin-client (point-lookup) branch directly by
+# patching `coord.board_service.resolve` to return a truthy service — the
+# local-DB branch (board_service unset) is already covered above.
+
+
+class _FakeSvc:
+    """Placeholder ServiceConfig. Its attributes are never read — these tests
+    monkeypatch `fetch_assignment`/`fetch_board_payload` directly instead of
+    performing real HTTP calls."""
+
+    url = "http://daemon:7435"
+    token = None
+
+
+def _patch_thin_client(monkeypatch, *, fetch_assignment=None, fetch_board_payload=None):
+    """Route the idempotency gate through its thin-client branch."""
+    monkeypatch.setattr("coord.board_service.resolve", lambda: _FakeSvc())
+    if fetch_assignment is not None:
+        monkeypatch.setattr("coord.client.fetch_assignment", fetch_assignment)
+    if fetch_board_payload is not None:
+        monkeypatch.setattr("coord.client.fetch_board_payload", fetch_board_payload)
+
+
+def _fail_if_called(*_a, **_kw):
+    pytest.fail("fetch_board_payload must not be called — point lookup already answered")
+
+
+class TestPointLookupRegressionGuard:
+    """The gate must use GET /assignment/{id}, never the full GET /board
+    collection, whenever the point lookup itself succeeds (found or not) —
+    the collection is a compatibility fallback for a 404 ONLY."""
+
+    def test_already_recorded_no_full_board_fetch(self, monkeypatch) -> None:
+        _patch_thin_client(
+            monkeypatch,
+            fetch_assignment=lambda svc, aid, **kw: {"test_state": "passed"},
+            fetch_board_payload=_fail_if_called,
+        )
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+        monkeypatch.setattr(
+            "click.prompt",
+            lambda *a, **kw: pytest.fail("must not prompt — verdict already on the row"),
+        )
+
+        from coord.commands.review import _prompt_and_relay_test_verdict
+
+        ok = _prompt_and_relay_test_verdict(
+            work_assignment_id="work-1349a",
+            smoke_assignment_id="smoke-1349a",
+            repo_name="claude-coordinator",
+            repo_github="JDonaghy/claude-coordinator",
+            issue_number=1349,
+            machine_name="precision",
+            verdict_cmd_hint="coord test --passed work-1349a",
+        )
+        assert ok is True
+
+    def test_row_found_empty_state_still_no_full_board_fetch(self, monkeypatch) -> None:
+        """Row IS found by the point endpoint but test_state is empty — this
+        is NOT the 404 case, so the collection fallback must not fire."""
+        _patch_thin_client(
+            monkeypatch,
+            fetch_assignment=lambda svc, aid, **kw: {"test_state": None},
+            fetch_board_payload=_fail_if_called,
+        )
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+        monkeypatch.setattr("click.prompt", lambda *a, **kw: "s")
+
+        from coord.commands.review import _prompt_and_relay_test_verdict
+
+        ok = _prompt_and_relay_test_verdict(
+            work_assignment_id="work-1349b",
+            smoke_assignment_id="smoke-1349b",
+            repo_name="claude-coordinator",
+            repo_github="JDonaghy/claude-coordinator",
+            issue_number=1349,
+            machine_name="precision",
+            verdict_cmd_hint="coord test --passed work-1349b",
+        )
+        assert ok is False  # operator skipped, but no crash / no stray fetch
+
+
+class TestFourOhFourCollectionFallback:
+    """A point-endpoint 404 (unknown id, or a pre-#1336 daemon) falls back to
+    the full collection payload exactly once — same compatibility shape as
+    `load_assignment_review_findings`."""
+
+    def test_404_falls_back_to_collection(self, monkeypatch) -> None:
+        payload = {
+            "assignments": [
+                {"assignment_id": "work-1349c", "test_state": "skipped"},
+            ]
+        }
+        _patch_thin_client(
+            monkeypatch,
+            fetch_assignment=lambda svc, aid, **kw: None,
+            fetch_board_payload=lambda svc, **kw: payload,
+        )
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+        monkeypatch.setattr(
+            "click.prompt",
+            lambda *a, **kw: pytest.fail("must not prompt — verdict found via fallback"),
+        )
+
+        from coord.commands.review import _prompt_and_relay_test_verdict
+
+        ok = _prompt_and_relay_test_verdict(
+            work_assignment_id="work-1349c",
+            smoke_assignment_id="smoke-1349c",
+            repo_name="claude-coordinator",
+            repo_github="JDonaghy/claude-coordinator",
+            issue_number=1349,
+            machine_name="precision",
+            verdict_cmd_hint="coord test --passed work-1349c",
+        )
+        assert ok is True
+
+
+class TestReadFailureDistinctFromNoVerdict:
+    """A read failure (timeout/transport) must be (a) logged, (b) surfaced to
+    the operator with wording textually distinct from "no verdict recorded",
+    and (c) must NOT block the operator's subsequent answer from reaching
+    `record_test_verdict` — re-prompting after a failed read is safe (the
+    write is idempotent); staying silent about *why* is the bug (#1349)."""
+
+    def test_timeout_warns_distinctly_and_still_prompts(self, monkeypatch, caplog) -> None:
+        import logging
+
+        caplog.set_level(logging.WARNING)
+
+        def _boom(*_a, **_kw):
+            raise TimeoutError("board read timed out")
+
+        _patch_thin_client(monkeypatch, fetch_assignment=_boom)
+        monkeypatch.setattr(
+            "coord.client.fetch_board_payload",
+            lambda *a, **k: pytest.fail(
+                "404 fallback must not fire on a raised exception"
+            ),
+        )
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+        monkeypatch.setattr("click.prompt", lambda *a, **kw: "p")
+
+        echoed: list = []
+        monkeypatch.setattr(
+            "click.echo", lambda msg="", **kw: echoed.append(str(msg))
+        )
+
+        captured: dict = {}
+        monkeypatch.setattr(
+            "coord.state.record_test_verdict", lambda **kw: captured.update(kw)
+        )
+
+        from coord.commands.review import _prompt_and_relay_test_verdict
+
+        ok = _prompt_and_relay_test_verdict(
+            work_assignment_id="work-1349d",
+            smoke_assignment_id="smoke-1349d",
+            repo_name="claude-coordinator",
+            repo_github="JDonaghy/claude-coordinator",
+            issue_number=1349,
+            machine_name="precision",
+            verdict_cmd_hint="coord test --passed work-1349d",
+        )
+
+        # (c) the operator's answer still reaches record_test_verdict.
+        assert ok is True
+        assert captured.get("test_state") == "passed"
+        assert captured.get("assignment_id") == "work-1349d"
+
+        # (a) logged, not swallowed.
+        assert any(
+            "test-verdict idempotency gate" in rec.message
+            and "work-1349d" in rec.message
+            for rec in caplog.records
+        ), f"no warning logged; records={[r.message for r in caplog.records]}"
+
+        # (b) operator-visible and textually distinct from "no verdict
+        # recorded" wording — must say the READ failed, not that the agent
+        # never reported.
+        read_failure_msgs = [m for m in echoed if "could not read the board" in m]
+        assert read_failure_msgs, f"no read-failure warning printed: {echoed}"
+        assert not any("no test verdict recorded" in m for m in read_failure_msgs)
+
+    def test_timeout_headless_prints_both_distinct_messages(self, monkeypatch) -> None:
+        """Non-TTY + read failure: the read-failure warning AND the generic
+        no-verdict hint are both printed (headless has no prompt to fall back
+        to), and they remain textually distinct."""
+
+        def _boom(*_a, **_kw):
+            raise TimeoutError("board read timed out")
+
+        _patch_thin_client(monkeypatch, fetch_assignment=_boom)
+        monkeypatch.setattr(
+            "coord.client.fetch_board_payload",
+            lambda *a, **k: pytest.fail(
+                "404 fallback must not fire on a raised exception"
+            ),
+        )
+        monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+        echoed: list = []
+        monkeypatch.setattr(
+            "click.echo", lambda msg="", **kw: echoed.append(str(msg))
+        )
+
+        from coord.commands.review import _prompt_and_relay_test_verdict
+
+        ok = _prompt_and_relay_test_verdict(
+            work_assignment_id="work-1349e",
+            smoke_assignment_id="smoke-1349e",
+            repo_name="claude-coordinator",
+            repo_github="JDonaghy/claude-coordinator",
+            issue_number=1349,
+            machine_name="precision",
+            verdict_cmd_hint="coord test --passed work-1349e",
+        )
+
+        assert ok is False
+        assert any("could not read the board" in m for m in echoed)
+        assert any("no test verdict recorded" in m for m in echoed)
