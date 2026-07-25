@@ -87,6 +87,14 @@ ADVISORY = "advisory"
 # The briefing instructs the worker to exit non-zero on any failure, so
 # exit_code==0 unambiguously means the fix landed — marking it advisory
 # would block the auto re-enqueue and inflate the retry cap.
+#
+# Also used (#1323, revised #1357) to gate which assignment types get a
+# `stash_unmatched_globs` diagnostic recorded when an artifact_paths glob
+# misses — review/smoke/test/merge/conflict-fix routinely finish DONE
+# without (re)producing every configured glob, so the diagnostic is only
+# meaningful for "work" assignments.  Note that gate no longer affects
+# `status` for the stash case (see `AgentServer._reap`) — only for the
+# zero-commit case above.
 _ADVISORY_TYPES = ("work",)
 
 # Maximum number of terminal (done/failed/cancelled) assignments retained in
@@ -1636,11 +1644,28 @@ class AgentAssignment:
     claude_session_id: str | None = None
     # #448: advisory reason when the worker exited cleanly (exit_code==0) but
     # pushed 0 commits.  None on all other status values.
-    # #1323: also reused (for "work"-type assignments only, see
-    # _ADVISORY_TYPES) to hold a stash-advisory reason when a configured
-    # artifact_paths glob matched 0 files — so this is an opaque "why this
-    # assignment is ADVISORY" string, not always about commit count.
+    #
+    # #1323 used to *also* reuse this field (for "work"-type assignments,
+    # see _ADVISORY_TYPES) to hold a reason when a configured artifact_paths
+    # glob matched 0 files, downgrading DONE -> ADVISORY in the process.
+    # That was reverted by #1357: most work in a repo is unrelated to any
+    # one artifact_paths glob (e.g. claude-coordinator's only glob is a Rust
+    # `tui/` binary, which every Python-only change is guaranteed to miss),
+    # so a glob miss is not evidence the assignment failed — it false-failed
+    # the overwhelming majority of headless work in this repo. `stash_
+    # unmatched_globs` below is the diagnostic-only replacement; this field
+    # is once again *only* about commit count.
     zero_commit_reason: str | None = None
+    # #1357 (revert of the #1323 downgrade): diagnostic-only note recording
+    # which configured artifact_paths glob(s) matched 0 files for a "work"
+    # assignment's stash. Deliberately kept separate from zero_commit_reason
+    # — a stash miss is not a commit count, and conflating the two on a
+    # single opaque string is what made a healthy, pushed, exit-0 assignment
+    # land on the board as a false Red failure. Setting this field NEVER
+    # changes `status`; it exists purely so a human (or `coord pull-artifact`
+    # /the Test stage) can see "no stashed artifact for this glob, rebuild
+    # from source" without having to dig through the raw worker log.
+    stash_unmatched_globs: list[str] | None = None
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -2508,7 +2533,8 @@ class AgentServer:
         worker itself used during development.
 
         Returns a (possibly empty) list of glob patterns that matched 0 files
-        on disk so the caller can surface per-glob advisory messages (#1323).
+        on disk so the caller can record a per-glob diagnostic (#1323,
+        diagnostic-only as of #1357 — it no longer affects `status`).
         """
         if assignment.status != DONE:
             return []
@@ -4466,42 +4492,52 @@ class AgentServer:
         # #305: stash artifacts BEFORE removing the worktree so the compiled
         # outputs survive cleanup.  Only runs for DONE assignments (workers
         # that exited cleanly) with configured artifact_paths for this repo.
-        # #1323: capture unmatched globs so we can emit a per-glob advisory.
+        # #1323/#1357: capture unmatched globs so we can record a per-glob
+        # diagnostic (see below — it no longer changes status, see #1357).
         _stash_unmatched: list[str] = []
         if assignment is not None:
             _stash_unmatched = self._stash_artifacts(assignment)
 
-        # #1323: if any artifact glob matched 0 files AND the assignment is
-        # still DONE (not already advisory for another reason), downgrade to
-        # ADVISORY with a reason that names the specific unmatched glob(s).
-        # This reuses the same zero-commit advisory mechanism: update the
-        # assignment under the lock, then re-persist so the status is durable.
-        # Gated on _ADVISORY_TYPES (same as the zero-commit check above) so
-        # review/smoke/test/merge/conflict-fix workers — which routinely
-        # finish DONE without (re)producing every configured artifact_paths
-        # glob — are never falsely flagged as advisory.
+        # #1357 (revert of the #1323 downgrade): a configured artifact_paths
+        # glob matching 0 files is NOT evidence the work is bad. Most work in
+        # this repo is unrelated to any single glob — e.g. claude-coordinator's
+        # only glob is the Rust `tui/target/debug/coord-tui` binary, which
+        # every Python-only change is guaranteed to miss — so #1323's blanket
+        # DONE -> ADVISORY downgrade false-failed the overwhelming majority of
+        # headless work assignments in this repo (real commits, exit 0,
+        # pushed branch, all reported Red).
+        #
+        # Record the unmatched glob(s) as a diagnostic ONLY: it never mutates
+        # `status` or `zero_commit_reason` (a stash miss is not a commit
+        # count). `coord pull-artifact`'s 404 path already has its own
+        # ground-truth reason (`artifact_absence_reason`); this field just
+        # lets a human — or a future Test-stage message — say "no stashed
+        # artifact for this glob, rebuilding from source" without digging
+        # through the raw worker log. Still gated on _ADVISORY_TYPES so
+        # review/smoke/test/merge/conflict-fix assignments, which routinely
+        # finish DONE without reproducing every glob, don't get a spurious
+        # diagnostic either.
         if (
             _stash_unmatched
             and assignment is not None
             and assignment.spec.type in _ADVISORY_TYPES
         ):
             _missed_str = ", ".join(repr(g) for g in _stash_unmatched)
-            _stash_advisory_reason = (
+            _stash_diag_reason = (
                 f"stash: 0 files matched "
                 + (repr(_stash_unmatched[0]) if len(_stash_unmatched) == 1
                    else f"{len(_stash_unmatched)} glob(s): {_missed_str}")
             )
             with self._lock:
                 _sa = self._assignments.get(assignment_id)
-                if _sa is not None and _sa.status == DONE:
-                    _sa.status = ADVISORY
-                    _sa.zero_commit_reason = _stash_advisory_reason
+                if _sa is not None:
+                    _sa.stash_unmatched_globs = list(_stash_unmatched)
             self._persist()
             try:
                 with open(assignment.log_path, "a") as _lf:
                     _lf.write(
-                        f"# reap: advisory — {_stash_advisory_reason}; "
-                        "status set to advisory\n"
+                        f"# reap: stash diagnostic — {_stash_diag_reason}; "
+                        "status left unchanged (see #1357)\n"
                     )
             except (OSError, AttributeError):
                 pass

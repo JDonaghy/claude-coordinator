@@ -2775,20 +2775,24 @@ def test_stash_artifacts_build_command_logged_on_failure(tmp_path: Path) -> None
     assert "exit=42" in log_text
 
 
-def test_reap_worker_advisory_on_stash_miss(tmp_path: Path) -> None:
-    """Assignment transitions to ADVISORY when a stash glob matched 0 files (#1323).
+def test_reap_worker_stash_miss_stays_done_with_diagnostic(tmp_path: Path) -> None:
+    """A stash glob matching 0 files records a diagnostic but stays DONE (#1357).
 
-    Mirrors the zero-commit advisory: if any configured artifact glob resolves
-    to nothing after the worker exits, the assignment status is downgraded from
-    DONE to ADVISORY with a reason naming the unmatched glob(s) so the TUI and
-    coord notify can surface the miss.
+    #1323 downgraded DONE -> ADVISORY here, which false-failed the
+    overwhelming majority of headless work assignments in a repo whose only
+    artifact glob is unrelated to most changes (the motivating case:
+    claude-coordinator's sole glob is a Rust `tui/` binary that Python-only
+    work can never produce). #1357 reverts the status change: the assignment
+    stays DONE, `zero_commit_reason` stays None (a stash miss is not a commit
+    count), and the miss is recorded on the separate, diagnostic-only
+    `stash_unmatched_globs` field instead.
 
     This drives the real `_reap` path via `assign()`/`wait_for()` (rather than
-    re-implementing the downgrade inline) so a regression in `_reap`'s actual
+    re-implementing the logic inline) so a regression in `_reap`'s actual
     logic would be caught here.  The worker makes an empty commit so it clears
     the *separate* zero-commit advisory check first — isolating this test to
     the stash-miss path specifically.  `type` defaults to "work", which is in
-    `_ADVISORY_TYPES`, so the downgrade applies.
+    `_ADVISORY_TYPES`, so the diagnostic is recorded.
     """
     repo = _init_repo(tmp_path / "repo")
     server = _server(
@@ -2801,18 +2805,21 @@ def test_reap_worker_advisory_on_stash_miss(tmp_path: Path) -> None:
     a = server.assign(_spec(repo))
     final = server.wait_for(a.id, timeout=10)
 
-    assert final.status == ADVISORY
-    assert "missing-gui" in (final.zero_commit_reason or "")
+    assert final.status == DONE
+    assert final.zero_commit_reason is None
+    assert final.stash_unmatched_globs is not None
+    assert any("missing-gui" in g for g in final.stash_unmatched_globs)
     server.shutdown()
 
 
-def test_reap_review_type_not_downgraded_on_stash_miss(tmp_path: Path) -> None:
-    """A type="review" assignment must NOT be downgraded on a stash-glob miss (#1323 review finding #1).
+def test_reap_review_type_gets_no_stash_diagnostic(tmp_path: Path) -> None:
+    """A type="review" assignment gets no stash diagnostic on a glob miss (#1323 review finding #1).
 
     review/smoke/test/merge/conflict-fix assignments routinely finish DONE
     without (re)producing every configured artifact_paths glob (e.g. a review
     session that never runs a full build).  Only "work" assignments (in
-    _ADVISORY_TYPES) should be downgraded to ADVISORY on a stash miss.
+    _ADVISORY_TYPES) get the `stash_unmatched_globs` diagnostic recorded —
+    and per #1357, no assignment type ever has its status changed for this.
     """
     repo = _init_repo(tmp_path / "repo")
     server = _server(
@@ -2827,6 +2834,7 @@ def test_reap_review_type_not_downgraded_on_stash_miss(tmp_path: Path) -> None:
 
     assert final.status == DONE
     assert final.zero_commit_reason is None
+    assert final.stash_unmatched_globs is None
     server.shutdown()
 
 
