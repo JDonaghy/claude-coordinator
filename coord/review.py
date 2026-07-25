@@ -879,6 +879,25 @@ def build_review_briefing(
     lines.append("```")
     lines.append("")
     lines.append("Use `REVIEW_VERDICT: request-changes` if changes are needed.")
+    # #1346: the three marker lines are a machine contract, not prose. The
+    # surrounding briefing is Markdown and the body placeholder invites
+    # Markdown, so reviewers have emitted `**REVIEW_VERDICT: request-changes**`
+    # — which the parser rejected outright, silently dropping a complete
+    # review. State the constraint and show the failing string; a negative
+    # example is what actually stops the drift.
+    lines.append("")
+    lines.append(
+        "FORMAT CONTRACT — the three marker lines "
+        "(`REVIEW_VERDICT:`, `REVIEW_BODY:`, `END_REVIEW`) are parsed by "
+        "machine. Each must start at the beginning of its own line as "
+        "literal plain text, with NO Markdown decoration: no `**bold**`, no "
+        "backticks, no `#` heading marks, no list bullet. "
+        "`**REVIEW_VERDICT: request-changes**` is WRONG. "
+        "`REVIEW_VERDICT: request-changes` is right. The review BODY between "
+        "the markers may be Markdown — the marker lines may not. Before you "
+        "finish, re-read your last message and confirm the verdict line "
+        "begins with `REVIEW_VERDICT:` and nothing precedes it."
+    )
 
     return "\n".join(lines)
 

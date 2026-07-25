@@ -48,6 +48,43 @@ def _echo_artifact_stash(fr: object) -> None:
         click.echo(f"  stashed {n} artifact(s)")
 
 
+def _smoke_report_reminder(*, assignment_id: str, smoke_of: str) -> str:
+    """The reporting contract prepended to an interactive smoke briefing (#1349).
+
+    Recording the verdict is the ONE artifact this session exists to produce,
+    and — unlike a review, which emits a transcript-recoverable
+    ``REVIEW_VERDICT`` block (#606/#651) — a test verdict has NO
+    PATH-independent fallback channel. If ``coord test`` never runs, or runs
+    and fails, the verdict is simply lost and the operator is re-prompted on
+    exit for something the agent was dispatched to do. So the contract is
+    stated as a terminal obligation, and the agent is required to CONFIRM the
+    command succeeded rather than assume it did.
+
+    Extracted to module scope so the contract is unit-testable — the briefing
+    text IS the product here, and a silent edit that drops the obligation is
+    exactly the drift this session is trying to stop.
+    """
+    return (
+        f"[Coordinator smoke assignment {assignment_id}] HUMAN-ATTENDED "
+        "interactive smoke test.\n"
+        "  REQUIRED terminal step — do this BEFORE you finish, every time, "
+        "even if the session was short or the operator seems done:\n"
+        f"    coord test --passed {smoke_of}\n"
+        f"    coord test --fail {smoke_of} --reason \"<full failure brief>\"\n"
+        "  Run exactly one of them once the operator has a clear position. "
+        "Then CHECK THE OUTPUT: the command prints a confirmation. If it "
+        "errored, or `coord` is not on your PATH, say so plainly to the "
+        "operator and print the exact command for them to run — do NOT report "
+        "the verdict as recorded when you have not seen it confirmed. There "
+        "is no automatic recovery for a test verdict: if this command does "
+        "not run, the verdict is lost and the operator has to re-enter it by "
+        "hand.\n"
+        f"  Then run `coord report-result --assignment {assignment_id} "
+        "--status done --summary <one-line summary>` so this session's row "
+        "closes.\n\n"
+    )
+
+
 def _dispatch_review_of(
     *,
     machine: str,
@@ -221,6 +258,11 @@ def _dispatch_review_of(
         "blocking item, with file:line) in REVIEW_BODY. This is the "
         "REQUIRED, PATH-independent step — it is recovered from your "
         "session transcript even if nothing else below runs.\n"
+        "     The three marker lines are parsed by machine: emit each at "
+        "the start of its own line as literal plain text, with NO Markdown "
+        "decoration. `**REVIEW_VERDICT: request-changes**` is WRONG and is "
+        "silently dropped (#1346); `REVIEW_VERDICT: request-changes` is "
+        "right. The body between the markers may be Markdown.\n"
         "  2. OPTIONALLY, if `coord` is on your PATH, you can ALSO write "
         f"those same findings to a file (e.g. /tmp/review-{assignment_id}.md) "
         "and run:\n"
@@ -697,13 +739,8 @@ def _dispatch_smoke_of(
         f"{smoke_of} --reason \"...\"`.\n"
     )
 
-    report_reminder = (
-        f"[Coordinator smoke assignment {assignment_id}] HUMAN-ATTENDED "
-        "interactive smoke test. Record the operator's verdict with "
-        f"`coord test --passed {smoke_of}` or `coord test --fail "
-        f"{smoke_of} --reason \"...\"`. When you exit, also run "
-        f"`coord report-result --assignment {assignment_id} --status done "
-        "--summary <one-line summary>` so this session's row closes.\n\n"
+    report_reminder = _smoke_report_reminder(
+        assignment_id=assignment_id, smoke_of=smoke_of
     )
     effective_briefing = _issue_ctx + report_reminder + smoke_briefing
 
