@@ -1085,22 +1085,36 @@ def plan(
             base_status = _state_to_plan_status(entry.state)
             reason: str | None = None
 
+            ci_summary = None
             if entry.state == PENDING:
                 base_status, reason = _entry_gate_status(
                     entry, board, config, ci_store, gh_ops
                 )
 
-            # #1344: structured CI rollup for the TUI's badges — computed for
-            # any queue entry with an open PR (not just PENDING ones being
-            # gate-checked), so a MERGING/MERGED row's last-known CI state
-            # still renders. `list_checks_for_pr` on the request-scoped
-            # `GateSnapshot` is a dict lookup, not a `gh` call, so this never
-            # violates the zero-I/O `/board` read path.
-            ci_summary = None
-            if ci_store is not None and ci_store.is_available and entry.pr_number:
-                checks = ci_store.list_checks_for_pr(entry.repo_github, entry.pr_number)
-                if checks:
-                    ci_summary = summarize_counts(checks)
+                # #1344: structured CI rollup for the TUI's badges. Deliberately
+                # scoped to PENDING entries only — the same scope as the gate
+                # check above — because `ci_store` is not always the cheap,
+                # tick-refreshed `GateSnapshot` (a dict lookup). Two other
+                # callers pass a freshly-built *live* `CiStore`
+                # (`ci_github.GitHubCi`) instead: `_auto_drain_tick`
+                # (serve_app.py, every ~30s when `merge.auto_drain` is on) and
+                # `coord merge --plan` (commands/merge.py). `merge_queue`
+                # never prunes MERGED entries (see
+                # `prune_stale_queue_entries`), so on a long-lived project the
+                # queue table accumulates unbounded merged history — widening
+                # this to "any entry with a pr_number" would fire one live
+                # `gh pr checks` subprocess per historical merged PR on every
+                # auto-drain tick, reintroducing the exact unbounded-`gh`-
+                # polling failure class #1344 removed from the TUI, just
+                # relocated to the daemon. It also wouldn't gain anything on
+                # the safe /board path: `GateSnapshotRefresher.refresh` itself
+                # only ever populates checks for entries that are PENDING at
+                # refresh time, so a MERGING/MERGED row never had real
+                # snapshot data to render in the first place.
+                if ci_store is not None and ci_store.is_available and entry.pr_number:
+                    checks = ci_store.list_checks_for_pr(entry.repo_github, entry.pr_number)
+                    if checks:
+                        ci_summary = summarize_counts(checks)
 
             result.append(PlannedMerge(
                 assignment_id=entry.assignment_id,
