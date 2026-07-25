@@ -5,6 +5,7 @@ coord/cli.py (#747)."""
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 
@@ -12,6 +13,8 @@ import click
 
 
 from coord.commands._common import _CONFIG_OPTION, _load_config
+
+log = logging.getLogger(__name__)
 
 
 def _collect_review_body_via_editor(
@@ -120,8 +123,25 @@ def _prompt_and_relay_review_verdict(
         _cached = load_assignment_review_findings(assignment_id)
         if _cached is not None:
             _pre_verdict, _pre_body = _cached
-    except Exception:  # noqa: BLE001 — DB unavailable → fall through
-        pass
+    except Exception as exc:  # noqa: BLE001 — #1349: log + surface, don't swallow
+        # A *read* failure (timeout/transport/auth) is NOT the same outcome as
+        # "board genuinely has no verdict yet" — collapsing the two here would
+        # reproduce the #1349 incident (a read failure silently masquerading as
+        # "the agent never reported", re-prompting the operator with zero
+        # evidence of which happened). Falling through to Step 2 / the prompt
+        # below is still fine — the eventual write is idempotent — but it must
+        # not happen silently.
+        log.warning(
+            "review-verdict board-content gate: could not read cached verdict/"
+            "findings for assignment %s: %s", assignment_id, exc,
+        )
+        click.echo(
+            f"  warning: could not read the board for a cached review verdict "
+            f"on {assignment_id}: {exc}\n"
+            "  This does NOT mean no verdict was captured — the read itself "
+            "failed. Falling back to the prompt below.",
+            err=True,
+        )
 
     # ── Step 2: remote transcript-floor (#877) ──────────────────────────────
     # When board is empty and ssh_target is known, re-run the transcript-floor
@@ -305,6 +325,17 @@ def _prompt_and_relay_test_verdict(
     function prints a confirmation and returns True immediately — no
     double-prompt.
 
+    **#1349 point lookup**: the idempotency read is a single field off a
+    single row, so it uses ``GET /assignment/{id}`` (point endpoint, ~2.7 KB)
+    instead of the full ``GET /board`` collection (4.4 MB, 0.7-1.2s to build
+    against a 5s client timeout) — mirrors
+    :func:`coord.state.load_assignment_review_findings`'s point-lookup-first
+    shape, including its 404 compatibility fallback to the collection for a
+    pre-#1336 daemon.  A read *failure* here is logged and surfaced to the
+    operator distinctly from "no verdict recorded" — see the incident writeup
+    in #1349: silently falling through to the prompt on any exception erased
+    the evidence of what actually happened.
+
     Mirrors :func:`_prompt_and_relay_review_verdict` (which handles the REVIEW
     stage).  Same contract for headless callers: no-op + hint when stdin is
     not a TTY.
@@ -326,22 +357,82 @@ def _prompt_and_relay_test_verdict(
         f"[smoke={smoke_assignment_id}]"
     )
 
-    # ── Idempotency gate ──────────────────────────────────────────────────────
-    # Read the WORK row (not the smoke session) from the board.  If it already
-    # has test_state set the agent self-reported — do nothing.
+    # ── Idempotency gate (#1349) ────────────────────────────────────────────
+    # Read the WORK row (not the smoke session) and check test_state.  If it
+    # already has test_state set the agent self-reported — do nothing.
+    #
+    # Point lookup first (#1349): a thin client hits GET /assignment/{id}
+    # instead of paying for the full GET /board collection just to read one
+    # field off one row — see load_assignment_review_findings for the model
+    # this mirrors, including the 404 compatibility fallback for a
+    # pre-#1336 daemon.  On the daemon host itself (no board_service
+    # configured) the local DB is canonical and this isn't an HTTP round
+    # trip at all, so the pre-existing local Board lookup is unchanged.
+    #
+    # A *read* failure must stay distinguishable from "board says no verdict"
+    # — the old code was `except Exception: pass`, which turned a timeout /
+    # transport / auth failure into the exact same outcome as "genuinely no
+    # verdict yet", silently re-prompting the operator with zero evidence of
+    # which happened. That is why the incident that motivated this fix
+    # (operator re-typing a verdict 5s after `coord test --passed` had
+    # already succeeded) could not be diagnosed from the logs afterwards —
+    # the failure erased its own evidence. Re-prompting after a read failure
+    # is still fine and safe (the write is idempotent); being SILENT about
+    # it is the bug.
+    _test_state: str | None = None
+    _read_exc: Exception | None = None
     try:
-        from coord.board_service import read_board as _read_board_tv  # noqa: PLC0415
+        from coord.board_service import resolve as _resolve_board_service  # noqa: PLC0415
 
-        _board = _read_board_tv()
-        _work = _board.find_by_id(work_assignment_id)
-        if _work is not None and (_work.test_state or "").strip():
-            click.echo(
-                f"  test verdict already recorded: {_work.test_state!r} for "
-                f"{_ctx} (agent used `coord test` — no operator prompt needed)"
-            )
-            return True
-    except Exception:  # noqa: BLE001 — board unavailable → fall through to prompt
-        pass
+        _svc = _resolve_board_service()
+        if _svc is not None:
+            from coord.client import fetch_assignment, fetch_board_payload  # noqa: PLC0415
+
+            _row = fetch_assignment(_svc, work_assignment_id)
+            if _row is None:
+                # 404: unknown id, or a pre-#1336 daemon (an unmatched route
+                # is also a 404) — one compatibility pass through the
+                # collection payload, exactly like load_assignment_review_findings.
+                _payload = fetch_board_payload(_svc)
+                _row = next(
+                    (
+                        a
+                        for a in _payload.get("assignments", [])
+                        if a.get("assignment_id") == work_assignment_id
+                    ),
+                    None,
+                )
+            if _row is not None:
+                _test_state = (_row.get("test_state") or "").strip() or None
+        else:
+            from coord.board_service import read_board as _read_board_tv  # noqa: PLC0415
+
+            _work = _read_board_tv().find_by_id(work_assignment_id)
+            if _work is not None:
+                _test_state = (_work.test_state or "").strip() or None
+    except Exception as exc:  # noqa: BLE001 — #1349: log + surface, never swallow
+        _read_exc = exc
+        log.warning(
+            "test-verdict idempotency gate: could not read assignment %s "
+            "from the board: %s", work_assignment_id, exc,
+        )
+
+    if _test_state:
+        click.echo(
+            f"  test verdict already recorded: {_test_state!r} for "
+            f"{_ctx} (agent used `coord test` — no operator prompt needed)"
+        )
+        return True
+
+    if _read_exc is not None:
+        click.echo(
+            "  warning: could not read the board to check for an existing "
+            f"test verdict for {_ctx}: {_read_exc}\n"
+            "  This does NOT mean the agent failed to report — the read "
+            "itself failed. Falling back to the prompt below; re-answering "
+            "is safe (the write is idempotent).",
+            err=True,
+        )
 
     # ── Non-TTY path ──────────────────────────────────────────────────────────
     if not sys.stdin.isatty():
