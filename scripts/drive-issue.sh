@@ -48,7 +48,6 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE_TOOL="$HERE/coord_issue_state.py"
 TEST_RUNNER="$HERE/coord-test-runner.sh"
-REVIEW_TOOL="$HERE/coord_dispatch_review.py"
 
 # ── defaults ─────────────────────────────────────────────────────────────────
 
@@ -669,7 +668,7 @@ while true; do
                 fi
                 REVIEW_DISPATCHES=$(( REVIEW_DISPATCHES + 1 ))
                 log "REVIEW: requesting explicitly (interactive work, #555)"
-                "$REVIEW_TOOL" "$WORK_AID" 2>&1 | tee -a "$RUN_LOG" || \
+                coord review "$WORK_AID" 2>&1 | tee -a "$RUN_LOG" || \
                     die "explicit review dispatch failed for $WORK_AID"
             fi
             sleep "$POLL"; continue
