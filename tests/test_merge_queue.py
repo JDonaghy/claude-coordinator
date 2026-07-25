@@ -2815,6 +2815,42 @@ class TestPlan:
         assert plan[0].pr_number is None
         assert plan[0].ci_summary is None
 
+    def test_ci_summary_not_fetched_for_merged_entries(self, coord_db) -> None:
+        """Review fix (#1344): `plan()` must not call `list_checks_for_pr` for
+        non-PENDING entries when handed a *live* `CiStore` — the callers that
+        pass one (`_auto_drain_tick`'s auto-drain and `coord merge --plan`,
+        as opposed to the daemon's snapshot-backed `/board` read) would
+        otherwise shell out to `gh pr checks` once per historical MERGED
+        entry in the queue on every call, since `merge_queue` never prunes
+        MERGED rows. Scoping the CI-summary computation to PENDING entries
+        (matching `_entry_gate_status`'s own scope) prevents that."""
+        from types import SimpleNamespace
+
+        calls: list[tuple[str, int]] = []
+
+        class FakeCi:
+            is_available = True
+
+            def list_checks_for_pr(self, repo, number):
+                calls.append((repo, number))
+                return [SimpleNamespace(name="build", status="completed", conclusion="success")]
+
+        items = [
+            _q("w1", size=50, pr=101, state=MERGED),
+            _q("w2", size=50, pr=102, state=MERGING),
+        ]
+        save_queue(items)
+        board = self._board(completed=[
+            self._work("w1", test_state="passed"),
+            self._review("w1", verdict="approve"),
+            self._work("w2", test_state="passed"),
+            self._review("w2", verdict="approve"),
+        ])
+        cfg = self._config()
+        plan = mq.plan(board, cfg, ci_store=FakeCi())
+        assert calls == []
+        assert all(pm.ci_summary is None for pm in plan)
+
     def test_ci_not_checked_without_pr_number(self, coord_db) -> None:
         """An entry with no PR yet opened is not blocked on CI."""
         from types import SimpleNamespace
