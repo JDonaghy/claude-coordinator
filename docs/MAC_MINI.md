@@ -119,6 +119,68 @@ Order matters loosely; the coord agent goes last.
    the macOS suites to it via `smoke_tests.capability_rules` (#1159 / CP-4 adds the `os:*`
    capability convention and the CI matrix).
 
+## What non-macOS work to route there
+
+The mac is not a single-purpose macOS box. Most of the fleet's work is platform-agnostic and can
+route to it — and **it is useful before milestone #39 lands**, which is not obvious from
+[`CROSS_PLATFORM.md`](CROSS_PLATFORM.md) alone.
+
+**Two findings that establish this (verified 2026-07-25):**
+
+1. **`coord/` contains zero Linux-isms.** No `systemctl`, `/proc/`, `readlink -f`, `apt-get`, or
+   `DISPLAY`/`Xvfb` references, and **no `sys.platform` / `platform.system()` branches at all**. The
+   package is written POSIX-generic.
+2. **macOS is already an intended agent platform.** `coord/interactive.py`'s module docstring states
+   the POSIX imports are guarded because "the stdlib `pty` / `termios` / `fcntl` modules are not
+   present on Windows, but agent machines are **Linux/macOS only**." All three modules exist on
+   macOS — so **CP-1 (#1156) is a Windows concern, not a mac blocker.**
+
+### Routes cleanly
+
+| Work | Why |
+|---|---|
+| **coord-tui / quadraui TUI-side Rust** | `TuiDriver` renders to ratatui's `TestBackend` — no TTY, no display, fully portable |
+| **Reviews** | `claude -p` + `gh pr diff`; zero platform surface |
+| **`claude-coordinator` Python** | portable in principle (finding 1) — but unverified in practice, see below |
+| **webapp (React / Vite / vitest)** | portable; Playwright too, once a `browser` capability is staged |
+
+The tui case is where the mac relieves a *current* bottleneck rather than just adding a body.
+`coordinator.yml` annotates dellserver `NOTE 4 cores: fine for the Python suite, poor for tui/**
+cargo builds`, and records that the fleet "was deadlocking at two concurrent claude-coordinator
+items with only precision + elitebook." An M4 is a strong cargo machine and lands directly on that
+constraint.
+
+### Does not route there
+
+**vimcode GTK4 work.** GTK4-on-quartz builds via Homebrew but behaves differently enough that a
+`gtk` capability on the mac would be a lie for anything visual. Keep GTK work on precision /
+elitebook until macOS GTK is a deliberate target.
+
+### Two caveats
+
+- **Portable-in-principle is not verified.** The coord pytest suite has never run on macOS. Finding
+  1 covers the *source*; tests are where environment leaks in (BSD vs GNU userland in anything that
+  shells out, tmux/ssh behaviour, path assumptions). Run the suite by hand before trusting dispatch.
+- **CI is Linux-only until CP-4 (#1159).** Mac-developed work can pass locally and fail CI, or the
+  reverse. That cost is real — but it cuts both ways: routing genuine work to the mac is the
+  cheapest continuous de-risking of milestone #39, surfacing portability bugs incrementally instead
+  of all at once when the mac milestone is finally picked up.
+
+### Staging
+
+Mirror the discipline already recorded for elitebook's `browser` capability — it was verified
+locally *before* being added to the config. Start narrow:
+
+```yaml
+- name: macmini
+  capabilities: [rust, python]            # NOT gtk
+  repos: [claude-coordinator, quadraui]   # hold vimcode until GTK4-on-mac is deliberate
+```
+
+Then verify by hand (`pytest`; `cargo test` in `tui/`) and widen from there. Note the one real
+setup gap: **`coord agent` under launchd is CP-3 (#1158) and unbuilt** — until it lands, run the
+agent in a foreground/tmux session or hand-write a plist.
+
 ## Ongoing hygiene
 
 - Watch memory pressure before raising concurrency past 1.
