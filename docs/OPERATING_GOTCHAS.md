@@ -191,17 +191,46 @@ it on the same issue and it picks up from wherever the board actually is.
 Supporting files: `coord-test-runner.sh` (the Test gate) and
 `coord_issue_state.py` (read-only per-issue state oracle, ETag-cached).
 
+**The driver no longer runs the Test stage itself (#1426).** It observes
+`test_state` exactly as it already did for Review and Merge. The suite is
+dispatched as a real `type="smoke"` assignment by `dispatch_pending_smoke`,
+mirrored into `coord notify` so the timer drives it (not only `coord resume` —
+see section 7). That makes the stage board-visible and capability-routed, and
+is what allows a drive to run from a host with no checkout.
+
+Two config keys are load-bearing for that, both on the **daemon host's**
+`coordinator.yml` (see section 8 — editing the thin-client cache does nothing):
+
+- `smoke_tests.auto_queue: true` — defaults to **False**
+  (`coord/config.py:151`), and while false `dispatch_pending_smoke` returns
+  immediately. With the observer-only driver that means the Test gate has no
+  producer at all and a drive waits until its deadline.
+- the repo's `test_command` — for claude-coordinator this points at
+  `scripts/coord-test-runner.sh`, because the repo is two codebases and a bare
+  `pytest` or `cargo test` would run the wrong suite or miss half the diff.
+
+Note that enabling `auto_queue` also **back-fills**: any completed work row
+with no test verdict becomes eligible, so turning it on works through the
+existing backlog as capacity frees. Expect smoke assignments for issues you did
+not just start.
+
 Known limits, tracked under milestone #49 / epic #1406:
 
-- **The test runner is claude-coordinator-only.** It routes on `coord/*` and
-  `tui/*`; any other repo matches neither and the gate is recorded as
-  **`skipped`**, which satisfies both the review and merge gates. Driving a
-  `quadraui` or `vimcode` issue therefore merges untested code unless you pass
-  `--test-command`. See **#1408**.
-- **The Test stage is invisible in the TUI** — it runs locally with no board
-  row, so the Pipeline row drops to idle for minutes mid-run (#1395).
-- **Locks are per-machine.** Drivers on different hosts do not serialize their
-  merges (#1400).
 - Interactive (`provider_name="claude-pty"`) work **never** auto-dispatches a
   review (the #555 guard). The driver refuses at preflight; `--force-review`
   requests one explicitly, or use `coord review <aid>`.
+- **The failure path is still unproven.** Every drive so far has passed its
+  tests, so the `coord fix` loop on a genuine test failure has not run
+  end-to-end. This is the reason #1392 (port to `coord drive`) is deliberately
+  not dispatchable yet — porting now would port unexercised paths.
+- Flags must precede the positionals (`drive-issue.sh --machine precision
+  <repo> <issue>`); the parse loop `break`s at the first non-flag, so trailing
+  flags fail with a usage dump. Fixed by #1392's Click port.
+- **Never edit `drive-issue.sh` while a drive is running.** bash reads a script
+  lazily by byte offset, so an in-place edit shifts them under every live
+  interpreter and can corrupt a run mid-flight.
+
+Resolved since this list was first written: the runner's path routing now
+covers other repos and **refuses** rather than recording a false `skipped`
+(#1408); the Test stage is board-visible (#1395 `running` marker, then #1426);
+merges serialize fleet-wide rather than per-machine (#1400).
