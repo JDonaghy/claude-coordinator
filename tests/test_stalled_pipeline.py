@@ -504,3 +504,63 @@ class TestReachableFromNotify:
             notify_mod.run(config)
 
         mock_post_comment.assert_called_once()
+
+    def test_run_returns_stalled_as_fourth_tuple_element(
+        self, config: Config, coord_db
+    ) -> None:
+        """`run()` must return the stalled detections to its caller, not just
+        post a GitHub comment — the CLI (and any future board/TUI consumer)
+        can only surface what it's handed back. Regression guard for the
+        review finding that the sweep was invisible from `coord notify`'s own
+        output even though it fired."""
+        board = _vimcode_602_board()
+        state_mod.save_board(board)
+
+        with patch.object(
+            notify_mod, "_agent_status", return_value={"completed": [], "active": []}
+        ), patch("coord.notify.github_ops.post_issue_comment"):
+            posted, stuck, needs_attention, stalled = notify_mod.run(config)
+
+        assert posted == []
+        assert stuck == []
+        assert needs_attention == []
+        assert len(stalled) == 1
+        assert stalled[0].assignment_id == "work-602"
+        assert stalled[0].reason == "review_request_changes_no_fix"
+
+
+class TestNotifyCliSurfacesStalled:
+    """#1441 review finding: detection alone isn't "surfacing" — the issue's
+    explicit ask was CLI + board surfacing, mirroring how `detect_needs_
+    attention` results are echoed by `coord notify`'s own CLI command
+    (coord/commands/lifecycle.py). Drives the actual click command, not just
+    `notify.run()`, so a future refactor that stops threading the stalled
+    list through the CLI fails this test rather than shipping silently."""
+
+    def test_notify_command_echoes_stalled_detection(
+        self, config: Config, coord_db, capsys, monkeypatch
+    ) -> None:
+        from pathlib import Path
+
+        from coord.commands import lifecycle
+
+        board = _vimcode_602_board()
+        state_mod.save_board(board)
+
+        monkeypatch.setattr(lifecycle, "_load_config", lambda _p: config)
+
+        with patch.object(
+            notify_mod, "_agent_status", return_value={"completed": [], "active": []}
+        ), patch("coord.notify.github_ops.post_issue_comment"):
+            lifecycle.notify.callback(config_path=Path("unused"))
+
+        out = capsys.readouterr().out
+        assert "stalled-pipeline detection" in out
+        assert "[stalled:review_request_changes_no_fix]" in out
+        assert "vimcode #602" in out
+        assert "work-602" in out
+        # The "no new transitions" early-return guard must account for the
+        # stalled set too — a stalled-only pass must never print the
+        # misleading "nothing to do" message (the review's called-out
+        # failure scenario).
+        assert "No new transitions to notify." not in out
