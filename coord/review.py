@@ -107,6 +107,19 @@ _VERDICT_ALIASES: dict[str, str] = {
 # auto-record a verdict.  `END_REVIEW` remains the required terminator for a
 # legitimate strict parse.  Call it only AFTER the strict parse has already
 # returned `None` and the calling floor has confirmed attribution.
+#
+# #1348 round 3: `_parse_review_text` now also runs
+# `_decode_transcript_for_diagnostic` before matching `_REVIEW_BLOCK_RE` (see
+# below) — the NDJSON DECODE is shared between the strict parser and this
+# diagnostic, because a stream-json log's JSON-escaped newlines defeat
+# `[\r\n]+` regardless of which regex runs against it.  Sharing the decode is
+# NOT the same as wiring the diagnostic's loose marker detection
+# (`_REVIEW_MARKER_DETECT_RE`, which has no `END_REVIEW` requirement) into the
+# strict path — that restraint above is unchanged.  `_REVIEW_BLOCK_RE` and its
+# mandatory `END_REVIEW` terminator are exactly as strict as before; a
+# malformed block (e.g. bolded `**REVIEW_VERDICT:**`, the #1346 shape) still
+# fails `_parse_review_text` and must go through this diagnostic, same as
+# always.
 
 # Detect a REVIEW_VERDICT: line even when `_REVIEW_BLOCK_RE` cannot extract
 # a clean block.  Captures everything on the marker line so the verdict word
@@ -188,16 +201,28 @@ def _decode_transcript_for_diagnostic(text: str) -> str | None:
     first in the file, a plain ``.search()`` would find it before the real
     verdict emitted later by the assistant.
 
-    This decodes *text* the same way the strict parser does (:func:`parse_event`
-    / ``_assistant_text`` in :mod:`coord.worker_events`): only lines that
-    parse as a JSON object contribute anything at all, and only
-    ``"assistant"``-typed events contribute text — the non-JSON argv/header
-    comment line (and any ``"system"``/``"user"`` event that might otherwise
-    echo the system-prompt template back) is silently skipped, never
-    concatenated into the decoded text. Returns the assistant texts joined by
-    real ``"\\n"``, in emission order — or ``None`` when *text* contains no
-    NDJSON at all (e.g. an old-format plain-text log, or plain prose in a
-    test fixture), so the caller falls back to treating *text* as-is.
+    This decodes *text* using the same machinery as the strict parser
+    (:func:`parse_event` / ``_assistant_text`` in :mod:`coord.worker_events`):
+    only lines that parse as a JSON object contribute anything at all, and
+    only ``"assistant"``-typed events contribute text — the non-JSON
+    argv/header comment line (and any ``"system"``/``"user"`` event that
+    might otherwise echo the system-prompt template back) is silently
+    skipped, never concatenated into the decoded text. Returns the assistant
+    texts joined by real ``"\\n"``, in emission order — or ``None`` when
+    *text* contains no NDJSON at all (e.g. an old-format plain-text log, or
+    plain prose in a test fixture), so the caller falls back to treating
+    *text* as-is.
+
+    #1348 round 3: this is now shared by :func:`_parse_review_text` (the
+    STRICT parser) as well as :func:`detect_unparsed_review_marker` (the
+    loose diagnostic) — see the comment above `detect_unparsed_review_marker`
+    for why sharing the decode does not loosen the strict grammar.
+    `parse_review_from_log`'s ``is_stream_json`` branch already ran
+    individual lines through `parse_event`/`_assistant_text`, but its
+    plain-text fallback branch (taken whenever `is_stream_json`'s
+    first-non-comment-line heuristic misses, even on a log that IS valid
+    NDJSON) handed the strict regex raw, undecoded text — silently dropping
+    well-formed verdicts whose newlines were still JSON-escaped on disk.
     """
     from coord.worker_events import _assistant_text, parse_event  # noqa: PLC0415
 
@@ -418,8 +443,29 @@ def estimate_review_counts(
 
 
 def _parse_review_text(text: str) -> ReviewFindings | None:
-    """Extract the last ReviewFindings block from *text*, or None."""
-    matches = list(_REVIEW_BLOCK_RE.finditer(text))
+    """Extract the last ReviewFindings block from *text*, or None.
+
+    *text* is decoded via :func:`_decode_transcript_for_diagnostic` before
+    `_REVIEW_BLOCK_RE` runs (#1348 round 3): a `claude -p --output-format
+    stream-json` log stores every real newline inside the assistant's review
+    text as the literal two-character escape ``\\n`` on disk, which
+    `_REVIEW_BLOCK_RE`'s ``[\\r\\n]+`` can never match unless it's decoded
+    first — and `parse_review_from_log`'s plain-text fallback branch (taken
+    whenever `is_stream_json`'s first-non-comment-line heuristic misses, even
+    on a log that IS valid NDJSON) was handing this function raw, undecoded
+    text, silently dropping well-formed verdicts. Decoding also drops the
+    non-JSON `# argv=...` header line, whose embedded system-prompt template
+    would otherwise be a spurious match — hence `matches[-1]` (last match),
+    not `.search()`, same defense as `detect_unparsed_review_marker`. When
+    *text* isn't NDJSON at all (plain-text log, or an already-decoded single
+    assistant-message chunk from the stream-json per-event path below), the
+    decode is a no-op and *text* is matched as-is — this does NOT loosen the
+    grammar: `END_REVIEW` is still the mandatory terminator, and a malformed
+    block (e.g. bolded markers) still fails here exactly as before.
+    """
+    decoded = _decode_transcript_for_diagnostic(text)
+    search_text = text if decoded is None else decoded
+    matches = list(_REVIEW_BLOCK_RE.finditer(search_text))
     if not matches:
         return None
     m = matches[-1]

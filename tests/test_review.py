@@ -1760,6 +1760,79 @@ END_REVIEW
         assert result.verdict == "request-changes"
         assert "Bug at line 7" in result.body
 
+    def test_strict_parse_decodes_stream_json_when_heuristic_misses(
+        self, tmp_path: Path
+    ) -> None:
+        """#1348 round 3 regression, shaped after the real failing log
+        (``~/.coord/logs/efc198d6475a.log``).
+
+        Round 2 (a3f9454) fixed ``detect_unparsed_review_marker`` — the
+        DIAGNOSTIC — to decode NDJSON before matching. But that diagnostic
+        only ever runs after the STRICT parser (``parse_review_from_log`` /
+        ``_parse_review_text``) has already returned ``None``, and on the
+        real log the strict parser was the one dropping a perfectly
+        well-formed ``REVIEW_VERDICT: approve ... END_REVIEW`` block.
+
+        Root cause: a real reviewer log can carry a first physical line that
+        is neither blank, nor a ``#``-prefixed agent header, nor JSON (e.g.
+        CLI startup banner text) before the actual
+        ``--output-format stream-json`` NDJSON stream begins.
+        ``is_stream_json`` only inspects that first non-blank/non-comment
+        line, so it reports ``False`` for a log that is otherwise entirely
+        legitimate NDJSON — and ``parse_review_from_log`` then fell back to
+        matching ``_REVIEW_BLOCK_RE`` against the RAW, undecoded file text,
+        where every real newline inside the reviewer's message is stored as
+        the literal two-character escape ``\\n`` (correct JSON encoding),
+        which ``[\\r\\n]+`` can never match unescaped.
+
+        The fix (this commit) makes ``_parse_review_text`` run
+        ``_decode_transcript_for_diagnostic`` before ``_REVIEW_BLOCK_RE``
+        regardless of which branch called it, so this no longer depends on
+        ``is_stream_json`` guessing right. The grammar itself is unchanged:
+        ``END_REVIEW`` is still mandatory and the LAST match still wins — a
+        non-JSON ``# argv=...`` header line embedding the reviewer's own
+        system-prompt TEMPLATE (which contains the literal placeholder
+        ``REVIEW_VERDICT: approve ... <your full review text in markdown>
+        ... END_REVIEW``) must never leak through as the reported verdict.
+        """
+        from coord.worker_events import is_stream_json
+
+        real_review_text = (
+            "Reviewing the diff now.\n\n"
+            "REVIEW_VERDICT: approve\n"
+            "REVIEW_BODY:\n"
+            "Clean diff, tests pass, no CLAUDE.md violations. This closes #1400.\n"
+            "END_REVIEW"
+        )
+        event = {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": real_review_text}]},
+        }
+        header_argv = (
+            "claude -p --output-format stream-json --system-prompt "
+            + REVIEWER_SYSTEM_PROMPT.replace("\n", "\\n")
+            + " --model sonnet"
+        )
+        log_text = (
+            "Claude Code v1.2.3 starting up...\n"  # non-JSON, non-comment preamble
+            f"# agent=elitebook repo=coord issue=#1400 argv={header_argv}\n"
+            + json.dumps(event)
+            + "\n"
+        )
+        log = tmp_path / "review.log"
+        log.write_text(log_text, encoding="utf-8")
+
+        # Confirm the premise: is_stream_json's heuristic really does miss
+        # this shape, so this test fails loudly (not silently) if that
+        # heuristic is ever changed to no longer reproduce the bug.
+        assert is_stream_json(log) is False
+
+        result = parse_review_from_log(log)
+        assert result is not None
+        assert result.verdict == "approve"
+        assert "This closes #1400" in result.body
+        assert "<your full review text in markdown>" not in result.body
+
     def test_not_found_returns_none(self, tmp_path: Path) -> None:
         log = tmp_path / "review.log"
         _write_plain_log(log, "I reviewed the diff. It looks fine.\n")
