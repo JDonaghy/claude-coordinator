@@ -1,0 +1,12 @@
+F                                                                        [100%]
+=================================== FAILURES ===================================
+_________________________ test_fails_and_prints_error __________________________
+test_error_print.py:3: in test_fails_and_prints_error
+    assert False, "genuine assertion failure, unrelated to the ERROR print"
+E   AssertionError: genuine assertion failure, unrelated to the ERROR print
+E   assert False
+----------------------------- Captured stdout call -----------------------------
+ERROR: this is just log output from the test body, not a collection error
+=========================== short test summary info ============================
+FAILED test_error_print.py::test_fails_and_prints_error - AssertionError: gen...
+1 failed in 0.01s
