@@ -157,6 +157,33 @@ class _ThreadLocalCapture:
 
 _stdio_capture_install_lock = threading.Lock()
 
+# #1400: serialize the actual merge-queue *processing* done by ``POST /merge``
+# (as opposed to #1278's per-thread output capture, which only stops two
+# concurrent callbacks' printed lines from crossing streams). Two overlapping
+# ``/merge`` requests still ran the click callback in genuinely parallel
+# threadpool threads, and that callback:
+#
+#   * toggles the process-*global* ``COORD_MERGE_ON_DAEMON`` env var around
+#     the call (see ``_run()`` below) — if request A's ``finally`` clears it
+#     while request B's callback is still mid-flight, B's own re-entrant
+#     ``daemon_reroute_target()`` check can flip and re-route B's merge back
+#     out over HTTP to itself.
+#   * does a full read-modify-write of the merge queue
+#     (``merge_queue.load_queue()`` → mutate → ``save_queue()`` replaces the
+#     WHOLE table). Two concurrent cycles built from the same stale snapshot
+#     silently lose whichever ran first's writes when the second's
+#     ``save_queue()`` overwrites them — an entry another driver just
+#     verified MERGED can revert to PENDING with no error anywhere.
+#
+# Both are real "silently misreports" hazards distinct from stdout
+# cross-talk, and neither is fixed by per-thread capture alone. A single
+# process-wide lock around the whole critical section in ``_run()`` makes
+# concurrent ``/merge`` calls (from any caller — a driver, the TUI, a human)
+# genuinely serialize: the second caller's request simply blocks until the
+# first's merge finishes, same as two ``coord merge`` invocations on one
+# host always have.
+_merge_lock = threading.Lock()
+
 
 def _ensure_stdio_capture_proxies() -> tuple[_ThreadLocalCapture, _ThreadLocalCapture]:
     """Idempotently install the #1278 thread-local stdout/stderr proxies.
@@ -4235,59 +4262,67 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             buf = io.StringIO()
             code = 0
             err = None
-            prev = os.environ.get("COORD_MERGE_ON_DAEMON")
-            os.environ["COORD_MERGE_ON_DAEMON"] = "1"  # guard against re-routing
-            try:
-                # #1251-review: fold stderr into the same buffer as stdout.
-                # click.echo(..., err=True) — the "not PENDING" / drop /
-                # --override-human-required usage errors below — resolves
-                # sys.stderr fresh at call time, so without capturing stderr
-                # too those messages vanish into the daemon's own journal
-                # instead of reaching the client: a daemon-routed `coord merge
-                # --only` would exit 1 with zero output, the exact bug #1251
-                # reports. #1278: both proxies are per-thread (see
-                # _ThreadLocalCapture), so concurrent /merge calls no longer
-                # cross-contaminate each other's buf.
-                with stdout_proxy.capture(buf), stderr_proxy.capture(buf):
-                    merge_cmd.callback(
-                        config_path=config.path,
-                        dry_run=bool(body.get("dry_run")),
-                        # #684 added --plan/show_plan to the merge command and
-                        # routes --plan via /board, so /merge never needs it —
-                        # but the callback still *requires* the param.  Pass
-                        # False explicitly or the call raises "merge() missing 1
-                        # required positional argument: 'show_plan'" and every
-                        # daemon-routed merge (thin client, TUI 'Go', headless
-                        # drain) crashes before doing anything.
-                        show_plan=False,
-                        order=body.get("order"),
-                        repo_filter=body.get("repo_filter"),
-                        method=body.get("method") or "rebase",
-                        force_merge=bool(body.get("force_merge")),
-                        # #821: daemon always enforces review regardless of any
-                        # skip_review flag the client sends.  The gate is
-                        # safety-critical and must not be bypassable remotely.
-                        skip_review=False,
-                        skip_smoke=bool(body.get("skip_smoke")),
-                        drop_assignment=None,  # already handled above
-                        only_assignment=body.get("only"),  # #780: single-entry merge
-                        # #1251: audited HUMAN_REQUIRED override — unlike
-                        # skip_review this is safe to trust from the client
-                        # verbatim: it's gated on --only (one specific entry)
-                        # and always writes its own audit row, so there's no
-                        # blanket-bypass risk analogous to the review gate.
-                        override_human_required=body.get("override_human_required"),
-                    )
-            except SystemExit as e:  # click commands sys.exit() on some paths
-                code = e.code if isinstance(e.code, int) else (1 if e.code else 0)
-            except Exception as e:  # noqa: BLE001
-                err = str(e)
-                code = 1
-            finally:
-                if prev is None:
-                    os.environ.pop("COORD_MERGE_ON_DAEMON", None)
-                else:
-                    os.environ["COORD_MERGE_ON_DAEMON"] = prev
+            # #1400: block until any other in-flight /merge finishes — see
+            # _merge_lock's module-level docstring for why per-thread output
+            # capture (#1278) alone isn't enough here. This runs inside the
+            # threadpool worker (never the event loop thread), so blocking
+            # here only occupies this one request's worker slot.
+            with _merge_lock:
+                prev = os.environ.get("COORD_MERGE_ON_DAEMON")
+                os.environ["COORD_MERGE_ON_DAEMON"] = "1"  # guard against re-routing
+                try:
+                    # #1251-review: fold stderr into the same buffer as stdout.
+                    # click.echo(..., err=True) — the "not PENDING" / drop /
+                    # --override-human-required usage errors below — resolves
+                    # sys.stderr fresh at call time, so without capturing stderr
+                    # too those messages vanish into the daemon's own journal
+                    # instead of reaching the client: a daemon-routed `coord merge
+                    # --only` would exit 1 with zero output, the exact bug #1251
+                    # reports. #1278: both proxies are per-thread (see
+                    # _ThreadLocalCapture), so concurrent /merge calls no longer
+                    # cross-contaminate each other's buf. #1400: _merge_lock above
+                    # additionally serializes the whole call, so "concurrent" here
+                    # is now belt-and-braces rather than the only protection.
+                    with stdout_proxy.capture(buf), stderr_proxy.capture(buf):
+                        merge_cmd.callback(
+                            config_path=config.path,
+                            dry_run=bool(body.get("dry_run")),
+                            # #684 added --plan/show_plan to the merge command and
+                            # routes --plan via /board, so /merge never needs it —
+                            # but the callback still *requires* the param.  Pass
+                            # False explicitly or the call raises "merge() missing 1
+                            # required positional argument: 'show_plan'" and every
+                            # daemon-routed merge (thin client, TUI 'Go', headless
+                            # drain) crashes before doing anything.
+                            show_plan=False,
+                            order=body.get("order"),
+                            repo_filter=body.get("repo_filter"),
+                            method=body.get("method") or "rebase",
+                            force_merge=bool(body.get("force_merge")),
+                            # #821: daemon always enforces review regardless of any
+                            # skip_review flag the client sends.  The gate is
+                            # safety-critical and must not be bypassable remotely.
+                            skip_review=False,
+                            skip_smoke=bool(body.get("skip_smoke")),
+                            drop_assignment=None,  # already handled above
+                            only_assignment=body.get("only"),  # #780: single-entry merge
+                            # #1251: audited HUMAN_REQUIRED override — unlike
+                            # skip_review this is safe to trust from the client
+                            # verbatim: it's gated on --only (one specific entry)
+                            # and always writes its own audit row, so there's no
+                            # blanket-bypass risk analogous to the review gate.
+                            override_human_required=body.get("override_human_required"),
+                        )
+                except SystemExit as e:  # click commands sys.exit() on some paths
+                    code = e.code if isinstance(e.code, int) else (1 if e.code else 0)
+                except Exception as e:  # noqa: BLE001
+                    err = str(e)
+                    code = 1
+                finally:
+                    if prev is None:
+                        os.environ.pop("COORD_MERGE_ON_DAEMON", None)
+                    else:
+                        os.environ["COORD_MERGE_ON_DAEMON"] = prev
             return {"output": buf.getvalue(), "exit_code": code, "error": err}
 
         result = await run_in_threadpool(_run)
