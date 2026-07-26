@@ -268,6 +268,17 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
                 if live_error:
                     click.echo(f"      error: {live_error}")
 
+    # #920: sibling-overlap warnings — approved (PENDING) queue entries that
+    # touch overlapping files and have been aging.  Mirrors the merge-queue
+    # skip above: the queue is host-local, so this is a no-op on a thin
+    # client (use `coord merge --plan`, which fetches the daemon-computed
+    # equivalent via /board, from a thin client instead).
+    if not svc:
+        from coord.commands.merge import _print_sibling_overlap_warnings
+
+        overlaps = mq.find_sibling_overlaps(board, cfg)
+        _print_sibling_overlap_warnings(overlaps)
+
     # Auto-loop iteration-cap blockers: assignments where the review→fix loop
     # exhausted all allowed iterations without receiving an approval.  These
     # require manual intervention (bump pipeline.max_review_iterations or

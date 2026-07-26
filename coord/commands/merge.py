@@ -457,6 +457,32 @@ def _print_merge_plan_entries(planned: list) -> None:
         )
 
 
+def _print_sibling_overlap_warnings(warnings: list) -> None:
+    """#920: print "these approved branches will conflict" warnings.
+
+    ``warnings`` is a list of :class:`coord.merge_queue.SiblingOverlapWarning`
+    (or daemon-payload reconstructions of the same shape). No-op when empty —
+    callers don't need to guard the call.
+    """
+    if not warnings:
+        return
+    click.echo("")
+    click.echo("⚠ Sibling overlap (approved branches aging against a moving main):")
+    for w in warnings:
+        order = " → ".join(f"#{n}" for n in w.issue_numbers)
+        files = list(w.overlapping_files)
+        files_str = ", ".join(files[:5])
+        if len(files) > 5:
+            files_str += f", +{len(files) - 5} more"
+        click.echo(f"  {w.repo_name} → {w.target_branch}: {order}")
+        click.echo(f"    overlapping files: {files_str}")
+        click.echo(
+            f"    oldest waiting {w.oldest_age_hours:.1f}h — these will conflict if merged"
+            " out of order or later; merge promptly, oldest first"
+            " ('coord merge --order <assignment_ids>' to force this order)."
+        )
+
+
 def _show_plan_from_daemon(
     svc,
     *,
@@ -509,6 +535,24 @@ def _show_plan_from_daemon(
             _p.rank = _i
 
     _print_merge_plan_entries(planned)
+
+    # #920: sibling-overlap warnings — precomputed server-side into /board
+    # (see coord.serve_app's `sibling_overlap_warnings` projection) since a
+    # thin client has no local queue/board to compute them from itself.
+    from coord.merge_queue import SiblingOverlapWarning  # noqa: PLC0415
+
+    raw_overlaps: list[dict] = payload.get("sibling_overlap_warnings") or []
+    known_ow = set(SiblingOverlapWarning.__dataclass_fields__)
+    overlaps = [
+        SiblingOverlapWarning(**{
+            k: (tuple(v) if isinstance(v, list) else v)
+            for k, v in d.items() if k in known_ow
+        })
+        for d in raw_overlaps
+    ]
+    if repo_filter:
+        overlaps = [w for w in overlaps if w.repo_name == repo_filter]
+    _print_sibling_overlap_warnings(overlaps)
 
 
 def _merge_via_daemon(svc, params: dict) -> None:
@@ -747,6 +791,15 @@ def merge(
                 _p.rank = _i
 
         _print_merge_plan_entries(planned)
+
+        # #920: sibling-overlap warnings, computed live off the same board.
+        try:
+            _overlaps = _plan_mq.find_sibling_overlaps(_board, _cfg)
+        except Exception:  # noqa: BLE001 — never let the warning break --plan
+            _overlaps = []
+        if repo_filter:
+            _overlaps = [w for w in _overlaps if w.repo_name == repo_filter]
+        _print_sibling_overlap_warnings(_overlaps)
         return
 
     from coord import github_ops as gh_ops

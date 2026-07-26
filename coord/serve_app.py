@@ -2854,9 +2854,19 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                     ]
                 except Exception:  # noqa: BLE001
                     projection["merge_staging"] = []
+                # #920: sibling-overlap warnings — approved (PENDING queue)
+                # entries whose files overlap and have been aging.  Same
+                # _board snapshot; fail-open like merge_staging above.
+                try:
+                    projection["sibling_overlap_warnings"] = [
+                        _asdict(w) for w in _mq.find_sibling_overlaps(_board, _cfg)
+                    ]
+                except Exception:  # noqa: BLE001
+                    projection["sibling_overlap_warnings"] = []
             except Exception:  # noqa: BLE001 — plan failure must not blank the board
                 projection["merge_plan"] = []
                 projection["merge_staging"] = []
+                projection["sibling_overlap_warnings"] = []
             # #550: server-computed per-issue stage/gate projection — generalizes
             # the #776/#778 pattern to coord-tui's `pipeline.rs` stage-status
             # functions.  Reuses the `_board`/`_ci` snapshot built above; only

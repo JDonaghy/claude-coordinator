@@ -4830,6 +4830,7 @@ def test_board_payload_regression(file_db: Path, valid_config_path: Path):
     for key in (
         "merge_plan",
         "merge_staging",
+        "sibling_overlap_warnings",
         "issue_stage_projection",
         "milestone_work_orders",
         "children",

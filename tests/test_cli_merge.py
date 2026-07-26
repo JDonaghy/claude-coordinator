@@ -1141,6 +1141,51 @@ class TestStatusMergeQueue:
         assert "#1 (worker/a1 → main)" in result.output
         assert "[conflict]" in result.output
 
+    def test_status_shows_sibling_overlap_warning(
+        self, config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        """#920: `coord status` warns on aged, file-overlapping approved siblings."""
+        import time as _time
+
+        from coord.models import Assignment, Board
+        from coord.state import save_board
+
+        old_enqueued = _time.time() - 25 * 3600
+        mq.save_queue([
+            mq.QueuedMerge(
+                assignment_id="q1", repo_name="api", repo_github="acme/api",
+                branch="issue-601-q1", target_branch="main",
+                issue_number=601, issue_title="Q one",
+                state=mq.PENDING, enqueued_at=old_enqueued,
+            ),
+            mq.QueuedMerge(
+                assignment_id="q2", repo_name="api", repo_github="acme/api",
+                branch="issue-602-q2", target_branch="main",
+                issue_number=602, issue_title="Q two",
+                state=mq.PENDING, enqueued_at=_time.time(),
+            ),
+        ])
+        save_board(Board(active=[], completed=[
+            Assignment(
+                machine_name="laptop", repo_name="api", issue_number=601,
+                issue_title="Q one", assignment_id="q1", type="work",
+                status="done", branch="issue-601-q1",
+                files_allowed=["coord/shared.py"],
+            ),
+            Assignment(
+                machine_name="laptop", repo_name="api", issue_number=602,
+                issue_title="Q two", assignment_id="q2", type="work",
+                status="done", branch="issue-602-q2",
+                files_allowed=["coord/shared.py"],
+            ),
+        ]))
+
+        with patch("coord.network.check_all", return_value=[]):
+            result = CliRunner().invoke(main, ["status", "--config", str(config_file)])
+        assert result.exit_code == 0, result.output
+        assert "Sibling overlap" in result.output
+        assert "#601" in result.output and "#602" in result.output
+
 
 # ── #779: coord merge --plan ──────────────────────────────────────────────────
 
@@ -1302,6 +1347,93 @@ reviews:
         assert result.exit_code == 0, result.output
         assert "empty" in result.output.lower()
 
+    def test_plan_shows_sibling_overlap_warning(
+        self, config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        """#920: --plan warns when ≥2 approved, aging entries touch the same files."""
+        import time as _time
+
+        from coord.models import Assignment, Board
+        from coord.state import save_board
+
+        old_enqueued = _time.time() - 25 * 3600  # older than the 24h default
+        e1 = mq.QueuedMerge(
+            assignment_id="s1", repo_name="api", repo_github="acme/api",
+            branch="issue-401-s1", target_branch="main",
+            issue_number=401, issue_title="Sibling one",
+            state=mq.PENDING, enqueued_at=old_enqueued,
+        )
+        e2 = mq.QueuedMerge(
+            assignment_id="s2", repo_name="api", repo_github="acme/api",
+            branch="issue-402-s2", target_branch="main",
+            issue_number=402, issue_title="Sibling two",
+            state=mq.PENDING, enqueued_at=_time.time(),
+        )
+        mq.save_queue([e1, e2])
+        w1 = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=401,
+            issue_title="Sibling one", assignment_id="s1", type="work",
+            status="done", branch="issue-401-s1",
+            files_allowed=["coord/shared.py"],
+        )
+        w2 = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=402,
+            issue_title="Sibling two", assignment_id="s2", type="work",
+            status="done", branch="issue-402-s2",
+            files_allowed=["coord/shared.py"],
+        )
+        save_board(Board(active=[], completed=[w1, w2]))
+
+        result = CliRunner().invoke(
+            main, ["merge", "--config", str(config_file), "--plan"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "Sibling overlap" in result.output
+        assert "#401" in result.output and "#402" in result.output
+        assert "coord/shared.py" in result.output
+
+    def test_plan_no_sibling_overlap_warning_when_not_aged(
+        self, config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        """No warning when the overlapping entries haven't aged past the threshold."""
+        import time as _time
+
+        from coord.models import Assignment, Board
+        from coord.state import save_board
+
+        e1 = mq.QueuedMerge(
+            assignment_id="f1", repo_name="api", repo_github="acme/api",
+            branch="issue-501-f1", target_branch="main",
+            issue_number=501, issue_title="Fresh one",
+            state=mq.PENDING, enqueued_at=_time.time(),
+        )
+        e2 = mq.QueuedMerge(
+            assignment_id="f2", repo_name="api", repo_github="acme/api",
+            branch="issue-502-f2", target_branch="main",
+            issue_number=502, issue_title="Fresh two",
+            state=mq.PENDING, enqueued_at=_time.time(),
+        )
+        mq.save_queue([e1, e2])
+        w1 = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=501,
+            issue_title="Fresh one", assignment_id="f1", type="work",
+            status="done", branch="issue-501-f1",
+            files_allowed=["coord/shared.py"],
+        )
+        w2 = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=502,
+            issue_title="Fresh two", assignment_id="f2", type="work",
+            status="done", branch="issue-502-f2",
+            files_allowed=["coord/shared.py"],
+        )
+        save_board(Board(active=[], completed=[w1, w2]))
+
+        result = CliRunner().invoke(
+            main, ["merge", "--config", str(config_file), "--plan"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "Sibling overlap" not in result.output
+
 
 # ── #779-fix: coord merge --plan daemon routing via /board ────────────────────
 
@@ -1367,6 +1499,39 @@ class TestMergePlanDaemonRouting:
         assert "#42" in result.output
         assert "+77" in result.output
         assert "READY" in result.output
+
+    def test_plan_prints_daemon_sibling_overlap_warnings(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """#920: --plan prints the daemon-precomputed sibling_overlap_warnings."""
+        from coord.client import ServiceConfig
+
+        svc = ServiceConfig(url="http://dellserver:7435")
+        payload = self._make_plan_payload()
+        payload["sibling_overlap_warnings"] = [
+            {
+                "repo_name": "api",
+                "target_branch": "main",
+                "issue_numbers": [401, 402],
+                "overlapping_files": ["coord/shared.py"],
+                "oldest_age_hours": 25.3,
+            },
+        ]
+
+        with (
+            patch("coord.client.resolve_board_service", return_value=svc),
+            patch("coord.client.fetch_board_payload", return_value=payload),
+            patch("coord.client.post_record") as post_mock,
+        ):
+            result = CliRunner().invoke(
+                main, ["merge", "--config", str(config_file), "--plan"]
+            )
+
+        assert result.exit_code == 0, result.output
+        post_mock.assert_not_called()
+        assert "Sibling overlap" in result.output
+        assert "#401" in result.output and "#402" in result.output
+        assert "coord/shared.py" in result.output
 
     def test_plan_daemon_missing_merge_plan_exits_cleanly(
         self, config_file: Path, coord_dir: Path

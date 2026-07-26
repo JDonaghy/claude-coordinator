@@ -1158,6 +1158,146 @@ def reorder(items: list[QueuedMerge], order: list[str]) -> list[QueuedMerge]:
     return head + tail
 
 
+# ── Sibling overlap warnings (#920) ─────────────────────────────────────────
+#
+# The 2026-07-02 mess (docs referenced in #915) was triggered by late
+# merging of overlapping sibling branches: #769/#645/#770 (+#768) were a
+# milestone chain all editing the same new files, approved but left sitting
+# while main moved, so every rebase collided with its siblings' additions.
+# Nothing warned that these would conflict if merged out of order or late.
+#
+# `find_sibling_overlaps` is a pure, read-only heuristic over the merge
+# queue: it groups PENDING (i.e. approved — see `enqueue_approved_work`'s
+# review+smoke gate) entries by `(repo_github, target_branch)`, clusters
+# same-group entries whose originating assignment's `files_allowed`
+# (the brain's inferred "files likely touched" — the same signal
+# `compute_do_not_touch` uses pre-dispatch, see `coord.dispatch`) overlap,
+# and reports a warning once the oldest member of a ≥2-entry cluster has
+# been sitting in the queue at least `config.merge.sibling_overlap_aging_hours`.
+
+
+@dataclass(frozen=True)
+class SiblingOverlapWarning:
+    """≥2 approved, aging queue entries whose branches touch the same files.
+
+    `issue_numbers` is already in the suggested merge order — oldest
+    ``enqueued_at`` first, since that entry has drifted furthest from a
+    moving main and merging it first shrinks the others' eventual rebase.
+    """
+
+    repo_name: str
+    target_branch: str
+    issue_numbers: tuple[int, ...] = field(default_factory=tuple)
+    overlapping_files: tuple[str, ...] = field(default_factory=tuple)
+    oldest_age_hours: float = 0.0
+
+
+def find_sibling_overlaps(
+    board,
+    config,
+    *,
+    now: float | None = None,
+) -> list[SiblingOverlapWarning]:
+    """Detect approved, aging, file-overlapping sibling branches in the queue.
+
+    Pure/read-only: loads the queue via :func:`load_queue`, reads
+    ``files_allowed`` off the matching assignments on *board*
+    (``board.completed`` + ``board.active``), does no GitHub/subprocess
+    calls. ``config.merge.sibling_overlap_aging_hours`` (default 24h) gates
+    how long the oldest entry in an overlapping cluster must have waited
+    before it's worth surfacing — a value of ``0`` (or a missing
+    ``merge`` config) disables the warning entirely.
+
+    Only ``PENDING`` entries are considered: by the time an assignment has a
+    queue entry, :func:`enqueue`/:func:`enqueue_approved_work` have already
+    applied the review+smoke gate, so a PENDING entry is "approved" in the
+    sense #920 means. Entries without a recorded ``enqueued_at`` (pre-#274
+    rows) are skipped — there's no age to measure.
+    """
+    aging_hours = getattr(getattr(config, "merge", None), "sibling_overlap_aging_hours", 24.0)
+    if not aging_hours or aging_hours <= 0:
+        return []
+    if now is None:
+        now = time.time()
+
+    entries = [e for e in load_queue() if e.state == PENDING and e.enqueued_at is not None]
+    if len(entries) < 2:
+        return []
+
+    pool = (
+        list(getattr(board, "completed", []) or [])
+        + list(getattr(board, "active", []) or [])
+    )
+    files_by_aid: dict[str, set[str]] = {}
+    for a in pool:
+        aid = getattr(a, "assignment_id", None)
+        if aid:
+            files_by_aid[aid] = set(getattr(a, "files_allowed", None) or [])
+
+    groups: dict[tuple[str, str], list[QueuedMerge]] = {}
+    for e in entries:
+        groups.setdefault((e.repo_github, e.target_branch), []).append(e)
+
+    warnings: list[SiblingOverlapWarning] = []
+    for (repo_github, target_branch), group in groups.items():
+        if len(group) < 2:
+            continue
+
+        # Union-find: cluster entries transitively sharing >=1 file.
+        parent = {e.assignment_id: e.assignment_id for e in group}
+
+        def find(x: str) -> str:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a: str, b: str) -> None:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        for i in range(len(group)):
+            files_i = files_by_aid.get(group[i].assignment_id, set())
+            if not files_i:
+                continue
+            for j in range(i + 1, len(group)):
+                files_j = files_by_aid.get(group[j].assignment_id, set())
+                if files_i & files_j:
+                    union(group[i].assignment_id, group[j].assignment_id)
+
+        clusters: dict[str, list[QueuedMerge]] = {}
+        for e in group:
+            clusters.setdefault(find(e.assignment_id), []).append(e)
+
+        for members in clusters.values():
+            if len(members) < 2:
+                continue
+            oldest_enqueued = min(m.enqueued_at for m in members)
+            age_hours = (now - oldest_enqueued) / 3600.0
+            if age_hours < aging_hours:
+                continue
+
+            ordered = sorted(members, key=lambda m: (m.enqueued_at, m.assignment_id))
+            overlap_files: set[str] = set()
+            for i in range(len(ordered)):
+                files_i = files_by_aid.get(ordered[i].assignment_id, set())
+                for j in range(i + 1, len(ordered)):
+                    files_j = files_by_aid.get(ordered[j].assignment_id, set())
+                    overlap_files |= files_i & files_j
+
+            warnings.append(SiblingOverlapWarning(
+                repo_name=members[0].repo_name,
+                target_branch=target_branch,
+                issue_numbers=tuple(m.issue_number for m in ordered),
+                overlapping_files=tuple(sorted(overlap_files)),
+                oldest_age_hours=round(age_hours, 1),
+            ))
+
+    warnings.sort(key=lambda w: (-w.oldest_age_hours, w.repo_name, w.target_branch))
+    return warnings
+
+
 # ── Staging section (#778) ────────────────────────────────────────────────────
 
 # Status values for StagingItem.status — never stored in the DB.
