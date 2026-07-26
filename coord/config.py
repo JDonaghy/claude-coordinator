@@ -697,11 +697,20 @@ class MergeConfig:
 
     Set ``max_per_tick`` to cap how many merges the daemon may perform in a
     single tick (default ``0`` = unlimited).
+
+    ``sibling_overlap_aging_hours`` (#920) gates
+    :func:`coord.merge_queue.find_sibling_overlaps` — the "these approved
+    branches will conflict if merged out of order or late" warning shown by
+    ``coord status`` / ``coord merge --plan``. It's the number of hours the
+    oldest entry in a file-overlapping cluster of approved (PENDING) queue
+    entries must have been waiting before the warning fires. ``0`` disables
+    the warning entirely. Default ``24.0``.
     """
 
     auto_drain: bool = False
     max_per_tick: int = 0
     auto_reap_merged: bool = True
+    sibling_overlap_aging_hours: float = 24.0
 
 
 @dataclass
@@ -1733,6 +1742,13 @@ def _parse_merge(raw: Any) -> MergeConfig:
         if not isinstance(value, bool):
             raise ConfigError("merge.auto_reap_merged must be a boolean")
         cfg.auto_reap_merged = value
+    if "sibling_overlap_aging_hours" in raw:
+        value = raw["sibling_overlap_aging_hours"]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+            raise ConfigError(
+                "merge.sibling_overlap_aging_hours must be a non-negative number"
+            )
+        cfg.sibling_overlap_aging_hours = float(value)
     return cfg
 
 

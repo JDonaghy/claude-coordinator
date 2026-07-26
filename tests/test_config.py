@@ -13,6 +13,7 @@ from coord.config import (
     ProviderDef,
     ProvidersConfig,
     _parse_concurrency,
+    _parse_merge,
     load,
 )
 
@@ -1175,3 +1176,40 @@ def test_provider_def_defaults() -> None:
     assert defn.attach_url is None
     assert defn.env == {}
     assert defn.extra_args == []
+
+
+# ── #920: merge.sibling_overlap_aging_hours ─────────────────────────────────
+
+def test_merge_defaults() -> None:
+    cfg = _parse_merge(None)
+    assert cfg.auto_drain is False
+    assert cfg.sibling_overlap_aging_hours == 24.0
+
+
+def test_merge_sibling_overlap_aging_hours_parses() -> None:
+    assert _parse_merge({"sibling_overlap_aging_hours": 6}).sibling_overlap_aging_hours == 6.0
+    assert _parse_merge({"sibling_overlap_aging_hours": 0}).sibling_overlap_aging_hours == 0.0
+    assert _parse_merge(
+        {"sibling_overlap_aging_hours": 12.5}
+    ).sibling_overlap_aging_hours == 12.5
+
+
+def test_merge_sibling_overlap_aging_hours_rejects_negative() -> None:
+    with pytest.raises(
+        ConfigError, match="sibling_overlap_aging_hours must be a non-negative number"
+    ):
+        _parse_merge({"sibling_overlap_aging_hours": -1})
+
+
+def test_merge_sibling_overlap_aging_hours_rejects_bool() -> None:
+    with pytest.raises(
+        ConfigError, match="sibling_overlap_aging_hours must be a non-negative number"
+    ):
+        _parse_merge({"sibling_overlap_aging_hours": True})
+
+
+def test_merge_sibling_overlap_aging_hours_rejects_non_number() -> None:
+    with pytest.raises(
+        ConfigError, match="sibling_overlap_aging_hours must be a non-negative number"
+    ):
+        _parse_merge({"sibling_overlap_aging_hours": "lots"})

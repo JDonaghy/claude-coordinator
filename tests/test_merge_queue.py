@@ -3375,6 +3375,171 @@ class TestStagingItems:
         assert items == []
 
 
+# ── #920: find_sibling_overlaps ──────────────────────────────────────────────
+
+class TestFindSiblingOverlaps:
+    """#920: warn when ≥2 approved (PENDING), aging queue entries touch the
+    same files — the #769/#645/#770 sibling-branch-collision shape.
+    """
+
+    AGING_HOURS = 2.0
+    NOW = 1_000_000.0  # arbitrary fixed epoch so ages are deterministic
+
+    @staticmethod
+    def _config(aging_hours: float = AGING_HOURS):
+        from coord.config import MergeConfig
+        from types import SimpleNamespace
+        return SimpleNamespace(merge=MergeConfig(sibling_overlap_aging_hours=aging_hours))
+
+    @staticmethod
+    def _board(completed=None, active=None):
+        from coord.models import Board
+        return Board(active=list(active or []), completed=list(completed or []))
+
+    @staticmethod
+    def _work(aid: str, *, issue_number: int, files: list[str]) -> Assignment:
+        return Assignment(
+            machine_name="m1", repo_name="api", issue_number=issue_number,
+            issue_title=f"issue {issue_number}", assignment_id=aid, type="work",
+            status="done", branch=f"issue-{issue_number}-{aid}",
+            files_allowed=files,
+        )
+
+    def _entry(
+        self, aid: str, *, issue_number: int, enqueued_at: float,
+        repo_github: str = "acme/api", target_branch: str = "main",
+        state: str = mq.PENDING,
+    ) -> mq.QueuedMerge:
+        return mq.QueuedMerge(
+            assignment_id=aid, repo_name="api", repo_github=repo_github,
+            branch=f"issue-{issue_number}-{aid}", target_branch=target_branch,
+            issue_number=issue_number, issue_title=f"issue {issue_number}",
+            state=state, enqueued_at=enqueued_at,
+        )
+
+    def test_warns_on_aged_overlapping_pair(self, coord_db) -> None:
+        old_enqueued = self.NOW - (self.AGING_HOURS + 1) * 3600
+        mq.save_queue([
+            self._entry("a1", issue_number=101, enqueued_at=old_enqueued),
+            self._entry("a2", issue_number=102, enqueued_at=self.NOW - 60),
+        ])
+        board = self._board(completed=[
+            self._work("a1", issue_number=101, files=["coord/foo.py", "coord/bar.py"]),
+            self._work("a2", issue_number=102, files=["coord/bar.py", "coord/baz.py"]),
+        ])
+        warnings = mq.find_sibling_overlaps(board, self._config(), now=self.NOW)
+        assert len(warnings) == 1
+        w = warnings[0]
+        assert w.repo_name == "api"
+        assert w.target_branch == "main"
+        assert w.issue_numbers == (101, 102)  # oldest (a1) first
+        assert w.overlapping_files == ("coord/bar.py",)
+        assert w.oldest_age_hours == pytest.approx(self.AGING_HOURS + 1, abs=0.05)
+
+    def test_no_warning_when_files_dont_overlap(self, coord_db) -> None:
+        old_enqueued = self.NOW - (self.AGING_HOURS + 1) * 3600
+        mq.save_queue([
+            self._entry("a1", issue_number=101, enqueued_at=old_enqueued),
+            self._entry("a2", issue_number=102, enqueued_at=self.NOW - 60),
+        ])
+        board = self._board(completed=[
+            self._work("a1", issue_number=101, files=["coord/foo.py"]),
+            self._work("a2", issue_number=102, files=["coord/baz.py"]),
+        ])
+        assert mq.find_sibling_overlaps(board, self._config(), now=self.NOW) == []
+
+    def test_no_warning_when_not_yet_aged(self, coord_db) -> None:
+        """Overlap exists but the oldest entry hasn't crossed the threshold yet."""
+        mq.save_queue([
+            self._entry("a1", issue_number=101, enqueued_at=self.NOW - 60),
+            self._entry("a2", issue_number=102, enqueued_at=self.NOW - 30),
+        ])
+        board = self._board(completed=[
+            self._work("a1", issue_number=101, files=["coord/foo.py"]),
+            self._work("a2", issue_number=102, files=["coord/foo.py"]),
+        ])
+        assert mq.find_sibling_overlaps(board, self._config(), now=self.NOW) == []
+
+    def test_no_warning_with_single_entry(self, coord_db) -> None:
+        old_enqueued = self.NOW - (self.AGING_HOURS + 1) * 3600
+        mq.save_queue([self._entry("a1", issue_number=101, enqueued_at=old_enqueued)])
+        board = self._board(completed=[
+            self._work("a1", issue_number=101, files=["coord/foo.py"]),
+        ])
+        assert mq.find_sibling_overlaps(board, self._config(), now=self.NOW) == []
+
+    def test_non_pending_entries_ignored(self, coord_db) -> None:
+        """A MERGED sibling doesn't trigger a warning against a live PENDING one."""
+        old_enqueued = self.NOW - (self.AGING_HOURS + 1) * 3600
+        mq.save_queue([
+            self._entry("a1", issue_number=101, enqueued_at=old_enqueued, state=mq.MERGED),
+            self._entry("a2", issue_number=102, enqueued_at=self.NOW - 60),
+        ])
+        board = self._board(completed=[
+            self._work("a1", issue_number=101, files=["coord/foo.py"]),
+            self._work("a2", issue_number=102, files=["coord/foo.py"]),
+        ])
+        assert mq.find_sibling_overlaps(board, self._config(), now=self.NOW) == []
+
+    def test_different_target_branches_not_grouped(self, coord_db) -> None:
+        old_enqueued = self.NOW - (self.AGING_HOURS + 1) * 3600
+        mq.save_queue([
+            self._entry("a1", issue_number=101, enqueued_at=old_enqueued, target_branch="main"),
+            self._entry("a2", issue_number=102, enqueued_at=old_enqueued, target_branch="feature/ms-1"),
+        ])
+        board = self._board(completed=[
+            self._work("a1", issue_number=101, files=["coord/foo.py"]),
+            self._work("a2", issue_number=102, files=["coord/foo.py"]),
+        ])
+        assert mq.find_sibling_overlaps(board, self._config(), now=self.NOW) == []
+
+    def test_transitive_cluster_of_three(self, coord_db) -> None:
+        """a1↔a2 share a file, a2↔a3 share a different file — all three cluster."""
+        old_enqueued = self.NOW - (self.AGING_HOURS + 1) * 3600
+        mq.save_queue([
+            self._entry("a1", issue_number=101, enqueued_at=old_enqueued),
+            self._entry("a2", issue_number=102, enqueued_at=self.NOW - 120),
+            self._entry("a3", issue_number=103, enqueued_at=self.NOW - 60),
+        ])
+        board = self._board(completed=[
+            self._work("a1", issue_number=101, files=["coord/a.py"]),
+            self._work("a2", issue_number=102, files=["coord/a.py", "coord/b.py"]),
+            self._work("a3", issue_number=103, files=["coord/b.py"]),
+        ])
+        warnings = mq.find_sibling_overlaps(board, self._config(), now=self.NOW)
+        assert len(warnings) == 1
+        assert warnings[0].issue_numbers == (101, 102, 103)
+        assert set(warnings[0].overlapping_files) == {"coord/a.py", "coord/b.py"}
+
+    def test_disabled_via_zero_aging_hours(self, coord_db) -> None:
+        old_enqueued = self.NOW - 1000 * 3600
+        mq.save_queue([
+            self._entry("a1", issue_number=101, enqueued_at=old_enqueued),
+            self._entry("a2", issue_number=102, enqueued_at=old_enqueued),
+        ])
+        board = self._board(completed=[
+            self._work("a1", issue_number=101, files=["coord/foo.py"]),
+            self._work("a2", issue_number=102, files=["coord/foo.py"]),
+        ])
+        cfg = self._config(aging_hours=0)
+        assert mq.find_sibling_overlaps(board, cfg, now=self.NOW) == []
+
+    def test_missing_merge_config_defaults_to_24h(self, coord_db) -> None:
+        """A config object with no `.merge` attribute falls back to the default."""
+        from types import SimpleNamespace
+        old_enqueued = self.NOW - 25 * 3600
+        mq.save_queue([
+            self._entry("a1", issue_number=101, enqueued_at=old_enqueued),
+            self._entry("a2", issue_number=102, enqueued_at=self.NOW - 60),
+        ])
+        board = self._board(completed=[
+            self._work("a1", issue_number=101, files=["coord/foo.py"]),
+            self._work("a2", issue_number=102, files=["coord/foo.py"]),
+        ])
+        warnings = mq.find_sibling_overlaps(board, SimpleNamespace(), now=self.NOW)
+        assert len(warnings) == 1
+
+
 # ── #420: display_error — recompute stale gate errors live ──────────────────
 
 class TestDisplayError:
