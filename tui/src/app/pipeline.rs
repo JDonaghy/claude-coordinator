@@ -4911,9 +4911,18 @@ impl CoordApp {
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
             .and_then(|a| a.test_state.as_deref());
+        // #1395: "running" is a transient, non-verdict marker an unattended
+        // driver (scripts/drive-issue.sh) sets while it runs the suite
+        // locally (bypassing dispatch_smoke, so there's no `type="smoke"`
+        // assignment for `has_active_smoke_session` above to catch) —
+        // mirrors `coord.stage_projection.test_stage_status_for`. It is
+        // overwritten with a terminal passed/failed/skipped verdict when the
+        // run concludes; every gate elsewhere keys off the terminal values
+        // explicitly, so this never reads as a verdict anywhere else.
         match verdict {
             Some("passed") | Some("skipped") => StageStatus::Done,
             Some("failed") => StageStatus::Failed,
+            Some("running") => StageStatus::Active,
             _ => StageStatus::Pending,
         }
     }

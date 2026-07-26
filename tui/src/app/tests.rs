@@ -7207,6 +7207,22 @@
     }
 
     #[test]
+    fn test_stage_active_when_test_state_running() {
+        // #1395: scripts/drive-issue.sh bypasses dispatch_smoke and runs the
+        // suite locally, so there's no `type="smoke"` assignment for
+        // `has_active_smoke_session` to catch — it sets test_state="running"
+        // directly on the work row instead. Without this, the Test box read
+        // Pending (indistinguishable from "hasn't started") for however long
+        // the local suite took.
+        let mut app = make_pipeline_app_with_test_gate();
+        app.data
+            .assignments
+            .push(_work_assignment("w1", 100.0, "done", Some("running")));
+        let issue = &app.pipeline_issues[0];
+        assert_eq!(app.test_stage_status_for(issue), StageStatus::Active);
+    }
+
+    #[test]
     fn test_stage_failed_when_later_retest_failed_after_prior_pass() {
         // A later fix-work that was actually re-tested and FAILED must win over
         // the earlier pass — the most recent carrier of a verdict decides.

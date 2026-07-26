@@ -72,6 +72,9 @@ ENUM_OVERRIDES: dict[tuple[str, str], str] = {
     # coord/models.py Assignment.review_state docstring: pending|dispatched|done.
     ("Assignment", "review_state"): "'pending' | 'dispatched' | 'done' | null",
     # coord/models.py Assignment.test_state mirrors pipeline.py's test_verdict.
+    # #1395: TestVerdict includes 'running' — a transient, non-verdict value a
+    # driver sets while it runs the suite locally; every reader compares
+    # against the terminal values explicitly, so this never gates as a verdict.
     ("Assignment", "test_state"): "TestVerdict | null",
     # coord/models.py Assignment.review_verdict docstring: None | approve | request-changes.
     ("Assignment", "review_verdict"): "'approve' | 'request-changes' | null",
@@ -107,7 +110,7 @@ export type AssignmentType =
   | 'merge'
   | 'fix'
 
-export type TestVerdict = 'passed' | 'failed' | 'skipped'
+export type TestVerdict = 'passed' | 'failed' | 'skipped' | 'running'
 
 /**
  * Actions supported by POST /api/pipeline/action.
