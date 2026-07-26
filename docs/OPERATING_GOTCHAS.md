@@ -39,20 +39,60 @@ Release steps: [`AGENT_OPERATIONS.md`](AGENT_OPERATIONS.md#publishing-a-release-
 
 ---
 
-## 2. Restarting the daemon needs a quiet fleet
+## 2. Restarting anything needs a quiet fleet — and the two restarts are unsafe in *different* ways
 
-An interactive session runs a **finalize backstop on exit** that POSTs to the
-daemon to record the branch and terminal status. Restart `coord-serve` while
-one is live and that finalize fails — losing the branch, the verdict, or both.
+The two services have **different victims**, so one check does not cover both.
+
+### `coord agent update` / restarting `coord-agent` kills headless workers
+
+A headless `claude -p` worker is a **subprocess of `coord-agent`**. Restart the
+agent and the worker dies mid-task, its assignment flips to `failed`, and any
+uncommitted work in its worktree is stranded.
+
+**`coord sessions --remote` will NOT warn you** — it lists *interactive tmux*
+sessions only. Headless workers are invisible to it.
+
+This trap was walked straight into while deploying v0.4.77 (the release whose
+whole purpose was fixing a different worker-work-loss bug): `coord sessions
+--remote` said "No running interactive sessions", `coord agent update --all`
+ran, and #1400's in-flight fix worker on elitebook went `running → failed`.
+
+Check for **active assignments**, not sessions:
 
 ```bash
-coord sessions --remote        # ALWAYS check first
+# per machine — the authoritative check
+curl -s http://<agent-host>:7433/status | python3 -c \
+  "import json,sys; print([(a['id'],a['status']) for a in json.load(sys.stdin).get('active',[])])"
+
+# or from the board, for every machine at once
+coord status                 # look for running assignments, not just machine health
+```
+
+Restart only machines with no active assignment. `coord agent update --machine
+<name>` exists precisely so you can update the idle ones and come back for the
+busy one.
+
+### Restarting `coord-serve` breaks interactive finalize
+
+An interactive session runs a **finalize backstop on exit** that POSTs to the
+daemon to record the branch and terminal status. Restart `coord-serve` while one
+is live and that finalize fails — losing the branch, the verdict, or both.
+
+```bash
+coord sessions --remote        # the RIGHT check for this one
 ssh <daemon-host> 'XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart coord-serve'
 ```
 
-Restarting `coord-agent` is **lower risk** — tmux sessions are independent of
-it, since interactive sessions bypass the agent HTTP server. It is specifically
-`coord-serve` that finalize talks to.
+### Summary
+
+| restarting | kills | check with |
+|---|---|---|
+| `coord-agent` (incl. `coord agent update`) | **headless workers** (subprocesses) | agent `/status` active list, or `coord status` |
+| `coord-serve` | **interactive finalize** (branch/verdict write) | `coord sessions --remote` |
+
+Doing a full deploy safely means both checks, and often waiting: a machine
+running a worker cannot be agent-updated, and a fleet with a live interactive
+session cannot have its daemon restarted.
 
 ---
 
