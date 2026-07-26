@@ -26,6 +26,15 @@ EVENT_ADVISORY = "advisory"
 # based detection, which also catches the "silently burned budget, looked
 # productive the whole time" failure mode STUCK: lines miss (see #448).
 EVENT_NEEDS_ATTENTION = "needs_attention"
+# #1441: a pipeline row whose auto-loop TRANSITION already fired (a review
+# completed, a fix completed) but which is now stuck on a precondition that
+# landed too late for that one-shot reaction to see — e.g. a test verdict
+# that arrives after the review it should have unblocked was already
+# processed. Distinct from EVENT_NEEDS_ATTENTION (which watches *running*
+# assignments for a wall-clock/convergence signal) — this watches *done*
+# work chains for a downstream step that should have happened by now and
+# didn't.
+EVENT_STALLED = "stalled_pipeline"
 
 
 @dataclass
@@ -399,6 +408,55 @@ def format_needs_attention(
         "Detection + surfacing only — nothing was killed or reassigned. A "
         "human should take a look; use `coord log <id>` to see what it's "
         "doing, or `coord retry`/`coord stop` to intervene.",
+    ]
+    return "\n".join(lines)
+
+
+_STALLED_REASON_LABELS = {
+    "review_request_changes_no_fix": "Review requested changes, no fix dispatched",
+    "done_no_review": "Work done, no review ever dispatched",
+    "approved_not_queued": "Approved + tested, but not queued for merge",
+}
+
+
+def format_stalled_pipeline(
+    *,
+    assignment_id: str,
+    machine_name: str,
+    repo_name: str,
+    issue_number: int,
+    reason: str,
+    detail: str,
+) -> str:
+    """Format a "stalled pipeline row" comment (#1441).
+
+    *reason* is one of ``"review_request_changes_no_fix"``,
+    ``"done_no_review"``, or ``"approved_not_queued"``; *detail* is a
+    human-readable one-liner naming the unmet precondition.
+    """
+    marker = _marker(
+        EVENT_STALLED,
+        assignment=assignment_id,
+        machine=machine_name,
+        repo=repo_name,
+        reason=reason,
+    )
+    label = _STALLED_REASON_LABELS.get(reason, reason)
+    lines = [
+        marker,
+        "## 🧊 Pipeline row stalled",
+        f"**Machine:** {machine_name}",
+        f"**Assignment:** {assignment_id}",
+        f"**Issue:** #{issue_number}",
+        f"**Reason:** {label}",
+        "",
+        detail.strip(),
+        "",
+        "Detection + surfacing only — nothing was dispatched automatically. "
+        "This row's auto-loop transition already fired once and won't fire "
+        "again on its own; a human should look at `coord status` and "
+        "decide whether to dispatch a fix/review manually or drop it with "
+        "`coord backlog`.",
     ]
     return "\n".join(lines)
 

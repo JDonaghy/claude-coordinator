@@ -6,8 +6,12 @@ import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import httpx
+
+if TYPE_CHECKING:
+    from coord.models import Assignment, Board
 
 log = logging.getLogger(__name__)
 
@@ -27,9 +31,11 @@ from coord.comments import (
     EVENT_FAILURE,
     EVENT_NEEDS_ATTENTION,
     EVENT_PLAN,
+    EVENT_STALLED,
     EVENT_STUCK,
     format_needs_attention,
     format_plan,
+    format_stalled_pipeline,
     format_stuck,
 )
 from coord.config import Config
@@ -92,6 +98,31 @@ def _needs_attention_notified_key(assignment_id: str) -> str:
     notifications, and vice versa.
     """
     return f"{assignment_id}:needs-attention"
+
+
+@dataclass
+class StalledDetection:
+    """#1441: a pipeline row whose auto-loop transition already fired once
+    but which is stuck on a precondition that landed too late for that
+    one-shot reaction to see. See :func:`detect_stalled_pipeline`."""
+
+    assignment_id: str
+    machine_name: str
+    repo_name: str
+    issue_number: int
+    reason: str  # "review_request_changes_no_fix" | "done_no_review" | "approved_not_queued"
+    detail: str
+
+
+def _stalled_notified_key(assignment_id: str) -> str:
+    """Notified ledger key for stalled-pipeline events (#1441).
+
+    Composite key (mirrors :func:`_needs_attention_notified_key`) so a
+    one-shot stalled-pipeline comment does not block later completion/
+    failure/stuck/needs-attention notifications for the same assignment_id,
+    and vice versa.
+    """
+    return f"{assignment_id}:stalled"
 
 
 def _fmt_minutes(seconds: float) -> str:
@@ -243,6 +274,214 @@ def post_needs_attention(detection: NeedsAttentionDetection, record: dict) -> No
         record["repo_github"], detection.issue_number, body
     )
     mark_notified(_needs_attention_notified_key(detection.assignment_id), EVENT_NEEDS_ATTENTION)
+
+
+# ── Stalled-pipeline sweeper (#1441) ────────────────────────────────────────
+#
+# The auto-loop (coord.auto_loop) only reacts to review/fix TRANSITIONS — the
+# instant `coord notify` sees a review or fix flip to `done` during THAT
+# pass. Once the transition is consumed nothing ever re-examines the row, so
+# a precondition that lands late (a Test verdict backfilled two days after
+# the review completed — vimcode #602) leaves it stranded: looks complete on
+# the board, isn't. This sweeper re-scans every *done* work chain on the
+# board each notify pass and flags the ones stuck on an unmet precondition
+# a fresh transition would have already resolved. Detection only — no
+# dispatch, mirroring detect_needs_attention's contract.
+
+
+def _pipeline_heads(board: "Board") -> list["Assignment"]:
+    """Return the most-recent WORK_LIKE_TYPES assignment per (repo, issue).
+
+    A row can be bounced through 1+ auto-loop fix iterations, each a
+    separate ``Assignment`` sharing the same ``(repo_name, issue_number)``.
+    Only the most recent one reflects the pipeline's actual current
+    position — earlier rows in the chain are superseded, and evaluating them
+    too would re-flag a condition a later fix already addressed.
+    """
+    from coord.models import WORK_LIKE_TYPES  # noqa: PLC0415
+
+    all_assignments = list(board.active) + list(board.completed)
+    heads: dict[tuple[str, int], "Assignment"] = {}
+    for a in all_assignments:
+        if a.type not in WORK_LIKE_TYPES:
+            continue
+        key = (a.repo_name, a.issue_number)
+        ts = a.dispatched_at or a.finished_at or 0.0
+        cur = heads.get(key)
+        cur_ts = (cur.dispatched_at or cur.finished_at or 0.0) if cur is not None else -1.0
+        if cur is None or ts >= cur_ts:
+            heads[key] = a
+    return list(heads.values())
+
+
+def detect_stalled_pipeline(
+    config: Config,
+    *,
+    board: "Board | None" = None,
+    merge_queue_items: list | None = None,
+    terminal_cache: dict | None = None,
+) -> list[tuple[StalledDetection, "Assignment"]]:
+    """Scan the board for *done* work chains stuck on an unmet precondition
+    that a fresh review/fix transition would already have resolved (#1441).
+
+    Three candidate stall states, checked per pipeline "head" (the most
+    recent work-like assignment for a given (repo, issue) — see
+    :func:`_pipeline_heads`):
+
+    1. ``review_request_changes_no_fix`` — the head's linked review
+       completed with verdict ``request-changes`` and no fix assignment was
+       ever dispatched in response (the vimcode #602 reference case: the
+       review's transition fired and was consumed while some other
+       precondition was outstanding, and nothing has re-examined it since).
+    2. ``done_no_review`` — the head carries a terminal Test verdict
+       (``passed``/``skipped``), the "review" gate is required, the
+       completion is not an interactive (``provider_name="claude-pty"``)
+       session (interactive completions are deliberately excluded from
+       automatic review dispatch — #555), and yet no review assignment was
+       ever dispatched for it.
+    3. ``approved_not_queued`` — the head satisfies every merge gate
+       (:func:`coord.merge_queue.passes_merge_gates` — reused rather than
+       re-derived, per #1441's own request) but has no merge-queue entry.
+
+    Every candidate is checked against the shared #522 terminal-state guard
+    (:func:`coord.github_ops.work_is_terminal`, via *terminal_cache* — the
+    same cache :func:`coord.notify.run` threads through the review/fix
+    auto-loop calls) so a closed issue or merged PR never surfaces, and
+    against the ``notified`` ledger (composite key, :func:`_stalled_notified_key`)
+    so a flagged row is not re-flagged every pass.
+
+    Detection only, mirroring :func:`detect_needs_attention`'s contract — no
+    dispatch, no kill, no handoff. *board* / *merge_queue_items* /
+    *terminal_cache* are all optional so callers (tests, or a future
+    ``reconcile()`` caller) can supply their own instead of hitting the
+    board service / DB / GitHub.
+    """
+    # `github_ops` is already imported at module level (used by every other
+    # post_* helper in this file) — no local re-import here, so a caller
+    # that mocks `coord.notify.github_ops.post_issue_comment` for the
+    # posting side doesn't also have to reason about a separately-imported
+    # local name for the terminal-state check below.
+    from coord.auto_loop import FIX_DISPATCH_TYPES  # noqa: PLC0415
+    from coord.merge_queue import load_queue, passes_merge_gates  # noqa: PLC0415
+
+    if board is None:
+        from coord.board_service import read_board  # noqa: PLC0415
+        board = read_board()
+    if merge_queue_items is None:
+        merge_queue_items = load_queue()
+    if terminal_cache is None:
+        terminal_cache = {}
+
+    notified = load_notified()
+    all_assignments = list(board.active) + list(board.completed)
+
+    results: list[tuple[StalledDetection, "Assignment"]] = []
+    for work in _pipeline_heads(board):
+        if work.status != "done" or not work.assignment_id:
+            continue
+        if _stalled_notified_key(work.assignment_id) in notified:
+            continue
+
+        repo = config.repo(work.repo_name)
+        repo_github = repo.github if repo is not None else None
+        if repo_github and github_ops.work_is_terminal(
+            repo_github, work.issue_number, work.branch, cache=terminal_cache
+        ):
+            continue
+
+        required_gates = work.required_gates or list(config.pipeline.default_gates)
+
+        review = next(
+            (
+                a for a in all_assignments
+                if a.review_of_assignment_id == work.assignment_id and a.type == "review"
+            ),
+            None,
+        )
+
+        reason: str | None = None
+        detail = ""
+
+        if (
+            review is not None
+            and review.status == "done"
+            and review.review_verdict == "request-changes"
+        ):
+            fix = next(
+                (
+                    a for a in all_assignments
+                    if a.review_of_assignment_id == work.assignment_id
+                    and a.type in FIX_DISPATCH_TYPES
+                ),
+                None,
+            )
+            if fix is None:
+                reason = "review_request_changes_no_fix"
+                detail = (
+                    f"Review {review.assignment_id} completed with "
+                    "request-changes and no fix worker was ever dispatched "
+                    "for it."
+                )
+        elif (
+            review is None
+            and "review" in required_gates
+            and work.provider_name != "claude-pty"
+            and work.test_state in ("passed", "skipped")
+        ):
+            reason = "done_no_review"
+            detail = (
+                f"Work is done with test_state={work.test_state!r} but no "
+                "review assignment was ever dispatched for it."
+            )
+        elif review is None or review.status == "done":
+            # Either the review gate doesn't apply, or a review already
+            # completed without leaving a request-changes verdict blocking
+            # it (approved, or advanced past advisory-only nits) — the only
+            # remaining question is whether it made it into the merge queue.
+            already_queued = any(
+                m.assignment_id == work.assignment_id for m in merge_queue_items
+            )
+            if not already_queued and passes_merge_gates(work, config, board):
+                reason = "approved_not_queued"
+                detail = (
+                    "Work passes every merge gate (review + test) but has "
+                    "no merge-queue entry."
+                )
+
+        if reason is None:
+            continue
+
+        results.append((
+            StalledDetection(
+                assignment_id=work.assignment_id,
+                machine_name=work.machine_name,
+                repo_name=work.repo_name,
+                issue_number=work.issue_number,
+                reason=reason,
+                detail=detail,
+            ),
+            work,
+        ))
+
+    return results
+
+
+def post_stalled_pipeline(detection: StalledDetection, config: Config) -> None:
+    """Post a stalled-pipeline comment to GitHub and mark notified (#1441)."""
+    repo = config.repo(detection.repo_name)
+    repo_github = repo.github if repo is not None else None
+    if not repo_github:
+        return
+    body = format_stalled_pipeline(
+        assignment_id=detection.assignment_id,
+        machine_name=detection.machine_name,
+        repo_name=detection.repo_name,
+        issue_number=detection.issue_number,
+        reason=detection.reason,
+        detail=detection.detail,
+    )
+    github_ops.post_issue_comment(repo_github, detection.issue_number, body)
+    mark_notified(_stalled_notified_key(detection.assignment_id), EVENT_STALLED)
 
 
 def _agent_status(host: str, port: int = AGENT_PORT, timeout: float = 5.0) -> dict | None:
@@ -1265,6 +1504,13 @@ def run(
     global _AGENT_HOSTS
     _AGENT_HOSTS = {m.name: m.host for m in config.machines}
 
+    # #522: one terminal-state cache shared across every gh-hitting check in
+    # this notify run (the auto-loop review/fix dispatches below, and the
+    # #1441 stalled-pipeline sweep at the end), so a burst of activity for
+    # the same merged/closed issue (the #349 ×4 case) costs a single `gh`
+    # round-trip, not one per caller.
+    terminal_cache: dict = {}
+
     # Collect (transition, record, entry) tuples for review completions so we
     # can feed them to the auto-loop after all notifications are posted.
     review_completions: list[tuple[Transition, dict, dict]] = []
@@ -1355,10 +1601,6 @@ def run(
     # Auto-loop: for each completed review, optionally dispatch a fix worker.
     # Runs after notify posts the completion comment so GitHub has the full
     # review body before any fix briefing references "previous findings".
-    # #522: one terminal-state cache shared across every auto-loop call in this
-    # notify run, so a burst of transitions for the same merged/closed issue
-    # (the #349 ×4 case) costs a single `gh` round-trip, not one per transition.
-    terminal_cache: dict = {}
     if review_completions:
         try:
             from coord.auto_loop import run_for_review_transition  # noqa: PLC0415
@@ -1406,5 +1648,25 @@ def run(
                     )
         except Exception:  # noqa: BLE001
             log.exception("auto_loop: unexpected error in fix completion loop")
+
+    # #1441: sweep for pipeline rows whose auto-loop transition already fired
+    # once but which are now stuck on a precondition that landed too late
+    # (the vimcode #602 reference case). Runs last, after the review/fix
+    # auto-loop above has had a chance to act on THIS pass's transitions, so
+    # a row that just got a fresh fix/review dispatched above is not also
+    # flagged as stalled in the same pass. Best-effort, non-fatal, detection
+    # + surfacing only — mirrors the #846 needs-attention block above; the
+    # crucial difference from `reconcile()`-only sweepers (see
+    # docs/OPERATING_GOTCHAS.md §7) is that this runs from `coord notify`.
+    try:
+        for detection, _work in detect_stalled_pipeline(
+            config, terminal_cache=terminal_cache
+        ):
+            try:
+                post_stalled_pipeline(detection, config)
+            except Exception:  # noqa: BLE001
+                continue
+    except Exception:  # noqa: BLE001
+        log.exception("detect_stalled_pipeline: unexpected error")
 
     return posted, stuck_posted, needs_attention_posted
