@@ -12,6 +12,7 @@ from coord.models import Assignment, Board, Machine, Repo
 from coord.smoke import (
     SMOKE_SYSTEM_PROMPT,
     build_smoke_briefing,
+    dispatch_pending_smoke,
     dispatch_smoke,
     match_rules,
     pick_smoke_machine,
@@ -417,13 +418,64 @@ def test_dispatch_smoke_skipped_when_auto_queue_off(
     assert result is None
 
 
-def test_dispatch_smoke_skipped_when_no_rule_matches(
+def test_dispatch_smoke_dispatches_work_when_no_rule_matches_but_test_command_set(
     gtk_and_server_config: Config,
 ) -> None:
+    """#1426: a capability-rule miss used to mean "skip silently" — the
+    blocker that kept the Test stage from ever dispatching for any repo/diff
+    not explicitly covered by `capability_rules` (only `tui/`-  and
+    `coord/dashboard/webapp/`-style rules were ever routed; everything else,
+    including most Python work, silently never got a headless Test-stage
+    dispatch at all). It now means "no extra hardware capability required" —
+    `type="work"` still dispatches, to any capable-for-repo machine, as long
+    as a real command is configured."""
     result = dispatch_smoke(
         _completed(), Board(), gtk_and_server_config,
         http_client=_FakeClient({"id": "x"}),
         diff_lookup=lambda repo, branch: ["docs/README.md"],
+    )
+    assert result is not None
+    assert result.type == "smoke"
+    # No capability required → prefers the (idle) worker machine (#1402).
+    assert result.machine_name == "server"
+
+
+def test_dispatch_smoke_skipped_when_no_rule_matches_and_no_command_configured(
+) -> None:
+    """A repo with no `test_command` and no `smoke_tests.default_command`
+    has genuinely nothing to run — this must stay a silent skip, not a
+    dispatch of a command-less assignment."""
+    bare_repo = Repo(
+        name="api", github="acme/api", depends_on=[], default_branch="main",
+    )
+    cfg = Config(
+        repos=[bare_repo],
+        machines=[_machine("server", "server.tail", caps=["python"])],
+        smoke_tests=SmokeTestsConfig(auto_queue=True),
+    )
+    result = dispatch_smoke(
+        _completed(), Board(), cfg,
+        http_client=_FakeClient({"id": "x"}),
+        diff_lookup=lambda repo, branch: ["docs/README.md"],
+    )
+    assert result is None
+
+
+def test_dispatch_smoke_skipped_for_mock_author_when_no_rule_matches(
+    gtk_and_server_config: Config,
+) -> None:
+    """#930/#1176 + #1076/#1152: mock-author/test-author (Gate-A contract or
+    fixture-only diffs) keep the OLD skip-on-miss behavior even though a real
+    `test_command` is configured — a rule miss for these types means
+    "genuinely nothing to smoke-test", and `dispatch_pending_reviews`
+    back-fills `test_state="skipped"` for them. Dispatching a real suite run
+    here would duplicate that and burn a full test run on a diff that never
+    touches source."""
+    mock_author = replace(_completed(), type="mock-author", assignment_id="ma1")
+    result = dispatch_smoke(
+        mock_author, Board(), gtk_and_server_config,
+        http_client=_FakeClient({"id": "x"}),
+        diff_lookup=lambda repo, branch: ["tests/acceptance/fixture.screen"],
     )
     assert result is None
 
@@ -490,6 +542,26 @@ def test_dispatch_smoke_sends_to_capable_different_machine(
     assert payload["repo_path"] == "/d/api"
     # Briefing should mention the test_command fallback (make test).
     assert "make test" in payload["briefing"]
+
+
+def test_dispatch_smoke_marks_parent_test_state_running(
+    gtk_and_server_config: Config,
+) -> None:
+    """#1395/#1426: dispatching the Test stage as a real assignment must not
+    reopen the #1395 gap — the parent work row's `test_state` flips to
+    'running' the moment the smoke assignment is dispatched, the same
+    marker `coord test --running` set for the old local-subprocess path, so
+    the board/TUI reads Test as Active for the run's duration instead of
+    idle."""
+    parent = _completed(machine="server")
+    board = Board(completed=[parent])
+    result = dispatch_smoke(
+        parent, board, gtk_and_server_config,
+        http_client=_FakeClient({"id": "smoke-run"}),
+        diff_lookup=lambda repo, branch: ["src/gtk/window.c"],
+    )
+    assert result is not None
+    assert parent.test_state == "running"
 
 
 def test_dispatch_smoke_uses_default_command_when_set(
@@ -784,3 +856,87 @@ def test_reconcile_thin_client_falls_back_to_local_on_daemon_error(
 
     # Falls open to "no label" behaviour → respects auto_queue=True → dispatches.
     assert mock_dispatch.called
+
+
+# ── #1426: dispatch_pending_smoke — bulk backlog dispatch ───────────────────
+
+
+def test_dispatch_pending_smoke_off_when_auto_queue_disabled(
+    gtk_and_server_config: Config,
+) -> None:
+    cfg = replace(
+        gtk_and_server_config,
+        smoke_tests=replace(gtk_and_server_config.smoke_tests, auto_queue=False),
+    )
+    board = Board(completed=[_completed()])
+    assert dispatch_pending_smoke(board, cfg) == []
+
+
+def test_dispatch_pending_smoke_skips_rows_with_a_test_state(
+    gtk_and_server_config: Config, monkeypatch,
+) -> None:
+    """A row that already has ANY test_state (passed/failed/skipped/running)
+    must not be re-dispatched — it either has a verdict already, or someone
+    (an interactive --smoke-of session, or an in-flight smoke assignment) is
+    already handling it."""
+    from unittest.mock import patch as _patch
+
+    monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: None)
+
+    for state in ("passed", "failed", "skipped", "running"):
+        row = replace(_completed(), test_state=state)
+        board = Board(completed=[row])
+        with _patch("coord.smoke.dispatch_smoke") as mock_dispatch:
+            result = dispatch_pending_smoke(board, gtk_and_server_config)
+        assert result == []
+        assert not mock_dispatch.called, f"must not dispatch for test_state={state!r}"
+
+
+def test_dispatch_pending_smoke_skips_test_mode_smoke(
+    gtk_and_server_config: Config, monkeypatch,
+) -> None:
+    """test-mode:smoke means the TUI offers the interactive smoke agent — the
+    bulk headless path must not auto-dispatch for it."""
+    from unittest.mock import patch as _patch
+
+    monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: "smoke")
+
+    board = Board(completed=[_completed()])
+    with _patch("coord.smoke.dispatch_smoke") as mock_dispatch:
+        result = dispatch_pending_smoke(board, gtk_and_server_config)
+    assert result == []
+    assert not mock_dispatch.called
+
+
+def test_dispatch_pending_smoke_ignores_non_work_like_and_non_done_rows(
+    gtk_and_server_config: Config, monkeypatch,
+) -> None:
+    from unittest.mock import patch as _patch
+
+    monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: None)
+
+    review_row = replace(_completed(), type="review", assignment_id="r1")
+    active_row = replace(_completed(), status="running", assignment_id="w2")
+    board = Board(completed=[review_row, active_row])
+    with _patch("coord.smoke.dispatch_smoke") as mock_dispatch:
+        result = dispatch_pending_smoke(board, gtk_and_server_config)
+    assert result == []
+    assert not mock_dispatch.called
+
+
+def test_dispatch_pending_smoke_calls_dispatch_smoke_for_eligible_rows(
+    gtk_and_server_config: Config, monkeypatch,
+) -> None:
+    from unittest.mock import patch as _patch
+
+    monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: None)
+
+    eligible = _completed()
+    board = Board(completed=[eligible])
+    sentinel = object()
+    with _patch("coord.smoke.dispatch_smoke", return_value=sentinel) as mock_dispatch:
+        result = dispatch_pending_smoke(board, gtk_and_server_config)
+    assert mock_dispatch.called
+    call_args = mock_dispatch.call_args
+    assert call_args[0][0] is eligible
+    assert result == [sentinel]

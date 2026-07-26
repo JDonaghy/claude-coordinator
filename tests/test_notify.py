@@ -1110,6 +1110,77 @@ class TestDispatchBoardPendingReviewsNoSmokeGate:
         )
 
 
+class TestDispatchBoardPendingSmoke:
+    """#1426: `_dispatch_board_pending_smoke` must call `dispatch_smoke` for a
+    completed work row with no test verdict yet. Before this, the ONLY
+    caller of `dispatch_smoke` was `reconcile()`'s per-item loop over that
+    pass's newly-done rows, and the ONLY sanctioned caller of `reconcile()`
+    is the human-invoked `coord resume` — so a thin-client setup driven
+    purely by `coord-notify.timer` never dispatched the Test stage at all,
+    the gap `scripts/drive-issue.sh` had to paper over with a local
+    `coord-test-runner.sh` subprocess (#1395)."""
+
+    @staticmethod
+    def _config() -> Config:
+        from coord.config import SmokeTestsConfig
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api", test_command="make test")],
+            machines=[Machine(name="laptop", host="laptop.tailnet", repos=["api"])],
+        )
+        cfg.smoke_tests = SmokeTestsConfig(auto_queue=True)
+        return cfg
+
+    def test_dispatches_smoke_for_untested_completed_work(
+        self, coord_dir: Path
+    ) -> None:
+        from coord.models import Assignment, Board
+
+        work = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=11, issue_title="t",
+            assignment_id="untested-work", type="work",
+            status="done", branch="issue-11-fix",
+        )
+        state_mod.save_board(Board(completed=[work]))
+
+        dispatch_calls: list[str] = []
+
+        def _fake_dispatch(completed, board, config, **kwargs):
+            dispatch_calls.append(completed.assignment_id)
+            return None
+
+        with patch("coord.smoke.dispatch_smoke", _fake_dispatch), \
+             patch("coord.state.get_issue_test_mode", return_value=None):
+            notify_mod._dispatch_board_pending_smoke(self._config())
+
+        assert "untested-work" in dispatch_calls, (
+            "_dispatch_board_pending_smoke must call dispatch_smoke for a "
+            "completed work row with no test verdict (#1426)"
+        )
+
+    def test_skips_when_auto_queue_off(self, coord_dir: Path) -> None:
+        from dataclasses import replace as _replace
+
+        from coord.models import Assignment, Board
+
+        work = Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=12, issue_title="t",
+            assignment_id="off-work", type="work",
+            status="done", branch="issue-12-fix",
+        )
+        state_mod.save_board(Board(completed=[work]))
+
+        cfg = self._config()
+        cfg.smoke_tests = _replace(cfg.smoke_tests, auto_queue=False)
+
+        with patch("coord.smoke.dispatch_smoke") as mock_dispatch:
+            notify_mod._dispatch_board_pending_smoke(cfg)
+
+        assert not mock_dispatch.called
+
+
 class TestMilestoneChatNotifySuppression:
     """#770: milestone-chat completion must NOT post a GitHub comment.
 

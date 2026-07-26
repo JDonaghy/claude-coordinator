@@ -34,6 +34,7 @@ independence; for smoke we want a *capable* machine for hardware, and
 from __future__ import annotations
 
 import json
+import logging
 import time
 import uuid
 from dataclasses import dataclass
@@ -46,13 +47,20 @@ from coord.config import Config, SmokeRule, SmokeTestsConfig
 from coord.dispatch import AGENT_PORT
 from coord.models import WORK_LIKE_TYPES, Assignment, Board, Machine
 
+logger = logging.getLogger("coord.smoke")
+
 
 SMOKE_SYSTEM_PROMPT = """\
 You are a smoke-test runner dispatched by the coordinator. \
 Your only job: pull the branch, run the smoke command, report pass/fail.
 
 Rules:
-- Do NOT modify code. Do NOT push commits. You only validate.
+- Do NOT edit source files. Do NOT push commits. You only validate.
+- You MAY perform test-environment SETUP the smoke command needs — creating
+  a venv, `pip install`-ing dev deps, symlinking a sibling checkout for a
+  path dependency (e.g. coord-tui's quadraui link), writing build artifacts.
+  None of that touches the branch's source; it is exactly what the smoke
+  command itself does when run locally, so do it without asking.
 - Do NOT run `gh` commands. The coordinator owns GitHub interactions.
 - You MAY run git, build commands, and test commands.
 - Exit code is what the coordinator reads — exit 0 on pass, non-zero on \
@@ -339,26 +347,65 @@ def dispatch_smoke(
 
     touched = diff_lookup(repo.github, completed.branch)
     required_caps = match_rules(touched, smoke_cfg.capability_rules)
+    smoke_command = smoke_cfg.default_command or repo.test_command
+
     if not required_caps:
-        # No rule matched — either the diff doesn't need a specialized machine
-        # or rules aren't configured for this repo. Either way, skip silently.
+        # #1426: a capability-rule miss used to mean "skip silently" — the
+        # exact blocker that kept the Test stage from ever dispatching for
+        # any repo/diff not explicitly covered by a `capability_rules` entry
+        # (historically only `tui/` and `coord/dashboard/webapp/` were
+        # routed; everything else — most `coord/**` Python work included —
+        # never got a headless Test-stage dispatch at all).
+        #
+        # It now means "no EXTRA hardware capability required", not "nothing
+        # to test": a `type="work"` completion still dispatches, to any
+        # machine that can build/test the repo at all, as long as a real
+        # command is configured (`smoke_tests.default_command` or the repo's
+        # `test_command`) — see `pick_smoke_machine`, which treats an empty
+        # `required_caps` as "any capable-for-repo machine".
+        #
+        # `mock-author`/`test-author` (#930/#1176) keep the OLD skip-on-miss
+        # behavior: #1076/#1152 established that a rule miss for THOSE types
+        # means "genuinely nothing to smoke-test" (a Gate-A contract/fixture-
+        # only diff), and `dispatch_pending_reviews` back-fills
+        # `test_state="skipped"` for them — dispatching a real suite run
+        # here would duplicate that and burn a full test run on a diff that
+        # never touches source.
+        if completed.type != "work" or smoke_command is None:
+            return None
+
+    if smoke_command is None:
+        logger.warning(
+            "dispatch_smoke: %s#%s needs capabilities %s but no smoke "
+            "command is configured (smoke_tests.default_command or this "
+            "repo's test_command) — skipping. Configure one so the Test "
+            "stage stops silently no-oping for this repo.",
+            completed.repo_name, completed.issue_number, required_caps,
+        )
         return None
 
     choice = pick_smoke_machine(
         required_caps, completed.repo_name, completed.machine_name, board, config
     )
     if choice is None:
+        logger.warning(
+            "dispatch_smoke: %s#%s needs capabilities %s but no configured "
+            "machine has them (and can build repo %r) — the Test stage will "
+            "not run for this completion until a capable machine is added.",
+            completed.repo_name, completed.issue_number, required_caps,
+            completed.repo_name,
+        )
         return None
 
     repo_path = choice.machine.repo_path(completed.repo_name)
     if repo_path is None:
+        logger.warning(
+            "dispatch_smoke: chose machine %s for %s#%s but it has no "
+            "repo_paths entry for %r — cannot dispatch.",
+            choice.machine.name, completed.repo_name, completed.issue_number,
+            completed.repo_name,
+        )
         return None
-
-    smoke_command = (
-        smoke_cfg.default_command
-        or repo.test_command
-        or "echo 'no smoke command configured' && false"
-    )
 
     briefing = build_smoke_briefing(
         repo_github=repo.github,
@@ -425,4 +472,85 @@ def dispatch_smoke(
             repo_github=repo.github,
         )
 
+    # #1395/#1426: mark the PARENT work row's Test verdict "running" the
+    # moment the smoke assignment is dispatched — the same marker
+    # `coord test --running` set for the old local-subprocess path, so the
+    # board/TUI reads the Test box Active for the run's duration instead of
+    # idle/Pending. Without this, dispatching the Test stage as a real
+    # assignment would silently reopen the #1395 gap it was built to close:
+    # `test_state` would stay NULL from dispatch until the terminal verdict
+    # lands, indistinguishable from "not started yet".
+    if completed.assignment_id is not None:
+        from coord.state import record_test_verdict
+
+        record_test_verdict(
+            assignment_id=completed.assignment_id,
+            test_state="running",
+            test_reason="dispatched: Test stage running (#1426)",
+        )
+        completed.test_state = "running"
+
     return smoke_assignment
+
+
+# ── Bulk dispatch (#1426) ────────────────────────────────────────────────────
+
+
+def dispatch_pending_smoke(
+    board: Board,
+    config: Config,
+    *,
+    now: float | None = None,
+) -> list[Assignment]:
+    """Bulk Test-stage dispatch — the smoke analogue of
+    :func:`coord.review.dispatch_pending_reviews`.
+
+    Scans the FULL completed backlog on `board` (not just rows that just
+    transitioned this pass) for work-like completions with no test verdict
+    yet, and dispatches a smoke assignment for each eligible one via
+    :func:`dispatch_smoke` (which itself enforces `auto_queue`, the #459-style
+    dedupe via `has_active_followup`, and capability routing).
+
+    This is the single choke point both `reconcile()` (human-invoked `coord
+    resume`) and `coord notify` (the unattended 5-minute timer) route bulk
+    Test-stage dispatch through — mirroring `dispatch_pending_reviews`
+    exactly. Before this, `dispatch_smoke` was only ever called from
+    `reconcile()`'s per-item loop over that pass's newly-done rows, so a
+    thin-client/timer-only setup with nobody running `coord resume` never
+    dispatched the Test stage at all — the gap `drive-issue.sh` had to paper
+    over with a local `scripts/coord-test-runner.sh` subprocess (#1395).
+
+    Returns the list of smoke `Assignment`s actually dispatched. The caller
+    is responsible for persisting the board.
+    """
+    smoke_cfg = getattr(config, "smoke_tests", None)
+    if smoke_cfg is None or not smoke_cfg.auto_queue:
+        return []
+
+    from coord.state import get_issue_test_mode
+
+    dispatched: list[Assignment] = []
+    for completed in board.completed:
+        if completed.type not in WORK_LIKE_TYPES:
+            continue
+        if completed.status != "done":
+            continue
+        if completed.test_state is not None:
+            # Already has a verdict ("passed"/"failed"/"skipped"), or is
+            # "running" — someone (an interactive --smoke-of session, or a
+            # smoke assignment already in flight) is already handling it.
+            continue
+
+        # #685: per-issue test-mode policy gates auto-smoke dispatch.
+        #   test-mode:auto  → headless smoke (auto-dispatch here).
+        #   test-mode:smoke → skip; the TUI offers the interactive smoke agent.
+        #   no label        → no policy set → respect auto_queue (back-compat).
+        test_mode = get_issue_test_mode(completed.repo_name, completed.issue_number)
+        if test_mode == "smoke":
+            continue
+
+        smoke = dispatch_smoke(completed, board, config, now=now)
+        if smoke is not None:
+            dispatched.append(smoke)
+
+    return dispatched

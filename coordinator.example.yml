@@ -35,9 +35,18 @@ repos:
     # and still uses ~/.coord-venv/bin/pip so PEP 668 ("externally-managed-
     # environment" when pip resolves to /usr/bin/pip) doesn't bite.
     build_command: "~/.coord-venv/bin/pip wheel --no-deps --wheel-dir /tmp/coord-test-build ."
-    # #1021: coord-tui's TuiDriver harness runs via `cargo test` inside tui/.
-    # The headless smoke routes here when the smoke capability rule matches.
-    test_command: "cd tui && cargo test"
+    # #1426: point the headless Test stage at the SAME script the (now
+    # observer-only) scripts/drive-issue.sh used to run locally. This repo is
+    # two codebases (Python under coord/**, Rust under tui/**), so a single
+    # `cargo test` or `pytest` here would either run the wrong suite or miss
+    # one half of the diff — coord-test-runner.sh does the path routing
+    # (coord/**+tests/** -> pytest, tui/** -> cargo test, docs-only -> skip),
+    # the quadraui path-dep symlink for tui/, and flake-tolerant re-runs.
+    # `dispatch_smoke` runs this in place on whichever machine it dispatches
+    # to (see the `smoke_tests.capability_rules` rust rule below), so that
+    # machine's repo_paths checkout needs a `quadraui` sibling directory —
+    # true for every machine below (repo_paths list quadraui alongside it).
+    test_command: "scripts/coord-test-runner.sh . --base-ref origin/main --repo claude-coordinator"
     # artifact_paths: []  # no compiled binaries to stash for a Python package
 
 machines:
@@ -80,13 +89,26 @@ machines:
       claude-coordinator: ~/src/claude-coordinator
 
 smoke_tests:
-  # #1021: auto-dispatch headless smoke assignments when a work assignment
-  # completes.  The capability rule routes coord-tui changes (tui/ tree) to
-  # a machine with the rust capability so `cd tui && cargo test` compiles.
+  # #1021/#1426: auto-dispatch a headless smoke (Test-stage) assignment when
+  # a work assignment completes, on both `coord resume` (reconcile()) and the
+  # unattended `coord-notify.timer` (`coord notify`).
+  #
+  # `capability_rules` below is EXTRA hardware a diff needs beyond "any
+  # machine that can build/test this repo" — a rule miss does not mean
+  # "skip" (#1426): as long as a `test_command` is configured (above), the
+  # Test stage still dispatches for a plain `type="work"` completion, just to
+  # any capable-for-repo machine rather than a specifically-capabled one.
+  # Add a rule here only when a diff genuinely needs hardware most machines
+  # lack — GTK, a browser for Playwright, etc. — the tui/ rule below is the
+  # worked example: coord-tui's TuiDriver harness needs a Rust toolchain, and
+  # not every machine in this fleet has one (azure-vm doesn't).
   auto_queue: true
   capability_rules:
     - files: [tui/]
       requires: [rust]
+    # Worked example for a browser-driven acceptance suite (docs/PHONE_WEBAPP.md):
+    # - files: [coord/dashboard/webapp/]
+    #   requires: [browser]
 
 pipeline:
   # Lifecycle gate order. Test precedes Review so the smoke test runs before the

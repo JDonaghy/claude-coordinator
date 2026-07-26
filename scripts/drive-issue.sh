@@ -6,45 +6,52 @@
 #   scripts/drive-issue.sh [options] <repo> <issue>
 #
 # The pipeline is Work → Test → Review → Merge (pipeline.default_gates).  coord
-# already automates most of it: the `coord serve` tick loop reconciles and
+# now automates all of it (#1426): the `coord serve` tick loop reconciles and
 # enqueues, and the `coord-notify.timer` (5 min, on the daemon host) posts
-# completions, dispatches reviews, and runs the review → fix → re-review
-# auto-loop.  Two things are missing, and this script supplies them:
+# completions, auto-dispatches the Test-stage smoke assignment
+# (`dispatch_pending_smoke`), dispatches reviews, and runs the review → fix →
+# re-review auto-loop.  One thing is still missing, and this script supplies
+# it:
 #
-#   1. THE TEST GATE HAS NO HEADLESS PRODUCER.  `dispatch_smoke` is disabled
-#      (smoke_tests.auto_queue), is only called from `reconcile()` (which only
-#      `coord resume` runs — the notify timer has no smoke counterpart), only
-#      fires when a `capability_rules` prefix matches, and falls back to
-#      `echo ... && false` for a repo with no `test_command`.  So headless work
-#      lands `done` with `test_state=NULL` and, because
-#      `default_gates: [test, review, merge]` holds review until a
-#      passed/skipped verdict, the review never dispatches.  Observed live:
-#      #1348/#1349 sat done/test=NULL/review=pending for 12.8 hours.
-#      → The Test gate here runs scripts/coord-test-runner.sh in a scratch
-#        worktree and records the verdict with `coord test --passed|--fail`.
-#        Because that suite runs on THIS machine with no board assignment
-#        behind it, coord has no other way to know it's in flight — #1395
-#        made it invisible, reading idle/Pending for however long the suite
-#        took.  `coord test --running` (set right before the run, overwritten
-#        by the terminal verdict after) closes that gap: the board/TUI reads
-#        the Test box Active for the run's duration.
+#   NOTHING SEQUENCES THE STAGES FOR A SINGLE ISSUE.  `coord wait` is
+#   per-assignment (and reads the LOCAL dispatched ledger, so it does not
+#   work from a thin client at all).  → This script is a resumable state
+#   machine over the daemon's board: it dispatches the WORK assignment, then
+#   OBSERVES Test/Review/Merge — coord dispatches all three itself — nudging
+#   `coord notify` (--notify) when nothing has changed for --stall minutes.
 #
-#   2. NOTHING SEQUENCES THE STAGES FOR A SINGLE ISSUE.  `coord wait` is
-#      per-assignment (and reads the LOCAL dispatched ledger, so it does not
-#      work from a thin client at all).  → This script is a resumable state
-#      machine over the daemon's board.
+# #1426: this script used to run scripts/coord-test-runner.sh ITSELF, in a
+# scratch worktree, and record the verdict with `coord test --passed|--fail`.
+# That was a workaround for two bugs, both now fixed at the source:
+#   - `dispatch_smoke` silently no-op'd for almost every repo/diff: it
+#     required a `capability_rules` prefix match even for a plain `type=work`
+#     completion with a configured `test_command`, so only `tui/`-ish rules
+#     ever fired. It now dispatches for any `type="work"` completion with a
+#     real command configured, matched rule or not — a capability-rule miss
+#     just means "no EXTRA hardware required", not "skip".
+#   - `dispatch_smoke` was only ever called from `reconcile()`'s per-item
+#     loop, and the only sanctioned caller of `reconcile()` is the
+#     human-invoked `coord resume` — so a thin-client setup driven purely by
+#     `coord-notify.timer` never ran the Test stage at all. `notify.run()`
+#     now calls `dispatch_pending_smoke` too, the same shape as review
+#     dispatch.
+# With both fixed, the Test stage is a normal dispatched, board-visible,
+# capability-routed assignment — same as Review and Merge — so this script
+# only needs to OBSERVE it, exactly like it already does for Review and
+# Merge. `--skip-test` remains as an explicit override for a genuinely
+# untestable diff; it records `skipped` directly, no dispatch involved.
 #
-# A FAILING TEST IS A LOOP ITERATION, NOT A DEAD END.  On a genuine failure the
-# gate records `--fail` (which mirrors to the legacy `smoke_test` field and
-# stores the report where `coord fix` looks for it) and then runs `coord fix`,
-# which dispatches a headless follow-up worker on the SAME branch with the
-# model escalated and the failure quoted in its briefing.  The loop re-tests
-# and repeats, bounded by --max-fix-rounds.
+# A FAILING TEST IS A LOOP ITERATION, NOT A DEAD END.  On a genuine test
+# failure this script runs `coord fix` — a coordinator command, not a local
+# subprocess — which dispatches a headless follow-up worker on the SAME
+# branch with the model escalated and the failure quoted in its briefing.
+# The loop re-tests and repeats, bounded by --max-fix-rounds.
 #
 # Everywhere coord ALREADY has a path, this script observes rather than acts —
-# in particular it never dispatches a REVIEW fix, because the notify timer's
-# auto-loop already does, and two drivers racing is exactly the 2026-06-07
-# duplicate-fix-worker incident (#476/#477).
+# in particular it never dispatches the Test-stage smoke assignment (coord's
+# own `dispatch_pending_smoke` does) or a REVIEW fix (the notify timer's
+# auto-loop already does) — two drivers racing to dispatch the same thing is
+# exactly the 2026-06-07 duplicate-fix-worker incident (#476/#477).
 #
 # Every command it runs is a normal `coord` command.  Re-running it on the same
 # issue is safe and resumes from wherever the board actually is.
@@ -53,14 +60,12 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE_TOOL="$HERE/coord_issue_state.py"
-TEST_RUNNER="$HERE/coord-test-runner.sh"
 
 # ── defaults ─────────────────────────────────────────────────────────────────
 
 MACHINE=""
 MODEL=""
 DO_PLAN=0
-TEST_COMMAND=""
 MAX_FIX_ROUNDS=3
 SKIP_TEST=0
 REPO_PATH=""
@@ -95,23 +100,20 @@ Options:
                         which prepends to the top of every briefing (#603).
   --plan                Run a read-only plan stage first and auto-approve it
                         (coord assign --plan-only → coord approve-plan).
-  --test-command CMD    Override the Test gate. By default the gate runs
-                        scripts/coord-test-runner.sh, which path-routes for
-                        claude-coordinator (coord/** → pytest, tui/** →
-                        cargo test, plus the quadraui path-dep link and flake
-                        filtering) and, for every other repo, falls back to
-                        REPO_TEST_COMMAND (the repo's configured
-                        `test_command`) unless the diff is doc/config-only.
-                        A repo with neither a path rule nor a configured
-                        test_command makes the gate REFUSE rather than
-                        silently record 'skipped' (#1408).
   --max-fix-rounds N    Headless `coord fix` rounds on a failing test suite
                         (default 3). Each round continues the SAME branch with
-                        the model escalated.
-  --skip-test           Record the Test gate as `skipped` instead of running
-                        anything. Use only for genuinely untestable diffs.
-  --repo-path PATH      Local checkout to build the scratch worktree from.
-                        Default: ~/src/<repo>.
+                        the model escalated. Unaffected by WHERE the Test
+                        stage runs (#1426): coord dispatches it itself, onto
+                        a capability-matched machine, via
+                        scripts/coord-test-runner.sh (or the repo's
+                        configured `test_command`) — see coordinator.yml's
+                        `smoke_tests`. This script only observes the verdict.
+  --skip-test           Record the Test gate as `skipped` directly — no
+                        dispatch, no subprocess. Use only for genuinely
+                        untestable diffs.
+  --repo-path PATH      Local checkout used for branch/merge verification
+                        (git fetch + rev-list against origin). Default:
+                        ~/src/<repo>.
   --poll SECS           Board poll interval (default 60).
   --max-work-retries N  `coord retry` attempts on a failed work stage (default 1).
   --deadline MINS       Give up after this long (default 240).
@@ -156,7 +158,6 @@ while [[ $# -gt 0 ]]; do
         --model)            MODEL="$2"; shift 2 ;;
         --briefing-file)    BRIEFING_FILE="$2"; shift 2 ;;
         --plan)             DO_PLAN=1; shift ;;
-        --test-command)     TEST_COMMAND="$2"; shift 2 ;;
         --max-fix-rounds)   MAX_FIX_ROUNDS="$2"; shift 2 ;;
         --skip-test)        SKIP_TEST=1; shift ;;
         --repo-path)        REPO_PATH="$2"; shift 2 ;;
@@ -183,7 +184,6 @@ ISSUE="$2"
 
 command -v coord >/dev/null || die "coord not on PATH — activate the venv" 2
 [[ -f "$STATE_TOOL" ]] || die "missing $STATE_TOOL" 2
-[[ -x "$TEST_RUNNER" ]] || die "missing or non-executable $TEST_RUNNER" 2
 
 SCRATCH="${TMPDIR:-/tmp}/coord-drive-issue-$(id -u)"
 mkdir -p "$SCRATCH"
@@ -230,19 +230,16 @@ printf '%s #%s (pid %s)\n' "$REPO" "$ISSUE" "$$" >"$HOLDER"
 # freely across issues — the expensive stages stay parallel.
 MERGE_LOCK="$SCRATCH/merge.lock"
 
-# Clean up the test worktree on ANY exit — including Ctrl-C and SIGTERM. A
-# worktree left registered in the base checkout makes the NEXT run's `git
-# worktree add` fail on an already-registered path (the #618 orphaned-worktree
-# failure mode), so this is not merely tidiness.
-CURRENT_WT=""
+# Release the per-issue lock on ANY exit — including Ctrl-C and SIGTERM.
+#
+# #1426: this script no longer builds its own scratch worktree for the Test
+# stage (coord dispatches that itself, see the header comment), so there is
+# no worktree left here to clean up on exit — the #618 orphaned-worktree
+# failure mode this trap used to guard against lived entirely in that local
+# test run.
 cleanup() {
     local rc=$?
     rm -f "$HOLDER"
-    if [[ -n "$CURRENT_WT" ]]; then
-        local base="${REPO_PATH:-$HOME/src/$REPO}"
-        git -C "$base" worktree remove --force "$CURRENT_WT" 2>/dev/null || true
-        git -C "$base" worktree prune 2>/dev/null || true
-    fi
     exit $rc
 }
 trap cleanup EXIT INT TERM
@@ -305,114 +302,20 @@ dispatch_work() {
     coord "${args[@]}" 2>&1 | tee -a "$RUN_LOG"
 }
 
-# ── stage: test (script-owned) ───────────────────────────────────────────────
+# ── stage: test (coord-dispatched, #1426 — this script only observes) ───────
 
-# Runs the branch's tests and records the Test-gate verdict.
-#
-# The worktree is built in scratch, NEVER under ~/.coord/worktrees — the
-# daemon's hourly orphan sweep deletes worktrees with no live session and would
-# pull this one out from under a running suite.
-#
-# #1395: this whole stage runs on the OPERATOR machine with no board
-# assignment behind it — coord has no other way to know a suite is in
-# flight, so the Test box previously read idle/Pending for however long the
-# suite took (minutes, for tui/**). `coord test --running` records a
-# transient, non-verdict test_state that coord.stage_projection maps to
-# Active; the terminal `--passed`/`--fail`/`--skipped` call below overwrites
-# it exactly as before. Every merge/review gate keys off
-# `test_state in ("passed", "skipped")`, so "running" fails closed there —
-# see coord/models.py's test_state docstring.
-#
-# Returns 0 when the gate is now passed/skipped, 1 when it recorded a failure.
-run_test_gate() {
-    local aid="$1" branch="$2"
-
-    if [[ "$SKIP_TEST" -eq 1 ]]; then
-        log "TEST: --skip-test → recording 'skipped'"
-        coord test --skipped --reason "drive-issue.sh --skip-test" "$aid" \
-            2>&1 | tee -a "$RUN_LOG"
-        return 0
-    fi
-
-    log "TEST: starting → coord test --running $aid (board/TUI now shows Test Active)"
-    coord test --running "$aid" 2>&1 | tee -a "$RUN_LOG" || \
-        warn "coord test --running failed to record (non-fatal — continuing)"
-
-    local base="${REPO_PATH:-$HOME/src/$REPO}"
-    [[ -d "$base/.git" ]] || die "not a git checkout: $base (pass --repo-path)"
-
-    local wt_parent="$SCRATCH/wt/${REPO}-${ISSUE}"
-    # The worktree must sit in its OWN directory, because coord-test-runner.sh
-    # needs to drop a `quadraui` symlink as its SIBLING to satisfy
-    # tui/Cargo.toml's `path = "../../quadraui/quadraui"`.
-    local wt="$wt_parent/$REPO"
-    rm -rf "$wt_parent"
-    mkdir -p "$wt_parent"
-
-    log "TEST: fetching $branch into $wt"
-    git -C "$base" fetch --quiet origin "$branch" || die "could not fetch origin/$branch"
-    # Drop any registration left by a previous run that was killed before its
-    # cleanup ran — otherwise `worktree add` refuses the path as already used.
-    git -C "$base" worktree prune 2>/dev/null || true
-    # --detach so this never fights a checkout of the same branch elsewhere.
-    git -C "$base" worktree add --quiet --detach "$wt" FETCH_HEAD \
-        || die "git worktree add failed"
-    CURRENT_WT="$wt"
-
-    local out="$SCRATCH/${REPO}-${ISSUE}-test.out"
-    local rc=0
-    # --repo tells the runner which path-routing rules apply (claude-coordinator
-    # is the only repo with hardcoded rules); --fallback-command is the repo's
-    # configured test_command (REPO_TEST_COMMAND, from coordinator.yml) for
-    # every other repo. Passing neither correctly for a non-claude-coordinator
-    # repo is exactly #1408: the runner refuses instead of silently SKIPping.
-    local runner_args=("$wt" --base-ref "origin/${REPO_DEFAULT_BRANCH:-main}" --report "$out" --repo "$REPO")
-    [[ -n "${REPO_TEST_COMMAND:-}" ]] && runner_args+=(--fallback-command "$REPO_TEST_COMMAND")
-    if [[ -n "$TEST_COMMAND" ]]; then
-        # Escape hatch: run exactly what the caller asked for instead of the
-        # path-routed suites.
-        log "TEST: running override: $TEST_COMMAND"
-        ( cd "$wt" && bash -lc "$TEST_COMMAND" ) >"$out" 2>&1 || rc=$?
-    else
-        "$TEST_RUNNER" "${runner_args[@]}" || rc=$?
-    fi
-
-    git -C "$base" worktree remove --force "$wt" 2>/dev/null || \
-        warn "could not remove worktree $wt — remove it manually"
-    CURRENT_WT=""
-
-    # A docs-only diff has nothing to run; that is 'skipped', not 'passed'. The
-    # reason is whatever the runner actually decided (it names the paths it
-    # considered) — never a hardcoded string, so "nothing to test" and "could
-    # not determine what to test" (below) never collapse into the same text.
-    if [[ $rc -eq 0 ]] && grep -q '^SKIP:' "$out" 2>/dev/null; then
-        local skip_reason
-        skip_reason="$(grep '^SKIP:' "$out" | head -1 | sed 's/^SKIP: //')"
-        log "TEST: nothing to test → coord test --skipped $aid ($skip_reason)"
-        coord test --skipped --reason "$skip_reason" "$aid" \
-            2>&1 | tee -a "$RUN_LOG"
-        return 0
-    fi
-
-    if [[ $rc -eq 0 ]]; then
-        log "TEST: PASSED → coord test --passed $aid"
-        coord test --passed "$aid" 2>&1 | tee -a "$RUN_LOG"
-        return 0
-    fi
-
-    # A REFUSE (repo the runner has no routing/test_command for — #1408) is
-    # NOT a test failure; give it its own reason so it reads distinctly from a
-    # genuine suite failure, and so it is never confused with 'skipped' above.
-    local fail_reason="drive-issue.sh: test suite failed"
-    if grep -q '^REFUSE:' "$out" 2>/dev/null; then
-        fail_reason="$(grep '^REFUSE:' "$out" | head -1 | sed 's/^REFUSE: //')"
-    fi
-    log "TEST: FAILED → coord test --fail $aid"
-    # --output stores the report at ~/.coord/test_output/<aid>.txt, which is
-    # exactly where `coord fix` reads it to build the fix worker's briefing.
-    coord test --fail --reason "$fail_reason" \
-        --output "$out" "$aid" 2>&1 | tee -a "$RUN_LOG"
-    return 1
+# `--skip-test` is the one Test-stage action this script still takes itself:
+# an explicit human override for a genuinely untestable diff. It is a direct
+# `coord test --skipped` call, not a subprocess — everything else (dispatch,
+# running the suite, recording passed/failed) is coord's own
+# `dispatch_smoke`/`dispatch_pending_smoke`, triggered by `coord serve`'s tick
+# loop or `coord notify` (see the header comment). The main loop below just
+# polls `WORK_TEST_STATE` and waits.
+record_test_skip() {
+    local aid="$1"
+    log "TEST: --skip-test → recording 'skipped'"
+    coord test --skipped --reason "drive-issue.sh --skip-test" "$aid" \
+        2>&1 | tee -a "$RUN_LOG"
 }
 
 # The headless test-failure → fix path.
@@ -519,7 +422,7 @@ fi
 
 log "driving $REPO #$ISSUE"
 log "  machine        : $MACHINE"
-log "  test command   : ${TEST_COMMAND:-${REPO_TEST_COMMAND:-<none configured>}}"
+log "  test command   : ${REPO_TEST_COMMAND:-<none configured>} (coord dispatches this itself — #1426; this script observes)"
 log "  merge          : $([[ $DO_MERGE -eq 1 ]] && echo "yes ($MERGE_METHOD)" || echo no)"
 log "  auto-loop      : $([[ "${AUTO_LOOP:-0}" == "1" ]] && echo "on (coord dispatches review fixes; this script observes)" || echo off)"
 log "  test fix rounds: $MAX_FIX_ROUNDS (this script, via coord fix)"
@@ -692,25 +595,32 @@ while true; do
     fi
 
     # ---- TEST gate ---------------------------------------------------------
-    # #1395: "running" lands here alongside "" (no verdict yet) rather than
-    # in the `*)` catch-all below. It is ONLY ever observed on a resumed run
-    # after this same script was killed mid-suite (a live run never re-polls
-    # the board while run_test_gate blocks) — the prior attempt never reached
-    # a terminal verdict, so re-running the gate from scratch is correct and
-    # safe: run_test_gate re-fetches, rebuilds the scratch worktree, and
-    # overwrites the stale "running" marker either way.
+    # #1426: coord dispatches this stage itself now (dispatch_smoke via the
+    # `coord serve` tick loop or `coord notify` — see the header comment) onto
+    # a capability-matched machine; this script only observes
+    # `WORK_TEST_STATE`, exactly like it already does for REVIEW below.
     case "${WORK_TEST_STATE:-}" in
-        ""|running)
-            if run_test_gate "$WORK_AID" "$WORK_BRANCH"; then
-                sleep 5
+        "")
+            if [[ "$SKIP_TEST" -eq 1 ]]; then
+                record_test_skip "$WORK_AID"
+                sleep 5; continue
             fi
-            continue
+            # Waiting for coord to dispatch the Test stage itself
+            # (dispatch_smoke / dispatch_pending_smoke). The stall detector
+            # above already nudges `coord notify` (--notify) after
+            # --stall minutes of no state change — no need to force it here
+            # on every poll.
+            sleep "$POLL"; continue
+            ;;
+        running)
+            log "TEST: in progress on a capability-matched machine"
+            sleep "$POLL"; continue
             ;;
         failed)
             if (( FIX_ROUNDS >= MAX_FIX_ROUNDS )); then
                 die "test still failing after $FIX_ROUNDS fix round(s) — stopping.
    Reason: ${WORK_TEST_REASON:-none recorded}
-   Report: $SCRATCH/${REPO}-${ISSUE}-test.out
+   Inspect: coord log $WORK_AID --machine ${WORK_MACHINE:-$MACHINE}
    Continue by hand: coord assign --interactive --fix-of $WORK_AID"
             fi
             FIX_ROUNDS=$(( FIX_ROUNDS + 1 ))
