@@ -1407,6 +1407,21 @@ def test_reviewer_system_prompt_instructs_structured_output() -> None:
     assert "END_REVIEW" in REVIEWER_SYSTEM_PROMPT
 
 
+def test_reviewer_system_prompt_states_end_review_as_hard_requirement() -> None:
+    """#1427: 4% of emitted verdicts omitted `END_REVIEW` — a reviewer that
+    writes a complete, correct review and simply stops has its verdict
+    silently dropped (both measured occurrences were `approve`, the worst
+    shape: nothing is wrong and nothing says so). The prompt previously
+    showed `END_REVIEW` only inside a format example; it must also state,
+    as an explicit instruction (not just example text), that the terminator
+    is mandatory and that an otherwise-complete review without it is
+    discarded — the actual failure mode being a model that finishes its
+    prose and stops one line early."""
+    assert "HARD REQUIREMENT" in REVIEWER_SYSTEM_PROMPT
+    assert "discarded in its entirety" in REVIEWER_SYSTEM_PROMPT
+    assert "last line" in REVIEWER_SYSTEM_PROMPT.lower()
+
+
 def test_reviewer_system_prompt_forbids_running_the_test_suite() -> None:
     """A reviewer reads the diff; it must NOT run the test suite. Running it
     on a headless GUI project (e.g. vimcode) hangs the session, and build/test
@@ -1702,6 +1717,33 @@ Blocker at `cli.py:10`.
         _write_plain_log(log, """\
 I'll finish by emitting **REVIEW_VERDICT: approve** once I'm done reading,
 but I still have three files to go.
+""")
+        assert parse_review_from_log(log) is None
+
+    def test_complete_body_without_terminator_returns_none(
+        self, tmp_path: Path
+    ) -> None:
+        """#1427 canonical specimen (efc198d6475a.log): a COMPLETE, correct
+        `REVIEW_VERDICT: approve` + `REVIEW_BODY:` that ends its prose
+        naturally and simply stops — no `END_REVIEW` anywhere. This is a
+        different shape from `test_decoration_tolerance_still_requires_terminator`
+        above (mid-sentence prose that never reached a verdict format at all):
+        here the reviewer wrote a full, well-formed review and only omitted
+        the four-character terminator. Both must be rejected identically —
+        refusing an unterminated block is correct, because there is no way to
+        distinguish "finished, forgot the terminator" from "truncated
+        mid-body" without it. Recording either as authoritative would be
+        worse than recording neither."""
+        log = tmp_path / "review.log"
+        _write_plain_log(log, """\
+REVIEW_VERDICT: approve
+REVIEW_BODY:
+
+Reviewed the diff against the checklist. Tests cover the new code path,
+error handling matches project conventions, and the change stays within
+the files listed in the issue.
+
+No test-coverage gaps, scope violations, or security issues found. Approving.
 """)
         assert parse_review_from_log(log) is None
 

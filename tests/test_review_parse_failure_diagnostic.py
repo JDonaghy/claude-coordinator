@@ -77,6 +77,26 @@ REVIEW_BODY:
 Some findings here.  The block was truncated before the closing marker.
 """
 
+# The #1427 canonical specimen (efc198d6475a.log): a COMPLETE, well-formed
+# `approve` verdict with a full body that ends its prose naturally — the
+# reviewer simply stopped after the last sentence instead of also writing
+# `END_REVIEW`. Distinct from `_NO_TERMINATOR_TEXT` above (which reads as
+# mid-body truncation): this one reads as "finished and forgot the
+# terminator," the actual failure mode #1427 measured at 4% of emitted
+# verdicts. Must still be rejected by the strict parser — a complete-looking
+# body is not proof the session didn't die one line early — and must still
+# surface via the diagnostic so it isn't silently dropped.
+_COMPLETE_BODY_NO_TERMINATOR_TEXT = """\
+REVIEW_VERDICT: approve
+REVIEW_BODY:
+
+Reviewed the diff against the checklist. Tests cover the new code path,
+error handling matches project conventions, and the change stays within
+the files listed in the issue.
+
+No test-coverage gaps, scope violations, or security issues found. Approving.
+"""
+
 # A transcript where strict parsing SUCCEEDS (standard format).
 _CLEAN_TEXT = """\
 REVIEW_VERDICT: approve
@@ -124,6 +144,19 @@ class TestDetectUnparsedReviewMarker:
         result = self._call(_NO_TERMINATOR_TEXT)
         assert result is not None
         assert result.verdict_word == "request-changes"
+
+    def test_complete_body_without_terminator_fires_with_excerpt(self) -> None:
+        """#1427 canonical specimen: a complete, correct `approve` review that
+        simply stops without `END_REVIEW`. Strict parse must reject it (see
+        the paired `test_complete_body_without_terminator_returns_none` in
+        `tests/test_review.py`) and — since #1348 — this diagnostic must fire
+        with an excerpt containing the review's actual closing text, not just
+        a bare "marker seen" flag, so the operator can salvage the verdict."""
+        result = self._call(_COMPLETE_BODY_NO_TERMINATOR_TEXT)
+        assert result is not None
+        assert result.verdict_word == "approve"
+        assert "No test-coverage gaps" in result.excerpt
+        assert "Approving." in result.excerpt
 
     def test_no_marker_returns_none(self) -> None:
         """No REVIEW_VERDICT: → None (genuinely not a review)."""

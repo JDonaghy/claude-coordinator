@@ -225,6 +225,13 @@ def build_gate_b_briefing(
         "for fixes rather than shipping (docs/PIPELINE_V2.md's \"a gate can "
         "bounce backwards\" principle)."
     )
+    lines.append(
+        "`END_REVIEW` is a HARD REQUIREMENT (#1427): an otherwise-complete "
+        "verdict with no `END_REVIEW` line is discarded in its entirety, "
+        "not recorded with a best guess. Write `END_REVIEW` as the literal "
+        "last line of your final message even if your assessment already "
+        "feels finished."
+    )
     return "\n".join(lines)
 
 
