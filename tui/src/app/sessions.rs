@@ -104,14 +104,27 @@ impl CoordApp {
     /// Review/Merge stayed permanently disabled for an epic row once its
     /// Gate-A worker completed, since the strict `"work"` match never found
     /// it.
+    ///
+    /// #1223: also matches `type="test-author"` (the per-issue JIT
+    /// acceptance-authoring slice, #1084/#1173) — but unlike "work"/
+    /// "mock-author", a test-author assignment is recorded under the
+    /// milestone's tracking-issue number (`issue_number`), not the member
+    /// issue's own number, so it correlates back via `for_issue_number`
+    /// instead (set at dispatch by `coord.test_author.dispatch_test_author`).
+    /// Without this branch, `issue_num` (a member issue) would never match a
+    /// test-author row's `issue_number` (the tracking issue), leaving Start
+    /// review / Start merge / Fix permanently disabled for a member issue
+    /// once its JIT authoring slice finished — exactly the #1059 gap this
+    /// mirrors, one level down (per-issue instead of per-milestone).
     pub(crate) fn completed_work_aid_for(&self, coord_repo: &str, issue_num: u64) -> Option<String> {
         self.data
             .assignments
             .iter()
-            .filter(|a| a.issue_number == issue_num)
             .filter(|a| a.repo == coord_repo)
-            .filter(|a| {
-                matches!(a.assignment_type.as_deref().unwrap_or("work"), "work" | "mock-author")
+            .filter(|a| match a.assignment_type.as_deref().unwrap_or("work") {
+                "work" | "mock-author" => a.issue_number == issue_num,
+                "test-author" => a.for_issue_number == Some(issue_num),
+                _ => false,
             })
             .filter(|a| a.status == "done")
             .filter(|a| a.branch.as_deref().map(|b| !b.is_empty()).unwrap_or(false))
@@ -1867,12 +1880,20 @@ impl CoordApp {
         self.test_failed_work_aid_for(&repo, issue_key.1)
     }
 
+    /// #1223: also matches `type="test-author"`, correlated via
+    /// `for_issue_number` rather than `issue_number` — see
+    /// [`Self::completed_work_aid_for`]'s doc for why test-author needs the
+    /// different correlation field.
     pub(crate) fn test_failed_work_aid_for(&self, coord_repo: &str, issue_num: u64) -> Option<String> {
         self.data
             .assignments
             .iter()
-            .filter(|a| a.issue_number == issue_num && a.repo == coord_repo)
-            .filter(|a| a.assignment_type.as_deref().unwrap_or("work") == "work")
+            .filter(|a| a.repo == coord_repo)
+            .filter(|a| match a.assignment_type.as_deref().unwrap_or("work") {
+                "work" => a.issue_number == issue_num,
+                "test-author" => a.for_issue_number == Some(issue_num),
+                _ => false,
+            })
             .filter(|a| a.test_state.as_deref() == Some("failed"))
             .filter(|a| a.branch.as_deref().map(|b| !b.is_empty()).unwrap_or(false))
             .max_by(|a, b| {
@@ -1904,6 +1925,10 @@ impl CoordApp {
         self.failed_work_aid_with_branch_for(&repo, issue_key.1)
     }
 
+    /// #1223: also matches `type="test-author"`, correlated via
+    /// `for_issue_number` rather than `issue_number` — see
+    /// [`Self::completed_work_aid_for`]'s doc for why test-author needs the
+    /// different correlation field.
     pub(crate) fn failed_work_aid_with_branch_for(
         &self,
         coord_repo: &str,
@@ -1913,8 +1938,12 @@ impl CoordApp {
             .data
             .assignments
             .iter()
-            .filter(|a| a.issue_number == issue_num && a.repo == coord_repo)
-            .filter(|a| a.assignment_type.as_deref().unwrap_or("work") == "work")
+            .filter(|a| a.repo == coord_repo)
+            .filter(|a| match a.assignment_type.as_deref().unwrap_or("work") {
+                "work" => a.issue_number == issue_num,
+                "test-author" => a.for_issue_number == Some(issue_num),
+                _ => false,
+            })
             .max_by(|a, b| {
                 a.dispatched_at
                     .partial_cmp(&b.dispatched_at)
