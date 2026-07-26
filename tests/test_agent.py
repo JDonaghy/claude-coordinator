@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -3511,6 +3513,132 @@ class TestCompletedHistoryCap:
             f"list_assignments() returned {len(listing['completed'])} completed items, "
             f"expected ≤ {_COMPLETED_HISTORY_CAP}"
         )
+
+
+# ── #1421: _persist() must not race on a shared tmp file, and a corrupt
+# agent_state.json must be surfaced rather than silently discarded ───────────
+
+class TestPersistRobustness:
+    def _make_spec(self, repo_path: Path) -> AssignmentSpec:
+        return AssignmentSpec(
+            repo_name="api",
+            repo_path=str(repo_path),
+            issue_number=1,
+            issue_title="t",
+            briefing="b",
+            branch="main",
+        )
+
+    def test_concurrent_persist_never_corrupts_state_file(self, tmp_path: Path) -> None:
+        """Many threads calling _persist() concurrently must never leave
+        agent_state.json unparseable.
+
+        The pre-fix code staged every write through one shared, fixed
+        ``agent_state.json.tmp`` name outside the lock: thread A's
+        ``write_text()`` could be truncated mid-write by thread B opening the
+        *same* tmp path, and thread A's subsequent ``os.replace()`` would then
+        promote that truncated file into place. A reader polling the file
+        concurrently would occasionally see exactly the
+        ``JSONDecodeError: Expecting value: line 1 column 1 (char 0)`` from
+        the bug report. Looped heavily so it would have caught the race
+        reliably pre-fix; with the unique-tempfile fix each thread stages its
+        own file, so ``os.replace()`` is always promoting a complete write.
+        """
+        repo = _init_repo(tmp_path / "repo")
+        server = _server(tmp_path, repo_path=repo)
+        spec = self._make_spec(repo)
+        for i in range(5):
+            a = AgentAssignment(
+                id=f"seed{i}", spec=spec, status=DONE, finished_at=float(i), exit_code=0,
+            )
+            server._assignments[a.id] = a
+        server._persist()  # file exists before concurrent access starts
+
+        stop = threading.Event()
+        errors: list[str] = []
+        errors_lock = threading.Lock()
+
+        def persister() -> None:
+            for _ in range(60):
+                server._persist()
+
+        def reader() -> None:
+            while not stop.is_set():
+                try:
+                    json.loads(server.state_path.read_text())
+                except json.JSONDecodeError as e:
+                    with errors_lock:
+                        errors.append(str(e))
+                except FileNotFoundError:
+                    # Not the bug under test: os.replace() is atomic, so the
+                    # destination always resolves to a complete file once it
+                    # first exists (guaranteed by the _persist() call above).
+                    pass
+
+        persisters = [threading.Thread(target=persister) for _ in range(8)]
+        readers = [threading.Thread(target=reader) for _ in range(4)]
+        for t in readers:
+            t.start()
+        for t in persisters:
+            t.start()
+        for t in persisters:
+            t.join()
+        stop.set()
+        for t in readers:
+            t.join()
+
+        assert not errors, (
+            f"agent_state.json failed to parse under concurrent _persist() "
+            f"(the #1421 race): {errors}"
+        )
+        # The file must still be intact and complete afterwards too.
+        final = json.loads(server.state_path.read_text())
+        assert len(final["assignments"]) == 5
+
+    def test_persist_failure_is_logged_not_silently_swallowed(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A _persist() that can't write (state_dir gone) must log at ERROR
+        instead of the old bare ``except (FileNotFoundError, OSError): pass``
+        — a persist that silently fails is the other half of the #1421 blind
+        spot."""
+        repo = _init_repo(tmp_path / "repo")
+        server = _server(tmp_path, repo_path=repo)
+        shutil.rmtree(server.state_dir)
+
+        with caplog.at_level("ERROR", logger="coord.agent"):
+            server._persist()  # must not raise
+
+        assert "failed to persist" in caplog.text.lower()
+
+    def test_corrupt_state_file_is_logged_and_moved_aside(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A corrupt agent_state.json (e.g. left behind by the #1421 race, or
+        any other on-disk corruption) must be logged loudly and moved aside on
+        load — not silently discarded, which is what converted the original
+        race into invisible assignment-state loss on restart."""
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        state_path = state_dir / "agent_state.json"
+        garbage = "not valid json{"
+        state_path.write_text(garbage)
+
+        with caplog.at_level("ERROR", logger="coord.agent"):
+            server = AgentServer(machine_name="test", repos=["api"], state_dir=state_dir)
+
+        assert "corrupt" in caplog.text.lower()
+        assert server._assignments == {}
+
+        # The garbage must not still be sitting at the canonical path (ready
+        # to be silently clobbered by the next _persist()) — it must have
+        # been moved aside, recoverable and diagnosable.
+        assert not state_path.exists()
+        corrupt_files = list(state_dir.glob("agent_state.json.corrupt-*"))
+        assert len(corrupt_files) == 1, (
+            f"expected exactly one moved-aside corrupt file, found {corrupt_files}"
+        )
+        assert corrupt_files[0].read_text() == garbage
 
 
 # ── #715: /status payload stays lean regardless of history size ───────────────
