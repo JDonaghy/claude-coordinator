@@ -17,6 +17,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -5150,19 +5151,57 @@ class AgentServer:
                 # even if a future change relaxes _COMPLETED_HISTORY_CAP.
                 "assignments": [a.to_status_dict() for a in self._assignments.values()],
             }
+        # #1421: _persist() is called from many worker/monitor threads with
+        # only the snapshot above under self._lock — the file write itself
+        # happens unlocked so concurrent persists can overlap.  A *shared*
+        # fixed tmp filename let one thread's write_text() truncate the file
+        # mid-write by another thread, and os.replace() would then promote
+        # that truncated/empty file into place, silently wiping
+        # agent_state.json.  Staging through a unique tempfile.mkstemp() name
+        # in the same directory means concurrent persists can never collide:
+        # each thread renames its own file into place atomically.
+        tmp_path: Path | None = None
         try:
-            tmp = self.state_path.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(data, indent=2))
-            os.replace(tmp, self.state_path)
-        except (FileNotFoundError, OSError):
-            pass
+            fd, tmp_name = tempfile.mkstemp(
+                dir=str(self.state_dir), prefix="agent_state.", suffix=".tmp"
+            )
+            tmp_path = Path(tmp_name)
+            with os.fdopen(fd, "w") as f:
+                f.write(json.dumps(data, indent=2))
+            os.replace(tmp_path, self.state_path)
+        except (FileNotFoundError, OSError) as e:
+            _log.error("failed to persist agent state to %s: %s", self.state_path, e)
+            if tmp_path is not None:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def _load_state(self) -> None:
         if not self.state_path.exists():
             return
         try:
             data = json.loads(self.state_path.read_text())
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError) as e:
+            # #1421: a corrupt/truncated state file used to be discarded
+            # silently here, so an agent restart after the _persist() race
+            # (or any other on-disk corruption) would come back believing it
+            # had zero assignments — no log, no error, just invisible state
+            # loss. Log loudly and move the bad file aside so it's
+            # recoverable/diagnosable instead of being clobbered by the next
+            # _persist().
+            _log.error(
+                "corrupt agent state file %s (%s: %s) — starting with no "
+                "recovered assignments; original moved aside",
+                self.state_path, type(e).__name__, e,
+            )
+            try:
+                corrupt_path = self.state_path.with_name(
+                    f"{self.state_path.name}.corrupt-{int(time.time())}"
+                )
+                os.replace(self.state_path, corrupt_path)
+            except OSError:
+                pass
             return
         for entry in data.get("assignments", []):
             spec_data = entry.pop("spec", None)
