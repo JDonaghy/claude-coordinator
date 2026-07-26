@@ -412,10 +412,13 @@ def pipeline_stage_names(default_gates: list[str]) -> list[str]:
     per-issue plan-assignment prepend — see ``issue_stage_names``)."""
     stages = ["work"]
     for g in default_gates:
-        # #738: "merge" is retired from the per-issue pipeline strip; it's
-        # computed here regardless (for the Kanban badge / Merge Queue panel)
-        # but excluded from the per-issue stage-name ordering.
-        if g not in ("work", "plan", "merge"):
+        # #1429: "merge" is restored to the per-issue stage-name ordering as
+        # a read-only observation badge (#738 retired the per-issue *box*
+        # with its Go/dispatch affordance — that reasoning covered the
+        # affordance, not observation; merge is still initiated solely from
+        # the Merge Queue panel). "work"/"plan" stay excluded here since
+        # they're prepended explicitly above / by the caller.
+        if g not in ("work", "plan"):
             stages.append(g)
     return stages
 
@@ -440,10 +443,12 @@ def compute_issue_projection(
     """Compute the full per-issue stage badge dict.
 
     ``stages`` covers every name in this issue's stage strip (``plan``?,
-    ``work``, then the configured gates minus ``work``/``plan``/``merge``)
-    plus ``merge`` itself (computed unconditionally — the Kanban badge and
-    Merge Queue panel need it even though it's excluded from the per-issue
-    stage strip proper, #738).
+    ``work``, then the configured gates minus ``work``/``plan``) — including
+    ``merge`` (#1429: restored as a read-only observation badge; ``stage_status_for``
+    special-cases ``"merge"`` to delegate to ``merge_stage_status_for``, so the
+    loop below already produces the correct value) — plus a redundant explicit
+    ``merge`` assignment as a defensive fallback in case ``merge`` is ever
+    absent from ``names`` again (e.g. a future ``default_gates`` without it).
     """
     names = issue_stage_names(assignments_for_issue, default_gates)
     stages: dict[str, str] = {}
@@ -457,8 +462,11 @@ def compute_issue_projection(
             merge_entry=merge_entry,
             ci_store=ci_store,
         )
-    stages["merge"] = merge_stage_status_for(
-        assignments_for_issue, merge_entry, is_closed=is_closed, ci_store=ci_store
+    stages.setdefault(
+        "merge",
+        merge_stage_status_for(
+            assignments_for_issue, merge_entry, is_closed=is_closed, ci_store=ci_store
+        ),
     )
     # #932: the Acceptance box, computed unconditionally like "merge" above
     # (own box, own verdict — reported separately from the Test stage) and

@@ -559,9 +559,15 @@ impl CoordApp {
         }
         stages.push("work".to_string());
         for g in &self.data.pipeline_default_gates {
-            // #738: "merge" is retired from per-issue pipeline; it lives
-            // solely in the Merge Queue panel (Phase 3, SidebarView::MergeQueue).
-            if g != "work" && g != "plan" && g != "merge" {
+            // #1429: "merge" is restored to the per-issue stage-name ordering
+            // as a read-only observation badge (#738 retired the per-issue
+            // *box*'s Go/dispatch affordance — that reasoning was about the
+            // affordance, not observation; merge is still initiated solely
+            // from the Merge Queue panel, `is_dispatchable_stage` still
+            // excludes it, and `stage_status_for`/`merge_stage_status_for`
+            // already compute its real queue/CI/conflict-fix state).
+            // "work"/"plan" stay excluded — they're prepended separately.
+            if g != "work" && g != "plan" {
                 stages.push(g.clone());
             }
         }

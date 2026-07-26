@@ -98,6 +98,50 @@ def test_stage_status_stale_when_upstream_redispatched():
     ) == sp.STALE
 
 
+# ── pipeline_stage_names ─────────────────────────────────────────────────────
+
+
+def test_pipeline_stage_names_includes_merge_for_default_gate_order():
+    """#1429: restore "merge" to the per-issue stage-name ordering as a
+    read-only observation badge — #738 retired the per-issue *box* with its
+    Go/dispatch affordance, but the name ordering itself should still surface
+    where an issue sits, including a merged/queued/failed Merge stage."""
+    assert sp.pipeline_stage_names(["test", "review", "merge"]) == [
+        "work",
+        "test",
+        "review",
+        "merge",
+    ]
+
+
+def test_pipeline_stage_names_excludes_work_and_plan_from_gate_list():
+    """"work"/"plan" are prepended separately, so a duplicate in
+    ``default_gates`` must not double up."""
+    assert sp.pipeline_stage_names(["plan", "work", "review", "merge"]) == [
+        "work",
+        "review",
+        "merge",
+    ]
+
+
+def test_merged_issue_projects_merge_stage_as_done():
+    """A merged issue's Pipeline row must show the Merge badge as Done, not
+    silently omit it — that's the whole point of #1429: an issue stalled
+    after review (no merge) must be visually distinguishable from one that
+    actually merged."""
+    a = [_work(assignment_id="w1", status="done", test_state="passed", dispatched_at=1.0)]
+    entry = _entry(state="merged")
+    out = sp.compute_issue_projection(
+        a,
+        entry,
+        is_closed=False,
+        require_plan=False,
+        default_gates=["test", "review", "merge"],
+    )
+    assert out["stages"]["merge"] == sp.DONE
+    assert list(out["stages"].keys())[:4] == ["work", "test", "review", "merge"]
+
+
 # ── merge_stage_status_for ──────────────────────────────────────────────────
 
 

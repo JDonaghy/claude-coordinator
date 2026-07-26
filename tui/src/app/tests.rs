@@ -4606,13 +4606,15 @@
 
     #[test]
     fn pipeline_stage_names_prepends_work() {
-        // #738: "merge" is filtered out — per-issue pipeline ends at Review.
+        // #1429: "merge" is restored as a read-only observation stage — the
+        // per-issue pipeline now ends at Merge, not Review.
         let app = make_pipeline_app();
         assert_eq!(
             app.pipeline_stage_names(),
             vec![
                 "work".to_string(),
                 "review".to_string(),
+                "merge".to_string(),
             ]
         );
     }
@@ -6782,9 +6784,10 @@
 
     #[test]
     fn upstream_max_dispatched_at_aggregates_across_all_prior_stages() {
-        // #738: Pipeline is work → review (merge removed from per-issue stages).
-        // Querying upstream of "review" should see the latest dispatch across
-        // ALL prior work assignments.
+        // #1429: Pipeline is work → review → merge (merge restored as a
+        // read-only observation stage). Querying upstream of "review" should
+        // see the latest dispatch across ALL prior work assignments, and
+        // upstream of "merge" should see the latest across work + review.
         let mut app = make_pipeline_app();
         app.data
             .assignments
@@ -6795,8 +6798,13 @@
         let issue = &app.pipeline_issues[0];
         // Max across {work} prior to review = 250 (the second work dispatch).
         assert_eq!(app.upstream_max_dispatched_at(issue, "review"), Some(250.0));
-        // "merge" is no longer a per-issue stage → upstream lookup returns None.
-        assert_eq!(app.upstream_max_dispatched_at(issue, "merge"), None, "#738: merge not in stage list");
+        // "merge" is now a per-issue stage again — upstream lookup sees the
+        // same {work} max since no review assignment exists in this fixture.
+        assert_eq!(
+            app.upstream_max_dispatched_at(issue, "merge"),
+            Some(250.0),
+            "#1429: merge is back in the stage list, upstream aggregates work+review"
+        );
     }
 
     #[test]
@@ -9866,9 +9874,12 @@
         // Work stage ran → Done.
         assert_eq!(view.stages[0].status, StageStatus::Done);
         // Review not run but issue is closed → Skipped (not Pending).
-        // #738: merge is no longer a per-issue stage; only work+review remain.
         assert_eq!(view.stages[1].status, StageStatus::Skipped);
-        assert_eq!(view.stages.len(), 2, "#738: only work+review per-issue");
+        // #1429: merge is restored as a third, read-only per-issue stage —
+        // no merge_queue entry and the issue is closed → Skipped, same as review.
+        assert_eq!(view.stages.len(), 3, "#1429: work+review+merge per-issue");
+        assert_eq!(view.stages[2].label, "Merge");
+        assert_eq!(view.stages[2].status, StageStatus::Skipped);
         // No Go/Retry actions on any stage (issue is closed).
         for s in &view.stages {
             assert!(
@@ -10155,14 +10166,16 @@
 
     #[test]
     fn build_pipeline_widget_attaches_go_to_first_pending_work() {
-        // #738: per-issue pipeline is Work→Test→Review (no Merge stage).
+        // #1429: per-issue pipeline is Work→Review→Merge (Merge restored as
+        // a read-only observation stage — never carries a Go/Retry action).
         let app = make_pipeline_app();
         let view = app.build_pipeline_widget().unwrap();
-        assert_eq!(view.stages.len(), 2, "#738: only work+review per-issue");
+        assert_eq!(view.stages.len(), 3, "#1429: work+review+merge per-issue");
         assert_eq!(view.stages[0].label, "Work");
         // Only the work stage gets a Go button (and only when Pending).
         assert_eq!(view.stages[0].action.as_deref(), Some("Go"));
         assert!(view.stages[1].action.is_none());
+        assert!(view.stages[2].action.is_none(), "merge never carries a Go/Retry action");
     }
 
     /// #1199: an epic/tracking-issue row shows the milestone gate lane
@@ -10281,17 +10294,23 @@
         assert_eq!(view.stages[0].label, "Work");
         assert_eq!(view.stages[0].status, StageStatus::Done);
         assert!(view.stages[0].action.is_none(), "Work is done — no Go");
-        // #738: Review is the last per-issue stage; it gets the Go button.
+        // Review is the next actionable per-issue stage; it gets the Go button.
         assert_eq!(
             view.stages[1].action.as_deref(),
             Some("Go"),
             "Review should now own the Go button"
         );
-        assert_eq!(view.stages.len(), 2, "#738: no Merge stage in per-issue pipeline");
+        // #1429: Merge is restored as a third, read-only stage — Pending here
+        // (Review hasn't settled yet) and never carries a Go/Retry action.
+        assert_eq!(view.stages.len(), 3, "#1429: work+review+merge per-issue");
+        assert_eq!(view.stages[2].label, "Merge");
+        assert!(view.stages[2].action.is_none(), "merge never carries a Go/Retry action");
     }
 
-    /// #738: Work + review both done → pipeline complete, no Merge stage, no actions.
-    /// Merge lives solely in the Merge Queue panel (SidebarView::MergeQueue).
+    /// #1429: Work + review both done → Merge (Pending, real queue state)
+    /// is the only non-Done stage; still no Go/Retry action anywhere — Merge
+    /// is a read-only observation badge, dispatched solely from the Merge
+    /// Queue panel (SidebarView::MergeQueue).
     #[test]
     fn build_pipeline_widget_no_action_when_work_and_review_done() {
         let mut app = make_pipeline_app();
@@ -10382,12 +10401,17 @@
             for_issue_number: None,
         });
         let view = app.build_pipeline_widget().unwrap();
-        // Both stages done, no Merge stage remaining.
-        assert_eq!(view.stages.len(), 2, "#738: Work→Review only");
+        // Work + Review done; Merge is Pending (no merge_queue entry yet) but
+        // still carries no action — #1429: it's a read-only observation
+        // badge, never dispatchable from the per-issue strip.
+        assert_eq!(view.stages.len(), 3, "#1429: Work→Review→Merge");
         assert_eq!(view.stages[0].status, StageStatus::Done);
         assert_eq!(view.stages[1].status, StageStatus::Done);
+        assert_eq!(view.stages[2].label, "Merge");
+        assert_eq!(view.stages[2].status, StageStatus::Pending);
         assert!(view.stages[0].action.is_none());
-        assert!(view.stages[1].action.is_none(), "#738: review done — no Go (merge is in queue panel)");
+        assert!(view.stages[1].action.is_none(), "review done — no Go (merge is in queue panel)");
+        assert!(view.stages[2].action.is_none(), "merge is read-only — dispatched solely from the Merge Queue panel");
     }
 
     /// A `merged` row in merge_queue makes the Merge stage Done.
@@ -10748,9 +10772,11 @@
         assert_eq!(view.stages[0].action.as_deref(), Some("Retry"));
         // Review still Pending but its predecessor (Work) is Failed, not
         // Done — no Go on Review.
-        // #738: only 2 stages (work+review), no merge stage.
-        assert_eq!(view.stages.len(), 2);
+        // #1429: 3 stages (work+review+merge) — merge is back as a
+        // read-only observation stage.
+        assert_eq!(view.stages.len(), 3);
         assert!(view.stages[1].action.is_none());
+        assert!(view.stages[2].action.is_none(), "merge never carries a Go/Retry action");
     }
 
     /// Failed stage without a coord_repo mapping must not show Retry —
@@ -10809,7 +10835,7 @@
     }
 
     /// Plan stage is prepended when pipeline_require_plan is true.
-    /// #738: "merge" is no longer a per-issue stage.
+    /// #1429: "merge" is restored as a read-only observation stage.
     #[test]
     fn pipeline_stage_names_prepends_plan_when_required() {
         let mut app = make_pipeline_app();
@@ -10820,12 +10846,13 @@
                 "plan".to_string(),
                 "work".to_string(),
                 "review".to_string(),
+                "merge".to_string(),
             ]
         );
     }
 
     /// Plan stage is omitted when pipeline_require_plan is false (default).
-    /// #738: "merge" is no longer a per-issue stage.
+    /// #1429: "merge" is restored as a read-only observation stage.
     #[test]
     fn pipeline_stage_names_omits_plan_when_not_required() {
         let app = make_pipeline_app();
@@ -10837,6 +10864,7 @@
             vec![
                 "work".to_string(),
                 "review".to_string(),
+                "merge".to_string(),
             ]
         );
     }
@@ -15879,7 +15907,10 @@
     /// For a Done issue (all stages settled), the Pipeline tab body list
     /// shows the last stage's content.  With merge focused, it should
     /// surface merge queue details.
-    /// #738: per-issue pipeline ends at Review; stage content focuses the last stage.
+    /// #1429: merge is restored as the last per-issue stage; stage content
+    /// focuses it and shows the real queue state (State/PR), not a
+    /// placeholder — the merged PR is exactly what distinguishes "actually
+    /// merged" from "stalled after review".
     #[test]
     fn pipeline_tab_body_includes_stage_content_for_done_issue() {
         let mut app = make_pipeline_app();
@@ -15905,10 +15936,10 @@
             milestone_title: None,
             last_attempt: None,
         });
-        // #738: last per-issue stage is now "review" (merge removed).
+        // #1429: last per-issue stage is "merge" again.
         let stages = app.pipeline_stage_names_for_issue(&app.pipeline_issues[0]);
         let last_idx = stages.len() - 1;
-        assert_eq!(stages[last_idx], "review", "#738: last stage must be review");
+        assert_eq!(stages[last_idx], "merge", "#1429: last stage must be merge");
         app.pipeline_sel = Some(0);
         app.pipeline_focused_stage = Some(last_idx);
 
@@ -15919,10 +15950,15 @@
             .flat_map(|i| i.text.spans.iter().map(|s| s.text.clone()))
             .collect::<Vec<_>>()
             .join(" ");
-        // The stage-content header for review should appear.
+        // The stage-content header for merge, plus the real queue state
+        // (State: merged, PR #99) should appear.
         assert!(
-            text.contains("Stage content") || text.contains("Review") || text.contains("review"),
-            "expected review stage content in Pipeline tab body for Done issue; got: {text:?}",
+            text.contains("Stage content") || text.contains("Merge") || text.contains("merge"),
+            "expected merge stage content in Pipeline tab body for Done issue; got: {text:?}",
+        );
+        assert!(
+            text.contains("merged") && text.contains("99"),
+            "expected merge queue State/PR detail in Pipeline tab body; got: {text:?}",
         );
     }
 
@@ -20147,18 +20183,18 @@
         assert_eq!(app.resolve_nested_child_index(epic_idx, 0, None), Some(child_idx));
 
         // And the child's own pipeline lane must be the ordinary per-issue
-        // lane (Work/Test/Review — "merge" is retired from this per-issue
-        // strip per #738, living solely in the Merge Queue panel), NOT the
-        // epic gate lane, and NOT suppressed (`build_pipeline_widget`
-        // returning `None`, which is the literal "blank lane" the review
-        // reported).
+        // lane (Work/Test/Review/Merge — #1429 restored Merge as a
+        // read-only observation badge; it's still initiated solely from the
+        // Merge Queue panel), NOT the epic gate lane, and NOT suppressed
+        // (`build_pipeline_widget` returning `None`, which is the literal
+        // "blank lane" the review reported).
         app.pipeline_sel = Some(child_idx);
         let view = app
             .build_pipeline_widget()
             .expect("a regular nested child must render its own pipeline lane, not blank");
         assert_eq!(
             view.stages.iter().map(|s| s.label.as_str()).collect::<Vec<_>>(),
-            vec!["Work", "Test", "Review"],
+            vec!["Work", "Test", "Review", "Merge"],
         );
     }
 
@@ -26327,10 +26363,23 @@
         );
     }
 
-    /// #738: per-issue pipeline detail must NOT render a "Merge" stage box.
-    /// Merge lives solely in SidebarView::MergeQueue (the Phase-3 panel).
+    /// #1429: per-issue pipeline detail MUST render a "Merge" stage badge —
+    /// flips the #738 assertion. #738 retired the per-issue Merge *box*
+    /// because merge is inherently cross-issue (ordering/CI/`--order` live
+    /// in the Merge Queue panel); that reasoning was about the dispatch
+    /// *affordance*, not observation. Without the badge, an issue stalled
+    /// after review (merged-pending forever) renders identically to one
+    /// that's actually merged — #1429 restores it as a read-only badge so
+    /// the two are visually distinguishable, while keeping it inert:
+    /// - no Go/Retry action ever attaches to it (`is_dispatchable_stage`
+    ///   still excludes "merge");
+    /// - no NEW top-level right-click item is added for it (the pre-existing
+    ///   nested "Merge" items under "Start (interactive)"/"Start (automated)"
+    ///   — leg 3c/A3, #581/#606 — are a separate, already-shipped feature and
+    ///   stay out of scope here; this only checks the top-level menu, not
+    ///   inside those submenus).
     #[test]
-    fn tuidriver_pipeline_detail_has_no_merge_stage() {
+    fn tuidriver_pipeline_detail_shows_readonly_merge_badge() {
         use quadraui::tui::testing::driver_with_shell;
 
         let mut app = make_pipeline_app();
@@ -26381,18 +26430,61 @@
             for_issue_number: None,
         });
 
+        // Model-level assertions on the plain `CoordApp` — `driver.app()`
+        // isn't `CoordApp` (`driver_with_shell` wraps it in an opaque
+        // `ShellAdapter`, see the other `TuiDriver` tests' comment above),
+        // so these are checked here, before handing `app` to the driver.
+
+        // The badge is inert: no stage ever carries a Go/Retry action for
+        // "merge" — build_pipeline_widget must confirm this directly (the
+        // rendered [Go]/[Retry] text can't be distinguished from other
+        // stages' by screen-scraping alone).
+        let view = app
+            .build_pipeline_widget()
+            .expect("pipeline widget must render for this issue");
+        let merge_stage = view
+            .stages
+            .iter()
+            .find(|s| s.label == "Merge")
+            .expect("Merge stage must be present in the widget");
+        assert!(
+            merge_stage.action.is_none(),
+            "#1429: Merge must never carry a Go/Retry action — it's read-only, \
+             dispatched solely from the Merge Queue panel"
+        );
+
+        // No NEW top-level right-click item for the badge: the row's
+        // context menu top level must not gain a flat "Merge" action.
+        let issue = app.pipeline_issues[0].clone();
+        let items = app.context_menu_items_for_pipeline_row(
+            Some(issue.number),
+            &PipelineRowLifecycle::InProgress,
+            issue.coord_repo.as_deref(),
+        );
+        assert!(
+            !items.iter().any(|i| i.label == "Merge"),
+            "#1429: no new top-level 'Merge' context-menu item may be added for the \
+             read-only badge; got items: {:?}",
+            items.iter().map(|i| i.label.clone()).collect::<Vec<_>>()
+        );
+
         let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
         let screen = driver.screen();
 
-        // The stage strip must contain Work and Review but NOT Merge.
+        // The stage strip must contain Work, Review, AND Merge.
         assert!(
             screen.contains("Work") || screen.contains("WORK"),
-            "#738: Work stage must still render in per-issue pipeline:\n{}",
+            "#1429: Work stage must still render in per-issue pipeline:\n{}",
             screen
         );
         assert!(
-            !screen.contains("Merge") && !screen.contains("MERGE"),
-            "#738: Merge must NOT appear in per-issue pipeline (lives in Merge Queue panel):\n{}",
+            screen.contains("Review") || screen.contains("REVIEW"),
+            "#1429: Review stage must still render in per-issue pipeline:\n{}",
+            screen
+        );
+        assert!(
+            screen.contains("Merge") || screen.contains("MERGE"),
+            "#1429: Merge badge must be restored to the per-issue pipeline strip:\n{}",
             screen
         );
     }
