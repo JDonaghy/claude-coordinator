@@ -2270,6 +2270,70 @@
         );
     }
 
+    #[test]
+    fn completed_work_aid_for_recognizes_test_author_type_via_for_issue_number() {
+        // #1223 (item 4): a `test-author` assignment is recorded under the
+        // milestone's TRACKING issue number (`issue_number`), not the
+        // member issue's own number — it correlates back to the member
+        // issue via `for_issue_number` (set at dispatch by
+        // `coord.test_author.dispatch_test_author`). Unlike mock-author
+        // (#1059), a plain `issue_number == issue_num` match can never find
+        // it: `issue_num` here is the MEMBER issue (42), but the
+        // assignment's own `issue_number` is the TRACKING issue (751).
+        let mut app = make_test_app(BoardData::default());
+        let mut a = make_assignment_typed("done", 751, "api", Some("test-author"));
+        a.branch = Some("ms-9-jit-42".to_string());
+        a.for_issue_number = Some(42);
+        app.data.assignments.push(a);
+        assert_eq!(
+            app.completed_work_aid_for("api", 42).as_deref(),
+            Some("id-751-done"),
+            "a done test-author assignment must resolve for the MEMBER issue via for_issue_number"
+        );
+        // The tracking issue's own number must NOT accidentally match too —
+        // Gate A's mock-author track (keyed on issue_number itself) and a
+        // member's JIT test-author slice (keyed on for_issue_number) must
+        // stay distinct even though they can share a tracking-issue row.
+        assert!(
+            app.completed_work_aid_for("api", 751).is_none(),
+            "a test-author row must not resolve for the tracking issue's own number"
+        );
+    }
+
+    #[test]
+    fn test_failed_work_aid_for_recognizes_test_author_type_via_for_issue_number() {
+        // #1223: same correlation-field requirement as
+        // `completed_work_aid_for_recognizes_test_author_type_via_for_issue_number`,
+        // for the test-fail "Fix" front door.
+        let mut app = make_test_app(BoardData::default());
+        let mut a = make_assignment_typed("done", 751, "api", Some("test-author"));
+        a.branch = Some("ms-9-jit-42".to_string());
+        a.for_issue_number = Some(42);
+        a.test_state = Some("failed".to_string());
+        app.data.assignments.push(a);
+        assert_eq!(
+            app.test_failed_work_aid_for("api", 42).as_deref(),
+            Some("id-751-done"),
+            "a test-failed test-author assignment must resolve for the member issue"
+        );
+    }
+
+    #[test]
+    fn failed_work_aid_with_branch_for_recognizes_test_author_type_via_for_issue_number() {
+        // #1223: same correlation-field requirement, for the "Continue"
+        // front door on an outright-failed test-author attempt.
+        let mut app = make_test_app(BoardData::default());
+        let mut a = make_assignment_typed("failed", 751, "api", Some("test-author"));
+        a.branch = Some("ms-9-jit-42".to_string());
+        a.for_issue_number = Some(42);
+        app.data.assignments.push(a);
+        assert_eq!(
+            app.failed_work_aid_with_branch_for("api", 42).as_deref(),
+            Some("id-751-failed"),
+            "a failed-with-branch test-author assignment must resolve for the member issue"
+        );
+    }
+
     // ── #1104: Continue — failed-with-branch work-attempt detection ───────
 
     #[test]
@@ -2585,6 +2649,23 @@
         app
     }
 
+    /// #1223: the JIT acceptance-authoring actions now nest inside the
+    /// "Start (interactive)"/"Start (automated)" pull-right submenus rather
+    /// than sitting as flat top-level items (gap 1) — flatten one level of
+    /// `ContextMenuItem::parent` submenu so the acceptance-menu tests below
+    /// can still search by `action_id` without caring where an item lives.
+    fn flatten_menu_items(items: &[ContextMenuItem]) -> Vec<&ContextMenuItem> {
+        let mut out = Vec::new();
+        for item in items {
+            if let Some(children) = &item.submenu {
+                out.extend(flatten_menu_items(children));
+            } else {
+                out.push(item);
+            }
+        }
+        out
+    }
+
     #[test]
     fn acceptance_menu_items_present_only_for_milestone_work_order_member() {
         // #1060: unlike Gate A dispatch/sign-off (#1059, epic-row-only),
@@ -2596,6 +2677,7 @@
             &PipelineRowLifecycle::New,
             Some("api"),
         );
+        let items = flatten_menu_items(&items);
         assert!(
             items.iter().any(|i| i.action_id.as_deref() == Some("author-acceptance-tests")),
             "work-order member row must offer 'Author acceptance tests'"
@@ -2611,6 +2693,7 @@
             &PipelineRowLifecycle::New,
             Some("api"),
         );
+        let items = flatten_menu_items(&items);
         assert!(
             !items.iter().any(|i| i.action_id.as_deref() == Some("author-acceptance-tests")),
             "non-member row must NOT offer 'Author acceptance tests'"
@@ -2618,6 +2701,65 @@
         assert!(
             !items.iter().any(|i| i.action_id.as_deref() == Some("record-acceptance")),
             "non-member row must NOT offer 'Record acceptance'"
+        );
+    }
+
+    #[test]
+    fn acceptance_menu_items_nest_inside_start_submenus_not_top_level() {
+        // #1223 (gap 1): "Author acceptance tests (interactive)" and its
+        // headless/record siblings must be reachable via the SAME pull-right
+        // "Start (interactive)"/"Start (automated)" submenus as Work/Review/
+        // Fix/Testing/Merge — not flat top-level items sitting next to
+        // unrelated entries like "Chat about issue". Checks actual nesting
+        // position, unlike the flatten-based presence tests above.
+        let app = make_pipeline_app_for_acceptance_menu_test(0, "/nonexistent/api-repo");
+        let items = app.context_menu_items_for_pipeline_row(
+            Some(42),
+            &PipelineRowLifecycle::New,
+            Some("api"),
+        );
+        assert!(
+            !items.iter().any(|i| i.action_id.as_deref() == Some("author-acceptance-tests-interactive")),
+            "'Author acceptance tests (interactive)' must NOT be a flat top-level item:\n{items:#?}"
+        );
+        assert!(
+            !items.iter().any(|i| i.action_id.as_deref() == Some("author-acceptance-tests")),
+            "'Author acceptance tests' must NOT be a flat top-level item"
+        );
+        assert!(
+            !items.iter().any(|i| i.action_id.as_deref() == Some("record-acceptance")),
+            "'Record acceptance' must NOT be a flat top-level item"
+        );
+
+        let interactive_children = items
+            .iter()
+            .find(|i| i.label == "Start (interactive)")
+            .and_then(|p| p.submenu.as_ref())
+            .expect("Start (interactive) must be a submenu parent");
+        assert!(
+            interactive_children
+                .iter()
+                .any(|c| c.action_id.as_deref() == Some("author-acceptance-tests-interactive")),
+            "'Author acceptance tests (interactive)' must nest inside Start (interactive), \
+             alongside Work/Review/Fix/Testing/Merge"
+        );
+
+        let automated_children = items
+            .iter()
+            .find(|i| i.label == "Start (automated)")
+            .and_then(|p| p.submenu.as_ref())
+            .expect("Start (automated) must be a submenu parent");
+        assert!(
+            automated_children
+                .iter()
+                .any(|c| c.action_id.as_deref() == Some("author-acceptance-tests")),
+            "'Author acceptance tests' must nest inside Start (automated)"
+        );
+        assert!(
+            automated_children
+                .iter()
+                .any(|c| c.action_id.as_deref() == Some("record-acceptance")),
+            "'Record acceptance' must nest inside Start (automated)"
         );
     }
 
@@ -2639,6 +2781,7 @@
             &PipelineRowLifecycle::New,
             Some("api"),
         );
+        let items = flatten_menu_items(&items);
         let author_item = items
             .iter()
             .find(|i| i.action_id.as_deref() == Some("author-acceptance-tests"))
@@ -2660,6 +2803,7 @@
             &PipelineRowLifecycle::New,
             Some("api"),
         );
+        let items = flatten_menu_items(&items);
         let author_item = items
             .iter()
             .find(|i| i.action_id.as_deref() == Some("author-acceptance-tests"))
@@ -2683,6 +2827,7 @@
             &PipelineRowLifecycle::New,
             Some("api"),
         );
+        let items = flatten_menu_items(&items);
         assert!(
             items
                 .iter()
@@ -2696,6 +2841,7 @@
             &PipelineRowLifecycle::New,
             Some("api"),
         );
+        let items = flatten_menu_items(&items);
         assert!(
             !items
                 .iter()
@@ -2721,6 +2867,7 @@
             &PipelineRowLifecycle::New,
             Some("api"),
         );
+        let items = flatten_menu_items(&items);
         let item = items
             .iter()
             .find(|i| i.action_id.as_deref() == Some("author-acceptance-tests-interactive"))
@@ -2737,6 +2884,7 @@
             &PipelineRowLifecycle::New,
             Some("api"),
         );
+        let items = flatten_menu_items(&items);
         let item = items
             .iter()
             .find(|i| i.action_id.as_deref() == Some("author-acceptance-tests-interactive"))
@@ -2756,6 +2904,7 @@
             &PipelineRowLifecycle::New,
             Some("api"),
         );
+        let items = flatten_menu_items(&items);
         let record_item = items
             .iter()
             .find(|i| i.action_id.as_deref() == Some("record-acceptance"))
@@ -2774,6 +2923,7 @@
             &PipelineRowLifecycle::New,
             Some("api"),
         );
+        let items = flatten_menu_items(&items);
         let record_item = items
             .iter()
             .find(|i| i.action_id.as_deref() == Some("record-acceptance"))
@@ -3271,10 +3421,14 @@
         let handled = app.dispatch_context_menu_action("author-acceptance-tests-interactive", &target);
         assert!(handled, "author-acceptance-tests-interactive must be a recognised action");
 
+        // #1223: the session now lands in the row's OWN per-issue
+        // `detail_terminal_sessions` slot (keyed by `(repo_slug,
+        // issue_num)`), not the global standalone `terminal_session` — the
+        // correctness fix for the "clobbers a different issue's PTY" hazard.
         let sess = app
-            .terminal_session
-            .as_mut()
-            .expect("a real terminal session must be spawned");
+            .detail_terminal_sessions
+            .get_mut(&("acme/api".to_string(), 42))
+            .expect("a real terminal session must be spawned in the issue's own Terminal tab");
 
         let start = Instant::now();
         let mut text = String::new();
@@ -3294,6 +3448,129 @@
 
         sess.write_input(b"exit\r");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// #1223 gap 2 (the "sharpest" bug, a correctness hazard not just
+    /// cosmetic): launching an interactive test-author session for issue A,
+    /// then for a DIFFERENT issue B, must NOT reuse/clobber the same PTY.
+    /// Before the fix, both launches wrote into the single global
+    /// `terminal_session` field, so the operator could end up typing into
+    /// (or reading output from) the wrong issue's session. This asserts
+    /// both sessions land in their OWN slot in the per-issue
+    /// `detail_terminal_sessions` map (keyed by `(repo_slug, issue_num)`),
+    /// exactly like every other interactive flavour (Work/Review/Fix/Test/
+    /// Merge), and that the deprecated global slot is never touched.
+    #[test]
+    #[cfg(unix)]
+    fn author_acceptance_tests_interactive_sessions_for_two_issues_do_not_clobber_each_other() {
+        let mut pipeline_repo_paths = std::collections::HashMap::new();
+        pipeline_repo_paths.insert("api".to_string(), "/nonexistent/api-repo".to_string());
+        let data = BoardData {
+            pipeline_default_gates: vec!["review".to_string(), "merge".to_string()],
+            pipeline_tracked_labels: vec!["coord".to_string()],
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            pipeline_repo_paths,
+            open_issues: vec![
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 42,
+                    title: "Milestone member issue A".to_string(),
+                    body: String::new(),
+                    state: "open".to_string(),
+                    labels: vec!["coord".to_string()],
+                    milestone_number: Some(9),
+                    milestone_title: Some("v1.0".to_string()),
+                },
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 43,
+                    title: "Milestone member issue B".to_string(),
+                    body: String::new(),
+                    state: "open".to_string(),
+                    labels: vec!["coord".to_string()],
+                    milestone_number: Some(9),
+                    milestone_title: Some("v1.0".to_string()),
+                },
+            ],
+            milestone_work_orders: vec![MilestoneWorkOrder {
+                repo_name: "api".to_string(),
+                tracking_issue: 751,
+                milestone_title: "v1.0".to_string(),
+                nodes: vec![
+                    MilestoneWorkOrderNode {
+                        issue_number: 42,
+                        rank: 0,
+                        ready: true,
+                        next_up: true,
+                        blocked_on: vec![],
+                    },
+                    MilestoneWorkOrderNode {
+                        issue_number: 43,
+                        rank: 1,
+                        ready: true,
+                        next_up: false,
+                        blocked_on: vec![],
+                    },
+                ],
+            }],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        app.pipeline_issues = vec![
+            PipelineIssue {
+                number: 42,
+                title: "Milestone member issue A".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string()],
+                is_closed: false,
+            },
+            PipelineIssue {
+                number: 43,
+                title: "Milestone member issue B".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string()],
+                is_closed: false,
+            },
+        ];
+        app.rebuild_pipeline_sidebar(None);
+        app.active_view = SidebarView::Pipeline;
+
+        // Launch for issue A (#42).
+        app.pipeline_sel = Some(0);
+        assert!(app.launch_acceptance_author_interactive_for_selected_pipeline_row());
+        assert!(
+            app.detail_terminal_sessions.contains_key(&("acme/api".to_string(), 42)),
+            "issue A's session must land in its OWN detail_terminal_sessions slot"
+        );
+
+        // Launch for issue B (#43) — must NOT disturb issue A's slot.
+        app.pipeline_sel = Some(1);
+        assert!(app.launch_acceptance_author_interactive_for_selected_pipeline_row());
+        assert!(
+            app.detail_terminal_sessions.contains_key(&("acme/api".to_string(), 43)),
+            "issue B's session must land in its OWN detail_terminal_sessions slot"
+        );
+        assert!(
+            app.detail_terminal_sessions.contains_key(&("acme/api".to_string(), 42)),
+            "issue A's session must still be alive/present after issue B's launch — \
+             the #1223 clobber hazard would have removed or overwritten it"
+        );
+        assert_eq!(
+            app.detail_terminal_sessions.len(),
+            2,
+            "both issues must have DISTINCT sessions, not one shared/reused PTY"
+        );
+        assert!(
+            app.terminal_session.is_none(),
+            "the deprecated global standalone terminal_session must never be used \
+             by the per-issue test-author launcher"
+        );
     }
 
     /// #1174 TuiDriver black-box: open the context menu for a work-order-
@@ -3328,9 +3605,26 @@
         // row without needing to locate its exact pixel position first.
         driver.press(Key::Char('.'));
         assert!(
-            driver.screen_contains("Author acceptance tests (interactive)"),
-            "context menu must offer the interactive author action for a \
+            driver.screen_contains("Start (interactive)"),
+            "context menu must offer the Start (interactive) submenu for a \
              work-order member row with an existing contract.md:\n{}",
+            driver.screen(),
+        );
+
+        // #1223: "Author acceptance tests (interactive)" now nests inside
+        // "Start (interactive)" (gap 1 — discoverable in the same place as
+        // Work/Review/Fix/Testing/Merge) instead of sitting as a flat
+        // top-level item, so it isn't on screen until the pull-right
+        // submenu is opened. Click the parent first (same half-cell nudge
+        // `find` requires below), THEN find/click the nested action.
+        let (px, py) = driver.find("Start (interactive)").unwrap_or_else(|| {
+            panic!("could not find 'Start (interactive)' on screen:\n{}", driver.screen())
+        });
+        driver.click(px, py - 0.1);
+        assert!(
+            driver.screen_contains("Author acceptance tests (interactive)"),
+            "Start (interactive) submenu must offer the interactive author \
+             action for a work-order member row with an existing contract.md:\n{}",
             driver.screen(),
         );
 

@@ -531,6 +531,17 @@ impl CoordApp {
         // Interactive (Claude Max, human-attended) and automated (claude -p,
         // coordinator-dispatched) are separate parents so the execution model
         // is explicit at a glance.
+        // #1223: resolved up front (was computed further down, just before
+        // the "Audit outcomes" item) so the Start (interactive)/(automated)
+        // submenu construction below can nest the per-issue JIT
+        // acceptance-authoring actions alongside Work/Review/Fix/Testing/
+        // Merge — discoverable in the same place as the rest of the
+        // pipeline instead of a flat top-level item (#1223 gap 1).
+        let epic_issue: Option<&PipelineIssue> = issue_number
+            .and_then(|n| self.pipeline_issues.iter().find(|iss| iss.number == n));
+        let member_tracking_issue =
+            epic_issue.and_then(|iss| self.milestone_tracking_issue_for(iss));
+
         if issue_number.is_some() {
             // #486 Leg 4 UX: when a live interactive session already exists for
             // this issue, the only sensible interactive action is to reattach —
@@ -624,6 +635,26 @@ impl CoordApp {
                 merge_item.disabled = self.selected_completed_work_aid().is_none();
                 interactive_children.push(merge_item);
 
+                // #1223 (docs/ORACLE_LOOP.md, #1173): the JIT test-authoring
+                // track's human-attended sibling nests here too — same
+                // Start (interactive) submenu as Work/Review/Fix/Testing/
+                // Merge, instead of a flat top-level item. NOT epic-gated:
+                // applies to ordinary member issues of a milestone's `##
+                // Work order`, resolved via `milestone_tracking_issue_for`.
+                // Gated on the milestone's Gate A contract existing on disk
+                // — the independent test-author reads it from its own
+                // checkout (#931).
+                if let Some(iss) = epic_issue {
+                    if member_tracking_issue.is_some() {
+                        let mut author_interactive_item = ContextMenuItem::action(
+                            "author-acceptance-tests-interactive",
+                            "Author acceptance tests (interactive)",
+                        );
+                        author_interactive_item.disabled = !self.gate_a_contract_exists_for(iss);
+                        interactive_children.push(author_interactive_item);
+                    }
+                }
+
                 items.push(ContextMenuItem::parent("Start (interactive)", interactive_children));
 
                 // ── Start (automated) submenu ─────────────────────────────
@@ -646,6 +677,27 @@ impl CoordApp {
                         .map(|n| self.has_active_interactive_merge_for_issue(n))
                         .unwrap_or(false);
                 automated_children.push(auto_merge_item);
+
+                // #1223: the JIT test-authoring track's headless dispatch +
+                // its "record acceptance" trust-gate re-run nest into Start
+                // (automated) alongside Work/Plan/Merge — same gating as the
+                // interactive sibling above.
+                if let Some(iss) = epic_issue {
+                    if member_tracking_issue.is_some() {
+                        let mut author_item = ContextMenuItem::action(
+                            "author-acceptance-tests",
+                            "Author acceptance tests",
+                        );
+                        author_item.disabled = !self.gate_a_contract_exists_for(iss);
+                        automated_children.push(author_item);
+
+                        let mut record_item =
+                            ContextMenuItem::action("record-acceptance", "Record acceptance");
+                        record_item.disabled = self.selected_completed_work_aid().is_none();
+                        automated_children.push(record_item);
+                    }
+                }
+
                 items.push(ContextMenuItem::parent("Start (automated)", automated_children));
 
                 // #685: "Set test mode" — pick smoke vs auto policy for headless Work.
@@ -683,8 +735,8 @@ impl CoordApp {
             // Milestone Outcome Audit Phase 1 (#885): "Audit outcomes" —
             // human-attended READ-ONLY milestone-outcome analyst — only for
             // rows carrying the `epic` label (a milestone's tracking issue).
-            let epic_issue: Option<&PipelineIssue> = issue_number
-                .and_then(|n| self.pipeline_issues.iter().find(|iss| iss.number == n));
+            // `epic_issue` itself is resolved up top now (#1223), shared
+            // with the Start submenu nesting above.
             // #1198: case-insensitive — unified via `labels_carry_epic_label`
             // (was a case-sensitive `== "epic"` that silently dropped these
             // actions for an `Epic`/`EPIC`-cased label).
@@ -716,50 +768,16 @@ impl CoordApp {
                     epic_issue.and_then(|iss| self.pipeline_pr_number(iss)).is_none();
                 items.push(view_gate_a_item);
             }
-            // #1060 (docs/ORACLE_LOOP.md, #931/#932): per-issue acceptance
-            // actions — JIT authoring of THIS issue's slice of the
-            // milestone's sealed acceptance suite, and the external
-            // trust-gate re-run against the pushed SHA. Unlike the Gate A
-            // dispatch/sign-off pair above, these are NOT epic-gated: they
-            // apply to ordinary member issues of a milestone's `## Work
-            // order`, resolved via `milestone_tracking_issue_for` (#795's
-            // work-order projection, already on the wire — no new board
-            // field needed). Omitted entirely when the row isn't a member of
-            // any tracked work order (nothing to author/record against).
-            if let Some(iss) = epic_issue {
-                if self.milestone_tracking_issue_for(iss).is_some() {
-                    // "Author acceptance tests" is only meaningful once the
-                    // milestone's Gate A contract exists on disk — the
-                    // independent test-author reads it from its own
-                    // checkout (#931) — gated the same way Testing/Merge
-                    // above gate on a completed work assignment.
-                    let mut author_item = ContextMenuItem::action(
-                        "author-acceptance-tests",
-                        "Author acceptance tests",
-                    );
-                    author_item.disabled = !self.gate_a_contract_exists_for(iss);
-                    items.push(author_item);
-                    // #1174 (docs/ORACLE_LOOP.md, #1173): human-attended
-                    // sibling of the headless dispatch above — same gate
-                    // (contract.md must exist on disk), consumes `coord
-                    // acceptance author --interactive` rather than
-                    // reimplementing any PTY plumbing here.
-                    let mut author_interactive_item = ContextMenuItem::action(
-                        "author-acceptance-tests-interactive",
-                        "Author acceptance tests (interactive)",
-                    );
-                    author_interactive_item.disabled = !self.gate_a_contract_exists_for(iss);
-                    items.push(author_interactive_item);
-                    // "Record acceptance" re-runs the sealed suite
-                    // externally against the pushed SHA — needs a completed
-                    // work assignment with a branch to resolve that SHA
-                    // from (same gate Testing/Merge use above).
-                    let mut record_item =
-                        ContextMenuItem::action("record-acceptance", "Record acceptance");
-                    record_item.disabled = self.selected_completed_work_aid().is_none();
-                    items.push(record_item);
-                }
-            }
+            // #1223 (was #1060, docs/ORACLE_LOOP.md, #931/#932): the
+            // per-issue acceptance actions — JIT authoring of THIS issue's
+            // slice of the milestone's sealed acceptance suite, and the
+            // external trust-gate re-run against the pushed SHA — now nest
+            // into the Start (interactive)/(automated) submenus above
+            // instead of living here as flat top-level items (#1223 gap 1:
+            // not discoverable in the same place as the rest of the
+            // pipeline). See the `member_tracking_issue`-gated pushes into
+            // `interactive_children`/`automated_children` near the top of
+            // this function.
             items.push(ContextMenuItem::separator());
         }
         match lifecycle {

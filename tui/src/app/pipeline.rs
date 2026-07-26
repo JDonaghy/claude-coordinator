@@ -3081,6 +3081,15 @@ impl CoordApp {
     /// `reattachable_session_aid` applies for the `InteractiveLaunchMode`
     /// flavours, inlined here since `test-author` isn't one of that enum's
     /// assignment types.
+    ///
+    /// #1223 fix: this is per-issue (tied to one specific pipeline row),
+    /// exactly like Work/Review/Fix/Test/Merge — so, unlike a genuinely
+    /// row-independent target (merge-queue, milestone chat), it must land
+    /// the PTY in the row's OWN `detail_terminal_sessions` slot (keyed by
+    /// `(repo_slug, issue_num)`) and the Pipeline detail Terminal TAB, not
+    /// the global standalone `terminal_session` / `SidebarView::Terminal`
+    /// panel. Launching for issue A then issue B used to clobber/reuse the
+    /// same global PTY — the correctness hazard #1223 called out.
     pub(crate) fn launch_acceptance_author_interactive_for_selected_pipeline_row(&mut self) -> bool {
         let label = "Author acceptance tests (interactive)";
         let Some((issue, repo, tracking_issue, for_path)) =
@@ -3088,14 +3097,9 @@ impl CoordApp {
         else {
             return false;
         };
+        let issue_key = (issue.repo_slug.clone(), issue.number);
 
-        // #955: a selected Terminal-tree leaf takes over the main pane —
-        // clear the selection so the bare-shell pane this writes into is
-        // visible (mirrors `launch_merge_queue_interactive` /
-        // `reattach_session_by_aid`).
-        self.terminal_tree_selected = None;
-
-        if let Some(aid) = self
+        let reattach_aid = self
             .live_tmux_sessions
             .iter()
             .filter(|s| {
@@ -3105,40 +3109,34 @@ impl CoordApp {
             .find(|aid| {
                 self.session_assignment_is_running(aid)
                     && self.assignment_type_of(aid) == Some("test-author")
-            })
-        {
-            self.reattach_session_by_aid(&aid);
-            return true;
-        }
+            });
 
         let cfg_path = self
             .command_runner
             .config_path
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned());
-        let launch_line = build_acceptance_author_interactive_launch_cmd(
-            cfg_path.as_deref(),
-            &repo,
-            tracking_issue,
-            issue.number,
-            for_path.as_deref(),
-        );
+        let launch_line = if let Some(aid) = reattach_aid.as_deref() {
+            let cfg = match cfg_path.as_deref() {
+                Some(p) if !p.is_empty() => format!("--config {} ", shell_quote_arg(p)),
+                _ => String::new(),
+            };
+            format!("coord reattach {}{}\r", cfg, shell_quote_arg(aid))
+        } else {
+            build_acceptance_author_interactive_launch_cmd(
+                cfg_path.as_deref(),
+                &repo,
+                tracking_issue,
+                issue.number,
+                for_path.as_deref(),
+            )
+        };
 
-        // #1029 bug A: keep the ActivityBar/header chrome in sync too.
-        self.switch_active_view(SidebarView::Terminal);
-
-        if let Some(ref mut sess) = self.terminal_session {
+        if let Some(sess) = self.detail_terminal_sessions.get_mut(&issue_key) {
             sess.send_str(&launch_line);
         } else {
-            let cwd: std::path::PathBuf = self
-                .data
-                .pipeline_repo_paths
-                .get(repo.as_str())
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| {
-                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
-                });
-            let (cols, rows) = self.terminal_pending_dims.get().unwrap_or((80, 24));
+            let cwd = self.detail_terminal_cwd(&issue_key);
+            let (cols, rows) = self.detail_terminal_pending_dims.get().unwrap_or((80, 24));
             let shell = quadraui::terminal_engine::default_shell();
             match quadraui::terminal_engine::TerminalSession::spawn(
                 cols.max(20),
@@ -3149,11 +3147,12 @@ impl CoordApp {
             ) {
                 Ok(mut sess) => {
                     sess.send_str(&launch_line);
-                    self.terminal_session = Some(sess);
-                    self.terminal_spawn_error = None;
+                    self.detail_terminal_sessions.insert(issue_key.clone(), sess);
+                    self.detail_terminal_spawn_errors.remove(&issue_key);
                 }
                 Err(e) => {
-                    self.terminal_spawn_error = Some(e.to_string());
+                    self.detail_terminal_spawn_errors
+                        .insert(issue_key, e.to_string());
                     self.push_toast(
                         "Terminal error",
                         &format!("Failed to spawn terminal: {}", e),
@@ -3164,10 +3163,15 @@ impl CoordApp {
             }
         }
 
-        self.terminal_focused = true;
+        self.detail_terminal_focused = true;
+        let status_verb = if reattach_aid.is_some() {
+            "Reattaching to"
+        } else {
+            "Launched"
+        };
         self.push_toast(
             label,
-            &format!("Launched interactive test-author for #{}", issue.number),
+            &format!("{} interactive test-author for #{}", status_verb, issue.number),
             ToastSeverity::Info,
         );
         true
