@@ -1248,11 +1248,16 @@ class TestSmokeCompletionVerdict:
 
         conn = get_connection()
         row = conn.execute(
-            "SELECT test_state FROM assignments WHERE assignment_id=?", ("work-1",)
+            "SELECT test_state, smoke_test FROM assignments WHERE assignment_id=?",
+            ("work-1",),
         ).fetchone()
         assert row is not None, "work assignment must exist in DB"
         assert row["test_state"] == "passed", (
             f"expected test_state='passed' for exit_code=0, got {row['test_state']!r}"
+        )
+        # #1384: the legacy smoke_test mirror is derived by the writer.
+        assert row["smoke_test"] == "pass", (
+            f"expected smoke_test='pass' mirror, got {row['smoke_test']!r}"
         )
 
     def test_failing_smoke_sets_parent_test_state_failed(
@@ -1282,11 +1287,18 @@ class TestSmokeCompletionVerdict:
 
         conn = get_connection()
         row = conn.execute(
-            "SELECT test_state FROM assignments WHERE assignment_id=?", ("work-2",)
+            "SELECT test_state, smoke_test FROM assignments WHERE assignment_id=?",
+            ("work-2",),
         ).fetchone()
         assert row is not None, "work assignment must exist in DB"
         assert row["test_state"] == "failed", (
             f"expected test_state='failed' for non-zero exit_code, got {row['test_state']!r}"
+        )
+        # #1384: without this mirror `coord fix <work-2>` exits 1 with
+        # "smoke_test is None, expected 'fail'" — the headless fail→fix path
+        # is a dead end.  The writer derives it from test_state.
+        assert row["smoke_test"] == "fail", (
+            f"expected smoke_test='fail' mirror, got {row['smoke_test']!r}"
         )
 
     def test_interactive_smoke_mode_not_auto_certified(

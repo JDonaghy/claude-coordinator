@@ -481,10 +481,17 @@ def fix(assignment_id: str, config_path: Path, guidance: str) -> None:
         click.echo(f"error: assignment {assignment_id!r} not found in board", err=True)
         sys.exit(1)
 
-    if assignment.smoke_test != "fail":
+    # #1384: gate on the canonical `test_state` with the legacy `smoke_test`
+    # mirror as fallback, so the two fields can never drift apart again.  The
+    # writer (`state._record_test_verdict_local`) now derives the mirror, but
+    # rows recorded before that fix — a headless smoke failure via #1021's
+    # `coord/notify.py` propagation — carry `test_state='failed'` with
+    # `smoke_test=NULL` and must still be fixable.
+    if assignment.test_state != "failed" and assignment.smoke_test != "fail":
         click.echo(
-            f"error: assignment {assignment_id} smoke_test is "
-            f"{assignment.smoke_test!r}, expected 'fail'",
+            f"error: assignment {assignment_id} test_state is "
+            f"{assignment.test_state!r} / smoke_test is "
+            f"{assignment.smoke_test!r}, expected a failed test verdict",
             err=True,
         )
         sys.exit(1)
@@ -501,14 +508,19 @@ def fix(assignment_id: str, config_path: Path, guidance: str) -> None:
     test_output_file = COORD_DIR / "test_output" / f"{assignment_id}.txt"
     if test_output_file.exists():
         test_output = test_output_file.read_text()
-    elif assignment.smoke_test_reason:
+    elif assignment.smoke_test_reason or assignment.test_reason:
         # #1337: the board wire carries a bounded PREVIEW of the reason text;
         # the briefing quotes it verbatim — prefer the full text via the
         # detail loader (falls back to the board-carried value).
+        # #1384: fall back to `test_reason` too — a headless-smoke failure
+        # recorded before the mirror-derivation fix has no smoke_test_reason.
         from coord.state import load_assignment_test_reason as _load_tr  # noqa: PLC0415
 
         test_output = (
-            _load_tr(assignment_id) or assignment.smoke_test_reason
+            _load_tr(assignment_id)
+            or assignment.smoke_test_reason
+            or assignment.test_reason
+            or ""
         )
 
     guidance_text = guidance or "Fix the failing tests and push."

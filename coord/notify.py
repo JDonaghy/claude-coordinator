@@ -999,6 +999,11 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
             )
             if test_mode != "smoke":
                 succeeded = (transition.exit_code or 0) == 0
+                # #1384: no `smoke_test=` argument needed — the writer
+                # (`state._record_test_verdict_local`) derives the legacy
+                # mirror from `test_state`, so a headless smoke FAILURE lands
+                # as test_state='failed' AND smoke_test='fail' and stays
+                # reachable from `coord fix`.
                 record_test_verdict(
                     assignment_id=parent_id,
                     test_state="passed" if succeeded else "failed",
