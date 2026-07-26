@@ -80,7 +80,13 @@ Options:
   --machine NAME        Machine for the work dispatch (default: least-loaded
                         unpaused machine that hosts the repo).
   --model TIER          Model tier (haiku|sonnet|opus). Default: models.default.
-  --briefing-file FILE  Extra briefing text for the work dispatch.
+  --briefing-file FILE  REPLACES the entire auto-generated briefing for the
+                        work dispatch — it is NOT an addendum. The issue
+                        body, project rules and file scope are all dropped,
+                        so the worker only ever sees this file. To ADD
+                        guidance while keeping the real briefing, use
+                        `coord context add --pin <repo> <issue> '<note>'`,
+                        which prepends to the top of every briefing (#603).
   --plan                Run a read-only plan stage first and auto-approve it
                         (coord assign --plan-only → coord approve-plan).
   --test-command CMD    Override the Test gate. By default the gate runs
