@@ -90,9 +90,15 @@ Options:
   --plan                Run a read-only plan stage first and auto-approve it
                         (coord assign --plan-only → coord approve-plan).
   --test-command CMD    Override the Test gate. By default the gate runs
-                        scripts/coord-test-runner.sh, which path-routes
-                        (coord/** → pytest, tui/** → cargo test), links the
-                        quadraui path dep, and filters known flakes.
+                        scripts/coord-test-runner.sh, which path-routes for
+                        claude-coordinator (coord/** → pytest, tui/** →
+                        cargo test, plus the quadraui path-dep link and flake
+                        filtering) and, for every other repo, falls back to
+                        REPO_TEST_COMMAND (the repo's configured
+                        `test_command`) unless the diff is doc/config-only.
+                        A repo with neither a path rule nor a configured
+                        test_command makes the gate REFUSE rather than
+                        silently record 'skipped' (#1408).
   --max-fix-rounds N    Headless `coord fix` rounds on a failing test suite
                         (default 3). Each round continues the SAME branch with
                         the model escalated.
@@ -335,7 +341,13 @@ run_test_gate() {
 
     local out="$SCRATCH/${REPO}-${ISSUE}-test.out"
     local rc=0
-    local runner_args=("$wt" --base-ref "origin/${REPO_DEFAULT_BRANCH:-main}" --report "$out")
+    # --repo tells the runner which path-routing rules apply (claude-coordinator
+    # is the only repo with hardcoded rules); --fallback-command is the repo's
+    # configured test_command (REPO_TEST_COMMAND, from coordinator.yml) for
+    # every other repo. Passing neither correctly for a non-claude-coordinator
+    # repo is exactly #1408: the runner refuses instead of silently SKIPping.
+    local runner_args=("$wt" --base-ref "origin/${REPO_DEFAULT_BRANCH:-main}" --report "$out" --repo "$REPO")
+    [[ -n "${REPO_TEST_COMMAND:-}" ]] && runner_args+=(--fallback-command "$REPO_TEST_COMMAND")
     if [[ -n "$TEST_COMMAND" ]]; then
         # Escape hatch: run exactly what the caller asked for instead of the
         # path-routed suites.
@@ -349,10 +361,15 @@ run_test_gate() {
         warn "could not remove worktree $wt — remove it manually"
     CURRENT_WT=""
 
-    # A docs-only diff has nothing to run; that is 'skipped', not 'passed'.
+    # A docs-only diff has nothing to run; that is 'skipped', not 'passed'. The
+    # reason is whatever the runner actually decided (it names the paths it
+    # considered) — never a hardcoded string, so "nothing to test" and "could
+    # not determine what to test" (below) never collapse into the same text.
     if [[ $rc -eq 0 ]] && grep -q '^SKIP:' "$out" 2>/dev/null; then
-        log "TEST: nothing to test → coord test --skipped $aid"
-        coord test --skipped --reason "no test-bearing paths changed" "$aid" \
+        local skip_reason
+        skip_reason="$(grep '^SKIP:' "$out" | head -1 | sed 's/^SKIP: //')"
+        log "TEST: nothing to test → coord test --skipped $aid ($skip_reason)"
+        coord test --skipped --reason "$skip_reason" "$aid" \
             2>&1 | tee -a "$RUN_LOG"
         return 0
     fi
@@ -363,10 +380,17 @@ run_test_gate() {
         return 0
     fi
 
+    # A REFUSE (repo the runner has no routing/test_command for — #1408) is
+    # NOT a test failure; give it its own reason so it reads distinctly from a
+    # genuine suite failure, and so it is never confused with 'skipped' above.
+    local fail_reason="drive-issue.sh: test suite failed"
+    if grep -q '^REFUSE:' "$out" 2>/dev/null; then
+        fail_reason="$(grep '^REFUSE:' "$out" | head -1 | sed 's/^REFUSE: //')"
+    fi
     log "TEST: FAILED → coord test --fail $aid"
     # --output stores the report at ~/.coord/test_output/<aid>.txt, which is
     # exactly where `coord fix` reads it to build the fix worker's briefing.
-    coord test --fail --reason "drive-issue.sh: test suite failed" \
+    coord test --fail --reason "$fail_reason" \
         --output "$out" "$aid" 2>&1 | tee -a "$RUN_LOG"
     return 1
 }
