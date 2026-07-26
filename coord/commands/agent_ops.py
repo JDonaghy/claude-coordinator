@@ -403,8 +403,12 @@ def agent_clean_worktrees(
                 kept = data.get("kept", 0)
                 freed = data.get("bytes_freed", 0)
                 freed_mb = freed / (1024 * 1024)
+                # #1402: the same endpoint GCs the shared cargo target cache.
+                cargo_mb = data.get("cargo_cache_bytes", 0) / (1024 * 1024)
+                evicted = data.get("cargo_caches_evicted", 0)
                 click.echo(
-                    f" cleaned={cleaned} kept={kept} freed={freed_mb:.1f} MB"
+                    f" cleaned={cleaned} kept={kept} freed={freed_mb:.1f} MB "
+                    f"cargo-cache={cargo_mb:.1f} MB (evicted {evicted})"
                 )
             else:
                 click.echo(f" HTTP {resp.status_code}")

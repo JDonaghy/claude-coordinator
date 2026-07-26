@@ -179,10 +179,31 @@ class TestCleanWorktrees:
             "cleaned": 3,
             "kept": 1,
             "bytes_freed": 12345,
+            # #1402: an agent too old to report the cargo-cache GC counters
+            # still yields the full wire shape, defaulted to 0.
+            "cargo_cache_bytes": 0,
+            "cargo_caches_evicted": 0,
             "error": None,
         }
         assert "/worktree-clean" in mock_post.call_args.args[0]
         assert mock_post.call_args.kwargs["json"] == {"recent_secs": 300.0}
+
+    def test_reports_cargo_cache_gc_counters(self) -> None:
+        """#1402: the shared cargo-cache GC runs in the same agent sweep, so
+        its counters ride back on the /worktree-clean response."""
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {
+            "cleaned": 0,
+            "kept": 0,
+            "bytes_freed": 0,
+            "cargo_cache_bytes": 4096,
+            "cargo_caches_evicted": 2,
+        }
+        with patch.object(network.httpx, "post", return_value=resp):
+            result = network.clean_worktrees(_m())
+        assert result["cargo_cache_bytes"] == 4096
+        assert result["cargo_caches_evicted"] == 2
 
     def test_passes_recent_secs(self) -> None:
         resp = MagicMock()

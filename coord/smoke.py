@@ -18,7 +18,9 @@ Public entry points:
 - `match_rules(touched_files, rules)`  — pure: returns the union of required
   capabilities for any rule whose `files` prefix matches a touched file.
 - `pick_smoke_machine(required_caps, worker_machine, board, config)` — picks
-  a capable machine (different from the worker if possible).
+  a capable machine, preferring the worker's own (its build cache is warm —
+  #1402); pass `prefer_worker=False` for the old different-machine-first
+  order.
 - `dispatch_smoke(completed, board, config, ...)` — the full path; called
   from reconcile when a work assignment transitions to done.
 
@@ -104,14 +106,33 @@ def pick_smoke_machine(
     worker_machine_name: str,
     board: Board,
     config: Config,
+    *,
+    prefer_worker: bool = True,
 ) -> SmokeMachineChoice | None:
     """Pick a machine with all `required_caps` for `repo_name`.
 
-    Preference order:
-    1. Idle, capable, different from worker
-    2. Busy, capable, different from worker (smoke will queue)
-    3. Worker machine itself, if capable
-    4. None — no machine can validate this change
+    Preference order (#1402):
+    1. The worker's own machine, if capable and idle
+    2. Idle, capable, different from worker
+    3. The worker's own machine, if capable (busy — smoke will queue)
+    4. Busy, capable, different from worker (smoke will queue)
+    5. None — no machine can validate this change
+
+    **Why the worker machine is preferred.** This used to prefer a machine
+    *different* from the worker.  That preference is right for **review**,
+    where independence from the worker's context is the entire point — but a
+    test run needs **capability**, not independence: it re-runs the suite
+    against the pushed commit and the verdict is identical wherever it runs.
+    Meanwhile the worker's machine is the one with a warm build cache
+    (``coord.cargo_cache``, #1402) and, for a Rust repo, that is the
+    difference between ~18 s and ~3 min.  Capability rules still bind
+    absolutely: a GTK or browser suite goes to a capable machine even when
+    the worker ran somewhere else, and a worker machine that lacks a required
+    capability is never chosen.
+
+    Pass ``prefer_worker=False`` to restore the different-machine-first
+    ordering (used by callers that want independence, and by tests pinning
+    the old behaviour).
 
     Returns None when capabilities can't be matched.
     """
@@ -124,6 +145,18 @@ def pick_smoke_machine(
         return None
 
     busy = {a.machine_name for a in board.active if a.status in ("pending", "running")}
+
+    same = next((m for m in candidates if m.name == worker_machine_name), None)
+
+    if prefer_worker and same is not None and same.name not in busy:
+        return SmokeMachineChoice(
+            machine=same,
+            is_worker=True,
+            rationale=(
+                f"chose {same.name} — the worker machine, idle and has "
+                f"{required_caps}; its build cache is already warm"
+            ),
+        )
 
     idle_different = [
         m for m in candidates
@@ -139,6 +172,16 @@ def pick_smoke_machine(
             ),
         )
 
+    if prefer_worker and same is not None:
+        return SmokeMachineChoice(
+            machine=same,
+            is_worker=True,
+            rationale=(
+                f"chose {same.name} — the worker machine has {required_caps} and a "
+                "warm build cache; capable but busy, smoke will queue"
+            ),
+        )
+
     busy_different = [
         m for m in candidates if m.name != worker_machine_name
     ]
@@ -151,7 +194,6 @@ def pick_smoke_machine(
             ),
         )
 
-    same = next((m for m in candidates if m.name == worker_machine_name), None)
     if same is not None:
         return SmokeMachineChoice(
             machine=same,

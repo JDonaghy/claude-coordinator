@@ -119,6 +119,8 @@ def test_match_rules_no_trailing_slash_matches_files_too() -> None:
 def test_pick_smoke_prefers_capable_machine_different_from_worker(
     gtk_and_server_config: Config,
 ) -> None:
+    """The worker machine (``server``) lacks ``gtk``, so the capable machine
+    wins — #1402's worker preference never overrides a capability rule."""
     board = Board()
     choice = pick_smoke_machine(
         ["gtk"], "api", "server", board, gtk_and_server_config
@@ -142,6 +144,7 @@ def test_pick_smoke_returns_none_when_no_machine_has_capability(
 def test_pick_smoke_falls_back_to_worker_machine_when_only_capable(
     repo: Repo,
 ) -> None:
+    """Only the worker machine is capable — it is chosen either way."""
     cfg = Config(
         repos=[repo],
         machines=[_machine("desktop-a", "d.tail", caps=["python", "gtk"])],
@@ -151,11 +154,83 @@ def test_pick_smoke_falls_back_to_worker_machine_when_only_capable(
     assert choice is not None
     assert choice.machine.name == "desktop-a"
     assert choice.is_worker is True
-    assert "same machine" in choice.rationale
+
+    # Same outcome with the pre-#1402 ordering — capability is the only
+    # constraint that can be satisfied here.
+    legacy = pick_smoke_machine(
+        ["gtk"], "api", "desktop-a", Board(), cfg, prefer_worker=False
+    )
+    assert legacy is not None
+    assert legacy.machine.name == "desktop-a"
+    assert legacy.is_worker is True
+    assert "same machine" in legacy.rationale
 
 
-def test_pick_smoke_picks_busy_different_over_idle_worker(repo: Repo) -> None:
-    """Capability + different-machine wins over idle but worker."""
+# ── #1402: the Test stage prefers the machine with the warm build cache ─────
+
+
+def test_pick_smoke_prefers_idle_worker_machine_over_idle_other(repo: Repo) -> None:
+    """#1402: with two equally capable idle machines, the worker's own wins —
+    its cargo target cache is already warm (~18 s vs ~3 min cold)."""
+    cfg = Config(
+        repos=[repo],
+        machines=[
+            _machine("server", "server.tail", caps=["python", "gtk"]),
+            _machine("desktop-a", "d.tail", caps=["python", "gtk"]),
+        ],
+        smoke_tests=SmokeTestsConfig(auto_queue=True),
+    )
+    choice = pick_smoke_machine(["gtk"], "api", "server", Board(), cfg)
+    assert choice is not None
+    assert choice.machine.name == "server"
+    assert choice.is_worker is True
+    assert "warm" in choice.rationale
+
+
+def test_pick_smoke_prefer_worker_false_restores_different_machine_first(
+    repo: Repo,
+) -> None:
+    """#1402: the old ordering is still reachable via ``prefer_worker=False``
+    (review-style independence), so the flip is opt-out, not one-way."""
+    cfg = Config(
+        repos=[repo],
+        machines=[
+            _machine("server", "server.tail", caps=["python", "gtk"]),
+            _machine("desktop-a", "d.tail", caps=["python", "gtk"]),
+        ],
+        smoke_tests=SmokeTestsConfig(auto_queue=True),
+    )
+    choice = pick_smoke_machine(
+        ["gtk"], "api", "server", Board(), cfg, prefer_worker=False
+    )
+    assert choice is not None
+    assert choice.machine.name == "desktop-a"
+    assert choice.is_worker is False
+
+
+def test_pick_smoke_worker_preference_never_beats_capability_rules(
+    repo: Repo,
+) -> None:
+    """#1402 acceptance: capability rules still bind.  The worker machine is
+    idle but has no ``gtk``, so the Test stage goes to the capable machine
+    even though that means a cold build."""
+    cfg = Config(
+        repos=[repo],
+        machines=[
+            _machine("server", "server.tail", caps=["python"]),
+            _machine("desktop-a", "d.tail", caps=["python", "gtk"]),
+        ],
+        smoke_tests=SmokeTestsConfig(auto_queue=True),
+    )
+    choice = pick_smoke_machine(["gtk"], "api", "server", Board(), cfg)
+    assert choice is not None
+    assert choice.machine.name == "desktop-a"
+    assert choice.is_worker is False
+
+
+def test_pick_smoke_busy_worker_machine_beats_busy_other(repo: Repo) -> None:
+    """#1402: when every capable machine is busy the warm one still wins —
+    the smoke queues on the worker machine rather than rebuilding cold."""
     cfg = Config(
         repos=[repo],
         machines=[
@@ -168,12 +243,40 @@ def test_pick_smoke_picks_busy_different_over_idle_worker(repo: Repo) -> None:
         Assignment(
             machine_name="desktop-a", repo_name="api", issue_number=99,
             issue_title="other", status="running", assignment_id="x",
+        ),
+        Assignment(
+            machine_name="server", repo_name="api", issue_number=98,
+            issue_title="mine", status="running", assignment_id="y",
+        ),
+    ])
+    choice = pick_smoke_machine(["gtk"], "api", "server", board, cfg)
+    assert choice is not None
+    assert choice.machine.name == "server"
+    assert choice.is_worker is True
+    assert "busy" in choice.rationale
+
+
+def test_pick_smoke_idle_other_beats_busy_worker_machine(repo: Repo) -> None:
+    """#1402: a warm-but-busy worker machine loses to an idle capable one —
+    queueing behind another worker costs more than the cold build saves."""
+    cfg = Config(
+        repos=[repo],
+        machines=[
+            _machine("server", "server.tail", caps=["python", "gtk"]),
+            _machine("desktop-a", "d.tail", caps=["python", "gtk"]),
+        ],
+        smoke_tests=SmokeTestsConfig(auto_queue=True),
+    )
+    board = Board(active=[
+        Assignment(
+            machine_name="server", repo_name="api", issue_number=98,
+            issue_title="mine", status="running", assignment_id="y",
         )
     ])
     choice = pick_smoke_machine(["gtk"], "api", "server", board, cfg)
     assert choice is not None
     assert choice.machine.name == "desktop-a"
-    assert "busy" in choice.rationale
+    assert choice.is_worker is False
 
 
 # ── Config parsing ──────────────────────────────────────────────────────────
