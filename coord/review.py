@@ -654,6 +654,15 @@ REVIEW_BODY:
 <your full review text in markdown>
 END_REVIEW
 
+`END_REVIEW` is a HARD REQUIREMENT, not a formatting flourish: the coordinator \
+only records a verdict when it sees that exact line, so a review that is \
+otherwise complete and correct but stops one line early is discarded in its \
+entirety — the same as if you had never reviewed at all. The LAST LINE of your \
+LAST MESSAGE must be exactly `END_REVIEW` on its own line, with nothing after \
+it. Do not stop as soon as your review prose feels finished; write the \
+`END_REVIEW` line and then stop. Before you end your session, re-read your \
+final message and confirm its last line is `END_REVIEW`.
+
 If the diff is clean, approve — but be thorough first.\
 """
 
@@ -1137,9 +1146,14 @@ def build_review_briefing(
         "backticks, no `#` heading marks, no list bullet. "
         "`**REVIEW_VERDICT: request-changes**` is WRONG. "
         "`REVIEW_VERDICT: request-changes` is right. The review BODY between "
-        "the markers may be Markdown — the marker lines may not. Before you "
-        "finish, re-read your last message and confirm the verdict line "
-        "begins with `REVIEW_VERDICT:` and nothing precedes it."
+        "the markers may be Markdown — the marker lines may not. "
+        "`END_REVIEW` is a HARD REQUIREMENT: an otherwise-complete, correct "
+        "review with no `END_REVIEW` line is discarded in its entirety, not "
+        "recorded with a best guess — so write `END_REVIEW` even if your "
+        "review prose already feels finished. Before you finish, re-read "
+        "your last message and confirm the verdict line begins with "
+        "`REVIEW_VERDICT:` with nothing preceding it, AND that the very "
+        "last line is `END_REVIEW`."
     )
 
     return "\n".join(lines)

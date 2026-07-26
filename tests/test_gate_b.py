@@ -141,6 +141,14 @@ class TestBuildGateBBriefing:
         assert "END_REVIEW" in briefing
         assert "request-changes" in briefing
 
+    def test_states_end_review_as_hard_requirement(self) -> None:
+        """#1427: the Gate-B briefing must state END_REVIEW as mandatory, not
+        just show it inside the format example — same rationale as the
+        per-issue reviewer prompt this path shares its system prompt with."""
+        briefing = self._build("contract")
+        assert "HARD REQUIREMENT" in briefing
+        assert "discarded in its entirety" in briefing
+
     def test_instructs_reviewer_not_to_touch_docs(self) -> None:
         # #933 scope guard: "Do not touch README/CHANGELOG/docs."
         briefing = self._build("contract")
