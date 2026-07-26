@@ -11,7 +11,7 @@ from click.testing import CliRunner
 from coord.cli import main
 from coord.config import Config, ConcurrencyConfig
 from coord.models import Assignment, Board, Machine, Repo
-from coord.reconcile import _reassign, reconcile
+from coord.reconcile import _reassign, describe_no_candidate_machines, reconcile
 from coord.state import save_board
 
 
@@ -239,6 +239,74 @@ class TestAutoReassign:
         assert len(board.active) == 0
 
 
+# ── #1396: diagnosable "no available machine" message ──────────────────────
+
+
+class TestDescribeNoCandidateMachines:
+    """describe_no_candidate_machines names the blocking machine + its load."""
+
+    def test_names_busy_machine_and_age(self) -> None:
+        config = Config(
+            repos=[Repo(name="claude-coordinator", github="a/a")],
+            machines=[
+                Machine(name="elitebook", host="e", repos=["claude-coordinator"],
+                        repo_paths={"claude-coordinator": "/tmp/a"}),
+            ],
+        )
+        failed = Assignment(
+            machine_name="elitebook", repo_name="claude-coordinator",
+            issue_number=99, issue_title="x", assignment_id="a-failed",
+            status="failed",
+        )
+        # A stale phantom `running` row — exactly the #1396 reproduction:
+        # a dead interactive session nothing reaped, dispatched_at far in
+        # the past so its age is large.
+        phantom = Assignment(
+            machine_name="elitebook", repo_name="claude-coordinator",
+            issue_number=767, issue_title="chat", assignment_id="phantom-1",
+            status="running", type="chat", dispatched_at=1.0,
+        )
+        board = Board(active=[phantom])
+
+        msg = describe_no_candidate_machines(failed, board, config)
+
+        assert "elitebook" in msg
+        assert "busy" in msg
+        assert "chat" in msg  # names the type occupying the machine
+        assert "#767" in msg
+        assert "age=" in msg  # the age is what makes a stale phantom obvious
+
+    def test_names_paused_machine(self) -> None:
+        config = Config(
+            repos=[Repo(name="api", github="a/a")],
+            machines=[
+                Machine(name="laptop", host="l", repos=["api"], repo_paths={"api": "/tmp/a"}),
+            ],
+        )
+        failed = Assignment(
+            machine_name="other", repo_name="api", issue_number=1,
+            issue_title="x", assignment_id="a1", status="failed",
+        )
+        with patch("coord.machine_pause.paused_set", return_value={"laptop"}):
+            msg = describe_no_candidate_machines(failed, Board(), config)
+
+        assert "laptop" in msg
+        assert "paused" in msg
+
+    def test_no_relevant_machine_says_so(self) -> None:
+        config = Config(
+            repos=[Repo(name="api", github="a/a")],
+            machines=[Machine(name="laptop", host="l", repos=["other"])],
+        )
+        failed = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=1,
+            issue_title="x", assignment_id="a1", status="failed",
+        )
+        msg = describe_no_candidate_machines(failed, Board(), config)
+        assert "api" in msg
+        assert "no machine" in msg
+
+
 # ── CLI retry command ───────────────────────────────────────────────────────
 
 
@@ -289,6 +357,42 @@ class TestCoordRetry:
         result = runner.invoke(main, ["retry", "a1", "--config", str(config_file)])
         assert result.exit_code != 0
         assert "not failed" in result.output
+
+    def test_retry_no_available_machine_names_busy_machine(
+        self, tmp_path: Path, coord_db,
+    ) -> None:
+        """#1396: when retry fails, the message must name the blocking
+        machine and its apparent load rather than a bare "no available
+        machine to retry on" — the #1396 reproduction had every machine
+        idle per `coord status` but a phantom `running` row made retry
+        refuse with no hint why.
+        """
+        config_file = tmp_path / "coordinator.yml"
+        config_file.write_text(
+            "repos:\n  - name: api\n    github: a/a\n"
+            "machines:\n"
+            "  - name: elitebook\n    host: e\n    repos: [api]\n    repo_paths:\n      api: /tmp/a\n"
+        )
+        board = Board(
+            active=[
+                Assignment(machine_name="elitebook", repo_name="api", issue_number=767,
+                           issue_title="chat", assignment_id="phantom-1",
+                           status="running", type="chat", dispatched_at=1.0),
+            ],
+            completed=[
+                Assignment(machine_name="elitebook", repo_name="api", issue_number=42,
+                           issue_title="Fix auth", assignment_id="a1", status="failed",
+                           briefing="do it", finished_at=1.0),
+            ],
+        )
+        save_board(board)
+
+        runner = CliRunner()
+        result = runner.invoke(main, ["retry", "a1", "--config", str(config_file)])
+
+        assert result.exit_code != 0
+        assert "elitebook" in result.output
+        assert "busy" in result.output
 
     def test_retry_unknown_assignment(self, tmp_path: Path, coord_db) -> None:
         config_file = tmp_path / "coordinator.yml"
