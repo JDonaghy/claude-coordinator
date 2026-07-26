@@ -182,6 +182,23 @@ _stdio_capture_install_lock = threading.Lock()
 # genuinely serialize: the second caller's request simply blocks until the
 # first's merge finishes, same as two ``coord merge`` invocations on one
 # host always have.
+#
+# Every caller that does the same load->mutate->save cycle on the shared
+# merge-queue table must take this same lock, not just ``POST /merge`` —
+# see ``_auto_drain_tick`` (the opt-in background drain tick) and the
+# ``drop`` shortcut in ``post_merge`` below, both of which touch the
+# identical table via the identical pattern.
+#
+# Trade-off (#1400-review, not addressed here): this is a bare
+# ``threading.Lock()`` with no timeout, so a hung ``merge_cmd.callback()``
+# (stuck ``gh``/git subprocess, network partition) now wedges every
+# subsequent ``/merge``/auto-drain caller fleet-wide until a manual daemon
+# restart — a new failure mode versus the pre-#1400 state, where a hang in
+# one request didn't block others (at the cost of the correctness bug this
+# lock fixes). Accepted for the tier:small scope #1400 called out; a
+# lease-with-TTL (``POST /merge-lease`` / ``DELETE /merge-lease``) was named
+# as the tier:large alternative specifically to avoid this, and remains a
+# candidate follow-up if a hung merge in production makes it worth building.
 _merge_lock = threading.Lock()
 
 
@@ -1032,47 +1049,59 @@ def _auto_drain_tick(config: Config) -> "list":
         log.debug("auto-drain: no READY entries")
         return []
 
-    # Load the raw queue and restrict to PENDING + READY.
-    all_items = mq.load_queue()
-    ready_items = [
-        item for item in all_items
-        if item.assignment_id in ready_aids and item.state == PENDING
-    ]
+    # #1400-review: this whole load->process->save cycle is the exact same
+    # merge-queue read-modify-write hazard ``_merge_lock`` was introduced to
+    # close for ``POST /merge`` — ``mq.process()`` has exactly two call
+    # sites in the codebase (the other is the daemon-routed ``coord merge``
+    # callback, already wrapped in ``_merge_lock``) and both do a full
+    # ``load_queue()`` -> mutate -> ``save_queue()`` replace of the WHOLE
+    # table. Without also taking ``_merge_lock`` here, a driver's ``/merge``
+    # request and this tick (fired independently every ~30s by
+    # ``_tick_loop``, off the event loop via ``run_in_threadpool``) can
+    # still race and silently clobber each other's just-recorded state —
+    # see ``_merge_lock``'s module-level docstring for the full hazard.
+    with _merge_lock:
+        # Load the raw queue and restrict to PENDING + READY.
+        all_items = mq.load_queue()
+        ready_items = [
+            item for item in all_items
+            if item.assignment_id in ready_aids and item.state == PENDING
+        ]
 
-    if not ready_items:
-        log.debug("auto-drain: plan shows READY but no PENDING queue rows match")
-        return []
+        if not ready_items:
+            log.debug("auto-drain: plan shows READY but no PENDING queue rows match")
+            return []
 
-    # Apply per-tick cap when configured.
-    cap = config.merge.max_per_tick
-    if cap > 0 and len(ready_items) > cap:
-        log.debug(
-            "auto-drain: capping %d READY entries to %d (max_per_tick)",
-            len(ready_items), cap,
+        # Apply per-tick cap when configured.
+        cap = config.merge.max_per_tick
+        if cap > 0 and len(ready_items) > cap:
+            log.debug(
+                "auto-drain: capping %d READY entries to %d (max_per_tick)",
+                len(ready_items), cap,
+            )
+            ready_items = ready_items[:cap]
+
+        # process() mutates ready_items in place (state, pr_number, etc.).
+        events = mq.process(
+            ready_items,
+            github_ops,
+            method="rebase",
+            dry_run=False,
+            presorted=False,
+            ci_store=ci_store,
+            force_merge=False,
+            config=config,
+            board=board,
+            skip_review=False,
+            skip_smoke=False,
         )
-        ready_items = ready_items[:cap]
 
-    # process() mutates ready_items in place (state, pr_number, etc.).
-    events = mq.process(
-        ready_items,
-        github_ops,
-        method="rebase",
-        dry_run=False,
-        presorted=False,
-        ci_store=ci_store,
-        force_merge=False,
-        config=config,
-        board=board,
-        skip_review=False,
-        skip_smoke=False,
-    )
-
-    # Persist: merge the mutated rows back over the on-disk queue (same
-    # pattern as ``coord merge`` in cli.py to avoid clobbering unrelated rows).
-    fresh = mq.load_queue()
-    by_id = {item.assignment_id: item for item in ready_items}
-    merged = [by_id.get(item.assignment_id, item) for item in fresh]
-    mq.save_queue(merged)
+        # Persist: merge the mutated rows back over the on-disk queue (same
+        # pattern as ``coord merge`` in cli.py to avoid clobbering unrelated rows).
+        fresh = mq.load_queue()
+        by_id = {item.assignment_id: item for item in ready_items}
+        merged = [by_id.get(item.assignment_id, item) for item in fresh]
+        mq.save_queue(merged)
 
     # #1038: one operational row per MergeEvent this auto-drain tick produced
     # (opened/sized/merged/checks_failed/checks_pending/review_required/
@@ -4238,19 +4267,31 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         # invoke the CLI at all.
         drop_aid = body.get("drop")
         if drop_aid:
-            from coord import merge_queue as _mq  # noqa: PLC0415
+            def _run_drop() -> dict:
+                from coord import merge_queue as _mq  # noqa: PLC0415
 
-            removed = _mq.drop_entry(str(drop_aid))
-            if removed:
-                return JSONResponse(
-                    {"output": f"merge-queue: dropped entry {drop_aid}\n", "exit_code": 0}
-                )
-            return JSONResponse(
-                {
+                # #1400-review: a concurrent real merge can snapshot the
+                # queue via load_queue() before this drop's DELETE lands,
+                # then overwrite it right back in when its own save_queue()
+                # replaces the whole table — silently resurrecting the row
+                # this just removed. Take the same _merge_lock the merge
+                # critical section holds so the two can never interleave;
+                # see _merge_lock's module-level docstring.
+                with _merge_lock:
+                    removed = _mq.drop_entry(str(drop_aid))
+                if removed:
+                    return {"output": f"merge-queue: dropped entry {drop_aid}\n", "exit_code": 0}
+                return {
                     "output": f"merge-queue: no entry found for {drop_aid!r}\n",
                     "exit_code": 1,
                 }
-            )
+
+            # Off the event-loop thread: this may now block on _merge_lock
+            # behind a multi-minute concurrent merge, and a plain
+            # threading.Lock.acquire() on the event-loop thread would freeze
+            # every other request for that long.
+            result = await run_in_threadpool(_run_drop)
+            return JSONResponse(result)
 
         def _run() -> dict:
             import io  # noqa: PLC0415

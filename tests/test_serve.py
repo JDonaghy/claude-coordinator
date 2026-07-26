@@ -295,6 +295,78 @@ def test_serve_merge_concurrent_requests_do_not_cross_talk(
     )
 
 
+def test_serve_merge_drop_serializes_on_merge_lock(
+    file_db: Path, valid_config_path: Path, rw_db
+):
+    """#1400-review: the ``--drop`` shortcut in ``post_merge`` must take the
+    same ``_merge_lock`` a concurrent real merge holds.
+
+    ``drop_entry()`` issues a direct SQL ``DELETE`` on the row, but a
+    concurrent real merge's ``load_queue()`` -> mutate -> ``save_queue()``
+    cycle replaces the WHOLE table (see ``merge_queue.save_queue``). If that
+    merge already snapshotted the queue (via ``load_queue()``) before this
+    drop's ``DELETE`` lands, its own ``save_queue()`` writes the stale
+    snapshot back over the table and silently resurrects the just-dropped
+    row. Taking ``_merge_lock`` around the drop closes the same gap #1400
+    closed for two concurrent ``/merge`` requests.
+
+    Holds ``_merge_lock`` in the main thread and fires the drop request on a
+    background thread; asserts the request blocks (the row is still present)
+    until the lock is released, then completes and actually removes it.
+    """
+    import threading
+
+    from coord.serve_app import _merge_lock
+
+    mq.save_queue([
+        mq.QueuedMerge(
+            assignment_id="m1",
+            repo_name="api",
+            repo_github="acme/api",
+            branch="worker/m1",
+            target_branch="main",
+            issue_number=1,
+            issue_title="t",
+            size=None,
+            state=mq.PENDING,
+        )
+    ])
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+
+    result: dict = {}
+    # Kept open for the whole test: the background thread's request must
+    # finish (lock released, response received) before the TestClient's
+    # transport is torn down at the end of the ``with`` block.
+    with TestClient(app) as cli:
+        def _post():
+            result["resp"] = cli.post("/merge", json={"drop": "m1"})
+
+        _merge_lock.acquire()
+        try:
+            t = threading.Thread(target=_post)
+            t.start()
+            t.join(timeout=0.3)
+            assert t.is_alive(), (
+                "POST /merge {'drop': ...} returned while _merge_lock was "
+                "still held externally -- the drop shortcut is not "
+                "serialized against a concurrent merge (#1400 regression)"
+            )
+            # The lock is still held, so drop_entry() must not have run yet.
+            assert any(item.assignment_id == "m1" for item in mq.load_queue()), (
+                "the row was removed before _merge_lock was released -- "
+                "drop_entry() ran outside the lock (#1400 regression)"
+            )
+        finally:
+            _merge_lock.release()
+        t.join(timeout=5)
+        assert not t.is_alive(), "drop request did not finish after _merge_lock was released"
+
+    body = result["resp"].json()
+    assert body["exit_code"] == 0
+    assert "dropped entry m1" in body["output"]
+    assert not any(item.assignment_id == "m1" for item in mq.load_queue())
+
+
 # ── #1081: daemon-side config reload-on-write ───────────────────────────────
 
 def _bump_mtime(path: Path, seconds_ahead: float = 5.0) -> None:
@@ -4227,6 +4299,74 @@ def test_auto_drain_error_isolation(
     after = mq.load_queue()
     assert len(after) == 1
     assert after[0].state == "pending"
+
+
+def test_auto_drain_serializes_on_merge_lock(
+    tmp_path: "Path", rw_db, monkeypatch
+) -> None:
+    """#1400-review: ``_auto_drain_tick``'s load->process->save critical
+    section must take the same ``_merge_lock`` a concurrent ``POST /merge``
+    holds.
+
+    ``merge_queue.process()`` has exactly two call sites in the codebase:
+    the daemon-routed ``coord merge`` callback (already wrapped in
+    ``_merge_lock`` by #1400) and this auto-drain tick. Both do a full
+    ``load_queue()`` -> mutate -> ``save_queue()`` replace of the WHOLE
+    merge-queue table. Without also taking ``_merge_lock`` here, a driver's
+    ``/merge`` request and this tick (fired independently every ~30s by
+    ``_tick_loop``) can still race and silently clobber each other's
+    just-recorded state — the identical hazard #1400 closed for two
+    concurrent ``/merge`` requests, just reached via a different pair of
+    callers.
+
+    Holds ``_merge_lock`` in the main thread and starts ``_auto_drain_tick``
+    on a background thread; asserts the tick blocks (never reaches
+    ``merge_queue.process()``) until the lock is released.
+    """
+    import threading
+
+    from coord.config import load as load_config
+    from coord.serve_app import _auto_drain_tick, _merge_lock
+
+    from coord.ci_store import NoOpCi as _NoOpCi
+    monkeypatch.setattr("coord.ci_store.build_ci_store", lambda t: _NoOpCi())
+
+    process_called = threading.Event()
+
+    def _fake_process(items, *a, **kw):
+        process_called.set()
+        return []
+
+    monkeypatch.setattr("coord.merge_queue.process", _fake_process)
+
+    _seed_queued_ready_entry(rw_db)
+    cfg = load_config(_make_drain_config(tmp_path, auto_drain=True))
+
+    result: dict = {}
+
+    def _run():
+        result["events"] = _auto_drain_tick(cfg)
+
+    _merge_lock.acquire()
+    try:
+        t = threading.Thread(target=_run)
+        t.start()
+        t.join(timeout=0.3)
+        assert t.is_alive(), (
+            "_auto_drain_tick returned while _merge_lock was still held "
+            "externally -- its critical section is not serialized against "
+            "a concurrent /merge (#1400 regression)"
+        )
+        assert not process_called.is_set(), (
+            "_auto_drain_tick called merge_queue.process() before "
+            "acquiring _merge_lock (#1400 regression)"
+        )
+    finally:
+        _merge_lock.release()
+    t.join(timeout=5)
+    assert not t.is_alive(), "_auto_drain_tick did not finish after _merge_lock was released"
+    assert process_called.is_set()
+    assert result["events"] == []
 
 
 # ── #1038: operational-tier audit hooks ──────────────────────────────────────
