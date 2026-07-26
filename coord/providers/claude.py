@@ -159,6 +159,10 @@ class ClaudeProvider(Provider):
             "--system-prompt", system_prompt,
             "--allowedTools", allowed_tools,
             "--permission-mode", permission_mode,
+            # #1445: see the matching comment in default_worker_command —
+            # workers must not inherit the host checkout's project/local
+            # Claude Code settings.
+            "--setting-sources", "user",
         ]
         if effective_model:
             argv.extend(["--model", effective_model])

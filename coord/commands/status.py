@@ -783,6 +783,14 @@ def _diagnose_orphan_worktrees(config_path: Path, *, dry_run: bool) -> None:
     An orphaned worktree is one under ``~/.coord/worktrees/`` whose
     assignment_id has no live tmux session and no running/pending DB row.
     Dirty worktrees (uncommitted changes) are reported but never deleted.
+
+    #1445: also runs :func:`coord.agent.check_worktree_writable` against
+    ``~/.coord/worktrees/`` first and reports a DEGRADED line naming the
+    path and (when it's a permission rule at fault) the exact rule/file —
+    this machine invariant is otherwise invisible until a dispatched worker
+    burns a full session discovering it can't save anything. This check is
+    LOCAL-machine only, same as the rest of this sweep; it does not reach
+    out to other machines in the fleet.
     """
     from coord.diagnose import (  # noqa: PLC0415
         _find_orphaned_worktrees,
@@ -793,6 +801,7 @@ def _diagnose_orphan_worktrees(config_path: Path, *, dry_run: bool) -> None:
         tmux_session_name,
         tmux_session_alive,
     )
+    from coord.agent import check_worktree_writable  # noqa: PLC0415
     from coord.board_service import read_board  # noqa: PLC0415
     from coord.state import COORD_DIR  # noqa: PLC0415
 
@@ -800,8 +809,22 @@ def _diagnose_orphan_worktrees(config_path: Path, *, dry_run: bool) -> None:
     board = read_board()
     worktrees_dir = COORD_DIR / "worktrees"
 
-    if not worktrees_dir.exists():
-        click.echo("~/.coord/worktrees/ does not exist — nothing to sweep.")
+    # #1445: surface a machine that can't write its own worktrees as
+    # DEGRADED rather than silently idle-and-ready — this is the same
+    # fleet invariant `AgentServer.assign()` now preflights before every
+    # dispatch, checked here so an operator (or `scripts/drive-issue.sh`)
+    # can catch it ahead of time with a plain `coord diagnose --orphan-worktrees`.
+    write_issue = check_worktree_writable(worktrees_dir)
+    if write_issue is not None:
+        click.echo(f"⚠ DEGRADED: workers on this machine cannot write to {worktrees_dir}: {write_issue}")
+    else:
+        click.echo(f"✓ {worktrees_dir} is writable by workers.")
+
+    # check_worktree_writable() just mkdir'd worktrees_dir (parents=True,
+    # exist_ok=True) as part of its probe, so it always exists by this point
+    # — an empty directory just means no worktrees are currently checked out.
+    if not any(worktrees_dir.iterdir()):
+        click.echo("~/.coord/worktrees/ has no worktrees — nothing to sweep.")
         return
 
     # Collect all assignment_ids with live tmux sessions.

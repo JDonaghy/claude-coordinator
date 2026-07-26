@@ -2377,6 +2377,147 @@ def _sealed_write_guard_tools(files_forbidden: list[str]) -> list[str]:
     return patterns
 
 
+# ── #1445: worktree-writability preflight ───────────────────────────────────
+#
+# A worker's ability to write into its own worktree is a fleet invariant, not
+# a per-machine preference — see #1445 for the incident this guards against:
+# a host-local `.claude/settings.local.json` deny rule blanketing
+# `~/.coord/**` (added to stop an OPERATOR's interactive session from
+# editing coordinator.yml/coord.db) silently also blocked every worker's own
+# worktree under `~/.coord/worktrees/<id>/`, burning a full $5.23 session
+# that reasoned, designed, and only discovered at the very end that it could
+# not save anything. `default_worker_command`'s `--setting-sources user`
+# (above) closes off the specific mechanism (workers no longer load
+# project/local settings at all), but this preflight check is kept as a
+# defense-in-depth: it also catches a blanket deny rule living in the
+# machine's *user*-level settings (`~/.claude/settings.json`, still loaded)
+# and plain OS-level write failures (read-only mount, wrong ownership, full
+# disk) that have nothing to do with Claude Code at all.
+_DENY_PATTERN_RE = re.compile(r"^(Edit|Write)\(//(.+)\)$")
+
+
+def _deny_pattern_blocks_path(pattern: str, path: Path) -> bool:
+    """True if permission *pattern* (an Edit(...)/Write(...) deny entry) would
+    block Claude Code's Edit/Write tools somewhere under *path*.
+
+    Only recognises the specific shape this issue is about: an absolute-path
+    pattern using Claude Code's ``//<abs-path>`` marker, optionally with a
+    trailing ``/**`` (or ``/*``) wildcard blanketing a whole subtree — e.g.
+    ``Write(//home/john/.coord/**)``. Narrower, relative, or mid-pattern-glob
+    entries are deliberately not matched: a false negative here just means
+    the plain OS-level write probe (which still runs) is the only guard,
+    whereas a false positive would incorrectly refuse a machine that is
+    actually fine. *path* must be absolute.
+    """
+    m = _DENY_PATTERN_RE.match(pattern)
+    if not m:
+        return False
+    raw = "/" + m.group(2)
+    if raw.endswith("/**"):
+        base = raw[: -len("/**")]
+    elif raw.endswith("/*"):
+        base = raw[: -len("/*")]
+    else:
+        base = raw
+    base_path = Path(base)
+    try:
+        path.relative_to(base_path)
+        return True
+    except ValueError:
+        return False
+
+
+def _iter_deny_patterns(settings: dict) -> list[str]:
+    """Return the string entries of ``settings["permissions"]["deny"]``."""
+    perms = settings.get("permissions")
+    if not isinstance(perms, dict):
+        return []
+    deny = perms.get("deny")
+    if not isinstance(deny, list):
+        return []
+    return [d for d in deny if isinstance(d, str)]
+
+
+def find_blocking_deny_rule(
+    worktree_path: Path, *, settings_files: Iterable[Path] | None = None
+) -> str | None:
+    """Scan Claude Code settings files for a deny rule blocking *worktree_path*.
+
+    Defaults to scanning just the machine's user-level settings
+    (``~/.claude/settings.json``) — the one settings source a worker still
+    loads after the ``--setting-sources user`` restriction in
+    :func:`default_worker_command`; a checkout-local
+    ``.claude/settings.local.json`` can no longer reach a worker at all, so
+    it is intentionally not scanned here.
+
+    Returns a human-readable ``"'<pattern>' in <file>"`` message for the
+    first matching rule found, or ``None`` when no scanned file carries one
+    (including when a file is absent or fails to parse as JSON — this is a
+    best-effort advisory check, not a security boundary).
+    """
+    if settings_files is None:
+        settings_files = [Path.home() / ".claude" / "settings.json"]
+
+    worktree_path = worktree_path.expanduser()
+    for settings_path in settings_files:
+        try:
+            raw = settings_path.read_text()
+        except OSError:
+            continue
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        for pattern in _iter_deny_patterns(data):
+            if _deny_pattern_blocks_path(pattern, worktree_path):
+                return f"{pattern!r} in {settings_path}"
+    return None
+
+
+def check_worktree_writable(
+    worktree_path: Path, *, settings_files: Iterable[Path] | None = None
+) -> str | None:
+    """Preflight probe (#1445): can a worker actually write into its own worktree?
+
+    Two checks, catching two different failure classes:
+
+    1. A plain OS-level create/delete probe — catches real filesystem issues
+       (read-only mount, wrong ownership, full disk) that would block ANY
+       process, Claude Code or not.
+    2. :func:`find_blocking_deny_rule` — catches a Claude Code permission
+       rule that blocks only Edit/Write *tool calls* while the OS-level
+       probe above succeeds fine (the #1445 incident itself).
+
+    Returns ``None`` when both checks are clear, or a human-readable message
+    identifying the failure — naming the path and, for a deny-rule hit, the
+    exact rule and file — suitable for an assignment error or a `coord
+    diagnose` line. Call this **before** spawning a worker into
+    *worktree_path*, not after.
+
+    *settings_files* overrides which settings file(s) :func:`find_blocking_deny_rule`
+    scans (default: the machine's ``~/.claude/settings.json``) — mainly for
+    tests; production callers should leave it unset.
+    """
+    worktree_path = worktree_path.expanduser()
+    try:
+        worktree_path.mkdir(parents=True, exist_ok=True)
+        probe = worktree_path / f".coord-write-probe-{os.getpid()}"
+        probe.write_text("probe")
+        probe.unlink()
+    except OSError as e:
+        return f"cannot write to {worktree_path}: {e}"
+
+    blocked_by = find_blocking_deny_rule(worktree_path, settings_files=settings_files)
+    if blocked_by is not None:
+        return (
+            f"a Claude Code permission rule denies Edit/Write under "
+            f"{worktree_path}: {blocked_by}"
+        )
+    return None
+
+
 def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER_BINARY) -> list[str]:
     """Build the argv for invoking the worker on this assignment.
 
@@ -2462,6 +2603,29 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
         "--system-prompt", system_prompt,
         "--allowedTools", allowed_tools,
         "--permission-mode", "acceptEdits",
+        # #1445: a worker must not inherit whatever project/local Claude Code
+        # settings the host's checkout happens to carry — e.g. a
+        # `.claude/settings.local.json` deny rule the OPERATOR added for
+        # their own interactive session in that checkout (meant to protect
+        # ~/.coord/coordinator.yml etc from an interactive session, but
+        # written broadly enough to blanket ~/.coord/** including every
+        # worker's own worktree under ~/.coord/worktrees/<id>/). Confirmed
+        # empirically: Claude Code resolves a linked git worktree's project
+        # settings back to the MAIN checkout even though the worktree itself
+        # has no .claude/ dir of its own (it's untracked/gitignored there),
+        # so a deny rule that never touches the worktree's working directory
+        # still blocked Edit/Write calls from a `claude -p` session cwd'd
+        # into that worktree. Restricting to "user" means a worker's
+        # permission profile is fully controlled by the --allowedTools /
+        # --disallowedTools / --permission-mode flags in this function (and
+        # its own hard-coded system prompt), not by the checkout's
+        # settings.json / settings.local.json. This is the headless/
+        # `claude -p` path only — the human-attended interactive PTY path
+        # (coord.providers.claude_pty.ClaudePtyProvider) intentionally keeps
+        # the default sources so an operator's own `coord init`-configured
+        # convenience allow-list still applies to a session they're
+        # attached to and watching.
+        "--setting-sources", "user",
     ]
     if spec.model:
         argv.extend(["--model", spec.model])
@@ -3564,6 +3728,20 @@ class AgentServer:
             return assignment  # Don't raise — let coordinator see the failure
 
         assignment.worktree_path = str(worktree_path)
+
+        # #1445: refuse to spawn a worker into a worktree it can't actually
+        # write to — cheap to catch here (a stat + a JSON parse) vs. a full
+        # session that reasons, designs, and only discovers at the very end
+        # that it had nowhere to save its work.
+        write_issue = check_worktree_writable(worktree_path)
+        if write_issue is not None:
+            assignment.status = FAILED
+            assignment.error = f"worktree not writable: {write_issue}"
+            assignment.finished_at = time.time()
+            with self._lock:
+                self._assignments[assignment.id] = assignment
+            self._persist()
+            return assignment  # Don't raise — let coordinator see the failure
 
         with self._lock:
             self._assignments[assignment.id] = assignment
