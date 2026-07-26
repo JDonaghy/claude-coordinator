@@ -213,6 +213,7 @@ def _make_cfg(
     *,
     default_model: str = "sonnet",
     escalation: list[str] | None = None,
+    labels: dict[str, str] | None = None,
 ) -> Config:
     return Config(
         repos=[Repo(name="api", github="acme/api")],
@@ -227,6 +228,7 @@ def _make_cfg(
         models=ModelsConfig(
             default=default_model,
             escalation=escalation or ["haiku", "sonnet", "opus"],
+            labels=labels or {},
         ),
     )
 
@@ -287,6 +289,56 @@ class TestDispatchModel:
         payload = mock_post.call_args.kwargs["json"]
         assert "model" in payload
         assert payload["model"] == "haiku"
+
+    # ── #1430: models.labels acceptance criteria ────────────────────────
+
+    @patch("coord.dispatch.httpx.post")
+    def test_tier_small_label_dispatches_haiku(self, mock_post: MagicMock) -> None:
+        cfg = _make_cfg(default_model="sonnet", labels={"tier:small": "haiku", "tier:large": "opus"})
+        proposal = _make_proposal(issue_labels=["tier:small"])
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        dispatch(proposal, cfg)
+        assert mock_post.call_args.kwargs["json"]["model"] == "haiku"
+
+    @patch("coord.dispatch.httpx.post")
+    def test_tier_large_label_dispatches_opus(self, mock_post: MagicMock) -> None:
+        cfg = _make_cfg(default_model="sonnet", labels={"tier:small": "haiku", "tier:large": "opus"})
+        proposal = _make_proposal(issue_labels=["tier:large"])
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        dispatch(proposal, cfg)
+        assert mock_post.call_args.kwargs["json"]["model"] == "opus"
+
+    @patch("coord.dispatch.httpx.post")
+    def test_unlabelled_issue_dispatches_default(self, mock_post: MagicMock) -> None:
+        cfg = _make_cfg(default_model="sonnet", labels={"tier:small": "haiku", "tier:large": "opus"})
+        proposal = _make_proposal(issue_labels=[])
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        dispatch(proposal, cfg)
+        assert mock_post.call_args.kwargs["json"]["model"] == "sonnet"
+
+    @patch("coord.dispatch.httpx.post")
+    def test_explicit_model_still_overrides_label(self, mock_post: MagicMock) -> None:
+        cfg = _make_cfg(default_model="sonnet", labels={"tier:large": "opus"})
+        proposal = _make_proposal(issue_labels=["tier:large"], model="haiku")
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        dispatch(proposal, cfg)
+        assert mock_post.call_args.kwargs["json"]["model"] == "haiku"
 
 
 # ── coord assign --model passes through ────────────────────────────────────
@@ -408,6 +460,161 @@ class TestCliAssignModel:
         records = state_mod.load_dispatched()
         assert len(records) == 1
         assert records[0]["model"] == "haiku"
+
+
+CONFIG_YAML_WITH_LABELS = """\
+repos:
+  - name: api
+    github: acme/api
+    default_branch: main
+machines:
+  - name: laptop
+    host: laptop.tailnet
+    repos: [api]
+    repo_paths:
+      api: /tmp/api
+models:
+  default: sonnet
+  escalation: [haiku, sonnet, opus]
+  labels:
+    tier:small: haiku
+    tier:large: opus
+"""
+
+
+@pytest.fixture
+def cli_config_file_with_labels(tmp_path: Path) -> Path:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(CONFIG_YAML_WITH_LABELS)
+    return p
+
+
+class TestCliAssignModelLabels:
+    """#1430: `coord assign` (no --model) resolves models.labels from the
+    issue's GitHub labels."""
+
+    def test_tier_small_label_resolves_haiku(
+        self, cli_config_file_with_labels: Path, cli_coord_dir: Path,
+    ) -> None:
+        with patch(
+            "coord.github_ops.get_issue",
+            return_value={"title": "t", "labels": [{"name": "tier:small"}]},
+        ), patch(
+            "coord.dispatch.dispatch", return_value={"id": "abc-123"}
+        ) as disp, patch(
+            "coord.github_ops.post_issue_comment"
+        ), patch(
+            "coord.github_ops.check_branch_exists", return_value=False
+        ), patch(
+            "coord.claim.find_work_claim", return_value=None
+        ):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "42", "--config", str(cli_config_file_with_labels)],
+            )
+        assert result.exit_code == 0, result.output
+        proposal = disp.call_args[0][0]
+        assert proposal.model == "haiku"
+
+    def test_tier_large_label_resolves_opus(
+        self, cli_config_file_with_labels: Path, cli_coord_dir: Path,
+    ) -> None:
+        with patch(
+            "coord.github_ops.get_issue",
+            return_value={"title": "t", "labels": [{"name": "tier:large"}]},
+        ), patch(
+            "coord.dispatch.dispatch", return_value={"id": "abc-123"}
+        ) as disp, patch(
+            "coord.github_ops.post_issue_comment"
+        ), patch(
+            "coord.github_ops.check_branch_exists", return_value=False
+        ), patch(
+            "coord.claim.find_work_claim", return_value=None
+        ):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "42", "--config", str(cli_config_file_with_labels)],
+            )
+        assert result.exit_code == 0, result.output
+        proposal = disp.call_args[0][0]
+        assert proposal.model == "opus"
+
+    def test_unlabelled_issue_resolves_default(
+        self, cli_config_file_with_labels: Path, cli_coord_dir: Path,
+    ) -> None:
+        with patch(
+            "coord.github_ops.get_issue", return_value={"title": "t", "labels": []},
+        ), patch(
+            "coord.dispatch.dispatch", return_value={"id": "abc-123"}
+        ) as disp, patch(
+            "coord.github_ops.post_issue_comment"
+        ), patch(
+            "coord.github_ops.check_branch_exists", return_value=False
+        ), patch(
+            "coord.claim.find_work_claim", return_value=None
+        ):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "42", "--config", str(cli_config_file_with_labels)],
+            )
+        assert result.exit_code == 0, result.output
+        proposal = disp.call_args[0][0]
+        assert proposal.model == "sonnet"
+
+    def test_explicit_model_flag_overrides_label(
+        self, cli_config_file_with_labels: Path, cli_coord_dir: Path,
+    ) -> None:
+        with patch(
+            "coord.github_ops.get_issue",
+            return_value={"title": "t", "labels": [{"name": "tier:large"}]},
+        ), patch(
+            "coord.dispatch.dispatch", return_value={"id": "abc-123"}
+        ) as disp, patch(
+            "coord.github_ops.post_issue_comment"
+        ), patch(
+            "coord.github_ops.check_branch_exists", return_value=False
+        ), patch(
+            "coord.claim.find_work_claim", return_value=None
+        ):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "assign", "laptop", "api", "42",
+                    "--config", str(cli_config_file_with_labels),
+                    "--model", "haiku",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        proposal = disp.call_args[0][0]
+        assert proposal.model == "haiku"
+
+    def test_plan_only_does_not_inherit_label_model(
+        self, cli_config_file_with_labels: Path, cli_coord_dir: Path,
+    ) -> None:
+        """A --plan-only dispatch must not inherit tier:large -> opus."""
+        with patch(
+            "coord.github_ops.get_issue",
+            return_value={"title": "t", "labels": [{"name": "tier:large"}]},
+        ), patch(
+            "coord.dispatch.dispatch", return_value={"id": "abc-123"}
+        ) as disp, patch(
+            "coord.github_ops.post_issue_comment"
+        ), patch(
+            "coord.github_ops.check_branch_exists", return_value=False
+        ), patch(
+            "coord.claim.find_work_claim", return_value=None
+        ):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "assign", "laptop", "api", "42",
+                    "--config", str(cli_config_file_with_labels),
+                    "--plan-only",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        proposal = disp.call_args[0][0]
+        assert proposal.model == "sonnet"
 
 
 # ── Escalation on follow-up commands ───────────────────────────────────────

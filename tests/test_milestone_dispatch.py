@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 import pytest
 
-from coord.config import Config
+from coord.config import Config, ModelsConfig
 from coord.milestone_dispatch import (
     MilestoneContext,
     MilestoneDispatchError,
@@ -659,3 +659,64 @@ class TestDispatchEntry:
         assert outcome.ok is False
         assert "could not ensure feature/ms-9 exists" in outcome.error
         disp.assert_not_called()
+
+    def test_tier_label_resolves_model_for_work_dispatch(self, coord_db) -> None:
+        """#1430: dispatch_entry resolves models.labels for a plain "work"
+        dispatch (require_plan=false, the default in _config())."""
+        cfg = _config([_machine("laptop", ["api"])])
+        cfg.models = ModelsConfig(default="sonnet", labels={"tier:large": "opus"})
+        board = Board()
+        pick = self._pick(cfg, board)
+        repo = cfg.repo("api")
+
+        proposals = []
+
+        def fake_dispatch(proposal, config):
+            proposals.append(proposal)
+            return {"id": "asn-1"}
+
+        with patch(
+            "coord.github_ops.get_issue",
+            return_value={"title": "Fix X", "body": "b", "labels": [{"name": "tier:large"}]},
+        ), \
+             patch("coord.dispatch.dispatch", side_effect=fake_dispatch), \
+             patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.github_ops.check_branch_exists", return_value=False):
+            outcome = dispatch_entry(pick, repo, cfg, board, tracking_issue=100)
+
+        assert outcome.ok is True
+        assert len(proposals) == 1
+        assert proposals[0].model == "opus"
+        assert proposals[0].type == "work"
+
+    def test_require_plan_does_not_inherit_label_model(self, coord_db) -> None:
+        """#1430: when dispatch.require_plan upgrades this to a plan-type
+        dispatch, it must stay on models.default, not inherit tier:large."""
+        from coord.config import DispatchConfig
+
+        cfg = _config([_machine("laptop", ["api"])])
+        cfg.models = ModelsConfig(default="sonnet", labels={"tier:large": "opus"})
+        cfg.dispatch = DispatchConfig(require_plan=True)
+        board = Board()
+        pick = self._pick(cfg, board)
+        repo = cfg.repo("api")
+
+        proposals = []
+
+        def fake_dispatch(proposal, config):
+            proposals.append(proposal)
+            return {"id": "asn-1"}
+
+        with patch(
+            "coord.github_ops.get_issue",
+            return_value={"title": "Fix X", "body": "b", "labels": [{"name": "tier:large"}]},
+        ), \
+             patch("coord.dispatch.dispatch", side_effect=fake_dispatch), \
+             patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.github_ops.check_branch_exists", return_value=False):
+            outcome = dispatch_entry(pick, repo, cfg, board, tracking_issue=100)
+
+        assert outcome.ok is True
+        assert len(proposals) == 1
+        assert proposals[0].model == "sonnet"
+        assert proposals[0].type == "plan"

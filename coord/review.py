@@ -1423,6 +1423,9 @@ def dispatch_review(
     issue_body = fetch_body(repo.github, completed.issue_number)
 
     # Pin the reviewer's model to avoid the agent defaulting to Opus (#911).
+    # #1430: deliberately not consulting models.labels — the reviewer's
+    # effort scales with diff size, not the original work issue's tier
+    # label, and #911 already pins this deliberately.
     review_model_alias = config.models.default
     review_model_wire = config.models.resolve(review_model_alias)
 

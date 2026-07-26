@@ -322,6 +322,53 @@ def resolve_required_gates(
                 break
 
 
+def resolve_models(
+    proposals: list[Proposal],
+    config: Config,
+    issues_by_repo: dict[str, list[dict]],
+) -> None:
+    """Resolve proposal.model for each work proposal from config.models.labels.
+
+    #1430: mirrors :func:`resolve_required_gates`'s shape and precedence
+    convention (issue-label order; first configured label wins) so the two
+    label-driven resolvers behave the same way for the same kind of
+    ambiguity — see :meth:`coord.config.ModelsConfig.model_for_labels`.
+
+    Only ``type="work"`` proposals are touched. ``_apply_require_plan``
+    (called before this, in :func:`propose`) may already have upgraded a
+    proposal to ``type="plan"`` — plan workers are read-only/cheap and must
+    not inherit a ``tier:large`` -> opus routing meant for the eventual work
+    dispatch, so plan proposals are left on ``models.default`` here.
+
+    Leaves ``proposal.model`` unset (``None``) when no label matches, so the
+    existing ``if not p.model: p.model = cfg.models.default`` fallback in
+    ``coord approve`` (``coord/commands/dispatch.py``) keeps working
+    unchanged. Never overrides a model already set on the proposal (the
+    brain's own JSON output, or a human editing saved proposals before
+    approving).
+    """
+    if not config.models.labels:
+        return  # no label overrides configured, nothing to do
+
+    for proposal in proposals:
+        if proposal.type != "work" or proposal.model:
+            continue
+        repo_issues = issues_by_repo.get(proposal.repo_name, [])
+        issue = next(
+            (iss for iss in repo_issues if iss.get("number") == proposal.issue_number),
+            None,
+        )
+        if issue is None:
+            continue
+        issue_labels: list[str] = [
+            lbl.get("name", "") for lbl in (issue.get("labels") or [])
+        ]
+        proposal.issue_labels = issue_labels
+        resolved = config.models.model_for_labels(issue_labels)
+        if resolved:
+            proposal.model = resolved
+
+
 def parse_split_proposals(text: str) -> list[SplitProposal]:
     """Parse split proposals from the brain's JSON response."""
     data = json.loads(_strip_fences(text))
@@ -390,5 +437,6 @@ def propose(config: Config) -> tuple[list[Proposal], list[SplitProposal]]:
     proposals = parse_proposals(response)
     _apply_require_plan(proposals, config)
     resolve_required_gates(proposals, config, context["issues_by_repo"])
+    resolve_models(proposals, config, context["issues_by_repo"])
     _annotate_large_proposals(proposals, config)
     return proposals, parse_split_proposals(response)

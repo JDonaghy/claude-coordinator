@@ -598,6 +598,15 @@ def dispatch_entry(
                 error=f"could not ensure feature/ms-{milestone_number} exists: {e}",
             )
 
+    # #1430: models.labels routes work dispatches by the issue's tier/type
+    # label; plan workers (require_plan=true) deliberately stay on
+    # `default` — read-only/cheap, must not inherit a tier:large -> opus
+    # routing meant for the eventual work dispatch.
+    proposal_type = "plan" if config.dispatch.require_plan else "work"
+    resolved_model = (
+        config.models.model_for_labels(issue_labels) if proposal_type == "work" else None
+    ) or config.models.default
+
     proposal = Proposal(
         id=0,
         machine_name=machine.name,
@@ -606,10 +615,11 @@ def dispatch_entry(
         issue_title=issue_title,
         rationale="milestone work-order dispatch (coord milestone dispatch)",
         briefing=briefing,
-        model=config.models.default,
-        type="plan" if config.dispatch.require_plan else "work",
+        model=resolved_model,
+        type=proposal_type,
         required_gates=required_gates,
         milestone_number=milestone_number,
+        issue_labels=issue_labels,
     )
 
     try:

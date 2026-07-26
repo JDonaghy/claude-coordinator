@@ -542,6 +542,104 @@ class TestDispatch:
             dispatch(p, cfg)
 
 
+class TestModelResolution:
+    """#1430: dispatch() resolves models.labels for type="work" proposals
+    that carry issue_labels, with proposal.model (explicit override) always
+    winning, and plan-type proposals deliberately excluded."""
+
+    def _config_with_labels(self) -> Config:
+        return Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+            )],
+        )
+
+    @patch("coord.dispatch.httpx.post")
+    def test_work_type_resolves_model_from_labels(
+        self, mock_post: MagicMock,
+    ) -> None:
+        from coord.config import ModelsConfig
+
+        cfg = self._config_with_labels()
+        cfg.models = ModelsConfig(
+            default="sonnet", labels={"tier:large": "opus"},
+        )
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=10, issue_title="x", rationale="", type="work",
+            issue_labels=["tier:large"],
+        )
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        dispatch(p, cfg)
+        assert mock_post.call_args.kwargs["json"]["model"] == "opus"
+
+    @patch("coord.dispatch.httpx.post")
+    def test_explicit_model_overrides_label(self, mock_post: MagicMock) -> None:
+        from coord.config import ModelsConfig
+
+        cfg = self._config_with_labels()
+        cfg.models = ModelsConfig(default="sonnet", labels={"tier:large": "opus"})
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=10, issue_title="x", rationale="", type="work",
+            issue_labels=["tier:large"], model="haiku",
+        )
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        dispatch(p, cfg)
+        assert mock_post.call_args.kwargs["json"]["model"] == "haiku"
+
+    @patch("coord.dispatch.httpx.post")
+    def test_no_matching_label_falls_back_to_default(
+        self, mock_post: MagicMock,
+    ) -> None:
+        from coord.config import ModelsConfig
+
+        cfg = self._config_with_labels()
+        cfg.models = ModelsConfig(default="sonnet", labels={"tier:large": "opus"})
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=10, issue_title="x", rationale="", type="work",
+            issue_labels=["bug"],
+        )
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        dispatch(p, cfg)
+        assert mock_post.call_args.kwargs["json"]["model"] == "sonnet"
+
+    @patch("coord.dispatch.httpx.post")
+    def test_plan_type_does_not_inherit_label_model(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """A plan-stage proposal must not inherit tier:large -> opus even
+        when the underlying issue carries that label — plan workers are
+        read-only/cheap and route on their own rule (models.default)."""
+        from coord.config import ModelsConfig
+
+        cfg = self._config_with_labels()
+        cfg.models = ModelsConfig(default="sonnet", labels={"tier:large": "opus"})
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=10, issue_title="x", rationale="", type="plan",
+            issue_labels=["tier:large"],
+        )
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        dispatch(p, cfg)
+        assert mock_post.call_args.kwargs["json"]["model"] == "sonnet"
+
+
 class TestOracleReadinessGate:
     """#1138: `dispatch()` hard-gates a `type="work"` dispatch on the
     issue-level oracle gate (`coord.milestone_dispatch.issue_oracle_ready`)

@@ -260,6 +260,10 @@ def dispatch_refinement(
 
     # Build the Proposal — model resolves through models.versions so the
     # wire payload carries an exact id (the same path work dispatch uses).
+    # #1430: deliberately not consulting models.labels — this is a
+    # conversational refinement chat, often used to help shape the issue
+    # (including its labels) in the first place, not the eventual work
+    # dispatch that follows.
     resolved_model = cfg.models.default
     proposal = Proposal(
         id=0,
@@ -425,6 +429,9 @@ def dispatch_board_refinement(
         open_issue_titles=open_titles,
     )
 
+    # #1430: deliberately not consulting models.labels — a board-level
+    # refinement chat has no single issue (issue_number=0 sentinel below),
+    # so there's no label to resolve against.
     resolved_model = cfg.models.default
     issue_title = f"Board refinement for {repo}"
 

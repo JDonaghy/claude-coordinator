@@ -631,6 +631,38 @@ def approve_plan(assignment_id: str, config_path: Path) -> None:
     plan_obj = WorkerPlan.from_dict(plan_dict)
     files_likely = plan_obj.files_modify or assignment.files_allowed or []
 
+    # #1430: the plan's ESTIMATE — informed by actually reading the code —
+    # is a better signal than the label chosen at issue-creation time, so it
+    # overrides the label-derived model for the work assignment. Falls back
+    # to the label when there's no usable ESTIMATE, and to models.default
+    # when neither resolves (mirrors dispatch()'s own precedence).
+    label_model: str | None = None
+    repo = cfg.repo(assignment.repo_name)
+    if repo is not None:
+        try:
+            from coord import github_ops  # noqa: PLC0415
+            issue_data = github_ops.get_issue(repo.github, assignment.issue_number)
+            issue_labels = [
+                lbl.get("name", "") for lbl in (issue_data.get("labels") or [])
+            ]
+            label_model = cfg.models.model_for_labels(issue_labels)
+        except RuntimeError:
+            pass  # best-effort — fall through to estimate/default below
+    estimate_model = cfg.models.model_for_estimate(plan_obj.estimate)
+    if estimate_model:
+        work_model = estimate_model
+        click.echo(
+            f"  model: {work_model} (from plan ESTIMATE={plan_obj.estimate!r}"
+            + (f", overriding label-derived {label_model!r}" if label_model else "")
+            + ")"
+        )
+    elif label_model:
+        work_model = label_model
+        click.echo(f"  model: {work_model} (from issue label)")
+    else:
+        work_model = None
+        click.echo(f"  model: {cfg.models.default} (default)")
+
     click.echo(
         f"Approving plan {assignment_id}: "
         f"{assignment.repo_name} #{assignment.issue_number} — {assignment.issue_title}"
@@ -642,6 +674,7 @@ def approve_plan(assignment_id: str, config_path: Path) -> None:
             cfg,
             assignment,
             enhanced_briefing,
+            model=work_model,
             type="work",
             files_likely=files_likely,
             # The plan is read-only; its recorded branch is a throwaway
