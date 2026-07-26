@@ -568,6 +568,11 @@ class TestProcessRealGithubOpsChokepoint:
                 return ""
             if args[:2] == ("pr", "merge"):
                 return "merged"
+            if args[:2] == ("api", "graphql"):
+                # #1354: the close-guard also does a live batch state
+                # lookup; no live answer here, so it falls back to the
+                # checkbox in epic_json above (#1039 unticked -> open).
+                raise RuntimeError("gh api graphql: not available in this test")
             raise AssertionError(f"unexpected gh call: {args}")
 
         monkeypatch.setattr(real_gh_ops, "_gh", fake_gh)

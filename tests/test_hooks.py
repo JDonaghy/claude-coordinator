@@ -189,6 +189,10 @@ class TestRunHooks:
                     '- [x] #1040\\n", "title": "Epic", "state": "open", '
                     '"milestone": null, "labels": []}'
                 )
+            if args[:2] == ("api", "graphql"):
+                # #1354: the guard also does a live batch state lookup; no
+                # live answer here, so it falls back to the checkbox above.
+                raise RuntimeError("gh api graphql: not available in this test")
             raise AssertionError(f"unexpected gh call: {args}")
 
         monkeypatch.setattr("coord.github_ops._gh", fake_gh)
