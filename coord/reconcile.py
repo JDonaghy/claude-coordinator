@@ -475,6 +475,75 @@ def _reassign(
     return retry_assignment
 
 
+def describe_no_candidate_machines(
+    failed: Assignment, board: Board, config: Config,
+) -> str:
+    """Explain why :func:`_reassign` found no candidate machine (#1396).
+
+    ``_reassign`` silently returns ``None`` on any of: no idle machine can
+    work on the repo, a TOS-gate refusal, or a dispatch POST failure — so a
+    caller (``coord retry``) can only ever say "no available machine to
+    retry on", which is true from the code's point of view and useless to an
+    operator when ``coord status`` shows every machine idle. The real cause
+    is almost always a phantom ``running`` board row: a dead interactive
+    (``claude-pty``) session that nothing reaped, still counted as "busy".
+
+    Mirrors ``_reassign``'s exact candidate filter (repo capability, repo
+    path, pause set, busy set, same-machine exclusion) but keeps a reason
+    per excluded machine instead of discarding it, so the message names the
+    blocking machines and what they're apparently running — including the
+    age, which makes a 400-hour-old phantom obvious at a glance.
+    """
+    from coord.machine_pause import paused_set  # noqa: PLC0415
+
+    paused = paused_set()
+    now = time.time()
+
+    running_by_machine: dict[str, list[Assignment]] = {}
+    for a in board.active:
+        if a.status == "running":
+            running_by_machine.setdefault(a.machine_name, []).append(a)
+
+    lines: list[str] = []
+    has_free_candidate = False
+    relevant = False
+    for m in config.machines:
+        if not m.can_work_on(failed.repo_name) or m.repo_path(failed.repo_name) is None:
+            continue  # not relevant to this repo — don't clutter the message
+        relevant = True
+        if m.name in paused:
+            lines.append(f"  {m.name}: paused")
+            continue
+        running = running_by_machine.get(m.name)
+        if running:
+            parts = []
+            for a in running:
+                age_h = (now - a.dispatched_at) / 3600 if a.dispatched_at else None
+                age_str = f"{age_h:.1f}h" if age_h is not None else "?h"
+                parts.append(
+                    f"{a.repo_name}#{a.issue_number} type={a.type} age={age_str}"
+                )
+            lines.append(f"  {m.name}: busy ({'; '.join(parts)})")
+            continue
+        if m.name == failed.machine_name:
+            lines.append(f"  {m.name}: same machine that just failed (fallback-only)")
+            continue
+        has_free_candidate = True
+
+    if not relevant:
+        return f"no machine in coordinator.yml can work on repo {failed.repo_name!r}"
+
+    if has_free_candidate:
+        # A machine WAS free per this filter — _reassign must have failed for
+        # a different reason (TOS-gate refusal or a dispatch POST error).
+        return (
+            "a candidate machine was available but the retry dispatch "
+            "failed (provider gate or network error) — check daemon logs"
+        )
+
+    return "no available machine to retry on:\n" + "\n".join(lines)
+
+
 def reconcile(board: Board, config: Config) -> list[str]:
     """Poll agent servers and update board assignments that have finished.
 

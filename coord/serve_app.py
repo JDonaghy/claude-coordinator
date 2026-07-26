@@ -880,6 +880,81 @@ def _reap_merged_sessions_tick(config: Config) -> list[str]:
     return reaped
 
 
+def _reap_stale_interactive_sessions_tick(config: Config) -> list[str]:
+    """Reap dead interactive (``claude-pty``) sessions on the daemon tick (#1396).
+
+    ``reap_stale_interactive_sessions`` / ``reap_stale_remote_interactive_sessions``
+    (:mod:`coord.interactive`) already exist and are exercised by
+    :func:`coord.reconcile.reconcile` — but the ONLY sanctioned caller of the
+    full ``reconcile()`` is ``coord resume``, a human-invoked command.  On a
+    thin-client setup driven by ``coord-notify.timer`` (which calls
+    ``notify.run()``, not ``reconcile()``) or a bare daemon with no operator
+    running ``coord resume``, a killed ``--interactive`` tmux session (chat /
+    audit / conflict-fix / work) leaves a ``running`` board row forever.  That
+    phantom row then poisons every consumer of ``board.active`` filtered on
+    ``status == "running"`` — most visibly ``coord retry``'s
+    :func:`coord.reconcile._reassign`, which treats the machine hosting the
+    phantom as busy and refuses to retry even when every real machine is idle.
+
+    This function is the daemon-tick mirror of that sweep, called on the same
+    slow cadence as :func:`_reap_merged_sessions_tick` (``merges_interval``,
+    default 5 min) since it is the same shape of operation: probe tmux,
+    finalize, clean the worktree.  Unlike ``_reap_merged_sessions_tick`` (which
+    is scoped to detached ``type="conflict-fix"`` *merge* sessions gated on
+    board ``status='merged'``), this covers ANY dead ``claude-pty`` session
+    still marked ``running``/``pending`` — chat, audit, conflict-fix, and
+    interactive work sessions alike — mirroring the full scope of
+    :func:`coord.interactive.reap_stale_interactive_sessions`.
+
+    Local sessions are reaped unconditionally once their tmux session (or
+    pane) is confirmed dead; remote sessions are only reaped after
+    ``concurrency.interactive_session_timeout_hours`` (default 12h) to avoid
+    flagging a merely-unreachable host. Both reapers are no-ops when their
+    preconditions aren't met (no local tmux binary; remote sweep disabled via
+    a zero timeout) — see their docstrings in :mod:`coord.interactive`.
+
+    Returns the assignment IDs that were reaped (empty when nothing was
+    reaped). Extracted as a module-level function so tests can call it
+    directly without wiring up the async ``_tick_loop`` infrastructure
+    (mirrors the pattern of ``_reap_merged_sessions_tick``).
+    """
+    import logging  # noqa: PLC0415
+
+    from coord.state import build_board  # noqa: PLC0415
+    from coord.interactive import (  # noqa: PLC0415
+        reap_stale_interactive_sessions,
+        reap_stale_remote_interactive_sessions,
+    )
+
+    log = logging.getLogger("coord.serve")
+    board = build_board()
+
+    reaped = list(reap_stale_interactive_sessions(board, config))
+    reaped.extend(reap_stale_remote_interactive_sessions(board, config))
+
+    if reaped:
+        log.info(
+            "reap-stale-interactive: reaped %d dead session(s): %s",
+            len(reaped),
+            ", ".join(reaped),
+        )
+        from coord.audit import record_audit  # noqa: PLC0415
+
+        record_audit(
+            tier="operational",
+            category="session",
+            event_type="reap_stale_interactive_session",
+            actor="daemon",
+            summary=(
+                f"reap-stale-interactive: reaped {len(reaped)} dead "
+                f"interactive session(s)"
+            ),
+            details={"assignment_ids": reaped[:20]},
+        )
+
+    return reaped
+
+
 def _auto_drain_tick(config: Config) -> "list":
     """Drain READY merge-queue entries — the opt-in daemon auto-merge (#781).
 
@@ -4666,6 +4741,23 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                             )
                     except Exception:  # noqa: BLE001
                         log.warning("reap-merged-sessions tick failed", exc_info=True)
+                    # Step 5c: #1396 reap dead interactive (claude-pty) chat /
+                    # audit / conflict-fix / work sessions on the same slow
+                    # cadence, so a phantom "running" row (killed tmux, no
+                    # human ever ran `coord resume`) doesn't silently poison
+                    # `coord retry` / `coord plan`'s busy-machine detection.
+                    # Independent try/except — a reap failure must never
+                    # silence the issues-sync step below. (The tick function
+                    # itself logs + records the audit row on a reap.)
+                    try:
+                        await run_in_threadpool(
+                            _reap_stale_interactive_sessions_tick, config
+                        )
+                    except Exception:  # noqa: BLE001
+                        log.warning(
+                            "reap-stale-interactive-sessions tick failed",
+                            exc_info=True,
+                        )
                     try:
                         synced = await run_in_threadpool(
                             _sync_issues_tick, config

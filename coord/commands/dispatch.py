@@ -1267,7 +1267,7 @@ def stop(assignment_id: str, config_path: Path) -> None:
 @_CONFIG_OPTION
 def retry(assignment_id: str, config_path: Path) -> None:
     from coord.board_service import read_board, write_board
-    from coord.reconcile import _reassign
+    from coord.reconcile import _reassign, describe_no_candidate_machines
 
     cfg = _load_config(config_path)
     board = read_board()
@@ -1292,7 +1292,13 @@ def retry(assignment_id: str, config_path: Path) -> None:
 
     result = _reassign(assignment, board, cfg, model=escalated)
     if result is None:
-        click.echo("error: no available machine to retry on", err=True)
+        # #1396: name the blocking machines and their apparent load instead
+        # of a bare "no available machine" — the usual cause is a phantom
+        # `running` row from a dead interactive session nothing reaped.
+        click.echo(
+            f"error: {describe_no_candidate_machines(assignment, board, cfg)}",
+            err=True,
+        )
         sys.exit(1)
 
     write_board(board)
