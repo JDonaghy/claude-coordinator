@@ -199,14 +199,21 @@ if ! flock -n 9; then
 fi
 printf '%s #%s (pid %s)\n' "$REPO" "$ISSUE" "$$" >"$HOLDER"
 
-# Merges are serialized FLEET-WIDE even when the runs themselves are parallel.
-# Two reasons, both real:
-#   1. The daemon's POST /merge handler installs a process-global
-#      `redirect_stdout` to capture output. Concurrent merge requests swap each
-#      other's buffers — a documented incident where a --dry-run reported a
-#      merge that another request had actually performed.
-#   2. Serialized merges keep the queue's conflict ordering intelligible; two
-#      branches rebasing onto a moving main at once is how pile-ups start.
+# Merges are serialized on THIS HOST even when the runs themselves are
+# parallel. $SCRATCH (and so this lock) is per-machine — it does NOT serialize
+# a driver here against a driver on another host. That used to matter a lot:
+# the daemon's POST /merge handler installed a process-global `redirect_stdout`
+# to capture output, so concurrent merge requests from *any* two hosts could
+# swap each other's buffers (a documented incident where a --dry-run reported
+# a merge that another request had actually performed). #1400 fixed that at
+# the source — the daemon now serializes the whole `/merge` critical section
+# behind an internal lock, so overlapping requests from different hosts
+# genuinely queue there and never cross-talk. This local flock is now
+# belt-and-braces for same-host callers rather than the only thing preventing
+# fleet-wide cross-talk; it still earns its keep by keeping this host's own
+# queue submissions ordered (two branches rebasing onto a moving main at once
+# is how pile-ups start) and by failing fast/locally instead of piling up
+# blocked requests on the daemon.
 # The lock is held ONLY around `coord merge`, so work/test/review still overlap
 # freely across issues — the expensive stages stay parallel.
 MERGE_LOCK="$SCRATCH/merge.lock"

@@ -188,55 +188,43 @@ def test_serve_merge_relays_stderr_usage_errors(
 def test_serve_merge_concurrent_requests_do_not_cross_talk(
     file_db: Path, valid_config_path: Path, rw_db, monkeypatch: pytest.MonkeyPatch
 ):
-    """#1278: two concurrent ``POST /merge`` calls must not leak each other's
-    captured CLI output.
+    """#1278/#1400: two concurrent ``POST /merge`` calls must never leak each
+    other's captured CLI output, and — since #1400 — must not even run their
+    click callbacks concurrently in the first place.
 
-    ``post_merge``'s ``_run()`` used to capture output with
+    History: ``post_merge``'s ``_run()`` used to capture output with
     ``contextlib.redirect_stdout(buf)``, which rebinds the process-*global*
-    ``sys.stdout``. The callback itself runs inside a ``run_in_threadpool``
-    worker THREAD though, so two concurrent requests race on that global:
-    whichever swap lands last "wins" for both, and each caller's response can
-    end up containing (or missing) the OTHER request's output. #1278 observed
-    this in the wild as a ``--dry-run`` merge response reporting the
-    "opened"/"merged" lines of a concurrently-running real merge.
+    ``sys.stdout``. The callback runs inside a ``run_in_threadpool`` worker
+    THREAD though, so two concurrent requests raced on that global: whichever
+    swap landed last "won" for both, and each caller's response could end up
+    containing (or missing) the OTHER request's output. #1278 fixed the
+    *capture* itself (thread-local, see ``_ThreadLocalCapture``) but left the
+    underlying merge-queue processing running genuinely in parallel across
+    threads — which has its own unprotected process-global state (the
+    ``COORD_MERGE_ON_DAEMON`` env-var toggle) and its own read-modify-write
+    race (``merge_queue.load_queue()`` -> mutate -> ``save_queue()`` replaces
+    the WHOLE table, so a losing writer silently reverts a winning writer's
+    just-recorded MERGED state). #1400 closes that by wrapping the whole
+    critical section in ``_merge_lock``, a process-wide ``threading.Lock``,
+    so a second ``/merge`` request now blocks until the first fully finishes
+    rather than running concurrently at all.
 
-    The interleaving below is choreographed with ``threading.Event`` at every
-    step (not left to GIL-scheduling luck), so it reproduces the bug on every
-    run instead of occasionally. A first cut of this test that only
-    synchronized start/finish (not each individual write) passed even on
-    unfixed ``main`` — the two writes of the real-merge callback landed in
-    *different* buffers depending on exactly when the dry run happened to get
-    scheduled, so an assertion pinned to one specific line was not reliable.
-    The fix is to make every single write's ordering an explicit
-    happens-before relationship:
+    This test drives a real merge (``dry_run=False``) and a dry run
+    (``dry_run=True``) concurrently, choreographed with ``threading.Event``
+    so the ordering is deterministic rather than left to GIL-scheduling luck:
 
       1. the real-merge callback signals ``a_started`` as soon as it starts
-         (at that point its capture is already active — installed by
-         ``post_merge``'s ``_run()`` before the callback is invoked).
-      2. the dry-run request is only sent by the test driver AFTER awaiting
-         that signal, so the dry run's capture is guaranteed to install
-         *after* the real merge's — the exact ordering #1278 hit in
-         production (dry-run landing ~2s after the real merge started).
-      3. the dry-run callback signals ``dry_started`` as soon as IT starts
-         (its own capture now active — the most-recently-installed one).
-      4. the real-merge callback waits for ``dry_started`` before writing
-         BOTH of its lines, and does not return (i.e. does not let its own
-         capture context exit) until after the dry run has also written —
-         so at the moment of each of the real merge's writes, the dry run's
-         capture is guaranteed to be the most-recently-installed one, and
-         guaranteed to still be active.
-      5. the dry-run callback waits for ``real_wrote`` before writing its
-         own line and returning — so it can't finish (and restore/pop its
-         capture) before the real merge has written into it.
-
-    Under the old global ``sys.stdout`` swap, this ordering makes ALL THREE
-    lines land in the dry run's buffer and leaves the real merge's own
-    buffer empty — the #1278 symptom (a dry-run response reporting another
-    request's real "opened"/"merged" lines) in its most acute form. The
-    #1278 fix (per-thread capture, see ``_ThreadLocalCapture`` in
-    ``coord/serve_app.py``) routes each write by the calling thread, so this
-    choreographed interleaving can no longer cross-contaminate regardless of
-    write order.
+         (the lock is held and its capture is active at this point).
+      2. the test driver waits for that signal, then fires the dry-run
+         request and gives it a beat to reach the daemon — if ``_merge_lock``
+         were not actually serializing, the dry run's callback would start
+         running (and set ``dry_started``) right away, before the real merge
+         releases the lock. Assert that does NOT happen.
+      3. the test driver then lets the real merge finish (sets
+         ``real_may_finish``); only once its callback returns -- and
+         ``_merge_lock`` is released -- can the dry run's callback start.
+      4. the dry-run callback itself asserts ``real_finished`` is already set
+         as a second, in-process check of the same invariant.
     """
     import asyncio as _asyncio
     import threading
@@ -248,33 +236,28 @@ def test_serve_merge_concurrent_requests_do_not_cross_talk(
 
     a_started = threading.Event()
     dry_started = threading.Event()
-    real_wrote = threading.Event()
-    dry_wrote = threading.Event()
+    real_may_finish = threading.Event()
+    real_finished = threading.Event()
 
     def fake_callback(**kwargs):
         if not kwargs["dry_run"]:
-            # Real merge: signal we've started (capture already active), then
-            # wait for the dry run to start (and install ITS capture) before
-            # writing EITHER line — so under the bug both writes target
-            # whichever capture was installed most recently: the dry run's.
+            # Real merge: signal we've started (lock held, capture active),
+            # then hold the lock open until the test driver has confirmed the
+            # concurrently-fired dry run did NOT start meanwhile.
             a_started.set()
-            assert dry_started.wait(timeout=5), "dry-run callback never started"
+            assert real_may_finish.wait(timeout=5), "test driver never released the real merge"
             click.echo("opened PR #1274")
             click.echo("merged PR #1274")
-            real_wrote.set()
-            # Stay inside our own capture (don't return -> don't let it pop)
-            # until the dry run has also written, so the old code's global
-            # sys.stdout can't flip back to our buffer before the dry run's
-            # write lands in the same (currently dry run's) target.
-            assert dry_wrote.wait(timeout=5), "dry-run callback never wrote"
+            real_finished.set()
         else:
-            # Dry run: only proceed once the real merge has started (test
-            # driver already waited on a_started before sending this
-            # request), then signal our own capture is now the active one.
+            # Dry run: under the #1400 fix this can only run after the real
+            # merge's callback has returned and released _merge_lock.
             dry_started.set()
-            assert real_wrote.wait(timeout=5), "real-merge callback never wrote"
+            assert real_finished.is_set(), (
+                "dry-run callback started before the concurrent real merge "
+                "finished -- /merge is not actually serialized (#1400 regression)"
+            )
             click.echo("(dry run) would merge nothing")
-            dry_wrote.set()
 
     monkeypatch.setattr(merge_cmd, "callback", fake_callback)
     app = build_app(SqliteStore(file_db), load_config(valid_config_path))
@@ -283,12 +266,20 @@ def test_serve_merge_concurrent_requests_do_not_cross_talk(
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
             real_task = _asyncio.create_task(cli.post("/merge", json={"dry_run": False}))
-            # Wait for the real-merge callback to actually start (its capture
-            # is active) before firing the dry run — mirrors #1278's ~2s gap
-            # between the live merge agent's request and the dry-run's.
+            # Wait for the real-merge callback to actually start (lock held)
+            # before firing the dry run.
             while not a_started.is_set():
                 await _asyncio.sleep(0.005)
             dry_task = _asyncio.create_task(cli.post("/merge", json={"dry_run": True}))
+            # Give the dry run a beat to reach the daemon and attempt the
+            # lock -- under the #1400 fix it must block, never run its
+            # callback, while the real merge is still holding _merge_lock.
+            await _asyncio.sleep(0.2)
+            assert not dry_started.is_set(), (
+                "dry run's callback started while the real merge still held "
+                "_merge_lock -- /merge is not actually serialized (#1400 regression)"
+            )
+            real_may_finish.set()
             return await _asyncio.gather(real_task, dry_task)
 
     real_resp, dry_resp = _asyncio.run(_run())
