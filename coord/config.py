@@ -265,6 +265,10 @@ class AcceptanceConfig:
         return repo_name in self.drivers
 
 
+# #1430: plan-worker ESTIMATE -> escalation rung (see ModelsConfig.model_for_estimate).
+_ESTIMATE_RUNG: dict[str, int] = {"trivial": 0, "small": 0, "medium": 1, "large": 2}
+
+
 @dataclass
 class ModelsConfig:
     """Model tier selection and escalation ladder for workers.
@@ -273,7 +277,10 @@ class ModelsConfig:
     specify one.  `escalation` is an ordered list of model aliases (low →
     high); when a worker fails or gets stuck, the coordinator escalates to
     the next entry via `next_model`.  `labels` is a per-issue-label override
-    (e.g. ``documentation: haiku``) consumed by the brain / planner.
+    (e.g. ``documentation: haiku``) resolved via :meth:`model_for_labels` —
+    consulted by every ``type="work"`` dispatch site (``coord plan`` /
+    ``approve``, ``coord assign``, ``coord milestone dispatch``); plan-stage
+    and review-stage dispatches deliberately stay on ``default`` (#1430).
 
     `versions` pins an alias to an exact model id, e.g.
     ``{sonnet: claude-sonnet-4-6, opus: claude-opus-4-7}``.  When set, the
@@ -313,6 +320,61 @@ class ModelsConfig:
         if alias is None:
             return None
         return self.versions.get(alias, alias)
+
+    def model_for_labels(self, issue_labels: list[str]) -> str | None:
+        """Resolve an issue's GitHub labels to a model alias via ``labels``.
+
+        #1430: ``labels`` used to be validated at parse time and read by
+        nothing — every dispatch ran ``default`` regardless of the issue's
+        tier/category label. This is the resolver every dispatch site now
+        calls before falling back to ``default`` itself.
+
+        Precedence when an issue carries several configured labels (e.g.
+        both ``bug`` and ``tier:large``): *issue-label order wins* — the
+        issue's own labels are walked in the order GitHub returns them, and
+        the first one with an entry in ``labels`` is used. This mirrors the
+        precedence rule ``coord.brain.resolve_required_gates`` and
+        ``coord.commands.dispatch_workers._dispatch_headless`` already use
+        for ``pipeline.labels``, so the two label-driven resolvers behave
+        the same way for the same kind of ambiguity.
+
+        Returns ``None`` (never ``default``) when no configured label is
+        present on the issue, or ``labels`` itself is empty — mirroring the
+        None-passthrough style of :meth:`resolve`. Callers are expected to
+        fall back to ``default`` themselves, e.g.::
+
+            model = override or config.models.model_for_labels(issue_labels) or config.models.default
+        """
+        if not self.labels:
+            return None
+        for label in issue_labels:
+            if label in self.labels:
+                return self.labels[label]
+        return None
+
+    def model_for_estimate(self, estimate: str | None) -> str | None:
+        """Map a plan worker's ``ESTIMATE`` to a model alias via ``escalation``.
+
+        #1430: once a plan has run, its ``ESTIMATE`` (trivial | small |
+        medium | large — derived from actually reading the code) is a
+        better-informed signal than the label chosen at issue-creation time,
+        so ``approve_plan`` uses this to override the label-derived model
+        for the work assignment it dispatches.
+
+        ``trivial``/``small`` resolve to the lowest rung of ``escalation``,
+        ``medium`` to the middle, ``large`` to the top — clamped to
+        ``len(escalation) - 1`` so a short/custom ladder doesn't index out
+        of range. Returns ``None`` for an empty/unrecognised estimate or an
+        empty ``escalation`` list — callers fall back to the label-derived
+        or default model themselves.
+        """
+        if not estimate or not self.escalation:
+            return None
+        idx = _ESTIMATE_RUNG.get(estimate.strip().lower())
+        if idx is None:
+            return None
+        idx = min(idx, len(self.escalation) - 1)
+        return self.escalation[idx]
 
 
 @dataclass

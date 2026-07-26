@@ -436,6 +436,13 @@ class Proposal:
     # behavior exactly: brain-proposed and other non-milestone-aware
     # dispatches are unaffected.
     milestone_number: int | None = None
+    # #1430: the issue's GitHub label names, when the caller already fetched
+    # them (avoids a redundant GH call).  ``coord.dispatch.dispatch()``
+    # consults this via ``config.models.model_for_labels()`` to resolve
+    # ``models.labels`` for ``type="work"`` proposals when *model* wasn't
+    # already set by the caller.  Empty by default — callers that don't
+    # populate it simply get today's ``models.default`` behavior.
+    issue_labels: list[str] = field(default_factory=list)
 
 
 @dataclass

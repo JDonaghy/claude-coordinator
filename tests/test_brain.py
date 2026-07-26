@@ -15,9 +15,17 @@ from coord.brain import (
     gather_context,
     parse_proposals,
     propose,
+    resolve_models,
     resolve_required_gates,
 )
-from coord.config import Config, DispatchConfig, PipelineConfig, ProviderDef, ProvidersConfig
+from coord.config import (
+    Config,
+    DispatchConfig,
+    ModelsConfig,
+    PipelineConfig,
+    ProviderDef,
+    ProvidersConfig,
+)
 from coord.models import Machine, Proposal, Repo
 from coord.providers.claude import ClaudeProvider
 
@@ -391,6 +399,139 @@ class TestResolveRequiredGates:
 
         assert len(proposals) == 1
         assert proposals[0].required_gates == ["merge"]
+
+
+class TestResolveModels:
+    """#1430: resolve_models() mirrors resolve_required_gates's shape and
+    precedence convention (issue-label order; first configured label wins)
+    for the same kind of ambiguity, applied to config.models.labels."""
+
+    def _config_with_labels(self) -> Config:
+        return Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(name="laptop", host="laptop.tailnet", repos=["api"])],
+            models=ModelsConfig(
+                default="sonnet",
+                labels={"documentation": "haiku", "tier:large": "opus"},
+            ),
+        )
+
+    def _proposal(
+        self, issue_number: int = 10, repo: str = "api", type: str = "work",
+        model: str | None = None,
+    ) -> Proposal:
+        return Proposal(
+            id=1,
+            machine_name="laptop",
+            repo_name=repo,
+            issue_number=issue_number,
+            issue_title="Some issue",
+            rationale="",
+            type=type,
+            model=model,
+        )
+
+    def test_no_labels_config_leaves_model_unchanged(self) -> None:
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(name="laptop", host="laptop.tailnet", repos=["api"])],
+        )
+        p = self._proposal()
+        issues_by_repo = {"api": [{"number": 10, "title": "x", "labels": [{"name": "documentation"}]}]}
+        resolve_models([p], cfg, issues_by_repo)
+        assert p.model is None  # unchanged
+
+    def test_matching_label_sets_model(self) -> None:
+        cfg = self._config_with_labels()
+        p = self._proposal(issue_number=10)
+        issues_by_repo = {
+            "api": [{"number": 10, "title": "x", "labels": [{"name": "tier:large"}]}]
+        }
+        resolve_models([p], cfg, issues_by_repo)
+        assert p.model == "opus"
+
+    def test_no_matching_label_leaves_model_unset(self) -> None:
+        cfg = self._config_with_labels()
+        p = self._proposal(issue_number=10)
+        issues_by_repo = {
+            "api": [{"number": 10, "title": "x", "labels": [{"name": "bug"}]}]
+        }
+        resolve_models([p], cfg, issues_by_repo)
+        assert p.model is None  # caller (coord approve) falls back to models.default
+
+    def test_first_matching_label_wins(self) -> None:
+        """Multi-label precedence: the issue's own label order decides."""
+        cfg = self._config_with_labels()
+        p = self._proposal(issue_number=10)
+        issues_by_repo = {
+            "api": [
+                {
+                    "number": 10,
+                    "title": "x",
+                    "labels": [{"name": "tier:large"}, {"name": "documentation"}],
+                }
+            ]
+        }
+        resolve_models([p], cfg, issues_by_repo)
+        assert p.model == "opus"  # tier:large listed first on the issue
+
+    def test_plan_type_is_skipped(self) -> None:
+        """A plan-stage proposal must not inherit a label-derived model —
+        plan workers route on their own rule (#1430)."""
+        cfg = self._config_with_labels()
+        p = self._proposal(issue_number=10, type="plan")
+        issues_by_repo = {
+            "api": [{"number": 10, "title": "x", "labels": [{"name": "tier:large"}]}]
+        }
+        resolve_models([p], cfg, issues_by_repo)
+        assert p.model is None
+
+    def test_does_not_override_existing_model(self) -> None:
+        """A proposal that already has a model (brain output, or a human
+        edit) is left alone."""
+        cfg = self._config_with_labels()
+        p = self._proposal(issue_number=10, model="haiku")
+        issues_by_repo = {
+            "api": [{"number": 10, "title": "x", "labels": [{"name": "tier:large"}]}]
+        }
+        resolve_models([p], cfg, issues_by_repo)
+        assert p.model == "haiku"  # unchanged, despite tier:large -> opus
+
+    def test_missing_issue_leaves_model_unchanged(self) -> None:
+        cfg = self._config_with_labels()
+        p = self._proposal(issue_number=99)
+        issues_by_repo = {"api": [{"number": 10, "title": "x", "labels": []}]}
+        resolve_models([p], cfg, issues_by_repo)
+        assert p.model is None
+
+    def test_propose_calls_resolve_models(self) -> None:
+        """propose() should apply label-based model resolution to proposals."""
+        cfg = self._config_with_labels()
+        issues_ctx = {
+            "issues_by_repo": {
+                "api": [
+                    {
+                        "number": 10,
+                        "title": "Fix auth",
+                        "labels": [{"name": "tier:large"}],
+                        "body": "",
+                    }
+                ]
+            },
+            "machine_status": {"laptop": {"status": "idle"}},
+        }
+        response_json = json.dumps([{
+            "machine_name": "laptop",
+            "repo_name": "api",
+            "issue_number": 10,
+            "issue_title": "Fix auth",
+        }])
+        with patch("coord.brain.gather_context", return_value=issues_ctx), \
+             patch("coord.brain.call_claude", return_value=response_json):
+            proposals, _ = propose(cfg)
+
+        assert len(proposals) == 1
+        assert proposals[0].model == "opus"
 
 
 # ---------------------------------------------------------------------------

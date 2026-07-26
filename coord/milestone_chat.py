@@ -440,6 +440,8 @@ def dispatch_milestone_chat(
 
     briefing = ctx.briefing
     tracking_title = ctx.tracking_title
+    # #1430: deliberately not consulting models.labels — this chat is keyed
+    # to the milestone's tracking issue, not a single labelled work issue.
     resolved_model = config.models.default
     proposal = Proposal(
         id=0,
@@ -545,6 +547,8 @@ def dispatch_new_milestone_chat(
     )
 
     draft_title = seed_title or "(new milestone draft)"
+    # #1430: deliberately not consulting models.labels — a brand-new
+    # milestone draft has no issue/labels to resolve against yet.
     resolved_model = config.models.default
     proposal = Proposal(
         id=0,

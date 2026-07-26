@@ -298,6 +298,9 @@ def dispatch_gate_b_review(
         )
 
     review_target = review_target_for(milestone_number)
+    # #1430: deliberately not consulting models.labels — Gate B reviews the
+    # *assembled milestone* against the tracking issue, not a single labelled
+    # work issue, so there's no single tier label to resolve against.
     payload = {
         "repo_name": repo_cfg.name,
         "repo_path": repo_path,

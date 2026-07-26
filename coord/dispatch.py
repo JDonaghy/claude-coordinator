@@ -246,10 +246,29 @@ def dispatch(
         if "tests/acceptance/" not in files_forbidden:
             files_forbidden.append("tests/acceptance/")
 
-    # Resolve model: proposal override → config default → None (let claude pick).
-    # The board/DB stores the alias for legibility; only the wire payload is
-    # translated to an exact model id via models.versions (when configured).
-    model = proposal.model if proposal.model else config.models.default
+    # Resolve model: proposal override → models.labels (type="work" only) →
+    # config default. The board/DB stores the alias for legibility; only the
+    # wire payload is translated to an exact model id via models.versions
+    # (when configured).
+    #
+    # #1430: most callers (coord approve, coord assign, coord milestone
+    # dispatch) already pre-resolve `proposal.model` via
+    # `config.models.model_for_labels()` before calling dispatch() — for
+    # bookkeeping, so the dispatched record/board reflect what actually ran.
+    # This is the fallback for any caller that doesn't: it repeats the same
+    # rule so dispatch() is correct on its own, not just when every caller
+    # remembers to do the work upfront. Label routing is gated to
+    # `type="work"` — plan workers are read-only/cheap and must not inherit
+    # a `tier:large` -> opus routing meant for the eventual work dispatch
+    # (plan/review/smoke/etc. either bypass dispatch() entirely with their
+    # own payload, or deliberately stay on `default`; see gate_b.py,
+    # review.py, refine_chat.py, milestone_chat.py).
+    label_model = (
+        config.models.model_for_labels(proposal.issue_labels)
+        if proposal.type == "work"
+        else None
+    )
+    model = proposal.model or label_model or config.models.default
     wire_model = config.models.resolve(model)
 
     # #255: pin the worker's branch base to the repo's configured default

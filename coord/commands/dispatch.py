@@ -236,6 +236,11 @@ def approve(
     for p in selected:
         click.echo(f"[{p.id}] {p.machine_name} → {p.repo_name} #{p.issue_number}: {p.issue_title}")
         # Resolve model so the dispatched record and board reflect what ran.
+        # #1430: coord.brain.resolve_models() already set p.model from
+        # models.labels (via config.models.model_for_labels) for work
+        # proposals with a matching label, during `coord plan`. This is
+        # just the final fallback for proposals it left unset (no match, or
+        # saved before label-based model resolution was wired in).
         if not p.model:
             p.model = cfg.models.default
         # Resolve required_gates: fall back to config default for proposals

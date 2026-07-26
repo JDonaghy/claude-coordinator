@@ -3946,6 +3946,11 @@ def _dispatch_interactive_work(
     from coord.agent import AssignmentSpec  # noqa: PLC0415
     from coord.models import Proposal  # noqa: PLC0415
 
+    # #1430: deliberately NOT consulting models.labels here. This is the
+    # human-attended `--interactive` launcher (subscription-billed, not
+    # metered per dispatch) — the operator is at the keyboard and can pass
+    # --model directly when a tier matters; unlike the headless paths, a
+    # wrong default here doesn't silently burn API budget unattended.
     resolved_model = model if model else cfg.models.default
     assignment_id = _uuid.uuid4().hex[:12]
 
@@ -4545,9 +4550,6 @@ def _dispatch_headless(
     # Build a Proposal inline
     from coord.models import Proposal
 
-    # Resolve model: --model flag → config default → None (let claude pick).
-    resolved_model = model if model else cfg.models.default
-
     # Resolve required_gates: check issue labels against pipeline.labels config,
     # fall back to pipeline.default_gates.
     issue_labels: list[str] = [
@@ -4564,6 +4566,16 @@ def _dispatch_headless(
     # otherwise dispatch.require_plan sets the default.
     effective_plan_only = plan_only or (cfg.dispatch.require_plan and not no_plan)
 
+    # Resolve model: --model flag → models.labels (work dispatch only) →
+    # config default. #1430: plan workers are read-only/cheap and must not
+    # inherit a tier:large -> opus routing meant for the eventual work
+    # dispatch, so label resolution only applies when this is a work
+    # dispatch, not a plan-only one.
+    label_model = (
+        cfg.models.model_for_labels(issue_labels) if not effective_plan_only else None
+    )
+    resolved_model = model or label_model or cfg.models.default
+
     proposal = Proposal(
         id=0,
         machine_name=machine,
@@ -4575,6 +4587,7 @@ def _dispatch_headless(
         model=resolved_model,
         type="plan" if effective_plan_only else "work",
         required_gates=resolved_gates,
+        issue_labels=issue_labels,
     )
 
     click.echo(f"{machine} → {repo} #{issue}: {issue_title}")
