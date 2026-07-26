@@ -24,6 +24,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Iterable
 
+from coord import cargo_cache
+
 if TYPE_CHECKING:
     # Type-only import to give `_spawn_pty` a precise annotation without
     # eagerly triggering the import cycle (coord.providers.claude_pty imports
@@ -1033,6 +1035,35 @@ def narrow_artifact_paths(
     return narrowed if any_narrowed else list(artifact_paths)
 
 
+def cargo_relative_pattern(pattern: str) -> str | None:
+    """Rewrite an ``artifact_paths`` glob so it resolves inside the shared
+    cargo target dir (#1402).
+
+    ``artifact_paths`` are worktree-relative and, for Rust repos, point through
+    cargo's default in-tree target dir — e.g.
+    ``tui/target/debug/coord-tui``.  Once a worker builds with
+    ``CARGO_TARGET_DIR=~/.coord/cargo-target/<repo>``, that binary lands at
+    ``<cache>/debug/coord-tui`` and the in-worktree glob matches nothing —
+    which is exactly the silent stash-miss that downgraded good work in #1357.
+
+    Returns the portion of *pattern* after its last ``target`` path component
+    (``"debug/coord-tui"`` for the example above), or ``None`` when the
+    pattern has no ``target`` component (nothing to rewrite) or nothing
+    follows it.
+    """
+    parts = Path(pattern).parts
+    if ".." in parts:
+        return None
+    try:
+        idx = len(parts) - 1 - parts[::-1].index("target")
+    except ValueError:
+        return None
+    rest = parts[idx + 1 :]
+    if not rest:
+        return None
+    return str(Path(*rest))
+
+
 def stash_artifacts_for_branch(
     worktree_path: Path,
     branch: str,
@@ -1096,6 +1127,15 @@ def stash_artifacts_for_branch(
         return 0
 
     copied = 0
+    # #1402: when the worker built against the shared per-repo cargo cache,
+    # ``<worktree>/**/target/`` no longer exists — fall back to the cache for
+    # any pattern that misses in the worktree, so a Rust repo's
+    # ``artifact_paths`` keeps resolving (and #1357's silent stash-miss does
+    # not come back through the front door).
+    _cargo_dir = cargo_cache.target_dir_for_repo(repo_name, state_dir)
+    if _cargo_dir is not None and not _cargo_dir.is_dir():
+        _cargo_dir = None
+
     # #1323: collect per-pattern misses (patterns whose glob returned 0 files)
     # so we can report them individually even when other patterns matched.
     _unmatched_patterns: list[str] = []
@@ -1115,6 +1155,15 @@ def stash_artifacts_for_branch(
             _unmatched_patterns.append(pattern)
             continue
         file_matches = [src for src in matches if src.is_file()]
+        if not file_matches and _cargo_dir is not None:
+            cargo_pattern = cargo_relative_pattern(pattern)
+            if cargo_pattern:
+                try:
+                    file_matches = [
+                        src for src in _cargo_dir.glob(cargo_pattern) if src.is_file()
+                    ]
+                except (ValueError, OSError):
+                    file_matches = []
         if not file_matches:
             _unmatched_patterns.append(pattern)
         candidates.extend(file_matches)
@@ -3085,13 +3134,24 @@ class AgentServer:
           disk.  A symlink in ``state_dir/worktrees/`` is not something
           the agent creates; treat it as opaque and skip.
 
-        Returns ``{"cleaned": N, "kept": M, "bytes_freed": B}``.  A
-        protected entry counts as ``kept`` — the return shape is
+        Returns ``{"cleaned": N, "kept": M, "bytes_freed": B}`` plus the
+        ``cargo_*`` keys from :func:`coord.cargo_cache.sweep` (#1402).  A
+        protected entry counts as ``kept`` — the three original keys are
         unchanged so existing callers keep working.
+
+        #1402: the same pass GCs the shared cargo target cache.  It runs on
+        both exit paths (a machine may hold a multi-GiB cache with no
+        worktrees at all) and never evicts a cache belonging to a repo with
+        a live assignment here.
         """
         worktree_base = self.state_dir / "worktrees"
         if not worktree_base.exists():
-            return {"cleaned": 0, "kept": 0, "bytes_freed": 0}
+            return {
+                "cleaned": 0,
+                "kept": 0,
+                "bytes_freed": 0,
+                **self._gc_cargo_cache(),
+            }
 
         now = time.time()
         protect_set: set[str] = set(protect) if protect else set()
@@ -3247,7 +3307,33 @@ class AgentServer:
         # need a separate endpoint.  Default TTL is 3 days.
         self._gc_artifacts()
 
-        return {"cleaned": cleaned, "kept": kept, "bytes_freed": bytes_freed}
+        return {
+            "cleaned": cleaned,
+            "kept": kept,
+            "bytes_freed": bytes_freed,
+            # #1402: bound the shared cargo cache in the same sweep.
+            **self._gc_cargo_cache(),
+        }
+
+    def _gc_cargo_cache(self) -> dict:
+        """Bound the shared cargo target cache (#1402).
+
+        Repos with a pending/running assignment on this agent are protected
+        so the GC can never delete a target dir out from under a build in
+        flight.  Best-effort: any failure degrades to an empty dict rather
+        than aborting the worktree sweep that calls it.
+        """
+        with self._lock:
+            live_repos = {
+                a.spec.repo_name
+                for a in self._assignments.values()
+                if a.status in (PENDING, RUNNING)
+            }
+        try:
+            return cargo_cache.sweep(self.state_dir, protect_repos=live_repos)
+        except OSError as e:  # pragma: no cover - defensive
+            _log.warning("cargo cache GC failed: %s", e)
+            return {}
 
     def list_assignments(self) -> dict:
         from coord.worker_events import is_stream_json, parse_log
@@ -4147,6 +4233,13 @@ class AgentServer:
         # env() is effectively {} so the result is identical to calling
         # _worker_subprocess_env() directly (no-config parity preserved).
         _spawn_env = _worker_subprocess_env()
+        # #1402: shared per-repo cargo target dir (see coord.cargo_cache).
+        # Must stay in sync with the PTY path in ``_spawn_pty``.
+        _spawn_env.update(
+            cargo_cache.cargo_env(
+                assignment.spec.repo_name, self.state_dir, _spawn_env
+            )
+        )
         if spec.provider is not None and spec.provider in self._providers:
             _spawn_env.update(self._providers[spec.provider].env())
 
@@ -4296,6 +4389,13 @@ class AgentServer:
             # Provider env() entries take precedence.
             env = _worker_subprocess_env()
             env.setdefault("TERM", "xterm-256color")
+            # #1402: point cargo at this machine's shared per-repo target dir
+            # so the build cache survives worktree cleanup and is reused by
+            # the next worker.  Applied before ``provider.env()`` so a
+            # provider that sets CARGO_TARGET_DIR explicitly still wins.
+            env.update(
+                cargo_cache.cargo_env(assignment.spec.repo_name, self.state_dir, env)
+            )
             env.update(provider.env())
 
             proc = subprocess.Popen(

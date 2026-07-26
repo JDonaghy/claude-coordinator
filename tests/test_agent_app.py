@@ -440,8 +440,9 @@ def test_worktree_clean_accepts_optional_protect_field(tmp_path: Path) -> None:
     )
     assert r.status_code == 200
     body = r.json()
-    # Return shape is unchanged and protected entry counts as kept.
-    assert set(body) == {"cleaned", "kept", "bytes_freed"}
+    # Return shape is additive only and protected entry counts as kept
+    # (#1402 adds the shared cargo-cache GC counters alongside).
+    assert {"cleaned", "kept", "bytes_freed"} <= set(body)
     assert body["cleaned"] == 1
     assert body["kept"] == 1
     assert protected.exists()
@@ -455,7 +456,9 @@ def test_worktree_clean_no_body_still_works(tmp_path: Path) -> None:
     # Empty body → default recent_secs, no protect list.
     r = client.post("/worktree-clean", json={})
     assert r.status_code == 200
-    assert set(r.json()) == {"cleaned", "kept", "bytes_freed"}
+    # #1402 adds the shared cargo-cache GC counters; the original three keys
+    # are unchanged so an older client keeps working.
+    assert {"cleaned", "kept", "bytes_freed"} <= set(r.json())
 
 
 # ── GET /artifact/{repo}/{branch} ─────────────────────────────────────────────

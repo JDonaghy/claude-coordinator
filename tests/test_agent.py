@@ -435,7 +435,14 @@ def test_clean_worktrees_empty_base(tmp_path: Path) -> None:
     """clean_worktrees returns zero counts when no worktrees directory exists."""
     server = _server(tmp_path)
     result = server.clean_worktrees()
-    assert result == {"cleaned": 0, "kept": 0, "bytes_freed": 0}
+    assert result["cleaned"] == 0
+    assert result["kept"] == 0
+    assert result["bytes_freed"] == 0
+    # #1402: the cargo-cache GC runs on this exit path too (a machine can
+    # hold a multi-GiB cache with no worktrees at all), reporting an empty
+    # cache rather than being skipped.
+    assert result["cargo_cache_bytes"] == 0
+    assert result["cargo_caches_evicted"] == 0
 
 
 def test_clean_worktrees_removes_orphan(tmp_path: Path) -> None:
@@ -680,8 +687,9 @@ def test_clean_worktrees_respects_protect_list(tmp_path: Path) -> None:
     result = server.clean_worktrees(recent_secs=0, protect=[protected_id])
     assert result["cleaned"] == 1
     assert result["kept"] == 1
-    # Return shape unchanged.
-    assert set(result) == {"cleaned", "kept", "bytes_freed"}
+    # Return shape is additive only: the original three keys are unchanged
+    # (#1402 adds the cargo-cache GC counters alongside them).
+    assert {"cleaned", "kept", "bytes_freed"} <= set(result)
     assert (server.state_dir / "worktrees" / protected_id).exists()
     assert not (server.state_dir / "worktrees" / other_id).exists()
 

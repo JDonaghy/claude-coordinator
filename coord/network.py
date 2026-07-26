@@ -224,7 +224,10 @@ def clean_worktrees(
     same wire shape as before.
 
     Returns ``{"ok": bool, "cleaned": int, "kept": int, "bytes_freed": int,
-    "error": str | None}``.
+    "cargo_cache_bytes": int, "cargo_caches_evicted": int,
+    "error": str | None}``.  The ``cargo_*`` fields (#1402) report the shared
+    cargo target cache's size after the agent's GC and how many per-repo
+    caches it evicted; they are 0 against an agent too old to report them.
     """
     url = f"http://{machine.host}:{AGENT_PORT}/worktree-clean"
     payload: dict[str, object] = {"recent_secs": recent_secs}
@@ -258,5 +261,9 @@ def clean_worktrees(
         "cleaned": data.get("cleaned", 0),
         "kept": data.get("kept", 0),
         "bytes_freed": data.get("bytes_freed", 0),
+        # #1402: shared cargo-cache GC counters.  ``.get`` defaults keep an
+        # older agent (which doesn't report them) on the same wire shape.
+        "cargo_cache_bytes": data.get("cargo_cache_bytes", 0),
+        "cargo_caches_evicted": data.get("cargo_caches_evicted", 0),
         "error": None,
     }
