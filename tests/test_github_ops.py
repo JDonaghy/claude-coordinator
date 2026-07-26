@@ -379,6 +379,96 @@ class TestGetOpenChildren:
             assert github_ops.has_open_children("acme/api", 1041) is False
 
 
+def _fake_gh_dispatch(issue_body_json: str, graphql: str | Exception):
+    """Route ``_gh`` calls by subcommand: ``issue view`` returns the parent's
+    body, ``api graphql`` returns (or raises) the live-state batch lookup —
+    the two `_gh` calls `get_open_children` now makes per invocation (#1354)."""
+
+    def _fake(*args: str) -> str:
+        if args[:2] == ("issue", "view"):
+            return issue_body_json
+        if args[:2] == ("api", "graphql"):
+            if isinstance(graphql, Exception):
+                raise graphql
+            return graphql
+        raise AssertionError(f"unexpected gh args: {args}")
+
+    return _fake
+
+
+def _graphql_states(states: dict[int, str]) -> str:
+    """Build a ``gh api graphql`` response matching
+    :func:`coord.github_ops.get_issues_live_state`'s expected shape: one
+    aliased ``issue(number: N)`` field per entry."""
+    repository = {
+        f"n{number}": {"number": number, "state": state.upper()}
+        for number, state in states.items()
+    }
+    return json.dumps({"data": {"repository": repository}})
+
+
+class TestGetOpenChildrenLiveState:
+    """#1354: the checklist box is only a proxy for child state and drifts —
+    the guard must trust a live lookup over the box in both directions."""
+
+    def test_stale_unticked_box_but_child_closed_live_is_excluded(self) -> None:
+        # Box says #1039 is still open; live GitHub says it's closed (the
+        # box was simply never ticked). The live answer wins.
+        with patch(
+            "coord.github_ops._gh",
+            side_effect=_fake_gh_dispatch(
+                _EPIC_WITH_OPEN_CHILD,
+                _graphql_states({1039: "closed", 1040: "closed"}),
+            ),
+        ):
+            assert github_ops.get_open_children("acme/api", 1041) == []
+
+    def test_ticked_box_over_genuinely_open_child_is_included(self) -> None:
+        # False-negative direction (no coverage before #1354): the box says
+        # #1039 is checked off, but GitHub says it's still open (reopened,
+        # or the box was ticked in error). The live answer must win here
+        # too — a ticked box must not let a close sail over a real open
+        # child.
+        with patch(
+            "coord.github_ops._gh",
+            side_effect=_fake_gh_dispatch(
+                _EPIC_ALL_CHILDREN_CLOSED,
+                _graphql_states({1039: "open", 1040: "closed"}),
+            ),
+        ):
+            children = github_ops.get_open_children("acme/api", 1041)
+        assert children == [{"number": 1039, "state": "open"}]
+
+    def test_live_lookup_failure_falls_back_to_checkbox_state(self) -> None:
+        # The batch GraphQL call itself fails (network/auth/rate-limit) —
+        # this must not wedge the close; fall back to the checklist's own
+        # signal, i.e. today's pre-#1354 behavior, rather than refusing
+        # outright or silently allowing every close through.
+        with patch(
+            "coord.github_ops._gh",
+            side_effect=_fake_gh_dispatch(
+                _EPIC_WITH_OPEN_CHILD, RuntimeError("gh boom"),
+            ),
+        ):
+            children = github_ops.get_open_children("acme/api", 1041)
+        assert children == [{"number": 1039, "state": "open"}]
+
+    def test_live_lookup_missing_a_number_falls_back_for_that_child_only(self) -> None:
+        # GitHub doesn't resolve every aliased number (e.g. deleted issue) —
+        # the response simply omits that field. Only the unresolved child
+        # falls back to its checkbox state; a resolved sibling still uses
+        # its live state.
+        with patch(
+            "coord.github_ops._gh",
+            side_effect=_fake_gh_dispatch(
+                _EPIC_WITH_OPEN_CHILD,  # #1039 open (box), #1040 closed (box)
+                _graphql_states({1040: "open"}),  # #1039 missing; #1040 live-open
+            ),
+        ):
+            children = github_ops.get_open_children("acme/api", 1041)
+        assert {c["number"] for c in children} == {1039, 1040}
+
+
 class _FakeCompletedProcess:
     def __init__(self, returncode: int = 0, stderr: str = "") -> None:
         self.returncode = returncode
@@ -398,6 +488,38 @@ class TestCloseIssueGuard:
                  "coord.github_ops.subprocess.run",
                  side_effect=AssertionError("must not attempt the close call"),
              ):
+            with pytest.raises(github_ops.IssueHasOpenChildrenError, match=r"#1039"):
+                github_ops.close_issue("acme/api", 1041)
+
+    def test_closes_over_stale_unticked_boxes_when_children_are_live_closed(self) -> None:
+        # #1354 repro (epics #929/#1034): every child is actually closed on
+        # GitHub, but the checklist boxes were never ticked. The live
+        # lookup must let this close through with no `--force`.
+        with patch(
+            "coord.github_ops._gh",
+            side_effect=_fake_gh_dispatch(
+                _EPIC_WITH_OPEN_CHILD,  # boxes: #1039 unticked, #1040 ticked
+                _graphql_states({1039: "closed", 1040: "closed"}),
+            ),
+        ), patch(
+            "coord.github_ops.subprocess.run", return_value=_FakeCompletedProcess(),
+        ) as mock_run:
+            github_ops.close_issue("acme/api", 1041)
+        mock_run.assert_called_once()
+
+    def test_refuses_close_over_ticked_box_when_child_is_live_open(self) -> None:
+        # #1354's inverse defect: a ticked box over a genuinely open child
+        # must not let the close sail through.
+        with patch(
+            "coord.github_ops._gh",
+            side_effect=_fake_gh_dispatch(
+                _EPIC_ALL_CHILDREN_CLOSED,  # boxes: both ticked
+                _graphql_states({1039: "open", 1040: "closed"}),
+            ),
+        ), patch(
+            "coord.github_ops.subprocess.run",
+            side_effect=AssertionError("must not attempt the close call"),
+        ):
             with pytest.raises(github_ops.IssueHasOpenChildrenError, match=r"#1039"):
                 github_ops.close_issue("acme/api", 1041)
 

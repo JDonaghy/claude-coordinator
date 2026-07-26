@@ -311,20 +311,84 @@ class IssueHasOpenChildrenError(RuntimeError):
     """
 
 
+def get_issues_live_state(repo: str, numbers: list[int]) -> dict[int, str]:
+    """Batch-fetch the *live* open/closed state of each issue in *numbers*.
+
+    One GraphQL request (one aliased ``issue(number: N)`` field per number)
+    rather than N ``gh issue view`` round-trips — see #1354: a close-guard
+    that fans out one lookup per child turns closing an epic into N API
+    calls. Returns ``{number: "open" | "closed"}``; a number that GitHub
+    doesn't resolve (deleted, wrong repo) is simply absent from the result.
+
+    Returns ``{}`` on any failure — a bad *repo* string, a ``gh`` error, or
+    an unparseable response — so callers can treat "no live data" uniformly
+    and fall back to their offline signal (see :func:`get_open_children`),
+    matching the deliberate fail-open contract on the parent lookup.
+    """
+    if not numbers:
+        return {}
+    try:
+        owner, name = repo.split("/", 1)
+    except ValueError:
+        return {}
+    unique = sorted(set(numbers))
+    fields = "\n".join(
+        f"  n{n}: issue(number: {n}) {{ number state }}" for n in unique
+    )
+    query = (
+        f"query {{ repository(owner: {json.dumps(owner)}, name: {json.dumps(name)}) {{\n"
+        f"{fields}\n"
+        f"}} }}"
+    )
+    try:
+        raw = _gh("api", "graphql", "-f", f"query={query}")
+        data = json.loads(raw)
+    except (RuntimeError, ValueError):
+        return {}
+    data_field = data.get("data") if isinstance(data, dict) else None
+    repo_data = data_field.get("repository") if isinstance(data_field, dict) else None
+    if not isinstance(repo_data, dict):
+        return {}
+    result: dict[int, str] = {}
+    for value in repo_data.values():
+        if not isinstance(value, dict):
+            continue
+        num, state = value.get("number"), value.get("state")
+        if num is None or state is None:
+            continue
+        result[int(num)] = str(state).lower()
+    return result
+
+
 def get_open_children(repo: str, issue_number: int) -> list[dict]:
     """Open children of *issue_number*, per the #1195 parentage seam (#1196).
 
     Uses :class:`coord.parentage.MarkdownParentage` over the issue's own
-    body (fetched via :func:`get_issue`). The ``## Sub-issues`` checklist
-    convention (#1008) is the primary parentage source; with
-    ``fallback_to_work_order=True`` this also falls back to a ``##
-    Work order`` block (#1221) so epics seeded before #1008 — which have
-    only a Work order block, not a Sub-issues checklist — still register
-    their children instead of silently reading as childless. The live
-    GitHub sub-issues REST API (:class:`coord.parentage_github.
+    body (fetched via :func:`get_issue`) to discover *which* issues are
+    children — the ``## Sub-issues`` checklist convention (#1008) is the
+    primary parentage source; with ``fallback_to_work_order=True`` this also
+    falls back to a ``## Work order`` block (#1221) so epics seeded before
+    #1008 — which have only a Work order block, not a Sub-issues checklist —
+    still register their children instead of silently reading as childless.
+
+    Each discovered child's reported state then comes from a **live**
+    lookup (:func:`get_issues_live_state`, one batched GraphQL call for all
+    children at once) rather than the checklist's own ``- [x]``/``- [ ]``
+    box (#1354: the box is a proxy that drifts — a closed child's box is
+    often never ticked, and a ticked box can just as easily sit over a
+    child that was later reopened). The checkbox is used only as the
+    per-child fallback when the live lookup doesn't cover that number
+    (batch call failed entirely, or GitHub didn't resolve that number) —
+    preserving the pre-#1354 offline behavior for exactly the cases where a
+    live answer isn't available, rather than treating a lookup failure as
+    grounds to refuse or to silently allow the close.
+
+    The live GitHub sub-issues REST API (:class:`coord.parentage_github.
     GitHubParentage`) is wired but not yet backfilled onto existing epics
-    (EP-2, unbuilt), so checking it here would silently miss every real
-    epic and defeat the guard.
+    (EP-2, unbuilt), so using it *instead of* the markdown checklist here to
+    discover children would silently miss every real epic and defeat the
+    guard — only the per-child *state* is live, not the parent->child edges
+    themselves.
 
     Returns ``[{"number": int, "state": "open"}, ...]``. **Fails open**
     (returns ``[]``) both when the issue lookup itself errors (a transient
@@ -348,7 +412,14 @@ def get_open_children(repo: str, issue_number: int) -> list[dict]:
         )
     except Exception:  # noqa: BLE001 — malformed checklist: fail open, don't wedge close
         return []
-    return [{"number": c.number, "state": c.state} for c in children if c.state == "open"]
+    if not children:
+        return []
+    live_states = get_issues_live_state(repo, [c.number for c in children])
+    return [
+        {"number": c.number, "state": live_states.get(c.number, c.state)}
+        for c in children
+        if live_states.get(c.number, c.state) == "open"
+    ]
 
 
 def has_open_children(repo: str, issue_number: int) -> bool:
