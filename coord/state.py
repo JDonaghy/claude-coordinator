@@ -969,6 +969,7 @@ def mark_notified(
         EVENT_FAILURE,
         EVENT_NEEDS_ATTENTION,
         EVENT_PLAN,
+        EVENT_STALLED,
         EVENT_STUCK,
     )
 
@@ -999,14 +1000,16 @@ def mark_notified(
     conn.commit()
 
     # #1036: this is the single funnel every notify.py call site (completion,
-    # failure, advisory, stuck, needs-attention) reaches — hook here rather
-    # than at each of the ~10 mark_notified() call sites.  Stuck/needs-
-    # attention keys are composite (f"{aid}:stuck" / f"{aid}:needs-attention",
-    # see notify.py's _stuck_notified_key / _needs_attention_notified_key) so
-    # strip the suffix to recover the real assignment_id for the repo/issue
-    # lookup and for the audit row's correlation key.
+    # failure, advisory, stuck, needs-attention, stalled) reaches — hook here
+    # rather than at each of the ~10 mark_notified() call sites.  Stuck/needs-
+    # attention/stalled keys are composite (f"{aid}:stuck" /
+    # f"{aid}:needs-attention" / f"{aid}:stalled", see notify.py's
+    # _stuck_notified_key / _needs_attention_notified_key /
+    # _stalled_notified_key) so strip the suffix to recover the real
+    # assignment_id for the repo/issue lookup and for the audit row's
+    # correlation key.
     real_assignment_id = assignment_id
-    for _suffix in (":stuck", ":needs-attention"):
+    for _suffix in (":stuck", ":needs-attention", ":stalled"):
         if real_assignment_id.endswith(_suffix):
             real_assignment_id = real_assignment_id[: -len(_suffix)]
             break
@@ -1021,10 +1024,12 @@ def mark_notified(
         EVENT_PLAN: "plan",
         EVENT_STUCK: "override",
         EVENT_NEEDS_ATTENTION: "override",
+        EVENT_STALLED: "override",
     }.get(event, "dispatch")
     _event_actor = {
         EVENT_STUCK: "daemon",
         EVENT_NEEDS_ATTENTION: "daemon",
+        EVENT_STALLED: "daemon",
     }.get(event, "worker")
     _record_audit(
         tier="business",

@@ -255,6 +255,10 @@ EXTENDED_ALLOWLIST: dict[str, set[tuple[str, str]]] = {
         # call site (inside notify.run()).
         ("post_needs_attention", "mark_notified"),
         ("post_orphaned_review_findings", "mark_notified"),
+        # #1441: post_stalled_pipeline mirrors post_needs_attention exactly —
+        # same call site (inside notify.run(), at the very end of the
+        # #1441 stalled-pipeline sweep).
+        ("post_stalled_pipeline", "mark_notified"),
         # save_plan: called from _try_parse_and_post_plan (inside
         # post_transition) → daemon via COORD_NOTIFY_ON_DAEMON.
         ("_try_parse_and_post_plan", "save_plan"),
