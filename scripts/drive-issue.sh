@@ -22,6 +22,12 @@
 #      #1348/#1349 sat done/test=NULL/review=pending for 12.8 hours.
 #      → The Test gate here runs scripts/coord-test-runner.sh in a scratch
 #        worktree and records the verdict with `coord test --passed|--fail`.
+#        Because that suite runs on THIS machine with no board assignment
+#        behind it, coord has no other way to know it's in flight — #1395
+#        made it invisible, reading idle/Pending for however long the suite
+#        took.  `coord test --running` (set right before the run, overwritten
+#        by the terminal verdict after) closes that gap: the board/TUI reads
+#        the Test box Active for the run's duration.
 #
 #   2. NOTHING SEQUENCES THE STAGES FOR A SINGLE ISSUE.  `coord wait` is
 #      per-assignment (and reads the LOCAL dispatched ledger, so it does not
@@ -307,6 +313,16 @@ dispatch_work() {
 # daemon's hourly orphan sweep deletes worktrees with no live session and would
 # pull this one out from under a running suite.
 #
+# #1395: this whole stage runs on the OPERATOR machine with no board
+# assignment behind it — coord has no other way to know a suite is in
+# flight, so the Test box previously read idle/Pending for however long the
+# suite took (minutes, for tui/**). `coord test --running` records a
+# transient, non-verdict test_state that coord.stage_projection maps to
+# Active; the terminal `--passed`/`--fail`/`--skipped` call below overwrites
+# it exactly as before. Every merge/review gate keys off
+# `test_state in ("passed", "skipped")`, so "running" fails closed there —
+# see coord/models.py's test_state docstring.
+#
 # Returns 0 when the gate is now passed/skipped, 1 when it recorded a failure.
 run_test_gate() {
     local aid="$1" branch="$2"
@@ -317,6 +333,10 @@ run_test_gate() {
             2>&1 | tee -a "$RUN_LOG"
         return 0
     fi
+
+    log "TEST: starting → coord test --running $aid (board/TUI now shows Test Active)"
+    coord test --running "$aid" 2>&1 | tee -a "$RUN_LOG" || \
+        warn "coord test --running failed to record (non-fatal — continuing)"
 
     local base="${REPO_PATH:-$HOME/src/$REPO}"
     [[ -d "$base/.git" ]] || die "not a git checkout: $base (pass --repo-path)"
@@ -672,8 +692,15 @@ while true; do
     fi
 
     # ---- TEST gate ---------------------------------------------------------
+    # #1395: "running" lands here alongside "" (no verdict yet) rather than
+    # in the `*)` catch-all below. It is ONLY ever observed on a resumed run
+    # after this same script was killed mid-suite (a live run never re-polls
+    # the board while run_test_gate blocks) — the prior attempt never reached
+    # a terminal verdict, so re-running the gate from scratch is correct and
+    # safe: run_test_gate re-fetches, rebuilds the scratch worktree, and
+    # overwrites the stale "running" marker either way.
     case "${WORK_TEST_STATE:-}" in
-        "")
+        ""|running)
             if run_test_gate "$WORK_AID" "$WORK_BRANCH"; then
                 sleep 5
             fi

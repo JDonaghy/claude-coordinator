@@ -189,7 +189,7 @@ def test_stage_status_for(
     is_closed: bool,
     require_plan: bool,
 ) -> str:
-    """Mirrors ``pipeline.rs::test_stage_status_for`` (#200/#235/#310/#585).
+    """Mirrors ``pipeline.rs::test_stage_status_for`` (#200/#235/#310/#585/#1395).
 
     Excludes the #235 "Phase 1 build in flight" override — that's a locally
     spawned TUI subprocess with no server-side equivalent; the TUI overlays
@@ -208,6 +208,18 @@ def test_stage_status_for(
     with_verdict = [a for a in work if (a.test_state or "") != ""]
     verdict_assignment = _latest_by_dispatch(with_verdict)
     verdict = verdict_assignment.test_state if verdict_assignment else None
+    # #1395: "running" is a transient, non-verdict marker — an unattended
+    # driver (scripts/drive-issue.sh) that bypasses dispatch_smoke and runs
+    # the suite locally sets it right before the run and overwrites it with a
+    # terminal passed/failed/skipped verdict when the run concludes. Without
+    # this, the Test box reads Pending (indistinguishable from "not started")
+    # for however long the local suite takes — the #1395 invisible-test-stage
+    # bug. It must never be treated as a verdict by any gate; the merge gate
+    # (`has_smoke_verdict`) and the review gate (`dispatch_pending_reviews`)
+    # both key off `test_state in ("passed", "skipped")`, so "running" already
+    # fails closed there without any change.
+    if verdict == "running":
+        return ACTIVE
     if verdict in ("passed", "skipped"):
         return DONE
     if verdict == "failed":

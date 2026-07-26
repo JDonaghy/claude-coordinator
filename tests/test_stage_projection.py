@@ -185,6 +185,28 @@ def test_test_stage_active_smoke_session_overrides_prior_pass():
     assert sp.test_stage_status_for(a, is_closed=False, require_plan=False) == sp.ACTIVE
 
 
+def test_test_stage_running_verdict_is_active():
+    """#1395: an unattended driver (scripts/drive-issue.sh) that runs the
+    suite locally has no `type="smoke"` assignment for
+    `_has_active_smoke_session` to catch — it sets `test_state="running"`
+    directly on the work row instead, and this must read Active (not
+    Pending, indistinguishable from "nothing happening yet")."""
+    a = [_work(status="done", test_state="running")]
+    assert sp.test_stage_status_for(a, is_closed=False, require_plan=False) == sp.ACTIVE
+
+
+def test_test_stage_running_verdict_never_satisfies_merge_or_review_gates():
+    """#1395: "running" must fail closed everywhere a terminal verdict is
+    required — it is emphatically not one."""
+    from coord.merge_queue import has_smoke_verdict
+    from coord.models import Board
+
+    work = _work(status="done", test_state="running", assignment_id="w1")
+    entry = _entry(assignment_id="w1")
+    board = Board(completed=[work])
+    assert has_smoke_verdict(entry, board) is False
+
+
 def test_test_stage_bounce_fix_work_inherits_prior_passed_verdict():
     """#310: a bounce-created fix-work assignment with empty test_state
     doesn't strand Test at Pending — the most recent assignment *carrying* a

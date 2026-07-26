@@ -431,6 +431,17 @@ def _restore_default_branch_after_test(cfg, assignment) -> None:
 @click.option("--passed", "verdict", flag_value="pass", help="Mark Test gate as passed.")
 @click.option("--fail", "verdict", flag_value="fail", help="Mark Test gate as failed.")
 @click.option("--skipped", "verdict", flag_value="skip", help="Mark Test gate as skipped (trivial change).")
+@click.option(
+    "--running", "verdict", flag_value="running",
+    help=(
+        "Mark the Test gate as in-progress (#1395). A transient, non-verdict "
+        "marker for a driver that runs the suite locally instead of through "
+        "dispatch_smoke — set right before the run starts so the TUI/board "
+        "reads the Test box Active instead of Pending for the run's "
+        "duration. Overwrite it with --passed/--fail/--skipped when the run "
+        "concludes; every gate treats it as 'no verdict yet'."
+    ),
+)
 @click.option("--reason", default="", help="Reason for failure or skip (used with --fail/--skipped).")
 @click.option("--output", "output_file", type=click.Path(), default=None,
               help="File with test output to store (used with --fail).")
@@ -457,8 +468,11 @@ def test(assignment_id: str, config_path: Path, verdict: str | None, reason: str
     # ── Record verdict ──────────────────────────────────────────────────
     if verdict:
         # Map CLI verdict flags to the canonical test_state values used by the
-        # TUI's Test stage and the reconcile review-gating logic.
-        test_state_map = {"pass": "passed", "fail": "failed", "skip": "skipped"}
+        # TUI's Test stage and the reconcile review-gating logic. "running"
+        # (#1395) is NOT a verdict — it's a transient in-progress marker a
+        # driver sets around a locally-run suite, overwritten by one of the
+        # other three flags when the run concludes.
+        test_state_map = {"pass": "passed", "fail": "failed", "skip": "skipped", "running": "running"}
         assignment.test_state = test_state_map[verdict]
         # #1213: a --skipped verdict carries a reason too (e.g. "trivial dep
         # bump, covered by regression test in the same PR") — that reason IS
@@ -505,18 +519,24 @@ def test(assignment_id: str, config_path: Path, verdict: str | None, reason: str
             smoke_test=assignment.smoke_test,
             smoke_test_reason=assignment.smoke_test_reason,
         )
-        verdict_word = {"pass": "PASSED", "fail": "FAILED", "skip": "SKIPPED"}[verdict]
+        verdict_word = {
+            "pass": "PASSED", "fail": "FAILED", "skip": "SKIPPED", "running": "RUNNING",
+        }[verdict]
         click.echo(f"Test gate {verdict_word} for {assignment.repo_name} #{assignment.issue_number}")
         if verdict in ("fail", "skip") and reason:
             click.echo(f"  reason: {reason}")
         elif verdict == "pass":
             click.echo("  Run: coord merge to proceed")
+        elif verdict == "running":
+            click.echo("  (transient — record --passed/--fail/--skipped when the run concludes)")
 
         # #271 part 1: restore the local checkout to `default_branch` after a
         # pass/skip verdict (legacy safety — #561 means a Build no longer moves
         # the base, so this is a no-op on fresh checkouts), and #561: remove the
         # throwaway test worktree now that testing concluded.  `--fail` leaves
-        # the worktree so the user can dig into the failure.
+        # the worktree so the user can dig into the failure. `running` is
+        # neither — the driver manages its own scratch worktree separately, so
+        # this command never touched one in the first place.
         if verdict in ("pass", "skip"):
             _restore_default_branch_after_test(cfg, assignment)
             _cleanup_test_worktree(cfg, assignment)

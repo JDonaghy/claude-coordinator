@@ -285,6 +285,13 @@ class Assignment:
     # #200: human-driven Test gate verdict for type="work" assignments.
     # None | "passed" | "failed" | "skipped". Review auto-dispatch is gated on
     # this being passed/skipped (or no Test stage configured).
+    # #1395: also "running" — a transient, non-verdict marker an unattended
+    # driver (scripts/drive-issue.sh) sets while it runs the suite locally
+    # (bypassing dispatch_smoke), so coord.stage_projection.test_stage_status_for
+    # can show the Test box Active instead of indistinguishable-from-idle
+    # Pending. Every gate that reads this field keys off the terminal
+    # passed/skipped/failed values explicitly, so "running" fails closed
+    # everywhere by construction — never add a bare `is not None` check here.
     test_state: str | None = None
     test_reason: str | None = None
     # #253: parsed adversarial-review verdict for type="review" assignments.

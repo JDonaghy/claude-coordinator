@@ -322,7 +322,12 @@ def compute_pipeline(
 
     # Expose the human Test-gate verdict so the phone detail screen can display
     # it and the record-test-verdict gate can be conditionally shown.
-    # Reads from Assignment.test_state (None | "passed" | "failed" | "skipped").
+    # Reads from Assignment.test_state — None | "passed" | "failed" | "skipped"
+    # | "running" (#1395: a transient, non-verdict marker an unattended driver
+    # sets while it runs the suite locally; deliberately NOT filtered out
+    # here — it's real signal for the phone screen too, and `test_verdict ==
+    # "failed"` / `!= None` (the only comparisons made against this field)
+    # both already do the right thing while it's "running").
     test_verdict = assignment.test_state
 
     # #846: long-running / non-converging signal, shared with the coordinator

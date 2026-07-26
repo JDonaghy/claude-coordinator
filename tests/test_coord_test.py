@@ -144,6 +144,41 @@ class TestSmokeVerdict:
         assert board.completed[0].test_state == "skipped"
         assert board.completed[0].test_reason == "trivial dep bump, covered by regression test"
 
+    def test_running_records_transient_marker(
+        self, config_file: Path, board_with_done: Board,
+    ) -> None:
+        # #1395: an unattended driver sets `--running` right before it starts
+        # a local suite so the board (and coord-tui's Test box) shows
+        # something is happening, then overwrites it with a terminal verdict
+        # when the run concludes. It must never touch the legacy smoke_test
+        # mirror, and it must not clean up / restore the worktree the way a
+        # terminal --passed/--skipped does — this command never built one.
+        runner = CliRunner()
+        result = runner.invoke(main, [
+            "test", "abc123", "--running",
+            "--config", str(config_file),
+        ])
+        assert result.exit_code == 0
+        assert "RUNNING" in result.output
+
+        from coord.state import load_board
+        board = load_board()
+        assert board.completed[0].test_state == "running"
+        assert board.completed[0].smoke_test is None
+
+    def test_running_then_passed_overwrites_transient_marker(
+        self, config_file: Path, board_with_done: Board,
+    ) -> None:
+        runner = CliRunner()
+        runner.invoke(main, ["test", "abc123", "--running", "--config", str(config_file)])
+        result = runner.invoke(main, ["test", "abc123", "--passed", "--config", str(config_file)])
+        assert result.exit_code == 0
+
+        from coord.state import load_board
+        board = load_board()
+        assert board.completed[0].test_state == "passed"
+        assert board.completed[0].smoke_test == "pass"
+
     def test_unknown_assignment_errors(self, config_file: Path, coord_db) -> None:
         save_board(Board())
         runner = CliRunner()

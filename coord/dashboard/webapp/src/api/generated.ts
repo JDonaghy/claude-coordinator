@@ -29,7 +29,7 @@ export type AssignmentType =
   | 'merge'
   | 'fix'
 
-export type TestVerdict = 'passed' | 'failed' | 'skipped'
+export type TestVerdict = 'passed' | 'failed' | 'skipped' | 'running'
 
 /**
  * Actions supported by POST /api/pipeline/action.
