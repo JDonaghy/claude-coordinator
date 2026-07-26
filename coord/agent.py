@@ -97,6 +97,29 @@ ADVISORY = "advisory"
 # zero-commit case above.
 _ADVISORY_TYPES = ("work",)
 
+# #1394: assignment types whose worktree, when left dirty, holds real source
+# the worker meant to ship — so an automatic WIP commit on the assignment
+# branch is strictly better than deleting it.  Everything else is excluded on
+# purpose:
+#   * review / smoke / test / plan / *-chat are read-only by design, so their
+#     dirt is build or test scratch and committing it would pollute the PR.
+#   * conflict-fix / merge can die mid-rebase, where the "dirt" is conflict
+#     markers — committing those to the branch would be actively harmful.
+# Excluded types are still never force-deleted while dirty; they're preserved
+# by KEEPING the worktree (see `AgentServer._rescue_uncommitted_work`).
+_WIP_RESCUE_TYPES = ("work", "fix", "test-author", "mock-author")
+
+# #1394: subject prefix for the coordinator's rescue commit.  Deliberately
+# loud — it lands on the assignment branch and a human (or the adversarial
+# reviewer) must be able to tell at a glance that the worker did not author it.
+_WIP_COMMIT_PREFIX = "WIP [coord-rescue]"
+
+# #1394: above this many dirty paths, assume the worktree picked up something
+# that should have been gitignored (a venv, `node_modules`, a build tree) in a
+# repo whose .gitignore doesn't cover it, and do NOT commit it to the branch.
+# The worktree is kept instead — still never deleted, just not auto-committed.
+_WIP_RESCUE_MAX_FILES = 200
+
 # Maximum number of terminal (done/failed/cancelled) assignments retained in
 # memory and persisted to agent_state.json (#452).  Oldest entries (by
 # finished_at, falling back to started_at) are dropped once this limit is
@@ -460,6 +483,47 @@ def _git(cwd: Path, *args: str, timeout: float = 15.0) -> str:
     if result.returncode != 0:
         raise _GitError(f"git {' '.join(args)} failed: {result.stderr.strip()}")
     return result.stdout.strip()
+
+
+def _worktree_dirt(wt_path: Path) -> tuple[int, int] | None:
+    """Return ``(tracked_changes, untracked_files)`` for *wt_path* (#1394).
+
+    ``tracked_changes`` counts staged/unstaged modifications, additions and
+    deletions of files git already knows about; ``untracked_files`` counts new
+    files git does not track yet (``??`` entries).  ``git status --porcelain``
+    honours ``.gitignore``, so build output and virtualenvs never show up.
+
+    ``--untracked-files=all`` is required, not cosmetic: the default
+    (``normal``) collapses an entire untracked directory into a single ``??
+    dir/`` line, so a 5000-file ``node_modules`` would count as one file and
+    slip under ``_WIP_RESCUE_MAX_FILES``.
+
+    Returns ``None`` when git could not be asked (not a worktree, git missing,
+    timeout).  Callers must treat ``None`` as "possibly dirty" and refuse to
+    force-delete — guessing "clean" is what destroys work.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=str(wt_path),
+            capture_output=True,
+            text=True,
+            timeout=30.0,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    tracked = 0
+    untracked = 0
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        if line.startswith("??"):
+            untracked += 1
+        else:
+            tracked += 1
+    return tracked, untracked
 
 
 def _commits_ahead(wt_path: Path, base: str) -> int | None:
@@ -1666,6 +1730,18 @@ class AgentAssignment:
     # /the Test stage) can see "no stashed artifact for this glob, rebuild
     # from source" without having to dig through the raw worker log.
     stash_unmatched_globs: list[str] | None = None
+    # #1394: set when the assignment finished with uncommitted changes in its
+    # worktree.  Records what happened to that work — rescued as a WIP commit
+    # on the assignment branch (and whether the push landed), or left in place
+    # with the worktree deliberately kept.  Never None-but-deleted: if this
+    # field is set, the work still exists somewhere, and the string says where.
+    #
+    # This is the "wrote something we could not commit" signal that #1394 was
+    # about.  A bare ADVISORY ("wrote nothing") leaves it None; when the reap
+    # already flagged ADVISORY, `zero_commit_reason` is rewritten to carry the
+    # same message so the board, `coord status` and the GitHub advisory comment
+    # all stop claiming "0 commits pushed" when work was in fact rescued.
+    dirty_worktree_reason: str | None = None
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -1711,6 +1787,23 @@ They are managed by the coordinator.
 Push with `git push origin HEAD`. \
 NEVER commit or push to main or develop directly. \
 Do NOT open a PR — the coordinator handles that.
+
+This session is ONE-SHOT and non-interactive (#1394):
+- There is no next turn and no human to reply to you. Background-task \
+completion notifications will NEVER reach you — nothing wakes you up.
+- NEVER start a long-running command in the background and then end your \
+turn waiting for it (no `run_in_background`, no `&`, no "I'll wait for the \
+test run to finish"). Run it in the FOREGROUND and block until it returns, \
+or raise the timeout, or skip it and say so. If you end your turn waiting, \
+the session is over and your work is thrown away.
+- ALWAYS `git add`, `git commit`, and `git push origin HEAD` BEFORE your \
+final message — even if the build is broken, the tests are failing, or you \
+ran out of time. Uncommitted changes are destroyed when the session ends. \
+A committed work-in-progress with an honest final message is strictly \
+better than a perfect uncommitted diff, which is worth nothing.
+- Your final message is the LAST thing you will ever say. Never end it with \
+"I'll continue", "waiting for X", or "will follow up" — finish or report \
+the blocker.
 
 Before writing any code, verify the feature or fix isn't already implemented. \
 Grep for relevant function names, check existing modules, and read related files. \
@@ -3687,6 +3780,197 @@ class AgentServer:
 
         return worktree_path
 
+    def _log_line(self, assignment: AgentAssignment, text: str) -> None:
+        """Append one line to the assignment log. Never raises (#1394)."""
+        try:
+            with open(assignment.log_path, "a") as fh:
+                fh.write(text if text.endswith("\n") else text + "\n")
+        except (OSError, AttributeError, TypeError):
+            pass
+
+    def _record_dirty_worktree(
+        self, assignment: AgentAssignment, reason: str
+    ) -> None:
+        """Persist *reason* on the assignment so the board can surface it.
+
+        #1394: a dirty worktree at teardown means the worker wrote something it
+        never committed.  That is a materially different outcome from "the
+        worker wrote nothing", and until now the two were indistinguishable —
+        both landed as a bare ADVISORY reading "0 commits pushed" while the
+        code was silently deleted.  Recording the reason (and rewriting
+        ``zero_commit_reason`` when the reap already flagged ADVISORY, since
+        that is the string `coord status`, the dashboard and the GitHub
+        advisory comment all render) is what makes the loss visible.
+        """
+        with self._lock:
+            live = self._assignments.get(assignment.id, assignment)
+            live.dirty_worktree_reason = reason
+            if live.status == ADVISORY:
+                live.zero_commit_reason = reason
+            # Keep the caller's object in sync when it isn't the live one, so
+            # a caller holding a detached copy still sees the outcome.
+            assignment.dirty_worktree_reason = reason
+            if assignment.status == ADVISORY:
+                assignment.zero_commit_reason = reason
+        self._persist()
+
+    def _rescue_uncommitted_work(
+        self, assignment: AgentAssignment, wt_path: Path
+    ) -> bool:
+        """Preserve uncommitted work in *wt_path*. Returns "safe to remove".
+
+        #1394.  ``_cleanup_worktree`` used to force-remove and ``rmtree`` the
+        worktree with no dirty check at all, so a worker that ended its turn
+        mid-edit — backgrounded its test suite and waited for a notification
+        that a one-shot ``claude -p`` session can never receive, crashed,
+        timed out, or was reaped — had its only copy of the work deleted.  The
+        ``--orphan-worktrees`` sweep has guarded against exactly this since
+        #618 ("Dirty worktrees are reported but never auto-deleted"); the
+        synchronous per-assignment path simply never got the same guard.
+
+        Returns ``True`` when the caller may proceed with removal, i.e. either
+        the worktree is clean or the work now lives in a commit on the
+        assignment branch.  Branch refs are shared with the parent repo, so
+        once the commit exists it survives the worktree being removed — even
+        if the subsequent push fails.
+
+        Returns ``False`` to mean "do not delete": the worktree is the only
+        copy of the work and must be kept for a human to recover.
+        """
+        dirt = _worktree_dirt(wt_path)
+        if dirt is None:
+            # Could not ask git.  Refuse to delete — guessing "clean" here is
+            # precisely the bug.  A leaked worktree is recoverable; the work
+            # is not.
+            reason = (
+                f"could not determine whether worktree {wt_path} has "
+                "uncommitted changes; kept it rather than risk deleting work"
+            )
+            self._log_line(assignment, f"# cleanup: {reason} (#1394)")
+            self._record_dirty_worktree(assignment, reason)
+            return False
+
+        tracked, untracked = dirt
+        if tracked == 0 and untracked == 0:
+            return True  # clean — unchanged behaviour
+
+        if assignment.spec.type not in _WIP_RESCUE_TYPES:
+            # Read-only or mid-rebase worker.  Untracked-only dirt is build or
+            # test scratch (`.pytest_cache`, stray logs) and deleting it is
+            # correct — keeping the worktree for every smoke run would leak
+            # one per assignment.  Tracked modifications, though, mean real
+            # edits to real files, so keep the worktree.
+            if tracked == 0:
+                return True
+            reason = (
+                f"{assignment.spec.type!r} worker left {tracked} uncommitted "
+                f"change(s) to tracked files; worktree {wt_path} kept (not "
+                "auto-committed — a WIP commit from this assignment type "
+                "would pollute the branch)"
+            )
+            self._log_line(assignment, f"# cleanup: {reason} (#1394)")
+            self._record_dirty_worktree(assignment, reason)
+            return False
+
+        total = tracked + untracked
+        if total > _WIP_RESCUE_MAX_FILES:
+            reason = (
+                f"worker left {total} uncommitted file(s) — too many to commit "
+                "safely (looks like un-gitignored build output); worktree "
+                f"{wt_path} kept so nothing is lost"
+            )
+            self._log_line(assignment, f"# cleanup: {reason} (#1394)")
+            self._record_dirty_worktree(assignment, reason)
+            return False
+
+        branch = assignment.branch or assignment.spec.target_branch or "HEAD"
+        subject = (
+            f"{_WIP_COMMIT_PREFIX} #{assignment.spec.issue_number}: "
+            f"uncommitted worker changes preserved by the coordinator"
+        )
+        body = (
+            "The worker finished (or died) with uncommitted changes in its "
+            "worktree.\nThe coordinator committed them verbatim so they "
+            "would not be destroyed by\nworktree teardown. This commit was "
+            "NOT authored by the worker and has not\nbeen built, tested or "
+            "reviewed — treat it as a recovery snapshot.\n\n"
+            f"assignment: {assignment.id}\nSee #1394."
+        )
+        self._log_line(
+            assignment,
+            f"# cleanup: worktree dirty ({tracked} tracked, {untracked} "
+            f"untracked) — rescuing as a WIP commit on {branch} (#1394)",
+        )
+
+        try:
+            _git(wt_path, "add", "-A", timeout=60.0)
+        except (_GitError, subprocess.TimeoutExpired) as e:
+            reason = (
+                f"{total} uncommitted file(s) could not be staged ({e}); "
+                f"worktree {wt_path} kept — recover the work manually"
+            )
+            self._log_line(assignment, f"# cleanup: {reason} (#1394)")
+            self._record_dirty_worktree(assignment, reason)
+            return False
+
+        commit_args = ["commit", "--no-verify", "-m", subject, "-m", body]
+        committed = False
+        try:
+            _git(wt_path, *commit_args, timeout=60.0)
+            committed = True
+        except (_GitError, subprocess.TimeoutExpired):
+            # Most likely no committer identity configured on this agent.
+            # Retry with a fallback identity rather than lose the work; `-c`
+            # overrides only this invocation and never touches repo config.
+            try:
+                _git(
+                    wt_path,
+                    "-c", "user.name=coord",
+                    "-c", "user.email=coord@localhost",
+                    *commit_args,
+                    timeout=60.0,
+                )
+                committed = True
+            except (_GitError, subprocess.TimeoutExpired) as e2:
+                reason = (
+                    f"{total} uncommitted file(s) could not be committed "
+                    f"({e2}); worktree {wt_path} kept — recover the work "
+                    "manually"
+                )
+                self._log_line(assignment, f"# cleanup: {reason} (#1394)")
+                self._record_dirty_worktree(assignment, reason)
+                return False
+
+        if not committed:  # pragma: no cover - defensive
+            return False
+
+        # The commit now lives on the branch ref in the shared object store,
+        # so the worktree is expendable from here on.  Push is best-effort:
+        # its failure downgrades the message, not the safety of the work.
+        pushed = False
+        try:
+            _git(wt_path, "push", "-u", "origin", "HEAD", timeout=60.0)
+            pushed = True
+        except (_GitError, subprocess.TimeoutExpired) as e:
+            self._log_line(
+                assignment, f"# cleanup: WIP rescue push failed ({e}) (#1394)"
+            )
+
+        where = (
+            f"committed to {branch} and pushed"
+            if pushed
+            else f"committed to local branch {branch} (push failed — the "
+            "commit exists only on this agent)"
+        )
+        reason = (
+            f"worker left {total} uncommitted file(s) ({tracked} tracked, "
+            f"{untracked} new); {where} as a {_WIP_COMMIT_PREFIX} commit. "
+            "The work is UNVERIFIED — review it before testing or merging."
+        )
+        self._log_line(assignment, f"# cleanup: {reason} (#1394)")
+        self._record_dirty_worktree(assignment, reason)
+        return True
+
     def _cleanup_worktree(self, assignment: AgentAssignment) -> None:
         """Remove the worktree for a finished assignment. Best-effort.
 
@@ -3696,11 +3980,32 @@ class AgentServer:
         keep the branch "checked out" from git's perspective, causing the next
         ``_setup_worktree`` to fail with a collision error until a ``prune``
         ran separately.
+
+        #1394: never destroys uncommitted work.  A dirty worktree is either
+        rescued into a WIP commit on the assignment branch (work-authoring
+        assignment types) or kept on disk, and the outcome is recorded on the
+        assignment — see :meth:`_rescue_uncommitted_work`.
         """
         if not assignment.worktree_path:
             return
         wt_path = Path(assignment.worktree_path)
         repo_path = Path(assignment.spec.repo_path).expanduser()
+
+        # #1394: check for uncommitted work BEFORE any destructive step.  The
+        # `except _GitError` fallback below runs `shutil.rmtree`, which no
+        # amount of git-level care would survive, so the gate has to be here.
+        if wt_path.exists() and not self._rescue_uncommitted_work(
+            assignment, wt_path
+        ):
+            # Work preserved only inside this worktree — keep it.  Prune stale
+            # admin entries for OTHER worktrees; this one stays registered on
+            # purpose so `git worktree list` still shows where the work is.
+            try:
+                _git(repo_path, "worktree", "prune")
+            except _GitError:
+                pass
+            return
+
         try:
             if wt_path.exists():
                 _git(repo_path, "worktree", "remove", str(wt_path), "--force")
