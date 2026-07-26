@@ -952,6 +952,182 @@ def test_default_worker_command_mock_author_not_sealed() -> None:
     assert "--disallowedTools" not in argv
 
 
+# ── #1445: worktree-writability preflight ───────────────────────────────────
+
+
+def test_default_worker_command_restricts_setting_sources_to_user() -> None:
+    """A worker must not inherit the host checkout's project/local Claude
+    Code settings (e.g. a `.claude/settings.local.json` deny rule) — see
+    #1445. --setting-sources user means only the machine's own user-level
+    settings apply; project/local (the checkout) are never loaded."""
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path="/tmp/repo",
+        issue_number=1,
+        issue_title="t",
+        briefing="b",
+    )
+    argv = default_worker_command(spec)
+    assert "--setting-sources" in argv
+    idx = argv.index("--setting-sources")
+    assert argv[idx + 1] == "user"
+
+
+def test_default_worker_command_restricts_setting_sources_for_plan_type() -> None:
+    """Same restriction applies to every spec.type, not just 'work' — all of
+    them are headless dispatches that must not depend on host checkout
+    state."""
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path="/tmp/repo",
+        issue_number=1,
+        issue_title="t",
+        briefing="b",
+        type="plan",
+    )
+    argv = default_worker_command(spec)
+    assert "--setting-sources" in argv
+    idx = argv.index("--setting-sources")
+    assert argv[idx + 1] == "user"
+
+
+def test_deny_pattern_blocks_path_matches_blanket_prefix() -> None:
+    from coord.agent import _deny_pattern_blocks_path
+
+    # The exact shape from the #1445 incident report.
+    pattern = "Write(//home/john/.coord/**)"
+    assert _deny_pattern_blocks_path(
+        pattern, Path("/home/john/.coord/worktrees/a1860bb9f9f8")
+    )
+    assert _deny_pattern_blocks_path(pattern, Path("/home/john/.coord"))
+
+
+def test_deny_pattern_blocks_path_does_not_match_unrelated_path() -> None:
+    from coord.agent import _deny_pattern_blocks_path
+
+    pattern = "Write(//home/john/.coord/**)"
+    assert not _deny_pattern_blocks_path(pattern, Path("/home/john/src/other-repo"))
+
+
+def test_deny_pattern_blocks_path_ignores_non_absolute_patterns() -> None:
+    from coord.agent import _deny_pattern_blocks_path
+
+    # Relative/tool-bare patterns aren't the shape this check targets —
+    # must not raise, must not false-positive.
+    assert not _deny_pattern_blocks_path("Bash(git push --force *)", Path("/x"))
+    assert not _deny_pattern_blocks_path("Edit(src/**)", Path("/x"))
+
+
+def test_find_blocking_deny_rule_detects_blanket_deny(tmp_path: Path) -> None:
+    from coord.agent import find_blocking_deny_rule
+
+    worktree = tmp_path / "coord" / "worktrees" / "abc123"
+    settings = tmp_path / "settings.json"
+    coord_root_nolead = str(tmp_path / "coord")[1:]  # strip leading "/"
+    settings.write_text(json.dumps({
+        "permissions": {"deny": [f"Write(//{coord_root_nolead}/**)", "Edit(//" + coord_root_nolead + "/**)"]}
+    }))
+
+    result = find_blocking_deny_rule(worktree, settings_files=[settings])
+    assert result is not None
+    assert "Write" in result
+    assert str(settings) in result
+
+
+def test_find_blocking_deny_rule_clean_when_no_match(tmp_path: Path) -> None:
+    from coord.agent import find_blocking_deny_rule
+
+    worktree = tmp_path / "coord" / "worktrees" / "abc123"
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"permissions": {"deny": ["Bash(rm -rf *)"]}}))
+
+    assert find_blocking_deny_rule(worktree, settings_files=[settings]) is None
+
+
+def test_find_blocking_deny_rule_tolerates_missing_or_bad_settings_file(tmp_path: Path) -> None:
+    from coord.agent import find_blocking_deny_rule
+
+    worktree = tmp_path / "coord" / "worktrees" / "abc123"
+    missing = tmp_path / "does-not-exist.json"
+    bad_json = tmp_path / "bad.json"
+    bad_json.write_text("not json{{{")
+
+    assert find_blocking_deny_rule(worktree, settings_files=[missing, bad_json]) is None
+
+
+def test_check_worktree_writable_clean(tmp_path: Path) -> None:
+    from coord.agent import check_worktree_writable
+
+    worktree = tmp_path / "worktrees" / "abc123"
+    assert check_worktree_writable(worktree, settings_files=[]) is None
+    # The probe file is cleaned up, not left behind.
+    assert list(worktree.iterdir()) == []
+
+
+def test_check_worktree_writable_detects_os_level_failure(tmp_path: Path) -> None:
+    """A parent path component that is a plain file (not a directory) makes
+    mkdir(parents=True) fail with a deterministic OSError regardless of
+    the test runner's uid (avoids relying on chmod, which root ignores)."""
+    from coord.agent import check_worktree_writable
+
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("i am a file")
+    worktree = blocker / "worktrees" / "abc123"
+
+    result = check_worktree_writable(worktree, settings_files=[])
+    assert result is not None
+    assert "cannot write" in result
+
+
+def test_check_worktree_writable_detects_deny_rule(tmp_path: Path) -> None:
+    """Reproduces the #1445 incident: the OS-level probe succeeds (the
+    worktree directory itself is perfectly writable) but a deny rule
+    blanketing the worktree's ancestor is present in the scanned settings
+    file — this must still be reported, not silently missed."""
+    from coord.agent import check_worktree_writable
+
+    worktree = tmp_path / "coord" / "worktrees" / "abc123"
+    settings = tmp_path / "settings.json"
+    coord_root_nolead = str(tmp_path / "coord")[1:]
+    settings.write_text(json.dumps({
+        "permissions": {"deny": [f"Write(//{coord_root_nolead}/**)"]}
+    }))
+
+    result = check_worktree_writable(worktree, settings_files=[settings])
+    assert result is not None
+    assert str(worktree) in result
+    assert "permission rule" in result
+    # The directory creation half of the probe still ran fine — confirms
+    # this is the deny-rule branch, not the OS-error branch.
+    assert worktree.exists()
+
+
+def test_assign_refuses_dispatch_when_worktree_not_writable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """#1445 acceptance: AgentServer.assign() must refuse to spawn a worker
+    into a worktree the preflight probe reports as blocked — failing fast
+    at dispatch time (assignment.status == FAILED with a message naming the
+    path/rule) instead of burning a full session that discovers this at the
+    very end."""
+    import coord.agent as agent_module
+
+    repo = _init_repo(tmp_path / "repo")
+    server = _server(tmp_path, repo_path=repo)
+
+    def _fake_check(worktree_path: Path, **kwargs) -> str | None:
+        return f"a Claude Code permission rule denies Edit/Write under {worktree_path}: 'Write(//home/john/.coord/**)' in /home/john/.claude/settings.json"
+
+    monkeypatch.setattr(agent_module, "check_worktree_writable", _fake_check)
+
+    a = server.assign(_spec(repo))
+    assert a.status == FAILED
+    assert a.error is not None
+    assert "not writable" in a.error
+    assert "permission rule" in a.error
+    # No worker subprocess should have been spawned for this assignment.
+    assert a.id not in server._processes
+    server.shutdown()
+
+
 def test_reap_captures_claude_session_id(tmp_path: Path) -> None:
     """_reap populates AgentAssignment.claude_session_id from a system.init log line."""
     repo = _init_repo(tmp_path / "repo")
