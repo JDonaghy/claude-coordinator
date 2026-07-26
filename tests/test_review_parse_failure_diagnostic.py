@@ -27,6 +27,8 @@ from pathlib import Path
 
 import pytest
 
+from coord.review import REVIEWER_SYSTEM_PROMPT
+
 # ── Fixtures: real-world transcript shapes ───────────────────────────────────
 
 # The #873 / #1346 shape: bolded markers, END_REVIEW present.
@@ -169,6 +171,54 @@ class TestDetectUnparsedReviewMarker:
         assert result is not None
         # Excerpt should start with REVIEW_VERDICT:, not include the preamble.
         assert result.excerpt.startswith("REVIEW_VERDICT:")
+
+    def test_stream_json_log_with_system_prompt_header_defeats_naive_fix(self) -> None:
+        """#1348 round 2 regression (efc198d6475a.log).
+
+        A real ``claude -p --output-format stream-json`` log has TWO traps a
+        naive fix must survive at once:
+
+        1. Line 1 is the agent's non-JSON ``# argv=...`` header, which embeds
+           the reviewer's OWN ``--system-prompt`` argument — newline-escaped
+           onto that one physical line by ``agent.py``
+           (``shlex.join(argv).replace("\\n", "\\\\n")``). That system prompt
+           CONTAINS the literal ``REVIEW_VERDICT: approve\\nREVIEW_BODY:\\n
+           <your full review text in markdown>\\nEND_REVIEW`` template.
+        2. The real verdict, emitted later by the assistant, is itself a
+           JSON-escaped string (real newlines stored as literal ``\\n``) and,
+           in this fixture, malformed the #1346 way (bolded markers) so the
+           strict parser legitimately rejects it and the diagnostic must fire.
+
+        A fix that only unescapes ``\\n`` across the whole raw log and then
+        `.search()`es (first match) would match the HEADER's template, not
+        the real verdict — "worse than failing" per #1348, because it looks
+        like it worked. This fixture defeats that naive fix: the header must
+        be excluded entirely (it isn't JSON), and only the real, later
+        verdict may be reported.
+        """
+        header_argv = (
+            "claude -p --output-format stream-json --system-prompt "
+            + REVIEWER_SYSTEM_PROMPT.replace("\n", "\\n")
+            + " --model sonnet"
+        )
+        header = f"# agent=elitebook repo=coord issue=#{_ISSUE} argv={header_argv}\n"
+        real_verdict_text = (
+            f"[Coordinator review assignment {_AID} for issue #{_ISSUE}]\n\n"
+            "**REVIEW_VERDICT: request-changes**\n\n"
+            "**REVIEW_BODY:**\n\n"
+            "## Summary\n\nSomething is genuinely wrong here.\n\nEND_REVIEW"
+        )
+        log_text = header + _stream_json_line(real_verdict_text) + "\n"
+
+        result = self._call(log_text)
+
+        assert result is not None
+        assert result.verdict_word == "request-changes"
+        # The excerpt must come from the REAL (decoded, real-newline) verdict
+        # — not the header's raw, still-escaped system-prompt template.
+        assert "Something is genuinely wrong here" in result.excerpt
+        assert "your full review text in markdown" not in result.excerpt
+        assert "\\n" not in result.excerpt
 
 
 # ── 2. Local floor diagnostic out-param tests ────────────────────────────────

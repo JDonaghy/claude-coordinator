@@ -150,11 +150,12 @@ class UnparsedReviewMarker:
             ``request-changes``) or a known alias (``pass`` → approve,
             ``fail`` → request-changes) the operator prompt defaults to it
             instead of ``[s]kip``.
-        excerpt: Bounded slice of the raw transcript starting from the
-            ``REVIEW_VERDICT:`` line, capped at :data:`_DIAGNOSTIC_EXCERPT_MAX`
-            chars.  For stream-json logs this may include surrounding JSON
-            scaffolding.  Passed to ``_collect_review_body_via_editor`` as
-            ``pre_body`` so the operator edits the real review text.
+        excerpt: Bounded slice starting from the ``REVIEW_VERDICT:`` line,
+            capped at :data:`_DIAGNOSTIC_EXCERPT_MAX` chars.  For stream-json
+            logs this is the DECODED assistant text (real newlines, no JSON
+            scaffolding) — see :func:`_decode_transcript_for_diagnostic`.
+            Passed to ``_collect_review_body_via_editor`` as ``pre_body`` so
+            the operator edits the real review text.
         transcript_path: Filesystem path of the transcript scanned.  For the
             remote-ssh path this is the path **on the remote host** (useful in
             a ``ssh <host> cat <path>`` hint).  ``None`` when unknown.
@@ -166,6 +167,54 @@ class UnparsedReviewMarker:
     excerpt: str
     transcript_path: str | None = None
     host: str | None = None
+
+
+def _decode_transcript_for_diagnostic(text: str) -> str | None:
+    """Best-effort NDJSON (stream-json) decode of *text*, for #1348 round 2.
+
+    ``claude -p --output-format stream-json`` (and Claude Code's own session
+    transcripts under ``~/.claude/projects/``) emit one JSON object per line.
+    Any real newline inside an assistant message's text is therefore stored
+    on disk as the two-character escape ``\\n``, not a ``0x0A`` byte — valid
+    JSON, but useless to a regex that anchors on ``[\\r\\n]``. Worse, line 1 of
+    every agent log is a non-JSON ``# agent=... argv=...`` comment that embeds
+    the reviewer's own ``--system-prompt`` argument verbatim (also
+    newline-escaped onto one physical line by ``agent.py``'s
+    ``.replace("\\n", "\\\\n")``) — and that system prompt CONTAINS the literal
+    ``REVIEW_VERDICT: approve\\nREVIEW_BODY:\\n<your full review text in
+    markdown>\\nEND_REVIEW`` template the reviewer is instructed to fill in.
+    A one-shot ``text.replace("\\\\n", "\\n")`` over the whole raw log would
+    turn that template into something that matches — and since it comes
+    first in the file, a plain ``.search()`` would find it before the real
+    verdict emitted later by the assistant.
+
+    This decodes *text* the same way the strict parser does (:func:`parse_event`
+    / ``_assistant_text`` in :mod:`coord.worker_events`): only lines that
+    parse as a JSON object contribute anything at all, and only
+    ``"assistant"``-typed events contribute text — the non-JSON argv/header
+    comment line (and any ``"system"``/``"user"`` event that might otherwise
+    echo the system-prompt template back) is silently skipped, never
+    concatenated into the decoded text. Returns the assistant texts joined by
+    real ``"\\n"``, in emission order — or ``None`` when *text* contains no
+    NDJSON at all (e.g. an old-format plain-text log, or plain prose in a
+    test fixture), so the caller falls back to treating *text* as-is.
+    """
+    from coord.worker_events import _assistant_text, parse_event  # noqa: PLC0415
+
+    texts: list[str] = []
+    saw_json = False
+    for line in text.splitlines():
+        event = parse_event(line)
+        if event is None:
+            continue
+        saw_json = True
+        if event.type == "assistant":
+            t = _assistant_text(event)
+            if t:
+                texts.append(t)
+    if not saw_json:
+        return None
+    return "\n".join(texts)
 
 
 def detect_unparsed_review_marker(
@@ -183,6 +232,15 @@ def detect_unparsed_review_marker(
     its return value to auto-record a verdict.  ``END_REVIEW`` is still the
     required terminator for a legitimate strict parse.
 
+    *text* is decoded via :func:`_decode_transcript_for_diagnostic` before any
+    matching happens (#1348 round 2) — callers pass the RAW file/transcript
+    content, which for a stream-json log has every real newline inside the
+    assistant's text escaped as ``\\n`` (two characters), not ``0x0A``; the
+    strict-parser regexes below would never match that unless it's decoded
+    first, same as the strict parser itself does via
+    ``parse_event``/``_assistant_text``. When *text* isn't NDJSON at all (old
+    plain-text logs) it's matched as-is, unchanged from before.
+
     Returns ``None`` when:
 
     * No ``REVIEW_VERDICT:`` marker is present — *text* is genuinely not a
@@ -194,12 +252,25 @@ def detect_unparsed_review_marker(
     (capped at :data:`_DIAGNOSTIC_EXCERPT_MAX` chars from the marker line) and
     the detected verdict word with Markdown decorators stripped.
     """
-    m = _REVIEW_MARKER_DETECT_RE.search(text)
-    if not m:
+    decoded = _decode_transcript_for_diagnostic(text)
+    search_text = text if decoded is None else decoded
+
+    matches = list(_REVIEW_MARKER_DETECT_RE.finditer(search_text))
+    if not matches:
         return None
-    # Guard: strict parse succeeded → return None, never double-report (#1348).
-    if _REVIEW_BLOCK_RE.search(text):
+    # Guard: strict parse succeeded on the SAME (decoded) text → return None,
+    # never double-report (#1348).
+    if _REVIEW_BLOCK_RE.search(search_text):
         return None
+    # Take the LAST match, not the first (#1348 round 2). Decoding already
+    # excludes the non-JSON argv/header comment line that embeds the
+    # reviewer's own system-prompt TEMPLATE (see
+    # _decode_transcript_for_diagnostic), but this also protects the
+    # plain-text fallback path (decoded is None) where that template text
+    # could still precede the real verdict in the raw log, and it mirrors
+    # `_parse_review_text`'s own `matches[-1]`: a reviewer that second-guesses
+    # itself mid-session emits the real verdict last.
+    m = matches[-1]
     # Extract and normalize the verdict word.  Strip common Markdown decorators
     # (*_`#) so e.g. "**request-changes**" normalises to "request-changes".
     raw_line = m.group(1).strip()
@@ -208,10 +279,10 @@ def detect_unparsed_review_marker(
     # Bounded excerpt: start at the beginning of the REVIEW_VERDICT: line,
     # capture up to _DIAGNOSTIC_EXCERPT_MAX chars so the operator can see
     # the full verdict block without holding the whole (possibly multi-MB) log.
-    line_start = text.rfind("\n", 0, m.start()) + 1  # +1 skips the \n itself
+    line_start = search_text.rfind("\n", 0, m.start()) + 1  # +1 skips the \n itself
     start = line_start
-    end = min(len(text), start + _DIAGNOSTIC_EXCERPT_MAX)
-    excerpt = text[start:end]
+    end = min(len(search_text), start + _DIAGNOSTIC_EXCERPT_MAX)
+    excerpt = search_text[start:end]
     return UnparsedReviewMarker(
         verdict_word=verdict_word,
         excerpt=excerpt,
