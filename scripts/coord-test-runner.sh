@@ -1,28 +1,42 @@
 #!/usr/bin/env bash
 #
-# coord-test-runner.sh — run the RIGHT tests for a claude-coordinator branch,
-# in a throwaway worktree, and distinguish a real failure from a flake.
+# coord-test-runner.sh — run the RIGHT tests for a branch, in a throwaway
+# worktree, and distinguish a real failure from a flake.
 #
 #   scripts/coord-test-runner.sh <worktree> [--base-ref REF] [--report FILE]
+#                                 [--repo NAME] [--fallback-command CMD]
+#                                 [--print-routing]
 #
 # This is the Test gate's engine.  `drive-issue.sh` calls it; it is also useful
 # on its own ("did this branch actually break anything?").
 #
-# Three things it handles that a bare `pytest && cargo test` does not:
+# Four things it handles that a bare `pytest && cargo test` does not:
 #
-#  1. PATH ROUTING.  This repo is two codebases with two toolchains, and a
-#     single `test_command` in coordinator.yml cannot express that.  Changes
-#     under coord/** or tests/** run pytest; changes under tui/** run
-#     `cargo test`.  A docs-only diff runs neither and reports SKIP.
-#     This is not just a speed optimisation — running the Rust suite against a
-#     pure-Python diff adds flake risk for zero signal (observed: #1349's
-#     branch, a Python-only change, tripped a tui flake).
+#  1. PATH ROUTING — claude-coordinator ONLY.  That repo is two codebases with
+#     two toolchains, and a single `test_command` in coordinator.yml cannot
+#     express that.  Changes under coord/** or tests/** run pytest; changes
+#     under tui/** run `cargo test`.  A docs-only diff runs neither and
+#     reports SKIP.  This is not just a speed optimisation — running the Rust
+#     suite against a pure-Python diff adds flake risk for zero signal
+#     (observed: #1349's branch, a Python-only change, tripped a tui flake).
+#
+#     `--repo NAME` selects this behaviour; it defaults to "claude-coordinator"
+#     for back-compat with callers that omit it.  EVERY OTHER REPO has no
+#     hardcoded routing (#1408) — pass `--fallback-command CMD` (the repo's
+#     configured `test_command`, e.g. quadraui's `cargo test --features tui`)
+#     and the runner treats it as one suite: skip only on a genuinely
+#     doc/config-only diff, run it otherwise.  `--repo` given with NO
+#     `--fallback-command`, for any repo other than claude-coordinator, is a
+#     repo the runner has no rule for at all — it REFUSES (exit 1) rather than
+#     silently reporting SKIP.  A silent green Test gate on unrun tests is
+#     exactly the failure mode #1408 exists to close.
 #
 #  2. THE quadraui PATH DEP.  tui/Cargo.toml points at
 #     `../../quadraui/quadraui`, which is resolved RELATIVE TO THE WORKTREE —
 #     so in a scratch worktree it dangles and the build fails outright.  A
 #     sibling symlink to the real checkout is required.  Verified: without it
-#     the path does not exist; with it, the build succeeds.
+#     the path does not exist; with it, the build succeeds.  (claude-coordinator
+#     routing only; a repo run via `--fallback-command` builds itself.)
 #
 #  3. FLAKE FILTERING.  The tui suite has known races under full-parallel
 #     `cargo test` (#1260 tracks 3 in commands::tests; this script also caught
@@ -33,12 +47,20 @@
 #     escalated fix round on a test the worker never touched.
 #     Build/collection errors are never flake-retried — those are always real.
 #
-# Exit codes: 0 pass (or skip — nothing to test), 1 genuine failure, 2 usage.
+#  4. `--print-routing` computes the routing decision (which suite(s) would
+#     run, or SKIP/REFUSE) and exits WITHOUT building or testing anything —
+#     used by the regression tests to assert routing cheaply and deterministically.
+#
+# Exit codes: 0 pass (or skip — nothing to test), 1 genuine failure or refusal
+# (cannot determine what to test), 2 usage.
 
 set -euo pipefail
 
 BASE_REF="origin/main"
 REPORT=""
+REPO_NAME="claude-coordinator"
+FALLBACK_CMD=""
+PRINT_ROUTING=0
 QUADRAUI_SRC="${QUADRAUI_SRC:-$HOME/src/quadraui}"
 # Persistent so the 3m12s cold Rust build is paid once, not once per fix round
 # (warm rebuilds land in 10-35s).
@@ -47,9 +69,12 @@ CARGO_TARGET="${COORD_TEST_CARGO_TARGET:-${TMPDIR:-/tmp}/coord-test-cargo-target
 WT=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --base-ref) BASE_REF="$2"; shift 2 ;;
-        --report)   REPORT="$2"; shift 2 ;;
-        -h|--help)  sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --base-ref)         BASE_REF="$2"; shift 2 ;;
+        --report)           REPORT="$2"; shift 2 ;;
+        --repo)             REPO_NAME="$2"; shift 2 ;;
+        --fallback-command) FALLBACK_CMD="$2"; shift 2 ;;
+        --print-routing)    PRINT_ROUTING=1; shift ;;
+        -h|--help)  sed -n '2,55p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
         -*)         echo "unknown option: $1" >&2; exit 2 ;;
         *)          WT="$1"; shift ;;
     esac
@@ -66,27 +91,89 @@ say() { [[ -n "$REPORT" ]] && printf '%s\n' "$*" >>"$REPORT"; printf '%s\n' "$*"
 
 # ── what changed? ────────────────────────────────────────────────────────────
 
+DIFF_FAILED=0
 if ! CHANGED="$(git -C "$WT" diff --name-only "${BASE_REF}...HEAD" 2>/dev/null)"; then
     warn "could not diff against $BASE_REF — falling back to running everything"
     CHANGED=""
-    RUN_PY=1; RUN_RS=1
-else
-    RUN_PY=0; RUN_RS=0
-    while IFS= read -r f; do
-        [[ -z "$f" ]] && continue
-        case "$f" in
-            coord/*|tests/*|pyproject.toml|conftest.py) RUN_PY=1 ;;
-            tui/*)                                      RUN_RS=1 ;;
-        esac
-    done <<<"$CHANGED"
+    DIFF_FAILED=1
 fi
 
 n_changed="$(printf '%s\n' "$CHANGED" | grep -c . || true)"
 log "changed files vs $BASE_REF: $n_changed"
-log "routing: pytest=$RUN_PY cargo=$RUN_RS"
 
-if [[ "$RUN_PY" -eq 0 && "$RUN_RS" -eq 0 ]]; then
-    say "SKIP: no test-bearing paths changed (docs/config only)"
+# Paths that are never test-bearing, in ANY repo. A diff touching only these
+# is genuinely "nothing to test" — distinct from "could not determine what to
+# test", which is a routing gap, not a property of the diff. See #1408.
+is_doc_only_path() {
+    case "$1" in
+        *.md|*.MD|docs/*|LICENSE*|NOTICE*|CHANGELOG*|.gitignore|.github/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+changed_list() { printf '%s' "$CHANGED" | tr '\n' ' ' | sed 's/ *$//'; }
+
+# ── routing: decide what to run ─────────────────────────────────────────────
+#
+# claude-coordinator is two codebases in one repo (python under coord/**,
+# tests/**; rust under tui/**) with no single test_command that covers both,
+# so it gets its own hardcoded path routing (below). EVERY OTHER REPO has
+# exactly one configured test_command (coordinator.yml's `test_command`,
+# passed in here as --fallback-command) — the only question there is whether
+# THIS diff is doc/config-only (skip) or not (run the one command). A repo
+# that is neither claude-coordinator nor carrying a --fallback-command is one
+# this script has no rule for at all: REFUSE rather than silently SKIP (#1408
+# — a silent SKIP there means the merge gate is satisfied by tests that were
+# never run).
+RUN_PY=0; RUN_RS=0; RUN_FALLBACK=0
+ROUTE_MODE="unknown"
+
+if [[ "$REPO_NAME" == "claude-coordinator" ]]; then
+    ROUTE_MODE="coordinator"
+    if [[ "$DIFF_FAILED" -eq 1 ]]; then
+        RUN_PY=1; RUN_RS=1
+    else
+        while IFS= read -r f; do
+            [[ -z "$f" ]] && continue
+            case "$f" in
+                coord/*|tests/*|pyproject.toml|conftest.py) RUN_PY=1 ;;
+                tui/*)                                      RUN_RS=1 ;;
+            esac
+        done <<<"$CHANGED"
+    fi
+    log "routing: repo=$REPO_NAME pytest=$RUN_PY cargo=$RUN_RS"
+elif [[ -n "$FALLBACK_CMD" ]]; then
+    ROUTE_MODE="fallback"
+    if [[ "$DIFF_FAILED" -eq 1 ]]; then
+        RUN_FALLBACK=1
+    else
+        while IFS= read -r f; do
+            [[ -z "$f" ]] && continue
+            is_doc_only_path "$f" || RUN_FALLBACK=1
+        done <<<"$CHANGED"
+    fi
+    log "routing: repo=$REPO_NAME fallback-command run=$RUN_FALLBACK ($FALLBACK_CMD)"
+else
+    log "routing: repo=$REPO_NAME — no path rule and no --fallback-command"
+fi
+
+if [[ "$PRINT_ROUTING" -eq 1 ]]; then
+    case "$ROUTE_MODE" in
+        coordinator) printf 'ROUTING mode=coordinator pytest=%s cargo=%s\n' "$RUN_PY" "$RUN_RS" ;;
+        fallback)    printf 'ROUTING mode=fallback run=%s\n' "$RUN_FALLBACK" ;;
+        unknown)     printf 'ROUTING mode=unknown\n' ;;
+    esac
+    exit 0
+fi
+
+if [[ "$ROUTE_MODE" == "unknown" ]]; then
+    say "REFUSE: cannot determine what to test for repo '$REPO_NAME' — no path routing rule for it and no configured test_command (--fallback-command) was passed. This must never be recorded as skipped; add test_command to coordinator.yml for this repo, or extend this script's routing."
+    exit 1
+fi
+
+if { [[ "$ROUTE_MODE" == "coordinator" ]] && [[ "$RUN_PY" -eq 0 && "$RUN_RS" -eq 0 ]]; } \
+   || { [[ "$ROUTE_MODE" == "fallback" ]] && [[ "$RUN_FALLBACK" -eq 0 ]]; }; then
+    say "SKIP: nothing to test — no test-bearing paths changed (docs/config only): $(changed_list)"
     exit 0
 fi
 
@@ -223,6 +310,27 @@ run_rust() {
     return 1
 }
 
+# ── fallback (any repo's own configured test_command) ───────────────────────
+#
+# One suite, no flake filtering — this script does not know the failure-report
+# format of an arbitrary command, so a fallback failure is always reported as
+# genuine rather than flake-retried. The repo builds and tests itself; unlike
+# claude-coordinator's tui/ there is no known cross-repo path dep to wire up
+# here (if one shows up for a given repo, that repo earns its own case here).
+run_fallback() {
+    local out="$WT/.fallback.out"
+    local rc=0
+    log "running: $FALLBACK_CMD"
+    (cd "$WT" && bash -lc "$FALLBACK_CMD") >"$out" 2>&1 || rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+        say "PASS(fallback): $FALLBACK_CMD"
+        return 0
+    fi
+    say "FAIL(fallback): $FALLBACK_CMD exited $rc"
+    tail -n 40 "$out" | sed 's/^/      /'
+    return 1
+}
+
 # ── drive ────────────────────────────────────────────────────────────────────
 
 if [[ "$RUN_PY" -eq 1 ]]; then
@@ -230,6 +338,9 @@ if [[ "$RUN_PY" -eq 1 ]]; then
 fi
 if [[ "$RUN_RS" -eq 1 ]]; then
     run_rust || FAILED_SUITES+=("rust")
+fi
+if [[ "$RUN_FALLBACK" -eq 1 ]]; then
+    run_fallback || FAILED_SUITES+=("fallback")
 fi
 
 if [[ ${#FLAKES[@]} -gt 0 ]]; then
