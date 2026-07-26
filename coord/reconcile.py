@@ -690,7 +690,6 @@ def reconcile(board: Board, config: Config) -> list[str]:
             agent_completed[e["id"]] = e
 
     changed: list[str] = []
-    newly_done_work: list = []  # assignments that just transitioned work → done
     newly_failed: list = []  # assignments that just transitioned to failed
 
     # Sweep for dead interactive (--interactive / claude-pty) sessions before
@@ -744,9 +743,11 @@ def reconcile(board: Board, config: Config) -> list[str]:
                     # Always mark work(-like) completions as pending review so
                     # the dispatch loop below (and future reconcile passes)
                     # can pick them up reliably. #930: "mock-author" is
-                    # work-like too — see WORK_LIKE_TYPES.
+                    # work-like too — see WORK_LIKE_TYPES. (#1426: Test-stage
+                    # dispatch no longer needs its own "just transitioned"
+                    # list — dispatch_pending_smoke scans the full completed
+                    # backlog, the same shape as dispatch_pending_reviews.)
                     done.review_state = "pending"
-                    newly_done_work.append(done)
                 elif done.type == "review":
                     # A review finished — update the original work assignment.
                     orig_id = done.review_of_assignment_id
@@ -828,28 +829,25 @@ def reconcile(board: Board, config: Config) -> list[str]:
         if review.assignment_id is not None:
             changed.append(review.assignment_id)
 
-    # Auto-queue smoke tests for any work assignments that just finished.
-    # Independent of review dispatch — both can fire for the same completion.
+    # Auto-queue smoke tests for any completed work-like assignment still
+    # missing a test verdict. Independent of review dispatch — both can fire
+    # for the same completion.
     #
-    # #685: per-issue test-mode policy gates auto-smoke dispatch.
-    #   test-mode:auto  → headless smoke (auto-dispatch here, current behaviour).
-    #   test-mode:smoke → skip; the TUI will offer the interactive smoke agent.
-    #   no label        → no policy set (pre-#685 dispatch) → respect auto_queue
-    #                     as before (backward-compatible).
-    smoke_cfg = getattr(config, "smoke_tests", None)
-    if smoke_cfg is not None and smoke_cfg.auto_queue:
-        from coord.smoke import dispatch_smoke
-        from coord.state import get_issue_test_mode
+    # #1426: routed through `dispatch_pending_smoke`, the single choke point
+    # `reconcile()` and `coord notify` both call (mirroring
+    # `dispatch_pending_reviews` for the Review stage) — it scans the FULL
+    # completed backlog, not just this pass's `newly_done_work`, so a row
+    # that was missed on an earlier pass (e.g. no capable machine existed
+    # yet) is retried here automatically instead of staying stuck forever.
+    # `dispatch_pending_smoke` itself enforces `smoke_tests.auto_queue`, the
+    # #685 per-issue test-mode gate (test-mode:smoke skips auto-dispatch —
+    # the TUI offers the interactive smoke agent instead), and the
+    # has_active_followup dedupe.
+    from coord.smoke import dispatch_pending_smoke
 
-        for completed in newly_done_work:
-            test_mode = get_issue_test_mode(completed.repo_name, completed.issue_number)
-            if test_mode == "smoke":
-                # Interactive-smoke mode: the TUI raises the --smoke-of offer;
-                # don't auto-dispatch here.
-                continue
-            smoke = dispatch_smoke(completed, board, config)
-            if smoke is not None and smoke.assignment_id is not None:
-                changed.append(smoke.assignment_id)
+    for smoke in dispatch_pending_smoke(board, config):
+        if smoke.assignment_id is not None:
+            changed.append(smoke.assignment_id)
 
     # Auto-reassign failed work assignments to a different machine.
     if newly_failed and getattr(config.concurrency, "auto_reassign", False):

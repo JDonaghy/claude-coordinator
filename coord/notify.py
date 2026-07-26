@@ -1199,6 +1199,28 @@ def post_orphaned_review_findings(
     return posted_ids
 
 
+def _dispatch_board_pending_smoke(config: Config) -> None:
+    """Load the board, dispatch any pending Test-stage smoke, and save.
+
+    #1426: `dispatch_pending_smoke` (:mod:`coord.smoke`) was previously only
+    ever called from `reconcile()`'s per-item loop, and the ONLY sanctioned
+    caller of the full `reconcile()` is `coord resume`, a human-invoked
+    command. A thin-client setup driven purely by `coord-notify.timer` (which
+    calls `notify.run()`, not `reconcile()`) never dispatched the Test stage
+    at all — the exact gap `scripts/drive-issue.sh` had to paper over with a
+    local `scripts/coord-test-runner.sh` subprocess (#1395). Mirrors
+    :func:`_dispatch_board_pending_reviews` exactly, and is safe to call even
+    when the board file doesn't exist.
+    """
+    from coord.board_service import read_board, write_board
+    from coord.smoke import dispatch_pending_smoke
+
+    board = read_board()
+    dispatched = dispatch_pending_smoke(board, config)
+    if dispatched:
+        write_board(board)
+
+
 def _dispatch_board_pending_reviews(config: Config) -> None:
     """Load the board, dispatch any pending reviews, and save.
 
@@ -1304,6 +1326,17 @@ def run(
             needs_attention_posted.append(detection)
     except Exception:  # noqa: BLE001
         log.exception("detect_needs_attention: unexpected error")
+
+    # Dispatch pending Test-stage smoke from the saved board (#1426;
+    # best-effort, non-fatal). Runs BEFORE review dispatch to mirror the
+    # pipeline's Work -> Test -> Review order, though ordering isn't load-
+    # bearing here: dispatch_pending_reviews already holds review dispatch
+    # until test_state is passed/skipped regardless of which runs first in
+    # a given pass.
+    try:
+        _dispatch_board_pending_smoke(config)
+    except Exception:  # noqa: BLE001
+        pass
 
     # Dispatch pending reviews from the saved board (best-effort, non-fatal).
     try:
