@@ -152,7 +152,36 @@ never advances.
 
 ---
 
-## 8. The unattended driver (`scripts/`)
+## 8. `coordinator.remote.yml` is a cache — your config edit will revert
+
+On a thin client, `coord config` resolves to `~/.coord/coordinator.remote.yml`.
+That file is **not** the config. It is a cache
+(`coord.client.REMOTE_CONFIG_CACHE`, `client.py:38`) re-fetched from the
+daemon's `GET /config` on essentially every thin-client command and overwritten
+wholesale.
+
+Edit it and the change disappears — usually within seconds, because the command
+you run to *verify* the edit is itself a re-fetch. Both the edit and its
+disappearance are silent. When this happened during the #1426 cutover the first
+suspect was a concurrently-running agent; the actual culprit was the `coord
+config` used to check the work.
+
+Fleet config is edited on the **daemon host**:
+
+```bash
+coord sessions --remote        # MUST be empty — restart breaks interactive finalize
+ssh <daemon-host> 'vi ~/.coord/coordinator.yml'
+ssh <daemon-host> 'XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart coord-serve'
+coord config                   # re-caches from the daemon
+```
+
+Then read the refreshed local cache back: if it shows the new value, the edit
+*and* the daemon reload are both proven in one step. Note that the daemon does
+not hot-reload — without the restart the file is changed and nothing uses it.
+
+---
+
+## 9. The unattended driver (`scripts/`)
 
 `scripts/drive-issue.sh` drives one issue Work → Test → Review → Merge with
 nothing watching, using only normal `coord` commands. It is resumable — re-run
