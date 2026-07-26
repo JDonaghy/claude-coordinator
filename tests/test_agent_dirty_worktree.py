@@ -20,12 +20,16 @@ Two halves are tested here:
 
 from __future__ import annotations
 
+import shutil
 import subprocess
+import threading
+import time
 import uuid
 from pathlib import Path
 
 import pytest
 
+import coord.agent as agent_mod
 from coord.agent import (
     ADVISORY,
     DONE,
@@ -377,6 +381,126 @@ def test_cancelled_mid_edit_worker_keeps_its_work(tmp_path: Path) -> None:
     server.cancel(a.id)
 
     assert _git(repo, "show", "issue-1394-cancel:half_done.py") == "interrupted"
+
+
+# ── #1424: worktree vanishes mid-rescue / concurrent teardown ────────────────
+
+def test_worktree_vanishing_mid_rescue_is_recorded_not_raised(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """#1424: if the worktree directory disappears between the dirt check and
+    the `git add` that stages it for the WIP rescue commit, `subprocess.run`
+    raises `FileNotFoundError` on the vanished *cwd* — not `_GitError` or
+    `subprocess.TimeoutExpired`. Before the fix this escaped
+    `_rescue_uncommitted_work`'s except clause entirely and surfaced as an
+    unhandled exception on the reap thread (observed in CI as
+    `PytestUnhandledThreadExceptionWarning`), losing the work with no
+    advisory recorded at all — see the traceback quoted in #1424.
+
+    Reproduces the vanishing-directory race deterministically by having a
+    patched `_worktree_dirt` (the first thing `_rescue_uncommitted_work`
+    calls) remove the directory as a side effect right after computing the
+    real dirt count — simulating a concurrent teardown winning the TOCTOU
+    window between the dirt check and the `git add`.
+    """
+    repo = _init_local_repo(tmp_path / "repo")
+    wt = tmp_path / "wt"
+    _git(repo, "worktree", "add", "-b", "issue-1424-vanish", str(wt), "HEAD")
+    (wt / "important_fix.py").write_text("the fix\n")
+
+    real_worktree_dirt = agent_mod._worktree_dirt
+
+    def _dirt_then_vanish(path: Path) -> tuple[int, int] | None:
+        result = real_worktree_dirt(path)
+        shutil.rmtree(path, ignore_errors=True)
+        return result
+
+    monkeypatch.setattr(agent_mod, "_worktree_dirt", _dirt_then_vanish)
+
+    server = _server(tmp_path, repo)
+    a = _make_assignment(repo, wt, branch="issue-1424-vanish")
+    server._assignments[a.id] = a
+
+    server._cleanup_worktree(a)  # must not raise
+
+    assert a.dirty_worktree_reason is not None
+    assert "could not be staged" in a.dirty_worktree_reason
+    assert "kept" in a.dirty_worktree_reason
+
+
+def test_concurrent_cleanup_calls_for_same_assignment_are_serialized(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """#1424: `cancel()` (synchronous) and the `_reap` thread can both reach
+    `_cleanup_worktree` for the SAME assignment — cancel() kills the worker
+    process and tears down immediately, while the reap thread (unblocked by
+    that same process exit) runs its own teardown moments later. Without
+    serialization the two race through `wt_path.exists()` -> rescue -> `git
+    worktree remove`/`rmtree` on the same directory — the TOCTOU behind this
+    issue. This drives two threads through `_cleanup_worktree` concurrently
+    for one assignment (widening the race window via a patched
+    `_worktree_dirt`) and asserts the rescue never runs from both threads at
+    once, and that neither call raises.
+    """
+    repo = _init_local_repo(tmp_path / "repo")
+    wt = tmp_path / "wt"
+    _git(repo, "worktree", "add", "-b", "issue-1424-race", str(wt), "HEAD")
+    (wt / "important_fix.py").write_text("the fix\n")
+
+    server = _server(tmp_path, repo)
+    a = _make_assignment(repo, wt, branch="issue-1424-race")
+    server._assignments[a.id] = a
+
+    real_worktree_dirt = agent_mod._worktree_dirt
+    state_lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    def _slow_dirt(path: Path) -> tuple[int, int] | None:
+        nonlocal active, max_active
+        with state_lock:
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            # Widen the race window so a second, unserialized call to
+            # `_cleanup_worktree` would reliably land inside this one's
+            # rescue — reproducing the TOCTOU without the fix.
+            time.sleep(0.1)
+            if path.exists():
+                return real_worktree_dirt(path)
+            return None
+        finally:
+            with state_lock:
+                active -= 1
+
+    monkeypatch.setattr(agent_mod, "_worktree_dirt", _slow_dirt)
+
+    errors: list[BaseException] = []
+
+    def _run() -> None:
+        try:
+            server._cleanup_worktree(a)
+        except BaseException as e:  # noqa: BLE001 - captured for assertion
+            errors.append(e)
+
+    threads = [threading.Thread(target=_run) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert not any(t.is_alive() for t in threads), "cleanup thread hung"
+    assert not errors, f"_cleanup_worktree raised: {errors!r}"
+    assert max_active == 1, (
+        "both threads ran the dirty-worktree rescue concurrently — "
+        "_cleanup_worktree is not serialized per assignment"
+    )
+
+    # Exactly one WIP rescue commit landed — not zero (work lost) and not a
+    # duplicate/corrupt state from two threads racing the same git ops.
+    subjects = _git(repo, "log", "--format=%s", "issue-1424-race").splitlines()
+    wip_commits = [s for s in subjects if _WIP_COMMIT_PREFIX in s]
+    assert len(wip_commits) == 1, f"expected exactly 1 WIP commit, got: {subjects!r}"
 
 
 # ── End-to-end: the exact #1394 scenario through assign() → reap ─────────────

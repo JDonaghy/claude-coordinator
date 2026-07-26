@@ -2562,6 +2562,30 @@ class AgentServer:
         self._assignments: dict[str, AgentAssignment] = {}
         self._processes: dict[str, subprocess.Popen] = {}
         self._threads: dict[str, threading.Thread] = {}
+        # #1424: per-assignment lock serializing `_cleanup_worktree`. Both
+        # `cancel()` (synchronously, right after marking CANCELLED) and the
+        # `_reap` background thread (unblocked by the same SIGTERM-driven
+        # process exit, at the end of its own teardown) can reach
+        # `_cleanup_worktree` for the SAME assignment. Without serialization
+        # the two calls race through `wt_path.exists()` → rescue → `git
+        # worktree remove` on the same directory, and one thread's `git add`/
+        # `commit` can start after the other has already removed it — a
+        # TOCTOU that surfaces as an unhandled `FileNotFoundError`. Created
+        # lazily per assignment id; pruned alongside `_assignments` in
+        # `_prune_completed_history`.
+        self._cleanup_locks: dict[str, threading.Lock] = {}
+        # #1424: signals that `_reap` (and therefore `_cleanup_worktree`,
+        # which it calls near the end) has fully finished for an assignment.
+        # `_reap` flips `assignment.status` out of RUNNING/PENDING partway
+        # through — well BEFORE the worktree teardown/WIP-rescue-commit/push
+        # that follows it — so a caller (originally `wait_for`, a test
+        # helper, but the same trap would bite any real caller) that treats
+        # "status is terminal" as "fully done" can observe the assignment
+        # before its uncommitted work has actually been rescued onto the
+        # branch. One `threading.Event` per assignment id, created when the
+        # reap thread is spawned and set in `_reap_guarded`'s `finally` once
+        # `_reap` returns (success or exception) — see `wait_for`.
+        self._reap_complete: dict[str, threading.Event] = {}
 
         # Cache for /health worktree_bytes — recomputing it walks every
         # file under ~/.coord/worktrees on every /health call, which is
@@ -3644,15 +3668,35 @@ class AgentServer:
         return parse_progress(a.log_path).to_dict()
 
     def wait_for(self, assignment_id: str, timeout: float = 10.0) -> AgentAssignment:
-        """Block until an assignment leaves RUNNING. Test helper."""
+        """Block until an assignment leaves RUNNING *and* its teardown is done.
+
+        Test helper.
+
+        #1424: `_reap` flips `assignment.status` out of RUNNING/PENDING well
+        before it finishes — worktree cleanup, the WIP-rescue commit for
+        uncommitted work, and its push all happen afterward, in the same
+        background thread. A caller that returns as soon as `status` looks
+        terminal can observe the assignment mid-teardown: exactly the flake
+        behind `test_end_to_end_worker_exits_with_uncommitted_work`, whose
+        assertion on the *remote* branch raced the rescue commit's push. So
+        this also waits for `_reap_complete[assignment_id]` (set in
+        `_reap_guarded`'s `finally`) when one was registered — i.e. when a
+        reap thread was actually spawned for this assignment. Some failure
+        paths (e.g. `_pull_then_spawn` failing before `_spawn` ever runs)
+        mark an assignment FAILED without ever starting a reap thread; for
+        those there is nothing to wait for, so a missing event is treated as
+        "already done" rather than blocking until the timeout.
+        """
         deadline = time.time() + timeout
         while time.time() < deadline:
             with self._lock:
                 a = self._assignments.get(assignment_id)
+                event = self._reap_complete.get(assignment_id)
             if a is None:
                 raise KeyError(assignment_id)
             if a.status != RUNNING and a.status != PENDING:
-                return a
+                if event is None or event.is_set():
+                    return a
             time.sleep(0.05)
         raise TimeoutError(f"assignment {assignment_id} still {a.status} after {timeout}s")
 
@@ -3990,12 +4034,20 @@ class AgentServer:
 
         try:
             _git(wt_path, "add", "-A", timeout=60.0)
-        except (_GitError, subprocess.TimeoutExpired) as e:
+        except (_GitError, subprocess.TimeoutExpired, OSError) as e:
+            # #1424: OSError (typically FileNotFoundError on *cwd*) fires when
+            # the worktree directory vanishes between the `_worktree_dirt`
+            # check above and this call — e.g. a concurrent `_cleanup_worktree`
+            # for the same assignment (cancel() + the reap thread can both
+            # reach here). `subprocess.run(cwd=wt_path)` raises OSError, not
+            # `_GitError`, so it has to be caught here explicitly or it
+            # escapes as an unhandled exception on a background thread and
+            # the work is lost with no advisory at all.
             reason = (
                 f"{total} uncommitted file(s) could not be staged ({e}); "
                 f"worktree {wt_path} kept — recover the work manually"
             )
-            self._log_line(assignment, f"# cleanup: {reason} (#1394)")
+            self._log_line(assignment, f"# cleanup: {reason} (#1394) (#1424)")
             self._record_dirty_worktree(assignment, reason)
             return False
 
@@ -4004,10 +4056,13 @@ class AgentServer:
         try:
             _git(wt_path, *commit_args, timeout=60.0)
             committed = True
-        except (_GitError, subprocess.TimeoutExpired):
+        except (_GitError, subprocess.TimeoutExpired, OSError):
             # Most likely no committer identity configured on this agent.
             # Retry with a fallback identity rather than lose the work; `-c`
             # overrides only this invocation and never touches repo config.
+            # #1424: also reached if the worktree vanished mid-add/commit
+            # (OSError) — the retry below will hit the same OSError and fall
+            # through to the handler that records the dirty-worktree reason.
             try:
                 _git(
                     wt_path,
@@ -4017,13 +4072,13 @@ class AgentServer:
                     timeout=60.0,
                 )
                 committed = True
-            except (_GitError, subprocess.TimeoutExpired) as e2:
+            except (_GitError, subprocess.TimeoutExpired, OSError) as e2:
                 reason = (
                     f"{total} uncommitted file(s) could not be committed "
                     f"({e2}); worktree {wt_path} kept — recover the work "
                     "manually"
                 )
-                self._log_line(assignment, f"# cleanup: {reason} (#1394)")
+                self._log_line(assignment, f"# cleanup: {reason} (#1394) (#1424)")
                 self._record_dirty_worktree(assignment, reason)
                 return False
 
@@ -4037,7 +4092,7 @@ class AgentServer:
         try:
             _git(wt_path, "push", "-u", "origin", "HEAD", timeout=60.0)
             pushed = True
-        except (_GitError, subprocess.TimeoutExpired) as e:
+        except (_GitError, subprocess.TimeoutExpired, OSError) as e:
             self._log_line(
                 assignment, f"# cleanup: WIP rescue push failed ({e}) (#1394)"
             )
@@ -4057,6 +4112,32 @@ class AgentServer:
         self._record_dirty_worktree(assignment, reason)
         return True
 
+    def _cleanup_lock_for(self, assignment_id: str) -> threading.Lock:
+        """Return the (lazily-created) teardown lock for *assignment_id*.
+
+        #1424: see the `_cleanup_locks` comment in `__init__` for why this
+        exists — it serializes `cancel()` and `_reap()` when both race to
+        clean up the same assignment's worktree.
+        """
+        with self._lock:
+            lock = self._cleanup_locks.get(assignment_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._cleanup_locks[assignment_id] = lock
+            return lock
+
+    def _reap_complete_event(self, assignment_id: str) -> threading.Event:
+        """Return the (lazily-created) reap-completion event for *assignment_id*.
+
+        #1424: see the `_reap_complete` comment in `__init__`.
+        """
+        with self._lock:
+            event = self._reap_complete.get(assignment_id)
+            if event is None:
+                event = threading.Event()
+                self._reap_complete[assignment_id] = event
+            return event
+
     def _cleanup_worktree(self, assignment: AgentAssignment) -> None:
         """Remove the worktree for a finished assignment. Best-effort.
 
@@ -4071,9 +4152,20 @@ class AgentServer:
         rescued into a WIP commit on the assignment branch (work-authoring
         assignment types) or kept on disk, and the outcome is recorded on the
         assignment — see :meth:`_rescue_uncommitted_work`.
+
+        #1424: the whole body runs under a per-assignment lock (see
+        `_cleanup_lock_for`) because `cancel()` and the `_reap` thread can
+        both call this for the same assignment — without serialization the
+        `wt_path.exists()` check here is a TOCTOU against the other thread's
+        `git worktree remove`/`rmtree`.
         """
         if not assignment.worktree_path:
             return
+        with self._cleanup_lock_for(assignment.id):
+            self._cleanup_worktree_locked(assignment)
+
+    def _cleanup_worktree_locked(self, assignment: AgentAssignment) -> None:
+        """Body of `_cleanup_worktree`, run under the assignment's lock."""
         wt_path = Path(assignment.worktree_path)
         repo_path = Path(assignment.spec.repo_path).expanduser()
 
@@ -4291,8 +4383,17 @@ class AgentServer:
             assignment.started_at = time.time()
             self._processes[assignment.id] = proc
 
+        # #1424: register (unset) the reap-completion event BEFORE starting
+        # the thread, not lazily inside `_reap_guarded`. `wait_for` treats a
+        # missing event as "no reap thread was ever spawned for this
+        # assignment, nothing to wait for" — if the entry only appeared once
+        # the thread reached its `finally` clause, a `wait_for` call that
+        # raced the thread start would misread "hasn't gotten there yet" as
+        # "never going to happen" and return before teardown/rescue actually
+        # finished, which is the exact race this event exists to close.
+        self._reap_complete_event(assignment.id)
         thread = threading.Thread(
-            target=self._reap,
+            target=self._reap_guarded,
             args=(assignment.id, proc, log_fh, assignment.log_path),
             daemon=True,
             name=f"agent-reap-{assignment.id}",
@@ -4671,8 +4772,17 @@ class AgentServer:
             assignment.started_at = time.time()
             self._processes[assignment.id] = proc
 
+        # #1424: register (unset) the reap-completion event BEFORE starting
+        # the thread, not lazily inside `_reap_guarded`. `wait_for` treats a
+        # missing event as "no reap thread was ever spawned for this
+        # assignment, nothing to wait for" — if the entry only appeared once
+        # the thread reached its `finally` clause, a `wait_for` call that
+        # raced the thread start would misread "hasn't gotten there yet" as
+        # "never going to happen" and return before teardown/rescue actually
+        # finished, which is the exact race this event exists to close.
+        self._reap_complete_event(assignment.id)
         thread = threading.Thread(
-            target=self._reap,
+            target=self._reap_guarded,
             args=(assignment.id, proc, log_fh, assignment.log_path),
             daemon=True,
             name=f"agent-reap-{assignment.id}",
@@ -4690,6 +4800,42 @@ class AgentServer:
         so the two callers share a single implementation.
         """
         return _commits_ahead(wt_path, base)
+
+    def _reap_guarded(
+        self,
+        assignment_id: str,
+        proc: subprocess.Popen,
+        log_fh,
+        log_path: str,
+    ) -> None:
+        """Run `_reap`, logging (never silently swallowing) any exception.
+
+        #1424: `_reap` runs on a daemon thread with no caller to propagate
+        an exception to. An uncaught exception there (e.g. the
+        `FileNotFoundError` from `_rescue_uncommitted_work` racing a
+        worktree that vanished mid-teardown) previously surfaced only via
+        Python's default `threading.excepthook` dump to stderr — in tests
+        that shows up as a `PytestUnhandledThreadExceptionWarning`; in
+        production, with nothing watching that stderr, it is simply gone.
+        Logging at ERROR here routes it through this process's normal
+        logging config instead, without changing `_reap`'s behaviour on the
+        happy path.
+
+        The `finally` also sets this assignment's reap-completion event —
+        regardless of whether `_reap` returned normally or raised — so
+        `wait_for` can tell "status flipped terminal" apart from "teardown
+        (worktree cleanup + WIP rescue commit/push) has actually finished".
+        """
+        try:
+            self._reap(assignment_id, proc, log_fh, log_path)
+        except Exception:
+            _log.error(
+                "agent-reap-%s: unhandled exception in _reap",
+                assignment_id,
+                exc_info=True,
+            )
+        finally:
+            self._reap_complete_event(assignment_id).set()
 
     def _reap(
         self,
@@ -4956,6 +5102,17 @@ class AgentServer:
 
         Caller must hold self._lock (or call from __init__ before threads
         start).  Active (pending/running) assignments are never pruned.
+
+        #1424: also drops the pruned ids' `_cleanup_locks` and
+        `_reap_complete` entries, so neither per-assignment dict grows
+        unbounded over a long-running agent's lifetime. Skips any lock
+        still held — pruning can race with `_cleanup_worktree` if a
+        `_reap`/`cancel()` teardown is mid-flight for an old id — leaving it
+        for the next prune pass rather than risk dropping a lock a thread is
+        currently using for mutual exclusion. The reap-completion event has
+        no "still in use" check (an `Event` can't report waiters) but by the
+        time an id is old enough to be pruned its reap thread has long since
+        finished and set it, so dropping it is safe.
         """
         terminal = [
             a for a in self._assignments.values()
@@ -4972,6 +5129,10 @@ class AgentServer:
             )
             for old in terminal[_COMPLETED_HISTORY_CAP:]:
                 self._assignments.pop(old.id, None)
+                lock = self._cleanup_locks.get(old.id)
+                if lock is not None and not lock.locked():
+                    self._cleanup_locks.pop(old.id, None)
+                self._reap_complete.pop(old.id, None)
 
     def _persist(self) -> None:
         with self._lock:
