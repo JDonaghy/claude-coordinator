@@ -815,6 +815,12 @@ def record_test_verdict(
     The single-row analogue of the ``coord test`` ``save_board`` write, used so a
     thin client (and the TUI's verdict key) can record a verdict to the shared DB
     without rewriting the whole board.
+
+    ``smoke_test``/``smoke_test_reason`` are **optional** (#1384): omit them and
+    the writer derives the legacy mirror from ``test_state``
+    (``passed``→``pass``, ``failed``→``fail``, ``skipped``→ untouched).  Both
+    the local and the daemon ``/test-verdict`` route funnel through
+    :func:`_record_test_verdict_local`, so the derivation applies either way.
     """
     svc = _board_service()
     resp = _route_write(
@@ -847,14 +853,40 @@ def _record_test_verdict_local(
     smoke_test: str | None = None,
     smoke_test_reason: str | None = None,
 ) -> None:
-    """UPDATE the assignment's test_state/test_reason (+ smoke_test mirror)."""
+    """UPDATE the assignment's test_state/test_reason (+ smoke_test mirror).
+
+    #1384: the legacy ``smoke_test`` mirror is **derived from ``test_state``**
+    whenever the caller does not supply one, instead of being left NULL.  The
+    mirror is not decoration — ``coord fix`` (and the ``--fix-of`` front door)
+    gate on ``smoke_test == "fail"``, so a ``test_state='failed'`` row without
+    the mirror is a dead end: the merge gate blocks correctly, the TUI shows
+    Red correctly, and the one command that would dispatch a fix refuses.
+    Deriving here (the single writer both the local and daemon ``/test-verdict``
+    paths funnel through) fixes every present and future caller at once, rather
+    than relying on each one to remember — the trap that #1021's headless smoke
+    propagation in ``coord/notify.py`` fell into.
+
+    Derivation matches ``coord test`` and the TUI's ``record_test_verdict_conn``
+    (``tui/src/app/settings_ui.rs``): ``passed``→``pass``, ``failed``→``fail``
+    (carrying ``test_reason`` as the smoke reason), ``skipped``→ leave the
+    mirror untouched.
+    """
+    if smoke_test is None:
+        # Derive the legacy mirror from the canonical verdict.
+        if test_state == "passed":
+            smoke_test, smoke_test_reason = "pass", None
+        elif test_state == "failed":
+            smoke_test, smoke_test_reason = "fail", test_reason
+        # "skipped" (and any unknown state) leaves smoke_test NULL — the same
+        # choice `coord test --skipped` makes.
+
     conn = get_connection()
     conn.execute(
         "UPDATE assignments SET test_state=?, test_reason=? WHERE assignment_id=?",
         (test_state, test_reason, assignment_id),
     )
-    # Mirror to legacy smoke_test only when a value was supplied (pass/fail),
-    # matching coord test / the TUI's record_test_verdict_conn.
+    # Mirror to legacy smoke_test only for pass/fail, matching coord test /
+    # the TUI's record_test_verdict_conn.
     if smoke_test is not None:
         conn.execute(
             "UPDATE assignments SET smoke_test=?, smoke_test_reason=? "

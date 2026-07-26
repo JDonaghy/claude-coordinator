@@ -483,8 +483,8 @@ class TestFix:
     def test_fix_on_non_failed_errors(
         self, config_file: Path, coord_dir: Path
     ) -> None:
-        """coord fix fails when smoke_test is not 'fail'."""
-        assignment = _done_assignment(smoke_test="pass")
+        """coord fix fails when the test verdict is a pass, not a fail."""
+        assignment = _done_assignment(smoke_test="pass", test_state="passed")
         board = _make_board(assignment)
         state_mod.save_board(board)
 
@@ -493,12 +493,12 @@ class TestFix:
             ["fix", "abc-123", "--config", str(config_file)],
         )
         assert result.exit_code != 0
-        assert "expected 'fail'" in result.output.lower() or "pass" in result.output.lower()
+        assert "expected a failed test verdict" in result.output.lower()
 
     def test_fix_on_no_smoke_test_errors(
         self, config_file: Path, coord_dir: Path
     ) -> None:
-        """coord fix fails when no smoke test has been recorded."""
+        """coord fix fails when no test verdict has been recorded at all."""
         assignment = _done_assignment(smoke_test=None)
         board = _make_board(assignment)
         state_mod.save_board(board)
@@ -508,7 +508,143 @@ class TestFix:
             ["fix", "abc-123", "--config", str(config_file)],
         )
         assert result.exit_code != 0
-        assert "expected 'fail'" in result.output.lower() or "none" in result.output.lower()
+        assert "expected a failed test verdict" in result.output.lower()
+
+    def test_fix_accepts_test_state_failed_without_mirror(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """#1384: a legacy row with test_state='failed' but smoke_test=NULL.
+
+        Rows recorded by #1021's headless-smoke propagation *before* the
+        writer learned to derive the mirror carry only ``test_state``.
+        ``coord fix`` reads ``test_state`` with ``smoke_test`` as fallback,
+        so those rows stay fixable instead of being a permanent dead end.
+        """
+        assignment = _done_assignment(
+            smoke_test=None,
+            smoke_test_reason=None,
+            test_state="failed",
+            test_reason="headless smoke",
+        )
+        board = _make_board(assignment)
+        state_mod.save_board(board)
+
+        captured = {}
+
+        def fake_dispatch(proposal, config, **kwargs):
+            captured["briefing"] = proposal.briefing
+            return {"id": "fix-1384"}
+
+        with patch("coord.dispatch.dispatch", side_effect=fake_dispatch), \
+             patch("coord.github_ops.post_issue_comment"):
+            result = CliRunner().invoke(
+                main,
+                ["fix", "abc-123", "--config", str(config_file)],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "fix-1384" in result.output
+        # test_reason is the only failure story on such a row — it must reach
+        # the fix worker's briefing.
+        assert "headless smoke" in captured["briefing"]
+
+    def test_headless_smoke_failure_to_fix_handoff(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """#1384 acceptance: notify(smoke, exit!=0) → `coord fix` dispatches.
+
+        The end-to-end handoff between coord's only headless producer of a
+        FAILED Test verdict (``notify.post_transition`` for a ``type="smoke"``
+        completion, #1021) and its only headless test-fail → fix path
+        (``coord fix``).  Before #1384 the producer wrote
+        ``test_state='failed'`` with ``smoke_test=NULL`` and ``coord fix``
+        exited 1 with "smoke_test is None, expected 'fail'".
+        """
+        from coord.models import Assignment as _A
+        from coord.notify import EVENT_COMPLETION, Transition, post_transition
+        from coord.state import (
+            _record_dispatched_assignment_local,
+            get_connection,
+        )
+
+        # The parent work row (done, no verdict yet).
+        work = _done_assignment()
+        state_mod.save_board(_make_board(work))
+
+        # The headless smoke assignment that points back at it.
+        _record_dispatched_assignment_local(
+            assignment=_A(
+                assignment_id="smoke-1384",
+                machine_name="laptop",
+                repo_name="api",
+                issue_number=42,
+                issue_title="[smoke] Add feature X",
+                type="smoke",
+                status="running",
+                review_of_assignment_id="abc-123",
+                branch="issue-42-feature-x",
+            ),
+            repo_github="acme/api",
+        )
+
+        transition = Transition(
+            assignment_id="smoke-1384",
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=42,
+            event=EVENT_COMPLETION,
+            exit_code=1,
+        )
+        record = {
+            "repo_github": "acme/api",
+            "type": "smoke",
+            "review_of_assignment_id": "abc-123",
+        }
+        entry = {
+            "started_at": 1000.0,
+            "finished_at": 1010.0,
+            "branch": "issue-42-feature-x",
+            "log_path": None,
+        }
+
+        with (
+            patch("coord.notify.post_completion"),
+            patch("coord.notify.mark_notified"),
+            patch("coord.notify._capture_cost"),
+            patch("coord.notify._capture_smoke_tests"),
+            patch("coord.notify._capture_completion_summary"),
+            patch("coord.notify._capture_claude_session_id"),
+        ):
+            post_transition(transition, record, entry)
+
+        # (a) BOTH columns are written on the parent work row.
+        row = get_connection().execute(
+            "SELECT test_state, smoke_test FROM assignments WHERE assignment_id='abc-123'"
+        ).fetchone()
+        assert row["test_state"] == "failed"
+        assert row["smoke_test"] == "fail", (
+            "the legacy mirror must be derived so `coord fix` can see the verdict"
+        )
+
+        # (b) `coord fix` accepts that row and dispatches on the same branch.
+        captured = {}
+
+        def fake_dispatch(proposal, config, **kwargs):
+            captured["briefing"] = proposal.briefing
+            captured["machine"] = proposal.machine_name
+            return {"id": "fix-headless"}
+
+        with patch("coord.dispatch.dispatch", side_effect=fake_dispatch), \
+             patch("coord.github_ops.post_issue_comment"):
+            result = CliRunner().invoke(
+                main,
+                ["fix", "abc-123", "--config", str(config_file)],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "fix-headless" in result.output
+        assert "issue-42-feature-x" in captured["briefing"]  # same branch
+        assert "headless smoke" in captured["briefing"]  # the failure story
 
     def test_fix_not_found(
         self, config_file: Path, coord_dir: Path

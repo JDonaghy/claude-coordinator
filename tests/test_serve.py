@@ -2496,6 +2496,129 @@ def test_record_test_verdict_local_appends_context(coord_db):
     assert len(state._list_issue_context_local("api", 7)) == 1
 
 
+# ── #1384: the legacy smoke_test mirror is DERIVED when not supplied ──────────
+
+
+def _seed_verdict_row(conn, aid: str) -> None:
+    conn.execute(
+        "INSERT INTO assignments(assignment_id,machine_name,repo_name,issue_number,"
+        f"issue_title,status,type) VALUES('{aid}','m','api',7,'t','done','work')"
+    )
+    conn.commit()
+
+
+def _verdict_cols(conn, aid: str):
+    return conn.execute(
+        "SELECT test_state, smoke_test, smoke_test_reason FROM assignments "
+        "WHERE assignment_id=?",
+        (aid,),
+    ).fetchone()
+
+
+def test_verdict_writer_derives_smoke_fail_when_not_supplied(coord_db):
+    """#1384: test_state='failed' with no smoke_test= mirrors to 'fail'.
+
+    This is the #1021 headless-smoke call shape (``coord/notify.py``): it
+    passes no ``smoke_test=``.  Without derivation the row lands
+    ``smoke_test=NULL`` and ``coord fix`` refuses it — the headless
+    fail→fix path is a dead end.
+    """
+    from coord import state
+    _seed_verdict_row(coord_db, "hs1")
+
+    state._record_test_verdict_local(
+        assignment_id="hs1", test_state="failed", test_reason="headless smoke"
+    )
+
+    row = _verdict_cols(coord_db, "hs1")
+    assert row["test_state"] == "failed"
+    assert row["smoke_test"] == "fail", "the legacy mirror must be derived"
+    assert row["smoke_test_reason"] == "headless smoke"
+
+
+def test_verdict_writer_derives_smoke_pass_when_not_supplied(coord_db):
+    """#1384: test_state='passed' with no smoke_test= mirrors to 'pass'."""
+    from coord import state
+    _seed_verdict_row(coord_db, "hs2")
+
+    state._record_test_verdict_local(
+        assignment_id="hs2", test_state="passed", test_reason="headless smoke"
+    )
+
+    row = _verdict_cols(coord_db, "hs2")
+    assert row["test_state"] == "passed"
+    assert row["smoke_test"] == "pass"
+    # A pass carries no smoke reason (matches `coord test --passed`).
+    assert row["smoke_test_reason"] is None
+
+
+def test_verdict_writer_leaves_mirror_null_for_skipped(coord_db):
+    """#1384: 'skipped' leaves smoke_test NULL — same as `coord test --skipped`.
+
+    review.py's #1076/#1152 Gate-A auto-skip relies on this: `coord fix` only
+    gates on a FAILED verdict, so a skip must not manufacture a mirror.
+    """
+    from coord import state
+    _seed_verdict_row(coord_db, "hs3")
+
+    state._record_test_verdict_local(
+        assignment_id="hs3", test_state="skipped", test_reason="nothing to smoke"
+    )
+
+    row = _verdict_cols(coord_db, "hs3")
+    assert row["test_state"] == "skipped"
+    assert row["smoke_test"] is None
+
+
+def test_verdict_writer_explicit_mirror_still_wins(coord_db):
+    """#1384: an explicitly supplied mirror is used verbatim (no derivation).
+
+    The `coord test` CLI / dashboard / interactive-review paths all pass
+    the mirror explicitly — derivation must not change their behaviour.
+    """
+    from coord import state
+    _seed_verdict_row(coord_db, "hs4")
+
+    state._record_test_verdict_local(
+        assignment_id="hs4",
+        test_state="failed",
+        test_reason="long story",
+        smoke_test="fail",
+        smoke_test_reason="short reason",
+    )
+
+    row = _verdict_cols(coord_db, "hs4")
+    assert row["smoke_test"] == "fail"
+    assert row["smoke_test_reason"] == "short reason"
+
+
+def test_serve_test_verdict_derives_mirror_without_smoke_test(
+    file_db: Path, valid_config_path: Path, rw_db
+):
+    """#1384: the daemon /test-verdict route derives the mirror too.
+
+    A thin client (or anything POSTing the endpoint directly) that omits
+    ``smoke_test`` must land the same columns as the local writer.
+    """
+    _seed_running_assignment(rw_db, aid="work79")
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post(
+            "/test-verdict",
+            json={
+                "assignment_id": "work79",
+                "test_state": "failed",
+                "test_reason": "headless smoke",
+            },
+        )
+    assert resp.status_code == 200
+    row = rw_db.execute(
+        "SELECT test_state, smoke_test FROM assignments WHERE assignment_id='work79'"
+    ).fetchone()
+    assert row["test_state"] == "failed"
+    assert row["smoke_test"] == "fail"
+
+
 def test_post_result_request_changes_appends_context(coord_db, monkeypatch):
     # #603: a request-changes verdict auto-appends a context entry (source=review).
     from coord import issue_store, state
