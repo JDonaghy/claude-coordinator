@@ -9,7 +9,7 @@ import pytest
 from click.testing import CliRunner
 
 from coord.cli import main
-from coord.config import Config, ConcurrencyConfig
+from coord.config import Config, ConcurrencyConfig, ProviderDef, ProvidersConfig
 from coord.models import Assignment, Board, Machine, Repo
 from coord.reconcile import _reassign, describe_no_candidate_machines, reconcile
 from coord.state import save_board
@@ -268,7 +268,13 @@ class TestDescribeNoCandidateMachines:
         )
         board = Board(active=[phantom])
 
-        msg = describe_no_candidate_machines(failed, board, config)
+        # Explicitly mock the pause set — this repo is dogfooded on the
+        # operator's own real fleet (machines named elitebook/precision/
+        # laptop per coordinator.yml), so an unmocked `paused_set()` reads
+        # the real `~/.coord/paused_machines.json` on whatever box runs the
+        # suite (#1396 review finding 3).
+        with patch("coord.machine_pause.paused_set", return_value=set()):
+            msg = describe_no_candidate_machines(failed, board, config)
 
         assert "elitebook" in msg
         assert "busy" in msg
@@ -305,6 +311,61 @@ class TestDescribeNoCandidateMachines:
         msg = describe_no_candidate_machines(failed, Board(), config)
         assert "api" in msg
         assert "no machine" in msg
+
+    def test_fallback_same_machine_counts_as_free_candidate(self) -> None:
+        """#1396 review finding 1: the machine that just failed is a REAL
+        fallback candidate when it's idle (not busy/paused) — `_reassign`'s
+        fallback pass drops only the "different machine" constraint. The
+        message must not say "no available machine" in this case; it must
+        say a candidate existed and explain the actual failure.
+
+        Here the sole machine's resolved provider is `claude-pty`
+        (human_attended_only=True), so the diagnostic re-check hits the
+        TOS gate and the message must name it specifically.
+        """
+        config = Config(
+            repos=[Repo(name="api", github="a/a")],
+            machines=[
+                Machine(name="solo", host="s", repos=["api"], repo_paths={"api": "/tmp/a"}),
+            ],
+            providers=ProvidersConfig(
+                default="my-pty",
+                definitions={"my-pty": ProviderDef(type="claude-pty")},
+            ),
+        )
+        failed = Assignment(
+            machine_name="solo", repo_name="api", issue_number=1,
+            issue_title="x", assignment_id="a1", status="failed",
+        )
+        with patch("coord.machine_pause.paused_set", return_value=set()):
+            msg = describe_no_candidate_machines(failed, Board(), config)
+
+        assert "no available machine" not in msg
+        assert "TOS gate" in msg
+        assert "human_attended_only" in msg
+
+    def test_fallback_same_machine_dispatch_failure_message(self) -> None:
+        """Same fallback-candidate scenario, but with a provider that
+        passes the TOS gate — the message must describe a dispatch
+        failure, not repeat "no available machine" (#1396 review
+        finding 2: the old "check daemon logs" advice was a dead end
+        because neither failure path logged anything)."""
+        config = Config(
+            repos=[Repo(name="api", github="a/a")],
+            machines=[
+                Machine(name="solo", host="s", repos=["api"], repo_paths={"api": "/tmp/a"}),
+            ],
+        )
+        failed = Assignment(
+            machine_name="solo", repo_name="api", issue_number=1,
+            issue_title="x", assignment_id="a1", status="failed",
+        )
+        with patch("coord.machine_pause.paused_set", return_value=set()):
+            msg = describe_no_candidate_machines(failed, Board(), config)
+
+        assert "no available machine" not in msg
+        assert "candidate machine was available" in msg
+        assert "dispatch request failed" in msg
 
 
 # ── CLI retry command ───────────────────────────────────────────────────────
@@ -388,7 +449,12 @@ class TestCoordRetry:
         save_board(board)
 
         runner = CliRunner()
-        result = runner.invoke(main, ["retry", "a1", "--config", str(config_file)])
+        # Mocked for the same reason as test_names_busy_machine_and_age
+        # above — an unmocked real pause file would make "elitebook" read
+        # as paused instead of busy on a box where it's genuinely paused
+        # (#1396 review finding 3).
+        with patch("coord.machine_pause.paused_set", return_value=set()):
+            result = runner.invoke(main, ["retry", "a1", "--config", str(config_file)])
 
         assert result.exit_code != 0
         assert "elitebook" in result.output
