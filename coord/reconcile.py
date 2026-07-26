@@ -526,7 +526,15 @@ def describe_no_candidate_machines(
             lines.append(f"  {m.name}: busy ({'; '.join(parts)})")
             continue
         if m.name == failed.machine_name:
+            # `_reassign`'s fallback pass drops only the "different machine"
+            # constraint — it still honors busy/paused — so an idle machine
+            # that just failed IS a real fallback candidate (#1396 review
+            # finding 1). Categorize it as such; the "(fallback-only)" label
+            # stays in `lines` for readers of the busy/paused branch below,
+            # but this path never reaches that branch once a candidate is
+            # found.
             lines.append(f"  {m.name}: same machine that just failed (fallback-only)")
+            has_free_candidate = True
             continue
         has_free_candidate = True
 
@@ -535,10 +543,35 @@ def describe_no_candidate_machines(
 
     if has_free_candidate:
         # A machine WAS free per this filter — _reassign must have failed for
-        # a different reason (TOS-gate refusal or a dispatch POST error).
+        # a different reason: a TOS-gate refusal or a dispatch POST error.
+        # Re-run the same config-only gate check (no network call) so the
+        # message states the *actual* reason instead of a guess that may be
+        # a dead end (#1396 review finding 2 — "check daemon logs" pointed
+        # nowhere, since neither failure path logs anything today).
+        from coord.providers import guard_unattended_dispatch  # noqa: PLC0415
+
+        repo_for_provider = config.repo(failed.repo_name)
+        try:
+            guard_unattended_dispatch(
+                spec_provider=None,
+                repo_provider=(
+                    repo_for_provider.provider
+                    if repo_for_provider is not None
+                    else None
+                ),
+                providers_cfg=config.providers,
+                models_cfg=config.models,
+                where="describe_no_candidate_machines (diagnostic re-check)",
+            )
+        except ValueError as exc:
+            return (
+                "a candidate machine was available, but the retry was "
+                f"refused by the provider TOS gate: {exc}"
+            )
         return (
             "a candidate machine was available but the retry dispatch "
-            "failed (provider gate or network error) — check daemon logs"
+            "request failed (network error or the agent was unreachable) "
+            "— re-run `coord retry` to try again"
         )
 
     return "no available machine to retry on:\n" + "\n".join(lines)
