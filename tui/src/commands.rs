@@ -591,8 +591,31 @@ mod tests {
         None
     }
 
+    /// #1260: tests below spawn *real* `coord` subprocesses (`--version`,
+    /// `--help`, `version`) via `CommandRunner::spawn`/`spawn_queued`. Under
+    /// the default full-parallel `cargo test`, dozens of these can land at
+    /// once and race for CPU, occasionally starving one past the 10 s bound
+    /// in `wait_for_result` above — which then returns `None` and trips an
+    /// `unwrap()`/`expect()` in the test, even though nothing is actually
+    /// broken. Serialize just this handful of subprocess-spawning tests
+    /// against each other with a shared lock so they never contend for CPU
+    /// with one another; every other test in the suite (including the
+    /// canned-result tests in this module that use `new_for_test`) keeps
+    /// running fully in parallel.
+    static SUBPROCESS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Acquire the subprocess-test lock, recovering from poisoning so a
+    /// panic in one subprocess test doesn't cascade into spurious "lock
+    /// poisoned" failures for the rest of the suite.
+    fn lock_subprocess_test() -> std::sync::MutexGuard<'static, ()> {
+        SUBPROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn spawn_returns_false_when_busy() {
+        let _guard = lock_subprocess_test();
         let mut runner = CommandRunner::new();
         assert!(runner.spawn(&["--version"]));
         assert!(!runner.spawn(&["--version"]));
@@ -627,6 +650,7 @@ mod tests {
 
     #[test]
     fn poll_captures_result() {
+        let _guard = lock_subprocess_test();
         let mut runner = CommandRunner::new();
         runner.spawn(&["--version"]);
         let result = wait_for_result(&mut runner)
@@ -650,6 +674,7 @@ mod tests {
 
     #[test]
     fn spawn_injects_config_for_subcommand() {
+        let _guard = lock_subprocess_test();
         // Build a runner that has a known config path and verify the
         // injected args include --config before the extra args.
         let mut runner = CommandRunner::new();
@@ -666,6 +691,7 @@ mod tests {
 
     #[test]
     fn spawn_no_inject_for_flag_args() {
+        let _guard = lock_subprocess_test();
         // When args[0] starts with '-' (e.g. --version), no --config injection
         // should happen. We verify by spawning --version and checking it succeeds.
         let mut runner = CommandRunner::new();
@@ -896,6 +922,7 @@ mod tests {
     /// the first command completes (via `poll()`).
     #[test]
     fn queue_runs_after_first_completes() {
+        let _guard = lock_subprocess_test();
         let mut runner = CommandRunner::new();
         // Start first command.
         assert!(runner.spawn(&["--version"]));
@@ -921,6 +948,7 @@ mod tests {
     /// Commands in the queue run in FIFO order.
     #[test]
     fn queue_maintains_fifo_order() {
+        let _guard = lock_subprocess_test();
         let mut runner = CommandRunner::new();
         // Start first command.
         assert!(runner.spawn(&["--version"]));
@@ -955,6 +983,7 @@ mod tests {
     /// currently running, and also drops a command that is already pending.
     #[test]
     fn spawn_queued_deduplicates_identical_commands() {
+        let _guard = lock_subprocess_test();
         let mut runner = CommandRunner::new();
         // Start a command.
         assert!(runner.spawn(&["--version"]));
@@ -986,6 +1015,7 @@ mod tests {
     /// as items drain through the queue.
     #[test]
     fn queue_depth_reflects_pending_count() {
+        let _guard = lock_subprocess_test();
         let mut runner = CommandRunner::new();
         assert_eq!(runner.queue_depth(), 0, "starts empty");
         // Start first command; queue should still be empty (it's running, not queued).
@@ -1015,6 +1045,7 @@ mod tests {
     /// like stop, retry, notify, merge, agent restart.
     #[test]
     fn spawn_queued_returns_queued_when_busy() {
+        let _guard = lock_subprocess_test();
         let mut runner = CommandRunner::new();
         // Start a "current" command.
         assert_eq!(runner.spawn_queued(&["--version"]), SpawnQueuedOutcome::Started);
@@ -1037,6 +1068,7 @@ mod tests {
     /// invariant must not be broken by the migration.
     #[test]
     fn background_spawn_skips_when_busy() {
+        let _guard = lock_subprocess_test();
         let mut runner = CommandRunner::new();
         assert!(runner.spawn(&["--version"]), "first spawn should succeed");
         assert!(runner.is_running());
@@ -1054,6 +1086,7 @@ mod tests {
     /// (pending) are silently deduped — no scary error, queue stays at 1.
     #[test]
     fn spawn_queued_dedup_prevents_pile_up() {
+        let _guard = lock_subprocess_test();
         let mut runner = CommandRunner::new();
         assert!(runner.spawn(&["--version"]));
         // Queue one instance of --help.
@@ -1078,6 +1111,7 @@ mod tests {
     /// the `Queued` path is never taken when there is nothing to wait for.
     #[test]
     fn spawn_queued_starts_immediately_when_idle() {
+        let _guard = lock_subprocess_test();
         let mut runner = CommandRunner::new();
         assert!(!runner.is_running(), "runner should start idle");
         let outcome = runner.spawn_queued(&["--version"]);
