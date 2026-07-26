@@ -927,6 +927,162 @@ class TestReassignBriefing:
         assert "blocked on an external dependency" in payload["briefing"]
 
 
+# ── #1411: retrying a failed FIX round carries findings + review_iteration ──
+
+
+class TestReassignFixRound:
+    @patch("coord.reconcile.httpx.post")
+    def test_reassign_fix_round_carries_review_findings(
+        self, mock_post: MagicMock, coord_db,
+    ) -> None:
+        """A retry of a failed FIX-round assignment (review_iteration > 0)
+        must rebuild the fix briefing with the reviewer's findings — not the
+        generic continuation text, which has no notion of what the reviewer
+        objected to (the branch already carries the rejected code)."""
+        from coord.reconcile import _reassign
+        from coord.models import Board
+        from coord.state import save_board, update_assignment_review_findings
+
+        resp = MagicMock()
+        resp.json.return_value = {"id": "newid"}
+        mock_post.return_value = resp
+
+        work0 = Assignment(
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=1,
+            issue_title="Add the widget",
+            briefing="Add a widget that renders correctly.",
+            assignment_id="work0",
+            status="done",
+            type="work",
+            branch="issue-1-widget",
+        )
+        review1 = Assignment(
+            machine_name="server",
+            repo_name="api",
+            issue_number=1,
+            issue_title="[review] Add the widget",
+            briefing="",
+            assignment_id="review1",
+            status="done",
+            type="review",
+            review_of_assignment_id="work0",
+        )
+        # The DB row must exist before update_assignment_review_findings can
+        # write to it (mirrors how notify populates the cache in production).
+        save_board(Board(completed=[work0, review1]))
+        update_assignment_review_findings(
+            "review1",
+            verdict="request-changes",
+            body="### Blocking\n- Null check missing in render()",
+        )
+
+        board = Board(completed=[work0, review1])
+        failed = Assignment(
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=1,
+            issue_title="[fix-1] Add the widget",
+            briefing="",  # #1336: the board-projection wire drops `briefing`
+            assignment_id="oldid",
+            status="failed",
+            model="sonnet",
+            type="work",
+            branch="issue-1-widget",
+            review_iteration=1,
+            review_of_assignment_id="work0",
+        )
+
+        result = _reassign(failed, board, _reassign_cfg())
+        assert result is not None
+
+        payload = mock_post.call_args.kwargs["json"]
+        assert "Null check missing in render()" in payload["briefing"]
+        assert "reviewer findings" in payload["briefing"].lower()
+        # The original work briefing carries through too (auto_loop's
+        # _build_fix_briefing appends it under its own section).
+        assert "Add a widget that renders correctly." in payload["briefing"]
+
+        # The loop's iteration counter must survive the retry so
+        # max_review_iterations keeps counting instead of resetting to 0.
+        assert result.review_iteration == 1
+        assert result.review_of_assignment_id == "work0"
+
+    @patch("coord.reconcile.httpx.post")
+    def test_reassign_fix_round_falls_back_when_findings_unavailable(
+        self, mock_post: MagicMock, coord_db,
+    ) -> None:
+        """When the work/review chain can't be reconstructed (e.g. the
+        review row fell off the board's retention window), the retry must
+        still succeed via the generic continuation briefing rather than
+        raising or hanging."""
+        from coord.reconcile import _reassign
+        from coord.models import Board
+
+        resp = MagicMock()
+        resp.json.return_value = {"id": "newid"}
+        mock_post.return_value = resp
+
+        board = Board()  # work0/review1 not on the board — chain unresolvable
+        failed = Assignment(
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=1,
+            issue_title="[fix-1] Add the widget",
+            briefing="Fix instructions carried on the failed row.",
+            assignment_id="oldid",
+            status="failed",
+            model="sonnet",
+            type="work",
+            branch="issue-1-widget",
+            review_iteration=1,
+            review_of_assignment_id="work0",
+        )
+
+        result = _reassign(failed, board, _reassign_cfg())
+        assert result is not None
+        payload = mock_post.call_args.kwargs["json"]
+        assert "Fix instructions carried on the failed row." in payload["briefing"]
+        # review_iteration is still preserved even on the fallback path.
+        assert result.review_iteration == 1
+
+    @patch("coord.reconcile.httpx.post")
+    def test_reassign_original_work_review_iteration_stays_zero(
+        self, mock_post: MagicMock, coord_db,
+    ) -> None:
+        """Retrying a failed ORIGINAL work row (never reviewed,
+        review_iteration=0) is unchanged: no fix-round wrapping, and the
+        iteration counter stays at 0."""
+        from coord.reconcile import _reassign
+        from coord.models import Board
+
+        resp = MagicMock()
+        resp.json.return_value = {"id": "newid"}
+        mock_post.return_value = resp
+
+        board = Board()
+        failed = Assignment(
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=1,
+            issue_title="Add the widget",
+            briefing="Add a widget that renders correctly.",
+            assignment_id="oldid",
+            status="failed",
+            model="sonnet",
+            type="work",
+            branch="issue-1-widget",
+        )
+
+        result = _reassign(failed, board, _reassign_cfg())
+        assert result is not None
+        payload = mock_post.call_args.kwargs["json"]
+        assert "reviewer findings" not in payload["briefing"].lower()
+        assert result.review_iteration == 0
+        assert result.review_of_assignment_id is None
+
+
 # ── Assignment dataclass backward compatibility ────────────────────────────
 
 

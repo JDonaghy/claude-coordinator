@@ -237,8 +237,63 @@ def _capture_tokens_best_effort(assignment_id: str, entry: dict) -> None:
         pass
 
 
+def _build_fix_round_retry_briefing(
+    failed: Assignment, board: Board, repo_cfg, max_review_iterations: int,
+) -> str | None:
+    """#1411: rebuild the FIX briefing (reviewer findings included) for a
+    retried fix-round assignment.
+
+    ``failed`` is itself a fix worker (``review_iteration > 0``) dispatched
+    by the auto-loop — its branch already carries the code the reviewer
+    rejected. The generic retry briefing built by :func:`_build_retry_briefing`
+    has no notion of *why*, so a plain continuation retry reliably repeats
+    the same request-changes verdict (a wasted work+review round) and, worse,
+    used to reset ``review_iteration`` to 0 — silently disabling the
+    ``max_review_iterations`` flood guard.
+
+    Reuses ``auto_loop._build_fix_briefing`` — the exact function the
+    original fix dispatch used — fed with the reviewer's findings recovered
+    via ``auto_loop._load_review_findings`` (DB cache → local log → agent
+    HTTP → GitHub message bus), the same resolution chain the auto-loop
+    itself relies on. This is deliberately a reuse, not a new capability.
+
+    Returns ``None`` when the review chain can't be reconstructed (the
+    reviewed work assignment or its review is missing from the board, or the
+    findings can't be recovered from any source) — the caller falls back to
+    the generic continuation briefing rather than blocking the retry.
+    """
+    work = board.find_by_id(failed.review_of_assignment_id)
+    if work is None:
+        return None
+
+    review = next(
+        (
+            a for a in (*board.active, *board.completed)
+            if a.type == "review"
+            and a.review_of_assignment_id == failed.review_of_assignment_id
+        ),
+        None,
+    )
+    if review is None:
+        return None
+
+    from coord.auto_loop import _build_fix_briefing, _load_review_findings  # noqa: PLC0415
+
+    findings = _load_review_findings(
+        review, None, None,
+        repo_github=repo_cfg.github if repo_cfg is not None else None,
+    )
+    if findings is None:
+        return None
+
+    return _build_fix_briefing(
+        work, findings, failed.review_iteration, max_review_iterations,
+    )
+
+
 def _build_retry_briefing(
     failed: Assignment, repo_cfg, *, default_branch: str | None = None,
+    board: Board | None = None, max_review_iterations: int = 3,
 ) -> str:
     """#1101: reconstruct a real briefing for a retried assignment.
 
@@ -261,9 +316,21 @@ def _build_retry_briefing(
       committed;
     - the recorded failure reason, so the worker knows why the previous
       attempt stopped instead of re-discovering it from scratch.
+
+    #1411: when *failed* is itself a fix round (``review_iteration > 0``),
+    the ``## Task`` section is instead the rebuilt FIX briefing — reviewer
+    findings included — via :func:`_build_fix_round_retry_briefing`, so the
+    retry knows what the reviewer objected to instead of blindly redoing
+    work the branch already contains.
     """
+    fix_task: str | None = None
+    if failed.review_iteration and failed.review_iteration > 0 and board is not None:
+        fix_task = _build_fix_round_retry_briefing(
+            failed, board, repo_cfg, max_review_iterations,
+        )
+
     base = (failed.briefing or "").strip()
-    if not base and repo_cfg is not None:
+    if not base and fix_task is None and repo_cfg is not None:
         try:
             from coord import github_ops  # noqa: PLC0415
 
@@ -307,7 +374,12 @@ def _build_retry_briefing(
         )
     if failed.failure_reason:
         sections.append(f"## Why the previous attempt failed\n{failed.failure_reason}")
-    if base:
+    if fix_task is not None:
+        sections.append(
+            f"## Task — fix round {failed.review_iteration} "
+            f"(reviewer findings included)\n{fix_task}"
+        )
+    elif base:
         sections.append(f"## Task\n{base}")
     if not sections:
         # Nothing stored, nothing fetched, no branch context either — this
@@ -409,6 +481,7 @@ def _reassign(
         retry_default_branch = resolve_base_branch(repo_cfg, milestone_number)
     retry_briefing = _build_retry_briefing(
         failed, repo_cfg, default_branch=retry_default_branch,
+        board=board, max_review_iterations=config.pipeline.max_review_iterations,
     )
     payload = {
         "repo_name": failed.repo_name,
@@ -461,6 +534,15 @@ def _reassign(
         # /status — the retry payload above already told the agent to
         # check out `failed.branch` via target_branch.
         branch=failed.branch,
+        # #1411: carry the fix-loop bookkeeping across the retry. Without
+        # this the retry's review_iteration silently resets to 0, so
+        # `pipeline.max_review_iterations` loses its accounting — a story
+        # that already burned fix rounds looks fresh again. Preserving
+        # review_of_assignment_id too keeps the work/review chain intact
+        # for `_build_fix_round_retry_briefing` if THIS retry also fails
+        # and gets retried again.
+        review_iteration=failed.review_iteration,
+        review_of_assignment_id=failed.review_of_assignment_id,
     )
     board.active.append(retry_assignment)
 
