@@ -1488,15 +1488,24 @@ def _dispatch_board_pending_reviews(config: Config) -> None:
 
 def run(
     config: Config,
-) -> tuple[list[Transition], list[StuckDetection], list[NeedsAttentionDetection]]:
-    """Detect and post all pending transitions, stuck signals, and #846
-    needs-attention detections.
+) -> tuple[
+    list[Transition],
+    list[StuckDetection],
+    list[NeedsAttentionDetection],
+    list[StalledDetection],
+]:
+    """Detect and post all pending transitions, stuck signals, #846
+    needs-attention detections, and #1441 stalled-pipeline detections.
 
     Also dispatches any pending reviews found on the saved board so that
     ``coord notify`` acts as a reliable review-dispatch trigger in addition
     to ``coord status --reconcile``.
 
-    Returns (posted_transitions, posted_stuck, posted_needs_attention).
+    Returns (posted_transitions, posted_stuck, posted_needs_attention,
+    posted_stalled). The stalled entry is new in #1441 — appended rather than
+    inserted, so any existing caller unpacking a 3-tuple positionally would
+    break loudly (a good thing: it means the CLI/board/TUI surfacing this
+    issue asks for was actually wired up, not silently skipped).
     """
     # Refresh the agent-host cache so _try_parse_and_post_review (and any
     # other helper using _agent_host) can resolve hostnames without
@@ -1658,6 +1667,7 @@ def run(
     # + surfacing only — mirrors the #846 needs-attention block above; the
     # crucial difference from `reconcile()`-only sweepers (see
     # docs/OPERATING_GOTCHAS.md §7) is that this runs from `coord notify`.
+    stalled_posted: list[StalledDetection] = []
     try:
         for detection, _work in detect_stalled_pipeline(
             config, terminal_cache=terminal_cache
@@ -1666,7 +1676,8 @@ def run(
                 post_stalled_pipeline(detection, config)
             except Exception:  # noqa: BLE001
                 continue
+            stalled_posted.append(detection)
     except Exception:  # noqa: BLE001
         log.exception("detect_stalled_pipeline: unexpected error")
 
-    return posted, stuck_posted, needs_attention_posted
+    return posted, stuck_posted, needs_attention_posted, stalled_posted

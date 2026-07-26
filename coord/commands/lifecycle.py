@@ -111,8 +111,8 @@ def notify(config_path: Path) -> None:
     from coord.notify import run as run_notify
 
     cfg = _load_config(config_path)
-    posted, stuck, needs_attention = run_notify(cfg)
-    if not posted and not stuck and not needs_attention:
+    posted, stuck, needs_attention, stalled = run_notify(cfg)
+    if not posted and not stuck and not needs_attention and not stalled:
         click.echo("No new transitions to notify.")
         return
     if posted:
@@ -138,6 +138,14 @@ def notify(config_path: Path) -> None:
                 f"#{n.issue_number} (assignment {n.assignment_id})"
             )
             click.echo(f"    {n.detail}")
+    if stalled:
+        click.echo(f"Posted {len(stalled)} stalled-pipeline detection(s):")
+        for s in stalled:
+            click.echo(
+                f"  [stalled:{s.reason}] {s.machine_name} → {s.repo_name} "
+                f"#{s.issue_number} (assignment {s.assignment_id})"
+            )
+            click.echo(f"    {s.detail}")
     board = read_board()
 
     if is_round_complete(board) and cfg.hooks.on_round_complete:
