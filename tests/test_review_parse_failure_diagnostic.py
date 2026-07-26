@@ -6,6 +6,17 @@ dropped because `**REVIEW_VERDICT: request-changes**` (bolded) did not match
 `_REVIEW_BLOCK_RE` — a strict-parse failure on a transcript that passes the
 attribution gates must:
 
+(#1346 has since landed on `main` and made `_REVIEW_BLOCK_RE` itself tolerate
+Markdown decoration directly around the `REVIEW_VERDICT:` / `REVIEW_BODY:`
+markers, so bolding *only those two* no longer breaks the strict parser. The
+fixtures below still use bolded markers — for realism, and because the
+strict/diagnostic split must still cooperate correctly when decoration IS
+tolerated elsewhere in the block — but pair them with a terminator shape
+`_REVIEW_BLOCK_RE` does not, and should not, tolerate: `END_REVIEW` is a
+literal machine token, not free text, so a natural-language stand-in like
+`## End Review` still isn't a match. This keeps the "clearly a review,
+strict parse fails" scenario alive post-#1346.)
+
 * surface a greppable ``log.warning`` naming host + path,
 * print operator-visible output clearly distinct from "no verdict reported",
 * open the editor seeded with the recovered excerpt (never blank),
@@ -31,9 +42,14 @@ from coord.review import REVIEWER_SYSTEM_PROMPT
 
 # ── Fixtures: real-world transcript shapes ───────────────────────────────────
 
-# The #873 / #1346 shape: bolded markers, END_REVIEW present.
-# The strict parser fails because the verdict group requires a bare word
-# followed by \s*[\r\n]+, and `**` immediately after the verdict breaks that.
+# The #873 / #1346 shape, updated for post-#1346 `main`: bolded VERDICT/BODY
+# markers (now tolerated on their own by `_REVIEW_BLOCK_RE`'s `_MD` class),
+# combined with a terminator that ISN'T just decorated `END_REVIEW` but a
+# different literal string entirely (a markdown heading, "## End Review",
+# not the required `END_REVIEW` token). `_MD` only absorbs emphasis/code-span/
+# heading punctuation immediately around a marker token — it can't turn one
+# literal string into another, so this still fails the strict parser while
+# remaining a realistic "reviewer wrote a plausible variant" shape.
 _BOLDED_MARKERS_TEXT = """\
 **REVIEW_VERDICT: request-changes**
 
@@ -47,7 +63,7 @@ This PR has critical issues.
 
 - `coord/review.py:42`: wrong path
 
-END_REVIEW
+## End Review
 """
 
 # A genuinely broken block: marker present but the terminator is absent.
@@ -96,7 +112,7 @@ class TestDetectUnparsedReviewMarker:
         return detect_unparsed_review_marker(text, **kw)
 
     def test_bolded_markers_returns_marker(self) -> None:
-        """The real #1346 shape: bolded markers, END_REVIEW present.
+        """Bolded VERDICT/BODY markers + a non-literal terminator variant.
         Strict parser fails; detector should fire."""
         result = self._call(_BOLDED_MARKERS_TEXT)
         assert result is not None
@@ -186,8 +202,11 @@ class TestDetectUnparsedReviewMarker:
            <your full review text in markdown>\\nEND_REVIEW`` template.
         2. The real verdict, emitted later by the assistant, is itself a
            JSON-escaped string (real newlines stored as literal ``\\n``) and,
-           in this fixture, malformed the #1346 way (bolded markers) so the
-           strict parser legitimately rejects it and the diagnostic must fire.
+           in this fixture, uses a terminator variant (``## End Review``, not
+           the literal ``END_REVIEW`` token) that ``_REVIEW_BLOCK_RE`` still
+           legitimately rejects post-#1346 (bolded VERDICT/BODY markers alone
+           are now tolerated — see ``_BOLDED_MARKERS_TEXT`` above), so the
+           diagnostic must fire.
 
         A fix that only unescapes ``\\n`` across the whole raw log and then
         `.search()`es (first match) would match the HEADER's template, not
@@ -206,7 +225,7 @@ class TestDetectUnparsedReviewMarker:
             f"[Coordinator review assignment {_AID} for issue #{_ISSUE}]\n\n"
             "**REVIEW_VERDICT: request-changes**\n\n"
             "**REVIEW_BODY:**\n\n"
-            "## Summary\n\nSomething is genuinely wrong here.\n\nEND_REVIEW"
+            "## Summary\n\nSomething is genuinely wrong here.\n\n## End Review"
         )
         log_text = header + _stream_json_line(real_verdict_text) + "\n"
 
