@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 
 from coord.config import Config
 from coord.dispatch import AGENT_PORT
-from coord.models import WORK_LIKE_TYPES, Assignment, Board
+from coord.models import WORK_LIKE_TYPES, Assignment, Board, Machine
 
 if TYPE_CHECKING:
     from coord.merge_queue import QueuedMerge
@@ -393,12 +393,38 @@ def _build_retry_briefing(
     return "\n\n".join(sections)
 
 
+def _running_by_machine(board: Board) -> dict[str, list[Assignment]]:
+    """Group ``board.active`` running assignments by machine name (#1417).
+
+    Shared by :func:`_reassign` and :func:`describe_no_candidate_machines` so
+    the two paths can never drift on what counts as "running".
+    """
+    running: dict[str, list[Assignment]] = {}
+    for a in board.active:
+        if a.status == "running":
+            running.setdefault(a.machine_name, []).append(a)
+    return running
+
+
+def _machine_capacity(machine: Machine, config: Config) -> int:
+    """Effective concurrent-assignment cap for *machine* (#1417).
+
+    ``machines[].max_workers`` in coordinator.yml overrides the fleet-wide
+    ``concurrency.max_workers`` default — set it lower on hardware that
+    can't keep up with the fleet norm (e.g. a 4-core box among 20-core
+    desktops). Unset (``None``) means "use the fleet-wide default", so a
+    single running assignment no longer reads as "full" the way a bare
+    ``machine in busy`` membership check used to (#1417).
+    """
+    return machine.max_workers if machine.max_workers is not None else config.concurrency.max_workers
+
+
 def _reassign(
     failed: Assignment, board: Board, config: Config,
     *,
     model: str | None = None,
 ) -> Assignment | None:
-    """Re-dispatch a failed assignment to an idle different machine.
+    """Re-dispatch a failed assignment to a machine with spare capacity.
 
     *model* overrides the model tier on the retry. When None, the
     original assignment's model is reused (escalation happens at the call
@@ -406,12 +432,23 @@ def _reassign(
     """
     from coord.machine_pause import paused_set
     paused = paused_set()
-    busy = {a.machine_name for a in board.active if a.status == "running"}
+    running = _running_by_machine(board)
+
+    # #1417: fleet-wide cap first — respected regardless of per-machine
+    # headroom, mirroring `concurrency.max_workers`'s documented meaning as
+    # the total concurrent-worker budget across the whole fleet.
+    fleet_running = sum(len(v) for v in running.values())
+    if fleet_running >= config.concurrency.max_workers:
+        return None
+
+    def has_room(m: Machine) -> bool:
+        return len(running.get(m.name, [])) < _machine_capacity(m, config)
+
     candidates = [
         m for m in config.machines
         if m.can_work_on(failed.repo_name)
         and m.repo_path(failed.repo_name) is not None
-        and m.name not in busy
+        and has_room(m)
         and m.name != failed.machine_name
         and m.name not in paused
     ]
@@ -422,7 +459,7 @@ def _reassign(
             m for m in config.machines
             if m.can_work_on(failed.repo_name)
             and m.repo_path(failed.repo_name) is not None
-            and m.name not in busy
+            and has_room(m)
             and m.name not in paused
         ]
     if not candidates:
@@ -562,66 +599,92 @@ def describe_no_candidate_machines(
 ) -> str:
     """Explain why :func:`_reassign` found no candidate machine (#1396).
 
-    ``_reassign`` silently returns ``None`` on any of: no idle machine can
-    work on the repo, a TOS-gate refusal, or a dispatch POST failure — so a
-    caller (``coord retry``) can only ever say "no available machine to
-    retry on", which is true from the code's point of view and useless to an
-    operator when ``coord status`` shows every machine idle. The real cause
-    is almost always a phantom ``running`` board row: a dead interactive
-    (``claude-pty``) session that nothing reaped, still counted as "busy".
+    ``_reassign`` silently returns ``None`` on any of: no machine with spare
+    capacity can work on the repo, a TOS-gate refusal, or a dispatch POST
+    failure — so a caller (``coord retry``) can only ever say "no available
+    machine to retry on", which is true from the code's point of view and
+    useless to an operator when ``coord status`` shows every machine well
+    under capacity. The real cause is almost always a phantom ``running``
+    board row: a dead interactive (``claude-pty``) session that nothing
+    reaped, still counted against the machine's capacity.
 
     Mirrors ``_reassign``'s exact candidate filter (repo capability, repo
-    path, pause set, busy set, same-machine exclusion) but keeps a reason
-    per excluded machine instead of discarding it, so the message names the
-    blocking machines and what they're apparently running — including the
-    age, which makes a 400-hour-old phantom obvious at a glance.
+    path, pause set, capacity check, same-machine exclusion — #1417 replaced
+    the old binary "any running assignment = busy" rule with a per-machine
+    capacity count against ``machines[].max_workers``/``concurrency.
+    max_workers``) but keeps a reason per excluded machine instead of
+    discarding it, so the message names the blocking machines and what
+    they're apparently running — including the age, which makes a
+    400-hour-old phantom obvious at a glance.
     """
     from coord.machine_pause import paused_set  # noqa: PLC0415
 
     paused = paused_set()
     now = time.time()
 
-    running_by_machine: dict[str, list[Assignment]] = {}
-    for a in board.active:
-        if a.status == "running":
-            running_by_machine.setdefault(a.machine_name, []).append(a)
+    running_by_machine = _running_by_machine(board)
+
+    relevant_machines = [
+        m for m in config.machines
+        if m.can_work_on(failed.repo_name) and m.repo_path(failed.repo_name) is not None
+    ]
+    if not relevant_machines:
+        return f"no machine in coordinator.yml can work on repo {failed.repo_name!r}"
+
+    # #1417: the fleet-wide cap blocks every machine regardless of
+    # individual headroom — computed once so a machine that's personally
+    # under its own cap can still be correctly labeled as blocked by the
+    # fleet-wide budget instead of silently reading as "free".
+    fleet_running = sum(len(v) for v in running_by_machine.values())
+    fleet_cap = config.concurrency.max_workers
+    fleet_full = fleet_running >= fleet_cap
 
     lines: list[str] = []
     has_free_candidate = False
-    relevant = False
-    for m in config.machines:
-        if not m.can_work_on(failed.repo_name) or m.repo_path(failed.repo_name) is None:
-            continue  # not relevant to this repo — don't clutter the message
-        relevant = True
+    for m in relevant_machines:
         if m.name in paused:
             lines.append(f"  {m.name}: paused")
             continue
-        running = running_by_machine.get(m.name)
-        if running:
-            parts = []
-            for a in running:
-                age_h = (now - a.dispatched_at) / 3600 if a.dispatched_at else None
-                age_str = f"{age_h:.1f}h" if age_h is not None else "?h"
-                parts.append(
-                    f"{a.repo_name}#{a.issue_number} type={a.type} age={age_str}"
+        running = running_by_machine.get(m.name, [])
+        cap = _machine_capacity(m, config)
+        own_full = len(running) >= cap
+        if own_full or fleet_full:
+            if running:
+                parts = []
+                for a in running:
+                    age_h = (now - a.dispatched_at) / 3600 if a.dispatched_at else None
+                    age_str = f"{age_h:.1f}h" if age_h is not None else "?h"
+                    parts.append(
+                        f"{a.repo_name}#{a.issue_number} type={a.type} age={age_str}"
+                    )
+                load_desc = f"{len(running)}/{cap} running: {'; '.join(parts)}"
+            else:
+                load_desc = f"0/{cap} running"
+            if own_full:
+                reason = f"busy — at capacity ({load_desc})"
+            else:
+                # This machine has its own headroom, but the fleet-wide
+                # budget (concurrency.max_workers) is exhausted — name the
+                # actual binding constraint rather than implying the
+                # machine itself is the problem.
+                reason = (
+                    f"fleet at capacity ({fleet_running}/{fleet_cap} running "
+                    f"fleet-wide; this machine {load_desc})"
                 )
-            lines.append(f"  {m.name}: busy ({'; '.join(parts)})")
+            lines.append(f"  {m.name}: {reason}")
             continue
         if m.name == failed.machine_name:
             # `_reassign`'s fallback pass drops only the "different machine"
-            # constraint — it still honors busy/paused — so an idle machine
-            # that just failed IS a real fallback candidate (#1396 review
-            # finding 1). Categorize it as such; the "(fallback-only)" label
-            # stays in `lines` for readers of the busy/paused branch below,
-            # but this path never reaches that branch once a candidate is
-            # found.
+            # constraint — it still honors capacity/paused — so a
+            # under-capacity machine that just failed IS a real fallback
+            # candidate (#1396 review finding 1). Categorize it as such; the
+            # "(fallback-only)" label stays in `lines` for readers of the
+            # capacity/paused branch below, but this path never reaches that
+            # branch once a candidate is found.
             lines.append(f"  {m.name}: same machine that just failed (fallback-only)")
             has_free_candidate = True
             continue
         has_free_candidate = True
-
-    if not relevant:
-        return f"no machine in coordinator.yml can work on repo {failed.repo_name!r}"
 
     if has_free_candidate:
         # A machine WAS free per this filter — _reassign must have failed for

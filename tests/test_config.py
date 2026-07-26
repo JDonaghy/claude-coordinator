@@ -108,6 +108,48 @@ def test_machine_references_unknown_repo(tmp_path: Path) -> None:
         load(p)
 
 
+def test_machine_max_workers_parsed(tmp_path: Path) -> None:
+    """#1417: machines[].max_workers overrides the fleet-wide
+    concurrency.max_workers for capacity checks (e.g. `coord retry`)."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: tiny\n    host: h\n    repos: [api]\n    max_workers: 2\n"
+        "  - name: big\n    host: h2\n    repos: [api]\n"
+    )
+    cfg = load(p)
+    by_name = {m.name: m for m in cfg.machines}
+    assert by_name["tiny"].max_workers == 2
+    # Unset stays None — callers fall back to concurrency.max_workers.
+    assert by_name["big"].max_workers is None
+
+
+def test_machine_max_workers_rejects_non_integer(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n    max_workers: \"lots\"\n"
+    )
+    with pytest.raises(ConfigError, match="max_workers must be an integer"):
+        load(p)
+
+
+def test_machine_max_workers_rejects_zero_or_negative(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n"
+        "  - name: api\n    github: a/a\n"
+        "machines:\n"
+        "  - name: m\n    host: h\n    repos: [api]\n    max_workers: 0\n"
+    )
+    with pytest.raises(ConfigError, match="max_workers must be at least 1"):
+        load(p)
+
+
 def test_unknown_dependency(tmp_path: Path) -> None:
     p = tmp_path / "coordinator.yml"
     p.write_text(

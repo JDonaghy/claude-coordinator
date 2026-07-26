@@ -253,6 +253,9 @@ class _StubMachine:
     host: str = "localhost"
     repos: list[str] = field(default_factory=list)
     _paths: dict[str, str] = field(default_factory=dict)
+    # #1417: _reassign's capacity check reads Machine.max_workers — keep
+    # this stub in sync with the real dataclass's optional override.
+    max_workers: int | None = None
 
     def repo_path(self, name: str) -> str | None:
         return self._paths.get(name)
