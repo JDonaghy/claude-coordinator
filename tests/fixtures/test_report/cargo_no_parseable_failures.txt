@@ -1,0 +1,9 @@
+   Compiling cargo_capture_np v0.1.0 (/tmp/cargo_capture_no_parse)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.07s
+     Running unittests src/lib.rs (/home/john/.coord/cargo-target/claude-coordinator/debug/deps/cargo_capture_np-6de30862566cbeab)
+
+running 1 test
+error: test failed, to rerun pass `--lib`
+
+Caused by:
+  process didn't exit successfully: `/home/john/.coord/cargo-target/claude-coordinator/debug/deps/cargo_capture_np-6de30862566cbeab` (signal: 6, SIGABRT: process abort signal)
