@@ -1110,6 +1110,15 @@ def _parse_machines(raw: Any, repos: list[Repo]) -> list[Machine]:
                 f"machines[{i}] ({name!r}) repo_paths references unknown repos: {unknown_paths}"
             )
 
+        # #1417: optional per-machine capacity override. `None` (unset)
+        # means "use concurrency.max_workers" — see Machine.max_workers.
+        machine_max_workers = entry.get("max_workers")
+        if machine_max_workers is not None:
+            if isinstance(machine_max_workers, bool) or not isinstance(machine_max_workers, int):
+                raise ConfigError(f"machines[{i}].max_workers must be an integer")
+            if machine_max_workers < 1:
+                raise ConfigError(f"machines[{i}].max_workers must be at least 1")
+
         machines.append(
             Machine(
                 name=name,
@@ -1117,6 +1126,7 @@ def _parse_machines(raw: Any, repos: list[Repo]) -> list[Machine]:
                 capabilities=capabilities,
                 repos=machine_repos,
                 repo_paths=repo_paths,
+                max_workers=machine_max_workers,
             )
         )
     return machines

@@ -145,6 +145,12 @@ class Machine:
     capabilities: list[str] = field(default_factory=list)
     repos: list[str] = field(default_factory=list)
     repo_paths: dict[str, str] = field(default_factory=dict)
+    # #1417: optional per-machine override of `concurrency.max_workers`.
+    # `None` means "no override" — the machine's effective cap is the
+    # fleet-wide default. Set this lower on hardware that can't keep up with
+    # the fleet norm (e.g. a 4-core box among 20-core desktops) so automated
+    # capacity checks (`coord retry`) don't pile concurrent workers onto it.
+    max_workers: int | None = None
 
     def can_work_on(self, repo_name: str) -> bool:
         return repo_name in self.repos

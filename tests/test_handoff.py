@@ -180,6 +180,116 @@ class TestReassign:
         assert posted_payload["branch"] == "main"
 
 
+# ── #1417: capacity-based retry (replaces "any running = busy") ────────────
+
+
+class TestReassignCapacity:
+    def test_two_machines_one_running_each_under_fleet_cap_succeeds(self) -> None:
+        """The exact #1417 reproduction: two machines, one running
+        assignment apiece, fleet cap well above 2 (the operator's real
+        config: concurrency.max_workers: 8). Retry must succeed — a single
+        running assignment is not "full"."""
+        config = Config(
+            repos=[Repo(name="claude-coordinator", github="a/a")],
+            machines=[
+                Machine(name="precision", host="p", repos=["claude-coordinator"],
+                        repo_paths={"claude-coordinator": "/tmp/a"}),
+                Machine(name="elitebook", host="e", repos=["claude-coordinator"],
+                        repo_paths={"claude-coordinator": "/tmp/a"}),
+            ],
+            concurrency=ConcurrencyConfig(max_workers=8),
+        )
+        failed = Assignment(
+            machine_name="elitebook", repo_name="claude-coordinator", issue_number=1402,
+            issue_title="x", assignment_id="a-failed", status="failed",
+            briefing="do the thing",
+        )
+        board = Board(active=[
+            Assignment(machine_name="precision", repo_name="claude-coordinator",
+                       issue_number=1348, issue_title="other work",
+                       assignment_id="running-1", status="running", type="work"),
+            Assignment(machine_name="elitebook", repo_name="claude-coordinator",
+                       issue_number=1395, issue_title="other work 2",
+                       assignment_id="running-2", status="running", type="work"),
+        ])
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "retry1"}
+        mock_resp.raise_for_status = lambda: None
+
+        with patch("coord.machine_pause.paused_set", return_value=set()), \
+             patch("coord.reconcile.httpx.post", return_value=mock_resp):
+            result = _reassign(failed, board, config)
+
+        assert result is not None
+        # Prefers the machine that isn't the one that just failed.
+        assert result.machine_name == "precision"
+
+    def test_machine_at_its_own_cap_is_excluded(self) -> None:
+        """A machine with an explicit `max_workers` override that's already
+        saturated must stay excluded even though the fleet-wide cap has
+        plenty of headroom (#1417 per-machine override)."""
+        config = Config(
+            repos=[Repo(name="api", github="a/a")],
+            machines=[
+                Machine(name="tiny", host="t", repos=["api"],
+                        repo_paths={"api": "/tmp/a"}, max_workers=1),
+            ],
+            concurrency=ConcurrencyConfig(max_workers=8),
+        )
+        failed = Assignment(
+            machine_name="other", repo_name="api", issue_number=1,
+            issue_title="x", assignment_id="a1", status="failed",
+        )
+        board = Board(active=[
+            Assignment(machine_name="tiny", repo_name="api", issue_number=2,
+                       issue_title="busy work", assignment_id="running-1",
+                       status="running", type="work"),
+        ])
+
+        with patch("coord.machine_pause.paused_set", return_value=set()):
+            result = _reassign(failed, board, config)
+            msg = describe_no_candidate_machines(failed, board, config)
+
+        assert result is None
+        assert "tiny" in msg
+        assert "at capacity" in msg
+        assert "1/1" in msg
+
+    def test_fleet_wide_cap_blocks_retry_even_with_idle_machine_headroom(self) -> None:
+        """concurrency.max_workers is a fleet-wide budget: once the total
+        running count across all machines hits it, retry must refuse even
+        though no single machine looks "full" on its own."""
+        config = Config(
+            repos=[Repo(name="api", github="a/a")],
+            machines=[
+                Machine(name="m1", host="h1", repos=["api"], repo_paths={"api": "/tmp/a"}),
+                Machine(name="m2", host="h2", repos=["api"], repo_paths={"api": "/tmp/a"}),
+            ],
+            concurrency=ConcurrencyConfig(max_workers=2),
+        )
+        failed = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1,
+            issue_title="x", assignment_id="a1", status="failed",
+        )
+        board = Board(active=[
+            Assignment(machine_name="m1", repo_name="api", issue_number=2,
+                       issue_title="w1", assignment_id="running-1",
+                       status="running", type="work"),
+            Assignment(machine_name="m2", repo_name="api", issue_number=3,
+                       issue_title="w2", assignment_id="running-2",
+                       status="running", type="work"),
+        ])
+
+        with patch("coord.machine_pause.paused_set", return_value=set()):
+            result = _reassign(failed, board, config)
+            msg = describe_no_candidate_machines(failed, board, config)
+
+        assert result is None
+        assert "fleet at capacity" in msg
+        assert "2/2" in msg
+
+
 # ── Auto-reassign from reconcile ────────────────────────────────────────────
 
 
@@ -252,6 +362,12 @@ class TestDescribeNoCandidateMachines:
                 Machine(name="elitebook", host="e", repos=["claude-coordinator"],
                         repo_paths={"claude-coordinator": "/tmp/a"}),
             ],
+            # #1417: pin the fleet cap to 1 so this sole machine's single
+            # running row genuinely saturates it — with the default cap of
+            # 2, one running assignment now leaves room and this scenario
+            # would (correctly) find elitebook as a fallback candidate
+            # instead of reproducing the "genuinely full" case under test.
+            concurrency=ConcurrencyConfig(max_workers=1),
         )
         failed = Assignment(
             machine_name="elitebook", repo_name="claude-coordinator",
@@ -433,6 +549,12 @@ class TestCoordRetry:
             "repos:\n  - name: api\n    github: a/a\n"
             "machines:\n"
             "  - name: elitebook\n    host: e\n    repos: [api]\n    repo_paths:\n      api: /tmp/a\n"
+            # #1417: pin the fleet cap to 1 — the sole machine's single
+            # running (phantom) row must genuinely saturate it for this to
+            # still reproduce "no available machine". At the default cap of
+            # 2, one running row leaves room and retry would (correctly)
+            # succeed via the same-machine fallback instead.
+            "concurrency:\n  max_workers: 1\n"
         )
         board = Board(
             active=[
