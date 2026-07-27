@@ -123,6 +123,115 @@ def test_project_treats_every_work_like_type_as_the_work_row(work_type):
     assert state.work_type == work_type
 
 
+# ── #1453: oracle-loop JIT slice resolution ─────────────────────────────────
+
+
+def test_project_resolves_milestone_number_from_the_issues_list():
+    payload = {
+        "assignments": [],
+        "issues": [
+            {"repo_name": REPO, "number": 1392, "milestone_number": 38},
+            {"repo_name": REPO, "number": 999, "milestone_number": 99},
+        ],
+    }
+    state = project(payload, REPO, 1392, make_config())
+    assert state.milestone_number == 38
+
+
+def test_project_leaves_milestone_number_none_with_no_matching_issue():
+    state = project({"assignments": [], "issues": []}, REPO, 1392, make_config())
+    assert state.milestone_number is None
+
+
+def test_project_resolves_the_tracking_issue_from_milestone_work_orders():
+    payload = {
+        "assignments": [],
+        "milestone_work_orders": [
+            {
+                "repo_name": REPO,
+                "tracking_issue": 1120,
+                "nodes": [{"issue_number": 1392}, {"issue_number": 1393}],
+            },
+            {
+                "repo_name": "quadraui",
+                "tracking_issue": 55,
+                "nodes": [{"issue_number": 1392}],
+            },
+        ],
+    }
+    state = project(payload, REPO, 1392, make_config())
+    assert state.milestone_tracking_issue == 1120
+
+
+def test_project_leaves_tracking_issue_none_when_not_a_work_order_member():
+    payload = {
+        "assignments": [],
+        "milestone_work_orders": [
+            {"repo_name": REPO, "tracking_issue": 1120, "nodes": [{"issue_number": 1393}]}
+        ],
+    }
+    state = project(payload, REPO, 1392, make_config())
+    assert state.milestone_tracking_issue is None
+
+
+def test_project_reads_the_jit_slice_test_author_row_keyed_on_for_issue_number():
+    """#1171/#1138: a JIT slice's assignment carries `issue_number` ==
+    the milestone's TRACKING issue, and `for_issue_number` == the member
+    issue the slice is FOR — so this must NOT be picked up as `work_aid`
+    (that would be #1141's hardcoded-copy class all over again, just
+    inverted), only as `acceptance_author_aid` via `for_issue_number`.
+    """
+    payload = {
+        "assignments": [
+            row(
+                assignment_id="ta1",
+                issue_number=1120,  # the tracking issue, not 1392
+                type="test-author",
+                status="running",
+                for_issue_number=1392,
+            )
+        ]
+    }
+    state = project(payload, REPO, 1392, make_config())
+    assert state.work_aid == ""
+    assert state.acceptance_author_aid == "ta1"
+    assert state.acceptance_author_status == "running"
+
+
+def test_project_ignores_a_test_author_row_for_a_different_member_issue():
+    payload = {
+        "assignments": [
+            row(
+                assignment_id="ta1",
+                issue_number=1120,
+                type="test-author",
+                status="done",
+                for_issue_number=1393,  # a sibling slice, not this issue
+            )
+        ]
+    }
+    state = project(payload, REPO, 1392, make_config())
+    assert state.acceptance_author_aid == ""
+
+
+def test_project_picks_the_most_recent_acceptance_author_row():
+    payload = {
+        "assignments": [
+            row(
+                assignment_id="old", issue_number=1120, type="test-author",
+                status="failed", for_issue_number=1392, dispatched_at=100.0,
+            ),
+            row(
+                assignment_id="new", issue_number=1120, type="test-author",
+                status="running", for_issue_number=1392, dispatched_at=200.0,
+            ),
+        ]
+    }
+    state = project(payload, REPO, 1392, make_config())
+    assert state.acceptance_author_aid == "new"
+    assert state.acceptance_author_status == "running"
+
+
 # ── review/smoke keyed on the work row ───────────────────────────────────────
 
 

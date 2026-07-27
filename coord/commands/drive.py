@@ -30,6 +30,15 @@ itself), looping a failing test through `coord fix` on the same branch.
 Re-running it on the same issue is safe and resumes from wherever the board
 actually is.
 
+#1453: when this issue resolves to a milestone with a merged Gate-A contract
+(`tests/acceptance/ms-NN/contract.md`) and the repo has an acceptance driver
+configured, the sealed JIT acceptance slice is authored first (`coord
+acceptance author <repo> <tracking_issue> --issue <N>`) and observed through
+to a landed merge — ONLY THEN is `coord assign`/`coord approve-plan` run.
+Pass --no-acceptance to skip this and drive the issue exactly as before.
+The preflight banner's "acceptance" line always states which mode a run is
+in and why.
+
 Exit codes: 0 merged (verified against the remote default branch), or review
 approved with --no-merge; 1 a stage reached a terminal failure a script cannot
 resolve; 2 bad usage / configuration; 3 deadline exceeded.
@@ -249,6 +258,16 @@ def _rebuild_drive_argv(
         "the session releases the per-issue flock, which IS the correct Stop."
     ),
 )
+@click.option(
+    "--no-acceptance",
+    is_flag=True,
+    help=(
+        "Skip the #1453 oracle-loop JIT slice authoring step even when this "
+        "issue's milestone has a merged Gate-A contract — use when the "
+        "contract is stale/wrong for this issue, or you just want a plain "
+        "run. Dispatches straight to `coord assign` as before #1453."
+    ),
+)
 @_CONFIG_OPTION
 def drive(
     repo: str,
@@ -272,6 +291,7 @@ def drive(
     max_merge_attempts: int,
     dry_run: bool,
     use_tmux: bool,
+    no_acceptance: bool,
     config_path: Path,
 ) -> None:
     # Imported lazily so `coord --help` doesn't pay for httpx/subprocess setup.
@@ -337,6 +357,7 @@ def drive(
         force_review=force_review,
         dry_run=dry_run,
         max_merge_attempts=max_merge_attempts,
+        no_acceptance=no_acceptance,
         config_path=str(config_path) if config_path else "",
     )
     driver = Driver(repo=repo, issue=issue, opts=opts, config=config)

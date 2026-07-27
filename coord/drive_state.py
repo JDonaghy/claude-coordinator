@@ -101,6 +101,27 @@ class IssueState:
 
     picked_machine: str = ""
 
+    # ── #1453: oracle-loop JIT slice authoring ──────────────────────────
+    # `milestone_number` is the issue's own GitHub milestone (the `ms-NN`
+    # Gate-A contract this issue's slice would live under); resolved from
+    # the same `/board` `issues` list the TUI's `pipeline_issue_milestone`
+    # reads. `milestone_tracking_issue` is the epic that owns the `##
+    # Work order` block this issue is a member node of — resolved from
+    # `milestone_work_orders`, mirroring the TUI's
+    # `milestone_tracking_issue_for` (tui/src/app/pipeline.rs). Both are
+    # ``None`` for a plain issue with no milestone, or one not (yet) a
+    # member of any tracked work order — the "normal drive" case.
+    milestone_number: int | None = None
+    milestone_tracking_issue: int | None = None
+
+    # The JIT slice's own `type="test-author"` assignment (#1171: keyed on
+    # `for_issue_number == issue`, NOT `issue_number` — that field is the
+    # milestone's TRACKING issue, so this row is invisible to `work_aid`
+    # above by design). Empty until `coord acceptance author ... --issue
+    # <N>` has been dispatched for this issue.
+    acceptance_author_aid: str = ""
+    acceptance_author_status: str = ""
+
     # ── derived ──────────────────────────────────────────────────────────
     @property
     def fingerprint(self) -> str:
@@ -194,6 +215,37 @@ def project(payload: dict, repo: str, issue: int, config: Any) -> IssueState:
 
     exit_code = (work or {}).get("exit_code")
 
+    # #1453: oracle-loop JIT slice resolution — both reads are over data
+    # already published on /board, no extra I/O (see IssueState's docstring
+    # for the two source lists and their TUI-side counterparts).
+    milestone_number = None
+    for oi in payload.get("issues") or []:
+        if oi.get("repo_name") == repo and oi.get("number") == issue:
+            milestone_number = oi.get("milestone_number")
+            break
+
+    milestone_tracking_issue = None
+    for mwo in payload.get("milestone_work_orders") or []:
+        if mwo.get("repo_name") != repo:
+            continue
+        if any(n.get("issue_number") == issue for n in mwo.get("nodes") or []):
+            milestone_tracking_issue = mwo.get("tracking_issue")
+            break
+
+    # The JIT slice's own assignment row: keyed on `for_issue_number`, NOT
+    # `issue_number` (that field carries the milestone's TRACKING issue for
+    # this dispatch shape — #1171/#1138) — so it is deliberately excluded
+    # from `mine`/`work_aid` above.
+    acceptance_author = _latest(
+        [
+            a
+            for a in payload.get("assignments") or []
+            if a.get("repo_name") == repo
+            and a.get("type") == "test-author"
+            and a.get("for_issue_number") == issue
+        ]
+    )
+
     return IssueState(
         repo=repo,
         issue=issue,
@@ -228,6 +280,10 @@ def project(payload: dict, repo: str, issue: int, config: Any) -> IssueState:
         merge_pr_url=(merge_entry or {}).get("pr_url") or "",
         merge_aid=(merge_entry or {}).get("assignment_id") or "",
         picked_machine=pick_machine(payload, repo, config),
+        milestone_number=milestone_number,
+        milestone_tracking_issue=milestone_tracking_issue,
+        acceptance_author_aid=g(acceptance_author, "assignment_id"),
+        acceptance_author_status=g(acceptance_author, "status"),
     )
 
 

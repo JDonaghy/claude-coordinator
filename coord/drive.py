@@ -45,6 +45,22 @@ does) — two drivers racing to dispatch the same thing is exactly the
 Re-running it on the same issue is safe and resumes from wherever the board
 actually is.
 
+THE ORACLE LOOP (#1453, docs/ORACLE_LOOP.md).  When this issue's milestone
+already has a merged Gate-A contract and the repo has an acceptance driver
+configured, dispatching ``coord assign`` straight away would just hit the
+#1138 hard gate (``coord.dispatch.enforce_oracle_readiness``) and refuse —
+the issue's JIT acceptance slice hasn't been authored yet.  Rather than dead-
+end there, :func:`resolve_oracle_decision` (resolved ONCE, at preflight —
+mirrors ``tui/src/app/pipeline.rs``'s ``gate_a_contract_exists_for`` and
+``coord.milestone_dispatch.gate_a_status``, all three keyed on
+:func:`coord.acceptance.gate_a_contract_path`) puts this run into "oracle
+drive" mode: :func:`_dispatch_work_stage` authors the slice first (``coord
+acceptance author <repo> <tracking_issue> --issue <N>``) and
+:func:`_decide_acceptance_author` observes it through to a landed merge
+(``status='merged'``, #609 — its own Test/Review/Merge are driven by coord
+exactly like a normal work row) before ever calling ``coord assign``.
+``--no-acceptance`` opts out back to the pre-#1453 behaviour.
+
 STRUCTURE.  All decision logic lives in :func:`decide` and :func:`preflight`,
 which are pure functions over an :class:`~coord.drive_state.IssueState` plus
 injected verifiers.  :class:`Driver` is the thin I/O shell: poll, execute the
@@ -121,6 +137,12 @@ class DriveOptions:
     force_review: bool = False
     dry_run: bool = False
     max_merge_attempts: int = 3
+    # #1453: skip the oracle-loop JIT slice authoring step below even when
+    # this issue's milestone has a merged Gate-A contract — an escape hatch
+    # for "the contract is stale/wrong for this issue" or "I want a plain
+    # run", matching the opt-out every other oracle-loop gate offers
+    # (`oracle:exempt` label, `exempt:` manifest list).
+    no_acceptance: bool = False
     # Threaded onto every `coord` subprocess so a `coord drive --config X` run
     # cannot dispatch against a *different* config than it is reading.  The
     # bash driver ran a bare `coord` and silently had this gap.  Empty means
@@ -192,6 +214,185 @@ def _succeed(message: str) -> Action:
 
 def _die(message: str, exit_code: int = EXIT_TERMINAL_FAILURE) -> Action:
     return Action(kind=EXIT, message=message, exit_code=exit_code)
+
+
+# ── oracle-loop JIT slice authoring (#1453) ─────────────────────────────────
+
+
+class AcceptanceGateChecker(Protocol):
+    """The one GitHub question :func:`resolve_oracle_decision` cannot answer
+    from the board payload alone: has Gate A's contract actually merged?"""
+
+    def contract_exists(self, repo_name: str, milestone_number: int) -> bool: ...
+
+
+@dataclass
+class GitHubAcceptanceGateChecker:
+    """Real implementation: reuses ``coord.milestone_dispatch.gate_a_status``
+    — the SAME check ``coord milestone dispatch``'s Gate A gate and the
+    #1138 ``issue_oracle_ready`` hard gate already run — rather than
+    re-deriving the ``tests/acceptance/ms-NN/contract.md`` path here. That
+    function returns ``None`` for two different reasons ("no driver
+    configured" or "contract exists"); callers of this checker have already
+    confirmed ``config.acceptance.has_driver(repo_name)`` themselves
+    (:func:`resolve_oracle_decision` does), so ``None`` is unambiguous here.
+    """
+
+    config: Any
+
+    def contract_exists(self, repo_name: str, milestone_number: int) -> bool:
+        from coord.milestone_dispatch import gate_a_status  # noqa: PLC0415
+
+        repo_cfg = self.config.repo(repo_name)
+        if repo_cfg is None:
+            return False
+        return gate_a_status(repo_cfg, self.config, milestone_number) is None
+
+
+@dataclass(frozen=True)
+class OracleDecision:
+    """Resolved ONCE per run (at preflight time, alongside machine
+    resolution) — never recomputed per poll, since *gate_checker* costs a
+    GitHub fetch and a milestone's Gate-A status does not change mid-run.
+
+    ``active`` gates the JIT-authoring branch in :func:`_dispatch_work_stage`;
+    ``reason`` is what the preflight banner prints so an operator never has
+    to guess which mode a run is in. ``tracking_issue`` is set iff ``active``
+    — the argument :func:`_decide_acceptance_author` needs to build ``coord
+    acceptance author <repo> <tracking_issue> --issue <N>``.
+    """
+
+    active: bool
+    reason: str
+    tracking_issue: int | None = None
+
+
+def resolve_oracle_decision(
+    state: IssueState,
+    opts: DriveOptions,
+    config: Any,
+    gate_checker: AcceptanceGateChecker,
+) -> OracleDecision:
+    """The #1453 gate: does this issue's Work dispatch get preceded by an
+    independent JIT acceptance-slice authoring session?
+
+    Mirrors — and must never drift from — the same rule the TUI's
+    ``gate_a_contract_exists_for`` (``tui/src/app/pipeline.rs``) and
+    ``coord.milestone_dispatch.gate_a_status`` already enforce, both via
+    :func:`coord.acceptance.gate_a_contract_path`: a repo with a configured
+    acceptance driver, an issue that resolves to a milestone with a tracking
+    issue, and a Gate-A contract already merged for that milestone. This
+    complements (does not replace) the #1138 hard gate
+    (``coord.dispatch.enforce_oracle_readiness``), which would otherwise
+    just refuse the eventual ``coord assign``/``coord approve-plan`` with no
+    explanation once an oracle-opted-in milestone's issue reaches it — this
+    proactively drives the authoring + merge to completion FIRST so a plain
+    ``coord drive`` doesn't dead-end on that refusal.
+    """
+    if opts.no_acceptance:
+        return OracleDecision(False, "--no-acceptance set — normal drive")
+    if not config.acceptance.has_driver(state.repo):
+        return OracleDecision(
+            False, f"{state.repo!r} has no acceptance.drivers entry — normal drive"
+        )
+    if state.milestone_number is None:
+        return OracleDecision(
+            False, f"#{state.issue} has no GitHub milestone — normal drive"
+        )
+    if state.milestone_tracking_issue is None:
+        return OracleDecision(
+            False,
+            f"#{state.issue} isn't a member of a tracked milestone work order — "
+            "normal drive",
+        )
+    if not gate_checker.contract_exists(state.repo, state.milestone_number):
+        from coord.acceptance import gate_a_contract_path  # noqa: PLC0415
+
+        path = gate_a_contract_path(state.milestone_number)
+        return OracleDecision(
+            False,
+            f"Gate A contract {path!r} not merged yet on "
+            f"{state.repo_default_branch!r} — normal drive (run `coord "
+            f"acceptance mock {state.repo} {state.milestone_tracking_issue}` "
+            "first for the oracle loop, docs/ORACLE_LOOP.md)",
+        )
+    return OracleDecision(
+        True,
+        f"ORACLE DRIVE — ms-{state.milestone_number}'s Gate-A contract is "
+        f"merged: authoring the sealed JIT slice for #{state.issue} "
+        f"(`coord acceptance author {state.repo} "
+        f"{state.milestone_tracking_issue} --issue {state.issue}`) before "
+        "dispatching work",
+        tracking_issue=state.milestone_tracking_issue,
+    )
+
+
+def _decide_acceptance_author(
+    state: IssueState, oracle: OracleDecision, machine: str
+) -> Action | None:
+    """The #1453 JIT-slice gate itself. ``None`` means "landed — fall
+    through to dispatching work normally" (only ever called when
+    ``oracle.active``).
+
+    Observes a `type="test-author"` assignment scoped to THIS issue
+    (``for_issue_number == state.issue`` — #1171/#1138 key the JIT slice's
+    row on the milestone's TRACKING issue via `issue_number`, so it never
+    shows up as this issue's own ``work_aid``; see ``IssueState``'s
+    docstring). That assignment is itself `WORK_LIKE`
+    (``coord.models.WORK_LIKE_TYPES``), so coord drives its OWN Test → Review
+    → Merge exactly like a normal work row (dispatch_pending_smoke /
+    dispatch_pending_reviews / the merge queue) with zero help from this
+    driver — this only waits for its board row to reach ``status='merged'``
+    (#609), the identical terminal signal :func:`decide`'s own merged check
+    uses for the real work row.
+    """
+    aid = state.acceptance_author_aid
+    status = state.acceptance_author_status
+
+    if not aid:
+        return Action(
+            kind=RUN,
+            label=(
+                "ACCEPTANCE: authoring sealed JIT slice → coord acceptance "
+                f"author {state.repo} {oracle.tracking_issue} --issue "
+                f"{state.issue}"
+            ),
+            command=(
+                "acceptance", "author", state.repo, str(oracle.tracking_issue),
+                "--issue", str(state.issue),
+            ),
+            error_message=(
+                f"coord acceptance author failed to dispatch for #{state.issue}. "
+                "Check coordinator.yml's acceptance.drivers entry for "
+                f"{state.repo!r}, or re-run coord drive with --no-acceptance "
+                "to skip JIT authoring."
+            ),
+        )
+
+    if status == "merged":
+        return None
+
+    if status == "failed":
+        return _die(
+            f"acceptance author {aid} failed — inspect: coord log {aid} "
+            f"--machine {state.work_machine or machine}\n"
+            "   Continue by hand, or re-run coord drive with "
+            "--no-acceptance to skip JIT authoring."
+        )
+
+    if status == "cancelled":
+        return _die(
+            f"acceptance author {aid} was cancelled — re-dispatch by hand: "
+            f"coord acceptance author {state.repo} {oracle.tracking_issue} "
+            f"--issue {state.issue}\n"
+            "   or re-run coord drive with --no-acceptance."
+        )
+
+    # "" / running / done / advisory: still landing through Test → Review →
+    # Merge — coord's own tick loop drives that, exactly like a normal work
+    # row; this only observes (same posture as every other gate in this
+    # module).
+    return _wait(label=f"ACCEPTANCE: JIT slice {aid} authoring/merging in progress")
 
 
 # ── merge verification ───────────────────────────────────────────────────────
@@ -399,6 +600,7 @@ def decide(
     verifier: MergeVerifier,
     *,
     machine: str = "",
+    oracle: OracleDecision | None = None,
 ) -> Action:
     """One step of the state machine: given the board, what next?
 
@@ -407,6 +609,11 @@ def decide(
     ordering is identical, and — critically — **no terminal status falls
     through to a bare wait**.  An ``advisory`` work row doing exactly that was
     a silent 240-minute spin (fixed in PR #1386, and now unit-tested).
+
+    *oracle* (#1453) is resolved ONCE per run by :func:`resolve_oracle_decision`
+    and threaded through unchanged on every call — ``None`` (the default,
+    every pre-#1453 caller) behaves exactly as before: no JIT slice, straight
+    to ``coord assign``.
     """
     machine = machine or opts.machine or state.picked_machine
 
@@ -427,7 +634,7 @@ def decide(
 
     # ---- no work yet: plan and/or dispatch ---------------------------------
     if not state.work_aid:
-        return _dispatch_work_stage(state, opts, machine)
+        return _dispatch_work_stage(state, opts, machine, oracle)
 
     # ---- work failed: bounded retry ----------------------------------------
     if state.work_status == "failed":
@@ -506,8 +713,27 @@ def decide(
     return replace(merge, warnings=warnings + merge.warnings)
 
 
-def _dispatch_work_stage(state: IssueState, opts: DriveOptions, machine: str) -> Action:
-    """No work row yet: run the optional plan stage, then dispatch the work."""
+def _dispatch_work_stage(
+    state: IssueState,
+    opts: DriveOptions,
+    machine: str,
+    oracle: OracleDecision | None = None,
+) -> Action:
+    """No work row yet: run the optional plan stage, then dispatch the work.
+
+    #1453: when *oracle* is active, the sealed JIT acceptance slice for this
+    issue is authored — and observed through to a landed merge — BEFORE
+    either the plan or the direct-assign path below. Otherwise the #1138
+    hard gate (``coord.dispatch.enforce_oracle_readiness``) would simply
+    refuse the eventual ``coord assign``/``coord approve-plan`` once an
+    oracle-opted-in milestone's issue reaches it, with this driver never
+    having explained why.
+    """
+    if oracle is not None and oracle.active:
+        gate = _decide_acceptance_author(state, oracle, machine)
+        if gate is not None:
+            return gate
+
     if opts.do_plan:
         if not state.plan_aid:
             args = ["assign", "--plan-only", machine, state.repo, str(state.issue)]
@@ -1001,6 +1227,7 @@ class Driver:
     config: Any
     fetcher: BoardFetcher = field(default_factory=BoardFetcher)
     verifier: MergeVerifier | None = None
+    oracle_gate: AcceptanceGateChecker | None = None
     out: Any = None
     err: Any = None
     sleeper: Callable[[float], None] = time.sleep
@@ -1015,6 +1242,8 @@ class Driver:
             self.verifier = GitMergeVerifier(
                 repo_path=self.opts.repo_path, warn=self.warn
             )
+        if self.oracle_gate is None:
+            self.oracle_gate = GitHubAcceptanceGateChecker(config=self.config)
 
     # ── logging ─────────────────────────────────────────────────────────
     @staticmethod
@@ -1159,8 +1388,14 @@ class Driver:
         pre = preflight(state, self.opts)
         machine = pre.machine
 
+        # #1453: resolved ONCE here (not per-poll) — the gate_checker inside
+        # costs a GitHub fetch and a milestone's Gate-A status can't change
+        # mid-run. Threaded unchanged into every decide() call below.
+        oracle = resolve_oracle_decision(state, self.opts, self.config, self.oracle_gate)
+
         self.log(f"driving {self.repo} #{self.issue}")
         self.log(f"  machine        : {machine}")
+        self.log(f"  acceptance     : {oracle.reason}")
         self.log(
             f"  test command   : {state.repo_test_command or '<none configured>'} "
             "(coord dispatches this itself — #1426; this observes)"
@@ -1250,7 +1485,7 @@ class Driver:
                 last_change = now
 
             action = decide(
-                state, self.opts, counters, self.verifier, machine=machine
+                state, self.opts, counters, self.verifier, machine=machine, oracle=oracle
             )
             for warning in action.warnings:
                 self.warn(warning)
