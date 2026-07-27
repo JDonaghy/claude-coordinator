@@ -375,7 +375,11 @@ class TestDriveAttachCli:
         assert result.exit_code == 1
         assert "no live drive session" in out
 
-    def test_attaches_when_live(self) -> None:
+    def test_attaches_when_live(self, monkeypatch) -> None:
+        # Not nested in a client: attach-session. Must not depend on the ambient
+        # $TMUX of whoever runs pytest — inside tmux this takes the switch-client
+        # branch and the assert below fails (green in CI, red for an operator).
+        monkeypatch.delenv("TMUX", raising=False)
         with (
             patch("coord.interactive.tmux_session_alive", return_value=True),
             patch("coord.commands.drive.subprocess.run", return_value=MagicMock(returncode=0)) as run,
