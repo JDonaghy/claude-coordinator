@@ -370,6 +370,22 @@ pub(crate) fn epic_badge_span_for_labels(labels: &[String]) -> Option<StyledSpan
     }
 }
 
+/// #1500: GitHub label an operator sets (via the TUI's "Mark ready" /
+/// "Unmark ready" Pipeline row actions, or `coord queue`/`coord unqueue`
+/// directly) to stage a New issue into In-progress:`ready` with no
+/// dispatch — the "next up" marker.  Deliberately a *new* label rather
+/// than reusing `status:ready`: that label is already applied
+/// automatically by `coord track` / the refinement finalize step for
+/// *every* issue sent to the Pipeline, so it carries no "an operator
+/// specifically staged this" signal.
+pub(crate) const QUEUED_LABEL: &str = "status:queued";
+
+/// Case-insensitive check for [`QUEUED_LABEL`] against an arbitrary label
+/// list, mirroring `labels_carry_epic_label`'s convention.
+pub(crate) fn labels_carry_queued_label(labels: &[String]) -> bool {
+    labels.iter().any(|l| l.eq_ignore_ascii_case(QUEUED_LABEL))
+}
+
 /// Compute the PipelineView layout that the TUI backend would paint into
 /// `rect`. Lets `mouse_main_click` hit-test without holding a `Backend`.
 ///
@@ -670,6 +686,17 @@ impl CoordApp {
         if has_work_assignment {
             return "in-progress";
         }
+        // #1500: an operator-staged issue (`status:queued`, set via the
+        // "Mark ready" row action / `coord queue`) with no work dispatched
+        // yet is the "next up" intent marker — render it under In-progress
+        // with the `ready` badge (never `in-flight`: `active_issue_in_flight`
+        // is false with no live session). Checked AFTER the real-work branch
+        // above so actual dispatch always outranks the marker — once a
+        // worker lands, the row flips to `in-flight` on its own with no
+        // extra bookkeeping needed here.
+        if labels_carry_queued_label(&issue.all_labels) {
+            return "in-progress";
+        }
         // #628: a coord-tracked, not-yet-started issue is just "new". Neither
         // `status:ready` (Pending) nor `status:refining` (Refining) splits a
         // separate bucket anymore — they gate no dispatch, so the New/Pending and
@@ -692,7 +719,12 @@ impl CoordApp {
     ///   flagged the latter as arguably still in-progress rather than a new
     ///   bucket, to avoid growing the lifecycle-section enum for one case).
     /// - No child started yet (all `Ready`/`Blocked`, or the child list
-    ///   resolved to zero DAG nodes) → "new" stands.
+    ///   resolved to zero DAG nodes) → "new" stands, UNLESS #1500's
+    ///   `status:queued` staging marker is present on the epic itself or
+    ///   any child (checked below) — an epic almost never carries a direct
+    ///   assignment of its own, so its "Mark ready" action stages the
+    ///   marker somewhere in the epic+children set rather than relying on
+    ///   the plain-issue branch in [`Self::pipeline_lifecycle_section`].
     fn epic_lifecycle_section(&self, issue: &PipelineIssue, children: &[EpicChild]) -> &'static str {
         let repo_name = issue.coord_repo.clone().unwrap_or_default();
         let work_order: Vec<WorkOrderNode> = children
@@ -708,9 +740,61 @@ impl CoordApp {
             .iter()
             .any(|n| matches!(n.state, NodeState::Done | NodeState::InFlight));
         if any_progress {
-            "in-progress"
-        } else {
-            "new"
+            return "in-progress";
+        }
+        // #1500: staged-but-not-started — the epic itself carries
+        // `status:queued`, or a child does (e.g. only one child was staged
+        // individually before the epic itself was marked ready).
+        if labels_carry_queued_label(&issue.all_labels)
+            || self.children_carry_queued_label(&repo_name, children)
+        {
+            return "in-progress";
+        }
+        "new"
+    }
+
+    /// #1500: numbers of `children` (an epic's `## Sub-issues` list) that
+    /// currently carry [`QUEUED_LABEL`], resolved against the
+    /// `open_issues` label cache (children aren't necessarily
+    /// `coord`-labelled themselves, so they may not appear in
+    /// `self.pipeline_issues`). Shared by [`Self::epic_lifecycle_section`]
+    /// (membership test) and `unmark_selected_ready`'s epic fan-out (which
+    /// child numbers to strip the label from).
+    pub(crate) fn queued_child_numbers(&self, repo_name: &str, children: &[EpicChild]) -> Vec<u64> {
+        children
+            .iter()
+            .filter(|c| {
+                self.data
+                    .open_issues
+                    .iter()
+                    .find(|oi| oi.repo_name == repo_name && oi.number == c.number)
+                    .map(|oi| labels_carry_queued_label(&oi.labels))
+                    .unwrap_or(false)
+            })
+            .map(|c| c.number)
+            .collect()
+    }
+
+    /// #1500: true when any of `children` currently carries [`QUEUED_LABEL`].
+    fn children_carry_queued_label(&self, repo_name: &str, children: &[EpicChild]) -> bool {
+        !self.queued_child_numbers(repo_name, children).is_empty()
+    }
+
+    /// #1500: does `issue` carry the `status:queued` staging marker —
+    /// directly, or (for an epic tracking issue) via the epic itself or any
+    /// child? This is the same test [`Self::pipeline_lifecycle_section`] /
+    /// [`Self::epic_lifecycle_section`] use to promote a not-yet-dispatched
+    /// row to In-progress, exposed here so the context menu can gate
+    /// "Unmark ready" to rows an actual `status:queued` put there (rather
+    /// than a row that reached In-progress via real work, which "Unmark
+    /// ready" would be a confusing no-op for).
+    pub(crate) fn pipeline_issue_is_queued(&self, issue: &PipelineIssue) -> bool {
+        if labels_carry_queued_label(&issue.all_labels) {
+            return true;
+        }
+        match (issue.coord_repo.as_deref(), self.epic_children_for(issue)) {
+            (Some(repo), Some(children)) => self.children_carry_queued_label(repo, children),
+            _ => false,
         }
     }
 

@@ -36161,7 +36161,10 @@ Milestone tracking issue.
             label_change_for_subcommand("backlog"),
             Some((
                 [].as_slice(),
-                ["status:refining", "status:ready"].as_slice()
+                // #1500: also strips `status:queued` — dropping a staged
+                // card to Backlog must not leave the marker behind to
+                // silently re-surface on a later `coord track`.
+                ["status:refining", "status:ready", "status:queued"].as_slice()
             ))
         );
         assert_eq!(
@@ -36169,6 +36172,688 @@ Milestone tracking issue.
             None,
             "an unmapped subcommand must fall back to the coord subprocess, not panic/guess",
         );
+    }
+
+    /// #1500: `label_change_for_subcommand("queue")` / `("unqueue")` must
+    /// match the Python `coord queue` / `coord unqueue` label sets exactly
+    /// (`coord/commands/issues.py`) — the acceptance test this issue calls
+    /// out by name, mirroring the pattern the test just above already
+    /// established for `ready`/`refine`/`track`/`backlog`.
+    #[test]
+    fn label_change_for_subcommand_matches_python_queue_unqueue_label_sets() {
+        assert_eq!(
+            label_change_for_subcommand("queue"),
+            Some((["status:queued"].as_slice(), [].as_slice())),
+            "coord queue: add status:queued, remove nothing"
+        );
+        assert_eq!(
+            label_change_for_subcommand("unqueue"),
+            Some(([].as_slice(), ["status:queued"].as_slice())),
+            "coord unqueue: add nothing, remove status:queued"
+        );
+    }
+
+    // ── #1500: "Mark ready" / "Unmark ready" (`status:queued` staging) ────────
+    //
+    // Black-box TuiDriver acceptance coverage per CLAUDE.md, plus a couple of
+    // direct-dispatch companions for the parts a TuiDriver test can't see
+    // (the driver doesn't expose the wrapped `CoordApp` for a typed field
+    // check — same limitation documented on
+    // `tuidriver_send_to_pipeline_posts_directly_to_daemon_no_subprocess`).
+
+    /// True when `argv[0] == subcommand` for some recorded spawn. Used
+    /// instead of a blanket `spawned_calls.is_empty()` — a successful
+    /// "Mark ready"/"Unmark ready" also kicks a background `coord sync
+    /// --quiet` refresh (`maybe_kick_pipeline_loader`, same as "Send to
+    /// Pipeline"), which is legitimate and unrelated to what these tests
+    /// check: that the label change itself went through the direct POST
+    /// seam rather than falling back to a `coord queue`/`coord unqueue`
+    /// subprocess.
+    fn spawned_a_subcommand(app: &CoordApp, subcommand: &str) -> bool {
+        app.command_runner
+            .spawned_calls
+            .iter()
+            .any(|argv| argv.first().map(|s| s.as_str()) == Some(subcommand))
+    }
+
+    /// A repo with one `status:queued` issue (#300, staged — no assignment)
+    /// and one ordinary New issue (#301, no queued label), so a test can
+    /// assert #300 renders under In-progress while #301 stays under New —
+    /// mirroring `make_epic_completed_child_app`'s "plain unworked sibling
+    /// forces the New section to render" trick, rather than relying on the
+    /// fragile "the New section vanished" signal (a bare `driver.find("New")`
+    /// could false-positive on unrelated chrome, e.g. the "New Issue" CTA
+    /// elsewhere in the app).
+    fn make_queued_and_new_issue_app() -> CoordApp {
+        let stub = |number: u64, title: &str, labels: Vec<String>| PipelineIssue {
+            number,
+            title: title.to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: labels,
+            is_closed: false,
+        };
+        let data = BoardData {
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        app.pipeline_issues = vec![
+            stub(
+                300,
+                "Staged issue",
+                vec!["coord".to_string(), "status:queued".to_string()],
+            ),
+            stub(301, "Fresh issue", vec!["coord".to_string()]),
+        ];
+        app.active_view = SidebarView::Pipeline;
+        app.rebuild_pipeline_sidebar(None);
+        app
+    }
+
+    /// Acceptance #1: a New issue carrying `status:queued` renders under
+    /// In-progress with a `ready` badge, and no longer under New.
+    #[test]
+    fn tuidriver_queued_issue_renders_under_in_progress_with_ready_badge_not_new() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_queued_and_new_issue_app();
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        let screen = driver.screen();
+
+        // Search the exact "<label> (<count>)" header text (not a bare "New"
+        // substring, which could false-positive against unrelated chrome
+        // elsewhere in the app, e.g. a "New Issue" CTA) — the count also
+        // doubles as proof #301 (the only candidate) landed in New, without
+        // needing to expand the collapsed-by-default "No milestone" bucket
+        // underneath it just to find its row directly.
+        let in_progress_hdr = driver.find("In-progress (1)").unwrap_or_else(|| {
+            panic!("#1500: a status:queued issue must produce an In-progress section:\n{screen}")
+        });
+        let new_hdr = driver.find("New (1)").unwrap_or_else(|| {
+            panic!("sanity: the ordinary #301 issue must still render a New section:\n{screen}")
+        });
+        let staged_pos = driver
+            .find("#300")
+            .unwrap_or_else(|| panic!("#1500: the staged issue #300 must render:\n{screen}"));
+
+        // In-progress renders first (#815), New after — so #300 landing
+        // between the two headers proves it nested under In-progress, not New.
+        assert!(
+            in_progress_hdr.1 < staged_pos.1 && staged_pos.1 < new_hdr.1,
+            "#1500: #300 must render under In-progress (between the In-progress and \
+             New headers), not under New: in_progress={in_progress_hdr:?} \
+             #300={staged_pos:?} New={new_hdr:?}\n{screen}",
+        );
+
+        let staged_line = screen.lines().nth(staged_pos.1 as usize).unwrap_or_default();
+        assert!(
+            staged_line.contains("ready"),
+            "#1500: a staged issue with no dispatch must carry the 'ready' badge, \
+             not 'in-flight': {staged_line:?}\n{screen}",
+        );
+    }
+
+    /// Acceptance #2 (presence half): right-clicking a New row offers
+    /// "Mark ready".
+    #[test]
+    fn tuidriver_pipeline_new_row_right_click_offers_mark_ready() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_pipeline_app();
+        app.active_view = SidebarView::Pipeline;
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+
+        // #857: a "No milestone" bucket starts collapsed — click it to
+        // reveal #42 underneath (same expand step
+        // `tuidriver_send_to_pipeline_posts_directly_to_daemon_no_subprocess`
+        // uses for the Board panel's equivalent bucket). #42's repo ("api")
+        // is declared first, so the FIRST "No milestone" match is its own.
+        let (mex, mey) = driver.find("No milestone").unwrap_or_else(|| {
+            panic!(
+                "#1500: 'No milestone' group header not found on initial render:\n{}",
+                driver.screen()
+            )
+        });
+        driver.click(mex, mey);
+
+        let (x, y) = driver
+            .find("#42")
+            .unwrap_or_else(|| panic!("New row #42 must render:\n{}", driver.screen()));
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: MouseButton::Right,
+            position: Point::new(x, y),
+            modifiers: Modifiers::default(),
+        });
+        let menu_screen = driver.screen();
+        assert!(
+            menu_screen.contains("Mark ready"),
+            "#1500: right-click on a New row must offer 'Mark ready':\n{}",
+            menu_screen
+        );
+    }
+
+    /// Acceptance #2 (effect half): clicking "Mark ready" on a plain (non-epic)
+    /// New issue POSTs exactly one `status:queued` label change, for that
+    /// issue only — no fan-out, no `coord` subprocess spawned.
+    #[test]
+    fn dispatch_mark_ready_posts_status_queued_for_plain_issue_only() {
+        let mut app = make_pipeline_app();
+        app.pipeline_sel = Some(0); // #42, repo "api" — see make_pipeline_app
+        app.active_view = SidebarView::Pipeline;
+
+        let mock = MockBoardService::start(r#"{"labels": ["coord", "status:queued"], "changed": true}"#);
+        let _guard = set_test_board_service(mock.url(), None);
+
+        let target = ContextMenuTarget::PipelineRow {
+            issue_number: Some(42),
+            repo_name: Some("api".to_string()),
+            lifecycle: PipelineRowLifecycle::New,
+        };
+        let fired = app.dispatch_context_menu_action("mark-ready", &target);
+        assert!(fired);
+
+        let requests = mock.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "a plain issue must POST exactly one label change, not fan out; got {:?}",
+            requests
+        );
+        assert!(requests[0].starts_with("POST /issue-label"));
+        // Not `spawned_calls.is_empty()`: a successful label change also
+        // kicks a background `coord sync --quiet` refresh
+        // (`maybe_kick_pipeline_loader`) — legitimate production behavior,
+        // not the thing under test here. What must NOT happen is the
+        // `coord queue` subprocess fallback (the no-board-service path).
+        assert!(
+            !spawned_a_subcommand(&app, "queue"),
+            "a board service is configured — must NOT fall back to a coord queue \
+             subprocess; got {:?}",
+            app.command_runner.spawned_calls,
+        );
+        assert_eq!(app.toasts.last().unwrap().0.title, "Mark ready");
+    }
+
+    /// An epic tracking issue (#500) in Pipeline:New with two open (Ready)
+    /// children (#501, #502) and NO Done/InFlight child — the fixture for
+    /// the "Mark ready (epic + N children)" label test and its basic
+    /// fan-out companion below.
+    ///
+    /// Deliberately all-Ready: `epic_lifecycle_section`'s pre-existing
+    /// #1253 rule already promotes an epic with ANY Done-or-InFlight child
+    /// straight to "in-progress" (`any_progress`, checked before #1500's own
+    /// `status:queued` branch) — so a *genuinely* `New`-classified epic can
+    /// never have a Done child to begin with. The Done-exclusion behavior
+    /// itself is covered separately below
+    /// (`dispatch_mark_ready_excludes_done_children_even_if_reached_directly`),
+    /// exercising `mark_selected_ready` directly rather than via a real
+    /// right-click (which could never reach that data combination live).
+    fn make_pipeline_epic_new_row_app() -> CoordApp {
+        let open = |number: u64, title: &str, state: &str, labels: Vec<String>| OpenIssue {
+            repo_name: "api".to_string(),
+            number,
+            title: title.to_string(),
+            body: String::new(),
+            state: state.to_string(),
+            labels,
+            milestone_number: None,
+            milestone_title: None,
+        };
+        let coord = || vec!["coord".to_string()];
+        let data = BoardData {
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            open_issues: vec![
+                open(500, "Epic tracker", "open", vec!["coord".to_string(), "epic".to_string()]),
+                open(501, "Child A", "open", coord()),
+                open(502, "Child B", "open", coord()),
+            ],
+            epic_children: vec![EpicChildren {
+                repo_name: "api".to_string(),
+                tracking_issue: 500,
+                children: vec![
+                    EpicChild { number: 501, state: "open".to_string() },
+                    EpicChild { number: 502, state: "open".to_string() },
+                ],
+            }],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 500,
+            title: "Epic tracker".to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string(), "epic".to_string()],
+            is_closed: false,
+        }];
+        app.active_view = SidebarView::Pipeline;
+        app.rebuild_pipeline_sidebar(None);
+        app
+    }
+
+    /// Acceptance #3 (presence half): right-clicking a New epic row names
+    /// the child count in the "Mark ready" label.
+    #[test]
+    fn tuidriver_pipeline_new_epic_row_names_non_done_child_count() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_pipeline_epic_new_row_app();
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+
+        // #857: "No milestone" starts collapsed — expand it to reveal #500.
+        let (mex, mey) = driver.find("No milestone").unwrap_or_else(|| {
+            panic!(
+                "#1500: 'No milestone' group header not found on initial render:\n{}",
+                driver.screen()
+            )
+        });
+        driver.click(mex, mey);
+
+        let (x, y) = driver
+            .find("#500")
+            .unwrap_or_else(|| panic!("epic row #500 must render:\n{}", driver.screen()));
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: MouseButton::Right,
+            position: Point::new(x, y),
+            modifiers: Modifiers::default(),
+        });
+        let menu_screen = driver.screen();
+        assert!(
+            menu_screen.contains("Mark ready (epic + 2 children)"),
+            "#1500: a New epic row's Mark ready label must name the non-Done \
+             child count:\n{}",
+            menu_screen
+        );
+    }
+
+    /// Acceptance #3 (effect half): clicking "Mark ready" on a New epic row
+    /// fans the label change out to the epic itself plus both children.
+    #[test]
+    fn dispatch_mark_ready_epic_fans_out_to_children() {
+        let mut app = make_pipeline_epic_new_row_app();
+        app.pipeline_sel = Some(0); // the epic — only entry in pipeline_issues
+
+        let mock = MockBoardService::start(r#"{"labels": ["coord", "status:queued"], "changed": true}"#);
+        let _guard = set_test_board_service(mock.url(), None);
+
+        let target = ContextMenuTarget::PipelineRow {
+            issue_number: Some(500),
+            repo_name: Some("api".to_string()),
+            lifecycle: PipelineRowLifecycle::New,
+        };
+        let fired = app.dispatch_context_menu_action("mark-ready", &target);
+        assert!(fired);
+
+        let requests = mock.requests();
+        assert_eq!(
+            requests.len(),
+            3,
+            "epic + 2 children = 3 POSTs; got {:?}",
+            requests
+        );
+        assert!(requests.iter().all(|r| r.starts_with("POST /issue-label")));
+        assert!(
+            !spawned_a_subcommand(&app, "queue"),
+            "must NOT fall back to a coord queue subprocess; got {:?}",
+            app.command_runner.spawned_calls,
+        );
+        let toast_body = app.toasts.last().unwrap().0.body.clone();
+        assert!(
+            toast_body.contains('3') || toast_body.to_lowercase().contains("child"),
+            "the ONE summary toast should read as a multi-issue batch: {toast_body:?}",
+        );
+    }
+
+    /// `mark_selected_ready`'s epic fan-out must exclude a Done child even
+    /// when reached directly — defensive coverage for
+    /// `epic_child_kept_in_progress` reuse, independent of whether a live
+    /// right-click could ever surface this exact data combination (it
+    /// can't: see the doc comment on `make_pipeline_epic_new_row_app`
+    /// explaining why a *classified* New epic never has a Done child).
+    /// Here the epic is forced into `pipeline_sel` directly, bypassing
+    /// lifecycle classification entirely, to pin the exclusion behavior of
+    /// the dispatch function itself.
+    #[test]
+    fn dispatch_mark_ready_excludes_done_children_even_if_reached_directly() {
+        let data = BoardData {
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            open_issues: vec![
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 510,
+                    title: "Epic tracker".to_string(),
+                    body: String::new(),
+                    state: "open".to_string(),
+                    labels: vec!["coord".to_string(), "epic".to_string()],
+                    milestone_number: None,
+                    milestone_title: None,
+                },
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 511,
+                    title: "Child A".to_string(),
+                    body: String::new(),
+                    state: "open".to_string(),
+                    labels: vec!["coord".to_string()],
+                    milestone_number: None,
+                    milestone_title: None,
+                },
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 512,
+                    title: "Child B (done)".to_string(),
+                    body: String::new(),
+                    state: "closed".to_string(),
+                    labels: vec!["coord".to_string()],
+                    milestone_number: None,
+                    milestone_title: None,
+                },
+            ],
+            epic_children: vec![EpicChildren {
+                repo_name: "api".to_string(),
+                tracking_issue: 510,
+                children: vec![
+                    EpicChild { number: 511, state: "open".to_string() },
+                    EpicChild { number: 512, state: "closed".to_string() },
+                ],
+            }],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 510,
+            title: "Epic tracker".to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string(), "epic".to_string()],
+            is_closed: false,
+        }];
+        app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
+
+        let mock = MockBoardService::start(r#"{"labels": ["coord", "status:queued"], "changed": true}"#);
+        let _guard = set_test_board_service(mock.url(), None);
+
+        let target = ContextMenuTarget::PipelineRow {
+            issue_number: Some(510),
+            repo_name: Some("api".to_string()),
+            lifecycle: PipelineRowLifecycle::New,
+        };
+        let fired = app.dispatch_context_menu_action("mark-ready", &target);
+        assert!(fired);
+
+        let requests = mock.requests();
+        assert_eq!(
+            requests.len(),
+            2,
+            "epic + 1 non-Done child (#512 is Done, excluded) = 2 POSTs; got {:?}",
+            requests
+        );
+    }
+
+    /// An epic (#600) staged via `status:queued` directly on itself, with
+    /// two open (Ready) children and no assignments anywhere — the fixture
+    /// for acceptance #4 (staged epic renders once with children badged
+    /// ready).
+    fn make_staged_epic_app() -> CoordApp {
+        let data = BoardData {
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            open_issues: vec![
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 601,
+                    title: "Child A".to_string(),
+                    body: String::new(),
+                    state: "open".to_string(),
+                    labels: vec!["coord".to_string()],
+                    milestone_number: None,
+                    milestone_title: None,
+                },
+                OpenIssue {
+                    repo_name: "api".to_string(),
+                    number: 602,
+                    title: "Child B".to_string(),
+                    body: String::new(),
+                    state: "open".to_string(),
+                    labels: vec!["coord".to_string()],
+                    milestone_number: None,
+                    milestone_title: None,
+                },
+            ],
+            epic_children: vec![EpicChildren {
+                repo_name: "api".to_string(),
+                tracking_issue: 600,
+                children: vec![
+                    EpicChild { number: 601, state: "open".to_string() },
+                    EpicChild { number: 602, state: "open".to_string() },
+                ],
+            }],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 600,
+            title: "Epic tracker".to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            // Staged directly on the epic itself (not via a child) —
+            // `epic_lifecycle_section`'s own-label branch.
+            all_labels: vec!["coord".to_string(), "epic".to_string(), "status:queued".to_string()],
+            is_closed: false,
+        }];
+        app.pipeline_epic_expanded.insert(("api".to_string(), 600), true);
+        app.active_view = SidebarView::Pipeline;
+        app.rebuild_pipeline_sidebar(None);
+        app
+    }
+
+    /// Acceptance #4: a staged epic (no work dispatched anywhere) renders
+    /// exactly once under In-progress, with both of its children nested
+    /// beneath it, badged `ready`.
+    #[test]
+    fn tuidriver_staged_epic_renders_once_with_children_badged_ready() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_staged_epic_app();
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        let screen = driver.screen();
+
+        let in_progress_hdr = driver.find("In-progress").unwrap_or_else(|| {
+            panic!("#1500: a staged epic must produce an In-progress section:\n{screen}")
+        });
+        assert_eq!(
+            screen.matches("#600").count(),
+            1,
+            "#1500: the staged epic must render exactly once:\n{screen}",
+        );
+        let epic_pos = driver.find("#600").unwrap();
+        assert!(
+            epic_pos.1 > in_progress_hdr.1,
+            "epic #600 must render below the In-progress header: \
+             hdr={in_progress_hdr:?} epic={epic_pos:?}\n{screen}",
+        );
+
+        let lines: Vec<&str> = screen.lines().collect();
+        for child in ["#601", "#602"] {
+            let pos = driver
+                .find(child)
+                .unwrap_or_else(|| panic!("child {child} must render nested under the epic:\n{screen}"));
+            assert!(
+                pos.1 > epic_pos.1,
+                "child {child} must nest below the epic row: epic={epic_pos:?} child={pos:?}\n{screen}",
+            );
+            let line = lines.get(pos.1 as usize).copied().unwrap_or_default();
+            assert!(
+                line.contains("ready"),
+                "#1500: an unworked child under a staged epic must show 'ready', \
+                 not 'in-flight'/'done': {line:?}\n{screen}",
+            );
+        }
+    }
+
+    /// Acceptance #5: within the same repo group, an in-flight (running
+    /// work) issue still sorts above a merely-staged one — the #1487
+    /// ordering survives the new `status:queued` membership rule.
+    #[test]
+    fn tuidriver_in_progress_sorts_in_flight_above_staged() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let data = BoardData {
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            assignments: vec![make_assignment_typed("running", 310, "api", Some("work"))],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        let stub = |number: u64, title: &str, labels: Vec<String>| PipelineIssue {
+            number,
+            title: title.to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: labels,
+            is_closed: false,
+        };
+        app.pipeline_issues = vec![
+            // Staged issue declared FIRST — the sort must still move the
+            // in-flight one above it.
+            stub(311, "Staged", vec!["coord".to_string(), "status:queued".to_string()]),
+            stub(310, "Running", vec!["coord".to_string()]),
+        ];
+        app.active_view = SidebarView::Pipeline;
+        app.rebuild_pipeline_sidebar(None);
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        let screen = driver.screen();
+        let y_running = driver
+            .find("#310")
+            .unwrap_or_else(|| panic!("#310 must render:\n{screen}"))
+            .1;
+        let y_staged = driver
+            .find("#311")
+            .unwrap_or_else(|| panic!("#311 must render:\n{screen}"))
+            .1;
+        assert!(
+            y_running < y_staged,
+            "#1500/#1487: the in-flight #310 must sort above the staged #311 \
+             (#311 is declared first in issue order): #310@{y_running} #311@{y_staged}\n{screen}",
+        );
+    }
+
+    /// Acceptance #6 (gating matrix): "Unmark ready" is present only on a
+    /// row actually staged via `status:queued` with no real work progress,
+    /// and disappears the moment real work exists — mirrors
+    /// `pipeline_drop_to_backlog_gating`'s structure for the sibling action.
+    #[test]
+    fn pipeline_unmark_ready_gating() {
+        fn unmark_present(app: &CoordApp) -> bool {
+            app.context_menu_items_for_pipeline_row(Some(42), &PipelineRowLifecycle::InProgress, None)
+                .iter()
+                .any(|i| i.action_id.as_deref() == Some("unmark-ready"))
+        }
+
+        let mut app = make_pipeline_app();
+        app.pipeline_sel = Some(0); // #42, repo "api"
+        app.active_view = SidebarView::Pipeline;
+
+        // Not queued, no work → absent (nothing to unmark).
+        assert!(
+            !unmark_present(&app),
+            "a row with no status:queued marker must not offer Unmark ready"
+        );
+
+        // Queued, no work → present.
+        app.pipeline_issues[0].all_labels.push("status:queued".to_string());
+        assert!(
+            unmark_present(&app),
+            "a staged row with no real work must offer Unmark ready"
+        );
+
+        // Queued AND real work progress (a completed work assignment) →
+        // absent — mirrors #618's "Drop to backlog" guard.
+        app.data
+            .assignments
+            .push(make_assignment_typed("done", 42, "api", Some("work")));
+        assert!(
+            !unmark_present(&app),
+            "#1500: once real work exists, Unmark ready must not offer to un-stage it"
+        );
+    }
+
+    /// Acceptance #6 (presence half): right-clicking a staged (queued,
+    /// no work) In-progress row offers "Unmark ready" in the rendered menu.
+    #[test]
+    fn tuidriver_pipeline_staged_row_right_click_offers_unmark_ready() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_pipeline_app();
+        app.pipeline_issues[0].all_labels.push("status:queued".to_string());
+        app.active_view = SidebarView::Pipeline;
+        app.rebuild_pipeline_sidebar(None);
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        let (x, y) = driver
+            .find("#42")
+            .unwrap_or_else(|| panic!("staged row #42 must render:\n{}", driver.screen()));
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: MouseButton::Right,
+            position: Point::new(x, y),
+            modifiers: Modifiers::default(),
+        });
+        let menu_screen = driver.screen();
+        assert!(
+            menu_screen.contains("Unmark ready"),
+            "#1500: right-click on a staged In-progress row must offer 'Unmark ready':\n{}",
+            menu_screen
+        );
+    }
+
+    /// Acceptance #6 (effect half): clicking "Unmark ready" strips
+    /// `status:queued` for that issue, returning it to New.
+    #[test]
+    fn dispatch_unmark_ready_removes_status_queued_for_plain_issue() {
+        let mut app = make_pipeline_app();
+        app.pipeline_issues[0].all_labels.push("status:queued".to_string());
+        app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
+
+        let mock = MockBoardService::start(r#"{"labels": ["coord"], "changed": true}"#);
+        let _guard = set_test_board_service(mock.url(), None);
+
+        let target = ContextMenuTarget::PipelineRow {
+            issue_number: Some(42),
+            repo_name: Some("api".to_string()),
+            lifecycle: PipelineRowLifecycle::InProgress,
+        };
+        let fired = app.dispatch_context_menu_action("unmark-ready", &target);
+        assert!(fired);
+
+        let requests = mock.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "a plain issue must POST exactly one label change; got {:?}",
+            requests
+        );
+        assert!(requests[0].starts_with("POST /issue-label"));
+        assert!(
+            !spawned_a_subcommand(&app, "unqueue"),
+            "must NOT fall back to a coord unqueue subprocess; got {:?}",
+            app.command_runner.spawned_calls,
+        );
+        assert_eq!(app.toasts.last().unwrap().0.title, "Unmark ready");
     }
 
     /// #1012: with no board service configured (the default in tests —
