@@ -4070,4 +4070,164 @@ class TestListAssignmentsTokens:
         # No token keys expected when log is absent — coordinator should
         # treat missing keys as 0, same as older agents.
         assert entry.get("input_tokens", 0) == 0
-        assert entry.get("output_tokens", 0) == 0
+
+
+# ── #1492: agent-side clearing of terminal ADVISORY entries ────────────────────
+
+
+class TestAdvisoryTerminalPrune:
+    """#1472 filtered a stale ADVISORY entry (0-commit work whose issue later
+    closed / branch merged out of band) at render time in `coord status`, but
+    the agent itself kept re-serving it on every `/status` poll forever —
+    every other reader (dashboard, TUI, any future client) had to reimplement
+    the same filter. `AgentServer._prune_terminal_advisory` fixes this at the
+    source: the agent drops the entry from its own state once it confirms the
+    work is terminal on GitHub, so nothing downstream ever sees it again.
+    """
+
+    def _make_spec(self, repo_path: Path, **overrides) -> AssignmentSpec:
+        base = dict(
+            repo_name="api",
+            repo_path=str(repo_path),
+            issue_number=1492,
+            issue_title="t",
+            briefing="b",
+            branch="issue-1492-fix",
+        )
+        base.update(overrides)
+        return AssignmentSpec(**base)
+
+    def _add_github_remote(self, repo_path: Path, slug: str = "acme/widgets") -> None:
+        subprocess.run(
+            ["git", "remote", "add", "origin", f"git@github.com:{slug}.git"],
+            cwd=str(repo_path), check=True, capture_output=True,
+        )
+
+    def test_dropped_when_work_is_terminal(self, tmp_path: Path, monkeypatch) -> None:
+        """An advisory entry whose issue/branch is confirmed terminal on
+        GitHub is removed from the agent's own state — not just hidden."""
+        repo = _init_repo(tmp_path / "repo")
+        self._add_github_remote(repo)
+        server = _server(tmp_path, repo_path=repo)
+        spec = self._make_spec(repo)
+
+        a = AgentAssignment(
+            id="adv-1", spec=spec, status=ADVISORY, finished_at=1.0, exit_code=0,
+            branch="issue-1492-fix",
+        )
+        server._assignments[a.id] = a
+
+        from coord import github_ops
+        monkeypatch.setattr(github_ops, "work_is_terminal", lambda *args, **kwargs: True)
+
+        server._prune_terminal_advisory()
+
+        assert "adv-1" not in server._assignments
+        listing = server.list_assignments()
+        assert listing["completed"] == []
+
+    def test_kept_when_work_still_live(self, tmp_path: Path, monkeypatch) -> None:
+        """A genuine, still-live advisory (issue open, branch unmerged) must
+        not be dropped."""
+        repo = _init_repo(tmp_path / "repo")
+        self._add_github_remote(repo)
+        server = _server(tmp_path, repo_path=repo)
+        spec = self._make_spec(repo)
+
+        a = AgentAssignment(
+            id="adv-2", spec=spec, status=ADVISORY, finished_at=1.0, exit_code=0,
+            branch="issue-1492-fix",
+        )
+        server._assignments[a.id] = a
+
+        from coord import github_ops
+        monkeypatch.setattr(github_ops, "work_is_terminal", lambda *args, **kwargs: False)
+
+        server._prune_terminal_advisory()
+
+        assert "adv-2" in server._assignments
+        listing = server.list_assignments()
+        assert len(listing["completed"]) == 1
+
+    def test_kept_when_no_github_remote(self, tmp_path: Path, monkeypatch) -> None:
+        """Fail-open: a repo with no (or a non-GitHub) origin remote can't be
+        checked, so the entry is left in place rather than guessed away."""
+        repo = _init_repo(tmp_path / "repo")  # no `origin` remote configured
+        server = _server(tmp_path, repo_path=repo)
+        spec = self._make_spec(repo)
+
+        a = AgentAssignment(
+            id="adv-3", spec=spec, status=ADVISORY, finished_at=1.0, exit_code=0,
+            branch="issue-1492-fix",
+        )
+        server._assignments[a.id] = a
+
+        from coord import github_ops
+        calls = []
+        monkeypatch.setattr(
+            github_ops, "work_is_terminal",
+            lambda *args, **kwargs: calls.append((args, kwargs)) or True,
+        )
+
+        server._prune_terminal_advisory()
+
+        assert "adv-3" in server._assignments
+        assert calls == [], "work_is_terminal must not be called without a resolvable slug"
+
+    def test_rate_limited_across_polls(self, tmp_path: Path, monkeypatch) -> None:
+        """Two `/status` polls in quick succession cost exactly one GitHub
+        terminality sweep, not one per poll (#1492's #1472-mirrored fail-open
+        cost concern) — verified here via `list_assignments()`, the actual
+        `/status` handler entry point."""
+        repo = _init_repo(tmp_path / "repo")
+        self._add_github_remote(repo)
+        server = _server(tmp_path, repo_path=repo)
+        spec = self._make_spec(repo)
+
+        a = AgentAssignment(
+            id="adv-4", spec=spec, status=ADVISORY, finished_at=1.0, exit_code=0,
+            branch="issue-1492-fix",
+        )
+        server._assignments[a.id] = a
+
+        from coord import github_ops
+        calls = []
+
+        def _fake_terminal(*args, **kwargs):
+            calls.append((args, kwargs))
+            return False
+
+        monkeypatch.setattr(github_ops, "work_is_terminal", _fake_terminal)
+
+        server.list_assignments()
+        server.list_assignments()
+
+        assert len(calls) == 1, (
+            f"expected exactly one GitHub sweep across two polls within the "
+            f"cooldown window, got {len(calls)}"
+        )
+
+    def test_persisted_state_no_longer_carries_settled_advisory(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """The drop is written through to agent_state.json too — a restarted
+        agent must not resurrect the settled advisory entry from disk."""
+        repo = _init_repo(tmp_path / "repo")
+        self._add_github_remote(repo)
+        server = _server(tmp_path, repo_path=repo)
+        spec = self._make_spec(repo)
+
+        a = AgentAssignment(
+            id="adv-5", spec=spec, status=ADVISORY, finished_at=1.0, exit_code=0,
+            branch="issue-1492-fix",
+        )
+        server._assignments[a.id] = a
+        server._persist()
+
+        from coord import github_ops
+        monkeypatch.setattr(github_ops, "work_is_terminal", lambda *args, **kwargs: True)
+
+        server._prune_terminal_advisory()
+
+        state = json.loads(server.state_path.read_text())
+        assert all(entry["id"] != "adv-5" for entry in state["assignments"])

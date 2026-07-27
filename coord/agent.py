@@ -135,6 +135,18 @@ _WIP_RESCUE_MAX_FILES = 200
 # suspenders on top of the real, size-based fix.
 _COMPLETED_HISTORY_CAP = 25
 
+# #1492: minimum interval between GitHub terminality sweeps of ADVISORY
+# assignments (see `AgentServer._prune_terminal_advisory`). That sweep runs
+# from the `/status` hot path (`list_assignments`), so a bare per-call check
+# would put a `gh` round-trip per distinct advisory (repo, issue, branch) on
+# every poll — the same "fail-open cost" #1472 accepted in `coord status`'s
+# render-time filter, just moved one hop earlier. Gating it behind a cooldown
+# means the coordinator-visible cost is one sweep per cooldown window,
+# regardless of poll frequency, while still clearing a settled advisory
+# entry agent-side (see module docstring for `_COMPLETED_HISTORY_CAP`) well
+# within an operator's normal polling cadence.
+_ADVISORY_TERMINAL_CHECK_COOLDOWN_S = 300.0
+
 
 # ── Reap tuning ───────────────────────────────────────────────────────────────
 # claude-cli sometimes does not exit after emitting its final
@@ -486,6 +498,44 @@ def _git(cwd: Path, *args: str, timeout: float = 15.0) -> str:
     if result.returncode != 0:
         raise _GitError(f"git {' '.join(args)} failed: {result.stderr.strip()}")
     return result.stdout.strip()
+
+
+def _infer_repo_github_slug(repo_path: str) -> str | None:
+    """Best-effort ``owner/repo`` slug for *repo_path*'s ``origin`` remote (#1492).
+
+    The agent never learns the GitHub slug configured in the coordinator's
+    ``coordinator.yml`` — :class:`AssignmentSpec` (the wire shape a worker is
+    dispatched with) carries only ``repo_name``/``repo_path``; the
+    coordinator owns config, the agent is a dumb dispatcher. Checking whether
+    an ADVISORY assignment's work has gone terminal on GitHub needs the slug
+    anyway (:func:`coord.github_ops.work_is_terminal` takes one directly), so
+    this derives it from the checkout's own ``origin`` remote URL instead of
+    threading a new field through every assignment spec on the wire.
+
+    Handles both the SSH (``git@github.com:owner/repo.git``) and HTTPS
+    (``https://github.com/owner/repo.git``) remote forms. Deliberately does
+    NOT use a regex with a lazy repo-name match up to an optional ``.git``
+    suffix — repo names may themselves contain dots (e.g. ``repo.js``),
+    which a naive ``(?:\\.git)?$`` pattern would truncate. Stripping a
+    literal trailing ``.git`` instead handles that correctly.
+
+    Returns ``None`` on any failure (no ``origin`` remote, non-GitHub
+    remote, missing/deleted worktree, git timeout) — callers must treat that
+    as "can't check, leave the entry alone", matching ``work_is_terminal``'s
+    own fail-open convention.
+    """
+    try:
+        url = _git(Path(repo_path), "remote", "get-url", "origin").strip()
+    except (_GitError, OSError, subprocess.TimeoutExpired):
+        return None
+    if "github.com" not in url:
+        return None
+    tail = url.split("github.com", 1)[1].lstrip(":/")
+    tail = tail.removesuffix(".git").rstrip("/")
+    parts = tail.split("/")
+    if len(parts) != 2 or not all(parts):
+        return None
+    return "/".join(parts)
 
 
 def _worktree_dirt(wt_path: Path) -> tuple[int, int] | None:
@@ -2794,6 +2844,11 @@ class AgentServer:
         # `_reap` returns (success or exception) — see `wait_for`.
         self._reap_complete: dict[str, threading.Event] = {}
 
+        # #1492: last time `_prune_terminal_advisory` actually ran a GitHub
+        # terminality sweep over ADVISORY assignments. 0.0 means "never" so
+        # the very first `/status` poll after startup always sweeps once.
+        self._last_advisory_terminal_check: float = 0.0
+
         # Cache for /health worktree_bytes — recomputing it walks every
         # file under ~/.coord/worktrees on every /health call, which is
         # tens or hundreds of thousands of stat syscalls when worktrees
@@ -3568,6 +3623,14 @@ class AgentServer:
 
     def list_assignments(self) -> dict:
         from coord.worker_events import is_stream_json, parse_log
+
+        # #1492: clear any ADVISORY entry that's gone terminal on GitHub
+        # before serving the completed list — see `_prune_terminal_advisory`
+        # docstring for the rate limiting and fail-open behavior.
+        try:
+            self._prune_terminal_advisory()
+        except Exception:  # noqa: BLE001 — must never break /status
+            _log.warning("_prune_terminal_advisory failed", exc_info=True)
 
         with self._lock:
             assignments = list(self._assignments.values())
@@ -5404,6 +5467,89 @@ class AgentServer:
                 if lock is not None and not lock.locked():
                     self._cleanup_locks.pop(old.id, None)
                 self._reap_complete.pop(old.id, None)
+
+    def _prune_terminal_advisory(self) -> None:
+        """Drop ADVISORY assignments whose work is already terminal on GitHub (#1492).
+
+        #1472 added a render-time filter in `coord status`
+        (`_live_advisory_entries`) that *hides* an advisory entry once
+        GitHub shows the issue closed or the PR merged — but the agent
+        itself never stopped *serving* that entry, so every other consumer
+        of the completed-assignment map (the dashboard API, the TUI, any
+        future client) has to reimplement the same filter or keep showing a
+        stale "UNVERIFIED — review it" nag forever. `_prune_completed_history`
+        above only drops terminal entries by *count*
+        (`_COMPLETED_HISTORY_CAP`), never by GitHub outcome, so a settled
+        advisory can sit well within the cap and keep being served
+        indefinitely.
+
+        This is the shared-seam fix: once the agent itself confirms an
+        advisory entry's work is terminal, it drops the entry from its own
+        state, so nothing downstream — present or future — ever has to
+        check again. `coord status`'s render-time filter stays in place as a
+        fail-open backstop for entries served by an agent that predates this
+        method.
+
+        Rate-limited to once per `_ADVISORY_TERMINAL_CHECK_COOLDOWN_S` via
+        `self._last_advisory_terminal_check` — this runs from the `/status`
+        hot path (`list_assignments`), so an unthrottled check would put a
+        `gh` round-trip per distinct (repo, issue, branch) on every poll,
+        exactly the "fail-open cost" #1472 already accepted once in
+        `coord status`'s render-time filter.
+
+        Best-effort and fail-open throughout, mirroring
+        `github_ops.work_is_terminal`'s own convention: a missing/unreadable
+        checkout, an unresolvable (non-GitHub, or gone) `origin` remote, or a
+        `gh` failure all just leave the entry in place for the next pass —
+        never treated as evidence the work is or isn't done.
+        """
+        now = time.time()
+        with self._lock:
+            if (
+                now - self._last_advisory_terminal_check
+                < _ADVISORY_TERMINAL_CHECK_COOLDOWN_S
+            ):
+                return
+            self._last_advisory_terminal_check = now
+            candidates = [
+                a for a in self._assignments.values() if a.status == ADVISORY
+            ]
+        if not candidates:
+            return
+
+        from coord import github_ops  # noqa: PLC0415
+
+        terminal_cache: dict = {}
+        slug_cache: dict[str, str | None] = {}
+        terminal_ids: list[str] = []
+        for a in candidates:
+            repo_path = a.spec.repo_path
+            if repo_path not in slug_cache:
+                slug_cache[repo_path] = _infer_repo_github_slug(repo_path)
+            repo_github = slug_cache[repo_path]
+            if not repo_github:
+                continue
+            try:
+                terminal = github_ops.work_is_terminal(
+                    repo_github, a.spec.issue_number, a.branch,
+                    cache=terminal_cache,
+                )
+            except Exception:  # noqa: BLE001 — fail-open, never crash /status
+                terminal = False
+            if terminal:
+                terminal_ids.append(a.id)
+
+        if not terminal_ids:
+            return
+
+        with self._lock:
+            for aid in terminal_ids:
+                self._assignments.pop(aid, None)
+                lock = self._cleanup_locks.get(aid)
+                if lock is not None and not lock.locked():
+                    self._cleanup_locks.pop(aid, None)
+                self._reap_complete.pop(aid, None)
+        self._persist()
 
     def _persist(self) -> None:
         with self._lock:
