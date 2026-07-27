@@ -425,15 +425,69 @@ def load_dispatched() -> list[dict]:
     NULL``).  Assignments inserted solely via :func:`save_board` (e.g. created
     directly in tests without going through the dispatch path) are excluded.
 
-    **Thin-client note (#906):** reads the local DB directly.  On a thin client
-    this will be empty/stale.  Callers that need the canonical list on a thin
-    client should use ``board_service.read_board()`` and build the dispatch-dict
-    format from the board's active assignments instead (see
-    ``coord.commands.plan_followup._dispatch_followup`` for the board-based
-    migration).  The guard fires on thin clients so the offending caller is
-    identifiable.
+    **Daemon-aware (#1493):** when a ``board_service`` is configured the local
+    SQLite is empty/stale — the canonical assignments live on the daemon.
+    Reads them from the ``GET /board`` payload (mirrors
+    :func:`load_done_reviews_needing_post`'s #905 remote path) so thin-client
+    callers (``coord log``/``reattach``/``wait``, ``coord sessions``,
+    ``coord status``, the dashboard) see the real dispatched set instead of an
+    empty list. Falls back to the local DB on the daemon host (no
+    ``board_service``) or on fetch failure.
     """
-    _thin_client_local_board_guard("load_dispatched")
+    svc = _board_service()
+    if svc is not None:
+        try:
+            from coord.client import fetch_board_payload  # noqa: PLC0415
+
+            payload = fetch_board_payload(svc)
+            results = [
+                _dispatched_dict_from_payload(a)
+                for a in payload.get("assignments", [])
+                if a.get("dispatched_at")
+            ]
+            results.sort(key=lambda d: d.get("dispatched_at") or 0)
+            return results
+        except Exception:  # noqa: BLE001 — daemon unreachable → local fallback
+            pass
+    return _load_dispatched_local()
+
+
+def _dispatched_dict_from_payload(a: dict) -> dict:
+    """Build a :func:`load_dispatched`-shaped dict from a ``/board`` payload row.
+
+    Mirrors :func:`_row_to_dispatched_dict`'s field set exactly (including the
+    #846/#1137 ``review_iteration``/``provider_name`` fields downstream
+    consumers such as ``coord.notify.detect_needs_attention`` and
+    ``attention_signal`` rely on) so the remote and local paths are
+    indistinguishable to callers.
+    """
+    return {
+        "assignment_id": a.get("assignment_id"),
+        "machine_name": a.get("machine_name", ""),
+        "repo_name": a.get("repo_name", ""),
+        "repo_github": a.get("repo_github"),
+        "issue_number": a.get("issue_number", 0),
+        "issue_title": a.get("issue_title", ""),
+        "files_likely": a.get("files_allowed") or [],
+        "briefing": a.get("briefing") or "",
+        "model": a.get("model"),
+        "type": a.get("type", "work"),
+        "required_gates": a.get("required_gates") or [],
+        "dispatched_at": a.get("dispatched_at"),
+        "review_of_assignment_id": a.get("review_of_assignment_id"),
+        "review_target": a.get("review_target"),
+        "status": a.get("status"),
+        "review_iteration": a.get("review_iteration", 0) or 0,
+        "provider_name": a.get("provider_name"),
+    }
+
+
+def _load_dispatched_local() -> list[dict]:
+    """Local-DB read for :func:`load_dispatched`.
+
+    Used on the daemon host (local DB is canonical) or as the offline
+    fallback.
+    """
     conn = get_connection()
     rows = conn.execute(
         "SELECT * FROM assignments WHERE dispatched_at IS NOT NULL ORDER BY dispatched_at"
@@ -1010,14 +1064,43 @@ def mark_notified(
     Also updates the assignments table so that build_board() reflects the new
     status without needing a separate save_board() call.
 
-    **Thin-client note (#906):** this function writes the local DB directly.
-    On a thin client the canonical writes happen on the daemon via the
-    ``COORD_NOTIFY_ON_DAEMON`` whole-command reroute (see
-    ``coord.commands.lifecycle.notify``).  The guard fires when a thin-client
-    caller bypasses the reroute — surfacing the issue without breaking the
-    call.
+    **Daemon-aware (#1493):** routes to ``POST /notified`` when a
+    ``board_service`` is configured, mirroring :func:`mark_review_posted` /
+    :func:`mark_needs_attention_notified`.  ``coord notify``'s own ~10 call
+    sites (stuck/needs-attention/stalled detection, completion/failure/
+    advisory) are already covered by the ``COORD_NOTIFY_ON_DAEMON``
+    whole-command reroute (see ``coord.commands.lifecycle.notify``) — for
+    those this routed write is a no-op passthrough to the local path, since
+    ``board_service`` is unset by the time they run on the daemon.  This
+    routing exists for the callers that reach ``mark_notified`` WITHOUT that
+    reroute: ``coord.notify.post_orphaned_review_findings`` (#1493), invoked
+    directly by ``coord post-pending-reviews`` and the dashboard's
+    "post findings" action — both of which had been silently writing to a
+    thin client's empty local ledger.
     """
-    _thin_client_local_board_guard("mark_notified")
+    svc = _board_service()
+    resp = _route_write(
+        svc,
+        "/notified",
+        {"assignment_id": assignment_id, "event": event, "branch": branch},
+    )
+    if resp is not None:
+        return
+    _mark_notified_local(assignment_id, event, branch=branch)
+
+
+def _mark_notified_local(
+    assignment_id: str,
+    event: str,
+    *,
+    branch: str | None = None,
+) -> None:
+    """Local-DB write for :func:`mark_notified`.
+
+    Called directly by the daemon endpoint so it never re-routes back over
+    HTTP, and by :func:`mark_notified` itself when no ``board_service`` is
+    configured (the daemon host, or a plain single-machine setup).
+    """
     from coord.comments import (
         EVENT_ADVISORY,
         EVENT_COMPLETION,
@@ -1145,11 +1228,12 @@ def _mark_needs_attention_notified_local(assignment_id: str) -> None:
     """Local-DB write for :func:`mark_needs_attention_notified`.
 
     Called directly by the daemon endpoint so it never re-routes back over
-    HTTP.
+    HTTP — calls :func:`_mark_notified_local` directly (rather than the
+    public :func:`mark_notified`) for the same reason, #1493.
     """
     from coord.comments import EVENT_NEEDS_ATTENTION  # noqa: PLC0415
 
-    mark_notified(f"{assignment_id}:needs-attention", EVENT_NEEDS_ATTENTION)
+    _mark_notified_local(f"{assignment_id}:needs-attention", EVENT_NEEDS_ATTENTION)
 
 
 # ── Review-findings tracking ──────────────────────────────────────────────────

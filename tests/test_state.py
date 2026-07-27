@@ -1070,39 +1070,75 @@ class TestThinClientLocalBoardGuard:
     # AST audit (test_thin_client_board_audit.py) exercised them. These close
     # that gap with the same triad shape used above.
 
-    def test_mark_notified_warns_on_thin_client(self, coord_db, monkeypatch) -> None:
+    # #1493: mark_notified is no longer merely guarded — it's daemon-routed
+    # (POST /notified), mirroring mark_review_posted /
+    # mark_needs_attention_notified.  These replace the old warn/raise/no-warn
+    # triad above (which asserted the OLD behavior: warn-then-write-locally,
+    # the exact silent divergence #1493 fixed) with routing coverage.  Full
+    # daemon-endpoint + post_orphaned_review_findings integration coverage
+    # lives in tests/test_review_verdict_relay.py.
+
+    def test_mark_notified_routes_to_daemon_when_service_configured(
+        self, coord_db, monkeypatch
+    ) -> None:
+        import coord.client as cc
         from coord.state import mark_notified
 
         self._set_thin_client(monkeypatch)
+        captured: dict = {}
+        monkeypatch.setattr(
+            cc,
+            "post_record",
+            lambda svc, path, payload, **kw: captured.update(
+                path=path, payload=payload
+            )
+            or {"ok": True},
+        )
 
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            mark_notified("no-such-id", "completion")
+        mark_notified("aid-1493", "completion", branch="issue-1-foo")
 
-        guard_warns = [w for w in caught if "#615" in str(w.message)]
-        assert guard_warns, "mark_notified on thin client must emit a #615 UserWarning"
-        assert "mark_notified" in str(guard_warns[0].message)
+        assert captured["path"] == "/notified"
+        assert captured["payload"] == {
+            "assignment_id": "aid-1493",
+            "event": "completion",
+            "branch": "issue-1-foo",
+        }
 
-    def test_mark_notified_raises_in_strict_mode(self, coord_db, monkeypatch) -> None:
-        from coord.state import mark_notified
+        # Local DB must NOT have been written (empty local DB, thin-client).
+        from coord.state import load_notified
 
-        self._set_thin_client(monkeypatch)
-        monkeypatch.setenv("COORD_STRICT_LOCAL_BOARD", "1")
+        assert "aid-1493" not in load_notified()
 
-        with pytest.raises(RuntimeError, match="#615"):
-            mark_notified("no-such-id", "completion")
-
-    def test_mark_notified_no_warning_on_daemon_host(self, coord_db, monkeypatch) -> None:
-        from coord.state import mark_notified
+    def test_mark_notified_writes_local_ledger_when_no_service(
+        self, coord_db, monkeypatch
+    ) -> None:
+        from coord.state import load_notified, mark_notified
 
         self._set_daemon_host(monkeypatch)
 
+        mark_notified("aid-local", "completion")
+
+        assert load_notified()["aid-local"]["event"] == "completion"
+
+    def test_mark_notified_no_615_warning_either_way(self, coord_db, monkeypatch) -> None:
+        """Neither branch emits the #615 guard warning any more (#1493)."""
+        import coord.client as cc
+        from coord.state import mark_notified
+
+        self._set_thin_client(monkeypatch)
+        monkeypatch.setattr(
+            cc, "post_record", lambda svc, path, payload, **kw: {"ok": True}
+        )
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            mark_notified("no-such-id", "completion")
+            mark_notified("aid-thin", "completion")
+        assert not [w for w in caught if "#615" in str(w.message)]
 
-        guard_warns = [w for w in caught if "#615" in str(w.message)]
-        assert not guard_warns, "mark_notified on daemon host must NOT emit a #615 warning"
+        self._set_daemon_host(monkeypatch)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            mark_notified("aid-daemon", "completion")
+        assert not [w for w in caught if "#615" in str(w.message)]
 
     def test_save_plan_warns_on_thin_client(self, coord_db, monkeypatch) -> None:
         from coord.state import save_plan
@@ -1138,39 +1174,108 @@ class TestThinClientLocalBoardGuard:
         guard_warns = [w for w in caught if "#615" in str(w.message)]
         assert not guard_warns, "save_plan on daemon host must NOT emit a #615 warning"
 
-    def test_load_dispatched_warns_on_thin_client(self, coord_db, monkeypatch) -> None:
+    # #1493: load_dispatched is no longer merely guarded — it's daemon-routed
+    # (reads GET /board, filtered to dispatched_at IS NOT NULL), mirroring
+    # load_done_reviews_needing_post (#905). These replace the old
+    # warn/raise/no-warn triad with routing coverage.
+
+    def test_load_dispatched_reads_from_daemon_when_service_configured(
+        self, coord_db, monkeypatch
+    ) -> None:
+        import coord.client as cc
         from coord.state import load_dispatched
 
         self._set_thin_client(monkeypatch)
+        monkeypatch.setattr(
+            cc,
+            "fetch_board_payload",
+            lambda svc, **kw: {
+                "assignments": [
+                    {
+                        "assignment_id": "aid-905",
+                        "machine_name": "precision",
+                        "repo_name": "api",
+                        "repo_github": "acme/api",
+                        "issue_number": 42,
+                        "issue_title": "t",
+                        "status": "running",
+                        "type": "work",
+                        "dispatched_at": 12345.0,
+                    },
+                    {
+                        # Never dispatched (e.g. a save_board-only test row) —
+                        # must be excluded, matching the local SQL's
+                        # dispatched_at IS NOT NULL filter.
+                        "assignment_id": "aid-undispatched",
+                        "dispatched_at": None,
+                    },
+                ]
+            },
+        )
 
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            load_dispatched()
+        result = load_dispatched()
+        assert [r["assignment_id"] for r in result] == ["aid-905"]
+        assert result[0]["machine_name"] == "precision"
+        assert result[0]["dispatched_at"] == 12345.0
 
-        guard_warns = [w for w in caught if "#615" in str(w.message)]
-        assert guard_warns, "load_dispatched on thin client must emit a #615 UserWarning"
-        assert "load_dispatched" in str(guard_warns[0].message)
-
-    def test_load_dispatched_raises_in_strict_mode(self, coord_db, monkeypatch) -> None:
-        from coord.state import load_dispatched
-
-        self._set_thin_client(monkeypatch)
-        monkeypatch.setenv("COORD_STRICT_LOCAL_BOARD", "1")
-
-        with pytest.raises(RuntimeError, match="#615"):
-            load_dispatched()
-
-    def test_load_dispatched_no_warning_on_daemon_host(self, coord_db, monkeypatch) -> None:
-        from coord.state import load_dispatched
+    def test_load_dispatched_falls_back_to_local_when_no_service(
+        self, coord_db, monkeypatch
+    ) -> None:
+        from coord.state import load_dispatched, record_dispatched
+        from coord.models import Proposal
 
         self._set_daemon_host(monkeypatch)
+        record_dispatched(
+            assignment_id="aid-local",
+            proposal=Proposal(
+                id=1,
+                machine_name="laptop",
+                repo_name="api",
+                issue_number=1,
+                issue_title="t",
+                rationale="r",
+                files_likely=[],
+            ),
+            repo_github="acme/api",
+        )
 
+        result = load_dispatched()
+        assert any(r["assignment_id"] == "aid-local" for r in result)
+
+    def test_load_dispatched_falls_back_to_local_on_daemon_error(
+        self, coord_db, monkeypatch
+    ) -> None:
+        """If the daemon fetch raises, fall back to the local DB (best-effort)."""
+        import coord.client as cc
+        from coord.state import load_dispatched
+
+        self._set_thin_client(monkeypatch)
+        monkeypatch.setattr(
+            cc,
+            "fetch_board_payload",
+            lambda svc, **kw: (_ for _ in ()).throw(RuntimeError("daemon down")),
+        )
+
+        # Empty local DB + unreachable daemon → empty list, not an exception.
+        assert load_dispatched() == []
+
+    def test_load_dispatched_no_615_warning_either_way(self, coord_db, monkeypatch) -> None:
+        """Neither branch emits the #615 guard warning any more (#1493)."""
+        import coord.client as cc
+        from coord.state import load_dispatched
+
+        self._set_thin_client(monkeypatch)
+        monkeypatch.setattr(cc, "fetch_board_payload", lambda svc, **kw: {"assignments": []})
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             load_dispatched()
+        assert not [w for w in caught if "#615" in str(w.message)]
 
-        guard_warns = [w for w in caught if "#615" in str(w.message)]
-        assert not guard_warns, "load_dispatched on daemon host must NOT emit a #615 warning"
+        self._set_daemon_host(monkeypatch)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            load_dispatched()
+        assert not [w for w in caught if "#615" in str(w.message)]
 
 
 class TestSetAssignmentFailureReason:

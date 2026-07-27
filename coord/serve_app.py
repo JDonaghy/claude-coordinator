@@ -1883,6 +1883,39 @@ def _openapi_spec() -> dict:
                 },
             }
         },
+        "/notified": {
+            "post": {
+                "summary": (
+                    "Record the notification ledger entry + assignment status "
+                    "update for an assignment (thin-client route for "
+                    "`coord.state.mark_notified` callers outside the "
+                    "`coord notify` whole-command reroute, #1493)"
+                ),
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "assignment_id": {"type": "string"},
+                                    "event": {"type": "string"},
+                                    "branch": {"type": "string", "nullable": True},
+                                },
+                                "required": ["assignment_id", "event"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {"application/json": {"schema": ok_response}},
+                    },
+                    "400": {"description": "Missing field"},
+                },
+            }
+        },
         "/assignment-usage": {
             "post": {
                 "summary": "Route cost/token/is_interactive/smoke_tests writes (#665/#749)",
@@ -3630,6 +3663,33 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             )
         return JSONResponse({"ok": True})
 
+    async def post_notified(request: Request) -> Response:
+        # #1493: route mark_notified's ledger write + assignment status update
+        # to the daemon's shared DB. Mirrors post_needs_attention_notified /
+        # post_review_posted — covers thin-client callers that reach
+        # coord.state.mark_notified WITHOUT the COORD_NOTIFY_ON_DAEMON
+        # whole-command reroute (coord.notify.post_orphaned_review_findings,
+        # invoked directly by `coord post-pending-reviews` and the
+        # dashboard's "post findings" action).
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        try:
+            state._mark_notified_local(
+                body["assignment_id"], body["event"], branch=body.get("branch")
+            )
+        except KeyError as e:
+            return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "notified write failed", "detail": str(e)},
+                status_code=503,
+            )
+        _bust_board_cache()
+        return JSONResponse({"ok": True})
+
     async def post_board(request: Request) -> Response:
         # #749: generic whole-board upsert endpoint backing
         # coord.board_service.write_board() for the commands that still
@@ -4963,6 +5023,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             post_needs_attention_notified,
             methods=["POST"],
         ),
+        Route("/notified", post_notified, methods=["POST"]),
         Route("/board", post_board, methods=["POST"]),
         Route("/assignment-usage", post_assignment_usage, methods=["POST"]),
         Route("/assignment-session-id", post_assignment_session_id, methods=["POST"]),

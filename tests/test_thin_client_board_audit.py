@@ -26,6 +26,22 @@ every *reachable* call site to route through ``coord.board_service`` /
   private ``_get_issue_test_mode_local`` otherwise) after a review caught it
   being reachable from a thin client via ``coord resume`` -> ``reconcile()``
   — so it's no longer tracked as an unrouted local function here.
+
+**#1493** removed ``mark_notified`` and ``load_dispatched`` from
+``BOARD_FUNCS_EXTENDED`` for the same reason: both are now daemon-routed
+(``mark_notified`` -> ``POST /notified``, ``load_dispatched`` -> the existing
+``GET /board`` payload), not merely guarded. The #615 guard on these two had
+only ever fired via callers that bypass the ``COORD_NOTIFY_ON_DAEMON``
+whole-command reroute — namely ``coord.notify.post_orphaned_review_findings``
+(reached directly by ``coord post-pending-reviews`` and the dashboard's
+"post findings" action) and every ``load_dispatched()`` caller outside
+``coord notify``'s own reroute (``coord log``/``wait``/``watch``, ``coord
+status``, ``coord report-result``). Now that both functions branch on
+``board_service`` internally, every existing call site (including the ones
+below still shown as historical context in the allowlists) is safe
+unconditionally, so they're no longer tracked here. ``save_plan`` remains
+tracked — it stays merely guarded, covered only by the two call paths its own
+docstring names.
 * The **second test** (``test_no_unallowlisted_board_calls_in_core_modules``)
   scans the wider set of core modules beyond ``coord/commands/`` for the same
   ``BOARD_LOCAL_FUNCS`` *plus* raw ``get_connection()`` calls — the one
@@ -52,10 +68,11 @@ BOARD_FUNCS_ORIGINAL = {"build_board", "save_board", "load_board"}
 # NOTE: get_issue_test_mode is NOT here — it's daemon-routed (like
 # get_test_plan), not merely guarded, after the #906 review found it
 # reachable from a thin client via `coord resume` -> reconcile().
+# NOTE: mark_notified and load_dispatched are ALSO not here as of #1493 — both
+# are now daemon-routed (POST /notified, GET /board respectively), for the
+# same reason as get_issue_test_mode above.
 BOARD_FUNCS_EXTENDED = {
-    "mark_notified",       # local notifications + assignments write; guarded
     "save_plan",           # local plans write; guarded
-    "load_dispatched",     # local assignments read; guarded
 }
 
 # All board-local function names tracked by both tests.
@@ -139,32 +156,24 @@ COMMANDS_ALLOWLIST: dict[str, set[tuple[str, str]]] = {
     # recorded via the single-row `record_test_verdict` on both paths (it
     # self-routes to the daemon when board_service is set), so test_gate.py
     # has no direct BOARD_LOCAL_FUNCS call sites left.
-    # #590-routed: build_board + load_dispatched are both in the `else:` branch
-    # of `svc = resolve_board_service(); if svc is not None: ...daemon path...
-    # else: ...local path...`.  On a thin client `svc` is not None, so neither
-    # call is reached; `report_result` routes to the daemon's board payload.
-    "review.py": {("report_result", "build_board"), ("report_result", "load_dispatched")},
+    # #590-routed: build_board is in the `else:` branch of `svc =
+    # resolve_board_service(); if svc is not None: ...daemon path... else:
+    # ...local path...`.  On a thin client `svc` is not None, so the call is
+    # not reached; `report_result` routes to the daemon's board payload.
+    # (`report_result` also calls `load_dispatched` — no longer tracked here
+    # since #1493 made it daemon-routed; see BOARD_FUNCS_EXTENDED above.)
+    "review.py": {("report_result", "build_board")},
     # #762-routed: `diagnose`'s body already routed via `daemon_reroute_target`
     # above; this build_board() is the deliberate host-local read for the
     # already-routed body — see the "NOTE: deliberately NO save_board here"
     # comment a few lines below the call.
-    # `status` uses load_dispatched() only inside `if notified:` where
-    # `notified = {} if svc else load_notified()` — so on a thin client
-    # `notified` is `{}` and load_dispatched() is never executed.
-    "status.py": {("diagnose", "build_board"), ("status", "load_dispatched")},
-    # `log` uses load_dispatched() as a fast-path local lookup; when the local
-    # ledger is empty (thin client), the record is None and the function falls
-    # through to `_resolve_log_machine_via_daemon()` (#851) — so thin clients
-    # degrade gracefully to the daemon lookup, not a hard error.
-    # `wait` + `watch` use load_dispatched() to find which machine the
-    # assignment is on; on a thin client the local ledger is empty and these
-    # commands error "not found" — a known gap, tracked as a follow-up
-    # (needs a daemon-board fallback analogous to _resolve_log_machine_via_daemon).
-    "sessions.py": {
-        ("log", "load_dispatched"),
-        ("wait", "load_dispatched"),
-        ("watch", "load_dispatched"),
-    },
+    # (`status` also calls `load_dispatched` — no longer tracked here since
+    # #1493 made it daemon-routed; see BOARD_FUNCS_EXTENDED above.)
+    "status.py": {("diagnose", "build_board")},
+    # (`sessions.py`'s `log`/`wait`/`watch` used to appear here for
+    # `load_dispatched` — no longer tracked since #1493 made it daemon-routed;
+    # see BOARD_FUNCS_EXTENDED above. sessions.py has no other
+    # BOARD_LOCAL_FUNCS call sites, so it no longer needs an entry here.)
     # #590/#749: informational-only local peek, gated behind
     # `if not is_remote():` — used only to print "no saved board" vs
     # "rebuilding" before the real (daemon-aware) `read_board()` call.
@@ -206,8 +215,8 @@ def test_no_unallowlisted_direct_board_calls_in_commands() -> None:
         "If you ADDED a new direct call site: it must be routed through the "
         "daemon first (mirror `coord merge`'s daemon_reroute_target() / "
         "board_service.route_write() pattern, #615/#906) — do not call "
-        "coord.state.build_board/save_board/load_board/mark_notified/save_plan/"
-        "load_dispatched unconditionally from a CLI command. "
+        "coord.state.build_board/save_board/load_board/save_plan "
+        "unconditionally from a CLI command. "
         "If it's already safely guarded (e.g. behind an `if svc is None:` / "
         "`if not is_remote():` check, or only reached after a daemon-routing "
         "early-return), add it to COMMANDS_ALLOWLIST with a one-line reason.\n"
@@ -245,26 +254,17 @@ EXTENDED_ALLOWLIST: dict[str, set[tuple[str, str]]] = {
     # COORD_NOTIFY_ON_DAEMON whole-command reroute (#906): on a thin client
     # `coord notify` POSTs to /notify and the daemon runs the whole function
     # against the canonical DB.
+    # (notify.py's many load_dispatched()/mark_notified() call sites —
+    # detect_transitions/detect_stuck/detect_needs_attention, post_transition/
+    # post_stuck/post_needs_attention/post_orphaned_review_findings/
+    # post_stalled_pipeline — used to be listed here individually. Both
+    # functions are no longer tracked as of #1493: they're daemon-routed
+    # (POST /notified, GET /board) rather than merely guarded, so every call
+    # site — including post_orphaned_review_findings, which is the ONE
+    # notify.py caller reachable OUTSIDE the COORD_NOTIFY_ON_DAEMON reroute
+    # via `coord post-pending-reviews` and the dashboard's "post findings"
+    # action — is now unconditionally safe. See BOARD_FUNCS_EXTENDED above.)
     "notify.py": {
-        # load_dispatched: two callers; both are inside notify.run() which is
-        # rerouted to the daemon on thin clients.
-        ("detect_transitions", "load_dispatched"),
-        ("detect_stuck", "load_dispatched"),
-        # #846: detect_needs_attention mirrors detect_stuck exactly — same
-        # load_dispatched() scan, same call site (inside notify.run()).
-        ("detect_needs_attention", "load_dispatched"),
-        # mark_notified: called from post_transition / post_stuck /
-        # post_orphaned_review_findings — all inside notify.run() → daemon.
-        ("post_transition", "mark_notified"),
-        ("post_stuck", "mark_notified"),
-        # #846: post_needs_attention mirrors post_stuck exactly — same
-        # call site (inside notify.run()).
-        ("post_needs_attention", "mark_notified"),
-        ("post_orphaned_review_findings", "mark_notified"),
-        # #1441: post_stalled_pipeline mirrors post_needs_attention exactly —
-        # same call site (inside notify.run(), at the very end of the
-        # #1441 stalled-pipeline sweep).
-        ("post_stalled_pipeline", "mark_notified"),
         # save_plan: called from _try_parse_and_post_plan (inside
         # post_transition) → daemon via COORD_NOTIFY_ON_DAEMON.
         ("_try_parse_and_post_plan", "save_plan"),

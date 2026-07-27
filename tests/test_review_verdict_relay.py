@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import warnings
 from pathlib import Path
 from unittest.mock import patch
 
@@ -406,6 +407,58 @@ def test_post_review_posted_endpoint_missing_field_returns_400(
     assert resp.status_code == 400
 
 
+# ── POST /notified (#1493) ────────────────────────────────────────────────────
+
+
+def test_post_notified_endpoint_writes_ledger_and_status(
+    file_db: Path, valid_config_path: Path, rw_db
+) -> None:
+    """POST /notified writes the notification ledger AND updates assignment
+    status on the daemon's DB — the endpoint backing mark_notified's daemon
+    route (#1493)."""
+    rw_db.execute(
+        "INSERT INTO assignments "
+        "(assignment_id, machine_name, repo_name, repo_github, "
+        " issue_number, issue_title, status, type) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("aid-1493", "precision", "api", "acme/api", 1493, "t", "running", "work"),
+    )
+    rw_db.commit()
+
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post(
+            "/notified",
+            json={
+                "assignment_id": "aid-1493",
+                "event": "completion",
+                "branch": "issue-1493-foo",
+            },
+        )
+    assert resp.status_code == 200 and resp.json()["ok"] is True
+
+    notif_row = rw_db.execute(
+        "SELECT event, branch FROM notifications WHERE assignment_id='aid-1493'"
+    ).fetchone()
+    assert notif_row["event"] == "completion"
+    assert notif_row["branch"] == "issue-1493-foo"
+
+    assignment_row = rw_db.execute(
+        "SELECT status, branch FROM assignments WHERE assignment_id='aid-1493'"
+    ).fetchone()
+    assert assignment_row["status"] == "done"
+    assert assignment_row["branch"] == "issue-1493-foo"
+
+
+def test_post_notified_endpoint_missing_field_returns_400(
+    file_db: Path, valid_config_path: Path, rw_db
+) -> None:
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post("/notified", json={"assignment_id": "aid-x"})  # missing event
+    assert resp.status_code == 400
+
+
 # ── idempotency via review_posted_at ─────────────────────────────────────────
 
 
@@ -533,9 +586,11 @@ def test_post_orphaned_finds_and_posts_from_daemon_board(
     monkeypatch.setattr(notify_mod, "_agent_status", lambda host: agent_status)
 
     # Stub GitHub posting.
-    with patch("coord.notify.github_ops.post_pr_review") as mock_gh_review, \
-         patch("coord.notify.github_ops.post_issue_comment"):
-        posted = notify_mod.post_orphaned_review_findings(config)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with patch("coord.notify.github_ops.post_pr_review") as mock_gh_review, \
+             patch("coord.notify.github_ops.post_issue_comment"):
+            posted = notify_mod.post_orphaned_review_findings(config)
 
     # The function reported success.
     assert "rev-905" in posted
@@ -554,5 +609,19 @@ def test_post_orphaned_finds_and_posts_from_daemon_board(
     assert len(posted_calls) == 1
     assert posted_calls[0][1]["assignment_id"] == "rev-905"
 
-    # Local DB was NOT written (empty still).
+    # #1493: /notified was ALSO sent to the daemon — mark_notified() is called
+    # right after mark_review_posted() (notify.py's `if not already_notified:`
+    # branch) and, before #1493, wrote straight to the empty local ledger
+    # instead of routing here, the exact gap this test guards against.
+    notified_calls = [c for c in daemon_calls if c[0] == "/notified"]
+    assert len(notified_calls) == 1
+    assert notified_calls[0][1]["assignment_id"] == "rev-905"
+    assert notified_calls[0][1]["event"] == "completion"
+
+    # Local DB was NOT written (empty still) — neither table.
     assert get_connection().execute("SELECT COUNT(*) FROM assignments").fetchone()[0] == 0
+    assert get_connection().execute("SELECT COUNT(*) FROM notifications").fetchone()[0] == 0
+
+    # #1493: no #615 UserWarning — mark_notified is now routed, not guarded.
+    guard_warns = [w for w in caught if "#615" in str(w.message)]
+    assert not guard_warns, f"unexpected #615 warning(s): {[str(w.message) for w in guard_warns]}"
