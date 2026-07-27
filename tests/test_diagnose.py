@@ -1170,6 +1170,58 @@ def test_failed_without_failure_reason_not_healthy(monkeypatch, config) -> None:
     assert res.recovered is True
 
 
+def test_phantom_failed_with_passed_test_and_approved_review_is_flagged(
+    monkeypatch, config
+) -> None:
+    """#1451: a status='failed' work row that already has a passing test
+    verdict AND an approved review on a real branch is self-evidently a
+    phantom failure, not a real one — diagnose must surface it with a
+    concrete recovery command rather than silently agreeing it's failed."""
+    _stub(monkeypatch, session="dead")
+    monkeypatch.setattr(diagnose, "_prune_orphan_for_failed", lambda *a, **k: None)
+
+    a = _assign(
+        aid="w-phantom-failed",
+        status="failed",
+        branch="issue-920-foo",
+        verdict="approve",
+        failure_reason=None,
+    )
+    a.test_state = "passed"
+    board = Board(completed=[a])
+    res = diagnose.diagnose_stage(board, config, "api", 42, "work")
+
+    assert any(
+        "phantom failure" in f and "w-phantom-failed" in f for f in res.findings
+    ), f"expected a phantom-failure finding; findings={res.findings}"
+    assert any("report-result" in f for f in res.findings), (
+        f"expected the finding to name the recovery command; findings={res.findings}"
+    )
+
+
+def test_failed_without_contradiction_is_not_flagged_as_phantom(
+    monkeypatch, config
+) -> None:
+    """A genuinely failed row (no passing test, no approved review) must NOT
+    get the phantom-failure finding — only actual contradictions are
+    flagged."""
+    _stub(monkeypatch, session="dead")
+    monkeypatch.setattr(diagnose, "_prune_orphan_for_failed", lambda *a, **k: None)
+
+    a = _assign(
+        aid="w-really-failed",
+        status="failed",
+        branch="issue-42-foo",
+        failure_reason=None,
+    )
+    board = Board(completed=[a])
+    res = diagnose.diagnose_stage(board, config, "api", 42, "work")
+
+    assert not any("phantom failure" in f for f in res.findings), (
+        f"should not flag a genuine failure as phantom; findings={res.findings}"
+    )
+
+
 def test_maybe_fix_base_checkout_lock_reports_finding(monkeypatch, config) -> None:
     """When the base checkout on a remote machine holds the branch, diagnose
     reports a finding and fixes it via SSH (#814)."""

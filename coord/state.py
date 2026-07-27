@@ -121,10 +121,46 @@ _UPSERT_SQL = """
         ?, ?, ?
     )
     ON CONFLICT(assignment_id) DO UPDATE SET
-        status             = excluded.status,
+        -- #1451: `status`/`finished_at` are guarded by a finished_at-CAS, not
+        -- blindly overwritten like the other columns below. A whole-board
+        -- `save_board()` call carries an in-memory snapshot that can be
+        -- arbitrarily stale by the time it actually writes (reconcile_board_
+        -- merges alone can spend seconds per repo hitting GitHub in between
+        -- the `build_board()` read and this write) — long enough for a
+        -- concurrent, more-authoritative single-row seam write (`coord
+        -- report-result`, `finalize_interactive_exit`'s git-floor/merge-verify
+        -- gate) to land in between and then get silently clobbered back to
+        -- the stale snapshot's value (#1451: a human-corrected `done` reverted
+        -- to `failed` seconds later with no logged writer). The existing
+        -- per-issue `coord diagnose` avoids this by never calling save_board
+        -- after a seam write (see commands/status.py); this closes the same
+        -- hole at the root so every OTHER whole-board save_board() caller
+        -- (the periodic reconcile ticks chief among them) is covered too,
+        -- without having to audit every call site.
+        --
+        -- Rule: once a row has a recorded `finished_at` (i.e. it's already
+        -- terminal), only accept an incoming write whose own `finished_at` is
+        -- present and >= the stored one — a same-or-newer terminal write is a
+        -- real transition (or a harmless re-save of the same state); a NULL
+        -- or older incoming `finished_at` means this board snapshot was read
+        -- before (or raced) the row's real terminal write and must not undo
+        -- it. A row with no stored `finished_at` yet (still running/pending)
+        -- is unaffected — every first-time transition proceeds exactly as
+        -- before.
+        status = CASE
+            WHEN finished_at IS NULL THEN excluded.status
+            WHEN excluded.finished_at IS NOT NULL
+                 AND excluded.finished_at >= finished_at THEN excluded.status
+            ELSE status
+        END,
         branch             = excluded.branch,
         pr_url             = excluded.pr_url,
-        finished_at        = excluded.finished_at,
+        finished_at = CASE
+            WHEN finished_at IS NULL THEN excluded.finished_at
+            WHEN excluded.finished_at IS NOT NULL
+                 AND excluded.finished_at >= finished_at THEN excluded.finished_at
+            ELSE finished_at
+        END,
         smoke_test         = excluded.smoke_test,
         -- #1337: the unbounded free-text columns (smoke_test_reason,
         -- test_reason, briefing) are EXCLUDED from this whole-board upsert.
@@ -992,6 +1028,19 @@ def mark_notified(
                 "UPDATE assignments SET status=?, finished_at=? WHERE assignment_id=?",
                 ("done", now, assignment_id),
             )
+    elif event == EVENT_ADVISORY:
+        # #1451: this used to fall into the bare `else` below and stamp
+        # `status='failed'` — a headless #448 advisory (0-commit clean exit)
+        # would get a distinctive "advisory" GitHub comment posted by
+        # `notify.post_transition` and then, one line later, have this same
+        # call unconditionally overwrite its own just-recorded state to
+        # `failed`. No evidence of an actual failure (empty exit_code, no
+        # failure_reason) ever backed that write — it was a straight
+        # mislabel, not a real terminal failure.
+        conn.execute(
+            "UPDATE assignments SET status='advisory', finished_at=? WHERE assignment_id=?",
+            (now, assignment_id),
+        )
     else:
         conn.execute(
             "UPDATE assignments SET status='failed', finished_at=? WHERE assignment_id=?",

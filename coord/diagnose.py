@@ -131,6 +131,46 @@ def _latest(assignments: list["Assignment"]) -> "Assignment | None":
     return assignments[0] if assignments else None
 
 
+def _flag_contradictory_failed(latest: "Assignment", res: DiagnoseResult) -> None:
+    """#1451: flag a ``status='failed'`` work row whose own fields already
+    prove it isn't — a passing test verdict and/or an approved review on a
+    row that pushed a real branch is self-evidently not a failure.
+
+    This is deliberately NOT based on ``exit_code``/``failure_reason`` being
+    empty — those are empty on the overwhelming majority of legitimate
+    ``failed`` rows too (a launch-failure ``failure_reason`` is the rare
+    exception, and no current write path persists ``exit_code`` to the DB at
+    all), so that pair is not a usable signal on its own. The reliable
+    signal is a genuine contradiction: evidence of *success* recorded on a
+    row the board calls failed.
+
+    Best-effort and read-only — appends a finding only, no write. Detection,
+    not correction: the fix is either ``coord report-result --assignment
+    <id> --status done`` (interactive) or re-running the completing worker.
+    """
+    if latest.status != "failed":
+        return
+    contradictions: list[str] = []
+    if latest.test_state == "passed":
+        contradictions.append("test_state=passed")
+    if latest.review_verdict == "approve":
+        contradictions.append("review_verdict=approve")
+    if not contradictions:
+        return
+    if not latest.branch:
+        # No pushed branch to review/test at all — the "passed"/"approve"
+        # values must be stale carry-over from a prior assignment row, not
+        # evidence about *this* failed row. Don't flag without a branch.
+        return
+    res.findings.append(
+        f"⚠ status='failed' contradicts its own fields ({', '.join(contradictions)}, "
+        f"branch={latest.branch}) — looks like a phantom failure (#1451), not a "
+        "real one. If the work is actually done, recover it with "
+        f"`coord report-result --assignment {latest.assignment_id} --status done "
+        '--summary "..."` (or re-run the completing worker if unsure).'
+    )
+
+
 def current_stage(board: "Board", repo_name: str, issue_number: int) -> str:
     """The stage of the most-recently-dispatched assignment for the issue
     (what ``coord diagnose <repo> <issue>`` targets when ``--stage`` is
@@ -488,6 +528,8 @@ def diagnose_stage(
         f"{stage}: latest={latest.assignment_id} status={latest.status} "
         f"session={state} machine={latest.machine_name}"
     )
+    if stage in ("work", "test", "merge"):
+        _flag_contradictory_failed(latest, res)
 
     if reset:
         _do_reset(
