@@ -44,6 +44,7 @@
       "review_state": null,
       "review_target": null,
       "review_verdict": null,
+      "review_verdict_original": null,
       "smoke_test": null,
       "smoke_test_reason": null,
       "smoke_tests": null,
@@ -99,6 +100,7 @@
       "review_state": null,
       "review_target": null,
       "review_verdict": "approve",
+      "review_verdict_original": null,
       "smoke_test": null,
       "smoke_test_reason": null,
       "smoke_tests": null,
@@ -154,6 +156,7 @@
       "review_state": null,
       "review_target": null,
       "review_verdict": "approve",
+      "review_verdict_original": null,
       "smoke_test": null,
       "smoke_test_reason": null,
       "smoke_tests": [

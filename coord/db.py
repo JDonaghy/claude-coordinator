@@ -374,6 +374,11 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # treats the approval as stale (new commits since the review → re-review
         # required).  NULL for rows predating this feature.
         "ALTER TABLE assignments ADD COLUMN review_head_sha TEXT",
+        # #1456: the reviewer's own verdict, preserved when the coordinator's
+        # #476 advisory-only gate downgrades a `request-changes` to `approve`.
+        # NULL means no override occurred (and for every row predating this
+        # column).  See coord.models.Assignment.review_verdict_original.
+        "ALTER TABLE assignments ADD COLUMN review_verdict_original TEXT",
         # #944: the Acceptance-gate verdict (oracle loop, docs/ORACLE_LOOP.md)
         # — set by `coord acceptance record --issue N --sha <sha>`, the
         # coordinator's external re-run of the sealed suite against the

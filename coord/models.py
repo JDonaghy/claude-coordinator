@@ -306,6 +306,15 @@ class Assignment:
     # by the merge-queue gate (`has_approved_review`) to refuse merging work
     # whose review has not approved.
     review_verdict: str | None = None
+    # #1456: the reviewer's OWN verdict, preserved when the coordinator
+    # overrides it. `review_verdict` above is the *effective* verdict every
+    # gate reads; when the #476 advisory-only gate downgrades a
+    # `request-changes` to `approve` it records the original here rather than
+    # overwriting it in place, so an override is always auditable (the audit
+    # log's `review_verdict_overridden` event carries the counts that
+    # justified it). None means "no override happened" — the overwhelmingly
+    # common case, and every row predating this field.
+    review_verdict_original: str | None = None
     # #821: SHA of the branch HEAD captured at the time the review assignment
     # ran.  When set, `has_approved_review` compares this against the merge
     # queue entry's `branch_head_sha` to reject stale approvals — if the

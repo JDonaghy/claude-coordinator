@@ -27,7 +27,7 @@ import logging
 import re
 import time
 import uuid
-from typing import Iterable
+from typing import Iterable, NamedTuple
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -403,16 +403,73 @@ def parse_review_header(body: str) -> dict[str, str | int] | None:
     return out if "verdict" in out else None
 
 
-def estimate_review_counts(
-    body: str,
-) -> tuple[int | None, int | None, int | None]:
+class ReviewCounts(NamedTuple):
+    """Result of :func:`estimate_review_counts` — counts *with* a "could not
+    determine" signal.
+
+    Each field is **either** an ``int`` (the heuristic found a section for that
+    bucket and counted its bullets — ``0`` means "the reviewer raised none")
+    **or** ``None``, which means **unparseable: we do not know**.  Those two
+    cases need *opposite* defaults, and conflating them is exactly the #1456
+    fail-open bug: ``bool(None)`` is ``False``, so a ``None`` blocking count
+    read as "no blocking findings" and silently rewrote a reviewer's
+    ``request-changes`` into ``approve``.
+
+    Subclasses ``tuple``, so existing ``b, nb, nits = estimate_review_counts(...)``
+    unpacking and ``== (None, None, None)`` comparisons keep working.
+    """
+
+    blocking: int | None
+    nonblocking: int | None
+    nits: int | None
+
+    @property
+    def blocking_is_known(self) -> bool:
+        """True when the blocking count was actually parsed (``0`` included).
+
+        False means *unparseable* — the body carried no recognised blocking
+        section, so the heuristic has no evidence either way.  Callers that
+        would act on "no blocking findings" MUST check this first.
+        """
+        return self.blocking is not None
+
+    @property
+    def total_findings(self) -> int:
+        """Number of findings the heuristic actually read out of the body."""
+        return (self.blocking or 0) + (self.nonblocking or 0) + (self.nits or 0)
+
+    def is_advisory_only(self) -> bool:
+        """True only when the heuristic **conclusively** read the reviewer's
+        findings and none of them were blocking (#476 gate, tightened by #1456).
+
+        Requires BOTH:
+
+        1. ``blocking`` was *explicitly parsed as zero* — a recognised blocking
+           section that listed nothing.  A missing (``None``) blocking count is
+           "we could not tell", never "there are none".
+        2. At least one non-blocking / nit finding was parsed.  Zero findings
+           anywhere means the heuristic failed to read the body at all (the
+           #1445 shape: prose paragraphs plus one empty ``### Minor notes``
+           heading → ``blocking=None nonblocking=None nits=0``) — and a body we
+           could not read must never override an explicit ``request-changes``.
+
+        Anything else fails **closed**: the reviewer's verdict stands.
+        """
+        if self.blocking != 0 or not self.blocking_is_known:
+            return False
+        return (self.nonblocking or 0) + (self.nits or 0) > 0
+
+
+def estimate_review_counts(body: str) -> ReviewCounts:
     """Best-effort count of (blocking, nonblocking, nits) bullets in *body*.
 
     Walks markdown sections.  A section is recognised when its heading
     contains one of `_SECTION_KEYWORDS`; counts are the number of `- ` /
     `* ` / `1. ` bullets directly under that section (until the next
-    heading).  Returns ``(None, None, None)`` when no recognised
-    sections appear — the heuristic refuses to guess.
+    heading).  A bucket stays ``None`` when no heading mapped to it — that is
+    an explicit **"could not determine"**, NOT a zero; see
+    :class:`ReviewCounts`.  Returns ``ReviewCounts(None, None, None)`` when no
+    recognised sections appear at all — the heuristic refuses to guess.
     """
     counts: dict[str, int | None] = {"blocking": None, "nonblocking": None, "nits": None}
     current: str | None = None
@@ -439,7 +496,7 @@ def estimate_review_counts(
         if current is not None and bullet_re.match(line):
             counts[current] = (counts[current] or 0) + 1
 
-    return counts["blocking"], counts["nonblocking"], counts["nits"]
+    return ReviewCounts(counts["blocking"], counts["nonblocking"], counts["nits"])
 
 
 def _parse_review_text(text: str) -> ReviewFindings | None:
@@ -1131,6 +1188,24 @@ def build_review_briefing(
     lines.append("```")
     lines.append("")
     lines.append("Use `REVIEW_VERDICT: request-changes` if changes are needed.")
+    # #1456: the coordinator's #476 gate (advisory-only request-changes must
+    # not burn another fix round) reads the body's section headings. It now
+    # requires an EXPLICIT zero-blocking section before it will decline to
+    # dispatch a fix — an unparseable body keeps your request-changes verdict
+    # verbatim. So structure the body: without a `## Blocking findings`
+    # section, a request-changes always costs a full fix+re-review round.
+    lines.append("")
+    lines.append(
+        "BODY STRUCTURE — when your verdict is `request-changes`, the review "
+        "body MUST contain a `## Blocking findings` heading listing every "
+        "must-fix item as a `- ` bullet. If nothing is genuinely blocking, "
+        "write the heading with the single non-bullet line `None.` under it "
+        "and put your other points under `## Non-blocking concerns` and/or "
+        "`## Nits`. These headings are machine-counted: an empty blocking "
+        "section is how you tell the coordinator your objections are advisory "
+        "and no fix round is needed. Never state a blocking objection only in "
+        "prose outside these sections."
+    )
     # #1346: the three marker lines are a machine contract, not prose. The
     # surrounding briefing is Markdown and the body placeholder invites
     # Markdown, so reviewers have emitted `**REVIEW_VERDICT: request-changes**`

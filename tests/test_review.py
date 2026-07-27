@@ -2185,6 +2185,58 @@ class TestReviewHeader:
         assert nits == 1
 
 
+class TestReviewCountsAdvisoryGate:
+    """#1456: `None` (unparseable) and `0` (explicitly none) must never be
+    conflated — they need opposite defaults, and only `0` may justify
+    downgrading a reviewer's `request-changes`."""
+
+    def _counts(self, body: str):
+        from coord.review import estimate_review_counts
+        return estimate_review_counts(body)
+
+    def test_blocking_is_known_distinguishes_none_from_zero(self) -> None:
+        absent = self._counts("## Nits\n- one\n")
+        explicit_zero = self._counts("## Blocking\n\nNone.\n\n## Nits\n- one\n")
+        assert absent.blocking is None
+        assert absent.blocking_is_known is False
+        assert explicit_zero.blocking == 0
+        assert explicit_zero.blocking_is_known is True
+
+    def test_advisory_only_requires_explicit_zero(self) -> None:
+        # Explicit empty blocking section + a real nit → advisory.
+        assert self._counts(
+            "## Blocking\n\nNone.\n\n## Nits\n- one\n"
+        ).is_advisory_only() is True
+        # No blocking section at all → unparseable → NOT advisory.
+        assert self._counts("## Nits\n- one\n").is_advisory_only() is False
+
+    def test_advisory_only_requires_at_least_one_parsed_finding(self) -> None:
+        """The #1445 shape: one empty nits heading, everything else prose.
+        Zero findings parsed anywhere means the heuristic read nothing —
+        it must not speak for the reviewer."""
+        counts = self._counts(
+            "The worktree leaks on the failure path.\n"
+            "\n### Minor notes\n\n"
+            "Requesting changes rather than approving as-is.\n"
+        )
+        assert (counts.blocking, counts.nonblocking, counts.nits) == (None, None, 0)
+        assert counts.total_findings == 0
+        assert counts.is_advisory_only() is False
+
+    def test_advisory_only_false_when_blocking_findings_exist(self) -> None:
+        counts = self._counts("## Blocking\n- real bug\n## Nits\n- one\n")
+        assert counts.blocking == 1
+        assert counts.is_advisory_only() is False
+
+    def test_counts_still_unpack_and_compare_as_a_plain_tuple(self) -> None:
+        """Back-compat: ReviewCounts subclasses tuple, so every existing
+        `b, nb, nits = ...` / `== (None, None, None)` call site keeps working."""
+        counts = self._counts("Looks fine to me.\n")
+        b, nb, nits = counts
+        assert (b, nb, nits) == (None, None, None)
+        assert counts == (None, None, None)
+
+
 # ── Flood guard: dispatch_pending_reviews (incident 2026-06-08) ──────────────
 
 

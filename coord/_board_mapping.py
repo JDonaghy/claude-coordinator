@@ -99,6 +99,9 @@ def row_to_assignment(row: object) -> Assignment:
         test_state=d.get("test_state"),
         test_reason=d.get("test_reason"),
         review_verdict=d.get("review_verdict"),
+        # #1456: reviewer's own verdict when the coordinator overrode it;
+        # None for rows with no override and for rows predating the column.
+        review_verdict_original=d.get("review_verdict_original"),
         # #821: commit-bound review gate; None for pre-821 rows.
         review_head_sha=d.get("review_head_sha"),
         cost_usd=d.get("cost_usd"),

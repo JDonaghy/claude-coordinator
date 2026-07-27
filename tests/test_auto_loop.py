@@ -460,14 +460,21 @@ class TestProcessReviewCompletion:
     def test_request_changes_no_blocking_advances_with_nits(
         self, config: Config, tmp_path
     ) -> None:
-        """request-changes with only non-blocking findings must NOT dispatch a
-        fix — it advances the pipeline as approve-with-nits (#476)."""
-        # Body has a recognised non-blocking section and no blocking section,
-        # mirroring the #532 review (nonblocking=4, blocking absent).
+        """request-changes with an EXPLICITLY empty blocking section plus only
+        non-blocking findings must NOT dispatch a fix — it advances the
+        pipeline as approve-with-nits (#476).
+
+        #1456 tightened the evidence standard: the blocking section must be
+        present and explicitly empty (parsed as 0).  An *absent* blocking
+        section is "we could not tell", not "there are none" — covered by
+        `test_request_changes_no_blocking_section_fails_closed` below.
+        """
         log_file = tmp_path / "review.log"
         log_file.write_text(
             "REVIEW_VERDICT: request-changes\n"
             "REVIEW_BODY:\n"
+            "## Blocking findings\n"
+            "None.\n"
             "## Minor observations (not blocking)\n"
             "- Low-value test could exercise the real handler\n"
             "- Pre-existing issue in main, not this PR\n"
@@ -494,6 +501,9 @@ class TestProcessReviewCompletion:
         # so the merge gate lets it through.
         assert work.review_state == "done"
         assert review.review_verdict == "approve"
+        # #1456: the reviewer's own verdict is preserved alongside the
+        # coordinator's override, never overwritten in place.
+        assert review.review_verdict_original == "request-changes"
         mock_notice.assert_called_once()
 
     def test_request_changes_with_blocking_still_dispatches_fix(
@@ -559,6 +569,139 @@ class TestProcessReviewCompletion:
             )
 
         assert actions[0].kind == "fix_dispatched"
+
+    # ── #1456: the gate must FAIL CLOSED on an unparseable blocking count ────
+
+    def _assert_fix_dispatched_and_verdict_intact(
+        self, config: Config, body: str, tmp_path,
+    ):
+        """Drive `process_review_completion` over a request-changes *body* and
+        assert the verdict survived intact (no #476 downgrade)."""
+        log_file = tmp_path / "review.log"
+        log_file.write_text(
+            f"REVIEW_VERDICT: request-changes\nREVIEW_BODY:\n{body}\nEND_REVIEW\n"
+        )
+        review = _review_assignment()
+        work = _work_assignment(review_iteration=0)
+        board = _board_with(work, review)
+
+        mock_http = MagicMock()
+        mock_http.post.return_value.json.return_value = {"id": "fix-001"}
+        mock_http.post.return_value.raise_for_status = MagicMock()
+
+        with patch("coord.auto_loop.record_dispatched_assignment"):
+            actions = process_review_completion(
+                review, board, config,
+                log_path=str(log_file),
+                http_client=mock_http,
+            )
+
+        assert actions[0].kind == "fix_dispatched"
+        assert review.review_verdict == "request-changes", (
+            "#1456: a request-changes verdict must never be silently rewritten "
+            "to approve on the strength of a heuristic that failed to parse"
+        )
+        assert review.review_verdict_original is None  # no override happened
+        return actions
+
+    def test_issue_1445_prose_review_keeps_request_changes(
+        self, config: Config, tmp_path
+    ) -> None:
+        """#1456 regression, reproduced from the #1445 review body.
+
+        The reviewer wrote an unambiguous prose rejection with a single empty
+        heading that happened to match a *nits* keyword.  That parsed as
+        ``blocking=None nonblocking=None nits=0`` — and the old gate's
+        ``parsed_any and not bool(blocking)`` test read the lone ``0`` as
+        "counts parsed, no blocking findings" and rewrote the verdict to
+        ``approve`` with ``MERGE_STATUS=READY``.  Rejected code advanced toward
+        merge with no human in the loop.
+        """
+        body = (
+            "The PR leaks a worktree on the failure path, and the new test "
+            "reads the caller's real `~/.claude/settings.json`, so it will "
+            "flake on machines that already have that file.\n"
+            "\n"
+            "### Minor notes\n"
+            "\n"
+            "Naming in the helper is fine; no complaints there.\n"
+            "\n"
+            "Given the leaked-worktree bug undermines the PR's core "
+            '"fail cheaply" premise, and the test-hermeticity gap risks '
+            "flaking the existing suite, I'm requesting changes rather than "
+            "approving as-is.\n"
+        )
+        # Guard the exact parse that caused the incident.
+        from coord.review import estimate_review_counts
+
+        counts = estimate_review_counts(body)
+        assert counts.nits == 0 and counts.blocking is None, (
+            "fixture no longer reproduces the #1445 parse; update it"
+        )
+        self._assert_fix_dispatched_and_verdict_intact(config, body, tmp_path)
+
+    def test_request_changes_no_blocking_section_fails_closed(
+        self, config: Config, tmp_path
+    ) -> None:
+        """An ABSENT blocking section is 'we do not know', not 'there are
+        none' — so nits/non-blocking sections alone can't downgrade a verdict
+        (#1456).  Pre-#1456 this shape was silently approved."""
+        body = (
+            "## Minor observations (not blocking)\n"
+            "- Comment is slightly misleading\n"
+            "\n"
+            "Separately, the retry loop never resets the counter — that is a "
+            "real bug and it is why I am requesting changes.\n"
+        )
+        self._assert_fix_dispatched_and_verdict_intact(config, body, tmp_path)
+
+    def test_empty_blocking_section_with_no_other_findings_fails_closed(
+        self, config: Config, tmp_path
+    ) -> None:
+        """An explicitly-empty blocking section with NO other parsed findings
+        means the heuristic read nothing at all — the reviewer's objections
+        live in prose it cannot see.  Fail closed (#1456)."""
+        body = (
+            "## Blocking findings\n"
+            "\n"
+            "The lock is dropped before the write completes; that must be "
+            "fixed before this merges.\n"
+        )
+        self._assert_fix_dispatched_and_verdict_intact(config, body, tmp_path)
+
+    def test_override_records_audit_event(
+        self, config: Config, tmp_path
+    ) -> None:
+        """#1456: a downgrade must leave an audit trail carrying BOTH verdicts
+        and the counts that justified it — never a silent in-place rewrite."""
+        log_file = tmp_path / "review.log"
+        log_file.write_text(
+            "REVIEW_VERDICT: request-changes\n"
+            "REVIEW_BODY:\n"
+            "## Blocking findings\n"
+            "None.\n"
+            "## Nits\n"
+            "- Rename the temp var\n"
+            "END_REVIEW\n"
+        )
+        review = _review_assignment()
+        work = _work_assignment(review_iteration=0)
+        board = _board_with(work, review)
+
+        with patch("coord.auto_loop._post_advisory_nits_notice"), \
+                patch("coord.audit.record_audit") as mock_audit:
+            actions = process_review_completion(
+                review, board, config, log_path=str(log_file),
+            )
+
+        assert actions[0].kind == "approved_with_nits"
+        mock_audit.assert_called_once()
+        kwargs = mock_audit.call_args.kwargs
+        assert kwargs["event_type"] == "review_verdict_overridden"
+        assert kwargs["details"]["original_verdict"] == "request-changes"
+        assert kwargs["details"]["effective_verdict"] == "approve"
+        assert kwargs["details"]["blocking"] == 0
+        assert kwargs["details"]["nits"] == 1
 
 
 # ── Unit tests: _build_fix_briefing ─────────────────────────────────────────
@@ -1243,10 +1386,13 @@ class TestRunForReviewTransition:
         from coord.state import load_board, save_board
 
         review_log = tmp_path / "review.log"
-        # Body has a recognised non-blocking section and no blocking section.
+        # #1456: an explicitly-empty blocking section is now required before
+        # the gate will downgrade the verdict.
         review_log.write_text(
             "REVIEW_VERDICT: request-changes\n"
             "REVIEW_BODY:\n"
+            "## Blocking findings\n"
+            "None.\n"
             "## Minor observations (not blocking)\n"
             "- nit one\n- nit two\n"
             "END_REVIEW\n"
@@ -1274,6 +1420,9 @@ class TestRunForReviewTransition:
         review_loaded = loaded.find_by_id("review-xyz")
         assert review_loaded is not None
         assert review_loaded.review_verdict == "approve"
+        # #1456: the override must round-trip through the DB too — the
+        # reviewer's original verdict is recorded, not replaced.
+        assert review_loaded.review_verdict_original == "request-changes"
 
     def test_review_not_on_board_returns_empty(
         self, config: Config, tmp_path, coord_db
