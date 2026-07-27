@@ -617,7 +617,10 @@ def dispatch_entry(
     resolved_model = label_model or config.models.default
     # #1454: surfaced on the outcome so `coord milestone dispatch`'s CLI
     # output states *why* this model was picked, same as `coord assign` /
-    # `coord approve`.
+    # `coord approve`. `issue_labels` (above, line ~572) came from
+    # `issue_data` fetched fresh just moments ago in this same call — so
+    # this is never stale, unlike a proposal snapshot carried over from an
+    # earlier `coord plan`/`coord milestone plan` run.
     from coord.config import describe_model_choice  # noqa: PLC0415
 
     model_reason = describe_model_choice(
