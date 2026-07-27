@@ -99,6 +99,9 @@ def _assignment_upsert_params(a: Assignment) -> tuple:
         a.review_head_sha,
         # #1475: content-addressed patch-id alongside the SHA above.
         a.review_patch_id,
+        # #1476: scoped-re-review audit trail.
+        int(a.review_scoped),
+        a.review_scope_base_sha,
         a.cost_usd,
         # #252: encode list as JSON; None → NULL.
         (json.dumps(a.smoke_tests) if a.smoke_tests is not None else None),
@@ -116,7 +119,8 @@ _UPSERT_SQL = """
         review_target, required_gates, plan, unreachable_count, review_iteration,
         review_posted_at, test_state, test_reason, review_verdict,
         review_verdict_original, review_verdict_override_reason, review_head_sha,
-        review_patch_id, cost_usd, smoke_tests, provider_name
+        review_patch_id, review_scoped, review_scope_base_sha,
+        cost_usd, smoke_tests, provider_name
     ) VALUES (
         ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?,
@@ -125,7 +129,8 @@ _UPSERT_SQL = """
         ?, ?, ?, ?, ?,
         ?, ?, ?, ?,
         ?, ?, ?,
-        ?, ?, ?, ?
+        ?, ?, ?,
+        ?, ?, ?
     )
     ON CONFLICT(assignment_id) DO UPDATE SET
         -- #1451: `status`/`finished_at` are guarded by a finished_at-CAS, not
@@ -208,6 +213,16 @@ _UPSERT_SQL = """
         -- a later upsert without the patch-id (older code path, agent
         -- reload) must not erase a captured value.
         review_patch_id    = COALESCE(excluded.review_patch_id, review_patch_id),
+        -- #1476: scoped-re-review audit trail. review_scoped defaults to 0,
+        -- not NULL, so plain COALESCE (which only fires on NULL) can't be
+        -- used to "preserve once set" the way it is for the NULL-default
+        -- text columns above — a legitimate incoming 0 would COALESCE right
+        -- through. The CASE spells out the actual intent instead: once a row
+        -- is marked scoped, a later upsert (older code path, agent reload)
+        -- can never un-mark it. review_scope_base_sha IS NULL-default text,
+        -- so it keeps the ordinary COALESCE-preserve pattern.
+        review_scoped      = CASE WHEN review_scoped = 1 THEN 1 ELSE excluded.review_scoped END,
+        review_scope_base_sha = COALESCE(excluded.review_scope_base_sha, review_scope_base_sha),
         -- #208: cost_usd is set once at completion.  COALESCE so a re-load
         -- of the same row from an agent that doesn't know the cost
         -- doesn't blow away a previously-captured value.
