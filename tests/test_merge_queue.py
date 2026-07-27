@@ -1866,6 +1866,59 @@ class TestSmokeGate:
         assert "smoke_required" not in kinds
         assert items[0].state == PENDING  # dry-run: state untouched
 
+    # ── #1479-review: target_branch_head_sha population ──
+
+    def test_process_populates_target_branch_head_sha_from_gh_ops(self) -> None:
+        """#1479: process() must populate entry.target_branch_head_sha via
+        gh_ops.get_branch_sha(target_branch) — the production population path
+        has_smoke_verdict's base-moved staleness check relies on."""
+        sha_calls: list[tuple[str, str]] = []
+
+        class _TrackingGh(FakeGh):
+            def get_branch_sha(self, repo: str, branch: str) -> str | None:
+                sha_calls.append((repo, branch))
+                return "main-sha-123"
+
+        cfg = self._config()
+        work = self._work("w1", test_state="passed")
+        board = self._board(completed=[work])
+        items = [_q("w1", size=10)]
+        process(items, _TrackingGh(), config=cfg, board=board)
+
+        assert ("acme/api", "main") in sha_calls, (
+            "process() must call gh_ops.get_branch_sha for the target branch"
+        )
+        assert items[0].target_branch_head_sha == "main-sha-123"
+
+    def test_process_hoists_target_branch_head_sha_fetch_per_group(self) -> None:
+        """#1479-review (non-blocking): entries grouped under the same
+        (repo_github, target_branch) share an identical target_branch_head_sha
+        — process() must fetch it once per group, not once per entry."""
+        sha_calls: list[tuple[str, str]] = []
+
+        class _TrackingGh(FakeGh):
+            def get_branch_sha(self, repo: str, branch: str) -> str | None:
+                sha_calls.append((repo, branch))
+                return "main-sha-shared"
+
+        cfg = self._config()
+        w1 = self._work("w1", test_state="passed")
+        w2 = self._work("w2", test_state="passed")
+        board = self._board(completed=[w1, w2])
+        items = [
+            _q("w1", branch="worker/w1", size=10),
+            _q("w2", branch="worker/w2", size=20),
+        ]
+        process(items, _TrackingGh(), config=cfg, board=board)
+
+        target_calls = [c for c in sha_calls if c == ("acme/api", "main")]
+        assert len(target_calls) == 1, (
+            "target_branch_head_sha must be fetched once per group, "
+            f"got {len(target_calls)} calls: {sha_calls}"
+        )
+        assert items[0].target_branch_head_sha == "main-sha-shared"
+        assert items[1].target_branch_head_sha == "main-sha-shared"
+
 
 class TestGateBypassAudit:
     """#1213: a per-issue label override honoured by requires_review /

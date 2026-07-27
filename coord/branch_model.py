@@ -45,6 +45,7 @@ __all__ = [
     "feature_branch_name",
     "resolve_base_branch",
     "resolve_base_branch_for_issue",
+    "resolve_base_branch_for_issue_number",
     "ensure_feature_branch_exists",
     "fetch_issue_milestone_number",
 ]
@@ -136,6 +137,35 @@ def resolve_base_branch_for_issue(repo: "Repo", issue_data: dict) -> str:
     """
     milestone = issue_data.get("milestone") or {}
     milestone_number = milestone.get("number") if isinstance(milestone, dict) else None
+    return resolve_base_branch(repo, milestone_number)
+
+
+def resolve_base_branch_for_issue_number(
+    repo: "Repo", repo_github: str, issue_number: int, *, cache: dict | None = None,
+) -> str:
+    """Like :func:`resolve_base_branch_for_issue`, but for a call site that
+    only has an issue *number* rather than an already-fetched issue dict.
+
+    #1479-review: unifies "does this repo opt into the git model, and if so
+    which milestone/base branch does this issue resolve to" for call sites
+    that hadn't already fetched the full issue payload —
+    ``coord.merge_queue.enqueue_approved_work`` and
+    ``coord.state._stamp_test_staleness_anchor`` each reimplemented this
+    guard-then-lookup slightly differently before this helper existed
+    (one via :func:`fetch_issue_milestone_number` directly, the other via
+    :func:`resolve_base_branch_for_issue` plus a raw ``get_issue`` call). A
+    single implementation means the two can't silently drift apart.
+
+    Skips the milestone lookup entirely (no ``gh`` call at all) when the repo
+    hasn't opted into the git model (``repo.develop_branch`` unset) —
+    mirrors :func:`resolve_base_branch`'s own zero-extra-cost guarantee for
+    repos that haven't adopted it. *cache* is forwarded unchanged to
+    :func:`fetch_issue_milestone_number` for batch call sites that want to
+    dedupe repeated lookups across a pass.
+    """
+    if not getattr(repo, "develop_branch", None):
+        return getattr(repo, "default_branch", None) or "main"
+    milestone_number = fetch_issue_milestone_number(repo_github, issue_number, cache=cache)
     return resolve_base_branch(repo, milestone_number)
 
 

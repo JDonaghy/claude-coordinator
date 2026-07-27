@@ -857,17 +857,14 @@ def enqueue_approved_work(config, board=None) -> list[str]:
         # model. The milestone lookup itself is skipped entirely (no `gh`
         # call) when the repo hasn't opted in — fails open to
         # `default_branch`, today's behavior, unchanged.
-        target_branch = getattr(repo_cfg, "default_branch", None) or "main"
-        if getattr(repo_cfg, "develop_branch", None):
-            from coord.branch_model import (  # noqa: PLC0415
-                fetch_issue_milestone_number,
-                resolve_base_branch,
-            )
+        from coord.branch_model import resolve_base_branch_for_issue_number  # noqa: PLC0415
 
-            milestone_number = fetch_issue_milestone_number(
-                repo_cfg.github, getattr(a, "issue_number", 0), cache=milestone_cache,
-            )
-            target_branch = resolve_base_branch(repo_cfg, milestone_number)
+        target_branch = resolve_base_branch_for_issue_number(
+            repo_cfg,
+            repo_cfg.github,
+            getattr(a, "issue_number", 0),
+            cache=milestone_cache,
+        )
 
         if refresh_entry_assignment(
             a,
@@ -1663,7 +1660,15 @@ def process(
             continue
         groups.setdefault((entry.repo_github, entry.target_branch), []).append(entry)
 
+    _unset = object()
+
     for group in groups.values():
+        # #1479-review: every entry in a group shares the same target_branch
+        # (that's the grouping key), so target_branch_head_sha is the same
+        # value for all of them — fetch it once per group instead of once
+        # per entry to avoid N redundant `gh api` calls for an N-entry group.
+        _group_target_branch_head_sha: str | None | object = _unset
+
         if dry_run:
             for entry in group:
                 events.append(MergeEvent(entry, "opened", f"(dry run) would open PR for {entry.branch}"))
@@ -1709,9 +1714,11 @@ def process(
                     and config is not None
                     and requires_smoke(entry, config)
                 ):
-                    entry.target_branch_head_sha = gh_ops.get_branch_sha(
-                        entry.repo_github, entry.target_branch
-                    )
+                    if _group_target_branch_head_sha is _unset:
+                        _group_target_branch_head_sha = gh_ops.get_branch_sha(
+                            entry.repo_github, entry.target_branch
+                        )
+                    entry.target_branch_head_sha = _group_target_branch_head_sha
                 # #292 (Defect 4): apply the review gate in dry-run so output
                 # reflects real behaviour.  CI cannot be checked in dry-run
                 # (no PR exists yet), so review and smoke gates are evaluated.
@@ -1825,9 +1832,11 @@ def process(
                 and config is not None
                 and requires_smoke(entry, config)
             ):
-                entry.target_branch_head_sha = gh_ops.get_branch_sha(
-                    entry.repo_github, entry.target_branch
-                )
+                if _group_target_branch_head_sha is _unset:
+                    _group_target_branch_head_sha = gh_ops.get_branch_sha(
+                        entry.repo_github, entry.target_branch
+                    )
+                entry.target_branch_head_sha = _group_target_branch_head_sha
             # Review gate (#253/#821): refuse to merge when a review is required
             # by the pipeline policy but no approved review is on the board.
             # --skip-review bypasses for trivial/docs-only merges where the
