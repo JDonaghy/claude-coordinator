@@ -1,0 +1,152 @@
+"""CLI-surface tests for `coord drive` (#1392).
+
+Flag parity with the deleted ``scripts/drive-issue.sh`` is the acceptance bar,
+so the first test asserts the flag *set* rather than any single option — a
+dropped flag silently breaks every operator habit and every runbook.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+from click.testing import CliRunner
+
+from coord.cli import main
+from coord.commands.drive import drive
+from coord.drive import EXIT_TERMINAL_FAILURE, EXIT_USAGE, DriveError
+
+
+# Every flag drive-issue.sh accepted. --machine/--model/--repo-path/--merge-method
+# etc. are here too, but these are the ones #1392 names explicitly.
+LEGACY_FLAGS = {
+    "--plan",
+    "--skip-test",
+    "--max-fix-rounds",
+    "--accept-advisory",
+    "--force-review",
+    "--no-merge",
+    "--dry-run",
+    "--deadline",
+    "--poll",
+    # the rest of the bash surface
+    "--machine",
+    "--model",
+    "--briefing-file",
+    "--repo-path",
+    "--max-work-retries",
+    "--stall",
+    "--notify",
+    "--merge-method",
+}
+
+
+def declared_flags() -> set[str]:
+    flags: set[str] = set()
+    for param in drive.params:
+        flags.update(param.opts)
+    return flags
+
+
+@pytest.mark.parametrize("flag", sorted(LEGACY_FLAGS))
+def test_every_drive_issue_sh_flag_survived_the_port(flag):
+    assert flag in declared_flags()
+
+
+def test_drive_is_registered_on_the_main_cli():
+    assert "drive" in main.commands
+
+
+def test_help_renders_without_touching_the_board():
+    result = CliRunner().invoke(main, ["drive", "--help"])
+    assert result.exit_code == 0
+    assert "Work → Test → Review → Merge" in result.output
+
+
+def test_issue_must_be_a_number():
+    result = CliRunner().invoke(main, ["drive", "somerepo", "not-a-number"])
+    assert result.exit_code != 0
+
+
+def test_a_drive_error_becomes_its_own_exit_code(monkeypatch, valid_config_path: Path):
+    """DriveError's exit_code is the script contract: 2 usage, 1 terminal, 3 deadline."""
+
+    def boom(self):
+        raise DriveError("nope", EXIT_USAGE)
+
+    monkeypatch.setattr("coord.drive.Driver.run", boom)
+    result = CliRunner().invoke(
+        main, ["drive", "--config", str(valid_config_path), "somerepo", "1"]
+    )
+    assert result.exit_code == EXIT_USAGE
+    assert "nope" in result.output
+
+
+def test_the_drivers_return_code_is_the_processs_exit_code(
+    monkeypatch, valid_config_path: Path
+):
+    monkeypatch.setattr(
+        "coord.drive.Driver.run", lambda self: EXIT_TERMINAL_FAILURE
+    )
+    result = CliRunner().invoke(
+        main, ["drive", "--config", str(valid_config_path), "somerepo", "1"]
+    )
+    assert result.exit_code == EXIT_TERMINAL_FAILURE
+
+
+def test_flags_are_threaded_into_drive_options(monkeypatch, valid_config_path: Path):
+    seen: dict = {}
+
+    def capture(self):
+        seen["opts"] = self.opts
+        seen["repo"] = self.repo
+        seen["issue"] = self.issue
+        return 0
+
+    monkeypatch.setattr("coord.drive.Driver.run", capture)
+    result = CliRunner().invoke(
+        main,
+        [
+            "drive",
+            "--config", str(valid_config_path),
+            "--machine", "precision",
+            "--model", "opus",
+            "--plan",
+            "--skip-test",
+            "--accept-advisory",
+            "--force-review",
+            "--no-merge",
+            "--merge-method", "squash",
+            "--max-fix-rounds", "7",
+            "--poll", "5",
+            "--deadline", "30",
+            "--stall", "4",
+            "--notify",
+            "--dry-run",
+            "somerepo", "1392",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    opts = seen["opts"]
+    assert (seen["repo"], seen["issue"]) == ("somerepo", 1392)
+    assert opts.machine == "precision"
+    assert opts.model == "opus"
+    assert opts.do_plan is True
+    assert opts.skip_test is True
+    assert opts.accept_advisory is True
+    assert opts.force_review is True
+    assert opts.do_merge is False  # --no-merge inverts
+    assert opts.merge_method == "squash"
+    assert opts.max_fix_rounds == 7
+    assert opts.poll == 5
+    assert opts.deadline_mins == 30
+    assert opts.stall_mins == 4
+    assert opts.notify is True
+    assert opts.dry_run is True
+    # Pinned so every `coord` subprocess reads the same file this run does.
+    assert opts.config_path == str(valid_config_path)
+
+
+def test_merge_method_is_constrained_to_the_three_coord_merge_supports():
+    result = CliRunner().invoke(main, ["drive", "--merge-method", "octopus", "r", "1"])
+    assert result.exit_code != 0

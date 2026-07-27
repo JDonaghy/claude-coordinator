@@ -109,6 +109,7 @@ from coord.commands.issues import (
     track,
     untrack,
 )
+from coord.commands.drive import drive
 from coord.commands.lifecycle import done, housekeeping, notify, resume, serve, web
 from coord.commands.milestone import milestone_group
 from coord.commands.plans import plans_cmd
@@ -366,6 +367,7 @@ main.add_command(web)
 main.add_command(serve)
 main.add_command(wait)
 main.add_command(watch)
+main.add_command(drive)
 main.add_command(pr)
 main.add_command(fix)
 main.add_command(review)
