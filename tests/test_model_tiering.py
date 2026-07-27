@@ -617,6 +617,164 @@ class TestCliAssignModelLabels:
         assert proposal.model == "sonnet"
 
 
+# ── #1454: `coord approve` re-checks CURRENT labels, not a plan-time cache ──
+
+
+class TestCliApproveModelLabels:
+    """#1454: labelling an issue AFTER `coord plan` ran (but before `coord
+    approve` dispatches it) must still route via `models.labels` — the
+    saved proposal's `model` is unset in that case (no label matched at
+    plan time), and `coord approve` used to blindly fill it with
+    `models.default` instead of re-checking the issue's current labels."""
+
+    def test_approve_resolves_model_from_label_when_unset(
+        self, cli_config_file_with_labels: Path, cli_coord_dir: Path,
+    ) -> None:
+        from coord.models import Proposal
+        from coord.state import save_proposals
+
+        save_proposals([
+            Proposal(
+                id=1, machine_name="laptop", repo_name="api", issue_number=42,
+                issue_title="t", rationale="r",
+            ),
+        ])
+        with patch(
+            "coord.github_ops.get_issue",
+            return_value={"labels": [{"name": "tier:large"}]},
+        ), patch(
+            "coord.dispatch.dispatch", return_value={"id": "abc-123"}
+        ) as disp, patch(
+            "coord.github_ops.post_issue_comment"
+        ), patch(
+            "coord.claim.find_work_claim", return_value=None
+        ):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "approve", "1",
+                    "--config", str(cli_config_file_with_labels),
+                    "--skip-freshness",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        proposal = disp.call_args[0][0]
+        assert proposal.model == "opus"
+        assert "via label 'tier:large'" in result.output
+
+    def test_approve_falls_back_to_default_when_no_label_match(
+        self, cli_config_file_with_labels: Path, cli_coord_dir: Path,
+    ) -> None:
+        from coord.models import Proposal
+        from coord.state import save_proposals
+
+        save_proposals([
+            Proposal(
+                id=1, machine_name="laptop", repo_name="api", issue_number=42,
+                issue_title="t", rationale="r",
+            ),
+        ])
+        with patch(
+            "coord.github_ops.get_issue", return_value={"labels": []},
+        ), patch(
+            "coord.dispatch.dispatch", return_value={"id": "abc-123"}
+        ) as disp, patch(
+            "coord.github_ops.post_issue_comment"
+        ), patch(
+            "coord.claim.find_work_claim", return_value=None
+        ):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "approve", "1",
+                    "--config", str(cli_config_file_with_labels),
+                    "--skip-freshness",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        proposal = disp.call_args[0][0]
+        assert proposal.model == "sonnet"
+        assert "default; no label match" in result.output
+
+    def test_approve_does_not_override_a_plan_time_model(
+        self, cli_config_file_with_labels: Path, cli_coord_dir: Path,
+    ) -> None:
+        """A model already resolved (brain output, or a label match at plan
+        time) is never revisited — only the unset case re-checks labels."""
+        from coord.models import Proposal
+        from coord.state import save_proposals
+
+        save_proposals([
+            Proposal(
+                id=1, machine_name="laptop", repo_name="api", issue_number=42,
+                issue_title="t", rationale="r", model="haiku",
+            ),
+        ])
+        with patch(
+            "coord.github_ops.get_issue",
+            return_value={"labels": [{"name": "tier:large"}]},
+        ) as get_issue, patch(
+            "coord.dispatch.dispatch", return_value={"id": "abc-123"}
+        ) as disp, patch(
+            "coord.github_ops.post_issue_comment"
+        ), patch(
+            "coord.claim.find_work_claim", return_value=None
+        ):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "approve", "1",
+                    "--config", str(cli_config_file_with_labels),
+                    "--skip-freshness",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        proposal = disp.call_args[0][0]
+        assert proposal.model == "haiku"
+        assert "resolved at plan time" in result.output
+        get_issue.assert_not_called()
+
+
+class TestCliPlanCallsResolveModels:
+    """#1454: `coord plan`'s CLI wrapper used to skip `resolve_models()`
+    entirely (only `coord.brain.propose()`'s full cycle called it), so
+    `models.labels` routing was silently dead for every proposal that went
+    through `coord plan` -> `coord approve` regardless of timing."""
+
+    def test_plan_dry_run_calls_resolve_models(
+        self, cli_config_file_with_labels: Path, cli_coord_dir: Path,
+    ) -> None:
+        from coord.models import Proposal
+
+        proposal = Proposal(
+            id=1, machine_name="laptop", repo_name="api", issue_number=42,
+            issue_title="t", rationale="r",
+        )
+        with patch(
+            "coord.brain.gather_context",
+            return_value={"issues_by_repo": {}, "machine_status": {}},
+        ), patch(
+            "coord.brain.build_prompt", return_value="prompt"
+        ), patch(
+            "coord.brain.call_claude", return_value="[]"
+        ), patch(
+            "coord.brain.parse_proposals", return_value=[proposal]
+        ), patch(
+            "coord.brain.parse_split_proposals", return_value=[]
+        ), patch(
+            "coord.brain.resolve_required_gates"
+        ) as mock_gates, patch(
+            "coord.brain.resolve_models"
+        ) as mock_models:
+            result = CliRunner().invoke(
+                main,
+                ["plan", "--dry-run", "--config", str(cli_config_file_with_labels)],
+            )
+        assert result.exit_code == 0, result.output
+        mock_models.assert_called_once()
+        mock_gates.assert_called_once()
+
+
 # ── Escalation on follow-up commands ───────────────────────────────────────
 
 

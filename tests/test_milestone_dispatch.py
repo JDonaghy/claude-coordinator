@@ -688,6 +688,9 @@ class TestDispatchEntry:
         assert len(proposals) == 1
         assert proposals[0].model == "opus"
         assert proposals[0].type == "work"
+        # #1454: the outcome states *why* opus was picked.
+        assert outcome.model == "opus"
+        assert "via label 'tier:large'" in outcome.model_reason
 
     def test_require_plan_does_not_inherit_label_model(self, coord_db) -> None:
         """#1430: when dispatch.require_plan upgrades this to a plan-type

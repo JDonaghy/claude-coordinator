@@ -501,6 +501,12 @@ class DispatchOutcome:
     ok: bool
     assignment_id: str | None = None
     error: str | None = None
+    # #1454: the resolved model + a human-readable reason (e.g. "via label
+    # 'tier:large'" / "default; no label match") — see
+    # `coord.config.describe_model_choice`. `None` on a failed outcome (no
+    # model was ever resolved) or for a non-"work" proposal_type.
+    model: str | None = None
+    model_reason: str | None = None
 
 
 def dispatch_entry(
@@ -603,9 +609,20 @@ def dispatch_entry(
     # `default` — read-only/cheap, must not inherit a tier:large -> opus
     # routing meant for the eventual work dispatch.
     proposal_type = "plan" if config.dispatch.require_plan else "work"
-    resolved_model = (
-        config.models.model_for_labels(issue_labels) if proposal_type == "work" else None
-    ) or config.models.default
+    label_model, matched_label = (
+        config.models.model_for_labels_with_reason(issue_labels)
+        if proposal_type == "work"
+        else (None, None)
+    )
+    resolved_model = label_model or config.models.default
+    # #1454: surfaced on the outcome so `coord milestone dispatch`'s CLI
+    # output states *why* this model was picked, same as `coord assign` /
+    # `coord approve`.
+    from coord.config import describe_model_choice  # noqa: PLC0415
+
+    model_reason = describe_model_choice(
+        resolved_model=resolved_model, matched_label=matched_label,
+    )
 
     proposal = Proposal(
         id=0,
@@ -659,4 +676,6 @@ def dispatch_entry(
         machine_name=machine.name,
         ok=True,
         assignment_id=str(assignment_id),
+        model=resolved_model,
+        model_reason=model_reason,
     )

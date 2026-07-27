@@ -308,7 +308,9 @@ class TestApproveSplitAdvisory:
         save_proposals([self._make_proposal(files)])
 
         runner = CliRunner()
-        with patch("coord.claim.find_work_claim", return_value=None):
+        with patch("coord.claim.find_work_claim", return_value=None), patch(
+            "coord.github_ops.get_issue", return_value={"labels": []}
+        ):
             result = runner.invoke(main, ["approve", "1", "--config", str(config_file), "--dry-run"])
 
         assert result.exit_code == 0, result.output
@@ -326,7 +328,9 @@ class TestApproveSplitAdvisory:
         save_proposals([self._make_proposal(files)])
 
         runner = CliRunner()
-        with patch("coord.claim.find_work_claim", return_value=None):
+        with patch("coord.claim.find_work_claim", return_value=None), patch(
+            "coord.github_ops.get_issue", return_value={"labels": []}
+        ):
             result = runner.invoke(main, ["approve", "1", "--config", str(config_file), "--dry-run"])
 
         assert result.exit_code == 0, result.output
@@ -356,7 +360,9 @@ class TestApproveSplitAdvisory:
         save_proposals([self._make_proposal(files)])
 
         runner = CliRunner()
-        with patch("coord.claim.find_work_claim", return_value=None):
+        with patch("coord.claim.find_work_claim", return_value=None), patch(
+            "coord.github_ops.get_issue", return_value={"labels": []}
+        ):
             result = runner.invoke(main, ["approve", "1", "--config", str(config_file), "--dry-run"])
 
         assert result.exit_code == 0, result.output

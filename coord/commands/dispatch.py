@@ -14,6 +14,7 @@ import click
 import httpx
 
 from coord import github_ops
+from coord.config import describe_model_choice
 
 from coord.commands._common import AGENT_PORT, _CONFIG_OPTION, _load_config
 from coord.commands.dispatch_workers import (
@@ -42,7 +43,7 @@ def plan(config_path: Path, dry_run: bool) -> None:
     click.echo("Gathering context...", nl=False)
     sys.stdout.flush()
 
-    from coord.brain import gather_context, build_prompt, call_claude, parse_proposals, parse_split_proposals, resolve_required_gates, SYSTEM_PROMPT
+    from coord.brain import gather_context, build_prompt, call_claude, parse_proposals, parse_split_proposals, resolve_models, resolve_required_gates, SYSTEM_PROMPT
     context = gather_context(cfg)
     issue_count = sum(len(v) for v in context["issues_by_repo"].values())
     online = sum(1 for v in context["machine_status"].values() if v.get("status") != "offline" and "error" not in str(v))
@@ -55,6 +56,13 @@ def plan(config_path: Path, dry_run: bool) -> None:
         response = call_claude(SYSTEM_PROMPT, prompt)
         proposals = parse_proposals(response)
         resolve_required_gates(proposals, cfg, context["issues_by_repo"])
+        # #1454: this CLI wrapper never called resolve_models() (only
+        # coord.brain.propose()'s full cycle did) — so `models.labels`
+        # routing was silently dead for the entire `coord plan` ->
+        # `coord approve` two-step; every work proposal saved by `coord
+        # plan` reached `approve()` with `p.model` unset regardless of the
+        # issue's tier/category label, and fell back to `models.default`.
+        resolve_models(proposals, cfg, context["issues_by_repo"])
         splits = parse_split_proposals(response)
     except RuntimeError as e:
         click.echo(f"error: {e}", err=True)
@@ -238,11 +246,43 @@ def approve(
         # Resolve model so the dispatched record and board reflect what ran.
         # #1430: coord.brain.resolve_models() already set p.model from
         # models.labels (via config.models.model_for_labels) for work
-        # proposals with a matching label, during `coord plan`. This is
-        # just the final fallback for proposals it left unset (no match, or
-        # saved before label-based model resolution was wired in).
+        # proposals with a matching label, during `coord plan`.
+        #
+        # #1454: that resolution is only as fresh as the issue's labels AT
+        # PLAN TIME. "Label it, then dispatch it" is the documented tier
+        # workflow (#1430) — and `coord plan` / `coord approve` are two
+        # separate invocations that can be minutes or hours apart, so a
+        # label added after planning must still win here, not silently fall
+        # back to `models.default` because the plan-time snapshot missed
+        # it. When there's no already-resolved model, re-check the issue's
+        # CURRENT labels with a live fetch (same as `coord assign` /
+        # `coord milestone dispatch` already do) before falling back.
+        plan_time_model = p.model
+        matched_label: str | None = None
+        if p.type == "work" and not p.model:
+            repo_for_model = cfg.repo(p.repo_name)
+            fresh_labels: list[str] = []
+            if repo_for_model is not None:
+                try:
+                    fresh_issue = github_ops.get_issue(repo_for_model.github, p.issue_number)
+                    fresh_labels = [
+                        lbl.get("name", "") for lbl in (fresh_issue.get("labels") or [])
+                    ]
+                except RuntimeError:
+                    fresh_labels = []  # fail open — fall back to default below
+            label_model, matched_label = cfg.models.model_for_labels_with_reason(fresh_labels)
+            if label_model:
+                p.model = label_model
         if not p.model:
             p.model = cfg.models.default
+        click.echo(
+            "     model: "
+            + describe_model_choice(
+                resolved_model=p.model,
+                explicit_reason="resolved at plan time" if plan_time_model else None,
+                matched_label=matched_label,
+            )
+        )
         # Resolve required_gates: fall back to config default for proposals
         # that were saved before label-based gate resolution was wired in.
         if not p.required_gates:

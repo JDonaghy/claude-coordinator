@@ -327,7 +327,7 @@ class TestApproveNetworkErrors:
         with patch(
             "coord.dispatch.httpx.post",
             side_effect=httpx.ConnectError("[Errno 111] Connection refused"),
-        ):
+        ), patch("coord.github_ops.get_issue", return_value={"labels": []}):
             result = CliRunner().invoke(
                 main, ["approve", "1", "--config", str(config_file)]
             )

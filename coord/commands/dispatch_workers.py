@@ -4571,8 +4571,10 @@ def _dispatch_headless(
     # inherit a tier:large -> opus routing meant for the eventual work
     # dispatch, so label resolution only applies when this is a work
     # dispatch, not a plan-only one.
-    label_model = (
-        cfg.models.model_for_labels(issue_labels) if not effective_plan_only else None
+    label_model, matched_label = (
+        cfg.models.model_for_labels_with_reason(issue_labels)
+        if not effective_plan_only
+        else (None, None)
     )
     resolved_model = model or label_model or cfg.models.default
 
@@ -4597,7 +4599,19 @@ def _dispatch_headless(
         else:
             click.echo("  mode: plan-only (read-only, no worktree)")
     if resolved_model:
-        click.echo(f"  model: {resolved_model}")
+        # #1454: state *why* this model was picked — a silent fall-through
+        # to models.default (stale/missing label) used to be indistinguishable
+        # from an intentional default in this same line of output.
+        from coord.config import describe_model_choice  # noqa: PLC0415
+
+        click.echo(
+            "  model: "
+            + describe_model_choice(
+                resolved_model=resolved_model,
+                explicit_reason="explicit --model" if model else None,
+                matched_label=matched_label,
+            )
+        )
 
     if dry_run:
         click.echo("  (dry run — not dispatched)")
