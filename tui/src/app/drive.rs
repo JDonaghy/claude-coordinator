@@ -7,7 +7,11 @@
 //! the TUI's half of that: discover live drive sessions (mirrors
 //! `fleet_terminals.rs`'s `FleetTerminal`/`LiveTmuxSession` pattern), launch
 //! one from the Pipeline row context menu, attach the per-issue Terminal tab
-//! to it, and stop it.
+//! to it, and stop it. "Launch" always ends attached: `spawn_drive_shell`
+//! types `coord drive … --tmux && coord drive-attach …` as a single chained
+//! command line, so opening the Terminal tab right after clicking "Drive
+//! (automated)" shows the live run, not a launch confirmation sitting above
+//! a dead shell prompt.
 //!
 //! LOCAL ONLY: unlike fleet terminals / interactive `coord-<aid>` sessions, a
 //! drive runs on the operator's own machine (see #1398's "Out of scope" —
@@ -115,7 +119,18 @@ pub(crate) fn spawn_drive_sessions_fetch() -> std::sync::mpsc::Receiver<Vec<Driv
 /// per-issue terminal shell.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DriveShellMode {
-    /// `coord drive <repo> <issue> --tmux` — start a fresh drive.
+    /// `coord drive <repo> <issue> --tmux && coord drive-attach <repo>
+    /// <issue>` — start a fresh drive, then immediately attach the SAME
+    /// pane to the tmux session it just created. `coord drive --tmux`
+    /// creates the session synchronously (`tmux new-session -d` blocks
+    /// until the session exists — `launch_drive_in_tmux`, `coord/drive.py`)
+    /// and only then exits 0, so chaining with `&&` is race-free: the
+    /// attach never fires on a `--tmux` invocation that failed (e.g. "already
+    /// driving"), and it never races a session that isn't there yet. Without
+    /// this chain the pane would show the launch confirmation and then sit
+    /// at a dead shell prompt — the acceptance criterion is "opening the
+    /// Terminal tab shows the live run," not "shows a one-line confirmation
+    /// that a run started somewhere else."
     Launch,
     /// `coord drive-attach <repo> <issue>` — reattach to a live one.
     Attach,
@@ -192,7 +207,10 @@ impl CoordApp {
     /// Work → Test → Review → Merge sequence to `coord drive`, which
     /// dispatches every stage itself. Unlike
     /// `launch_interactive_session_on_machine`, this carries no work_aid and
-    /// never runs `coord assign`.
+    /// never runs `coord assign`. The pane doesn't stop at the launch
+    /// confirmation: `spawn_drive_shell` chains straight into `coord
+    /// drive-attach` so the Terminal tab shows the live run immediately,
+    /// not a dead prompt (see `DriveShellMode::Launch`'s doc).
     pub(crate) fn launch_drive_for_selected_issue(&mut self) {
         let Some((repo, issue_key)) = self.selected_issue_repo_and_key() else {
             self.pipeline_status = Some((
@@ -255,15 +273,28 @@ impl CoordApp {
                         // `--config` is a per-SUBCOMMAND option — must come
                         // AFTER `drive`, not before it (same rule the
                         // `coord reattach`/`coord assign` launch lines follow).
+                        // `drive-attach` takes no `--config` (it's a bare
+                        // `tmux attach-session`, no coord config to load —
+                        // see `coord/commands/drive.py::drive_attach`), so
+                        // the flag is only threaded into the first half of
+                        // the chain.
                         let cfg = match cfg_path.as_deref() {
                             Some(p) if !p.is_empty() => {
                                 format!("--config {} ", shell_quote_arg(p))
                             }
                             _ => String::new(),
                         };
+                        // Chain straight into `drive-attach` once the launch
+                        // succeeds (see `DriveShellMode::Launch`'s doc for why
+                        // this is race-free) — otherwise this pane shows the
+                        // launch confirmation and then sits at a dead shell
+                        // prompt instead of the live run, defeating the
+                        // issue's headline acceptance criterion.
                         format!(
-                            "coord drive {}{} {} --tmux\r",
+                            "coord drive {}{} {} --tmux && coord drive-attach {} {}\r",
                             cfg,
+                            shell_quote_arg(&repo),
+                            issue_num,
                             shell_quote_arg(&repo),
                             issue_num,
                         )
@@ -294,6 +325,17 @@ impl CoordApp {
                         pending: true,
                         pending_sweep_count: 0,
                     });
+                    // The "[driving]" badge is baked into the cached Pipeline
+                    // sidebar tree at `rebuild_pipeline_sidebar` time (it
+                    // isn't recomputed on every render like the context
+                    // menu, which reads `drive_sessions` fresh whenever it's
+                    // opened) — without this call the optimistic entry above
+                    // is real but invisible until the next unrelated board
+                    // refresh rebuilds the tree, contradicting "immediately"
+                    // in the comment above. `None` lets it recapture the
+                    // current selection itself; nothing about launching a
+                    // drive changes which issue is selected.
+                    self.rebuild_pipeline_sidebar(None);
                     self.pipeline_status = Some((
                         format!("Driving {repo} #{issue_num} — Work → Test → Review → Merge"),
                         Instant::now(),
@@ -319,6 +361,12 @@ impl CoordApp {
 
         self.drive_sessions
             .retain(|s| !(s.repo == killed.repo && s.issue == killed.issue));
+
+        // Symmetric with the launch side in `spawn_drive_shell`: the
+        // "[driving]" badge is baked into the cached Pipeline sidebar tree,
+        // so removing the session from `drive_sessions` alone leaves a
+        // stale badge on screen until the next unrelated board refresh.
+        self.rebuild_pipeline_sidebar(None);
 
         self.push_toast(
             "Drive stopped",
@@ -541,6 +589,12 @@ mod tests {
     /// `paste_to_pty_bracketed_when_mode_2004_enabled` /
     /// `paste_to_detail_terminal_bracketed_when_mode_2004_enabled` in
     /// `tests.rs`.
+    ///
+    /// #1398 review round 2: also asserts the launch line CHAINS into
+    /// `coord drive-attach` — the actual fix for "Drive (automated) never
+    /// attaches the Terminal tab to the live run." Without the `&&
+    /// coord drive-attach …` suffix this pane would show only the launch
+    /// confirmation and then sit at a dead shell prompt.
     #[test]
     #[cfg(unix)]
     fn launch_drive_types_the_coord_drive_command_line_for_the_right_repo_and_issue() {
@@ -593,6 +647,12 @@ mod tests {
         assert!(
             screen.contains("--tmux"),
             "launch must run detached inside tmux, not as a TUI child; got:\n{screen}"
+        );
+        assert!(
+            screen.contains("&& coord drive-attach"),
+            "launch must chain straight into `coord drive-attach` so the pane \
+             ends up attached to the live run instead of a dead shell prompt \
+             after the launch confirmation; got:\n{screen}"
         );
     }
 
@@ -654,6 +714,116 @@ mod tests {
         assert!(
             screen.contains("42"),
             "must target the selected issue's number; got:\n{screen}"
+        );
+    }
+
+    /// #1398 review: black-box `TuiDriver` coverage for the marquee flow the
+    /// issue opens with — "Right-click a Pipeline row → Drive (automated) →
+    /// … Select the issue, open Terminal, watch it work" — through the REAL
+    /// `event → handle → render` path (`quadraui::tui::testing::
+    /// driver_with_shell`), not a direct call into an internal method. Drives
+    /// a right-click (mirrors `tuidriver_right_click_opens_board_context_
+    /// menu`'s full `UiEvent::MouseDown { button: Right }` chain) on the
+    /// Pipeline row, asserts "Drive (automated)" renders in the menu, clicks
+    /// it, and asserts the Terminal tab becomes the active tab AND the
+    /// "[driving]" row badge appears — both read straight off the rendered
+    /// screen grid, exactly what the coord-tui testing policy in this repo's
+    /// CLAUDE.md requires for a user-visible change.
+    #[test]
+    fn tuidriver_drive_automated_menu_item_switches_to_terminal_and_shows_badge() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(BoardData::default());
+        app.pipeline_issues = vec![pipeline_issue(42, Some("myrepo"))];
+        app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
+        // Bakes the sidebar tree (including the drive badge span) from the
+        // fixture's `pipeline_issues` — mirrors what a real board refresh /
+        // selection change does before the row is ever on screen.
+        app.rebuild_pipeline_sidebar(None);
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+
+        let screen_before = driver.screen();
+        assert!(
+            screen_before.contains("Gates"),
+            "sanity: must start on the Overview tab (renders the Repo/Local/ \
+             Labels/Gates meta block) before anything is clicked:\n{screen_before}"
+        );
+
+        // The lone issue has no milestone, so it lands in the "No milestone"
+        // bucket, collapsed by default (mirrors `tuidriver_pipeline_new_
+        // milestone_chevron_click_expands_and_persists`'s precedent) — expand
+        // it first so "#42" is actually on screen to click.
+        let (label_x, label_y) = driver.find("No milestone").unwrap_or_else(|| {
+            panic!("'No milestone' bucket header not found:\n{screen_before}")
+        });
+        driver.click((label_x - 2.0).max(0.0), label_y);
+
+        let (x, y) = driver.find("#42").unwrap_or_else(|| {
+            panic!(
+                "#1398: could not find Pipeline row '#42' after expanding its \
+                 bucket:\n{}",
+                driver.screen()
+            )
+        });
+
+        // Right-click the row — the same full `UiEvent::MouseDown { button:
+        // Right }` → `handle` → `open_context_menu` chain a real right-click
+        // takes (`tuidriver_right_click_opens_board_context_menu`'s pattern),
+        // not a direct `open_context_menu`/`dispatch_context_menu_action` call.
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: MouseButton::Right,
+            position: Point::new(x, y),
+            modifiers: Modifiers::default(),
+        });
+
+        assert!(
+            driver.screen_contains("Drive (automated)"),
+            "right-click on an idle Pipeline row must offer 'Drive (automated)':\n{}",
+            driver.screen(),
+        );
+
+        let (dx, dy) = driver.find("Drive (automated)").unwrap_or_else(|| {
+            panic!(
+                "#1398: could not find 'Drive (automated)' menu item on screen:\n{}",
+                driver.screen()
+            )
+        });
+        // `find` returns the row's screen-centre, but the context menu's
+        // fractional-anchor layout hit-tests `[row + 0.5, row + 1.5)` — one
+        // item-height below where it visibly renders (see the identical
+        // nudge + rationale on the "Author acceptance tests (interactive)"
+        // click above `tuidriver_author_acceptance_tests_interactive_menu_
+        // item_dispatches`). Without it this click lands on "Set test mode",
+        // the item directly below "Drive (automated)" in the menu.
+        driver.click(dx, dy - 0.1);
+
+        // Tab-switch: the Overview-only Repo/Local/Labels/Gates meta block
+        // (`pipeline_tab_body_list`, rendered ONLY when `pipeline_detail_tab
+        // == Overview`) must be gone — the pinned stage strip that every
+        // OTHER tab (Terminal included) shows above its own body is not
+        // enough on its own to prove the tab changed (it renders on every
+        // non-Overview tab), so its disappearance is the honest on-screen
+        // signal that we left Overview. The exact destination
+        // (`PipelineDetailTab::Terminal`, not some other tab) is pinned by
+        // the direct-call companion test
+        // `dispatch_start_drive_launches_and_switches_to_terminal_tab` above,
+        // which the TuiDriver shell adapter doesn't expose a typed field to
+        // re-check here (same split as
+        // `sessions_panel_stop_running_session_shows_feedback_toast`).
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("Gates"),
+            "clicking 'Drive (automated)' must switch away from the Overview \
+             tab (to Terminal) so the live run is what's shown, not a launch \
+             confirmation left sitting on Overview:\n{screen}",
+        );
+        assert!(
+            screen.contains("[driving]"),
+            "the Pipeline row must carry the '[driving]' badge once a drive \
+             has been launched for it:\n{screen}",
         );
     }
 
