@@ -51,6 +51,9 @@
       "smoke_test_reason": null,
       "smoke_tests": null,
       "status": "running",
+      "test_base_sha": null,
+      "test_head_sha": null,
+      "test_patch_id": null,
       "test_plan": null,
       "test_plan_branch_head": null,
       "test_reason": null,
@@ -109,6 +112,9 @@
       "smoke_test_reason": null,
       "smoke_tests": null,
       "status": "done",
+      "test_base_sha": null,
+      "test_head_sha": null,
+      "test_patch_id": null,
       "test_plan": null,
       "test_plan_branch_head": null,
       "test_reason": null,
@@ -170,6 +176,9 @@
         "round_number is non-zero"
       ],
       "status": "done",
+      "test_base_sha": null,
+      "test_head_sha": null,
+      "test_patch_id": null,
       "test_plan": {
         "steps": [
           {

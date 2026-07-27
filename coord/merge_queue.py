@@ -386,12 +386,28 @@ def has_smoke_verdict(entry: "QueuedMerge", board) -> bool:
 
     The gate **fails closed** (returns ``False``) only when we can positively
     identify the work assignment(s) on the branch and none of them carries a
-    ``test_state in ('passed', 'skipped')`` verdict.
+    *fresh* ``test_state in ('passed', 'skipped')`` verdict.
 
     Collects all work assignment IDs connected to the entry — by shared
     branch, or (#567) by the ``review_of_assignment_id`` chain, which also
     catches fix workers dispatched with ``branch=NULL`` (the #557 remote-
     interactive-rework gap) — to handle bounce/fix-work chains.
+
+    #1479: unlike the pre-existing behaviour, a terminal verdict is not
+    trusted unconditionally — it is checked against the branch/base state it
+    was recorded against (``test_head_sha``/``test_patch_id``/
+    ``test_base_sha``, stamped by ``coord.state._record_test_verdict_local``)
+    the same way ``has_approved_review`` checks ``review_head_sha``/
+    ``review_patch_id``, **plus** one condition the review gate deliberately
+    doesn't have: the *merge base itself* moving. A rebase onto a moved base
+    can break tests without the branch's own diff changing at all (a
+    semantic conflict — upstream renamed something the branch calls), so
+    that combination no longer having been tested must re-block the gate
+    even when ``branch_patch_id`` is unchanged. Content changing (new
+    commits on the branch) also re-blocks, mirroring the review gate. Either
+    anchor missing on either side skips that half of the check (fail open —
+    #821/#1475's existing convention), so rows/entries predating this
+    feature behave exactly as before.
     """
     pool = list(getattr(board, "completed", []) or []) + list(
         getattr(board, "active", []) or []
@@ -409,11 +425,45 @@ def has_smoke_verdict(entry: "QueuedMerge", board) -> bool:
     if not branch_work:
         return True
 
-    # Work found — check whether any carries a terminal smoke verdict.
-    return any(
-        getattr(a, "test_state", None) in ("passed", "skipped")
-        for a in branch_work
-    )
+    current_base_sha = getattr(entry, "target_branch_head_sha", None)
+    current_branch_sha = getattr(entry, "branch_head_sha", None)
+    current_patch_id = getattr(entry, "branch_patch_id", None)
+
+    # Work found — check whether any carries a fresh terminal smoke verdict.
+    for a in branch_work:
+        if getattr(a, "test_state", None) not in ("passed", "skipped"):
+            continue
+
+        # Merge base moved: the tested combination (this branch + that base)
+        # no longer exists, even if the branch's own diff is unchanged.
+        test_base_sha = getattr(a, "test_base_sha", None)
+        if (
+            test_base_sha is not None
+            and current_base_sha is not None
+            and test_base_sha != current_base_sha
+        ):
+            continue  # stale: re-verify against the new base
+
+        # Branch content changed since the test ran. Same SHA-then-patch-id
+        # fallback as has_approved_review: a content-identical rebase (SHA
+        # moved, patch-id didn't) does not invalidate the verdict.
+        test_head_sha = getattr(a, "test_head_sha", None)
+        if (
+            test_head_sha is not None
+            and current_branch_sha is not None
+            and test_head_sha != current_branch_sha
+        ):
+            test_patch_id = getattr(a, "test_patch_id", None)
+            if not (
+                test_patch_id is not None
+                and current_patch_id is not None
+                and test_patch_id == current_patch_id
+            ):
+                continue  # stale: branch content changed since the test ran
+
+        return True
+
+    return False
 
 
 # Stored error strings that only reflect the gate state *at the moment a
@@ -493,6 +543,16 @@ class QueuedMerge:
     # still covers it. None means patch-id tracking is not available (fails
     # closed to the pre-#1475 SHA-only staleness check).
     branch_patch_id: str | None = None
+    # #1479: current HEAD SHA of `target_branch` itself, populated at
+    # process() time alongside branch_head_sha/branch_patch_id.
+    # `has_smoke_verdict` compares this against the test verdict's recorded
+    # `test_base_sha` to detect a merge base that moved since the test ran —
+    # a condition `branch_patch_id` (the branch's own content fingerprint)
+    # cannot see, since a rebase replays the identical diff onto a new base
+    # without changing it. None means base-SHA tracking is not available for
+    # this entry (transient, like branch_head_sha/branch_patch_id — never
+    # persisted to the queue DB).
+    target_branch_head_sha: str | None = None
     # #1077: the originating assignment's `type` (e.g. "work", "mock-author"),
     # captured at enqueue time. Drives both the PR-body "Closes #N" vs
     # "Refs #N" keyword (`_briefing_body`) and whether `process()` closes
@@ -1616,23 +1676,41 @@ def process(
                     entry.branch_head_sha = gh_ops.get_branch_sha(
                         entry.repo_github, entry.branch
                     )
-                # #1475: populate branch_patch_id alongside branch_head_sha so
-                # has_approved_review can carry an approval forward across a
-                # content-identical rebase instead of re-blocking on SHA alone.
-                # Only fetch it when a review is actually required for this
-                # entry — has_approved_review never consults branch_patch_id
-                # otherwise, so skipping here saves a `gh api compare` round
-                # trip per entry per process() tick for the common no-review
-                # (skip_review / gate-disabled) case.
+                # #1475/#1479: populate branch_patch_id alongside
+                # branch_head_sha so has_approved_review / has_smoke_verdict
+                # can carry a verdict forward across a content-identical
+                # rebase instead of re-blocking on SHA alone. Only fetch it
+                # when review or smoke is actually required for this entry —
+                # neither gate consults branch_patch_id otherwise, so
+                # skipping here saves a `gh api compare` round trip per entry
+                # per process() tick for the common gate-disabled case.
                 if (
                     board is not None
                     and entry.branch_patch_id is None
-                    and not skip_review
                     and config is not None
-                    and requires_review(entry, config)
+                    and (
+                        (not skip_review and requires_review(entry, config))
+                        or (not skip_smoke and requires_smoke(entry, config))
+                    )
                 ):
                     entry.branch_patch_id = gh_ops.get_branch_patch_id(
                         entry.repo_github, entry.target_branch, entry.branch
+                    )
+                # #1479: populate target_branch_head_sha so has_smoke_verdict
+                # can detect a merge base that moved since the test verdict
+                # was recorded — a condition branch_patch_id can't see, since
+                # a rebase replays the identical diff onto a new base without
+                # changing it. Only fetched when smoke is actually required,
+                # same cost-avoidance as branch_patch_id above.
+                if (
+                    board is not None
+                    and entry.target_branch_head_sha is None
+                    and not skip_smoke
+                    and config is not None
+                    and requires_smoke(entry, config)
+                ):
+                    entry.target_branch_head_sha = gh_ops.get_branch_sha(
+                        entry.repo_github, entry.target_branch
                     )
                 # #292 (Defect 4): apply the review gate in dry-run so output
                 # reflects real behaviour.  CI cannot be checked in dry-run
@@ -1714,23 +1792,41 @@ def process(
                 entry.branch_head_sha = gh_ops.get_branch_sha(
                     entry.repo_github, entry.branch
                 )
-            # #1475: populate branch_patch_id alongside branch_head_sha so
-            # has_approved_review can carry an approval forward across a
-            # content-identical rebase instead of re-blocking on SHA alone.
-            # Only fetch it when a review is actually required for this entry
-            # — has_approved_review never consults branch_patch_id otherwise,
-            # so skipping here saves a `gh api compare` round trip per entry
-            # per process() tick for the common no-review (skip_review /
-            # gate-disabled) case.
+            # #1475/#1479: populate branch_patch_id alongside branch_head_sha
+            # so has_approved_review / has_smoke_verdict can carry a verdict
+            # forward across a content-identical rebase instead of
+            # re-blocking on SHA alone. Only fetch it when review or smoke is
+            # actually required for this entry — neither gate consults
+            # branch_patch_id otherwise, so skipping here saves a `gh api
+            # compare` round trip per entry per process() tick for the
+            # common gate-disabled case.
             if (
                 board is not None
                 and entry.branch_patch_id is None
-                and not skip_review
                 and config is not None
-                and requires_review(entry, config)
+                and (
+                    (not skip_review and requires_review(entry, config))
+                    or (not skip_smoke and requires_smoke(entry, config))
+                )
             ):
                 entry.branch_patch_id = gh_ops.get_branch_patch_id(
                     entry.repo_github, entry.target_branch, entry.branch
+                )
+            # #1479: populate target_branch_head_sha so has_smoke_verdict can
+            # detect a merge base that moved since the test verdict was
+            # recorded — a condition branch_patch_id can't see, since a
+            # rebase replays the identical diff onto a new base without
+            # changing it. Only fetched when smoke is actually required,
+            # same cost-avoidance as branch_patch_id above.
+            if (
+                board is not None
+                and entry.target_branch_head_sha is None
+                and not skip_smoke
+                and config is not None
+                and requires_smoke(entry, config)
+            ):
+                entry.target_branch_head_sha = gh_ops.get_branch_sha(
+                    entry.repo_github, entry.target_branch
                 )
             # Review gate (#253/#821): refuse to merge when a review is required
             # by the pipeline policy but no approved review is on the board.

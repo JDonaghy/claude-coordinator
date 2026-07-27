@@ -13,6 +13,7 @@ from coord.state import (
     load_proposals,
     clear_proposals,
     record_dispatched,
+    record_test_verdict,
     update_assignment_claude_session_id,
 )
 
@@ -1620,3 +1621,153 @@ class TestListIssueNumbersWithAssignments:
         )
         monkeypatch.setattr(cc, "fetch_remote_board", lambda svc, **kw: board)
         assert list_issue_numbers_with_assignments("api") == {5, 6}
+
+
+class TestTestVerdictStalenessAnchor:
+    """#1479: `record_test_verdict` best-effort captures test_head_sha /
+    test_patch_id / test_base_sha alongside a terminal (passed/skipped)
+    verdict, so `coord.merge_queue.has_smoke_verdict` can later detect a
+    stale verdict (moved base or changed branch content)."""
+
+    @staticmethod
+    def _seed_assignment(coord_db, *, assignment_id="aid-1", branch="worker/aid-1"):
+        coord_db.execute(
+            "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+            "issue_number, issue_title, branch) VALUES (?, 'm1', 'api', 1, 't', ?)",
+            (assignment_id, branch),
+        )
+        coord_db.commit()
+
+    @staticmethod
+    def _config(monkeypatch, *, develop_branch=None):
+        from coord import config as _config_mod
+        from coord.models import Repo
+
+        repo = Repo(name="api", github="acme/api", default_branch="main",
+                    develop_branch=develop_branch)
+
+        class _Cfg:
+            def repo(self, name):
+                return repo if name == "api" else None
+
+        monkeypatch.setattr(_config_mod, "load", lambda *a, **k: _Cfg())
+        return repo
+
+    def test_stamps_anchor_fields_on_passed_verdict(self, coord_db, monkeypatch) -> None:
+        self._seed_assignment(coord_db)
+        self._config(monkeypatch)
+        monkeypatch.setattr(
+            "coord.github_ops.get_branch_sha",
+            lambda repo, branch: {"worker/aid-1": "branch-sha", "main": "main-sha"}[branch],
+        )
+        monkeypatch.setattr(
+            "coord.github_ops.get_branch_patch_id", lambda repo, base, branch: "patch-id-1",
+        )
+
+        record_test_verdict(assignment_id="aid-1", test_state="passed")
+
+        row = coord_db.execute(
+            "SELECT test_head_sha, test_patch_id, test_base_sha "
+            "FROM assignments WHERE assignment_id='aid-1'"
+        ).fetchone()
+        assert row["test_head_sha"] == "branch-sha"
+        assert row["test_patch_id"] == "patch-id-1"
+        assert row["test_base_sha"] == "main-sha"
+
+    def test_stamps_anchor_fields_on_skipped_verdict(self, coord_db, monkeypatch) -> None:
+        self._seed_assignment(coord_db)
+        self._config(monkeypatch)
+        monkeypatch.setattr("coord.github_ops.get_branch_sha", lambda repo, branch: "sha")
+        monkeypatch.setattr(
+            "coord.github_ops.get_branch_patch_id", lambda repo, base, branch: "patch",
+        )
+
+        record_test_verdict(assignment_id="aid-1", test_state="skipped")
+
+        row = coord_db.execute(
+            "SELECT test_base_sha FROM assignments WHERE assignment_id='aid-1'"
+        ).fetchone()
+        assert row["test_base_sha"] == "sha"
+
+    def test_no_anchor_stamped_on_failed_verdict(self, coord_db, monkeypatch) -> None:
+        """A 'failed' verdict already blocks the merge gate on its own — the
+        extra `gh` round trips are skipped."""
+        self._seed_assignment(coord_db)
+        calls = []
+        monkeypatch.setattr(
+            "coord.github_ops.get_branch_sha",
+            lambda repo, branch: calls.append(branch) or "sha",
+        )
+
+        record_test_verdict(assignment_id="aid-1", test_state="failed", test_reason="boom")
+
+        assert calls == []
+        row = coord_db.execute(
+            "SELECT test_base_sha FROM assignments WHERE assignment_id='aid-1'"
+        ).fetchone()
+        assert row["test_base_sha"] is None
+
+    def test_gh_failure_leaves_anchor_null_without_raising(self, coord_db, monkeypatch) -> None:
+        self._seed_assignment(coord_db)
+        self._config(monkeypatch)
+        monkeypatch.setattr(
+            "coord.github_ops.get_branch_sha",
+            lambda repo, branch: (_ for _ in ()).throw(RuntimeError("gh unavailable")),
+        )
+
+        # Must not raise — the verdict write itself must still succeed.
+        record_test_verdict(assignment_id="aid-1", test_state="passed")
+
+        row = coord_db.execute(
+            "SELECT test_state, test_base_sha FROM assignments WHERE assignment_id='aid-1'"
+        ).fetchone()
+        assert row["test_state"] == "passed"
+        assert row["test_base_sha"] is None
+
+    def test_repo_not_in_config_leaves_anchor_null(self, coord_db, monkeypatch) -> None:
+        self._seed_assignment(coord_db)
+
+        class _EmptyCfg:
+            def repo(self, name):
+                return None
+
+        from coord import config as _config_mod
+        monkeypatch.setattr(_config_mod, "load", lambda *a, **k: _EmptyCfg())
+
+        record_test_verdict(assignment_id="aid-1", test_state="passed")
+
+        row = coord_db.execute(
+            "SELECT test_base_sha FROM assignments WHERE assignment_id='aid-1'"
+        ).fetchone()
+        assert row["test_base_sha"] is None
+
+    def test_milestone_repo_resolves_feature_branch_as_base(
+        self, coord_db, monkeypatch
+    ) -> None:
+        """#934: a repo that opted into the develop/feature-branch git model
+        resolves the milestone's feature/ms-NN branch as the base — not the
+        flat default_branch — mirroring `enqueue_approved_work`."""
+        self._seed_assignment(coord_db)
+        self._config(monkeypatch, develop_branch="develop")
+        monkeypatch.setattr(
+            "coord.github_ops.get_issue",
+            lambda repo, issue_number: {"milestone": {"number": 7}},
+        )
+        seen_bases = []
+
+        def _get_sha(repo, branch):
+            seen_bases.append(branch)
+            return f"sha-for-{branch}"
+
+        monkeypatch.setattr("coord.github_ops.get_branch_sha", _get_sha)
+        monkeypatch.setattr(
+            "coord.github_ops.get_branch_patch_id", lambda repo, base, branch: "patch",
+        )
+
+        record_test_verdict(assignment_id="aid-1", test_state="passed")
+
+        row = coord_db.execute(
+            "SELECT test_base_sha FROM assignments WHERE assignment_id='aid-1'"
+        ).fetchone()
+        assert row["test_base_sha"] == "sha-for-feature/ms-7"
+        assert "feature/ms-7" in seen_bases
