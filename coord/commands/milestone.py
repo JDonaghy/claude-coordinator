@@ -764,9 +764,12 @@ def _echo_pick(pick: MachinePick) -> None:
 
 def _echo_outcome(outcome: DispatchOutcome) -> None:
     if outcome.ok:
+        model_suffix = (
+            f", model: {outcome.model} ({outcome.model_reason})" if outcome.model else ""
+        )
         click.echo(
             f"  #{outcome.issue_number} -> {outcome.machine_name} "
-            f"(dispatched, assignment {outcome.assignment_id})"
+            f"(dispatched, assignment {outcome.assignment_id}{model_suffix})"
         )
     else:
         click.echo(

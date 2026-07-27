@@ -4575,6 +4575,18 @@ def _dispatch_headless(
         cfg.models.model_for_labels(issue_labels) if not effective_plan_only else None
     )
     resolved_model = model or label_model or cfg.models.default
+    # #1454: state which rule picked the model — `issue_labels` above came
+    # from `issue_data` fetched fresh (live `gh`) by the caller just before
+    # this function ran, so this reflects the issue's labels as of *now*,
+    # not a stale snapshot.
+    if model:
+        model_reason = "explicit --model"
+    elif effective_plan_only:
+        model_reason = "default; plan-only dispatch skips label routing"
+    elif label_model:
+        model_reason = "label match"
+    else:
+        model_reason = "default; no label match"
 
     proposal = Proposal(
         id=0,
@@ -4597,7 +4609,7 @@ def _dispatch_headless(
         else:
             click.echo("  mode: plan-only (read-only, no worktree)")
     if resolved_model:
-        click.echo(f"  model: {resolved_model}")
+        click.echo(f"  model: {resolved_model} ({model_reason})")
 
     if dry_run:
         click.echo("  (dry run — not dispatched)")

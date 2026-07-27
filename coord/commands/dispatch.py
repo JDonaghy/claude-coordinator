@@ -236,13 +236,55 @@ def approve(
     for p in selected:
         click.echo(f"[{p.id}] {p.machine_name} → {p.repo_name} #{p.issue_number}: {p.issue_title}")
         # Resolve model so the dispatched record and board reflect what ran.
-        # #1430: coord.brain.resolve_models() already set p.model from
-        # models.labels (via config.models.model_for_labels) for work
-        # proposals with a matching label, during `coord plan`. This is
-        # just the final fallback for proposals it left unset (no match, or
-        # saved before label-based model resolution was wired in).
-        if not p.model:
+        # #1430 set p.model from models.labels (via
+        # config.models.model_for_labels) for work proposals with a
+        # matching label, during `coord plan` — but that snapshot can be
+        # arbitrarily stale by the time `coord approve` actually runs: the
+        # operator's natural workflow is `coord plan` → notice a label is
+        # missing → `coord issue label ... --add tier:large` → `coord
+        # approve`, and the label never gets a chance to influence
+        # dispatch because the proposal already froze `model` (or its
+        # absence) at plan time (#1454). `resolve_models()` is the only
+        # thing that ever sets `p.model` for a plan-sourced proposal (the
+        # brain's own JSON schema has no `model` field), so it's always
+        # safe to re-derive it here from a live label fetch rather than
+        # trust the snapshot.
+        fresh_label_model: str | None = None
+        refreshed = False
+        if not dry_run:
+            # Skip the live fetch on --dry-run: it's a preview, and dry-run
+            # runs (e.g. in tests) shouldn't need network/`gh` access.
+            repo_cfg = cfg.repo(p.repo_name)
+            if repo_cfg is not None:
+                try:
+                    issue_data = github_ops.get_issue(repo_cfg.github, p.issue_number)
+                    fresh_labels = [
+                        lbl.get("name", "") for lbl in (issue_data.get("labels") or [])
+                    ]
+                    p.issue_labels = fresh_labels
+                    fresh_label_model = cfg.models.model_for_labels(fresh_labels)
+                    refreshed = True
+                except RuntimeError as e:
+                    click.echo(
+                        f"     warning: could not refresh labels for model "
+                        f"routing ({e}); using plan-time snapshot",
+                        err=True,
+                    )
+        if fresh_label_model:
+            p.model = fresh_label_model
+            model_reason = "label match (refreshed at approve time)"
+        elif p.model:
+            model_reason = (
+                "label match (live re-check found none; plan-time snapshot kept)"
+                if refreshed
+                else "label match (plan-time snapshot; not refreshed on --dry-run)"
+            )
+        else:
             p.model = cfg.models.default
+            model_reason = (
+                "default; no label match" if refreshed else "default"
+            )
+        click.echo(f"     model: {p.model} ({model_reason})")
         # Resolve required_gates: fall back to config default for proposals
         # that were saved before label-based gate resolution was wired in.
         if not p.required_gates:

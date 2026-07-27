@@ -501,6 +501,12 @@ class DispatchOutcome:
     ok: bool
     assignment_id: str | None = None
     error: str | None = None
+    # #1454: which model was picked and why — `dispatch_entry` fetches
+    # labels fresh (see below) immediately before resolving, so this
+    # reflects the issue's labels as of dispatch time, not a stale
+    # snapshot.
+    model: str | None = None
+    model_reason: str | None = None
 
 
 def dispatch_entry(
@@ -603,9 +609,20 @@ def dispatch_entry(
     # `default` — read-only/cheap, must not inherit a tier:large -> opus
     # routing meant for the eventual work dispatch.
     proposal_type = "plan" if config.dispatch.require_plan else "work"
-    resolved_model = (
+    label_model = (
         config.models.model_for_labels(issue_labels) if proposal_type == "work" else None
-    ) or config.models.default
+    )
+    resolved_model = label_model or config.models.default
+    # #1454: `issue_labels` (above, line ~572) came from `issue_data`
+    # fetched fresh just moments ago in this same call — so this is never
+    # stale, unlike a proposal snapshot carried over from an earlier
+    # `coord plan`/`coord milestone plan` run.
+    if proposal_type != "work":
+        model_reason = "default; plan-only dispatch skips label routing"
+    elif label_model:
+        model_reason = "label match"
+    else:
+        model_reason = "default; no label match"
 
     proposal = Proposal(
         id=0,
@@ -659,4 +676,6 @@ def dispatch_entry(
         machine_name=machine.name,
         ok=True,
         assignment_id=str(assignment_id),
+        model=resolved_model,
+        model_reason=model_reason,
     )
