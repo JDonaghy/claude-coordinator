@@ -36,7 +36,8 @@ repos:
     # environment" when pip resolves to /usr/bin/pip) doesn't bite.
     build_command: "~/.coord-venv/bin/pip wheel --no-deps --wheel-dir /tmp/coord-test-build ."
     # #1426: point the headless Test stage at the SAME script the (now
-    # observer-only) scripts/drive-issue.sh used to run locally. This repo is
+    # observer-only) unattended driver used to run locally — `coord drive`
+    # since #1392, scripts/drive-issue.sh before that. This repo is
     # two codebases (Python under coord/**, Rust under tui/**), so a single
     # `cargo test` or `pytest` here would either run the wrong suite or miss
     # one half of the diff — coord-test-runner.sh does the path routing

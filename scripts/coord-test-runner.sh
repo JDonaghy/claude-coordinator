@@ -7,8 +7,15 @@
 #                                 [--repo NAME] [--fallback-command CMD]
 #                                 [--print-routing]
 #
-# This is the Test gate's engine.  `drive-issue.sh` calls it; it is also useful
-# on its own ("did this branch actually break anything?").
+# This is the Test gate's engine.  coord dispatches it as the repo's
+# `test_command` (#1426); it is also useful on its own ("did this branch
+# actually break anything?").  `coord drive` (#1392, the Python port of the
+# former drive-issue.sh) only OBSERVES the verdict this produces.
+#
+# #1392 kept this as shell on purpose: venv creation, the cargo env, and the
+# quadraui sibling symlink are genuinely shell work.  Its four sharp-edged
+# parsers were extracted to tested Python in coord/test_report.py (#1436) —
+# that module is the reference behaviour; the grep/awk below still mirrors it.
 #
 # Four things it handles that a bare `pytest && cargo test` does not:
 #
@@ -74,7 +81,12 @@ while [[ $# -gt 0 ]]; do
         --repo)             REPO_NAME="$2"; shift 2 ;;
         --fallback-command) FALLBACK_CMD="$2"; shift 2 ;;
         --print-routing)    PRINT_ROUTING=1; shift ;;
-        -h|--help)  sed -n '2,55p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        # Print the header comment block: every line from #2 up to (not
+        # including) the first line that is not a comment. Computed rather
+        # than a hardcoded range, so editing the header can't silently
+        # truncate --help (#1392).
+        -h|--help)  awk 'NR==1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' \
+                        "${BASH_SOURCE[0]}"; exit 0 ;;
         -*)         echo "unknown option: $1" >&2; exit 2 ;;
         *)          WT="$1"; shift ;;
     esac
