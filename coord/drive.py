@@ -55,10 +55,15 @@ mirrors ``tui/src/app/pipeline.rs``'s ``gate_a_contract_exists_for`` and
 ``coord.milestone_dispatch.gate_a_status``, all three keyed on
 :func:`coord.acceptance.gate_a_contract_path`) puts this run into "oracle
 drive" mode: :func:`_dispatch_work_stage` authors the slice first (``coord
-acceptance author <repo> <tracking_issue> --issue <N>``) and
-:func:`_decide_acceptance_author` observes it through to a landed merge
-(``status='merged'``, #609 — its own Test/Review/Merge are driven by coord
-exactly like a normal work row) before ever calling ``coord assign``.
+acceptance author <repo> <tracking_issue> --issue <N>``, plus ``--for-path``
+when the repo's driver is routed — resolved from the milestone's Gate-A
+mock kind via the SHARED :func:`coord.acceptance.resolve_for_path`, so this
+never drifts from whatever eventually resolves it for the TUI's own menu,
+#1460) and :func:`_decide_acceptance_author` observes it through to a landed
+merge (``status='merged'``, #609 — its own Test/Review/Merge are driven by
+coord exactly like a normal work row) before ever calling ``coord assign``.
+An ``advisory`` JIT-slice exit is handled exactly like the main work row's
+(``--accept-advisory``, #1357) rather than waited on forever.
 ``--no-acceptance`` opts out back to the pre-#1453 behaviour.
 
 STRUCTURE.  All decision logic lives in :func:`decide` and :func:`preflight`,
@@ -220,10 +225,14 @@ def _die(message: str, exit_code: int = EXIT_TERMINAL_FAILURE) -> Action:
 
 
 class AcceptanceGateChecker(Protocol):
-    """The one GitHub question :func:`resolve_oracle_decision` cannot answer
-    from the board payload alone: has Gate A's contract actually merged?"""
+    """The GitHub questions :func:`resolve_oracle_decision` and
+    :func:`_decide_acceptance_author` cannot answer from the board payload
+    alone: has Gate A's contract actually merged, and (for a routed repo)
+    which subtree does this milestone's slice belong to?"""
 
     def contract_exists(self, repo_name: str, milestone_number: int) -> bool: ...
+
+    def resolve_for_path(self, repo_name: str, milestone_number: int) -> str | None: ...
 
 
 @dataclass
@@ -247,6 +256,20 @@ class GitHubAcceptanceGateChecker:
         if repo_cfg is None:
             return False
         return gate_a_status(repo_cfg, self.config, milestone_number) is None
+
+    def resolve_for_path(self, repo_name: str, milestone_number: int) -> str | None:
+        """#1453 review finding 1: the ``--for-path`` a routed repo's JIT
+        acceptance-author dispatch needs. Delegates to
+        :func:`coord.acceptance.resolve_for_path` (the SHARED derivation —
+        see its docstring); raises :class:`coord.acceptance.
+        ForPathResolutionError` unchanged so callers report it verbatim.
+        """
+        from coord.acceptance import resolve_for_path  # noqa: PLC0415
+
+        repo_cfg = self.config.repo(repo_name)
+        if repo_cfg is None:
+            return None
+        return resolve_for_path(self.config, repo_cfg, milestone_number)
 
 
 @dataclass(frozen=True)
@@ -328,7 +351,12 @@ def resolve_oracle_decision(
 
 
 def _decide_acceptance_author(
-    state: IssueState, oracle: OracleDecision, machine: str
+    state: IssueState,
+    oracle: OracleDecision,
+    opts: DriveOptions,
+    machine: str,
+    gate_checker: AcceptanceGateChecker,
+    verifier: MergeVerifier,
 ) -> Action | None:
     """The #1453 JIT-slice gate itself. ``None`` means "landed — fall
     through to dispatching work normally" (only ever called when
@@ -350,17 +378,37 @@ def _decide_acceptance_author(
     status = state.acceptance_author_status
 
     if not aid:
+        command = [
+            "acceptance", "author", state.repo, str(oracle.tracking_issue),
+            "--issue", str(state.issue),
+        ]
+        # #1453 review finding 1: a ROUTED repo's `coord acceptance author`
+        # hard-refuses with no --for-path (coord.test_author.
+        # dispatch_test_author's "no route matched" RuntimeError) — resolve
+        # it from the milestone's Gate-A mock kind (the SHARED
+        # coord.acceptance.resolve_for_path helper) before ever dispatching,
+        # so a routed repo's very first JIT-authoring attempt doesn't die.
+        from coord.acceptance import ForPathResolutionError  # noqa: PLC0415
+
+        try:
+            for_path = gate_checker.resolve_for_path(state.repo, state.milestone_number)
+        except ForPathResolutionError as exc:
+            return _die(
+                f"could not resolve --for-path for {state.repo}'s JIT "
+                f"acceptance slice on #{state.issue}: {exc}"
+            )
+        if for_path:
+            command += ["--for-path", for_path]
+
         return Action(
             kind=RUN,
             label=(
                 "ACCEPTANCE: authoring sealed JIT slice → coord acceptance "
                 f"author {state.repo} {oracle.tracking_issue} --issue "
                 f"{state.issue}"
+                + (f" --for-path {for_path}" if for_path else "")
             ),
-            command=(
-                "acceptance", "author", state.repo, str(oracle.tracking_issue),
-                "--issue", str(state.issue),
-            ),
+            command=tuple(command),
             error_message=(
                 f"coord acceptance author failed to dispatch for #{state.issue}. "
                 "Check coordinator.yml's acceptance.drivers entry for "
@@ -375,7 +423,7 @@ def _decide_acceptance_author(
     if status == "failed":
         return _die(
             f"acceptance author {aid} failed — inspect: coord log {aid} "
-            f"--machine {state.work_machine or machine}\n"
+            f"--machine {state.acceptance_author_machine or machine}\n"
             "   Continue by hand, or re-run coord drive with "
             "--no-acceptance to skip JIT authoring."
         )
@@ -388,10 +436,47 @@ def _decide_acceptance_author(
             "   or re-run coord drive with --no-acceptance."
         )
 
-    # "" / running / done / advisory: still landing through Test → Review →
-    # Merge — coord's own tick loop drives that, exactly like a normal work
-    # row; this only observes (same posture as every other gate in this
-    # module).
+    if status == "advisory":
+        # #1453 review finding 2: this is the #1386 bug class reborn — an
+        # ``advisory`` row is TERMINAL (drive_state.TERMINAL_STATUSES) and
+        # is explicitly excluded from coord's Test/Review/Merge auto-loop
+        # (coord.reconcile's "review_state = 'advisory'" skip), so it will
+        # NEVER transition to 'merged' on its own — treating it as
+        # "still landing" below would spin forever. Mirror `_decide_advisory`
+        # exactly: a real 0-commit exit is terminal outright; a #1357-style
+        # false positive (commits present) needs the same
+        # `--accept-advisory` opt-in the main work row uses, not a silent
+        # pass-through.
+        branch = state.acceptance_author_branch
+        probe = replace(state, work_branch=branch) if branch else state
+        if not branch or not verifier.branch_has_commits(probe):
+            return _die(
+                f"acceptance author {aid} exited ADVISORY with no commits on "
+                "its branch — nothing was authored, so there is no slice to "
+                "land.\n"
+                f"   inspect: coord log {aid} --machine "
+                f"{state.acceptance_author_machine or machine}\n"
+                "   Continue by hand, or re-run coord drive with "
+                "--no-acceptance to skip JIT authoring."
+            )
+        if not opts.accept_advisory:
+            return _die(
+                f"acceptance author {aid} is ADVISORY, but its branch carries "
+                "real commits (the #1357 signature — see _decide_advisory).\n"
+                "   Proceed anyway with --accept-advisory, or re-run coord "
+                "drive with --no-acceptance."
+            )
+        return Action(
+            kind=WAIT,
+            warnings=(
+                f"ACCEPTANCE: JIT slice {aid} is ADVISORY with commits present "
+                "— proceeding per --accept-advisory (#1357)",
+            ),
+        )
+
+    # "" / running / done: still landing through Test → Review → Merge —
+    # coord's own tick loop drives that, exactly like a normal work row;
+    # this only observes (same posture as every other gate in this module).
     return _wait(label=f"ACCEPTANCE: JIT slice {aid} authoring/merging in progress")
 
 
@@ -601,6 +686,7 @@ def decide(
     *,
     machine: str = "",
     oracle: OracleDecision | None = None,
+    gate_checker: AcceptanceGateChecker | None = None,
 ) -> Action:
     """One step of the state machine: given the board, what next?
 
@@ -613,7 +699,9 @@ def decide(
     *oracle* (#1453) is resolved ONCE per run by :func:`resolve_oracle_decision`
     and threaded through unchanged on every call — ``None`` (the default,
     every pre-#1453 caller) behaves exactly as before: no JIT slice, straight
-    to ``coord assign``.
+    to ``coord assign``. *gate_checker* is only consulted when *oracle* is
+    active (to resolve a routed repo's ``--for-path``, #1453 review finding
+    1) — unused, like *oracle*, on every pre-#1453 call site.
     """
     machine = machine or opts.machine or state.picked_machine
 
@@ -634,7 +722,7 @@ def decide(
 
     # ---- no work yet: plan and/or dispatch ---------------------------------
     if not state.work_aid:
-        return _dispatch_work_stage(state, opts, machine, oracle)
+        return _dispatch_work_stage(state, opts, machine, oracle, gate_checker, verifier)
 
     # ---- work failed: bounded retry ----------------------------------------
     if state.work_status == "failed":
@@ -718,6 +806,8 @@ def _dispatch_work_stage(
     opts: DriveOptions,
     machine: str,
     oracle: OracleDecision | None = None,
+    gate_checker: AcceptanceGateChecker | None = None,
+    verifier: MergeVerifier | None = None,
 ) -> Action:
     """No work row yet: run the optional plan stage, then dispatch the work.
 
@@ -730,7 +820,11 @@ def _dispatch_work_stage(
     having explained why.
     """
     if oracle is not None and oracle.active:
-        gate = _decide_acceptance_author(state, oracle, machine)
+        assert gate_checker is not None and verifier is not None, (
+            "oracle.active implies resolve_oracle_decision ran with a real "
+            "gate_checker; decide()/Driver always thread one through"
+        )
+        gate = _decide_acceptance_author(state, oracle, opts, machine, gate_checker, verifier)
         if gate is not None:
             return gate
 
@@ -1485,7 +1579,8 @@ class Driver:
                 last_change = now
 
             action = decide(
-                state, self.opts, counters, self.verifier, machine=machine, oracle=oracle
+                state, self.opts, counters, self.verifier,
+                machine=machine, oracle=oracle, gate_checker=self.oracle_gate,
             )
             for warning in action.warnings:
                 self.warn(warning)
