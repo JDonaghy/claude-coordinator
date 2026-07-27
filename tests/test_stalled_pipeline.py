@@ -717,6 +717,120 @@ class TestDispatchPerReason:
         assert "fix_dispatched" in action.detail
         stub.assert_called_once()
 
+    def test_review_request_changes_no_fix_approved_is_not_no_action(
+        self, config: Config, monkeypatch
+    ) -> None:
+        """#1478 review fix: `process_review_completion` resolving as
+        `approved` (no fix dispatched) still mutates `board` in place
+        (`review_verdict`, `work.review_state`, merge-queue refresh) per its
+        own documented contract. Classifying that as `no_action` silently
+        dropped the mutation — see `test_sweep_persists_approved_transition`
+        for the end-to-end persistence assertion."""
+        config.pipeline.auto_dispatch_stalled = True
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="request-changes"),
+        )
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        )[0]
+        assert detection.reason == "review_request_changes_no_fix"
+
+        stub = MagicMock(return_value=[
+            LoopAction(
+                kind="approved", assignment_id="review-1",
+                detail="Review verdict: approve — pipeline advancing",
+            ),
+        ])
+        monkeypatch.setattr("coord.auto_loop.process_review_completion", stub)
+
+        action = notify_mod.dispatch_stalled_pipeline_action(detection, work, board, config)
+
+        assert action.kind == "review_transition_applied"
+        assert action.kind in notify_mod._STALLED_DISPATCH_KINDS
+        stub.assert_called_once()
+
+    def test_review_request_changes_no_fix_approved_with_nits_is_not_no_action(
+        self, config: Config, monkeypatch
+    ) -> None:
+        """Same as above for the #476 advisory-only approve-with-nits gate."""
+        config.pipeline.auto_dispatch_stalled = True
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="request-changes"),
+        )
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        )[0]
+
+        stub = MagicMock(return_value=[
+            LoopAction(
+                kind="approved_with_nits", assignment_id="review-1",
+                detail="advancing as approve-with-nits; no fix dispatched",
+            ),
+        ])
+        monkeypatch.setattr("coord.auto_loop.process_review_completion", stub)
+
+        action = notify_mod.dispatch_stalled_pipeline_action(detection, work, board, config)
+
+        assert action.kind == "review_transition_applied"
+        assert action.kind in notify_mod._STALLED_DISPATCH_KINDS
+
+    def test_review_request_changes_no_fix_terminal_skip_is_not_no_action(
+        self, config: Config, monkeypatch
+    ) -> None:
+        """`terminal_skip` still flips `work.review_state = "done"` in
+        `_dispatch_fix_for_review` even though no fix is dispatched."""
+        config.pipeline.auto_dispatch_stalled = True
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="request-changes"),
+        )
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        )[0]
+
+        stub = MagicMock(return_value=[
+            LoopAction(
+                kind="terminal_skip", assignment_id="review-1",
+                detail="issue #602 already merged/closed — no fix dispatched",
+            ),
+        ])
+        monkeypatch.setattr("coord.auto_loop.process_review_completion", stub)
+
+        action = notify_mod.dispatch_stalled_pipeline_action(detection, work, board, config)
+
+        assert action.kind == "review_transition_applied"
+        assert action.kind in notify_mod._STALLED_DISPATCH_KINDS
+
+    def test_review_request_changes_no_fix_genuine_no_action_stays_no_action(
+        self, config: Config, monkeypatch
+    ) -> None:
+        """`no_work_found`/`max_iterations`/`disabled`/`no_findings` genuinely
+        do not mutate `board` — must still classify as `no_action` so a
+        no-op doesn't get treated (and audited) as a real dispatch."""
+        config.pipeline.auto_dispatch_stalled = True
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="request-changes"),
+        )
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        )[0]
+
+        stub = MagicMock(return_value=[
+            LoopAction(
+                kind="max_iterations", assignment_id="review-1",
+                detail="max_review_iterations=5 reached",
+            ),
+        ])
+        monkeypatch.setattr("coord.auto_loop.process_review_completion", stub)
+
+        action = notify_mod.dispatch_stalled_pipeline_action(detection, work, board, config)
+
+        assert action.kind == "no_action"
+        assert action.kind not in notify_mod._STALLED_DISPATCH_KINDS
+
     def test_done_no_review_dispatches_review(self, config: Config, monkeypatch) -> None:
         config.pipeline.auto_dispatch_stalled = True
         board = _board(_work("work-1", test_state="passed"))
@@ -753,6 +867,42 @@ class TestDispatchPerReason:
 
         assert action.kind == "enqueued"
         stub.assert_called_once_with(config, board)
+
+    def test_approved_not_queued_already_queued_by_earlier_row_still_reports_enqueued(
+        self, config: Config, monkeypatch
+    ) -> None:
+        """#1478 review non-blocking finding: `enqueue_approved_work`
+        bulk-enqueues every eligible row, so a *second* `approved_not_queued`
+        row detected in the same sweep tick sees an empty `changed` list even
+        though it genuinely was queued as a side effect of the first row's
+        call. Checking queue membership directly (not just `changed`) must
+        still classify this as `enqueued`, not a misleading `no_action`."""
+        config.pipeline.auto_dispatch_stalled = True
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="approve"),
+        )
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        )[0]
+        assert detection.reason == "approved_not_queued"
+
+        # This call returns nothing new for work-1 (an earlier row in the
+        # same tick already triggered its enqueue)...
+        enqueue_stub = MagicMock(return_value=[])
+        monkeypatch.setattr("coord.merge_queue.enqueue_approved_work", enqueue_stub)
+        # ...but it is, in fact, already sitting in the queue.
+        already_queued = [QueuedMerge(
+            assignment_id="work-1", repo_name="vimcode", repo_github="acme/vimcode",
+            branch="issue-602-fix", target_branch="main", issue_number=602,
+            issue_title="t", state=PENDING,
+        )]
+        monkeypatch.setattr("coord.merge_queue.load_queue", lambda: already_queued)
+
+        action = notify_mod.dispatch_stalled_pipeline_action(detection, work, board, config)
+
+        assert action.kind == "enqueued"
+        assert "already enqueued" in action.detail
 
     def test_merge_conflict_unresolved_dispatches_conflict_fix(
         self, config: Config, monkeypatch
@@ -897,3 +1047,81 @@ class TestSweepStalledPipeline:
         stub.assert_not_called()
         args, _kwargs = mock_post.call_args
         assert "nothing was dispatched automatically" in args[2].lower()
+
+    def test_sweep_persists_review_transition_applied_mutation(
+        self, config: Config, coord_db, monkeypatch
+    ) -> None:
+        """#1478 review fix: an `approved`/`approved_with_nits`/`terminal_skip`
+        resolution from `process_review_completion` (no fix dispatched) must
+        still be persisted — mirrors what the real function does to `board`
+        in place (`review.review_verdict`, `work.review_state = "done"`).
+        Before the fix, this classified as `no_action`, `board_dirty` never
+        got set, and the mutation was silently dropped even though the row
+        was permanently marked notified."""
+        config.pipeline.auto_dispatch_stalled = True
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="request-changes"),
+        )
+        state_mod.save_board(board)
+
+        def fake_process_review_completion(review, board, config, **kwargs):
+            # Mirror what the real `process_review_completion` does for an
+            # `approved` resolution: mutate `board` in place and return an
+            # action list with no `fix_dispatched` kind.
+            work = board.find_by_id(review.review_of_assignment_id)
+            work.review_state = "done"
+            review.review_verdict = "approve"
+            return [LoopAction(
+                kind="approved", assignment_id=review.assignment_id,
+                detail="Review verdict: approve — pipeline advancing",
+            )]
+
+        monkeypatch.setattr(
+            "coord.auto_loop.process_review_completion", fake_process_review_completion
+        )
+
+        with patch("coord.notify.github_ops.post_issue_comment") as mock_post:
+            first = notify_mod._sweep_stalled_pipeline(config, terminal_cache={})
+
+        assert len(first) == 1
+        assert first[0].reason == "review_request_changes_no_fix"
+        mock_post.assert_called_once()
+        args, _kwargs = mock_post.call_args
+        assert "auto-dispatched" in args[2].lower()
+
+        # The mutation must have been persisted, not silently dropped.
+        persisted = state_mod.load_board()
+        persisted_work = persisted.find_by_id("work-1")
+        assert persisted_work.review_state == "done"
+
+        # And it's marked notified exactly like a real dispatch — one-shot.
+        notified = state_mod.load_notified()
+        assert "work-1:stalled" in notified
+
+    def test_sweep_does_not_mark_notified_on_dispatch_exception(
+        self, config: Config, coord_db, monkeypatch
+    ) -> None:
+        """A transient failure inside `dispatch_stalled_pipeline_action`
+        (e.g. an unreachable agent) must not permanently foreclose future
+        retries the way a considered decline does — no comment is posted and
+        the row stays off the one-shot ledger, so the next tick retries it."""
+        config.pipeline.auto_dispatch_stalled = True
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="approve"),
+        )
+        state_mod.save_board(board)
+
+        monkeypatch.setattr(
+            "coord.merge_queue.enqueue_approved_work",
+            MagicMock(side_effect=RuntimeError("agent unreachable")),
+        )
+
+        with patch("coord.notify.github_ops.post_issue_comment") as mock_post:
+            first = notify_mod._sweep_stalled_pipeline(config, terminal_cache={})
+
+        assert first == []
+        mock_post.assert_not_called()
+        notified = state_mod.load_notified()
+        assert "work-1:stalled" not in notified

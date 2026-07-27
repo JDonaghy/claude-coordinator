@@ -535,11 +535,24 @@ class StalledDispatchAction:
     """One of:
     - ``"fix_dispatch_attempted"`` — re-ran the review-completion transition
       (:func:`coord.auto_loop.process_review_completion`) for
-      ``review_request_changes_no_fix``; see *detail* for what it did.
+      ``review_request_changes_no_fix`` and it dispatched a fix worker; see
+      *detail* for what it did.
+    - ``"review_transition_applied"`` — re-ran
+      :func:`coord.auto_loop.process_review_completion` for
+      ``review_request_changes_no_fix`` and it resolved as ``approved``,
+      ``approved_with_nits`` (the #476 advisory-only gate), or
+      ``terminal_skip`` — no fix worker was dispatched, but the call still
+      mutated *board* in place (``review.review_verdict``,
+      ``work.review_state = "done"``, a merge-queue ``refresh_entry_assignment``)
+      per that function's own "the caller is responsible for persisting the
+      board after this returns" contract. Must be persisted exactly like a
+      real dispatch even though no agent was launched.
     - ``"review_dispatched"``       — a review was dispatched for
       ``done_no_review``.
     - ``"enqueued"``                — the work was enqueued for merge for
-      ``approved_not_queued``.
+      ``approved_not_queued`` (including when a *different* row's
+      ``enqueue_approved_work`` call already enqueued this one earlier in
+      the same sweep tick — see the queue-membership check below).
     - ``"conflict_fix_dispatched"`` — a conflict-fix worker was dispatched
       for ``merge_conflict_unresolved``.
     - ``"no_action"``               — the reused dispatcher declined (no
@@ -556,13 +569,30 @@ class StalledDispatchAction:
     detail: str = ""
 
 
-# Action kinds that represent a REAL dispatch (mutate the board / merge
-# queue / fire an agent request) — used to decide (a) whether the board
-# needs writing back, (b) which GitHub comment to post, and (c) whether the
-# audit row is business-tier (a real transition) or operational-tier (a
-# no-op/skip, informational only).
+# Action kinds that represent a REAL dispatch OR a board mutation that must
+# be persisted (mutate the board / merge queue / fire an agent request) —
+# used to decide (a) whether the board needs writing back, (b) which GitHub
+# comment to post, and (c) whether the audit row is business-tier (a real
+# transition) or operational-tier (a no-op/skip, informational only).
+#
+# ``review_transition_applied`` belongs here even though it does not launch
+# an agent: an approved/approved-with-nits/terminal-skip resolution from
+# ``process_review_completion`` still flips ``work.review_state``/
+# ``review.review_verdict`` in place, and losing that mutation while the
+# one-shot ledger marks the row notified anyway is exactly the #1478 review
+# bug this set exists to prevent.
 _STALLED_DISPATCH_KINDS = frozenset({
-    "fix_dispatch_attempted", "review_dispatched", "enqueued", "conflict_fix_dispatched",
+    "fix_dispatch_attempted", "review_transition_applied", "review_dispatched",
+    "enqueued", "conflict_fix_dispatched",
+})
+
+# process_review_completion (and the _dispatch_fix_for_review it may call)
+# kinds that mutate `board` in place per its own documented contract, even
+# when they don't dispatch a fix worker. `disabled`/`no_findings` return
+# before any mutation; `no_work_found`/`max_iterations` return without
+# touching `board` (only a GitHub notice for the latter).
+_MUTATING_REVIEW_COMPLETION_KINDS = frozenset({
+    "fix_dispatched", "approved", "approved_with_nits", "terminal_skip",
 })
 
 
@@ -667,10 +697,24 @@ def dispatch_stalled_pipeline_action(
         kind_set = {a.kind for a in actions}
         kinds = ", ".join(a.kind for a in actions) or "no_action"
         details = "; ".join(a.detail for a in actions if a.detail)
-        return StalledDispatchAction(
-            kind="fix_dispatch_attempted" if "fix_dispatched" in kind_set else "no_action",
-            detail=f"process_review_completion → {kinds}" + (f" ({details})" if details else ""),
-        )
+        detail_msg = f"process_review_completion → {kinds}" + (f" ({details})" if details else "")
+        # #1478 review fix: `process_review_completion` mutates `board` in
+        # place for several outcomes besides `fix_dispatched` — an
+        # `approved`/`approved_with_nits`/`terminal_skip` resolution still
+        # flips `review.review_verdict`/`work.review_state` and refreshes the
+        # merge-queue entry (see that function's own "caller is responsible
+        # for persisting the board" contract). Classifying those as
+        # `no_action` silently dropped the mutation (the sweep's `board_dirty`
+        # never got set) while the one-shot ledger still marked the row
+        # notified — permanently losing the transition. Any kind in
+        # `_MUTATING_REVIEW_COMPLETION_KINDS` must therefore map to a
+        # `_STALLED_DISPATCH_KINDS` member so `_sweep_stalled_pipeline`
+        # persists it.
+        if "fix_dispatched" in kind_set:
+            return StalledDispatchAction(kind="fix_dispatch_attempted", detail=detail_msg)
+        if kind_set & _MUTATING_REVIEW_COMPLETION_KINDS:
+            return StalledDispatchAction(kind="review_transition_applied", detail=detail_msg)
+        return StalledDispatchAction(kind="no_action", detail=detail_msg)
 
     if detection.reason == "done_no_review":
         from coord.review import dispatch_review  # noqa: PLC0415
@@ -687,16 +731,32 @@ def dispatch_stalled_pipeline_action(
         )
 
     if detection.reason == "approved_not_queued":
-        from coord.merge_queue import enqueue_approved_work  # noqa: PLC0415
+        from coord.merge_queue import enqueue_approved_work, load_queue  # noqa: PLC0415
 
         changed = enqueue_approved_work(config, board)
-        if work.assignment_id not in changed:
+        if work.assignment_id in changed:
             return StalledDispatchAction(
-                kind="no_action",
-                detail="enqueue_approved_work made no change for this assignment",
+                kind="enqueued", detail=f"{work.assignment_id} enqueued for merge",
+            )
+        # #1478 review non-blocking finding: `enqueue_approved_work` bulk-
+        # enqueues EVERY eligible row on `board.completed`, not just this one.
+        # If an earlier row in the same sweep tick already triggered the
+        # enqueue for this assignment, this call's `changed` list comes back
+        # without it (nothing new to do) even though it genuinely is queued —
+        # checking `changed` alone would misreport a real outcome as
+        # `no_action`. Check queue membership directly instead of relying
+        # solely on `changed`.
+        if any(m.assignment_id == work.assignment_id for m in load_queue()):
+            return StalledDispatchAction(
+                kind="enqueued",
+                detail=(
+                    f"{work.assignment_id} already enqueued for merge (queued "
+                    "earlier in this sweep tick)"
+                ),
             )
         return StalledDispatchAction(
-            kind="enqueued", detail=f"{work.assignment_id} enqueued for merge",
+            kind="no_action",
+            detail="enqueue_approved_work made no change for this assignment",
         )
 
     if detection.reason == "merge_conflict_unresolved":
@@ -1780,6 +1840,16 @@ def _sweep_stalled_pipeline(
     other best-effort loop in this module) — the ``continue`` on failure
     means that row's ``notified`` key is never set, so it is picked back up
     on the next tick rather than silently dropped.
+
+    An unexpected exception *from* ``dispatch_stalled_pipeline_action``
+    itself (e.g. a momentarily-unreachable agent during ``dispatch_review``/
+    ``dispatch_conflict_fix``) gets the same treatment, not the "declined"
+    treatment: no comment is posted and the row is NOT marked notified, so
+    it is retried on the next tick rather than permanently foreclosed. A
+    considered decline (``no_action`` returned normally — no capable
+    machine, gate not satisfied, entry vanished) still posts the diagnostic
+    comment and marks notified per the one-shot "act once" guardrail; only a
+    genuine raised exception gets the retry treatment.
     """
     from coord.board_service import read_board, write_board
 
@@ -1795,12 +1865,11 @@ def _sweep_stalled_pipeline(
             )
         except Exception:  # noqa: BLE001
             log.exception(
-                "dispatch_stalled_pipeline_action: unexpected error for %s",
+                "dispatch_stalled_pipeline_action: unexpected error for %s — "
+                "not marking notified so this row is retried next tick",
                 detection.assignment_id,
             )
-            action = StalledDispatchAction(
-                kind="no_action", detail="dispatch_stalled_pipeline_action raised — see log",
-            )
+            continue
 
         dispatched = action.kind in _STALLED_DISPATCH_KINDS
         try:
