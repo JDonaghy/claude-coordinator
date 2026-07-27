@@ -46,6 +46,7 @@ from coord import github_ops
 from coord.models import Assignment, Board
 from coord.review import (
     ReviewFindings,
+    blocking_findings_confirmed_absent,
     dispatch_review,
     estimate_review_counts,
     parse_review_from_agent,
@@ -266,29 +267,72 @@ def process_review_completion(
     # dispatched over a single cosmetic one-liner the reviewer itself counted
     # as non-blocking). Treat advisory-only request-changes as approve-with-
     # nits: advance the pipeline, surface the nits, and do not dispatch a fix.
+    #
+    # #1456 (CRITICAL, fails open): this gate used to fire on
+    # `parsed_any and not bool(blocking)`, which treated `blocking=None`
+    # ("could not determine") identically to `blocking=0` ("reviewer raised
+    # nothing blocking") — opposite meanings needing opposite defaults. On
+    # #1445 a reviewer's well-formed prose `request-changes` was rewritten to
+    # `approve` and marked merge-ready because the *nits* bucket happened to
+    # parse as 0 (satisfying `parsed_any`) while *blocking* parsed as None.
+    # The evidence standard now lives in `blocking_findings_confirmed_absent`
+    # and is fail-closed: no positive evidence ⇒ the reviewer's verdict stands.
     blocking, nonblocking, nits = estimate_review_counts(findings.body)
-    parsed_any = any(c is not None for c in (blocking, nonblocking, nits))
-    has_blocking = bool(blocking)  # None or 0 → no blocking findings detected
-    if parsed_any and not has_blocking:
-        log.info(
-            "auto_loop: request-changes with no blocking findings for review %s "
-            "(blocking=%r nonblocking=%r nits=%r) — advancing as approve-with-"
-            "nits, not dispatching a fix",
+    if blocking_findings_confirmed_absent(findings.body):
+        # log.warning, not info: this is the coordinator overriding a human-
+        # readable rejection. It must be conspicuous in the log, and it is
+        # additionally recorded on the assignment (below) and posted to GitHub.
+        log.warning(
+            "auto_loop: OVERRIDING reviewer verdict for review %s — "
+            "request-changes with an explicitly empty blocking section "
+            "(blocking=%r nonblocking=%r nits=%r); advancing as approve-with-"
+            "nits per the #476 gate, not dispatching a fix",
             review.assignment_id, blocking, nonblocking, nits,
         )
         # The merge gate keys off review_verdict; record approve so the nits
         # don't block the merge. The nits remain visible in the review comment
         # already posted to the PR, plus the advisory notice below.
+        #
+        # #1456: never *silently* rewrite a verdict — preserve the reviewer's
+        # own verdict alongside the override plus the counts that justified it,
+        # so an audit can always tell a reviewer approval from a coordinator
+        # one.
+        override_reason = (
+            f"#476 approve-with-nits gate: blocking={blocking} "
+            f"nonblocking={nonblocking} nits={nits}"
+        )
+        review.review_verdict_original = findings.verdict
+        review.review_verdict_override_reason = override_reason
         review.review_verdict = "approve"
-        _post_advisory_nits_notice(review, board, config, nonblocking, nits)
+        _record_verdict_override(
+            review, board,
+            original_verdict=findings.verdict,
+            blocking=blocking, nonblocking=nonblocking, nits=nits,
+        )
+        _post_advisory_nits_notice(
+            review, board, config, nonblocking, nits,
+            original_verdict=findings.verdict,
+        )
         return _advance_pipeline(
             review, board, config,
             kind="approved_with_nits",
             detail=(
-                "Review requested changes but flagged no blocking issues "
-                f"(nonblocking={nonblocking}, nits={nits}) — advancing as "
-                "approve-with-nits; no fix dispatched"
+                "Review requested changes but its blocking section was "
+                f"explicitly empty (nonblocking={nonblocking}, nits={nits}) — "
+                "advancing as approve-with-nits (reviewer verdict preserved in "
+                "review_verdict_original); no fix dispatched"
             ),
+        )
+
+    if blocking is None:
+        # The common case now: the reviewer wrote prose with no recognisable
+        # blocking section. Fail closed and say so, so the operator can see
+        # *why* a fix round was dispatched rather than the gate firing.
+        log.info(
+            "auto_loop: could not determine a blocking-finding count for review "
+            "%s (blocking=None nonblocking=%r nits=%r) — honouring the "
+            "reviewer's request-changes verdict (#1456 fail-closed)",
+            review.assignment_id, nonblocking, nits,
         )
 
     # Genuine blocking findings (or counts unparseable) → dispatch a fix worker.
@@ -354,12 +398,70 @@ def _advance_pipeline(
     return [LoopAction(kind=kind, assignment_id=review.assignment_id, detail=detail)]
 
 
+def _record_verdict_override(
+    review: Assignment,
+    board: Board,
+    *,
+    original_verdict: str,
+    blocking: int | None,
+    nonblocking: int | None,
+    nits: int | None,
+) -> None:
+    """#1456: write a durable audit row when the coordinator downgrades a
+    reviewer's ``request-changes`` to ``approve``.
+
+    The third leg of the audit trail, after the board row (which carries both
+    verdicts) and the GitHub notice: a timestamped business-tier event, so an
+    operator can answer "which merges rode an overridden verdict?" after the
+    fact — including for work whose issue has since been closed.  Best-effort;
+    an audit failure must never block the pipeline.
+    """
+    work = (
+        board.find_by_id(review.review_of_assignment_id)
+        if review.review_of_assignment_id
+        else None
+    )
+    try:
+        from coord.audit import record_audit  # noqa: PLC0415
+
+        record_audit(
+            tier="business",
+            category="review",
+            event_type="review_verdict_overridden",
+            actor="coordinator",
+            summary=(
+                f"Coordinator overrode review verdict {original_verdict} → "
+                f"approve for {review.repo_name}#{review.issue_number} "
+                f"(#476 advisory-only gate: blocking={blocking}, "
+                f"nonblocking={nonblocking}, nits={nits})"
+            ),
+            repo=review.repo_name,
+            issue=review.issue_number,
+            assignment_id=review.assignment_id,
+            machine=review.machine_name,
+            details={
+                "original_verdict": original_verdict,
+                "effective_verdict": "approve",
+                "blocking": blocking,
+                "nonblocking": nonblocking,
+                "nits": nits,
+                "work_assignment_id": work.assignment_id if work else None,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 — audit is best-effort
+        log.warning(
+            "auto_loop: failed to record verdict-override audit for %s: %s",
+            review.assignment_id, exc,
+        )
+
+
 def _post_advisory_nits_notice(
     review: Assignment,
     board: Board,
     config: Config,
     nonblocking: int | None,
     nits: int | None,
+    original_verdict: str = "request-changes",
 ) -> None:
     """Post a short audit-trail comment when the loop auto-advances past an
     advisory-only request-changes verdict (#476).
@@ -368,6 +470,10 @@ def _post_advisory_nits_notice(
     auto-loop behaviour. Best-effort: a gh failure must never block the
     pipeline. The full findings are already on the PR via the review comment;
     this just records the decision not to dispatch another fix round.
+
+    #1456: the comment now names both verdicts — the reviewer's
+    (*original_verdict*) and the coordinator's override — so the GitHub thread
+    reads as an override, not as an approval the reviewer never gave.
     """
     work = (
         board.find_by_id(review.review_of_assignment_id)
@@ -382,13 +488,19 @@ def _post_advisory_nits_notice(
     from coord import github_ops  # noqa: PLC0415
 
     body = (
-        f"<!-- coord:event=auto_loop_advisory_advance assignment={work.assignment_id} -->\n"
-        f"## ✅ Auto-advanced past advisory review (no blocking findings)\n\n"
+        f"<!-- coord:event=auto_loop_advisory_advance assignment={work.assignment_id} "
+        f"original_verdict={original_verdict} override_verdict=approve -->\n"
+        f"## ⚠️ Coordinator overrode the review verdict (no blocking findings)\n\n"
+        f"- **Reviewer's verdict:** `{original_verdict}`\n"
+        f"- **Coordinator's override:** `approve` (approve-with-nits)\n"
+        f"- **Evidence:** the review's blocking section was **explicitly empty** "
+        f"(non-blocking={nonblocking}, nits={nits})\n\n"
         f"The latest review of issue **#{work.issue_number}** returned "
-        f"`request-changes` but flagged **no blocking findings** "
-        f"(non-blocking={nonblocking}, nits={nits}). Per the #476 decision "
-        f"gate, the coordinator is **not** dispatching another fix round over "
-        f"non-blocking suggestions — the PR advances to the merge gate.\n\n"
+        f"`{original_verdict}` while flagging no blocking findings. Per the #476 "
+        f"decision gate, the coordinator is **not** dispatching another fix "
+        f"round over non-blocking suggestions — the PR advances to the merge "
+        f"gate. The reviewer's own verdict is preserved on the assignment "
+        f"(`review_verdict_original`); it has not been erased.\n\n"
         f"The reviewer's notes remain in the review comment above. If any nit "
         f"is in fact a must-fix, dispatch a fix manually with `coord assign` "
         f"or bounce it before merging.\n"

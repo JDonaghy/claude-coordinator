@@ -267,6 +267,27 @@ def test_briefing_warns_when_same_machine() -> None:
     assert "running on the same machine as the worker" in briefing
 
 
+def test_briefing_requires_the_three_finding_sections() -> None:
+    """#1456: the #476 gate now fails closed, so an advisory-only
+    request-changes is only recognisable from an explicitly-empty blocking
+    section.  Both the briefing and REVIEWER_SYSTEM_PROMPT must ask for the
+    headings — without them the gate is unreachable and every advisory review
+    costs a full fix+re-review round."""
+    from coord.review import REVIEWER_SYSTEM_PROMPT
+
+    briefing = build_review_briefing(
+        pr_number=42, pr_url=None, repo_github="acme/api", repo_name="api",
+        issue_number=7, issue_title="Fix login", issue_body="",
+        branch="issue-7", worker_machine="laptop", same_as_worker=False,
+        reviews_cfg=ReviewsConfig(enabled=True), repo_claude_md=None,
+    )
+    for text in (briefing, REVIEWER_SYSTEM_PROMPT):
+        assert "## Blocking findings" in text
+        assert "## Non-blocking concerns" in text
+        assert "## Nits" in text
+    assert "None." in briefing
+
+
 def test_briefing_uses_generic_checklist_when_none_configured() -> None:
     briefing = build_review_briefing(
         pr_number=1, pr_url=None, repo_github="acme/api", repo_name="api",
@@ -2183,6 +2204,73 @@ class TestReviewHeader:
         assert b == 0
         assert nb is None
         assert nits == 1
+
+
+class TestBlockingFindingsConfirmedAbsent:
+    """#1456: the evidence standard for overriding a reviewer's verdict.
+
+    Fail-closed by construction — everything the heuristic cannot read must
+    return False, because a False only costs an extra fix round while a wrong
+    True advances rejected code toward merge with no human in the loop.
+    """
+
+    def test_explicit_empty_blocking_section_is_confirmed(self) -> None:
+        from coord.review import blocking_findings_confirmed_absent
+        body = (
+            "## Blocking findings\n"
+            "None.\n"
+            "## Nits\n"
+            "- Trailing whitespace\n"
+        )
+        assert blocking_findings_confirmed_absent(body) is True
+
+    def test_truly_empty_blocking_section_is_confirmed(self) -> None:
+        from coord.review import blocking_findings_confirmed_absent
+        body = "## Blocking findings\n\n## Nits\n- One nit\n"
+        assert blocking_findings_confirmed_absent(body) is True
+
+    def test_missing_blocking_section_is_not_confirmed(self) -> None:
+        """The #1445 shape: nits parse as 0, blocking is unknown.  Unknown is
+        NOT zero — this is the whole of #1456."""
+        from coord.review import (
+            blocking_findings_confirmed_absent,
+            estimate_review_counts,
+        )
+        body = (
+            "Two problems block this: the worktree leaks and the test is not\n"
+            "hermetic. Requesting changes.\n"
+            "#### Nits\n"
+            "Nothing worth calling out.\n"
+        )
+        assert estimate_review_counts(body) == (None, None, 0)
+        assert blocking_findings_confirmed_absent(body) is False
+
+    def test_nonblocking_only_body_is_not_confirmed(self) -> None:
+        """The pre-#1456 #476 fixture shape (#532 incident): a non-blocking
+        section and no blocking heading.  Still not positive evidence."""
+        from coord.review import blocking_findings_confirmed_absent
+        body = "## Minor observations (not blocking)\n- nit one\n- nit two\n"
+        assert blocking_findings_confirmed_absent(body) is False
+
+    def test_bulleted_blocking_finding_is_not_confirmed(self) -> None:
+        from coord.review import blocking_findings_confirmed_absent
+        body = "## Blocking findings\n- Silent failure swallows the error\n"
+        assert blocking_findings_confirmed_absent(body) is False
+
+    def test_prose_blocking_finding_is_not_confirmed(self) -> None:
+        """A finding written as a paragraph under a blocking heading counts as
+        unreadable, not empty — the bullet counter alone would say 0."""
+        from coord.review import blocking_findings_confirmed_absent
+        body = (
+            "## Blocking findings\n"
+            "The worktree created on the early-exit path is never removed, so "
+            "every failed dispatch leaks a directory until the disk fills.\n"
+        )
+        assert blocking_findings_confirmed_absent(body) is False
+
+    def test_empty_body_is_not_confirmed(self) -> None:
+        from coord.review import blocking_findings_confirmed_absent
+        assert blocking_findings_confirmed_absent("") is False
 
 
 # ── Flood guard: dispatch_pending_reviews (incident 2026-06-08) ──────────────

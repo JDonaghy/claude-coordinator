@@ -27,7 +27,7 @@ import logging
 import re
 import time
 import uuid
-from typing import Iterable
+from typing import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -348,6 +348,20 @@ _SECTION_KEYWORDS: dict[str, tuple[str, ...]] = {
     "nits": ("nits", "nit:", "polish", "minor", "style"),
 }
 
+# Check buckets in order of keyword specificity so that "Non-blocking
+# concerns" doesn't accidentally match the `blocking` bucket first.
+_ORDERED_BUCKETS: tuple[str, ...] = ("nonblocking", "nits", "blocking")
+
+# Phrases that make an otherwise-prose line in a *blocking* section readable
+# as "the reviewer explicitly raised nothing here" (#1456).  Only consulted
+# for short lines — a long paragraph is prose the bullet counter cannot see,
+# and therefore evidence that the section is NOT confirmed empty.
+_NO_FINDINGS_PHRASES: tuple[str, ...] = (
+    "none", "n/a", "nothing", "no blocking", "no issues", "no required",
+    "no must-fix", "no must fix", "all clear",
+)
+_NO_FINDINGS_MAX_LEN = 60
+
 
 def format_review_header(
     *,
@@ -403,6 +417,43 @@ def parse_review_header(body: str) -> dict[str, str | int] | None:
     return out if "verdict" in out else None
 
 
+_BULLET_RE = re.compile(r"^\s*(?:[-*]|\d+\.)\s+\S")
+
+
+def _bucket_for_heading(heading_line: str) -> str | None:
+    """Map a markdown heading line to a `_SECTION_KEYWORDS` bucket, or None."""
+    heading_text = heading_line.lstrip("#").strip().lower()
+    for bucket in _ORDERED_BUCKETS:
+        if any(kw in heading_text for kw in _SECTION_KEYWORDS[bucket]):
+            return bucket
+    return None
+
+
+def _iter_review_sections(body: str) -> Iterator[tuple[str | None, list[str]]]:
+    """Yield ``(bucket, lines)`` for each markdown section of *body*.
+
+    *bucket* is the `_SECTION_KEYWORDS` bucket the section's heading maps to,
+    or ``None`` for the preamble (text before the first heading) and for
+    headings that match no keyword.  *lines* are the right-stripped lines
+    under that heading, up to the next heading.
+
+    Shared by `estimate_review_counts` (which counts bullets) and
+    `blocking_findings_confirmed_absent` (which inspects prose), so the two
+    can never disagree about where a section starts and ends (#1456).
+    """
+    current: str | None = None
+    lines: list[str] = []
+    for raw in body.splitlines():
+        line = raw.rstrip()
+        if line.startswith("#"):
+            yield current, lines
+            current = _bucket_for_heading(line)
+            lines = []
+            continue
+        lines.append(line)
+    yield current, lines
+
+
 def estimate_review_counts(
     body: str,
 ) -> tuple[int | None, int | None, int | None]:
@@ -413,33 +464,73 @@ def estimate_review_counts(
     `* ` / `1. ` bullets directly under that section (until the next
     heading).  Returns ``(None, None, None)`` when no recognised
     sections appear — the heuristic refuses to guess.
+
+    **``None`` means "could not determine", never "zero" (#1456).**  A caller
+    that conflates the two turns a heuristic miss into a positive claim that
+    the reviewer raised nothing — which is how a `request-changes` verdict got
+    silently rewritten to `approve` on #1445.  Callers deciding *anything*
+    about whether blocking findings exist must go through
+    `blocking_findings_confirmed_absent`, not compare these values themselves.
     """
     counts: dict[str, int | None] = {"blocking": None, "nonblocking": None, "nits": None}
-    current: str | None = None
-    bullet_re = re.compile(r"^\s*(?:[-*]|\d+\.)\s+\S")
-    # Check buckets in order of keyword specificity so that "Non-blocking
-    # concerns" doesn't accidentally match the `blocking` bucket first.
-    ordered_buckets = ("nonblocking", "nits", "blocking")
-
-    for raw in body.splitlines():
-        line = raw.rstrip()
-        if line.startswith("#"):
-            # Found a heading — figure out which bucket (if any) it maps to.
-            heading_text = line.lstrip("#").strip().lower()
-            current = None
-            for bucket in ordered_buckets:
-                if any(kw in heading_text for kw in _SECTION_KEYWORDS[bucket]):
-                    current = bucket
-                    # Initialise the count for this bucket so it shows as 0
-                    # (not None) even when the section is empty.
-                    if counts[current] is None:
-                        counts[current] = 0
-                    break
+    for bucket, lines in _iter_review_sections(body):
+        if bucket is None:
             continue
-        if current is not None and bullet_re.match(line):
-            counts[current] = (counts[current] or 0) + 1
-
+        # Initialise the count for this bucket so it shows as 0 (not None)
+        # even when the section is empty.
+        counts[bucket] = (counts[bucket] or 0) + sum(
+            1 for line in lines if _BULLET_RE.match(line)
+        )
     return counts["blocking"], counts["nonblocking"], counts["nits"]
+
+
+def _is_no_findings_line(text: str) -> bool:
+    """True when *text* reads as an explicit "nothing here" marker.
+
+    Deliberately narrow: only short lines qualify, so a real finding written
+    as prose ("No error path is handled when the worktree leaks, so …") is
+    never mistaken for an empty section.
+    """
+    stripped = text.strip(" \t*_`~>-–—.:!()[]")
+    if not stripped:
+        return True
+    if len(stripped) > _NO_FINDINGS_MAX_LEN:
+        return False
+    low = stripped.lower()
+    return any(phrase in low for phrase in _NO_FINDINGS_PHRASES)
+
+
+def blocking_findings_confirmed_absent(body: str) -> bool:
+    """True only when *body* carries POSITIVE evidence of zero blocking findings.
+
+    This is the evidence standard for overriding a reviewer's verdict (#1456).
+    It is deliberately *fail-closed*: everything the heuristic cannot read
+    returns ``False``, i.e. "assume the reviewer meant what it said".
+
+    Returns ``True`` only when **all** of the following hold:
+
+    1. A blocking section was actually located (``blocking is not None`` —
+       a heading matching `_SECTION_KEYWORDS["blocking"]`).  A body with no
+       such heading yields ``None`` = *unknown*, which must never be read as
+       zero: that conflation is the #1456 defect, where a well-formed prose
+       `request-changes` on #1445 was rewritten to `approve` because the
+       *nits* bucket happened to parse as 0 while *blocking* parsed as None.
+    2. That section contains no bullets (an explicit parsed zero).
+    3. That section contains no substantive prose either — a reviewer who
+       writes blocking findings as paragraphs under "## Blocking" would
+       otherwise count as zero and fail open all the same.  Short "None" /
+       "N/A" markers are allowed (that's the shape being looked for).
+    """
+    blocking, _nonblocking, _nits = estimate_review_counts(body)
+    if blocking is None or blocking != 0:
+        return False
+    for bucket, lines in _iter_review_sections(body):
+        if bucket != "blocking":
+            continue
+        for line in lines:
+            if not _is_no_findings_line(line.strip()):
+                return False
+    return True
 
 
 def _parse_review_text(text: str) -> ReviewFindings | None:
@@ -653,6 +744,23 @@ REVIEW_VERDICT: request-changes
 REVIEW_BODY:
 <your full review text in markdown>
 END_REVIEW
+
+Structure the markdown body with these three headings, in this order, ALWAYS \
+all three even when a section is empty — write `None` under a heading with \
+nothing in it, and write every finding as a `- ` bullet, never as a bare \
+paragraph:
+
+## Blocking findings
+## Non-blocking concerns
+## Nits
+
+The coordinator reads these sections to decide whether a `request-changes` is \
+a real must-fix or advisory-only. It is deliberately conservative: a body it \
+cannot read is treated as blocking, so an omitted or prose-only \
+`## Blocking findings` section costs a full extra fix+review round even when \
+you raised nothing blocking. Put blocking findings ONLY under \
+`## Blocking findings` — anything you would still merge over belongs in one of \
+the other two sections.
 
 `END_REVIEW` is a HARD REQUIREMENT, not a formatting flourish: the coordinator \
 only records a verdict when it sees that exact line, so a review that is \
@@ -1131,6 +1239,24 @@ def build_review_briefing(
     lines.append("```")
     lines.append("")
     lines.append("Use `REVIEW_VERDICT: request-changes` if changes are needed.")
+    # #1456: the coordinator's #476 gate (an advisory-only request-changes must
+    # not burn another fix round) counts bullets under the body's section
+    # headings, and since #1456 it fails CLOSED — an unparseable body keeps the
+    # reviewer's verdict verbatim. Say so here as well as in
+    # REVIEWER_SYSTEM_PROMPT: without an explicit blocking section the gate can
+    # never fire, so every advisory review costs a full fix+re-review round.
+    lines.append("")
+    lines.append(
+        "BODY STRUCTURE — the markdown body MUST use these three headings, "
+        "always all three, with every finding as a `- ` bullet under one of "
+        "them: `## Blocking findings`, `## Non-blocking concerns`, `## Nits`. "
+        "Write the single line `None.` under a heading with nothing under it. "
+        "These sections are machine-counted: an explicitly empty blocking "
+        "section is how you tell the coordinator your objections are advisory "
+        "and no fix round is needed, and a body it cannot read is treated as "
+        "blocking. Never state a blocking objection only in prose outside "
+        "these sections."
+    )
     # #1346: the three marker lines are a machine contract, not prose. The
     # surrounding briefing is Markdown and the body placeholder invites
     # Markdown, so reviewers have emitted `**REVIEW_VERDICT: request-changes**`

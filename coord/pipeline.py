@@ -69,6 +69,14 @@ class PipelineView:
     # ("approve" | "request-changes" | None).  Populated when the reviewer has
     # completed and emitted a structured REVIEW_VERDICT block.
     review_verdict: str | None = None
+    # #1456: when the coordinator overrode the reviewer's verdict (the #476
+    # approve-with-nits gate), the reviewer's OWN verdict and the evidence that
+    # justified the override.  Both None when `review_verdict` is the
+    # reviewer's own call — which is the normal case.  Exposed here so the
+    # dashboard/TUI can render "approve (coordinator override of
+    # request-changes)" instead of a bare approve the reviewer never gave.
+    review_verdict_original: str | None = None
+    review_verdict_override_reason: str | None = None
     # Full text body of the review findings as cached by notify/auto_loop.
     # Populated from the DB review_findings column so the phone detail screen
     # can render them without a slow GitHub re-fetch.  None when no findings
@@ -319,6 +327,13 @@ def compute_pipeline(
     # Derive the cached review verdict from the in-memory review assignment
     # (no I/O — review_assignment is already fetched from the board above).
     review_verdict = review_assignment.review_verdict if review_assignment else None
+    # #1456: carry the override audit trail alongside the effective verdict.
+    review_verdict_original = (
+        review_assignment.review_verdict_original if review_assignment else None
+    )
+    review_verdict_override_reason = (
+        review_assignment.review_verdict_override_reason if review_assignment else None
+    )
 
     # Expose the human Test-gate verdict so the phone detail screen can display
     # it and the record-test-verdict gate can be conditionally shown.
@@ -377,6 +392,8 @@ def compute_pipeline(
         progress_pct=progress_pct,
         review_findings_pending=review_findings_pending,
         review_verdict=review_verdict,
+        review_verdict_original=review_verdict_original,
+        review_verdict_override_reason=review_verdict_override_reason,
         review_findings_body=review_findings_body,
         test_verdict=test_verdict,
         needs_attention=needs_attention_reason is not None,

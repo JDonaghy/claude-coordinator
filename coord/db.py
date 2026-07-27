@@ -426,6 +426,15 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # rather than re-resolved from the live board at merge time. NULL
         # for rows predating this column, which fall back the same way.
         "ALTER TABLE merge_queue ADD COLUMN required_gates TEXT",
+        # #1456: audit trail for a coordinator override of a reviewer's verdict
+        # (the #476 approve-with-nits gate).  `review_verdict_original` holds
+        # the reviewer's own verdict and `review_verdict_override_reason` the
+        # parsed counts that justified the override; `review_verdict` keeps the
+        # effective value the merge gate reads.  NULL for every row where the
+        # coordinator never overrode anything, and for rows predating this
+        # column — see coord.models.Assignment.review_verdict_original.
+        "ALTER TABLE assignments ADD COLUMN review_verdict_original TEXT",
+        "ALTER TABLE assignments ADD COLUMN review_verdict_override_reason TEXT",
     ]
     for sql in migrations:
         try:
