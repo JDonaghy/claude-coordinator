@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from coord.acceptance import (
+    ForPathResolutionError,
     ManifestData,
     ManifestError,
     acceptance_capability_gap,
@@ -18,12 +19,13 @@ from coord.acceptance import (
     ms_dir_for_issue,
     oracle_loop_contract_block,
     parse_manifest_text,
+    resolve_for_path,
 )
 # Aliased on import: pytest treats any module-level `test_*` name as a
 # collectible test function, and `test_ids_for_issue` takes required
 # positional args — importing it under its real name breaks collection.
 from coord.acceptance import test_ids_for_issue as ids_for_issue
-from coord.config import Config
+from coord.config import AcceptanceConfig, AcceptanceDriverConfig, Config
 from coord.models import Machine, Repo
 
 
@@ -293,3 +295,137 @@ class TestAcceptanceCapabilityGap:
             ],
         )
         assert acceptance_capability_gap("browser", "webapp", cfg) is None
+
+
+class TestResolveForPath:
+    """#1453 review finding 1: the ONE place ``--for-path`` is derived from
+    a milestone's Gate-A mock kind (``*.screen`` -> ``tui-tuidriver``,
+    ``*.out`` -> ``cli-pytest``, docs/ORACLE_LOOP.md) — shared by
+    ``coord/drive.py``'s JIT-authoring dispatch (and, per the pinned #1453
+    review guidance, #1460's eventual TUI-menu equivalent)."""
+
+    @staticmethod
+    def _routed_config() -> Config:
+        return Config(
+            repos=[Repo(name="claude-coordinator", github="john/claude-coordinator")],
+            machines=[],
+            acceptance=AcceptanceConfig(
+                drivers={
+                    "claude-coordinator": AcceptanceDriverConfig(
+                        routes=[
+                            AcceptanceDriverConfig(
+                                match="coord/**", kind="cli-pytest", run="pytest",
+                            ),
+                            AcceptanceDriverConfig(
+                                match="tui/**", kind="tui-tuidriver", run="cargo test",
+                            ),
+                        ]
+                    )
+                }
+            ),
+        )
+
+    def test_repo_with_no_driver_at_all_returns_none(self) -> None:
+        cfg = Config(repos=[Repo(name="api", github="acme/api")], machines=[])
+        assert resolve_for_path(cfg, cfg.repo("api"), 37) is None
+
+    def test_unrouted_flat_driver_returns_none_without_listing_anything(self) -> None:
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[],
+            acceptance=AcceptanceConfig(
+                drivers={"api": AcceptanceDriverConfig(kind="cli-pytest", run="pytest")}
+            ),
+        )
+        calls: list[tuple] = []
+        result = resolve_for_path(
+            cfg, cfg.repo("api"), 37,
+            list_mock_dir=lambda *a: calls.append(a) or (),
+        )
+        assert result is None
+        assert calls == []
+
+    def test_screen_mocks_resolve_to_the_tui_tuidriver_route(self) -> None:
+        cfg = self._routed_config()
+        result = resolve_for_path(
+            cfg, cfg.repo("claude-coordinator"), 38,
+            list_mock_dir=lambda *a: ("plans-base.screen", "plans-detail.screen"),
+        )
+        assert result == "tui/**"
+
+    def test_out_mocks_resolve_to_the_cli_pytest_route(self) -> None:
+        cfg = self._routed_config()
+        result = resolve_for_path(
+            cfg, cfg.repo("claude-coordinator"), 37,
+            list_mock_dir=lambda *a: ("usage_by_issue.out",),
+        )
+        assert result == "coord/**"
+
+    def test_passes_repo_github_mocks_path_and_default_branch_to_the_lister(self) -> None:
+        cfg = self._routed_config()
+        calls: list[tuple] = []
+        resolve_for_path(
+            cfg, cfg.repo("claude-coordinator"), 38,
+            list_mock_dir=lambda *a: calls.append(a) or ("x.screen",),
+        )
+        assert calls == [
+            ("john/claude-coordinator", "tests/acceptance/ms-38/mocks", "main"),
+        ]
+
+    def test_unrecognized_extensions_are_ignored_not_fatal(self) -> None:
+        cfg = self._routed_config()
+        result = resolve_for_path(
+            cfg, cfg.repo("claude-coordinator"), 38,
+            list_mock_dir=lambda *a: ("README.md", "a.screen"),
+        )
+        assert result == "tui/**"
+
+    def test_no_recognized_mocks_raises(self) -> None:
+        cfg = self._routed_config()
+        with pytest.raises(ForPathResolutionError, match="no recognized mock files"):
+            resolve_for_path(
+                cfg, cfg.repo("claude-coordinator"), 38,
+                list_mock_dir=lambda *a: (),
+            )
+
+    def test_mixed_mock_kinds_raises(self) -> None:
+        cfg = self._routed_config()
+        with pytest.raises(ForPathResolutionError, match="mixed mock kinds"):
+            resolve_for_path(
+                cfg, cfg.repo("claude-coordinator"), 38,
+                list_mock_dir=lambda *a: ("a.screen", "b.out"),
+            )
+
+    def test_kind_with_no_matching_route_raises(self) -> None:
+        cfg = Config(
+            repos=[Repo(name="claude-coordinator", github="john/claude-coordinator")],
+            machines=[],
+            acceptance=AcceptanceConfig(
+                drivers={
+                    "claude-coordinator": AcceptanceDriverConfig(
+                        routes=[
+                            AcceptanceDriverConfig(
+                                match="coord/**", kind="cli-pytest", run="pytest",
+                            ),
+                        ]
+                    )
+                }
+            ),
+        )
+        with pytest.raises(ForPathResolutionError, match="matches 0 routes"):
+            resolve_for_path(
+                cfg, cfg.repo("claude-coordinator"), 38,
+                list_mock_dir=lambda *a: ("a.screen",),
+            )
+
+    def test_error_message_names_the_no_acceptance_and_manual_for_path_escape_hatches(
+        self,
+    ) -> None:
+        cfg = self._routed_config()
+        with pytest.raises(ForPathResolutionError) as exc:
+            resolve_for_path(
+                cfg, cfg.repo("claude-coordinator"), 38,
+                list_mock_dir=lambda *a: (),
+            )
+        assert "--no-acceptance" in str(exc.value)
+        assert "--for-path" in str(exc.value)

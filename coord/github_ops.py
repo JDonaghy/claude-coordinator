@@ -868,6 +868,22 @@ def get_repo_file(repo: str, path: str, branch: str = "develop") -> str:
     return base64.b64decode(data["content"]).decode()
 
 
+def list_repo_dir(repo: str, path: str, branch: str = "develop") -> list[str]:
+    """Filenames (not full paths) directly under *path* on *branch*.
+
+    Same ``contents`` endpoint :func:`get_repo_file` uses, which returns a
+    JSON array (rather than a single file object) when *path* is a
+    directory. Raises like :func:`get_repo_file` (``RuntimeError`` via
+    ``_gh``) when *path* doesn't exist — callers that want a soft "not
+    found" should catch that, mirroring ``_default_gate_a_file_exists``.
+    """
+    raw = _gh("api", f"repos/{repo}/contents/{path}?ref={branch}")
+    data = json.loads(raw)
+    if not isinstance(data, list):
+        return []
+    return [entry["name"] for entry in data if entry.get("type") == "file"]
+
+
 def check_branch_exists(repo: str, branch: str) -> bool:
     try:
         _gh("api", f"repos/{repo}/branches/{branch}")

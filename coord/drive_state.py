@@ -121,6 +121,8 @@ class IssueState:
     # <N>` has been dispatched for this issue.
     acceptance_author_aid: str = ""
     acceptance_author_status: str = ""
+    acceptance_author_branch: str = ""
+    acceptance_author_machine: str = ""
 
     # ── derived ──────────────────────────────────────────────────────────
     @property
@@ -284,6 +286,8 @@ def project(payload: dict, repo: str, issue: int, config: Any) -> IssueState:
         milestone_tracking_issue=milestone_tracking_issue,
         acceptance_author_aid=g(acceptance_author, "assignment_id"),
         acceptance_author_status=g(acceptance_author, "status"),
+        acceptance_author_branch=g(acceptance_author, "branch"),
+        acceptance_author_machine=g(acceptance_author, "machine_name"),
     )
 
 

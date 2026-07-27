@@ -971,3 +971,35 @@ class TestCurrentGhLogin:
     def test_returns_none_on_failure(self) -> None:
         with patch("coord.github_ops._gh", side_effect=RuntimeError("no auth")):
             assert github_ops._current_gh_login() is None
+
+
+class TestListRepoDir:
+    """#1453 review finding 1: the GitHub-fetch backing coord.acceptance.
+    resolve_for_path's default mock-lister — same `contents` endpoint
+    get_repo_file uses, but returning a directory listing instead of one
+    file's content."""
+
+    def test_returns_file_names_only(self) -> None:
+        payload = json.dumps([
+            {"name": "a.screen", "type": "file"},
+            {"name": "b.screen", "type": "file"},
+            {"name": "subdir", "type": "dir"},
+        ])
+        with patch("coord.github_ops._gh", return_value=payload) as mock_gh:
+            names = github_ops.list_repo_dir("acme/api", "tests/acceptance/ms-1/mocks", branch="main")
+        assert sorted(names) == ["a.screen", "b.screen"]
+        args = mock_gh.call_args.args
+        assert args[0] == "api"
+        assert args[1] == "repos/acme/api/contents/tests/acceptance/ms-1/mocks?ref=main"
+
+    def test_a_single_file_path_returns_empty_list(self) -> None:
+        # The contents endpoint returns a single JSON *object* (not a list)
+        # when the path names a file, not a directory.
+        payload = json.dumps({"name": "contract.md", "type": "file"})
+        with patch("coord.github_ops._gh", return_value=payload):
+            assert github_ops.list_repo_dir("acme/api", "tests/acceptance/ms-1/contract.md") == []
+
+    def test_missing_path_propagates_the_gh_error(self) -> None:
+        with patch("coord.github_ops._gh", side_effect=RuntimeError("gh boom")):
+            with pytest.raises(RuntimeError):
+                github_ops.list_repo_dir("acme/api", "tests/acceptance/ms-1/mocks")

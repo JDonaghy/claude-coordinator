@@ -21,12 +21,12 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import yaml
 
 from coord.config import Config
-from coord.models import Machine
+from coord.models import Machine, Repo
 
 ACCEPTANCE_DIRNAME = "tests/acceptance"
 
@@ -47,6 +47,113 @@ def gate_a_contract_path(milestone_number: int) -> str:
     letting the milestone's issues dispatch).
     """
     return f"{ACCEPTANCE_DIRNAME}/{ms_dirname(milestone_number)}/contract.md"
+
+
+def _mocks_dir(milestone_number: int) -> str:
+    return f"{ACCEPTANCE_DIRNAME}/{ms_dirname(milestone_number)}/mocks"
+
+
+# Mock-fixture file extension -> the driver ``kind`` it implies (the SAME
+# rule each ``AcceptanceDriverConfig.mock`` glob already encodes in
+# coordinator.yml / docs/ORACLE_LOOP.md: ``"*.screen"`` for ``tui-tuidriver``,
+# ``"*.out"`` for ``cli-pytest``). Single source of truth for the
+# mock-kind -> ``--for-path`` derivation (#1453 review) — do not re-derive
+# this mapping a second time anywhere else.
+MOCK_EXT_TO_DRIVER_KIND: dict[str, str] = {
+    ".screen": "tui-tuidriver",
+    ".out": "cli-pytest",
+}
+
+
+class ForPathResolutionError(Exception):
+    """A routed repo's ``--for-path`` could not be resolved unambiguously
+    from a milestone's Gate-A mocks. Message is operator-facing."""
+
+
+# (repo_github, dir_path, branch) -> filenames (not full paths) directly
+# under that directory, or () when it doesn't exist. Injected so tests never
+# hit `gh` — mirrors ``coord.milestone_dispatch.GateAFileExists``.
+MockLister = Callable[[str, str, str], "tuple[str, ...]"]
+
+
+def _default_list_mock_dir(repo_github: str, path: str, branch: str) -> "tuple[str, ...]":
+    from coord import github_ops  # noqa: PLC0415
+
+    try:
+        return tuple(github_ops.list_repo_dir(repo_github, path, branch=branch))
+    except RuntimeError:
+        return ()
+
+
+def resolve_for_path(
+    config: Config,
+    repo_cfg: Repo,
+    milestone_number: int,
+    *,
+    list_mock_dir: MockLister | None = None,
+) -> str | None:
+    """Derive the ``--for-path`` glob a ROUTED repo's JIT acceptance-author
+    dispatch needs, from *milestone_number*'s Gate-A mock file kind.
+
+    SHARED helper (#1453 review finding 1, tracked for #1460's TUI-menu
+    equivalent too — do not duplicate this rule): the mock fixtures a
+    milestone's Gate-A contract ships under ``tests/acceptance/ms-NN/mocks/``
+    (already merged to the default branch by the time this is ever called —
+    :func:`coord.milestone_dispatch.gate_a_status` gates on exactly that)
+    have a file extension that implies exactly one driver ``kind``
+    (:data:`MOCK_EXT_TO_DRIVER_KIND`). Crossing that against
+    ``acceptance.drivers.<repo>.routes[].kind`` picks the one route whose
+    ``match`` glob is this milestone's ``--for-path``.
+
+    Returns:
+    - ``None`` when *repo_cfg* has no acceptance driver at all, or a FLAT
+      (unrouted) one — :meth:`coord.config.AcceptanceConfig.driver_for`
+      already resolves those with no path, so no ``--for-path`` is needed.
+    - the single matching route's ``match`` glob when resolution is
+      unambiguous.
+
+    Raises :class:`ForPathResolutionError` (operator-facing, mirrors
+    ``coord.test_author.dispatch_test_author``'s "no route matched" message)
+    when the repo IS routed but resolution is ambiguous — no mocks found,
+    more than one mock kind present, or zero/more-than-one route declares
+    the implied kind. Callers should surface this rather than guess.
+    """
+    entry = config.acceptance.drivers.get(repo_cfg.name)
+    if entry is None or not entry.routes:
+        return None
+
+    lister = list_mock_dir or _default_list_mock_dir
+    mocks_dir = _mocks_dir(milestone_number)
+    names = lister(repo_cfg.github, mocks_dir, repo_cfg.default_branch)
+
+    kinds = {
+        MOCK_EXT_TO_DRIVER_KIND[Path(name).suffix]
+        for name in names
+        if Path(name).suffix in MOCK_EXT_TO_DRIVER_KIND
+    }
+
+    def _refuse(reason: str) -> "ForPathResolutionError":
+        routes = ", ".join(f"{r.match!r} ({r.kind})" for r in entry.routes)
+        return ForPathResolutionError(
+            f"repo {repo_cfg.name!r} has a routed acceptance driver ({routes}) "
+            f"but --for-path could not be derived from {mocks_dir!r}'s mock "
+            f"kind: {reason}. Pass --no-acceptance to skip JIT authoring, or "
+            f"dispatch by hand: coord acceptance author {repo_cfg.name} "
+            "<tracking_issue> --issue <N> --for-path <glob>"
+        )
+
+    if not kinds:
+        raise _refuse(f"no recognized mock files found ({names!r})")
+    if len(kinds) > 1:
+        raise _refuse(f"mixed mock kinds found ({sorted(kinds)!r})")
+    kind = next(iter(kinds))
+
+    matches = [route.match for route in entry.routes if route.kind == kind]
+    if len(matches) != 1:
+        raise _refuse(
+            f"mock kind {kind!r} matches {len(matches)} routes, need exactly 1"
+        )
+    return matches[0]
 
 
 class ManifestError(Exception):

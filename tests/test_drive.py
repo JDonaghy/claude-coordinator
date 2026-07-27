@@ -97,6 +97,11 @@ def step(s: IssueState, opts: DriveOptions | None = None, **kw) -> Action:
     """One decide() call with sensible defaults."""
     verifier = kw.pop("verifier", None) or FakeVerifier()
     counters = kw.pop("counters", None) or DriveCounters()
+    # A default gate_checker whose resolve_for_path() is a no-op (None, "no
+    # --for-path needed") — every pre-#1453-review test drives an unrouted
+    # (or no) acceptance config, so this preserves their assertions
+    # byte-for-byte; oracle tests that care override it explicitly.
+    gate_checker = kw.pop("gate_checker", None) or FakeGateChecker()
     return decide(
         s,
         opts or DriveOptions(machine="precision"),
@@ -104,6 +109,7 @@ def step(s: IssueState, opts: DriveOptions | None = None, **kw) -> Action:
         verifier,
         machine=kw.pop("machine", "precision"),
         oracle=kw.pop("oracle", None),
+        gate_checker=gate_checker,
     )
 
 
@@ -260,13 +266,28 @@ def make_config_with_acceptance_driver() -> Config:
 
 
 class FakeGateChecker:
-    def __init__(self, *, exists: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        exists: bool = True,
+        for_path: str | None = None,
+        for_path_error: Exception | None = None,
+    ) -> None:
         self._exists = exists
+        self._for_path = for_path
+        self._for_path_error = for_path_error
         self.calls: list[tuple[str, int]] = []
+        self.for_path_calls: list[tuple[str, int]] = []
 
     def contract_exists(self, repo_name: str, milestone_number: int) -> bool:
         self.calls.append((repo_name, milestone_number))
         return self._exists
+
+    def resolve_for_path(self, repo_name: str, milestone_number: int) -> str | None:
+        self.for_path_calls.append((repo_name, milestone_number))
+        if self._for_path_error is not None:
+            raise self._for_path_error
+        return self._for_path
 
 
 def oracle_state(**kw) -> IssueState:
@@ -353,6 +374,53 @@ def test_the_default_gate_checker_reuses_gate_a_status_not_a_reimplementation():
 
     src = inspect.getsource(GitHubAcceptanceGateChecker.contract_exists)
     assert "gate_a_status" in src
+
+
+def test_the_default_gate_checker_delegates_for_path_to_the_shared_helper():
+    """#1453 review finding 1: GitHubAcceptanceGateChecker.resolve_for_path
+    must call coord.acceptance.resolve_for_path (the ONE shared derivation)
+    rather than re-deriving --for-path itself."""
+    import inspect
+
+    src = inspect.getsource(GitHubAcceptanceGateChecker.resolve_for_path)
+    assert "resolve_for_path(" in src
+
+
+def test_the_default_gate_checker_resolve_for_path_is_wired_end_to_end(monkeypatch):
+    """Exercises the real resolve_for_path() call through the checker with a
+    stubbed mock-lister, rather than trusting the source-scan above alone."""
+    calls = []
+
+    def fake_list_repo_dir(repo: str, path: str, branch: str = "develop") -> list[str]:
+        calls.append((repo, path, branch))
+        return ["plans-base.screen"]
+
+    monkeypatch.setattr("coord.github_ops.list_repo_dir", fake_list_repo_dir)
+
+    from coord.config import AcceptanceConfig, AcceptanceDriverConfig
+
+    cfg = Config(
+        repos=[Repo(name=REPO, github="john/claude-coordinator")],
+        machines=[],
+        acceptance=AcceptanceConfig(
+            drivers={
+                REPO: AcceptanceDriverConfig(routes=[
+                    AcceptanceDriverConfig(match="coord/**", kind="cli-pytest", run="pytest"),
+                    AcceptanceDriverConfig(match="tui/**", kind="tui-tuidriver", run="cargo test"),
+                ])
+            }
+        ),
+    )
+    checker = GitHubAcceptanceGateChecker(config=cfg)
+    assert checker.resolve_for_path(REPO, 38) == "tui/**"
+    assert calls == [
+        ("john/claude-coordinator", "tests/acceptance/ms-38/mocks", "main"),
+    ]
+
+
+def test_the_default_gate_checker_resolve_for_path_returns_none_for_unknown_repo():
+    checker = GitHubAcceptanceGateChecker(config=make_config())
+    assert checker.resolve_for_path("no-such-repo", 38) is None
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -495,6 +563,125 @@ def test_oracle_active_still_honours_do_plan_after_the_slice_has_landed():
         oracle=oracle,
     )
     assert action.command == ("assign", "--plan-only", "precision", REPO, "1392")
+
+
+# ── #1453 review finding 1: --for-path resolution for a routed repo ─────────
+
+
+def test_oracle_active_appends_for_path_when_the_gate_checker_resolves_one():
+    """A ROUTED repo's `coord acceptance author` hard-refuses with no
+    --for-path (coord.test_author.dispatch_test_author) — the driver must
+    resolve and pass it, not dispatch blind."""
+    oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
+    checker = FakeGateChecker(for_path="tui/**")
+    action = step(oracle_state(), oracle=oracle, gate_checker=checker)
+    assert action.kind == RUN
+    assert action.command == (
+        "acceptance", "author", REPO, "1120", "--issue", "1392",
+        "--for-path", "tui/**",
+    )
+    assert checker.for_path_calls == [(REPO, 38)]
+
+
+def test_oracle_active_omits_for_path_for_an_unrouted_repo():
+    """resolve_for_path() returning None means "no --for-path needed" (flat,
+    unrouted driver config, or none at all) — command is unchanged from
+    before #1453's review fix."""
+    oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
+    action = step(oracle_state(), oracle=oracle, gate_checker=FakeGateChecker())
+    assert action.command == (
+        "acceptance", "author", REPO, "1120", "--issue", "1392",
+    )
+
+
+def test_oracle_active_dies_when_for_path_cannot_be_resolved():
+    """An ambiguous/unresolvable routed config must report and stop — not
+    dispatch a `coord acceptance author` that the CLI will reject anyway
+    (coord.acceptance.ForPathResolutionError)."""
+    from coord.acceptance import ForPathResolutionError
+
+    oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
+    checker = FakeGateChecker(
+        for_path_error=ForPathResolutionError("no route matched")
+    )
+    action = step(oracle_state(), oracle=oracle, gate_checker=checker)
+    assert action.is_exit
+    assert action.exit_code == EXIT_TERMINAL_FAILURE
+    assert "no route matched" in action.message
+
+
+# ── #1453 review finding 2: an ADVISORY JIT slice must not spin forever ─────
+
+
+def test_oracle_active_advisory_with_no_commits_is_terminal():
+    oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
+    verifier = FakeVerifier(has_commits=False)
+    action = step(
+        oracle_state(
+            acceptance_author_aid="ta1",
+            acceptance_author_status="advisory",
+            acceptance_author_branch="",
+        ),
+        oracle=oracle,
+        verifier=verifier,
+    )
+    assert action.is_exit
+    assert action.exit_code == EXIT_TERMINAL_FAILURE
+    assert "no commits" in action.message
+
+
+def test_oracle_active_advisory_with_commits_requires_accept_advisory():
+    """The #1357 false-positive shape — real commits, downgraded to
+    advisory anyway — must not be treated as "still landing"; it needs the
+    same --accept-advisory opt-in the main work row uses."""
+    oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
+    verifier = FakeVerifier(has_commits=True)
+    action = step(
+        oracle_state(
+            acceptance_author_aid="ta1",
+            acceptance_author_status="advisory",
+            acceptance_author_branch="issue-1453-slice",
+        ),
+        oracle=oracle,
+        verifier=verifier,
+    )
+    assert action.is_exit
+    assert action.exit_code == EXIT_TERMINAL_FAILURE
+    assert "--accept-advisory" in action.message
+
+
+def test_oracle_active_advisory_with_commits_and_accept_advisory_waits():
+    oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
+    verifier = FakeVerifier(has_commits=True)
+    action = step(
+        oracle_state(
+            acceptance_author_aid="ta1",
+            acceptance_author_status="advisory",
+            acceptance_author_branch="issue-1453-slice",
+        ),
+        DriveOptions(machine="precision", accept_advisory=True),
+        oracle=oracle,
+        verifier=verifier,
+    )
+    assert action.kind == WAIT
+    assert any("--accept-advisory" in w for w in action.warnings)
+
+
+def test_oracle_active_advisory_never_falls_through_to_a_bare_wait_label():
+    """Regression guard for the #1453-review bug itself: an advisory JIT
+    slice must never produce the generic "authoring/merging in progress"
+    wait label — that label is the silent-spin signature (#1386's class)."""
+    oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
+    action = step(
+        oracle_state(
+            acceptance_author_aid="ta1",
+            acceptance_author_status="advisory",
+            acceptance_author_branch="",
+        ),
+        oracle=oracle,
+        verifier=FakeVerifier(has_commits=False),
+    )
+    assert "authoring/merging in progress" not in (action.label or "")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
