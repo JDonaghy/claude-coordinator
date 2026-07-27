@@ -3146,7 +3146,7 @@ impl CoordApp {
                                 "Phantom session cleared",
                                 &format!(
                                     "#{issue_number}: removed {removed} phantom live-session \
-                                     entr{}. The card will move to Idle on the next refresh.",
+                                     entr{}. The card will show as 'ready' on the next refresh.",
                                     if removed == 1 { "y" } else { "ies" },
                                 ),
                                 ToastSeverity::Info,
@@ -5021,33 +5021,25 @@ impl CoordApp {
             // the rebuild below reads `pipeline_milestone_expanded` to decide
             // each header's expanded state — so we can force it open.
             //
-            // #1069: In-progress now has the same milestone tier (nested
-            // under liveness rather than repo).  Its headers default
-            // *expanded*, but a user may have explicitly collapsed one, so
-            // apply the same reveal fix — force both the liveness group and
-            // the milestone group open.
+            // #1069: In-progress has the same milestone tier, nested under a
+            // repo node (#1487 — it used to be a Live/Idle liveness node).
+            // Its headers default *expanded*, but a user may have explicitly
+            // collapsed one, so apply the same reveal fix — force both the
+            // repo group and the milestone group open.
             let lc_key = self.pipeline_lifecycle_section(pi);
             let repo_key = Self::pipeline_repo_key(pi).to_string();
             let mil_key = match self.pipeline_issue_milestone(pi) {
                 Some((n, _)) => n.to_string(),
                 None => "no-milestone".to_string(),
             };
-            let liveness_key = if self.issue_session_is_live(pi) {
-                "live"
-            } else {
-                "idle"
-            }
-            .to_string();
             if lc_key == "new" {
                 self.pipeline_milestone_expanded
                     .insert((lc_key.to_string(), repo_key, mil_key), true);
             } else if lc_key == "in-progress" {
-                self.pipeline_lifecycle_expanded.insert(
-                    ("in-progress".to_string(), liveness_key.clone()),
-                    true,
-                );
+                self.pipeline_lifecycle_expanded
+                    .insert(("in-progress".to_string(), repo_key.clone()), true);
                 self.pipeline_milestone_expanded.insert(
-                    ("in-progress".to_string(), liveness_key, mil_key),
+                    ("in-progress".to_string(), repo_key, mil_key),
                     true,
                 );
             }
@@ -5926,7 +5918,7 @@ impl CoordApp {
             // also removes status:ready, so `drop-to-refining` reuses
             // the same command.
             // #266: shared by the Board row menu (Refining/Refined → Backlog)
-            // and the Pipeline row menu (New / In-progress:Idle → Backlog).
+            // and the Pipeline row menu (New / In-progress → Backlog).
             // Board rows carry repo+num on the target; Pipeline rows resolve
             // them from the selected pipeline issue instead.
             "drop-to-backlog" => match target {
@@ -6114,7 +6106,7 @@ impl CoordApp {
                         "Phantom session cleared",
                         &format!(
                             "#{}: removed {} phantom live-session entr{}. \
-                             The card will move to Idle on the next refresh.",
+                             The card will show as 'ready' on the next refresh.",
                             issue_number,
                             removed,
                             if removed == 1 { "y" } else { "ies" },

@@ -4747,17 +4747,21 @@ impl CoordApp {
                         true
                     }
                     SidebarEvent::RowToggleExpand { section, ref path } if path.len() == 1 => {
-                        // A one-level path = a repo/liveness sub-header was toggled.
-                        // New/Done group by repo; Active groups by liveness (Live/Idle).
-                        // Both persist expand state in pipeline_lifecycle_expanded
-                        // keyed by (lc_key, group_key).
+                        // A one-level path = a repo sub-header was toggled.
+                        // Every grouped section keys by repo (#1487 replaced
+                        // In-progress's Live/Idle split with repo nodes), and
+                        // all persist expand state in pipeline_lifecycle_expanded
+                        // keyed by (lc_key, repo_key).  In-progress still needs
+                        // its own accessor: it orders issues in-flight-first
+                        // within a repo, so `gi` must index the same group list
+                        // the renderer emitted.
                         let search_offset = 1usize;
                         if section >= search_offset {
                             let state_idx = section - search_offset;
                             if let Some(&lc_key) = self.pipeline_state_section_names.get(state_idx)
                             {
                                 let groups = if lc_key == "in-progress" {
-                                    self.pipeline_active_by_liveness()
+                                    self.pipeline_active_by_repo()
                                 } else {
                                     self.pipeline_repos_for_state(lc_key)
                                 };
@@ -4805,11 +4809,11 @@ impl CoordApp {
                     }
                     SidebarEvent::RowToggleExpand { section, ref path } if path.len() == 2 => {
                         // #668/#1069: A two-level path = a milestone sub-header
-                        // was toggled, within either a New section (grouped
-                        // repo → milestone) or an In-progress section (grouped
-                        // liveness → milestone).  Persist the state in
+                        // was toggled, within either a New section or an
+                        // In-progress section — both grouped repo → milestone
+                        // (#1487).  Persist the state in
                         // pipeline_milestone_expanded keyed by (lc_key,
-                        // repo_key_or_liveness_key, milestone_key).
+                        // repo_key, milestone_key).
                         // Refining/Pending have no milestone tier, so a
                         // path.len()==2 there is an issue row (not a header) —
                         // those sections handle selection via RowSelected, not
@@ -4850,7 +4854,7 @@ impl CoordApp {
                                         }
                                     }
                                 } else if lc_key == "in-progress" {
-                                    let groups = self.pipeline_active_by_liveness();
+                                    let groups = self.pipeline_active_by_repo();
                                     let gi = path[0] as usize;
                                     let mi = path[1] as usize;
                                     if let Some((group_key, issue_idxs)) = groups.get(gi) {
