@@ -933,9 +933,20 @@ def reconcile(board: Board, config: Config) -> list[str]:
     # dispatch_pending_reviews() bounds this with a per-pass cap + surge gate
     # (flood guard, incident 2026-06-08) and applies the #459 active-fix
     # dedupe, so a backlog unmasking can't flood metered reviews.
-    from coord.review import dispatch_pending_reviews
+    from coord.review import dispatch_pending_reviews, dispatch_scoped_reviews_for_queue
 
     for review in dispatch_pending_reviews(board, config):
+        if review.assignment_id is not None:
+            changed.append(review.assignment_id)
+
+    # #1476: a conflict-fix rebase can void an already-approved review by
+    # changing content (patch-id mismatch) without any other new commit —
+    # dispatch a re-review SCOPED to just the resolution delta instead of
+    # leaving the merge entry blocked until a human notices and forces a
+    # full re-review. Independent of dispatch_pending_reviews above (that
+    # one looks at completed WORK rows; this one looks at PENDING merge
+    # queue entries whose approval a rebase just voided).
+    for review in dispatch_scoped_reviews_for_queue(board, config):
         if review.assignment_id is not None:
             changed.append(review.assignment_id)
 

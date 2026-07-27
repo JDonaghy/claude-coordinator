@@ -1375,6 +1375,190 @@ class TestReviewGate:
         assert items[0].state == PENDING  # dry-run: state untouched
 
 
+class TestScopedReviewCandidate:
+    """#1476: find_scoped_review_candidate / only_conflict_fix_since_review —
+    the pure-logic gate deciding whether a voided approval qualifies for a
+    re-review SCOPED to the conflict-fix resolution delta instead of a full
+    re-review of the whole PR."""
+
+    @staticmethod
+    def _board(active=None, completed=None):
+        from coord.models import Board
+        return Board(active=list(active or []), completed=list(completed or []))
+
+    @staticmethod
+    def _work(aid: str = "w1") -> Assignment:
+        return Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id=aid, type="work", status="done", branch=f"worker/{aid}",
+        )
+
+    @staticmethod
+    def _review(
+        of_aid: str, *, verdict: str | None = "approve", status: str = "done",
+        head_sha: str | None = "abc123", patch_id: str | None = "patchid-old",
+        dispatched_at: float = 100.0,
+    ) -> Assignment:
+        return Assignment(
+            machine_name="m2", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id=f"rev-{of_aid}", type="review", status=status,
+            review_of_assignment_id=of_aid, review_verdict=verdict,
+            review_head_sha=head_sha, review_patch_id=patch_id,
+            dispatched_at=dispatched_at,
+        )
+
+    @staticmethod
+    def _conflict_fix(
+        merge_entry_id: str, *, status: str = "done", dispatched_at: float = 200.0,
+    ) -> Assignment:
+        return Assignment(
+            machine_name="m1", repo_name="api", issue_number=1,
+            issue_title="[conflict-fix] t", assignment_id="cf1",
+            type="conflict-fix", status=status,
+            review_of_assignment_id=merge_entry_id, dispatched_at=dispatched_at,
+        )
+
+    def _voided_entry(self) -> QueuedMerge:
+        entry = _q("w1", branch="worker/w1")
+        entry.branch_head_sha = "def456"
+        entry.branch_patch_id = "patchid-new"
+        return entry
+
+    # ── find_scoped_review_candidate ───────────────────────────────────────
+
+    def test_finds_candidate_on_patch_id_mismatch(self) -> None:
+        work = self._work("w1")
+        review = self._review("w1")
+        board = self._board(completed=[work, review])
+        entry = self._voided_entry()
+        found = mq.find_scoped_review_candidate(entry, board)
+        assert found is review
+
+    def test_returns_none_when_content_identical(self) -> None:
+        """#1475 already carries this approval forward — nothing to scope."""
+        work = self._work("w1")
+        review = self._review("w1", patch_id="patchid-same")
+        board = self._board(completed=[work, review])
+        entry = _q("w1", branch="worker/w1")
+        entry.branch_head_sha = "def456"
+        entry.branch_patch_id = "patchid-same"
+        assert mq.find_scoped_review_candidate(entry, board) is None
+
+    def test_returns_none_when_sha_unchanged(self) -> None:
+        work = self._work("w1")
+        review = self._review("w1", head_sha="abc123")
+        board = self._board(completed=[work, review])
+        entry = _q("w1", branch="worker/w1")
+        entry.branch_head_sha = "abc123"  # nothing moved
+        entry.branch_patch_id = "patchid-old"
+        assert mq.find_scoped_review_candidate(entry, board) is None
+
+    def test_returns_none_when_review_patch_id_missing(self) -> None:
+        """Fail closed — an unconfirmable diff gets a full review."""
+        work = self._work("w1")
+        review = self._review("w1", patch_id=None)
+        board = self._board(completed=[work, review])
+        entry = self._voided_entry()
+        assert mq.find_scoped_review_candidate(entry, board) is None
+
+    def test_returns_none_when_current_patch_id_missing(self) -> None:
+        work = self._work("w1")
+        review = self._review("w1")
+        board = self._board(completed=[work, review])
+        entry = _q("w1", branch="worker/w1")
+        entry.branch_head_sha = "def456"
+        entry.branch_patch_id = None
+        assert mq.find_scoped_review_candidate(entry, board) is None
+
+    def test_returns_none_when_no_review_at_all(self) -> None:
+        work = self._work("w1")
+        board = self._board(completed=[work])
+        entry = self._voided_entry()
+        assert mq.find_scoped_review_candidate(entry, board) is None
+
+    def test_returns_none_when_verdict_was_request_changes(self) -> None:
+        work = self._work("w1")
+        review = self._review("w1", verdict="request-changes")
+        board = self._board(completed=[work, review])
+        entry = self._voided_entry()
+        assert mq.find_scoped_review_candidate(entry, board) is None
+
+    # ── only_conflict_fix_since_review ──────────────────────────────────────
+
+    def test_true_when_only_a_conflict_fix_intervened(self) -> None:
+        work = self._work("w1")
+        review = self._review("w1", dispatched_at=100.0)
+        cf = self._conflict_fix("w1", dispatched_at=200.0)
+        board = self._board(completed=[work, review, cf])
+        entry = self._voided_entry()
+        assert mq.only_conflict_fix_since_review(entry, board, review) is True
+
+    def test_false_when_no_conflict_fix_found(self) -> None:
+        """Nothing to attribute the content change to — fail closed."""
+        work = self._work("w1")
+        review = self._review("w1", dispatched_at=100.0)
+        board = self._board(completed=[work, review])
+        entry = self._voided_entry()
+        assert mq.only_conflict_fix_since_review(entry, board, review) is False
+
+    def test_false_when_a_fix_round_also_ran_after_the_review(self) -> None:
+        """Guardrail: any other new commit ⇒ full review, not scoped."""
+        work = self._work("w1")
+        review = self._review("w1", dispatched_at=100.0)
+        cf = self._conflict_fix("w1", dispatched_at=200.0)
+        fix_work = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1,
+            issue_title="[fix-1] t", assignment_id="fix1", type="work",
+            status="done", branch="worker/w1",
+            review_of_assignment_id="w1", dispatched_at=250.0,
+        )
+        board = self._board(completed=[work, review, cf, fix_work])
+        entry = self._voided_entry()
+        assert mq.only_conflict_fix_since_review(entry, board, review) is False
+
+    def test_conflict_fix_before_review_not_relevant(self) -> None:
+        """A conflict-fix that ran BEFORE this review doesn't count as the
+        source of the post-approval content change — fail closed."""
+        work = self._work("w1")
+        review = self._review("w1", dispatched_at=300.0)
+        cf = self._conflict_fix("w1", dispatched_at=100.0)  # earlier
+        board = self._board(completed=[work, review, cf])
+        entry = self._voided_entry()
+        assert mq.only_conflict_fix_since_review(entry, board, review) is False
+
+    def test_ignores_conflict_fix_for_a_different_entry(self) -> None:
+        work = self._work("w1")
+        review = self._review("w1", dispatched_at=100.0)
+        cf = self._conflict_fix("other-entry", dispatched_at=200.0)
+        board = self._board(completed=[work, review, cf])
+        entry = self._voided_entry()
+        assert mq.only_conflict_fix_since_review(entry, board, review) is False
+
+    def test_ignores_failed_conflict_fix(self) -> None:
+        work = self._work("w1")
+        review = self._review("w1", dispatched_at=100.0)
+        cf = self._conflict_fix("w1", status="failed", dispatched_at=200.0)
+        board = self._board(completed=[work, review, cf])
+        entry = self._voided_entry()
+        assert mq.only_conflict_fix_since_review(entry, board, review) is False
+
+    def test_fix_round_before_review_does_not_disqualify(self) -> None:
+        """A fix round that ran BEFORE the review (and so is exactly what the
+        review covered) must not itself disqualify the scoped path."""
+        earlier_fix = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1,
+            issue_title="[fix-1] t", assignment_id="fix1", type="work",
+            status="done", branch="worker/w1",
+            review_of_assignment_id="w1", dispatched_at=50.0,
+        )
+        work = self._work("w1")
+        review = self._review("w1", dispatched_at=100.0)
+        cf = self._conflict_fix("w1", dispatched_at=200.0)
+        board = self._board(completed=[work, earlier_fix, review, cf])
+        entry = self._voided_entry()
+        assert mq.only_conflict_fix_since_review(entry, board, review) is True
+
+
 class TestPassesMergeGates:
     """#946: passes_merge_gates() is the shared predicate composing the
     review + smoke gates, used by every enqueue path (enqueue_approved_work,

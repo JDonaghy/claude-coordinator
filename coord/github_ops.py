@@ -1103,6 +1103,28 @@ def compute_patch_id(diff_text: str | None) -> str | None:
     return line.split()[0]
 
 
+def get_compare_diff(repo: str, base: str, head: str) -> str | None:
+    """Return the raw three-dot (``base...head``) unified diff text, or None.
+
+    *head* may be a branch name or a commit SHA — GitHub's compare API treats
+    them identically, so this also works for a historical SHA that is no
+    longer any branch's tip (e.g. the HEAD a review approved before a
+    conflict-fix rebase moved the branch on, #1476). Factored out of
+    :func:`get_branch_patch_id` so a scoped re-review can fetch the diff for
+    an old SHA as well as the current branch tip, without duplicating the
+    ``gh api compare`` call shape. Returns ``None`` on any ``gh`` failure —
+    callers must fail closed (missing diff ⇒ cannot confirm anything about
+    its content).
+    """
+    try:
+        return _gh(
+            "api", f"repos/{repo}/compare/{base}...{head}",
+            "-H", "Accept: application/vnd.github.v3.diff",
+        )
+    except RuntimeError:
+        return None
+
+
 def get_branch_patch_id(repo: str, base: str, branch: str) -> str | None:
     """Return the content-addressed patch-id for *branch*'s diff against *base*.
 
@@ -1113,14 +1135,7 @@ def get_branch_patch_id(repo: str, base: str, branch: str) -> str | None:
     content" and falls back to the pre-#1475 SHA-only staleness check
     (fail closed).
     """
-    try:
-        diff = _gh(
-            "api", f"repos/{repo}/compare/{base}...{branch}",
-            "-H", "Accept: application/vnd.github.v3.diff",
-        )
-    except RuntimeError:
-        return None
-    return compute_patch_id(diff)
+    return compute_patch_id(get_compare_diff(repo, base, branch))
 
 
 def create_pr(

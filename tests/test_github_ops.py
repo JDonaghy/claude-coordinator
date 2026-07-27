@@ -1123,3 +1123,42 @@ class TestGetBranchPatchId:
     def test_returns_none_on_gh_error(self) -> None:
         with patch("coord.github_ops._gh", side_effect=RuntimeError("gh boom")):
             assert github_ops.get_branch_patch_id("acme/api", "main", "feature") is None
+
+
+class TestGetCompareDiff:
+    """#1476: the raw three-dot diff fetch factored out of get_branch_patch_id
+    so a scoped re-review can fetch the diff for a historical SHA too."""
+
+    def test_fetches_the_compare_diff(self) -> None:
+        diff = _unified_diff("hello")
+        with patch("coord.github_ops._gh", return_value=diff) as mock_gh:
+            result = github_ops.get_compare_diff("acme/api", "main", "feature")
+        assert result == diff
+        args = mock_gh.call_args.args
+        assert args[0] == "api"
+        assert args[1] == "repos/acme/api/compare/main...feature"
+
+    def test_works_with_a_sha_as_head(self) -> None:
+        """A SHA that is no longer any branch's tip — e.g. a review's
+        review_head_sha after a conflict-fix rebase moved the branch on —
+        is a valid `head` just like a branch name; GitHub's compare API
+        doesn't distinguish them."""
+        diff = _unified_diff("hello")
+        with patch("coord.github_ops._gh", return_value=diff) as mock_gh:
+            result = github_ops.get_compare_diff("acme/api", "main", "deadbeef1234")
+        assert result == diff
+        args = mock_gh.call_args.args
+        assert args[1] == "repos/acme/api/compare/main...deadbeef1234"
+
+    def test_returns_none_on_gh_error(self) -> None:
+        with patch("coord.github_ops._gh", side_effect=RuntimeError("gh boom")):
+            assert github_ops.get_compare_diff("acme/api", "main", "feature") is None
+
+    def test_get_branch_patch_id_delegates_to_get_compare_diff(self) -> None:
+        """Refactor guard: get_branch_patch_id must still hash exactly the
+        diff get_compare_diff would fetch (#1475 behaviour unchanged)."""
+        diff = _unified_diff("hello")
+        with patch("coord.github_ops.get_compare_diff", return_value=diff) as mock_diff:
+            result = github_ops.get_branch_patch_id("acme/api", "main", "feature")
+        mock_diff.assert_called_once_with("acme/api", "main", "feature")
+        assert result == github_ops.compute_patch_id(diff)

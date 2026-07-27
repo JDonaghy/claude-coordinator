@@ -226,6 +226,113 @@ def has_approved_review(entry: "QueuedMerge", board) -> bool:
     return False
 
 
+def find_scoped_review_candidate(entry: "QueuedMerge", board) -> Assignment | None:
+    """Return the previously-approved review whose approval was voided
+    ONLY by a content-changing rebase (#1476), or ``None``.
+
+    Mirrors :func:`has_approved_review`'s SHA/patch-id staleness walk but
+    returns the review :class:`~coord.models.Assignment` itself (not a
+    bool) — a scoped re-review needs the prior review's ``review_head_sha``
+    (the base to diff the resolution from) and ``briefing``/findings as
+    established context, not just a yes/no.
+
+    Returns ``None`` — meaning "not this path, fall back to a full review"
+    — when:
+
+    - No approved review exists for *entry*'s work chain at all.
+    - The branch's current SHA/patch-id aren't both known (can't confirm
+      anything changed).
+    - The most-recently-matched approved review's SHA still matches the
+      current one (nothing changed — not stale at all).
+    - Its patch-id still matches the current one (content-identical
+      rebase — :func:`has_approved_review` already carries this forward,
+      there is no delta to scope a review around).
+    - Either patch-id is missing (fail closed, same posture as
+      ``has_approved_review``: an unconfirmable diff gets a full review,
+      never a guessed-at scoped one).
+    """
+    pool = list(getattr(board, "completed", []) or []) + list(getattr(board, "active", []) or [])
+    branch_work_ids = _chain_work_ids(entry, pool)
+    if not branch_work_ids:
+        return None
+
+    current_sha = getattr(entry, "branch_head_sha", None)
+    current_patch_id = getattr(entry, "branch_patch_id", None)
+    if current_sha is None or current_patch_id is None:
+        return None
+
+    for a in pool:
+        if getattr(a, "type", None) != "review":
+            continue
+        if getattr(a, "review_of_assignment_id", None) not in branch_work_ids:
+            continue
+        if getattr(a, "review_verdict", None) != "approve":
+            continue
+        review_sha = getattr(a, "review_head_sha", None)
+        if review_sha is None or review_sha == current_sha:
+            continue  # not stale, or SHA tracking unavailable — not this path
+        review_patch_id = getattr(a, "review_patch_id", None)
+        if review_patch_id is None:
+            continue  # fail closed — cannot confirm scope, full review
+        if review_patch_id == current_patch_id:
+            continue  # content-identical — has_approved_review already covers it
+        return a  # approval voided ONLY by a content-changing rebase
+    return None
+
+
+def only_conflict_fix_since_review(entry: "QueuedMerge", board, review: Assignment) -> bool:
+    """True when the sole thing that changed *entry*'s branch since *review*
+    approved it was one or more successful conflict-fix rebases (#1476's
+    scoping guardrail) — i.e. a scoped review is safe to dispatch.
+
+    False (⇒ the caller must fall back to a full review) when:
+
+    - No successful (``status="done"``) conflict-fix for this merge entry is
+      found at all — there is nothing to attribute the content change to,
+      and guessing would be unsound.
+    - Any other :data:`~coord.models.WORK_LIKE_TYPES` assignment in the
+      branch's work chain (a fix/bounce round, a fresh work dispatch — i.e.
+      a genuine new commit, not a rebase) was dispatched after *review* ran.
+
+    Dispatch order, not completion order, is what's compared against
+    *review*'s own dispatch time — a fix round that was *in flight* when the
+    review was dispatched (and so is exactly what the review covered) must
+    not itself disqualify the scoped path; only a fix/work round that
+    started **after** the approval counts as "another commit".
+    """
+    pool = list(getattr(board, "completed", []) or []) + list(getattr(board, "active", []) or [])
+    branch_work_ids = _chain_work_ids(entry, pool)
+    review_dispatched_at = getattr(review, "dispatched_at", None)
+
+    found_conflict_fix = False
+    for a in pool:
+        atype = getattr(a, "type", None)
+        a_dispatched_at = getattr(a, "dispatched_at", None)
+        if atype == "conflict-fix":
+            if getattr(a, "review_of_assignment_id", None) != entry.assignment_id:
+                continue
+            if getattr(a, "status", None) != "done":
+                continue
+            if (
+                review_dispatched_at is not None
+                and a_dispatched_at is not None
+                and a_dispatched_at < review_dispatched_at
+            ):
+                continue  # a conflict-fix from BEFORE this review isn't relevant
+            found_conflict_fix = True
+            continue
+        if atype in WORK_LIKE_TYPES:
+            if getattr(a, "assignment_id", None) not in branch_work_ids:
+                continue
+            if (
+                review_dispatched_at is not None
+                and a_dispatched_at is not None
+                and a_dispatched_at > review_dispatched_at
+            ):
+                return False  # a new work/fix round happened — not conflict-fix-only
+    return found_conflict_fix
+
+
 # ── Smoke gate (#465) ──────────────────────────────────────────────────────
 
 def requires_smoke(entry: "QueuedMerge", config) -> bool:

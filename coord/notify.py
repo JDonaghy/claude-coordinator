@@ -1806,7 +1806,7 @@ def _dispatch_board_pending_reviews(config: Config) -> None:
     Safe to call even when the board file doesn't exist.
     """
     from coord.board_service import read_board, write_board
-    from coord.review import dispatch_pending_reviews
+    from coord.review import dispatch_pending_reviews, dispatch_scoped_reviews_for_queue
 
     # #749: read_board()/write_board() route through the daemon when
     # board_service is configured, so this no longer silently no-ops on a
@@ -1820,6 +1820,12 @@ def _dispatch_board_pending_reviews(config: Config) -> None:
     # the bulk-dispatch flood guard (per-pass cap + surge gate, incident
     # 2026-06-08) and the #459 active-fix dedupe, so notify can't flood either.
     dispatched = dispatch_pending_reviews(board, config)
+
+    # #1476: same scoped-re-review dispatch reconcile() runs, so a conflict-fix
+    # that voids an approval by changing content gets a delta-scoped re-review
+    # from `coord notify` too, not just `coord status --reconcile`.
+    dispatched = dispatched + dispatch_scoped_reviews_for_queue(board, config)
+
     if dispatched:
         write_board(board)
 

@@ -127,6 +127,8 @@ export interface Assignment {
   review_verdict_override_reason: string | null
   review_head_sha: string | null
   review_patch_id: string | null
+  review_scoped: boolean
+  review_scope_base_sha: string | null
   cost_usd: number | null
   smoke_tests: string[] | null
   provider_name: string | null

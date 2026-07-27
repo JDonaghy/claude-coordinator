@@ -9,13 +9,18 @@ from pathlib import Path
 import pytest
 
 from coord.config import Config, PipelineConfig, ReviewsConfig, load
+from coord.merge_queue import QueuedMerge
 from coord.models import Assignment, Board, Machine, Repo
 from coord.review import (
     REVIEWER_SYSTEM_PROMPT,
     ReviewFindings,
     build_review_briefing,
+    build_scoped_review_briefing,
+    compute_resolution_delta,
     dispatch_pending_reviews,
     dispatch_review,
+    dispatch_scoped_review,
+    dispatch_scoped_reviews_for_queue,
     parse_review_from_log,
     pick_reviewer_machine,
 )
@@ -1432,6 +1437,372 @@ def test_dispatch_review_records_to_dispatched_ledger(
     assert records[0]["assignment_id"] == "review-ledger-1"
     assert records[0]["repo_github"] == "acme/api"
     assert records[0]["machine_name"] == "server"
+
+
+# ── #1476: scoped re-review ──────────────────────────────────────────────────
+
+
+def test_compute_resolution_delta_shows_only_the_changed_hunk() -> None:
+    old = (
+        "diff --git a/f.py b/f.py\n"
+        "--- a/f.py\n+++ b/f.py\n"
+        "@@ -1,3 +1,3 @@\n"
+        "-old line\n+kept line\n context\n"
+    )
+    new = (
+        "diff --git a/f.py b/f.py\n"
+        "--- a/f.py\n+++ b/f.py\n"
+        "@@ -1,3 +1,3 @@\n"
+        "-old line\n+resolved line\n context\n"
+    )
+    delta = compute_resolution_delta(old, new)
+    assert delta is not None
+    assert "resolved line" in delta
+    assert "kept line" in delta
+
+
+def test_compute_resolution_delta_none_when_old_missing() -> None:
+    assert compute_resolution_delta(None, "some diff") is None
+    assert compute_resolution_delta("", "some diff") is None
+    assert compute_resolution_delta("   ", "some diff") is None
+
+
+def test_compute_resolution_delta_none_when_new_missing() -> None:
+    assert compute_resolution_delta("some diff", None) is None
+    assert compute_resolution_delta("some diff", "") is None
+
+
+def test_compute_resolution_delta_none_when_identical() -> None:
+    text = "identical diff text\nline two\n"
+    assert compute_resolution_delta(text, text) is None
+
+
+def test_scoped_briefing_contains_delta_and_established_context_framing() -> None:
+    briefing = build_scoped_review_briefing(
+        pr_number=42,
+        pr_url="https://github.com/acme/api/pull/42",
+        repo_github="acme/api",
+        repo_name="api",
+        issue_number=7,
+        issue_title="Add feature",
+        branch="issue-7-fix",
+        resolution_delta="-old resolution\n+new resolution\n",
+        default_branch="main",
+    )
+    assert "**already approved**" in briefing
+    assert "do NOT need to re-review the whole PR" in briefing
+    assert "-old resolution" in briefing
+    assert "+new resolution" in briefing
+    assert "REVIEW_VERDICT: approve" in briefing
+    assert "END_REVIEW" in briefing
+    assert "## Blocking findings" in briefing
+    assert "## Non-blocking concerns" in briefing
+    assert "## Nits" in briefing
+
+
+def _scoped_entry(**overrides) -> QueuedMerge:
+    defaults = dict(
+        assignment_id="w1",
+        repo_name="api",
+        repo_github="acme/api",
+        branch="issue-1-fix",
+        target_branch="main",
+        issue_number=1,
+        issue_title="Fix the thing",
+        pr_number=42,
+        pr_url="https://github.com/acme/api/pull/42",
+    )
+    defaults.update(overrides)
+    return QueuedMerge(**defaults)
+
+
+def _scoped_prior_review(**overrides) -> Assignment:
+    defaults = dict(
+        machine_name="laptop",
+        repo_name="api",
+        issue_number=1,
+        issue_title="[review] Fix the thing",
+        assignment_id="rev1",
+        type="review",
+        status="done",
+        review_of_assignment_id="w1",
+        review_verdict="approve",
+        review_head_sha="oldsha",
+        review_patch_id="patchid-old",
+        dispatched_at=100.0,
+    )
+    defaults.update(overrides)
+    return Assignment(**defaults)
+
+
+def _scoped_diff_fetcher(repo: str, base: str, ref: str) -> str:
+    if ref == "oldsha":
+        return (
+            "diff --git a/f.py b/f.py\n@@ -1 +1 @@\n-old\n+kept-from-before\n"
+        )
+    return "diff --git a/f.py b/f.py\n@@ -1 +1 @@\n-old\n+conflict-fix-resolution\n"
+
+
+def test_dispatch_scoped_review_dispatches_with_delta_in_briefing(
+    two_machine_config: Config,
+) -> None:
+    board = Board()
+    entry = _scoped_entry()
+    prior = _scoped_prior_review()
+    client = _FakeHTTPClient({"id": "scoped-1"})
+
+    result = dispatch_scoped_review(
+        entry, prior, board, two_machine_config,
+        http_client=client, now=999.0, diff_fetcher=_scoped_diff_fetcher,
+    )
+
+    assert result is not None
+    assert result.type == "review"
+    assert result.status == "running"
+    assert result.assignment_id == "scoped-1"
+    assert result.dispatched_at == 999.0
+    assert board.active == [result]
+
+    # #1476 audit trail.
+    assert result.review_scoped is True
+    assert result.review_scope_base_sha == "oldsha"
+    # Same parent as the review being superseded — the existing fix/re-review
+    # auto-loop keys off this exactly like a full review.
+    assert result.review_of_assignment_id == "w1"
+
+    _, payload = client.calls[0]
+    assert payload["type"] == "review"
+    assert "conflict-fix-resolution" in payload["briefing"]
+    assert "kept-from-before" in payload["briefing"]
+
+
+def test_dispatch_scoped_review_returns_none_when_delta_unavailable(
+    two_machine_config: Config,
+) -> None:
+    board = Board()
+    entry = _scoped_entry()
+    prior = _scoped_prior_review()
+
+    result = dispatch_scoped_review(
+        entry, prior, board, two_machine_config,
+        http_client=_FakeHTTPClient({"id": "scoped-1"}),
+        diff_fetcher=lambda repo, base, ref: None,  # gh fetch failed both sides
+    )
+    assert result is None
+    assert board.active == []
+
+
+def test_dispatch_scoped_review_returns_none_when_reviews_disabled(repo: Repo) -> None:
+    cfg = Config(
+        repos=[repo],
+        machines=[Machine(name="laptop", host="laptop.tail", capabilities=["python"],
+                           repos=["api"], repo_paths={"api": "/work/api"})],
+        reviews=ReviewsConfig(enabled=False, auto_dispatch=True),
+    )
+    board = Board()
+    result = dispatch_scoped_review(
+        _scoped_entry(), _scoped_prior_review(), board, cfg,
+        diff_fetcher=_scoped_diff_fetcher,
+    )
+    assert result is None
+
+
+def test_dispatch_scoped_review_returns_none_without_prior_head_sha(
+    two_machine_config: Config,
+) -> None:
+    """Fail closed — no SHA to diff from means no scope can be computed."""
+    board = Board()
+    prior = _scoped_prior_review(review_head_sha=None)
+    result = dispatch_scoped_review(
+        _scoped_entry(), prior, board, two_machine_config,
+        diff_fetcher=_scoped_diff_fetcher,
+    )
+    assert result is None
+
+
+def test_dispatch_scoped_reviews_for_queue_dispatches_when_eligible(
+    two_machine_config: Config,
+) -> None:
+    from coord import merge_queue as mq
+
+    work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1, issue_title="t",
+        assignment_id="w1", type="work", status="done", branch="issue-1-fix",
+    )
+    prior = _scoped_prior_review()
+    cf = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1,
+        issue_title="[conflict-fix] t", assignment_id="cf1", type="conflict-fix",
+        status="done", review_of_assignment_id="w1", dispatched_at=200.0,
+    )
+    board = Board(completed=[work, prior, cf])
+    entry = _scoped_entry(state=mq.PENDING)
+    entry.branch_head_sha = "newsha"
+    entry.branch_patch_id = "patchid-new"  # differs from prior.review_patch_id
+
+    client = _FakeHTTPClient({"id": "scoped-2"})
+    dispatched = dispatch_scoped_reviews_for_queue(
+        board, two_machine_config,
+        queue_items=[entry],
+        http_client=client,
+        diff_fetcher=_scoped_diff_fetcher,
+    )
+
+    assert len(dispatched) == 1
+    assert dispatched[0].review_scoped is True
+    assert dispatched[0].review_of_assignment_id == "w1"
+
+
+def test_dispatch_scoped_reviews_for_queue_falls_back_when_fix_round_intervened(
+    two_machine_config: Config,
+) -> None:
+    """Guardrail: a work/fix commit (not just a conflict-fix) intervened
+    since the approval — this path must not fire; a full review is needed."""
+    from coord import merge_queue as mq
+
+    work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1, issue_title="t",
+        assignment_id="w1", type="work", status="done", branch="issue-1-fix",
+    )
+    prior = _scoped_prior_review()
+    cf = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1,
+        issue_title="[conflict-fix] t", assignment_id="cf1", type="conflict-fix",
+        status="done", review_of_assignment_id="w1", dispatched_at=200.0,
+    )
+    fix_work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1,
+        issue_title="[fix-1] t", assignment_id="fix1", type="work", status="done",
+        branch="issue-1-fix", review_of_assignment_id="w1", dispatched_at=250.0,
+    )
+    board = Board(completed=[work, prior, cf, fix_work])
+    entry = _scoped_entry(state=mq.PENDING)
+    entry.branch_head_sha = "newsha"
+    entry.branch_patch_id = "patchid-new"
+
+    dispatched = dispatch_scoped_reviews_for_queue(
+        board, two_machine_config,
+        queue_items=[entry],
+        http_client=_FakeHTTPClient({"id": "scoped-3"}),
+        diff_fetcher=_scoped_diff_fetcher,
+    )
+    assert dispatched == []
+
+
+def test_dispatch_scoped_reviews_for_queue_skips_when_already_approved(
+    two_machine_config: Config,
+) -> None:
+    """A content-identical rebase (#1475) already carries the approval
+    forward — nothing for the scoped path to do."""
+    from coord import merge_queue as mq
+
+    work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1, issue_title="t",
+        assignment_id="w1", type="work", status="done", branch="issue-1-fix",
+    )
+    prior = _scoped_prior_review(review_patch_id="patchid-same")
+    board = Board(completed=[work, prior])
+    entry = _scoped_entry(state=mq.PENDING)
+    entry.branch_head_sha = "newsha"
+    entry.branch_patch_id = "patchid-same"
+
+    dispatched = dispatch_scoped_reviews_for_queue(
+        board, two_machine_config,
+        queue_items=[entry],
+        http_client=_FakeHTTPClient({"id": "scoped-4"}),
+        diff_fetcher=_scoped_diff_fetcher,
+    )
+    assert dispatched == []
+
+
+def test_dispatch_scoped_reviews_for_queue_dedupes_already_handled_entry(
+    two_machine_config: Config,
+) -> None:
+    """A review already dispatched after the prior approval — scoped or
+    full — means don't fire a second one for the same voided approval."""
+    from coord import merge_queue as mq
+
+    work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1, issue_title="t",
+        assignment_id="w1", type="work", status="done", branch="issue-1-fix",
+    )
+    prior = _scoped_prior_review()
+    cf = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1,
+        issue_title="[conflict-fix] t", assignment_id="cf1", type="conflict-fix",
+        status="done", review_of_assignment_id="w1", dispatched_at=200.0,
+    )
+    already_dispatched_review = Assignment(
+        machine_name="server", repo_name="api", issue_number=1,
+        issue_title="[scoped-review] t", assignment_id="rev2", type="review",
+        status="running", review_of_assignment_id="w1", dispatched_at=250.0,
+    )
+    board = Board(
+        active=[already_dispatched_review], completed=[work, prior, cf],
+    )
+    entry = _scoped_entry(state=mq.PENDING)
+    entry.branch_head_sha = "newsha"
+    entry.branch_patch_id = "patchid-new"
+
+    dispatched = dispatch_scoped_reviews_for_queue(
+        board, two_machine_config,
+        queue_items=[entry],
+        http_client=_FakeHTTPClient({"id": "scoped-5"}),
+        diff_fetcher=_scoped_diff_fetcher,
+    )
+    assert dispatched == []
+
+
+def test_dispatch_scoped_reviews_for_queue_request_changes_drives_normal_fix_loop(
+    two_machine_config: Config,
+) -> None:
+    """The scoped review's Assignment shape (type='review', same
+    review_of_assignment_id chain, standard REVIEW_VERDICT parsing) must be
+    indistinguishable from a full review to every downstream consumer — a
+    request-changes verdict on it drives the exact same auto_loop fix path.
+    This asserts the dispatched shape carries everything auto_loop's
+    request-changes handling (coord.auto_loop._dispatch_fix and friends)
+    keys off, without needing to re-run the whole auto-loop machinery here.
+    """
+    from coord import merge_queue as mq
+
+    work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1, issue_title="t",
+        assignment_id="w1", type="work", status="done", branch="issue-1-fix",
+    )
+    prior = _scoped_prior_review()
+    cf = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1,
+        issue_title="[conflict-fix] t", assignment_id="cf1", type="conflict-fix",
+        status="done", review_of_assignment_id="w1", dispatched_at=200.0,
+    )
+    board = Board(completed=[work, prior, cf])
+    entry = _scoped_entry(state=mq.PENDING)
+    entry.branch_head_sha = "newsha"
+    entry.branch_patch_id = "patchid-new"
+
+    dispatched = dispatch_scoped_reviews_for_queue(
+        board, two_machine_config,
+        queue_items=[entry],
+        http_client=_FakeHTTPClient({"id": "scoped-6"}),
+        diff_fetcher=_scoped_diff_fetcher,
+    )
+    assert len(dispatched) == 1
+    scoped_review = dispatched[0]
+
+    # Simulate the reviewer coming back with request-changes, the same way
+    # notify.py would record it on any ordinary review assignment.
+    scoped_review.review_verdict = "request-changes"
+    scoped_review.status = "done"
+
+    # coord.merge_queue.has_approved_review must see this exactly like a
+    # normal request-changes review — i.e. still blocked.
+    board.active.remove(scoped_review)
+    board.completed.append(scoped_review)
+    assert mq.has_approved_review(entry, board) is False
+    # And auto_loop's chain-resolution finds it under the same parent work
+    # id a full review would have used.
+    assert scoped_review.review_of_assignment_id == "w1"
 
 
 # ── _find_or_open_pr — PR body carries closing keyword (#287) ───────────────

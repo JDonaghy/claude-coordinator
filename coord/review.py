@@ -23,6 +23,7 @@ plumbing — keeping them apart avoids twisting both shapes.
 
 from __future__ import annotations
 
+import difflib
 import logging
 import re
 import time
@@ -1933,6 +1934,456 @@ def dispatch_pending_reviews(board, config, *, test_gate_active: bool = False, n
             held,
             cap,
         )
+    return dispatched
+
+
+# ── Scoped re-review (#1476) ─────────────────────────────────────────────────
+#
+# When a conflict-fix rebase changes content under an already-`approve`d
+# review (the branch's patch-id no longer matches the one the review covered
+# — see #1475), `has_approved_review` correctly voids the stale approval, but
+# the only way to get an approval back today is a FULL re-review of the whole
+# PR — even when the conflict-fix resolution touched a handful of lines. The
+# functions below dispatch a review scoped to just that resolution delta
+# instead: the reviewer is told the PR was already approved, handed a diff
+# *of diffs* showing exactly what the rebase changed, and asked to rule on
+# that alone. `coord.merge_queue.find_scoped_review_candidate` /
+# `only_conflict_fix_since_review` gate when this path is eligible; a
+# request-changes verdict here is a completely ordinary `type="review"`
+# assignment (same `review_of_assignment_id` chain, same REVIEW_VERDICT
+# parsing), so the existing fix/re-review auto-loop drives it identically to
+# a full review — nothing downstream needs to know the review was scoped.
+
+
+def compute_resolution_delta(old_diff_text: str | None, new_diff_text: str | None) -> str | None:
+    """Return a unified diff *between* two full unified diffs (#1476).
+
+    A diff of diffs: treats each of *old_diff_text* (the diff a prior review
+    approved) and *new_diff_text* (the branch's current diff) as a plain text
+    blob and runs :mod:`difflib` over them. The result shows exactly the
+    lines a conflict-fix resolution touched — typically a couple of hunks —
+    instead of forcing a reviewer to re-read the whole PR to find them.
+
+    Returns ``None`` when either input is missing/blank (nothing to scope a
+    review around — the caller must fall back to a full review) or when the
+    two diffs are textually identical (no delta to show — shouldn't happen
+    once the caller has already confirmed the patch-ids differ, but this
+    fails safe rather than dispatching a review with an empty "what changed"
+    section).
+    """
+    if not old_diff_text or not old_diff_text.strip():
+        return None
+    if not new_diff_text or not new_diff_text.strip():
+        return None
+    old_lines = old_diff_text.splitlines(keepends=True)
+    new_lines = new_diff_text.splitlines(keepends=True)
+    delta = list(difflib.unified_diff(
+        old_lines, new_lines,
+        fromfile="previously-reviewed diff",
+        tofile="current diff (post conflict-fix)",
+    ))
+    if not delta:
+        return None
+    return "".join(delta)
+
+
+def build_scoped_review_briefing(
+    *,
+    pr_number: int | None,
+    pr_url: str | None,
+    repo_github: str,
+    repo_name: str,
+    issue_number: int,
+    issue_title: str,
+    branch: str | None,
+    resolution_delta: str,
+    default_branch: str = "main",
+) -> str:
+    """Assemble a SCOPED re-review briefing (#1476). Pure function — testable.
+
+    Dispatched when a conflict-fix rebase changed content under an
+    already-approved review with no other intervening work/fix commit
+    (``coord.merge_queue.only_conflict_fix_since_review``). The reviewer is
+    told the PR was already approved — it must not re-derive a verdict
+    already reached — and is handed ONLY the resolution delta
+    (:func:`compute_resolution_delta`) to rule on. This is the whole point:
+    a ~1300-line PR whose conflict-fix resolution was two hunks costs a
+    ~15-line read, not a full re-review (the #1453 motivating case).
+    """
+    lines: list[str] = []
+    lines.append(f"# Scoped re-review: {repo_github} PR #{pr_number}")
+    lines.append("")
+    lines.append(
+        f"You are re-reviewing issue #{issue_number}: {issue_title}. This PR "
+        "was **already approved** by a previous review. Since then, an "
+        "automated conflict-fix worker rebased the branch onto its target "
+        "branch to resolve a merge conflict, and that rebase changed "
+        "content — so the branch's content-fingerprint no longer matches "
+        "what the prior review covered, and the approval was voided."
+    )
+    lines.append("")
+    lines.append(
+        "**You do NOT need to re-review the whole PR.** Everything the "
+        "prior review already approved stands — do not re-litigate it and "
+        "do not raise new findings about code the resolution delta below "
+        "doesn't touch. Your ONLY job is to judge whether the conflict-fix "
+        "resolution itself introduced a real bug or silently dropped "
+        "something either side of the conflict needed."
+    )
+    lines.append("")
+    lines.append("## Context")
+    lines.append(f"- Repo: {repo_github} (local name: {repo_name})")
+    lines.append(f"- Branch: {branch or '(unknown)'}")
+    if pr_url:
+        lines.append(f"- PR URL: {pr_url}")
+    lines.append("")
+    lines.append("## Resolution delta (review THIS)")
+    lines.append("")
+    lines.append(
+        "This is a diff *of diffs* — the difference between the diff the "
+        "prior review approved and the branch's current diff, computed "
+        "with `git patch-id`-fingerprinted content that changed under the "
+        "conflict-fix rebase. A line starting with `-` was in the "
+        "previously-approved diff and is gone now; a line starting with "
+        "`+` is new since the approval. This is exactly what the "
+        "conflict-fix resolution changed — nothing else in the PR did."
+    )
+    lines.append("")
+    lines.append("```diff")
+    lines.append(resolution_delta.strip())
+    lines.append("```")
+    lines.append("")
+    lines.append("## What to do")
+    lines.append("")
+    lines.append(
+        "1. Read the resolution delta above. If a hunk doesn't make sense "
+        "standalone, `git fetch origin && git diff origin/"
+        f"{default_branch}...origin/{branch or 'HEAD'}` gets you the full "
+        "current diff for extra context — but you should rarely need it."
+    )
+    lines.append(
+        "2. `approve` unless the resolution itself introduces a genuine bug "
+        "or silently drops content either side of the conflict needed. "
+        "Do NOT block on style/nit findings about code outside the delta — "
+        "that code was already approved."
+    )
+    lines.append(
+        "3. At the END of your session, output your findings in this exact "
+        "format (the coordinator posts the review to GitHub on your "
+        "behalf — do NOT run any `gh` commands):"
+    )
+    lines.append("")
+    lines.append("```")
+    lines.append("REVIEW_VERDICT: approve")
+    lines.append("REVIEW_BODY:")
+    lines.append("<your full review text in markdown>")
+    lines.append("END_REVIEW")
+    lines.append("```")
+    lines.append("")
+    lines.append(
+        "Use `REVIEW_VERDICT: request-changes` if the resolution introduced "
+        "a real bug."
+    )
+    lines.append(
+        "BODY STRUCTURE — same three headings as a normal review, always "
+        "all three: `## Blocking findings`, `## Non-blocking concerns`, "
+        "`## Nits`. Write the single line `None.` under a heading with "
+        "nothing under it."
+    )
+    lines.append(
+        "FORMAT CONTRACT — `REVIEW_VERDICT:`, `REVIEW_BODY:`, and "
+        "`END_REVIEW` are parsed by machine: plain text at the start of "
+        "their own line, no Markdown decoration. `END_REVIEW` is a HARD "
+        "REQUIREMENT — an otherwise-complete review missing that exact "
+        "line is discarded in its entirety."
+    )
+    return "\n".join(lines)
+
+
+def dispatch_scoped_review(
+    entry,
+    prior_review: Assignment,
+    board: Board,
+    config: Config,
+    *,
+    http_client: httpx.Client | None = None,
+    now: float | None = None,
+    diff_fetcher=None,
+    branch_sha_fetcher=None,
+    patch_id_computer=None,
+) -> Assignment | None:
+    """Dispatch a SCOPED re-review (#1476) for a merge entry whose approval
+    was voided ONLY by a content-changing conflict-fix rebase.
+
+    Caller contract: only call this after
+    :func:`coord.merge_queue.find_scoped_review_candidate` (its result is
+    *prior_review*) and :func:`coord.merge_queue.only_conflict_fix_since_review`
+    (the guardrail) have both confirmed this path applies — mirrors how
+    :func:`dispatch_review` trusts :func:`dispatch_pending_reviews`'s
+    eligibility filter rather than re-deriving it. *entry* is a
+    ``coord.merge_queue.QueuedMerge``.
+
+    *diff_fetcher* defaults to :func:`coord.github_ops.get_compare_diff`
+    (``(repo, base, ref) -> str | None``); inject a stub in tests. Fetches
+    the diff *prior_review* covered (``target_branch...prior_review.
+    review_head_sha``) and the branch's current diff (``target_branch...
+    entry.branch``), computes the resolution delta between them, and — only
+    when that delta is non-empty — dispatches a review briefed on just the
+    delta. Returns ``None`` (caller falls back to a full :func:`dispatch_review`)
+    when either diff can't be fetched, the delta comes back empty, no
+    reviewer machine is available, or every candidate agent rejects the
+    dispatch — never guesses at scope from partial information.
+
+    Returns the new review Assignment (already appended to ``board.active``,
+    with ``review_scoped=True`` and ``review_scope_base_sha=prior_review.
+    review_head_sha`` for the #1476 audit trail) on success.
+    """
+    if not config.reviews.enabled or not config.reviews.auto_dispatch:
+        return None
+    if not prior_review.review_head_sha:
+        return None
+
+    repo = config.repo(entry.repo_name)
+    if repo is None:
+        return None
+    base_branch = entry.target_branch or repo.default_branch
+
+    _diff = diff_fetcher or github_ops.get_compare_diff
+    try:
+        old_diff = _diff(repo.github, base_branch, prior_review.review_head_sha)
+    except Exception:  # noqa: BLE001 — fail-safe: unfetchable old diff → no scope
+        old_diff = None
+    try:
+        new_diff = _diff(repo.github, base_branch, entry.branch)
+    except Exception:  # noqa: BLE001
+        new_diff = None
+
+    delta = compute_resolution_delta(old_diff, new_diff)
+    if delta is None:
+        log.warning(
+            "[review] scoped review for merge entry %s: could not compute a "
+            "resolution delta (old/new diff unavailable or identical) — "
+            "caller should fall back to a full review",
+            entry.assignment_id,
+        )
+        return None
+
+    candidates = _ranked_reviewer_candidates(
+        prior_review.machine_name, entry.repo_name, board, config
+    )
+    if not candidates:
+        return None
+
+    review_model_alias = config.models.default
+    review_model_wire = config.models.resolve(review_model_alias)
+
+    _get_sha = branch_sha_fetcher or github_ops.get_branch_sha
+    review_head_sha: str | None = None
+    try:
+        review_head_sha = _get_sha(repo.github, entry.branch)
+    except Exception:  # noqa: BLE001 — fail-safe: missing SHA is not blocking
+        pass
+
+    _compute_patch_id = patch_id_computer or github_ops.compute_patch_id
+    review_patch_id: str | None = None
+    try:
+        review_patch_id = _compute_patch_id(new_diff)
+    except Exception:  # noqa: BLE001
+        pass
+
+    client = http_client or httpx
+    for machine, _same_as_worker in candidates:
+        repo_path = machine.repo_path(entry.repo_name)
+        if repo_path is None:
+            continue
+
+        briefing = build_scoped_review_briefing(
+            pr_number=entry.pr_number,
+            pr_url=entry.pr_url,
+            repo_github=repo.github,
+            repo_name=repo.name,
+            issue_number=entry.issue_number,
+            issue_title=entry.issue_title,
+            branch=entry.branch,
+            resolution_delta=delta,
+            default_branch=base_branch,
+        )
+
+        payload = {
+            "repo_name": entry.repo_name,
+            "repo_path": repo_path,
+            "issue_number": entry.issue_number,
+            "issue_title": f"[scoped-review] {entry.issue_title}",
+            "briefing": briefing,
+            "files_allowed": [],
+            "files_forbidden": [],
+            "pull_repos": [],
+            "type": "review",
+            "model": review_model_wire,
+            "system_prompt": REVIEWER_SYSTEM_PROMPT,
+            "review_target": str(entry.pr_number) if entry.pr_number else entry.branch,
+            "branch": base_branch or "main",
+        }
+
+        url = f"http://{machine.host}:{AGENT_PORT}/assign"
+        try:
+            resp = client.post(url, json=payload, timeout=15)
+            resp.raise_for_status()
+            agent_response = resp.json()
+        except (httpx.HTTPError, httpx.TimeoutException) as exc:
+            log.warning(
+                "[review] scoped-review agent %s unreachable/rejected (%s) — "
+                "trying next candidate",
+                machine.name, exc,
+            )
+            continue
+
+        review_assignment = Assignment(
+            machine_name=machine.name,
+            repo_name=entry.repo_name,
+            issue_number=entry.issue_number,
+            issue_title=f"[scoped-review] {entry.issue_title}",
+            files_allowed=[],
+            files_forbidden=[],
+            briefing=briefing,
+            assignment_id=agent_response.get("id") or uuid.uuid4().hex[:12],
+            status="running",
+            branch=entry.branch,
+            pr_url=entry.pr_url,
+            dispatched_at=now if now is not None else time.time(),
+            type="review",
+            review_target=str(entry.pr_number) if entry.pr_number else entry.branch,
+            # Same parent as the review being superseded — keeps the
+            # existing work-chain / fix-loop machinery (has_approved_review,
+            # auto_loop's request-changes dispatch) working unmodified.
+            review_of_assignment_id=prior_review.review_of_assignment_id,
+            model=review_model_alias,
+            review_head_sha=review_head_sha,
+            review_patch_id=review_patch_id,
+            # #1476 audit trail.
+            review_scoped=True,
+            review_scope_base_sha=prior_review.review_head_sha,
+        )
+        board.active.append(review_assignment)
+
+        from coord.state import record_dispatched_assignment  # noqa: PLC0415
+        record_dispatched_assignment(
+            assignment=review_assignment,
+            repo_github=repo.github,
+        )
+
+        return review_assignment
+
+    return None
+
+
+def dispatch_scoped_reviews_for_queue(
+    board: Board,
+    config: Config,
+    *,
+    queue_items: list | None = None,
+    http_client: httpx.Client | None = None,
+    now: float | None = None,
+    diff_fetcher=None,
+    branch_sha_fetcher=None,
+    branch_patch_id_fetcher=None,
+    patch_id_computer=None,
+) -> list[Assignment]:
+    """Scan the merge queue for entries eligible for a #1476 SCOPED
+    re-review and dispatch one for each, instead of leaving them blocked on
+    "review required but not approved" until a human notices and manually
+    forces a full re-review.
+
+    Mirrors :func:`dispatch_pending_reviews`'s "bounded pass, caller
+    persists the board" shape so it slots into the same
+    ``reconcile()``/``coord notify`` polling sites; unlike that function it
+    also owns the merge-queue read/write itself (``queue_items`` defaults to
+    :func:`coord.merge_queue.load_queue`, saved back at the end) since the
+    scoped/full distinction is a property of the queue entry, not the board.
+
+    An entry is eligible when: it's ``PENDING`` and review-gated
+    (:func:`coord.merge_queue.requires_review`); it does NOT already have an
+    approved review (:func:`coord.merge_queue.has_approved_review` — a
+    content-identical rebase already carries the approval forward and needs
+    nothing further);
+    :func:`coord.merge_queue.find_scoped_review_candidate` finds a prior
+    `approve`d review voided ONLY by a content-changing rebase; and
+    :func:`coord.merge_queue.only_conflict_fix_since_review` confirms no
+    other work/fix commit intervened. Entries failing any of these are left
+    untouched for the existing full-review paths to handle. A dedupe check
+    skips entries where a review dispatched after the prior approval is
+    already in flight or completed, so a slow reconcile loop can't fire two
+    scoped reviews for the same voided approval.
+
+    Returns the dispatched review Assignments (already on ``board.active``).
+    """
+    from coord import merge_queue as mq  # noqa: PLC0415
+
+    if not config.reviews.enabled or not config.reviews.auto_dispatch:
+        return []
+
+    items = queue_items if queue_items is not None else mq.load_queue()
+    _get_sha = branch_sha_fetcher or github_ops.get_branch_sha
+    _get_branch_patch_id = branch_patch_id_fetcher or github_ops.get_branch_patch_id
+
+    dispatched: list[Assignment] = []
+    mutated = False
+    for entry in items:
+        if entry.state != mq.PENDING:
+            continue
+        if not mq.requires_review(entry, config):
+            continue
+
+        if entry.branch_head_sha is None:
+            try:
+                entry.branch_head_sha = _get_sha(entry.repo_github, entry.branch)
+                mutated = True
+            except Exception:  # noqa: BLE001 — fail-safe: leave unset
+                pass
+        if entry.branch_patch_id is None:
+            try:
+                entry.branch_patch_id = _get_branch_patch_id(
+                    entry.repo_github, entry.target_branch, entry.branch
+                )
+                mutated = True
+            except Exception:  # noqa: BLE001
+                pass
+
+        if mq.has_approved_review(entry, board):
+            continue  # not stale, or a content-identical rebase covers it (#1475)
+
+        prior_review = mq.find_scoped_review_candidate(entry, board)
+        if prior_review is None:
+            continue  # no scoped candidate — needs a full review, not this path
+
+        if not mq.only_conflict_fix_since_review(entry, board, prior_review):
+            continue  # guardrail: another commit intervened — full review required
+
+        pool = list(board.active) + list(board.completed)
+        already_handled = any(
+            a.type == "review"
+            and a.review_of_assignment_id == prior_review.review_of_assignment_id
+            and a.assignment_id != prior_review.assignment_id
+            and (a.dispatched_at or 0) > (prior_review.dispatched_at or 0)
+            for a in pool
+        )
+        if already_handled:
+            continue
+
+        review = dispatch_scoped_review(
+            entry, prior_review, board, config,
+            http_client=http_client,
+            now=now,
+            diff_fetcher=diff_fetcher,
+            branch_sha_fetcher=branch_sha_fetcher,
+            patch_id_computer=patch_id_computer,
+        )
+        if review is not None:
+            dispatched.append(review)
+
+    if mutated and queue_items is None:
+        mq.save_queue(items)
+
     return dispatched
 
 

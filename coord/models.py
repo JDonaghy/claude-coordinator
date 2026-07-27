@@ -353,6 +353,19 @@ class Assignment:
     # — the SHA remains the audit/#821 trail. None for rows predating #1475
     # or where the diff/patch-id could not be computed.
     review_patch_id: str | None = None
+    # #1476: True when this ``type="review"`` assignment is a SCOPED
+    # re-review — dispatched because a conflict-fix rebase changed content
+    # under an already-`approve`d review (`review_patch_id` mismatch), with
+    # no other intervening work/fix commit. The reviewer was handed the
+    # prior approved diff as established context plus only the resolution
+    # delta, not the full PR — so a `False`/default here means "read the
+    # whole diff" for every audit consumer. `review_scope_base_sha` records
+    # the prior review's `review_head_sha`, i.e. which commit the delta was
+    # computed FROM, so the audit trail can reconstruct exactly what was
+    # (and wasn't) re-read. Both None/False for every row predating this
+    # feature and for ordinary full reviews.
+    review_scoped: bool = False
+    review_scope_base_sha: str | None = None
     # #208: parsed worker cost from the final stream-json `result` event.
     # None means "not yet captured" (older rows, in-flight workers, or
     # workers whose log lacked usage data).  Set on completion by

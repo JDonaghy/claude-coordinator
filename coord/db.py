@@ -458,6 +458,18 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         "ALTER TABLE assignments ADD COLUMN test_head_sha TEXT",
         "ALTER TABLE assignments ADD COLUMN test_patch_id TEXT",
         "ALTER TABLE assignments ADD COLUMN test_base_sha TEXT",
+        # #1476: audit trail for a SCOPED re-review — dispatched when a
+        # conflict-fix rebase changed content under an already-approved
+        # review (patch-id mismatch) but no other work/fix commit
+        # intervened. `review_scoped` marks the review row as scoped (vs. a
+        # full re-review of the whole PR); `review_scope_base_sha` records
+        # the prior review's `review_head_sha` — the commit the resolution
+        # delta was computed from — so a later audit can distinguish
+        # "reviewed the 15-line resolution" from "reviewed the whole PR".
+        # 0/NULL for every row predating this column and for ordinary
+        # (non-scoped) reviews.
+        "ALTER TABLE assignments ADD COLUMN review_scoped INTEGER DEFAULT 0",
+        "ALTER TABLE assignments ADD COLUMN review_scope_base_sha TEXT",
     ]
     for sql in migrations:
         try:
