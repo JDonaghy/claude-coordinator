@@ -261,7 +261,14 @@ def find_scoped_review_candidate(entry: "QueuedMerge", board) -> Assignment | No
     if current_sha is None or current_patch_id is None:
         return None
 
-    for a in pool:
+    # Walk most-recently-dispatched first so a branch that's been through
+    # more than one review-then-rebase cycle picks its latest approval as
+    # the diff base, not an older one — a stale pick still produces a safe
+    # (over-inclusive, never under-inclusive) delta, but a needlessly large
+    # one. ``pool`` is otherwise unordered (completed + active concatenated).
+    ordered = sorted(pool, key=lambda a: getattr(a, "dispatched_at", None) or 0, reverse=True)
+
+    for a in ordered:
         if getattr(a, "type", None) != "review":
             continue
         if getattr(a, "review_of_assignment_id", None) not in branch_work_ids:

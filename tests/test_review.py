@@ -1805,6 +1805,233 @@ def test_dispatch_scoped_reviews_for_queue_request_changes_drives_normal_fix_loo
     assert scoped_review.review_of_assignment_id == "w1"
 
 
+def test_dispatch_scoped_review_stays_independent_of_the_worker_machine(
+    two_machine_config: Config,
+) -> None:
+    """#1476 fix: candidate ranking must exclude the machine that authored
+    the branch under review (looked up via ``entry.assignment_id``), not the
+    *prior reviewer's* machine. Here the original worker ran on "laptop" and
+    the prior (now-voided) review ran on "server" — the opposite machine.
+    Under the bug, "server" (the reviewer) was treated as the machine to
+    avoid, so the ranked candidate list put "laptop" — the actual worker —
+    first, and the scoped re-review would land right back on the machine
+    that authored the conflict-fix resolution being judged.
+    """
+    work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1, issue_title="t",
+        assignment_id="w1", type="work", status="done", branch="issue-1-fix",
+    )
+    prior = _scoped_prior_review(machine_name="server")
+    board = Board(completed=[work, prior])
+    entry = _scoped_entry()
+    client = _FakeHTTPClient({"id": "scoped-indep"})
+
+    result = dispatch_scoped_review(
+        entry, prior, board, two_machine_config,
+        http_client=client, diff_fetcher=_scoped_diff_fetcher,
+    )
+
+    assert result is not None
+    # Must be dispatched to "server" (different from the worker's "laptop"),
+    # not back onto "laptop" where the code under review was written.
+    assert result.machine_name == "server"
+
+
+def test_dispatch_scoped_review_falls_back_to_reviewer_machine_when_worker_not_found(
+    two_machine_config: Config,
+) -> None:
+    """Defensive fallback: if the work assignment behind ``entry.assignment_id``
+    can no longer be found on the board (e.g. pruned), ranking falls back to
+    the prior reviewer's machine rather than crashing."""
+    prior = _scoped_prior_review(machine_name="server")
+    board = Board(completed=[prior])  # no "w1" work assignment on the board
+    entry = _scoped_entry()
+    client = _FakeHTTPClient({"id": "scoped-fallback"})
+
+    result = dispatch_scoped_review(
+        entry, prior, board, two_machine_config,
+        http_client=client, diff_fetcher=_scoped_diff_fetcher,
+    )
+
+    assert result is not None  # still dispatches — doesn't crash or stall
+
+
+def test_dispatch_scoped_review_respects_tos_gate(
+    two_machine_config: Config,
+) -> None:
+    """#437 STRUCTURAL TOS-COMPLIANCE GATE: a repo/provider configured
+    ``human_attended_only`` must never receive an auto-dispatched scoped
+    review — mirrors the guard ``dispatch_review`` already applies."""
+    def _raising_guard(**kwargs):
+        raise ValueError("provider 'claude-pty' is human_attended_only")
+
+    import coord.providers as providers_mod
+
+    board = Board()
+    entry = _scoped_entry()
+    prior = _scoped_prior_review()
+
+    saved = providers_mod.guard_unattended_dispatch
+    providers_mod.guard_unattended_dispatch = _raising_guard
+    try:
+        result = dispatch_scoped_review(
+            entry, prior, board, two_machine_config,
+            http_client=_FakeHTTPClient({"id": "scoped-tos"}),
+            diff_fetcher=_scoped_diff_fetcher,
+        )
+    finally:
+        providers_mod.guard_unattended_dispatch = saved
+
+    assert result is None
+    assert board.active == []
+
+
+def test_dispatch_scoped_review_respects_work_is_terminal(
+    two_machine_config: Config, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#522 chokepoint: never dispatch a scoped review for an issue/PR
+    that's already terminal (closed/merged) on GitHub."""
+    monkeypatch.setattr("coord.github_ops.work_is_terminal", lambda *a, **k: True)
+
+    board = Board()
+    entry = _scoped_entry()
+    prior = _scoped_prior_review()
+
+    result = dispatch_scoped_review(
+        entry, prior, board, two_machine_config,
+        http_client=_FakeHTTPClient({"id": "scoped-terminal"}),
+        diff_fetcher=_scoped_diff_fetcher,
+    )
+
+    assert result is None
+    assert board.active == []
+
+
+def test_dispatch_scoped_reviews_for_queue_respects_flood_threshold(
+    two_machine_config: Config,
+) -> None:
+    """Mirrors dispatch_pending_reviews's surge gate: more eligible entries
+    than reviews.flood_threshold ⇒ refuse the whole pass, dispatch nothing."""
+    from coord import merge_queue as mq
+
+    cfg = replace(two_machine_config, reviews=ReviewsConfig(
+        enabled=True, auto_dispatch=True, flood_threshold=1,
+    ))
+
+    entries = []
+    board_completed = []
+    for i in range(2):
+        wid = f"w{i}"
+        work = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=i, issue_title="t",
+            assignment_id=wid, type="work", status="done", branch=f"issue-{i}-fix",
+        )
+        prior = _scoped_prior_review(
+            assignment_id=f"rev{i}", review_of_assignment_id=wid, issue_number=i,
+        )
+        cf = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=i,
+            issue_title="[conflict-fix] t", assignment_id=f"cf{i}", type="conflict-fix",
+            status="done", review_of_assignment_id=wid, dispatched_at=200.0,
+        )
+        board_completed.extend([work, prior, cf])
+        entry = _scoped_entry(
+            assignment_id=wid, branch=f"issue-{i}-fix", issue_number=i,
+        )
+        entry.branch_head_sha = "newsha"
+        entry.branch_patch_id = "patchid-new"
+        entries.append(entry)
+
+    board = Board(completed=board_completed)
+    dispatched = dispatch_scoped_reviews_for_queue(
+        board, cfg,
+        queue_items=entries,
+        http_client=_FakeHTTPClient({"id": "scoped-flood"}),
+        diff_fetcher=_scoped_diff_fetcher,
+    )
+    assert dispatched == []
+
+
+def test_dispatch_scoped_reviews_for_queue_respects_per_pass_cap(
+    two_machine_config: Config,
+) -> None:
+    """Mirrors dispatch_pending_reviews's per-pass cap: with more eligible
+    entries than reviews.max_auto_dispatch_per_pass, only the cap's worth
+    dispatch this pass — the rest stay pending for the next one."""
+    from coord import merge_queue as mq
+
+    cfg = replace(two_machine_config, reviews=ReviewsConfig(
+        enabled=True, auto_dispatch=True, flood_threshold=0,
+        max_auto_dispatch_per_pass=1,
+    ))
+
+    entries = []
+    board_completed = []
+    for i in range(2):
+        wid = f"w{i}"
+        work = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=i, issue_title="t",
+            assignment_id=wid, type="work", status="done", branch=f"issue-{i}-fix",
+        )
+        prior = _scoped_prior_review(
+            assignment_id=f"rev{i}", review_of_assignment_id=wid, issue_number=i,
+        )
+        cf = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=i,
+            issue_title="[conflict-fix] t", assignment_id=f"cf{i}", type="conflict-fix",
+            status="done", review_of_assignment_id=wid, dispatched_at=200.0,
+        )
+        board_completed.extend([work, prior, cf])
+        entry = _scoped_entry(
+            assignment_id=wid, branch=f"issue-{i}-fix", issue_number=i,
+        )
+        entry.branch_head_sha = "newsha"
+        entry.branch_patch_id = "patchid-new"
+        entries.append(entry)
+
+    board = Board(completed=board_completed)
+    dispatched = dispatch_scoped_reviews_for_queue(
+        board, cfg,
+        queue_items=entries,
+        http_client=_FakeHTTPClient({"id": "scoped-cap"}),
+        diff_fetcher=_scoped_diff_fetcher,
+    )
+    assert len(dispatched) == 1
+
+
+def test_find_scoped_review_candidate_picks_most_recently_dispatched_approval() -> None:
+    """Non-blocking finding: when more than one approved review exists in
+    the work chain, the most-recently-dispatched one should be picked as the
+    diff base — not just the first one encountered while walking the
+    (unsorted) completed+active pool."""
+    from coord import merge_queue as mq
+
+    work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1, issue_title="t",
+        assignment_id="w1", type="work", status="done", branch="issue-1-fix",
+    )
+    older_review = _scoped_prior_review(
+        assignment_id="rev-old", review_head_sha="sha-old",
+        review_patch_id="patchid-old", dispatched_at=100.0,
+    )
+    newer_review = _scoped_prior_review(
+        assignment_id="rev-new", review_head_sha="sha-new",
+        review_patch_id="patchid-new", dispatched_at=300.0,
+    )
+    # Deliberately append the older one last, so a naive "first match while
+    # walking the pool" bug would still (accidentally) get this right unless
+    # we also test pool order — put newer_review first in the list to prove
+    # the pick is by dispatched_at, not list position.
+    board = Board(completed=[work, newer_review, older_review])
+    entry = _scoped_entry()
+    entry.branch_head_sha = "currentsha"
+    entry.branch_patch_id = "patchid-current"
+
+    candidate = mq.find_scoped_review_candidate(entry, board)
+    assert candidate is not None
+    assert candidate.assignment_id == "rev-new"
+
+
 # ── _find_or_open_pr — PR body carries closing keyword (#287) ───────────────
 
 
