@@ -2111,6 +2111,7 @@ def dispatch_scoped_review(
     diff_fetcher=None,
     branch_sha_fetcher=None,
     patch_id_computer=None,
+    terminal_cache: dict | None = None,
 ) -> Assignment | None:
     """Dispatch a SCOPED re-review (#1476) for a merge entry whose approval
     was voided ONLY by a content-changing conflict-fix rebase.
@@ -2137,6 +2138,17 @@ def dispatch_scoped_review(
     Returns the new review Assignment (already appended to ``board.active``,
     with ``review_scoped=True`` and ``review_scope_base_sha=prior_review.
     review_head_sha`` for the #1476 audit trail) on success.
+
+    Applies the same two structural guards as :func:`dispatch_review` before
+    doing any work: the #522 terminal-work chokepoint (issue closed / PR
+    merged — pass a shared *terminal_cache* dict across a bulk pass the same
+    way :func:`dispatch_pending_reviews` does) and the #437 TOS-compliance
+    gate (refuses a ``human_attended_only`` provider). Reviewer-candidate
+    ranking excludes the machine that actually authored *entry*'s branch
+    (looked up on *board* via ``entry.assignment_id`` — the work assignment,
+    not the prior reviewer) so the scoped review stays independent of the
+    code it's judging, mirroring :func:`dispatch_review`'s
+    ``completed.machine_name`` contract.
     """
     if not config.reviews.enabled or not config.reviews.auto_dispatch:
         return None
@@ -2146,6 +2158,37 @@ def dispatch_scoped_review(
     repo = config.repo(entry.repo_name)
     if repo is None:
         return None
+
+    # #522 (mirrored from dispatch_review): never (re)dispatch a review for
+    # work that's already done on GitHub — issue closed OR PR merged. Best
+    # effort — a small race window remains before the merge-queue entry is
+    # cleaned up, same as the full-review path.
+    if github_ops.work_is_terminal(
+        repo.github, entry.issue_number, entry.branch, cache=terminal_cache
+    ):
+        return None
+
+    # #437: STRUCTURAL TOS-COMPLIANCE GATE — mirrored from dispatch_review
+    # (coord/review.py ~1463). Scoped reviews are dispatched from the same
+    # unattended paths (reconcile()/coord notify) as a full review, so they
+    # must be refused exactly the same way when the effective provider is
+    # `human_attended_only` (interactive Claude Code via PTY, ToS §3.7).
+    # Without this gate a repo/provider configured that way could have a
+    # scoped review silently routed to it — the #1476 findings called this
+    # out explicitly as a gap versus dispatch_review.
+    from coord.providers import guard_unattended_dispatch  # noqa: PLC0415
+    try:
+        guard_unattended_dispatch(
+            spec_provider=None,
+            repo_provider=repo.provider,
+            providers_cfg=config.providers,
+            models_cfg=config.models,
+            where="auto-dispatch scoped review",
+        )
+    except ValueError as exc:
+        log.warning("[review] skipping auto-dispatch scoped review: %s", exc)
+        return None
+
     base_branch = entry.target_branch or repo.default_branch
 
     _diff = diff_fetcher or github_ops.get_compare_diff
@@ -2168,8 +2211,22 @@ def dispatch_scoped_review(
         )
         return None
 
+    # #1476 fix: rank candidates against the machine that authored the code
+    # under review — the WORK assignment behind *entry* — not the prior
+    # reviewer's machine. ``QueuedMerge`` doesn't carry the worker's machine
+    # name directly, so look up the work assignment on *board* by
+    # ``entry.assignment_id``, exactly mirroring how ``dispatch_review``
+    # passes ``completed.machine_name`` (``completed`` *is* the work
+    # assignment there). Fall back to the prior reviewer's machine only if
+    # the work assignment can no longer be found on the board (defensive;
+    # keeps this fail-open rather than raising).
+    worker_assignment = board.find_by_id(entry.assignment_id)
+    worker_machine_name = (
+        worker_assignment.machine_name if worker_assignment is not None
+        else prior_review.machine_name
+    )
     candidates = _ranked_reviewer_candidates(
-        prior_review.machine_name, entry.repo_name, board, config
+        worker_machine_name, entry.repo_name, board, config
     )
     if not candidates:
         return None
@@ -2300,6 +2357,11 @@ def dispatch_scoped_reviews_for_queue(
     also owns the merge-queue read/write itself (``queue_items`` defaults to
     :func:`coord.merge_queue.load_queue`, saved back at the end) since the
     scoped/full distinction is a property of the queue entry, not the board.
+    It also mirrors that function's two review-flood-incident (2026-06-08)
+    safety mechanisms — the ``reviews.flood_threshold`` surge gate and the
+    ``reviews.max_auto_dispatch_per_pass`` per-pass cap — so a batch of
+    conflict-fix rebases completing together can't fire an unbounded burst
+    of metered ``claude -p`` reviews in a single pass.
 
     An entry is eligible when: it's ``PENDING`` and review-gated
     (:func:`coord.merge_queue.requires_review`); it does NOT already have an
@@ -2317,6 +2379,8 @@ def dispatch_scoped_reviews_for_queue(
 
     Returns the dispatched review Assignments (already on ``board.active``).
     """
+    import os
+
     from coord import merge_queue as mq  # noqa: PLC0415
 
     if not config.reviews.enabled or not config.reviews.auto_dispatch:
@@ -2326,7 +2390,7 @@ def dispatch_scoped_reviews_for_queue(
     _get_sha = branch_sha_fetcher or github_ops.get_branch_sha
     _get_branch_patch_id = branch_patch_id_fetcher or github_ops.get_branch_patch_id
 
-    dispatched: list[Assignment] = []
+    eligible: list[tuple] = []  # (entry, prior_review)
     mutated = False
     for entry in items:
         if entry.state != mq.PENDING:
@@ -2370,6 +2434,46 @@ def dispatch_scoped_reviews_for_queue(
         if already_handled:
             continue
 
+        eligible.append((entry, prior_review))
+
+    def _persist() -> None:
+        if mutated and queue_items is None:
+            mq.save_queue(items)
+
+    if not eligible:
+        _persist()
+        return []
+
+    # Surge gate — same shape as dispatch_pending_reviews. A sudden surge is
+    # the review-flood unmasking signature, so halt entirely and require a
+    # human to clear the backlog or opt in.
+    threshold = config.reviews.flood_threshold
+    override = (
+        config.reviews.allow_review_flood
+        or os.environ.get("COORD_ALLOW_REVIEW_FLOOD") == "1"
+    )
+    if threshold and len(eligible) > threshold and not override:
+        log.warning(
+            "[review] scoped-review flood guard: %d merge-queue entries are "
+            "eligible for a scoped re-review (> reviews.flood_threshold=%d). "
+            "Refusing bulk dispatch to avoid a metered review flood. Clear "
+            "the stale backlog, or set reviews.allow_review_flood: true (or "
+            "COORD_ALLOW_REVIEW_FLOOD=1) to override.",
+            len(eligible), threshold,
+        )
+        _persist()
+        return []
+
+    # Per-pass cap — the remainder stay PENDING and are picked up next pass.
+    cap = config.reviews.max_auto_dispatch_per_pass
+    # #522: one terminal-state cache for this whole pass, mirrored from
+    # dispatch_pending_reviews, so a backlog of already-merged entries costs
+    # one gh lookup per issue, not one per entry revisited.
+    terminal_cache: dict = {}
+    dispatched: list[Assignment] = []
+    for entry, prior_review in eligible:
+        if cap and len(dispatched) >= cap:
+            break
         review = dispatch_scoped_review(
             entry, prior_review, board, config,
             http_client=http_client,
@@ -2377,13 +2481,12 @@ def dispatch_scoped_reviews_for_queue(
             diff_fetcher=diff_fetcher,
             branch_sha_fetcher=branch_sha_fetcher,
             patch_id_computer=patch_id_computer,
+            terminal_cache=terminal_cache,
         )
         if review is not None:
             dispatched.append(review)
 
-    if mutated and queue_items is None:
-        mq.save_queue(items)
-
+    _persist()
     return dispatched
 
 
