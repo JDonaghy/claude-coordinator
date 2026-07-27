@@ -1382,7 +1382,7 @@ impl CoordApp {
                -> check assignment_type on the review row\n\
             9. Misleading green review box (#473)\n   \
                -> cross-check review_verdict in DB: sqlite3 ~/.coord/coord.db\n\
-            10. Live/Idle misclassification (#559)\n   \
+            10. in-flight/ready liveness misclassification (#559)\n   \
                -> confirm assignment status matches what TUI shows\n\
             11. CI failing or pending (#240)\n   \
                -> gh pr checks --repo {slug} {pr}\n\

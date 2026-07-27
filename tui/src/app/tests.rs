@@ -5245,22 +5245,28 @@
     }
 
     #[test]
-    fn pipeline_active_by_liveness_splits_on_live_session() {
+    fn pipeline_active_by_repo_groups_by_repo_and_flags_liveness_per_row() {
+        // #1487: the In-progress section groups by REPO (not Live/Idle), and
+        // the liveness classification that used to pick the group now decides
+        // the per-row `in-flight`/`ready` badge (`active_issue_in_flight`).
         let mut app = make_pipeline_app();
         // Use a `done` work assignment: the issue is still "in-progress" (any
         // work assignment suffices for pipeline_lifecycle_section), but there is
-        // no *running* assignment and no tmux session — it must be Idle.
+        // no *running* assignment and no tmux session — it must read `ready`.
         app.data
             .assignments
             .push(make_assignment_typed("done", 42, "api", Some("work")));
 
-        // No live session, no running assignment → Idle.
-        let groups = app.pipeline_active_by_liveness();
+        // Grouping is by repo regardless of liveness.
+        let groups = app.pipeline_active_by_repo();
         assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].0, "idle");
+        assert_eq!(groups[0].0, "api", "the group node is the repo, not Live/Idle");
         assert_eq!(groups[0].1.len(), 1);
+        let idx = groups[0].1[0];
+        // No live session, no running assignment → ready.
+        assert!(!app.active_issue_in_flight(idx));
 
-        // A live tmux session for api#42 → it moves to the Live group.
+        // A live tmux session for api#42 → the row reads in-flight.
         app.live_tmux_sessions = vec![LiveTmuxSession {
             assignment_id: "x".to_string(),
             issue_number: Some(42),
@@ -5271,14 +5277,15 @@
             pending_sweep_count: 0,
             attached: false,
         }];
-        let groups = app.pipeline_active_by_liveness();
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].0, "live");
+        let groups = app.pipeline_active_by_repo();
+        assert_eq!(groups.len(), 1, "still one repo group");
+        assert_eq!(groups[0].0, "api");
+        assert!(app.active_issue_in_flight(groups[0].1[0]));
 
         // Cross-repo guard (#480): a same-number session in another repo must
         // NOT mark api#42 live.  The work assignment is "done" (not running),
         // so the only liveness signal would be the tmux session — and it's in
-        // the wrong repo, so the result must be Idle.
+        // the wrong repo, so the row must stay `ready`.
         app.live_tmux_sessions = vec![LiveTmuxSession {
             assignment_id: "y".to_string(),
             issue_number: Some(42),
@@ -5289,14 +5296,17 @@
             pending_sweep_count: 0,
             attached: false,
         }];
-        let groups = app.pipeline_active_by_liveness();
-        assert_eq!(groups[0].0, "idle", "cross-repo session must not mark it live");
+        let groups = app.pipeline_active_by_repo();
+        assert!(
+            !app.active_issue_in_flight(groups[0].1[0]),
+            "cross-repo session must not mark it live"
+        );
     }
 
     #[test]
-    fn active_liveness_selection_resolves_through_nested_path() {
-        // End-to-end: the [group, milestone, issue] path for Active (#1069)
-        // resolves back to the right pipeline_issues index via
+    fn active_repo_group_selection_resolves_through_nested_path() {
+        // End-to-end: the [repo, milestone, issue] path for Active
+        // (#1069/#1487) resolves back to the right pipeline_issues index via
         // selected_pipeline_index().
         let mut app = make_pipeline_app();
         app.data
@@ -5313,7 +5323,7 @@
             attached: false,
         }];
         app.rebuild_pipeline_sidebar(None);
-        // Default selection is [0, 0, 0] = first group (Live) → first
+        // Default selection is [0, 0, 0] = first repo group (api) → first
         // milestone (No milestone, since this fixture has no milestone
         // data) → #42.
         let idx = app
@@ -5322,14 +5332,16 @@
         assert_eq!(app.pipeline_issues[idx].number, 42);
     }
 
-    // ── #897: headless running assignments → Live ─────────────────────────────
+    // ── #897: headless running assignments → in-flight ───────────────────────
 
     #[test]
-    fn headless_running_work_classifies_as_live() {
+    fn headless_running_work_classifies_as_in_flight() {
         // #897: a headless (is_interactive=false) `claude -p` work assignment
-        // with status="running" must place the issue in the Live group even
-        // though no tmux session exists.  Previously it fell through to Idle
-        // because `issue_session_is_live` only checked `live_tmux_sessions`.
+        // with status="running" must mark the issue live even though no tmux
+        // session exists.  Previously it fell through to not-live because
+        // `issue_session_is_live` only checked `live_tmux_sessions`.
+        // #1487: that classification now drives the per-row `in-flight` badge
+        // rather than a Live group node.
         let mut app = make_pipeline_app();
         let mut a = make_assignment_typed("running", 42, "api", Some("work"));
         a.is_interactive = false;
@@ -5337,19 +5349,19 @@
 
         // Confirm no tmux session is present — the assignment is the only signal.
         assert!(app.live_tmux_sessions.is_empty());
-        let groups = app.pipeline_active_by_liveness();
+        let groups = app.pipeline_active_by_repo();
         assert_eq!(groups.len(), 1);
-        assert_eq!(
-            groups[0].0, "live",
-            "headless running work assignment must render under Live, not Idle"
-        );
         assert_eq!(groups[0].1.len(), 1);
+        assert!(
+            app.active_issue_in_flight(groups[0].1[0]),
+            "headless running work assignment must render as in-flight, not ready"
+        );
     }
 
     #[test]
-    fn headless_running_review_classifies_as_live() {
+    fn headless_running_review_classifies_as_in_flight() {
         // #897: the running-assignment check is type-agnostic — a running
-        // review (non-work type) must also mark the issue as Live.
+        // review (non-work type) must also mark the issue as live.
         let mut app = make_pipeline_app();
         // A done work assignment puts issue #42 in-progress (pipeline_lifecycle_section).
         app.data
@@ -5361,20 +5373,20 @@
         app.data.assignments.push(review);
 
         assert!(app.live_tmux_sessions.is_empty());
-        let groups = app.pipeline_active_by_liveness();
+        let groups = app.pipeline_active_by_repo();
         assert_eq!(groups.len(), 1);
-        assert_eq!(
-            groups[0].0, "live",
-            "running review assignment (non-work type) must render under Live"
+        assert!(
+            app.active_issue_in_flight(groups[0].1[0]),
+            "running review assignment (non-work type) must render as in-flight"
         );
     }
 
     #[test]
-    fn interactive_running_assignment_without_tmux_stays_idle() {
+    fn interactive_running_assignment_without_tmux_stays_ready() {
         // #1097: an interactive/chat assignment with status="running" but no
         // matching live_tmux_sessions entry (e.g. the session crashed
         // uncleanly and nothing ever revisited its DB status) must NOT be
-        // treated as Live via the #897 headless fallback — that fallback is
+        // treated as live via the #897 headless fallback — that fallback is
         // headless-only. Interactive liveness comes solely from
         // has_tmux_session, which self-corrects when tmux discovery stops
         // finding the session.
@@ -5384,18 +5396,18 @@
         app.data.assignments.push(a);
 
         assert!(app.live_tmux_sessions.is_empty());
-        let groups = app.pipeline_active_by_liveness();
+        let groups = app.pipeline_active_by_repo();
         assert_eq!(groups.len(), 1);
-        assert_eq!(
-            groups[0].0, "idle",
-            "dead interactive session with a stale running status must not pin the issue Live"
+        assert!(
+            !app.active_issue_in_flight(groups[0].1[0]),
+            "dead interactive session with a stale running status must not read in-flight"
         );
     }
 
     #[test]
-    fn in_progress_no_running_assignment_stays_idle() {
+    fn in_progress_no_running_assignment_stays_ready() {
         // An in-progress issue whose work assignment is done (not running)
-        // and has no live tmux session must remain in Idle — we must not
+        // and has no live tmux session must read `ready` — we must not
         // false-positive on completed work.
         let mut app = make_pipeline_app();
         app.data
@@ -5403,11 +5415,11 @@
             .push(make_assignment_typed("done", 42, "api", Some("work")));
 
         assert!(app.live_tmux_sessions.is_empty());
-        let groups = app.pipeline_active_by_liveness();
+        let groups = app.pipeline_active_by_repo();
         assert_eq!(groups.len(), 1);
-        assert_eq!(
-            groups[0].0, "idle",
-            "issue with only a done assignment and no tmux session must stay Idle"
+        assert!(
+            !app.active_issue_in_flight(groups[0].1[0]),
+            "issue with only a done assignment and no tmux session must stay ready"
         );
     }
 
@@ -15010,7 +15022,7 @@
             "New row must offer an enabled Drop to backlog"
         );
 
-        // In-progress:Idle with only a FAILED work attempt (nothing to
+        // In-progress with only a FAILED work attempt (nothing to
         // preserve, no live session) → present + enabled.
         app.data
             .assignments
@@ -15018,7 +15030,7 @@
         assert_eq!(
             drop_disabled(&app, PipelineRowLifecycle::InProgress),
             Some(false),
-            "In-progress:Idle with no completed work must allow Drop to backlog"
+            "In-progress with no completed work must allow Drop to backlog"
         );
 
         // #618: a COMPLETED Work stage (done) → present but DISABLED.
@@ -15061,7 +15073,7 @@
 
     /// #258: a "Chat about issue" session (type=`chat`) is a scoping
     /// conversation, not pipeline work — a chat-only issue must classify as New,
-    /// not In-progress, so it leaves the Active/Idle group (and stripping
+    /// not In-progress, so it leaves the In-progress section (and stripping
     /// status:ready actually moves it out of the active pipeline).
     #[test]
     fn chat_only_issue_classifies_as_new_not_in_progress() {
@@ -20047,12 +20059,11 @@
 
     #[test]
     fn pipeline_in_progress_not_milestone_grouped() {
-        // The *outer* In-progress grouping (`pipeline_active_by_liveness`)
-        // must remain liveness-only (Live/Idle) — #1069 nests a milestone
-        // tier *underneath* each liveness group (see the
-        // `pipeline_in_progress_*milestone*` tests below), but the liveness
-        // helper itself must never emit milestone keys as its top-level
-        // groups.
+        // The *outer* In-progress grouping (`pipeline_active_by_repo`)
+        // must remain repo-only — #1069 nests a milestone tier *underneath*
+        // each repo group (see the `pipeline_in_progress_*milestone*` tests
+        // below), but the repo helper itself must never emit milestone keys
+        // as its top-level groups.
         let mut app = make_pipeline_milestone_app();
         // Add an active assignment for issue #10 to put it in-progress.
         app.data
@@ -20065,14 +20076,20 @@
             app.pipeline_state_section_names.contains(&"in-progress"),
             "In-progress section must be present",
         );
-        // The in-progress liveness groups must NOT be milestone buckets.
-        let active = app.pipeline_active_by_liveness();
-        assert!(!active.is_empty(), "must have liveness groups");
-        // Keys must be "live" or "idle", not milestone keys like "1" or "no-milestone".
+        // The in-progress repo groups must NOT be milestone buckets.
+        let active = app.pipeline_active_by_repo();
+        assert!(!active.is_empty(), "must have repo groups");
+        // Keys must be repo keys, not milestone keys like "1"/"no-milestone"
+        // (and, post-#1487, not "live"/"idle" either).
+        let repo_keys: Vec<String> = app
+            .pipeline_issues
+            .iter()
+            .map(|i| CoordApp::pipeline_repo_key(i).to_string())
+            .collect();
         for (key, _) in &active {
             assert!(
-                key == "live" || key == "idle",
-                "in-progress group key must be 'live' or 'idle', got '{key}'",
+                repo_keys.contains(key),
+                "in-progress group key must be a repo key, got '{key}'",
             );
         }
     }
@@ -20080,8 +20097,8 @@
     // ── #1069: In-progress milestone tier ──────────────────────────────────
 
     /// Helper: build an App with three in-progress issues in one repo — two
-    /// running (Live) across two different named milestones, and one with a
-    /// `done`-status assignment (Idle) with no milestone.  Mirrors
+    /// running (in-flight) across two different named milestones, and one
+    /// with a `done`-status assignment (ready) with no milestone.  Mirrors
     /// `make_pipeline_milestone_app` but puts the issues in the In-progress
     /// lifecycle instead of New.
     fn make_pipeline_inprogress_milestone_app() -> CoordApp {
@@ -20160,53 +20177,19 @@
     }
 
     #[test]
-    fn pipeline_milestone_header_repo_tag_single_repo_bucket() {
-        // A milestone bucket whose issues all share one repo resolves to
-        // that repo's tag.
+    fn pipeline_in_progress_milestones_grouped_within_repo() {
+        // #1487: one repo group holds every in-progress issue of that repo;
+        // the milestone tier sits underneath it. #10 (v1.0) and #20 (v2.0)
+        // land in separate named-milestone buckets, #30 in "No milestone".
         let app = make_pipeline_inprogress_milestone_app();
-        let all_repos = vec!["api".to_string()];
-        let tag = app.pipeline_milestone_header_repo_tag(&[0, 1], &all_repos);
-        assert_eq!(tag, Some("A".to_string()));
-    }
-
-    #[test]
-    fn pipeline_milestone_header_repo_tag_mixed_repo_bucket_returns_none() {
-        // A milestone bucket mixing issues from two repos can't show a
-        // single header tag — the render path falls back to per-issue tags.
-        let mut app = make_pipeline_inprogress_milestone_app();
-        app.pipeline_issues[1].coord_repo = Some("web".to_string());
-        app.pipeline_issues[1].repo_slug = "acme/web".to_string();
-        let all_repos = vec!["api".to_string(), "web".to_string()];
-        let tag = app.pipeline_milestone_header_repo_tag(&[0, 1], &all_repos);
-        assert_eq!(
-            tag, None,
-            "mixed-repo bucket must not resolve to a single header tag"
-        );
-    }
-
-    #[test]
-    fn pipeline_in_progress_milestones_grouped_within_liveness() {
-        // Within the Live liveness group, issues #10 and #20 must land in
-        // separate named-milestone buckets; the Idle group's #30 must land
-        // in "No milestone".
-        let app = make_pipeline_inprogress_milestone_app();
-        let active = app.pipeline_active_by_liveness();
-        let (_, live_idxs) = active
-            .iter()
-            .find(|(k, _)| k == "live")
-            .expect("Live group must exist");
-        let live_milestones = app.pipeline_milestones_for_issues(live_idxs);
-        assert_eq!(live_milestones.len(), 2, "two named milestones under Live");
-        assert_eq!(live_milestones[0].1, "v1.0");
-        assert_eq!(live_milestones[1].1, "v2.0");
-
-        let (_, idle_idxs) = active
-            .iter()
-            .find(|(k, _)| k == "idle")
-            .expect("Idle group must exist");
-        let idle_milestones = app.pipeline_milestones_for_issues(idle_idxs);
-        assert_eq!(idle_milestones.len(), 1);
-        assert_eq!(idle_milestones[0].1, "No milestone");
+        let active = app.pipeline_active_by_repo();
+        assert_eq!(active.len(), 1, "one repo group ('api')");
+        assert_eq!(active[0].0, "api");
+        let milestones = app.pipeline_milestones_for_issues(&active[0].1);
+        assert_eq!(milestones.len(), 3, "v1.0, v2.0 and No milestone");
+        assert_eq!(milestones[0].1, "v1.0");
+        assert_eq!(milestones[1].1, "v2.0");
+        assert_eq!(milestones[2].1, "No milestone");
     }
 
     #[test]
@@ -20223,7 +20206,7 @@
             + 1; // + search_offset
         app.pipeline_sidebar.set_active_section(Some(section));
 
-        // Live (gi=0) → v1.0 (mi=0) → #10 (ii=0).
+        // api (gi=0) → v1.0 (mi=0) → #10 (ii=0).
         app.pipeline_sidebar
             .set_selected_path(section, Some(vec![0, 0, 0]));
         let idx = app
@@ -20231,7 +20214,7 @@
             .expect("3-level issue path must resolve");
         assert_eq!(app.pipeline_issues[idx].number, 10);
 
-        // Live (gi=0) → v2.0 (mi=1) → #20 (ii=0).
+        // api (gi=0) → v2.0 (mi=1) → #20 (ii=0).
         app.pipeline_sidebar
             .set_selected_path(section, Some(vec![0, 1, 0]));
         let idx = app
@@ -20248,22 +20231,21 @@
             "selecting a milestone header must not resolve to an issue index"
         );
 
-        // A 1-level path (liveness header selected) must also resolve to None.
+        // A 1-level path (repo header selected) must also resolve to None.
         app.pipeline_sidebar
             .set_selected_path(section, Some(vec![0]));
         assert_eq!(
             app.selected_pipeline_index(),
             None,
-            "selecting a liveness header must not resolve to an issue index"
+            "selecting a repo header must not resolve to an issue index"
         );
     }
 
     #[test]
-    fn tuidriver_in_progress_milestone_headers_between_liveness_and_issues() {
-        // TuiDriver: with active issues across two milestones in the Live
-        // group, the milestone headers must render between "Live" and the
-        // "#N" issue rows, and the repo tag must appear on the milestone
-        // header (not on the issue row underneath it).
+    fn tuidriver_in_progress_milestone_headers_between_repo_and_issues() {
+        // TuiDriver (#1487): with active issues across two milestones, the
+        // milestone headers must render between the REPO node and the "#N"
+        // issue rows — and no Live/Idle node exists any more.
         use quadraui::tui::testing::driver_with_shell;
 
         let mut app = make_pipeline_inprogress_milestone_app();
@@ -20273,8 +20255,8 @@
         let screen = driver.screen();
 
         assert!(
-            driver.screen_contains("Live"),
-            "Live liveness header must be visible:\n{screen}"
+            driver.screen_contains("api"),
+            "repo group node 'api' must be visible:\n{screen}"
         );
         assert!(
             driver.screen_contains("v1.0"),
@@ -20293,26 +20275,26 @@
             "issue #20 must be visible under its milestone:\n{screen}"
         );
 
-        // Ordering: Live header above both milestone headers, which are
+        // Ordering: repo node above both milestone headers, which are
         // above their respective issue rows.
-        let (_, live_y) = driver.find("Live").expect("Live header must be found");
+        let (_, repo_y) = driver.find("api").expect("repo node must be found");
         let (_, v1_y) = driver.find("v1.0").expect("v1.0 header must be found");
         let (_, v2_y) = driver.find("v2.0").expect("v2.0 header must be found");
         let (_, i10_y) = driver.find("#10").expect("#10 row must be found");
         let (_, i20_y) = driver.find("#20").expect("#20 row must be found");
-        assert!(live_y < v1_y, "Live header must render above v1.0:\n{screen}");
+        assert!(repo_y < v1_y, "repo node must render above v1.0:\n{screen}");
         assert!(v1_y < i10_y, "v1.0 header must render above #10:\n{screen}");
         assert!(v1_y < v2_y, "v1.0 must render above v2.0 (sorted by milestone number):\n{screen}");
         assert!(v2_y < i20_y, "v2.0 header must render above #20:\n{screen}");
 
         // Indentation: milestone headers are indented one level deeper than
-        // the liveness header; issue rows one level deeper still.
-        let (live_x, _) = driver.find("Live").unwrap();
+        // the repo node; issue rows one level deeper still.
+        let (repo_x, _) = driver.find("api").unwrap();
         let (v1_x, _) = driver.find("v1.0").unwrap();
         let (i10_x, _) = driver.find("#10").unwrap();
         assert!(
-            v1_x > live_x,
-            "milestone header must be indented deeper than the liveness header:\n{screen}"
+            v1_x > repo_x,
+            "milestone header must be indented deeper than the repo node:\n{screen}"
         );
         assert!(
             i10_x > v1_x,
@@ -20323,19 +20305,18 @@
     #[test]
     fn pipeline_in_progress_no_milestone_bucket_for_untracked_issue() {
         // An in-progress issue with no milestone data must fall into a
-        // "No milestone" group underneath its liveness bucket.
+        // "No milestone" bucket underneath its repo node (#1487).
         let app = make_pipeline_inprogress_milestone_app();
-        let active = app.pipeline_active_by_liveness();
-        let (_, idle_idxs) = active
-            .iter()
-            .find(|(k, _)| k == "idle")
-            .expect("Idle group must exist (issue #30 has a done, non-live assignment)");
-        assert_eq!(idle_idxs.len(), 1);
-        assert_eq!(app.pipeline_issues[idle_idxs[0]].number, 30);
-        let milestones = app.pipeline_milestones_for_issues(idle_idxs);
-        assert_eq!(milestones.len(), 1);
-        assert_eq!(milestones[0].0, "no-milestone");
-        assert_eq!(milestones[0].1, "No milestone");
+        let active = app.pipeline_active_by_repo();
+        assert_eq!(active.len(), 1);
+        let milestones = app.pipeline_milestones_for_issues(&active[0].1);
+        let (key, display, idxs) = milestones
+            .last()
+            .expect("'No milestone' must be the last bucket");
+        assert_eq!(key, "no-milestone");
+        assert_eq!(display, "No milestone");
+        assert_eq!(idxs.len(), 1);
+        assert_eq!(app.pipeline_issues[idxs[0]].number, 30);
     }
 
     #[test]
@@ -20385,14 +20366,14 @@
 
         // child_pos 0 → #101, which IS in pipeline_issues → its own idx 1,
         // not the epic's idx 0.
-        assert_eq!(app.resolve_nested_child_index(0, 0, None), Some(1));
+        assert_eq!(app.resolve_nested_child_index(0, 0, false), Some(1));
         // child_pos 1 → #102, which is NOT independently tracked in
         // pipeline_issues → None (nested-display-only row), never silently
         // the parent epic's idx 0.
-        assert_eq!(app.resolve_nested_child_index(0, 1, None), None);
+        assert_eq!(app.resolve_nested_child_index(0, 1, false), None);
         // parent_idx pointing at a non-epic issue (#101 has no children of
         // its own) → None.
-        assert_eq!(app.resolve_nested_child_index(1, 0, None), None);
+        assert_eq!(app.resolve_nested_child_index(1, 0, false), None);
     }
 
     /// #1199 fix (review-reported regression): a regular issue nested under
@@ -20474,7 +20455,7 @@
             .iter()
             .position(|i| i.number == 102)
             .unwrap();
-        assert_eq!(app.resolve_nested_child_index(epic_idx, 0, None), Some(child_idx));
+        assert_eq!(app.resolve_nested_child_index(epic_idx, 0, false), Some(child_idx));
 
         // And the child's own pipeline lane must be the ordinary per-issue
         // lane (Work/Test/Review/Merge — #1429 restored Merge as a
@@ -20581,7 +20562,7 @@
     ///
     /// #1281 note: the pre-#1281 fixture used a CLOSED child (#102 with
     /// `state="closed"`) — which under #1281 no longer nests under the
-    /// epic's In-progress → Idle instance and so gives the test no row to
+    /// epic's In-progress nesting and so gives the test no row to
     /// select. The child is now open+Ready so the nested row still
     /// renders and the #1199 selection-preservation invariant stays
     /// covered.
@@ -20656,7 +20637,7 @@
     /// `milestone_dag::build_dag_nodes` — its [`NodeState`] resolves to
     /// [`NodeState::Done`] via the aged-out ⇒ terminal heuristic. Under
     /// #1281 a Done child does not nest under its epic's In-progress →
-    /// Idle instance, so `locate_pipeline_selection` legitimately returns
+    /// In-progress nesting, so `locate_pipeline_selection` legitimately returns
     /// `None`: there is no rendered nested row to select, and hence no
     /// "select then refresh must not snap to the epic" invariant to test.
     /// The child stays out of the Pipeline until the epic itself closes.
@@ -20683,7 +20664,7 @@
             // #103 has no cached OpenIssue at all → `build_dag_nodes`
             // resolves it to `NodeState::Done` via the aged-out ⇒ terminal
             // heuristic, so #1281 filters it out of the epic's In-progress
-            // → Idle instance's nested list.
+            // → In-progress nested list.
             epic_children: vec![EpicChildren {
                 repo_name: "api".to_string(),
                 tracking_issue: 100,
@@ -20700,7 +20681,7 @@
         app.rebuild_pipeline_sidebar(None);
 
         // #1281: the aged-out (Done-presumed) nested child no longer
-        // renders under In-progress → Idle, so `locate_pipeline_selection`
+        // renders under In-progress, so `locate_pipeline_selection`
         // returns None — the child simply isn't on the screen for the user
         // to select in the first place.
         assert!(
@@ -27955,12 +27936,17 @@
         app.rebuild_board_sidebar();
         app.rebuild_pipeline_sidebar(None);
 
-        // Explicitly collapse both the Live liveness group and the Sprint 1
-        // milestone group, simulating a user who collapsed them earlier.
+        // Explicitly collapse both the repo group (#1487 — it used to be the
+        // Live liveness group) and the Sprint 1 milestone group, simulating a
+        // user who collapsed them earlier.
         app.pipeline_lifecycle_expanded
-            .insert(("in-progress".to_string(), "live".to_string()), false);
+            .insert(("in-progress".to_string(), "myrepo".to_string()), false);
         app.pipeline_milestone_expanded.insert(
-            ("in-progress".to_string(), "live".to_string(), "3".to_string()),
+            (
+                "in-progress".to_string(),
+                "myrepo".to_string(),
+                "3".to_string(),
+            ),
             false,
         );
 
@@ -27981,7 +27967,7 @@
         );
         assert!(
             pipeline_screen.contains("#7"),
-            "#1069: issue #7 must be visible after the jump, even though its liveness \
+            "#1069/#1487: issue #7 must be visible after the jump, even though its repo \
              and milestone groups were both collapsed beforehand:\n{pipeline_screen}"
         );
     }
@@ -30521,10 +30507,10 @@ Milestone tracking issue.
     /// flat sibling under the same milestone header.
     ///
     /// #1281 note: the epic classifies as In-progress (any Done child
-    /// promotes it) so the nested render path is the Live/Idle instance's
+    /// promotes it) so the nested render path is the In-progress
     /// filtered child list. #101 (Ready, no live session) nests under the
-    /// Idle instance; #102 (Done) is intentionally **absent** from the
-    /// In-progress → Idle nested list — its "M/M done" contribution stays
+    /// filtered one; #102 (Done) is intentionally **absent** from the
+    /// In-progress nested list — its "M/M done" contribution stays
     /// in the epic's own progress badge (asserted below), which reads off
     /// the unfiltered nesting. A distinct #1281 fixture below covers the
     /// hidden-child regression directly.
@@ -30566,12 +30552,12 @@ Milestone tracking issue.
             "#101 must render BELOW the epic row: epic={epic_pos:?} a={child_a_pos:?}\n{screen}",
         );
         // #1281: the Done child #102 is filtered out of the In-progress →
-        // Idle instance's nested child list and remains suppressed from
+        // In-progress nested child list and remains suppressed from
         // flat sibling rendering, so it must not render anywhere on the
         // Pipeline screen while its epic is still open.
         assert!(
             !driver.screen_contains("#102"),
-            "#102 (Done child of an in-progress epic) must NOT render nested under In-progress → Idle (#1281):\n{screen}",
+            "#102 (Done child of an in-progress epic) must NOT render nested under In-progress (#1281):\n{screen}",
         );
         assert_eq!(
             sibling_pos.0, epic_pos.0,
@@ -31182,7 +31168,7 @@ Milestone tracking issue.
 
         // Untouched epic ⇒ expanded by default, non-Done children visible.
         // #1281: the Done child #102 is filtered out of the In-progress →
-        // Idle instance's nested list regardless of the epic's expand
+        // In-progress nested list regardless of the epic's expand
         // state, so this test drives the chevron only against the Ready
         // child #101.
         let screen = driver.screen();
@@ -31346,7 +31332,7 @@ Milestone tracking issue.
 
         // One click on the chevron — the non-Done child returns.
         // #1281: the Done child #102 stays hidden across expand — the
-        // In-progress → Idle instance's nested list drops it regardless
+        // In-progress nested list drops it regardless
         // of the epic's expand state.
         driver.click(epic_pos.0 - 1.0, epic_pos.1);
 
@@ -31701,19 +31687,18 @@ Milestone tracking issue.
         );
     }
 
-    // ── #1269: In-progress Live/Idle epic-liveness partition ────────────────
+    // ── #1269/#1487: In-progress epic nesting under the repo node ───────────
 
     /// #1269: shared fixture — epic #100 tracking two children: #101 (a
     /// running headless worker — LIVE) and #102 (closed — DONE, therefore
     /// idle). All three issues carry `coord` labels of their own, so #101
     /// and #102 are ALSO independently present in `pipeline_issues` —
     /// mirrors `make_epic_nesting_app`'s dedup pattern above, and lets these
-    /// tests exercise both the nested-render partition AND
-    /// `resolve_nested_child_index`'s liveness filtering.
+    /// tests exercise both the nested render AND
+    /// `resolve_nested_child_index`'s Done-child filtering.
     ///
-    /// The epic's row-expand state — keyed on `(coord_repo, number)` alone,
-    /// shared across BOTH its Live and Idle row instances — is
-    /// force-expanded so both instances' children render without a click.
+    /// The epic's row-expand state — keyed on `(coord_repo, number)` — is
+    /// force-expanded so its children render without a click.
     fn make_epic_liveness_app() -> CoordApp {
         let data = BoardData {
             open_issues: vec![
@@ -31799,62 +31784,58 @@ Milestone tracking issue.
         app
     }
 
-    /// #1269 + #1281: epic + 2 children (one live, one done) — the epic
-    /// renders under BOTH Live and Idle; the live child #101 nests ONLY
-    /// under the Live instance; the done child #102 is filtered out of
-    /// BOTH In-progress instances (#1281) and, being globally nested under
-    /// an epic that is itself still in-progress, also skipped from a flat
-    /// Done-section row — so it does not appear anywhere on the Pipeline
-    /// while the epic remains open.
+    /// #1487 (was #1269 + #1281): epic + 2 children (one live, one done) —
+    /// the epic renders EXACTLY ONCE, under its repo node, with all of its
+    /// non-Done children beneath it. The done child #102 is filtered out
+    /// (#1281) and, being globally nested under an epic that is itself
+    /// still in-progress, also skipped from a flat Done-section row — so it
+    /// does not appear anywhere on the Pipeline while the epic remains open.
     #[test]
-    fn tuidriver_pipeline_epic_live_and_idle_children_partition_across_instances() {
+    fn tuidriver_pipeline_epic_renders_once_under_repo_node() {
         use quadraui::tui::testing::driver_with_shell;
 
         let app = make_epic_liveness_app();
         let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 50);
         let screen = driver.screen();
 
-        let live_hdr = driver
-            .find("Live")
-            .expect(&format!("Live section header must render:\n{screen}"));
-        let idle_hdr = driver
-            .find("Idle")
-            .expect(&format!("Idle section header must render:\n{screen}"));
+        // #1487: the top-level In-progress node is the repo, not Live/Idle.
+        let repo_hdr = driver
+            .find("api")
+            .unwrap_or_else(|| panic!("repo group node 'api' must render:\n{screen}"));
         assert!(
-            live_hdr.1 < idle_hdr.1,
-            "Live section must render above Idle: live={live_hdr:?} idle={idle_hdr:?}\n{screen}",
+            driver.find("Idle").is_none(),
+            "the Idle liveness group node must be gone (#1487):\n{screen}",
         );
 
-        // The epic renders TWICE — once per liveness instance. Even though
-        // the Idle instance's filtered child list is empty (its only idle
-        // child is #102 Done, dropped by #1281), the epic row itself
-        // stays visible with its progress summary.
+        // The epic renders ONCE — this is the #1487 regression: before the
+        // repo-grouping change it rendered once under Live and once under
+        // Idle, straddling a single epic across two places in the tree.
         assert_eq!(
             screen.matches("#100").count(),
-            2,
-            "epic #100 must render once under Live and once under Idle (regardless of \
-             whether the Idle instance has any non-Done children to expand):\n{screen}",
+            1,
+            "epic #100 must render exactly once, under its repo node (#1487):\n{screen}",
         );
 
-        // #101 (live) renders exactly once, nested under the Live instance —
+        // #101 (live) renders exactly once, nested under the epic —
         // never duplicated as a flat sibling (#1253 dedup still holds).
         assert_eq!(
             screen.matches("#101").count(),
             1,
             "#101 (live) must render exactly once:\n{screen}",
         );
-        let child_live_pos = driver
+        let child_pos = driver
             .find("#101")
-            .expect(&format!("live child #101 must render nested under Live:\n{screen}"));
+            .unwrap_or_else(|| panic!("child #101 must render nested under the epic:\n{screen}"));
+        let epic_pos = driver.find("#100").unwrap();
         assert!(
-            child_live_pos.1 > live_hdr.1 && child_live_pos.1 < idle_hdr.1,
-            "#101 must render between the Live header ({live_hdr:?}) and the Idle header \
-             ({idle_hdr:?}), i.e. nested under Live: {child_live_pos:?}\n{screen}",
+            child_pos.1 > epic_pos.1 && child_pos.1 > repo_hdr.1,
+            "#101 must render below the epic row, which is below the repo node: \
+             repo={repo_hdr:?} epic={epic_pos:?} child={child_pos:?}\n{screen}",
         );
 
-        // #1281: the Done child #102 is filtered out of both In-progress
-        // instances (Live and Idle) and stays globally nested under the
-        // still-open epic, so it renders nowhere on the Pipeline.
+        // #1281: the Done child #102 is filtered out of the In-progress
+        // nesting and stays globally nested under the still-open epic, so it
+        // renders nowhere on the Pipeline.
         assert_eq!(
             screen.matches("#102").count(),
             0,
@@ -31863,48 +31844,41 @@ Milestone tracking issue.
         );
     }
 
-    /// #1269 + #1281: `resolve_nested_child_index` (the click/selection
-    /// resolver) must apply the SAME per-instance filter the render loop
-    /// used — liveness AND `epic_child_kept_in_progress` (drop Done). The
-    /// fixture's only live child #101 (Ready) survives the Live-filter, so
-    /// position 0 under Live resolves to #101. The only idle child #102 is
-    /// Done and is filtered out entirely, so the Idle-filtered child list
-    /// is empty and every position resolves to `None`. Without the shared
-    /// predicate — if the decoder still walked the raw unfiltered
-    /// `epic_children` — position 0 under Idle would silently resolve to
+    /// #1281 + #1487: `resolve_nested_child_index` (the click/selection
+    /// resolver) must walk the SAME child subsequence the render loop
+    /// emitted — `in_progress_child_rows` (drop Done, sort in-flight first).
+    /// The fixture's child #101 survives the filter, so position 0 resolves
+    /// to #101; #102 is Done and dropped entirely, so position 1 is out of
+    /// range. Without the shared function — if the decoder still walked the
+    /// raw unfiltered `epic_children` — position 1 would silently resolve to
     /// #102 while the render loop already dropped it, and a click on the
-    /// filtered subsequence's phantom "next" row would misdirect.
+    /// filtered subsequence would misdirect.
     #[test]
-    fn resolve_nested_child_index_uses_the_matching_liveness_filtered_child_list() {
+    fn resolve_nested_child_index_uses_the_in_progress_filtered_child_list() {
         let app = make_epic_liveness_app();
         let epic_idx = app.pipeline_issues.iter().position(|i| i.number == 100).unwrap();
         let child_101_idx = app.pipeline_issues.iter().position(|i| i.number == 101).unwrap();
 
         assert_eq!(
-            app.resolve_nested_child_index(epic_idx, 0, Some(true)),
+            app.resolve_nested_child_index(epic_idx, 0, true),
             Some(child_101_idx),
-            "position 0 of the LIVE-filtered child list must resolve to #101",
+            "position 0 of the In-progress-filtered child list must resolve to #101",
         );
         assert_eq!(
-            app.resolve_nested_child_index(epic_idx, 1, Some(true)),
+            app.resolve_nested_child_index(epic_idx, 1, true),
             None,
-            "the live-filtered child list has only one entry — position 1 is out of range",
+            "#1281: #102 is Done and dropped from the In-progress child list — position 1 \
+             must resolve to None, not the raw #102 index",
         );
+        // The unfiltered (New/Done/Refining/Pending) path still sees both.
         assert_eq!(
-            app.resolve_nested_child_index(epic_idx, 0, Some(false)),
-            None,
-            "#1281: the Idle-filtered child list is empty (its only idle child #102 is Done \
-             and dropped by `epic_child_kept_in_progress`) — position 0 must resolve to None, \
-             not the raw #102 index",
-        );
-        assert_eq!(
-            app.resolve_nested_child_index(epic_idx, 1, Some(false)),
-            None,
-            "an empty filtered list resolves every position to None",
+            app.resolve_nested_child_index(epic_idx, 1, false),
+            app.pipeline_issues.iter().position(|i| i.number == 102),
+            "the unfiltered path nests the full child list, unchanged from #1197",
         );
     }
 
-    /// #1269: fixture for the single-child Live→Idle transition test — epic
+    /// #1269: fixture for the single-child live→finished transition test — epic
     /// #100 tracking exactly one child #101, whose liveness (a running
     /// headless worker vs closed-and-idle) is controlled by `child_live`.
     fn make_epic_single_child_app(child_live: bool) -> CoordApp {
@@ -31962,75 +31936,65 @@ Milestone tracking issue.
         app
     }
 
-    /// #1269 + #1281: when an epic's only live child finishes, the epic
-    /// (still open) must drop ENTIRELY to Idle — no lingering Live
-    /// section, no duplicate epic row left behind, and (per #1281) the
-    /// finished child itself must NOT nest under Idle either. The epic row
-    /// stays visible as a leaf in Idle with its `M/M done` summary until
-    /// the epic issue itself closes.
+    /// #1281 + #1487: when an epic's only live child finishes, the epic
+    /// (still open) keeps its single row under the repo node — its status
+    /// badge flips from `in-flight` to `ready`, and (per #1281) the
+    /// finished child itself must NOT nest beneath it. The epic row stays
+    /// visible as a leaf with its `M/M done` summary until the epic issue
+    /// itself closes.
     #[test]
-    fn tuidriver_pipeline_epic_single_live_child_finishing_drops_epic_to_idle_only() {
+    fn tuidriver_pipeline_epic_single_live_child_finishing_flips_row_to_ready() {
         use quadraui::tui::testing::driver_with_shell;
 
-        // Before: the only child is live — Live renders, Idle is absent
-        // (there's nothing idle to show).
+        // Before: the only child is live — the epic row reads `in-flight`.
         let app = make_epic_single_child_app(true);
+        let epic_idx = app.pipeline_issues.iter().position(|i| i.number == 100).unwrap();
+        assert!(
+            app.active_issue_in_flight(epic_idx),
+            "an epic with a live child must read in-flight",
+        );
         let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 50);
         let screen = driver.screen();
         assert!(
-            driver.find("Live").is_some(),
-            "Live section must render while the child is live:\n{screen}",
-        );
-        assert!(
-            driver.find("Idle").is_none(),
-            "Idle section must be absent — the epic's only child is live:\n{screen}",
+            driver.find("Idle").is_none() && driver.find("Live").is_none(),
+            "#1487: no Live/Idle group nodes exist any more:\n{screen}",
         );
         assert_eq!(
             screen.matches("#100").count(),
             1,
-            "epic renders once (Live only) while its only child is live:\n{screen}",
+            "epic renders exactly once while its only child is live:\n{screen}",
         );
 
         // After: the child finishes (issue closes, worker no longer
-        // running) — the epic drops to Idle only; Live disappears entirely.
+        // running) — the epic still renders once, now reading `ready`.
         let app2 = make_epic_single_child_app(false);
+        let epic_idx2 = app2.pipeline_issues.iter().position(|i| i.number == 100).unwrap();
+        assert!(
+            !app2.active_issue_in_flight(epic_idx2),
+            "once the only child finishes, the epic row must read ready",
+        );
         let driver2 = driver_with_shell(app2, CoordApp::shell_config(), 140, 50);
         let screen2 = driver2.screen();
-        assert!(
-            driver2.find("Live").is_none(),
-            "Live section must be ABSENT once the epic's only live child finishes:\n{screen2}",
-        );
-        let idle_hdr2 = driver2
-            .find("Idle")
-            .expect(&format!("Idle section must render once the child finishes:\n{screen2}"));
         assert_eq!(
             screen2.matches("#100").count(),
             1,
-            "epic renders once (Idle only) once its only child finishes:\n{screen2}",
-        );
-        let epic_pos2 = driver2
-            .find("#100")
-            .expect(&format!("epic row must render:\n{screen2}"));
-        assert!(
-            epic_pos2.1 > idle_hdr2.1,
-            "epic must render under the Idle section: {epic_pos2:?} idle_hdr={idle_hdr2:?}\n{screen2}",
+            "epic still renders exactly once once its only child finishes:\n{screen2}",
         );
         // #1281: the finished child #101 is Done and no longer nests
-        // under the epic's Idle instance — the epic row stays as a leaf
-        // with its progress summary until the epic itself closes.
+        // under the epic — the epic row stays as a leaf with its progress
+        // summary until the epic itself closes.
         assert!(
             !driver2.screen_contains("#101"),
-            "#1281: finished (Done) child must NOT nest under the epic in In-progress → Idle:\n{screen2}",
+            "#1281: finished (Done) child must NOT nest under the epic in In-progress:\n{screen2}",
         );
     }
 
-    /// #1269 + #1281: an epic whose children are ALL idle (one never
-    /// dispatched — Ready — plus one done) must appear ONLY under Idle,
-    /// absent from Live entirely. Under #1281, only the non-Done idle
-    /// child (#101 Ready) nests under Idle; the Done child (#102) is
-    /// filtered out. The epic itself still renders as an Idle leaf row.
+    /// #1281 + #1487: an epic whose children are all idle (one never
+    /// dispatched — Ready — plus one done) renders once under its repo
+    /// node. Under #1281, only the non-Done child (#101 Ready) nests
+    /// beneath it; the Done child (#102) is filtered out.
     #[test]
-    fn tuidriver_pipeline_epic_with_only_idle_children_absent_from_live() {
+    fn tuidriver_pipeline_epic_with_only_idle_children_renders_once() {
         use quadraui::tui::testing::driver_with_shell;
 
         let data = BoardData {
@@ -32096,41 +32060,34 @@ Milestone tracking issue.
         let screen = driver.screen();
 
         assert!(
-            driver.find("Live").is_none(),
-            "Live section must be absent — the epic has no live children:\n{screen}",
+            driver.find("Live").is_none() && driver.find("Idle").is_none(),
+            "#1487: no Live/Idle group nodes exist any more:\n{screen}",
         );
-        let idle_hdr = driver
-            .find("Idle")
-            .expect(&format!("Idle section must render:\n{screen}"));
 
         assert_eq!(
             screen.matches("#100").count(),
             1,
-            "epic renders once (Idle only):\n{screen}",
+            "epic renders exactly once, under its repo node:\n{screen}",
         );
         let epic_pos = driver
             .find("#100")
-            .expect(&format!("epic row must render:\n{screen}"));
-        assert!(
-            epic_pos.1 > idle_hdr.1,
-            "epic must render under Idle: epic={epic_pos:?} idle_hdr={idle_hdr:?}\n{screen}",
-        );
+            .unwrap_or_else(|| panic!("epic row must render:\n{screen}"));
 
-        // The Ready child #101 nests under the Idle instance; the Done
-        // child #102 is filtered out entirely by #1281 and renders
-        // nowhere on the Pipeline while the epic itself is still open.
+        // The Ready child #101 nests under the epic; the Done child #102 is
+        // filtered out entirely by #1281 and renders nowhere on the Pipeline
+        // while the epic itself is still open.
         let child_ready_pos = driver
             .find("#101")
-            .expect(&format!("Ready child #101 must render nested under Idle:\n{screen}"));
+            .unwrap_or_else(|| panic!("Ready child #101 must render nested under the epic:\n{screen}"));
         assert!(
             child_ready_pos.1 > epic_pos.1,
             "Ready child renders below the epic row:\n{screen}",
         );
         assert!(
             !driver.screen_contains("#102"),
-            "#1281: Done child #102 must NOT render — the epic's Idle instance drops \
-             Done children from its nested list, and the child stays globally nested \
-             under a still-open epic (so no flat Done-section row either):\n{screen}",
+            "#1281: Done child #102 must NOT render — the In-progress nesting drops \
+             Done children, and the child stays globally nested under a still-open \
+             epic (so no flat Done-section row either):\n{screen}",
         );
     }
 
@@ -32290,33 +32247,30 @@ Milestone tracking issue.
     }
 
     /// #1281 primary invariant: a Done child does NOT nest under its epic
-    /// in In-progress → Idle. The epic itself stays visible with its
-    /// progress summary (`M/M done`), so the operator still sees the
-    /// epic-level state without every finished child re-appearing as a
-    /// distinct nested row.
+    /// in In-progress. The epic itself stays visible with its progress
+    /// summary (`M/M done`), so the operator still sees the epic-level
+    /// state without every finished child re-appearing as a distinct
+    /// nested row.
     #[test]
-    fn tuidriver_pipeline_1281_done_child_hidden_from_in_progress_idle_nesting() {
+    fn tuidriver_pipeline_1281_done_child_hidden_from_in_progress_nesting() {
         use quadraui::tui::testing::driver_with_shell;
 
         let app = make_epic_done_children_app();
         let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 50);
         let screen = driver.screen();
 
-        let idle_hdr = driver
-            .find("Idle")
-            .expect(&format!("Idle section header must render:\n{screen}"));
+        assert!(
+            driver.find("Idle").is_none(),
+            "#1487: the Idle liveness group node is gone:\n{screen}",
+        );
         let epic_pos = driver
             .find("#100")
-            .expect(&format!("epic row must render as an Idle leaf:\n{screen}"));
-        assert!(
-            epic_pos.1 > idle_hdr.1,
-            "epic must render below the Idle header:\n{screen}",
-        );
+            .unwrap_or_else(|| panic!("epic row must render under In-progress:\n{screen}"));
 
-        // #101 (Ready, not live) nests under Idle — one non-Done idle child.
+        // #101 (Ready) nests under the epic — one non-Done child.
         let child_ready_pos = driver
             .find("#101")
-            .expect(&format!("Ready child #101 must nest under Idle:\n{screen}"));
+            .unwrap_or_else(|| panic!("Ready child #101 must nest under the epic:\n{screen}"));
         assert!(
             child_ready_pos.0 > epic_pos.0 && child_ready_pos.1 > epic_pos.1,
             "Ready child renders MORE indented and below the epic:\n{screen}",
@@ -32328,18 +32282,18 @@ Milestone tracking issue.
         // nested under a still-open epic.
         assert!(
             !driver.screen_contains("#102"),
-            "#1281: closed Done child #102 must not render nested under In-progress → Idle:\n{screen}",
+            "#1281: closed Done child #102 must not render nested under In-progress:\n{screen}",
         );
     }
 
     /// #1281: an epic whose children are ALL Done stays visible in
-    /// In-progress → Idle as a leaf row — with its `M/M done` progress
+    /// In-progress as a leaf row — with its `M/M done` progress
     /// summary — until the epic issue itself closes. This is the "don't
     /// regress the all-children-done epic" invariant from the briefing:
     /// the epic doesn't drop out of the Pipeline just because every child
     /// went Done under the new filter.
     #[test]
-    fn tuidriver_pipeline_1281_all_children_done_epic_stays_visible_in_idle_as_leaf() {
+    fn tuidriver_pipeline_1281_all_children_done_epic_stays_visible_as_leaf() {
         use quadraui::tui::testing::driver_with_shell;
 
         let data = BoardData {
@@ -32431,16 +32385,13 @@ Milestone tracking issue.
         let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 50);
         let screen = driver.screen();
 
-        let idle_hdr = driver
-            .find("Idle")
-            .expect(&format!("Idle section header must render — the epic is In-progress with all-Done children:\n{screen}"));
-        let epic_pos = driver
-            .find("#100")
-            .expect(&format!("epic row must STILL render in Idle (regression guard):\n{screen}"));
         assert!(
-            epic_pos.1 > idle_hdr.1,
-            "epic renders under Idle: epic={epic_pos:?} idle_hdr={idle_hdr:?}\n{screen}",
+            driver.find("Idle").is_none(),
+            "#1487: the Idle liveness group node is gone:\n{screen}",
         );
+        let epic_pos = driver.find("#100").unwrap_or_else(|| {
+            panic!("epic row must STILL render under In-progress (regression guard):\n{screen}")
+        });
 
         // No Done child renders nested under the epic — every child is
         // filtered out by `epic_child_kept_in_progress`.
@@ -32469,48 +32420,46 @@ Milestone tracking issue.
     }
 
     /// #1281: `resolve_nested_child_index` must skip Done children when
-    /// walking the In-progress instance's filtered child list, so
-    /// `child_pos` indexes the SAME subsequence the renderer emitted.
-    /// Without this the two decoders would drift past the renderer: a
-    /// click at position `n` in the on-screen list would resolve to the
-    /// n-th UNFILTERED entry, which — with Done children still in that
-    /// list — would misdirect to the wrong `pipeline_issues` index.
+    /// walking the In-progress filtered child list, so `child_pos` indexes
+    /// the SAME subsequence the renderer emitted.  Without this the two
+    /// decoders would drift past the renderer: a click at position `n` in
+    /// the on-screen list would resolve to the n-th UNFILTERED entry, which
+    /// — with Done children still in that list — would misdirect to the
+    /// wrong `pipeline_issues` index.
     #[test]
     fn resolve_nested_child_index_skips_done_children_under_in_progress() {
         let app = make_epic_done_children_app();
         let epic_idx = app.pipeline_issues.iter().position(|i| i.number == 100).unwrap();
         let ready_idx = app.pipeline_issues.iter().position(|i| i.number == 101).unwrap();
+        let merged_idx = app.pipeline_issues.iter().position(|i| i.number == 103).unwrap();
 
-        // Under Idle: the filtered child list keeps only #101 (Ready, not
-        // live). #102 (Done via `state=closed`) is dropped. #103 stays
-        // Ready per the DAG (open+merged is Ready in `build_dag_nodes`),
-        // so it also nests under Idle — position 1 resolves to #103's
-        // own pipeline_issues index.
-        let idle_pos_0 = app.resolve_nested_child_index(epic_idx, 0, Some(false));
+        // The filtered child list keeps #101 (Ready) and #103 (Ready per
+        // the DAG — open+merged is Ready in `build_dag_nodes`). #102 (Done
+        // via `state=closed`) is dropped.
         assert_eq!(
-            idle_pos_0,
+            app.resolve_nested_child_index(epic_idx, 0, true),
             Some(ready_idx),
-            "Idle-filtered position 0 must be #101 (Ready), skipping past the Done #102",
+            "position 0 must be #101 (Ready)",
         );
-
-        // The Live-filtered list is empty for this fixture (no child has
-        // a running headless assignment or tmux session), so every Live
-        // position resolves to None.
         assert_eq!(
-            app.resolve_nested_child_index(epic_idx, 0, Some(true)),
+            app.resolve_nested_child_index(epic_idx, 1, true),
+            Some(merged_idx),
+            "position 1 must be #103, skipping past the Done #102",
+        );
+        assert_eq!(
+            app.resolve_nested_child_index(epic_idx, 2, true),
             None,
-            "Live-filtered position 0 must be None — no child has a live session",
+            "only two children survive the filter — position 2 is out of range",
         );
     }
 
-    /// #1281: the shared `epic_child_kept_in_progress` predicate is what
-    /// the renderer + both decoders agree on. Directly verify the two
+    /// #1281 / #1487: the shared `in_progress_child_rows` transform is what
+    /// the renderer + both decoders agree on. Directly verify its two
     /// invariants at the unit level so a regression in either callsite
-    /// shows up here first: (1) liveness must match this instance, (2)
-    /// Done children are always dropped regardless of liveness.
+    /// shows up here first: (1) Done children are always dropped, (2)
+    /// in-flight children sort above ready ones, stably.
     #[test]
-    fn epic_child_kept_in_progress_agrees_across_renderer_and_decoders() {
-        let app = make_epic_done_children_app();
+    fn in_progress_child_rows_agrees_across_renderer_and_decoders() {
         let ready = EpicChildRow {
             number: 101,
             title: "Ready".to_string(),
@@ -32522,42 +32471,302 @@ Milestone tracking issue.
             state: NodeState::Done,
         };
         let in_flight = EpicChildRow {
-            number: 999,
+            number: 103,
             title: "InFlight".to_string(),
             state: NodeState::InFlight,
         };
+        let blocked = EpicChildRow {
+            number: 104,
+            title: "Blocked".to_string(),
+            state: NodeState::Blocked(vec![101]),
+        };
+        let ready_2 = EpicChildRow {
+            number: 105,
+            title: "Ready 2".to_string(),
+            state: NodeState::Ready,
+        };
 
-        // Liveness gate: a Ready child with no live session belongs under
-        // Idle (want_live=false) but NOT under Live.
-        assert!(
-            app.epic_child_kept_in_progress("api", &ready, false),
-            "Ready + no live session must be kept under Idle",
-        );
-        assert!(
-            !app.epic_child_kept_in_progress("api", &ready, true),
-            "Ready + no live session must NOT be kept under Live",
-        );
-
-        // #1281: Done drops the child from BOTH instances, regardless of
-        // whatever liveness state it might carry.
-        assert!(
-            !app.epic_child_kept_in_progress("api", &done, false),
-            "Done child must NEVER be kept under Idle (#1281)",
-        );
-        assert!(
-            !app.epic_child_kept_in_progress("api", &done, true),
-            "Done child must NEVER be kept under Live (#1281)",
+        let kept = CoordApp::in_progress_child_rows(&[
+            ready.clone(),
+            done.clone(),
+            blocked.clone(),
+            in_flight.clone(),
+            ready_2.clone(),
+        ]);
+        let numbers: Vec<u64> = kept.iter().map(|r| r.number).collect();
+        assert_eq!(
+            numbers,
+            vec![103, 101, 105, 104],
+            "#1281: Done (#102) is dropped. #1487: in-flight (#103) sorts above ready \
+             (#101, #105 — in their original order), which sorts above blocked (#104)",
         );
 
-        // A non-Done, non-live child (InFlight would normally imply live,
-        // but only via `child_session_is_live` — a bare InFlight row with
-        // no matching assignment/session in this fixture is treated as
-        // idle by the predicate). Not asserted as a #1281 invariant, but
-        // guards the shape: the predicate doesn't accidentally treat
-        // InFlight the same as Done.
+        // #1281 spelled out: a Done row never survives, whatever its position.
+        assert!(!CoordApp::epic_child_kept_in_progress(&done));
+        assert!(CoordApp::epic_child_kept_in_progress(&ready));
+        assert!(CoordApp::epic_child_kept_in_progress(&in_flight));
+        assert!(CoordApp::epic_child_kept_in_progress(&blocked));
+    }
+
+    // ── #1487: In-progress = repo nodes + in-flight-first ordering ──────────
+
+    /// #1487 fixture — one repo (`zeta`, so its would-be repo letter badge
+    /// is a distinctive "Z") whose In-progress section exercises every axis
+    /// the issue changed:
+    ///
+    /// - epic #200 (milestone 5, "v9.0") with children #202 (Ready, listed
+    ///   FIRST in the `## Sub-issues` order), #201 (InFlight — a running
+    ///   work assignment) and #203 (Done — closed). The in-flight-first sort
+    ///   therefore has to actually reorder the child list.
+    /// - plain #210 (settled `done` work assignment → `ready`) declared
+    ///   BEFORE plain #211 (running work assignment → `in-flight`), both in
+    ///   v9.0, so the in-flight-first sort has to reorder the milestone
+    ///   bucket too.
+    ///
+    /// Every child is independently present in `pipeline_issues` (so the
+    /// selection decoders can resolve a nested row to a real index) but is
+    /// suppressed from a flat top-level row by #1253's global nesting set.
+    fn make_in_progress_repo_grouping_app() -> CoordApp {
+        let open = |number: u64, title: &str, state: &str, labels: Vec<String>| OpenIssue {
+            repo_name: "zeta".to_string(),
+            number,
+            title: title.to_string(),
+            body: String::new(),
+            state: state.to_string(),
+            labels,
+            milestone_number: Some(5),
+            milestone_title: Some("v9.0".to_string()),
+        };
+        let coord = || vec!["coord".to_string()];
+        let coord_epic = || vec!["coord".to_string(), "epic".to_string()];
+        let data = BoardData {
+            pipeline_repos: vec![("zeta".to_string(), "acme/zeta".to_string())],
+            open_issues: vec![
+                open(200, "Epic", "open", coord_epic()),
+                open(201, "Child running", "open", coord()),
+                open(202, "Child waiting", "open", coord()),
+                open(203, "Child finished", "closed", coord()),
+                open(210, "Settled work", "open", coord()),
+                open(211, "Running work", "open", coord()),
+            ],
+            epic_children: vec![EpicChildren {
+                repo_name: "zeta".to_string(),
+                tracking_issue: 200,
+                children: vec![
+                    // Ready listed first on purpose — the rendered order must
+                    // put the InFlight #201 above it (#1487).
+                    EpicChild { number: 202, state: "open".to_string() },
+                    EpicChild { number: 201, state: "open".to_string() },
+                    EpicChild { number: 203, state: "closed".to_string() },
+                ],
+            }],
+            assignments: vec![
+                make_assignment_typed("running", 201, "zeta", Some("work")),
+                make_assignment_typed("done", 210, "zeta", Some("work")),
+                make_assignment_typed("running", 211, "zeta", Some("work")),
+            ],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        let issue = |number: u64, title: &str, closed: bool, labels: Vec<String>| PipelineIssue {
+            number,
+            title: title.to_string(),
+            body: String::new(),
+            repo_slug: "acme/zeta".to_string(),
+            coord_repo: Some("zeta".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: labels,
+            is_closed: closed,
+        };
+        app.pipeline_issues = vec![
+            issue(200, "Epic", false, coord_epic()),
+            issue(201, "Child running", false, coord()),
+            issue(202, "Child waiting", false, coord()),
+            issue(203, "Child finished", true, coord()),
+            // Declared BEFORE the in-flight #211 so the sort must move it down.
+            issue(210, "Settled work", false, coord()),
+            issue(211, "Running work", false, coord()),
+        ];
+        app.pipeline_epic_expanded.insert(("zeta".to_string(), 200), true);
+        app.active_view = SidebarView::Pipeline;
+        app.rebuild_pipeline_sidebar(None);
+        app
+    }
+
+    /// #1487 acceptance: the In-progress section's top-level nodes are
+    /// **repos**, not Live/Idle liveness buckets — and an epic with a live
+    /// child plus idle children renders EXACTLY ONCE beneath its repo node,
+    /// with ALL of its non-Done children under it. Before #1487 that epic
+    /// was straddled across two group nodes (one child under Live, the rest
+    /// under Idle) with its `N/M done` badge rendered twice.
+    #[test]
+    fn tuidriver_in_progress_groups_by_repo_and_renders_epic_once() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_in_progress_repo_grouping_app();
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 50);
+        let screen = driver.screen();
+
+        // The group node names the repo…
         assert!(
-            app.epic_child_kept_in_progress("api", &in_flight, false),
-            "InFlight (non-Done) child with no live session sits under Idle, not filtered",
+            driver.screen_contains("zeta"),
+            "the In-progress group node must name the repo:\n{screen}",
+        );
+        // …and the Live/Idle nodes are gone.
+        assert!(
+            driver.find("Live").is_none(),
+            "no 'Live' group node may remain in the In-progress section:\n{screen}",
+        );
+        assert!(
+            driver.find("Idle").is_none(),
+            "no 'Idle' group node may remain in the In-progress section:\n{screen}",
+        );
+
+        // The epic renders once — with BOTH of its non-Done children (one
+        // live, one idle) beneath it, in one place.
+        assert_eq!(
+            screen.matches("#200").count(),
+            1,
+            "epic #200 must render exactly once (#1487):\n{screen}",
+        );
+        assert_eq!(
+            screen.matches("#201").count(),
+            1,
+            "live child #201 must render once, nested under the epic:\n{screen}",
+        );
+        assert_eq!(
+            screen.matches("#202").count(),
+            1,
+            "idle child #202 must render once, under the SAME epic row as #201:\n{screen}",
+        );
+        assert_eq!(
+            screen.matches("#203").count(),
+            0,
+            "#1281: the Done child stays out of the In-progress nesting:\n{screen}",
+        );
+
+        // Both children sit below the single epic row.
+        let epic_y = driver.find("#200").unwrap().1;
+        assert!(
+            driver.find("#201").unwrap().1 > epic_y && driver.find("#202").unwrap().1 > epic_y,
+            "every non-Done child nests below the one epic row:\n{screen}",
+        );
+    }
+
+    /// #1487 acceptance: within a milestone bucket AND within an epic's
+    /// child list, `in-flight` rows sort above `ready` rows — the per-row
+    /// status is only useful if the eye doesn't have to hunt for it.
+    #[test]
+    fn tuidriver_in_progress_sorts_in_flight_above_ready() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_in_progress_repo_grouping_app();
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 50);
+        let screen = driver.screen();
+
+        // Milestone bucket: #211 (running work) above #210 (settled work),
+        // even though #210 comes first in `pipeline_issues` order.
+        let y210 = driver
+            .find("#210")
+            .unwrap_or_else(|| panic!("#210 must render:\n{screen}"))
+            .1;
+        let y211 = driver
+            .find("#211")
+            .unwrap_or_else(|| panic!("#211 must render:\n{screen}"))
+            .1;
+        assert!(
+            y211 < y210,
+            "#1487: the in-flight #211 must sort above the ready #210 within the \
+             milestone bucket (#210 is first in issue order): #211@{y211} #210@{y210}\n{screen}",
+        );
+
+        // Epic children: #201 (InFlight) above #202 (Ready), even though
+        // #202 is listed first in the epic's `## Sub-issues` order.
+        let y201 = driver.find("#201").unwrap().1;
+        let y202 = driver.find("#202").unwrap().1;
+        assert!(
+            y201 < y202,
+            "#1487: the in-flight child #201 must sort above the ready child #202 \
+             (#202 is first in the sub-issue list): #201@{y201} #202@{y202}\n{screen}",
+        );
+    }
+
+    /// #1487 acceptance: a top-level In-progress issue row carries its own
+    /// `in-flight` / `ready` status text — the signal the Live/Idle group
+    /// node used to be the only carrier of — and the milestone header no
+    /// longer carries the #1069 single-letter repo tag (the repo node above
+    /// it already names the repo, and a repo group can't be mixed-repo).
+    #[test]
+    fn tuidriver_in_progress_row_status_and_no_milestone_repo_tag() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_in_progress_repo_grouping_app();
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 50);
+        let screen = driver.screen();
+        let lines: Vec<&str> = screen.lines().collect();
+        let line_at = |y: f32| lines.get(y as usize).copied().unwrap_or_default();
+
+        // Top-level rows carry the status badge.
+        let running_line = line_at(driver.find("#211").unwrap().1);
+        assert!(
+            running_line.contains("in-flight"),
+            "#1487: a top-level in-progress row with a running worker must show \
+             'in-flight': {running_line:?}\n{screen}",
+        );
+        let settled_line = line_at(driver.find("#210").unwrap().1);
+        assert!(
+            settled_line.contains("ready"),
+            "#1487: a top-level in-progress row with no live session must show \
+             'ready': {settled_line:?}\n{screen}",
+        );
+
+        // The milestone header carries no repo letter badge. The repo is
+        // "zeta", so its tag would be a "Z" — the only uppercase Z anywhere
+        // near this row.
+        let mil_line = line_at(
+            driver
+                .find("v9.0")
+                .unwrap_or_else(|| panic!("milestone header must render:\n{screen}"))
+                .1,
+        );
+        assert!(
+            !mil_line.contains('Z'),
+            "#1487: the In-progress milestone header must NOT carry the repo letter \
+             badge ('Z' for zeta): {mil_line:?}\n{screen}",
+        );
+    }
+
+    /// #1487 invariant guard: right-clicking a nested epic-child row after
+    /// the in-flight-first reorder must target THAT child. The renderer and
+    /// both selection decoders index into the same `in_progress_child_rows`
+    /// subsequence — this is where an off-by-one would silently open the
+    /// menu for the wrong issue.
+    #[test]
+    fn tuidriver_right_click_nested_child_targets_that_child_after_sort() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_in_progress_repo_grouping_app();
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 50);
+
+        // #202 is the SECOND rendered child (the sort moved the in-flight
+        // #201 above it) but the FIRST entry in the raw sub-issue list — a
+        // decoder that walked the unsorted list would resolve this row to
+        // #201 instead.
+        let (x, y) = driver.find("#202").unwrap_or_else(|| {
+            panic!("nested child #202 must render:\n{}", driver.screen())
+        });
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: MouseButton::Right,
+            position: Point::new(x, y),
+            modifiers: Modifiers::default(),
+        });
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Copy issue #202"),
+            "#1487: right-clicking the second rendered child must target #202, \
+             not the child that used to sit at that position:\n{screen}",
         );
     }
 
@@ -32746,13 +32955,13 @@ Milestone tracking issue.
 
     /// #1287 TuiDriver black-box: an epic with one open child that has a
     /// completed (non-running) work assignment must render under
-    /// **In-progress → Idle**, NOT under New.  The worked child's nested
-    /// badge must show "in-flight" (not "ready"); the unstarted sibling
-    /// child must still show "ready".
+    /// **In-progress**, NOT under New.  The worked child's nested badge
+    /// must show "in-flight" (not "ready"); the unstarted sibling child
+    /// must still show "ready".
     ///
     /// This is the primary rendered regression guard for #1287.
     #[test]
-    fn tuidriver_pipeline_epic_with_completed_child_is_in_progress_idle() {
+    fn tuidriver_pipeline_epic_with_completed_child_is_in_progress() {
         use quadraui::tui::testing::driver_with_shell;
 
         let app = make_epic_completed_child_app();
@@ -32764,10 +32973,10 @@ Milestone tracking issue.
             "#1287: In-progress section must render — epic with a completed child \
              must not be stranded in New:\n{screen}"
         ));
-        // The "Idle" sub-header must render (no live session, so this is Idle).
+        // #1487: the sub-header is the repo node — no Live/Idle bucket.
         assert!(
-            driver.screen_contains("Idle"),
-            "#1287: Idle sub-bucket must render (no live session):\n{screen}",
+            !driver.screen_contains("Idle"),
+            "#1487: the Idle sub-bucket is gone — In-progress groups by repo:\n{screen}",
         );
 
         // Epic #300 must appear BELOW the In-progress header.

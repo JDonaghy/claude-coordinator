@@ -2003,13 +2003,15 @@ pub struct CoordApp {
     ///
     /// Key semantics: `(lifecycle_key, group_key)` — note the order is
     /// lifecycle-first now that lifecycle is the top-level grouping and the
-    /// sub-group is repo (New/Refining/Pending) or liveness (In-progress).
+    /// sub-group is the repo (#1487: In-progress groups by repo too — it used
+    /// to key on the Live/Idle liveness bucket).
     pipeline_lifecycle_expanded: std::collections::HashMap<(String, String), bool>,
     /// #668/#857/#1069: Expanded state for milestone sub-headers in the
     /// Pipeline New and In-progress sections (Done is a flat list post-#728
     /// and Refining/Pending have no milestone tier, so neither keys into this
     /// map).  Key: `(lifecycle_key, group_key, milestone_key)` — `group_key`
-    /// is the repo for New, the liveness bucket (Live/Idle) for In-progress.
+    /// is the repo for both New and In-progress (#1487; In-progress used to
+    /// key on its Live/Idle liveness bucket).
     /// Default for an untouched key: New → false (collapsed, #857
     /// milestones-first view); In-progress → true (expanded — that work is
     /// already in flight).  Persists across rebuilds once a user toggles a
@@ -3711,10 +3713,12 @@ impl CoordApp {
         if self.pending_data.is_none() {
             self.pending_data = Some(start_data_load());
         }
-        // #559: re-arm remote session discovery so the Live/Idle split stays
+        // #559: re-arm remote session discovery so per-row liveness stays
         // current for the entire TUI run.  The initial arm is one-shot
         // (startup only); without this, any session started after startup
-        // stays in Idle forever until the TUI is restarted.
+        // never registers as live until the TUI is restarted.  (#1487 dropped
+        // the Live/Idle *grouping*, but liveness still drives the per-row
+        // `in-flight`/`ready` badge — the refresh is still required.)
         if self.pending_remote_sessions.is_none() {
             self.pending_remote_sessions = Some(spawn_remote_tmux_sessions_fetch(
                 crate::commands::find_config(),

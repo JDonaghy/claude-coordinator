@@ -295,6 +295,7 @@ pub(crate) struct PendingFixForceConfirm {
 /// #1197: one resolved child row ready to nest beneath its epic's Pipeline
 /// row — issue number, title, and dispatch state (Done/InFlight/Ready,
 /// reusing `milestone_dag::build_dag_nodes` rather than re-deriving it).
+#[derive(Clone)]
 pub(crate) struct EpicChildRow {
     pub(crate) number: u64,
     pub(crate) title: String,
@@ -653,7 +654,7 @@ impl CoordApp {
         // chat-/refinement-only issue belongs in New, not Active.  Use the same
         // `is_workable_type` predicate as the Board classifier; the old inline
         // list omitted `chat`, which pinned chat-only issues (e.g. #258) to
-        // In-progress:Idle and made "Drop to backlog" appear to do nothing.
+        // In-progress and made "Drop to backlog" appear to do nothing.
         let has_work_assignment = self.data.assignments.iter().any(|a| {
             a.issue_number == issue.number
                 && issue
@@ -912,10 +913,10 @@ impl CoordApp {
         let path = self.pipeline_sidebar.selected_path(section)?;
 
         // Resolve the base issue index (the epic at the state's base depth)
-        // plus require the trailing nested-child segment. #1269: `want_live`
-        // carries the liveness this leaf's nested children were filtered to
+        // plus require the trailing nested-child segment. #1487: `in_progress`
+        // marks the leaves whose nested children were filtered + reordered
         // (In-progress only — see `resolve_nested_child_index`'s doc comment).
-        let (base_depth, parent_idx, want_live) = match state_key {
+        let (base_depth, parent_idx, in_progress) = match state_key {
             "new" => {
                 if path.len() < 3 {
                     return None;
@@ -924,25 +925,24 @@ impl CoordApp {
                 let (_, repo_issue_idxs) = repo_groups.get(path[0] as usize)?;
                 let milestones = self.pipeline_milestones_for_issues(repo_issue_idxs);
                 let (_, _, mil) = milestones.get(path[1] as usize)?;
-                (3usize, mil.get(path[2] as usize).copied()?, None)
+                (3usize, mil.get(path[2] as usize).copied()?, false)
             }
             "in-progress" => {
                 if path.len() < 3 {
                     return None;
                 }
-                let groups = self.pipeline_active_by_liveness();
-                let (gk, issue_idxs) = groups.get(path[0] as usize)?;
-                let want_live = Some(gk == "live");
+                let groups = self.pipeline_active_by_repo();
+                let (_, issue_idxs) = groups.get(path[0] as usize)?;
                 let milestones = self.pipeline_milestones_for_issues(issue_idxs);
                 let (_, _, mil) = milestones.get(path[1] as usize)?;
-                (3usize, mil.get(path[2] as usize).copied()?, want_live)
+                (3usize, mil.get(path[2] as usize).copied()?, true)
             }
             "done" => {
                 if path.len() < 2 {
                     return None;
                 }
                 let done_windowed = self.pipeline_done_windowed();
-                (2usize, done_windowed.get(path[1] as usize).copied()?, None)
+                (2usize, done_windowed.get(path[1] as usize).copied()?, false)
             }
             "refining" | "pending" => {
                 if path.len() < 2 {
@@ -950,7 +950,7 @@ impl CoordApp {
                 }
                 let groups = self.pipeline_repos_for_state(state_key);
                 let (_, issue_idxs) = groups.get(path[0] as usize)?;
-                (2usize, issue_idxs.get(path[1] as usize).copied()?, None)
+                (2usize, issue_idxs.get(path[1] as usize).copied()?, false)
             }
             _ => return None,
         };
@@ -961,23 +961,20 @@ impl CoordApp {
         }
         let parent = self.pipeline_issues.get(parent_idx)?;
         let child_pos = path[base_depth] as usize;
-        let child_number = if let Some(want_live) = want_live {
-            // #1269 / #1281: the parent rendered its In-progress-instance-
-            // FILTERED child list — `child_pos` indexes into that filtered
-            // subsequence, not the raw unfiltered `epic_children_for` order.
-            // Resolve the rows from `epic_child_rows_for` and apply the
-            // same `epic_child_kept_in_progress` predicate the renderer +
-            // `resolve_nested_child_index` both use so the three sites
-            // agree on what child sits at position `child_pos`.
+        let child_number = if in_progress {
+            // #1281 / #1487: the parent rendered its In-progress-FILTERED,
+            // in-flight-first-SORTED child list — `child_pos` indexes into
+            // that subsequence, not the raw `epic_children_for` order.
+            // Resolve the rows from `epic_child_rows_for` and run them
+            // through the same `in_progress_child_rows` the renderer +
+            // `resolve_nested_child_index` both use so the three sites agree
+            // on what child sits at position `child_pos`.
             let repo = parent.coord_repo.as_deref()?;
             let rows = self.epic_child_rows_for(repo, parent.number);
             if rows.is_empty() {
                 return None;
             }
-            rows.iter()
-                .filter(|row| self.epic_child_kept_in_progress(repo, row, want_live))
-                .nth(child_pos)?
-                .number
+            Self::in_progress_child_rows(&rows).get(child_pos)?.number
         } else {
             self.epic_children_for(parent)?.get(child_pos)?.number
         };
@@ -1108,8 +1105,10 @@ impl CoordApp {
     /// separate parameters `session_is_live` takes for a full `PipelineIssue`
     /// (whose `repo_slug` fallback doesn't apply here) collapse into one.
     ///
-    /// Used by `pipeline_active_by_liveness` to decide, per child, whether it
-    /// belongs under the epic's **Live** or **Idle** row instance.
+    /// #1487: used by `active_issue_in_flight` to decide whether an epic's
+    /// top-level In-progress row reads `in-flight` or `ready` — an epic
+    /// almost never carries a session of its own, so its status comes from
+    /// its children.  (Before #1487 this drove the Live/Idle *grouping*.)
     pub(crate) fn child_session_is_live(&self, epic_coord_repo: &str, child_number: u64) -> bool {
         self.session_is_live(Some(epic_coord_repo), epic_coord_repo, child_number)
     }
@@ -1187,72 +1186,85 @@ impl CoordApp {
         has_running_headless_assignment
     }
 
-    /// Split the in-progress ("Active") issues into two ordered groups by
-    /// whether a live claude session exists: `"live"` then `"idle"`.  Only
-    /// non-empty groups are returned — mirroring `pipeline_repos_for_state`'s
-    /// `(group_key, issue_indices)` shape so the nested `[group, child]` path
-    /// handling is identical for every Pipeline section.
+    /// #1487: whether a top-level In-progress row should read `in-flight`
+    /// (rather than `ready`).
     ///
-    /// #1269: a plain (non-epic) issue lands in exactly one bucket, keyed off
-    /// its own session (`issue_session_is_live`) — unchanged from before.
+    /// A plain (non-epic) issue is keyed off its own session
+    /// (`issue_session_is_live` — tmux session or running headless worker).
     ///
     /// An **epic** tracking issue almost never carries a session of its own
-    /// (the work happens on its children), so keying its bucket off
-    /// `issue_session_is_live(epic)` disconnected the Live/Idle split from
-    /// what's actually running — the epic (and every child nested beneath
-    /// it, unfiltered) sat wherever the epic's own near-always-absent
-    /// session put it. Instead, classify an epic by its *children*: it
-    /// appears under **Live** iff at least one child is itself live, and
-    /// under **Idle** iff at least one child is idle-or-done — so an epic
-    /// with both kinds of children appears in BOTH buckets (the render loop
-    /// then partitions which children nest under which instance, see
-    /// `filter_epic_nesting_by_liveness`). An epic with no live children at
-    /// all drops out of Live entirely; the #1253 "all children done, epic
-    /// still open" case still lands in Idle only, matching prior behavior.
-    pub(crate) fn pipeline_active_by_liveness(&self) -> Vec<(String, Vec<usize>)> {
-        let mut live: Vec<usize> = Vec::new();
-        let mut idle: Vec<usize> = Vec::new();
-        for idx in self.pipeline_active_issues() {
-            let issue = &self.pipeline_issues[idx];
-            if let Some(children) = self.epic_children_for(issue) {
-                let repo = issue.coord_repo.as_deref().unwrap_or_default();
-                let mut any_live = false;
-                let mut any_idle = false;
-                for child in children {
-                    if self.child_session_is_live(repo, child.number) {
-                        any_live = true;
-                    } else {
-                        any_idle = true;
-                    }
-                }
-                if any_live {
-                    live.push(idx);
-                }
-                if any_idle {
-                    idle.push(idx);
-                }
-            } else if self.issue_session_is_live(issue) {
-                live.push(idx);
-            } else {
-                idle.push(idx);
+    /// (the work happens on its children), so an epic is `in-flight` when
+    /// *any* of its children is live — the same child-liveness classification
+    /// #1269 used to build the old Live/Idle split, now applied per row
+    /// instead of as a grouping axis.  An epic that does happen to carry its
+    /// own session still counts.
+    pub(crate) fn active_issue_in_flight(&self, idx: usize) -> bool {
+        let Some(issue) = self.pipeline_issues.get(idx) else {
+            return false;
+        };
+        if let Some(children) = self.epic_children_for(issue) {
+            let repo = issue.coord_repo.as_deref().unwrap_or_default();
+            if children
+                .iter()
+                .any(|child| self.child_session_is_live(repo, child.number))
+            {
+                return true;
             }
         }
-        let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
-        if !live.is_empty() {
-            groups.push(("live".to_string(), live));
-        }
-        if !idle.is_empty() {
-            groups.push(("idle".to_string(), idle));
-        }
-        groups
+        self.issue_session_is_live(issue)
     }
 
-    /// Display label for an Active liveness group key (`"live"` → "Live").
-    pub(crate) fn liveness_group_label(key: &str) -> &'static str {
-        match key {
-            "live" => "Live",
-            _ => "Idle",
+    /// #1487: group the in-progress ("Active") issues by **repo** — the same
+    /// grouping the New / Refining / Pending sections use — in the same
+    /// insertion-order-of-`pipeline_issues` repo order
+    /// (`pipeline_repos_for_state`).  Only non-empty groups are returned,
+    /// mirroring `pipeline_repos_for_state`'s `(group_key, issue_indices)`
+    /// shape so the nested `[group, …]` path handling is identical for every
+    /// Pipeline section.
+    ///
+    /// This replaces the pre-#1487 `pipeline_active_by_liveness` Live/Idle
+    /// split.  Liveness is a *per-row attribute*, not a grouping axis: with
+    /// the old split an epic with one live and three idle children rendered
+    /// **twice**, once under each group, each instance showing only its half
+    /// of the children and its own duplicate `N/M done` badge.  Grouping by
+    /// repo renders every epic exactly once with all of its non-Done children
+    /// beneath it; the liveness signal survives as the per-row
+    /// `in-flight`/`ready` badge (`active_issue_in_flight`).
+    ///
+    /// Within a repo group the issues are ordered **in-flight first, then
+    /// ready**, ties broken by `pipeline_issues` index so the order is
+    /// stable.  `pipeline_milestones_for_issues` preserves the order of the
+    /// slice it is given, so each milestone bucket inherits the same sort —
+    /// and so do both selection decoders, which resolve through the very
+    /// same two functions.
+    pub(crate) fn pipeline_active_by_repo(&self) -> Vec<(String, Vec<usize>)> {
+        // Repo order from pipeline_issues (stable insertion order) — matches
+        // `pipeline_repos_for_state`, so In-progress lists repos in the same
+        // order as every other section.
+        let mut repos: Vec<String> = Vec::new();
+        for issue in &self.pipeline_issues {
+            let key = Self::pipeline_repo_key(issue).to_string();
+            if !repos.contains(&key) {
+                repos.push(key);
+            }
         }
+        let active = self.pipeline_active_issues();
+        let mut result: Vec<(String, Vec<usize>)> = Vec::new();
+        for repo_key in repos {
+            let mut ranked: Vec<(u8, usize)> = active
+                .iter()
+                .copied()
+                .filter(|&i| Self::pipeline_repo_key(&self.pipeline_issues[i]) == repo_key.as_str())
+                .map(|i| (if self.active_issue_in_flight(i) { 0 } else { 1 }, i))
+                .collect();
+            // (rank, idx) sorts in-flight above ready and keeps the original
+            // issue order within a rank.
+            ranked.sort_unstable();
+            if !ranked.is_empty() {
+                result.push((repo_key, ranked.into_iter().map(|(_, i)| i).collect()));
+            }
+        }
+        result
     }
 
     // ── #728: Done-section windowing helpers ─────────────────────────────────
@@ -1377,7 +1389,8 @@ impl CoordApp {
     /// Return issues for a lifecycle state, grouped by repo, in stable repo
     /// order (same order as `pipeline_repo_names`).  Only intended for
     /// `"new"`, `"refining"`, `"pending"`, and `"done"` — Active issues are
-    /// handled by `pipeline_active_issues` / `pipeline_active_by_liveness` instead.
+    /// handled by `pipeline_active_issues` / `pipeline_active_by_repo` instead
+    /// (same repo grouping, plus the #1487 in-flight-first ordering).
     ///
     /// Applies dedup, search filter, and dismissal filter.  Empty repos are
     /// omitted.
@@ -1560,22 +1573,14 @@ impl CoordApp {
             .collect()
     }
 
-    /// #1269 / #1281: shared "keep this child in this In-progress instance"
-    /// predicate. The renderer's [`Self::filter_epic_nesting_by_liveness`]
-    /// and both selection decoders — [`Self::resolve_nested_child_index`]
-    /// and [`Self::selected_nested_child_id`] — call this so the three sites
-    /// stay in exact agreement: `child_pos` in either decoder indexes into
-    /// EXACTLY the same filtered subsequence the renderer emitted rows for.
+    /// #1281 / #1487: shared "keep this child under its In-progress epic
+    /// row" predicate — the child must not itself be [`NodeState::Done`].
     ///
-    /// Two conditions must both hold for a nested-under-In-progress row:
-    /// 1. **Liveness matches this instance** — `child_session_is_live`
-    ///    equals `want_live` (Live or Idle), the #1269 partition.
-    /// 2. **Child is not itself Done** (#1281) — a Done child under an
-    ///    otherwise-in-progress epic is finished work and belongs to the
-    ///    Done section's flow, not under an In-progress → Idle epic row.
-    ///    The epic itself STAYS visible with its `M/M done` summary
-    ///    (`epic_progress_span`, keyed off the unfiltered nesting) — it's
-    ///    just the individual Done child rows that stop nesting there.
+    /// A Done child under an otherwise-in-progress epic is finished work and
+    /// belongs to the Done section's flow, not under the epic's In-progress
+    /// row.  The epic itself STAYS visible with its `M/M done` summary
+    /// (`epic_progress_span`, keyed off the unfiltered nesting) — it's just
+    /// the individual Done child rows that stop nesting there.
     ///
     /// Keyed off `EpicChildRow.state` — the [`NodeState`] the renderer
     /// already resolves via `build_dag_nodes` — rather than the coarse
@@ -1583,70 +1588,75 @@ impl CoordApp {
     /// GitHub-issue-not-yet-closed case (checkbox still "open",
     /// [`NodeState::Done`] via the assignment/state cache) agrees with the
     /// renderer's own display state.
-    pub(crate) fn epic_child_kept_in_progress(
-        &self,
-        epic_repo: &str,
-        row: &EpicChildRow,
-        want_live: bool,
-    ) -> bool {
-        if self.child_session_is_live(epic_repo, row.number) != want_live {
-            return false;
-        }
-        // #1281: a Done child does not nest under either In-progress
-        // instance. The epic itself stays visible with its M/M done badge
-        // (that badge is keyed off the unfiltered `full_nesting`, not the
-        // filtered one, in the render loop).
+    ///
+    /// Callers go through [`Self::in_progress_child_rows`], which also
+    /// applies the #1487 in-flight-first ordering — do not filter with this
+    /// predicate alone, or the resulting subsequence won't match the one the
+    /// renderer emitted.
+    pub(crate) fn epic_child_kept_in_progress(row: &EpicChildRow) -> bool {
         !matches!(row.state, NodeState::Done)
     }
 
-    /// #1269 / #1281: derive an In-progress-instance projection of an
-    /// already-computed [`EpicNesting`] — keeps, per epic, only the children
-    /// [`Self::epic_child_kept_in_progress`] accepts for this Live/Idle
-    /// instance (liveness matches AND not [`NodeState::Done`]), dropping any
-    /// epic whose filtered child list is empty from `by_epic`.
+    /// #1487: sort rank for an epic child's [`NodeState`] — in-flight first,
+    /// then ready, then blocked, then done (done never renders under
+    /// In-progress, see [`Self::epic_child_kept_in_progress`]).
+    fn node_state_rank(state: &NodeState) -> u8 {
+        match state {
+            NodeState::InFlight => 0,
+            NodeState::Ready => 1,
+            NodeState::Blocked(_) => 2,
+            NodeState::Done => 3,
+        }
+    }
+
+    /// #1281 / #1487: THE child-row subsequence the In-progress section
+    /// renders beneath an epic — Done children dropped, the rest ordered
+    /// in-flight → ready → blocked with ties keeping their original
+    /// (work-order / issue-number) position.
     ///
-    /// Used in the In-progress section to nest an epic's children beneath
-    /// its **Live** row instance (`want_live = true`) or its **Idle** row
-    /// instance (`want_live = false`) — the same epic can render once per
-    /// instance (see `pipeline_active_by_liveness`), each time expanding
-    /// only its matching half of the children.
+    /// The renderer (via [`Self::filter_epic_nesting_for_in_progress`]) and
+    /// both selection decoders — [`Self::resolve_nested_child_index`] and
+    /// [`Self::selected_nested_child_id`] — all funnel through this one
+    /// function so the three sites stay in exact agreement: `child_pos` in
+    /// either decoder indexes into EXACTLY the sequence the renderer emitted
+    /// rows for.  This is where an off-by-one would silently right-click the
+    /// wrong issue.
+    pub(crate) fn in_progress_child_rows(rows: &[EpicChildRow]) -> Vec<EpicChildRow> {
+        let mut kept: Vec<(u8, usize, EpicChildRow)> = rows
+            .iter()
+            .filter(|row| Self::epic_child_kept_in_progress(row))
+            .enumerate()
+            .map(|(pos, row)| (Self::node_state_rank(&row.state), pos, (*row).clone()))
+            .collect();
+        // (rank, original position) — stable in-flight-first ordering.
+        kept.sort_by_key(|(rank, pos, _)| (*rank, *pos));
+        kept.into_iter().map(|(_, _, row)| row).collect()
+    }
+
+    /// #1281 / #1487: derive the In-progress projection of an
+    /// already-computed [`EpicNesting`] — per epic, exactly the rows
+    /// [`Self::in_progress_child_rows`] yields (Done children dropped,
+    /// in-flight sorted above ready), dropping any epic whose resulting
+    /// child list is empty from `by_epic`.
     ///
     /// The unfiltered `nesting` passed in still backs the "N/M done"
     /// progress badge (`epic_progress_span`), which intentionally reports
-    /// against the WHOLE child set regardless of which instance is showing,
-    /// and still backs `nested` (the flat-row suppression set) so a child
-    /// dropped from the filtered per-instance list — for either reason —
-    /// does not suddenly reappear as a duplicate flat sibling elsewhere.
+    /// against the WHOLE child set, and still backs `nested` (the flat-row
+    /// suppression set) so a child dropped from the filtered list does not
+    /// suddenly reappear as a duplicate flat sibling elsewhere.
     ///
     /// An all-children-done epic keeps its top-level row (the loop over
     /// `mil_issue_idxs` doesn't consult `by_epic` to decide whether to emit
-    /// the epic — only to decide whether to expand children beneath it),
-    /// so the row stays visible under In-progress → Idle with its `M/M
-    /// done` summary until the epic issue itself closes.
-    pub(crate) fn filter_epic_nesting_by_liveness(
-        &self,
-        nesting: &EpicNesting,
-        want_live: bool,
-    ) -> EpicNesting {
+    /// the epic — only to decide whether to expand children beneath it), so
+    /// the row stays visible under In-progress with its `M/M done` summary
+    /// until the epic issue itself closes.
+    pub(crate) fn filter_epic_nesting_for_in_progress(nesting: &EpicNesting) -> EpicNesting {
         let mut filtered = EpicNesting {
             nested: nesting.nested.clone(),
             by_epic: std::collections::HashMap::new(),
         };
         for (&idx, rows) in &nesting.by_epic {
-            let repo = self
-                .pipeline_issues
-                .get(idx)
-                .and_then(|i| i.coord_repo.as_deref())
-                .unwrap_or_default();
-            let kept: Vec<EpicChildRow> = rows
-                .iter()
-                .filter(|row| self.epic_child_kept_in_progress(repo, row, want_live))
-                .map(|row| EpicChildRow {
-                    number: row.number,
-                    title: row.title.clone(),
-                    state: row.state.clone(),
-                })
-                .collect();
+            let kept = Self::in_progress_child_rows(rows);
             if !kept.is_empty() {
                 filtered.by_epic.insert(idx, kept);
             }
@@ -1798,41 +1808,36 @@ impl CoordApp {
     /// get "nothing selected" rather than silently falling back to acting
     /// on the parent epic instead.
     ///
-    /// #1269 / #1281: `want_live` must mirror whatever In-progress filter
-    /// the row that was actually rendered used — `Some(true)`/`Some(false)`
-    /// for a child nested beneath an epic's Live/Idle In-progress instance
-    /// (`child_pos` then indexes into the SAME filtered subsequence
-    /// [`Self::filter_epic_nesting_by_liveness`] produced, preserving the
-    /// parent's original child order), `None` everywhere else (New/Done/
-    /// Refining/Pending nest the full, unfiltered child list, unchanged
-    /// from #1197).
+    /// #1281 / #1487: `in_progress` must mirror whatever filter the row that
+    /// was actually rendered used — `true` for a child nested beneath an
+    /// epic's In-progress row (`child_pos` then indexes into the SAME
+    /// filtered + in-flight-first-sorted subsequence
+    /// [`Self::in_progress_child_rows`] produces), `false` everywhere else
+    /// (New/Done/Refining/Pending nest the full, unfiltered child list in its
+    /// original order, unchanged from #1197).
     ///
     /// The filtered path resolves the child list from [`Self::epic_child_rows_for`]
     /// (not [`Self::epic_children_for`]) so both branches walk the same
-    /// [`NodeState`]-carrying rows the renderer emitted, and applies
-    /// [`Self::epic_child_kept_in_progress`] — the same predicate — over
-    /// them. Without this, a Done child suppressed by the renderer (#1281)
-    /// but still visible to the decoder's stale `EpicChild.state` view
-    /// would shift the filtered subsequence, and `child_pos` would resolve
+    /// [`NodeState`]-carrying rows the renderer emitted, and runs them
+    /// through [`Self::in_progress_child_rows`] — the same function. Without
+    /// this, a Done child suppressed by the renderer (#1281), or the #1487
+    /// reordering, would shift the subsequence and `child_pos` would resolve
     /// to the wrong `pipeline_issues` index.
     pub(crate) fn resolve_nested_child_index(
         &self,
         parent_idx: usize,
         child_pos: usize,
-        want_live: Option<bool>,
+        in_progress: bool,
     ) -> Option<usize> {
         let issue = self.pipeline_issues.get(parent_idx)?;
         let repo = issue.coord_repo.clone();
-        let child_number = if let Some(want_live) = want_live {
+        let child_number = if in_progress {
             let repo_key = repo.as_deref()?;
             let rows = self.epic_child_rows_for(repo_key, issue.number);
             if rows.is_empty() {
                 return None;
             }
-            rows.iter()
-                .filter(|row| self.epic_child_kept_in_progress(repo_key, row, want_live))
-                .nth(child_pos)?
-                .number
+            Self::in_progress_child_rows(&rows).get(child_pos)?.number
         } else {
             let children = self.epic_children_for(issue)?;
             children.get(child_pos)?.number
@@ -1904,6 +1909,20 @@ impl CoordApp {
         }
     }
 
+    /// #1487: the `in-flight` / `ready` status badge for a **top-level**
+    /// In-progress row.  Before #1487 the only thing conveying this was the
+    /// Live/Idle group node the row sat under; with the section grouped by
+    /// repo instead, each row carries the signal itself — using the same
+    /// badge vocabulary and colours `epic_child_tree_row` already renders on
+    /// nested child rows.
+    pub(crate) fn in_progress_status_badge(&self, in_flight: bool) -> Badge {
+        if in_flight {
+            Badge::colored("in-flight", self.active_theme.link_fg)
+        } else {
+            Badge::colored("ready", self.active_theme.accent_fg)
+        }
+    }
+
     /// #668: Group a slice of `pipeline_issues` indices by milestone.
     ///
     /// Looks up milestone data via `pipeline_issue_milestone`.  Issues
@@ -1953,32 +1972,6 @@ impl CoordApp {
             .into_values()
             .filter(|(_, _, idxs)| !idxs.is_empty())
             .collect()
-    }
-
-    /// #1069: resolve the single-letter repo tag to show on an In-progress
-    /// milestone header.  A milestone belongs to exactly one repo, so the
-    /// tag normally moves off the per-issue rows and onto the header — this
-    /// returns `Some(tag)` when every issue in `mil_issue_idxs` shares the
-    /// same repo.  Returns `None` when the bucket is mixed-repo (the
-    /// "No milestone" catch-all can pool issues from multiple repos), in
-    /// which case the caller falls back to per-issue tags instead.
-    pub(crate) fn pipeline_milestone_header_repo_tag(
-        &self,
-        mil_issue_idxs: &[usize],
-        all_repos: &[String],
-    ) -> Option<String> {
-        let mut repo_keys: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        for &idx in mil_issue_idxs {
-            repo_keys.insert(Self::pipeline_repo_key(&self.pipeline_issues[idx]));
-        }
-        if repo_keys.len() == 1 {
-            repo_keys
-                .into_iter()
-                .next()
-                .map(|key| Self::repo_tag(key, all_repos))
-        } else {
-            None
-        }
     }
 
     /// Returns a map from GitHub repo slug (`owner/name`) to the count of
@@ -3473,8 +3466,9 @@ impl CoordApp {
         // headers, since they routinely accumulate multiple items per repo.
         // Each bucket is computed once here and reused for rows + restore.
         let active_flat: Vec<usize> = self.pipeline_active_issues();
-        // main: Live/Idle grouping for the in-progress section (#473/Live-Idle).
-        let active_by_liveness: Vec<(String, Vec<usize>)> = self.pipeline_active_by_liveness();
+        // #1487: repo grouping for the in-progress section (was the Live/Idle
+        // split — liveness is now a per-row badge, not a grouping axis).
+        let active_by_repo: Vec<(String, Vec<usize>)> = self.pipeline_active_by_repo();
         // #194: the non-Active states split into New / Refining / Pending,
         // each repo-grouped (Pending = the old single "New"/status:ready bucket).
         let new_by_repo: Vec<(String, Vec<usize>)> = self.pipeline_repos_for_state("new");
@@ -3584,49 +3578,40 @@ impl CoordApp {
 
             match lc_key {
                 "in-progress" => {
-                    // Active: two collapsible groups — **Live** (a claude
-                    // session is running in tmux, local or remote) and **Idle**
-                    // (in-progress, no session — waiting on you).  Mirrors the
-                    // repo-grouped tree the New/Done sections use; the group key
-                    // is the liveness bucket instead of a repo.
+                    // #1487: one collapsible group per **repo** — the same
+                    // grouping the New / Refining / Pending sections use.
+                    // (Before #1487 the top level was a Live/Idle liveness
+                    // split, which straddled a single epic across two places
+                    // in the tree: one child under Live, the rest under Idle,
+                    // with the `N/M done` badge rendered twice.  Liveness is
+                    // a per-row attribute and now renders as a per-row
+                    // `in-flight`/`ready` badge instead.)
                     //
-                    // #1069: within each liveness group, issues are further
+                    // #1069: within each repo group, issues are further
                     // grouped by milestone (3-level path [gi, mi, ii]) — the
                     // same `pipeline_milestones_for_issues` helper the New
-                    // section uses.  Since a milestone belongs to exactly one
-                    // repo, the single-letter repo tag moves from the issue
-                    // row up onto the milestone header; issue rows only keep
-                    // a tag when a bucket (typically "No milestone") turns out
-                    // to be mixed-repo, in which case the header can't carry
-                    // one tag so the per-issue tag stays for legibility.
+                    // section uses.  The milestone header carries no repo
+                    // letter badge any more (#1487): the repo node above it
+                    // already names the repo, and a repo group can't be
+                    // mixed-repo by construction.
                     sidebar.set_section_badge(
                         section_idx,
                         Some(StyledText::plain(format!("({})", active_flat.len()))),
                     );
-                    let tag_color = Color::rgb(180, 140, 240);
-                    for (gi, (group_key, issue_idxs)) in active_by_liveness.iter().enumerate() {
+                    for (gi, (group_key, issue_idxs)) in active_by_repo.iter().enumerate() {
                         let is_expanded = self
                             .pipeline_lifecycle_expanded
                             .get(&("in-progress".to_string(), group_key.clone()))
                             .copied()
                             .unwrap_or(true);
-                        let header_color = if group_key == "live" {
-                            Color::rgb(80, 160, 240) // blue = active session (matches accent_bg)
-                        } else {
-                            Color::rgb(150, 150, 160) // dim = idle
-                        };
                         rows.push(TreeRow {
                             path: vec![gi as u16],
                             indent: 1,
                             icon: None,
                             text: StyledText {
                                 spans: vec![StyledSpan::with_fg(
-                                    format!(
-                                        "{} ({})",
-                                        Self::liveness_group_label(group_key),
-                                        issue_idxs.len()
-                                    ),
-                                    header_color,
+                                    format!("{} ({})", group_key, issue_idxs.len()),
+                                    state_color("in-progress"),
                                 )],
                             },
                             badge: None,
@@ -3655,13 +3640,6 @@ impl CoordApp {
                             } else {
                                 Color::rgb(160, 160, 200) // muted purple for named
                             };
-                            // A milestone belongs to exactly one repo, so the
-                            // header carries the tag — unless this bucket
-                            // happens to mix repos (e.g. "No milestone" pooling
-                            // issues from several repos), in which case fall
-                            // back to per-issue tags below.
-                            let header_tag =
-                                self.pipeline_milestone_header_repo_tag(mil_issue_idxs, &repos);
                             rows.push(TreeRow {
                                 path: vec![gi as u16, mi as u16],
                                 indent: 2,
@@ -3676,9 +3654,9 @@ impl CoordApp {
                                         mil_color,
                                     )],
                                 },
-                                badge: header_tag
-                                    .clone()
-                                    .map(|tag| Badge::colored(tag, tag_color)),
+                                // #1487: no repo letter badge — the repo node
+                                // above already names the repo.
+                                badge: None,
                                 is_expanded: Some(is_mil_expanded),
                                 decoration: Decoration::Header,
                                 edit: None,
@@ -3690,22 +3668,16 @@ impl CoordApp {
                             // row instead of listing them a second time as
                             // flat siblings in this same milestone bucket.
                             //
-                            // #1269: `full_nesting` (every child, unfiltered)
-                            // backs the "N/M done" badge below — that summary
-                            // reports against the WHOLE child set regardless
-                            // of which liveness instance is showing. `nesting`
-                            // is filtered to just this group's liveness
-                            // (`group_key` — "live" or "idle") and is what
-                            // actually expands beneath the row: an epic with
-                            // both live and idle children renders once per
-                            // group, each instance showing only its matching
-                            // half (see `pipeline_active_by_liveness` /
-                            // `filter_epic_nesting_by_liveness`).
+                            // #1269/#1487: `full_nesting` (every child,
+                            // unfiltered) backs the "N/M done" badge below —
+                            // that summary reports against the WHOLE child
+                            // set. `nesting` is what actually expands beneath
+                            // the row: ALL non-Done children (the epic renders
+                            // exactly once now that the section groups by
+                            // repo), ordered in-flight first — see
+                            // `filter_epic_nesting_for_in_progress`.
                             let full_nesting = self.compute_epic_nesting(mil_issue_idxs);
-                            let nesting = self.filter_epic_nesting_by_liveness(
-                                &full_nesting,
-                                group_key == "live",
-                            );
+                            let nesting = Self::filter_epic_nesting_for_in_progress(&full_nesting);
                             for (ii, &issue_idx) in mil_issue_idxs.iter().enumerate() {
                                 let issue = &self.pipeline_issues[issue_idx];
                                 if Self::is_globally_nested(issue, &globally_nested) {
@@ -3716,17 +3688,16 @@ impl CoordApp {
                                 } else {
                                     Color::rgb(140, 140, 140)
                                 };
-                                // Mixed-repo fallback: the header couldn't
-                                // show a single tag, so keep it per-row.
-                                let row_badge = if header_tag.is_none() {
-                                    let tag = Self::repo_tag(
-                                        Self::pipeline_repo_key(issue),
-                                        &repos,
-                                    );
-                                    Some(Badge::colored(tag, tag_color))
-                                } else {
-                                    None
-                                };
+                                // #1487: per-row in-flight/ready status — the
+                                // signal the Live/Idle group node used to
+                                // carry. (The old mixed-repo repo-letter
+                                // fallback badge is gone: a repo group can't
+                                // be mixed-repo.)
+                                let row_badge = Some(
+                                    self.in_progress_status_badge(
+                                        self.active_issue_in_flight(issue_idx),
+                                    ),
+                                );
                                 let row_path = vec![gi as u16, mi as u16, ii as u16];
                                 // #1197: an epic row is a *branch* — it keeps
                                 // Decoration::Normal (it's real, actionable
@@ -3761,9 +3732,9 @@ impl CoordApp {
                                 // #1253: "N/M done" child-progress summary,
                                 // visible whether expanded or collapsed.
                                 // #1269: keyed off `full_nesting` (unfiltered)
-                                // so both the Live and Idle instance of an
-                                // epic show the SAME total, not just the
-                                // fraction of children matching this instance.
+                                // so the badge reports the epic's WHOLE child
+                                // set, not just the non-Done children that
+                                // actually nest beneath the row.
                                 if let Some(children) = full_nesting.by_epic.get(&issue_idx) {
                                     if let Some(span) = Self::epic_progress_span(children) {
                                         spans.push(span);
@@ -4360,8 +4331,9 @@ impl CoordApp {
     /// index.
     ///
     /// Path depth varies by state:
-    /// - `in-progress`: `[group_idx, milestone_idx, issue_idx]` (3-level, #1069 —
-    ///   `group_idx` is the liveness bucket, Live/Idle)
+    /// - `in-progress`: `[repo_idx, milestone_idx, issue_idx]` (3-level, #1069 —
+    ///   `repo_idx` indexes `pipeline_active_by_repo`; #1487 replaced the
+    ///   old Live/Idle liveness bucket with a repo node)
     /// - `new`: `[repo_idx, milestone_idx, issue_idx]` (3-level, #668)
     /// - `done`: `[0, issue_idx]` (2-level flat, #728 — no repo/milestone groups)
     /// - `refining` / `pending`: `[repo_idx, issue_idx]` (2-level)
@@ -4398,7 +4370,7 @@ impl CoordApp {
             let (_, _, mil_issue_idxs) = milestones.get(mi)?;
             let parent_idx = mil_issue_idxs.get(ii).copied()?;
             if path.len() > 3 {
-                self.resolve_nested_child_index(parent_idx, path[3] as usize, None)
+                self.resolve_nested_child_index(parent_idx, path[3] as usize, false)
             } else {
                 Some(parent_idx)
             }
@@ -4412,30 +4384,28 @@ impl CoordApp {
             let done_windowed = self.pipeline_done_windowed();
             let parent_idx = done_windowed.get(ii).copied()?;
             if path.len() > 2 {
-                self.resolve_nested_child_index(parent_idx, path[2] as usize, None)
+                self.resolve_nested_child_index(parent_idx, path[2] as usize, false)
             } else {
                 Some(parent_idx)
             }
         } else if state_key == "in-progress" {
-            // #1069: 3-level path [group_idx, milestone_idx, issue_idx].
+            // #1069/#1487: 3-level path [repo_idx, milestone_idx, issue_idx].
             if path.len() < 3 {
-                return None; // liveness or milestone header selected
+                return None; // repo or milestone header selected
             }
             let gi = path[0] as usize;
             let mi = path[1] as usize;
             let ii = path[2] as usize;
-            let groups = self.pipeline_active_by_liveness();
-            let (group_key, issue_idxs) = groups.get(gi)?;
-            // #1269: this group's liveness — a nested child (path.len() > 3)
-            // was rendered from the correspondingly-filtered child list (see
-            // `filter_epic_nesting_by_liveness`), so resolving it back to a
-            // `pipeline_issues` index must apply the SAME filter.
-            let want_live = group_key == "live";
+            let groups = self.pipeline_active_by_repo();
+            let (_, issue_idxs) = groups.get(gi)?;
             let milestones = self.pipeline_milestones_for_issues(issue_idxs);
             let (_, _, mil_issue_idxs) = milestones.get(mi)?;
             let parent_idx = mil_issue_idxs.get(ii).copied()?;
             if path.len() > 3 {
-                self.resolve_nested_child_index(parent_idx, path[3] as usize, Some(want_live))
+                // #1281/#1487: a nested child was rendered from the filtered +
+                // in-flight-first-sorted child list, so resolving it back to a
+                // `pipeline_issues` index must apply the SAME transform.
+                self.resolve_nested_child_index(parent_idx, path[3] as usize, true)
             } else {
                 Some(parent_idx)
             }
@@ -4450,7 +4420,7 @@ impl CoordApp {
             let (_, issue_idxs) = groups.get(gi)?;
             let parent_idx = issue_idxs.get(ii).copied()?;
             if path.len() > 2 {
-                self.resolve_nested_child_index(parent_idx, path[2] as usize, None)
+                self.resolve_nested_child_index(parent_idx, path[2] as usize, false)
             } else {
                 Some(parent_idx)
             }
@@ -4493,24 +4463,23 @@ impl CoordApp {
         for (state_idx, &state_key) in self.pipeline_state_section_names.iter().enumerate() {
             let section_idx = state_idx + search_offset;
             // Leaf groups for this state as (path_prefix, issue_idxs,
-            // want_live) — the same shapes the row-emission and
-            // `selected_pipeline_index` decoders use. #1269: `want_live` is
-            // `Some(gk == "live")` only for "in-progress" leaves (each one
-            // belongs to exactly one liveness group); every other state
-            // nests the full, unfiltered child list, matching #1197.
-            let leaves: Vec<(Vec<u16>, Vec<usize>, Option<bool>)> = match state_key {
+            // in_progress) — the same shapes the row-emission and
+            // `selected_pipeline_index` decoders use. #1487: `in_progress` is
+            // `true` only for "in-progress" leaves (whose nested children are
+            // filtered + reordered); every other state nests the full,
+            // unfiltered child list, matching #1197.
+            let leaves: Vec<(Vec<u16>, Vec<usize>, bool)> = match state_key {
                 "in-progress" => {
                     let mut out = Vec::new();
-                    for (gi, (gk, issue_idxs)) in
-                        self.pipeline_active_by_liveness().iter().enumerate()
+                    for (gi, (_, issue_idxs)) in
+                        self.pipeline_active_by_repo().iter().enumerate()
                     {
-                        let want_live = Some(gk == "live");
                         for (mi, (_, _, mil)) in self
                             .pipeline_milestones_for_issues(issue_idxs)
                             .into_iter()
                             .enumerate()
                         {
-                            out.push((vec![gi as u16, mi as u16], mil, want_live));
+                            out.push((vec![gi as u16, mi as u16], mil, true));
                         }
                     }
                     out
@@ -4525,26 +4494,27 @@ impl CoordApp {
                             .into_iter()
                             .enumerate()
                         {
-                            out.push((vec![ri as u16, mi as u16], mil, None));
+                            out.push((vec![ri as u16, mi as u16], mil, false));
                         }
                     }
                     out
                 }
-                "done" => vec![(vec![0u16], self.pipeline_done_windowed(), None)],
+                "done" => vec![(vec![0u16], self.pipeline_done_windowed(), false)],
                 "refining" | "pending" => self
                     .pipeline_repos_for_state(state_key)
                     .into_iter()
                     .enumerate()
-                    .map(|(ri, (_, idxs))| (vec![ri as u16], idxs, None))
+                    .map(|(ri, (_, idxs))| (vec![ri as u16], idxs, false))
                     .collect(),
                 _ => continue,
             };
 
-            for (prefix, issue_idxs, want_live) in &leaves {
+            for (prefix, issue_idxs, in_progress) in &leaves {
                 let full_nesting = self.compute_epic_nesting(issue_idxs);
-                let nesting = match *want_live {
-                    Some(wl) => self.filter_epic_nesting_by_liveness(&full_nesting, wl),
-                    None => full_nesting,
+                let nesting = if *in_progress {
+                    Self::filter_epic_nesting_for_in_progress(&full_nesting)
+                } else {
+                    full_nesting
                 };
                 // (1) top-level row (not suppressed by nesting).
                 for (ii, &idx) in issue_idxs.iter().enumerate() {
@@ -4569,7 +4539,7 @@ impl CoordApp {
                             let mut path = prefix.clone();
                             path.push(ii as u16);
                             path.push(ci as u16);
-                            let sel = self.resolve_nested_child_index(idx, ci, *want_live);
+                            let sel = self.resolve_nested_child_index(idx, ci, *in_progress);
                             return Some((section_idx, path, sel));
                         }
                     }
