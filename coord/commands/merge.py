@@ -27,6 +27,112 @@ def _machine_for_assignment(board, assignment_id: str | None) -> str | None:
     return target.machine_name if target is not None else None
 
 
+def _dispatch_conflict_fixes(events, config, *, dry_run: bool) -> None:
+    """#241: classify any conflict events and dispatch a conflict-fix worker
+    for the eligible ones.  Mutates each conflict event's ``ev.entry.state``
+    in place (to ``HUMAN_REQUIRED`` on a retry-cap hit or a non-rebaseable
+    classification) — ``ev.entry`` is the same object the caller's own
+    items list holds, so its subsequent save-queue step picks the mutation
+    up naturally, without a separate write here.
+
+    Shared by the whole-queue path and the ``--only`` surgical path
+    (#1474 review finding): the whole-queue path always ran this block, but
+    ``--only`` returned before ever reaching it — so a ``--only``-only
+    caller (``coord drive``, the TUI's ``--merge-of``) could park an entry
+    at ``CONFLICT`` with no conflict-fix ever dispatched and nothing
+    watching it, permanently: ``merge_queue.process()`` only ever acts on
+    ``PENDING`` entries, so a bare ``CONFLICT`` row is never reprocessed and
+    never gets a second chance at this classify-and-dispatch step.
+    """
+    conflict_events = [ev for ev in events if ev.kind == "conflict"]
+    if not conflict_events or dry_run:
+        return
+
+    from coord.audit import record_audit  # noqa: PLC0415
+    from coord.conflict_fix import (  # noqa: PLC0415
+        dispatch_conflict_fix,
+        has_prior_conflict_fix,
+    )
+    from coord.merge_queue import HUMAN_REQUIRED, classify_conflict  # noqa: PLC0415
+    from coord.state import load_board, save_board  # noqa: PLC0415
+
+    fix_board = load_board()
+    if fix_board is None:
+        return
+    dispatched_any = False
+    for ev in conflict_events:
+        kind = classify_conflict(ev.entry.error)
+        if kind == "rebaseable":
+            # Retry cap (#241/#784): if a conflict-fix already ran and
+            # failed for this entry in this session, don't loop — mark
+            # HUMAN_REQUIRED so the user takes over.  A successful
+            # prior fix does not trigger this guard (#784).
+            if has_prior_conflict_fix(fix_board, ev.entry.assignment_id):
+                ev.entry.state = HUMAN_REQUIRED
+                click.echo(
+                    f"  {ev.entry.repo_name} #{ev.entry.issue_number}: "
+                    "conflict-fix retry cap hit — manual resolution required"
+                )
+                # #1038: the coordinator's own retry-cap logic made this
+                # call, not the human running `coord merge` — operational
+                # tier, same as the other automatic conflict-classification
+                # outcomes below.
+                record_audit(
+                    tier="operational",
+                    category="merge",
+                    event_type="conflict_human_required",
+                    actor="daemon",
+                    summary=f"conflict-fix retry cap hit: "
+                    f"{ev.entry.repo_name}#{ev.entry.issue_number} — "
+                    "manual resolution required",
+                    repo=ev.entry.repo_name,
+                    issue=ev.entry.issue_number,
+                    assignment_id=ev.entry.assignment_id,
+                    details={"reason": "retry_cap"},
+                )
+                continue
+            fix = dispatch_conflict_fix(
+                ev.entry,
+                fix_board,
+                config,
+                prefer_machine=_machine_for_assignment(
+                    fix_board, ev.entry.assignment_id,
+                ),
+            )
+            if fix is not None:
+                click.echo(
+                    f"  {ev.entry.repo_name} #{ev.entry.issue_number}: "
+                    f"conflict-fix dispatched to {fix.machine_name}"
+                )
+                dispatched_any = True
+            else:
+                click.echo(
+                    f"  {ev.entry.repo_name} #{ev.entry.issue_number}: "
+                    "conflict-fix not dispatched (no machine / already in flight)"
+                )
+        elif kind == "human":
+            ev.entry.state = HUMAN_REQUIRED
+            click.echo(
+                f"  {ev.entry.repo_name} #{ev.entry.issue_number}: "
+                "permission/protection error — manual resolution required"
+            )
+            record_audit(
+                tier="operational",
+                category="merge",
+                event_type="conflict_human_required",
+                actor="daemon",
+                summary=f"conflict classified non-rebaseable: "
+                f"{ev.entry.repo_name}#{ev.entry.issue_number} — "
+                "manual resolution required",
+                repo=ev.entry.repo_name,
+                issue=ev.entry.issue_number,
+                assignment_id=ev.entry.assignment_id,
+                details={"reason": "permission_or_protection"},
+            )
+    if dispatched_any:
+        save_board(fix_board)
+
+
 @click.command(
     "verify-merge",
     help=(
@@ -910,6 +1016,11 @@ def merge(
             e = ev.entry
             prefix = f"  {e.repo_name} #{e.issue_number} ({e.branch})"
             click.echo(f"{prefix}: {ev.kind} — {ev.message}")
+        # #1474 review: --only used to return here without ever classifying
+        # a fresh conflict — see _dispatch_conflict_fixes's docstring. Run it
+        # before the save below so a retry-cap/non-rebaseable HUMAN_REQUIRED
+        # mutation on only_entry.state is persisted, not lost.
+        _dispatch_conflict_fixes(events_only, cfg_only, dry_run=dry_run)
         if not dry_run:
             # Save only the modified entry back; all other entries are untouched.
             all_items_only = mq.load_queue()
@@ -1094,90 +1205,9 @@ def merge(
         click.echo(f"{prefix}: {ev.kind} — {ev.message}")
 
     # #241: classify any conflict events and dispatch a conflict-fix worker
-    # for the eligible ones.  Mutates ev.entry.state in place — ev.entry IS
-    # items[i] from process() — so the final save block below picks up
-    # HUMAN_REQUIRED naturally without a separate save_queue call.
-    conflict_events = [ev for ev in events if ev.kind == "conflict"]
-    if conflict_events and not dry_run:
-        from coord.audit import record_audit
-        from coord.conflict_fix import dispatch_conflict_fix, has_prior_conflict_fix
-        from coord.merge_queue import HUMAN_REQUIRED, classify_conflict
-        from coord.state import load_board, save_board
-
-        fix_board = load_board()
-        if fix_board is not None:
-            dispatched_any = False
-            for ev in conflict_events:
-                kind = classify_conflict(ev.entry.error)
-                if kind == "rebaseable":
-                    # Retry cap (#241/#784): if a conflict-fix already ran and
-                    # failed for this entry in this session, don't loop — mark
-                    # HUMAN_REQUIRED so the user takes over.  A successful
-                    # prior fix does not trigger this guard (#784).
-                    if has_prior_conflict_fix(fix_board, ev.entry.assignment_id):
-                        ev.entry.state = HUMAN_REQUIRED
-                        click.echo(
-                            f"  {ev.entry.repo_name} #{ev.entry.issue_number}: "
-                            "conflict-fix retry cap hit — manual resolution required"
-                        )
-                        # #1038: the coordinator's own retry-cap logic made
-                        # this call, not the human running `coord merge` —
-                        # operational tier, same as the other automatic
-                        # conflict-classification outcomes below.
-                        record_audit(
-                            tier="operational",
-                            category="merge",
-                            event_type="conflict_human_required",
-                            actor="daemon",
-                            summary=f"conflict-fix retry cap hit: "
-                            f"{ev.entry.repo_name}#{ev.entry.issue_number} — "
-                            "manual resolution required",
-                            repo=ev.entry.repo_name,
-                            issue=ev.entry.issue_number,
-                            assignment_id=ev.entry.assignment_id,
-                            details={"reason": "retry_cap"},
-                        )
-                        continue
-                    fix = dispatch_conflict_fix(
-                        ev.entry,
-                        fix_board,
-                        cfg,
-                        prefer_machine=_machine_for_assignment(
-                            fix_board, ev.entry.assignment_id,
-                        ),
-                    )
-                    if fix is not None:
-                        click.echo(
-                            f"  {ev.entry.repo_name} #{ev.entry.issue_number}: "
-                            f"conflict-fix dispatched to {fix.machine_name}"
-                        )
-                        dispatched_any = True
-                    else:
-                        click.echo(
-                            f"  {ev.entry.repo_name} #{ev.entry.issue_number}: "
-                            "conflict-fix not dispatched (no machine / already in flight)"
-                        )
-                elif kind == "human":
-                    ev.entry.state = HUMAN_REQUIRED
-                    click.echo(
-                        f"  {ev.entry.repo_name} #{ev.entry.issue_number}: "
-                        "permission/protection error — manual resolution required"
-                    )
-                    record_audit(
-                        tier="operational",
-                        category="merge",
-                        event_type="conflict_human_required",
-                        actor="daemon",
-                        summary=f"conflict classified non-rebaseable: "
-                        f"{ev.entry.repo_name}#{ev.entry.issue_number} — "
-                        "manual resolution required",
-                        repo=ev.entry.repo_name,
-                        issue=ev.entry.issue_number,
-                        assignment_id=ev.entry.assignment_id,
-                        details={"reason": "permission_or_protection"},
-                    )
-            if dispatched_any:
-                save_board(fix_board)
+    # for the eligible ones (extracted to _dispatch_conflict_fixes, #1474
+    # review, so the --only path below can share it).
+    _dispatch_conflict_fixes(events, cfg, dry_run=dry_run)
 
     # Save state only when we actually moved
     if not dry_run:

@@ -521,6 +521,52 @@ class TestMergeOnly:
         # Summary line must reference --only.
         assert "only" in result.output.lower()
 
+    def test_only_dispatches_conflict_fix_on_a_fresh_conflict(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """#1474 review finding: `--only` transitioned a PENDING entry to
+        CONFLICT but returned before ever reaching the #241 classify +
+        dispatch-conflict-fix step — that block lived only in the
+        whole-queue path.  Since a CONFLICT entry is never reprocessed by
+        `merge_queue.process()` (PENDING-only), a `--only`-driven conflict
+        (`coord drive`'s own merge action; the TUI's `--merge-of`) parked at
+        CONFLICT with no conflict-fix ever dispatched and nothing watching
+        it — permanently.  Regression: a fresh conflict discovered via
+        `--only` must dispatch a conflict-fix worker exactly like the
+        whole-queue path already does (see test_conflict_marks_state_and_warns).
+        """
+        from coord.models import Board
+        from coord.state import save_board
+        save_board(Board())
+        _seed_queue([_entry("cf1")])
+
+        def fake_create_pr(repo, *, base, head, title, body):
+            return {"number": 500, "url": "u/500", "existed": False}
+
+        def fake_merge(repo, number, method="rebase"):
+            return False, "Merge conflict"
+
+        fake_fix = MagicMock()
+        fake_fix.machine_name = "laptop"
+
+        with patch("coord.github_ops.create_pr", side_effect=fake_create_pr), \
+             patch("coord.github_ops.get_pr_size", return_value=10), \
+             patch("coord.github_ops.merge_pr", side_effect=fake_merge), \
+             patch(
+                 "coord.conflict_fix.dispatch_conflict_fix",
+                 return_value=fake_fix,
+             ) as dcf:
+            result = CliRunner().invoke(
+                main, ["merge", "--config", str(config_file), "--only", "cf1"]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert dcf.called, "expected dispatch_conflict_fix for a fresh --only conflict"
+        assert "conflict-fix dispatched to laptop" in result.output
+
+        states = {x.assignment_id: x.state for x in mq.load_queue()}
+        assert states["cf1"] == mq.CONFLICT
+
     def test_only_errors_when_entry_not_pending(
         self, config_file: Path, coord_dir: Path
     ) -> None:
