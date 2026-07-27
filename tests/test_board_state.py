@@ -1232,3 +1232,167 @@ def test_update_assignment_smoke_tests_unknown_id_silent_noop(coord_db) -> None:
     from coord.state import update_assignment_smoke_tests
     # Just must not raise.
     update_assignment_smoke_tests("ghost", ["x"])
+
+
+# ── #1451: save_board must not clobber a newer terminal status ─────────────
+#
+# Regression for "phantom 'failed' status wedges a completed assignment —
+# and `coord report-result --status done` silently reverts". Root cause: a
+# whole-board `save_board()` call (the periodic reconcile ticks in
+# particular — `_reconcile_merges_tick` reads `build_board()`, spends real
+# time hitting GitHub, then calls `save_board(board)` with that now-stale
+# in-memory snapshot) blindly overwrote `status`/`finished_at` for every row
+# in the snapshot, including rows a concurrent single-row seam write (`coord
+# report-result`, `finalize_interactive_exit`) had *already* corrected in the
+# DB in between the read and the write. The correction landed, read back
+# correctly, and then silently reverted seconds later with no logged writer.
+
+
+def test_save_board_does_not_clobber_a_newer_terminal_status(coord_db) -> None:
+    """A stale in-memory snapshot (status='failed' as of an earlier read)
+    must not overwrite a status that was corrected to 'done' with a newer
+    `finished_at` in between the read and the `save_board()` write — the
+    exact #1451 revert."""
+    from coord.db import get_connection
+
+    aid = "wedge1451"
+    # 1. Row is already terminal 'failed' at t=1000 (e.g. the #604 merge-verify
+    #    gate's git-truth override, or any other seam write).
+    save_board(
+        Board(
+            completed=[
+                Assignment(
+                    machine_name="m", repo_name="r", issue_number=1,
+                    issue_title="t", briefing="b", assignment_id=aid,
+                    status="failed", finished_at=1000.0,
+                )
+            ]
+        )
+    )
+
+    # 2. A stale board snapshot is read — this is what a slow reconcile tick
+    #    (or any other build_board()-then-save_board() caller) is holding in
+    #    memory while it does other work.
+    stale_board = build_board()
+    assert stale_board.completed[0].status == "failed"
+
+    # 3. Meanwhile `coord report-result --status done` lands directly —
+    #    a scoped single-row write with a newer finished_at, exactly like
+    #    `coord.issue_store._update_local_state`.
+    conn = get_connection()
+    conn.execute(
+        "UPDATE assignments SET status='done', finished_at=? WHERE assignment_id=?",
+        (2000.0, aid),
+    )
+    conn.commit()
+
+    # 4. The slow tick finally calls save_board() with its stale snapshot —
+    #    this must NOT revert the correction.
+    save_board(stale_board)
+
+    row = conn.execute(
+        "SELECT status, finished_at FROM assignments WHERE assignment_id=?",
+        (aid,),
+    ).fetchone()
+    assert row["status"] == "done", (
+        "save_board() clobbered a newer terminal status with a stale "
+        "in-memory snapshot (#1451)"
+    )
+    assert row["finished_at"] == 2000.0
+
+    reloaded = load_board()
+    assert reloaded.completed[0].status == "done"
+
+
+def test_save_board_still_applies_first_time_terminal_transition(coord_db) -> None:
+    """The CAS guard must not regress the common case: a row with no
+    recorded `finished_at` yet (still running/pending) transitions to its
+    first terminal status exactly as before."""
+    aid = "firsttrans1451"
+    save_board(
+        Board(
+            active=[
+                Assignment(
+                    machine_name="m", repo_name="r", issue_number=2,
+                    issue_title="t", briefing="b", assignment_id=aid,
+                    status="running",
+                )
+            ]
+        )
+    )
+
+    board = build_board()
+    done = board.mark_done_by_id(aid, finished_at=1500.0)
+    assert done is not None
+    save_board(board)
+
+    reloaded = load_board()
+    assert reloaded.completed[0].status == "done"
+    assert reloaded.completed[0].finished_at == 1500.0
+
+
+def test_save_board_allows_newer_terminal_transition_over_older(coord_db) -> None:
+    """A same-or-newer terminal write (e.g. done -> merged) must still apply
+    even though the row was already terminal — only a STALE (older/None)
+    incoming `finished_at` is rejected."""
+    aid = "newertrans1451"
+    save_board(
+        Board(
+            completed=[
+                Assignment(
+                    machine_name="m", repo_name="r", issue_number=3,
+                    issue_title="t", briefing="b", assignment_id=aid,
+                    status="done", finished_at=1000.0,
+                )
+            ]
+        )
+    )
+
+    board = build_board()
+    board.completed[0].status = "merged"
+    board.completed[0].finished_at = 1000.0  # unchanged — same completion time
+    save_board(board)
+
+    reloaded = load_board()
+    assert reloaded.completed[0].status == "merged"
+
+
+# ── #1451: mark_notified(EVENT_ADVISORY) must not stamp status='failed' ────
+#
+# A second, independent instance of the same "mislabelled failed" bug class:
+# `coord.notify.post_transition`'s EVENT_ADVISORY branch posts the #448
+# advisory GitHub comment and then calls `mark_notified(aid, EVENT_ADVISORY)`
+# to sync the assignments table — but `mark_notified` only special-cased
+# EVENT_COMPLETION/EVENT_PLAN as 'done'; every other event (including
+# EVENT_ADVISORY) fell into the bare `else` and was stamped 'failed',
+# immediately overwriting the advisory state the very same call sequence had
+# just intended to record. No exit_code/failure_reason ever backed that
+# 'failed' — it was a pure mislabel, not a real terminal failure.
+
+
+def test_mark_notified_advisory_sets_advisory_not_failed(coord_db) -> None:
+    from coord.comments import EVENT_ADVISORY
+    from coord.state import mark_notified
+
+    aid = "advisory1451"
+    save_board(
+        Board(
+            active=[
+                Assignment(
+                    machine_name="m", repo_name="r", issue_number=4,
+                    issue_title="t", briefing="b", assignment_id=aid,
+                    status="running",
+                )
+            ]
+        )
+    )
+
+    mark_notified(aid, EVENT_ADVISORY)
+
+    board = build_board()
+    row = board.find_by_id(aid)
+    assert row is not None
+    assert row.status == "advisory", (
+        "mark_notified(EVENT_ADVISORY) must record 'advisory', not 'failed' "
+        "(#1451)"
+    )
