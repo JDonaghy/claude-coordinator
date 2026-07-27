@@ -81,6 +81,8 @@ export interface PipelineView {
   progress_pct: number
   review_findings_pending: boolean
   review_verdict: 'approve' | 'request-changes' | null
+  review_verdict_original: string | null
+  review_verdict_override_reason: string | null
   review_findings_body: string | null
   test_verdict: TestVerdict | null
   needs_attention: boolean
@@ -118,6 +120,8 @@ export interface Assignment {
   test_state: TestVerdict | null
   test_reason: string | null
   review_verdict: 'approve' | 'request-changes' | null
+  review_verdict_original: string | null
+  review_verdict_override_reason: string | null
   review_head_sha: string | null
   cost_usd: number | null
   smoke_tests: string[] | null

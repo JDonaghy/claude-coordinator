@@ -99,6 +99,10 @@ def row_to_assignment(row: object) -> Assignment:
         test_state=d.get("test_state"),
         test_reason=d.get("test_reason"),
         review_verdict=d.get("review_verdict"),
+        # #1456: coordinator-override audit trail; None when the reviewer's
+        # verdict stands (the normal case) and for pre-1456 rows.
+        review_verdict_original=d.get("review_verdict_original"),
+        review_verdict_override_reason=d.get("review_verdict_override_reason"),
         # #821: commit-bound review gate; None for pre-821 rows.
         review_head_sha=d.get("review_head_sha"),
         cost_usd=d.get("cost_usd"),

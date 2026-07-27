@@ -92,6 +92,9 @@ def _assignment_upsert_params(a: Assignment) -> tuple:
         a.test_state,
         a.test_reason,
         a.review_verdict,
+        # #1456: audit trail when the coordinator overrode the reviewer.
+        a.review_verdict_original,
+        a.review_verdict_override_reason,
         # #821: commit-bound SHA for review assignments.
         a.review_head_sha,
         a.cost_usd,
@@ -109,7 +112,8 @@ _UPSERT_SQL = """
         files_allowed, files_forbidden, model, dispatched_at, finished_at,
         smoke_test, smoke_test_reason, review_state, review_of_assignment_id,
         review_target, required_gates, plan, unreachable_count, review_iteration,
-        review_posted_at, test_state, test_reason, review_verdict, review_head_sha,
+        review_posted_at, test_state, test_reason, review_verdict,
+        review_verdict_original, review_verdict_override_reason, review_head_sha,
         cost_usd, smoke_tests, provider_name
     ) VALUES (
         ?, ?, ?, ?, ?,
@@ -117,7 +121,8 @@ _UPSERT_SQL = """
         ?, ?, ?, ?, ?,
         ?, ?, ?, ?,
         ?, ?, ?, ?, ?,
-        ?, ?, ?, ?, ?,
+        ?, ?, ?, ?,
+        ?, ?, ?,
         ?, ?, ?
     )
     ON CONFLICT(assignment_id) DO UPDATE SET
@@ -149,6 +154,14 @@ _UPSERT_SQL = """
         review_posted_at   = COALESCE(excluded.review_posted_at, review_posted_at),
         test_state         = excluded.test_state,
         review_verdict     = COALESCE(excluded.review_verdict, review_verdict),
+        -- #1456: once an override is recorded, preserve it.  A later upsert
+        -- from a path that doesn't know about the override (agent reload, thin
+        -- client round-trip) must never erase the reviewer's original verdict —
+        -- that would restore exactly the silent-rewrite behaviour #1456 fixed.
+        review_verdict_original = COALESCE(
+            excluded.review_verdict_original, review_verdict_original),
+        review_verdict_override_reason = COALESCE(
+            excluded.review_verdict_override_reason, review_verdict_override_reason),
         -- #821: once a review_head_sha is recorded, preserve it; a later
         -- upsert without the SHA (e.g. from an older code path) must not
         -- erase a captured value.

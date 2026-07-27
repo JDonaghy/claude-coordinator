@@ -48,6 +48,9 @@ function makeView(overrides: Partial<PipelineView> = {}): PipelineView {
     progress_pct: 25,
     review_findings_pending: false,
     review_verdict: null,
+    // #1456: null = the reviewer's own verdict stands (the normal case).
+    review_verdict_original: null,
+    review_verdict_override_reason: null,
     review_findings_body: null,
     test_verdict: null,
     needs_attention: false,

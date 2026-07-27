@@ -306,6 +306,18 @@ class Assignment:
     # by the merge-queue gate (`has_approved_review`) to refuse merging work
     # whose review has not approved.
     review_verdict: str | None = None
+    # #1456: audit trail for a coordinator-side verdict override.  When the
+    # #476 approve-with-nits gate downgrades a reviewer's "request-changes" to
+    # "approve", the reviewer's OWN verdict is preserved here and the evidence
+    # that justified the override (the parsed finding counts) in
+    # `review_verdict_override_reason`.  Both are None for the overwhelming
+    # majority of reviews — a non-None `review_verdict_original` is the signal
+    # that `review_verdict` is the coordinator's opinion, not the reviewer's.
+    # A verdict that changes must be auditable, never overwritten in place: the
+    # #1445 incident (a well-formed request-changes silently rewritten to
+    # approve) was invisible precisely because only the final value was stored.
+    review_verdict_original: str | None = None
+    review_verdict_override_reason: str | None = None
     # #821: SHA of the branch HEAD captured at the time the review assignment
     # ran.  When set, `has_approved_review` compares this against the merge
     # queue entry's `branch_head_sha` to reject stale approvals — if the
