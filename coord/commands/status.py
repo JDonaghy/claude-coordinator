@@ -671,6 +671,16 @@ def _diagnose_orphan_worktrees(config_path: Path, *, dry_run: bool) -> None:
     burns a full session discovering it can't save anything. This check is
     LOCAL-machine only, same as the rest of this sweep; it does not reach
     out to other machines in the fleet.
+
+    #1445 review: ``--dry-run`` means "report findings without writing," so
+    the OS-level half of the writability probe — which ``mkdir(parents=True,
+    exist_ok=True)``s ``worktrees_dir`` (a real, persistent creation on a
+    machine that never had one) and does a write+unlink of a probe file — is
+    skipped under ``--dry-run``. The deny-rule scan
+    (:func:`coord.agent.find_blocking_deny_rule`) is read-only and still runs.
+    On a machine that has never had a worktree, ``--dry-run`` therefore
+    reports "does not exist yet" rather than creating it just to say it's
+    empty.
     """
     from coord.diagnose import (  # noqa: PLC0415
         _find_orphaned_worktrees,
@@ -681,7 +691,7 @@ def _diagnose_orphan_worktrees(config_path: Path, *, dry_run: bool) -> None:
         tmux_session_name,
         tmux_session_alive,
     )
-    from coord.agent import check_worktree_writable  # noqa: PLC0415
+    from coord.agent import check_worktree_writable, find_blocking_deny_rule  # noqa: PLC0415
     from coord.board_service import read_board  # noqa: PLC0415
     from coord.state import COORD_DIR  # noqa: PLC0415
 
@@ -694,15 +704,37 @@ def _diagnose_orphan_worktrees(config_path: Path, *, dry_run: bool) -> None:
     # fleet invariant `AgentServer.assign()` now preflights before every
     # dispatch, checked here so an operator (or `scripts/drive-issue.sh`)
     # can catch it ahead of time with a plain `coord diagnose --orphan-worktrees`.
-    write_issue = check_worktree_writable(worktrees_dir)
-    if write_issue is not None:
-        click.echo(f"⚠ DEGRADED: workers on this machine cannot write to {worktrees_dir}: {write_issue}")
+    if dry_run:
+        if not worktrees_dir.exists():
+            click.echo(
+                f"~/.coord/worktrees/ does not exist yet — nothing to sweep "
+                f"(dry-run: skipping writability probe to avoid creating it)."
+            )
+            return
+        blocked_by = find_blocking_deny_rule(worktrees_dir)
+        if blocked_by is not None:
+            click.echo(
+                f"⚠ DEGRADED: workers on this machine cannot write to "
+                f"{worktrees_dir}: a Claude Code permission rule denies "
+                f"Edit/Write under {worktrees_dir}: {blocked_by}"
+            )
+        else:
+            click.echo(
+                f"✓ {worktrees_dir} is writable by workers "
+                f"(dry-run: OS-level write probe skipped)."
+            )
     else:
-        click.echo(f"✓ {worktrees_dir} is writable by workers.")
+        write_issue = check_worktree_writable(worktrees_dir)
+        if write_issue is not None:
+            click.echo(f"⚠ DEGRADED: workers on this machine cannot write to {worktrees_dir}: {write_issue}")
+        else:
+            click.echo(f"✓ {worktrees_dir} is writable by workers.")
 
-    # check_worktree_writable() just mkdir'd worktrees_dir (parents=True,
-    # exist_ok=True) as part of its probe, so it always exists by this point
-    # — an empty directory just means no worktrees are currently checked out.
+    # Outside --dry-run, check_worktree_writable() just mkdir'd worktrees_dir
+    # (parents=True, exist_ok=True) as part of its probe, so it always exists
+    # by this point — an empty directory just means no worktrees are
+    # currently checked out. Under --dry-run we already returned above when
+    # it didn't exist, so it's safe to iterate here too.
     if not any(worktrees_dir.iterdir()):
         click.echo("~/.coord/worktrees/ has no worktrees — nothing to sweep.")
         return
