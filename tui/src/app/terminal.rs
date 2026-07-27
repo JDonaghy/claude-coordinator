@@ -898,7 +898,23 @@ impl CoordApp {
                             &cwd,
                             10_000, // 10 000-line scrollback
                         ) {
-                            Ok(sess) => {
+                            Ok(mut sess) => {
+                                // #1398: a `coord drive --tmux` run for this
+                                // issue is already live (started earlier this
+                                // session, from an external shell, or before
+                                // a TUI restart) — attach the fresh shell to
+                                // it instead of leaving a bare prompt, so
+                                // opening the tab shows the live run.
+                                if let Some(repo) = self.issue_key_coord_repo(&issue_key) {
+                                    if self.issue_has_live_drive(issue_key.1, &repo) {
+                                        let line = format!(
+                                            "coord drive-attach {} {}\r",
+                                            shell_quote_arg(&repo),
+                                            issue_key.1,
+                                        );
+                                        sess.send_str(&line);
+                                    }
+                                }
                                 self.detail_terminal_sessions.insert(issue_key, sess);
                                 changed = true;
                             }

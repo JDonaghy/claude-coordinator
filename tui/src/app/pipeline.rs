@@ -3750,6 +3750,10 @@ impl CoordApp {
                                 if let Some(marker) = epic_badge_span(issue) {
                                     spans.push(marker);
                                 }
+                                // #1398: "driving" badge, same splice point.
+                                if let Some(marker) = self.drive_badge_span(issue) {
+                                    spans.push(marker);
+                                }
                                 spans.push(StyledSpan::with_fg(
                                     trunc(&issue.title, 20),
                                     title_color,
@@ -3868,6 +3872,10 @@ impl CoordApp {
                         // clipped by a long title or overwritten by the
                         // right-aligned repo-tag badge.
                         if let Some(marker) = epic_badge_span(issue) {
+                            spans.push(marker);
+                        }
+                        // #1398: "driving" badge, same splice point.
+                        if let Some(marker) = self.drive_badge_span(issue) {
                             spans.push(marker);
                         }
                         spans.push(StyledSpan::with_fg(trunc(&issue.title, 18), title_color));
@@ -4090,6 +4098,10 @@ impl CoordApp {
                                     if let Some(marker) = epic_badge_span(issue) {
                                         spans.push(marker);
                                     }
+                                    // #1398: "driving" badge, same splice point.
+                                    if let Some(marker) = self.drive_badge_span(issue) {
+                                        spans.push(marker);
+                                    }
                                     spans.push(StyledSpan::with_fg(
                                         trunc(&issue.title, 20),
                                         title_color,
@@ -4202,6 +4214,10 @@ impl CoordApp {
                                 // overwritten by the right-aligned stage
                                 // badge.
                                 if let Some(marker) = epic_badge_span(issue) {
+                                    spans.push(marker);
+                                }
+                                // #1398: "driving" badge, same splice point.
+                                if let Some(marker) = self.drive_badge_span(issue) {
                                     spans.push(marker);
                                 }
                                 spans.push(StyledSpan::with_fg(trunc(&issue.title, 20), title_color));

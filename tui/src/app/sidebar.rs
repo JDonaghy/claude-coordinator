@@ -206,6 +206,7 @@ impl CoordApp {
             || self.file_issue_modal.is_some()
             || self.pending_restart.is_some()
             || self.pending_kill_terminal.is_some()
+            || self.pending_kill_drive.is_some()
             || self.pending_kill_session.is_some()
             || self.pending_usage_range_start.is_some()
             || self.pending_usage_range_end.is_some()

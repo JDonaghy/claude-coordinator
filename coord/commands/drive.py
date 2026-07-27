@@ -12,6 +12,9 @@ and its four sharp-edged parsers already live in ``coord/test_report.py``.
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import click
@@ -31,6 +34,74 @@ Exit codes: 0 merged (verified against the remote default branch), or review
 approved with --no-merge; 1 a stage reached a terminal failure a script cannot
 resolve; 2 bad usage / configuration; 3 deadline exceeded.
 """
+
+
+def _rebuild_drive_argv(
+    repo: str,
+    issue: int,
+    *,
+    machine: str,
+    model: str,
+    briefing_file: str,
+    do_plan: bool,
+    max_fix_rounds: int,
+    skip_test: bool,
+    repo_path: str,
+    poll: float,
+    max_work_retries: int,
+    deadline_mins: float,
+    stall_mins: float,
+    notify: bool,
+    accept_advisory: bool,
+    force_review: bool,
+    no_merge: bool,
+    merge_method: str,
+    max_merge_attempts: int,
+    dry_run: bool,
+    config_path: Path,
+) -> list[str]:
+    """Rebuild a ``drive <repo> <issue> ...`` argv from parsed flags (`--tmux`).
+
+    The `--tmux` launch re-execs `coord drive` (minus `--tmux`) detached
+    inside a fresh tmux session, so every OTHER flag the operator passed
+    must survive the trip. Deliberately always emits every option (rather
+    than only the ones that differ from Click's own default) so this stays
+    correct even if a default ever changes — no drift between two places
+    that both need to know it.
+    """
+    argv = ["drive", repo, str(issue)]
+    if machine:
+        argv += ["--machine", machine]
+    if model:
+        argv += ["--model", model]
+    if briefing_file:
+        argv += ["--briefing-file", briefing_file]
+    if do_plan:
+        argv.append("--plan")
+    argv += ["--max-fix-rounds", str(max_fix_rounds)]
+    if skip_test:
+        argv.append("--skip-test")
+    if repo_path:
+        argv += ["--repo-path", repo_path]
+    argv += ["--poll", str(poll)]
+    argv += ["--max-work-retries", str(max_work_retries)]
+    argv += ["--deadline", str(deadline_mins)]
+    argv += ["--stall", str(stall_mins)]
+    if notify:
+        argv.append("--notify")
+    if accept_advisory:
+        argv.append("--accept-advisory")
+    if force_review:
+        argv.append("--force-review")
+    if no_merge:
+        argv.append("--no-merge")
+    argv += ["--merge-method", merge_method]
+    argv += ["--max-merge-attempts", str(max_merge_attempts)]
+    if dry_run:
+        argv.append("--dry-run")
+    if config_path:
+        argv += ["--config", str(config_path)]
+    return argv
 
 
 @click.command("drive", help=_DRIVE_HELP)
@@ -164,6 +235,20 @@ resolve; 2 bad usage / configuration; 3 deadline exceeded.
     is_flag=True,
     help="Print the resolved plan and current state, then exit.",
 )
+@click.option(
+    "--tmux",
+    "use_tmux",
+    is_flag=True,
+    help=(
+        "Launch the drive loop DETACHED in a `coord-drive-<repo>-<issue>` tmux "
+        "session instead of running inline (#1398). This invocation exits "
+        "immediately once the session exists — the run survives this terminal "
+        "closing, a TUI restart, or an ssh drop. Reattach with `coord "
+        "drive-attach <repo> <issue>`; list live runs with `coord "
+        "drive-sessions`; stop with `coord drive-stop <repo> <issue>` — killing "
+        "the session releases the per-issue flock, which IS the correct Stop."
+    ),
+)
 @_CONFIG_OPTION
 def drive(
     repo: str,
@@ -186,10 +271,51 @@ def drive(
     merge_method: str,
     max_merge_attempts: int,
     dry_run: bool,
+    use_tmux: bool,
     config_path: Path,
 ) -> None:
     # Imported lazily so `coord --help` doesn't pay for httpx/subprocess setup.
-    from coord.drive import Driver, DriveError, DriveOptions  # noqa: PLC0415
+    from coord.drive import (  # noqa: PLC0415
+        Driver,
+        DriveError,
+        DriveOptions,
+        coord_argv,
+        launch_drive_in_tmux,
+    )
+
+    if use_tmux:
+        argv = coord_argv() + _rebuild_drive_argv(
+            repo,
+            issue,
+            machine=machine,
+            model=model,
+            briefing_file=briefing_file,
+            do_plan=do_plan,
+            max_fix_rounds=max_fix_rounds,
+            skip_test=skip_test,
+            repo_path=repo_path,
+            poll=poll,
+            max_work_retries=max_work_retries,
+            deadline_mins=deadline_mins,
+            stall_mins=stall_mins,
+            notify=notify,
+            accept_advisory=accept_advisory,
+            force_review=force_review,
+            no_merge=no_merge,
+            merge_method=merge_method,
+            max_merge_attempts=max_merge_attempts,
+            dry_run=dry_run,
+            config_path=config_path,
+        )
+        try:
+            session = launch_drive_in_tmux(argv, repo=repo, issue=issue)
+        except DriveError as exc:
+            click.echo(f"✗ {exc}", err=True)
+            raise SystemExit(exc.exit_code) from None
+        click.echo(f"driving {repo} #{issue} in tmux session {session!r}")
+        click.echo(f"  attach with: coord drive-attach {repo} {issue}")
+        click.echo(f"  stop with:   coord drive-stop {repo} {issue}")
+        raise SystemExit(0)
 
     config = _load_config(config_path)
     opts = DriveOptions(
@@ -223,3 +349,114 @@ def drive(
         click.echo("interrupted", err=True)
         raise SystemExit(130) from None
     raise SystemExit(code)
+
+
+# ── `--tmux` companions: list / attach / stop (#1398) ─────────────────────────
+#
+# Three flat, hyphenated commands rather than a `drive` sub-group — `drive`
+# itself already spends its position on `REPO ISSUE`, so a group would need
+# a distinct verb anyway. Mirrors the naming of other hyphenated one-off
+# commands in this CLI (`verify-merge`, `fix-briefing`, `approve-plan`).
+
+
+@click.command(
+    "drive-sessions",
+    help="List live `coord drive --tmux` sessions (coord-drive-<repo>-<issue>).",
+)
+@click.option(
+    "--json", "output_json", is_flag=True, default=False,
+    help="Output as JSON — an array of {repo, issue, session_name, attached}. "
+         "Consumed by coord-tui to badge Pipeline rows and gate the menu.",
+)
+def drive_sessions(output_json: bool) -> None:
+    import json as _json  # noqa: PLC0415
+
+    from coord.drive import list_drive_sessions  # noqa: PLC0415
+
+    entries = list_drive_sessions()
+    if output_json:
+        click.echo(_json.dumps(entries))
+        return
+    if not entries:
+        click.echo("No live drive sessions.")
+        return
+    for e in entries:
+        attached_tag = " [attached]" if e.get("attached") else ""
+        click.echo(f"  {e['repo']} #{e['issue']}{attached_tag}")
+        click.echo(f"    attach with: coord drive-attach {e['repo']} {e['issue']}")
+        click.echo(f"    stop with:   coord drive-stop {e['repo']} {e['issue']}")
+
+
+@click.command(
+    "drive-attach",
+    help=(
+        "Attach to a live `coord drive --tmux` session for REPO ISSUE. "
+        "Type this into a local PTY exactly as `coord reattach`/`coord "
+        "terminal attach` are used for other session kinds."
+    ),
+)
+@click.argument("repo")
+@click.argument("issue", type=int)
+def drive_attach(repo: str, issue: int) -> None:
+    from coord.drive import drive_session_name  # noqa: PLC0415
+    from coord.interactive import TmuxHost, tmux_session_alive  # noqa: PLC0415
+
+    host = TmuxHost(None)
+    session = drive_session_name(repo, issue)
+    if not tmux_session_alive(session, host=host):
+        click.echo(f"error: no live drive session for {repo} #{issue}.", err=True)
+        sys.exit(1)
+
+    if os.environ.get("TMUX"):
+        # Already inside a tmux client — attach-session refuses to nest;
+        # switch-client moves the current client into the target session.
+        cmd = ["tmux", "switch-client", "-t", session]
+    else:
+        cmd = list(host.cmd(["attach-session", "-t", session], tty=True))
+
+    try:
+        result = subprocess.run(cmd)
+    except (subprocess.SubprocessError, OSError) as exc:
+        click.echo(f"error: failed to attach: {exc}", err=True)
+        sys.exit(1)
+    sys.exit(result.returncode)
+
+
+@click.command(
+    "drive-stop",
+    help=(
+        "Stop a live `coord drive --tmux` run for REPO ISSUE by killing its "
+        "tmux session. This IS the correct cancellation: the per-issue flock "
+        "releases the instant the process exits, so the driver's own "
+        "already-driving guard never sees a stale lock."
+    ),
+)
+@click.argument("repo")
+@click.argument("issue", type=int)
+def drive_stop(repo: str, issue: int) -> None:
+    from coord.drive import drive_session_name  # noqa: PLC0415
+    from coord.interactive import TmuxHost, tmux_session_alive  # noqa: PLC0415
+
+    host = TmuxHost(None)
+    session = drive_session_name(repo, issue)
+    if not tmux_session_alive(session, host=host):
+        click.echo(f"error: no live drive session for {repo} #{issue}.", err=True)
+        sys.exit(1)
+
+    try:
+        result = subprocess.run(
+            host.cmd(["kill-session", "-t", session]),
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        click.echo(f"error: failed to kill tmux session: {exc}", err=True)
+        sys.exit(1)
+    if result.returncode != 0:
+        click.echo(
+            f"error: tmux kill-session failed: {(result.stderr or '').strip()}",
+            err=True,
+        )
+        sys.exit(1)
+    click.echo(f"Stopped driving {repo} #{issue}.")
