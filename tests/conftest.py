@@ -53,6 +53,29 @@ def _no_agent_health_probe(monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def _no_worktree_writable_deny_scan(monkeypatch):
+    """#1445 review: keep `check_worktree_writable`'s deny-rule scan from
+    reading whatever `~/.claude/settings.json` happens to exist on the
+    machine running pytest.
+
+    `AgentServer.assign()` and `coord diagnose --orphan-worktrees`
+    (`coord/commands/status.py`) both call `check_worktree_writable()` /
+    `find_blocking_deny_rule()` with no `settings_files` override in
+    production, which resolves to the real `Path.home() / ".claude" /
+    "settings.json"`. Left unpatched, every existing `.assign()`-based test
+    in `test_agent.py` (none of which pass an explicit override) would
+    implicitly depend on that file's contents — exactly the class of bug
+    `_no_board_service` and `_no_agent_health_probe` above already exist to
+    prevent, and the fleet already has this exact deny-rule shape on
+    dellserver (#1445 itself). Tests exercising the scan directly pass their
+    own `settings_files=[...]` (or an explicit
+    `worktree_writable_settings_files=` to `AgentServer(...)`), which bypasses
+    this default entirely and is unaffected.
+    """
+    monkeypatch.setattr("coord.agent._default_deny_settings_files", lambda: [])
+
+
 def output_and_stderr(result) -> str:
     """CLI text across click versions: newer click separates stderr; older
     mixes it into .output and raises on .stderr access."""

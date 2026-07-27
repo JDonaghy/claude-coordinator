@@ -2438,6 +2438,24 @@ def _iter_deny_patterns(settings: dict) -> list[str]:
     return [d for d in deny if isinstance(d, str)]
 
 
+def _default_deny_settings_files() -> list[Path]:
+    """Production default for :func:`find_blocking_deny_rule`'s
+    *settings_files*: the real ``~/.claude/settings.json`` of whoever's
+    machine this process runs on.
+
+    Factored into its own function (rather than inlining ``Path.home()`` in
+    the signature) so it is a single monkeypatchable seam: every caller that
+    doesn't pass an explicit ``settings_files`` — :func:`check_worktree_writable`,
+    ``AgentServer.assign()``, and ``coord diagnose --orphan-worktrees`` alike —
+    funnels through here. Tests patch this one function (see
+    ``tests/conftest.py``'s ``_no_worktree_writable_deny_scan``) instead of
+    threading an override through every call site, mirroring how
+    ``_no_agent_health_probe`` stubs ``_fetch_agent_advertised_repos`` rather
+    than parameterizing every ``dispatch_review`` call.
+    """
+    return [Path.home() / ".claude" / "settings.json"]
+
+
 def find_blocking_deny_rule(
     worktree_path: Path, *, settings_files: Iterable[Path] | None = None
 ) -> str | None:
@@ -2456,7 +2474,7 @@ def find_blocking_deny_rule(
     best-effort advisory check, not a security boundary).
     """
     if settings_files is None:
-        settings_files = [Path.home() / ".claude" / "settings.json"]
+        settings_files = _default_deny_settings_files()
 
     worktree_path = worktree_path.expanduser()
     for settings_path in settings_files:
@@ -2712,6 +2730,17 @@ class AgentServer:
         # ``spec.provider`` matching a key in this dict take a different
         # path.
         providers: "dict[str, object] | None" = None,
+        # #1445 review: override for the settings file(s)
+        # :func:`check_worktree_writable` scans for a blocking deny rule.
+        # ``None`` (default) means production behavior — scan the real
+        # ``~/.claude/settings.json`` of whoever's machine this runs on.
+        # Tests must pass an explicit (e.g. empty) list so the suite's
+        # default behavior never depends on the machine's real home-directory
+        # settings — mirrors the ``worker_command`` injection seam above and
+        # the ``_no_board_service``/``_no_agent_health_probe`` hermeticity
+        # fixtures in conftest.py, which exist to prevent exactly this class
+        # of bug.
+        worktree_writable_settings_files: "Iterable[Path] | None" = None,
     ) -> None:
         self.machine_name = machine_name
         self.capabilities = list(capabilities)
@@ -2734,6 +2763,7 @@ class AgentServer:
         # are duck-typed (``build_command``, ``initial_input``,
         # ``capabilities``, ``env``) at call sites.
         self._providers: dict[str, object] = dict(providers or {})
+        self._worktree_writable_settings_files = worktree_writable_settings_files
 
         self._lock = threading.Lock()
         self._assignments: dict[str, AgentAssignment] = {}
@@ -3733,7 +3763,9 @@ class AgentServer:
         # write to — cheap to catch here (a stat + a JSON parse) vs. a full
         # session that reasons, designs, and only discovers at the very end
         # that it had nowhere to save its work.
-        write_issue = check_worktree_writable(worktree_path)
+        write_issue = check_worktree_writable(
+            worktree_path, settings_files=self._worktree_writable_settings_files
+        )
         if write_issue is not None:
             assignment.status = FAILED
             assignment.error = f"worktree not writable: {write_issue}"
@@ -3741,6 +3773,14 @@ class AgentServer:
             with self._lock:
                 self._assignments[assignment.id] = assignment
             self._persist()
+            # #1445 review: _setup_worktree() above already ran `git worktree
+            # add` and created a real branch before this check ran. Leaving
+            # that in place on every failed dispatch would leak a fresh
+            # worktree per retry — self-defeating for a check whose whole
+            # point is catching failures cheaply (and worse, one of the OS-
+            # level failures this check catches is a full disk). Tear it down
+            # the same way cancel() does.
+            self._cleanup_worktree(assignment)
             return assignment  # Don't raise — let coordinator see the failure
 
         with self._lock:

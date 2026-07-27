@@ -25,6 +25,7 @@ from coord.agent import (
     AgentServer,
     AssignmentSpec,
     _COMPLETED_HISTORY_CAP,
+    _git,
     _sealed_write_guard_tools,
     _worker_subprocess_env,
     default_worker_command,
@@ -1125,6 +1126,65 @@ def test_assign_refuses_dispatch_when_worktree_not_writable(tmp_path: Path, monk
     assert "permission rule" in a.error
     # No worker subprocess should have been spawned for this assignment.
     assert a.id not in server._processes
+    server.shutdown()
+
+
+def test_assign_cleans_up_worktree_when_not_writable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """#1445 review finding 1: a dispatch refused by the writability preflight
+    must not leak the git worktree + branch `_setup_worktree()` already
+    created before the check ran — every retry on a genuinely-blocked machine
+    would otherwise accumulate an abandoned worktree per attempt, undercutting
+    the whole point of a cheap preflight (and making a full-disk condition,
+    one of the OS-level failures this check catches, actively worse)."""
+    import coord.agent as agent_module
+
+    repo = _init_repo(tmp_path / "repo")
+    server = _server(tmp_path, repo_path=repo)
+
+    def _fake_check(worktree_path: Path, **kwargs) -> str | None:
+        return f"a Claude Code permission rule denies Edit/Write under {worktree_path}: 'Write(//home/john/.coord/**)' in /home/john/.claude/settings.json"
+
+    monkeypatch.setattr(agent_module, "check_worktree_writable", _fake_check)
+
+    a = server.assign(_spec(repo))
+    assert a.status == FAILED
+    assert a.worktree_path is not None
+    wt_path = Path(a.worktree_path)
+    assert not wt_path.exists(), "leaked worktree directory after refused dispatch"
+
+    # The branch must also be freed at the git level (no stale admin entry) —
+    # otherwise the *next* dispatch attempt on this same branch fails with a
+    # worktree-collision error instead of hitting the same writability refusal.
+    listing = _git(repo, "worktree", "list", "--porcelain")
+    assert str(wt_path) not in listing
+    server.shutdown()
+
+
+def test_assign_worktree_writable_settings_files_override(tmp_path: Path) -> None:
+    """#1445 review finding 2: AgentServer accepts an explicit
+    `worktree_writable_settings_files` override (mirroring the existing
+    `worker_command` injection seam), so a test wanting to exercise the real
+    deny-rule scan doesn't have to touch — or depend on — the real
+    `~/.claude/settings.json` of whatever machine runs the suite."""
+    repo = _init_repo(tmp_path / "repo")
+    settings = tmp_path / "fake-settings.json"
+    # `_server()` puts worktrees under `<tmp_path>/state/worktrees/<aid>` —
+    # deny the whole `state/` subtree so it matches regardless of the
+    # per-assignment uuid.
+    state_root_nolead = str(tmp_path / "state")[1:]
+    settings.write_text(json.dumps({
+        "permissions": {"deny": [f"Write(//{state_root_nolead}/**)"]}
+    }))
+
+    server = _server(
+        tmp_path,
+        repo_path=repo,
+        worktree_writable_settings_files=[settings],
+    )
+    a = server.assign(_spec(repo))
+    assert a.status == FAILED
+    assert a.error is not None
+    assert "permission rule" in a.error
     server.shutdown()
 
 
