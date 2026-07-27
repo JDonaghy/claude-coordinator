@@ -8,10 +8,15 @@ from pathlib import Path
 import pytest
 
 from coord.worker_events import (
+    USAGE_LIMIT_REASON_PREFIX,
     WorkerEvent,
     WorkerSummary,
     detect_anomalies,
+    detect_usage_limit_kill,
+    detect_usage_limit_kill_in_log,
+    format_usage_limit_reason,
     is_stream_json,
+    is_usage_limit_reason,
     iter_events,
     parse_event,
     parse_log,
@@ -462,3 +467,93 @@ class TestWorkerSummary:
         update_summary(s, e)
         assert s.session_id == "zzz"
         assert s.model_used == "claude-sonnet-4-6"
+
+
+# ── Usage-limit kill detection (#1461) ──────────────────────────────────────
+
+
+class TestDetectUsageLimitKill:
+    def test_detects_real_transcript_tail_message(self, tmp_path: Path) -> None:
+        """The exact captured evidence from #1461: the worker's own claude -p
+        process prints this line and exits — no terminating result event."""
+        p = tmp_path / "log.log"
+        p.write_text(
+            _ndjson([_init_event(), _assistant_text_event("working on it...")])
+            + "You’ve hit your session limit · resets 8:30pm (America/Chicago)\n"
+        )
+        kill = detect_usage_limit_kill_in_log(p)
+        assert kill is not None
+        assert kill.reset_at_raw == "8:30pm (America/Chicago)"
+
+    def test_json_escaped_apostrophe_and_middot_variant(self) -> None:
+        """The same message embedded as a JSON string's escaped unicode
+        (rather than a bare trailing line) must still be recognised."""
+        text = (
+            '{"type":"assistant","message":{"content":[{"type":"text",'
+            '"text":"You\\u2019ve hit your session limit \\u00b7 resets '
+            '8:30pm (America/Chicago)"}]}}\n'
+        )
+        kill = detect_usage_limit_kill(text)
+        assert kill is not None
+        assert kill.reset_at_raw.startswith("8:30pm (America/Chicago)")
+
+    def test_no_match_on_normal_completion_that_merely_discusses_it(self) -> None:
+        """A worker whose PR happens to touch this very issue and discusses
+        'session limit' mid-conversation must NOT be flagged — only the
+        transcript's actual tail counts (the #1461 false-positive guard)."""
+        text = _ndjson([
+            _init_event(),
+            _assistant_text_event(
+                "I'm implementing #1461, which is about detecting the "
+                "'session limit' kill message and reporting resets time."
+            ),
+            _assistant_text_event("Done implementing, running tests now."),
+            _result_event(total_cost_usd=0.1, stop_reason="end_turn", num_turns=2),
+        ])
+        assert detect_usage_limit_kill(text) is None
+
+    def test_gated_out_by_reap_when_transcript_has_terminating_result(
+        self, tmp_path: Path
+    ) -> None:
+        """Mirrors the agent.py `_reap` gate: a transcript that ends with a
+        normal `result` event is a real completion, never a kill — even if
+        the tail line itself happened to match textually is not expected
+        here since it wouldn't be the actual last line, but this test
+        documents the intended pairing with `_log_has_result`-style checks
+        by asserting a normal ending log has no kill in its own right."""
+        p = tmp_path / "log.log"
+        p.write_text(
+            _ndjson([
+                _init_event(),
+                _assistant_text_event("all done"),
+                _result_event(total_cost_usd=0.02, stop_reason="end_turn", num_turns=1),
+            ])
+        )
+        assert detect_usage_limit_kill_in_log(p) is None
+
+    def test_returns_none_for_missing_file(self, tmp_path: Path) -> None:
+        assert detect_usage_limit_kill_in_log(tmp_path / "nope.log") is None
+
+    def test_returns_none_for_empty_text(self) -> None:
+        assert detect_usage_limit_kill("") is None
+
+    def test_only_scans_the_last_few_lines(self) -> None:
+        """A phrase far from the tail (beyond the bounded scan window) must
+        not be detected — this is what keeps the detector from firing on
+        stray mid-conversation prose in a long transcript."""
+        lines = [f"line {i}" for i in range(20)]
+        lines.insert(0, "You've hit your session limit · resets 9am (UTC)")
+        text = "\n".join(lines) + "\n"
+        assert detect_usage_limit_kill(text) is None
+
+    def test_format_and_prefix_round_trip(self, tmp_path: Path) -> None:
+        p = tmp_path / "log.log"
+        p.write_text("You've hit your session limit · resets 8:30pm (America/Chicago)\n")
+        kill = detect_usage_limit_kill_in_log(p)
+        assert kill is not None
+        reason = format_usage_limit_reason(kill)
+        assert reason == f"{USAGE_LIMIT_REASON_PREFIX}8:30pm (America/Chicago)"
+        assert is_usage_limit_reason(reason) is True
+        assert is_usage_limit_reason(None) is False
+        assert is_usage_limit_reason("") is False
+        assert is_usage_limit_reason("some other failure") is False

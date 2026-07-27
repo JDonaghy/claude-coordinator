@@ -124,11 +124,19 @@ def reconcile_completed_assignments(
         # `reconcile()`, but that sweep is scoped to `type="work"` only, so
         # every other write-capable type (mock-author, test-author, ...) had
         # no path back to a correct branch once this tick got there first.
+        # #1461: stamp a usage-limit-kill diagnostic onto the board row when
+        # the agent's own reap flagged one (AgentServer._reap, agent.py) —
+        # regardless of whether the agent landed on FAILED or ADVISORY, both
+        # observed for a real kill. This is the primary production path
+        # (the daemon's passive tick) for getting the reason out of the
+        # ephemeral agent-side JSON and into the persisted, drive.py-visible
+        # `failure_reason` column.
         update_state_fn(
             assignment_id=aid,
             terminal_status=terminal,
             branch=a.branch or entry.get("branch"),
             review_state=None,
+            failure_reason=entry.get("usage_limit_reason"),
         )
 
         # #666 Gap A: best-effort cost/token capture from the agent completed
@@ -722,6 +730,43 @@ def describe_no_candidate_machines(
     return "no available machine to retry on:\n" + "\n".join(lines)
 
 
+def _record_usage_limit_reason(assignment_id: str | None, entry: dict) -> None:
+    """#1461: stamp a usage-limit-kill diagnostic (if the agent flagged one
+    on *entry*) onto *assignment_id*'s persisted ``failure_reason``.
+
+    Used by :func:`reconcile`'s (``coord resume``) FAILED/ADVISORY branches.
+    ``reconcile_completed_assignments`` — the daemon's own passive tick and
+    the primary production path — does the equivalent inline via
+    ``update_state_fn`` (a raw local write is safe there: that function is
+    daemon-tick-only, never thin-client-reachable). ``reconcile()`` is
+    different — it is called from ``coord resume``, which IS reachable from a
+    thin client (same #906 audit gap `get_issue_test_mode` was fixed for) —
+    so this goes through :func:`coord.state.set_assignment_failure_reason`,
+    which is already daemon-aware (routes to ``POST
+    /assignment-failure-reason`` when a board service is configured), rather
+    than a raw ``get_connection()`` write that would silently land on a thin
+    client's empty local DB instead.
+
+    This also normalises the row's status to ``'failed'`` (that helper's own
+    behaviour) even when the agent's reap landed on ADVISORY — a usage-limit
+    kill is, per #1461, the ONE terminal state known safe to re-dispatch
+    unchanged, which is what `coord/drive.py`'s FAILED bucket already means;
+    ADVISORY otherwise implies "needs a human look", which a kill does not.
+
+    Best-effort: never raises — a diagnostic write must not break a real
+    status transition.
+    """
+    reason = entry.get("usage_limit_reason")
+    if not reason or not assignment_id:
+        return
+    try:
+        from coord.state import set_assignment_failure_reason  # noqa: PLC0415
+
+        set_assignment_failure_reason(assignment_id, reason)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def reconcile(board: Board, config: Config) -> list[str]:
     """Poll agent servers and update board assignments that have finished.
 
@@ -853,6 +898,7 @@ def reconcile(board: Board, config: Config) -> list[str]:
                         done, succeeded=False,
                         agent_entry=entry, board=board, config=config,
                     )
+                _record_usage_limit_reason(a.assignment_id, entry)
             # NOTE: do NOT add to newly_failed — prevents auto_reassign loop.
         else:
             # Defensive: don't downgrade a DB-done assignment to failed when
@@ -875,6 +921,7 @@ def reconcile(board: Board, config: Config) -> list[str]:
                         failed, succeeded=False,
                         agent_entry=entry, board=board, config=config,
                     )
+                _record_usage_limit_reason(a.assignment_id, entry)
         changed.append(a.assignment_id)
 
     # Dispatch pending reviews for all completed work assignments.

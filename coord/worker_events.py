@@ -22,6 +22,7 @@ don't recognise.
 from __future__ import annotations
 
 import json
+import re
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -141,6 +142,119 @@ def is_stream_json(log_path: str | Path) -> bool:
     except OSError:
         return False
     return False
+
+
+# ── Usage-limit kill detection (#1461) ──────────────────────────────────────
+#
+# A worker (claude -p) that hits the account's Max/Pro *session* usage limit
+# mid-flight prints a terminal line like:
+#
+#   "You've hit your session limit · resets 8:30pm (America/Chicago)"
+#
+# and exits — with no structured event marking what happened, so the reap
+# path records a bare FAILED (or, if the CLI ends the turn gracefully before
+# any commit, ADVISORY) indistinguishable from a real defect. This is a
+# different signal from the *API* `rate_limit_event` handled above: that one
+# is a structured stream-json event describing 429 throttling; this is a
+# plain-text kill message from the CLI's own subscription-limit handling, and
+# it never arrives as a `rate_limit_event`.
+
+
+@dataclass
+class UsageLimitKill:
+    """Diagnostic: the transcript shows the worker was killed by hitting the
+    account's session usage limit — not an API rate limit, and not a genuine
+    defect. A worker in this state is safe to re-dispatch unchanged once the
+    limit resets; it must never be diagnosed as a bug or escalated (e.g. via
+    `coord fix`'s model bump).
+    """
+
+    reset_at_raw: str
+    excerpt: str
+
+
+# A stable, greppable prefix stamped onto `Assignment.failure_reason` (and
+# recognised by `coord/drive.py`'s state machine) whenever a kill is detected
+# — see `format_usage_limit_reason`/`is_usage_limit_reason` below.
+USAGE_LIMIT_REASON_PREFIX = "usage limit — resets "
+
+# Matches the CLI's own message regardless of whether the apostrophe/middle
+# dot appear as literal unicode glyphs (a plain trailing line) or as \uXXXX
+# escapes (embedded in a JSON string field) — only the stable ASCII words
+# around them are required, so this matches either encoding without first
+# decoding the line as JSON. Tolerant of "usage limit" phrasing too, in case
+# the CLI's wording changes.
+_USAGE_LIMIT_RE = re.compile(
+    r"(?:session|usage) limit[^\r\n]{0,40}?resets?\s+([^\r\n\"\\]+)",
+    re.IGNORECASE,
+)
+
+# How many of the transcript's final non-blank, non-comment lines to search.
+# Bounded to exactly the literal last one — the issue's own evidence was
+# "the literal last line of the raw transcript", and a bare substring/regex
+# search over the whole log would false-positive on a worker that merely
+# *discusses* usage limits mid-conversation (this very issue's own worker
+# transcript, for instance). Blank lines and coordinator-appended
+# `# reap: ...` comments (written to the SAME log file after the worker
+# exits, e.g. by the push-attempt bookkeeping in `_reap`) are skipped so this
+# still reaches the worker's own real last line despite them.
+_USAGE_LIMIT_TAIL_LINES = 1
+
+
+def format_usage_limit_reason(kill: UsageLimitKill) -> str:
+    """Render *kill* as the one-liner stamped onto ``failure_reason``."""
+    return f"{USAGE_LIMIT_REASON_PREFIX}{kill.reset_at_raw}"
+
+
+def is_usage_limit_reason(reason: str | None) -> bool:
+    """True iff *reason* is a `failure_reason` stamped by this detector."""
+    return bool(reason) and reason.startswith(USAGE_LIMIT_REASON_PREFIX)
+
+
+def detect_usage_limit_kill(text: str) -> UsageLimitKill | None:
+    """Scan *text* (a transcript, or any tail slice of one) for the "hit your
+    session limit" kill message.
+
+    Only the last few meaningful (non-blank, non ``#``-comment) lines are
+    considered — see ``_USAGE_LIMIT_TAIL_LINES`` — so an incidental mention
+    of "session limit" earlier in a normal, successfully-completed
+    conversation is never mistaken for a kill. Returns ``None`` when no match
+    is found.
+    """
+    lines = [
+        ln for ln in text.splitlines()
+        if ln.strip() and not ln.lstrip().startswith("#")
+    ]
+    for line in reversed(lines[-_USAGE_LIMIT_TAIL_LINES:]):
+        m = _USAGE_LIMIT_RE.search(line)
+        if not m:
+            continue
+        reset = m.group(1).strip().strip("\"'.,;: \t")
+        if reset:
+            return UsageLimitKill(reset_at_raw=reset, excerpt=line[:500])
+    return None
+
+
+def detect_usage_limit_kill_in_log(
+    log_path: str | Path, tail_bytes: int = 65536
+) -> UsageLimitKill | None:
+    """:func:`detect_usage_limit_kill` over the tail of *log_path*.
+
+    Reads at most *tail_bytes* from the end of the file — a kill message is
+    always the transcript's last line, so there is never a need to read the
+    whole (potentially multi-MB) log. Returns ``None`` for a missing file or
+    any read error (best-effort, mirrors ``is_stream_json``).
+    """
+    p = Path(log_path)
+    try:
+        size = p.stat().st_size
+        with open(p, "rb") as f:
+            if size > tail_bytes:
+                f.seek(-tail_bytes, 2)
+            data = f.read()
+    except OSError:
+        return None
+    return detect_usage_limit_kill(data.decode("utf-8", errors="replace"))
 
 
 # ── Field extraction helpers ────────────────────────────────────────────────
