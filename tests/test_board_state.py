@@ -57,6 +57,34 @@ class TestBoardPersistence:
         assert loaded.completed[0].status == "done"
         assert loaded.completed[0].finished_at == 950.0
 
+    def test_save_and_load_roundtrip_preserves_review_patch_id(self, coord_db) -> None:
+        """#1475: review_patch_id must round-trip through save_board/load_board
+        alongside review_head_sha, so has_approved_review can consult it on a
+        freshly-loaded board (not just the in-memory Assignment)."""
+        board = Board(
+            completed=[
+                Assignment(
+                    machine_name="server",
+                    repo_name="api",
+                    issue_number=7,
+                    issue_title="review",
+                    assignment_id="rev-1",
+                    type="review",
+                    status="done",
+                    review_of_assignment_id="w1",
+                    review_verdict="approve",
+                    review_head_sha="abc123",
+                    review_patch_id="patchid-xyz",
+                ),
+            ],
+        )
+        save_board(board)
+        loaded = load_board()
+
+        assert loaded is not None
+        assert loaded.completed[0].review_head_sha == "abc123"
+        assert loaded.completed[0].review_patch_id == "patchid-xyz"
+
     def test_load_empty_db_returns_none(self, coord_db) -> None:
         assert load_board() is None
 

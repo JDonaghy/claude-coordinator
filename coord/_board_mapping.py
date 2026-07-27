@@ -105,6 +105,9 @@ def row_to_assignment(row: object) -> Assignment:
         review_verdict_override_reason=d.get("review_verdict_override_reason"),
         # #821: commit-bound review gate; None for pre-821 rows.
         review_head_sha=d.get("review_head_sha"),
+        # #1475: content-addressed patch-id alongside the SHA above; None
+        # for pre-1475 rows or where the patch-id couldn't be computed.
+        review_patch_id=d.get("review_patch_id"),
         cost_usd=d.get("cost_usd"),
         # #252: stored as JSON; absent column → None (not parsed yet).
         smoke_tests=decode_smoke_tests(d.get("smoke_tests")),

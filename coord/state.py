@@ -97,6 +97,8 @@ def _assignment_upsert_params(a: Assignment) -> tuple:
         a.review_verdict_override_reason,
         # #821: commit-bound SHA for review assignments.
         a.review_head_sha,
+        # #1475: content-addressed patch-id alongside the SHA above.
+        a.review_patch_id,
         a.cost_usd,
         # #252: encode list as JSON; None → NULL.
         (json.dumps(a.smoke_tests) if a.smoke_tests is not None else None),
@@ -114,7 +116,7 @@ _UPSERT_SQL = """
         review_target, required_gates, plan, unreachable_count, review_iteration,
         review_posted_at, test_state, test_reason, review_verdict,
         review_verdict_original, review_verdict_override_reason, review_head_sha,
-        cost_usd, smoke_tests, provider_name
+        review_patch_id, cost_usd, smoke_tests, provider_name
     ) VALUES (
         ?, ?, ?, ?, ?,
         ?, ?, ?, ?, ?,
@@ -123,7 +125,7 @@ _UPSERT_SQL = """
         ?, ?, ?, ?, ?,
         ?, ?, ?, ?,
         ?, ?, ?,
-        ?, ?, ?
+        ?, ?, ?, ?
     )
     ON CONFLICT(assignment_id) DO UPDATE SET
         -- #1451: `status`/`finished_at` are guarded by a finished_at-CAS, not
@@ -202,6 +204,10 @@ _UPSERT_SQL = """
         -- upsert without the SHA (e.g. from an older code path) must not
         -- erase a captured value.
         review_head_sha    = COALESCE(excluded.review_head_sha, review_head_sha),
+        -- #1475: same COALESCE-preserve pattern as review_head_sha above —
+        -- a later upsert without the patch-id (older code path, agent
+        -- reload) must not erase a captured value.
+        review_patch_id    = COALESCE(excluded.review_patch_id, review_patch_id),
         -- #208: cost_usd is set once at completion.  COALESCE so a re-load
         -- of the same row from an agent that doesn't know the cost
         -- doesn't blow away a previously-captured value.

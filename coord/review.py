@@ -1383,6 +1383,7 @@ def dispatch_review(
     branch_sha_fetcher=None,
     health_checker=None,
     milestone_fetcher=None,
+    patch_id_computer=None,
 ) -> Assignment | None:
     """Open a PR for `completed` and dispatch a review assignment.
 
@@ -1394,6 +1395,12 @@ def dispatch_review(
     that returns the repo names a given agent advertises, or ``None`` to
     fail-open.  When not provided, ``_fetch_agent_advertised_repos`` is called
     directly.  Inject a stub in tests to avoid real network probes.
+
+    *patch_id_computer* is an optional ``(diff_text: str | None) -> str |
+    None`` callable (#1475) that fingerprints the merge-base diff being
+    reviewed. Defaults to ``github_ops.compute_patch_id`` (a pure, no-network
+    ``git patch-id --stable`` call); inject a stub in tests that don't want
+    to shell out to git.
     """
     if not config.reviews.enabled or not config.reviews.auto_dispatch:
         return None
@@ -1563,6 +1570,17 @@ def dispatch_review(
     except Exception:  # noqa: BLE001 — fail-safe: missing SHA is not blocking
         pass
 
+    # #1475: fingerprint the same merge-base diff the reviewer is shown
+    # (`diff_text`, computed above). Stored alongside review_head_sha so a
+    # later commit-bound staleness check (a rebase moving the SHA) can carry
+    # the approval forward when the content is byte-identical.
+    _compute_patch_id = patch_id_computer or github_ops.compute_patch_id
+    review_patch_id: str | None = None
+    try:
+        review_patch_id = _compute_patch_id(diff_text)
+    except Exception:  # noqa: BLE001 — fail-safe: missing patch-id is not blocking
+        pass
+
     # #603: per-issue context digest (cross-repo deps / prior findings).
     from coord.state import issue_context_block  # noqa: PLC0415
     context_prefix = issue_context_block(completed.repo_name, completed.issue_number)
@@ -1714,6 +1732,7 @@ def dispatch_review(
             review_of_assignment_id=completed.assignment_id,
             model=review_model_alias,
             review_head_sha=review_head_sha,
+            review_patch_id=review_patch_id,
         )
         board.active.append(review_assignment)
 

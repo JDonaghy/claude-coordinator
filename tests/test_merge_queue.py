@@ -267,6 +267,12 @@ class FakeGh:
         # backward-compatible "no SHA → skip staleness check" path runs.
         return None
 
+    def get_branch_patch_id(self, repo: str, base: str, branch: str) -> str | None:
+        # #1475: tests don't exercise patch-id tracking by default; return
+        # None so the fail-closed "no patch-id → stale on SHA mismatch"
+        # path runs, matching get_branch_sha's default above.
+        return None
+
     def get_pr_body(self, repo: str, number: int) -> str:
         return self.pr_bodies.get(number, "")
 
@@ -999,6 +1005,52 @@ class TestReviewGate:
         assert "merged" not in kinds, "stale approval must not allow merge"
         assert "review_required" in kinds, "stale approval must re-block the review gate"
 
+    def test_process_populates_branch_patch_id_from_gh_ops(self) -> None:
+        """#1475: process() must populate entry.branch_patch_id via
+        gh_ops.get_branch_patch_id — the production population path."""
+        patch_id_calls: list[tuple[str, str, str]] = []
+
+        class _TrackingGh(FakeGh):
+            def get_branch_patch_id(self, repo: str, base: str, branch: str) -> str | None:
+                patch_id_calls.append((repo, base, branch))
+                return "patchid-abc"
+
+        cfg = self._config()
+        work = self._work("w1")
+        review = self._review("w1", verdict="approve")
+        board = self._board(completed=[work, review])
+
+        items = [_q("w1", size=10)]
+        process(items, _TrackingGh(), config=cfg, board=board)
+
+        assert len(patch_id_calls) >= 1, "process() must call gh_ops.get_branch_patch_id"
+        assert patch_id_calls[0][2] == items[0].branch, "must fetch patch-id for the entry's branch"
+        assert items[0].branch_patch_id == "patchid-abc"
+
+    def test_process_rebase_with_matching_patch_id_still_merges_end_to_end(self) -> None:
+        """#1475: a rebase that moves the SHA but not the content must not
+        force a re-review — the merge proceeds on the carried-forward approval."""
+        cfg = self._config()
+        work = self._work("w1")
+        review = self._review("w1", verdict="approve")
+        review.review_head_sha = "oldsha"
+        review.review_patch_id = "patchid-same"
+
+        class _RebasedGh(FakeGh):
+            def get_branch_sha(self, repo: str, branch: str) -> str | None:
+                return "newsha"  # rebase moved the head
+
+            def get_branch_patch_id(self, repo: str, base: str, branch: str) -> str | None:
+                return "patchid-same"  # but the content is byte-identical
+
+        board = self._board(completed=[work, review])
+        items = [_q("w1", size=10)]
+        events = process(items, _RebasedGh(), config=cfg, board=board)
+
+        kinds = [e.kind for e in events]
+        assert "review_required" not in kinds, "content-identical rebase must not re-block review"
+        assert "merged" in kinds, "approval must carry forward across a pure rebase"
+
     # ── #821: commit-bound approval ───────────────────────────────────────
 
     def test_has_approved_review_stale_sha_blocks(self) -> None:
@@ -1038,6 +1090,67 @@ class TestReviewGate:
         board = self._board(completed=[work, review])
         # No SHAs → skip the commit check → approval still valid.
         assert mq.has_approved_review(entry, board) is True
+
+    # ── #1475: patch-id carries an approval across a content-identical rebase ──
+
+    def test_has_approved_review_matching_patch_id_survives_sha_move(self) -> None:
+        """#1475: a pure rebase moves the SHA but not the content — the
+        approval must still count when the patch-id matches."""
+        work = self._work("w1")
+        review = self._review("w1", verdict="approve")
+        review.review_head_sha = "abc123"
+        review.review_patch_id = "patchid-same"
+
+        entry = _q("w1", branch="worker/w1")
+        entry.branch_head_sha = "def456"  # SHA moved — a rebase happened
+        entry.branch_patch_id = "patchid-same"  # but the diff is identical
+
+        board = self._board(completed=[work, review])
+        assert mq.has_approved_review(entry, board) is True
+
+    def test_has_approved_review_differing_patch_id_stays_stale(self) -> None:
+        """#1475: a genuine content change must still void the approval even
+        though both patch-ids are present."""
+        work = self._work("w1")
+        review = self._review("w1", verdict="approve")
+        review.review_head_sha = "abc123"
+        review.review_patch_id = "patchid-old"
+
+        entry = _q("w1", branch="worker/w1")
+        entry.branch_head_sha = "def456"
+        entry.branch_patch_id = "patchid-new"  # conflict resolution changed content
+
+        board = self._board(completed=[work, review])
+        assert mq.has_approved_review(entry, board) is False
+
+    def test_has_approved_review_missing_patch_id_fails_closed(self) -> None:
+        """#1475: when the patch-id can't be computed on either side, the SHA
+        mismatch alone must still void the approval (fail closed, not open)."""
+        work = self._work("w1")
+        review = self._review("w1", verdict="approve")
+        review.review_head_sha = "abc123"
+        review.review_patch_id = None  # patch-id unavailable at review time
+
+        entry = _q("w1", branch="worker/w1")
+        entry.branch_head_sha = "def456"
+        entry.branch_patch_id = None  # patch-id unavailable at merge time
+
+        board = self._board(completed=[work, review])
+        assert mq.has_approved_review(entry, board) is False
+
+    def test_has_approved_review_one_sided_patch_id_fails_closed(self) -> None:
+        """#1475: a patch-id present on only one side must not be trusted."""
+        work = self._work("w1")
+        review = self._review("w1", verdict="approve")
+        review.review_head_sha = "abc123"
+        review.review_patch_id = "patchid-same"
+
+        entry = _q("w1", branch="worker/w1")
+        entry.branch_head_sha = "def456"
+        entry.branch_patch_id = None  # merge-time fetch failed
+
+        board = self._board(completed=[work, review])
+        assert mq.has_approved_review(entry, board) is False
 
     # ── #292 Defect 1: has_approved_review with bounce ────────────────────
 

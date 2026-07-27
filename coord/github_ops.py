@@ -1026,6 +1026,59 @@ def pr_diff(repo_github: str, pr_number: int, *, max_chars: int = 60000) -> str 
     return diff
 
 
+def compute_patch_id(diff_text: str | None) -> str | None:
+    """Return the ``git patch-id --stable`` hash of *diff_text*, or ``None``.
+
+    #1475: a content-addressed fingerprint of a diff — insensitive to commit
+    SHA / line numbers, but sensitive to the surrounding context lines. A
+    pure rebase with no conflict replays the identical diff against a new
+    base and produces the same patch-id even though the commit SHA changed;
+    a conflict resolution or genuine content change produces a different one
+    (that distinction is #1476's job, not this function's).
+
+    ``git patch-id`` operates purely on the piped diff text — no working
+    directory or repo checkout required, so this is safe to call from any
+    process. Returns ``None`` for empty/missing input or on any subprocess
+    failure; callers must fail closed (treat a missing patch-id as "cannot
+    confirm identical content", never as "identical").
+    """
+    if not diff_text or not diff_text.strip():
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "patch-id", "--stable"],
+            input=diff_text, capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    line = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
+    if not line:
+        return None
+    return line.split()[0]
+
+
+def get_branch_patch_id(repo: str, base: str, branch: str) -> str | None:
+    """Return the content-addressed patch-id for *branch*'s diff against *base*.
+
+    #1475: uses the GitHub three-dot compare API (no PR required, mirroring
+    :func:`get_branch_diff_size`) to fetch the raw unified diff, then hashes
+    it with :func:`compute_patch_id`. Returns ``None`` on any failure — the
+    merge-queue gate treats a missing patch-id as "cannot confirm identical
+    content" and falls back to the pre-#1475 SHA-only staleness check
+    (fail closed).
+    """
+    try:
+        diff = _gh(
+            "api", f"repos/{repo}/compare/{base}...{branch}",
+            "-H", "Accept: application/vnd.github.v3.diff",
+        )
+    except RuntimeError:
+        return None
+    return compute_patch_id(diff)
+
+
 def create_pr(
     repo: str,
     *,

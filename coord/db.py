@@ -435,6 +435,15 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # column — see coord.models.Assignment.review_verdict_original.
         "ALTER TABLE assignments ADD COLUMN review_verdict_original TEXT",
         "ALTER TABLE assignments ADD COLUMN review_verdict_override_reason TEXT",
+        # #1475: content-addressed fingerprint of the diff a review approved
+        # (`git patch-id --stable`), captured alongside `review_head_sha`. A
+        # rebase that changes no content produces the same patch-id even
+        # though the branch's HEAD SHA moved, so `has_approved_review` can
+        # carry the approval forward instead of re-blocking on the #821 SHA
+        # check. NULL for rows predating this column or where the patch-id
+        # could not be computed — those fall back to today's SHA-only
+        # staleness behaviour (fail closed).
+        "ALTER TABLE assignments ADD COLUMN review_patch_id TEXT",
     ]
     for sql in migrations:
         try:

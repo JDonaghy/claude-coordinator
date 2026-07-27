@@ -123,6 +123,7 @@ export interface Assignment {
   review_verdict_original: string | null
   review_verdict_override_reason: string | null
   review_head_sha: string | null
+  review_patch_id: string | null
   cost_usd: number | null
   smoke_tests: string[] | null
   provider_name: string | null

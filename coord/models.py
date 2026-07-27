@@ -326,6 +326,17 @@ class Assignment:
     # None for review assignments predating this field or where SHA tracking
     # is not available.
     review_head_sha: str | None = None
+    # #1475: content-addressed fingerprint (`git patch-id --stable`) of the
+    # diff the review covered, captured alongside `review_head_sha`. When a
+    # later commit-bound staleness check finds the SHAs differ (e.g. a
+    # conflict-fix rebase moved the head), `has_approved_review` falls back
+    # to comparing this against the branch's *current* patch-id — identical
+    # ⇒ the rebase changed no content and the approval still covers it;
+    # different (or either side unavailable) ⇒ stale, same as before this
+    # field existed. Stored alongside `review_head_sha`, never replacing it
+    # — the SHA remains the audit/#821 trail. None for rows predating #1475
+    # or where the diff/patch-id could not be computed.
+    review_patch_id: str | None = None
     # #208: parsed worker cost from the final stream-json `result` event.
     # None means "not yet captured" (older rows, in-flight workers, or
     # workers whose log lacked usage data).  Set on completion by
