@@ -1550,7 +1550,16 @@ def dispatch_review(
     # the branch's own changes (a stale-base diff sweeps in already-merged
     # commits as spurious deletions, #546).  Best-effort: None keeps the
     # fallback three-dot git-diff instructions in the briefing.
-    diff_text = github_ops.pr_diff(repo.github, pr["number"]) if pr else None
+    # #1475: fetch the full, untruncated diff once — it's the input to the
+    # content-hash (`review_patch_id` below) and must never be the mutated,
+    # truncated-with-a-trailer string (hashing that gives a patch-id that can
+    # never match the merge-time `branch_patch_id`, which is computed from an
+    # uncapped compare-API diff). The display copy shown to the reviewer is
+    # then truncated locally from the same fetch — no second `gh` call.
+    full_diff_text = github_ops.pr_diff(repo.github, pr["number"], max_chars=None) if pr else None
+    diff_text = (
+        github_ops.truncate_diff_text(full_diff_text) if full_diff_text is not None else None
+    )
 
     fetch_body = issue_body_fetcher or _fetch_issue_body
     issue_body = fetch_body(repo.github, completed.issue_number)
@@ -1570,14 +1579,16 @@ def dispatch_review(
     except Exception:  # noqa: BLE001 — fail-safe: missing SHA is not blocking
         pass
 
-    # #1475: fingerprint the same merge-base diff the reviewer is shown
-    # (`diff_text`, computed above). Stored alongside review_head_sha so a
-    # later commit-bound staleness check (a rebase moving the SHA) can carry
-    # the approval forward when the content is byte-identical.
+    # #1475: fingerprint the *full* merge-base diff (`full_diff_text`, computed
+    # above) — not the display-truncated `diff_text` — so this matches the
+    # merge-time counterpart (`get_branch_patch_id`, also uncapped) for any PR
+    # whose diff exceeds the display truncation threshold. Stored alongside
+    # review_head_sha so a later commit-bound staleness check (a rebase moving
+    # the SHA) can carry the approval forward when the content is byte-identical.
     _compute_patch_id = patch_id_computer or github_ops.compute_patch_id
     review_patch_id: str | None = None
     try:
-        review_patch_id = _compute_patch_id(diff_text)
+        review_patch_id = _compute_patch_id(full_diff_text)
     except Exception:  # noqa: BLE001 — fail-safe: missing patch-id is not blocking
         pass
 
