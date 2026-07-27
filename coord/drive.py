@@ -1092,7 +1092,32 @@ def _decide_review(
 def _decide_merge(
     state: IssueState, opts: DriveOptions, counters: DriveCounters
 ) -> Action:
-    """The MERGE stage."""
+    """The MERGE stage.
+
+    #1474: a CONFLICT status must NOT be a bare wait.  ``dispatch_conflict_fix``
+    (coord.conflict_fix) has exactly two sanctioned callers — inside an actual
+    ``coord merge`` run, and the semantic-escalation variant behind
+    ``pipeline.escalate_semantic_conflicts`` that only ``coord resume``
+    (human-invoked) reaches — so nothing ever dispatches the fix worker while
+    this function just parks on ``_wait()``.  That was the exact deadlock that
+    stalled #1453/#1461 for ~14 hours despite ``classify_conflict()`` correctly
+    saying ``rebaseable`` and a capable machine being idle: the coordinator's
+    own #241 auto-rebase machinery was never invoked.
+
+    The fix is to fall through to the same bounded ``coord merge --only <aid>``
+    retry below every other non-terminal status already uses — that call is
+    what runs ``classify_conflict`` + ``dispatch_conflict_fix`` (or discovers
+    one is already in flight / already failed and escalates to
+    ``HUMAN_REQUIRED``, which stays terminal via the check above). Once a
+    conflict-fix is actually dispatched, it shows up as a `type="conflict-fix"`
+    row for this same issue, so the very first check in :func:`decide`
+    (``state.active_count > 0`` → wait) parks the run there on the next poll —
+    :func:`decide` never even reaches this function while it is running. That
+    is what keeps this from double-dispatching or fighting an in-flight fix;
+    :func:`coord.conflict_fix.has_prior_conflict_fix` /
+    :func:`~coord.conflict_fix._has_active_conflict_fix` are the belt-and-
+    braces guard inside ``dispatch_conflict_fix`` itself.
+    """
     status = state.merge_status
     if status.upper() == "HUMAN_REQUIRED":
         return _die(
@@ -1102,10 +1127,6 @@ def _decide_merge(
             f"     coord merge --only {state.merge_aid or state.work_aid} "
             "--override-human-required '<reason>'"
         )
-    if status.upper() == "CONFLICT":
-        # coord auto-dispatches a conflict-fix worker and re-enqueues on
-        # success; give it room rather than fighting it.
-        return _wait(label="MERGE: conflict — waiting for coord's conflict-fix worker")
     if status.upper() == "BLOCKED":
         return _wait(
             label=(
@@ -1116,7 +1137,10 @@ def _decide_merge(
 
     # Cap the attempts: without this, a merge that fails for a reason the board
     # never reflects (so merge_status stays empty) would re-run `coord merge`
-    # on every poll until the deadline.
+    # on every poll until the deadline. The same cap bounds the CONFLICT case
+    # (#1474) — a `coord merge --only` that keeps landing back on CONFLICT
+    # (e.g. a fresh conflict on every rebase attempt) must still terminate
+    # rather than spin forever.
     if counters.merge_attempts >= opts.max_merge_attempts:
         return _die(
             f"merge attempted {counters.merge_attempts} times without landing.\n"
@@ -1129,12 +1153,22 @@ def _decide_merge(
     # Tolerant on purpose: the first attempt often lands before the daemon's
     # tick has run `enqueue_approved_work`, so `--only <aid>` finds no queue
     # entry.  That is a "try again next poll", not a reason to abort the run —
-    # the attempt cap above is what bounds it.
+    # the attempt cap above is what bounds it. A CONFLICT entry that is
+    # already CONFLICT (not PENDING) similarly errors out of `--only`
+    # (`coord merge --only` refuses a non-PENDING entry) rather than
+    # reclassifying it — that message still counts against the same cap, so
+    # a genuinely stuck entry dies with a clear pointer instead of spinning.
+    conflict_note = (
+        " — retrying via coord merge's own conflict-fix dispatch (#241)"
+        if status.upper() == "CONFLICT"
+        else ""
+    )
     return Action(
         kind=RUN,
         label=(
             f"MERGE: attempt {counters.merge_attempts}/{opts.max_merge_attempts} "
             f"(coord merge --only {aid} --method {opts.merge_method})"
+            f"{conflict_note}"
         ),
         command=("merge", "--only", aid, "--method", opts.merge_method),
         on_error="warn",

@@ -1048,10 +1048,53 @@ def test_human_required_is_matched_case_insensitively(status):
     assert step(approved_work(merge_status=status)).is_exit
 
 
-def test_a_conflict_waits_for_coords_conflict_fix_worker():
+def test_a_conflict_runs_coord_merge_rather_than_waiting_forever():
+    """#1474: `dispatch_conflict_fix` has exactly two sanctioned callers — an
+    actual `coord merge` run, and the semantic-escalation variant reachable
+    only from `coord resume` (human-invoked). A bare `_wait()` here means
+    NOTHING ever dispatches the fix worker — the exact deadlock that stalled
+    #1453/#1461 for ~14 hours. The regression test that would have caught
+    it: CONFLICT must yield a RUN action (the `coord merge --only <aid>`
+    that actually runs `classify_conflict` + `dispatch_conflict_fix`), not a
+    WAIT with nothing behind it.
+    """
     action = step(approved_work(merge_status="CONFLICT"))
+    assert action.kind == RUN
+    assert action.command == ("merge", "--only", "w1", "--method", "rebase")
+
+
+def test_conflict_retries_are_bounded_by_the_same_merge_attempt_cap():
+    """CONFLICT falls through to the same bounded retry as every other
+    non-terminal merge status — a `coord merge --only` that keeps landing
+    back on CONFLICT must still terminate, not spin until the deadline."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_merge_attempts=2)
+    s = approved_work(merge_status="CONFLICT")
+
+    assert step(s, opts, counters=counters).kind == RUN
+    assert step(s, opts, counters=counters).kind == RUN
+    exhausted = step(s, opts, counters=counters)
+    assert exhausted.is_exit
+    assert "merge attempted 2 times without landing" in exhausted.message
+
+
+def test_a_conflict_with_an_active_conflict_fix_waits_instead_of_re_dispatching():
+    """Once a conflict-fix worker is actually dispatched, it is a
+    `type="conflict-fix"` row scoped to this same issue — `decide()`'s own
+    ``active_count`` gate (checked before the merge stage is ever reached)
+    must park the run there, never re-attempt `coord merge --only` while one
+    is already in flight. This is what makes the #1474 fix safe: RUN once
+    to dispatch, then the board itself — not a flag `_decide_merge` has to
+    track — is what prevents a duplicate dispatch on the next poll.
+    """
+    action = step(
+        approved_work(
+            merge_status="CONFLICT",
+            active_count=1,
+            active_types=("conflict-fix",),
+        )
+    )
     assert action.kind == WAIT
-    assert "conflict-fix" in action.label
 
 
 def test_a_blocked_merge_waits_and_reports_the_gate():

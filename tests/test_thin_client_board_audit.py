@@ -122,12 +122,18 @@ COMMANDS_ALLOWLIST: dict[str, set[tuple[str, str]]] = {
     # #584-routed: `reconcile_merges` and `merge` only reach these calls after
     # `daemon_reroute_target()` returns None (i.e. we ARE the daemon, or no
     # daemon is configured) — see the early `if _svc is not None: ...; return`
-    # guard above each of these bodies.
+    # guard above each of these bodies. `_dispatch_conflict_fixes` (#1474
+    # review: extracted so the `--only` surgical path can share the #241
+    # conflict-fix dispatch the whole-queue path already had) is only ever
+    # called from within `merge()`'s two bodies, both past that same guard —
+    # the load_board/save_board pair just moved from `merge`'s own frame into
+    # this helper's, not into a new unguarded call site.
     "merge.py": {
         ("reconcile_merges", "build_board"),
         ("reconcile_merges", "save_board"),
         ("merge", "load_board"),
-        ("merge", "save_board"),
+        ("_dispatch_conflict_fixes", "load_board"),
+        ("_dispatch_conflict_fixes", "save_board"),
     },
     # #1337: `coord test` no longer calls save_board at all — the verdict is
     # recorded via the single-row `record_test_verdict` on both paths (it
