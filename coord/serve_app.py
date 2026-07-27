@@ -1041,6 +1041,22 @@ def _auto_drain_tick(config: Config) -> "list":
     except Exception:  # noqa: BLE001
         ci_store = None
 
+    # #1477: re-test any parked CONFLICT entry against GitHub's own
+    # mergeability computation before the plan is built — otherwise a branch
+    # repaired by a conflict-fix worker (or by hand) since the last tick
+    # keeps showing READY-blocking BLOCKED/CONFLICT status here forever, and
+    # auto-drain (unlike a human running `coord merge`) has no other chance
+    # to notice. Best-effort: a reconciliation failure must not disable the
+    # rest of the drain tick.
+    try:
+        for ev in mq.reconcile_conflict_entries(github_ops):
+            log.info(
+                "auto-drain: conflict reconciled for %s#%d (%s): %s",
+                ev.entry.repo_name, ev.entry.issue_number, ev.entry.branch, ev.message,
+            )
+    except Exception:  # noqa: BLE001
+        log.warning("auto-drain: conflict reconciliation failed", exc_info=True)
+
     # Compute the gate-annotated plan — the single source of truth for READY.
     merge_plan = mq.plan(board, config, ci_store=ci_store, gh_ops=github_ops)
     ready_aids = {pm.assignment_id for pm in merge_plan if pm.status == PLAN_READY}

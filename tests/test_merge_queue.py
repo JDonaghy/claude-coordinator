@@ -242,6 +242,12 @@ class FakeGh:
     # and is_epic_issue returns False, matching pre-#1318 behavior.
     pr_commit_messages: dict[int, list[str]] = field(default_factory=dict)
     epic_issues: set[int] = field(default_factory=set)
+    # #1477: PR number -> mergeable verdict (True/False/None). Defaults keep
+    # every prior test (none of which set this) inert — check_pr_mergeable
+    # returns None ("unknown") so reconcile_conflict_entries never unparks
+    # an entry unless a test opts in explicitly.
+    mergeable_results: dict[int, bool | None] = field(default_factory=dict)
+    mergeable_calls: list[tuple[str, int]] = field(default_factory=list)
 
     def create_pr(self, repo: str, *, base: str, head: str, title: str, body: str) -> dict:
         self.create_calls.append((repo, {"base": base, "head": head, "title": title}))
@@ -288,6 +294,10 @@ class FakeGh:
 
     def get_pr_commit_messages(self, repo: str, number: int) -> list[str]:
         return self.pr_commit_messages.get(number, [])
+
+    def check_pr_mergeable(self, repo: str, number: int) -> bool | None:
+        self.mergeable_calls.append((repo, number))
+        return self.mergeable_results.get(number)
 
 
 class TestProcess:
@@ -2066,6 +2076,180 @@ class TestRefreshEntryAssignment:
         result = mq.refresh_entry_assignment(work, repo_github="acme/api", target_branch="main")
         assert result is False
         assert load_queue() == []
+
+
+class TestReconcileConflictEntries:
+    """#1477: a CONFLICT entry re-tests its cached verdict on every tick
+    instead of trusting the `gh pr merge` failure recorded whenever the
+    queue last attempted it."""
+
+    def test_clears_conflict_when_pr_now_mergeable(self, coord_db) -> None:
+        entry = _q("a", state=CONFLICT, pr=100)
+        entry.error = "gh pr merge 1464 ... --rebase failed: X Pull request #1464 is not mergeable"
+        save_queue([entry])
+
+        gh = FakeGh(mergeable_results={100: True})
+        events = mq.reconcile_conflict_entries(gh)
+
+        assert len(events) == 1
+        assert events[0].kind == "reopened"
+        reloaded = load_queue()[0]
+        assert reloaded.state == PENDING
+        assert reloaded.error is None
+        assert gh.mergeable_calls == [("acme/api", 100)]
+
+    def test_leaves_entry_parked_when_still_conflicting(self, coord_db) -> None:
+        entry = _q("a", state=CONFLICT, pr=100)
+        entry.error = "not mergeable"
+        save_queue([entry])
+
+        gh = FakeGh(mergeable_results={100: False})
+        events = mq.reconcile_conflict_entries(gh)
+
+        assert events == []
+        reloaded = load_queue()[0]
+        assert reloaded.state == CONFLICT
+        assert reloaded.error == "not mergeable"
+
+    def test_leaves_entry_parked_when_mergeability_unknown(self, coord_db) -> None:
+        """Fail-closed: `None` (gh error / GitHub still computing) must never
+        be treated as a green light to unpark an entry."""
+        entry = _q("a", state=CONFLICT, pr=100)
+        save_queue([entry])
+
+        gh = FakeGh()  # mergeable_results defaults to {} -> None
+        events = mq.reconcile_conflict_entries(gh)
+
+        assert events == []
+        assert load_queue()[0].state == CONFLICT
+
+    def test_skips_entry_with_no_pr_number(self, coord_db) -> None:
+        entry = _q("a", state=CONFLICT, pr=None)
+        save_queue([entry])
+
+        gh = FakeGh(mergeable_results={100: True})
+        events = mq.reconcile_conflict_entries(gh)
+
+        assert events == []
+        assert gh.mergeable_calls == []
+        assert load_queue()[0].state == CONFLICT
+
+    def test_only_touches_conflict_entries(self, coord_db) -> None:
+        """PENDING/MERGED/HUMAN_REQUIRED entries are never re-tested."""
+        pending = _q("p", state=PENDING, pr=200)
+        merged = _q("m", state=MERGED, pr=201)
+        human = _q("h", state=mq.HUMAN_REQUIRED, pr=202)
+        save_queue([pending, merged, human])
+
+        gh = FakeGh(mergeable_results={200: True, 201: True, 202: True})
+        events = mq.reconcile_conflict_entries(gh)
+
+        assert events == []
+        assert gh.mergeable_calls == []
+        states = {x.assignment_id: x.state for x in load_queue()}
+        assert states == {"p": PENDING, "m": MERGED, "h": mq.HUMAN_REQUIRED}
+
+    def test_gh_exception_does_not_wedge_the_tick(self, coord_db) -> None:
+        entry = _q("a", state=CONFLICT, pr=100)
+        save_queue([entry])
+
+        class RaisingGh(FakeGh):
+            def check_pr_mergeable(self, repo: str, number: int) -> bool | None:
+                raise RuntimeError("gh timeout")
+
+        events = mq.reconcile_conflict_entries(RaisingGh())
+        assert events == []
+        assert load_queue()[0].state == CONFLICT
+
+    def test_multiple_conflict_entries_reconciled_independently(self, coord_db) -> None:
+        clean = _q("clean", state=CONFLICT, pr=100)
+        still_broken = _q("broken", state=CONFLICT, pr=101)
+        save_queue([clean, still_broken])
+
+        gh = FakeGh(mergeable_results={100: True, 101: False})
+        events = mq.reconcile_conflict_entries(gh)
+
+        assert [e.entry.assignment_id for e in events] == ["clean"]
+        states = {x.assignment_id: x.state for x in load_queue()}
+        assert states == {"clean": PENDING, "broken": CONFLICT}
+
+
+class TestResolveEntryKey:
+    """#1477: --only/--drop accept a durable 'repo#issue' key in addition to
+    a raw assignment_id, since the id mints fresh across a drop + re-enqueue
+    cycle and can silently stop matching what an operator last saw."""
+
+    def test_resolves_exact_assignment_id(self, coord_db) -> None:
+        items = [_q("aid1"), _q("aid2")]
+        assert mq.resolve_entry_key(items, "aid2") is items[1]
+
+    def test_resolves_durable_repo_issue_key(self, coord_db) -> None:
+        entry = QueuedMerge(
+            assignment_id="aee6301971bf", repo_name="api", repo_github="acme/api",
+            branch="issue-1461-fix", target_branch="main", issue_number=1461,
+            issue_title="t", state=PENDING,
+        )
+        items = [entry]
+        assert mq.resolve_entry_key(items, "api#1461") is entry
+        assert mq.resolve_entry_key(items, "acme/api#1461") is entry
+
+    def test_survives_drop_and_reenqueue_with_new_assignment_id(self, coord_db) -> None:
+        """The exact bug in #1477: the id changes across drop + re-enqueue,
+        but the durable key still finds the (new) row."""
+        original = QueuedMerge(
+            assignment_id="292740800331", repo_name="api", repo_github="acme/api",
+            branch="issue-1461-fix", target_branch="main", issue_number=1461,
+            issue_title="t", state=CONFLICT,
+        )
+        save_queue([original])
+        assert mq.drop_entry("api#1461") is True
+        assert load_queue() == []
+
+        # Re-enqueue mints a fresh assignment id for the same branch/issue.
+        retry = Assignment(
+            machine_name="m", repo_name="api", issue_number=1461, issue_title="t",
+            assignment_id="aee6301971bf", branch="issue-1461-fix", status="done",
+        )
+        enqueue(retry, repo_github="acme/api", target_branch="main")
+
+        resolved = mq.resolve_entry_key(load_queue(), "api#1461")
+        assert resolved is not None
+        assert resolved.assignment_id == "aee6301971bf"
+
+    def test_returns_none_when_no_match(self, coord_db) -> None:
+        items = [_q("aid1")]
+        assert mq.resolve_entry_key(items, "nonexistent") is None
+        assert mq.resolve_entry_key(items, "api#9999") is None
+
+    def test_does_not_fuzzy_match_plain_ids(self, coord_db) -> None:
+        """A plain id with no '#' must never fall through to a durable-key
+        scan — only an exact assignment_id match is attempted."""
+        items = [_q("aid")]
+        assert mq.resolve_entry_key(items, "ai") is None
+
+    def test_ambiguous_durable_key_prefers_most_recent(self, coord_db) -> None:
+        old = _q("old-aid", state=MERGED)
+        old.issue_number = 1461
+        new = _q("new-aid", state=PENDING)
+        new.issue_number = 1461
+        items = [old, new]
+        assert mq.resolve_entry_key(items, "api#1461") is new
+
+
+class TestDropEntryDurableKey:
+    """#1477: drop_entry() resolves the durable 'repo#issue' form too."""
+
+    def test_drops_by_durable_key(self, coord_db) -> None:
+        entry = _q("aid1")
+        entry.issue_number = 42
+        save_queue([entry])
+        assert mq.drop_entry("api#42") is True
+        assert load_queue() == []
+
+    def test_returns_false_when_durable_key_has_no_match(self, coord_db) -> None:
+        save_queue([_q("aid1")])
+        assert mq.drop_entry("api#9999") is False
+        assert len(load_queue()) == 1
 
 
 class TestEnqueueApprovedWork:

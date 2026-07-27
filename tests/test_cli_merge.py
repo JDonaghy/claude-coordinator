@@ -440,8 +440,118 @@ class TestMergeCommand:
         assert merge_order[0] == 300
 
 
+class TestMergeConflictReconciliation:
+    """#1477: a CONFLICT entry re-tests its mergeability on every tick instead
+    of trusting the `gh pr merge` failure cached from the last attempt."""
+
+    def test_repaired_branch_clears_and_merges_without_manual_drop(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        entry = mq.QueuedMerge(
+            assignment_id="c1", repo_name="api", repo_github="acme/api",
+            branch="worker/c1", target_branch="main", issue_number=1,
+            issue_title="t", state=mq.CONFLICT, pr_number=900,
+            error="gh pr merge 900 ... --rebase failed: not mergeable",
+        )
+        _seed_queue([entry])
+
+        def fake_merge(repo, number, method="rebase"):
+            return True, "ok"
+
+        with patch("coord.github_ops.check_pr_mergeable", return_value=True), \
+             patch("coord.github_ops.create_pr") as create, \
+             patch("coord.github_ops.get_pr_size", return_value=10), \
+             patch("coord.github_ops.merge_pr", side_effect=fake_merge):
+            result = CliRunner().invoke(
+                main, ["merge", "--config", str(config_file)]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "reopened" in result.output.lower()
+        # The pre-existing PR is reused — no new PR is opened for a
+        # conflict entry that already has one.
+        create.assert_not_called()
+        states = {e.assignment_id: e.state for e in mq.load_queue()}
+        assert states["c1"] == mq.MERGED, f"expected c1 MERGED, got {states['c1']!r}"
+
+    def test_still_conflicting_branch_stays_parked(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        entry = mq.QueuedMerge(
+            assignment_id="c2", repo_name="api", repo_github="acme/api",
+            branch="worker/c2", target_branch="main", issue_number=2,
+            issue_title="t", state=mq.CONFLICT, pr_number=901,
+            error="not mergeable",
+        )
+        _seed_queue([entry])
+
+        with patch("coord.github_ops.check_pr_mergeable", return_value=False), \
+             patch("coord.github_ops.merge_pr") as merge_fn:
+            result = CliRunner().invoke(
+                main, ["merge", "--config", str(config_file)]
+            )
+
+        assert result.exit_code == 0, result.output
+        merge_fn.assert_not_called()
+        states = {e.assignment_id: e.state for e in mq.load_queue()}
+        assert states["c2"] == mq.CONFLICT
+
+    def test_dry_run_reflects_cleared_conflict_not_stale_verdict(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """Regression for the #1477 repro: `coord merge --dry-run` must not
+        keep reporting a conflict count once the branch is actually clean."""
+        entry = mq.QueuedMerge(
+            assignment_id="c3", repo_name="api", repo_github="acme/api",
+            branch="worker/c3", target_branch="main", issue_number=3,
+            issue_title="t", state=mq.CONFLICT, pr_number=902,
+            error="not mergeable",
+        )
+        _seed_queue([entry])
+
+        with patch("coord.github_ops.check_pr_mergeable", return_value=True):
+            result = CliRunner().invoke(
+                main, ["merge", "--config", str(config_file), "--dry-run"]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "conflict=1" not in result.output.replace(" ", "")
+        states = {e.assignment_id: e.state for e in mq.load_queue()}
+        assert states["c3"] == mq.PENDING
+
+
 class TestMergeOnly:
     """#780: coord merge --only <aid> — single-entry isolation."""
+
+    def test_only_accepts_durable_repo_issue_key(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """#1477: --only <repo#issue> resolves even when the row's current
+        assignment_id doesn't match anything the operator remembers — the
+        exact scenario after a drop + re-enqueue mints a fresh id."""
+        entry = mq.QueuedMerge(
+            assignment_id="aee6301971bf", repo_name="api", repo_github="acme/api",
+            branch="worker/durable", target_branch="main", issue_number=1461,
+            issue_title="t", state=mq.PENDING,
+        )
+        _seed_queue([entry])
+
+        def fake_create_pr(repo, *, base, head, title, body):
+            return {"number": 700, "url": "u/700", "existed": False}
+
+        def fake_merge(repo, number, method="rebase"):
+            return True, "ok"
+
+        with patch("coord.github_ops.create_pr", side_effect=fake_create_pr), \
+             patch("coord.github_ops.get_pr_size", return_value=10), \
+             patch("coord.github_ops.merge_pr", side_effect=fake_merge):
+            result = CliRunner().invoke(
+                main, ["merge", "--config", str(config_file), "--only", "api#1461"]
+            )
+
+        assert result.exit_code == 0, result.output
+        states = {e.assignment_id: e.state for e in mq.load_queue()}
+        assert states["aee6301971bf"] == mq.MERGED, result.output
 
     def test_only_merges_selected_entry_and_leaves_others_pending(
         self, config_file: Path, coord_dir: Path

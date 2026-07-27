@@ -494,6 +494,35 @@ def close_issue(
         )
 
 
+def check_pr_mergeable(repo: str, number: int) -> bool | None:
+    """Return GitHub's current mergeability verdict for PR *number* (#1477).
+
+    Used by the merge queue's stale-``CONFLICT`` reconciliation
+    (:func:`coord.merge_queue.reconcile_conflict_entries`) to re-test whether
+    a parked entry's branch has since become clean — a conflict-fix worker
+    landed, or a human pushed a fix by hand — rather than trusting the
+    ``gh pr merge`` failure message cached from whenever the queue last
+    attempted it.
+
+    Returns ``True`` when GitHub reports ``MERGEABLE``, ``False`` when it
+    reports ``CONFLICTING``, and ``None`` for anything else — including
+    ``UNKNOWN`` (GitHub computes mergeability asynchronously; a very recent
+    push can read back unresolved for a few seconds) and any ``gh``
+    error/timeout. Callers must treat ``None`` the same as ``False`` — an
+    inconclusive read is never a green light to unpark an entry.
+    """
+    try:
+        raw = _gh("pr", "view", str(number), "--repo", repo, "--json", "mergeable")
+        value = json.loads(raw).get("mergeable")
+    except Exception:  # noqa: BLE001 — fail-safe: unknown mergeability blocks nothing
+        return None
+    if value == "MERGEABLE":
+        return True
+    if value == "CONFLICTING":
+        return False
+    return None
+
+
 def get_pr_body(repo: str, number: int) -> str:
     """Return PR *number*'s current body text (empty string if unset)."""
     raw = _gh("pr", "view", str(number), "--repo", repo, "--json", "body")

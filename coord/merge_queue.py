@@ -568,6 +568,17 @@ class GhOps(Protocol):
         """
         ...
 
+    def check_pr_mergeable(self, repo: str, number: int) -> bool | None:
+        """Return GitHub's current mergeability verdict for PR *number*.
+
+        ``True`` when cleanly mergeable, ``False`` when conflicting, ``None``
+        when unknown (still computing, or the check itself failed). Used by
+        :func:`reconcile_conflict_entries` (#1477) to re-test a parked
+        ``CONFLICT`` entry rather than trusting the cached verdict from
+        whenever the queue last attempted it.
+        """
+        ...
+
 
 # ── Persistence ──────────────────────────────────────────────────────────
 
@@ -909,6 +920,104 @@ def refresh_entry_assignment(
         existing.error = None
     save_queue(items)
     return True
+
+
+# ── Stale-conflict reconciliation (#1477) ───────────────────────────────────
+
+def reconcile_conflict_entries(gh_ops: "GhOps") -> list["MergeEvent"]:
+    """Re-test every ``CONFLICT`` entry's mergeability and clear stale verdicts.
+
+    A ``CONFLICT`` entry caches the ``gh pr merge`` failure message from
+    whenever the queue last attempted it, and ``process()`` never looks at it
+    again — it only ever iterates ``PENDING`` entries. When a conflict-fix
+    worker (#241) lands a rebase, or a human pushes a fix by hand, the branch
+    becomes clean but the entry sits parked on the old verdict forever,
+    requiring the three-step manual incantation described in #1477
+    (``--drop`` → a bare re-enqueue → ``--only``) to notice.
+
+    This re-tests GitHub's own mergeability computation for every
+    ``CONFLICT`` entry that has an open PR and, when it now reports clean,
+    returns the entry to ``PENDING`` and clears the stored error so it
+    re-enters the ordinary merge flow on this tick — no manual archaeology.
+
+    Fail-closed by design: an entry with no PR yet, or whose mergeability
+    can't be determined (``gh`` error, or GitHub still computing it — both
+    surface as ``None`` from :meth:`GhOps.check_pr_mergeable`), is left
+    untouched. Only an explicit ``True`` unparks it — never speculative.
+
+    Loads and saves the queue directly (same shape as
+    :func:`enqueue_approved_work`), so this is safe to call unconditionally,
+    even under ``--dry-run``: it corrects previously-cached state rather than
+    taking a merge action, mirroring the auto-enqueue scan that already runs
+    regardless of ``--dry-run`` in ``coord merge``.
+
+    Returns the list of :class:`MergeEvent` for entries that were cleared, so
+    callers can echo them the same way they echo ``process()`` events.
+    """
+    items = load_queue()
+    events: list[MergeEvent] = []
+    changed = False
+    for entry in items:
+        if entry.state != CONFLICT or not entry.pr_number:
+            continue
+        try:
+            mergeable = gh_ops.check_pr_mergeable(entry.repo_github, entry.pr_number)
+        except Exception:  # noqa: BLE001 — never let a gh hiccup wedge the tick
+            mergeable = None
+        if mergeable is not True:
+            continue
+        entry.state = PENDING
+        entry.error = None
+        changed = True
+        events.append(MergeEvent(
+            entry, "reopened",
+            f"conflict cleared — PR #{entry.pr_number} ({entry.branch}) is "
+            "mergeable again, returned to pending",
+        ))
+    if changed:
+        save_queue(items)
+    return events
+
+
+def resolve_entry_key(items: list["QueuedMerge"], key: str) -> "QueuedMerge | None":
+    """Resolve *key* to a queue entry — by ``assignment_id`` or durable key.
+
+    ``assignment_id`` is volatile across a drop + re-enqueue cycle: a fresh
+    row mints whatever assignment id the board currently shows for that
+    issue, which is not guaranteed to match the id an operator last saw in
+    ``coord status`` (#1477 — compounding the already-documented gotcha that
+    a queue entry can be keyed to the first, killed, assignment rather than
+    the retry that actually did the work). ``repo_name#issue_number``
+    survives that churn, so ``--only``/``--drop`` accept it as a durable
+    alternative to a raw assignment_id.
+
+    Tries an exact ``assignment_id`` match first — unchanged, most specific.
+    Falls back to the ``repo#issue`` form only when *key* contains ``#``
+    (plain assignment ids never do, so this can never accidentally shadow
+    one). When more than one entry matches the durable key — e.g. a stale
+    ``MERGED``/``CONFLICT`` row alongside a fresh re-enqueue for the same
+    issue — the most recently added match wins (``load_queue()`` returns
+    rows in insertion order).
+
+    Returns ``None`` when nothing matches either form — callers must treat
+    that as an explicit error, never a silent no-op (#1477).
+    """
+    for entry in items:
+        if entry.assignment_id == key:
+            return entry
+    if "#" in key:
+        repo_part, _, issue_part = key.rpartition("#")
+        try:
+            issue_number = int(issue_part)
+        except ValueError:
+            return None
+        matches = [
+            e for e in items
+            if e.issue_number == issue_number and repo_part in (e.repo_name, e.repo_github)
+        ]
+        if matches:
+            return matches[-1]
+    return None
 
 
 # ── Plan-status constants (#776) ─────────────────────────────────────────────
@@ -1972,11 +2081,18 @@ def drop_entry(assignment_id: str) -> bool:
     route through the daemon (``/merge`` endpoint with ``"drop": aid`` in the
     body) rather than calling this directly — the daemon guard pattern is the
     same as ``coord merge`` (#584).
+
+    #1477: *assignment_id* is resolved via :func:`resolve_entry_key`, so the
+    durable ``repo#issue`` form works here too — not just a raw assignment
+    id, which can go stale across a drop + re-enqueue cycle.
     """
     conn = get_connection()
+    entry = resolve_entry_key(load_queue(), assignment_id)
+    if entry is None:
+        return False
     with conn:
         cursor = conn.execute(
-            "DELETE FROM merge_queue WHERE assignment_id = ?", (assignment_id,)
+            "DELETE FROM merge_queue WHERE assignment_id = ?", (entry.assignment_id,)
         )
     return cursor.rowcount > 0
 

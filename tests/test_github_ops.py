@@ -44,6 +44,43 @@ class TestIssueIsClosed:
             assert github_ops.issue_is_closed("acme/api", 1) is False
 
 
+class TestCheckPrMergeable:
+    """#1477: check_pr_mergeable() re-tests GitHub's own mergeability
+    computation, used to clear a merge-queue entry's stale CONFLICT verdict."""
+
+    def test_true_when_mergeable(self) -> None:
+        with patch(
+            "coord.github_ops._gh",
+            return_value=json.dumps({"mergeable": "MERGEABLE"}),
+        ):
+            assert github_ops.check_pr_mergeable("acme/api", 1) is True
+
+    def test_false_when_conflicting(self) -> None:
+        with patch(
+            "coord.github_ops._gh",
+            return_value=json.dumps({"mergeable": "CONFLICTING"}),
+        ):
+            assert github_ops.check_pr_mergeable("acme/api", 1) is False
+
+    def test_none_when_unknown(self) -> None:
+        """GitHub computes mergeability asynchronously — a very recent push
+        can read back UNKNOWN for a few seconds. Must not be treated as a
+        green light."""
+        with patch(
+            "coord.github_ops._gh",
+            return_value=json.dumps({"mergeable": "UNKNOWN"}),
+        ):
+            assert github_ops.check_pr_mergeable("acme/api", 1) is None
+
+    def test_none_on_gh_error(self) -> None:
+        with patch("coord.github_ops._gh", side_effect=RuntimeError("gh boom")):
+            assert github_ops.check_pr_mergeable("acme/api", 1) is None
+
+    def test_none_on_malformed_json(self) -> None:
+        with patch("coord.github_ops._gh", return_value="not json"):
+            assert github_ops.check_pr_mergeable("acme/api", 1) is None
+
+
 def _gh_pr_and_branch(pr_list_json: str, branch_json: str | None):
     """Build a ``_gh`` ``side_effect`` that answers ``pr list`` with
     *pr_list_json* and ``api .../branches/<name>`` with *branch_json* (or
