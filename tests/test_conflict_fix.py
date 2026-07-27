@@ -502,6 +502,34 @@ class TestReconcileHook:
         assert entry.state == HUMAN_REQUIRED
         assert "Manual rebase required" in (entry.error or "")
 
+    def test_usage_limit_kill_gets_accurate_message(self, coord_db) -> None:
+        """#1461 review finding 2: a conflict-fix worker killed by the
+        account's usage limit did not fail to resolve anything — the parked
+        HUMAN_REQUIRED entry must say "wait for the reset", not send the
+        operator chasing a "manual rebase required" defect that isn't
+        there."""
+        from coord import merge_queue as mq
+        from coord.reconcile import _on_conflict_fix_done
+
+        self._populate_queue(error="Merge conflict")
+        fix = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=1, issue_title="x",
+            assignment_id="fix-id", status="failed",
+            type="conflict-fix", review_of_assignment_id="abc123",
+        )
+        _on_conflict_fix_done(
+            fix, succeeded=False,
+            agent_entry={
+                "usage_limit_reason": "usage limit — resets 8:30pm (America/Chicago)",
+            },
+        )
+
+        entry = mq.load_queue()[0]
+        assert entry.state == HUMAN_REQUIRED
+        assert "Manual rebase required" not in (entry.error or "")
+        assert "usage limit — resets 8:30pm (America/Chicago)" in (entry.error or "")
+        assert "wait for the reset" in (entry.error or "").lower()
+
     def test_noop_when_no_parent(self, coord_db) -> None:
         from coord.reconcile import _on_conflict_fix_done
 

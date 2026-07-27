@@ -348,6 +348,45 @@ class TestAutoReassign:
         assert "a1" in changed
         assert len(board.active) == 0
 
+    @patch("coord.reconcile._query_agent")
+    @patch("coord.reconcile.httpx.post")
+    def test_no_reassign_on_usage_limit_kill(
+        self, mock_post: MagicMock, mock_query: MagicMock,
+    ) -> None:
+        """#1461 review finding 1: a usage-limit kill is an account-wide
+        exhausted budget, not a per-machine defect — auto_reassign must NOT
+        re-dispatch it onto a different machine (that just burns the same
+        budget and is guaranteed to die the same way until the reset)."""
+        config = Config(
+            repos=[Repo(name="api", github="a/a")],
+            machines=[
+                Machine(name="laptop", host="l", repos=["api"], repo_paths={"api": "/tmp/a"}),
+                Machine(name="server", host="s", repos=["api"], repo_paths={"api": "/tmp/a"}),
+            ],
+            concurrency=ConcurrencyConfig(auto_reassign=True),
+        )
+        board = Board(active=[
+            Assignment(machine_name="laptop", repo_name="api", issue_number=42,
+                       issue_title="Fix", assignment_id="a1", status="running",
+                       type="work", briefing="do it"),
+        ])
+        mock_query.return_value = {
+            "active": [],
+            "completed": [{
+                "id": "a1",
+                "status": "failed",
+                "finished_at": 100.0,
+                "usage_limit_reason": "usage limit — resets 8:30pm (America/Chicago)",
+            }],
+        }
+
+        changed = reconcile(board, config)
+        assert "a1" in changed
+        assert len(board.active) == 0  # no retry dispatched
+        retry_assignments = [a for a in board.active if "[retry]" in a.issue_title]
+        assert len(retry_assignments) == 0
+        mock_post.assert_not_called()
+
 
 # ── #1396: diagnosable "no available machine" message ──────────────────────
 
