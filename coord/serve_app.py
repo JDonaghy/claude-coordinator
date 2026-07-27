@@ -3503,21 +3503,36 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
 
     async def post_test_verdict(request: Request) -> Response:
         # #590 Phase 2: record a Test-gate verdict on the shared DB.
+        # #1479-review: _record_test_verdict_local now stamps a staleness
+        # anchor (up to three synchronous `gh` subprocess calls, worst case
+        # ~90s) for every terminal verdict via _stamp_test_staleness_anchor.
+        # Run the whole write in a threadpool so that doesn't block this
+        # daemon's single asyncio event loop for other concurrent requests
+        # (/board polls, other writes) — mirrors post_merge's handling of
+        # its own multi-minute `gh`-heavy work below.
+        from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
+
         from coord import state  # noqa: PLC0415
 
         body = await _read_json(request)
         if body is None:
             return JSONResponse({"error": "invalid JSON body"}, status_code=400)
         try:
-            state._record_test_verdict_local(
-                assignment_id=body["assignment_id"],
-                test_state=body["test_state"],
+            required = {
+                "assignment_id": body["assignment_id"],
+                "test_state": body["test_state"],
+            }
+        except KeyError as e:
+            return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        try:
+            await run_in_threadpool(
+                state._record_test_verdict_local,
+                assignment_id=required["assignment_id"],
+                test_state=required["test_state"],
                 test_reason=body.get("test_reason"),
                 smoke_test=body.get("smoke_test"),
                 smoke_test_reason=body.get("smoke_test_reason"),
             )
-        except KeyError as e:
-            return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
         except Exception as e:  # noqa: BLE001
             return JSONResponse(
                 {"error": "test-verdict write failed", "detail": str(e)},

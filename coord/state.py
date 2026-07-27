@@ -1078,7 +1078,7 @@ def _stamp_test_staleness_anchor(
     hiccup can't fail the verdict write it rides along with.
     """
     try:
-        from coord.branch_model import resolve_base_branch_for_issue  # noqa: PLC0415
+        from coord.branch_model import resolve_base_branch_for_issue_number  # noqa: PLC0415
         from coord import config as _config  # noqa: PLC0415
         from coord import github_ops as _gho  # noqa: PLC0415
 
@@ -1087,12 +1087,13 @@ def _stamp_test_staleness_anchor(
         if repo_cfg is None:
             return
 
-        target_branch = getattr(repo_cfg, "default_branch", None) or "main"
-        if getattr(repo_cfg, "develop_branch", None):
-            # Milestone-aware base (#934) — only pays for the extra `gh`
-            # lookup when the repo actually opted into the git model.
-            issue_data = _gho.get_issue(repo_cfg.github, issue_number)
-            target_branch = resolve_base_branch_for_issue(repo_cfg, issue_data)
+        # Milestone-aware base (#934) — shared with
+        # coord.merge_queue.enqueue_approved_work's identical resolution
+        # (#1479-review) so the two can't drift apart. Only pays for the
+        # extra `gh` lookup when the repo actually opted into the git model.
+        target_branch = resolve_base_branch_for_issue_number(
+            repo_cfg, repo_cfg.github, issue_number,
+        )
 
         test_head_sha = _gho.get_branch_sha(repo_cfg.github, branch)
         test_base_sha = _gho.get_branch_sha(repo_cfg.github, target_branch)
