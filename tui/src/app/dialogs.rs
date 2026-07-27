@@ -572,6 +572,18 @@ impl CoordApp {
                         None => self.issue_has_any_discovered_session(n),
                     })
                     .unwrap_or(false);
+            // #1398: a live `coord drive --tmux` run is a THIRD kind of
+            // liveness, independent of the interactive-session axis above —
+            // it dispatches Work/Test/Review/Merge itself, so every "Start …"
+            // action would race it for the same gate (offering "Start
+            // testing" mid-drive is the two-writers case the issue calls
+            // out). Only checked when `repo_name` is known: a drive session
+            // is always repo-scoped (unlike the interactive fallback above,
+            // there is no repo-agnostic variant to fall back to).
+            let has_live_drive = issue_number
+                .zip(repo_name)
+                .map(|(n, r)| self.issue_has_live_drive(n, r))
+                .unwrap_or(false);
             if has_running {
                 // Running session — collapse the entire launcher block to a
                 // single Reattach item; everything else is unreachable anyway.
@@ -579,6 +591,11 @@ impl CoordApp {
                     "reattach-live-session",
                     "Reattach to live session",
                 ));
+            } else if has_live_drive {
+                // Driving — collapse to Attach/Stop; every manual Start
+                // action is unreachable (coord drive dispatches them itself).
+                items.push(ContextMenuItem::action("attach-drive", "Attach to drive"));
+                items.push(ContextMenuItem::action("stop-drive", "Stop drive"));
             } else {
                 // Zombie session — offer Reattach alongside Start launchers so
                 // the operator can reach both the still-alive tmux session AND
@@ -699,6 +716,15 @@ impl CoordApp {
                 }
 
                 items.push(ContextMenuItem::parent("Start (automated)", automated_children));
+
+                // #1398: "Drive (automated)" — `coord drive --tmux` drives
+                // the WHOLE Work → Test → Review → Merge sequence unattended
+                // (coord dispatches every stage itself), unlike the
+                // single-stage items above. Flat, not nested, for visibility
+                // — this is the marquee one-click entry point the issue asks
+                // for. Only offered when `has_running`/`has_zombie`/
+                // `has_live_drive` are all false (this whole `else` branch).
+                items.push(ContextMenuItem::action("start-drive", "Drive (automated)"));
 
                 // #685: "Set test mode" — pick smoke vs auto policy for headless Work.
                 if let Some(num) = issue_number {
@@ -2252,6 +2278,40 @@ impl CoordApp {
             });
         }
 
+        // ── #1398: Stop drive confirm ───────────────────────────────────────
+        if let Some(ref p) = self.pending_kill_drive {
+            return Some(Dialog {
+                table: None,
+                id: WidgetId::new("dialog:stop-drive"),
+                title: StyledText::plain("Stop Drive"),
+                body: vec![StyledText::plain(format!(
+                    "Stop driving {} #{}? This kills the tmux session — the driver's \
+                     lock releases immediately and the run ends wherever it currently \
+                     is (in-flight Work/Test/Review/Merge is NOT rolled back).",
+                    p.repo, p.issue,
+                ))],
+                buttons: vec![
+                    DialogButton {
+                        id: WidgetId::new("yes"),
+                        label: "y  Confirm stop".into(),
+                        is_default: true,
+                        is_cancel: false,
+                        tint: Some(Color::rgb(200, 80, 80)),
+                    },
+                    DialogButton {
+                        id: WidgetId::new("cancel"),
+                        label: "Cancel".into(),
+                        is_default: false,
+                        is_cancel: true,
+                        tint: None,
+                    },
+                ],
+                severity: Some(DialogSeverity::Warning),
+                vertical_buttons: false,
+                input: None,
+            });
+        }
+
         // ── #1033: Kill session confirm ───────────────────────────────────
         if let Some(ref p) = self.pending_kill_session {
             return Some(Dialog {
@@ -2783,6 +2843,8 @@ impl CoordApp {
             self.pending_restart = None;
         } else if self.pending_kill_terminal.is_some() {
             self.pending_kill_terminal = None;
+        } else if self.pending_kill_drive.is_some() {
+            self.pending_kill_drive = None;
         } else if self.pending_kill_session.is_some() {
             self.pending_kill_session = None;
         } else if self.pending_purge.is_some() {
@@ -3352,6 +3414,17 @@ impl CoordApp {
                 self.confirm_kill_terminal(p);
             } else {
                 self.pending_kill_terminal = None;
+            }
+            *self.dialog_layout.borrow_mut() = None;
+            return;
+        }
+
+        // ── #1398: Stop drive ────────────────────────────────────────────────
+        if let Some(p) = self.pending_kill_drive.clone() {
+            if id == "yes" {
+                self.confirm_kill_drive(p);
+            } else {
+                self.pending_kill_drive = None;
             }
             *self.dialog_layout.borrow_mut() = None;
             return;
@@ -6081,6 +6154,35 @@ impl CoordApp {
             // #684: headless merge via the existing queue — `coord merge --order`.
             "start-merge-automated" => {
                 self.dispatch_merge_automated_for_selected_pipeline_issue();
+                true
+            }
+            // #1398: "Drive (automated)" — `coord drive <repo> <issue>
+            // --tmux`, detached so it survives the TUI restarting.
+            "start-drive" => {
+                self.pipeline_detail_tab = PipelineDetailTab::Terminal;
+                self.launch_drive_for_selected_issue();
+                true
+            }
+            // #1398: reattach the per-issue Terminal tab to a live drive.
+            "attach-drive" => {
+                self.pipeline_detail_tab = PipelineDetailTab::Terminal;
+                self.attach_drive_for_selected_issue();
+                true
+            }
+            // #1398: arms the "Stop drive" confirm dialog rather than
+            // killing directly — a drive can carry 60-90 minutes of
+            // in-flight work. Resolved straight from `target` (mirrors
+            // "kill-terminal") rather than the live selection.
+            "stop-drive" => {
+                let (repo, issue) = match target {
+                    ContextMenuTarget::PipelineRow {
+                        issue_number: Some(n),
+                        repo_name: Some(r),
+                        ..
+                    } => (r.clone(), *n),
+                    _ => return false,
+                };
+                self.pending_kill_drive = Some(PendingKillDrive { repo, issue });
                 true
             }
             "start-with-plan" => {

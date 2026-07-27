@@ -114,6 +114,7 @@ __all__ = [
     "InteractiveFinalizeResult",
     "TMUX_SESSION_PREFIX",
     "TERM_SESSION_PREFIX",
+    "DRIVE_SESSION_PREFIX",
     "TmuxHost",
     "tmux_session_name",
     "tmux_available",
@@ -140,6 +141,19 @@ TMUX_SESSION_PREFIX = "coord-"
 #: (:func:`list_coord_tmux_sessions`) explicitly excludes this prefix, and
 #: ``coord terminal list`` (``coord/commands/terminal.py``) matches only it.
 TERM_SESSION_PREFIX = "coord-term-"
+
+#: Prefix for detached ``coord drive --tmux`` sessions (#1398) — the
+#: unattended single-issue driver running in the background so it survives
+#: the launching terminal (or the TUI) closing.  Session name is
+#: ``coord-drive-<repo>-<issue>``.  Distinct from :data:`TMUX_SESSION_PREFIX`
+#: for the same reason :data:`TERM_SESSION_PREFIX` is: it also starts with
+#: ``"coord-"``, so assignment-session discovery
+#: (:func:`list_coord_tmux_sessions`) explicitly excludes it too — a drive
+#: session carries a repo/issue, not an assignment_id, and must not show up
+#: as a phantom "(unknown issue)" row in ``coord sessions``/reattach
+#: discovery.  ``coord drive-sessions`` (``coord/drive.py``) is the
+#: dedicated surface for it.
+DRIVE_SESSION_PREFIX = "coord-drive-"
 
 #: SSH connection-multiplexing options for remote (#486/#494) tmux calls.
 #: One interactive launch fires ~5+ separate ssh invocations (has-session →
@@ -390,11 +404,12 @@ def list_coord_tmux_sessions(
     (defensive OR) to avoid a stray malformed line flipping it to detached.
 
     Free-floating ``coord-term-*`` sessions (#952, ``coord terminal new``)
-    are explicitly excluded even though they also start with
-    :data:`TMUX_SESSION_PREFIX` — they carry no assignment_id and must not
-    show up as a phantom "(unknown issue)" row in ``coord sessions``/
-    reattach discovery.  ``coord terminal list`` is the dedicated surface
-    for them.
+    and ``coord-drive-*`` unattended-driver sessions (#1398, ``coord drive
+    --tmux``) are explicitly excluded even though they also start with
+    :data:`TMUX_SESSION_PREFIX` — neither carries an assignment_id, so
+    both would otherwise show up as a phantom "(unknown issue)" row in
+    ``coord sessions``/reattach discovery.  ``coord terminal list`` and
+    ``coord drive-sessions`` are the dedicated surfaces for them.
 
     Args:
         host: Target host.  Defaults to ``TmuxHost(None)`` (local).  This
@@ -436,6 +451,8 @@ def list_coord_tmux_sessions(
                 continue
             if name.startswith(TERM_SESSION_PREFIX):
                 continue  # #952: free-floating terminal, not an assignment session
+            if name.startswith(DRIVE_SESSION_PREFIX):
+                continue  # #1398: unattended driver session, not an assignment session
             existing = pane_dead_per_session.get(name)
             # "0" (alive) wins over "1" (dead).
             if existing is None or pane_dead == "0":

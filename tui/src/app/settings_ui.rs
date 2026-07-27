@@ -732,6 +732,10 @@ impl CoordApp {
         if self.pending_remote_terminals.is_some() && self.poll_remote_terminals() {
             needs_redraw = true;
         }
+        // #1398: drain the background drive-session discovery sweep.
+        if self.pending_drive_sessions.is_some() && self.poll_drive_sessions() {
+            needs_redraw = true;
+        }
 
         // #603: the fix-briefing preview arrived → repaint the confirm dialog.
         if self.fix_briefing_rx.is_some() && self.poll_fix_briefing_preview() {

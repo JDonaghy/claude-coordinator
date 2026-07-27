@@ -97,6 +97,7 @@ pub(crate) mod usage;
 pub(crate) mod fleet_terminals;
 pub(crate) mod fleet_sessions;
 pub(crate) mod workspace;
+pub(crate) mod drive;
 #[allow(unused_imports)]
 use self::types::*;
 #[allow(unused_imports)]
@@ -128,6 +129,8 @@ use self::fleet_terminals::*;
 use self::fleet_sessions::*;
 #[allow(unused_imports)]
 use self::workspace::*;
+#[allow(unused_imports)]
+use self::drive::*;
 
 // ─── Auto-refresh interval ────────────────────────────────────────────────────
 
@@ -2687,6 +2690,23 @@ pub struct CoordApp {
     /// key/outside click cancels.  Mirrors `pending_restart`.
     pending_kill_terminal: Option<PendingKillTerminal>,
 
+    // ── #1398: unattended `coord drive --tmux` session discovery ────────────
+    /// Live `coord-drive-<repo>-<issue>` tmux sessions, discovered via `coord
+    /// drive-sessions --json` (`drive` module). Drives the Pipeline row
+    /// "driving" badge, the context-menu Attach/Stop gate, and the per-issue
+    /// Terminal tab's auto-attach. LOCAL ONLY — no `--remote` sweep, since a
+    /// drive runs on the operator's own machine (see the `drive` module doc).
+    drive_sessions: Vec<DriveSession>,
+    /// In-flight background sweep of `coord drive-sessions --json`, armed at
+    /// startup and re-armed by `refresh()`. Mirrors `pending_remote_terminals`;
+    /// when it lands it merges into `drive_sessions` (preserving any
+    /// not-yet-covered `pending` optimistic entry, see `poll_drive_sessions`).
+    pending_drive_sessions: Option<std::sync::mpsc::Receiver<Vec<DriveSession>>>,
+    /// Pending "Stop drive" confirmation — armed by the context-menu "Stop
+    /// drive" item. The dialog's confirm button fires `confirm_kill_drive`;
+    /// any other key/outside click cancels. Mirrors `pending_kill_terminal`.
+    pending_kill_drive: Option<PendingKillDrive>,
+
     // ── #1032: Sessions panel (machine → repo → session tree) ───────────────
     /// Per-machine expand state for the Sessions-view tree, keyed by machine
     /// name. Absent entries default to expanded when the machine hosts ≥1
@@ -3386,6 +3406,11 @@ impl CoordApp {
             fleet_terminal_sessions: std::collections::HashMap::new(),
             fleet_terminal_spawn_errors: std::collections::HashMap::new(),
             pending_kill_terminal: None,
+            // #1398: drive-session discovery — local snapshot now, background
+            // sweep re-armed on the same cadence as sessions/terminals.
+            drive_sessions: fetch_drive_sessions(),
+            pending_drive_sessions: Some(spawn_drive_sessions_fetch()),
+            pending_kill_drive: None,
             // #1032: Sessions panel tree — no persisted expand/selection
             // state, mirrors terminal_tree_*'s defaults.
             sessions_tree_expanded: std::collections::HashMap::new(),
@@ -3700,6 +3725,12 @@ impl CoordApp {
             self.pending_remote_terminals = Some(spawn_remote_fleet_terminals_fetch(
                 crate::commands::find_config(),
             ));
+        }
+        // #1398: re-arm the drive-session sweep for the same reason — a
+        // drive started (or stopped) from an EXTERNAL shell should still
+        // show up without a full TUI restart.
+        if self.pending_drive_sessions.is_none() {
+            self.pending_drive_sessions = Some(spawn_drive_sessions_fetch());
         }
     }
 

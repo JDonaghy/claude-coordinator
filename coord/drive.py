@@ -64,7 +64,7 @@ import sys
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Protocol, Sequence
 
 from coord.drive_state import (
     BoardFetcher,
@@ -72,6 +72,12 @@ from coord.drive_state import (
     IssueState,
     project,
     scratch_dir,
+)
+from coord.interactive import (
+    DRIVE_SESSION_PREFIX,
+    TmuxHost,
+    tmux_available,
+    tmux_session_alive,
 )
 
 # ── exit codes (unchanged from drive-issue.sh) ───────────────────────────────
@@ -856,6 +862,133 @@ def coord_argv() -> list[str]:
     if found:
         return [found]
     return [sys.executable, "-m", "coord.cli"]
+
+
+# ── tmux launch (`coord drive --tmux`, #1398) ─────────────────────────────────
+#
+# A drive runs 60-90 minutes. `--tmux` launches it DETACHED in a
+# `coord-drive-<repo>-<issue>` tmux session instead of running inline, so the
+# run survives the launching terminal closing, a TUI restart, or an ssh drop
+# — the same rationale, and the same `TmuxHost`/`tmux_available`/
+# `tmux_session_alive` seam, as the `coord-<assignment_id>` interactive
+# sessions in `coord/interactive.py` and the free-floating `coord-term-*`
+# terminals in `coord/commands/terminal.py`. Unlike both of those, a drive
+# session is LOCAL ONLY — the driver runs on the operator's machine, reading
+# the daemon's board over the network, so there is no remote/ssh variant
+# here (see the class docstring's "Out of scope" note in #1398).
+#
+# Killing the tmux session IS Stop: the per-issue `flock` in `Driver.run()`
+# is released when the process's file descriptor closes (the OS does this on
+# any process exit, including SIGHUP from a killed tmux pane) — no separate
+# cleanup code is needed for cancellation to be correct.
+
+
+def drive_session_name(repo: str, issue: int) -> str:
+    """Return the canonical tmux session name for a ``coord drive --tmux`` run."""
+    return f"{DRIVE_SESSION_PREFIX}{repo}-{issue}"
+
+
+def parse_drive_session_name(session_name: str) -> tuple[str, int] | None:
+    """Parse a ``coord-drive-<repo>-<issue>`` session name back to ``(repo, issue)``.
+
+    Returns ``None`` when *session_name* doesn't carry the drive prefix, or
+    the segment after the LAST hyphen isn't a bare issue number (repo names
+    may themselves contain hyphens, so the issue number — always numeric —
+    is what anchors the split).
+    """
+    if not session_name.startswith(DRIVE_SESSION_PREFIX):
+        return None
+    rest = session_name[len(DRIVE_SESSION_PREFIX):]
+    repo, sep, issue_str = rest.rpartition("-")
+    if not sep or not repo or not issue_str.isdigit():
+        return None
+    return repo, int(issue_str)
+
+
+def list_drive_sessions(*, host: TmuxHost = TmuxHost(None)) -> list[dict[str, Any]]:
+    """Return live ``coord-drive-*`` tmux sessions on *host* as parsed dicts.
+
+    Each entry: ``{"repo": str, "issue": int, "session_name": str, "attached": bool}``.
+    Mirrors :func:`coord.commands.terminal.list_tmux_terminal_sessions` — a
+    single ``tmux list-sessions`` call; returns ``[]`` when tmux is
+    unavailable, has no server running, or has no matching sessions.
+    """
+    try:
+        result = subprocess.run(
+            host.cmd([
+                "list-sessions", "-F",
+                "#{session_name}\t#{session_attached}",
+            ]),
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return []
+    if result.returncode != 0:
+        return []
+
+    sessions: list[dict[str, Any]] = []
+    for raw_line in result.stdout.splitlines():
+        parts = raw_line.split("\t")
+        if len(parts) < 2:
+            continue
+        name, attached_raw = parts[0].strip(), parts[1].strip()
+        parsed = parse_drive_session_name(name)
+        if parsed is None:
+            continue
+        repo, issue = parsed
+        sessions.append({
+            "repo": repo,
+            "issue": issue,
+            "session_name": name,
+            "attached": attached_raw not in ("", "0"),
+        })
+    return sessions
+
+
+def launch_drive_in_tmux(
+    cmd: Sequence[str],
+    *,
+    repo: str,
+    issue: int,
+    host: TmuxHost = TmuxHost(None),
+) -> str:
+    """Create a detached tmux session named for *(repo, issue)* running *cmd*.
+
+    *cmd* is a full argv (e.g. ``coord_argv() + ["drive", repo, str(issue),
+    ...]``) — each element is passed to tmux as a SEPARATE argument, which
+    tmux hands to ``execve`` unmodified (no shell re-splitting), so a path
+    containing spaces (``--briefing-file``, ``--config``) survives intact.
+
+    Returns the session name.  Raises :class:`DriveError` when tmux is
+    unavailable or a session for this *(repo, issue)* is already alive — the
+    CLI checks aliveness first for a friendlier message, but this guards
+    direct/test callers too.
+    """
+    if not tmux_available():
+        raise DriveError("tmux is not available on this machine.", EXIT_USAGE)
+    session = drive_session_name(repo, issue)
+    if tmux_session_alive(session, host=host):
+        raise DriveError(
+            f"already driving {repo} #{issue} (tmux session {session!r} is live).\n"
+            f"   attach with: coord drive-attach {repo} {issue}",
+            EXIT_USAGE,
+        )
+    try:
+        result = subprocess.run(
+            host.cmd(["new-session", "-d", "-s", session, *cmd]),
+            capture_output=True,
+            text=True,
+            timeout=15.0,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        raise DriveError(f"failed to create tmux session: {exc}", EXIT_USAGE) from exc
+    if result.returncode != 0:
+        raise DriveError(
+            f"tmux new-session failed: {(result.stderr or '').strip()}", EXIT_USAGE
+        )
+    return session
 
 
 @dataclass
