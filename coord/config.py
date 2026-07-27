@@ -584,6 +584,20 @@ class PipelineConfig:
     (``Assignment.review_iteration``) an assignment may accumulate without
     reaching a green test verdict + approved review before it is flagged as
     non-converging (thrashing). Default 3.
+
+    ``auto_dispatch_stalled`` (#1478) controls whether
+    ``coord.notify.detect_stalled_pipeline`` (#1441) gets a dispatch arm in
+    addition to its diagnostic GitHub comment. Detection + narration is
+    always on (there is no flag for that half — it is cheap and has shipped
+    since #1441); this flag gates only the *action*: enqueueing an
+    ``approved_not_queued`` row for merge, dispatching a conflict-fix for a
+    merge entry stuck ``CONFLICT``, or dispatching the fix/review a
+    review-completion transition would have. **Defaults to ``False``** —
+    ships dark, same posture as ``escalate_semantic_conflicts``, until
+    unattended dispatch on a stalled row earns trust. The one-shot
+    ``notified`` ledger keyed by ``_stalled_notified_key`` (shared with the
+    comment) still applies, so a row is acted on once per tick-cycle, not
+    every 5 minutes.
     """
 
     default_gates: list[str] = field(default_factory=lambda: ["test", "review", "merge"])
@@ -594,6 +608,8 @@ class PipelineConfig:
     # #1291 — DEFAULT OFF. See the class docstring.
     escalate_semantic_conflicts: bool = False
     semantic_conflict_model: str = "fable"
+    # #1478 — DEFAULT OFF. See the class docstring.
+    auto_dispatch_stalled: bool = False
     attention_thresholds: dict[str, float] = field(
         default_factory=lambda: dict(_DEFAULT_ATTENTION_THRESHOLDS)
     )
@@ -1642,6 +1658,12 @@ def _parse_pipeline(raw: Any) -> PipelineConfig:
         if not isinstance(value, str) or not value.strip():
             raise ConfigError("pipeline.semantic_conflict_model must be a non-empty string")
         cfg.semantic_conflict_model = value.strip()
+
+    if "auto_dispatch_stalled" in raw:
+        value = raw["auto_dispatch_stalled"]
+        if not isinstance(value, bool):
+            raise ConfigError("pipeline.auto_dispatch_stalled must be a boolean")
+        cfg.auto_dispatch_stalled = value
 
     if "attention_thresholds" in raw:
         value = raw["attention_thresholds"]

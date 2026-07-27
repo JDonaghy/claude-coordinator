@@ -36,6 +36,7 @@ from coord.comments import (
     format_needs_attention,
     format_plan,
     format_stalled_pipeline,
+    format_stalled_pipeline_dispatch,
     format_stuck,
 )
 from coord.config import Config
@@ -110,7 +111,8 @@ class StalledDetection:
     machine_name: str
     repo_name: str
     issue_number: int
-    reason: str  # "review_request_changes_no_fix" | "done_no_review" | "approved_not_queued"
+    reason: str  # "review_request_changes_no_fix" | "done_no_review" |
+    # "approved_not_queued" | "merge_conflict_unresolved" (#1478)
     detail: str
 
 
@@ -324,7 +326,7 @@ def detect_stalled_pipeline(
     """Scan the board for *done* work chains stuck on an unmet precondition
     that a fresh review/fix transition would already have resolved (#1441).
 
-    Three candidate stall states, checked per pipeline "head" (the most
+    Four candidate stall states, checked per pipeline "head" (the most
     recent work-like assignment for a given (repo, issue) — see
     :func:`_pipeline_heads`):
 
@@ -342,6 +344,18 @@ def detect_stalled_pipeline(
     3. ``approved_not_queued`` — the head satisfies every merge gate
        (:func:`coord.merge_queue.passes_merge_gates` — reused rather than
        re-derived, per #1441's own request) but has no merge-queue entry.
+    4. ``merge_conflict_unresolved`` (#1478) — the head already HAS a
+       merge-queue entry, but that entry is parked ``CONFLICT`` with an
+       error :func:`coord.merge_queue.classify_conflict` calls
+       ``"rebaseable"`` and no conflict-fix attempt is active or already
+       failed (:func:`coord.conflict_fix.has_prior_conflict_fix`). This is
+       exactly the gap :mod:`coord.commands.merge`'s
+       ``_dispatch_conflict_fixes`` docstring calls out for the ``--only``
+       path pre-#1474 — a bare ``CONFLICT`` row that never got a second
+       classify-and-dispatch pass, except here for *any* path (not only
+       ``--only``): a ``coord merge`` invocation that dispatched a
+       conflict-fix which then failed to actually attempt (no idle
+       machine) leaves the entry parked with nothing watching it.
 
     Every candidate is checked against the shared #522 terminal-state guard
     (:func:`coord.github_ops.work_is_terminal`, via *terminal_cache* — the
@@ -351,8 +365,10 @@ def detect_stalled_pipeline(
     so a flagged row is not re-flagged every pass.
 
     Detection only, mirroring :func:`detect_needs_attention`'s contract — no
-    dispatch, no kill, no handoff. *board* / *merge_queue_items* /
-    *terminal_cache* are all optional so callers (tests, or a future
+    dispatch, no kill, no handoff (that lives in
+    :func:`dispatch_stalled_pipeline_action`, #1478, gated behind
+    ``config.pipeline.auto_dispatch_stalled``). *board* / *merge_queue_items*
+    / *terminal_cache* are all optional so callers (tests, or a future
     ``reconcile()`` caller) can supply their own instead of hitting the
     board service / DB / GitHub.
     """
@@ -362,7 +378,13 @@ def detect_stalled_pipeline(
     # posting side doesn't also have to reason about a separately-imported
     # local name for the terminal-state check below.
     from coord.auto_loop import FIX_DISPATCH_TYPES  # noqa: PLC0415
-    from coord.merge_queue import load_queue, passes_merge_gates  # noqa: PLC0415
+    from coord.conflict_fix import has_prior_conflict_fix  # noqa: PLC0415
+    from coord.merge_queue import (  # noqa: PLC0415
+        CONFLICT,
+        classify_conflict,
+        load_queue,
+        passes_merge_gates,
+    )
 
     if board is None:
         from coord.board_service import read_board  # noqa: PLC0415
@@ -437,15 +459,32 @@ def detect_stalled_pipeline(
             # Either the review gate doesn't apply, or a review already
             # completed without leaving a request-changes verdict blocking
             # it (approved, or advanced past advisory-only nits) — the only
-            # remaining question is whether it made it into the merge queue.
-            already_queued = any(
-                m.assignment_id == work.assignment_id for m in merge_queue_items
+            # remaining question is whether it made it into the merge queue,
+            # and if it did, whether that entry is stuck.
+            matching_entry = next(
+                (m for m in merge_queue_items if m.assignment_id == work.assignment_id),
+                None,
             )
-            if not already_queued and passes_merge_gates(work, config, board):
-                reason = "approved_not_queued"
+            if matching_entry is None:
+                if passes_merge_gates(work, config, board):
+                    reason = "approved_not_queued"
+                    detail = (
+                        "Work passes every merge gate (review + test) but has "
+                        "no merge-queue entry."
+                    )
+            elif (
+                matching_entry.state == CONFLICT
+                and classify_conflict(matching_entry.error) == "rebaseable"
+                and not has_prior_conflict_fix(board, matching_entry.assignment_id)
+            ):
+                # #1478: a rebaseable CONFLICT with no active/failed
+                # conflict-fix attempt — the #1474 classify-and-dispatch step
+                # never got (or never got a second) chance at this entry.
+                reason = "merge_conflict_unresolved"
                 detail = (
-                    "Work passes every merge gate (review + test) but has "
-                    "no merge-queue entry."
+                    f"Merge queue entry for branch {matching_entry.branch!r} is "
+                    f"stuck in CONFLICT ({matching_entry.error or 'no error recorded'}) "
+                    "with no active or previously-failed conflict-fix attempt."
                 )
 
         if reason is None:
@@ -479,6 +518,245 @@ def post_stalled_pipeline(detection: StalledDetection, config: Config) -> None:
         issue_number=detection.issue_number,
         reason=detection.reason,
         detail=detection.detail,
+    )
+    github_ops.post_issue_comment(repo_github, detection.issue_number, body)
+    mark_notified(_stalled_notified_key(detection.assignment_id), EVENT_STALLED)
+
+
+# ── #1478: dispatch arm ──────────────────────────────────────────────────────
+
+
+@dataclass
+class StalledDispatchAction:
+    """The outcome of :func:`dispatch_stalled_pipeline_action` for one
+    :class:`StalledDetection`."""
+
+    kind: str
+    """One of:
+    - ``"fix_dispatch_attempted"`` — re-ran the review-completion transition
+      (:func:`coord.auto_loop.process_review_completion`) for
+      ``review_request_changes_no_fix``; see *detail* for what it did.
+    - ``"review_dispatched"``       — a review was dispatched for
+      ``done_no_review``.
+    - ``"enqueued"``                — the work was enqueued for merge for
+      ``approved_not_queued``.
+    - ``"conflict_fix_dispatched"`` — a conflict-fix worker was dispatched
+      for ``merge_conflict_unresolved``.
+    - ``"no_action"``               — the reused dispatcher declined (no
+      capable machine, already in flight, gate not actually satisfied,
+      entry vanished from the board/queue between detection and dispatch).
+    - ``"skipped_live_session"``    — a running/pending assignment already
+      exists for this (repo, issue); never act underneath a live session
+      (#602).
+    - ``"skipped_human_required"``  — the conflict-fix retry cap was already
+      hit; surfacing to a human, not auto-retrying.
+    - ``"disabled"``                — ``pipeline.auto_dispatch_stalled`` is
+      off; detection/narration still happened, dispatch did not.
+    """
+    detail: str = ""
+
+
+# Action kinds that represent a REAL dispatch (mutate the board / merge
+# queue / fire an agent request) — used to decide (a) whether the board
+# needs writing back, (b) which GitHub comment to post, and (c) whether the
+# audit row is business-tier (a real transition) or operational-tier (a
+# no-op/skip, informational only).
+_STALLED_DISPATCH_KINDS = frozenset({
+    "fix_dispatch_attempted", "review_dispatched", "enqueued", "conflict_fix_dispatched",
+})
+
+
+def _stalled_row_has_live_session(board: "Board", work: "Assignment") -> bool:
+    """#602 guardrail: true when a running/pending assignment already exists
+    for *work*'s (repo, issue) — e.g. an interactive ``--fix-of``/
+    ``--review-of``/``--merge-of`` session a human is actively driving.
+    :func:`dispatch_stalled_pipeline_action` must never act underneath one:
+    racing an auto-dispatch against a live session can duplicate or clobber
+    it. Broader than :func:`coord.claim.has_active_work_followup` (which
+    only checks ``work``/``conflict-fix``) — any live assignment type
+    (review, smoke, chat, ...) for the same issue counts here.
+    """
+    for a in board.active:
+        if a.status not in ("running", "pending"):
+            continue
+        if a.repo_name == work.repo_name and a.issue_number == work.issue_number:
+            return True
+    return False
+
+
+def dispatch_stalled_pipeline_action(
+    detection: StalledDetection,
+    work: "Assignment",
+    board: "Board",
+    config: Config,
+    *,
+    terminal_cache: dict | None = None,
+) -> StalledDispatchAction:
+    """#1478: act on a #1441 stalled-pipeline detection instead of only
+    narrating it.
+
+    Gated by ``config.pipeline.auto_dispatch_stalled`` (default ``False`` —
+    detection/narration via :func:`post_stalled_pipeline` is unconditional;
+    this is the opt-in action half). Mutates *board* in place exactly like
+    the auto-loop / review-dispatch helpers it delegates to — the caller is
+    responsible for persisting it.
+
+    Reuses the SAME dispatch machinery the original, on-time transition
+    would have used for each reason, rather than re-deriving new logic:
+
+    - ``review_request_changes_no_fix`` → re-locates the ``request-changes``
+      review and re-runs :func:`coord.auto_loop.process_review_completion`
+      on it — the exact function the auto-loop calls the instant a review
+      transitions to done, complete with its iteration cap and terminal
+      guard.
+    - ``done_no_review`` → :func:`coord.review.dispatch_review`, the same
+      call ``detect_transitions``/``dispatch_pending_reviews`` make on a
+      fresh work completion.
+    - ``approved_not_queued`` → :func:`coord.merge_queue.enqueue_approved_work`,
+      the same bulk gate-checked enqueue the daemon passive tick already
+      runs on every interval.
+    - ``merge_conflict_unresolved`` → :func:`coord.conflict_fix.dispatch_conflict_fix`,
+      the #1474 ``_dispatch_conflict_fixes`` path.
+
+    Never re-entrant across ticks: the caller only reaches this after
+    :func:`detect_stalled_pipeline` has already filtered out any row whose
+    ``_stalled_notified_key`` is in the ``notified`` ledger, and the caller
+    marks that key notified right after this returns (via
+    :func:`post_stalled_pipeline` or :func:`post_stalled_pipeline_dispatch`)
+    — so a given assignment_id gets exactly one dispatch attempt per stall,
+    mirroring the one-shot comment (#1441's own guardrail, reused rather
+    than re-derived per #1478's own request).
+    """
+    if not config.pipeline.auto_dispatch_stalled:
+        return StalledDispatchAction(
+            kind="disabled", detail="pipeline.auto_dispatch_stalled is False",
+        )
+
+    if _stalled_row_has_live_session(board, work):
+        return StalledDispatchAction(
+            kind="skipped_live_session",
+            detail=(
+                f"a running/pending assignment already exists for "
+                f"{work.repo_name}#{work.issue_number} — not acting "
+                "underneath a live session (#602)"
+            ),
+        )
+
+    if detection.reason == "review_request_changes_no_fix":
+        from coord.auto_loop import process_review_completion  # noqa: PLC0415
+
+        all_assignments = list(board.active) + list(board.completed)
+        review = next(
+            (
+                a for a in all_assignments
+                if a.review_of_assignment_id == work.assignment_id and a.type == "review"
+            ),
+            None,
+        )
+        if review is None:
+            return StalledDispatchAction(
+                kind="no_action", detail="review no longer found on board",
+            )
+        machine_host = next(
+            (m.host for m in config.machines if m.name == review.machine_name), None,
+        )
+        actions = process_review_completion(
+            review, board, config,
+            machine_host=machine_host, terminal_cache=terminal_cache,
+        )
+        kind_set = {a.kind for a in actions}
+        kinds = ", ".join(a.kind for a in actions) or "no_action"
+        details = "; ".join(a.detail for a in actions if a.detail)
+        return StalledDispatchAction(
+            kind="fix_dispatch_attempted" if "fix_dispatched" in kind_set else "no_action",
+            detail=f"process_review_completion → {kinds}" + (f" ({details})" if details else ""),
+        )
+
+    if detection.reason == "done_no_review":
+        from coord.review import dispatch_review  # noqa: PLC0415
+
+        review = dispatch_review(work, board, config, terminal_cache=terminal_cache)
+        if review is None:
+            return StalledDispatchAction(
+                kind="no_action",
+                detail="dispatch_review declined (no machine / already in flight / gate)",
+            )
+        return StalledDispatchAction(
+            kind="review_dispatched",
+            detail=f"review {review.assignment_id} dispatched to {review.machine_name}",
+        )
+
+    if detection.reason == "approved_not_queued":
+        from coord.merge_queue import enqueue_approved_work  # noqa: PLC0415
+
+        changed = enqueue_approved_work(config, board)
+        if work.assignment_id not in changed:
+            return StalledDispatchAction(
+                kind="no_action",
+                detail="enqueue_approved_work made no change for this assignment",
+            )
+        return StalledDispatchAction(
+            kind="enqueued", detail=f"{work.assignment_id} enqueued for merge",
+        )
+
+    if detection.reason == "merge_conflict_unresolved":
+        from coord.conflict_fix import (  # noqa: PLC0415
+            dispatch_conflict_fix,
+            has_prior_conflict_fix,
+        )
+        from coord.merge_queue import load_queue  # noqa: PLC0415
+
+        entry = next(
+            (m for m in load_queue() if m.assignment_id == work.assignment_id), None,
+        )
+        if entry is None:
+            return StalledDispatchAction(
+                kind="no_action", detail="merge queue entry no longer found",
+            )
+        if has_prior_conflict_fix(board, entry.assignment_id):
+            return StalledDispatchAction(
+                kind="skipped_human_required",
+                detail="conflict-fix already active or its retry cap was already hit",
+            )
+        fix = dispatch_conflict_fix(entry, board, config, prefer_machine=work.machine_name)
+        if fix is None:
+            return StalledDispatchAction(
+                kind="no_action",
+                detail="dispatch_conflict_fix declined (no machine / no repo_path)",
+            )
+        return StalledDispatchAction(
+            kind="conflict_fix_dispatched",
+            detail=f"conflict-fix {fix.assignment_id} dispatched to {fix.machine_name}",
+        )
+
+    return StalledDispatchAction(
+        kind="no_action", detail=f"no dispatch arm for reason={detection.reason!r}",
+    )
+
+
+def post_stalled_pipeline_dispatch(
+    detection: StalledDetection, action: StalledDispatchAction, config: Config,
+) -> None:
+    """Post the #1478 auto-dispatch outcome comment and mark notified.
+
+    Posted INSTEAD OF :func:`post_stalled_pipeline` when
+    :func:`dispatch_stalled_pipeline_action` actually dispatched something
+    for this row (see that function's *kind* values) — the two write to the
+    same GitHub thread, so posting both would leave a directly
+    contradictory "nothing was dispatched automatically" comment sitting
+    right above this one.
+    """
+    repo = config.repo(detection.repo_name)
+    repo_github = repo.github if repo is not None else None
+    if not repo_github:
+        return
+    body = format_stalled_pipeline_dispatch(
+        assignment_id=detection.assignment_id,
+        repo_name=detection.repo_name,
+        issue_number=detection.issue_number,
+        reason=detection.reason,
+        action_kind=action.kind,
+        action_detail=action.detail,
     )
     github_ops.post_issue_comment(repo_github, detection.issue_number, body)
     mark_notified(_stalled_notified_key(detection.assignment_id), EVENT_STALLED)
@@ -1486,6 +1764,99 @@ def _dispatch_board_pending_reviews(config: Config) -> None:
         write_board(board)
 
 
+def _sweep_stalled_pipeline(
+    config: Config, *, terminal_cache: dict | None = None,
+) -> list[StalledDetection]:
+    """Detect #1441 stalled-pipeline rows, post one comment per row, and —
+    when ``config.pipeline.auto_dispatch_stalled`` is on — dispatch the
+    action the original transition would have taken (#1478).
+
+    Loads its own board (rather than accepting one) so mutations from a
+    dispatched action (a freshly-enqueued merge entry, a newly dispatched
+    review/fix/conflict-fix, ``board.review_state`` flips) can be persisted
+    back via ``write_board`` — mirrors ``_dispatch_board_pending_reviews``/
+    ``_dispatch_board_pending_smoke`` above. A comment-posting failure for
+    one row must not stop the sweep from reaching the rest (matches every
+    other best-effort loop in this module) — the ``continue`` on failure
+    means that row's ``notified`` key is never set, so it is picked back up
+    on the next tick rather than silently dropped.
+    """
+    from coord.board_service import read_board, write_board
+
+    board = read_board()
+    detections = detect_stalled_pipeline(config, board=board, terminal_cache=terminal_cache)
+
+    posted: list[StalledDetection] = []
+    board_dirty = False
+    for detection, work in detections:
+        try:
+            action = dispatch_stalled_pipeline_action(
+                detection, work, board, config, terminal_cache=terminal_cache,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "dispatch_stalled_pipeline_action: unexpected error for %s",
+                detection.assignment_id,
+            )
+            action = StalledDispatchAction(
+                kind="no_action", detail="dispatch_stalled_pipeline_action raised — see log",
+            )
+
+        dispatched = action.kind in _STALLED_DISPATCH_KINDS
+        try:
+            if dispatched:
+                post_stalled_pipeline_dispatch(detection, action, config)
+            else:
+                post_stalled_pipeline(detection, config)
+        except Exception:  # noqa: BLE001
+            continue
+        posted.append(detection)
+        if dispatched:
+            board_dirty = True
+
+        # #1478 guardrail: "log every auto-dispatch to the audit trail with
+        # the detection that triggered it" — business-tier (never dropped
+        # by the operational/business audit-level gate) for an actual
+        # dispatch; operational-tier for a no-op/skip, so the "nothing
+        # happened" rows don't inflate the business audit stream but are
+        # still reconstructable when `audit.level` includes operational.
+        try:
+            from coord.audit import record_audit  # noqa: PLC0415
+
+            record_audit(
+                tier="business" if dispatched else "operational",
+                category="pipeline",
+                event_type="stalled_pipeline_auto_dispatch",
+                actor="coordinator",
+                summary=(
+                    f"stalled-pipeline sweep ({detection.reason}) -> {action.kind} "
+                    f"for {detection.repo_name}#{detection.issue_number}"
+                ),
+                repo=detection.repo_name,
+                issue=detection.issue_number,
+                assignment_id=detection.assignment_id,
+                machine=detection.machine_name,
+                details={
+                    "stalled_reason": detection.reason,
+                    "stalled_detail": detection.detail,
+                    "action_kind": action.kind,
+                    "action_detail": action.detail,
+                },
+            )
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "record_audit failed for stalled dispatch %s", detection.assignment_id,
+            )
+
+    if board_dirty:
+        try:
+            write_board(board)
+        except Exception:  # noqa: BLE001
+            log.exception("write_board failed after stalled-pipeline dispatch")
+
+    return posted
+
+
 def run(
     config: Config,
 ) -> tuple[
@@ -1658,25 +2029,19 @@ def run(
         except Exception:  # noqa: BLE001
             log.exception("auto_loop: unexpected error in fix completion loop")
 
-    # #1441: sweep for pipeline rows whose auto-loop transition already fired
-    # once but which are now stuck on a precondition that landed too late
-    # (the vimcode #602 reference case). Runs last, after the review/fix
-    # auto-loop above has had a chance to act on THIS pass's transitions, so
-    # a row that just got a fresh fix/review dispatched above is not also
-    # flagged as stalled in the same pass. Best-effort, non-fatal, detection
-    # + surfacing only — mirrors the #846 needs-attention block above; the
-    # crucial difference from `reconcile()`-only sweepers (see
+    # #1441/#1478: sweep for pipeline rows whose auto-loop transition
+    # already fired once but which are now stuck on a precondition that
+    # landed too late (the vimcode #602 reference case), post a diagnostic
+    # (or, when `pipeline.auto_dispatch_stalled` is on, act). Runs last,
+    # after the review/fix auto-loop above has had a chance to act on THIS
+    # pass's transitions, so a row that just got a fresh fix/review
+    # dispatched above is not also flagged as stalled in the same pass.
+    # Best-effort, non-fatal — mirrors the #846 needs-attention block above;
+    # the crucial difference from `reconcile()`-only sweepers (see
     # docs/OPERATING_GOTCHAS.md §7) is that this runs from `coord notify`.
     stalled_posted: list[StalledDetection] = []
     try:
-        for detection, _work in detect_stalled_pipeline(
-            config, terminal_cache=terminal_cache
-        ):
-            try:
-                post_stalled_pipeline(detection, config)
-            except Exception:  # noqa: BLE001
-                continue
-            stalled_posted.append(detection)
+        stalled_posted = _sweep_stalled_pipeline(config, terminal_cache=terminal_cache)
     except Exception:  # noqa: BLE001
         log.exception("detect_stalled_pipeline: unexpected error")
 
