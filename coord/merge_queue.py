@@ -1619,7 +1619,18 @@ def process(
                 # #1475: populate branch_patch_id alongside branch_head_sha so
                 # has_approved_review can carry an approval forward across a
                 # content-identical rebase instead of re-blocking on SHA alone.
-                if board is not None and entry.branch_patch_id is None:
+                # Only fetch it when a review is actually required for this
+                # entry — has_approved_review never consults branch_patch_id
+                # otherwise, so skipping here saves a `gh api compare` round
+                # trip per entry per process() tick for the common no-review
+                # (skip_review / gate-disabled) case.
+                if (
+                    board is not None
+                    and entry.branch_patch_id is None
+                    and not skip_review
+                    and config is not None
+                    and requires_review(entry, config)
+                ):
                     entry.branch_patch_id = gh_ops.get_branch_patch_id(
                         entry.repo_github, entry.target_branch, entry.branch
                     )
@@ -1706,7 +1717,18 @@ def process(
             # #1475: populate branch_patch_id alongside branch_head_sha so
             # has_approved_review can carry an approval forward across a
             # content-identical rebase instead of re-blocking on SHA alone.
-            if board is not None and entry.branch_patch_id is None:
+            # Only fetch it when a review is actually required for this entry
+            # — has_approved_review never consults branch_patch_id otherwise,
+            # so skipping here saves a `gh api compare` round trip per entry
+            # per process() tick for the common no-review (skip_review /
+            # gate-disabled) case.
+            if (
+                board is not None
+                and entry.branch_patch_id is None
+                and not skip_review
+                and config is not None
+                and requires_review(entry, config)
+            ):
                 entry.branch_patch_id = gh_ops.get_branch_patch_id(
                     entry.repo_github, entry.target_branch, entry.branch
                 )

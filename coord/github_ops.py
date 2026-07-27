@@ -1007,23 +1007,38 @@ def find_pr_for_branch(repo: str, branch: str) -> dict | None:
     return items[0] if items else None
 
 
-def pr_diff(repo_github: str, pr_number: int, *, max_chars: int = 60000) -> str | None:
+def truncate_diff_text(diff: str, max_chars: int = 60000) -> str:
+    """Truncate *diff* to *max_chars* with a trailing note, if it's over.
+
+    Factored out of :func:`pr_diff` (#1475) so callers that need the full,
+    untruncated diff for content hashing (``compute_patch_id``) can still
+    apply the same display truncation to a *separate* copy shown to a human
+    reviewer or embedded in a briefing, without a second ``gh`` fetch.
+    """
+    if len(diff) > max_chars:
+        return diff[:max_chars] + f"\n... [diff truncated at {max_chars} chars] ..."
+    return diff
+
+
+def pr_diff(repo_github: str, pr_number: int, *, max_chars: int | None = 60000) -> str | None:
     """Return the merge-base (three-dot) diff for PR ``pr_number``, or None.
 
     ``gh pr diff`` is three-dot / merge-base by GitHub semantics, so the output
     is exactly the branch's own changes (#612) — code merged to the base after
     the branch was cut never appears as spurious deletions. Truncated to
     *max_chars* with a trailing note so a huge diff can't blow the briefing
-    size. Best-effort: returns None on any ``gh`` error so the caller falls
-    back to the in-briefing three-dot diff instructions.
+    size — pass ``max_chars=None`` to get the full, untruncated diff (#1475:
+    needed for content-hashing via ``compute_patch_id``, which must not hash
+    a mutated/truncated string). Best-effort: returns None on any ``gh`` error
+    so the caller falls back to the in-briefing three-dot diff instructions.
     """
     try:
         diff = _gh("pr", "diff", str(pr_number), "--repo", repo_github)
     except RuntimeError:
         return None
-    if len(diff) > max_chars:
-        diff = diff[:max_chars] + f"\n... [diff truncated at {max_chars} chars] ..."
-    return diff
+    if max_chars is None:
+        return diff
+    return truncate_diff_text(diff, max_chars)
 
 
 def compute_patch_id(diff_text: str | None) -> str | None:

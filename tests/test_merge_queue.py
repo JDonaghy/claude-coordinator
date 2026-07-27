@@ -1027,6 +1027,48 @@ class TestReviewGate:
         assert patch_id_calls[0][2] == items[0].branch, "must fetch patch-id for the entry's branch"
         assert items[0].branch_patch_id == "patchid-abc"
 
+    def test_process_skips_branch_patch_id_fetch_when_review_not_required(self) -> None:
+        """#1475 (non-blocking review finding): has_approved_review never
+        consults branch_patch_id unless a review is actually required for the
+        entry, so process() must not spend a `gh api compare` round trip
+        populating it in that case (gate disabled here via default_gates)."""
+        patch_id_calls: list[tuple[str, str, str]] = []
+
+        class _TrackingGh(FakeGh):
+            def get_branch_patch_id(self, repo: str, base: str, branch: str) -> str | None:
+                patch_id_calls.append((repo, base, branch))
+                return "patchid-abc"
+
+        cfg = self._config(gates=["merge"])  # "review" not in the effective gates
+        work = self._work("w1")
+        board = self._board(completed=[work])
+
+        items = [_q("w1", size=10)]
+        process(items, _TrackingGh(), config=cfg, board=board)
+
+        assert patch_id_calls == [], "review not required — must not fetch branch_patch_id"
+        assert items[0].branch_patch_id is None
+
+    def test_process_skips_branch_patch_id_fetch_when_skip_review(self) -> None:
+        """#1475 (non-blocking review finding): --skip-review means the review
+        gate (and its patch-id check) is never consulted either."""
+        patch_id_calls: list[tuple[str, str, str]] = []
+
+        class _TrackingGh(FakeGh):
+            def get_branch_patch_id(self, repo: str, base: str, branch: str) -> str | None:
+                patch_id_calls.append((repo, base, branch))
+                return "patchid-abc"
+
+        cfg = self._config(gates=["review", "merge"])
+        work = self._work("w1")
+        board = self._board(completed=[work])
+
+        items = [_q("w1", size=10)]
+        process(items, _TrackingGh(), config=cfg, board=board, skip_review=True)
+
+        assert patch_id_calls == [], "skip_review — must not fetch branch_patch_id"
+        assert items[0].branch_patch_id is None
+
     def test_process_rebase_with_matching_patch_id_still_merges_end_to_end(self) -> None:
         """#1475: a rebase that moves the SHA but not the content must not
         force a re-review — the merge proceeds on the carried-forward approval."""

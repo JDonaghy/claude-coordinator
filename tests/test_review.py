@@ -615,6 +615,32 @@ def test_pr_diff_truncates_at_max_chars(monkeypatch) -> None:
     assert len(out) < len(big)
 
 
+def test_pr_diff_max_chars_none_returns_full_diff(monkeypatch) -> None:
+    """#1475: max_chars=None must return the diff byte-for-byte, with no
+    truncation and no trailing note — needed so `compute_patch_id` hashes
+    exactly what the merge-time `get_branch_patch_id` compare-API fetch
+    hashes, whatever the diff's size."""
+    from coord import github_ops
+
+    big = "x" * 100_000
+    monkeypatch.setattr(github_ops, "_gh", lambda *args: big)
+    out = github_ops.pr_diff("acme/api", 42, max_chars=None)
+    assert out == big
+
+
+def test_truncate_diff_text_matches_pr_diff_truncation(monkeypatch) -> None:
+    """#1475: truncate_diff_text is the extracted helper pr_diff uses
+    internally — calling it directly on a full diff must produce the exact
+    same display copy pr_diff would have returned for that max_chars."""
+    from coord import github_ops
+
+    big = "x" * 10_000
+    monkeypatch.setattr(github_ops, "_gh", lambda *args: big)
+    via_pr_diff = github_ops.pr_diff("acme/api", 42, max_chars=100)
+    via_helper = github_ops.truncate_diff_text(big, max_chars=100)
+    assert via_pr_diff == via_helper
+
+
 def test_pr_diff_returns_none_on_gh_error(monkeypatch) -> None:
     """#612: pr_diff is best-effort — a gh failure yields None, not a raise."""
     from coord import github_ops
@@ -1287,6 +1313,58 @@ def test_dispatch_review_tolerates_patch_id_fetch_failure(
     # Dispatch must succeed; review_patch_id is None (unavailable is not blocking).
     assert result is not None
     assert result.review_patch_id is None
+
+
+def test_dispatch_review_patch_id_hashes_untruncated_diff(
+    monkeypatch, two_machine_config: Config,
+) -> None:
+    """#1475 blocking finding: review_patch_id must be computed from the full,
+    untruncated diff — not the display-truncated text with a trailing
+    "[diff truncated...]" note — so it matches the merge-time
+    ``branch_patch_id`` (computed from an uncapped compare-API diff) for any
+    PR whose diff exceeds the 60000-char display cap. The briefing shown to
+    the reviewer must still get the truncated copy."""
+    from coord import github_ops
+
+    # A diff comfortably over the 60000-char display truncation threshold.
+    big_diff = "diff --git a/f.py b/f.py\n" + ("+x\n" * 30000)
+    assert len(big_diff) > 60000
+    monkeypatch.setattr(github_ops, "_gh", lambda *args, **kwargs: big_diff)
+
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    client = _FakeHTTPClient({"id": "patchid-full-1"})
+    captured: dict[str, str | None] = {}
+
+    def _capture_patch_id(diff_text: str | None) -> str | None:
+        captured["diff_text"] = diff_text
+        return "patchid-full"
+
+    result = dispatch_review(
+        completed, board, two_machine_config,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {
+            "number": 11, "url": "https://github.com/acme/api/pull/11", "existed": True,
+        },
+        claude_md_reader=lambda p: "",
+        issue_body_fetcher=lambda repo, num: "",
+        remote_branch_checker=lambda repo, branch: True,
+        branch_sha_fetcher=lambda repo, branch: "deadbeef1234",
+        patch_id_computer=_capture_patch_id,
+    )
+
+    assert result is not None
+    assert result.review_patch_id == "patchid-full"
+    # The hash input must be the *full* diff, byte-for-byte — no truncation.
+    assert captured["diff_text"] == big_diff
+    assert "[diff truncated" not in captured["diff_text"]
+
+    # But the briefing embedded in the dispatched payload must be the
+    # display-truncated copy, so a huge diff still can't blow the briefing.
+    assert client.calls, "expected a dispatch POST"
+    _, payload = client.calls[0]
+    assert "[diff truncated at 60000 chars]" in payload["briefing"]
+    assert len(payload["briefing"]) < len(big_diff)
 
 
 def test_dispatch_review_handles_http_failure_gracefully(
