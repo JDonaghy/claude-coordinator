@@ -267,6 +267,27 @@ def test_briefing_warns_when_same_machine() -> None:
     assert "running on the same machine as the worker" in briefing
 
 
+def test_briefing_requires_the_three_finding_sections() -> None:
+    """#1456: the #476 gate now fails closed, so an advisory-only
+    request-changes is only recognisable from an explicitly-empty blocking
+    section.  Both the briefing and REVIEWER_SYSTEM_PROMPT must ask for the
+    headings — without them the gate is unreachable and every advisory review
+    costs a full fix+re-review round."""
+    from coord.review import REVIEWER_SYSTEM_PROMPT
+
+    briefing = build_review_briefing(
+        pr_number=42, pr_url=None, repo_github="acme/api", repo_name="api",
+        issue_number=7, issue_title="Fix login", issue_body="",
+        branch="issue-7", worker_machine="laptop", same_as_worker=False,
+        reviews_cfg=ReviewsConfig(enabled=True), repo_claude_md=None,
+    )
+    for text in (briefing, REVIEWER_SYSTEM_PROMPT):
+        assert "## Blocking findings" in text
+        assert "## Non-blocking concerns" in text
+        assert "## Nits" in text
+    assert "None." in briefing
+
+
 def test_briefing_uses_generic_checklist_when_none_configured() -> None:
     briefing = build_review_briefing(
         pr_number=1, pr_url=None, repo_github="acme/api", repo_name="api",

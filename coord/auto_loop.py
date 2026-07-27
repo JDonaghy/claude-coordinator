@@ -304,6 +304,11 @@ def process_review_completion(
         review.review_verdict_original = findings.verdict
         review.review_verdict_override_reason = override_reason
         review.review_verdict = "approve"
+        _record_verdict_override(
+            review, board,
+            original_verdict=findings.verdict,
+            blocking=blocking, nonblocking=nonblocking, nits=nits,
+        )
         _post_advisory_nits_notice(
             review, board, config, nonblocking, nits,
             original_verdict=findings.verdict,
@@ -391,6 +396,63 @@ def _advance_pipeline(
                     work.assignment_id, exc,
                 )
     return [LoopAction(kind=kind, assignment_id=review.assignment_id, detail=detail)]
+
+
+def _record_verdict_override(
+    review: Assignment,
+    board: Board,
+    *,
+    original_verdict: str,
+    blocking: int | None,
+    nonblocking: int | None,
+    nits: int | None,
+) -> None:
+    """#1456: write a durable audit row when the coordinator downgrades a
+    reviewer's ``request-changes`` to ``approve``.
+
+    The third leg of the audit trail, after the board row (which carries both
+    verdicts) and the GitHub notice: a timestamped business-tier event, so an
+    operator can answer "which merges rode an overridden verdict?" after the
+    fact — including for work whose issue has since been closed.  Best-effort;
+    an audit failure must never block the pipeline.
+    """
+    work = (
+        board.find_by_id(review.review_of_assignment_id)
+        if review.review_of_assignment_id
+        else None
+    )
+    try:
+        from coord.audit import record_audit  # noqa: PLC0415
+
+        record_audit(
+            tier="business",
+            category="review",
+            event_type="review_verdict_overridden",
+            actor="coordinator",
+            summary=(
+                f"Coordinator overrode review verdict {original_verdict} → "
+                f"approve for {review.repo_name}#{review.issue_number} "
+                f"(#476 advisory-only gate: blocking={blocking}, "
+                f"nonblocking={nonblocking}, nits={nits})"
+            ),
+            repo=review.repo_name,
+            issue=review.issue_number,
+            assignment_id=review.assignment_id,
+            machine=review.machine_name,
+            details={
+                "original_verdict": original_verdict,
+                "effective_verdict": "approve",
+                "blocking": blocking,
+                "nonblocking": nonblocking,
+                "nits": nits,
+                "work_assignment_id": work.assignment_id if work else None,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 — audit is best-effort
+        log.warning(
+            "auto_loop: failed to record verdict-override audit for %s: %s",
+            review.assignment_id, exc,
+        )
 
 
 def _post_advisory_nits_notice(

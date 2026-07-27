@@ -1420,6 +1420,16 @@ class TestRunForReviewTransition:
         # is unauditable exactly as it was on #1445.
         assert review_loaded.review_verdict_original == "request-changes"
         assert "blocking=0" in (review_loaded.review_verdict_override_reason or "")
+        # #1456: the third leg of the audit trail — a durable business-tier
+        # event, so "which merges rode an overridden verdict?" is answerable
+        # after the issue is closed and the board row has aged out of view.
+        from coord.audit import query_audit_log
+
+        entries = query_audit_log(event_type="review_verdict_overridden")["entries"]
+        assert len(entries) == 1, entries
+        assert entries[0]["details"]["original_verdict"] == "request-changes"
+        assert entries[0]["details"]["effective_verdict"] == "approve"
+        assert entries[0]["details"]["blocking"] == 0
 
     def test_review_not_on_board_returns_empty(
         self, config: Config, tmp_path, coord_db

@@ -1239,6 +1239,24 @@ def build_review_briefing(
     lines.append("```")
     lines.append("")
     lines.append("Use `REVIEW_VERDICT: request-changes` if changes are needed.")
+    # #1456: the coordinator's #476 gate (an advisory-only request-changes must
+    # not burn another fix round) counts bullets under the body's section
+    # headings, and since #1456 it fails CLOSED — an unparseable body keeps the
+    # reviewer's verdict verbatim. Say so here as well as in
+    # REVIEWER_SYSTEM_PROMPT: without an explicit blocking section the gate can
+    # never fire, so every advisory review costs a full fix+re-review round.
+    lines.append("")
+    lines.append(
+        "BODY STRUCTURE — the markdown body MUST use these three headings, "
+        "always all three, with every finding as a `- ` bullet under one of "
+        "them: `## Blocking findings`, `## Non-blocking concerns`, `## Nits`. "
+        "Write the single line `None.` under a heading with nothing under it. "
+        "These sections are machine-counted: an explicitly empty blocking "
+        "section is how you tell the coordinator your objections are advisory "
+        "and no fix round is needed, and a body it cannot read is treated as "
+        "blocking. Never state a blocking objection only in prose outside "
+        "these sections."
+    )
     # #1346: the three marker lines are a machine contract, not prose. The
     # surrounding briefing is Markdown and the body placeholder invites
     # Markdown, so reviewers have emitted `**REVIEW_VERDICT: request-changes**`
