@@ -1234,6 +1234,61 @@ def test_dispatch_review_tolerates_sha_fetch_failure(
     assert result.review_head_sha is None
 
 
+def test_dispatch_review_captures_patch_id(
+    two_machine_config: Config,
+) -> None:
+    """#1475: dispatch_review must set review_patch_id on the returned
+    Assignment, alongside review_head_sha, so has_approved_review can later
+    carry the approval across a content-identical rebase."""
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    client = _FakeHTTPClient({"id": "patchid-review-1"})
+
+    result = dispatch_review(
+        completed, board, two_machine_config,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {
+            "number": 9, "url": "https://github.com/acme/api/pull/9", "existed": True,
+        },
+        claude_md_reader=lambda p: "",
+        issue_body_fetcher=lambda repo, num: "",
+        remote_branch_checker=lambda repo, branch: True,
+        branch_sha_fetcher=lambda repo, branch: "deadbeef1234",
+        patch_id_computer=lambda diff_text: "patchid-xyz",  # injected for test
+    )
+
+    assert result is not None
+    assert result.review_patch_id == "patchid-xyz"
+
+
+def test_dispatch_review_tolerates_patch_id_fetch_failure(
+    two_machine_config: Config,
+) -> None:
+    """#1475: dispatch_review must not fail when the patch-id computer raises."""
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    client = _FakeHTTPClient({"id": "patchid-fail-1"})
+
+    def _failing_patch_id(diff_text):
+        raise RuntimeError("git patch-id unavailable")
+
+    result = dispatch_review(
+        completed, board, two_machine_config,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {
+            "number": 10, "url": "https://github.com/acme/api/pull/10", "existed": True,
+        },
+        claude_md_reader=lambda p: "",
+        issue_body_fetcher=lambda repo, num: "",
+        remote_branch_checker=lambda repo, branch: True,
+        patch_id_computer=_failing_patch_id,
+    )
+
+    # Dispatch must succeed; review_patch_id is None (unavailable is not blocking).
+    assert result is not None
+    assert result.review_patch_id is None
+
+
 def test_dispatch_review_handles_http_failure_gracefully(
     two_machine_config: Config,
 ) -> None:

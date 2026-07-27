@@ -174,6 +174,13 @@ def has_approved_review(entry: "QueuedMerge", board) -> bool:
     the ``review_of_assignment_id`` chain, which also catches fix workers
     dispatched with ``branch=NULL`` — and accept any approved review that
     points to any of them.
+
+    #1475: a SHA mismatch alone no longer voids the approval outright. When
+    the branch's current content-addressed patch-id (``branch_patch_id``)
+    matches the patch-id captured at review time (``review_patch_id``), the
+    SHA moved but the diff didn't — e.g. a conflict-fix rebase that resolved
+    cleanly — so the approval still covers this content. Missing either
+    patch-id fails closed to the pre-#1475 behaviour (stale, re-review).
     """
     pool = list(getattr(board, "completed", []) or []) + list(getattr(board, "active", []) or [])
 
@@ -189,6 +196,7 @@ def has_approved_review(entry: "QueuedMerge", board) -> bool:
     # the review completed.  When either SHA is absent (pre-821 rows or SHA
     # tracking unavailable) the check is skipped (backward-compatible).
     current_sha = getattr(entry, "branch_head_sha", None)
+    current_patch_id = getattr(entry, "branch_patch_id", None)
 
     for a in pool:
         if getattr(a, "type", None) != "review":
@@ -199,6 +207,20 @@ def has_approved_review(entry: "QueuedMerge", board) -> bool:
             continue
         review_sha = getattr(a, "review_head_sha", None)
         if review_sha is not None and current_sha is not None and review_sha != current_sha:
+            # #1475: the SHA moved — before declaring the approval stale,
+            # check whether the underlying content is identical via
+            # patch-id. A pure rebase (no conflict) replays the identical
+            # diff against a new base and produces the same patch-id even
+            # though the commit SHA changed; a conflict resolution or a
+            # genuine content change produces a different one. Fail closed
+            # when either patch-id is unavailable.
+            review_patch_id = getattr(a, "review_patch_id", None)
+            if (
+                review_patch_id is not None
+                and current_patch_id is not None
+                and review_patch_id == current_patch_id
+            ):
+                return True  # content-identical rebase — approval still covers it
             continue  # stale: branch moved past the commit the review covered
         return True
     return False
@@ -463,6 +485,14 @@ class QueuedMerge:
     # `review_head_sha` to detect stale approvals (commits pushed after review).
     # None means SHA tracking is not available for this entry.
     branch_head_sha: str | None = None
+    # #1475: current content-addressed patch-id for the branch's diff against
+    # `target_branch`, populated at process() time alongside branch_head_sha.
+    # `has_approved_review` falls back to comparing this against the review's
+    # `review_patch_id` when the SHAs differ (e.g. a conflict-fix rebase) —
+    # identical patch-id means the rebase changed no content, so the approval
+    # still covers it. None means patch-id tracking is not available (fails
+    # closed to the pre-#1475 SHA-only staleness check).
+    branch_patch_id: str | None = None
     # #1077: the originating assignment's `type` (e.g. "work", "mock-author"),
     # captured at enqueue time. Drives both the PR-body "Closes #N" vs
     # "Refs #N" keyword (`_briefing_body`) and whether `process()` closes
@@ -523,6 +553,18 @@ class GhOps(Protocol):
         ``has_approved_review`` can reject stale approvals (#821).  Returning
         ``None`` (on any network/auth failure) is safe — the staleness check
         is skipped for rows without a SHA, preserving backward compatibility.
+        """
+        ...
+
+    def get_branch_patch_id(self, repo: str, base: str, branch: str) -> str | None:
+        """Return the content-addressed patch-id for *branch*'s diff against
+        *base*, or None on failure.
+
+        Used to populate ``QueuedMerge.branch_patch_id`` at process() time so
+        ``has_approved_review`` can carry an approval forward across a pure
+        rebase (#1475) even though the branch's HEAD SHA changed. Returning
+        ``None`` is safe — the gate falls back to the pre-#1475 SHA-only
+        staleness check.
         """
         ...
 
@@ -1574,6 +1616,13 @@ def process(
                     entry.branch_head_sha = gh_ops.get_branch_sha(
                         entry.repo_github, entry.branch
                     )
+                # #1475: populate branch_patch_id alongside branch_head_sha so
+                # has_approved_review can carry an approval forward across a
+                # content-identical rebase instead of re-blocking on SHA alone.
+                if board is not None and entry.branch_patch_id is None:
+                    entry.branch_patch_id = gh_ops.get_branch_patch_id(
+                        entry.repo_github, entry.target_branch, entry.branch
+                    )
                 # #292 (Defect 4): apply the review gate in dry-run so output
                 # reflects real behaviour.  CI cannot be checked in dry-run
                 # (no PR exists yet), so review and smoke gates are evaluated.
@@ -1653,6 +1702,13 @@ def process(
             if board is not None and entry.branch_head_sha is None:
                 entry.branch_head_sha = gh_ops.get_branch_sha(
                     entry.repo_github, entry.branch
+                )
+            # #1475: populate branch_patch_id alongside branch_head_sha so
+            # has_approved_review can carry an approval forward across a
+            # content-identical rebase instead of re-blocking on SHA alone.
+            if board is not None and entry.branch_patch_id is None:
+                entry.branch_patch_id = gh_ops.get_branch_patch_id(
+                    entry.repo_github, entry.target_branch, entry.branch
                 )
             # Review gate (#253/#821): refuse to merge when a review is required
             # by the pipeline policy but no approved review is on the board.

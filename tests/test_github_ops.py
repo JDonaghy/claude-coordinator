@@ -1003,3 +1003,86 @@ class TestListRepoDir:
         with patch("coord.github_ops._gh", side_effect=RuntimeError("gh boom")):
             with pytest.raises(RuntimeError):
                 github_ops.list_repo_dir("acme/api", "tests/acceptance/ms-1/mocks")
+
+
+def _unified_diff(content: str) -> str:
+    """A minimal single-file unified diff adding *content* as line 1 of ``foo``."""
+    return (
+        "diff --git a/foo b/foo\n"
+        "index e69de29..d95f3ad 100644\n"
+        "--- a/foo\n"
+        "+++ b/foo\n"
+        "@@ -0,0 +1 @@\n"
+        f"+{content}\n"
+    )
+
+
+class TestComputePatchId:
+    """#1475: content-addressed fingerprint of a diff, via the real
+    ``git patch-id --stable`` binary — a pure function on diff text, no repo
+    checkout or network required, so exercising the real subprocess is both
+    safe and the most faithful test."""
+
+    def test_identical_diffs_produce_the_same_patch_id(self) -> None:
+        diff = _unified_diff("hello")
+        a = github_ops.compute_patch_id(diff)
+        b = github_ops.compute_patch_id(diff)
+        assert a is not None
+        assert a == b
+
+    def test_a_pure_rebase_reproduces_the_same_diff_text(self) -> None:
+        # A rebase that changes no content re-emits byte-identical diff text
+        # against the new base (only the commit SHA / context outside the
+        # diff changes) — patch-id must therefore be stable across it.
+        diff_before_rebase = _unified_diff("hello")
+        diff_after_rebase = _unified_diff("hello")
+        assert github_ops.compute_patch_id(diff_before_rebase) == (
+            github_ops.compute_patch_id(diff_after_rebase)
+        )
+
+    def test_different_content_produces_a_different_patch_id(self) -> None:
+        a = github_ops.compute_patch_id(_unified_diff("hello"))
+        b = github_ops.compute_patch_id(_unified_diff("goodbye"))
+        assert a is not None
+        assert b is not None
+        assert a != b
+
+    def test_none_input_returns_none(self) -> None:
+        assert github_ops.compute_patch_id(None) is None
+
+    def test_empty_string_returns_none(self) -> None:
+        assert github_ops.compute_patch_id("") is None
+        assert github_ops.compute_patch_id("   \n") is None
+
+    def test_subprocess_failure_fails_closed_to_none(self) -> None:
+        with patch(
+            "coord.github_ops.subprocess.run",
+            side_effect=OSError("git not found"),
+        ):
+            assert github_ops.compute_patch_id(_unified_diff("hello")) is None
+
+    def test_nonzero_exit_fails_closed_to_none(self) -> None:
+        class _FakeResult:
+            returncode = 1
+            stdout = ""
+
+        with patch("coord.github_ops.subprocess.run", return_value=_FakeResult()):
+            assert github_ops.compute_patch_id(_unified_diff("hello")) is None
+
+
+class TestGetBranchPatchId:
+    """#1475: fetches the three-dot compare diff (no PR required, mirroring
+    get_branch_diff_size) and hashes it."""
+
+    def test_computes_patch_id_from_compare_diff(self) -> None:
+        diff = _unified_diff("hello")
+        with patch("coord.github_ops._gh", return_value=diff) as mock_gh:
+            result = github_ops.get_branch_patch_id("acme/api", "main", "feature")
+        assert result == github_ops.compute_patch_id(diff)
+        args = mock_gh.call_args.args
+        assert args[0] == "api"
+        assert args[1] == "repos/acme/api/compare/main...feature"
+
+    def test_returns_none_on_gh_error(self) -> None:
+        with patch("coord.github_ops._gh", side_effect=RuntimeError("gh boom")):
+            assert github_ops.get_branch_patch_id("acme/api", "main", "feature") is None
