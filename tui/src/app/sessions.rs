@@ -759,6 +759,183 @@ impl CoordApp {
         true
     }
 
+    /// #1500: "Mark ready" — stage the selected New row into
+    /// In-progress:`ready` by setting `status:queued`, with no dispatch. On
+    /// an epic row this fans out to the epic itself plus every non-Done
+    /// child (`epic_child_kept_in_progress` — the same "still worth
+    /// showing under In-progress" filter the nested-child renderer already
+    /// applies), so the whole epic renders together with its remaining
+    /// children badged `ready`.
+    pub(crate) fn mark_selected_ready(&mut self) -> bool {
+        let Some(idx) = self.pipeline_sel else {
+            return false;
+        };
+        let Some(issue) = self.pipeline_issues.get(idx).cloned() else {
+            return false;
+        };
+        let Some(coord_repo) = issue.coord_repo.clone() else {
+            return false;
+        };
+        let mut targets = vec![issue.number];
+        if self.epic_children_for(&issue).is_some() {
+            let rows = self.epic_child_rows_for(&coord_repo, issue.number);
+            targets.extend(
+                rows.iter()
+                    .filter(|r| Self::epic_child_kept_in_progress(r))
+                    .map(|r| r.number),
+            );
+        }
+        let handled = self.apply_staging_label_change(&coord_repo, &targets, "queue", "Mark ready");
+        if handled {
+            self.maybe_kick_pipeline_loader();
+        }
+        handled
+    }
+
+    /// #1500: "Unmark ready" — the reverse of "Mark ready": strips
+    /// `status:queued` from the selected row, returning it to New. On an
+    /// epic row this also strips the label from every child that currently
+    /// carries it (not just the non-Done ones — clearing the marker
+    /// everywhere it was set is what makes "returns to New" actually true;
+    /// a `status:queued` child left behind would keep the epic classified
+    /// as In-progress via `epic_lifecycle_section`'s own-or-child check).
+    pub(crate) fn unmark_selected_ready(&mut self) -> bool {
+        let Some(idx) = self.pipeline_sel else {
+            return false;
+        };
+        let Some(issue) = self.pipeline_issues.get(idx).cloned() else {
+            return false;
+        };
+        let Some(coord_repo) = issue.coord_repo.clone() else {
+            return false;
+        };
+        let mut targets = vec![issue.number];
+        if let Some(children) = self.epic_children_for(&issue) {
+            targets.extend(self.queued_child_numbers(&coord_repo, children));
+        }
+        let handled =
+            self.apply_staging_label_change(&coord_repo, &targets, "unqueue", "Unmark ready");
+        if handled {
+            self.maybe_kick_pipeline_loader();
+        }
+        handled
+    }
+
+    /// #1500: shared batch label-change core for "Mark ready" / "Unmark
+    /// ready". `issue_numbers` is the epic + non-Done-children fan-out (or
+    /// a single-element slice for a plain issue).
+    ///
+    /// Prefers the direct `apply_issue_labels_remote` POST seam (#1012) —
+    /// issued once per target — over N serial `coord <subcommand>`
+    /// subprocesses, so a multi-issue epic batch completes as one
+    /// operation instead of trickling through the command queue. Emits
+    /// exactly ONE toast summarizing the whole batch and explicitly calls
+    /// out any target that failed rather than silently applying a partial
+    /// batch. Falls back to queuing one `coord <subcommand>` subprocess per
+    /// target when no board service is configured.
+    ///
+    /// `subcommand` must be one `label_change_for_subcommand` recognizes
+    /// (`"queue"` / `"unqueue"`) — the add/remove label sets come from that
+    /// shared table rather than being passed in separately, so this can
+    /// never drift from the Python `coord queue`/`coord unqueue` label sets
+    /// acceptance-tested against it.
+    fn apply_staging_label_change(
+        &mut self,
+        coord_repo: &str,
+        issue_numbers: &[u64],
+        subcommand: &'static str,
+        toast_title: &str,
+    ) -> bool {
+        let Some(&first) = issue_numbers.first() else {
+            return false;
+        };
+        let Some((add, remove)) = label_change_for_subcommand(subcommand) else {
+            return false;
+        };
+        if let Some((url, token)) = resolve_board_service() {
+            let repo_github = self
+                .data
+                .pipeline_repos
+                .iter()
+                .find(|(name, _)| name == coord_repo)
+                .map(|(_, gh)| gh.as_str());
+            let mut changed = 0usize;
+            let mut failed: Vec<(u64, String)> = Vec::new();
+            for &num in issue_numbers {
+                match apply_issue_labels_remote(
+                    &url,
+                    token.as_deref(),
+                    coord_repo,
+                    num,
+                    add,
+                    remove,
+                    repo_github,
+                ) {
+                    Ok((_labels, did_change)) => {
+                        if did_change {
+                            changed += 1;
+                        }
+                    }
+                    Err(e) => failed.push((num, e)),
+                }
+            }
+            let total = issue_numbers.len();
+            if failed.is_empty() {
+                let body = if total == 1 {
+                    format!(
+                        "#{}: {}.",
+                        first,
+                        if changed > 0 {
+                            "updated"
+                        } else {
+                            "no change (already set)"
+                        }
+                    )
+                } else {
+                    format!(
+                        "#{} + {} child issue(s): {} updated, {} already set.",
+                        first,
+                        total - 1,
+                        changed,
+                        total - changed
+                    )
+                };
+                self.push_toast(toast_title, &body, ToastSeverity::Success);
+            } else {
+                let failed_list = failed
+                    .iter()
+                    .map(|(n, e)| format!("#{} ({})", n, e))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let body = format!(
+                    "{}/{} updated; {} failed: {}",
+                    changed,
+                    total,
+                    failed.len(),
+                    failed_list
+                );
+                self.push_toast(toast_title, &body, ToastSeverity::Error);
+            }
+        } else {
+            for &num in issue_numbers {
+                let num_str = num.to_string();
+                let _ = self.command_runner.spawn_queued(&[subcommand, coord_repo, &num_str]);
+            }
+            let body = if issue_numbers.len() == 1 {
+                format!("#{}: queued `coord {}`…", first, subcommand)
+            } else {
+                format!(
+                    "#{} + {} child issue(s): queued `coord {}`…",
+                    first,
+                    issue_numbers.len() - 1,
+                    subcommand
+                )
+            };
+            self.push_toast(toast_title, &body, ToastSeverity::Info);
+        }
+        true
+    }
+
     /// #685: confirm the test-mode choice dialog.
     ///
     /// 1. Queues `coord set-test-mode <repo_slug> <issue> <mode>` to persist

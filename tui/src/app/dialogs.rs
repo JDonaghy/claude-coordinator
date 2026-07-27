@@ -811,6 +811,31 @@ impl CoordApp {
         }
         match lifecycle {
             PipelineRowLifecycle::New => {
+                // #1500: "Mark ready" stages the row into In-progress:`ready`
+                // by setting `status:queued` — display + intent only, no
+                // dispatch. An epic row (`epic_children_for` resolves) names
+                // the non-Done child count in the label, matching exactly
+                // what clicking it will fan the label change out to
+                // (`mark_selected_ready`) — so the label never promises a
+                // count the action doesn't deliver.
+                let mut epic_ready_count: Option<usize> = None;
+                if let Some(iss) = epic_issue {
+                    if let Some(repo) = iss.coord_repo.as_deref() {
+                        if self.epic_children_for(iss).is_some() {
+                            let rows = self.epic_child_rows_for(repo, iss.number);
+                            epic_ready_count = Some(
+                                rows.iter()
+                                    .filter(|r| Self::epic_child_kept_in_progress(r))
+                                    .count(),
+                            );
+                        }
+                    }
+                }
+                let mark_ready_label = match epic_ready_count {
+                    Some(n) if n > 0 => format!("Mark ready (epic + {} children)", n),
+                    _ => "Mark ready".to_string(),
+                };
+                items.push(ContextMenuItem::action("mark-ready", &mark_ready_label));
                 // #266: Drop a not-yet-started pipeline item back to Backlog
                 // (strips `status:ready`).  Always enabled for New — no work
                 // has been dispatched, so there is nothing to interrupt.
@@ -844,6 +869,23 @@ impl CoordApp {
                     "diagnose-fix-stage",
                     "Diagnose & fix stage…",
                 ));
+                // #1500: "Unmark ready" reverses "Mark ready" — strips
+                // `status:queued`, returning the row to New. Only offered
+                // when the row actually got here via that marker (an
+                // ordinary in-progress row with real work has nothing to
+                // "unmark"), and — same guard as "Drop to backlog" below —
+                // never once real work exists, so a live/completed session
+                // can't be silently un-staged out from under it.
+                let has_real_progress = issue_number
+                    .map(|n| self.issue_has_live_session(n))
+                    .unwrap_or(false)
+                    || self.selected_issue_has_work_progress();
+                let is_staged = epic_issue
+                    .map(|iss| self.pipeline_issue_is_queued(iss))
+                    .unwrap_or(false);
+                if is_staged && !has_real_progress {
+                    items.push(ContextMenuItem::action("unmark-ready", "Unmark ready"));
+                }
                 // #266: Drop an In-progress *idle* item back to Backlog (strips
                 // `status:ready`).  Disabled when (a) a live session is attached
                 // — a row whose work is actively running must not be yanked out
@@ -853,10 +895,7 @@ impl CoordApp {
                 // scoping chats or *failed* attempts stay droppable.
                 let mut drop_item =
                     ContextMenuItem::action("drop-to-backlog", "Drop to backlog");
-                drop_item.disabled = issue_number
-                    .map(|n| self.issue_has_live_session(n))
-                    .unwrap_or(false)
-                    || self.selected_issue_has_work_progress();
+                drop_item.disabled = has_real_progress;
                 items.push(drop_item);
                 items.push(ContextMenuItem::separator());
             }
@@ -5946,6 +5985,33 @@ impl CoordApp {
                 "Drop to Refining",
                 "#{}: tagging status:refining…",
             ),
+            // #1500: "Mark ready" — stage the selected New row (or epic +
+            // non-Done children) into In-progress:`ready` via `status:queued`.
+            // No dispatch — pure display + intent.
+            "mark-ready" => {
+                let ok = self.mark_selected_ready();
+                if !ok {
+                    self.push_toast(
+                        "Mark ready",
+                        "No issue selected or no repo mapping found.",
+                        ToastSeverity::Warning,
+                    );
+                }
+                ok
+            }
+            // #1500: "Unmark ready" — the reverse: strips `status:queued`
+            // (epic + any queued children too), returning the row to New.
+            "unmark-ready" => {
+                let ok = self.unmark_selected_ready();
+                if !ok {
+                    self.push_toast(
+                        "Unmark ready",
+                        "No issue selected or no repo mapping found.",
+                        ToastSeverity::Warning,
+                    );
+                }
+                ok
+            }
             // #262: Start with Plan — dispatches a `type="plan"` worker
             // first.  Reuses the existing Pipeline-stage dispatcher so
             // the click + the [Go] button on the stage strip share one

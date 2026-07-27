@@ -541,8 +541,13 @@ def untrack(repo: str, issue: int, config_path: Path) -> None:
     _apply_label_change(
         repo, issue, config_path,
         add=set(),
+        # #1500: also strip `status:queued` (see `backlog`'s identical
+        # note) — dropping a staged card out of the Pipeline entirely must
+        # not leave the marker behind to silently re-surface on a later
+        # `coord track`.
         remove_if_present={
             "coord", "status:ready", "status:refining", "status:backlog",
+            "status:queued",
         },
         success_message=f"#{issue} ({slug}) dropped to Backlog (removed from Pipeline)",
         no_op_message=f"#{issue} ({slug}) not in the Pipeline (no coord label)",
@@ -573,7 +578,70 @@ def backlog(repo: str, issue: int, config_path: Path) -> None:
     _apply_label_change(
         repo, issue, config_path,
         add=set(),
-        remove_if_present={"status:refining", "status:ready"},
+        # #1500: also strip `status:queued` — an issue staged as "ready"
+        # (via `coord queue` / the TUI's "Mark ready") that gets dropped
+        # back to Backlog must not carry the marker back in with it; a
+        # stale `status:queued` would silently re-surface it as
+        # In-progress:ready the moment it's re-tracked into the Pipeline.
+        remove_if_present={"status:refining", "status:ready", "status:queued"},
         success_message=f"#{issue} ({slug}) dropped to Backlog",
         no_op_message=f"#{issue} ({slug}) already in Backlog (no status:* label)",
+    )
+
+
+@click.command(
+    help=(
+        "Stage a Pipeline issue as \"next up\" by tagging it with "
+        "`status:queued` — moves a Pipeline:New card into "
+        "In-progress:`ready` with no dispatch (display + intent only).\n\n"
+        "Deliberately a separate label from `status:ready`: that one is "
+        "already applied automatically by `coord track` / the refinement "
+        "finalize step for every issue sent to the Pipeline, so it carries "
+        "no \"an operator specifically staged this\" signal.\n\n"
+        "REPO is the local repo name from coordinator.yml; ISSUE is the "
+        "GH issue number."
+    )
+)
+@click.argument("repo")
+@click.argument("issue", type=int)
+@_CONFIG_OPTION
+def queue(repo: str, issue: int, config_path: Path) -> None:
+    """#1500: TUI right-click 'Mark ready' fires this command to stage a
+    Pipeline:New issue (or an epic + its non-Done children, one call per
+    issue) into In-progress:`ready`."""
+    cfg = _load_config(config_path)
+    repo_entry = cfg.repo(repo)
+    slug = repo_entry.github if repo_entry else repo
+    _apply_label_change(
+        repo, issue, config_path,
+        add={"status:queued"},
+        remove_if_present=set(),
+        success_message=f"#{issue} ({slug}) marked ready (status:queued)",
+        no_op_message=f"#{issue} ({slug}) already marked ready (status:queued present)",
+    )
+
+
+@click.command(
+    help=(
+        "Reverse of `coord queue` — removes `status:queued`, returning an "
+        "In-progress:`ready` card to Pipeline:New.\n\n"
+        "REPO is the local repo name from coordinator.yml; ISSUE is the "
+        "GH issue number."
+    )
+)
+@click.argument("repo")
+@click.argument("issue", type=int)
+@_CONFIG_OPTION
+def unqueue(repo: str, issue: int, config_path: Path) -> None:
+    """#1500: TUI right-click 'Unmark ready' fires this command to strip
+    `status:queued`, returning the issue to Pipeline:New."""
+    cfg = _load_config(config_path)
+    repo_entry = cfg.repo(repo)
+    slug = repo_entry.github if repo_entry else repo
+    _apply_label_change(
+        repo, issue, config_path,
+        add=set(),
+        remove_if_present={"status:queued"},
+        success_message=f"#{issue} ({slug}) unmarked ready (status:queued removed)",
+        no_op_message=f"#{issue} ({slug}) not marked ready (no status:queued label)",
     )

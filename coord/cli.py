@@ -105,8 +105,10 @@ from coord.commands.issues import (
     backlog,
     context_group,
     issue_group,
+    queue,
     sync,
     track,
+    unqueue,
     untrack,
 )
 from coord.commands.drive import drive, drive_attach, drive_sessions, drive_stop
@@ -350,6 +352,8 @@ main.add_command(fix_briefing_cmd)
 main.add_command(track)
 main.add_command(untrack)
 main.add_command(backlog)
+main.add_command(queue)
+main.add_command(unqueue)
 main.add_command(set_test_mode)
 main.add_command(notify)
 main.add_command(post_pending_reviews)

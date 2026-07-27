@@ -1754,12 +1754,15 @@ pub(crate) fn record_test_verdict_remote(
 /// #1012: (add, remove) label sets for each `dispatch_board_row_command`
 /// subcommand — the shared entry point behind the Board row-menu actions
 /// Refine, Send-to-Pipeline (`track`), Mark Refined (`ready`), and
-/// Drop-to-Backlog/Drop-to-Refining (`backlog`/`refine`). These mirror the
-/// Python `_apply_label_change` call sites **exactly**:
-/// `coord/commands/chat.py` (`ready`, `refine`) and
-/// `coord/commands/issues.py` (`track`, `backlog`). Any drift here silently
-/// desyncs the Rust direct-POST path from the `coord` CLI fallback, so keep
-/// these lists byte-for-byte in sync with those functions.
+/// Drop-to-Backlog/Drop-to-Refining (`backlog`/`refine`) — plus #1500's
+/// Pipeline row actions Mark ready / Unmark ready (`queue`/`unqueue`),
+/// consumed directly by `apply_staging_label_change` rather than through
+/// `dispatch_board_row_command`. These mirror the Python
+/// `_apply_label_change` call sites **exactly**: `coord/commands/chat.py`
+/// (`ready`, `refine`) and `coord/commands/issues.py` (`track`, `backlog`,
+/// `queue`, `unqueue`). Any drift here silently desyncs the Rust
+/// direct-POST path from the `coord` CLI fallback, so keep these lists
+/// byte-for-byte in sync with those functions.
 ///
 /// Returns `None` for a subcommand this seam doesn't know how to translate
 /// to a label change — the caller falls back to the `coord` subprocess for
@@ -1779,7 +1782,14 @@ pub(crate) fn label_change_for_subcommand(
             &["status:refining", "status:backlog"],
         )),
         // coord/commands/issues.py::backlog
-        "backlog" => Some((&[], &["status:refining", "status:ready"])),
+        "backlog" => Some((
+            &[],
+            &["status:refining", "status:ready", "status:queued"],
+        )),
+        // coord/commands/issues.py::queue (#1500 "Mark ready")
+        "queue" => Some((&["status:queued"], &[])),
+        // coord/commands/issues.py::unqueue (#1500 "Unmark ready")
+        "unqueue" => Some((&[], &["status:queued"])),
         _ => None,
     }
 }
