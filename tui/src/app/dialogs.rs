@@ -722,8 +722,11 @@ impl CoordApp {
                 // (coord dispatches every stage itself), unlike the
                 // single-stage items above. Flat, not nested, for visibility
                 // — this is the marquee one-click entry point the issue asks
-                // for. Only offered when `has_running`/`has_zombie`/
-                // `has_live_drive` are all false (this whole `else` branch).
+                // for. Only offered when `has_running`/`has_live_drive` are
+                // both false (this whole `else` branch) — like the "Start
+                // (automated)" parent item right above it, `has_zombie` does
+                // NOT gate this: it still appears alongside "Reattach to live
+                // session" when a zombie session exists.
                 items.push(ContextMenuItem::action("start-drive", "Drive (automated)"));
 
                 // #685: "Set test mode" — pick smoke vs auto policy for headless Work.

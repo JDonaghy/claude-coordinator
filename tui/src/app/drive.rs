@@ -532,6 +532,131 @@ mod tests {
         );
     }
 
+    /// #1398 review: the reviewer asked for a test that asserts "the
+    /// dispatched `coord drive ... --tmux` invocation (or the shell-typed
+    /// command line) for the right repo/issue" — `spawn_drive_shell` types
+    /// the launch line into a REAL PTY (no `CommandRunner` involved for
+    /// launch/attach, only for `confirm_kill_drive`), so the only way to
+    /// observe it is to read back what the shell echoes, same pattern as
+    /// `paste_to_pty_bracketed_when_mode_2004_enabled` /
+    /// `paste_to_detail_terminal_bracketed_when_mode_2004_enabled` in
+    /// `tests.rs`.
+    #[test]
+    #[cfg(unix)]
+    fn launch_drive_types_the_coord_drive_command_line_for_the_right_repo_and_issue() {
+        use std::time::{Duration, Instant};
+
+        fn poll_until(
+            sess: &mut quadraui::terminal_engine::TerminalSession,
+            max_ms: u64,
+            predicate: impl Fn(&quadraui::terminal_engine::TerminalSession) -> bool,
+        ) -> bool {
+            let start = Instant::now();
+            let limit = Duration::from_millis(max_ms);
+            while start.elapsed() < limit {
+                sess.poll();
+                if predicate(sess) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            false
+        }
+
+        let mut app = make_test_app(BoardData::default());
+        app.pipeline_issues = vec![pipeline_issue(42, Some("myrepo"))];
+        app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
+        app.detail_terminal_pending_dims.set(Some((80, 24)));
+
+        app.launch_drive_for_selected_issue();
+
+        let sess = app
+            .detail_terminal_sessions
+            .get_mut(&("acme/myrepo".to_string(), 42))
+            .expect("must spawn the per-issue terminal shell");
+
+        assert!(
+            poll_until(sess, 5_000, |s| s.screen_text().contains("coord drive")),
+            "the typed launch line must reach the shell's echoed screen; got:\n{}",
+            sess.screen_text()
+        );
+        let screen = sess.screen_text();
+        assert!(
+            screen.contains("myrepo"),
+            "must target the selected issue's repo; got:\n{screen}"
+        );
+        assert!(
+            screen.contains("42"),
+            "must target the selected issue's number; got:\n{screen}"
+        );
+        assert!(
+            screen.contains("--tmux"),
+            "launch must run detached inside tmux, not as a TUI child; got:\n{screen}"
+        );
+    }
+
+    /// Same as above for `attach_drive_for_selected_issue`: types `coord
+    /// drive-attach <repo> <issue>` (no `--tmux` — attach reuses the
+    /// already-running session).
+    #[test]
+    #[cfg(unix)]
+    fn attach_drive_types_the_coord_drive_attach_command_line_for_the_right_repo_and_issue() {
+        use std::time::{Duration, Instant};
+
+        fn poll_until(
+            sess: &mut quadraui::terminal_engine::TerminalSession,
+            max_ms: u64,
+            predicate: impl Fn(&quadraui::terminal_engine::TerminalSession) -> bool,
+        ) -> bool {
+            let start = Instant::now();
+            let limit = Duration::from_millis(max_ms);
+            while start.elapsed() < limit {
+                sess.poll();
+                if predicate(sess) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            false
+        }
+
+        let mut app = make_test_app(BoardData::default());
+        app.pipeline_issues = vec![pipeline_issue(42, Some("myrepo"))];
+        app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
+        app.detail_terminal_pending_dims.set(Some((80, 24)));
+        app.drive_sessions = vec![DriveSession {
+            repo: "myrepo".to_string(),
+            issue: 42,
+            attached: false,
+            pending: false,
+            pending_sweep_count: 0,
+        }];
+
+        app.attach_drive_for_selected_issue();
+
+        let sess = app
+            .detail_terminal_sessions
+            .get_mut(&("acme/myrepo".to_string(), 42))
+            .expect("must spawn the per-issue terminal shell");
+
+        assert!(
+            poll_until(sess, 5_000, |s| s.screen_text().contains("coord drive-attach")),
+            "the typed attach line must reach the shell's echoed screen; got:\n{}",
+            sess.screen_text()
+        );
+        let screen = sess.screen_text();
+        assert!(
+            screen.contains("myrepo"),
+            "must target the selected issue's repo; got:\n{screen}"
+        );
+        assert!(
+            screen.contains("42"),
+            "must target the selected issue's number; got:\n{screen}"
+        );
+    }
+
     #[test]
     fn launch_drive_for_selected_issue_refuses_when_already_driving() {
         let mut app = make_test_app(BoardData::default());
