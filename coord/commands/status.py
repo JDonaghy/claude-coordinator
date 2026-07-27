@@ -6,12 +6,63 @@ from __future__ import annotations
 import re
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import click
 
 from coord import __version__, github_ops
 
 from coord.commands._common import _CONFIG_OPTION, _load_config
+
+if TYPE_CHECKING:
+    from coord.config import Config
+
+
+def _live_advisory_entries(
+    entries: list[dict],
+    cfg: "Config",
+    *,
+    cache: dict | None = None,
+) -> list[dict]:
+    """Drop advisory entries (#448) whose work is already terminal on GitHub.
+
+    #1472: an advisory entry is agent-local state served verbatim from the
+    worker's own completed-assignment map on every ``/status`` poll — nothing
+    tells the agent the issue closed or the branch merged, so a genuinely
+    resolved advisory (e.g. rescued, reviewed, and merged by hand) keeps
+    showing "The work is UNVERIFIED — review it before testing or merging."
+    forever. That trains the operator to skim past the whole advisory block,
+    which is exactly where a real 0-commit rescue needs to be noticed.
+
+    Reuses the shared #522 chokepoint guard
+    (:func:`coord.github_ops.work_is_terminal` — "issue closed OR PR merged")
+    rather than a second ad hoc check. **Fail-open**: an entry whose repo
+    isn't in *cfg* (or has no ``github`` slug configured) is kept rather than
+    silently dropped — ``work_is_terminal`` itself already fails open on any
+    GitHub/CLI error. *cache* defaults to a dict scoped to this call so a
+    repeated ``(repo, issue, branch)`` triple across entries costs one ``gh``
+    round-trip, not one per entry — this list renders on every ``coord
+    status``.
+    """
+    if cache is None:
+        cache = {}
+    live = []
+    for e in entries:
+        spec = e.get("spec") or {}
+        repo_name = spec.get("repo_name")
+        repo_cfg = cfg.repo(repo_name) if repo_name else None
+        if repo_cfg is None or not repo_cfg.github:
+            live.append(e)
+            continue
+        if github_ops.work_is_terminal(
+            repo_cfg.github,
+            spec.get("issue_number"),
+            e.get("branch"),
+            cache=cache,
+        ):
+            continue
+        live.append(e)
+    return live
 
 
 @click.command(help="Show all machines, assignments, and connectivity.")
@@ -233,10 +284,23 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
     # operator knows they need attention without having to dig into logs.
     # Usage-limit kills are excluded — surfaced separately above, since they
     # are a wait condition rather than something needing human attention.
-    advisory_entries = [
-        e for e in agent_completed.values()
-        if e.get("status") == "advisory" and not e.get("usage_limit_reason")
-    ]
+    #
+    # #1472: an advisory entry is agent-local state — it lives in the
+    # worker's own completed-assignment map (`_COMPLETED_HISTORY_CAP` prunes
+    # it by *count*, not by GitHub outcome) — so it keeps being re-served
+    # here forever, even after the issue closes or the branch merges out
+    # from under it. Re-check terminal state on every render rather than
+    # trusting the agent to have cleared it.
+    #
+    # Both filters apply: #1461 drops usage-limit kills (a wait condition,
+    # shown above) and #1472 drops work that has since gone terminal.
+    advisory_entries = _live_advisory_entries(
+        [
+            e for e in agent_completed.values()
+            if e.get("status") == "advisory" and not e.get("usage_limit_reason")
+        ],
+        cfg,
+    )
     if advisory_entries:
         click.echo("")
         click.echo("⚠ Advisory (needs attention — worker exited cleanly with 0 commits):")
