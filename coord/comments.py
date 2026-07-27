@@ -416,6 +416,7 @@ _STALLED_REASON_LABELS = {
     "review_request_changes_no_fix": "Review requested changes, no fix dispatched",
     "done_no_review": "Work done, no review ever dispatched",
     "approved_not_queued": "Approved + tested, but not queued for merge",
+    "merge_conflict_unresolved": "Merge entry stuck in CONFLICT, no fix attempted",
 }
 
 
@@ -457,6 +458,51 @@ def format_stalled_pipeline(
         "again on its own; a human should look at `coord status` and "
         "decide whether to dispatch a fix/review manually or drop it with "
         "`coord backlog`.",
+    ]
+    return "\n".join(lines)
+
+
+def format_stalled_pipeline_dispatch(
+    *,
+    assignment_id: str,
+    repo_name: str,
+    issue_number: int,
+    reason: str,
+    action_kind: str,
+    action_detail: str,
+) -> str:
+    """Format the #1478 auto-dispatch outcome comment for a stalled row.
+
+    Posted INSTEAD OF :func:`format_stalled_pipeline`'s diagnostic-only
+    comment when ``pipeline.auto_dispatch_stalled`` is on and
+    ``coord.notify.dispatch_stalled_pipeline_action`` actually dispatched
+    something for this row — posting both would leave a directly
+    contradictory "nothing was dispatched automatically" comment sitting
+    right above this one on the same issue thread.
+    """
+    marker = _marker(
+        EVENT_STALLED,
+        assignment=assignment_id,
+        repo=repo_name,
+        reason=reason,
+        auto_dispatch=action_kind,
+    )
+    label = _STALLED_REASON_LABELS.get(reason, reason)
+    lines = [
+        marker,
+        "## ⚙️ Stalled pipeline row auto-dispatched",
+        f"**Assignment:** {assignment_id}",
+        f"**Issue:** #{issue_number}",
+        f"**Stall reason:** {label}",
+        f"**Action taken:** `{action_kind}`",
+        "",
+        action_detail.strip(),
+        "",
+        "The coordinator's stalled-pipeline sweep (#1478, "
+        "`pipeline.auto_dispatch_stalled`) dispatched the action the "
+        "original auto-loop transition would have taken. This is "
+        "best-effort automation — check `coord status` if the outcome "
+        "looks wrong.",
     ]
     return "\n".join(lines)
 

@@ -1156,6 +1156,46 @@ class TestPipelineConfigParsing:
         ):
             load(p)
 
+    def test_auto_dispatch_stalled_defaults_to_false(self, tmp_path) -> None:
+        """#1478: the stalled-pipeline sweeper's dispatch arm ships dark —
+        detection/narration (#1441) is unconditional; only the action is
+        gated, and it's opt-in."""
+        from coord.config import load
+
+        p = tmp_path / "coordinator.yml"
+        p.write_text(
+            "repos:\n  - name: api\n    github: acme/api\n"
+            "machines:\n  - name: laptop\n    host: laptop.tail\n    repos: [api]\n"
+        )
+        cfg = load(p)
+        assert cfg.pipeline.auto_dispatch_stalled is False
+
+    def test_can_enable_auto_dispatch_stalled(self, tmp_path) -> None:
+        from coord.config import load
+
+        p = tmp_path / "coordinator.yml"
+        p.write_text(
+            "repos:\n  - name: api\n    github: acme/api\n"
+            "machines:\n  - name: laptop\n    host: laptop.tail\n    repos: [api]\n"
+            "pipeline:\n  auto_dispatch_stalled: true\n"
+        )
+        cfg = load(p)
+        assert cfg.pipeline.auto_dispatch_stalled is True
+
+    def test_invalid_auto_dispatch_stalled_raises(self, tmp_path) -> None:
+        from coord.config import ConfigError, load
+
+        p = tmp_path / "coordinator.yml"
+        p.write_text(
+            "repos:\n  - name: api\n    github: acme/api\n"
+            "machines:\n  - name: laptop\n    host: laptop.tail\n    repos: [api]\n"
+            "pipeline:\n  auto_dispatch_stalled: maybe\n"
+        )
+        with pytest.raises(
+            ConfigError, match="pipeline.auto_dispatch_stalled must be a boolean"
+        ):
+            load(p)
+
 
 # ── Unit tests: Assignment.review_iteration persistence ─────────────────────
 

@@ -16,16 +16,17 @@ dispatch/kill/handoff, idempotent via the shared `notified` ledger.
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from coord import notify as notify_mod
 from coord import state as state_mod
+from coord.auto_loop import LoopAction
 from coord.comments import EVENT_STALLED, format_stalled_pipeline
 from coord.config import Config, PipelineConfig
 from coord.github_ops import work_is_terminal as _real_work_is_terminal
-from coord.merge_queue import PENDING, QueuedMerge
+from coord.merge_queue import CONFLICT, PENDING, QueuedMerge
 from coord.models import Assignment, Board, Machine, Repo
 
 
@@ -564,3 +565,335 @@ class TestNotifyCliSurfacesStalled:
         # misleading "nothing to do" message (the review's called-out
         # failure scenario).
         assert "No new transitions to notify." not in out
+
+
+# ── Candidate stall state 4: merge queue entry stuck CONFLICT (#1478) ──────
+
+
+class TestMergeConflictUnresolved:
+    def test_flags_rebaseable_conflict_with_no_prior_fix(self, config: Config) -> None:
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="approve"),
+        )
+        queued = [QueuedMerge(
+            assignment_id="work-1", repo_name="vimcode", repo_github="acme/vimcode",
+            branch="issue-602-fix", target_branch="main", issue_number=602,
+            issue_title="t", state=CONFLICT, error="could not be rebased onto main",
+        )]
+        results = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=queued
+        )
+        assert len(results) == 1
+        assert results[0][0].reason == "merge_conflict_unresolved"
+
+    def test_not_flagged_when_pending(self, config: Config) -> None:
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="approve"),
+        )
+        queued = [QueuedMerge(
+            assignment_id="work-1", repo_name="vimcode", repo_github="acme/vimcode",
+            branch="issue-602-fix", target_branch="main", issue_number=602,
+            issue_title="t", state=PENDING,
+        )]
+        results = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=queued
+        )
+        assert results == []
+
+    def test_not_flagged_when_conflict_is_not_rebaseable(self, config: Config) -> None:
+        """A permission/branch-protection error classifies as "human", not
+        "rebaseable" — #1474's own classify-and-dispatch step marks it
+        HUMAN_REQUIRED rather than retrying, so it isn't a stall a dispatch
+        arm should touch."""
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="approve"),
+        )
+        queued = [QueuedMerge(
+            assignment_id="work-1", repo_name="vimcode", repo_github="acme/vimcode",
+            branch="issue-602-fix", target_branch="main", issue_number=602,
+            issue_title="t", state=CONFLICT, error="required status check is missing",
+        )]
+        results = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=queued
+        )
+        assert results == []
+
+    def test_not_flagged_when_conflict_fix_already_active(self, config: Config) -> None:
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="approve"),
+            Assignment(
+                machine_name="mac-mini", repo_name="vimcode", issue_number=602,
+                issue_title="[conflict-fix] t", assignment_id="cf-1", status="running",
+                type="conflict-fix", review_of_assignment_id="work-1",
+            ),
+        )
+        queued = [QueuedMerge(
+            assignment_id="work-1", repo_name="vimcode", repo_github="acme/vimcode",
+            branch="issue-602-fix", target_branch="main", issue_number=602,
+            issue_title="t", state=CONFLICT, error="could not be rebased onto main",
+        )]
+        results = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=queued
+        )
+        assert results == []
+
+    def test_not_flagged_when_conflict_fix_retry_cap_hit(self, config: Config) -> None:
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="approve"),
+            Assignment(
+                machine_name="mac-mini", repo_name="vimcode", issue_number=602,
+                issue_title="[conflict-fix] t", assignment_id="cf-1", status="failed",
+                type="conflict-fix", review_of_assignment_id="work-1",
+            ),
+        )
+        queued = [QueuedMerge(
+            assignment_id="work-1", repo_name="vimcode", repo_github="acme/vimcode",
+            branch="issue-602-fix", target_branch="main", issue_number=602,
+            issue_title="t", state=CONFLICT, error="could not be rebased onto main",
+        )]
+        results = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=queued
+        )
+        assert results == []
+
+
+# ── #1478: the dispatch arm ─────────────────────────────────────────────────
+#
+# `dispatch_stalled_pipeline_action` reuses the SAME dispatch machinery the
+# on-time transition would have used for each reason — these tests assert
+# the routing (right reused call, right result), not the internals of the
+# reused function (already covered by test_auto_loop.py / test_review.py /
+# test_merge_queue.py / test_conflict_fix.py).
+
+
+class TestDispatchDisabledByDefault:
+    def test_dispatch_declines_when_flag_off(self, config: Config) -> None:
+        """`auto_dispatch_stalled` defaults to False — detection-only,
+        #1441's shipped behaviour, must be unchanged by default."""
+        assert config.pipeline.auto_dispatch_stalled is False
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="approve"),
+        )
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        )[0]
+
+        action = notify_mod.dispatch_stalled_pipeline_action(detection, work, board, config)
+
+        assert action.kind == "disabled"
+
+
+class TestDispatchPerReason:
+    def test_review_request_changes_no_fix_dispatches_fix(
+        self, config: Config, monkeypatch
+    ) -> None:
+        config.pipeline.auto_dispatch_stalled = True
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="request-changes"),
+        )
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        )[0]
+        assert detection.reason == "review_request_changes_no_fix"
+
+        stub = MagicMock(return_value=[
+            LoopAction(
+                kind="fix_dispatched", assignment_id="review-1",
+                detail="fix worker fix-9 dispatched to mac-mini (iteration 1/5)",
+            ),
+        ])
+        monkeypatch.setattr("coord.auto_loop.process_review_completion", stub)
+
+        action = notify_mod.dispatch_stalled_pipeline_action(detection, work, board, config)
+
+        assert action.kind == "fix_dispatch_attempted"
+        assert "fix_dispatched" in action.detail
+        stub.assert_called_once()
+
+    def test_done_no_review_dispatches_review(self, config: Config, monkeypatch) -> None:
+        config.pipeline.auto_dispatch_stalled = True
+        board = _board(_work("work-1", test_state="passed"))
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        )[0]
+        assert detection.reason == "done_no_review"
+
+        new_review = _review("work-1", aid="review-99", status="pending")
+        stub = MagicMock(return_value=new_review)
+        monkeypatch.setattr("coord.review.dispatch_review", stub)
+
+        action = notify_mod.dispatch_stalled_pipeline_action(detection, work, board, config)
+
+        assert action.kind == "review_dispatched"
+        assert "review-99" in action.detail
+        stub.assert_called_once()
+
+    def test_approved_not_queued_enqueues(self, config: Config, monkeypatch) -> None:
+        config.pipeline.auto_dispatch_stalled = True
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="approve"),
+        )
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        )[0]
+        assert detection.reason == "approved_not_queued"
+
+        stub = MagicMock(return_value=["work-1"])
+        monkeypatch.setattr("coord.merge_queue.enqueue_approved_work", stub)
+
+        action = notify_mod.dispatch_stalled_pipeline_action(detection, work, board, config)
+
+        assert action.kind == "enqueued"
+        stub.assert_called_once_with(config, board)
+
+    def test_merge_conflict_unresolved_dispatches_conflict_fix(
+        self, config: Config, monkeypatch
+    ) -> None:
+        config.pipeline.auto_dispatch_stalled = True
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="approve"),
+        )
+        queued = [QueuedMerge(
+            assignment_id="work-1", repo_name="vimcode", repo_github="acme/vimcode",
+            branch="issue-602-fix", target_branch="main", issue_number=602,
+            issue_title="t", state=CONFLICT, error="could not be rebased onto main",
+        )]
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=queued
+        )[0]
+        assert detection.reason == "merge_conflict_unresolved"
+
+        fix_assignment = Assignment(
+            machine_name="mac-mini", repo_name="vimcode", issue_number=602,
+            issue_title="[conflict-fix] t", assignment_id="cf-1", status="pending",
+            type="conflict-fix",
+        )
+        stub = MagicMock(return_value=fix_assignment)
+        monkeypatch.setattr("coord.conflict_fix.dispatch_conflict_fix", stub)
+        monkeypatch.setattr("coord.merge_queue.load_queue", lambda: queued)
+
+        action = notify_mod.dispatch_stalled_pipeline_action(detection, work, board, config)
+
+        assert action.kind == "conflict_fix_dispatched"
+        assert "cf-1" in action.detail
+        stub.assert_called_once()
+
+
+class TestLiveSessionGuard:
+    def test_dispatch_skipped_when_live_session_active(
+        self, config: Config, monkeypatch
+    ) -> None:
+        """#602: never act on a row with a live (running/pending) session
+        for the same (repo, issue) — an interactive smoke/fix/review
+        session may be mid-flight and racing an auto-dispatch would
+        duplicate or clobber it. `smoke` isn't a WORK_LIKE_TYPES type, so it
+        doesn't change which assignment `_pipeline_heads` treats as the
+        stalled row — it's purely a live-session signal."""
+        config.pipeline.auto_dispatch_stalled = True
+        work = _work("work-1", test_state="passed")
+        review = _review("work-1", aid="review-1", review_verdict="approve")
+        live_session = Assignment(
+            machine_name="mac-mini", repo_name="vimcode", issue_number=602,
+            issue_title="interactive smoke", assignment_id="smoke-live",
+            status="running", type="smoke",
+        )
+        board = Board(active=[live_session], completed=[work, review])
+
+        detections = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        )
+        assert len(detections) == 1
+        detection, work_row = detections[0]
+        assert detection.reason == "approved_not_queued"
+
+        stub = MagicMock(return_value=["work-1"])
+        monkeypatch.setattr("coord.merge_queue.enqueue_approved_work", stub)
+
+        action = notify_mod.dispatch_stalled_pipeline_action(
+            detection, work_row, board, config
+        )
+
+        assert action.kind == "skipped_live_session"
+        stub.assert_not_called()
+
+
+class TestSweepStalledPipeline:
+    """Integration-level tests for `_sweep_stalled_pipeline` — the function
+    `run()` calls, wiring detection + post + dispatch + the one-shot ledger
+    together."""
+
+    def test_dispatches_once_and_marks_notified(
+        self, config: Config, coord_db, monkeypatch
+    ) -> None:
+        config.pipeline.auto_dispatch_stalled = True
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="approve"),
+        )
+        state_mod.save_board(board)
+
+        stub = MagicMock(return_value=["work-1"])
+        monkeypatch.setattr("coord.merge_queue.enqueue_approved_work", stub)
+
+        with patch("coord.notify.github_ops.post_issue_comment") as mock_post:
+            first = notify_mod._sweep_stalled_pipeline(config, terminal_cache={})
+
+        assert len(first) == 1
+        assert first[0].reason == "approved_not_queued"
+        stub.assert_called_once()
+        mock_post.assert_called_once()
+        args, _kwargs = mock_post.call_args
+        assert "auto-dispatched" in args[2].lower()
+
+        notified = state_mod.load_notified()
+        assert "work-1:stalled" in notified
+
+    def test_second_tick_does_not_redispatch(
+        self, config: Config, coord_db, monkeypatch
+    ) -> None:
+        config.pipeline.auto_dispatch_stalled = True
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="approve"),
+        )
+        state_mod.save_board(board)
+
+        stub = MagicMock(return_value=["work-1"])
+        monkeypatch.setattr("coord.merge_queue.enqueue_approved_work", stub)
+
+        with patch("coord.notify.github_ops.post_issue_comment"):
+            first = notify_mod._sweep_stalled_pipeline(config, terminal_cache={})
+            second = notify_mod._sweep_stalled_pipeline(config, terminal_cache={})
+
+        assert len(first) == 1
+        assert second == []
+        stub.assert_called_once()
+
+    def test_no_dispatch_when_flag_off_default_behaviour_unchanged(
+        self, config: Config, coord_db, monkeypatch
+    ) -> None:
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="approve"),
+        )
+        state_mod.save_board(board)
+
+        stub = MagicMock(return_value=["work-1"])
+        monkeypatch.setattr("coord.merge_queue.enqueue_approved_work", stub)
+
+        with patch("coord.notify.github_ops.post_issue_comment") as mock_post:
+            posted = notify_mod._sweep_stalled_pipeline(config, terminal_cache={})
+
+        assert len(posted) == 1
+        stub.assert_not_called()
+        args, _kwargs = mock_post.call_args
+        assert "nothing was dispatched automatically" in args[2].lower()
