@@ -11,6 +11,21 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify tag is on main
+        # #1471: main is a protected branch, so `git push origin main` can be
+        # rejected while a subsequent `git push origin vX.Y.Z` still succeeds
+        # (they are independent refs). Refuse to publish from a tag whose
+        # commit never actually landed on main — PyPI releases are immutable,
+        # so failing here is far cheaper than a bad publish.
+        run: |
+          git fetch origin main
+          tagged_commit="${{ github.sha }}"
+          if ! git merge-base --is-ancestor "$tagged_commit" origin/main; then
+            echo "::error::Tag ${{ github.ref_name }} points at commit $tagged_commit, which is not an ancestor of origin/main. This tag was likely pushed from a local commit that main's branch protection rejected. Refusing to publish — merge the commit to main first, then re-tag it."
+            exit 1
+          fi
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

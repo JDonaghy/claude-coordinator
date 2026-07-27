@@ -113,6 +113,7 @@ from coord.commands.drive import drive, drive_attach, drive_sessions, drive_stop
 from coord.commands.lifecycle import done, housekeeping, notify, resume, serve, web
 from coord.commands.milestone import milestone_group
 from coord.commands.plans import plans_cmd
+from coord.commands.release import release_preflight
 from coord.commands.plan_followup import (
     _dispatch_followup,  # noqa: F401 — re-exported for tests
     approve_plan,
@@ -379,3 +380,4 @@ main.add_command(reject_plan)
 main.add_command(resume_stuck)
 main.add_command(install_skills)
 main.add_command(acceptance_group)
+main.add_command(release_preflight)
