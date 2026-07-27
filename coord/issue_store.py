@@ -195,6 +195,7 @@ def _update_local_state(
     terminal_status: str,
     branch: str | None,
     review_state: str | None,
+    failure_reason: str | None = None,
 ) -> None:
     """Update the local assignments row + notifications ledger.
 
@@ -202,6 +203,13 @@ def _update_local_state(
     ``coord.state`` or the DB directly — keeps the seam clean for the
     future :issue:`183` refactor (which will likely replace this with
     an :class:`IssueStore` write).
+
+    ``failure_reason`` (#1461) is optional and, when given, is written
+    verbatim — currently only used to stamp a usage-limit-kill diagnostic
+    (see ``coord.worker_events.format_usage_limit_reason``) onto the row so
+    ``coord status`` and ``coord drive`` can recognise it without re-parsing
+    the worker log themselves. It never forces or implies a particular
+    ``terminal_status`` — the caller decides that independently.
     """
     # Import inside the function so test fixtures that stub the seam can
     # still import this module without dragging in the DB layer.
@@ -219,6 +227,9 @@ def _update_local_state(
     if review_state is not None:
         fields.append("review_state=?")
         params.append(review_state)
+    if failure_reason is not None:
+        fields.append("failure_reason=?")
+        params.append(failure_reason[:512])  # cap at 512 chars — one-liner
     params.append(assignment_id)
     conn.execute(
         f"UPDATE assignments SET {', '.join(fields)} WHERE assignment_id=?",

@@ -1792,6 +1792,18 @@ class AgentAssignment:
     # same message so the board, `coord status` and the GitHub advisory comment
     # all stop claiming "0 commits pushed" when work was in fact rescued.
     dirty_worktree_reason: str | None = None
+    # #1461: set when the worker's transcript shows it was killed by hitting
+    # the account's Max/Pro *session* usage limit rather than crashing on a
+    # real defect — see coord.worker_events.detect_usage_limit_kill_in_log.
+    # Formatted with coord.worker_events.format_usage_limit_reason (stable
+    # "usage limit — resets <time>" prefix). None on every other outcome.
+    # Set regardless of whether `_reap` landed on FAILED or ADVISORY — a kill
+    # has been observed producing either, depending on whether the CLI ended
+    # the turn before or after committing.  The coordinator (reconcile.py)
+    # reads this live field and stamps it onto the board's persisted
+    # `failure_reason` column so `coord status` and `coord drive` (#1392) can
+    # both recognise it without re-parsing the log themselves.
+    usage_limit_reason: str | None = None
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -4898,6 +4910,40 @@ class AgentServer:
         )
         log_fh.close()
 
+        # #1461: detect a usage-limit kill from the tail of the transcript.
+        # Done HERE — immediately after the worker's own process has exited
+        # and BEFORE any coordinator bookkeeping (push attempts, advisory
+        # diagnostics, etc.) appends its own lines to the same log file —
+        # so the "last line" the detector sees is genuinely the worker's own
+        # last line, never a later git-error/comment the coordinator wrote.
+        # Also gated on the log lacking its own terminating `result` event
+        # (the same `_log_has_result_fn` used by the wait loop above) so this
+        # can NEVER fire on a normal completion that merely *discusses* usage
+        # limits somewhere mid-conversation (this very issue's own worker
+        # transcript, for instance) — a real kill truncates before any
+        # `result` line, whereas every normal DONE/ADVISORY transcript ends
+        # with one.
+        _usage_limit_reason: str | None = None
+        if not _log_has_result_fn(log_path):
+            try:
+                from coord.worker_events import (  # noqa: PLC0415
+                    detect_usage_limit_kill_in_log,
+                    format_usage_limit_reason,
+                )
+                _kill = detect_usage_limit_kill_in_log(log_path)
+                if _kill is not None:
+                    _usage_limit_reason = format_usage_limit_reason(_kill)
+                    try:
+                        with open(log_path, "a") as reopen:
+                            reopen.write(
+                                "# reap: usage-limit kill detected — "
+                                f"{_usage_limit_reason} (#1461)\n"
+                            )
+                    except OSError:
+                        pass
+            except Exception:  # noqa: BLE001 — best-effort, never break reap
+                pass
+
         # Capture the branch the worker left the repo on. For worktree-based
         # assignments we read from the worktree; for legacy assignments (no
         # worktree_path) we fall back to the main repo clone.
@@ -5002,6 +5048,12 @@ class AgentServer:
                         assignment.status = DONE
                 else:
                     assignment.status = FAILED
+                # #1461: only ever attaches to a FAILED/ADVISORY transition
+                # (the `not _log_has_result_fn` gate above already excludes
+                # DONE in practice; this is defense in depth).
+                if (_usage_limit_reason is not None
+                        and assignment.status in (FAILED, ADVISORY)):
+                    assignment.usage_limit_reason = _usage_limit_reason
             self._processes.pop(assignment_id, None)
 
         # #315/#324: parse the log for the worker's claude session_id (from the

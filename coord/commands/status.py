@@ -181,16 +181,61 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
                     a.assignment_id,
                     finished_at=entry.get("finished_at"),
                 )
+            # #1461: stamp a usage-limit-kill diagnostic (if the agent
+            # flagged one — AgentServer._reap, agent.py) onto the persisted
+            # `failure_reason` column. Routed through the already-daemon-aware
+            # `set_assignment_failure_reason` (#618) rather than a raw
+            # get_connection() write — `coord status` is thin-client
+            # reachable, and a raw local write would silently land on the
+            # thin client's empty local DB instead of the daemon's (the same
+            # #906 audit gap `get_issue_test_mode` was fixed for). This also
+            # normalises status to 'failed' even when the branch above set
+            # 'advisory' — a usage-limit kill is the one terminal state known
+            # safe to re-dispatch unchanged (drive.py's FAILED bucket),
+            # mirrors coord.reconcile._record_usage_limit_reason exactly.
+            usage_limit_reason = entry.get("usage_limit_reason")
+            if usage_limit_reason and a.assignment_id:
+                try:
+                    from coord.state import set_assignment_failure_reason
+
+                    set_assignment_failure_reason(a.assignment_id, usage_limit_reason)
+                except Exception:  # noqa: BLE001 — diagnostic only
+                    pass
             reconciled += 1
         if reconciled:
             write_board(board)
             click.echo(f"\n  (reconciled {reconciled} assignment(s) from live agent data)")
 
+    # #1461: surface usage-limit kills as a distinct fleet-level condition —
+    # a known-safe-to-retry-once-reset wait, not a defect. Shown ahead of (and
+    # excluded from) the Advisory/plain-failure buckets below so a confusing
+    # evening reads as "3 killed by the usage limit, resets 8:30pm" instead of
+    # N unrelated-looking advisory/failed rows.
+    usage_limit_entries = [
+        e for e in agent_completed.values()
+        if e.get("usage_limit_reason")
+    ]
+    if usage_limit_entries:
+        click.echo("")
+        click.echo(
+            "⏳ Usage limit (worker killed by the account's usage limit — "
+            "safe to retry unchanged once reset):"
+        )
+        for e in usage_limit_entries:
+            spec = e.get("spec", {})
+            click.echo(
+                f"  #{spec.get('issue_number', '?')}: "
+                f"{spec.get('issue_title', '?')} "
+                f"[{spec.get('repo_name', '?')}]  — {e['usage_limit_reason']}"
+            )
+
     # #448: surface advisory assignments (0 commits, clean exit) so the
     # operator knows they need attention without having to dig into logs.
+    # Usage-limit kills are excluded — surfaced separately above, since they
+    # are a wait condition rather than something needing human attention.
     advisory_entries = [
         e for e in agent_completed.values()
-        if e.get("status") == "advisory"
+        if e.get("status") == "advisory" and not e.get("usage_limit_reason")
     ]
     if advisory_entries:
         click.echo("")

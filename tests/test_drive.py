@@ -256,6 +256,57 @@ def test_failed_work_retries_through_the_cli_then_stops_at_the_cap():
     assert "boom" in second.message
 
 
+def test_usage_limit_kill_waits_instead_of_retrying_or_dying():
+    """#1461: a usage-limit kill must WAIT (not retry, not die/escalate) —
+    retrying before the reset just burns the same exhausted budget and fails
+    again for no diagnostic reason. Must not consume the retry budget."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_work_retries=1)
+    s = state(
+        work_aid="w1", work_status="failed",
+        work_failure_reason="usage limit — resets 8:30pm (America/Chicago)",
+    )
+    action = step(s, opts, counters=counters)
+    assert action.kind == WAIT
+    assert counters.work_retries == 0
+    assert any("usage-limit" in w for w in action.warnings)
+    assert "8:30pm (America/Chicago)" in action.warnings[0]
+
+    # And it keeps waiting — never escalates into the retry-cap die either,
+    # even across repeated polls.
+    action2 = step(s, opts, counters=counters)
+    assert action2.kind == WAIT
+    assert counters.work_retries == 0
+
+
+def test_usage_limit_kill_on_advisory_also_waits():
+    """A kill has been observed landing ADVISORY (clean exit, 0 commits) just
+    as often as FAILED — must be recognised regardless of which terminal
+    status the agent's own reap chose."""
+    action = step(
+        state(
+            work_aid="w1", work_status="advisory",
+            work_failure_reason="usage limit — resets 8:30pm (America/Chicago)",
+        ),
+        verifier=FakeVerifier(has_commits=False),
+    )
+    assert action.kind == WAIT
+
+
+def test_normal_advisory_failure_reason_is_not_mistaken_for_a_usage_limit():
+    """A failure_reason that doesn't carry the exact stamped prefix must fall
+    through to the ordinary retry-or-die path unchanged."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_work_retries=1)
+    s = state(
+        work_aid="w1", work_status="failed",
+        work_failure_reason="usage limit exceeded on some unrelated API call",
+    )
+    action = step(s, opts, counters=counters)
+    assert action.command == ("retry", "w1")
+    assert counters.work_retries == 1
+
+
 def test_cancelled_work_is_terminal_and_says_how_to_re_dispatch():
     action = step(state(work_aid="w1", work_status="cancelled"))
     assert action.is_exit

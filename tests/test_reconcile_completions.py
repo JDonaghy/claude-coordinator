@@ -43,13 +43,17 @@ class _Recorder:
     def __init__(self) -> None:
         self.calls: list[dict] = []
 
-    def __call__(self, *, assignment_id, terminal_status, branch, review_state) -> None:
+    def __call__(
+        self, *, assignment_id, terminal_status, branch, review_state,
+        failure_reason=None,
+    ) -> None:
         self.calls.append(
             {
                 "assignment_id": assignment_id,
                 "terminal_status": terminal_status,
                 "branch": branch,
                 "review_state": review_state,
+                "failure_reason": failure_reason,
             }
         )
 
@@ -68,7 +72,7 @@ def test_flips_running_to_done_when_agent_reports_completed() -> None:
     assert out[0]["issue_number"] == 411
     assert rec.calls == [
         {"assignment_id": "w1", "terminal_status": "done",
-         "branch": "issue-1-x", "review_state": None}
+         "branch": "issue-1-x", "review_state": None, "failure_reason": None}
     ]
 
 
@@ -108,6 +112,50 @@ def test_maps_failed_and_advisory() -> None:
     )
     by = {c["assignment_id"]: c["terminal_status"] for c in rec.calls}
     assert by == {"w1": "failed", "w2": "advisory"}
+
+
+def test_usage_limit_reason_propagated_from_agent_entry() -> None:
+    """#1461: a usage-limit kill is carried on the agent's completed entry
+    (AgentServer._reap stamps ``usage_limit_reason``) and must be forwarded
+    to `_update_local_state` as `failure_reason` — this is the primary
+    production path (the daemon's passive tick) that gets it into the
+    persisted board row `coord status`/`coord drive` read. Both FAILED and
+    ADVISORY carry it: a real kill has been observed producing either.
+    """
+    rec = _Recorder()
+    reconcile_completed_assignments(
+        _config(),
+        board=_board(_running("w1", atype="work"), _running("w2", atype="work")),
+        agent_status_fn=lambda host: {"completed": [
+            {
+                "id": "w1", "status": "failed",
+                "usage_limit_reason": "usage limit — resets 8:30pm (America/Chicago)",
+            },
+            {
+                "id": "w2", "status": "advisory",
+                "usage_limit_reason": "usage limit — resets 8:30pm (America/Chicago)",
+            },
+        ]},
+        update_state_fn=rec, capture_plan=False,
+    )
+    by = {c["assignment_id"]: c["failure_reason"] for c in rec.calls}
+    assert by == {
+        "w1": "usage limit — resets 8:30pm (America/Chicago)",
+        "w2": "usage limit — resets 8:30pm (America/Chicago)",
+    }
+
+
+def test_no_failure_reason_when_agent_entry_lacks_usage_limit() -> None:
+    """A normal failure (no usage-limit kill detected) must not synthesize a
+    failure_reason out of nothing — None flows through unchanged."""
+    rec = _Recorder()
+    reconcile_completed_assignments(
+        _config(),
+        board=_board(_running("w1", atype="work")),
+        agent_status_fn=lambda host: {"completed": [{"id": "w1", "status": "failed"}]},
+        update_state_fn=rec, capture_plan=False,
+    )
+    assert rec.calls[0]["failure_reason"] is None
 
 
 def test_cancelled_maps_to_failed() -> None:
@@ -184,7 +232,7 @@ def test_captures_branch_from_agent_entry_when_board_branch_missing() -> None:
     assert rec.calls == [
         {"assignment_id": "ta1", "terminal_status": "done",
          "branch": "issue-1041-test-author-ms-33-acceptance-suite",
-         "review_state": None}
+         "review_state": None, "failure_reason": None}
     ]
 
 

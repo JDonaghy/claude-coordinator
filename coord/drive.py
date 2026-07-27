@@ -79,6 +79,7 @@ from coord.interactive import (
     tmux_available,
     tmux_session_alive,
 )
+from coord.worker_events import is_usage_limit_reason
 
 # ── exit codes (unchanged from drive-issue.sh) ───────────────────────────────
 
@@ -428,6 +429,37 @@ def decide(
     # ---- no work yet: plan and/or dispatch ---------------------------------
     if not state.work_aid:
         return _dispatch_work_stage(state, opts, machine)
+
+    # ---- work died from hitting the account's usage limit: wait -----------
+    #
+    # #1461: a usage-limit kill is NOT a defect and NOT the #1357 zero-commit
+    # advisory signature — it is the ONE terminal state known safe to
+    # re-dispatch unchanged, once the reset time passes. Falling into the
+    # bounded-retry branch below (or `coord fix`'s model escalation, on the
+    # advisory side) would just re-dispatch straight into the same exhausted
+    # budget and fail again for no diagnostic reason — exactly the confusion
+    # the issue is about. Detected via the `usage limit — resets ...` prefix
+    # that `coord.worker_events.format_usage_limit_reason` stamps onto
+    # `failure_reason` regardless of whether the agent's own reap landed on
+    # FAILED or ADVISORY (#1461's own worked example hit both in one
+    # session). Deliberately does NOT auto-retry here — retrying before the
+    # reset only produces more of the same; a human (or a future reset-aware
+    # auto-retry) re-runs `coord retry` once the window reopens.
+    if state.work_status in ("failed", "advisory") and is_usage_limit_reason(
+        state.work_failure_reason
+    ):
+        return Action(
+            kind=WAIT,
+            label=(
+                f"WORK: {state.work_aid} killed by the usage limit — waiting "
+                "for the reset, not retrying"
+            ),
+            warnings=(
+                f"usage-limit kill detected on {state.work_aid}: "
+                f"{state.work_failure_reason} — waiting for the reset instead "
+                "of retrying (#1461)",
+            ),
+        )
 
     # ---- work failed: bounded retry ----------------------------------------
     if state.work_status == "failed":
