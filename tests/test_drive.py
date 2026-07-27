@@ -25,7 +25,9 @@ dispatch. So the assertions below are on ``action.command``.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -43,11 +45,14 @@ from coord.drive import (
     DriveOptions,
     Driver,
     FileLock,
+    GitHubAcceptanceGateChecker,
     GitMergeVerifier,
     LockBusy,
+    OracleDecision,
     coord_argv,
     decide,
     preflight,
+    resolve_oracle_decision,
 )
 from coord.drive_state import IssueState
 from coord.models import Machine, Repo
@@ -98,6 +103,7 @@ def step(s: IssueState, opts: DriveOptions | None = None, **kw) -> Action:
         counters,
         verifier,
         machine=kw.pop("machine", "precision"),
+        oracle=kw.pop("oracle", None),
     )
 
 
@@ -234,6 +240,261 @@ def test_a_running_plan_just_waits():
 def test_anything_active_just_waits():
     action = step(state(active_count=1, active_types=("smoke",)))
     assert action.kind == WAIT
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# #1453: the oracle-loop JIT slice gate
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def make_config_with_acceptance_driver() -> Config:
+    from coord.config import AcceptanceConfig, AcceptanceDriverConfig
+
+    return Config(
+        repos=[Repo(name=REPO, github="john/claude-coordinator", test_command="pytest -q")],
+        machines=[Machine(name="precision", host="precision", repos=[REPO])],
+        acceptance=AcceptanceConfig(
+            drivers={REPO: AcceptanceDriverConfig(kind="cli-pytest", run="pytest")}
+        ),
+    )
+
+
+class FakeGateChecker:
+    def __init__(self, *, exists: bool = True) -> None:
+        self._exists = exists
+        self.calls: list[tuple[str, int]] = []
+
+    def contract_exists(self, repo_name: str, milestone_number: int) -> bool:
+        self.calls.append((repo_name, milestone_number))
+        return self._exists
+
+
+def oracle_state(**kw) -> IssueState:
+    base = dict(milestone_number=38, milestone_tracking_issue=1120)
+    base.update(kw)
+    return state(**base)
+
+
+# ── resolve_oracle_decision ──────────────────────────────────────────────────
+
+
+def test_resolve_oracle_decision_is_inactive_without_no_acceptance_flag_by_default():
+    """No acceptance driver configured at all -> normal drive, no GitHub call."""
+    checker = FakeGateChecker()
+    decision = resolve_oracle_decision(
+        oracle_state(), DriveOptions(), make_config(), checker
+    )
+    assert decision.active is False
+    assert "no acceptance.drivers entry" in decision.reason
+    assert checker.calls == []
+
+
+def test_resolve_oracle_decision_respects_no_acceptance_opt_out():
+    checker = FakeGateChecker()
+    decision = resolve_oracle_decision(
+        oracle_state(),
+        DriveOptions(no_acceptance=True),
+        make_config_with_acceptance_driver(),
+        checker,
+    )
+    assert decision.active is False
+    assert "--no-acceptance" in decision.reason
+    assert checker.calls == []
+
+
+def test_resolve_oracle_decision_is_inactive_with_no_milestone():
+    decision = resolve_oracle_decision(
+        oracle_state(milestone_number=None),
+        DriveOptions(),
+        make_config_with_acceptance_driver(),
+        FakeGateChecker(),
+    )
+    assert decision.active is False
+    assert "no GitHub milestone" in decision.reason
+
+
+def test_resolve_oracle_decision_is_inactive_with_no_tracking_issue():
+    decision = resolve_oracle_decision(
+        oracle_state(milestone_tracking_issue=None),
+        DriveOptions(),
+        make_config_with_acceptance_driver(),
+        FakeGateChecker(),
+    )
+    assert decision.active is False
+    assert "tracked milestone work order" in decision.reason
+
+
+def test_resolve_oracle_decision_is_inactive_when_the_contract_is_not_merged_yet():
+    checker = FakeGateChecker(exists=False)
+    decision = resolve_oracle_decision(
+        oracle_state(), DriveOptions(), make_config_with_acceptance_driver(), checker
+    )
+    assert decision.active is False
+    assert "ms-38/contract.md" in decision.reason
+    assert checker.calls == [(REPO, 38)]
+
+
+def test_resolve_oracle_decision_is_active_when_everything_lines_up():
+    checker = FakeGateChecker(exists=True)
+    decision = resolve_oracle_decision(
+        oracle_state(), DriveOptions(), make_config_with_acceptance_driver(), checker
+    )
+    assert decision.active is True
+    assert decision.tracking_issue == 1120
+    assert "ms-38" in decision.reason
+
+
+def test_the_default_gate_checker_reuses_gate_a_status_not_a_reimplementation():
+    """#1453: must not drift from tui's gate_a_contract_exists_for /
+    coord.milestone_dispatch.gate_a_status — both keyed on
+    coord.acceptance.gate_a_contract_path.
+    """
+    import inspect
+
+    src = inspect.getsource(GitHubAcceptanceGateChecker.contract_exists)
+    assert "gate_a_status" in src
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+TUI_PIPELINE_RS = REPO_ROOT / "tui" / "src" / "app" / "pipeline.rs"
+
+
+def test_gate_a_contract_path_agrees_across_tui_python_dispatch_and_drive():
+    """#1453's acceptance bar: "the gate matches the TUI's and Python's,
+    with a test asserting the three implementations agree."
+
+    Three independent call sites decide whether a milestone's Gate-A
+    contract exists:
+
+    - ``tui/src/app/pipeline.rs::gate_a_contract_exists_for`` — a local-fs
+      check for the interactive JIT-author menu item (#1060).
+    - ``coord.milestone_dispatch.gate_a_status`` — the #930 milestone-
+      dispatch gate (GitHub-fetch based); also what #1453's
+      ``GitHubAcceptanceGateChecker`` reuses (previous test).
+    - ``coord.drive.resolve_oracle_decision`` (#1453, this issue) — the
+      unattended driver's pre-work JIT-author gate.
+
+    All three MUST derive the path from the ``tests/acceptance/ms-NN/
+    contract.md`` convention — ``coord.acceptance.gate_a_contract_path`` on
+    the Python side — rather than re-deriving their own. A drifted format is
+    silent: the driver would wait forever for a contract that actually
+    exists at a slightly different path.
+    """
+    from coord.acceptance import gate_a_contract_path
+
+    path = gate_a_contract_path(42)
+    assert path == "tests/acceptance/ms-42/contract.md"
+
+    # Rust: gate_a_contract_exists_for builds the same path via four
+    # `.join()` calls — extract the literal segments and rebuild the
+    # equivalent path to prove no drift.
+    rust_src = TUI_PIPELINE_RS.read_text()
+    fn_match = re.search(
+        r"fn gate_a_contract_exists_for.*?\n    \}\n", rust_src, re.S
+    )
+    assert fn_match is not None, (
+        f"gate_a_contract_exists_for not found in {TUI_PIPELINE_RS} — update "
+        "this test's regex (it may have been renamed/moved), and re-verify "
+        "it still agrees with gate_a_contract_path rather than silently "
+        "leaving this test unable to catch a real drift"
+    )
+    fn_src = fn_match.group(0)
+    join_calls = re.findall(r'\.join\(\s*(?:"([^"]+)"|format!\("([^"]+)", \w+\))\s*\)', fn_src)
+    segments = [a or b for a, b in join_calls]
+    assert segments == ["tests", "acceptance", "ms-{}", "contract.md"], (
+        f"gate_a_contract_exists_for's path segments changed to {segments!r} "
+        "— update coord.acceptance.gate_a_contract_path (and this test) to "
+        "match, in the SAME change"
+    )
+    rust_path = "/".join(segments).replace("ms-{}", "ms-42")
+    assert rust_path == path
+
+    # Python: coord.milestone_dispatch.gate_a_status must call
+    # gate_a_contract_path too, not a private re-derivation.
+    import inspect
+
+    from coord import milestone_dispatch
+
+    assert "gate_a_contract_path(milestone_number)" in inspect.getsource(
+        milestone_dispatch.gate_a_status
+    )
+
+    # coord.drive: resolve_oracle_decision must do the same.
+    from coord import drive
+
+    assert "gate_a_contract_path(state.milestone_number)" in inspect.getsource(
+        drive.resolve_oracle_decision
+    )
+
+
+# ── decide()/_dispatch_work_stage with an active oracle decision ────────────
+
+
+def test_oracle_inactive_dispatches_work_directly_as_before():
+    """oracle=None (the default) is byte-for-byte the pre-#1453 behaviour."""
+    action = step(state())
+    assert action.command == ("assign", "precision", REPO, "1392")
+
+
+def test_oracle_active_authors_the_slice_before_dispatching_work():
+    oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
+    action = step(state(), oracle=oracle)
+    assert action.kind == RUN
+    assert action.command == (
+        "acceptance", "author", REPO, "1120", "--issue", "1392",
+    )
+
+
+def test_oracle_active_waits_while_the_slice_is_still_authoring():
+    oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
+    action = step(
+        state(acceptance_author_aid="ta1", acceptance_author_status="running"),
+        oracle=oracle,
+    )
+    assert action.kind == WAIT
+
+
+def test_oracle_active_dispatches_work_once_the_slice_has_merged():
+    oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
+    action = step(
+        state(acceptance_author_aid="ta1", acceptance_author_status="merged"),
+        oracle=oracle,
+    )
+    assert action.kind == RUN
+    assert action.command == ("assign", "precision", REPO, "1392")
+
+
+def test_oracle_active_is_terminal_when_the_slice_authoring_fails():
+    oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
+    action = step(
+        state(acceptance_author_aid="ta1", acceptance_author_status="failed"),
+        oracle=oracle,
+    )
+    assert action.is_exit
+    assert action.exit_code == EXIT_TERMINAL_FAILURE
+    assert "acceptance author ta1 failed" in action.message
+    assert "--no-acceptance" in action.message
+
+
+def test_oracle_active_is_terminal_when_the_slice_authoring_is_cancelled():
+    oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
+    action = step(
+        state(acceptance_author_aid="ta1", acceptance_author_status="cancelled"),
+        oracle=oracle,
+    )
+    assert action.is_exit
+    assert action.exit_code == EXIT_TERMINAL_FAILURE
+    assert "cancelled" in action.message
+
+
+def test_oracle_active_still_honours_do_plan_after_the_slice_has_landed():
+    oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
+    action = step(
+        state(acceptance_author_aid="ta1", acceptance_author_status="merged"),
+        DriveOptions(machine="precision", do_plan=True),
+        oracle=oracle,
+    )
+    assert action.command == ("assign", "--plan-only", "precision", REPO, "1392")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -800,7 +1061,7 @@ def driver_factory(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr("coord.drive_state.scratch_dir", lambda: tmp_path)
     monkeypatch.setattr("coord.drive.scratch_dir", lambda: tmp_path)
 
-    def make(payloads, *, opts=None, verifier=None, ticks=200):
+    def make(payloads, *, opts=None, verifier=None, config=None, oracle_gate=None, ticks=200):
         clock = {"t": 0.0}
         recorded: list[list[str]] = []
 
@@ -814,9 +1075,10 @@ def driver_factory(tmp_path, monkeypatch, capsys):
             repo=REPO,
             issue=ISSUE,
             opts=opts or DriveOptions(machine="precision", poll=1.0),
-            config=make_config(),
+            config=config or make_config(),
             fetcher=FakeFetcher(payloads),
             verifier=verifier or FakeVerifier(),
+            oracle_gate=oracle_gate,
             sleeper=lambda secs: clock.__setitem__("t", clock["t"] + secs),
             clock=lambda: clock["t"],
         )
@@ -830,6 +1092,55 @@ def test_driver_exits_zero_on_a_verified_merge(driver_factory, capsys):
     driver = driver_factory([board(status="merged")])
     assert driver.run() == EXIT_OK
     assert "MERGED" in capsys.readouterr().out
+
+
+# ── #1453: the preflight banner never leaves oracle mode unstated ───────────
+
+
+def test_driver_banner_reports_normal_drive_when_no_acceptance_driver_is_configured(
+    driver_factory, capsys,
+):
+    driver = driver_factory([board(status="merged")])
+    assert driver.run() == EXIT_OK
+    out = capsys.readouterr().out
+    assert "acceptance" in out
+    assert "no acceptance.drivers entry" in out
+
+
+def test_driver_banner_reports_oracle_drive_when_the_gate_is_satisfied(
+    driver_factory, capsys,
+):
+    payload = board(status="merged")
+    payload["issues"] = [{"repo_name": REPO, "number": ISSUE, "milestone_number": 38}]
+    payload["milestone_work_orders"] = [
+        {"repo_name": REPO, "tracking_issue": 1120, "nodes": [{"issue_number": ISSUE}]}
+    ]
+    driver = driver_factory(
+        [payload],
+        config=make_config_with_acceptance_driver(),
+        oracle_gate=FakeGateChecker(exists=True),
+    )
+    assert driver.run() == EXIT_OK
+    out = capsys.readouterr().out
+    assert "ORACLE DRIVE" in out
+    assert "ms-38" in out
+
+
+def test_driver_banner_reports_normal_drive_under_no_acceptance(driver_factory, capsys):
+    payload = board(status="merged")
+    payload["issues"] = [{"repo_name": REPO, "number": ISSUE, "milestone_number": 38}]
+    payload["milestone_work_orders"] = [
+        {"repo_name": REPO, "tracking_issue": 1120, "nodes": [{"issue_number": ISSUE}]}
+    ]
+    driver = driver_factory(
+        [payload],
+        opts=DriveOptions(machine="precision", poll=1.0, no_acceptance=True),
+        config=make_config_with_acceptance_driver(),
+        oracle_gate=FakeGateChecker(exists=True),
+    )
+    assert driver.run() == EXIT_OK
+    out = capsys.readouterr().out
+    assert "--no-acceptance set" in out
 
 
 def test_driver_shells_out_to_coord_and_never_calls_internals(driver_factory):

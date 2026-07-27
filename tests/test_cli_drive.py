@@ -123,6 +123,7 @@ def test_flags_are_threaded_into_drive_options(monkeypatch, valid_config_path: P
             "--stall", "4",
             "--notify",
             "--dry-run",
+            "--no-acceptance",
             "somerepo", "1392",
         ],
     )
@@ -143,8 +144,25 @@ def test_flags_are_threaded_into_drive_options(monkeypatch, valid_config_path: P
     assert opts.stall_mins == 4
     assert opts.notify is True
     assert opts.dry_run is True
+    assert opts.no_acceptance is True
     # Pinned so every `coord` subprocess reads the same file this run does.
     assert opts.config_path == str(valid_config_path)
+
+
+def test_no_acceptance_defaults_off(monkeypatch, valid_config_path: Path):
+    """#1453: without the flag, oracle-loop JIT authoring is not skipped."""
+    seen: dict = {}
+
+    def capture(self):
+        seen["opts"] = self.opts
+        return 0
+
+    monkeypatch.setattr("coord.drive.Driver.run", capture)
+    result = CliRunner().invoke(
+        main, ["drive", "--config", str(valid_config_path), "somerepo", "1392"]
+    )
+    assert result.exit_code == 0, result.output
+    assert seen["opts"].no_acceptance is False
 
 
 def test_merge_method_is_constrained_to_the_three_coord_merge_supports():
