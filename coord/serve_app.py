@@ -1041,42 +1041,47 @@ def _auto_drain_tick(config: Config) -> "list":
     except Exception:  # noqa: BLE001
         ci_store = None
 
-    # #1477: re-test any parked CONFLICT entry against GitHub's own
-    # mergeability computation before the plan is built — otherwise a branch
-    # repaired by a conflict-fix worker (or by hand) since the last tick
-    # keeps showing READY-blocking BLOCKED/CONFLICT status here forever, and
-    # auto-drain (unlike a human running `coord merge`) has no other chance
-    # to notice. Best-effort: a reconciliation failure must not disable the
-    # rest of the drain tick.
-    try:
-        for ev in mq.reconcile_conflict_entries(github_ops):
-            log.info(
-                "auto-drain: conflict reconciled for %s#%d (%s): %s",
-                ev.entry.repo_name, ev.entry.issue_number, ev.entry.branch, ev.message,
-            )
-    except Exception:  # noqa: BLE001
-        log.warning("auto-drain: conflict reconciliation failed", exc_info=True)
-
-    # Compute the gate-annotated plan — the single source of truth for READY.
-    merge_plan = mq.plan(board, config, ci_store=ci_store, gh_ops=github_ops)
-    ready_aids = {pm.assignment_id for pm in merge_plan if pm.status == PLAN_READY}
-
-    if not ready_aids:
-        log.debug("auto-drain: no READY entries")
-        return []
-
-    # #1400-review: this whole load->process->save cycle is the exact same
-    # merge-queue read-modify-write hazard ``_merge_lock`` was introduced to
-    # close for ``POST /merge`` — ``mq.process()`` has exactly two call
-    # sites in the codebase (the other is the daemon-routed ``coord merge``
-    # callback, already wrapped in ``_merge_lock``) and both do a full
-    # ``load_queue()`` -> mutate -> ``save_queue()`` replace of the WHOLE
-    # table. Without also taking ``_merge_lock`` here, a driver's ``/merge``
+    # #1400-review: both the #1477 reconcile step below and the
+    # load->process->save cycle further down are the exact same merge-queue
+    # read-modify-write hazard ``_merge_lock`` was introduced to close for
+    # ``POST /merge`` — every one of these does a full ``load_queue()`` ->
+    # mutate -> ``save_queue()`` replace of the WHOLE table. Without holding
+    # ``_merge_lock`` across *all* of them here, a driver's ``/merge``
     # request and this tick (fired independently every ~30s by
     # ``_tick_loop``, off the event loop via ``run_in_threadpool``) can
     # still race and silently clobber each other's just-recorded state —
     # see ``_merge_lock``'s module-level docstring for the full hazard.
+    # This is why the #1477 reconcile call below is inside this same
+    # ``with`` block rather than run before it.
     with _merge_lock:
+        # #1477: re-test any parked CONFLICT entry against GitHub's own
+        # mergeability computation before the plan is built — otherwise a
+        # branch repaired by a conflict-fix worker (or by hand) since the
+        # last tick keeps showing READY-blocking BLOCKED/CONFLICT status
+        # here forever, and auto-drain (unlike a human running
+        # `coord merge`) has no other chance to notice. Best-effort: a
+        # reconciliation failure must not disable the rest of the drain
+        # tick.
+        try:
+            for ev in mq.reconcile_conflict_entries(github_ops):
+                log.info(
+                    "auto-drain: conflict reconciled for %s#%d (%s): %s",
+                    ev.entry.repo_name, ev.entry.issue_number, ev.entry.branch, ev.message,
+                )
+        except Exception:  # noqa: BLE001
+            log.warning("auto-drain: conflict reconciliation failed", exc_info=True)
+
+        # Compute the gate-annotated plan — the single source of truth for
+        # READY. Held under the same lock as the reconcile step above so the
+        # plan is built from the just-reconciled state, not a stale
+        # pre-reconcile snapshot raced by a concurrent /merge.
+        merge_plan = mq.plan(board, config, ci_store=ci_store, gh_ops=github_ops)
+        ready_aids = {pm.assignment_id for pm in merge_plan if pm.status == PLAN_READY}
+
+        if not ready_aids:
+            log.debug("auto-drain: no READY entries")
+            return []
+
         # Load the raw queue and restrict to PENDING + READY.
         all_items = mq.load_queue()
         ready_items = [

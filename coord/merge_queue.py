@@ -1615,7 +1615,7 @@ def staging_items(board, config) -> list[StagingItem]:
 @dataclass
 class MergeEvent:
     entry: QueuedMerge
-    kind: str  # "opened" | "sized" | "merged" | "conflict" | "skipped" | "error"
+    kind: str  # "opened" | "sized" | "merged" | "conflict" | "skipped" | "error" | "reopened"
     message: str = ""
 
 

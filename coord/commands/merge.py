@@ -872,6 +872,16 @@ def merge(
     # is short-circuited above by _show_plan_from_daemon (/board, not /merge).
     # This local branch runs on the daemon itself (COORD_MERGE_ON_DAEMON set)
     # or when no daemon is configured (standalone dev environment).
+    #
+    # #1477-review: the reconcile call just below is a deliberate, narrow
+    # carve-out from "never causes side effects" — it persists CONFLICT ->
+    # PENDING (clearing entry.error) via save_queue() when the reconciled
+    # branch turns out to be clean. That's accepted here because (a) it's a
+    # state *correction*, not a merge action — no PR is touched — and (b)
+    # daemon-fronted setups (the common case) never reach this branch at all,
+    # since --plan is short-circuited above to the read-only /board path.
+    # Only a standalone/no-daemon dev environment running --plan directly
+    # observes this side effect.
     if show_plan:
         from coord import github_ops as _plan_gh_ops  # noqa: PLC0415
         from coord import merge_queue as _plan_mq  # noqa: PLC0415
@@ -885,7 +895,9 @@ def merge(
         # #1477: re-test any parked CONFLICT entry against GitHub's own
         # mergeability computation before building the plan — otherwise a
         # branch repaired by a conflict-fix worker (or by hand) keeps
-        # showing its stale conflict verdict here indefinitely.
+        # showing its stale conflict verdict here indefinitely.  See the
+        # #1477-review note above the `if show_plan:` line for why this is a
+        # deliberate exception to the "no side effects" contract.
         for _ev in _plan_mq.reconcile_conflict_entries(_plan_gh_ops):
             click.echo(
                 f"  {_ev.entry.repo_name} #{_ev.entry.issue_number} "
@@ -1182,10 +1194,17 @@ def merge(
     # must clear itself here, not require a manual --drop + re-enqueue +
     # --only. Runs unconditionally (even under --dry-run): it's a state
     # correction, not a merge action, same posture as the auto-enqueue scan
-    # above.
+    # above. #1477-review: unlike every other --dry-run line in this
+    # command, this one really does persist (it corrects previously-cached
+    # state rather than proposing a merge action), so it's called out
+    # explicitly here rather than left to blend in with the "(dry run)
+    # would ..." lines below.
     for ev in mq.reconcile_conflict_entries(gh_ops):
         e = ev.entry
-        click.echo(f"  {e.repo_name} #{e.issue_number} ({e.branch}): {ev.kind} — {ev.message}")
+        suffix = " (reconciled — persisted even under --dry-run)" if dry_run else ""
+        click.echo(
+            f"  {e.repo_name} #{e.issue_number} ({e.branch}): {ev.kind} — {ev.message}{suffix}"
+        )
 
     items = mq.load_queue()
     if repo_filter:
