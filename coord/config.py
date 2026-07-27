@@ -345,12 +345,26 @@ class ModelsConfig:
 
             model = override or config.models.model_for_labels(issue_labels) or config.models.default
         """
+        return self.model_for_labels_with_reason(issue_labels)[0]
+
+    def model_for_labels_with_reason(
+        self, issue_labels: list[str]
+    ) -> tuple[str | None, str | None]:
+        """Like :meth:`model_for_labels`, but also returns the label that
+        matched — ``(model, matched_label)``, or ``(None, None)`` under the
+        same conditions :meth:`model_for_labels` returns ``None``.
+
+        #1454: a silent fall-through to ``default`` (stale/missing label)
+        looks identical to an intentional default from the CLI output
+        alone. Callers use the matched label to print *why* a model was
+        chosen — see :func:`describe_model_choice`.
+        """
         if not self.labels:
-            return None
+            return None, None
         for label in issue_labels:
             if label in self.labels:
-                return self.labels[label]
-        return None
+                return self.labels[label], label
+        return None, None
 
     def model_for_estimate(self, estimate: str | None) -> str | None:
         """Map a plan worker's ``ESTIMATE`` to a model alias via ``escalation``.
@@ -375,6 +389,32 @@ class ModelsConfig:
             return None
         idx = min(idx, len(self.escalation) - 1)
         return self.escalation[idx]
+
+
+def describe_model_choice(
+    *,
+    resolved_model: str,
+    explicit_reason: str | None = None,
+    matched_label: str | None = None,
+) -> str:
+    """Format a one-line explanation of why *resolved_model* was chosen.
+
+    #1454: dispatch used to print just the bare model name, so a silent
+    mis-route to ``models.default`` (e.g. a tier label that hadn't been
+    picked up yet) read identically to an intentional default — the exact
+    ambiguity that made the stale-label-cache bug expensive to notice.
+
+    *explicit_reason*, when set, wins outright (e.g. ``"explicit --model"``
+    or ``"resolved at plan time"``) — the caller already knows the model
+    didn't come from a fresh label match. Otherwise *matched_label* (from
+    :meth:`ModelsConfig.model_for_labels_with_reason`) selects between the
+    "via label" and "default; no label match" phrasings.
+    """
+    if explicit_reason:
+        return f"{resolved_model} ({explicit_reason})"
+    if matched_label:
+        return f"{resolved_model} (via label {matched_label!r})"
+    return f"{resolved_model} (default; no label match)"
 
 
 @dataclass
