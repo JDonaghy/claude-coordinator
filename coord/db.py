@@ -444,6 +444,20 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # could not be computed — those fall back to today's SHA-only
         # staleness behaviour (fail closed).
         "ALTER TABLE assignments ADD COLUMN review_patch_id TEXT",
+        # #1479: Test-gate staleness anchor, captured (best-effort) alongside
+        # a terminal test_state write in
+        # `coord.state._record_test_verdict_local`. `test_head_sha` /
+        # `test_patch_id` mirror `review_head_sha` / `review_patch_id`
+        # (#821/#1475) for the branch's own content; `test_base_sha` is the
+        # NEW piece — the target/merge branch's HEAD SHA at test time, so
+        # `coord.merge_queue.has_smoke_verdict` can detect a base that moved
+        # out from under an otherwise content-identical branch (a rebase can
+        # break tests without changing the branch's own diff). NULL for rows
+        # predating this column or where the anchor couldn't be computed —
+        # those fall back to today's no-staleness-check behavior (fail open).
+        "ALTER TABLE assignments ADD COLUMN test_head_sha TEXT",
+        "ALTER TABLE assignments ADD COLUMN test_patch_id TEXT",
+        "ALTER TABLE assignments ADD COLUMN test_base_sha TEXT",
     ]
     for sql in migrations:
         try:

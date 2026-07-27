@@ -1005,9 +1005,24 @@ def _record_test_verdict_local(
     conn.commit()
 
     row = conn.execute(
-        "SELECT repo_name, issue_number, machine_name FROM assignments WHERE assignment_id=?",
+        "SELECT repo_name, issue_number, machine_name, branch FROM assignments "
+        "WHERE assignment_id=?",
         (assignment_id,),
     ).fetchone()
+
+    # #1479: pin a terminal verdict to the branch content and merge base it
+    # was tested against, so `coord.merge_queue.has_smoke_verdict` can later
+    # tell a stale verdict (base moved, or new commits pushed) from a fresh
+    # one. Only terminal "good" verdicts matter to that gate — a "failed"
+    # verdict already blocks the merge on its own, so skip the extra `gh`
+    # round trips for it.
+    if test_state in ("passed", "skipped") and row is not None and row["branch"]:
+        _stamp_test_staleness_anchor(
+            assignment_id=assignment_id,
+            repo_name=row["repo_name"],
+            issue_number=row["issue_number"],
+            branch=row["branch"],
+        )
     if row is not None:
         _record_audit(
             tier="business",
@@ -1033,6 +1048,68 @@ def _record_test_verdict_local(
             f"Test FAILED: {test_reason.strip()}",
             source="test",
         )
+
+
+def _stamp_test_staleness_anchor(
+    *,
+    assignment_id: str,
+    repo_name: str,
+    issue_number: int,
+    branch: str,
+) -> None:
+    """Best-effort: capture the branch/base SHAs a Test-gate verdict covers.
+
+    #1479: written once, right after a terminal (passed/skipped) verdict is
+    recorded, so a later merge-gate check (``coord.merge_queue.
+    has_smoke_verdict``) can tell whether the verdict still describes the
+    branch it would actually be merged into. Three GitHub API reads:
+    ``test_head_sha`` (the branch's own tip — mirrors ``review_head_sha``,
+    #821), ``test_patch_id`` (content fingerprint of the branch's diff
+    against its base — mirrors ``review_patch_id``, #1475), and
+    ``test_base_sha`` (the base branch's OWN tip) — the piece the review gate
+    doesn't need, since a rebase onto a moved base can break tests without
+    the branch's own diff changing at all.
+
+    Entirely best-effort and side-effect-free on failure: repo not found in
+    config, ``gh`` unauthenticated/unreachable, or any other error just
+    leaves the three columns NULL, which the merge-queue gate already treats
+    as "staleness tracking unavailable" and skips the check — the same
+    fail-open convention #821/#1475 established. Never raises, so a `gh`
+    hiccup can't fail the verdict write it rides along with.
+    """
+    try:
+        from coord.branch_model import resolve_base_branch_for_issue  # noqa: PLC0415
+        from coord import config as _config  # noqa: PLC0415
+        from coord import github_ops as _gho  # noqa: PLC0415
+
+        config = _config.load()
+        repo_cfg = config.repo(repo_name)
+        if repo_cfg is None:
+            return
+
+        target_branch = getattr(repo_cfg, "default_branch", None) or "main"
+        if getattr(repo_cfg, "develop_branch", None):
+            # Milestone-aware base (#934) — only pays for the extra `gh`
+            # lookup when the repo actually opted into the git model.
+            issue_data = _gho.get_issue(repo_cfg.github, issue_number)
+            target_branch = resolve_base_branch_for_issue(repo_cfg, issue_data)
+
+        test_head_sha = _gho.get_branch_sha(repo_cfg.github, branch)
+        test_base_sha = _gho.get_branch_sha(repo_cfg.github, target_branch)
+        test_patch_id = _gho.get_branch_patch_id(repo_cfg.github, target_branch, branch)
+    except Exception:  # noqa: BLE001 — best-effort anchor; see docstring.
+        return
+
+    if test_head_sha is None and test_base_sha is None and test_patch_id is None:
+        return  # nothing captured — don't bother writing an all-NULL row
+
+    conn = get_connection()
+    conn.execute(
+        "UPDATE assignments SET test_head_sha=?, test_patch_id=?, test_base_sha=? "
+        "WHERE assignment_id=?",
+        (test_head_sha, test_patch_id, test_base_sha, assignment_id),
+    )
+    conn.commit()
 
 
 # ── Notification ledger ────────────────────────────────────────────────────────

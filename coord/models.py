@@ -300,6 +300,22 @@ class Assignment:
     # everywhere by construction — never add a bare `is not None` check here.
     test_state: str | None = None
     test_reason: str | None = None
+    # #1479: staleness anchor for a terminal (passed/skipped) Test-gate
+    # verdict — captured once, best-effort, when the verdict is recorded
+    # (``coord.state._record_test_verdict_local``). Mirrors the review gate's
+    # ``review_head_sha``/``review_patch_id`` (#821/#1475) but adds a THIRD
+    # value the review gate deliberately doesn't need: the merge base's own
+    # HEAD SHA at test time. Review staleness is about what changed in the
+    # branch; test staleness is also about what the branch was combined
+    # with — a rebase onto a moved base can break tests without changing the
+    # branch's own diff, so the merge gate (``coord.merge_queue.
+    # has_smoke_verdict``) must re-verify even when the content is byte-
+    # identical. All three are None for rows predating this feature or where
+    # the anchor could not be captured (fails open — the staleness check is
+    # skipped, matching #821/#1475's convention).
+    test_head_sha: str | None = None
+    test_patch_id: str | None = None
+    test_base_sha: str | None = None
     # #253: parsed adversarial-review verdict for type="review" assignments.
     # None | "approve" | "request-changes". Set when notify or auto_loop
     # extracts the structured REVIEW_VERDICT from the reviewer's log; consumed

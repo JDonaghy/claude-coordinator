@@ -98,6 +98,12 @@ def row_to_assignment(row: object) -> Assignment:
         review_posted_at=d.get("review_posted_at"),
         test_state=d.get("test_state"),
         test_reason=d.get("test_reason"),
+        # #1479: Test-gate staleness anchor; None for pre-1479 rows or where
+        # it couldn't be captured — the merge-queue gate treats that as "SHA
+        # tracking unavailable" and skips the staleness check (fail open).
+        test_head_sha=d.get("test_head_sha"),
+        test_patch_id=d.get("test_patch_id"),
+        test_base_sha=d.get("test_base_sha"),
         review_verdict=d.get("review_verdict"),
         # #1456: coordinator-override audit trail; None when the reviewer's
         # verdict stands (the normal case) and for pre-1456 rows.

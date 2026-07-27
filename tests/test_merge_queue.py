@@ -1654,6 +1654,85 @@ class TestSmokeGate:
         entry = _q("orig", branch="worker/orig")
         assert mq.has_smoke_verdict(entry, board) is True
 
+    # ── #1479: test-verdict staleness (base-moved vs content-changed) ──
+
+    def test_has_smoke_verdict_stale_when_base_moved(self) -> None:
+        """Base moved, branch diff identical → test verdict is stale even
+        though the branch's own content fingerprint didn't change."""
+        work = self._work("w1", test_state="passed")
+        work.test_head_sha = "branch-sha-1"
+        work.test_patch_id = "patch-1"
+        work.test_base_sha = "main-sha-old"
+        board = self._board(completed=[work])
+
+        entry = _q("w1")
+        entry.branch_head_sha = "branch-sha-1"       # unchanged
+        entry.branch_patch_id = "patch-1"             # unchanged — identical content
+        entry.target_branch_head_sha = "main-sha-new"  # main advanced since the test ran
+
+        assert mq.has_smoke_verdict(entry, board) is False
+
+    def test_has_smoke_verdict_stale_when_branch_content_changed(self) -> None:
+        """Branch content changed (new commit) → test verdict is stale."""
+        work = self._work("w1", test_state="passed")
+        work.test_head_sha = "branch-sha-1"
+        work.test_patch_id = "patch-1"
+        work.test_base_sha = "main-sha-1"
+        board = self._board(completed=[work])
+
+        entry = _q("w1")
+        entry.branch_head_sha = "branch-sha-2"    # new commit pushed
+        entry.branch_patch_id = "patch-2"          # content actually changed
+        entry.target_branch_head_sha = "main-sha-1"  # base unchanged
+
+        assert mq.has_smoke_verdict(entry, board) is False
+
+    def test_has_smoke_verdict_fresh_when_neither_moved(self) -> None:
+        """Base unchanged, branch content unchanged → verdict still counts."""
+        work = self._work("w1", test_state="passed")
+        work.test_head_sha = "branch-sha-1"
+        work.test_patch_id = "patch-1"
+        work.test_base_sha = "main-sha-1"
+        board = self._board(completed=[work])
+
+        entry = _q("w1")
+        entry.branch_head_sha = "branch-sha-1"
+        entry.branch_patch_id = "patch-1"
+        entry.target_branch_head_sha = "main-sha-1"
+
+        assert mq.has_smoke_verdict(entry, board) is True
+
+    def test_has_smoke_verdict_fresh_across_content_identical_rebase(self) -> None:
+        """SHA moved but the diff didn't (a clean rebase that replayed onto
+        the *same* base tip) — falls back to the patch-id match, same as the
+        review gate's #1475 behaviour."""
+        work = self._work("w1", test_state="passed")
+        work.test_head_sha = "branch-sha-1"
+        work.test_patch_id = "patch-1"
+        work.test_base_sha = "main-sha-1"
+        board = self._board(completed=[work])
+
+        entry = _q("w1")
+        entry.branch_head_sha = "branch-sha-2"    # commit SHA changed...
+        entry.branch_patch_id = "patch-1"          # ...but content is identical
+        entry.target_branch_head_sha = "main-sha-1"
+
+        assert mq.has_smoke_verdict(entry, board) is True
+
+    def test_has_smoke_verdict_missing_anchors_fails_open(self) -> None:
+        """Rows predating #1479 (no test_base_sha/test_head_sha captured)
+        skip the staleness check entirely — same backward-compat contract as
+        #821/#1475 for the review gate."""
+        work = self._work("w1", test_state="passed")
+        board = self._board(completed=[work])
+
+        entry = _q("w1")
+        entry.branch_head_sha = "branch-sha-2"
+        entry.branch_patch_id = "patch-2"
+        entry.target_branch_head_sha = "main-sha-new"
+
+        assert mq.has_smoke_verdict(entry, board) is True
+
     # ── process() smoke gate ──
 
     def test_process_emits_smoke_required_when_no_verdict(self) -> None:
