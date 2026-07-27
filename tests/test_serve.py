@@ -4226,6 +4226,92 @@ def test_auto_drain_ready_entry_merges(
     assert all(r["assignment_id"] == "work-drain1" for r in op_rows)
 
 
+def test_auto_drain_reconciles_stale_conflict_before_planning(
+    tmp_path: "Path", rw_db, monkeypatch
+) -> None:
+    """#1477: a CONFLICT entry whose branch has since become mergeable clears
+    itself and merges within the same auto-drain tick — auto-drain has no
+    other chance to notice a conflict-fix worker (or a human) repairing the
+    branch, since it only ever considers PLAN_READY entries."""
+    from coord.config import load as load_config
+    from coord import merge_queue as mq
+    from coord.merge_queue import MERGED
+    from coord.serve_app import _auto_drain_tick
+
+    _seed_queued_ready_entry(
+        rw_db, aid="work-conflict1", branch="issue-57-impl", issue_number=57,
+    )
+    # Flip the seeded (otherwise fully-gated) row to CONFLICT with a PR
+    # already open — simulating a previous failed merge attempt whose branch
+    # has since been repaired by a conflict-fix worker or by hand.
+    rw_db.execute(
+        "UPDATE merge_queue SET state='conflict', pr_number=555, error=? "
+        "WHERE assignment_id=?",
+        ("not mergeable", "work-conflict1"),
+    )
+    rw_db.commit()
+
+    monkeypatch.setattr("coord.github_ops.check_pr_mergeable", lambda repo, number: True)
+    monkeypatch.setattr("coord.github_ops.get_pr_size", lambda repo, number: 42)
+    monkeypatch.setattr(
+        "coord.github_ops.merge_pr", lambda repo, number, method="rebase": (True, "merged"),
+    )
+    from coord.ci_store import NoOpCi as _NoOpCi
+    monkeypatch.setattr("coord.ci_store.build_ci_store", lambda t: _NoOpCi())
+
+    drain_config_path = _make_drain_config(tmp_path, auto_drain=True)
+    monkeypatch.setenv("COORD_CONFIG", str(drain_config_path))
+    cfg = load_config(drain_config_path)
+
+    events = _auto_drain_tick(cfg)
+
+    merge_events = [ev for ev in events if ev.kind == "merged"]
+    assert merge_events, f"expected a merged event, got: {[ev.kind for ev in events]}"
+    items = mq.load_queue()
+    assert any(item.state == MERGED for item in items), (
+        f"expected MERGED in queue, got: {[item.state for item in items]}"
+    )
+
+
+def test_auto_drain_still_conflicting_entry_stays_parked(
+    tmp_path: "Path", rw_db, monkeypatch
+) -> None:
+    """#1477: when GitHub still reports the PR as conflicting, auto-drain
+    must leave the entry parked — never speculatively unpark it."""
+    from coord.config import load as load_config
+    from coord import merge_queue as mq
+    from coord.serve_app import _auto_drain_tick
+
+    _seed_queued_ready_entry(
+        rw_db, aid="work-conflict2", branch="issue-58-impl", issue_number=58,
+    )
+    rw_db.execute(
+        "UPDATE merge_queue SET state='conflict', pr_number=556, error=? "
+        "WHERE assignment_id=?",
+        ("not mergeable", "work-conflict2"),
+    )
+    rw_db.commit()
+
+    monkeypatch.setattr("coord.github_ops.check_pr_mergeable", lambda repo, number: False)
+    merge_calls: list = []
+    monkeypatch.setattr(
+        "coord.github_ops.merge_pr",
+        lambda repo, number, method="rebase": merge_calls.append((repo, number)) or (True, "merged"),
+    )
+    from coord.ci_store import NoOpCi as _NoOpCi
+    monkeypatch.setattr("coord.ci_store.build_ci_store", lambda t: _NoOpCi())
+
+    cfg = load_config(_make_drain_config(tmp_path, auto_drain=True))
+    events = _auto_drain_tick(cfg)
+
+    assert events == [], f"expected no events, got: {[ev.kind for ev in events]}"
+    assert merge_calls == []
+    items = mq.load_queue()
+    assert any(item.state == "conflict" for item in items), (
+        f"expected the entry to stay CONFLICT, got: {[item.state for item in items]}"
+    )
+
+
 def test_auto_drain_blocked_entry_not_touched(
     tmp_path: "Path", rw_db, monkeypatch
 ) -> None:

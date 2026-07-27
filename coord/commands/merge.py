@@ -745,8 +745,10 @@ def _merge_via_daemon(svc, params: dict) -> None:
     default=None,
     metavar="ASSIGNMENT_ID",
     help=(
-        "#732: Drop exactly one merge_queue entry by assignment_id. "
-        "Routes through the daemon so thin clients don't need local DB access."
+        "#732: Drop exactly one merge_queue entry by assignment_id (or the durable "
+        "'repo#issue' form, #1477 — survives a drop + re-enqueue that would otherwise "
+        "mint a new assignment id). Routes through the daemon so thin clients don't "
+        "need local DB access."
     ),
 )
 
@@ -757,9 +759,10 @@ def _merge_via_daemon(svc, params: dict) -> None:
     default=None,
     metavar="ASSIGNMENT_ID",
     help=(
-        "#780: Merge exactly one entry by assignment_id, leaving the rest of the queue "
-        "untouched.  Mutually exclusive with --order.  BLOCKED entries are reported "
-        "and skipped (use --force-merge to override gates)."
+        "#780: Merge exactly one entry by assignment_id — or the durable 'repo#issue' "
+        "form (#1477), e.g. 'acme/api#1461', which survives a drop + re-enqueue — "
+        "leaving the rest of the queue untouched.  Mutually exclusive with --order.  "
+        "BLOCKED entries are reported and skipped (use --force-merge to override gates)."
     ),
 )
 
@@ -879,6 +882,16 @@ def merge(
         _board = _load_board()
         _ci = _build_ci_store(_cfg.ci_store.type)
 
+        # #1477: re-test any parked CONFLICT entry against GitHub's own
+        # mergeability computation before building the plan — otherwise a
+        # branch repaired by a conflict-fix worker (or by hand) keeps
+        # showing its stale conflict verdict here indefinitely.
+        for _ev in _plan_mq.reconcile_conflict_entries(_plan_gh_ops):
+            click.echo(
+                f"  {_ev.entry.repo_name} #{_ev.entry.issue_number} "
+                f"({_ev.entry.branch}): {_ev.kind} — {_ev.message}"
+            )
+
         planned = _plan_mq.plan(_board, _cfg, _ci, gh_ops=_plan_gh_ops)
 
         # --repo scoping
@@ -924,10 +937,16 @@ def merge(
             )
             sys.exit(1)
         cfg_only = _load_config(config_path)
+        # #1477: re-test any parked CONFLICT entry before resolving
+        # --only — a branch repaired since the last tick should be eligible
+        # for --only the moment it's clean, not only after a manual --drop.
+        for _ev in mq.reconcile_conflict_entries(gh_ops):
+            click.echo(
+                f"  {_ev.entry.repo_name} #{_ev.entry.issue_number} "
+                f"({_ev.entry.branch}): {_ev.kind} — {_ev.message}"
+            )
         only_queue = mq.load_queue()
-        only_entry = next(
-            (e for e in only_queue if e.assignment_id == only_assignment), None
-        )
+        only_entry = mq.resolve_entry_key(only_queue, only_assignment)
         if only_entry is None:
             click.echo(
                 f"merge-queue: no entry found for {only_assignment!r}", err=True
@@ -1156,6 +1175,17 @@ def merge(
                 )
     for line in auto_enqueued:
         click.echo(line)
+
+    # #1477: re-test any parked CONFLICT entry against GitHub's own
+    # mergeability computation before the pending scan below — a branch
+    # repaired by a conflict-fix worker (or by hand) since the last tick
+    # must clear itself here, not require a manual --drop + re-enqueue +
+    # --only. Runs unconditionally (even under --dry-run): it's a state
+    # correction, not a merge action, same posture as the auto-enqueue scan
+    # above.
+    for ev in mq.reconcile_conflict_entries(gh_ops):
+        e = ev.entry
+        click.echo(f"  {e.repo_name} #{e.issue_number} ({e.branch}): {ev.kind} — {ev.message}")
 
     items = mq.load_queue()
     if repo_filter:
