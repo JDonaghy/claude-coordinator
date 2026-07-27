@@ -961,8 +961,26 @@ def reconcile(board: Board, config: Config) -> list[str]:
 
     # Auto-reassign failed work assignments to a different machine.
     if newly_failed and getattr(config.concurrency, "auto_reassign", False):
+        from coord.worker_events import is_usage_limit_reason  # noqa: PLC0415
+
         for failed_a in newly_failed:
             if getattr(failed_a, "type", "work") != "work":
+                continue
+            # #1461 review finding 1: a usage-limit kill is an account-wide
+            # exhausted budget, not a per-machine defect — re-dispatching it
+            # onto a *different* machine still burns the same subscription
+            # limit and is guaranteed to die the same way until the reset.
+            # Check the just-seen agent entry (this pass; `_record_usage_
+            # limit_reason` below only writes through to the DB / board
+            # service, it does not mutate this in-memory `failed_a`) AND the
+            # already-persisted `failure_reason` (a prior pass already
+            # stamped it, e.g. after a race with `reconcile_completed_
+            # assignments`'s own tick).
+            entry = agent_completed.get(failed_a.assignment_id)
+            usage_limit = (entry or {}).get("usage_limit_reason") or getattr(
+                failed_a, "failure_reason", None,
+            )
+            if is_usage_limit_reason(usage_limit):
                 continue
             reassigned = _reassign(failed_a, board, config)
             if reassigned is not None and reassigned.assignment_id is not None:
@@ -1103,6 +1121,7 @@ def on_conflict_fix_done(
     board: Board | None = None,
     config: Config | None = None,
     stuck_summary: str | None = None,
+    usage_limit_reason: str | None = None,
 ) -> None:
     """Update the parent merge entry after a conflict-fix worker finishes.
 
@@ -1110,6 +1129,15 @@ def on_conflict_fix_done(
     ``coord merge`` retries.  On failure: marked HUMAN_REQUIRED so the TUI
     can surface "manual resolution required", and a comment is posted on
     the underlying issue so the user is notified outside the TUI too.
+
+    *usage_limit_reason* (#1461 review finding 2): when the conflict-fix
+    worker was killed by the account's usage limit mid-fix, it did not
+    actually fail to resolve anything — frame the parked entry as "wait for
+    the reset", not "manual rebase required", so the operator isn't sent
+    chasing a defect that doesn't exist. Still lands in HUMAN_REQUIRED
+    (rather than auto-retrying, which would just burn more of the same
+    exhausted budget — the #1461 "do not auto-retry immediately" rule
+    applies here too), just with an accurate message.
 
     Called from both ``reconcile()`` (via mark_done/failed) and
     ``coord notify`` (via post_transition) — both paths must trigger this
@@ -1130,43 +1158,56 @@ def on_conflict_fix_done(
             entry.last_attempt = None
         else:
             existing_error = entry.error or "conflict-fix failed"
-            # #1291: a SEMANTIC give-up gets ONE escalated attempt from a
-            # stronger model before the entry is parked.  Everything else —
-            # and a second semantic failure (the escalated attempt is itself
-            # a conflict-fix row, so `has_prior_semantic_escalation` blocks
-            # it) — behaves exactly as before.
-            fix = (
-                _try_semantic_escalation(
-                    entry,
-                    board=board,
-                    config=config,
-                    machine_name=machine_name,
-                    stuck_summary=stuck_summary,
-                )
-                if semantic
-                else None
-            )
-            if fix is not None:
-                # Stay in CONFLICT, not HUMAN_REQUIRED — the escalated worker
-                # is in flight.  If it fails, this hook runs again and the
-                # escalation guard sends the entry to HUMAN_REQUIRED.
-                entry.state = mq.CONFLICT
-                model = fix.model or "escalated model"
-                entry.error = (
-                    f"{existing_error}; semantic conflict escalated to "
-                    f"{model} (assignment {fix.assignment_id}) — review the "
-                    "resolution diff before merge."
-                )
-                escalated = (
-                    entry, model, fix.assignment_id or "", fix.machine_name or "",
-                )
-            else:
+            if usage_limit_reason:
                 entry.state = mq.HUMAN_REQUIRED
                 entry.error = (
-                    f"{existing_error}; conflict-fix worker did not resolve. "
-                    "Manual rebase required."
+                    f"{existing_error}; conflict-fix worker was killed by "
+                    f"the account's {usage_limit_reason} — not a real "
+                    "conflict. Wait for the reset, then re-run `coord "
+                    "merge` to retry unchanged."
                 )
                 failed_entry = entry
+            else:
+                # #1291: a SEMANTIC give-up gets ONE escalated attempt from a
+                # stronger model before the entry is parked.  Everything
+                # else — and a second semantic failure (the escalated
+                # attempt is itself a conflict-fix row, so
+                # `has_prior_semantic_escalation` blocks it) — behaves
+                # exactly as before.
+                fix = (
+                    _try_semantic_escalation(
+                        entry,
+                        board=board,
+                        config=config,
+                        machine_name=machine_name,
+                        stuck_summary=stuck_summary,
+                    )
+                    if semantic
+                    else None
+                )
+                if fix is not None:
+                    # Stay in CONFLICT, not HUMAN_REQUIRED — the escalated
+                    # worker is in flight.  If it fails, this hook runs
+                    # again and the escalation guard sends the entry to
+                    # HUMAN_REQUIRED.
+                    entry.state = mq.CONFLICT
+                    model = fix.model or "escalated model"
+                    entry.error = (
+                        f"{existing_error}; semantic conflict escalated to "
+                        f"{model} (assignment {fix.assignment_id}) — review "
+                        "the resolution diff before merge."
+                    )
+                    escalated = (
+                        entry, model, fix.assignment_id or "",
+                        fix.machine_name or "",
+                    )
+                else:
+                    entry.state = mq.HUMAN_REQUIRED
+                    entry.error = (
+                        f"{existing_error}; conflict-fix worker did not "
+                        "resolve. Manual rebase required."
+                    )
+                    failed_entry = entry
         changed = True
     if changed:
         mq.save_queue(items)
@@ -1202,14 +1243,30 @@ def _on_conflict_fix_done(
     SEMANTIC conflict (the ``coord:conflict=semantic`` marker), which — with
     ``pipeline.escalate_semantic_conflicts`` on — buys one escalated attempt
     instead of an immediate HUMAN_REQUIRED (#1291).
+
+    #1461 review finding 2: when the conflict-fix worker was itself killed
+    by the account's usage limit (flagged on *agent_entry* by
+    ``AgentServer._reap`` — the same signal ``_record_usage_limit_reason``
+    stamps onto ordinary work assignments), it didn't actually fail to
+    resolve anything. Skip the SEMANTIC-conflict check (there is nothing to
+    diagnose in the transcript — it was cut off, not concluded) and pass the
+    reason through so the parked entry gets an accurate message instead of
+    "manual rebase required".
     """
     parent_id = fix_assignment.review_of_assignment_id
     if not parent_id:
         return
 
+    usage_limit_reason = (agent_entry or {}).get("usage_limit_reason")
+
     semantic = False
     stuck_summary: str | None = None
-    if not succeeded and board is not None and config is not None:
+    if (
+        not succeeded
+        and not usage_limit_reason
+        and board is not None
+        and config is not None
+    ):
         semantic, stuck_summary = _semantic_verdict(
             fix_assignment, agent_entry, config,
         )
@@ -1223,6 +1280,7 @@ def _on_conflict_fix_done(
         board=board,
         config=config,
         stuck_summary=stuck_summary,
+        usage_limit_reason=usage_limit_reason,
     )
 
 
