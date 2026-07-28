@@ -1101,6 +1101,102 @@ def _record_test_verdict_local(
         )
 
 
+def record_review_reaffirm(
+    *,
+    review_assignment_id: str,
+    new_head_sha: str,
+    new_patch_id: str | None,
+    reason: str,
+    actor: str = "user",
+) -> None:
+    """Re-point an approved review's staleness anchors and audit it (#1488).
+
+    The single-row analogue of :func:`record_test_verdict` for the escape
+    hatch ``coord review-reaffirm`` — routes to the daemon when a
+    ``board_service`` is configured, otherwise writes directly.  Never
+    touches ``review_verdict`` (still ``"approve"``) — only the anchors
+    :func:`coord.merge_queue.has_approved_review` compares against the
+    branch's live head, so a reaffirmed row is indistinguishable from a
+    review that ran fresh against the current SHA, while the audit row
+    (``event_type="review_reaffirmed"``, distinct from ``review_approve``)
+    keeps the "this was a human call, not a re-review" trail intact.
+    """
+    svc = _board_service()
+    resp = _route_write(
+        svc,
+        "/review-reaffirm",
+        {
+            "review_assignment_id": review_assignment_id,
+            "new_head_sha": new_head_sha,
+            "new_patch_id": new_patch_id,
+            "reason": reason,
+            "actor": actor,
+        },
+    )
+    if resp is not None:
+        return
+    _record_review_reaffirm_local(
+        review_assignment_id=review_assignment_id,
+        new_head_sha=new_head_sha,
+        new_patch_id=new_patch_id,
+        reason=reason,
+        actor=actor,
+    )
+
+
+def _record_review_reaffirm_local(
+    *,
+    review_assignment_id: str,
+    new_head_sha: str,
+    new_patch_id: str | None,
+    reason: str,
+    actor: str = "user",
+) -> None:
+    """UPDATE the review assignment's ``review_head_sha``/``review_patch_id``
+    and append the audit row.  Raises :class:`ValueError` when
+    *review_assignment_id* doesn't resolve to a row — the CLI caller has
+    already re-read it off the board immediately before calling this, so a
+    miss here means it vanished (or was never a review row) between the two
+    reads, and silently no-op'ing would leave the operator believing a
+    non-existent reaffirmation had happened.
+    """
+    conn = get_connection()
+    prior = conn.execute(
+        "SELECT review_head_sha, review_patch_id, repo_name, issue_number, "
+        "machine_name, type FROM assignments WHERE assignment_id=?",
+        (review_assignment_id,),
+    ).fetchone()
+    if prior is None:
+        raise ValueError(f"no assignment found for {review_assignment_id!r}")
+    conn.execute(
+        "UPDATE assignments SET review_head_sha=?, review_patch_id=? "
+        "WHERE assignment_id=?",
+        (new_head_sha, new_patch_id, review_assignment_id),
+    )
+    conn.commit()
+    _record_audit(
+        tier="business",
+        category="review",
+        event_type="review_reaffirmed",
+        actor=actor,
+        summary=(
+            f"Review reaffirmed: {prior['repo_name']}#{prior['issue_number']} "
+            f"({review_assignment_id}) — {reason}"
+        ),
+        repo=prior["repo_name"],
+        issue=prior["issue_number"],
+        assignment_id=review_assignment_id,
+        machine=prior["machine_name"],
+        details={
+            "reason": reason,
+            "old_head_sha": prior["review_head_sha"],
+            "new_head_sha": new_head_sha,
+            "old_patch_id": prior["review_patch_id"],
+            "new_patch_id": new_patch_id,
+        },
+    )
+
+
 def _stamp_test_staleness_anchor(
     *,
     assignment_id: str,

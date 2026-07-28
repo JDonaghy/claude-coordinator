@@ -1641,6 +1641,68 @@ def test_serve_test_verdict_records(file_db: Path, valid_config_path: Path, rw_d
     assert row["test_reason"] == "scroll broke"
 
 
+def test_serve_review_reaffirm_records(file_db: Path, valid_config_path: Path, rw_db):
+    # #1488: the daemon write path for `coord review-reaffirm`.
+    _seed_running_assignment(rw_db, aid="rev1", atype="review")
+    rw_db.execute(
+        "UPDATE assignments SET review_head_sha=?, review_patch_id=?, "
+        "review_verdict=? WHERE assignment_id=?",
+        ("old-sha", "old-patch", "approve", "rev1"),
+    )
+    rw_db.commit()
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post(
+            "/review-reaffirm",
+            json={
+                "review_assignment_id": "rev1",
+                "new_head_sha": "new-sha",
+                "new_patch_id": "new-patch",
+                "reason": "conflict resolution: merged filters, suite green",
+            },
+        )
+    assert resp.status_code == 200
+    row = rw_db.execute(
+        "SELECT review_head_sha, review_patch_id, review_verdict FROM assignments "
+        "WHERE assignment_id='rev1'"
+    ).fetchone()
+    assert row["review_head_sha"] == "new-sha"
+    assert row["review_patch_id"] == "new-patch"
+    # The verdict itself is never touched by a reaffirm.
+    assert row["review_verdict"] == "approve"
+    audit = rw_db.execute(
+        "SELECT event_type, category, actor FROM audit_log "
+        "WHERE assignment_id='rev1'"
+    ).fetchone()
+    assert audit["event_type"] == "review_reaffirmed"
+    assert audit["category"] == "review"
+
+
+def test_serve_review_reaffirm_missing_field_400(
+    file_db: Path, valid_config_path: Path, rw_db,
+):
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post("/review-reaffirm", json={"review_assignment_id": "rev1"})
+    assert resp.status_code == 400
+
+
+def test_serve_review_reaffirm_unknown_assignment_404(
+    file_db: Path, valid_config_path: Path, rw_db,
+):
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post(
+            "/review-reaffirm",
+            json={
+                "review_assignment_id": "no-such-id",
+                "new_head_sha": "new-sha",
+                "reason": "conflict resolution",
+            },
+        )
+    assert resp.status_code == 404
+
+
 def test_serve_acceptance_verdict_records(file_db: Path, valid_config_path: Path, rw_db):
     # #944: /acceptance-verdict mirrors /test-verdict for the oracle loop's
     # Acceptance-gate verdict.
@@ -1719,6 +1781,31 @@ def test_record_test_verdict_routes_when_service_set(coord_db, monkeypatch):
     )
     assert captured["path"] == "/test-verdict"
     assert captured["payload"]["test_state"] == "passed"
+
+
+def test_record_review_reaffirm_routes_when_service_set(coord_db, monkeypatch):
+    from coord import client as cc
+    from coord import state
+
+    monkeypatch.setattr(
+        cc, "resolve_board_service", lambda *a, **k: cc.ServiceConfig("http://d:7435")
+    )
+    captured: dict = {}
+    monkeypatch.setattr(
+        cc, "post_record",
+        lambda svc, path, payload, **kw: captured.update(path=path, payload=payload) or {"ok": True},
+    )
+    state.record_review_reaffirm(
+        review_assignment_id="rev1", new_head_sha="new-sha", new_patch_id="new-patch",
+        reason="conflict resolution",
+    )
+    assert captured["path"] == "/review-reaffirm"
+    assert captured["payload"]["new_head_sha"] == "new-sha"
+    assert captured["payload"]["reason"] == "conflict resolution"
+    # Routed → no local row touched.
+    assert coord_db.execute(
+        "SELECT COUNT(*) c FROM audit_log WHERE assignment_id='rev1'"
+    ).fetchone()["c"] == 0
 
 
 def test_record_acceptance_verdict_routes_when_service_set(coord_db, monkeypatch):
