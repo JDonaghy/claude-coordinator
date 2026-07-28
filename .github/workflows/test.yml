@@ -20,6 +20,35 @@ jobs:
       - run: pip install -e ".[dev]"
       - run: pytest
 
+  # #1484: run the full suite with `gh` made unresolvable on PATH.
+  #
+  # Filed after the #1472 elitebook incident: a worker's systemd PATH excluded
+  # its linuxbrew-installed `gh`, and ~98 tests that inject every other
+  # dependency (pr_lookup, branch_sha_fetcher, ...) still reached one live
+  # `gh` subprocess call through an unmocked seam — so the suite's result
+  # depended on the host, not the code. #1483 closed the production-code half
+  # (every `gh` invocation now funnels through coord/github_ops.py, whose
+  # `_gh()` turns a missing/hung `gh` into a typed, caught error instead of a
+  # raw FileNotFoundError escaping past `except RuntimeError` guards). This
+  # job is the regression guard for that fix: without it, the next unmocked
+  # seam is invisible again until someone's agent happens to lack the binary.
+  #
+  # `ubuntu-latest` ships `gh` preinstalled, so this can't be a no-op PATH
+  # trick like `PATH=/usr/bin:/bin` (which would miss it entirely on hosts —
+  # dellserver, precision — where `gh` itself lives at /usr/bin/gh).
+  # scripts/run_tests_without_gh.sh instead shadows only the PATH directories
+  # that actually contain a `gh` binary, wherever that is, leaving every other
+  # directory (notably the venv's own bin/) untouched.
+  no-gh-on-path:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: scripts/run_tests_without_gh.sh python -m pytest tests/ -q
+
   # #906: run the test suite in thin-client mode with COORD_STRICT_LOCAL_BOARD=1
   # so any board touch reachable from a thin-client path raises RuntimeError
   # instead of silently no-oping against an empty local DB.  This job catches
