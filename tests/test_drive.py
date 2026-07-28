@@ -1290,10 +1290,11 @@ def recorded_git(monkeypatch):
     """Capture every subprocess argv and script the return values.
 
     #1483 moved the ``gh pr view`` call in ``verify_merged`` behind the
-    ``github_ops`` seam, so it now shells out via
-    ``coord.github_ops.subprocess.run`` rather than ``coord.drive.subprocess.
-    run`` — patch both to the same recorder/script so a single ``scripted``
-    dict still drives both the git and gh sides of a scenario.
+    ``github_ops`` seam. Both ``coord.drive`` and ``coord.github_ops`` do a
+    plain ``import subprocess``, so they share the same module-level
+    ``subprocess.run`` attribute — patching it once via ``coord.drive.
+    subprocess.run`` patches it for both call sites, and a single
+    ``scripted`` dict drives both the git and gh sides of a scenario.
     """
     calls: list[list[str]] = []
     scripted: dict[tuple[str, ...], tuple[int, str]] = {}
@@ -1306,7 +1307,6 @@ def recorded_git(monkeypatch):
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     monkeypatch.setattr("coord.drive.subprocess.run", fake_run)
-    monkeypatch.setattr("coord.github_ops.subprocess.run", fake_run)
     return calls, scripted
 
 
@@ -1335,10 +1335,9 @@ def test_verify_merged_reports_unmerged_when_cherry_shows_a_plus(recorded_git, t
     assert GitMergeVerifier(repo_path=str(tmp_path)).verify_merged(s) is False
 
 
-def test_verify_merged_prefers_the_github_pr_state(recorded_git, tmp_path, monkeypatch):
+def test_verify_merged_prefers_the_github_pr_state(recorded_git, tmp_path):
     calls, scripted = recorded_git
     (tmp_path / ".git").mkdir()
-    monkeypatch.setattr("coord.drive.shutil.which", lambda name: "/usr/bin/gh")
     scripted[("pr", "view")] = (0, "MERGED\n")
 
     s = state(work_branch="b", repo_github="john/x")
@@ -1347,10 +1346,9 @@ def test_verify_merged_prefers_the_github_pr_state(recorded_git, tmp_path, monke
     assert not any("cherry" in " ".join(c) for c in calls)
 
 
-def test_verify_merged_rejects_a_closed_pr(recorded_git, tmp_path, monkeypatch):
+def test_verify_merged_rejects_a_closed_pr(recorded_git, tmp_path):
     _calls, scripted = recorded_git
     (tmp_path / ".git").mkdir()
-    monkeypatch.setattr("coord.drive.shutil.which", lambda name: "/usr/bin/gh")
     scripted[("pr", "view")] = (0, "CLOSED\n")
 
     warned: list[str] = []
@@ -1360,11 +1358,10 @@ def test_verify_merged_rejects_a_closed_pr(recorded_git, tmp_path, monkeypatch):
 
 
 def test_verify_merged_falls_back_to_cherry_when_gh_finds_no_pr(
-    recorded_git, tmp_path, monkeypatch
+    recorded_git, tmp_path
 ):
     calls, scripted = recorded_git
     (tmp_path / ".git").mkdir()
-    monkeypatch.setattr("coord.drive.shutil.which", lambda name: "/usr/bin/gh")
     scripted[("pr", "view")] = (1, "")
     scripted[("cherry",)] = (0, "- abc\n")
     s = state(work_branch="b", repo_github="john/x")
