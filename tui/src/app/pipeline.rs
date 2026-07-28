@@ -3809,6 +3809,11 @@ impl CoordApp {
                                 if let Some(marker) = self.drive_badge_span(issue) {
                                     spans.push(marker);
                                 }
+                                // #1505: "[stuck]" driver-escalation badge,
+                                // same splice point.
+                                if let Some(marker) = self.escalation_badge_span(issue) {
+                                    spans.push(marker);
+                                }
                                 spans.push(StyledSpan::with_fg(
                                     trunc(&issue.title, 20),
                                     title_color,
@@ -3931,6 +3936,11 @@ impl CoordApp {
                         }
                         // #1398: "driving" badge, same splice point.
                         if let Some(marker) = self.drive_badge_span(issue) {
+                            spans.push(marker);
+                        }
+                        // #1505: "[stuck]" driver-escalation badge, same
+                        // splice point.
+                        if let Some(marker) = self.escalation_badge_span(issue) {
                             spans.push(marker);
                         }
                         spans.push(StyledSpan::with_fg(trunc(&issue.title, 18), title_color));
@@ -4157,6 +4167,11 @@ impl CoordApp {
                                     if let Some(marker) = self.drive_badge_span(issue) {
                                         spans.push(marker);
                                     }
+                                    // #1505: "[stuck]" driver-escalation
+                                    // badge, same splice point.
+                                    if let Some(marker) = self.escalation_badge_span(issue) {
+                                        spans.push(marker);
+                                    }
                                     spans.push(StyledSpan::with_fg(
                                         trunc(&issue.title, 20),
                                         title_color,
@@ -4273,6 +4288,11 @@ impl CoordApp {
                                 }
                                 // #1398: "driving" badge, same splice point.
                                 if let Some(marker) = self.drive_badge_span(issue) {
+                                    spans.push(marker);
+                                }
+                                // #1505: "[stuck]" driver-escalation badge,
+                                // same splice point.
+                                if let Some(marker) = self.escalation_badge_span(issue) {
                                     spans.push(marker);
                                 }
                                 spans.push(StyledSpan::with_fg(trunc(&issue.title, 20), title_color));

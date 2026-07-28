@@ -2518,6 +2518,159 @@ def test_serve_issue_context_unknown_action_400(file_db: Path, valid_config_path
     assert resp.status_code == 400
 
 
+# ── #1505: driver escalation records ────────────────────────────────────────
+
+def test_serve_drive_escalations_record_get_dismiss(
+    file_db: Path, valid_config_path: Path, rw_db
+):
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        r = cli.post("/drive-escalations", json={
+            "action": "record", "repo_name": "api", "issue_number": 7,
+            "stage": "merge", "reason": "merge_status=NEEDS_ATTENTION",
+            "gate_readings": "merge_status=NEEDS_ATTENTION | pr_url=(none)",
+            "proposed_command": "coord merge --plan --repo api",
+            "assignment_id": "w1",
+        })
+        assert r.status_code == 200
+        eid = r.json()["entry_id"]
+        assert isinstance(eid, int)
+
+        g = cli.get("/drive-escalations", params={"repo_name": "api", "issue_number": 7})
+        assert g.status_code == 200
+        entries = g.json()["entries"]
+        assert len(entries) == 1
+        assert entries[0]["reason"] == "merge_status=NEEDS_ATTENTION"
+        assert entries[0]["proposed_command"] == "coord merge --plan --repo api"
+        assert entries[0]["assignment_id"] == "w1"
+
+        # A second `record` for the SAME issue replaces, not duplicates.
+        cli.post("/drive-escalations", json={
+            "action": "record", "repo_name": "api", "issue_number": 7,
+            "reason": "still stuck", "proposed_command": "gh pr merge 1 --rebase",
+        })
+        g2 = cli.get("/drive-escalations", params={"repo_name": "api", "issue_number": 7})
+        assert len(g2.json()["entries"]) == 1
+        assert g2.json()["entries"][0]["reason"] == "still stuck"
+
+        d = cli.post("/drive-escalations", json={
+            "action": "dismiss", "repo_name": "api", "issue_number": 7,
+        })
+        assert d.json()["deleted"] is True
+    assert rw_db.execute(
+        "SELECT COUNT(*) c FROM drive_escalations WHERE repo_name='api' AND issue_number=7"
+    ).fetchone()["c"] == 0
+
+
+def test_serve_drive_escalations_list_all_and_by_repo(
+    file_db: Path, valid_config_path: Path, rw_db
+):
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        cli.post("/drive-escalations", json={
+            "action": "record", "repo_name": "api", "issue_number": 7,
+            "reason": "r1", "proposed_command": "c1",
+        })
+        cli.post("/drive-escalations", json={
+            "action": "record", "repo_name": "other", "issue_number": 9,
+            "reason": "r2", "proposed_command": "c2",
+        })
+        everything = cli.get("/drive-escalations").json()["entries"]
+        assert {e["repo_name"] for e in everything} == {"api", "other"}
+        just_api = cli.get("/drive-escalations", params={"repo_name": "api"}).json()["entries"]
+        assert [e["repo_name"] for e in just_api] == ["api"]
+
+
+def test_serve_drive_escalations_unknown_action_400(
+    file_db: Path, valid_config_path: Path, rw_db
+):
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post("/drive-escalations", json={
+            "action": "bogus", "repo_name": "api", "issue_number": 7,
+        })
+    assert resp.status_code == 400
+
+
+def test_record_drive_escalation_routes_when_service_set(coord_db, monkeypatch):
+    from coord import client as cc
+    from coord import state
+
+    monkeypatch.setattr(
+        cc, "resolve_board_service", lambda *a, **k: cc.ServiceConfig("http://d:7435")
+    )
+    captured: dict = {}
+    monkeypatch.setattr(
+        cc, "post_record",
+        lambda svc, path, payload, **kw: captured.update(path=path, payload=payload)
+        or {"entry_id": 42},
+    )
+    assert state.record_drive_escalation(
+        "api", 7, stage="merge", reason="stuck", gate_readings="",
+        proposed_command="coord merge --plan --repo api",
+    ) == 42
+    assert captured["path"] == "/drive-escalations"
+    assert captured["payload"]["action"] == "record"
+    # Routed → no local row created.
+    assert coord_db.execute("SELECT COUNT(*) c FROM drive_escalations").fetchone()["c"] == 0
+
+
+def test_dismiss_drive_escalation_routes_when_service_set(coord_db, monkeypatch):
+    from coord import client as cc
+    from coord import state
+
+    monkeypatch.setattr(
+        cc, "resolve_board_service", lambda *a, **k: cc.ServiceConfig("http://d:7435")
+    )
+    monkeypatch.setattr(
+        cc, "post_record",
+        lambda svc, path, payload, **kw: {"deleted": True},
+    )
+    assert state.dismiss_drive_escalation("api", 7) is True
+
+
+def test_get_drive_escalation_routes_when_service_set(coord_db, monkeypatch):
+    from coord import client as cc
+    from coord import state
+
+    monkeypatch.setattr(
+        cc, "resolve_board_service", lambda *a, **k: cc.ServiceConfig("http://d:7435")
+    )
+    monkeypatch.setattr(
+        cc, "fetch_drive_escalation",
+        lambda svc, repo, num: {"reason": "remote stuck", "proposed_command": "c"},
+    )
+    assert state.get_drive_escalation("api", 7)["reason"] == "remote stuck"
+
+
+def test_record_drive_escalation_local_upserts_by_repo_and_issue(coord_db):
+    from coord import state
+
+    first = state._record_drive_escalation_local(
+        "api", 7, stage="merge", reason="first", gate_readings="",
+        proposed_command="c1",
+    )
+    second = state._record_drive_escalation_local(
+        "api", 7, stage="merge", reason="second", gate_readings="",
+        proposed_command="c2",
+    )
+    assert first == second  # same row, not a duplicate
+    rows = state._list_drive_escalations_local("api")
+    assert len(rows) == 1
+    assert rows[0]["reason"] == "second"
+
+
+def test_dismiss_drive_escalation_local_reports_whether_a_row_existed(coord_db):
+    from coord import state
+
+    assert state._dismiss_drive_escalation_local("api", 7) is False
+    state._record_drive_escalation_local(
+        "api", 7, stage="merge", reason="x", gate_readings="", proposed_command="y",
+    )
+    assert state._dismiss_drive_escalation_local("api", 7) is True
+    assert state._get_drive_escalation_local("api", 7) is None
+
+
 # ── #873: durable issue_comments mirror ─────────────────────────────────────
 
 def test_serve_issue_comments_capture_then_get(file_db: Path, valid_config_path: Path, rw_db):

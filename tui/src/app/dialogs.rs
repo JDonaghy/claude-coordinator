@@ -808,6 +808,49 @@ impl CoordApp {
             // `interactive_children`/`automated_children` near the top of
             // this function.
             items.push(ContextMenuItem::separator());
+
+            // #1505: a driver escalation — `coord drive`'s merge stage
+            // stopped rather than retry a status no retry can fix
+            // (NEEDS_ATTENTION / unrecognised) and left a proposed fix.
+            // Shown regardless of lifecycle classification: a stuck merge
+            // still reads as "in progress" (the issue is still open), so
+            // this can't be nested under one specific `match lifecycle` arm
+            // below. "Open PR" is deliberately the SAME `"open-pr"` action
+            // the Done lifecycle uses below — a stuck merge almost always
+            // already has a PR open, so there is nothing escalation-
+            // specific about opening it.
+            if let (Some(n), Some(repo)) = (issue_number, repo_name) {
+                if let Some(esc) = self.escalation_for(repo, n) {
+                    // Informational, non-actionable header naming WHY the
+                    // driver stopped — the mockup's "Driver stuck on #N —
+                    // <reason>" line — so the operator isn't choosing
+                    // between Run/Open PR/Dismiss blind.
+                    let mut reason_item = ContextMenuItem::action(
+                        "escalation-reason",
+                        &format!("Driver stuck: {}", trunc(&esc.reason, 50)),
+                    );
+                    reason_item.disabled = true;
+                    items.push(reason_item);
+                    items.push(ContextMenuItem::action(
+                        "run-escalation",
+                        &format!("Run proposed fix: {}", trunc(&esc.proposed_command, 40)),
+                    ));
+                    let has_pr = self
+                        .pipeline_issues
+                        .iter()
+                        .find(|iss| iss.number == n)
+                        .and_then(|iss| self.pipeline_pr_number(iss))
+                        .is_some();
+                    let mut open_pr_item = ContextMenuItem::action("open-pr", "Open PR");
+                    open_pr_item.disabled = !has_pr;
+                    items.push(open_pr_item);
+                    items.push(ContextMenuItem::action(
+                        "dismiss-escalation",
+                        "Dismiss escalation",
+                    ));
+                    items.push(ContextMenuItem::separator());
+                }
+            }
         }
         match lifecycle {
             PipelineRowLifecycle::New => {
@@ -6244,6 +6287,39 @@ impl CoordApp {
                     _ => return false,
                 };
                 self.pending_kill_drive = Some(PendingKillDrive { repo, issue });
+                true
+            }
+            // #1505: "Run it" — the human's one-key response to a driver
+            // escalation.  Deliberately NOT gated behind a confirm dialog:
+            // the click itself, reached only by an operator reading the
+            // proposed command off the menu label, IS the "one-key human
+            // decision" the escalation record exists for (see
+            // `dispatch_run_escalation`'s doc comment).
+            "run-escalation" => {
+                let (repo, issue) = match target {
+                    ContextMenuTarget::PipelineRow {
+                        issue_number: Some(n),
+                        repo_name: Some(r),
+                        ..
+                    } => (r.clone(), *n),
+                    _ => return false,
+                };
+                self.dispatch_run_escalation(&repo, issue);
+                true
+            }
+            // #1505: "Dismiss escalation" — clears the record without
+            // acting on it (e.g. it was resolved by hand already, or the
+            // proposed command doesn't apply).
+            "dismiss-escalation" => {
+                let (repo, issue) = match target {
+                    ContextMenuTarget::PipelineRow {
+                        issue_number: Some(n),
+                        repo_name: Some(r),
+                        ..
+                    } => (r.clone(), *n),
+                    _ => return false,
+                };
+                self.dispatch_dismiss_escalation(&repo, issue);
                 true
             }
             "start-with-plan" => {

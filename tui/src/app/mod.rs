@@ -98,6 +98,7 @@ pub(crate) mod fleet_terminals;
 pub(crate) mod fleet_sessions;
 pub(crate) mod workspace;
 pub(crate) mod drive;
+pub(crate) mod escalation;
 #[allow(unused_imports)]
 use self::types::*;
 #[allow(unused_imports)]

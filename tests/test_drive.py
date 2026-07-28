@@ -34,6 +34,7 @@ import pytest
 from coord.config import Config, UsageGateConfig
 from coord.drive import (
     EXIT_DEADLINE,
+    EXIT_ESCALATED,
     EXIT_OK,
     EXIT_TERMINAL_FAILURE,
     EXIT_USAGE,
@@ -1249,6 +1250,87 @@ def test_a_blocked_merge_waits_and_reports_the_gate():
     assert "CI running" in action.label
 
 
+# ── #1505: escalate on a status retrying can't fix ──────────────────────────
+
+
+def test_needs_attention_escalates_on_the_first_encounter_instead_of_retrying():
+    """The #1477 bug: NEEDS_ATTENTION used to fall through to the same
+    bounded retry as PENDING/CONFLICT, burning the whole merge-attempt
+    budget on a status no retry could ever change. It must escalate
+    immediately — `counters.merge_attempts` never even increments."""
+    counters = DriveCounters()
+    action = step(approved_work(merge_status="NEEDS_ATTENTION"), counters=counters)
+    assert action.is_exit
+    assert action.exit_code == EXIT_ESCALATED
+    assert counters.merge_attempts == 0
+    assert action.command[:2] == ("escalate", "record")
+    assert "NEEDS_ATTENTION" in action.message
+
+
+def test_an_unrecognised_merge_status_also_escalates_rather_than_spinning():
+    """Acceptance: "a driver reaching NEEDS_ATTENTION (or an unrecognised
+    merge status) escalates" — not just the one named value."""
+    action = step(approved_work(merge_status="SOME_FUTURE_STATUS"))
+    assert action.is_exit
+    assert action.exit_code == EXIT_ESCALATED
+
+
+def test_escalation_command_proposes_the_gh_pr_merge_recipe_when_a_pr_is_known():
+    """Mirrors the #1477 resolution this issue was opened over: `gh pr merge
+    --rebase` + `coord reconcile-merges` when a PR number is on the board."""
+    action = step(
+        approved_work(
+            merge_status="NEEDS_ATTENTION",
+            merge_pr_url="https://github.com/john/claude-coordinator/pull/1496",
+        )
+    )
+    command_str = " ".join(action.command)
+    assert "--command" in action.command
+    idx = action.command.index("--command")
+    assert action.command[idx + 1] == "gh pr merge 1496 --rebase && coord reconcile-merges"
+    assert "--gate" in action.command
+    assert "pr_url=https://github.com/john/claude-coordinator/pull/1496" in command_str
+
+
+def test_escalation_command_falls_back_to_the_plan_view_with_no_known_pr():
+    action = step(approved_work(merge_status="NEEDS_ATTENTION", merge_pr_url=""))
+    idx = action.command.index("--command")
+    assert "coord merge --plan --repo" in action.command[idx + 1]
+
+
+def test_escalation_carries_the_assignment_id_and_gate_readings():
+    action = step(
+        approved_work(
+            merge_status="NEEDS_ATTENTION",
+            merge_reason="review not approved",
+        )
+    )
+    assert "--assignment" in action.command
+    idx = action.command.index("--assignment")
+    assert action.command[idx + 1] == "w1"
+    command_str = " ".join(action.command)
+    assert "merge_reason=review not approved" in command_str
+    assert "review_verdict=approve" in command_str
+
+
+def test_a_conflict_status_still_retries_rather_than_escalating():
+    """CONFLICT keeps its own #1474 dispatch path — it must NOT be swept
+    into the new escalate branch alongside NEEDS_ATTENTION."""
+    action = step(approved_work(merge_status="CONFLICT"))
+    assert action.kind == RUN
+
+
+def test_the_escalate_branch_runs_before_the_attempt_cap_is_checked():
+    """Even with the cap already exhausted, NEEDS_ATTENTION escalates
+    (distinct message/exit code) rather than reporting a generic
+    'merge attempted N times' exhaustion."""
+    counters = DriveCounters(merge_attempts=5)
+    opts = DriveOptions(machine="precision", max_merge_attempts=1)
+    action = step(approved_work(merge_status="NEEDS_ATTENTION"), opts, counters=counters)
+    assert action.exit_code == EXIT_ESCALATED
+    assert "attempted" not in action.message
+
+
 # ── terminal: merged, verified ───────────────────────────────────────────────
 
 
@@ -1657,6 +1739,48 @@ def test_driver_shells_out_to_coord_and_never_calls_internals(driver_factory):
     assert driver.run() == EXIT_TERMINAL_FAILURE  # cap reached, never landed
     argvs = [" ".join(a) for a in driver.recorded]  # type: ignore[attr-defined]
     assert any("merge --only w1 --method rebase" in a for a in argvs), argvs
+
+
+def test_driver_escalates_and_writes_the_record_via_the_cli(driver_factory):
+    """#1505 end to end: a NEEDS_ATTENTION merge status escalates instead of
+    burning `max_merge_attempts` on `coord merge --only`, and the write goes
+    out as a `coord escalate record` argv — the CLI-is-the-contract rule,
+    executed by the I/O shell (`Driver.run`), never `decide()` directly."""
+    payload = board(
+        status="done", test_state="passed", review_state="done", review_iteration=0
+    )
+    payload["assignments"].append(
+        {
+            "repo_name": REPO,
+            "issue_number": ISSUE,
+            "type": "review",
+            "assignment_id": "r1",
+            "dispatched_at": 2.0,
+            "status": "done",
+            "review_of_assignment_id": "w1",
+            "review_verdict": "approve",
+        }
+    )
+    payload["merge_plan"] = [
+        {
+            "repo_name": REPO,
+            "issue_number": ISSUE,
+            "status": "NEEDS_ATTENTION",
+            "assignment_id": "w1",
+            "pr_url": "https://github.com/john/claude-coordinator/pull/1496",
+        }
+    ]
+    driver = driver_factory(
+        [payload],
+        opts=DriveOptions(
+            machine="precision", poll=1.0, max_merge_attempts=3, deadline_mins=1.0
+        ),
+    )
+    assert driver.run() == EXIT_ESCALATED
+    argvs = [" ".join(a) for a in driver.recorded]  # type: ignore[attr-defined]
+    assert any("escalate record" in a for a in argvs), argvs
+    assert any("gh pr merge 1496 --rebase" in a for a in argvs), argvs
+    assert not any(" merge --only" in a for a in argvs), argvs
 
 
 def test_driver_returns_the_deadline_code_when_time_runs_out(driver_factory, capsys):

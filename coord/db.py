@@ -271,6 +271,31 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             verdict             TEXT
         );
 
+        -- #1505: board-visible "driver stuck" record.  Written by `coord
+        -- drive`'s merge stage the moment it hits a status no amount of
+        -- retrying can fix (NEEDS_ATTENTION / an unrecognised status) instead
+        -- of silently burning the merge-attempt budget on it (see
+        -- coord/drive.py's `_decide_merge`).  One row per (repo_name,
+        -- issue_number) — a fresh escalation replaces the previous one
+        -- (`ON CONFLICT ... DO UPDATE`, coord/state.py
+        -- `_record_drive_escalation_local`); `coord escalate dismiss` (or the
+        -- TUI's "Dismiss" menu item) deletes it outright. `gate_readings` is
+        -- a human-readable "key=value | key=value" summary, not JSON — the
+        -- whole record exists to be read by a human via the Pipeline row's
+        -- right-click menu, not machine-parsed.
+        CREATE TABLE IF NOT EXISTS drive_escalations (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            repo_name        TEXT    NOT NULL,
+            issue_number     INTEGER NOT NULL,
+            stage            TEXT    NOT NULL DEFAULT 'merge',
+            assignment_id    TEXT,
+            reason           TEXT    NOT NULL,
+            gate_readings    TEXT    NOT NULL DEFAULT '',
+            proposed_command TEXT    NOT NULL DEFAULT '',
+            created_at       REAL    NOT NULL,
+            UNIQUE(repo_name, issue_number)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_assignments_status ON assignments(status);
         CREATE INDEX IF NOT EXISTS idx_assignments_machine ON assignments(machine_name);
         CREATE INDEX IF NOT EXISTS idx_merge_queue_state ON merge_queue(state);
@@ -280,6 +305,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_audit_log_assignment ON audit_log(assignment_id);
         CREATE INDEX IF NOT EXISTS idx_issue_comments_issue
             ON issue_comments(repo_name, issue_number);
+        CREATE INDEX IF NOT EXISTS idx_drive_escalations_issue
+            ON drive_escalations(repo_name, issue_number);
 
         INSERT OR IGNORE INTO schema_version VALUES (1);
     """)

@@ -210,6 +210,7 @@
     "pipeline_default_gates": "[\"test\", \"review\", \"merge\"]",
     "round_number": "3"
   },
+  "escalations": [],
   "issues": [
     {
       "body": "## Context\n\nThe /board payload is shipped as raw SQLite rows...",
