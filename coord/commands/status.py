@@ -998,6 +998,19 @@ def _diagnose_orphan_worktrees(config_path: Path, *, dry_run: bool) -> None:
     default=None,
     help="Sort order (always descending). Default: cost for rollup views, time for --by-time.",
 )
+@click.option(
+    "--limits",
+    "show_limits",
+    is_flag=True,
+    help="Show the account's Max-plan 5h/weekly usage-window probe (#1466) "
+    "instead of the cost breakdown — server-side/account-wide, ~60s cached.",
+)
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    help="With --limits, emit the probe as structured JSON instead of text.",
+)
 def usage(
     config_path: Path,
     remote: bool,
@@ -1011,7 +1024,24 @@ def usage(
     by_dim: str | None,
     by_time: bool,
     sort_by: str | None,
+    show_limits: bool,
+    as_json: bool,
 ) -> None:
+    if as_json and not show_limits:
+        raise click.BadParameter(
+            "--json only applies to --limits", param_hint="'--json'"
+        )
+    if show_limits:
+        import json as _json
+
+        from coord.usage_limits import format_plan_limits, get_plan_limits
+
+        limits = get_plan_limits()
+        if as_json:
+            click.echo(_json.dumps(limits.to_dict(), indent=2))
+        else:
+            click.echo(format_plan_limits(limits))
+        return
     if issue_number is not None:
         _usage_issue_drill(config_path, issue_number, today=today, week=week, month=month, since_spec=since_spec)
         return

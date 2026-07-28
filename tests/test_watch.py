@@ -74,30 +74,37 @@ class TestFormatImportantEvent:
         e = self._event({"type": "system", "subtype": "something_else"})
         assert format_important_event(e) is None
 
-    def test_rate_limit_throttled(self) -> None:
+    @pytest.mark.parametrize("status", ["allowed_warning", "rejected"])
+    def test_rate_limit_throttled(self, status: str) -> None:
+        """#1466: only `allowed_warning`/`rejected` (the real statuses Claude
+        Code emits) count as throttled — a prior version of this test used
+        an invented "throttled" status the CLI never sends."""
         e = self._event(
             {"type": "rate_limit_event",
-             "rate_limit_info": {"status": "throttled", "resetsAt": 1716160000}}
+             "rate_limit_info": {"status": status, "resetsAt": 1716160000}}
         )
         out = format_important_event(e)
         assert out is not None
         assert "[rate_limit]" in out
-        assert "throttled" in out
+        assert status in out
         assert "1716160000" in out
 
     def test_rate_limit_allowed_not_surfaced(self) -> None:
+        """#1466: `allowed` fires on essentially every worker — must stay
+        silent, not surface a spurious rate-limit line."""
         e = self._event(
             {"type": "rate_limit_event",
              "rate_limit_info": {"status": "allowed"}}
         )
         assert format_important_event(e) is None
 
-    def test_rate_limit_no_info_surfaces(self) -> None:
-        """rate_limit_event without rate_limit_info sub-object is always notable."""
+    def test_rate_limit_no_info_not_surfaced(self) -> None:
+        """#1466: a `rate_limit_event` with no `rate_limit_info` sub-object
+        (or the old invented top-level `resets_at` shape Claude Code never
+        emits) is a shape we don't recognise — stay silent rather than
+        surface it unconditionally."""
         e = self._event({"type": "rate_limit_event", "resets_at": 99999})
-        out = format_important_event(e)
-        assert out is not None
-        assert "[rate_limit]" in out
+        assert format_important_event(e) is None
 
     def test_result_completed(self) -> None:
         e = self._event(
@@ -346,7 +353,7 @@ class TestWatchCommand:
         _write_log(log_file, [
             {"type": "system", "subtype": "init", "model": "m", "session_id": "s"},
             {"type": "rate_limit_event",
-             "rate_limit_info": {"status": "throttled", "resetsAt": 9999}},
+             "rate_limit_info": {"status": "rejected", "resetsAt": 9999}},
             {"type": "result", "is_error": False, "duration_ms": 1000,
              "num_turns": 1, "total_cost_usd": 0.01, "stop_reason": "end_turn"},
         ])
@@ -354,7 +361,7 @@ class TestWatchCommand:
         result = self._invoke(tmp_path, config_file, log_file)
         assert result.exit_code == 0
         assert "[rate_limit]" in result.output
-        assert "throttled" in result.output
+        assert "rejected" in result.output
 
     def test_stuck_in_assistant_surfaced(self, tmp_path: Path, coord_db) -> None:
         config_file, log_file = self._setup(tmp_path)

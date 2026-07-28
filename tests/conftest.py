@@ -76,6 +76,30 @@ def _no_worktree_writable_deny_scan(monkeypatch):
     monkeypatch.setattr("coord.agent._default_deny_settings_files", lambda: [])
 
 
+@pytest.fixture(autouse=True)
+def _no_real_usage_probe(monkeypatch):
+    """#1466: default the Max-plan usage-window probe to a real subprocess
+    NEVER running in tests.  ``coord approve``'s pre-check and
+    ``coord.drive.preflight`` (via an injected ``usage_prober=``, so it's
+    unaffected by this fixture) call ``coord.usage_limits.get_plan_limits``,
+    which shells out to ``claude -p "/usage"`` — on a machine that has
+    ``claude`` on PATH (every dev/agent box in this fleet does) that is a
+    REAL network call, exactly the class of non-hermetic dependency
+    ``_no_agent_health_probe`` above already exists to prevent. Stubbed to
+    ``status="unknown"`` — the gate's own fail-open behaviour — so the
+    default is silent and identical to "no probe available" everywhere
+    except the small number of tests exercising the gate directly, which
+    monkeypatch ``coord.usage_limits.get_plan_limits`` (or pass their own
+    ``usage_prober=``) themselves, taking priority over this default.
+    """
+    from coord.usage_limits import PlanLimits
+
+    monkeypatch.setattr(
+        "coord.usage_limits.get_plan_limits",
+        lambda *a, **k: PlanLimits(status="unknown"),
+    )
+
+
 def output_and_stderr(result) -> str:
     """CLI text across click versions: newer click separates stderr; older
     mixes it into .output and raises on .stderr access."""

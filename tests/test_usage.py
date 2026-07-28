@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from click.testing import CliRunner
@@ -546,6 +547,56 @@ class TestUsageCommand:
         assert result.exit_code == 0
         assert "Per-model" in result.output
         assert "claude-haiku-4-5" in result.output
+
+
+# ── `coord usage --limits` (#1466) ──────────────────────────────────────────
+
+
+class TestUsageLimitsFlag:
+    def test_limits_prints_session_and_week_with_reset_times(self) -> None:
+        from coord.usage_limits import PlanLimits
+
+        limits = PlanLimits(
+            status="ok",
+            session_pct=57.0,
+            session_resets_at="Jul 27, 1:30am (America/Chicago)",
+            week_pct=29.0,
+            week_resets_at="Aug 1, 12pm (America/Chicago)",
+        )
+        with patch("coord.usage_limits.get_plan_limits", return_value=limits):
+            result = CliRunner().invoke(main, ["usage", "--limits"])
+        assert result.exit_code == 0, result.output
+        assert "57" in result.output
+        assert "Jul 27, 1:30am (America/Chicago)" in result.output
+        assert "29" in result.output
+        assert "Aug 1, 12pm (America/Chicago)" in result.output
+
+    def test_limits_json_emits_structured_data(self) -> None:
+        from coord.usage_limits import PlanLimits
+
+        limits = PlanLimits(status="ok", session_pct=57.0, week_pct=29.0)
+        with patch("coord.usage_limits.get_plan_limits", return_value=limits):
+            result = CliRunner().invoke(main, ["usage", "--limits", "--json"])
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert payload["status"] == "ok"
+        assert payload["session_pct"] == 57.0
+        assert payload["week_pct"] == 29.0
+
+    def test_limits_unavailable_probe_reports_unknown_not_a_crash(self) -> None:
+        from coord.usage_limits import PlanLimits
+
+        with patch(
+            "coord.usage_limits.get_plan_limits",
+            return_value=PlanLimits(status="unknown", error="claude -p /usage timed out"),
+        ):
+            result = CliRunner().invoke(main, ["usage", "--limits"])
+        assert result.exit_code == 0, result.output
+        assert "unknown" in result.output
+
+    def test_json_without_limits_is_rejected(self) -> None:
+        result = CliRunner().invoke(main, ["usage", "--json"])
+        assert result.exit_code != 0
 
 
 # ── Per-issue rollup (#1115 CLI-1) ───────────────────────────────────────────

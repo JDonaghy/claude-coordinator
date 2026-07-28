@@ -442,6 +442,41 @@ class DispatchConfig:
     require_plan: bool = False
 
 
+@dataclass
+class UsageGateConfig:
+    """Pre-flight gate on the account's Max-plan 5h/weekly usage windows
+    (#1466).  ``coord drive``'s ``preflight()`` and the ``coord approve``
+    batch path probe ``claude -p "/usage"`` (see ``coord.usage_limits``) and
+    consult this before dispatching, so a run doesn't start work that's
+    certain to run straight into a 5-hour or weekly wall — the first sign of
+    which was previously a worker dying mid-task with the branch stranded.
+
+    ``mode`` is both the on/off switch and the enforcement level:
+
+    - ``"disabled"``   — never probe, never gate. Pre-#1466 behaviour.
+    - ``"warn"``  — probe and print a warning above threshold, but never
+      refuse a dispatch. **The default** — until the probe's prose parse
+      (``.result`` is NOT a stable contract, see ``coord.usage_limits``'s
+      docstring) has enough field mileage to trust for blocking real work.
+    - ``"block"`` — refuse to dispatch above threshold.
+
+    A probe that fails or returns "unknown" (no OAuth subscription session,
+    unparseable output, timeout, ...) NEVER blocks or warns regardless of
+    ``mode`` — see ``coord.usage_limits.evaluate_usage_gate``.
+
+    CAVEAT: Anthropic announced ``claude -p``/Agent SDK usage moving off the
+    subscription windows onto a separate monthly credit pool; that rollout
+    is paused as of 2026-06-15, so today this gate correctly predicts a
+    headless worker running into the same session/weekly walls ``/usage``
+    reports. If the rollout resumes, this gate stops being predictive and
+    would need to switch to tracking credit balance instead.
+    """
+
+    mode: str = "warn"  # "disabled" | "warn" | "block"
+    session_threshold_pct: float = 85.0
+    week_threshold_pct: float = 90.0
+
+
 # #846: default wall-clock thresholds (seconds) an assignment of a given
 # `type` may run before `coord.notify.detect_needs_attention` flags it.
 # Deliberately generous — this is a "human should glance at this" signal,
@@ -968,6 +1003,7 @@ class Config:
     models: ModelsConfig = field(default_factory=ModelsConfig)
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
     dispatch: DispatchConfig = field(default_factory=DispatchConfig)
+    usage_gate: UsageGateConfig = field(default_factory=UsageGateConfig)
     ci_store: CiStoreConfig = field(default_factory=CiStoreConfig)
     merge: MergeConfig = field(default_factory=MergeConfig)
     milestone: MilestoneConfig = field(default_factory=MilestoneConfig)
@@ -1017,6 +1053,7 @@ def load(path: str | Path | None = None) -> Config:
     models = _parse_models(raw.get("models"))
     pipeline = _parse_pipeline(raw.get("pipeline"))
     dispatch = _parse_dispatch(raw.get("dispatch"))
+    usage_gate = _parse_usage_gate(raw.get("usage_gate"))
     ci_store = _parse_ci_store(raw.get("ci_store"))
     merge = _parse_merge(raw.get("merge"))
     milestone = _parse_milestone(raw.get("milestone"))
@@ -1035,6 +1072,7 @@ def load(path: str | Path | None = None) -> Config:
         models=models,
         pipeline=pipeline,
         dispatch=dispatch,
+        usage_gate=usage_gate,
         ci_store=ci_store,
         merge=merge,
         milestone=milestone,
@@ -1758,6 +1796,30 @@ def _parse_dispatch(raw: Any) -> DispatchConfig:
         if not isinstance(value, bool):
             raise ConfigError("dispatch.require_plan must be a boolean")
         cfg.require_plan = value
+
+    return cfg
+
+
+def _parse_usage_gate(raw: Any) -> UsageGateConfig:
+    if raw is None:
+        return UsageGateConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'usage_gate' must be a mapping")
+
+    cfg = UsageGateConfig()
+
+    if "mode" in raw:
+        value = raw["mode"]
+        if value not in ("disabled", "warn", "block"):
+            raise ConfigError("usage_gate.mode must be one of: disabled, warn, block")
+        cfg.mode = value
+
+    for key in ("session_threshold_pct", "week_threshold_pct"):
+        if key in raw:
+            value = raw[key]
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not (0 <= value <= 100):
+                raise ConfigError(f"usage_gate.{key} must be a number between 0 and 100")
+            setattr(cfg, key, float(value))
 
     return cfg
 
