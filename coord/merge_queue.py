@@ -48,6 +48,14 @@ HUMAN_REQUIRED = "human_required"
 
 _REBASEABLE_SIGNALS = (
     "could not be rebased",
+    # #1467: GitHub's actual wording when a branch contains a merge commit
+    # — distinct from "could not be rebased" above (which never matched it)
+    # and previously fell through to "unknown", so #241's conflict-fix
+    # worker was never dispatched and the entry parked forever. A local
+    # `git rebase origin/main` linearises the branch, which is exactly what
+    # the dispatched conflict-fix worker attempts.
+    "can't be rebased",
+    "cannot be rebased",
     "merge conflict",
     "not up to date",
     "non-fast-forward",
@@ -56,6 +64,19 @@ _REBASEABLE_SIGNALS = (
     # would be needed.  Common on PRs that sat open while main moved.
     "merge commit cannot be cleanly created",
     "not mergeable",
+)
+
+# #1467: the specific subset of _REBASEABLE_SIGNALS that GitHub emits when a
+# --rebase merge is refused purely because the branch contains a merge
+# commit — a *linearity* failure, not a content conflict. This distinction
+# matters for reconcile_conflict_entries: GitHub's `mergeable` field (what
+# check_pr_mergeable reads) only reflects content conflicts and happily
+# reports MERGEABLE for a branch that is clean but not rebase-able, so a
+# plain mergeable check is not evidence that a retried --rebase will
+# succeed. See is_rebase_refusal().
+_REBASE_REFUSAL_SIGNALS = (
+    "can't be rebased",
+    "cannot be rebased",
 )
 
 _HUMAN_SIGNALS = (
@@ -85,6 +106,25 @@ def classify_conflict(error: str | None) -> str:
     if any(sig in text for sig in _REBASEABLE_SIGNALS):
         return "rebaseable"
     return "unknown"
+
+
+def is_rebase_refusal(error: str | None) -> bool:
+    """True when ``error`` is specifically GitHub's "branch can't be
+    rebased" refusal — a merge commit on the branch, not a content
+    conflict (#1467).
+
+    Narrower than ``classify_conflict(error) == "rebaseable"``, which also
+    matches ordinary content conflicts ("merge conflict", "not mergeable",
+    …) that GitHub's own ``mergeable`` field already reports accurately.
+    This predicate isolates the one failure mode where ``mergeable:
+    MERGEABLE`` is *not* proof a retried ``--rebase`` will succeed, so
+    :func:`reconcile_conflict_entries` and the ``coord merge`` CLI can treat
+    it differently from a plain conflict.
+    """
+    if not error:
+        return False
+    text = error.lower()
+    return any(sig in text for sig in _REBASE_REFUSAL_SIGNALS)
 
 
 # ── Work-chain resolution (#567) ────────────────────────────────────────────
@@ -814,6 +854,25 @@ class GhOps(Protocol):
         """
         ...
 
+    def branch_has_merge_commit(self, repo: str, number: int) -> bool | None:
+        """True when any commit on PR *number* has more than one parent.
+
+        ``True``/``False`` when determined, ``None`` when it can't be (any
+        ``gh`` error, or a malformed response) — an inconclusive read, same
+        fail-closed contract as :meth:`check_pr_mergeable`. Used by
+        :func:`process` (#1467) to fall back from ``--rebase`` to
+        ``--squash`` before attempting a merge GitHub would otherwise refuse
+        with "This branch can't be rebased", and by
+        :func:`reconcile_conflict_entries` to avoid unparking an entry whose
+        rebase-refusal will deterministically recur.
+
+        Optional on stub ``GhOps`` implementations: callers detect support
+        via ``getattr(gh_ops, "branch_has_merge_commit", None)`` and treat a
+        missing method the same as an inconclusive (``None``) result, so
+        existing test stubs that predate #1467 keep working unmodified.
+        """
+        ...
+
 
 # ── Persistence ──────────────────────────────────────────────────────────
 
@@ -1177,6 +1236,21 @@ def reconcile_conflict_entries(gh_ops: "GhOps") -> list["MergeEvent"]:
     surface as ``None`` from :meth:`GhOps.check_pr_mergeable`), is left
     untouched. Only an explicit ``True`` unparks it — never speculative.
 
+    #1467: a ``MERGEABLE`` verdict only reflects *content* conflicts — it
+    says nothing about whether a ``--rebase`` merge specifically will
+    succeed, because GitHub reports a branch carrying a merge commit as
+    ``MERGEABLE`` even though it flatly refuses to rebase-merge it. An
+    entry parked on that particular refusal (:func:`is_rebase_refusal`)
+    would otherwise unpark here, hit the exact same wall in :func:`process`,
+    and re-park — an infinite loop once auto-drain is on (#1491). For those
+    entries specifically, this also confirms via
+    :meth:`GhOps.branch_has_merge_commit` that the branch has actually gone
+    linear before unparking; an inconclusive read (``None``, or a ``gh_ops``
+    that doesn't support the probe) leaves the entry parked rather than
+    guessing — the same fail-closed posture as the mergeability check above.
+    A plain content conflict (no rebase-refusal wording) is unaffected and
+    keeps the original mergeable-only behaviour.
+
     Loads and saves the queue directly (same shape as
     :func:`enqueue_approved_work`), so this is safe to call unconditionally,
     even under ``--dry-run``: it corrects previously-cached state rather than
@@ -1198,6 +1272,18 @@ def reconcile_conflict_entries(gh_ops: "GhOps") -> list["MergeEvent"]:
             mergeable = None
         if mergeable is not True:
             continue
+        if is_rebase_refusal(entry.error):
+            probe = getattr(gh_ops, "branch_has_merge_commit", None)
+            if probe is None:
+                continue  # can't confirm linearity — stay parked (#1467)
+            try:
+                has_merge_commit = probe(entry.repo_github, entry.pr_number)
+            except Exception:  # noqa: BLE001
+                has_merge_commit = None
+            if has_merge_commit is not False:
+                # Still has a merge commit, or the probe was inconclusive —
+                # unparking now would just reproduce the same refusal.
+                continue
         entry.state = PENDING
         entry.error = None
         changed = True
@@ -2293,9 +2379,40 @@ def process(
                     continue  # #1318: refuse — never merge a branch that will
                     # auto-close an epic via a commit message we can't rewrite.
 
+            # #1467: pre-flight linearity check. GitHub refuses to
+            # rebase-merge any branch containing a merge commit ("This
+            # branch can't be rebased") — a distinct failure from a content
+            # conflict, and one GitHub's own `mergeable` field can't predict
+            # (a branch with a merge commit still reads MERGEABLE). Detect
+            # it via the PR's commit list — no local checkout is guaranteed
+            # on the daemon host, so `git rev-list --merges` is the wrong
+            # instrument here — and fall back to squash, which is always
+            # valid and keeps the target branch linear.
+            #
+            # Fail-closed: `branch_has_merge_commit` is optional on `gh_ops`
+            # (older stubs in tests predate #1467) and returns `None` on any
+            # `gh` error or ambiguous response; either case leaves `method`
+            # unchanged rather than guessing.
+            merge_method = method
+            if method == "rebase":
+                _probe = getattr(gh_ops, "branch_has_merge_commit", None)
+                if _probe is not None:
+                    try:
+                        _has_merge_commit = _probe(entry.repo_github, entry.pr_number)
+                    except Exception:  # noqa: BLE001
+                        _has_merge_commit = None
+                    if _has_merge_commit is True:
+                        merge_method = "squash"
+                        events.append(MergeEvent(
+                            entry, "method_fallback",
+                            f"PR #{entry.pr_number} ({entry.branch}) contains a "
+                            "merge commit and cannot be rebase-merged — "
+                            "falling back to --squash (#1467)",
+                        ))
+
             entry.last_attempt = time.time()
             entry.state = MERGING
-            ok, msg = gh_ops.merge_pr(entry.repo_github, entry.pr_number, method=method)
+            ok, msg = gh_ops.merge_pr(entry.repo_github, entry.pr_number, method=merge_method)
             if ok:
                 entry.state = MERGED
                 entry.error = None

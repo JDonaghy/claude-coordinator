@@ -169,6 +169,43 @@ class TestMergeCommand:
         assert states["a"] == mq.CONFLICT
         assert states["b"] == mq.MERGED  # #735: sibling merges despite conflict
 
+    def test_rebase_refusal_retry_cap_prints_recovery_path(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """#1467: GitHub's "branch can't be rebased" wording now classifies
+        as rebaseable (previously fell through to "unknown" and no
+        conflict-fix worker was ever dispatched). Once the retry cap is hit
+        — a conflict-fix already ran for this entry — the CLI must not just
+        say "manual resolution required" and leave the human to reconstruct
+        the fix: it should spell out the linearising rebase + the durable
+        `--only` key to retry with.
+        """
+        from coord.models import Board
+        from coord.state import save_board
+        save_board(Board())  # the conflict-event block is gated on load_board() != None
+        _seed_queue([_entry("r1")])
+
+        def fake_create_pr(repo, *, base, head, title, body):
+            return {"number": 700, "url": "u/700", "existed": False}
+
+        def fake_merge(repo, number, method="rebase"):
+            return False, "GraphQL: This branch can't be rebased (mergePullRequest)"
+
+        with patch("coord.github_ops.create_pr", side_effect=fake_create_pr), \
+             patch("coord.github_ops.get_pr_size", return_value=10), \
+             patch("coord.github_ops.merge_pr", side_effect=fake_merge), \
+             patch("coord.conflict_fix.has_prior_conflict_fix", return_value=True):
+            result = CliRunner().invoke(main, ["merge", "--config", str(config_file)])
+
+        assert result.exit_code == 0, result.output
+        assert "conflict-fix retry cap hit" in result.output
+        assert "recovery:" in result.output
+        assert "git rebase origin/main" in result.output
+        assert "coord merge --only api#1 --override-human-required" in result.output
+
+        states = {x.assignment_id: x.state for x in mq.load_queue()}
+        assert states["r1"] == mq.HUMAN_REQUIRED
+
     def test_human_classified_conflict_persists_as_human_required(
         self, config_file: Path, coord_dir: Path
     ) -> None:

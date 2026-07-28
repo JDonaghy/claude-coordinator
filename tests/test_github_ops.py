@@ -81,6 +81,49 @@ class TestCheckPrMergeable:
             assert github_ops.check_pr_mergeable("acme/api", 1) is None
 
 
+class TestBranchHasMergeCommit:
+    """#1467: branch_has_merge_commit() detects the one failure mode
+    check_pr_mergeable can't — a branch that's cleanly MERGEABLE but still
+    refused by `gh pr merge --rebase` because it contains a merge commit."""
+
+    def test_true_when_a_commit_has_two_parents(self) -> None:
+        commits = [
+            {"sha": "a1", "parents": [{"sha": "p1"}]},
+            {"sha": "a2", "parents": [{"sha": "p1"}, {"sha": "p2"}]},
+        ]
+        with patch("coord.github_ops._gh", return_value=json.dumps(commits)):
+            assert github_ops.branch_has_merge_commit("acme/api", 1) is True
+
+    def test_false_when_every_commit_has_one_parent(self) -> None:
+        commits = [
+            {"sha": "a1", "parents": [{"sha": "p1"}]},
+            {"sha": "a2", "parents": [{"sha": "p2"}]},
+        ]
+        with patch("coord.github_ops._gh", return_value=json.dumps(commits)):
+            assert github_ops.branch_has_merge_commit("acme/api", 1) is False
+
+    def test_false_for_a_root_commit_with_no_parents(self) -> None:
+        commits = [{"sha": "a1", "parents": []}]
+        with patch("coord.github_ops._gh", return_value=json.dumps(commits)):
+            assert github_ops.branch_has_merge_commit("acme/api", 1) is False
+
+    def test_none_on_gh_error(self) -> None:
+        with patch("coord.github_ops._gh", side_effect=RuntimeError("gh boom")):
+            assert github_ops.branch_has_merge_commit("acme/api", 1) is None
+
+    def test_none_on_malformed_json(self) -> None:
+        with patch("coord.github_ops._gh", return_value="not json"):
+            assert github_ops.branch_has_merge_commit("acme/api", 1) is None
+
+    def test_none_when_response_is_not_a_list(self) -> None:
+        # e.g. `gh api` returning an error object instead of the commits array.
+        with patch(
+            "coord.github_ops._gh",
+            return_value=json.dumps({"message": "Not Found"}),
+        ):
+            assert github_ops.branch_has_merge_commit("acme/api", 1) is None
+
+
 def _gh_pr_and_branch(pr_list_json: str, branch_json: str | None):
     """Build a ``_gh`` ``side_effect`` that answers ``pr list`` with
     *pr_list_json* and ``api .../branches/<name>`` with *branch_json* (or
