@@ -523,6 +523,44 @@ def check_pr_mergeable(repo: str, number: int) -> bool | None:
     return None
 
 
+def branch_has_merge_commit(repo: str, number: int) -> bool | None:
+    """True when any commit on PR *number* has more than one parent (#1467).
+
+    GitHub refuses to rebase-merge (``gh pr merge --rebase``) any branch
+    containing a merge commit — a *linearity* requirement distinct from a
+    content conflict. :func:`check_pr_mergeable`'s ``mergeable`` field can't
+    detect this: GitHub reports a branch with a merge commit as
+    ``MERGEABLE`` right up until the rebase-merge attempt itself fails with
+    "This branch can't be rebased". This probe answers the question
+    ``check_pr_mergeable`` can't, so :mod:`coord.merge_queue` can fall back
+    from ``--rebase`` to ``--squash`` before ever hitting that refusal.
+
+    Reads ``repos/{repo}/pulls/{number}/commits`` — each commit's
+    ``parents`` array has length > 1 only for a merge commit — rather than a
+    local ``git rev-list --merges``, because ``coord merge`` runs on the
+    daemon host, which has no guaranteed checkout of an arbitrary configured
+    repo. Pages up to 100 commits, comfortably above any real worker branch.
+
+    Returns ``True``/``False`` when determined, and ``None`` on any ``gh``
+    failure or malformed response — an inconclusive read. Mirrors
+    :func:`check_pr_mergeable`'s fail-closed contract: callers must treat
+    ``None`` as "don't know" and never let it drive a behaviour change (here:
+    never silently switch merge method, or unpark a queue entry, on an
+    inconclusive read).
+    """
+    try:
+        raw = _gh("api", f"repos/{repo}/pulls/{number}/commits?per_page=100")
+        commits = json.loads(raw)
+    except Exception:  # noqa: BLE001 — fail-safe: unknown parents blocks nothing
+        return None
+    if not isinstance(commits, list):
+        return None
+    try:
+        return any(len(c.get("parents") or []) > 1 for c in commits)
+    except (AttributeError, TypeError):
+        return None
+
+
 def get_pr_body(repo: str, number: int) -> str:
     """Return PR *number*'s current body text (empty string if unset)."""
     raw = _gh("pr", "view", str(number), "--repo", repo, "--json", "body")

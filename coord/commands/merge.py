@@ -53,7 +53,11 @@ def _dispatch_conflict_fixes(events, config, *, dry_run: bool) -> None:
         dispatch_conflict_fix,
         has_prior_conflict_fix,
     )
-    from coord.merge_queue import HUMAN_REQUIRED, classify_conflict  # noqa: PLC0415
+    from coord.merge_queue import (  # noqa: PLC0415
+        HUMAN_REQUIRED,
+        classify_conflict,
+        is_rebase_refusal,
+    )
     from coord.state import load_board, save_board  # noqa: PLC0415
 
     fix_board = load_board()
@@ -73,6 +77,20 @@ def _dispatch_conflict_fixes(events, config, *, dry_run: bool) -> None:
                     f"  {ev.entry.repo_name} #{ev.entry.issue_number}: "
                     "conflict-fix retry cap hit — manual resolution required"
                 )
+                # #1467: a rebase-refusal ("This branch can't be rebased")
+                # is fixed by linearising the branch — spell out the exact
+                # recovery so it isn't left to archaeology, and give the
+                # durable `repo#issue` key (#1477) `--only` accepts.
+                if is_rebase_refusal(ev.entry.error):
+                    _key = f"{ev.entry.repo_name}#{ev.entry.issue_number}"
+                    click.echo(
+                        f"    recovery: git checkout {ev.entry.branch} && "
+                        "git rebase origin/"
+                        f"{ev.entry.target_branch} && "
+                        "git push --force-with-lease, then "
+                        f"`coord merge --only {_key} "
+                        "--override-human-required`"
+                    )
                 # #1038: the coordinator's own retry-cap logic made this
                 # call, not the human running `coord merge` — operational
                 # tier, same as the other automatic conflict-classification

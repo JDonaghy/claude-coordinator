@@ -30,6 +30,7 @@ from coord.merge_queue import (
     PENDING,
     QueuedMerge,
     classify_conflict,
+    is_rebase_refusal,
 )
 from coord.models import Assignment, Board, Machine, Repo
 
@@ -90,6 +91,12 @@ class TestClassifyConflict:
         # #276: the actual phrasing gh pr merge returns when base has moved.
         "Pull request #273 is not mergeable: the merge commit cannot be cleanly created.",
         "X PR is not mergeable",
+        # #1467: GitHub's actual wording for a branch carrying a merge
+        # commit — previously unmatched by any signal (only "could not be
+        # rebased" existed), so this fell through to "unknown" and #241's
+        # conflict-fix worker was never dispatched.
+        "GraphQL: This branch can't be rebased (mergePullRequest)",
+        "This branch cannot be rebased due to conflicts",
     ])
     def test_rebaseable(self, msg: str) -> None:
         assert classify_conflict(msg) == "rebaseable"
@@ -108,6 +115,35 @@ class TestClassifyConflict:
         assert classify_conflict("some other error") == "unknown"
         assert classify_conflict("") == "unknown"
         assert classify_conflict(None) == "unknown"
+
+
+class TestIsRebaseRefusal:
+    """#1467: is_rebase_refusal() isolates the "branch can't be rebased"
+    wording from the broader "rebaseable" classification — the one failure
+    mode where GitHub's own mergeable field lies (reports MERGEABLE even
+    though a --rebase merge is refused), so reconcile_conflict_entries needs
+    a narrower signal than classify_conflict() to avoid the #1467 park/
+    unpark loop."""
+
+    @pytest.mark.parametrize("msg", [
+        "GraphQL: This branch can't be rebased (mergePullRequest)",
+        "This branch cannot be rebased due to conflicts",
+        "THIS BRANCH CAN'T BE REBASED",
+    ])
+    def test_true_for_rebase_refusal_wording(self, msg: str) -> None:
+        assert is_rebase_refusal(msg) is True
+
+    @pytest.mark.parametrize("msg", [
+        "Merge conflict in src/foo.py",
+        "could not be rebased",
+        "Pull request #273 is not mergeable",
+        "required status check 'ci' has not passed",
+        "some other error",
+        "",
+        None,
+    ])
+    def test_false_for_everything_else(self, msg) -> None:
+        assert is_rebase_refusal(msg) is False
 
 
 # ── Briefing ────────────────────────────────────────────────────────────────

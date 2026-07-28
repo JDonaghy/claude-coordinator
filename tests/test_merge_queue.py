@@ -248,6 +248,12 @@ class FakeGh:
     # an entry unless a test opts in explicitly.
     mergeable_results: dict[int, bool | None] = field(default_factory=dict)
     mergeable_calls: list[tuple[str, int]] = field(default_factory=list)
+    # #1467: PR number -> whether the branch carries a merge commit
+    # (True/False/None). Defaults keep every prior test (none of which set
+    # this) inert — branch_has_merge_commit returns None ("unknown") so the
+    # pre-flight squash fallback never fires unless a test opts in.
+    merge_commit_results: dict[int, bool | None] = field(default_factory=dict)
+    merge_commit_calls: list[tuple[str, int]] = field(default_factory=list)
 
     def create_pr(self, repo: str, *, base: str, head: str, title: str, body: str) -> dict:
         self.create_calls.append((repo, {"base": base, "head": head, "title": title}))
@@ -298,6 +304,10 @@ class FakeGh:
     def check_pr_mergeable(self, repo: str, number: int) -> bool | None:
         self.mergeable_calls.append((repo, number))
         return self.mergeable_results.get(number)
+
+    def branch_has_merge_commit(self, repo: str, number: int) -> bool | None:
+        self.merge_commit_calls.append((repo, number))
+        return self.merge_commit_results.get(number)
 
 
 class TestProcess:
@@ -547,6 +557,105 @@ class TestProcess:
         ]
         downgraded = [e for e in events if e.kind == "pr_body_downgraded"]
         assert downgraded and "#1120" in downgraded[0].message
+
+
+class TestProcessLinearityFallback:
+    """#1467: `gh pr merge --rebase` refuses any branch containing a merge
+    commit ("This branch can't be rebased") — a linearity failure GitHub's
+    `mergeable` field can't predict. process() pre-flight-checks for a merge
+    commit and falls back to --squash, which is always valid here."""
+
+    def test_falls_back_to_squash_when_branch_has_merge_commit(self) -> None:
+        items = [_q("a", pr=100, size=10)]
+        gh = FakeGh(merge_commit_results={100: True})
+        events = process(items, gh, method="rebase")
+
+        assert items[0].state == MERGED
+        assert gh.merge_calls == [("acme/api", 100, "squash")]
+        fallback = [e for e in events if e.kind == "method_fallback"]
+        assert len(fallback) == 1
+        assert "squash" in fallback[0].message
+        assert "#1467" in fallback[0].message
+
+    def test_stays_on_rebase_when_branch_is_linear(self) -> None:
+        items = [_q("a", pr=100, size=10)]
+        gh = FakeGh(merge_commit_results={100: False})
+        events = process(items, gh, method="rebase")
+
+        assert items[0].state == MERGED
+        assert gh.merge_calls == [("acme/api", 100, "rebase")]
+        assert not [e for e in events if e.kind == "method_fallback"]
+
+    def test_fail_closed_on_inconclusive_probe(self) -> None:
+        # merge_commit_results defaults to {} -> None (inconclusive). The
+        # method must stay unchanged rather than guess.
+        items = [_q("a", pr=100, size=10)]
+        gh = FakeGh()
+        events = process(items, gh, method="rebase")
+
+        assert gh.merge_calls == [("acme/api", 100, "rebase")]
+        assert not [e for e in events if e.kind == "method_fallback"]
+
+    def test_fail_closed_when_probe_raises(self) -> None:
+        class RaisingGh(FakeGh):
+            def branch_has_merge_commit(self, repo: str, number: int) -> bool | None:
+                raise RuntimeError("gh timeout")
+
+        items = [_q("a", pr=100, size=10)]
+        gh = RaisingGh()
+        events = process(items, gh, method="rebase")
+
+        assert gh.merge_calls == [("acme/api", 100, "rebase")]
+        assert not [e for e in events if e.kind == "method_fallback"]
+
+    def test_backward_compatible_with_gh_ops_lacking_the_probe(self) -> None:
+        # A pre-#1467 stub GhOps without branch_has_merge_commit at all must
+        # keep working — getattr(..., None) fails closed, same as an
+        # inconclusive read. A standalone class (not a FakeGh subclass) so
+        # the method is genuinely absent, not merely deleted.
+        class LegacyGh:
+            def __init__(self) -> None:
+                self.merge_calls: list[tuple[str, int, str]] = []
+
+            def get_pr_size(self, repo: str, number: int) -> int:
+                return 10
+
+            def merge_pr(self, repo: str, number: int, method: str = "rebase"):
+                self.merge_calls.append((repo, number, method))
+                return True, "merged"
+
+            def close_issue(self, repo: str, issue_number: int) -> None:
+                pass
+
+            def get_pr_body(self, repo: str, number: int) -> str:
+                return ""
+
+            def has_open_children(self, repo: str, issue_number: int) -> bool:
+                return False
+
+            def is_epic_issue(self, repo: str, issue_number: int) -> bool:
+                return False
+
+            def get_pr_commit_messages(self, repo: str, number: int) -> list[str]:
+                return []
+
+        items = [_q("a", pr=100, size=10)]
+        gh = LegacyGh()
+        events = process(items, gh, method="rebase")
+
+        assert gh.merge_calls == [("acme/api", 100, "rebase")]
+        assert not [e for e in events if e.kind == "method_fallback"]
+        assert not hasattr(gh, "branch_has_merge_commit")
+
+    def test_no_probe_when_method_is_not_rebase(self) -> None:
+        # squash/merge never hit the "can't be rebased" refusal — no need
+        # to spend a `gh api` round trip checking.
+        items = [_q("a", pr=100, size=10)]
+        gh = FakeGh(merge_commit_results={100: True})
+        process(items, gh, method="squash")
+
+        assert gh.merge_commit_calls == []
+        assert gh.merge_calls == [("acme/api", 100, "squash")]
 
 
 class TestProcessRealGithubOpsChokepoint:
@@ -2607,6 +2716,135 @@ class TestReconcileConflictEntries:
         assert [e.entry.assignment_id for e in events] == ["clean"]
         states = {x.assignment_id: x.state for x in load_queue()}
         assert states == {"clean": PENDING, "broken": CONFLICT}
+
+
+class TestReconcileConflictEntriesRebaseRefusalGuard:
+    """#1467: a `mergeable: MERGEABLE` verdict is not evidence that a
+    *rebase* merge will succeed — GitHub reports a branch carrying a merge
+    commit as MERGEABLE right up until `gh pr merge --rebase` refuses it.
+    An entry parked on that specific refusal must not unpark on the
+    mergeable check alone; it also needs confirmation the branch has
+    actually gone linear."""
+
+    _REBASE_REFUSAL = "GraphQL: This branch can't be rebased (mergePullRequest)"
+
+    def test_stays_parked_while_merge_commit_persists(self, coord_db) -> None:
+        entry = _q("a", state=CONFLICT, pr=100)
+        entry.error = self._REBASE_REFUSAL
+        save_queue([entry])
+
+        gh = FakeGh(mergeable_results={100: True}, merge_commit_results={100: True})
+        events = mq.reconcile_conflict_entries(gh)
+
+        assert events == []
+        assert load_queue()[0].state == CONFLICT
+        assert gh.merge_commit_calls == [("acme/api", 100)]
+
+    def test_stays_parked_when_merge_commit_probe_is_inconclusive(self, coord_db) -> None:
+        entry = _q("a", state=CONFLICT, pr=100)
+        entry.error = self._REBASE_REFUSAL
+        save_queue([entry])
+
+        # merge_commit_results defaults to {} -> None (fail-closed).
+        gh = FakeGh(mergeable_results={100: True})
+        events = mq.reconcile_conflict_entries(gh)
+
+        assert events == []
+        assert load_queue()[0].state == CONFLICT
+
+    def test_stays_parked_when_gh_ops_lacks_the_probe(self, coord_db) -> None:
+        entry = _q("a", state=CONFLICT, pr=100)
+        entry.error = self._REBASE_REFUSAL
+        save_queue([entry])
+
+        class NoProbeGh(FakeGh):
+            branch_has_merge_commit = None  # simulate a pre-#1467 stub
+
+        gh = NoProbeGh(mergeable_results={100: True})
+        events = mq.reconcile_conflict_entries(gh)
+
+        assert events == []
+        assert load_queue()[0].state == CONFLICT
+
+    def test_unparks_once_branch_is_confirmed_linear(self, coord_db) -> None:
+        entry = _q("a", state=CONFLICT, pr=100)
+        entry.error = self._REBASE_REFUSAL
+        save_queue([entry])
+
+        gh = FakeGh(mergeable_results={100: True}, merge_commit_results={100: False})
+        events = mq.reconcile_conflict_entries(gh)
+
+        assert [e.kind for e in events] == ["reopened"]
+        reloaded = load_queue()[0]
+        assert reloaded.state == PENDING
+        assert reloaded.error is None
+
+    def test_plain_conflict_unaffected_never_probes_merge_commit(self, coord_db) -> None:
+        # A content conflict (not a rebase refusal) keeps the pre-#1467
+        # mergeable-only behaviour untouched — the extra probe never fires.
+        entry = _q("a", state=CONFLICT, pr=100)
+        entry.error = "Pull request #100 is not mergeable"
+        save_queue([entry])
+
+        gh = FakeGh(mergeable_results={100: True})
+        events = mq.reconcile_conflict_entries(gh)
+
+        assert [e.kind for e in events] == ["reopened"]
+        assert gh.merge_commit_calls == []
+        assert load_queue()[0].state == PENDING
+
+
+class TestReconcileOscillationRegression:
+    """#1467 regression: an entry parked on a rebase-refusal whose PR
+    reports MERGEABLE must not endlessly unpark -> retry -> re-park across
+    ticks. Drives reconcile across multiple passes and (separately)
+    verifies the terminal, merged outcome once the branch actually becomes
+    linear."""
+
+    _REBASE_REFUSAL = "GraphQL: This branch can't be rebased (mergePullRequest)"
+
+    def test_does_not_oscillate_across_repeated_ticks(self, coord_db) -> None:
+        entry = _q("a", state=CONFLICT, pr=100)
+        entry.error = self._REBASE_REFUSAL
+        save_queue([entry])
+
+        # Worst case for the old behaviour: GitHub always reports
+        # MERGEABLE (true of a merge-commit branch) and the merge commit
+        # never resolves (e.g. no conflict-fix worker landed yet).
+        gh = FakeGh(mergeable_results={100: True}, merge_commit_results={100: True})
+
+        for tick in range(3):
+            events = mq.reconcile_conflict_entries(gh)
+            assert events == [], f"tick {tick}: entry unparked despite unresolved merge commit"
+            assert load_queue()[0].state == CONFLICT
+
+    def test_reaches_terminal_merged_state_once_branch_goes_linear(self, coord_db) -> None:
+        entry = _q("a", state=CONFLICT, pr=100, size=10)
+        entry.error = self._REBASE_REFUSAL
+        save_queue([entry])
+
+        gh = FakeGh(mergeable_results={100: True}, merge_commit_results={100: True})
+
+        # Pass 1: still has a merge commit -> stays parked, no wasted merge
+        # attempt or misleading "conflict cleared" event.
+        assert mq.reconcile_conflict_entries(gh) == []
+        assert load_queue()[0].state == CONFLICT
+
+        # A conflict-fix worker (or a human) rebases the branch onto main —
+        # the merge commit is gone.
+        gh.merge_commit_results[100] = False
+
+        # Pass 2: now unparks...
+        events = mq.reconcile_conflict_entries(gh)
+        assert [e.kind for e in events] == ["reopened"]
+        items = load_queue()
+        assert items[0].state == PENDING
+
+        # ...and the next merge pass succeeds cleanly via --rebase — a
+        # terminal state, not another park.
+        merge_events = mq.process(items, gh, method="rebase")
+        assert items[0].state == MERGED
+        assert not [e for e in merge_events if e.kind == "conflict"]
 
 
 class TestResolveEntryKey:
