@@ -80,10 +80,32 @@ def _is_label_not_found(exc: Exception) -> bool:
 
 
 def _gh(*args: str) -> str:
-    result = subprocess.run(
-        ["gh", *args],
-        capture_output=True, text=True, timeout=30,
-    )
+    """Run ``gh`` with *args* and return its stdout, or raise :class:`GhError`.
+
+    #1483: this is the single seam every ``_gh``-backed helper in this module
+    funnels through, so it is also the single place that must absorb the
+    ways ``gh`` can fail to even run — not just a non-zero exit.
+    ``subprocess.run`` raises ``FileNotFoundError`` when the ``gh`` binary
+    isn't on PATH (the elitebook incident that prompted #1483: a worker's
+    systemd PATH didn't include the linuxbrew-installed ``gh``) and
+    ``subprocess.TimeoutExpired`` when it hangs past the 30s budget; both are
+    caught here and re-raised as :class:`GhError` (a ``RuntimeError``
+    subclass) so every existing ``except RuntimeError`` call site — and any
+    future one — gets the same fail-safe behavior the pre-#1483 direct
+    ``shutil.which("gh")`` + ``subprocess.run(..., check=False)`` call sites
+    had, for free, without each caller having to remember to guard for it.
+    """
+    try:
+        result = subprocess.run(
+            ["gh", *args],
+            capture_output=True, text=True, timeout=30,
+        )
+    except FileNotFoundError as exc:
+        raise GhError(f"gh {' '.join(args)} failed: gh not found: {exc}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise GhError(f"gh {' '.join(args)} failed: timed out: {exc}") from exc
+    except OSError as exc:
+        raise GhError(f"gh {' '.join(args)} failed: {exc}") from exc
     if result.returncode != 0:
         raise RuntimeError(f"gh {' '.join(args)} failed: {result.stderr.strip()}")
     return result.stdout.strip()
@@ -820,10 +842,12 @@ def create_label(
 
     ``force=True`` (the default) makes this idempotent — ``gh`` overwrites
     the color/description if the label already exists instead of erroring.
-    Raises ``RuntimeError`` on ``gh`` failure; callers that treat label
-    pre-creation as best-effort (e.g. a concurrent-create race) should catch
-    it. Used by ``coord set-test-mode`` (#1483) to ensure the ``test-mode:*``
-    labels exist before ``change_issue_labels`` tries to add one.
+    Raises ``RuntimeError`` (a plain non-zero ``gh`` exit) or its subclass
+    :class:`GhError` (``gh`` missing from PATH or timed out — see ``_gh``) on
+    failure; callers that treat label pre-creation as best-effort (e.g. a
+    concurrent-create race) should catch ``RuntimeError`` to cover both. Used
+    by ``coord set-test-mode`` (#1483) to ensure the ``test-mode:*`` labels
+    exist before ``change_issue_labels`` tries to add one.
     """
     args = ["label", "create", label, "--repo", repo]
     if color:

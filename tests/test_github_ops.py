@@ -9,6 +9,7 @@ failure never blocks a legitimate dispatch.
 from __future__ import annotations
 
 import json
+import subprocess
 from unittest.mock import patch
 
 import pytest
@@ -1205,3 +1206,163 @@ class TestGetCompareDiff:
             result = github_ops.get_branch_patch_id("acme/api", "main", "feature")
         mock_diff.assert_called_once_with("acme/api", "main", "feature")
         assert result == github_ops.compute_patch_id(diff)
+
+
+class TestGhMissingOrHung:
+    """#1483: `_gh` is the single seam every helper in this module funnels
+    through, so a missing/hung `gh` binary must fail the same way (a
+    `RuntimeError` subclass) for every caller — not just `RuntimeError` on a
+    non-zero exit. Regression coverage for the elitebook incident: a worker
+    whose PATH didn't include `gh` crashed instead of degrading gracefully.
+    """
+
+    def test_gh_not_found_raises_gherror(self) -> None:
+        with patch("coord.github_ops.subprocess.run", side_effect=FileNotFoundError):
+            with pytest.raises(github_ops.GhError):
+                github_ops._gh("issue", "view", "1")
+
+    def test_gh_timeout_raises_gherror(self) -> None:
+        with patch(
+            "coord.github_ops.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="gh", timeout=30),
+        ):
+            with pytest.raises(github_ops.GhError):
+                github_ops._gh("issue", "view", "1")
+
+    def test_gherror_is_a_runtimeerror(self) -> None:
+        """GhError must subclass RuntimeError so existing `except
+        RuntimeError` call sites catch a missing/hung gh without change."""
+        with patch("coord.github_ops.subprocess.run", side_effect=FileNotFoundError):
+            with pytest.raises(RuntimeError):
+                github_ops._gh("issue", "view", "1")
+
+
+class TestCreateLabel:
+    """#1483: the seam behind `coord set-test-mode`'s label pre-creation."""
+
+    def test_builds_expected_argv(self) -> None:
+        with patch("coord.github_ops._gh", return_value="") as mock_gh:
+            github_ops.create_label(
+                "acme/api", "test-mode:auto", color="0075ca", description="d",
+            )
+        args = mock_gh.call_args.args
+        assert args[:3] == ("label", "create", "test-mode:auto")
+        assert "--force" in args  # force=True is the default
+
+    def test_raises_runtimeerror_on_gh_failure(self) -> None:
+        with patch("coord.github_ops._gh", side_effect=RuntimeError("gh boom")):
+            with pytest.raises(RuntimeError):
+                github_ops.create_label("acme/api", "test-mode:auto")
+
+    def test_raises_runtimeerror_when_gh_is_missing(self) -> None:
+        """A missing `gh` binary must still surface as a `RuntimeError` (via
+        `GhError`), not an uncaught `FileNotFoundError` — `coord.commands.
+        test_gate.set_test_mode` only catches `except RuntimeError`."""
+        with patch("coord.github_ops.subprocess.run", side_effect=FileNotFoundError):
+            with pytest.raises(RuntimeError):
+                github_ops.create_label("acme/api", "test-mode:auto")
+
+
+class TestGetPrStateForBranch:
+    """#1483: used by GitMergeVerifier.verify_merged, which calls this with
+    no try/except of its own — the function's own fail-to-None contract is
+    the only thing standing between a missing/hung gh and an unhandled crash
+    in `coord drive`."""
+
+    def test_returns_state_on_success(self) -> None:
+        with patch("coord.github_ops._gh", return_value="MERGED") as mock_gh:
+            assert github_ops.get_pr_state_for_branch("acme/api", "feature") == "MERGED"
+        args = mock_gh.call_args.args
+        assert args[:2] == ("pr", "view")
+        assert "feature" in args
+
+    def test_returns_none_on_gh_error(self) -> None:
+        with patch("coord.github_ops._gh", side_effect=RuntimeError("no such PR")):
+            assert github_ops.get_pr_state_for_branch("acme/api", "feature") is None
+
+    def test_returns_none_when_gh_is_missing(self) -> None:
+        with patch("coord.github_ops.subprocess.run", side_effect=FileNotFoundError):
+            assert github_ops.get_pr_state_for_branch("acme/api", "feature") is None
+
+    def test_returns_none_when_gh_times_out(self) -> None:
+        with patch(
+            "coord.github_ops.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="gh", timeout=30),
+        ):
+            assert github_ops.get_pr_state_for_branch("acme/api", "feature") is None
+
+
+class TestGetPrHeadRef:
+    """#1483: used by coord.commands.test_gate._maybe_reconcile_branch, which
+    calls this with no try/except of its own — same contract as
+    get_pr_state_for_branch above."""
+
+    def test_returns_head_ref_on_success(self) -> None:
+        with patch("coord.github_ops._gh", return_value="issue-42-fix") as mock_gh:
+            assert github_ops.get_pr_head_ref("acme/api", 42) == "issue-42-fix"
+        args = mock_gh.call_args.args
+        assert args[:2] == ("pr", "view")
+
+    def test_returns_none_on_gh_error(self) -> None:
+        with patch("coord.github_ops._gh", side_effect=RuntimeError("no such PR")):
+            assert github_ops.get_pr_head_ref("acme/api", 42) is None
+
+    def test_returns_none_when_gh_is_missing(self) -> None:
+        with patch("coord.github_ops.subprocess.run", side_effect=FileNotFoundError):
+            assert github_ops.get_pr_head_ref("acme/api", 42) is None
+
+    def test_returns_none_when_gh_times_out(self) -> None:
+        with patch(
+            "coord.github_ops.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="gh", timeout=30),
+        ):
+            assert github_ops.get_pr_head_ref("acme/api", 42) is None
+
+
+class TestGetPrChecks:
+    """#1483: the single gh sink for coord.ci_github.GitHubCi, the CI backend
+    behind the merge gate."""
+
+    def test_returns_checks_on_success(self) -> None:
+        payload = json.dumps([{"name": "test", "state": "COMPLETED", "conclusion": "SUCCESS"}])
+
+        class _FakeResult:
+            returncode = 0
+            stdout = payload
+            stderr = ""
+
+        with patch("coord.github_ops.subprocess.run", return_value=_FakeResult()):
+            checks = github_ops.get_pr_checks("acme/api", 42)
+        assert checks == json.loads(payload)
+
+    def test_nonzero_exit_with_valid_json_still_returns_checks(self) -> None:
+        """`gh pr checks` exits non-zero when a check failed, but stdout is
+        still valid JSON in that case."""
+        payload = json.dumps([{"name": "test", "state": "COMPLETED", "conclusion": "FAILURE"}])
+
+        class _FakeResult:
+            returncode = 1
+            stdout = payload
+            stderr = ""
+
+        with patch("coord.github_ops.subprocess.run", return_value=_FakeResult()):
+            checks = github_ops.get_pr_checks("acme/api", 42)
+        assert checks == json.loads(payload)
+
+    def test_nonzero_exit_with_empty_stdout_raises(self) -> None:
+        class _FakeResult:
+            returncode = 1
+            stdout = ""
+            stderr = "authentication required"
+
+        with patch("coord.github_ops.subprocess.run", return_value=_FakeResult()):
+            with pytest.raises(RuntimeError):
+                github_ops.get_pr_checks("acme/api", 42)
+
+    def test_gh_missing_raises_filenotfounderror(self) -> None:
+        """get_pr_checks does not go through `_gh` — its caller,
+        coord.ci_github.GitHubCi._fetch, is the one that catches
+        FileNotFoundError/TimeoutExpired directly (see test_ci_store.py)."""
+        with patch("coord.github_ops.subprocess.run", side_effect=FileNotFoundError):
+            with pytest.raises(FileNotFoundError):
+                github_ops.get_pr_checks("acme/api", 42)
