@@ -562,18 +562,13 @@ class GitMergeVerifier:
 
         # Primary: ask GitHub.  Authoritative for every merge method, and still
         # correct after the merged branch has been deleted from the remote.
-        if state.repo_github and shutil.which("gh"):
-            proc = subprocess.run(
-                [
-                    "gh", "pr", "view", branch,
-                    "--repo", state.repo_github,
-                    "--json", "state", "-q", ".state",
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            pr_state = (proc.stdout or "").strip() if proc.returncode == 0 else ""
+        # Routed through the github_ops seam (#1483) rather than shelling out
+        # to `gh` directly here — no `shutil.which` probe, so behaviour never
+        # silently varies with whether `gh` happens to be on this host's PATH.
+        if state.repo_github:
+            from coord import github_ops  # noqa: PLC0415
+
+            pr_state = github_ops.get_pr_state_for_branch(state.repo_github, branch) or ""
             if pr_state == "MERGED":
                 return True
             if pr_state:

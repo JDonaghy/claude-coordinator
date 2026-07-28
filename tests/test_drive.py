@@ -1287,7 +1287,14 @@ def test_a_merged_row_with_no_branch_cannot_be_verified():
 
 @pytest.fixture
 def recorded_git(monkeypatch):
-    """Capture every subprocess argv and script the return values."""
+    """Capture every subprocess argv and script the return values.
+
+    #1483 moved the ``gh pr view`` call in ``verify_merged`` behind the
+    ``github_ops`` seam, so it now shells out via
+    ``coord.github_ops.subprocess.run`` rather than ``coord.drive.subprocess.
+    run`` — patch both to the same recorder/script so a single ``scripted``
+    dict still drives both the git and gh sides of a scenario.
+    """
     calls: list[list[str]] = []
     scripted: dict[tuple[str, ...], tuple[int, str]] = {}
 
@@ -1299,6 +1306,7 @@ def recorded_git(monkeypatch):
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     monkeypatch.setattr("coord.drive.subprocess.run", fake_run)
+    monkeypatch.setattr("coord.github_ops.subprocess.run", fake_run)
     return calls, scripted
 
 

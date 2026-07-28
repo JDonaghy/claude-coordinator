@@ -683,24 +683,21 @@ def fetch_review_findings_from_github(
     comments back, so a fix worker on ANY machine can recover the findings even
     when the review ran elsewhere and isn't in the local DB — GitHub is the one
     store every machine already reaches.  Returns ``None`` on any failure.
+
+    Routed through :func:`coord.github_ops.get_issue_comments` (#1483) rather
+    than shelling out to ``gh`` directly — ``github_ops`` is the single ``gh``
+    sink so a GitLab/bare-DB backend has one seam to sit beside.
     """
-    import json as _json  # noqa: PLC0415
     import subprocess as _sp  # noqa: PLC0415
 
+    from coord import github_ops  # noqa: PLC0415
     from coord.comments import extract_findings_block  # noqa: PLC0415
 
     if not (repo_github and assignment_id):
         return None
     try:
-        out = _sp.run(
-            ["gh", "issue", "view", str(issue_number), "--repo", repo_github,
-             "--json", "comments"],
-            capture_output=True, text=True, timeout=20,
-        )
-        if out.returncode != 0:
-            return None
-        comments = _json.loads(out.stdout or "{}").get("comments", [])
-    except (_sp.TimeoutExpired, OSError, ValueError):
+        comments = github_ops.get_issue_comments(repo_github, issue_number)
+    except (RuntimeError, _sp.TimeoutExpired, OSError, ValueError):
         return None
     # Newest-first so a re-review's findings win over an earlier iteration's.
     for c in reversed(comments):

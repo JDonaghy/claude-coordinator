@@ -1,20 +1,22 @@
 """GitHub Actions backend for :mod:`coord.ci_store`.
 
-Shells out to ``gh pr checks <number> --repo <slug> --json …`` and maps the
-response to :class:`coord.ci_store.CheckRun`.  Results are cached per-(repo,
-number) for ``cache_ttl`` seconds so the merge gate (which may iterate over
-many PRs) doesn't hammer ``gh`` — the cost of a stale read in the gate path
-is at most one wasted retry, and the user will re-run ``coord merge`` anyway.
+Fetches via :func:`coord.github_ops.get_pr_checks` (``gh pr checks <number>
+--repo <slug> --json …`` — #1483: the single ``gh`` sink lives in
+``github_ops``, not here) and maps the response to
+:class:`coord.ci_store.CheckRun`.  Results are cached per-(repo, number) for
+``cache_ttl`` seconds so the merge gate (which may iterate over many PRs)
+doesn't hammer ``gh`` — the cost of a stale read in the gate path is at most
+one wasted retry, and the user will re-run ``coord merge`` anyway.
 """
 
 from __future__ import annotations
 
-import json
 import subprocess
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from coord import github_ops
 from coord.ci_store import CheckRun
 
 
@@ -99,26 +101,8 @@ class GitHubCi:
 
     def _fetch(self, repo: str, number: int) -> list[CheckRun]:
         try:
-            result = subprocess.run(
-                [
-                    "gh", "pr", "checks", str(number),
-                    "--repo", repo,
-                    "--json", "name,state,conclusion,link,startedAt,completedAt",
-                ],
-                capture_output=True, text=True, timeout=30,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            return []
-        if result.returncode != 0:
-            # `gh pr checks` exits non-zero when any check has failed — but
-            # the JSON output on stdout is still valid in that case. Only
-            # treat empty stdout as a real lookup failure.
-            stdout = (result.stdout or "").strip()
-            if not stdout:
-                return []
-        try:
-            raw = json.loads(result.stdout or "[]")
-        except json.JSONDecodeError:
+            raw = github_ops.get_pr_checks(repo, number)
+        except (FileNotFoundError, subprocess.TimeoutExpired, RuntimeError, ValueError):
             return []
         if not isinstance(raw, list):
             return []
