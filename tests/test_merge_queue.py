@@ -658,6 +658,51 @@ class TestProcessLinearityFallback:
         assert gh.merge_calls == [("acme/api", 100, "squash")]
 
 
+class TestProcessDryRunLinearityPreview:
+    """#1467-review: `coord merge --dry-run` previews the review/smoke gates
+    but, before this, never previewed the rebase→squash fallback — a
+    dry-run over an entry already carrying a merge commit silently said
+    "would merge ... via --rebase" even though the real run would fall
+    back to --squash. Only reachable when the entry already has a
+    pr_number (from an earlier non-dry-run attempt), since dry-run itself
+    never opens a PR and the probe needs one to query.
+    """
+
+    def test_previews_squash_fallback_when_pr_already_exists(self) -> None:
+        items = [_q("a", pr=100, size=10)]
+        gh = FakeGh(merge_commit_results={100: True})
+        events = process(items, gh, method="rebase", dry_run=True)
+
+        assert gh.merge_calls == []  # dry-run never actually merges
+        fallback = [e for e in events if e.kind == "method_fallback"]
+        assert len(fallback) == 1
+        assert "dry run" in fallback[0].message
+        assert "squash" in fallback[0].message
+        merged = [e for e in events if e.kind == "merged"]
+        assert merged and "--squash" in merged[0].message
+
+    def test_no_preview_without_a_prior_pr_number(self) -> None:
+        # A brand-new entry has no pr_number yet in dry-run (dry-run never
+        # creates one) — nothing to probe, so no fallback preview and the
+        # merge preview reports the requested method unchanged.
+        items = [_q("a", size=10)]
+        gh = FakeGh(merge_commit_results={100: True})
+        events = process(items, gh, method="rebase", dry_run=True)
+
+        assert not [e for e in events if e.kind == "method_fallback"]
+        merged = [e for e in events if e.kind == "merged"]
+        assert merged and "--rebase" in merged[0].message
+
+    def test_fail_closed_on_inconclusive_probe_in_dry_run(self) -> None:
+        items = [_q("a", pr=100, size=10)]
+        gh = FakeGh()  # merge_commit_results defaults to {} -> None
+        events = process(items, gh, method="rebase", dry_run=True)
+
+        assert not [e for e in events if e.kind == "method_fallback"]
+        merged = [e for e in events if e.kind == "merged"]
+        assert merged and "--rebase" in merged[0].message
+
+
 class TestProcessRealGithubOpsChokepoint:
     """#1196 acceptance criterion: 'Dispatching type="work" against an epic
     with an open child and merging it leaves the epic OPEN' — driven through

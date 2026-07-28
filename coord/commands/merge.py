@@ -89,7 +89,8 @@ def _dispatch_conflict_fixes(events, config, *, dry_run: bool) -> None:
                         f"{ev.entry.target_branch} && "
                         "git push --force-with-lease, then "
                         f"`coord merge --only {_key} "
-                        "--override-human-required`"
+                        '--override-human-required "rebase refusal '
+                        'resolved manually"`'
                     )
                 # #1038: the coordinator's own retry-cap logic made this
                 # call, not the human running `coord merge` — operational
