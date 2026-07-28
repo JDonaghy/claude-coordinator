@@ -10,6 +10,7 @@ Two-layer design so the logic is testable without hitting `gh`:
 from __future__ import annotations
 
 import json
+import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,6 +30,8 @@ from coord.db import get_connection
 from coord.models import CLOSES_ISSUE_TYPES, WORK_LIKE_TYPES, Assignment
 from coord.pr_body_lint import downgrade_closing_keywords, find_closing_references
 from coord.state import COORD_DIR
+
+_log = logging.getLogger(__name__)
 
 # Legacy path constant — kept for backward compat with monkeypatch calls in tests.
 QUEUE_FILE = COORD_DIR / "merge_queue.json"
@@ -169,6 +172,115 @@ def _chain_work_ids(entry: "QueuedMerge", pool: list) -> set[str]:
                 changed = True
 
     return work_ids
+
+
+# ── Branch winner resolution (#1490) ────────────────────────────────────────
+#
+# A fix/bounce cycle dispatches a fresh WORK_LIKE_TYPES assignment for every
+# retry, and every one of them keeps its row in `board.completed` forever —
+# all targeting the same branch. `enqueue_approved_work` (the daemon tick)
+# and `coord merge`'s own auto-enqueue scan both used to process every such
+# row independently and hand each one to `refresh_entry_assignment`, which
+# re-keys the ONE queue row that exists for the branch to whichever
+# assignment_id it was just called with. Processing three rows on one
+# branch in a single pass therefore re-keyed the same entry three times in
+# a row and printed three "auto-enqueued" lines for what is — and always
+# was — a single queue entry; because the gates
+# (`passes_merge_gates`/`has_approved_review`/`has_smoke_verdict`) are
+# resolved over the whole branch chain rather than the specific row passed
+# in, even the row with a *failed* test_state would pass the gate and win a
+# later iteration's re-key, so the "current" key flip-flopped across every
+# row on every single tick, forever (#1490's observed bug).
+#
+# The fix: resolve every branch to a single winner *before* touching the
+# queue at all, and never enqueue (or re-announce) the other rows.
+
+
+def _select_winning_work_assignment(work_assignments: list) -> "Assignment":
+    """Pick the one row in *work_assignments* — all sharing one branch —
+    that should key the branch's merge-queue entry.
+
+    Prefers the most-recently-dispatched row that already carries a fresh
+    terminal smoke verdict (``test_state in ('passed', 'skipped')``) — the
+    "approved + test-passed" row the issue asks the queue entry to track.
+    Falls back to the most-recently-dispatched row overall when none has
+    passed yet (the branch is still mid-cycle; it should still enqueue —
+    blocked on the smoke gate — rather than vanish). Ties on
+    ``dispatched_at`` (including everything being ``None``, e.g. rows from
+    tests or pre-#821 data) resolve to the last one in *work_assignments*
+    (typically ``board.completed`` insertion order, i.e. the most recently
+    seen row), same tie-break convention as :func:`resolve_entry_key`.
+    """
+    def _dispatched_at(a) -> float:
+        return getattr(a, "dispatched_at", None) or 0
+
+    passed = [
+        a for a in work_assignments
+        if getattr(a, "test_state", None) in ("passed", "skipped")
+    ]
+    pool = passed if passed else work_assignments
+    winner = pool[0]
+    for a in pool[1:]:
+        if _dispatched_at(a) >= _dispatched_at(winner):
+            winner = a
+    return winner
+
+
+def group_branch_candidates(completed: Iterable) -> list[tuple["Assignment", list]]:
+    """Group every done :data:`~coord.models.WORK_LIKE_TYPES` assignment in
+    *completed* by ``(repo_name, branch)`` and resolve each group to a
+    single winner (#1490).
+
+    Returns one ``(winner, superseded)`` pair per distinct ``(repo_name,
+    branch)`` group, in first-seen order (stable — output doesn't jitter
+    run to run). ``superseded`` holds the group's other rows (``[]`` when
+    there was only one); callers must log them and never enqueue them —
+    see :func:`_select_winning_work_assignment` for how the winner is
+    chosen.
+
+    Rows missing ``branch``/``assignment_id``, not in ``WORK_LIKE_TYPES``,
+    or not ``status == "done"`` are dropped from consideration entirely —
+    the same ad-hoc filter both call sites (`enqueue_approved_work`, the
+    ``coord merge`` auto-enqueue scan) applied before this was extracted.
+    """
+    order: list[tuple[str, str]] = []
+    groups: dict[tuple[str, str], list] = {}
+    for a in completed:
+        if getattr(a, "type", None) not in WORK_LIKE_TYPES:
+            continue
+        if getattr(a, "status", None) != "done":
+            continue
+        branch = getattr(a, "branch", None)
+        aid = getattr(a, "assignment_id", None)
+        if not branch or not aid:
+            continue
+        key = (getattr(a, "repo_name", None), branch)
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(a)
+
+    result: list[tuple["Assignment", list]] = []
+    for key in order:
+        rows = groups[key]
+        winner = rows[0] if len(rows) == 1 else _select_winning_work_assignment(rows)
+        superseded = [r for r in rows if r is not winner]
+        result.append((winner, superseded))
+    return result
+
+
+def _log_superseded(row) -> None:
+    """One clear line per row a branch-winner scan skipped (#1490) — so
+    "three rows, one queue entry" reads as expected coalescing rather than
+    "two got lost"."""
+    _log.info(
+        "merge-queue: %s#%s assignment %s (branch %s) superseded on this "
+        "branch — not enqueued",
+        getattr(row, "repo_name", None),
+        getattr(row, "issue_number", None),
+        getattr(row, "assignment_id", None),
+        getattr(row, "branch", None),
+    )
 
 
 # ── Review gate (#253) ──────────────────────────────────────────────────────
@@ -1034,6 +1146,19 @@ def enqueue_approved_work(config, board=None) -> list[str]:
     (``refresh_entry_assignment`` is a no-op when the entry already exists and
     is keyed correctly).
 
+    #1490: a fix/bounce cycle piles up more than one ``WORK_LIKE_TYPES`` row
+    on the *same* branch (the original dispatch plus every retry), and each
+    stays in ``board.completed`` forever. Processing every such row
+    independently — the pre-#1490 behaviour — re-keyed the branch's one
+    queue entry once per row, every single tick, because the review/smoke
+    gates are resolved over the whole branch chain (so even a *failed*-test
+    row passes them) and there was nothing to stop each row's turn from
+    winning the re-key. :func:`group_branch_candidates` now resolves every
+    branch to a single winner up front (the most-recently-dispatched row
+    with a passed/skipped verdict — falling back to the most recent row
+    overall when none has passed yet); every other row on that branch is
+    logged (:func:`_log_superseded`) and never touches the queue.
+
     Returns a list of assignment IDs for which an entry was created or updated.
     Call sites use this list for diagnostic logging; callers that don't need it
     can discard the return value.
@@ -1055,17 +1180,13 @@ def enqueue_approved_work(config, board=None) -> list[str]:
     completed = list(getattr(board, "completed", []) or [])
     existing_queue = load_queue()
 
-    for a in completed:
-        if getattr(a, "type", None) not in WORK_LIKE_TYPES:
-            continue
-        if getattr(a, "status", None) != "done":
-            continue
-        branch = getattr(a, "branch", None)
-        aid = getattr(a, "assignment_id", None)
-        if not branch or not aid:
-            continue
+    for a, superseded in group_branch_candidates(completed):
+        for row in superseded:
+            _log_superseded(row)
 
-        repo_name = getattr(a, "repo_name", None)
+        branch = a.branch
+        aid = a.assignment_id
+        repo_name = a.repo_name
         repo_cfg = config.repo(repo_name)
         if repo_cfg is None:
             continue
@@ -1298,26 +1419,46 @@ def reconcile_conflict_entries(gh_ops: "GhOps") -> list["MergeEvent"]:
 
 
 def resolve_entry_key(items: list["QueuedMerge"], key: str) -> "QueuedMerge | None":
-    """Resolve *key* to a queue entry — by ``assignment_id`` or durable key.
+    """Resolve *key* to a queue entry by whatever identifier the read path
+    printed — ``assignment_id``, the durable ``repo#issue`` form, a bare
+    issue number, or the branch name (#1477, #1490).
 
     ``assignment_id`` is volatile across a drop + re-enqueue cycle: a fresh
     row mints whatever assignment id the board currently shows for that
     issue, which is not guaranteed to match the id an operator last saw in
-    ``coord status`` (#1477 — compounding the already-documented gotcha that
-    a queue entry can be keyed to the first, killed, assignment rather than
-    the retry that actually did the work). ``repo_name#issue_number``
-    survives that churn, so ``--only``/``--drop`` accept it as a durable
-    alternative to a raw assignment_id.
+    ``coord status`` (#1477). #1490 sharpens this further: even *without* a
+    drop, a queue entry can legitimately be re-keyed between the moment the
+    board is read and the moment ``--only`` is invoked (a concurrent
+    auto-enqueue tick re-keying the branch's one entry to a newer fix
+    assignment) — so an id that was 100% correct when printed can already
+    be stale by the time it's passed here. Every fallback below resolves by
+    something that does *not* change out from under the operator for the
+    life of the entry.
 
-    Tries an exact ``assignment_id`` match first — unchanged, most specific.
-    Falls back to the ``repo#issue`` form only when *key* contains ``#``
-    (plain assignment ids never do, so this can never accidentally shadow
-    one). When more than one entry matches the durable key — e.g. a stale
-    ``MERGED``/``CONFLICT`` row alongside a fresh re-enqueue for the same
-    issue — the most recently added match wins (``load_queue()`` returns
-    rows in insertion order).
+    Resolution order (first match wins):
 
-    Returns ``None`` when nothing matches either form — callers must treat
+    1. Exact ``assignment_id`` — unchanged, most specific.
+    2. ``repo#issue`` (or ``repo_github#issue``) — only tried when *key*
+       contains ``#`` (plain ids/branches never do, so this can never
+       accidentally shadow one). A parse failure after ``#`` is a hard
+       miss — no fallthrough to the forms below.
+    3. A bare issue number — *key* parses as an ``int`` with no ``#``.
+       Matches ``entry.issue_number`` across every repo in *items*;
+       ambiguous only when the same issue number is queued for more than
+       one repo, in which case (like form 2) the most recently added match
+       wins.
+    4. The entry's own ``branch`` name (#1490) — the most stable identifier
+       there is: it's set once at enqueue time and never changes for the
+       life of the entry, unlike ``assignment_id`` which re-keys on every
+       fix/bounce round. This is the fallback the issue calls out
+       explicitly: "if an ID is genuinely re-keyed between passes, resolve
+       by branch".
+
+    When more than one entry matches forms 2-4, the most recently added
+    match wins (``load_queue()`` returns rows in insertion order) — the
+    #1477 tie-break, applied uniformly.
+
+    Returns ``None`` when nothing matches any form — callers must treat
     that as an explicit error, never a silent no-op (#1477).
     """
     for entry in items:
@@ -1335,6 +1476,18 @@ def resolve_entry_key(items: list["QueuedMerge"], key: str) -> "QueuedMerge | No
         ]
         if matches:
             return matches[-1]
+        return None
+    try:
+        bare_issue_number = int(key)
+    except ValueError:
+        bare_issue_number = None
+    if bare_issue_number is not None:
+        matches = [e for e in items if e.issue_number == bare_issue_number]
+        if matches:
+            return matches[-1]
+    branch_matches = [e for e in items if e.branch == key]
+    if branch_matches:
+        return branch_matches[-1]
     return None
 
 
