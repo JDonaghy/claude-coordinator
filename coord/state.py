@@ -4046,6 +4046,183 @@ def list_issue_context(repo_name: str, issue_number: int) -> list[dict]:
     return _list_issue_context_local(repo_name, issue_number)
 
 
+# ── Driver escalation records (#1505) ───────────────────────────────────────
+#
+# Written by `coord drive`'s merge stage the moment it hits a status no
+# amount of retrying can fix (NEEDS_ATTENTION / an unrecognised status) —
+# see coord/drive.py's `_decide_merge`. One row per (repo_name,
+# issue_number); a fresh `record` replaces the previous one, `dismiss`
+# deletes it. Mirrors the issue_context CRUD pattern above: a routed public
+# function + a `_*_local` DB-only twin, so the same code works whether this
+# call is running on the daemon host or a thin client.
+
+
+def record_drive_escalation(
+    repo_name: str,
+    issue_number: int,
+    *,
+    stage: str,
+    reason: str,
+    gate_readings: str,
+    proposed_command: str,
+    assignment_id: str | None = None,
+) -> int | None:
+    """Write (or replace) the escalation record for an issue.
+
+    Routes to the daemon when ``board_service`` is set, else writes the
+    local DB.  Returns the local row id on the local path; ``None`` when
+    routed (the daemon owns the id).
+    """
+    svc = _board_service()
+    resp = _route_write(
+        svc,
+        "/drive-escalations",
+        {
+            "action": "record",
+            "repo_name": repo_name,
+            "issue_number": issue_number,
+            "stage": stage,
+            "reason": reason,
+            "gate_readings": gate_readings,
+            "proposed_command": proposed_command,
+            "assignment_id": assignment_id,
+        },
+    )
+    if resp is not None:
+        return resp.get("entry_id")
+    return _record_drive_escalation_local(
+        repo_name,
+        issue_number,
+        stage=stage,
+        reason=reason,
+        gate_readings=gate_readings,
+        proposed_command=proposed_command,
+        assignment_id=assignment_id,
+    )
+
+
+def _record_drive_escalation_local(
+    repo_name: str,
+    issue_number: int,
+    *,
+    stage: str,
+    reason: str,
+    gate_readings: str,
+    proposed_command: str,
+    assignment_id: str | None = None,
+) -> int:
+    conn = get_connection()
+    now = time.time()
+    conn.execute(
+        "INSERT INTO drive_escalations "
+        "(repo_name, issue_number, stage, assignment_id, reason, "
+        " gate_readings, proposed_command, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(repo_name, issue_number) DO UPDATE SET "
+        "stage=excluded.stage, assignment_id=excluded.assignment_id, "
+        "reason=excluded.reason, gate_readings=excluded.gate_readings, "
+        "proposed_command=excluded.proposed_command, created_at=excluded.created_at",
+        (
+            repo_name, issue_number, stage, assignment_id, reason,
+            gate_readings, proposed_command, now,
+        ),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT id FROM drive_escalations WHERE repo_name = ? AND issue_number = ?",
+        (repo_name, issue_number),
+    ).fetchone()
+    return int(row["id"]) if row is not None else 0
+
+
+def dismiss_drive_escalation(repo_name: str, issue_number: int) -> bool:
+    """Clear the escalation record for an issue, if one exists.
+
+    Routes to the daemon when ``board_service`` is set, else deletes from
+    the local DB.  Returns whether a record was actually removed.
+    """
+    svc = _board_service()
+    resp = _route_write(
+        svc,
+        "/drive-escalations",
+        {
+            "action": "dismiss",
+            "repo_name": repo_name,
+            "issue_number": issue_number,
+        },
+    )
+    if resp is not None:
+        return bool(resp.get("deleted"))
+    return _dismiss_drive_escalation_local(repo_name, issue_number)
+
+
+def _dismiss_drive_escalation_local(repo_name: str, issue_number: int) -> bool:
+    conn = get_connection()
+    cur = conn.execute(
+        "DELETE FROM drive_escalations WHERE repo_name = ? AND issue_number = ?",
+        (repo_name, issue_number),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def get_drive_escalation(repo_name: str, issue_number: int) -> dict | None:
+    """The (at most one) open escalation record for an issue, or ``None``.
+
+    Routes to the daemon when ``board_service`` is set, else reads the
+    local DB directly.
+    """
+    svc = _board_service()
+    if svc is not None:
+        from coord.client import fetch_drive_escalation  # noqa: PLC0415
+
+        return fetch_drive_escalation(svc, repo_name, issue_number)
+    return _get_drive_escalation_local(repo_name, issue_number)
+
+
+def _get_drive_escalation_local(repo_name: str, issue_number: int) -> dict | None:
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT id, repo_name, issue_number, stage, assignment_id, reason, "
+        "gate_readings, proposed_command, created_at FROM drive_escalations "
+        "WHERE repo_name = ? AND issue_number = ?",
+        (repo_name, issue_number),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def list_drive_escalations(repo_name: str | None = None) -> list[dict]:
+    """Every open escalation record, optionally filtered to one repo.
+
+    Routes to the daemon when ``board_service`` is set, else reads the
+    local DB directly.
+    """
+    svc = _board_service()
+    if svc is not None:
+        from coord.client import fetch_drive_escalations  # noqa: PLC0415
+
+        return fetch_drive_escalations(svc, repo_name)
+    return _list_drive_escalations_local(repo_name)
+
+
+def _list_drive_escalations_local(repo_name: str | None = None) -> list[dict]:
+    conn = get_connection()
+    if repo_name:
+        rows = conn.execute(
+            "SELECT id, repo_name, issue_number, stage, assignment_id, reason, "
+            "gate_readings, proposed_command, created_at FROM drive_escalations "
+            "WHERE repo_name = ? ORDER BY id",
+            (repo_name,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, repo_name, issue_number, stage, assignment_id, reason, "
+            "gate_readings, proposed_command, created_at FROM drive_escalations "
+            "ORDER BY id"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def list_audit_log(
     *,
     since: float | None = None,

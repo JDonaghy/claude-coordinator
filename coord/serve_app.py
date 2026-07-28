@@ -1383,6 +1383,7 @@ def _board_response_schema(components: dict) -> dict:
             ("merge_queue", "BoardMergeQueueEntry"),
             ("proposals", "BoardProposal"),
             ("issues", "BoardIssue"),
+            ("drive_escalations", "BoardDriveEscalation"),
         ):
             components[key] = sqlite_table_schema(
                 conn,
@@ -1443,6 +1444,19 @@ def _board_response_schema(components: dict) -> dict:
                 "type": "array",
                 "description": "#778: approved/done work not yet in the merge queue",
                 "items": staging_item_ref,
+            },
+            "escalations": {
+                "type": "array",
+                "description": (
+                    "#1505: board-visible driver-escalation records — a "
+                    "`coord drive` merge stage that stopped rather than "
+                    "retry a status it can't fix (NEEDS_ATTENTION / "
+                    "unrecognised), naming the stop reason, the observed "
+                    "gate readings, and a proposed fix command. Cleared by "
+                    "`coord escalate dismiss` (or the TUI's Dismiss menu "
+                    "item)."
+                ),
+                "items": {"$ref": "#/components/schemas/BoardDriveEscalation"},
             },
             "issue_stage_projection": {
                 "type": "array",
@@ -2547,6 +2561,61 @@ def _openapi_spec() -> dict:
                                     "source": {"type": "string", "nullable": True},
                                     "entry_id": {"type": "integer"},
                                     "entries": {"type": "array", "items": {"type": "object"}},
+                                },
+                                "required": ["action", "repo_name", "issue_number"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {"description": "OK"},
+                    "400": {"description": "Missing field / unknown action"},
+                },
+            },
+        },
+        "/drive-escalations": {
+            "get": {
+                "summary": (
+                    "#1505: read driver-escalation records — a `coord drive` "
+                    "merge stage that stopped rather than retry a status it "
+                    "can't fix. Filter by repo_name (+ optional issue_number); "
+                    "omit both to list every open escalation."
+                ),
+                "parameters": [
+                    {
+                        "name": "repo_name", "in": "query", "required": False,
+                        "schema": {"type": "string"},
+                    },
+                    {
+                        "name": "issue_number", "in": "query", "required": False,
+                        "schema": {"type": "integer"},
+                    },
+                ],
+                "responses": {
+                    "200": {"description": "OK"},
+                    "400": {"description": "issue_number not an int"},
+                },
+            },
+            "post": {
+                "summary": "#1505: record or dismiss a driver-escalation record",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "action": {
+                                        "type": "string",
+                                        "enum": ["record", "dismiss"],
+                                    },
+                                    "repo_name": {"type": "string"},
+                                    "issue_number": {"type": "integer"},
+                                    "stage": {"type": "string"},
+                                    "reason": {"type": "string"},
+                                    "gate_readings": {"type": "string"},
+                                    "proposed_command": {"type": "string"},
+                                    "assignment_id": {"type": "string", "nullable": True},
                                 },
                                 "required": ["action", "repo_name", "issue_number"],
                             }
@@ -4447,6 +4516,71 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             )
         return JSONResponse({"error": f"unknown action: {action!r}"}, status_code=400)
 
+    async def get_drive_escalations(request: Request) -> Response:
+        # #1505: read driver-escalation record(s) — `repo_name` alone lists
+        # every open escalation for that repo; `repo_name` + `issue_number`
+        # narrows to the (at most one) record for that issue; neither given
+        # lists everything on file (the table is tiny — one row per stuck
+        # issue, cleared on dismiss).
+        from coord import state  # noqa: PLC0415
+
+        repo_name = request.query_params.get("repo_name")
+        raw_issue = request.query_params.get("issue_number")
+        issue_number = None
+        if raw_issue is not None:
+            try:
+                issue_number = int(raw_issue)
+            except (TypeError, ValueError):
+                return JSONResponse(
+                    {"error": "issue_number must be an int"}, status_code=400
+                )
+        try:
+            if repo_name and issue_number is not None:
+                entry = state._get_drive_escalation_local(repo_name, issue_number)
+                entries = [entry] if entry else []
+            else:
+                entries = state._list_drive_escalations_local(repo_name)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "drive-escalations read failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"entries": entries})
+
+    async def post_drive_escalations(request: Request) -> Response:
+        # #1505: record / dismiss a driver-escalation record on the shared DB.
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        action = body.get("action")
+        try:
+            if action == "record":
+                entry_id = state._record_drive_escalation_local(
+                    body["repo_name"],
+                    body["issue_number"],
+                    stage=body.get("stage") or "merge",
+                    reason=body["reason"],
+                    gate_readings=body.get("gate_readings") or "",
+                    proposed_command=body.get("proposed_command") or "",
+                    assignment_id=body.get("assignment_id"),
+                )
+                return JSONResponse({"entry_id": entry_id})
+            if action == "dismiss":
+                deleted = state._dismiss_drive_escalation_local(
+                    body["repo_name"], body["issue_number"]
+                )
+                return JSONResponse({"deleted": bool(deleted)})
+        except KeyError as e:
+            return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "drive-escalations write failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"error": f"unknown action: {action!r}"}, status_code=400)
+
     async def get_issue_comments(request: Request) -> Response:
         # #873: read an issue's captured comments (oldest-first) from the
         # durable mirror.
@@ -5331,6 +5465,8 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/milestone-edit", post_milestone_edit, methods=["POST"]),
         Route("/issue-context", get_issue_context, methods=["GET"]),
         Route("/issue-context", post_issue_context, methods=["POST"]),
+        Route("/drive-escalations", get_drive_escalations, methods=["GET"]),
+        Route("/drive-escalations", post_drive_escalations, methods=["POST"]),
         Route("/issue-comments", get_issue_comments, methods=["GET"]),
         Route("/issue-comments", post_issue_comments, methods=["POST"]),
         Route("/merge", post_merge, methods=["POST"]),

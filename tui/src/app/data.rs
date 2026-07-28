@@ -1442,6 +1442,11 @@ pub(crate) fn load_data() -> BoardData {
         // simply shows nothing (0) on this path, same posture as
         // plan_roster_supported above.
         0,
+        // #1505: local SQLite path has no daemon to compute driver-
+        // escalation records either (they're a raw table dump but still
+        // server-side only, same posture as merge_plan above). Pass empty;
+        // the Pipeline row/menu simply show no escalation on this path.
+        Vec::new(),
     )
 }
 
@@ -1480,6 +1485,7 @@ pub(crate) fn assemble_board_data(
     plan_roster_supported: bool,
     goal_header: GoalHeader,
     audit_recent_count: u64,
+    escalations: Vec<EscalationEntry>,
 ) -> BoardData {
     // ── Machine reachability probes + health fetches ──────────────────────
     // Probe using the Tailscale host (fixes #121: machine name ≠ Tailscale hostname).
@@ -1598,6 +1604,7 @@ pub(crate) fn assemble_board_data(
         plan_roster_supported,
         goal_header,
         audit_recent_count,
+        escalations,
     }
 }
 
@@ -2115,6 +2122,9 @@ pub(crate) fn load_data_remote(url: &str, token: Option<&str>) -> BoardData {
         // sidebar badge; `0` (`#[serde(default)]`) on daemons that predate
         // #1037.
         payload.audit_recent_count,
+        // #1505: server-computed driver-escalation records; empty on
+        // daemons that predate #1505.
+        payload.escalations,
     )
 }
 

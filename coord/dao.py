@@ -111,6 +111,7 @@ class CoordStore(Protocol):
     def list_assignments(self) -> list[dict]: ...
     def list_machines(self) -> list[dict]: ...
     def list_merge_queue(self) -> list[dict]: ...
+    def list_drive_escalations(self) -> list[dict]: ...
     def list_proposals(self) -> list[dict]: ...
     def list_issues(self) -> list[dict]: ...
     def list_plans(self) -> dict[str, Any]: ...
@@ -316,6 +317,10 @@ class SqliteStore:
         with closing(self._connect()) as conn:
             return self._table(conn, "merge_queue", order="id")
 
+    def list_drive_escalations(self) -> list[dict]:
+        with closing(self._connect()) as conn:
+            return self._table(conn, "drive_escalations", order="id")
+
     def list_proposals(self) -> list[dict]:
         with closing(self._connect()) as conn:
             return self._table(conn, "proposals", order="id")
@@ -439,6 +444,12 @@ class SqliteStore:
                 "notifications": self._capped_notifications(conn, keep, cutoff),
                 "board_meta": self._board_meta(conn),
                 "audit_recent_count": self._audit_recent_count(conn),
+                # #1505: board-visible driver-escalation records — see
+                # coord/db.py's drive_escalations table docstring. Small,
+                # unbounded-but-tiny table (one row per stuck issue, cleared
+                # on dismiss), so no retention cap like assignments/
+                # notifications above.
+                "escalations": self._table(conn, "drive_escalations", order="id"),
             }
 
     # ── writes (deferred to #590) ────────────────────────────────────────────────

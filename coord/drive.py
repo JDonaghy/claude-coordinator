@@ -79,6 +79,7 @@ import errno
 import fcntl
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -109,6 +110,10 @@ EXIT_OK = 0
 EXIT_TERMINAL_FAILURE = 1
 EXIT_USAGE = 2
 EXIT_DEADLINE = 3
+# #1505: distinct from EXIT_TERMINAL_FAILURE so `coord drive`'s exit code
+# alone tells a wrapper/notify path "a human decision is waiting on the
+# board" apart from "something actually broke" — see `_escalate_merge`.
+EXIT_ESCALATED = 4
 
 
 class DriveError(Exception):
@@ -1124,6 +1129,104 @@ def _decide_review(
     return Action(kind=WAIT, warnings=(f"unexpected review verdict '{verdict}'",))
 
 
+# #1505: merge statuses a bounded `coord merge --only` retry can actually
+# change. "" / PENDING / READY / MERGING are normal in-flight states — the
+# next `coord merge` tick is expected to move them forward. CONFLICT is
+# retried too, deliberately: that's what runs `classify_conflict` +
+# `dispatch_conflict_fix` (#1474, see this function's docstring). Everything
+# else — most commonly NEEDS_ATTENTION (what a HUMAN_REQUIRED/SKIPPED queue
+# entry surfaces as once `merge_queue.plan()` is in the payload — see
+# `_state_to_plan_status`), or any status this driver has never seen before
+# — cannot be resolved by retrying, so it escalates instead of spinning the
+# attempt cap down to zero on a no-op.
+_RETRYABLE_MERGE_STATUSES = frozenset({"", "PENDING", "READY", "MERGING", "CONFLICT"})
+
+_PR_NUMBER_RE = re.compile(r"/pull/(\d+)")
+
+
+def _extract_pr_number(pr_url: str) -> int | None:
+    """Best-effort PR number out of a GitHub PR URL, or ``None``."""
+    if not pr_url:
+        return None
+    m = _PR_NUMBER_RE.search(pr_url)
+    return int(m.group(1)) if m else None
+
+
+def _escalate_merge(state: IssueState, status: str) -> Action:
+    """Build the EXIT action for a merge status retrying cannot fix (#1505).
+
+    Escalates on the FIRST encounter rather than after exhausting
+    ``max_merge_attempts`` — a merge attempt is expensive (a whole
+    ``coord merge`` run) and, for these statuses, guaranteed to be a no-op;
+    an escalation record is cheap and actionable instead.
+
+    This function stays pure like every other decision in this module (see
+    the "STRUCTURE" section of the module docstring) — it only *describes*
+    the escalation via the returned :class:`Action`'s ``command``.  The
+    actual write happens in :meth:`Driver.run`'s exit handling, which runs
+    that command through the CLI exactly like any other board mutation this
+    driver performs (``coord escalate record ...``, never a direct
+    ``coord.state`` call).
+
+    The proposed command mirrors the #1477 resolution this issue was opened
+    over: when a PR is known, ``gh pr merge --rebase`` + ``coord
+    reconcile-merges`` is the sanctioned escape hatch (also documented in
+    docs/OPERATING_GOTCHAS.md). Without a known PR number there is nothing
+    concrete to propose beyond pointing at the plan for a human to read.
+    """
+    pr_number = _extract_pr_number(state.merge_pr_url)
+    if pr_number is not None:
+        proposed = f"gh pr merge {pr_number} --rebase && coord reconcile-merges"
+    else:
+        proposed = (
+            f"coord merge --plan --repo {state.repo}   "
+            "# inspect the gates, then decide"
+        )
+
+    reason = (
+        f"merge_status={status or '(empty)'} — no number of retries changes "
+        "this; escalating on first encounter instead of burning the "
+        "merge-attempt budget (#1505)"
+    )
+    gate_pairs = (
+        ("merge_status", status or "(empty)"),
+        ("merge_reason", state.merge_reason or "(none)"),
+        ("review_verdict", state.review_verdict or "(none)"),
+        ("test_state", state.work_test_state or "(none)"),
+        ("pr_url", state.merge_pr_url or "(none)"),
+    )
+    gates_summary = " | ".join(f"{k}={v}" for k, v in gate_pairs)
+    aid = state.merge_aid or state.work_aid
+
+    command: list[str] = [
+        "escalate", "record", state.repo, str(state.issue),
+        "--stage", "merge",
+        "--reason", reason,
+    ]
+    for k, v in gate_pairs:
+        command += ["--gate", f"{k}={v}"]
+    command += ["--command", proposed]
+    if aid:
+        command += ["--assignment", aid]
+
+    return Action(
+        kind=EXIT,
+        exit_code=EXIT_ESCALATED,
+        message=(
+            f"merge escalated: {reason}\n"
+            f"   gates: {gates_summary}\n"
+            f"   proposed: {proposed}\n"
+            f"   Recorded on the board — see: coord escalate list --repo {state.repo}"
+        ),
+        command=tuple(command),
+        error_message=(
+            "failed to record the escalation on the board (exiting anyway — "
+            f"resolve by hand: coord escalate record {state.repo} {state.issue} "
+            "--reason ... --command ...)"
+        ),
+    )
+
+
 def _decide_merge(
     state: IssueState, opts: DriveOptions, counters: DriveCounters
 ) -> Action:
@@ -1169,6 +1272,12 @@ def _decide_merge(
                 f"{state.merge_reason or 'gate not satisfied'}; re-checking"
             )
         )
+
+    # #1505: a status no retry can fix (most commonly NEEDS_ATTENTION)
+    # escalates immediately rather than falling into the bounded retry below
+    # — see `_RETRYABLE_MERGE_STATUSES` and `_escalate_merge`.
+    if status.upper() not in _RETRYABLE_MERGE_STATUSES:
+        return _escalate_merge(state, status)
 
     # Cap the attempts: without this, a merge that fails for a reason the board
     # never reflects (so merge_status stays empty) would re-run `coord merge`
@@ -1779,7 +1888,25 @@ class Driver:
                 self.warn(warning)
 
             if action.is_exit:
+                # #1499: capture the exit reason for the audit boundary before
+                # anything below can fail — the escalation write is explicitly
+                # best-effort, so it must not be able to cost us the reason.
                 self._last_exit_message = action.message
+                # #1505: an escalation exit still carries a `command` — the
+                # `coord escalate record ...` write that makes the stop
+                # reason board-visible after this process is gone. Run it
+                # HERE (the I/O shell), not inside `decide()`, which stays a
+                # pure function like every other decision in this module.
+                # Best-effort: a failed write must never block the exit
+                # itself (there is nothing left to retry), so this only
+                # warns, never raises.
+                if action.command:
+                    rc = self.run_coord(action.command)
+                    if rc != 0:
+                        self.warn(
+                            action.error_message
+                            or f"coord {' '.join(action.command)} exited {rc}"
+                        )
                 if action.exit_code == EXIT_OK:
                     for line in action.message.splitlines():
                         self.log(line)

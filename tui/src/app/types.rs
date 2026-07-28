@@ -623,6 +623,47 @@ pub(crate) struct BoardPayload {
     /// value) on daemons older than #1037, which never emit this key.
     #[serde(default)]
     pub(crate) audit_recent_count: u64,
+    /// #1505: board-visible driver-escalation records — see
+    /// `coord.drive._escalate_merge` / `coord/db.py`'s `drive_escalations`
+    /// table doc comment. Empty on the local-SQLite-mode read path (no
+    /// daemon to compute it — it's a raw table dump, but still server-side
+    /// only) and on daemons older than #1505.
+    #[serde(default)]
+    pub(crate) escalations: Vec<EscalationEntry>,
+}
+
+/// #1505: one board-visible "driver stuck" record — `coord drive`'s merge
+/// stage hit a status no amount of retrying can fix (NEEDS_ATTENTION / an
+/// unrecognised status) and escalated instead of burning the merge-attempt
+/// budget on it. A raw dump of the `drive_escalations` table row, one
+/// (repo_name, issue_number) at a time — see `coord/db.py`'s table comment
+/// and `coord.drive._escalate_merge`.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub(crate) struct EscalationEntry {
+    #[allow(dead_code)]
+    pub(crate) id: i64,
+    pub(crate) repo_name: String,
+    pub(crate) issue_number: i64,
+    // Parsed for wire parity / `Debug` dumps and reachable via `coord
+    // escalate list` outside the TUI; not yet surfaced on the Pipeline
+    // row/menu, which only needs `reason` + `proposed_command` today.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub(crate) stage: String,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub(crate) assignment_id: Option<String>,
+    pub(crate) reason: String,
+    /// Human-readable "key=value | key=value" summary of the gate readings
+    /// the driver observed — deliberately NOT JSON (see `coord/db.py`): this
+    /// record exists to be read by a human, not machine-parsed.
+    #[allow(dead_code)] // see `stage` above — not yet surfaced in the TUI
+    #[serde(default)]
+    pub(crate) gate_readings: String,
+    pub(crate) proposed_command: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(crate) created_at: Option<f64>,
 }
 
 /// #584: serde deserializer for `Assignment::test_plan` on the remote
@@ -1839,6 +1880,10 @@ pub struct BoardData {
     /// sidebar "N recent" badge. `0` on the local-SQLite-mode read path and
     /// on daemons older than #1037.
     pub(crate) audit_recent_count: u64,
+    /// #1505: mirrors `BoardPayload::escalations` — board-visible driver-
+    /// escalation records. Empty on the local-SQLite-mode read path and on
+    /// daemons older than #1505.
+    pub(crate) escalations: Vec<EscalationEntry>,
 }
 
 /// Parsed plan data, mirroring `coord.plan_parser.WorkerPlan.to_dict()`.

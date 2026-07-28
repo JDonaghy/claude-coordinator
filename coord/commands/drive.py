@@ -481,3 +481,125 @@ def drive_stop(repo: str, issue: int) -> None:
         )
         sys.exit(1)
     click.echo(f"Stopped driving {repo} #{issue}.")
+
+
+# ── driver escalation records (#1505) ────────────────────────────────────────
+#
+# `_decide_merge` writes one of these the moment the merge stage hits a
+# status no amount of retrying can fix (NEEDS_ATTENTION / an unrecognised
+# status) — see that function's docstring. `record` is the driver's own
+# write (`Driver.run` executes it as the last thing before exiting, via
+# `run_coord`, never as a direct DB call — same CLI-is-the-contract rule
+# every other board mutation in this module follows). `run`/`dismiss`/`list`
+# are the human's one-key responses, surfaced in coord-tui's Pipeline
+# right-click menu (`run-escalation`/`dismiss-escalation`) and reachable
+# from any shell.
+
+
+@click.group("escalate")
+def escalate_group() -> None:
+    """Board-visible "driver stuck" records the merge stage of `coord drive`
+    writes instead of burning the retry budget on a status retrying can't
+    fix (#1505). `record` is written by the driver itself; the human answers
+    with `run` (execute the proposed fix), `dismiss` (clear the record), or
+    `list` (see what's outstanding).
+    """
+
+
+@escalate_group.command("record")
+@click.argument("repo")
+@click.argument("issue", type=int)
+@click.option("--stage", default="merge", show_default=True, help="Pipeline stage that escalated.")
+@click.option("--reason", required=True, help="Why the driver stopped.")
+@click.option(
+    "--gate", "gates", multiple=True,
+    help="One observed gate reading as key=value. Repeatable.",
+)
+@click.option("--command", "proposed_command", required=True, help="The proposed fix, as a shell command.")
+@click.option("--assignment", "assignment_id", default=None, help="The merge-queue/work assignment id, if known.")
+@_CONFIG_OPTION
+def escalate_record(
+    repo: str,
+    issue: int,
+    stage: str,
+    reason: str,
+    gates: tuple[str, ...],
+    proposed_command: str,
+    assignment_id: str | None,
+    config_path: Path,
+) -> None:
+    """Write (or replace) the escalation record for REPO ISSUE."""
+    from coord.state import record_drive_escalation  # noqa: PLC0415
+
+    record_drive_escalation(
+        repo,
+        issue,
+        stage=stage,
+        reason=reason,
+        gate_readings=" | ".join(gates),
+        proposed_command=proposed_command,
+        assignment_id=assignment_id,
+    )
+    click.echo(f"escalation recorded for {repo} #{issue}: {reason}")
+
+
+@escalate_group.command("dismiss")
+@click.argument("repo")
+@click.argument("issue", type=int)
+@_CONFIG_OPTION
+def escalate_dismiss(repo: str, issue: int, config_path: Path) -> None:
+    """Clear the escalation record for REPO ISSUE without acting on it."""
+    from coord.state import dismiss_drive_escalation  # noqa: PLC0415
+
+    ok = dismiss_drive_escalation(repo, issue)
+    click.echo(f"dismissed escalation for {repo} #{issue}" if ok else "no escalation on file")
+
+
+@escalate_group.command("list")
+@click.option("--repo", "repo", default=None, help="Restrict to one repo (default: every repo).")
+@_CONFIG_OPTION
+def escalate_list(repo: str | None, config_path: Path) -> None:
+    """List every open escalation record."""
+    from coord.state import list_drive_escalations  # noqa: PLC0415
+
+    entries = list_drive_escalations(repo)
+    if not entries:
+        click.echo("(no open escalations)")
+        return
+    for e in entries:
+        click.echo(f"{e['repo_name']} #{e['issue_number']} [{e['stage']}]: {e['reason']}")
+        if e.get("gate_readings"):
+            click.echo(f"  gates:    {e['gate_readings']}")
+        click.echo(f"  proposed: {e['proposed_command']}")
+
+
+@escalate_group.command("run")
+@click.argument("repo")
+@click.argument("issue", type=int)
+@click.option(
+    "--dismiss/--no-dismiss", default=True,
+    help="Clear the record after the proposed command exits 0 (default: yes).",
+)
+@_CONFIG_OPTION
+def escalate_run(repo: str, issue: int, dismiss: bool, config_path: Path) -> None:
+    """Run the proposed fix command for REPO ISSUE's escalation.
+
+    This IS the "one-key human decision" the escalation record exists for —
+    nothing runs it automatically; a human (or the TUI's "Run it" menu item,
+    which shells out to exactly this) has to explicitly ask for it.
+    """
+    from coord.state import dismiss_drive_escalation, get_drive_escalation  # noqa: PLC0415
+
+    entry = get_drive_escalation(repo, issue)
+    if entry is None:
+        raise click.ClickException(f"no escalation on file for {repo} #{issue}")
+    command = (entry.get("proposed_command") or "").strip()
+    if not command:
+        raise click.ClickException("escalation record has no proposed command")
+    click.echo(f"running: {command}")
+    result = subprocess.run(command, shell=True)  # noqa: S602 — operator-approved, one-key by design
+    if result.returncode != 0:
+        raise click.ClickException(f"proposed command exited {result.returncode}")
+    if dismiss:
+        dismiss_drive_escalation(repo, issue)
+    click.echo("done")

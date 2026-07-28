@@ -234,3 +234,46 @@ Resolved since this list was first written: the runner's path routing now
 covers other repos and **refuses** rather than recording a false `skipped`
 (#1408); the Test stage is board-visible (#1395 `running` marker, then #1426);
 merges serialize fleet-wide rather than per-machine (#1400).
+
+## 10. A stuck merge (`NEEDS_ATTENTION`) escalates instead of retrying — the `gh pr merge` escape hatch
+
+`coord drive`'s merge stage (`_decide_merge` in `coord/drive.py`) only retries
+`coord merge --only <aid>` for statuses a retry can actually change — an
+in-flight `PENDING`/`READY`/`MERGING`, or `CONFLICT` (which retrying really
+does drive forward, via the #241 auto-rebase machinery). Anything else —
+most commonly `NEEDS_ATTENTION` (what a `HUMAN_REQUIRED`/`SKIPPED` queue entry
+surfaces as once the server-side merge plan is in the `/board` payload), or a
+status this driver has never seen before — **escalates on the first
+encounter** instead of burning `max_merge_attempts` retries on a call that
+cannot possibly land (#1505).
+
+Escalating means: the driver writes a board-visible record (`coord escalate
+record <repo> <issue> --reason ... --gate k=v ... --command ...`, one row per
+issue, replacing any earlier record for the same issue) naming why it
+stopped, the gate readings it observed (merge status/reason, review verdict,
+test state, PR url), and a **proposed** fix command — then exits with code
+`4` (`EXIT_ESCALATED`, distinct from the generic terminal-failure `1`).
+**Nothing runs the proposed command automatically** — a human (or the TUI's
+Pipeline right-click menu → "Run proposed fix", which shells out to `coord
+escalate run <repo> <issue>`) has to explicitly ask for it.
+
+**The sanctioned escape hatch**, when the escalation names a known PR and
+everything else — CI, review, patch identity — is already green (this was
+the entire #1477 postmortem: the coordinator had every fact it needed and no
+way to act on it):
+
+```
+gh pr merge <pr-number> --rebase
+coord reconcile-merges
+```
+
+`gh pr merge` lands the PR directly (bypassing the coordinator's own queue,
+which had already given up on this entry); `coord reconcile-merges`
+backfills the board so the merge-queue entry, the issue, and any downstream
+dependents reflect what GitHub now shows as merged — skipping this step
+leaves the board thinking the PR is still open. Read the escalation's own
+gate readings first (`coord escalate list --repo <repo>`, or the Pipeline
+row's right-click menu) — a `gh pr merge` on a PR that ISN'T actually clean
+(a failed check, an unapproved review) just moves the mess onto GitHub. Once
+resolved, `coord escalate dismiss <repo> <issue>` clears the record (`coord
+escalate run` does this automatically on a zero exit).

@@ -248,6 +248,61 @@ def fetch_issue_context(
     return entries if isinstance(entries, list) else []
 
 
+def fetch_drive_escalation(
+    svc: ServiceConfig,
+    repo_name: str,
+    issue_number: int,
+    *,
+    timeout: float = _DEFAULT_TIMEOUT,
+) -> dict | None:
+    """GET the (at most one) open driver-escalation record for an issue (#1505).
+
+    Returns ``None`` on ANY failure (404 from an older daemon, network error,
+    bad JSON, or genuinely no record) — ``coord escalate run``/``dismiss`` on a
+    thin client treat that as "nothing on file", same as the local-DB path.
+    """
+    try:
+        resp = httpx.get(
+            f"{svc.url}/drive-escalations",
+            params={"repo_name": repo_name, "issue_number": issue_number},
+            headers=_headers(svc),
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:  # noqa: BLE001 — fail-soft, mirrors fetch_issue_context
+        return None
+    entries = data.get("entries") if isinstance(data, dict) else None
+    if isinstance(entries, list) and entries:
+        return entries[0]
+    return None
+
+
+def fetch_drive_escalations(
+    svc: ServiceConfig,
+    repo_name: str | None = None,
+    *,
+    timeout: float = _DEFAULT_TIMEOUT,
+) -> list[dict]:
+    """GET every open driver-escalation record, optionally filtered to one
+    repo (#1505). ``[]`` on ANY failure — fail-soft, mirrors
+    :func:`fetch_issue_context`."""
+    try:
+        params = {"repo_name": repo_name} if repo_name else {}
+        resp = httpx.get(
+            f"{svc.url}/drive-escalations",
+            params=params,
+            headers=_headers(svc),
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:  # noqa: BLE001
+        return []
+    entries = data.get("entries") if isinstance(data, dict) else None
+    return entries if isinstance(entries, list) else []
+
+
 def fetch_audit_log(
     svc: ServiceConfig,
     *,
