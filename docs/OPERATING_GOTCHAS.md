@@ -19,6 +19,15 @@ Which deploy step applies is decided by **the file the fix touched**:
 | other `coord/**` | live immediately on the coordinator's editable install |
 | `tui/**` | **local `cargo build` + copy to `~/.local/bin/coord-tui`** |
 
+**Exception: dellserver.** The "editable install" row assumes a dev checkout at
+`~/src/claude-coordinator`. dellserver's `coord-serve` *and* its `coord` CLI both
+run from the same pinned, non-editable `~/.coord-venv` (deliberately — #1418, to
+close the editable-drift hazard). So on dellserver, "other `coord/**`" fixes ride
+the *same* release + restart path as the daemon row, not an instant one. Verified
+against #1491's milestone-#50 exit gate — see
+[`MERGE_AUTO_DRAIN_TRUST_BAR.md`](MERGE_AUTO_DRAIN_TRUST_BAR.md) for the full
+deploy-status audit this produced.
+
 Not academic. #1394 (worker strands uncommitted work, then cleanup destroys it)
 sat merged-but-undeployed, and the very next dispatch — #1402 — hit the
 identical bug: **$3.44 and 10 minutes lost to something already fixed on
