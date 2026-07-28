@@ -1,0 +1,67 @@
+FFFFFF                                                                   [100%]
+=================================== FAILURES ===================================
+______________ test_worker_spawn_exports_shared_cargo_target_dir _______________
+tests/test_cargo_cache.py:246: in test_worker_spawn_exports_shared_cargo_target_dir
+    assert target == str(server.state_dir / "cargo-target" / "api")
+E   AssertionError: assert '/home/john/....e-coordinator' == '/tmp/pytest-...go-target/api'
+E     
+E     - /tmp/pytest-of-john/pytest-370/test_worker_spawn_exports_shar0/state/cargo-target/api
+E     + /home/john/.coord/cargo-target/claude-coordinator
+_______________________ test_example_config_at_repo_root _______________________
+tests/test_config.py:184: in test_example_config_at_repo_root
+    cfg = load(_EXAMPLE_CONFIG)
+          ^^^^^^^^^^^^^^^^^^^^^
+coord/config.py:1045: in load
+    repos = _parse_repos(raw.get("repos"))
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+coord/config.py:1088: in _parse_repos
+    raise ConfigError("Config must define 'repos'")
+E   coord.config.ConfigError: Config must define 'repos'
+__________________ TestRepoConfig.test_example_config_parses ___________________
+tests/test_coord_test.py:86: in test_example_config_parses
+    cfg = load(Path(__file__).resolve().parents[1] / "coordinator.yml")
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+coord/config.py:1045: in load
+    repos = _parse_repos(raw.get("repos"))
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+coord/config.py:1088: in _parse_repos
+    raise ConfigError("Config must define 'repos'")
+E   coord.config.ConfigError: Config must define 'repos'
+___________________ test_generated_ts_matches_codegen_output ___________________
+tests/test_generated_types_fixture.py:27: in test_generated_ts_matches_codegen_output
+    assert on_disk == regenerated, (
+E   AssertionError: /home/john/src/claude-coordinator/coord/dashboard/webapp/src/api/generated.ts is stale — regenerate it with `.venv/bin/python scripts/codegen.py` and commit the result.
+E   assert '/**\n * AUTO...r | null\n}\n' == '/**\n * AUTO...g | null\n}\n'
+E     
+E     Skipping 4320 identical leading characters in diff, use -v to show
+E       er | null
+E     -   driven_by: string | null
+E       }
+_______________ TestHooksConfig.test_example_config_parses_hooks _______________
+tests/test_hooks.py:67: in test_example_config_parses_hooks
+    cfg = load(Path(__file__).resolve().parents[1] / "coordinator.yml")
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+coord/config.py:1045: in load
+    repos = _parse_repos(raw.get("repos"))
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+coord/config.py:1088: in _parse_repos
+    raise ConfigError("Config must define 'repos'")
+E   coord.config.ConfigError: Config must define 'repos'
+_______________ TestConcurrencyConfig.test_example_config_parses _______________
+tests/test_retry.py:65: in test_example_config_parses
+    cfg = load(Path(__file__).resolve().parents[1] / "coordinator.yml")
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+coord/config.py:1045: in load
+    repos = _parse_repos(raw.get("repos"))
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+coord/config.py:1088: in _parse_repos
+    raise ConfigError("Config must define 'repos'")
+E   coord.config.ConfigError: Config must define 'repos'
+=========================== short test summary info ============================
+FAILED tests/test_cargo_cache.py::test_worker_spawn_exports_shared_cargo_target_dir
+FAILED tests/test_config.py::test_example_config_at_repo_root - coord.config....
+FAILED tests/test_coord_test.py::TestRepoConfig::test_example_config_parses
+FAILED tests/test_generated_types_fixture.py::test_generated_ts_matches_codegen_output
+FAILED tests/test_hooks.py::TestHooksConfig::test_example_config_parses_hooks
+FAILED tests/test_retry.py::TestConcurrencyConfig::test_example_config_parses
+6 failed in 0.64s
