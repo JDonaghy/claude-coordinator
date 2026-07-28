@@ -144,6 +144,32 @@ def approve(
         click.echo("No pending proposals. Run `coord plan` first.", err=True)
         sys.exit(1)
 
+    # ── Max-plan usage-window pre-check (#1466) ─────────────────────────
+    # A batch approve can start several headless workers at once — exactly
+    # what runs a Max-plan 5h/weekly window dry mid-batch, stranding the
+    # later workers' branches. The probe is server-side/account-wide and
+    # ~60s cached (coord.usage_limits) so this costs nothing extra even
+    # across several `coord approve` calls in a row. `usage_gate.mode`
+    # defaults to "warn" — never refuses until an operator opts into
+    # "block" in coordinator.yml. See UsageGateConfig's docstring for the
+    # CAVEAT: this is predictive only while headless usage still draws the
+    # subscription windows `/usage` reports (paused rollout as of
+    # 2026-06-15) rather than a separate monthly credit pool.
+    if cfg.usage_gate.mode != "disabled":
+        from coord.usage_limits import evaluate_usage_gate, get_plan_limits
+
+        gate_result = evaluate_usage_gate(get_plan_limits(), cfg.usage_gate)
+        if gate_result.action == "block":
+            click.echo(
+                f"error: {gate_result.message} (usage_gate.mode: block) — "
+                "refusing to dispatch. Wait for the window to reset, or set "
+                "usage_gate.mode: warn in coordinator.yml.",
+                err=True,
+            )
+            sys.exit(1)
+        elif gate_result.action == "warn":
+            click.echo(f"warning: {gate_result.message}", err=True)
+
     try:
         selected_ids = [int(x.strip()) for x in ids.split(",")]
     except ValueError:

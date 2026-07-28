@@ -31,7 +31,7 @@ from pathlib import Path
 
 import pytest
 
-from coord.config import Config
+from coord.config import Config, UsageGateConfig
 from coord.drive import (
     EXIT_DEADLINE,
     EXIT_OK,
@@ -56,6 +56,7 @@ from coord.drive import (
 )
 from coord.drive_state import IssueState
 from coord.models import Machine, Repo
+from coord.usage_limits import PlanLimits
 
 
 REPO = "claude-coordinator"
@@ -189,6 +190,135 @@ def test_preflight_allows_interactive_work_that_already_has_a_review():
 def test_preflight_allows_headless_work():
     s = state(picked_machine="m", work_aid="w1", work_provider="claude-code")
     assert preflight(s, DriveOptions()).machine == "m"
+
+
+# ── #1466: the Max-plan 5h/weekly usage gate ────────────────────────────────
+#
+# preflight() stays pure — it never probes itself. A black-box test drives
+# it with a stubbed PlanLimits exactly like MergeVerifier/AcceptanceGate-
+# Checker are stubbed elsewhere in this file.
+
+
+def _config_with_gate(**gate_kw) -> Config:
+    cfg = make_config()
+    cfg.usage_gate = UsageGateConfig(**gate_kw)
+    return cfg
+
+
+def test_preflight_with_no_config_skips_the_gate_entirely():
+    """Every pre-#1466 call site (and most of this file's own tests) passes
+    no config at all — must behave exactly as before, gate or no gate."""
+    pre = preflight(
+        state(picked_machine="m"), DriveOptions(),
+        usage_limits=PlanLimits(status="ok", session_pct=99.0, week_pct=99.0),
+    )
+    assert pre.machine == "m"
+    assert pre.warnings == ()
+
+
+def test_preflight_gate_disabled_mode_ignores_a_maxed_out_probe():
+    cfg = _config_with_gate(mode="disabled", session_threshold_pct=1.0)
+    pre = preflight(
+        state(picked_machine="m"), DriveOptions(), cfg,
+        usage_limits=PlanLimits(status="ok", session_pct=99.0),
+    )
+    assert pre.warnings == ()
+
+
+def test_preflight_gate_below_threshold_proceeds_with_no_warning():
+    cfg = _config_with_gate(mode="warn", session_threshold_pct=85.0, week_threshold_pct=90.0)
+    pre = preflight(
+        state(picked_machine="m"), DriveOptions(), cfg,
+        usage_limits=PlanLimits(status="ok", session_pct=10.0, week_pct=10.0),
+    )
+    assert pre.warnings == ()
+
+
+def test_preflight_gate_above_threshold_warns_by_default_and_still_proceeds():
+    cfg = _config_with_gate(mode="warn", session_threshold_pct=85.0)
+    pre = preflight(
+        state(picked_machine="m"), DriveOptions(), cfg,
+        usage_limits=PlanLimits(status="ok", session_pct=90.0, session_resets_at="8pm (UTC)"),
+    )
+    assert pre.machine == "m"
+    assert any("90" in w and "8pm (UTC)" in w for w in pre.warnings)
+
+
+def test_preflight_gate_block_mode_refuses_above_threshold():
+    cfg = _config_with_gate(mode="block", week_threshold_pct=90.0)
+    with pytest.raises(DriveError) as exc:
+        preflight(
+            state(picked_machine="m"), DriveOptions(), cfg,
+            usage_limits=PlanLimits(status="ok", week_pct=95.0, week_resets_at="Aug 1"),
+        )
+    assert "week" in str(exc.value)
+    assert "Aug 1" in str(exc.value)
+    assert exc.value.exit_code == EXIT_USAGE
+
+
+def test_preflight_gate_unavailable_probe_proceeds_even_in_block_mode():
+    """A probe we can't trust must never block (or warn) a dispatch — see
+    coord.usage_limits.evaluate_usage_gate's docstring."""
+    cfg = _config_with_gate(mode="block", session_threshold_pct=1.0, week_threshold_pct=1.0)
+    pre = preflight(
+        state(picked_machine="m"), DriveOptions(), cfg,
+        usage_limits=PlanLimits(status="unknown", error="claude -p /usage timed out"),
+    )
+    assert pre.machine == "m"
+    assert pre.warnings == ()
+
+
+def test_preflight_gate_no_usage_limits_passed_is_treated_as_unavailable():
+    """config given but usage_limits omitted (e.g. a caller that skipped the
+    probe) — never fabricate an "ok" reading."""
+    cfg = _config_with_gate(mode="block", session_threshold_pct=1.0)
+    pre = preflight(state(picked_machine="m"), DriveOptions(), cfg)
+    assert pre.machine == "m"
+    assert pre.warnings == ()
+
+
+# ── Driver._loop wiring: the probe is consulted end-to-end ──────────────────
+
+
+def test_driver_loop_surfaces_a_usage_gate_warning(driver_factory, capsys):
+    cfg = _config_with_gate(mode="warn", session_threshold_pct=50.0)
+    driver = driver_factory(
+        [board(status="merged")],
+        config=cfg,
+        usage_prober=lambda: PlanLimits(status="ok", session_pct=95.0, session_resets_at="8pm"),
+    )
+    assert driver.run() == EXIT_OK
+    assert "Max-plan usage near limit" in capsys.readouterr().err
+
+
+def test_driver_loop_block_mode_refuses_before_dispatching(driver_factory, capsys):
+    cfg = _config_with_gate(mode="block", session_threshold_pct=50.0)
+    driver = driver_factory(
+        [board(status="merged")],
+        config=cfg,
+        usage_prober=lambda: PlanLimits(status="ok", session_pct=95.0),
+    )
+    # DriveError propagates out of run() unhandled (the CLI boundary in
+    # coord/commands/drive.py converts it to an exit code) — same contract
+    # every other preflight refusal in this file already uses.
+    with pytest.raises(DriveError) as exc:
+        driver.run()
+    assert "Max-plan usage near limit" in str(exc.value)
+    assert exc.value.exit_code == EXIT_USAGE
+    assert not driver.recorded  # never got as far as running a `coord` subcommand
+
+
+def test_driver_loop_disabled_gate_never_calls_the_prober(driver_factory):
+    cfg = _config_with_gate(mode="disabled")
+    calls = []
+
+    def prober():
+        calls.append(1)
+        return PlanLimits(status="ok", session_pct=99.0)
+
+    driver = driver_factory([board(status="merged")], config=cfg, usage_prober=prober)
+    assert driver.run() == EXIT_OK
+    assert calls == []
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1358,7 +1488,10 @@ def driver_factory(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr("coord.drive_state.scratch_dir", lambda: tmp_path)
     monkeypatch.setattr("coord.drive.scratch_dir", lambda: tmp_path)
 
-    def make(payloads, *, opts=None, verifier=None, config=None, oracle_gate=None, ticks=200):
+    def make(
+        payloads, *, opts=None, verifier=None, config=None, oracle_gate=None,
+        usage_prober=None, ticks=200,
+    ):
         clock = {"t": 0.0}
         recorded: list[list[str]] = []
 
@@ -1376,6 +1509,11 @@ def driver_factory(tmp_path, monkeypatch, capsys):
             fetcher=FakeFetcher(payloads),
             verifier=verifier or FakeVerifier(),
             oracle_gate=oracle_gate,
+            # #1466: never let a Driver test shell out to a real `claude -p
+            # "/usage"` — default to a stub reporting "unknown" (same as no
+            # probe at all), which the gate always treats as "proceed,
+            # silently". Tests exercising the gate itself pass their own.
+            usage_prober=usage_prober or (lambda: PlanLimits(status="unknown")),
             sleeper=lambda secs: clock.__setitem__("t", clock["t"] + secs),
             clock=lambda: clock["t"],
         )

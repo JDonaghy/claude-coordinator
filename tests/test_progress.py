@@ -161,16 +161,35 @@ class TestParseProgressStreamJson:
         assert "Turn" in p.updates[-1]
 
     def test_stream_json_rate_limit_surfaces_warning(self, tmp_path: Path) -> None:
+        """#1466: uses the REAL wire shape (nested `rate_limit_info`,
+        camelCase `resetsAt`) with a throttled status — `allowed` (the
+        common, healthy case) must NOT surface a warning."""
         log = tmp_path / "test.log"
         _ndjson_log(
             log,
             [
                 {"type": "system", "subtype": "init", "model": "x", "session_id": "s"},
-                {"type": "rate_limit_event", "resets_at": 1716160000.0},
+                {"type": "rate_limit_event",
+                 "rate_limit_info": {"status": "rejected", "resetsAt": 1716160000.0}},
             ],
         )
         p = parse_progress(str(log))
         assert any("rate limited" in w for w in p.warnings)
+
+    def test_stream_json_rate_limit_allowed_does_not_surface_warning(
+        self, tmp_path: Path
+    ) -> None:
+        log = tmp_path / "test.log"
+        _ndjson_log(
+            log,
+            [
+                {"type": "system", "subtype": "init", "model": "x", "session_id": "s"},
+                {"type": "rate_limit_event",
+                 "rate_limit_info": {"status": "allowed", "resetsAt": 1716160000.0}},
+            ],
+        )
+        p = parse_progress(str(log))
+        assert not any("rate limited" in w for w in p.warnings)
 
     def test_truncated_json_line_silently_skipped(self, tmp_path: Path) -> None:
         """A mid-write incomplete JSON line must be silently skipped, not raise.

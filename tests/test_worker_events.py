@@ -14,6 +14,7 @@ from coord.worker_events import (
     detect_anomalies,
     detect_usage_limit_kill,
     detect_usage_limit_kill_in_log,
+    format_important_event,
     format_usage_limit_reason,
     is_stream_json,
     is_usage_limit_reason,
@@ -68,6 +69,29 @@ def _tool_use_event(name: str, tool_input: dict) -> dict:
 
 def _result_event(**fields) -> dict:
     return {"type": "result", **fields}
+
+
+def _rate_limit_event(
+    status: str = "allowed",
+    *,
+    resets_at: float | None = 1785133800,
+    rate_limit_type: str = "five_hour",
+) -> dict:
+    """The REAL wire shape Claude Code v2.1.220 emits — verified live (#1466).
+
+    Nested under `rate_limit_info`, camelCase `resetsAt`. There is no
+    top-level `resets_at`/`reset_at` — a prior version of this test suite
+    invented that shape and it never matched what the CLI actually sends.
+    """
+    info: dict = {"status": status, "rateLimitType": rate_limit_type}
+    if resets_at is not None:
+        info["resetsAt"] = resets_at
+    return {
+        "type": "rate_limit_event",
+        "rate_limit_info": info,
+        "uuid": "11111111-1111-1111-1111-111111111111",
+        "session_id": "abc123",
+    }
 
 
 # ── parse_event ────────────────────────────────────────────────────────────
@@ -256,19 +280,37 @@ class TestParseLog:
         summary = parse_log(p)
         assert summary.permission_denials == ["Bash(rm -rf /)"]
 
-    def test_rate_limit_event_sets_flag(self, tmp_path: Path) -> None:
+    def test_rate_limit_event_allowed_does_not_set_flag(self, tmp_path: Path) -> None:
+        """#1466: `status: "allowed"` is the healthy, common case — Claude
+        Code emits it on essentially every run — and must never set
+        `rate_limited`."""
         p = tmp_path / "log.log"
         p.write_text(
             _ndjson(
                 [
                     _init_event(),
-                    {"type": "rate_limit_event", "resets_at": 1716160000.0},
+                    _rate_limit_event(status="allowed"),
+                ]
+            )
+        )
+        summary = parse_log(p)
+        assert summary.rate_limited is False
+        assert summary.rate_limit_resets_at is None
+
+    @pytest.mark.parametrize("status", ["allowed_warning", "rejected"])
+    def test_rate_limit_event_throttled_sets_flag(self, tmp_path: Path, status: str) -> None:
+        p = tmp_path / "log.log"
+        p.write_text(
+            _ndjson(
+                [
+                    _init_event(),
+                    _rate_limit_event(status=status, resets_at=1785133800),
                 ]
             )
         )
         summary = parse_log(p)
         assert summary.rate_limited is True
-        assert summary.rate_limit_resets_at == pytest.approx(1716160000.0)
+        assert summary.rate_limit_resets_at == pytest.approx(1785133800)
 
     def test_missing_file_returns_empty_summary(self, tmp_path: Path) -> None:
         summary = parse_log(tmp_path / "nope.log")
@@ -364,6 +406,15 @@ class TestRender:
         assert "6" in out
         assert "end_turn" in out
 
+    def test_rate_limit_event_renders_status_and_resets_at(self) -> None:
+        """#1466: `resets_at` must come from the nested `rate_limit_info.
+        resetsAt`, not the top-level field that Claude Code never sends."""
+        e = parse_event(json.dumps(_rate_limit_event(status="rejected", resets_at=1785133800)))
+        out = render_event(e)
+        assert "rejected" in out
+        assert "1785133800" in out
+        assert "resets_at=?" not in out
+
     def test_render_log_walks_file(self, tmp_path: Path) -> None:
         p = tmp_path / "log.log"
         p.write_text(
@@ -382,6 +433,31 @@ class TestRender:
         # The assistant turn carries a tool_use rather than text, so it
         # should be summarised as either text or tool_use=Bash.
         assert any("result" in l for l in lines)
+
+
+# ── format_important_event ───────────────────────────────────────────────
+
+
+class TestFormatImportantEvent:
+    def test_allowed_status_is_silent(self) -> None:
+        """The common case — fires on essentially every worker — must not
+        be surfaced to `coord watch`."""
+        e = parse_event(json.dumps(_rate_limit_event(status="allowed")))
+        assert format_important_event(e) is None
+
+    @pytest.mark.parametrize("status", ["allowed_warning", "rejected"])
+    def test_throttled_status_is_surfaced_with_reset_time(self, status: str) -> None:
+        e = parse_event(json.dumps(_rate_limit_event(status=status, resets_at=1785133800)))
+        out = format_important_event(e)
+        assert out is not None
+        assert status in out
+        assert "1785133800" in out
+
+    def test_missing_rate_limit_info_is_silent(self) -> None:
+        """An unrecognised shape (no `rate_limit_info`) is a shape we don't
+        understand, not a throttle — stay silent rather than guess."""
+        e = parse_event(json.dumps({"type": "rate_limit_event"}))
+        assert format_important_event(e) is None
 
 
 # ── detect_anomalies ───────────────────────────────────────────────────────
@@ -403,12 +479,27 @@ class TestDetectAnomalies:
             _ndjson(
                 [
                     _init_event(),
-                    {"type": "rate_limit_event", "resets_at": 1716160000.0},
+                    _rate_limit_event(status="rejected", resets_at=1785133800),
                 ]
             )
         )
         warnings = detect_anomalies(p)
         assert any("rate limited" in w for w in warnings)
+
+    def test_rate_limit_allowed_not_flagged(self, tmp_path: Path) -> None:
+        """#1466: a healthy `allowed` event must not produce a spurious
+        "rate limited" warning — it fires on essentially every worker."""
+        p = tmp_path / "log.log"
+        p.write_text(
+            _ndjson(
+                [
+                    _init_event(),
+                    _rate_limit_event(status="allowed"),
+                ]
+            )
+        )
+        warnings = detect_anomalies(p)
+        assert not any("rate limited" in w for w in warnings)
 
     def test_permission_denials_flagged(self, tmp_path: Path) -> None:
         p = tmp_path / "log.log"

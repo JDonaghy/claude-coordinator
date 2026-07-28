@@ -100,6 +100,7 @@ from coord.interactive import (
     tmux_available,
     tmux_session_alive,
 )
+from coord.usage_limits import PlanLimits, evaluate_usage_gate, get_plan_limits
 from coord.worker_events import is_usage_limit_reason
 
 # ── exit codes (unchanged from drive-issue.sh) ───────────────────────────────
@@ -616,11 +617,26 @@ class Preflight:
     warnings: tuple[str, ...] = ()
 
 
-def preflight(state: IssueState, opts: DriveOptions) -> Preflight:
+def preflight(
+    state: IssueState,
+    opts: DriveOptions,
+    config: Any = None,
+    *,
+    usage_limits: PlanLimits | None = None,
+) -> Preflight:
     """Resolve the machine and refuse the runs that can never win.
 
     Raises :class:`DriveError` for a configuration problem or for interactive
     work with no review (see below).
+
+    *usage_limits* (#1466) is the ALREADY-PROBED Max-plan 5h/weekly usage
+    snapshot — this function stays pure and never shells out itself, mirroring
+    the *verifier*/*gate_checker* injection pattern used elsewhere in this
+    module. ``None`` (every pre-#1466 caller, and any caller that skips the
+    probe) is treated exactly like an unavailable probe: the gate silently
+    lets the run proceed. *config* is likewise optional — ``None`` skips the
+    usage gate entirely (no ``usage_gate`` section to consult), which is what
+    every pre-#1466 test in this file's suite still passes.
     """
     machine = opts.machine or state.picked_machine
     if not machine:
@@ -630,6 +646,22 @@ def preflight(state: IssueState, opts: DriveOptions) -> Preflight:
         )
 
     warnings: list[str] = []
+
+    if config is not None:
+        gate_cfg = config.usage_gate
+        limits = usage_limits if usage_limits is not None else PlanLimits(status="unknown")
+        gate_result = evaluate_usage_gate(limits, gate_cfg)
+        if gate_result.action == "block":
+            raise DriveError(
+                f"{gate_result.message} (usage_gate.mode: block) — refusing to "
+                "dispatch. Wait for the window to reset, or lower urgency by "
+                "raising the threshold / setting usage_gate.mode: warn in "
+                "coordinator.yml.",
+                EXIT_USAGE,
+            )
+        if gate_result.action == "warn":
+            warnings.append(f"{gate_result.message} (usage_gate.mode: warn — proceeding anyway)")
+
     if not state.auto_loop:
         warnings.append(
             "pipeline.auto_loop is OFF — a request-changes review will NOT "
@@ -1400,6 +1432,10 @@ class Driver:
     err: Any = None
     sleeper: Callable[[float], None] = time.sleep
     clock: Callable[[], float] = time.monotonic
+    # #1466: injected so tests can stub the Max-plan usage probe without a
+    # real `claude -p "/usage"` subprocess — mirrors *verifier*/*oracle_gate*
+    # above. Defaults to the real (cached, ~60s) probe.
+    usage_prober: Callable[[], PlanLimits] = get_plan_limits
 
     _run_log: Path | None = field(default=None, init=False, repr=False)
     # #1499: the terminating Action's own message, captured by `_loop()` right
@@ -1629,7 +1665,16 @@ class Driver:
         if state is None:
             raise DriveError("could not read board state", EXIT_USAGE)
 
-        pre = preflight(state, self.opts)
+        # #1466: probe ONCE here (not per-poll) — the underlying `claude -p
+        # "/usage"` call is itself cached ~60s (coord.usage_limits), but
+        # there's no reason to re-shell-out every loop iteration for a
+        # decision only made at the top of the run. Skipped entirely when
+        # the gate is off, so a `disabled` config never pays the subprocess
+        # cost.
+        usage_limits = (
+            self.usage_prober() if self.config.usage_gate.mode != "disabled" else None
+        )
+        pre = preflight(state, self.opts, self.config, usage_limits=usage_limits)
         machine = pre.machine
 
         # #1453: resolved ONCE here (not per-poll) — the gate_checker inside

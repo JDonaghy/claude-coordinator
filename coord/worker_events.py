@@ -345,6 +345,59 @@ def _file_from_input(input_obj: object) -> str | None:
     return None
 
 
+# ── rate_limit_event wire shape (#1466) ─────────────────────────────────────
+#
+# Claude Code v2.1.220 emits a `rate_limit_event` on essentially every run —
+# it is the *healthy* case, not a throttle signal:
+#
+#   {"type": "rate_limit_event",
+#    "rate_limit_info": {"status": "allowed", "resetsAt": 1785133800,
+#      "rateLimitType": "five_hour", "overageStatus": "rejected",
+#      "overageDisabledReason": "org_level_disabled", "isUsingOverage": false},
+#    "uuid": "...", "session_id": "..."}
+#
+# Everything lives nested under `rate_limit_info`, camelCase. There is no
+# top-level `resets_at`/`reset_at` — that shape was invented (pre-#1466) and
+# the real CLI never emits it, which is why `rate_limit_resets_at` was always
+# ``None`` and `render_event` always printed `resets_at=?`. Only
+# `allowed_warning` and `rejected` mean the account is actually throttled;
+# `allowed` is the normal, common case and must never set `rate_limited`.
+#
+# `format_important_event` already read this shape correctly (nested,
+# camelCase, status-gated) — this helper is the single place both it and
+# `update_summary`/`render_event` now go through, so the two paths can't
+# disagree about the wire format again.
+_RATE_LIMIT_THROTTLED_STATUSES = frozenset({"allowed_warning", "rejected"})
+
+
+def _rate_limit_info(raw: dict) -> tuple[str | None, float | None]:
+    """Pull ``(status, resets_at)`` out of a ``rate_limit_event``'s payload.
+
+    Returns ``(None, None)`` when ``rate_limit_info`` is missing or not a
+    dict — a shape we don't recognise, not something to guess at.
+    """
+    info = raw.get("rate_limit_info")
+    if not isinstance(info, dict):
+        return None, None
+    status = info.get("status")
+    if not isinstance(status, str):
+        status = None
+    resets = info.get("resetsAt")
+    if not isinstance(resets, (int, float)):
+        resets = None
+    else:
+        resets = float(resets)
+    return status, resets
+
+
+def _is_rate_limit_throttled(status: str | None) -> bool:
+    """True iff *status* means the account is actually being throttled.
+
+    ``allowed`` (no status, or any other value) is the healthy/normal case.
+    """
+    return status in _RATE_LIMIT_THROTTLED_STATUSES
+
+
 def _assistant_text(event: WorkerEvent) -> str:
     """First text block from an assistant message, truncated for display."""
     raw = event.raw
@@ -416,10 +469,11 @@ def update_summary(summary: WorkerSummary, event: WorkerEvent) -> None:
         return
 
     if event.type == "rate_limit_event":
-        summary.rate_limited = True
-        resets = raw.get("resets_at") or raw.get("reset_at")
-        if isinstance(resets, (int, float)):
-            summary.rate_limit_resets_at = float(resets)
+        status, resets = _rate_limit_info(raw)
+        if _is_rate_limit_throttled(status):
+            summary.rate_limited = True
+            if resets is not None:
+                summary.rate_limit_resets_at = resets
         return
 
     if event.type == "result":
@@ -594,8 +648,8 @@ def render_event(event: WorkerEvent, *, turn_counter: list[int] | None = None) -
         return f"[tool_result{tag}] {tool_use_id}"
 
     if event.type == "rate_limit_event":
-        resets = raw.get("resets_at") or raw.get("reset_at") or "?"
-        return f"[rate_limit] resets_at={resets}"
+        status, resets = _rate_limit_info(raw)
+        return f"[rate_limit] status={status or '?'} resets_at={resets if resets is not None else '?'}"
 
     if event.type == "result":
         cost = raw.get("total_cost_usd") or raw.get("cost_usd") or 0.0
@@ -636,16 +690,11 @@ def format_important_event(event: WorkerEvent) -> str | None:
         return f"[init] {model} session {session}"
 
     if event.type == "rate_limit_event":
-        info = raw.get("rate_limit_info") or {}
-        status = info.get("status") or raw.get("status")
-        # Only surface throttled events (status != "allowed")
-        if status and status != "allowed":
-            resets = info.get("resetsAt") or info.get("resets_at") or raw.get("resets_at") or 0
-            return f"[rate_limit] {status}, resets at {resets}"
-        # No rate_limit_info sub-object — treat any rate_limit_event as notable
-        if not info:
-            resets = raw.get("resets_at") or raw.get("reset_at") or "?"
-            return f"[rate_limit] resets_at={resets}"
+        status, resets = _rate_limit_info(raw)
+        # Only surface throttled events — `allowed` is the healthy, common
+        # case (fires on essentially every run) and must stay silent.
+        if _is_rate_limit_throttled(status):
+            return f"[rate_limit] {status}, resets at {resets if resets is not None else '?'}"
         return None
 
     if event.type == "result":
