@@ -243,7 +243,7 @@ See [`docs/PIPELINE_V2.md`](docs/PIPELINE_V2.md) and [`docs/ORACLE_LOOP.md`](doc
 | `coord bounce <review-id>` | Bounce back to Work after a request-changes review (uses cached findings) |
 | `coord notify` | Poll agents, post GitHub comments, drive the auto-loop |
 | `coord merge [--dry-run] [--plan] [--repo N] [--method rebase\|squash\|merge] [--order IDs \| --only ID]` | Process the merge queue |
-| `coord merge --force-merge \| --skip-review \| --skip-smoke` | Override the CI / review / smoke gate for a merge |
+| `coord merge --force-merge \| --skip-review \| --skip-smoke` | Override the CI / review / smoke gate for a merge (`--skip-review` is local-only — a daemon-routed run rejects it outright rather than honouring or silently dropping it, #821/#1489) |
 | `coord merge --only <id> --override-human-required "<reason>"` | Audited override of a HUMAN_REQUIRED entry |
 | `coord verify-merge <work-id>` | Self-check a `--merge-of` rebase before reporting done |
 | `coord reconcile-merges [--repo N] [--dry-run]` | Backfill branches + record out-of-band merges |
