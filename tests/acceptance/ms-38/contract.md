@@ -1,6 +1,7 @@
 # Gate A Contract — ms-38: Plans panel → rich client
 
 _Mock-authored 2026-07-19 for milestone #38 (tracking issue #1120)._  
+_**Amended 2026-07-28 by the operator, by hand** — CC-4 (§5c, §5e, §5f, §7, §8.4) and the two CC-4 mocks only; no CC-2/CC-3 clause or mock was touched. Not an agent-authored revision: no `mock-author` / `test-author` session was dispatched, and no `type="work"` assignment touched this path. Recorded explicitly because the provenance of the 2026-07-19 correction (PR #1312) was ambiguous after the fact and cost real time to reconstruct — see #1314._  
 _Issues in scope: **#1122** (detail pane) · **#1123** (right-click menus) · **#1124** (help overlay + palette)._  
 _CC-1 (#1121, repo→plan tree sidebar) **already shipped** — its surface is the baseline; this contract covers the three remaining children._
 
@@ -186,18 +187,34 @@ Pressing **`?`** while `active_view == SidebarView::Plans` opens a cheatsheet mo
 
 The cheatsheet must list these entries (each an exact substring that must appear):
 
-| Required string | Meaning |
-|---|---|
-| `"right-click"` | menu hint |
-| `"Enter"` | open detail pane |
-| `"Esc"` | close / back |
-| `"c"` | quick capture |
-| `"C"` | guided chat |
-| `"u"` | toggle untracked |
-| `"r"` | refresh |
-| `"q"` | quit |
+| Required string | Key | Meaning |
+|---|---|---|
+| `"open context menu"` | right-click | menu hint |
+| `"open detail pane"` | `Enter` | open detail pane |
+| `"close / back"` | `Esc` | close / back |
+| `"this help overlay"` | `?` | this overlay |
+| `"command palette"` | `/` | command palette (§5e) |
+| `"quick capture plan"` | `c` | quick capture |
+| `"guided chat (new plan)"` | `C` | guided chat |
+| `"toggle untracked milestones"` | `u` | toggle untracked |
 
 **Testable:** for each string above, `driver.screen_contains(<string>)` is `true` while the overlay is open.
+
+> **Why these strings and not the bare key characters.** An earlier revision of this
+> clause required the bare keys — `"c"`, `"C"`, `"u"`, `"r"`, `"q"`, `"Enter"`, `"Esc"`,
+> `"right-click"`. **All eight** are satisfied by the **status bar alone**, with no
+> help overlay open at all: the Plans base status bar is
+> `j/k=nav  Enter=open epic  c=capture plan  u=toggle untracked  q=quit` and the detail-pane
+> status bar adds `Esc=back to list` and `right-click=menu`. An implementation that never
+> rendered the overlay would have passed. Every string above is instead a phrase that occurs
+> **only** inside the overlay, so each assertion genuinely fails when the overlay is missing
+> or hollow. Note in particular that `"quick capture plan"` and `"toggle untracked milestones"`
+> are deliberately longer than the base status bar's `capture plan` / `toggle untracked`,
+> and that the palette's own `Toggle untracked milestones` entry is capital-T (§5g).
+>
+> `r` (refresh) and `q` (quit) are dropped from the required set rather than lengthened —
+> the overlay's own wording for them (`refresh`, `quit`) is not distinguishable from the
+> status bar's. They remain in the mock; they are simply not load-bearing assertions.
 
 ### 5d. Help overlay — health chip legend
 
@@ -214,11 +231,26 @@ The overlay includes a health-chip legend section. Required substrings:
 
 ### 5e. Command palette — trigger
 
-Opening the command palette from the Plans panel (via the registered quadraui `Palette` key binding — `/` or `Ctrl+P`, implementation choice) shows a searchable list of Plans actions. Pressing **Esc** closes it.
+Pressing **`/`** while `active_view == SidebarView::Plans` opens the command palette (the registered quadraui `Palette` binding) — a searchable list of Plans actions. Pressing **Esc** closes it.
+
+**The trigger is `/`, and it is locked here.** It was previously left as "implementation choice" between `/` and `Ctrl+P` (see §8 note 4, now resolved): that deferral was unworkable, because CC-4 is the **first** child dispatched (§8 note 6) and its acceptance slice is authored *before* any implementation exists to be consulted. A sealed slice cannot assert on a key that has not been chosen. `/` matches what `mocks/plans-palette.screen` has always shown in its status bar.
+
+An implementation may register `Ctrl+P` as an **additional** alias; it may not replace `/`.
+
+**Testable:** `driver.press('/')` while the Plans panel is active opens the palette — i.e. `driver.screen_contains("command palette")` becomes `true`.
 
 ### 5f. Command palette — required title
 
-**Required:** `driver.screen_contains("command palette")` is `true` when the palette is open.
+**Required:** `driver.screen_contains("command palette")` is `true` when the palette is open.  
+**Required:** `driver.screen_contains("Plans actions")` is `true` when the palette is open — the section header, which appears in no other screen state.
+
+> Both are required, because as of the 2026-07-28 amendment the **help overlay also contains the
+> string `"command palette"`** (§5c requires it there, so `/` is discoverable). `"command palette"`
+> alone therefore no longer proves the palette specifically is open — a run that rendered the help
+> overlay instead would satisfy it. `"Plans actions"` is unique to the palette and closes that gap.
+> Note also that the palette's `"Quick capture plan"` (§5g) is capital-Q while the help overlay's
+> `"quick capture plan"` (§5c) is lowercase; `screen_contains` is case-sensitive, so the two do not
+> collide.
 
 ### 5g. Command palette — required Plans action entries
 
@@ -301,6 +333,12 @@ Optional outcome fields (`outcome_run_number`, `outcome_met`, `outcome_partial`,
 All mocks: 120 × 40 terminal, `driver_with_shell(app, CoordApp::shell_config(), 120, 40)`.  
 Tests are **in-crate** (`#[cfg(test)]` in `tui/src/app/tests.rs` or a nearby module) to access `make_test_app` and related `#[cfg(test)]`-only fixtures.
 
+**Column metric.** Widths are measured the way `unicode-width` (and therefore ratatui) measures them: East-Asian *Wide*/*Fullwidth* count as 2, ***Ambiguous* counts as 1**. Every glyph these mocks use — `▶ ▼ ◇ ● ○ ⚠ ⏸ ◐ ⚑ │ ║ ▎ ◆ ≣ ▦ ⚙` — is Ambiguous or Narrow, so each occupies exactly one column. This was verified empirically against the as-authored files: under ambiguous=1 their line widths cluster at 120/121, under ambiguous=2 they scatter across 123–127.
+
+**Normalization status.** `plans-help-overlay.screen` and `plans-palette.screen` (the CC-4 pair) are normalized: every content line is **exactly 120** columns and the Actions column is anchored at display column 74 throughout. Trailing whitespace is stripped, so blank-tailed rows are shorter than 120 in the file — a real render pads them; do not read a short line as a narrower screen.
+
+The other five mocks **still drift between 118 and 122 columns** and have not been touched. That is a cosmetic defect only — nothing in this contract diffs a mock as a golden grid; every assertion in §§2–5 is a `screen_contains` substring check. Normalize each one when its child's slice is authored (CC-2 → `plans-detail-pane`, CC-3 → the three `plans-rightclick-*`), so the change lands with the reviewer who is already looking at that surface.
+
 ---
 
 ## 8. Notes / open questions
@@ -311,7 +349,7 @@ Tests are **in-crate** (`#[cfg(test)]` in `tui/src/app/tests.rs` or a nearby mod
 
 3. **CC-3 status-bar hint set.** The exact post-CC-3 status bar string is: `" right-click=menu  ?=help  c=capture  q=quit "`. If the implementor adds additional hints, the contract's assertions remain satisfied as long as the required substrings appear.
 
-4. **CC-4 palette key binding.** The trigger key for the command palette is left to the implementor (common choices: `/`, `Ctrl+P`, `Ctrl+Shift+P`). The contract requires only that the palette can be opened from Plans and that `driver.screen_contains("command palette")` is `true` while it is open. The test author will need to know the actual binding; if not yet decided at JIT time, this item must be resolved first. **Note:** `mocks/plans-palette.screen` shows `/=palette` in the status bar — this `/` is a **placeholder** for illustration purposes only, not a locked-in key choice. The actual binding is CC-3's decision; the test author must confirm the real key with the CC-3 implementor before authoring acceptance tests for §5e.
+4. **CC-4 palette key binding — RESOLVED 2026-07-28: the trigger is `/`.** See §5e, which now pins it. This note previously deferred the choice to the implementor and stated that "the actual binding is CC-3's decision; the test author must confirm the real key with the CC-3 implementor before authoring acceptance tests for §5e." That was wrong twice over, and it blocked the first node of this milestone: the palette is **CC-4 (#1124)**, not CC-3 (#1123) — and per note 6 CC-4 is dispatched **first**, so there was no CC-3 implementor to consult and no implementation in existence at the time CC-4's sealed slice must be authored. A JIT test-author reaching this note had no way forward. `/` is now locked; `Ctrl+P` is permitted only as an additional alias. `mocks/plans-palette.screen` is no longer a placeholder in this respect — its `/=palette` status bar is normative.
 
 5. **Quadraui help layer (CC-4 dep).** `JDonaghy/quadraui#431` (help registry + `?` modal + Palette integration) is already merged to `develop` as of 2026-07-19. The coord-tui checkout's `~/src/quadraui` must be on the branch carrying it before `cargo build`. See CLAUDE.md §"coord-tui depends on quadraui by a relative path".
 
