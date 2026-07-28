@@ -4231,3 +4231,169 @@ class TestAdvisoryTerminalPrune:
 
         state = json.loads(server.state_path.read_text())
         assert all(entry["id"] != "adv-5" for entry in state["assignments"])
+
+
+# ── #1468: agent-side clearing of an advisory superseded by a later retry ──
+
+
+class TestSupersededAdvisoryPrune:
+    """#1468: a rescued WIP commit (see `_rescue_uncommitted_work`) can leave
+    an assignment ADVISORY ("UNVERIFIED — review before merging"). When a
+    *later* assignment for the same issue reaches DONE, that advisory is
+    stale, but `_prune_terminal_advisory` (#1492) only clears it once GitHub
+    shows the issue closed or the PR merged — a signal that doesn't exist yet
+    in the window between "retry finished" and "PR merged". `_prune_
+    superseded_advisory` closes exactly that gap, purely from in-agent state
+    (no GitHub round-trip).
+    """
+
+    def _make_spec(self, repo_path: Path, *, issue_number: int = 1468, **overrides) -> AssignmentSpec:
+        base = dict(
+            repo_name="api",
+            repo_path=str(repo_path),
+            issue_number=issue_number,
+            issue_title="t",
+            briefing="b",
+            branch="issue-1468-fix",
+        )
+        base.update(overrides)
+        return AssignmentSpec(**base)
+
+    def test_dropped_when_superseded_by_later_done_same_issue(self, tmp_path: Path) -> None:
+        """A later DONE assignment for the same issue clears the earlier
+        ADVISORY entry, even on a different branch (a retry may use
+        `fresh_branch`)."""
+        repo = _init_repo(tmp_path / "repo")
+        server = _server(tmp_path, repo_path=repo)
+
+        adv = AgentAssignment(
+            id="adv-1", spec=self._make_spec(repo, branch="issue-1468-fix"),
+            status=ADVISORY, finished_at=1.0, exit_code=0,
+            branch="issue-1468-fix",
+        )
+        server._assignments[adv.id] = adv
+
+        done = AgentAssignment(
+            id="done-1", spec=self._make_spec(repo, branch="issue-1468-fix-retry"),
+            status=DONE, finished_at=2.0, exit_code=0,
+            branch="issue-1468-fix-retry",
+        )
+        server._assignments[done.id] = done
+
+        server._prune_superseded_advisory()
+
+        assert "adv-1" not in server._assignments
+        assert "done-1" in server._assignments
+        listing = server.list_assignments()
+        ids = {e["id"] for e in listing["completed"]}
+        assert "adv-1" not in ids
+        assert "done-1" in ids
+
+    def test_kept_when_no_later_done(self, tmp_path: Path) -> None:
+        """A still-live advisory with no later DONE for its issue survives."""
+        repo = _init_repo(tmp_path / "repo")
+        server = _server(tmp_path, repo_path=repo)
+
+        adv = AgentAssignment(
+            id="adv-2", spec=self._make_spec(repo), status=ADVISORY,
+            finished_at=1.0, exit_code=0, branch="issue-1468-fix",
+        )
+        server._assignments[adv.id] = adv
+
+        server._prune_superseded_advisory()
+
+        assert "adv-2" in server._assignments
+
+    def test_kept_when_done_precedes_advisory(self, tmp_path: Path) -> None:
+        """Order matters: a DONE entry dispatched BEFORE the advisory does
+        not count as "later" — it can't have superseded a failure that
+        hadn't happened yet."""
+        repo = _init_repo(tmp_path / "repo")
+        server = _server(tmp_path, repo_path=repo)
+
+        done = AgentAssignment(
+            id="done-2", spec=self._make_spec(repo), status=DONE,
+            finished_at=1.0, exit_code=0, branch="issue-1468-fix",
+        )
+        server._assignments[done.id] = done
+
+        adv = AgentAssignment(
+            id="adv-3", spec=self._make_spec(repo), status=ADVISORY,
+            finished_at=2.0, exit_code=0, branch="issue-1468-fix-2",
+        )
+        server._assignments[adv.id] = adv
+
+        server._prune_superseded_advisory()
+
+        assert "adv-3" in server._assignments
+
+    def test_kept_when_different_issue(self, tmp_path: Path) -> None:
+        """A later DONE for a DIFFERENT issue must not clear this advisory."""
+        repo = _init_repo(tmp_path / "repo")
+        server = _server(tmp_path, repo_path=repo)
+
+        adv = AgentAssignment(
+            id="adv-4", spec=self._make_spec(repo, issue_number=1468),
+            status=ADVISORY, finished_at=1.0, exit_code=0,
+            branch="issue-1468-fix",
+        )
+        server._assignments[adv.id] = adv
+
+        done = AgentAssignment(
+            id="done-3", spec=self._make_spec(repo, issue_number=9999),
+            status=DONE, finished_at=2.0, exit_code=0,
+            branch="issue-9999-other",
+        )
+        server._assignments[done.id] = done
+
+        server._prune_superseded_advisory()
+
+        assert "adv-4" in server._assignments
+
+    def test_kept_when_different_repo_same_issue_number(self, tmp_path: Path) -> None:
+        """Issue numbers are only unique per-repo — a DONE for the same
+        issue *number* in a different repo must not clear this advisory."""
+        repo = _init_repo(tmp_path / "repo")
+        server = _server(tmp_path, repo_path=repo)
+
+        adv = AgentAssignment(
+            id="adv-5", spec=self._make_spec(repo, repo_name="api"),
+            status=ADVISORY, finished_at=1.0, exit_code=0,
+            branch="issue-1468-fix",
+        )
+        server._assignments[adv.id] = adv
+
+        done = AgentAssignment(
+            id="done-4", spec=self._make_spec(repo, repo_name="other"),
+            status=DONE, finished_at=2.0, exit_code=0,
+            branch="issue-1468-fix",
+        )
+        server._assignments[done.id] = done
+
+        server._prune_superseded_advisory()
+
+        assert "adv-5" in server._assignments
+
+    def test_persisted_state_no_longer_carries_superseded_advisory(self, tmp_path: Path) -> None:
+        """The drop is written through to agent_state.json too — a restarted
+        agent must not resurrect the superseded advisory entry from disk."""
+        repo = _init_repo(tmp_path / "repo")
+        server = _server(tmp_path, repo_path=repo)
+
+        adv = AgentAssignment(
+            id="adv-6", spec=self._make_spec(repo), status=ADVISORY,
+            finished_at=1.0, exit_code=0, branch="issue-1468-fix",
+        )
+        server._assignments[adv.id] = adv
+        server._persist()
+
+        done = AgentAssignment(
+            id="done-5", spec=self._make_spec(repo), status=DONE,
+            finished_at=2.0, exit_code=0, branch="issue-1468-fix-retry",
+        )
+        server._assignments[done.id] = done
+
+        server._prune_superseded_advisory()
+
+        state = json.loads(server.state_path.read_text())
+        assert all(entry["id"] != "adv-6" for entry in state["assignments"])
