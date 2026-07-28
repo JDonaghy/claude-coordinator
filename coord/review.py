@@ -1382,6 +1382,7 @@ def dispatch_review(
     health_checker=None,
     milestone_fetcher=None,
     patch_id_computer=None,
+    diff_fetcher=None,
 ) -> Assignment | None:
     """Open a PR for `completed` and dispatch a review assignment.
 
@@ -1399,6 +1400,14 @@ def dispatch_review(
     reviewed. Defaults to ``github_ops.compute_patch_id`` (a pure, no-network
     ``git patch-id --stable`` call); inject a stub in tests that don't want
     to shell out to git.
+
+    *diff_fetcher* is an optional ``(repo_github: str, pr_number: int, *,
+    max_chars: int | None) -> str | None`` callable (#1484) that fetches the
+    merge-base diff embedded in the reviewer's briefing and hashed into
+    ``review_patch_id``. Defaults to :func:`coord.github_ops.pr_diff` (a real
+    ``gh pr diff`` subprocess call); inject a stub in tests so a PR-having
+    dispatch never shells out to a live ``gh`` — mirrors
+    :func:`dispatch_scoped_review`'s ``diff_fetcher`` for the same reason.
     """
     if not config.reviews.enabled or not config.reviews.auto_dispatch:
         return None
@@ -1554,7 +1563,8 @@ def dispatch_review(
     # never match the merge-time `branch_patch_id`, which is computed from an
     # uncapped compare-API diff). The display copy shown to the reviewer is
     # then truncated locally from the same fetch — no second `gh` call.
-    full_diff_text = github_ops.pr_diff(repo.github, pr["number"], max_chars=None) if pr else None
+    _diff = diff_fetcher or github_ops.pr_diff
+    full_diff_text = _diff(repo.github, pr["number"], max_chars=None) if pr else None
     diff_text = (
         github_ops.truncate_diff_text(full_diff_text) if full_diff_text is not None else None
     )
