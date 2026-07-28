@@ -1703,6 +1703,58 @@ def test_serve_review_reaffirm_unknown_assignment_404(
     assert resp.status_code == 404
 
 
+def test_serve_review_reaffirm_non_review_assignment_409(
+    file_db: Path, valid_config_path: Path, rw_db,
+):
+    """#1488 review round 1: this endpoint accepts an arbitrary assignment id
+    from any caller with daemon access — a `work` row must be refused, not
+    silently stamped with review anchors + a "Review reaffirmed" audit row."""
+    _seed_running_assignment(rw_db, aid="w1", atype="work")
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post(
+            "/review-reaffirm",
+            json={
+                "review_assignment_id": "w1",
+                "new_head_sha": "new-sha",
+                "reason": "conflict resolution",
+            },
+        )
+    assert resp.status_code == 409
+    assert "not 'review'" in resp.json()["error"]
+    row = rw_db.execute(
+        "SELECT review_head_sha FROM assignments WHERE assignment_id='w1'"
+    ).fetchone()
+    assert row["review_head_sha"] is None
+    assert rw_db.execute(
+        "SELECT COUNT(*) c FROM audit_log WHERE assignment_id='w1'"
+    ).fetchone()["c"] == 0
+
+
+def test_serve_review_reaffirm_passes_conflict_fix_only_through(
+    file_db: Path, valid_config_path: Path, rw_db,
+):
+    """The attribution flag reaches the audit details, so the trail records
+    whether coord could attribute the delta or the human vouched alone."""
+    _seed_running_assignment(rw_db, aid="rev2", atype="review")
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post(
+            "/review-reaffirm",
+            json={
+                "review_assignment_id": "rev2",
+                "new_head_sha": "new-sha",
+                "reason": "hand-resolved rebase",
+                "conflict_fix_only": False,
+            },
+        )
+    assert resp.status_code == 200
+    audit = rw_db.execute(
+        "SELECT details_json FROM audit_log WHERE assignment_id='rev2'"
+    ).fetchone()
+    assert '"conflict_fix_only": false' in audit["details_json"]
+
+
 def test_serve_acceptance_verdict_records(file_db: Path, valid_config_path: Path, rw_db):
     # #944: /acceptance-verdict mirrors /test-verdict for the oracle loop's
     # Acceptance-gate verdict.

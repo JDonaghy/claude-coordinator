@@ -71,6 +71,17 @@ def _review(of_aid: str, **overrides) -> Assignment:
     return Assignment(**defaults)
 
 
+def _conflict_fix(entry_aid: str = "work-001", **overrides) -> Assignment:
+    defaults = dict(
+        machine_name="laptop", repo_name="api", issue_number=42,
+        issue_title="[conflict-fix] Some issue", assignment_id="cf-001",
+        type="conflict-fix", status="done", review_of_assignment_id=entry_aid,
+        dispatched_at=200.0,
+    )
+    defaults.update(overrides)
+    return Assignment(**defaults)
+
+
 _SMALL_DIFF = (
     "--- a/foo.py\n+++ b/foo.py\n@@ -1,2 +1,2 @@\n-old line\n+new line\n"
 )
@@ -199,6 +210,150 @@ class TestReviewReaffirmGuards:
         rec.assert_not_called()
 
 
+class TestReviewReaffirmConflictFixGuardrail:
+    """#1488 review round 1: `find_scoped_review_candidate` alone doesn't
+    establish "voided ONLY by a content-changing rebase" — that guarantee comes
+    from pairing it with `only_conflict_fix_since_review`, exactly as the
+    automated scoped dispatcher does. The CLI splits the guardrail's two False
+    reasons: intervening work ⇒ hard refuse; unattributed delta ⇒ loud warn."""
+
+    @staticmethod
+    def _fix_round(**overrides) -> Assignment:
+        defaults = dict(
+            machine_name="laptop", repo_name="api", issue_number=42,
+            issue_title="[fix-1] Some issue", assignment_id="fix-001",
+            type="work", status="done", branch="issue-42-fix",
+            review_of_assignment_id="work-001", dispatched_at=250.0,
+        )
+        defaults.update(overrides)
+        return Assignment(**defaults)
+
+    def test_intervening_fix_round_is_refused(
+        self, config_file: Path, coord_db
+    ) -> None:
+        """A bounce round dispatched AFTER the approval is new logic the
+        approval never saw — refused outright, no override flag, even though
+        the delta is well under reaffirm_max_diff_lines."""
+        work = _work(dispatched_at=10.0)
+        review = _review("work-001", dispatched_at=100.0)
+        fix = self._fix_round()
+        state_mod.save_board(Board(active=[], completed=[work, review, fix]))
+
+        with patch("coord.github_ops.get_branch_sha", return_value="cur-sha"), \
+             patch("coord.github_ops.get_branch_patch_id", return_value="cur-patch"), \
+             patch("coord.github_ops.get_compare_diff", return_value=_SMALL_DIFF), \
+             patch("coord.state.record_review_reaffirm") as rec:
+            result = _invoke(
+                "review-reaffirm", "--yes", "work-001", "--reason",
+                "conflict resolution", "--config", str(config_file),
+            )
+        assert result.exit_code != 0
+        assert "dispatched" in result.output
+        assert "fix-001" in result.output
+        assert "not a mechanical conflict resolution" in result.output
+        rec.assert_not_called()
+
+    def test_conflict_fix_only_reports_attribution_and_no_warning(
+        self, config_file: Path, coord_db
+    ) -> None:
+        work = _work(dispatched_at=10.0)
+        review = _review("work-001", dispatched_at=100.0)
+        cf = _conflict_fix("work-001")
+        state_mod.save_board(Board(active=[], completed=[work, review, cf]))
+
+        with patch("coord.github_ops.get_branch_sha", return_value="cur-sha"), \
+             patch("coord.github_ops.get_branch_patch_id", return_value="cur-patch"), \
+             patch("coord.github_ops.get_compare_diff", return_value=_SMALL_DIFF):
+            result = _invoke(
+                "review-reaffirm", "--yes", "work-001", "--reason",
+                "conflict resolution", "--config", str(config_file),
+            )
+        assert result.exit_code == 0, result.output
+        assert "a completed conflict-fix accounts for this delta" in result.output
+        assert "WARNING" not in result.output
+
+        audit = coord_db.execute(
+            "SELECT details_json FROM audit_log WHERE assignment_id='review-001'"
+        ).fetchone()
+        assert '"conflict_fix_only": true' in audit["details_json"]
+
+    def test_unattributed_delta_warns_loudly_but_proceeds(
+        self, config_file: Path, coord_db
+    ) -> None:
+        """No coord-tracked conflict-fix (the operator rebased by hand — the
+        gap this escape hatch exists to fill): warn, don't refuse."""
+        work = _work(dispatched_at=10.0)
+        review = _review("work-001", dispatched_at=100.0)
+        state_mod.save_board(Board(active=[], completed=[work, review]))
+
+        with patch("coord.github_ops.get_branch_sha", return_value="cur-sha"), \
+             patch("coord.github_ops.get_branch_patch_id", return_value="cur-patch"), \
+             patch("coord.github_ops.get_compare_diff", return_value=_SMALL_DIFF):
+            result = _invoke(
+                "review-reaffirm", "--yes", "work-001", "--reason",
+                "hand-resolved rebase", "--config", str(config_file),
+            )
+        assert result.exit_code == 0, result.output
+        assert "UNATTRIBUTED" in result.output
+        assert "WARNING" in result.output
+        assert "vouching for this diff yourself" in result.output
+
+        audit = coord_db.execute(
+            "SELECT details_json FROM audit_log WHERE assignment_id='review-001'"
+        ).fetchone()
+        assert '"conflict_fix_only": false' in audit["details_json"]
+
+
+class TestCountDiffChangedLines:
+    """The delta bound is the one guarantee that holds unconditionally (no
+    override flag), so its line counter must never UNDER-count."""
+
+    @staticmethod
+    def _count(text: str) -> int:
+        from coord.commands.review import _count_diff_changed_lines
+        return _count_diff_changed_lines(text)
+
+    def test_skips_file_headers(self) -> None:
+        assert self._count(_SMALL_DIFF) == 2
+
+    def test_counts_content_lines_that_look_like_headers(self) -> None:
+        """`++counter` renders as `+++counter`; a removed `---` YAML separator
+        renders as `----`. Both are content — a bare startswith() test dropped
+        them and undercounted the delta against reaffirm_max_diff_lines."""
+        diff = (
+            "diff --git a/a.yml b/a.yml\n"
+            "--- a/a.yml\n"
+            "+++ b/a.yml\n"
+            "@@ -1,3 +1,3 @@\n"
+            "----\n"          # removed a line whose text is '---'
+            "-  x: 1\n"
+            "+++counter\n"    # added a line whose text is '++counter'
+            "+  x: 2\n"
+        )
+        assert self._count(diff) == 4
+
+    def test_multi_file_headers_still_skipped(self) -> None:
+        diff = (
+            "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n"
+            "@@ -1 +1 @@\n-a\n+b\n"
+            "diff --git a/b.py b/b.py\n--- a/b.py\n+++ b/b.py\n"
+            "@@ -1 +1 @@\n-c\n+d\n"
+        )
+        assert self._count(diff) == 4
+
+    def test_new_file_header_skipped(self) -> None:
+        diff = (
+            "diff --git a/n.py b/n.py\nnew file mode 100644\n"
+            "--- /dev/null\n+++ b/n.py\n@@ -0,0 +1,2 @@\n+one\n+two\n"
+        )
+        assert self._count(diff) == 2
+
+    def test_unrecognizable_input_overcounts_rather_than_under(self) -> None:
+        """Fail closed: with no `@@` at all the counter still counts every
+        +/- line rather than silently reporting a smaller delta."""
+        assert self._count(_BIG_DIFF) == 100
+
+
 class TestReviewReaffirmSuccess:
     def test_success_with_yes_writes_and_audits(
         self, config_file: Path, coord_db
@@ -264,3 +419,26 @@ def test_record_review_reaffirm_local_raises_for_unknown_assignment(coord_db) ->
             new_patch_id=None,
             reason="conflict resolution",
         )
+
+
+def test_record_review_reaffirm_local_rejects_non_review_assignment(coord_db) -> None:
+    """Defense in depth: the daemon's POST /review-reaffirm takes an arbitrary
+    id, so a `work` row must not get review anchors stamped onto it (plus a
+    misleading "Review reaffirmed" audit entry)."""
+    state_mod.save_board(Board(active=[], completed=[_work("work-001")]))
+
+    with pytest.raises(ValueError, match="not 'review'"):
+        state_mod._record_review_reaffirm_local(
+            review_assignment_id="work-001",
+            new_head_sha="new-sha",
+            new_patch_id=None,
+            reason="conflict resolution",
+        )
+
+    row = coord_db.execute(
+        "SELECT review_head_sha FROM assignments WHERE assignment_id='work-001'"
+    ).fetchone()
+    assert row["review_head_sha"] is None
+    assert coord_db.execute(
+        "SELECT COUNT(*) c FROM audit_log WHERE assignment_id='work-001'"
+    ).fetchone()["c"] == 0

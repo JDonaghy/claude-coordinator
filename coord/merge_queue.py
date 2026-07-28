@@ -500,6 +500,45 @@ def find_scoped_review_candidate(
     return None
 
 
+def intervening_work_since_review(
+    entry: "QueuedMerge", board, review: Assignment
+) -> list[Assignment]:
+    """Return the :data:`~coord.models.WORK_LIKE_TYPES` assignments in
+    *entry*'s branch chain that were **dispatched after** *review* was — i.e.
+    genuine new commits (a bounce/fix round, a fresh work dispatch), not a
+    mechanical rebase.
+
+    Extracted from :func:`only_conflict_fix_since_review` so callers that need
+    to distinguish its two distinct "False" reasons can do so: a non-empty
+    list means "another commit landed after the approval" (never reaffirmable
+    without a re-review), whereas an empty list plus a ``False`` from
+    ``only_conflict_fix_since_review`` merely means "no coord-tracked
+    conflict-fix explains the delta" (e.g. the operator rebased by hand) —
+    unattributable, but not evidence of new logic. ``#1488``'s
+    ``coord review-reaffirm`` hard-refuses the former and warns loudly on the
+    latter; the automated dispatcher (``#1476``) declines both.
+
+    Dispatch order, not completion order, is compared — see
+    :func:`only_conflict_fix_since_review` for why.
+    """
+    pool = list(getattr(board, "completed", []) or []) + list(getattr(board, "active", []) or [])
+    branch_work_ids = _chain_work_ids(entry, pool)
+    review_dispatched_at = getattr(review, "dispatched_at", None)
+    if review_dispatched_at is None:
+        return []
+
+    out: list[Assignment] = []
+    for a in pool:
+        if getattr(a, "type", None) not in WORK_LIKE_TYPES:
+            continue
+        if getattr(a, "assignment_id", None) not in branch_work_ids:
+            continue
+        a_dispatched_at = getattr(a, "dispatched_at", None)
+        if a_dispatched_at is not None and a_dispatched_at > review_dispatched_at:
+            out.append(a)
+    return out
+
+
 def only_conflict_fix_since_review(entry: "QueuedMerge", board, review: Assignment) -> bool:
     """True when the sole thing that changed *entry*'s branch since *review*
     approved it was one or more successful conflict-fix rebases (#1476's
@@ -520,37 +559,28 @@ def only_conflict_fix_since_review(entry: "QueuedMerge", board, review: Assignme
     not itself disqualify the scoped path; only a fix/work round that
     started **after** the approval counts as "another commit".
     """
+    if intervening_work_since_review(entry, board, review):
+        return False  # a new work/fix round happened — not conflict-fix-only
+
     pool = list(getattr(board, "completed", []) or []) + list(getattr(board, "active", []) or [])
-    branch_work_ids = _chain_work_ids(entry, pool)
     review_dispatched_at = getattr(review, "dispatched_at", None)
 
-    found_conflict_fix = False
     for a in pool:
-        atype = getattr(a, "type", None)
-        a_dispatched_at = getattr(a, "dispatched_at", None)
-        if atype == "conflict-fix":
-            if getattr(a, "review_of_assignment_id", None) != entry.assignment_id:
-                continue
-            if getattr(a, "status", None) != "done":
-                continue
-            if (
-                review_dispatched_at is not None
-                and a_dispatched_at is not None
-                and a_dispatched_at < review_dispatched_at
-            ):
-                continue  # a conflict-fix from BEFORE this review isn't relevant
-            found_conflict_fix = True
+        if getattr(a, "type", None) != "conflict-fix":
             continue
-        if atype in WORK_LIKE_TYPES:
-            if getattr(a, "assignment_id", None) not in branch_work_ids:
-                continue
-            if (
-                review_dispatched_at is not None
-                and a_dispatched_at is not None
-                and a_dispatched_at > review_dispatched_at
-            ):
-                return False  # a new work/fix round happened — not conflict-fix-only
-    return found_conflict_fix
+        if getattr(a, "review_of_assignment_id", None) != entry.assignment_id:
+            continue
+        if getattr(a, "status", None) != "done":
+            continue
+        a_dispatched_at = getattr(a, "dispatched_at", None)
+        if (
+            review_dispatched_at is not None
+            and a_dispatched_at is not None
+            and a_dispatched_at < review_dispatched_at
+        ):
+            continue  # a conflict-fix from BEFORE this review isn't relevant
+        return True
+    return False
 
 
 # ── Smoke gate (#465) ──────────────────────────────────────────────────────
