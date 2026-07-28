@@ -199,7 +199,10 @@ def test_preflight_allows_headless_work():
 def test_no_work_row_dispatches_work_through_the_cli():
     action = step(state())
     assert action.kind == RUN
-    assert action.command == ("assign", "precision", REPO, "1392")
+    assert action.command == (
+        "assign", "precision", REPO, "1392",
+        "--driven-by", f"drive:{REPO}#1392",
+    )
 
 
 def test_dispatch_work_passes_model_and_briefing_file():
@@ -207,6 +210,7 @@ def test_dispatch_work_passes_model_and_briefing_file():
     action = step(state(), opts)
     assert action.command == (
         "assign", "precision", REPO, "1392",
+        "--driven-by", f"drive:{REPO}#1392",
         "--model", "opus",
         "--briefing-file", "/tmp/b.md",
     )
@@ -214,7 +218,10 @@ def test_dispatch_work_passes_model_and_briefing_file():
 
 def test_plan_flag_dispatches_a_plan_only_assignment_first():
     action = step(state(), DriveOptions(machine="precision", do_plan=True))
-    assert action.command == ("assign", "--plan-only", "precision", REPO, "1392")
+    assert action.command == (
+        "assign", "--plan-only", "precision", REPO, "1392",
+        "--driven-by", f"drive:{REPO}#1392",
+    )
 
 
 def test_a_done_plan_is_auto_approved():
@@ -501,7 +508,10 @@ def test_gate_a_contract_path_agrees_across_tui_python_dispatch_and_drive():
 def test_oracle_inactive_dispatches_work_directly_as_before():
     """oracle=None (the default) is byte-for-byte the pre-#1453 behaviour."""
     action = step(state())
-    assert action.command == ("assign", "precision", REPO, "1392")
+    assert action.command == (
+        "assign", "precision", REPO, "1392",
+        "--driven-by", f"drive:{REPO}#1392",
+    )
 
 
 def test_oracle_active_authors_the_slice_before_dispatching_work():
@@ -529,7 +539,10 @@ def test_oracle_active_dispatches_work_once_the_slice_has_merged():
         oracle=oracle,
     )
     assert action.kind == RUN
-    assert action.command == ("assign", "precision", REPO, "1392")
+    assert action.command == (
+        "assign", "precision", REPO, "1392",
+        "--driven-by", f"drive:{REPO}#1392",
+    )
 
 
 def test_oracle_active_is_terminal_when_the_slice_authoring_fails():
@@ -562,7 +575,10 @@ def test_oracle_active_still_honours_do_plan_after_the_slice_has_landed():
         DriveOptions(machine="precision", do_plan=True),
         oracle=oracle,
     )
-    assert action.command == ("assign", "--plan-only", "precision", REPO, "1392")
+    assert action.command == (
+        "assign", "--plan-only", "precision", REPO, "1392",
+        "--driven-by", f"drive:{REPO}#1392",
+    )
 
 
 # ── #1453 review finding 1: --for-path resolution for a routed repo ─────────
@@ -1373,6 +1389,54 @@ def test_driver_exits_zero_on_a_verified_merge(driver_factory, capsys):
     driver = driver_factory([board(status="merged")])
     assert driver.run() == EXIT_OK
     assert "MERGED" in capsys.readouterr().out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# #1499: audit events at the driver's own boundaries
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _drive_audit_rows(coord_db):
+    rows = coord_db.execute(
+        "SELECT event_type, actor, category, repo, issue, summary, details_json "
+        "FROM audit_log WHERE category = 'drive' ORDER BY id"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def test_run_records_drive_started_and_drive_exited_on_a_clean_finish(
+    driver_factory, coord_db, capsys
+):
+    driver = driver_factory([board(status="merged")])
+    assert driver.run() == EXIT_OK
+    capsys.readouterr()
+
+    rows = _drive_audit_rows(coord_db)
+    assert [r["event_type"] for r in rows] == ["drive_started", "drive_exited"]
+    for r in rows:
+        assert r["actor"] == "drive"
+        assert r["repo"] == REPO
+        assert r["issue"] == ISSUE
+    exit_details = json.loads(rows[1]["details_json"])
+    assert exit_details["exit_code"] == EXIT_OK
+
+
+def test_run_records_drive_exited_with_the_terminal_failure_reason(
+    driver_factory, coord_db, capsys
+):
+    # A work assignment that failed outright is a terminal DriveError exit —
+    # the exact "why did it stop?" the audit trail needs to answer after the
+    # driver process is long gone.
+    driver = driver_factory([board(status="failed")])
+    code = driver.run()
+    capsys.readouterr()
+    assert code == EXIT_TERMINAL_FAILURE
+
+    rows = _drive_audit_rows(coord_db)
+    assert [r["event_type"] for r in rows] == ["drive_started", "drive_exited"]
+    exit_details = json.loads(rows[1]["details_json"])
+    assert exit_details["exit_code"] == EXIT_TERMINAL_FAILURE
+    assert "failed" in rows[1]["summary"]
 
 
 # ── #1453: the preflight banner never leaves oracle mode unstated ───────────

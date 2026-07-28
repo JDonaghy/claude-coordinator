@@ -229,6 +229,50 @@ class TestAssignDispatch:
         assert kwargs.get("fresh_branch") is True
 
 
+    def test_driven_by_flag_is_recorded(self, config_file: Path, coord_dir: Path) -> None:
+        """#1499: `--driven-by` (set by `coord drive`) survives onto both the
+        Proposal handed to `dispatch()` and the persisted assignment row —
+        the durable provenance that distinguishes a drive dispatch from a
+        hand `coord assign` after the driver process has exited."""
+        with patch("coord.github_ops.get_issue", return_value={"title": "Fix bug"}), \
+             patch("coord.dispatch.dispatch", return_value={"id": "drv-1"}) as disp, \
+             patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.github_ops.check_branch_exists", return_value=False), \
+             patch("coord.claim.find_work_claim", return_value=None):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "assign", "laptop", "api", "7",
+                    "--config", str(config_file),
+                    "--driven-by", "drive:api#7",
+                ],
+            )
+        assert result.exit_code == 0
+        proposal = disp.call_args[0][0]
+        assert proposal.driven_by == "drive:api#7"
+
+        records = state_mod.load_dispatched()
+        assert len(records) == 1
+        assert records[0]["driven_by"] == "drive:api#7"
+
+    def test_driven_by_defaults_to_none_for_a_hand_dispatch(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """A plain `coord assign` (no `--driven-by`) must NOT be mistaken for
+        a drive dispatch — the column stays NULL."""
+        with patch("coord.github_ops.get_issue", return_value={"title": "Fix bug"}), \
+             patch("coord.dispatch.dispatch", return_value={"id": "hand-1"}), \
+             patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.github_ops.check_branch_exists", return_value=False), \
+             patch("coord.claim.find_work_claim", return_value=None):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "7", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0
+        records = state_mod.load_dispatched()
+        assert records[0]["driven_by"] is None
+
     def test_dispatch_http_error(self, config_file: Path, coord_dir: Path) -> None:
         import httpx
 

@@ -553,5 +553,6 @@ pub fn make_assignment_typed(
         audit_bottom_line: None,
         audit_run_number: None,
         for_issue_number: None,
+        driven_by: None,
     }
 }

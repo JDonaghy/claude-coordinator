@@ -1107,7 +1107,7 @@ pub(crate) fn load_data() -> BoardData {
              acceptance_total, acceptance_passed, \
              test_reason, review_state, pr_url, \
              audit_goals_json, audit_bottom_line, audit_run_number, \
-             for_issue_number \
+             for_issue_number, driven_by \
              FROM assignments ORDER BY dispatched_at DESC",
         ) {
             Ok(s) => s,
@@ -1194,6 +1194,9 @@ pub(crate) fn load_data() -> BoardData {
                     .get::<_, Option<i64>>(38)
                     .unwrap_or(None)
                     .map(|n| n as u64),
+                // #1499: durable drive provenance. unwrap_or(None) for the
+                // same graceful-degradation reason as the columns above.
+                driven_by: row.get::<_, Option<String>>(39).unwrap_or(None),
             })
         }) {
             Ok(r) => r,

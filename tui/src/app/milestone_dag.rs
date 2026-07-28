@@ -1301,6 +1301,7 @@ mod pure_tests {
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         }
     }
 

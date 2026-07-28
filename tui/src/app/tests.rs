@@ -1720,6 +1720,7 @@
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         };
         BoardData {
             assignments: vec![work],
@@ -3928,6 +3929,7 @@
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         }
     }
 
@@ -5238,6 +5240,7 @@
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         });
         // Has assignment → in-progress, even though status:ready label is set.
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
@@ -5724,6 +5727,7 @@
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         });
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
         assert_eq!(section, "new");
@@ -5813,6 +5817,7 @@
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         });
         // is_closed wins over has-assignment.
         let section = app.pipeline_lifecycle_section(&app.pipeline_issues[0]);
@@ -6021,6 +6026,7 @@
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         });
 
         // With no queue entry but a merged work assignment, Merge stage → Done.
@@ -6990,6 +6996,7 @@
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         }
     }
 
@@ -9483,6 +9490,7 @@
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         });
         let issue = &app.pipeline_issues[0];
         assert!(app.issue_has_any_assignment(issue));
@@ -9544,6 +9552,7 @@
                 audit_bottom_line: None,
                 audit_run_number: None,
                 for_issue_number: None,
+                driven_by: None,
             });
         }
         let issue = &app.pipeline_issues[0];
@@ -9599,6 +9608,7 @@
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         });
         // Same issue number but different repo — should be excluded.
         app.data.assignments.push(Assignment {
@@ -9643,6 +9653,7 @@
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         });
         let issue = &app.pipeline_issues[0];  // coord_repo = Some("api")
         let total = app.issue_total_cost(issue).expect("should have cost");
@@ -9698,6 +9709,7 @@
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         });
         // Interactive session — cost_usd is None (Max subscription).
         app.data.assignments.push(Assignment {
@@ -9742,6 +9754,7 @@
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         });
         let issue = &app.pipeline_issues[0];
         let total = app.issue_total_cost(issue).expect("should have cost from auto assignment");
@@ -9802,6 +9815,7 @@
                 audit_bottom_line: None,
                 audit_run_number: None,
                 for_issue_number: None,
+                driven_by: None,
             });
         }
         let issue = &app.pipeline_issues[0];
@@ -9856,6 +9870,7 @@
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         });
         // Same issue number, different repo — should be excluded.
         app.data.assignments.push(Assignment {
@@ -9900,6 +9915,7 @@
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         });
         let issue = &app.pipeline_issues[0];  // coord_repo = Some("api")
         assert_eq!(app.issue_total_tokens(issue), 1200, "expected 1000+200=1200 for api repo only");
@@ -9963,6 +9979,7 @@
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -10026,6 +10043,7 @@
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.derive_current_stage(issue), "done");
@@ -10175,6 +10193,7 @@
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         // Work stage ran → Done.
@@ -10262,6 +10281,7 @@
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Active);
@@ -10312,6 +10332,7 @@
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -10367,6 +10388,7 @@
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         });
         // Newer successful retry.
         app.data.assignments.push(Assignment {
@@ -10411,6 +10433,7 @@
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "work"), StageStatus::Done);
@@ -10463,6 +10486,7 @@
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         });
         let issue = &app.pipeline_issues[0];
         // issue.coord_repo == "api", assignment.repo == "different-repo" →
@@ -10595,6 +10619,7 @@
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].label, "Work");
@@ -10662,6 +10687,7 @@
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         });
         app.data.assignments.push(Assignment {
             id: "r1".to_string(),
@@ -10705,6 +10731,7 @@
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         // Work + Review done; Merge is Pending (no merge_queue entry yet) but
@@ -11004,6 +11031,7 @@
                 audit_bottom_line: None,
                 audit_run_number: None,
                 for_issue_number: None,
+                driven_by: None,
             });
         }
         app.data.merge_queue.push(MergeQueueEntry {
@@ -11072,6 +11100,7 @@
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         assert_eq!(view.stages[0].status, StageStatus::Failed);
@@ -11133,6 +11162,7 @@
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         });
         let view = app.build_pipeline_widget().unwrap();
         for stage in &view.stages {
@@ -11237,6 +11267,7 @@
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         });
         let issue = &app.pipeline_issues[0];
         assert_eq!(app.stage_status_for(issue, "plan"), StageStatus::Done);
@@ -11295,6 +11326,7 @@
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         });
         let issue = &app.pipeline_issues[0].clone();
         let id = app.find_done_plan_assignment_id(issue, "api");
@@ -11347,6 +11379,7 @@
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         });
         let issue = &app.pipeline_issues[0].clone();
         assert_eq!(app.find_done_plan_assignment_id(issue, "api"), None);
@@ -16658,6 +16691,7 @@
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         }];
 
         let result = parse_session_summaries_from_comments(&comments, &assignments);
@@ -16793,6 +16827,7 @@
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         };
         let result = parse_session_summaries_from_comments(&comments, &[fix_assignment]);
         assert_eq!(result.len(), 1);
@@ -16969,6 +17004,7 @@
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         };
 
         let data = BoardData {
@@ -17066,6 +17102,7 @@
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         };
 
         let data = BoardData {
@@ -17630,6 +17667,7 @@
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         };
 
         let data = BoardData {
@@ -18007,6 +18045,7 @@
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         };
         let mut app = make_test_app(BoardData {
             assignments: vec![work_assignment],
@@ -26562,6 +26601,7 @@
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         };
 
         // Review for the fix — approved.
@@ -26607,6 +26647,7 @@
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         };
 
         // The merge queue has the ORIGINAL work (different aid, same branch).
@@ -26703,6 +26744,7 @@
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         });
 
         // Model-level assertions on the plain `CoordApp` — `driver.app()`
@@ -29399,6 +29441,7 @@ Milestone tracking issue.
             audit_bottom_line: None,
             audit_run_number: None,
             for_issue_number: None,
+            driven_by: None,
         });
 
         assert!(app.maybe_bind_pending_milestone_chat());
