@@ -158,7 +158,56 @@ def requires_review(entry: "QueuedMerge", config) -> bool:
     return "review" in gates
 
 
-def has_approved_review(entry: "QueuedMerge", board) -> bool:
+def _backfill_branch_patch_id(entry: "QueuedMerge", gh_ops: "GhOps | None") -> str | None:
+    """Return ``entry.branch_patch_id``, computing and persisting it via
+    *gh_ops* when null, or ``None`` when it can't be determined.
+
+    #1506: ``entry.branch_patch_id`` is normally populated by :func:`process`
+    before the review/smoke gates run, but any entry that reaches
+    :func:`has_approved_review` / :func:`find_scoped_review_candidate`
+    without having gone through that backfill first — most notably every
+    queue row whose approved review predates #1475, which never got a
+    chance to backfill it — has ``branch_patch_id: None`` forever, and a
+    null there previously meant "cannot prove identical", voiding an
+    approval for a diff that had not changed by one byte.
+
+    The base passed is *entry.target_branch* — a branch **name**, resolved
+    by GitHub's three-dot compare API (:func:`coord.github_ops.
+    get_branch_patch_id`) to the true merge-base of the two refs — never the
+    PR's recorded ``baseRefOid``. Using ``baseRefOid`` produces a false
+    mismatch once the base branch has advanced past the PR's original fork
+    point (#1506's investigation hit exactly this).
+
+    ``gh_ops=None`` (no client available) or a missing repo/base/branch on
+    *entry* returns ``None`` without any I/O — callers fail closed exactly as
+    before. A successful computation is written back onto *entry* so the
+    ``gh api compare`` round trip happens at most once per entry; the caller
+    is responsible for persisting the entry (e.g. ``save_queue``) same as
+    the existing ``branch_head_sha``/``branch_patch_id`` backfills in
+    :func:`process`.
+    """
+    if gh_ops is None:
+        return None
+    repo = getattr(entry, "repo_github", None)
+    base = getattr(entry, "target_branch", None)
+    branch = getattr(entry, "branch", None)
+    if not repo or not base or not branch:
+        return None
+    try:
+        computed = gh_ops.get_branch_patch_id(repo, base, branch)
+    except Exception:  # noqa: BLE001 — fail-safe: unknown patch-id is not blocking
+        return None
+    if computed is not None:
+        try:
+            entry.branch_patch_id = computed
+        except Exception:  # noqa: BLE001 — best effort; a read-only entry just recomputes next time
+            pass
+    return computed
+
+
+def has_approved_review(
+    entry: "QueuedMerge", board, gh_ops: "GhOps | None" = None
+) -> bool:
     """True when a completed review with ``review_verdict='approve'`` exists
     on *board* for the work assignment behind *entry*.
 
@@ -180,7 +229,10 @@ def has_approved_review(entry: "QueuedMerge", board) -> bool:
     matches the patch-id captured at review time (``review_patch_id``), the
     SHA moved but the diff didn't — e.g. a conflict-fix rebase that resolved
     cleanly — so the approval still covers this content. Missing either
-    patch-id fails closed to the pre-#1475 behaviour (stale, re-review).
+    patch-id fails closed to the pre-#1475 behaviour (stale, re-review) —
+    UNLESS *gh_ops* is supplied, in which case a null ``branch_patch_id`` is
+    computed on demand (#1506) rather than treated as an unrecoverable
+    mismatch; see :func:`_backfill_branch_patch_id`.
     """
     pool = list(getattr(board, "completed", []) or []) + list(getattr(board, "active", []) or [])
 
@@ -197,6 +249,7 @@ def has_approved_review(entry: "QueuedMerge", board) -> bool:
     # tracking unavailable) the check is skipped (backward-compatible).
     current_sha = getattr(entry, "branch_head_sha", None)
     current_patch_id = getattr(entry, "branch_patch_id", None)
+    patch_id_attempted = current_patch_id is not None
 
     for a in pool:
         if getattr(a, "type", None) != "review":
@@ -215,18 +268,21 @@ def has_approved_review(entry: "QueuedMerge", board) -> bool:
             # genuine content change produces a different one. Fail closed
             # when either patch-id is unavailable.
             review_patch_id = getattr(a, "review_patch_id", None)
-            if (
-                review_patch_id is not None
-                and current_patch_id is not None
-                and review_patch_id == current_patch_id
-            ):
-                return True  # content-identical rebase — approval still covers it
+            if review_patch_id is not None:
+                if current_patch_id is None and not patch_id_attempted:
+                    # #1506: compute-once, not fail-closed-forever.
+                    current_patch_id = _backfill_branch_patch_id(entry, gh_ops)
+                    patch_id_attempted = True
+                if current_patch_id is not None and review_patch_id == current_patch_id:
+                    return True  # content-identical rebase — approval still covers it
             continue  # stale: branch moved past the commit the review covered
         return True
     return False
 
 
-def find_scoped_review_candidate(entry: "QueuedMerge", board) -> Assignment | None:
+def find_scoped_review_candidate(
+    entry: "QueuedMerge", board, gh_ops: "GhOps | None" = None
+) -> Assignment | None:
     """Return the previously-approved review whose approval was voided
     ONLY by a content-changing rebase (#1476), or ``None``.
 
@@ -240,8 +296,11 @@ def find_scoped_review_candidate(entry: "QueuedMerge", board) -> Assignment | No
     — when:
 
     - No approved review exists for *entry*'s work chain at all.
-    - The branch's current SHA/patch-id aren't both known (can't confirm
-      anything changed).
+    - The branch's current SHA isn't known (can't confirm anything changed),
+      or the current patch-id isn't known and can't be computed (#1506: when
+      *gh_ops* is supplied, a null ``branch_patch_id`` is backfilled on
+      demand via :func:`_backfill_branch_patch_id` instead of failing
+      immediately).
     - The most-recently-matched approved review's SHA still matches the
       current one (nothing changed — not stale at all).
     - Its patch-id still matches the current one (content-identical
@@ -258,6 +317,8 @@ def find_scoped_review_candidate(entry: "QueuedMerge", board) -> Assignment | No
 
     current_sha = getattr(entry, "branch_head_sha", None)
     current_patch_id = getattr(entry, "branch_patch_id", None)
+    if current_patch_id is None:
+        current_patch_id = _backfill_branch_patch_id(entry, gh_ops)
     if current_sha is None or current_patch_id is None:
         return None
 
@@ -1234,7 +1295,10 @@ def _entry_gate_status(
     reads the ``coord merge --force-merge`` output itself.
     """
     if config is not None and board is not None:
-        if requires_review(entry, config) and not has_approved_review(entry, board):
+        # #1506: pass gh_ops through so a null branch_patch_id (e.g. an entry
+        # whose approved review predates #1475) is computed on demand rather
+        # than displaying a stale "review not approved" the plan can't fix.
+        if requires_review(entry, config) and not has_approved_review(entry, board, gh_ops):
             return PLAN_BLOCKED, "review not approved"
         if requires_smoke(entry, config) and not has_smoke_verdict(entry, board):
             return PLAN_BLOCKED, "test verdict missing"
@@ -1951,7 +2015,7 @@ def process(
                     not skip_review
                     and config is not None
                     and requires_review(entry, config)
-                    and (board is None or not has_approved_review(entry, board))
+                    and (board is None or not has_approved_review(entry, board, gh_ops))
                 ):
                     _why = (
                         "board unavailable to confirm review approval"
@@ -2073,7 +2137,7 @@ def process(
                 not skip_review
                 and config is not None
                 and requires_review(entry, config)
-                and (board is None or not has_approved_review(entry, board))
+                and (board is None or not has_approved_review(entry, board, gh_ops))
             ):
                 msg = (
                     "review required but board unavailable to confirm approval"
