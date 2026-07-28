@@ -1204,6 +1204,103 @@ class TestReviewGate:
         board = self._board(completed=[work, review])
         assert mq.has_approved_review(entry, board) is False
 
+    # ── #1506: compute branch_patch_id on demand instead of voiding ────────
+
+    def test_has_approved_review_null_branch_patch_id_computed_via_gh_ops(self) -> None:
+        """#1506: an entry whose approval predates #1475 (branch_patch_id
+        never backfilled) must not be voided outright — when gh_ops is
+        supplied, the current patch-id is computed on demand and, if it
+        matches the review's, the approval still counts."""
+        work = self._work("w1")
+        review = self._review("w1", verdict="approve")
+        review.review_head_sha = "abc123"
+        review.review_patch_id = "patchid-same"
+
+        entry = _q("w1", branch="worker/w1", target="main", repo_github="acme/api")
+        entry.branch_head_sha = "def456"  # rebased — SHA moved
+        entry.branch_patch_id = None      # never backfilled (pre-#1475 review)
+
+        board = self._board(completed=[work, review])
+
+        class _Gh:
+            calls: list[tuple[str, str, str]] = []
+            def get_branch_patch_id(self, repo: str, base: str, branch: str) -> str | None:
+                self.calls.append((repo, base, branch))
+                return "patchid-same"
+
+        gh = _Gh()
+        assert mq.has_approved_review(entry, board, gh) is True
+        assert gh.calls == [("acme/api", "main", "worker/w1")]
+        # #1506 acceptance: the computed value is backfilled so a later call
+        # (e.g. process()'s own save_queue) persists it and never re-fetches.
+        assert entry.branch_patch_id == "patchid-same"
+
+    def test_has_approved_review_null_branch_patch_id_without_gh_ops_fails_closed(self) -> None:
+        """Backward compatibility: callers that don't pass gh_ops (e.g.
+        display_error, which is intentionally I/O-free) keep the pre-#1506
+        fail-closed behaviour."""
+        work = self._work("w1")
+        review = self._review("w1", verdict="approve")
+        review.review_head_sha = "abc123"
+        review.review_patch_id = "patchid-same"
+
+        entry = _q("w1", branch="worker/w1")
+        entry.branch_head_sha = "def456"
+        entry.branch_patch_id = None
+
+        board = self._board(completed=[work, review])
+        assert mq.has_approved_review(entry, board) is False
+        assert entry.branch_patch_id is None  # never touched — no gh_ops given
+
+    def test_has_approved_review_computed_patch_id_still_voids_on_genuine_change(self) -> None:
+        """#1506: computing the patch-id on demand must not turn into a
+        rubber stamp — a genuinely different diff still voids the approval."""
+        work = self._work("w1")
+        review = self._review("w1", verdict="approve")
+        review.review_head_sha = "abc123"
+        review.review_patch_id = "patchid-old"
+
+        entry = _q("w1", branch="worker/w1", target="main", repo_github="acme/api")
+        entry.branch_head_sha = "def456"
+        entry.branch_patch_id = None
+
+        class _Gh:
+            def get_branch_patch_id(self, repo: str, base: str, branch: str) -> str | None:
+                return "patchid-new"  # conflict resolution actually changed content
+
+        assert mq.has_approved_review(entry, self._board(completed=[work, review]), _Gh()) is False
+
+    def test_has_approved_review_computes_against_merge_base_not_baseRefOid(self) -> None:
+        """#1506: the base passed for patch-id computation must be
+        entry.target_branch (a branch name — GitHub's three-dot compare API
+        resolves this to the true merge-base) and never a PR's recorded
+        baseRefOid. This fixture makes the two diverge: computing against
+        the (wrong) baseRefOid-like SHA yields a value that does NOT match
+        the review's patch-id, while computing against the branch name
+        (merge-base) yields the correct match — proving the verdict follows
+        merge-base."""
+        work = self._work("w1")
+        review = self._review("w1", verdict="approve")
+        review.review_head_sha = "abc123"
+        review.review_patch_id = "patchid-correct"
+
+        entry = _q("w1", branch="worker/w1", target="main", repo_github="acme/api")
+        entry.branch_head_sha = "def456"
+        entry.branch_patch_id = None
+
+        stale_base_ref_oid = "0ldbaser3f0idsha"
+
+        class _Gh:
+            def get_branch_patch_id(self, repo: str, base: str, branch: str) -> str | None:
+                if base == stale_base_ref_oid:
+                    return "patchid-wrong-from-stale-base"
+                if base == "main":  # entry.target_branch — the merge-base path
+                    return "patchid-correct"
+                return None
+
+        board = self._board(completed=[work, review])
+        assert mq.has_approved_review(entry, board, _Gh()) is True
+
     # ── #292 Defect 1: has_approved_review with bounce ────────────────────
 
     def test_has_approved_review_bounce_fix_approves(self) -> None:
@@ -1469,6 +1566,28 @@ class TestScopedReviewCandidate:
         entry.branch_head_sha = "def456"
         entry.branch_patch_id = None
         assert mq.find_scoped_review_candidate(entry, board) is None
+
+    def test_computes_current_patch_id_via_gh_ops_when_null(self) -> None:
+        """#1506: when gh_ops is supplied, a null branch_patch_id is computed
+        on demand (same as has_approved_review) instead of bailing out
+        immediately — so a genuinely-voided pre-#1475 approval can still be
+        scoped to the conflict-fix delta rather than falling to a full
+        re-review."""
+        work = self._work("w1")
+        review = self._review("w1", patch_id="patchid-old")
+        board = self._board(completed=[work, review])
+        entry = _q("w1", branch="worker/w1", target="main", repo_github="acme/api")
+        entry.branch_head_sha = "def456"
+        entry.branch_patch_id = None
+
+        class _Gh:
+            def get_branch_patch_id(self, repo: str, base: str, branch: str) -> str | None:
+                assert (repo, base, branch) == ("acme/api", "main", "worker/w1")
+                return "patchid-new"
+
+        found = mq.find_scoped_review_candidate(entry, board, _Gh())
+        assert found is review
+        assert entry.branch_patch_id == "patchid-new"  # backfilled, computed once
 
     def test_returns_none_when_no_review_at_all(self) -> None:
         work = self._work("w1")
@@ -3356,6 +3475,40 @@ class TestPlan:
         assert plan[0].reason is None
         assert plan[0].rank == 1
         assert plan[0].size == 100
+
+    def test_ready_when_gh_ops_backfills_null_branch_patch_id(self, coord_db) -> None:
+        """#1506: an entry whose approved review predates #1475
+        (review_patch_id set, but the entry's own branch_patch_id was never
+        backfilled — e.g. no `coord merge` tick ran between the rebase and
+        this `plan()` call) must not display BLOCKED just because the
+        stored field is null — plan() already receives gh_ops (used for the
+        epic-closing-keyword gate); this proves it's also threaded into the
+        review gate's on-demand patch-id computation."""
+        items = [_q("w1", size=100, target="main", repo_github="acme/api")]
+        items[0].branch_head_sha = "def456"  # rebased since the review ran
+        items[0].branch_patch_id = None      # never backfilled
+        save_queue(items)
+        review = self._review("w1", verdict="approve")
+        review.review_head_sha = "abc123"
+        review.review_patch_id = "patchid-same"
+        board = self._board(completed=[
+            self._work("w1", test_state="passed"),
+            review,
+        ])
+        cfg = self._config()
+
+        class _Gh:
+            def get_branch_patch_id(self, repo: str, base: str, branch: str) -> str | None:
+                assert (repo, base) == ("acme/api", "main")
+                return "patchid-same"
+            def get_pr_commit_messages(self, repo: str, number: int) -> list[str]:
+                return []
+            def is_epic_issue(self, repo: str, issue_number: int) -> bool:
+                return False
+
+        plan = mq.plan(board, cfg, gh_ops=_Gh())
+        assert plan[0].status == mq.PLAN_READY
+        assert plan[0].reason is None
 
     def test_blocked_review_not_approved(self, coord_db) -> None:
         """Entry missing an approved review appears as BLOCKED with reason."""
