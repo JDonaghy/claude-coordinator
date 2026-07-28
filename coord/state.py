@@ -168,7 +168,6 @@ _UPSERT_SQL = """
                  AND excluded.finished_at >= finished_at THEN excluded.finished_at
             ELSE finished_at
         END,
-        smoke_test         = excluded.smoke_test,
         -- #1337: the unbounded free-text columns (smoke_test_reason,
         -- test_reason, briefing) are EXCLUDED from this whole-board upsert.
         -- The /board wire serves bounded previews of them (coord.board_wire)
@@ -179,6 +178,22 @@ _UPSERT_SQL = """
         -- them instead: record_test_verdict (test_reason/smoke_test_reason)
         -- and the dispatch-time INSERT (briefing) — the insert column list
         -- above still stores them for NEW rows.
+        --
+        -- #1482: `smoke_test` and `test_state` join that exclusion. They
+        -- are companions of `test_reason`/`smoke_test_reason` above — set
+        -- together, in the same UPDATE, by the single-row seam writer
+        -- `record_test_verdict` (and cleared together by
+        -- `reset_work_test_state`) — so a stale whole-board snapshot must
+        -- not blindly overwrite them any more than it may overwrite the
+        -- reason text. Before this fix, `test_reason` survived a stale
+        -- `save_board()` (already excluded) while `test_state`/`smoke_test`
+        -- did not, producing an impossible combination on disk: a `passed`
+        -- reason string paired with a reverted `test_state='running'` and
+        -- `smoke_test=NULL` (#1482, observed live on #1472). `COALESCE` is
+        -- NOT a fix here — a stale snapshot's `test_state='running'` is
+        -- non-NULL and would still clobber a recorded `'passed'`/`'failed'`.
+        -- The INSERT column list above is unaffected and still stores both
+        -- for NEW rows (dispatch time, before any seam write exists).
         review_state       = excluded.review_state,
         review_of_assignment_id = excluded.review_of_assignment_id,
         review_target      = excluded.review_target,
@@ -190,7 +205,6 @@ _UPSERT_SQL = """
         required_gates     = excluded.required_gates,
         review_iteration   = excluded.review_iteration,
         review_posted_at   = COALESCE(excluded.review_posted_at, review_posted_at),
-        test_state         = excluded.test_state,
         review_verdict     = COALESCE(excluded.review_verdict, review_verdict),
         -- #1456: once an override is recorded, preserve it.  A later upsert
         -- from a path that doesn't know about the override (agent reload, thin
