@@ -2809,20 +2809,14 @@ def test_serve_merge_relays_nonzero_exit(
     assert resp.json()["exit_code"] == 2
 
 
-def test_serve_merge_rejects_client_skip_review(
+def test_serve_merge_ignores_client_skip_review(
     file_db: Path, valid_config_path: Path, rw_db, monkeypatch
 ):
-    """#821/#1489: POST /merge with skip_review=True must be rejected outright,
-    not silently stripped.
+    """#821: POST /merge with skip_review=True must NOT propagate to the merge callback.
 
-    The daemon still always enforces the review gate regardless of any flag
-    the thin client sends (#821 invariant, unchanged) — but it used to do so
-    by quietly forcing skip_review=False into the merge callback with no
-    signal back to the caller, so an operator's --skip-review looked
-    accepted and then did nothing (#1489). Verify: the callback is never
-    invoked at all, the response carries a non-zero exit_code and an
-    explicit error mentioning the flag, and the review gate itself is still
-    unconditionally enforced.
+    The daemon always enforces the review gate regardless of any flag the thin
+    client sends.  Verify the callback is invoked with skip_review=False even
+    when the POST body contains skip_review=True.
     """
     from coord.cli import merge as merge_cmd
 
@@ -2836,13 +2830,10 @@ def test_serve_merge_rejects_client_skip_review(
     with TestClient(app) as cli:
         resp = cli.post("/merge", json={"skip_review": True, "dry_run": True})
     assert resp.status_code == 200
-    out = resp.json()
-    assert out["exit_code"] == 1
-    assert "skip-review" in out["error"]
-    assert "#821" in out["error"]
-    # The merge pipeline must never have run — this is a rejection, not a
-    # stripped-and-proceed no-op.
-    assert captured == {}
+    # Daemon must have stripped the client's skip_review flag.
+    assert captured.get("skip_review") is False, (
+        f"daemon must pass skip_review=False to callback, got {captured.get('skip_review')!r}"
+    )
 
 
 def test_merge_command_routes_to_daemon_when_service_set(coord_db, monkeypatch):

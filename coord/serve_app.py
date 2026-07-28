@@ -2527,12 +2527,6 @@ def _openapi_spec() -> dict:
         "/merge": {
             "post": {
                 "summary": "Run `coord merge` against the canonical DB (#584)",
-                "description": (
-                    "#1489: a truthy `skip_review` is rejected outright (exit_code 1, "
-                    "explicit `error`) rather than silently dropped — the #821 "
-                    "invariant (review gate can never be bypassed remotely) still "
-                    "holds, this just makes the refusal visible instead of silent."
-                ),
                 "requestBody": {
                     "required": True,
                     "content": {
@@ -2545,15 +2539,6 @@ def _openapi_spec() -> dict:
                                     "repo_filter": {"type": "string", "nullable": True},
                                     "method": {"type": "string"},
                                     "force_merge": {"type": "boolean"},
-                                    "skip_review": {
-                                        "type": "boolean",
-                                        "description": (
-                                            "#821/#1489: rejected — a truthy value "
-                                            "returns exit_code 1 with an explicit "
-                                            "error instead of being honoured or "
-                                            "silently dropped."
-                                        ),
-                                    },
                                     "skip_smoke": {"type": "boolean"},
                                     "drop": {"type": "string", "nullable": True},
                                     "only": {"type": "string", "nullable": True},
@@ -4414,28 +4399,6 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             result = await run_in_threadpool(_run_drop)
             return JSONResponse(result)
 
-        # #1489: a client-supplied skip_review used to be silently discarded
-        # here — the callback below was always invoked with skip_review=False
-        # regardless of what the client sent, so the CLI happily printed
-        # nothing unusual and the operator only discovered the override never
-        # applied when the review gate blocked the merge anyway (#1472).  The
-        # #821 invariant this exists for — a client can never bypass the
-        # review gate remotely — is correct and stays exactly as strict; the
-        # defect was the silence, not the enforcement.  Reject up front with
-        # an explicit error instead, before the merge pipeline (and the
-        # threadpool hop) ever runs.
-        if body.get("skip_review"):
-            return JSONResponse({
-                "output": "",
-                "exit_code": 1,
-                "error": (
-                    "--skip-review is not honoured through the daemon (#821): "
-                    "the review gate can only be satisfied by an approval "
-                    "recorded on the board. Approve the review (or otherwise "
-                    "satisfy the review gate) and retry without --skip-review."
-                ),
-            })
-
         def _run() -> dict:
             import io  # noqa: PLC0415
             import os  # noqa: PLC0415
@@ -4486,11 +4449,6 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                             # #821: daemon always enforces review regardless of any
                             # skip_review flag the client sends.  The gate is
                             # safety-critical and must not be bypassable remotely.
-                            # #1489: a truthy skip_review never reaches this point —
-                            # it's rejected explicitly above, before this function is
-                            # even defined — but the hardcoded False stays as
-                            # belt-and-braces in case a future change moves or
-                            # removes that early check.
                             skip_review=False,
                             skip_smoke=bool(body.get("skip_smoke")),
                             drop_assignment=None,  # already handled above

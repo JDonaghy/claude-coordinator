@@ -728,14 +728,7 @@ def _merge_via_daemon(svc, params: dict) -> None:
 @click.option(
     "--skip-review",
     is_flag=True,
-    help=(
-        "Skip the review-approval gate — merge even when no approved review is on "
-        "the board (#253). Local-only: when this run is routed to the daemon "
-        "(thin client / no local canonical DB), the daemon rejects a truthy "
-        "--skip-review outright (non-zero exit, explicit error) rather than "
-        "honouring or silently dropping it — the review gate can never be "
-        "bypassed remotely (#821, #1489)."
-    ),
+    help="Skip the review-approval gate — merge even when no approved review is on the board (#253).",
 )
 
 
