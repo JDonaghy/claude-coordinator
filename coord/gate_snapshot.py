@@ -21,10 +21,21 @@ consumer seams:
   reads for the epic-closing gate (``get_pr_commit_messages`` /
   ``is_epic_issue``).
 
-Fail-open by construction: a pair that has never been refreshed yields
-``[]`` / ``False``, exactly the degraded values the live gates already
-produce on a ``gh`` failure — so a fresh daemon serves a correct (if
-CI-unannotated) board instantly instead of blocking on GitHub.
+Fail-open by construction for a pair that has *never* been refreshed at all
+(no backend configured yet, ``ci_available=False``): ``commit_messages`` /
+``epic_issues`` still yield ``[]`` / ``False`` in that case, and
+``list_checks_for_pr`` yields ``[]`` too — so a fresh daemon serves a correct
+(if CI-unannotated) board instantly instead of blocking on GitHub.
+
+Once a CI backend *is* configured, ``list_checks_for_pr`` is no longer
+allowed to go stale silently (#1525): a snapshot older than
+:data:`STALE_AFTER_SECONDS`, or one whose refresh loop has stalled entirely,
+returns a synthetic failing check rather than the last-known (possibly
+long-stale) green data. A stale-green board display was never the actual
+mechanism behind the #1525 incident — ``coord merge`` doesn't consult this
+snapshot at all, see below — but an unattended ``coord drive`` reads exactly
+this display before deciding whether a merge is worth attempting, so it gets
+the same fail-closed treatment as the live gate.
 
 The *live* merge execution path (``coord merge``, auto-drain) keeps its own
 live ``CiStore`` — merging is a write and is allowed to pay for fresh truth;
@@ -40,6 +51,43 @@ from dataclasses import dataclass, field
 from coord.ci_store import CheckRun, build_ci_store
 
 log = logging.getLogger("coord.serve")
+
+# #1525: how old a published snapshot can get before the CI-check read path
+# stops trusting its "no failing checks" silence. The refresh loop's default
+# cadence is 30s (COORD_GATE_REFRESH_INTERVAL); 180s is 6x that — enough
+# headroom that one slow refresh pass doesn't flap the board between READY
+# and BLOCKED, while still catching a refresher that has stalled or died.
+# This only gates checks (the safety-critical CI read); commit_messages /
+# epic_issues keep the original fail-open contract described in the module
+# docstring — the #1318 epic-closing-keyword gate isn't a merge-safety gate
+# in the same sense CI is.
+#
+# This only protects the ``/board`` *display* path — ``coord merge`` and
+# auto-drain always build their own live :class:`coord.ci_store.CiStore`
+# (see the module docstring), never this snapshot. But a stale-green board
+# is exactly what an unattended ``coord drive`` looks at before deciding
+# whether a merge is even worth attempting, so a display-only lie here is
+# still worth refusing to tell.
+STALE_AFTER_SECONDS = 180.0
+
+
+def _stale_check(age_seconds: float | None) -> CheckRun:
+    """Synthetic failing :class:`CheckRun` standing in for "snapshot too old
+    to trust" — mirrors :func:`coord.ci_github._unreadable_check`.
+    ``conclusion="unknown"`` is not in
+    :data:`coord.ci_store._PASSING_CONCLUSIONS`, so ``failed_checks`` treats
+    this like any other hard failure.
+    """
+    age_desc = "never refreshed" if age_seconds is None else f"{age_seconds:.0f}s old"
+    return CheckRun(
+        name=f"coord: gate snapshot stale ({age_desc}, max {STALE_AFTER_SECONDS:.0f}s)",
+        status="completed",
+        conclusion="unknown",
+        url="",
+        run_id="",
+        started_at=None,
+        completed_at=None,
+    )
 
 
 @dataclass(frozen=True)
@@ -58,6 +106,16 @@ class GateSnapshot:
 
     # ── CiStore protocol ────────────────────────────────────────────────────
     def list_checks_for_pr(self, repo: str, number: int) -> list[CheckRun]:
+        # #1525: once a CI backend is configured (`ci_available`), a snapshot
+        # that's stale-beyond-bound must not silently read as "no failing
+        # checks" — that's the same fail-open shape as an unreadable `gh`
+        # call, just reached via a dead/slow refresh loop instead of a dead
+        # `gh` process. `ci_available=False` (no backend configured) is left
+        # alone: there's nothing to be stale about.
+        if self.ci_available:
+            age = None if self.refreshed_at is None else time.time() - self.refreshed_at
+            if age is None or age > STALE_AFTER_SECONDS:
+                return [_stale_check(age)]
         return self.checks.get((repo, number), [])
 
     @property

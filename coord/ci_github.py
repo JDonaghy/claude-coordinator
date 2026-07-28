@@ -102,10 +102,21 @@ class GitHubCi:
     def _fetch(self, repo: str, number: int) -> list[CheckRun]:
         try:
             raw = github_ops.get_pr_checks(repo, number)
-        except (FileNotFoundError, subprocess.TimeoutExpired, RuntimeError, ValueError):
-            return []
+        except (FileNotFoundError, subprocess.TimeoutExpired, RuntimeError, ValueError) as e:
+            # #1525: a `gh pr checks` read that outright failed (gh missing,
+            # timeout, non-zero exit with no stdout, unparseable JSON) used
+            # to return `[]` here — indistinguishable from "this PR genuinely
+            # has no checks configured", which the merge gate treats as
+            # clear to merge. That silent fail-open is the mechanism that let
+            # PR #1521 merge 11 minutes after `test (3.12)` recorded FAILURE:
+            # a transient read failure at exactly the wrong moment read as
+            # "no failing checks" instead of "unknown". Return a synthetic
+            # failing check instead so the gate blocks and says why; a caller
+            # that genuinely wants "unknown" treated as clear must pass
+            # `force_merge=True` explicitly.
+            return [_unreadable_check(repo, number, str(e))]
         if not isinstance(raw, list):
-            return []
+            return [_unreadable_check(repo, number, "gh pr checks returned non-list JSON")]
         return [
             CheckRun(
                 name=str(entry.get("name", "")),
@@ -119,3 +130,22 @@ class GitHubCi:
             for entry in raw
             if isinstance(entry, dict)
         ]
+
+
+def _unreadable_check(repo: str, number: int, detail: str) -> CheckRun:
+    """Synthetic :class:`CheckRun` standing in for "could not read CI" (#1525).
+
+    ``conclusion="unknown"`` is not in :data:`coord.ci_store._PASSING_CONCLUSIONS`,
+    so ``failed_checks`` picks this up like any other hard failure — the
+    merge gate blocks and the reason (surfaced via ``CheckRun.name``) tells
+    the operator this was a read failure, not a real CI failure.
+    """
+    return CheckRun(
+        name=f"coord: could not read CI status for {repo}#{number} ({detail})",
+        status="completed",
+        conclusion="unknown",
+        url="",
+        run_id="",
+        started_at=None,
+        completed_at=None,
+    )

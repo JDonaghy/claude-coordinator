@@ -14,6 +14,17 @@ from coord import state as state_mod
 from coord.cli import main
 
 
+# #1525: these fixtures never exercise the CI gate (that's covered by
+# tests/test_ci_store.py's TestMergeGate, with an explicit FakeCi) — they
+# test review/smoke/order/conflict behaviour. Before #1525, an unmocked
+# `ci_store: {type: github}` (the config default) meant every `coord merge`
+# invocation here shelled out to a real `gh pr checks` against the fake
+# "acme/api" repo; that call failed and silently returned `[]` (fail-open),
+# which happened to read as "no failing checks" and let the test's merge
+# through. #1525 makes that same read failure block the merge instead
+# (correctly — an unreadable CI status must not merge) which broke these
+# tests as a side effect. `type: none` opts out of the CI gate explicitly,
+# the same way `reviews: enabled: false` opts out of the review gate below.
 CONFIG_YAML = """\
 repos:
   - name: api
@@ -27,6 +38,8 @@ machines:
       api: /tmp/api
 reviews:
   enabled: false
+ci_store:
+  type: none
 """
 
 DEVELOP_BRANCH_CONFIG_YAML = """\
@@ -43,6 +56,8 @@ machines:
       api: /tmp/api
 reviews:
   enabled: false
+ci_store:
+  type: none
 """
 
 
