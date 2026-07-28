@@ -20,12 +20,35 @@ To cut a release:
 # 1. Bump the version in BOTH places (they must match):
 #    - pyproject.toml  → version = "X.Y.Z"
 #    - coord/__init__.py → __version__ = "X.Y.Z"
-# 2. Commit the bump, then push main:
-git push origin main
-# 3. Tag the bump commit and push the tag — THIS is what publishes:
-git tag vX.Y.Z <bump-commit-sha>
+# 2. Commit the bump on a branch and open a PR — a plain `git push origin
+#    main` no longer works (see below). Wait for its checks to go green,
+#    then merge it:
+git checkout -b release-vX.Y.Z
+git commit -am "Release vX.Y.Z"
+git push -u origin release-vX.Y.Z
+gh pr create --title "Release vX.Y.Z" --body "Version bump."
+# ... wait for checks, then merge (coord merge / gh pr merge / the UI) ...
+# 3. Pull the merged commit onto local main, run the preflight check, then
+#    tag *that* commit and push the tag — THIS is what publishes:
+git checkout main && git pull origin main
+coord release-preflight
+git tag vX.Y.Z <merged-commit-sha>
 git push origin vX.Y.Z
 ```
+
+**`main` requires passing status checks to push to (#1525).** Since
+`required_status_checks` was enabled on `main`, a fresh commit has no check
+runs yet, so `git push origin main` is rejected — even for admins
+(`enforce_admins` is on). The bump must go through a PR like any other
+change: branch → checks → merge → *then* tag the merged commit. Tagging
+before the bump has actually landed on `main` risks publishing (immutably,
+to PyPI) a commit `main` never accepted.
+
+`coord release-preflight` asserts you're on `main` with a clean tree that
+matches `origin/main` — i.e. it's a **post-merge, pre-tag** check. Run it
+after the release PR merges and you've pulled, not on the `release-v*`
+branch itself (it will correctly refuse there — the bump hasn't landed on
+`main` yet at that point).
 
 Watch the run:
 

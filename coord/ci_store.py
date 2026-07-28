@@ -38,10 +38,17 @@ class CheckRun:
     """A single CI check run on a PR.
 
     ``status`` is the lifecycle phase: queued / in_progress / completed.
-    ``conclusion`` is only meaningful when ``status == "completed"`` and is one
-    of success / failure / cancelled / skipped / neutral / timed_out / action_required.
-    Callers should treat ``conclusion in {"failure", "cancelled", "timed_out", "action_required"}``
-    as a hard-fail and ``status != "completed"`` as in-flight.
+    ``conclusion`` is only meaningful when ``status == "completed"`` and is
+    normally one of success / failure / cancelled / skipped / neutral /
+    timed_out / action_required / stale — but GitHub can and does add new
+    conclusions over time, and :class:`coord.ci_github.GitHubCi` synthesizes
+    the conclusion ``"unknown"`` when it couldn't read a PR's checks at all
+    (#1525). ``failed_checks`` below is an **allow-list**: a completed check
+    passes only when its conclusion is affirmatively known-benign
+    (``success`` / ``skipped`` / ``neutral``); anything else — including a
+    conclusion this module has never seen — blocks the merge gate. ``status
+    != "completed"`` is in-flight, handled separately by
+    :func:`in_flight_checks`.
     """
 
     name: str
@@ -81,12 +88,33 @@ class NoOpCi:
 
 # ── Classification helpers ──────────────────────────────────────────────────
 
-_FAILED_CONCLUSIONS = frozenset({"failure", "cancelled", "timed_out", "action_required"})
+# #1525: allow-list of conclusions known to be benign, not a deny-list of
+# conclusions known to be bad. Before this, `_FAILED_CONCLUSIONS` enumerated
+# {"failure", "cancelled", "timed_out", "action_required"} and anything NOT
+# in that set — a `"stale"` conclusion, a future GitHub conclusion this code
+# had never seen, or the synthetic `"unknown"` conclusion GitHubCi emits when
+# a `gh pr checks` read fails — silently read as "not failing", i.e. passing.
+# That is exactly the fail-open shape that let PR #1521 merge over a red
+# `test (3.12)` run: an unrecognised or unreadable conclusion must default to
+# BLOCKING, never to passing.
+_PASSING_CONCLUSIONS = frozenset({"success", "skipped", "neutral"})
+
+
+def _is_failing_conclusion(conclusion: str | None) -> bool:
+    return conclusion not in _PASSING_CONCLUSIONS
 
 
 def failed_checks(checks: list[CheckRun]) -> list[CheckRun]:
-    """Return checks whose conclusion indicates a hard failure."""
-    return [c for c in checks if c.conclusion in _FAILED_CONCLUSIONS]
+    """Return completed checks whose conclusion is not affirmatively passing.
+
+    Only evaluates ``status == "completed"`` checks — an in-flight check has
+    ``conclusion is None`` and is handled by :func:`in_flight_checks`
+    instead, not counted as failed here.
+    """
+    return [
+        c for c in checks
+        if c.status == "completed" and _is_failing_conclusion(c.conclusion)
+    ]
 
 
 def in_flight_checks(checks: list[CheckRun]) -> list[CheckRun]:
@@ -133,9 +161,11 @@ def summarize_counts(checks: list[CheckRun]) -> CiCheckSummary:
     (now-deleted) ``fetch_ci_check_summary`` used to compute client-side:
 
     - not yet ``completed`` → running
-    - completed + conclusion in ``_FAILED_CONCLUSIONS`` → failed (name + first
-      URL captured)
-    - completed + any other conclusion (success / skipped / neutral) → passed
+    - completed + conclusion NOT in ``_PASSING_CONCLUSIONS`` → failed (name +
+      first URL captured); this is an allow-list (#1525), so an unrecognised
+      or synthetic ``"unknown"`` conclusion counts as failed
+    - completed + conclusion in ``_PASSING_CONCLUSIONS`` (success / skipped /
+      neutral) → passed
 
     Used to populate :class:`coord.merge_queue.PlannedMerge.ci_summary` so the
     `/board` payload carries everything the TUI renders as CI badges (#1344).
@@ -151,7 +181,7 @@ def summarize_counts(checks: list[CheckRun]) -> CiCheckSummary:
         if c.status != "completed":
             running += 1
             continue
-        if c.conclusion in _FAILED_CONCLUSIONS:
+        if _is_failing_conclusion(c.conclusion):
             failed += 1
             failed_names.append(c.name)
             url = getattr(c, "url", "") or ""

@@ -331,10 +331,12 @@ def test_board_serves_ci_from_gate_snapshot(
         name="pytest", status="completed", conclusion="failure",
         url="", run_id="1", started_at=None, completed_at=None,
     )
+    import time as _time
+
     snap = GateSnapshot(
         checks={("acme/api", 7): [failed]},
         ci_available=True,
-        refreshed_at=1.0,
+        refreshed_at=_time.time(),
     )
     monkeypatch.setattr(GateSnapshotRefresher, "snapshot", lambda self: snap)
 

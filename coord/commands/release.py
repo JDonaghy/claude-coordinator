@@ -85,7 +85,16 @@ def release_preflight_checks(repo_root: Path) -> list[str]:
 
     branch = _git(repo_root, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
     if branch != "main":
-        problems.append(f"not on main (currently on '{branch}') — check out main before releasing")
+        # #1525: this check fires by design on a `release-v*` bump branch —
+        # this command is a post-merge, pre-tag check (see the module
+        # docstring's flow), not something to run while the bump PR is still
+        # open. Spell that out here since the bare "not on main" message
+        # read as a bug the first time it fired on a release branch.
+        problems.append(
+            f"not on main (currently on '{branch}') — this is a post-merge, "
+            "pre-tag check: merge the release PR first, then `git checkout "
+            "main && git pull origin main` and re-run this from there"
+        )
 
     fetch = _git(repo_root, "fetch", "origin", "main")
     if fetch.returncode != 0:

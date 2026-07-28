@@ -64,6 +64,29 @@ class TestFailedChecks:
     def test_skipped_is_not_failed(self) -> None:
         assert failed_checks([_check("a", conclusion="skipped")]) == []
 
+    def test_neutral_is_not_failed(self) -> None:
+        assert failed_checks([_check("a", conclusion="neutral")]) == []
+
+    def test_stale_is_failed(self) -> None:
+        """#1525: allow-list, not deny-list — GitHub's `stale` conclusion
+        (superseded by a newer run) wasn't in the old deny-list at all and
+        would have silently passed."""
+        assert [c.name for c in failed_checks([_check("a", conclusion="stale")])] == ["a"]
+
+    def test_unrecognised_conclusion_is_failed(self) -> None:
+        """#1525: a conclusion this codebase has never seen (a future GitHub
+        addition, or the synthetic "unknown" ci_github.py emits on a read
+        failure) must default to blocking, not passing."""
+        assert [
+            c.name for c in failed_checks([_check("a", conclusion="something_new")])
+        ] == ["a"]
+
+    def test_in_flight_check_is_not_failed(self) -> None:
+        """A queued/running check has conclusion=None and must be classified
+        by in_flight_checks, never counted as failed here."""
+        items = [_check("a", status="in_progress", conclusion=None)]
+        assert failed_checks(items) == []
+
 
 class TestInFlightChecks:
     def test_picks_queued_and_running(self) -> None:
@@ -173,10 +196,15 @@ class TestGitHubCi:
         assert len(checks) == 3
 
     def test_handles_missing_gh(self) -> None:
+        # #1525: a read failure must fail CLOSED — a synthetic "unknown"
+        # check, not an empty list indistinguishable from "no checks
+        # configured". `failed_checks` must pick it up as a hard failure.
         store = GitHubCi()
         with patch("coord.ci_github.subprocess.run", side_effect=FileNotFoundError):
             checks = store.list_checks_for_pr("acme/api", 42)
-        assert checks == []
+        assert len(checks) == 1
+        assert checks[0].conclusion == "unknown"
+        assert failed_checks(checks) == checks
 
     def test_handles_timeout(self) -> None:
         store = GitHubCi()
@@ -185,7 +213,9 @@ class TestGitHubCi:
             side_effect=subprocess.TimeoutExpired(cmd="gh", timeout=30),
         ):
             checks = store.list_checks_for_pr("acme/api", 42)
-        assert checks == []
+        assert len(checks) == 1
+        assert checks[0].conclusion == "unknown"
+        assert failed_checks(checks) == checks
 
     def test_handles_invalid_json(self) -> None:
         store = GitHubCi()
@@ -194,7 +224,20 @@ class TestGitHubCi:
             return_value=_gh_result("not json", returncode=0),
         ):
             checks = store.list_checks_for_pr("acme/api", 42)
-        assert checks == []
+        assert len(checks) == 1
+        assert checks[0].conclusion == "unknown"
+        assert failed_checks(checks) == checks
+
+    def test_handles_non_list_json(self) -> None:
+        """Valid JSON that isn't a list (e.g. an error object) also fails closed."""
+        store = GitHubCi()
+        with patch(
+            "coord.ci_github.subprocess.run",
+            return_value=_gh_result('{"error": "rate limited"}', returncode=0),
+        ):
+            checks = store.list_checks_for_pr("acme/api", 42)
+        assert len(checks) == 1
+        assert checks[0].conclusion == "unknown"
 
     def test_cache_avoids_second_call(self) -> None:
         store = GitHubCi(cache_ttl=60.0)
@@ -308,6 +351,38 @@ class TestMergeGate:
         items = [_entry("a")]
         gh = FakeGh()
         ci = FakeCi(by_pr={100: [_check("ci", conclusion="failure")]})
+        process(items, gh, ci_store=ci, force_merge=True)
+        assert gh.merge_calls == [(100, "rebase")]
+        assert items[0].state == MERGED
+
+    def test_unreadable_ci_blocks_merge(self) -> None:
+        """#1525 regression: a CI read that failed (represented here the same
+        way GitHubCi._fetch represents it — a synthetic "unknown" check) must
+        refuse to merge, exactly like a real CI failure."""
+        items = [_entry("a")]
+        gh = FakeGh()
+        ci = FakeCi(by_pr={100: [_check("ci", conclusion="unknown")]})
+        events = process(items, gh, ci_store=ci)
+        assert gh.merge_calls == []
+        assert items[0].state == PENDING
+        kinds = [e.kind for e in events]
+        assert "checks_failed" in kinds
+
+    def test_cancelled_check_blocks_merge(self) -> None:
+        """#1525 regression: CANCELLED (e.g. a fail-fast sibling of a real
+        failure) must refuse to merge without --force-merge."""
+        items = [_entry("a")]
+        gh = FakeGh()
+        ci = FakeCi(by_pr={100: [_check("ci", conclusion="cancelled")]})
+        events = process(items, gh, ci_store=ci)
+        assert gh.merge_calls == []
+        kinds = [e.kind for e in events]
+        assert "checks_failed" in kinds
+
+    def test_force_merge_overrides_unreadable_ci(self) -> None:
+        items = [_entry("a")]
+        gh = FakeGh()
+        ci = FakeCi(by_pr={100: [_check("ci", conclusion="unknown")]})
         process(items, gh, ci_store=ci, force_merge=True)
         assert gh.merge_calls == [(100, "rebase")]
         assert items[0].state == MERGED
