@@ -343,6 +343,106 @@ def test_merge_entry_falls_back_to_the_raw_queue_and_upcases_state():
     assert state.merge_aid == "w0"
 
 
+def test_needs_attention_plan_entry_recovers_a_retryable_conflict_from_the_raw_queue():
+    """#1505 review fix: `merge_queue.plan()` collapses CONFLICT into
+    NEEDS_ATTENTION for display, and `merge_plan` is what a normal
+    daemon-backed `/board` build actually populates. Without cross-checking
+    the raw queue row, `_decide_merge` would see NEEDS_ATTENTION for a
+    fresh, still-auto-fixable conflict and escalate on the first poll
+    instead of retrying — defeating #1474's auto-rebase/conflict-fix path.
+    """
+    payload = {
+        "assignments": [row(assignment_id="w1")],
+        "merge_plan": [
+            {
+                "repo_name": REPO,
+                "issue_number": 1392,
+                "status": "NEEDS_ATTENTION",
+                "assignment_id": "w1",
+            }
+        ],
+        "merge_queue": [
+            {
+                "repo_name": REPO,
+                "issue_number": 1392,
+                "state": "conflict",
+                "error": "rebase failed",
+                "assignment_id": "w1",
+            }
+        ],
+    }
+    state = project(payload, REPO, 1392, make_config())
+    assert state.merge_status == "CONFLICT"
+    assert state.merge_reason == "rebase failed"
+
+
+@pytest.mark.parametrize("raw_state", ["human_required", "skipped"])
+def test_needs_attention_plan_entry_stays_terminal_for_genuinely_terminal_raw_states(
+    raw_state,
+):
+    payload = {
+        "assignments": [row(assignment_id="w1")],
+        "merge_plan": [
+            {
+                "repo_name": REPO,
+                "issue_number": 1392,
+                "status": "NEEDS_ATTENTION",
+                "assignment_id": "w1",
+            }
+        ],
+        "merge_queue": [
+            {
+                "repo_name": REPO,
+                "issue_number": 1392,
+                "state": raw_state,
+                "assignment_id": "w1",
+            }
+        ],
+    }
+    state = project(payload, REPO, 1392, make_config())
+    assert state.merge_status == raw_state.upper()
+
+
+def test_needs_attention_plan_entry_with_no_raw_queue_row_stays_needs_attention():
+    """No raw row to cross-check against (e.g. it aged out) — fail safe by
+    keeping the terminal-looking status rather than guessing retryable."""
+    payload = {
+        "assignments": [row(assignment_id="w1")],
+        "merge_plan": [
+            {
+                "repo_name": REPO,
+                "issue_number": 1392,
+                "status": "NEEDS_ATTENTION",
+                "assignment_id": "w1",
+            }
+        ],
+    }
+    state = project(payload, REPO, 1392, make_config())
+    assert state.merge_status == "NEEDS_ATTENTION"
+
+
+def test_merge_plan_entry_reconstructs_pr_url_from_repo_github_and_pr_number():
+    """`PlannedMerge` (what real `merge_plan` payload entries serialize from)
+    carries `pr_number`, not a URL — the escalation record's proposed `gh pr
+    merge <n> --rebase` command needs a concrete number, so this must not
+    silently drop it just because the plan path lacks a `pr_url` field."""
+    payload = {
+        "assignments": [row(assignment_id="w1")],
+        "merge_plan": [
+            {
+                "repo_name": REPO,
+                "issue_number": 1392,
+                "status": "NEEDS_ATTENTION",
+                "assignment_id": "w1",
+                "repo_github": "john/claude-coordinator",
+                "pr_number": 1496,
+            }
+        ],
+    }
+    state = project(payload, REPO, 1392, make_config())
+    assert state.merge_pr_url == "https://github.com/john/claude-coordinator/pull/1496"
+
+
 # ── pick_machine ─────────────────────────────────────────────────────────────
 
 
