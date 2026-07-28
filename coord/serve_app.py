@@ -1253,6 +1253,116 @@ def _milestone_drain_tick(config: Config) -> list:
     return outcomes
 
 
+def _milestone_progress_tick(config: Config) -> list[str]:
+    """Refresh the `## Progress` section of every actively-registered
+    milestone's tracking issue — #1412 deliverable 2.
+
+    Shares its registry (``list_milestone_drains`` — populated by a
+    non-dry-run ``coord milestone dispatch``) with :func:`_milestone_drain_tick`,
+    but is deliberately **not** gated on ``config.milestone.auto_dispatch``:
+    this only reads the tracking issue + a live :func:`~coord.milestone_order.
+    ready_frontier` and splices a separate, clearly-labelled-as-generated
+    `## Progress` section into the body (:func:`~coord.milestone_order.
+    replace_progress_section`) — it never dispatches work, so there is no
+    dispatch-safety reason to leave it off. An operator can therefore watch
+    an epic's live per-item status update on GitHub even with auto-dispatch
+    switched off, per #1412's acceptance criteria.
+
+    Uses the same shared :class:`~coord.models.Board` snapshot per tick as
+    :func:`_milestone_drain_tick` (board reads are the only per-milestone
+    live input besides the tracking-issue fetch itself). Idempotent per
+    milestone — :func:`~coord.milestone_order.parse_progress` on the
+    existing body is compared against the freshly computed statuses before
+    writing, so a tick where nothing changed touches no GitHub state at all
+    (not even the timestamp). A per-milestone fetch/parse/write error must
+    not silence the others — caught and logged per entry, mirroring
+    :func:`_milestone_drain_tick`. Returns the ``"repo_name#tracking_issue"``
+    label of every milestone whose `## Progress` section was actually
+    rewritten this tick (empty when every registered milestone was already
+    up to date or none are registered).
+    """
+    import logging  # noqa: PLC0415
+    from datetime import datetime, timezone  # noqa: PLC0415
+
+    from coord import github_ops  # noqa: PLC0415
+    from coord import milestone_dispatch as md  # noqa: PLC0415
+    from coord.milestone_order import (  # noqa: PLC0415
+        compute_progress,
+        parse_progress,
+        ready_frontier,
+        render_progress,
+        replace_progress_section,
+    )
+    from coord.state import build_board, list_milestone_drains  # noqa: PLC0415
+
+    log = logging.getLogger("coord.serve")
+
+    drains = list_milestone_drains()
+    if not drains:
+        return []
+
+    board = build_board()
+    updated: list[str] = []
+    for entry in drains:
+        repo_name = entry.get("repo_name")
+        tracking_issue = entry.get("tracking_issue")
+        repo_cfg = config.repo(repo_name) if repo_name else None
+        if repo_cfg is None or tracking_issue is None:
+            # Malformed/unknown-repo entries are dropped by
+            # _milestone_drain_tick — nothing more to do here.
+            continue
+
+        try:
+            ctx = md.fetch_milestone_context(repo_cfg, tracking_issue)
+        except md.MilestoneDispatchError as e:
+            log.warning(
+                "milestone-progress: %s #%d fetch failed: %s",
+                repo_name, tracking_issue, e,
+            )
+            continue
+
+        if not ctx.work_order.nodes:
+            continue
+
+        frontier = ready_frontier(
+            ctx.work_order,
+            board,
+            repo_name=repo_cfg.name,
+            repo_github=repo_cfg.github,
+            terminal_issues=set(ctx.terminal_issues),
+        )
+        statuses = compute_progress(ctx.work_order, frontier, ctx.terminal_issues)
+
+        try:
+            issue_data = github_ops.get_issue(repo_cfg.github, tracking_issue)
+        except RuntimeError as e:
+            log.warning(
+                "milestone-progress: %s #%d could not fetch body: %s",
+                repo_name, tracking_issue, e,
+            )
+            continue
+
+        old_body = issue_data.get("body") or ""
+        if parse_progress(old_body) == statuses:
+            continue  # already up to date — no-op, not even the timestamp
+
+        generated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        new_block = render_progress(statuses, generated_at=generated_at)
+        candidate_body = replace_progress_section(old_body, new_block)
+        try:
+            github_ops.update_issue_body(repo_cfg.github, tracking_issue, candidate_body)
+        except RuntimeError as e:
+            log.warning(
+                "milestone-progress: %s #%d write failed: %s",
+                repo_name, tracking_issue, e,
+            )
+            continue
+
+        updated.append(f"{repo_name}#{tracking_issue}")
+
+    return updated
+
+
 def _board_response_schema(components: dict) -> dict:
     """#757: the `GET /board` response schema, built straight from the live
     (migrated) SQLite DDL — not a dataclass. Per
@@ -4981,6 +5091,27 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                                 )
                     except Exception:  # noqa: BLE001
                         log.warning("milestone-drain tick failed", exc_info=True)
+                # Step 3c: #1412 — refresh the `## Progress` section of every
+                # actively-registered milestone's tracking issue on the same
+                # cadence as the drain above. Deliberately NOT gated on
+                # config.milestone.auto_dispatch: this is a read-only status
+                # projection (parses the tracking issue + a live
+                # ready_frontier, splices a separate `## Progress` section),
+                # never a dispatch, so an operator can watch an epic's live
+                # per-item status on GitHub even with auto-dispatch left off.
+                # Independent try/except so a progress-sync failure never
+                # silences the other tick steps.
+                try:
+                    progress_updated = await run_in_threadpool(
+                        _milestone_progress_tick, config
+                    )
+                    if progress_updated:
+                        log.info(
+                            "milestone-progress: refreshed `## Progress` for %s",
+                            ", ".join(progress_updated),
+                        )
+                except Exception:  # noqa: BLE001
+                    log.warning("milestone-progress tick failed", exc_info=True)
                 # Step 4: #762 archival sweep on a slow cadence (default hourly).
                 # Independent try/except — a sweep failure must never crash the
                 # daemon or silence the reconcile/enqueue steps above.

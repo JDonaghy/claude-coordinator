@@ -980,6 +980,165 @@ class TestMilestoneSyncCmd:
         assert "unknown repo" in result.output
 
 
+# ── `coord milestone sync-progress` (#1412 deliverable 2) ──────────────────
+
+
+class TestMilestoneSyncProgressCmd:
+    def test_writes_progress_section_from_live_state(self, config_file: Path) -> None:
+        tracking_body = (
+            "Milestone plan.\n\n"
+            "## Work order\n"
+            "- #762  {group: A}\n"
+            "- #765  {after: #762}\n"
+        )
+
+        def get_issue(repo, number):
+            return _get_issue(repo, number, bodies={100: tracking_body}, states={762: "CLOSED"})
+
+        open_issues = [{"number": 765, "milestone": {"number": 9}}]
+        with patch("coord.github_ops.get_issue", side_effect=get_issue), \
+             patch("coord.github_ops.get_open_issues", return_value=open_issues), \
+             patch("coord.board_service.read_board", return_value=Board()), \
+             patch("coord.github_ops.update_issue_body") as mock_update:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "sync-progress", "api", "100", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        assert "[done] #762" in result.output
+        assert "[ready] #765" in result.output
+        mock_update.assert_called_once()
+        call_repo, call_issue, call_body = mock_update.call_args[0]
+        assert call_repo == "acme/api"
+        assert call_issue == 100
+
+        from coord.milestone_order import ProgressStatus, parse_progress, parse_work_order
+
+        statuses = parse_progress(call_body)
+        assert statuses == (
+            ProgressStatus(762, "done", "A"),
+            ProgressStatus(765, "ready"),
+        )
+        # `## Work order` is byte-identical — the write path never touches it.
+        assert "## Work order\n- #762  {group: A}\n- #765  {after: #762}\n" in call_body
+        assert parse_work_order(call_body) == parse_work_order(tracking_body)
+
+    def test_unchanged_state_is_a_full_noop(self, config_file: Path) -> None:
+        from coord.milestone_order import (
+            compute_progress,
+            parse_work_order,
+            ready_frontier,
+            render_progress,
+            replace_progress_section,
+        )
+
+        wo = parse_work_order(TRACKING_BODY)
+        frontier = ready_frontier(
+            wo, Board(), repo_name="api", repo_github="acme/api", terminal_issues=set(),
+        )
+        statuses = compute_progress(wo, frontier, set())
+        rendered = render_progress(statuses, generated_at="2020-01-01T00:00:00Z")
+        tracking_body = replace_progress_section(TRACKING_BODY, rendered)
+
+        def get_issue(repo, number):
+            return _get_issue(repo, number, bodies={100: tracking_body})
+
+        open_issues = [
+            {"number": 762, "milestone": {"number": 9}},
+            {"number": 763, "milestone": {"number": 9}},
+            {"number": 765, "milestone": {"number": 9}},
+        ]
+        with patch("coord.github_ops.get_issue", side_effect=get_issue), \
+             patch("coord.github_ops.get_open_issues", return_value=open_issues), \
+             patch("coord.board_service.read_board", return_value=Board()), \
+             patch("coord.github_ops.update_issue_body") as mock_update:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "sync-progress", "api", "100", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        assert "no-op" in result.output
+        mock_update.assert_not_called()
+
+    def test_dry_run_does_not_write(self, config_file: Path) -> None:
+        def get_issue(repo, number):
+            return _get_issue(repo, number)
+
+        open_issues = [
+            {"number": 762, "milestone": {"number": 9}},
+            {"number": 763, "milestone": {"number": 9}},
+            {"number": 765, "milestone": {"number": 9}},
+        ]
+        with patch("coord.github_ops.get_issue", side_effect=get_issue), \
+             patch("coord.github_ops.get_open_issues", return_value=open_issues), \
+             patch("coord.board_service.read_board", return_value=Board()), \
+             patch("coord.github_ops.update_issue_body") as mock_update:
+            result = CliRunner().invoke(
+                main,
+                [
+                    "milestone", "sync-progress", "api", "100",
+                    "--dry-run", "--config", str(config_file),
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        assert "would update" in result.output
+        mock_update.assert_not_called()
+
+    def test_composes_with_a_coexisting_sub_issues_section(self, config_file: Path) -> None:
+        """#1412 acceptance: a test covers the sync against a body carrying
+        both `## Work order` and a legacy `## Sub-issues` section — neither
+        is disturbed by the progress splice."""
+        tracking_body = (
+            "## Work order\n"
+            "- #762  {group: A}\n\n"
+            "## Sub-issues\n"
+            "- [ ] #762\n"
+        )
+
+        def get_issue(repo, number):
+            return _get_issue(repo, number, bodies={100: tracking_body}, states={762: "CLOSED"})
+
+        with patch("coord.github_ops.get_issue", side_effect=get_issue), \
+             patch("coord.github_ops.get_open_issues", return_value=[]), \
+             patch("coord.board_service.read_board", return_value=Board()), \
+             patch("coord.github_ops.update_issue_body") as mock_update:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "sync-progress", "api", "100", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        mock_update.assert_called_once()
+        _repo, _issue, call_body = mock_update.call_args[0]
+        assert "## Sub-issues\n- [ ] #762\n" in call_body
+        assert "## Work order\n- #762  {group: A}\n" in call_body
+        assert "## Progress" in call_body
+
+    def test_no_work_order_block_reports_and_exits_zero(self, config_file: Path) -> None:
+        def get_issue(repo, number):
+            return {
+                "number": number, "title": "t", "body": "just prose, no work order",
+                "state": "OPEN", "milestone": {"number": 9, "title": "M"},
+            }
+
+        with patch("coord.github_ops.get_issue", side_effect=get_issue), \
+             patch("coord.github_ops.update_issue_body") as mock_update:
+            result = CliRunner().invoke(
+                main,
+                ["milestone", "sync-progress", "api", "100", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        assert "nothing to report progress on" in result.output
+        mock_update.assert_not_called()
+
+    def test_unknown_repo_errors(self, config_file: Path) -> None:
+        result = CliRunner().invoke(
+            main,
+            ["milestone", "sync-progress", "nope", "100", "--config", str(config_file)],
+        )
+        assert result.exit_code == 2
+        assert "unknown repo" in result.output
+
+
 # ── `coord milestone chat --new` (#1009 brand-new-milestone dispatch) ───────
 
 
