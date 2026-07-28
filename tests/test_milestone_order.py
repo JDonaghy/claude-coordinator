@@ -13,15 +13,20 @@ import pytest
 
 from coord.milestone_order import (
     Frontier,
+    ProgressStatus,
     WorkOrder,
     WorkOrderError,
     WorkOrderNode,
+    compute_progress,
+    parse_progress,
     parse_sub_issues,
     parse_work_order,
     ready_frontier,
     remove_sub_issues_section,
+    render_progress,
     render_sub_issues,
     render_work_order,
+    replace_progress_section,
     replace_sub_issues_section,
     replace_work_order_section,
     validate_milestone_membership,
@@ -618,3 +623,190 @@ class TestRemoveSubIssuesSection:
         body = "Epic intro.\n\n## Sub-issues\n- [ ] #1050\n"
         new_body = remove_sub_issues_section(body)
         assert new_body == "Epic intro.\n"
+
+
+# ── compute_progress / render_progress / parse_progress / ─────────────────
+# replace_progress_section (#1412 deliverable 2) ────────────────────────────
+#
+# `## Progress` is derived, never hand-authored, so the acceptance bar is
+# different from the checklist sections above: it must (1) agree with
+# exactly what `coord milestone order` would print right now (no second
+# readiness notion), (2) round-trip through parse_progress for the
+# idempotent-no-op check, and (3) never disturb a coexisting `## Work
+# order` / `## Sub-issues` section.
+
+
+def _board() -> Board:
+    return Board()
+
+
+class TestComputeProgress:
+    def test_terminal_node_is_done(self) -> None:
+        wo = parse_work_order("## Work order\n- #1\n")
+        frontier = ready_frontier(
+            wo, _board(), repo_name="api", repo_github="acme/api",
+            terminal_issues={1},
+        )
+        statuses = compute_progress(wo, frontier, {1})
+        assert statuses == (ProgressStatus(1, "done", None, None),)
+
+    def test_unblocked_node_is_ready(self) -> None:
+        wo = parse_work_order("## Work order\n- #1  {group: A}\n")
+        frontier = ready_frontier(
+            wo, _board(), repo_name="api", repo_github="acme/api",
+            terminal_issues=set(),
+        )
+        statuses = compute_progress(wo, frontier, set())
+        assert statuses == (ProgressStatus(1, "ready", "A", None),)
+
+    def test_dependency_wait_is_blocked_with_reason(self) -> None:
+        wo = parse_work_order("## Work order\n- #1\n- #2  {after: #1}\n")
+        frontier = ready_frontier(
+            wo, _board(), repo_name="api", repo_github="acme/api",
+            terminal_issues=set(),
+        )
+        statuses = compute_progress(wo, frontier, set())
+        assert statuses[0] == ProgressStatus(1, "ready", None, None)
+        assert statuses[1] == ProgressStatus(2, "blocked", None, "waiting on #1")
+
+    def test_claimed_node_is_blocked_with_claim_reason(self) -> None:
+        wo = parse_work_order("## Work order\n- #1\n")
+        board = Board(active=[_active(issue=1)])
+        frontier = ready_frontier(
+            wo, board, repo_name="api", repo_github="acme/api",
+            terminal_issues=set(),
+        )
+        statuses = compute_progress(wo, frontier, set())
+        assert statuses[0].status == "blocked"
+        assert "claimed" in statuses[0].detail
+
+    def test_preserves_declared_order_including_terminal_nodes(self) -> None:
+        wo = parse_work_order(SAMPLE_BODY)
+        frontier = ready_frontier(
+            wo, _board(), repo_name="api", repo_github="acme/api",
+            terminal_issues={762, 763},
+        )
+        statuses = compute_progress(wo, frontier, {762, 763})
+        assert [s.issue_number for s in statuses] == [762, 763, 765, 766, 767]
+        assert statuses[0].status == "done" and statuses[1].status == "done"
+
+
+class TestRenderProgress:
+    def test_round_trips_through_parse_progress(self) -> None:
+        wo = parse_work_order(SAMPLE_BODY)
+        frontier = ready_frontier(
+            wo, _board(), repo_name="api", repo_github="acme/api",
+            terminal_issues={762, 763},
+        )
+        statuses = compute_progress(wo, frontier, {762, 763})
+        rendered = render_progress(statuses, generated_at="2026-07-28T00:00:00Z")
+        reparsed = parse_progress("## Progress\n" + rendered)
+        assert reparsed == statuses
+
+    def test_includes_the_generated_at_timestamp(self) -> None:
+        statuses = (ProgressStatus(1, "done"),)
+        rendered = render_progress(statuses, generated_at="2026-07-28T00:00:00Z")
+        assert "2026-07-28T00:00:00Z" in rendered
+
+    def test_includes_a_summary_line(self) -> None:
+        statuses = (
+            ProgressStatus(1, "done"),
+            ProgressStatus(2, "ready"),
+            ProgressStatus(3, "blocked", detail="waiting on #2"),
+        )
+        rendered = render_progress(statuses, generated_at="X")
+        assert "1/3 done" in rendered
+        assert "1 ready" in rendered
+        assert "1 blocked" in rendered
+
+    def test_empty_statuses_renders_no_summary(self) -> None:
+        rendered = render_progress((), generated_at="X")
+        assert "done" not in rendered.split("\n\n")[-1]
+
+    def test_renders_group_annotation(self) -> None:
+        rendered = render_progress(
+            (ProgressStatus(1, "ready", group="A"),), generated_at="X"
+        )
+        assert "- [ready] #1 (group A)" in rendered
+
+
+class TestParseProgress:
+    def test_no_heading_returns_empty(self) -> None:
+        assert parse_progress("just prose, no progress section") == ()
+
+    def test_ignores_generated_by_note_and_summary_line(self) -> None:
+        body = (
+            "## Progress\n"
+            "_Generated by `coord milestone sync-progress` ... ._\n\n"
+            "- [done] #1\n\n"
+            "**1/1 done** · 0 ready · 0 blocked\n"
+        )
+        assert parse_progress(body) == (ProgressStatus(1, "done"),)
+
+    def test_stops_at_next_heading(self) -> None:
+        body = "## Progress\n- [done] #1\n\n## Refs\n- [ ] #999\n"
+        statuses = parse_progress(body)
+        assert statuses == (ProgressStatus(1, "done"),)
+
+    def test_does_not_pick_up_a_work_order_block(self) -> None:
+        assert parse_progress(SAMPLE_BODY) == ()
+
+
+class TestReplaceProgressSection:
+    def test_appends_when_absent(self) -> None:
+        body = "Epic intro.\n\n## Work order\n- #1\n"
+        new_body = replace_progress_section(body, "- [done] #1")
+        assert "## Progress\n- [done] #1" in new_body
+        # `## Work order` is untouched, byte for byte.
+        assert "## Work order\n- #1\n" in new_body
+
+    def test_is_idempotent(self) -> None:
+        body = "## Progress\n- [done] #1\n"
+        once = replace_progress_section(body, "- [done] #1")
+        twice = replace_progress_section(once, "- [done] #1")
+        assert once == twice
+
+    def test_replaces_existing_section_in_place(self) -> None:
+        body = "## Progress\n- [ready] #1\n\n## Refs\nkept\n"
+        new_body = replace_progress_section(body, "- [done] #1")
+        assert "## Refs\nkept" in new_body
+        assert parse_progress(new_body) == (ProgressStatus(1, "done"),)
+        assert new_body.count("## Progress") == 1
+
+    def test_never_disturbs_a_coexisting_work_order_or_sub_issues_section(
+        self,
+    ) -> None:
+        """The #1412 acceptance bar: `## Work order` (and, transitionally,
+        `## Sub-issues`) must be byte-identical before and after a progress
+        sync, no matter where `## Progress` ends up being spliced."""
+        body = (
+            "Epic intro.\n\n"
+            "## Work order\n"
+            "- #762  {group: A}\n"
+            "- #765  {after: #762}\n\n"
+            "## Sub-issues\n"
+            "- [ ] #762\n"
+            "- [ ] #765\n\n"
+            "## Refs\n"
+            "some refs\n"
+        )
+        wo = parse_work_order(body)
+        frontier = ready_frontier(
+            wo, _board(), repo_name="api", repo_github="acme/api",
+            terminal_issues={762},
+        )
+        statuses = compute_progress(wo, frontier, {762})
+        rendered = render_progress(statuses, generated_at="X")
+        new_body = replace_progress_section(body, rendered)
+
+        work_order_block = new_body.split("## Work order\n")[1].split("\n\n")[0]
+        assert work_order_block == "- #762  {group: A}\n- #765  {after: #762}"
+        assert parse_work_order(new_body) == wo
+        assert parse_sub_issues(new_body) == parse_sub_issues(body)
+        assert "## Refs\nsome refs" in new_body
+        assert "## Progress" in new_body
+
+        # Re-running with the same statuses is a no-op — no duplicate
+        # `## Progress` section, no further churn.
+        again = replace_progress_section(new_body, rendered)
+        assert again == new_body

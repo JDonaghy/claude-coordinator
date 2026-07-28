@@ -4815,6 +4815,193 @@ def test_milestone_drain_tick_fetch_error_does_not_deregister(
     assert state.list_milestone_drains() == [{"repo_name": "api", "tracking_issue": 100}]
 
 
+# ── #1412 deliverable 2: _milestone_progress_tick ────────────────────────────
+
+
+def test_milestone_progress_tick_noop_when_no_registrations(
+    tmp_path: "Path", rw_db
+) -> None:
+    from coord.serve_app import _milestone_progress_tick
+
+    cfg = load_config(_make_milestone_config(tmp_path))
+    assert _milestone_progress_tick(cfg) == []
+
+
+def test_milestone_progress_tick_writes_progress_section(
+    tmp_path: "Path", rw_db, monkeypatch
+) -> None:
+    """A registered milestone with one terminal and one ready node gets a
+    freshly-rendered `## Progress` section spliced into its tracking-issue
+    body — never touching `## Work order`."""
+    from coord import state
+    from coord.milestone_order import ProgressStatus, parse_progress, parse_work_order
+    from coord.serve_app import _milestone_progress_tick
+
+    state.register_milestone_drain(repo_name="api", tracking_issue=100)
+
+    tracking_body = (
+        "## Work order\n"
+        "- #762  {group: A}\n"
+        "- #765  {after: #762}\n"
+    )
+
+    def get_issue(repo, number):
+        if number == 100:
+            return {
+                "number": 100, "title": "tracking", "body": tracking_body,
+                "state": "OPEN", "milestone": {"number": 9},
+            }
+        return {
+            "number": number, "title": "the work", "body": "",
+            "state": "CLOSED" if number == 762 else "OPEN",
+            "milestone": {"number": 9}, "labels": [],
+        }
+
+    monkeypatch.setattr("coord.github_ops.get_issue", get_issue)
+    monkeypatch.setattr(
+        "coord.github_ops.get_open_issues",
+        lambda repo: [{"number": 765, "milestone": {"number": 9}}],
+    )
+    updates: list = []
+    monkeypatch.setattr(
+        "coord.github_ops.update_issue_body",
+        lambda repo, issue, body: updates.append((repo, issue, body)),
+    )
+
+    cfg = load_config(_make_milestone_config(tmp_path, auto_dispatch=False))
+    updated = _milestone_progress_tick(cfg)
+
+    assert updated == ["api#100"]
+    assert len(updates) == 1
+    call_repo, call_issue, call_body = updates[0]
+    assert call_repo == "acme/api"
+    assert call_issue == 100
+    assert parse_progress(call_body) == (
+        ProgressStatus(762, "done", "A"),
+        ProgressStatus(765, "ready"),
+    )
+    assert parse_work_order(call_body) == parse_work_order(tracking_body)
+
+
+def test_milestone_progress_tick_unchanged_state_is_a_noop(
+    tmp_path: "Path", rw_db, monkeypatch
+) -> None:
+    """Re-running against a body whose `## Progress` already matches live
+    state must not touch GitHub at all — not even the timestamp."""
+    from coord import state
+    from coord.milestone_order import (
+        compute_progress,
+        parse_work_order,
+        ready_frontier,
+        render_progress,
+        replace_progress_section,
+    )
+    from coord.models import Board
+    from coord.serve_app import _milestone_progress_tick
+
+    state.register_milestone_drain(repo_name="api", tracking_issue=100)
+
+    base_body = "## Work order\n- #762\n"
+    wo = parse_work_order(base_body)
+    frontier = ready_frontier(
+        wo, Board(), repo_name="api", repo_github="acme/api", terminal_issues=set(),
+    )
+    statuses = compute_progress(wo, frontier, set())
+    tracking_body = replace_progress_section(
+        base_body, render_progress(statuses, generated_at="2020-01-01T00:00:00Z")
+    )
+
+    def get_issue(repo, number):
+        if number == 100:
+            return {
+                "number": 100, "title": "tracking", "body": tracking_body,
+                "state": "OPEN", "milestone": {"number": 9},
+            }
+        return {
+            "number": number, "title": "the work", "body": "", "state": "OPEN",
+            "milestone": {"number": 9}, "labels": [],
+        }
+
+    monkeypatch.setattr("coord.github_ops.get_issue", get_issue)
+    monkeypatch.setattr(
+        "coord.github_ops.get_open_issues",
+        lambda repo: [{"number": 762, "milestone": {"number": 9}}],
+    )
+    monkeypatch.setattr(
+        "coord.github_ops.update_issue_body",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not write")),
+    )
+
+    cfg = load_config(_make_milestone_config(tmp_path))
+    updated = _milestone_progress_tick(cfg)
+
+    assert updated == []
+
+
+def test_milestone_progress_tick_runs_even_when_auto_dispatch_is_off(
+    tmp_path: "Path", rw_db, monkeypatch
+) -> None:
+    """#1412: refreshing an epic's status is read-only and must not be
+    gated on milestone.auto_dispatch — an operator can watch live status
+    without opting into auto-dispatch."""
+    from coord import state
+    from coord.serve_app import _milestone_progress_tick
+
+    state.register_milestone_drain(repo_name="api", tracking_issue=100)
+
+    def get_issue(repo, number):
+        if number == 100:
+            return {
+                "number": 100, "title": "tracking", "body": "## Work order\n- #762\n",
+                "state": "OPEN", "milestone": {"number": 9},
+            }
+        return {
+            "number": number, "title": "the work", "body": "", "state": "OPEN",
+            "milestone": {"number": 9}, "labels": [],
+        }
+
+    monkeypatch.setattr("coord.github_ops.get_issue", get_issue)
+    monkeypatch.setattr(
+        "coord.github_ops.get_open_issues",
+        lambda repo: [{"number": 762, "milestone": {"number": 9}}],
+    )
+    updates: list = []
+    monkeypatch.setattr(
+        "coord.github_ops.update_issue_body",
+        lambda repo, issue, body: updates.append((repo, issue, body)),
+    )
+
+    cfg = load_config(_make_milestone_config(tmp_path, auto_dispatch=False))
+    assert cfg.milestone.auto_dispatch is False
+    updated = _milestone_progress_tick(cfg)
+
+    assert updated == ["api#100"]
+    assert len(updates) == 1
+
+
+def test_milestone_progress_tick_fetch_error_does_not_crash_other_entries(
+    tmp_path: "Path", rw_db, monkeypatch
+) -> None:
+    """A per-milestone fetch error must not silence progress-sync for the
+    other registered milestones (mirrors _milestone_drain_tick's isolation)."""
+    from coord import state
+    from coord.serve_app import _milestone_progress_tick
+
+    state.register_milestone_drain(repo_name="api", tracking_issue=100)
+    monkeypatch.setattr(
+        "coord.github_ops.get_issue",
+        lambda repo, number: (_ for _ in ()).throw(RuntimeError("rate limited")),
+    )
+
+    cfg = load_config(_make_milestone_config(tmp_path))
+    updated = _milestone_progress_tick(cfg)
+
+    assert updated == []
+    # Fetch failures don't deregister — the milestone stays registered for
+    # the next tick's retry, same posture as _milestone_drain_tick.
+    assert state.list_milestone_drains() == [{"repo_name": "api", "tracking_issue": 100}]
+
+
 def test_serve_milestone_drain_registers_row(
     file_db: Path, valid_config_path: Path, rw_db
 ):

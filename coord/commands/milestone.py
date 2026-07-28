@@ -35,11 +35,15 @@ from coord.milestone_order import (
     WorkOrder,
     WorkOrderError,
     WorkOrderNode,
+    compute_progress,
+    parse_progress,
     parse_sub_issues,
     parse_work_order,
     remove_sub_issues_section,
+    render_progress,
     render_sub_issues,
     render_work_order,
+    replace_progress_section,
     replace_sub_issues_section,
     replace_work_order_section,
     validate_milestone_membership,
@@ -601,6 +605,104 @@ def milestone_sync_cmd(repo: str, epic: int, dry_run: bool, config_path: Path) -
 
     if failed:
         sys.exit(1)
+
+
+@milestone_group.command(
+    "sync-progress",
+    help=(
+        "#1412 deliverable 2: render live per-item status into a separate "
+        "`## Progress` section of an epic's tracking-issue body — `## Work "
+        "order` (and, transitionally, `## Sub-issues`) are never touched. "
+        "REPO is the local repo name from coordinator.yml; TRACKING_ISSUE "
+        "is the GH issue number of the tracking issue.\n\n"
+        "Derives each node's status from exactly the same live inputs "
+        "`coord milestone order` already prints (terminal state + the "
+        "current ready frontier) — never a second notion of readiness. "
+        "Idempotent: a fresh run whose computed statuses match what's "
+        "already in `## Progress` is a no-op (not even the timestamp is "
+        "touched), so this is safe to run on a timer — the daemon tick "
+        "does exactly that for every milestone registered via a "
+        "non-dry-run `coord milestone dispatch`, regardless of whether "
+        "`milestone.auto_dispatch` is enabled (this command dispatches "
+        "nothing, so there's no reason to gate it on that flag)."
+    ),
+)
+@click.argument("repo")
+@click.argument("tracking_issue", type=int)
+@click.option(
+    "--dry-run", is_flag=True,
+    help="Show the computed status without writing anything.",
+)
+@_CONFIG_OPTION
+def milestone_sync_progress_cmd(
+    repo: str, tracking_issue: int, dry_run: bool, config_path: Path
+) -> None:
+    cfg = _load_config(config_path)
+    repo_entry = cfg.repo(repo)
+    if repo_entry is None:
+        click.echo(f"error: unknown repo {repo!r}", err=True)
+        sys.exit(2)
+
+    from coord import board_service, github_ops
+    from coord.milestone_order import ready_frontier
+
+    try:
+        ctx = fetch_milestone_context(repo_entry, tracking_issue)
+    except MilestoneDispatchError as e:
+        click.echo(f"error: {e}", err=True)
+        sys.exit(1)
+
+    if not ctx.work_order.nodes:
+        click.echo(
+            f"#{tracking_issue}: no `## Work order` block found — nothing to "
+            "report progress on"
+        )
+        return
+
+    board = board_service.read_board()
+    frontier = ready_frontier(
+        ctx.work_order,
+        board,
+        repo_name=repo_entry.name,
+        repo_github=repo_entry.github,
+        terminal_issues=set(ctx.terminal_issues),
+    )
+    statuses = compute_progress(ctx.work_order, frontier, ctx.terminal_issues)
+
+    try:
+        issue_data = github_ops.get_issue(repo_entry.github, tracking_issue)
+    except RuntimeError as e:
+        click.echo(f"error: could not fetch #{tracking_issue}: {e}", err=True)
+        sys.exit(1)
+    old_body = issue_data.get("body") or ""
+
+    click.echo(
+        f"Progress for #{tracking_issue} (milestone #{ctx.milestone_number}):"
+    )
+    for s in statuses:
+        bits = [f"[{s.status}]", f"#{s.issue_number}"]
+        if s.group:
+            bits.append(f"(group {s.group})")
+        line = "  " + " ".join(bits)
+        if s.detail:
+            line += f" — {s.detail}"
+        click.echo(line)
+
+    if parse_progress(old_body) == statuses:
+        click.echo("`## Progress` already up to date (no-op)")
+        return
+
+    if dry_run:
+        click.echo("(dry run — would update `## Progress`)")
+        return
+
+    from datetime import datetime, timezone
+
+    generated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    new_block = render_progress(statuses, generated_at=generated_at)
+    candidate_body = replace_progress_section(old_body, new_block)
+    github_ops.update_issue_body(repo_entry.github, tracking_issue, candidate_body)
+    click.echo(f"#{tracking_issue}: updated `## Progress` ({len(statuses)} item(s))")
 
 
 _DEFAULT_CAPTURE_BODY = (

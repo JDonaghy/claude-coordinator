@@ -63,13 +63,35 @@ the live GitHub sub-issues API for each referenced child
 (:mod:`coord.parentage_github`), and retires the now-redundant `##
 Sub-issues` section (:func:`remove_sub_issues_section`) — the API + `##
 Work order` together already carry everything that section did.
+
+#1412 adds a third, purely *derived* section: `## Progress`. Unlike `##
+Work order`/`## Sub-issues` (both hand-authored plans a human or a milestone
+chat session edits), `## Progress` is never edited directly — it's a
+read-only projection of live status onto the tracking-issue body, refreshed
+by ``coord milestone sync-progress`` (one-shot, operator-triggered) and the
+daemon tick (:func:`coord.serve_app._milestone_progress_tick`, for every
+milestone registered via ``coord milestone dispatch``). :func:`compute_progress`
+derives one :class:`ProgressStatus` per work-order node from exactly the
+inputs ``coord milestone order`` already prints — terminal state + a live
+:func:`ready_frontier` — so there is deliberately no second notion of
+readiness anywhere in this module; `## Progress` can only ever agree with
+what ``coord milestone order``/``dispatch`` would compute right now.
+:func:`render_progress` turns that into checklist-shaped text (a timestamp
+line + one `- [status] #N` line per node) and :func:`parse_progress` is its
+inverse, used only to detect a no-op (re-rendering identical status text
+should not touch the tracking issue, even though the timestamp itself always
+changes) — never for readiness. :func:`replace_progress_section` splices it
+in under its own `## Progress` heading, using the exact same
+splice-not-duplicate mechanics as :func:`replace_work_order_section` /
+:func:`replace_sub_issues_section`, so all three sections coexist in one
+tracking-issue body without stepping on each other.
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, Iterable
 
 from coord.claim import BranchLookup, Claim, find_work_claim
 from coord.models import Board
@@ -92,6 +114,11 @@ __all__ = [
     "BlockedNode",
     "Frontier",
     "ready_frontier",
+    "ProgressStatus",
+    "compute_progress",
+    "render_progress",
+    "parse_progress",
+    "replace_progress_section",
 ]
 
 # #645 task 5: the tracking-issue convention. A milestone's tracking issue —
@@ -594,3 +621,171 @@ def ready_frontier(
         ready.append(FrontierEntry(node.issue_number, node.group))
 
     return Frontier(ready=tuple(ready), blocked=tuple(blocked))
+
+
+# ── Progress (#1412) ─────────────────────────────────────────────────────────
+# A *derived* section, never hand-authored: `coord milestone sync-progress`
+# (one-shot) and the daemon tick (`coord.serve_app._milestone_progress_tick`,
+# every registered milestone) render it from exactly the same terminal-state +
+# `ready_frontier` inputs `coord milestone order` already prints, then splice
+# it into the tracking issue under its own `## Progress` heading — `##
+# Work order` (and, transitionally, `## Sub-issues`) are never touched.
+
+_PROGRESS_HEADING_RE = re.compile(r"^#{1,6}\s*Progress\s*$", re.IGNORECASE)
+_PROGRESS_ITEM_RE = re.compile(
+    r"^-\s*\[(?P<status>[a-zA-Z-]+)\]\s*#(?P<num>\d+)"
+    r"(?:\s*\(group\s+(?P<group>[^)]+)\))?"
+    r"(?:\s*—\s*(?P<detail>.+))?\s*$"
+)
+
+
+@dataclass(frozen=True)
+class ProgressStatus:
+    """One `## Work order` node's derived, live status (#1412).
+
+    ``status`` is one of ``"done"`` (the issue is in ``terminal_issues``),
+    ``"ready"`` (in :func:`ready_frontier`'s ``ready`` set right now), or
+    ``"blocked"`` (in its ``blocked`` set — ``detail`` carries *why*, taken
+    verbatim from :attr:`BlockedNode.reason`: waiting on a dependency,
+    claimed, or conflict-blocked). There is no fourth bucket: every
+    non-terminal node in a work order is, by construction, either ready or
+    blocked (:func:`ready_frontier` partitions its whole input that way).
+    """
+
+    issue_number: int
+    status: str
+    group: str | None = None
+    detail: str | None = None
+
+
+def compute_progress(
+    work_order: WorkOrder,
+    frontier: Frontier,
+    terminal_issues: set[int] | frozenset[int],
+) -> tuple[ProgressStatus, ...]:
+    """Derive one :class:`ProgressStatus` per *work_order* node.
+
+    Pure — takes the same ``terminal_issues`` and a *frontier* already
+    computed by :func:`ready_frontier` (which itself needs a live
+    :class:`~coord.models.Board`) rather than computing either itself, so
+    this stays exactly as easy to unit-test as the rest of the module and
+    never becomes a second place that decides what's ready. Iterates
+    ``work_order.nodes`` (not the frontier) so every declared node gets a
+    status line, in declared order, even ones the frontier dropped for
+    being terminal.
+    """
+    ready_numbers = {e.issue_number for e in frontier.ready}
+    blocked_by_number = {b.issue_number: b for b in frontier.blocked}
+    statuses: list[ProgressStatus] = []
+    for n in work_order.nodes:
+        if n.issue_number in terminal_issues:
+            statuses.append(ProgressStatus(n.issue_number, "done", n.group))
+        elif n.issue_number in ready_numbers:
+            statuses.append(ProgressStatus(n.issue_number, "ready", n.group))
+        else:
+            blocked = blocked_by_number.get(n.issue_number)
+            detail = blocked.reason if blocked is not None else "blocked"
+            statuses.append(
+                ProgressStatus(n.issue_number, "blocked", n.group, detail)
+            )
+    return tuple(statuses)
+
+
+def render_progress(statuses: Iterable[ProgressStatus], *, generated_at: str) -> str:
+    """Render *statuses* into the `## Progress` section body (no heading).
+
+    ``generated_at`` is an ISO-8601 timestamp string the caller stamps at
+    write time (kept out of this pure function's control so it's trivial to
+    assert exact output in a test) — labelled explicitly as generated so a
+    reader never mistakes this for a second hand-editable plan. One `- [done|
+    ready|blocked] #N  (group G) — detail` line per status, in the order
+    given, plus a one-line summary. :func:`parse_progress` is the inverse of
+    the per-status lines (the summary line and the generated-by note are
+    deliberately not round-tripped — they're always fully re-derived from
+    the statuses, never compared for the idempotent-no-op check).
+    """
+    statuses = tuple(statuses)
+    lines = [
+        "_Generated by `coord milestone sync-progress` from live board state "
+        f"as of {generated_at} — do not hand-edit; the plan itself lives in "
+        "`## Work order`._",
+        "",
+    ]
+    for s in statuses:
+        bits = [f"#{s.issue_number}"]
+        if s.group:
+            bits.append(f"(group {s.group})")
+        line = f"- [{s.status}] " + " ".join(bits)
+        if s.detail:
+            line += f" — {s.detail}"
+        lines.append(line)
+
+    if statuses:
+        done = sum(1 for s in statuses if s.status == "done")
+        ready = sum(1 for s in statuses if s.status == "ready")
+        blocked = sum(1 for s in statuses if s.status == "blocked")
+        lines.append("")
+        lines.append(
+            f"**{done}/{len(statuses)} done** · {ready} ready · {blocked} blocked"
+        )
+    return "\n".join(lines)
+
+
+def parse_progress(body: str) -> tuple[ProgressStatus, ...]:
+    """Parse the `## Progress` section of *body* back into status entries.
+
+    Only used to detect whether re-rendering would actually change anything
+    (the idempotent-no-op check ``coord milestone sync-progress``/the daemon
+    tick perform before writing — see the module docstring) — never for
+    readiness; that always comes from a fresh :func:`ready_frontier` call.
+    Ignores the generated-by note and the summary line (neither is a status
+    line), and — like :func:`_parse_checklist_section` — stops at the next
+    markdown heading. Returns an empty tuple when *body* has no `##
+    Progress` heading. Unlike :func:`parse_work_order`/:func:`parse_sub_issues`,
+    an unparseable line is silently skipped rather than raising: this
+    section is machine-written, never hand-authored, so a stray line here
+    is not a user error to report — worst case it's simply not compared.
+    """
+    lines = body.splitlines()
+    start = None
+    for i, line in enumerate(lines):
+        if _PROGRESS_HEADING_RE.match(line.strip()):
+            start = i + 1
+            break
+    if start is None:
+        return ()
+
+    statuses: list[ProgressStatus] = []
+    for line in lines[start:]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#"):
+            break
+        m = _PROGRESS_ITEM_RE.match(stripped)
+        if not m:
+            continue
+        statuses.append(
+            ProgressStatus(
+                issue_number=int(m.group("num")),
+                status=m.group("status"),
+                group=m.group("group"),
+                detail=m.group("detail"),
+            )
+        )
+    return tuple(statuses)
+
+
+def replace_progress_section(body: str, new_block: str) -> str:
+    """Idempotently insert/replace the `## Progress` section of *body* (#1412).
+
+    Mirrors :func:`replace_work_order_section`/:func:`replace_sub_issues_section`
+    exactly — same splice-not-duplicate semantics, keyed on a `## Progress`
+    heading — so this section coexists with `## Work order` and (during the
+    #1061 migration) `## Sub-issues` without any of the three splice helpers
+    ever touching another's region. ``new_block`` is
+    :func:`render_progress`'s output (checklist text only, no heading).
+    """
+    return _splice_checklist_section(
+        body, new_block, _PROGRESS_HEADING_RE, "## Progress"
+    )
