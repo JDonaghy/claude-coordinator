@@ -46,6 +46,20 @@ HUMAN_REQUIRED = "human_required"
 
 # ── Conflict classification ─────────────────────────────────────────────────
 
+# #1467: the specific subset of GitHub wording that means a --rebase merge
+# was refused purely because the branch contains a merge commit — a
+# *linearity* failure, not a content conflict. This distinction matters for
+# reconcile_conflict_entries: GitHub's `mergeable` field (what
+# check_pr_mergeable reads) only reflects content conflicts and happily
+# reports MERGEABLE for a branch that is clean but not rebase-able, so a
+# plain mergeable check is not evidence that a retried --rebase will
+# succeed. See is_rebase_refusal(). Defined once here and folded into
+# _REBASEABLE_SIGNALS below so the two lists can't drift apart.
+_REBASE_REFUSAL_SIGNALS = (
+    "can't be rebased",
+    "cannot be rebased",
+)
+
 _REBASEABLE_SIGNALS = (
     "could not be rebased",
     # #1467: GitHub's actual wording when a branch contains a merge commit
@@ -54,8 +68,7 @@ _REBASEABLE_SIGNALS = (
     # worker was never dispatched and the entry parked forever. A local
     # `git rebase origin/main` linearises the branch, which is exactly what
     # the dispatched conflict-fix worker attempts.
-    "can't be rebased",
-    "cannot be rebased",
+    *_REBASE_REFUSAL_SIGNALS,
     "merge conflict",
     "not up to date",
     "non-fast-forward",
@@ -64,19 +77,6 @@ _REBASEABLE_SIGNALS = (
     # would be needed.  Common on PRs that sat open while main moved.
     "merge commit cannot be cleanly created",
     "not mergeable",
-)
-
-# #1467: the specific subset of _REBASEABLE_SIGNALS that GitHub emits when a
-# --rebase merge is refused purely because the branch contains a merge
-# commit — a *linearity* failure, not a content conflict. This distinction
-# matters for reconcile_conflict_entries: GitHub's `mergeable` field (what
-# check_pr_mergeable reads) only reflects content conflicts and happily
-# reports MERGEABLE for a branch that is clean but not rebase-able, so a
-# plain mergeable check is not evidence that a retried --rebase will
-# succeed. See is_rebase_refusal().
-_REBASE_REFUSAL_SIGNALS = (
-    "can't be rebased",
-    "cannot be rebased",
 )
 
 _HUMAN_SIGNALS = (
@@ -2130,9 +2130,37 @@ def process(
                         f"(dry run) would be blocked: {_why} for {entry.branch}",
                     ))
                     continue
+                # #1467-review: preview the rebase→squash fallback in
+                # dry-run too. Only reachable when this entry already has a
+                # pr_number from an earlier (non-dry-run) attempt — dry-run
+                # never opens a PR itself, and the probe needs one to query
+                # — so a first-time dry-run preview of a brand-new entry
+                # still can't foresee the fallback. Same fail-closed
+                # contract as the real merge path: an inconclusive probe
+                # leaves the previewed method unchanged.
+                _preview_method = method
+                if method == "rebase" and entry.pr_number is not None:
+                    _probe = getattr(gh_ops, "branch_has_merge_commit", None)
+                    if _probe is not None:
+                        try:
+                            _has_merge_commit = _probe(
+                                entry.repo_github, entry.pr_number
+                            )
+                        except Exception:  # noqa: BLE001
+                            _has_merge_commit = None
+                        if _has_merge_commit is True:
+                            _preview_method = "squash"
+                            events.append(MergeEvent(
+                                entry, "method_fallback",
+                                f"(dry run) PR #{entry.pr_number} ({entry.branch}) "
+                                "contains a merge commit and cannot be "
+                                "rebase-merged — would fall back to --squash "
+                                "(#1467)",
+                            ))
                 events.append(MergeEvent(
                     entry, "merged",
-                    f"(dry run) would merge {entry.branch} → {entry.target_branch}"
+                    f"(dry run) would merge {entry.branch} → {entry.target_branch} "
+                    f"via --{_preview_method}"
                     f"{_bypass_note(entry, config)}",
                 ))
             continue

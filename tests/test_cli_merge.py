@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shlex
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -202,6 +203,19 @@ class TestMergeCommand:
         assert "recovery:" in result.output
         assert "git rebase origin/main" in result.output
         assert "coord merge --only api#1 --override-human-required" in result.output
+
+        # #1467-review: the printed recovery command must actually be
+        # runnable — --override-human-required is a REASON-taking option
+        # (rejects a missing/empty value), so the message must include a
+        # non-empty reason string, not just the bare flag.
+        recovery_line = next(
+            line for line in result.output.splitlines() if "recovery:" in line
+        )
+        recovery_cmd = recovery_line.split("`coord merge", 1)[1].rsplit("`", 1)[0]
+        args = shlex.split(f"coord merge{recovery_cmd}")
+        override_idx = args.index("--override-human-required")
+        reason = args[override_idx + 1]
+        assert reason.strip() != ""
 
         states = {x.assignment_id: x.state for x in mq.load_queue()}
         assert states["r1"] == mq.HUMAN_REQUIRED
