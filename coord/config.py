@@ -91,6 +91,14 @@ class ReviewsConfig:
     max_auto_dispatch_per_pass: int = 5  # cap reviews dispatched per reconcile/notify pass (0 = unbounded)
     flood_threshold: int = 12  # if more rows than this are pending review in one pass, refuse all (0 = no surge gate)
     allow_review_flood: bool = False  # override the surge gate (or set env COORD_ALLOW_REVIEW_FLOOD=1)
+    # #1488: sanity bound (additions+deletions) for `coord review-reaffirm` —
+    # the audited escape hatch that re-points a stale-but-content-changed
+    # approval's `review_head_sha` to the branch's current head instead of
+    # requiring a full re-review. A mechanical conflict-resolution delta is
+    # tens of lines; anything past this is refused outright (no override
+    # flag) so the command can never be used to wave through a genuine
+    # rewrite. 0 disables the bound (not recommended).
+    reaffirm_max_diff_lines: int = 300
 
 
 @dataclass
@@ -1336,7 +1344,7 @@ def _parse_reviews(raw: Any, repo_names: set[str]) -> ReviewsConfig:
                 raise ConfigError(f"reviews.{bool_field} must be a boolean")
             setattr(cfg, bool_field, value)
 
-    for int_field in ("max_auto_dispatch_per_pass", "flood_threshold"):
+    for int_field in ("max_auto_dispatch_per_pass", "flood_threshold", "reaffirm_max_diff_lines"):
         if int_field in raw:
             value = raw[int_field]
             # bool is a subclass of int — reject it explicitly so a stray

@@ -1183,3 +1183,206 @@ def fix_briefing_cmd(aid: str, config_path: Path) -> None:
     )
     ctx = issue_context_block(work.repo_name, work.issue_number)
     click.echo(ctx + fix_briefing, nl=False)
+
+
+def _count_diff_changed_lines(diff_text: str) -> int:
+    """Count content +/- lines in a unified diff, excluding the ``+++``/``---``
+    file-header lines (which always start with the same characters but carry
+    no content). Used by ``review-reaffirm`` to size the delta against the
+    ``reviews.reaffirm_max_diff_lines`` sanity bound."""
+    n = 0
+    for line in diff_text.splitlines():
+        if line.startswith("+++") or line.startswith("---"):
+            continue
+        if line.startswith("+") or line.startswith("-"):
+            n += 1
+    return n
+
+
+@click.command(
+    "review-reaffirm",
+    help=(
+        "Re-point a stale-but-content-changed approved review to the branch's "
+        "current head, with an audited reason (#1488) — the sanctioned "
+        "alternative to a full re-review or leaving the merge queue for a "
+        "mechanical conflict-resolution delta."
+    ),
+)
+@click.argument("work_assignment_id")
+@click.option(
+    "--reason",
+    required=True,
+    help=(
+        "Why this delta is safe to reaffirm without a full re-review "
+        "(e.g. 'conflict resolution: merged #1461 + #1472 filters, suite "
+        "green'). Written to the audit trail alongside the SHA anchors."
+    ),
+)
+@click.option(
+    "--yes", is_flag=True, default=False,
+    help="Skip the interactive confirmation prompt (for scripting).",
+)
+@_CONFIG_OPTION
+def review_reaffirm(
+    work_assignment_id: str, reason: str, yes: bool, config_path: Path,
+) -> None:
+    """``coord review-reaffirm <work_assignment_id> --reason "..."``
+
+    #1488: a content-changing rebase (typically a conflict resolution during
+    `coord merge`) correctly voids `has_approved_review`'s approval — but
+    until now the only sanctioned way past that was a full re-review
+    dispatch, or leaving the merge queue entirely via `gh pr merge` (which
+    left no board-visible record at all). This re-points the approving
+    review row's `review_head_sha`/`review_patch_id` to the branch's current
+    head instead, after showing the exact delta being waved through and
+    requiring confirmation — refusing outright (no override flag) when the
+    delta exceeds `reviews.reaffirm_max_diff_lines`, so this stays an escape
+    hatch for mechanical resolutions, never a review bypass.
+
+    Reuses the exact same eligibility check `dispatch_scoped_reviews_for_queue`
+    (#1476) uses to decide a *scoped re-review* is safe to dispatch
+    (`coord.merge_queue.find_scoped_review_candidate` /
+    `only_conflict_fix_since_review`'s sibling `has_approved_review`) — this
+    command takes the human-in-the-loop path through that same gap instead
+    of dispatching another `claude -p` review.
+    """
+    from coord import github_ops  # noqa: PLC0415
+    from coord import merge_queue as mq  # noqa: PLC0415
+    from coord.board_service import read_board  # noqa: PLC0415
+    from coord.state import record_review_reaffirm  # noqa: PLC0415
+
+    if not reason.strip():
+        click.echo("error: --reason must not be empty", err=True)
+        sys.exit(2)
+
+    cfg = _load_config(config_path)
+    board = read_board()
+    work = board.find_by_id(work_assignment_id)
+    if work is None:
+        click.echo(f"error: assignment {work_assignment_id!r} not found on the board", err=True)
+        sys.exit(1)
+    if not work.branch:
+        click.echo(f"error: assignment {work_assignment_id!r} has no branch recorded", err=True)
+        sys.exit(1)
+
+    repo = cfg.repo(work.repo_name)
+    if repo is None:
+        click.echo(f"error: unknown repo {work.repo_name!r}", err=True)
+        sys.exit(1)
+
+    # Reuse a live merge-queue entry when one exists (the common case — the
+    # operator got here because `coord merge` just refused with
+    # review_required); synthesize a throwaway one otherwise. Either way
+    # branch_head_sha/branch_patch_id are never trusted from load_queue()
+    # (they're transient, recomputed by `process()` on every run, never
+    # persisted) — always refetched live below so the gate is evaluated
+    # against the branch's ACTUAL current head, not a stale in-memory value.
+    items = mq.load_queue()
+    entry = next(
+        (e for e in items if e.repo_github == repo.github and e.branch == work.branch),
+        None,
+    )
+    if entry is None:
+        entry = mq.QueuedMerge(
+            assignment_id=work.assignment_id,
+            repo_name=work.repo_name,
+            repo_github=repo.github,
+            branch=work.branch,
+            target_branch=repo.default_branch,
+            issue_number=work.issue_number,
+            issue_title=work.issue_title or "",
+        )
+
+    entry.branch_head_sha = github_ops.get_branch_sha(entry.repo_github, entry.branch)
+    if entry.branch_head_sha is None:
+        click.echo(
+            f"error: could not resolve the current HEAD sha for branch "
+            f"{entry.branch!r} (gh api failure) — refusing to reaffirm "
+            f"without confirming the branch's actual current state",
+            err=True,
+        )
+        sys.exit(1)
+    entry.branch_patch_id = None  # force a fresh backfill below, never trust a stale value
+
+    if mq.has_approved_review(entry, board, github_ops):
+        click.echo(
+            "nothing to reaffirm — an approved review already covers the "
+            "branch's current head (either fresh, or a content-identical "
+            "rebase already carried forward by #1475)."
+        )
+        return
+
+    prior_review = mq.find_scoped_review_candidate(entry, board, github_ops)
+    if prior_review is None:
+        click.echo(
+            "error: no reaffirmable approval found — either this branch was "
+            "never reviewed+approved, or the delta since its last approval "
+            "can't be confirmed (missing patch-id data). A full re-review is "
+            f"required: coord review {work_assignment_id}",
+            err=True,
+        )
+        sys.exit(1)
+
+    old_sha = prior_review.review_head_sha
+    new_sha = entry.branch_head_sha
+    diff_text = github_ops.get_compare_diff(entry.repo_github, old_sha, new_sha)
+    if diff_text is None:
+        click.echo(
+            f"error: could not fetch the diff between the approved sha "
+            f"{old_sha!r} and the current head {new_sha!r} (gh api compare "
+            f"failed) — refusing to reaffirm without being able to show "
+            f"what's being waved through",
+            err=True,
+        )
+        sys.exit(1)
+
+    diff_lines = _count_diff_changed_lines(diff_text)
+    max_lines = cfg.reviews.reaffirm_max_diff_lines
+    if max_lines > 0 and diff_lines > max_lines:
+        click.echo(
+            f"error: delta is {diff_lines} changed lines, exceeding "
+            f"reviews.reaffirm_max_diff_lines ({max_lines}) — this is an "
+            f"escape hatch for mechanical conflict resolutions, not a review "
+            f"bypass. Dispatch a full re-review instead: "
+            f"coord review {work_assignment_id}",
+            err=True,
+        )
+        sys.exit(1)
+
+    click.echo(
+        f"Reaffirming review {prior_review.assignment_id} for "
+        f"{work.repo_name}#{work.issue_number} ({work.branch})"
+    )
+    click.echo(f"  approved sha:  {old_sha}")
+    click.echo(f"  current head:  {new_sha}")
+    click.echo(f"  delta:         {diff_lines} changed lines")
+    click.echo(f"  reason:        {reason}")
+    click.echo()
+    click.echo(github_ops.truncate_diff_text(diff_text))
+    click.echo()
+
+    if not yes and not click.confirm(
+        "Reaffirm this approval to cover the current head?"
+    ):
+        click.echo("aborted — approval NOT reaffirmed.")
+        sys.exit(1)
+
+    new_patch_id = github_ops.get_branch_patch_id(
+        entry.repo_github, entry.target_branch, entry.branch
+    )
+    try:
+        record_review_reaffirm(
+            review_assignment_id=prior_review.assignment_id,
+            new_head_sha=new_sha,
+            new_patch_id=new_patch_id,
+            reason=reason,
+        )
+    except Exception as e:  # noqa: BLE001
+        click.echo(f"error: reaffirm write failed: {e}", err=True)
+        sys.exit(1)
+
+    click.echo(
+        f"Reaffirmed: review {prior_review.assignment_id} now covers "
+        f"{new_sha[:12]} — {work.repo_name}#{work.issue_number} is unblocked "
+        f"for merge."
+    )

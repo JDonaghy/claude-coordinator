@@ -1758,6 +1758,40 @@ def _openapi_spec() -> dict:
                 },
             }
         },
+        "/review-reaffirm": {
+            "post": {
+                "summary": (
+                    "Re-point an approved review's staleness anchors to the "
+                    "branch's current head, audited (#1488)"
+                ),
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "review_assignment_id": {"type": "string"},
+                                    "new_head_sha": {"type": "string"},
+                                    "new_patch_id": {"type": "string", "nullable": True},
+                                    "reason": {"type": "string"},
+                                    "actor": {"type": "string"},
+                                },
+                                "required": ["review_assignment_id", "new_head_sha", "reason"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {"application/json": {"schema": ok_response}},
+                    },
+                    "400": {"description": "Missing field"},
+                    "404": {"description": "No such assignment"},
+                },
+            }
+        },
         "/acceptance-verdict": {
             "post": {
                 "summary": "Record an Acceptance-gate verdict (#944, oracle loop)",
@@ -3576,6 +3610,42 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             )
         return JSONResponse({"ok": True})
 
+    async def post_review_reaffirm(request: Request) -> Response:
+        # #1488: re-point an approved review's review_head_sha/review_patch_id
+        # to the branch's current head, on the shared DB. Mirrors
+        # post_test_verdict's shape; the diff-bound check and confirmation
+        # happen client-side (`coord review-reaffirm`) before this is ever
+        # called — this route is just the audited write.
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        try:
+            required = {
+                "review_assignment_id": body["review_assignment_id"],
+                "new_head_sha": body["new_head_sha"],
+                "reason": body["reason"],
+            }
+        except KeyError as e:
+            return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        try:
+            state._record_review_reaffirm_local(
+                review_assignment_id=required["review_assignment_id"],
+                new_head_sha=required["new_head_sha"],
+                new_patch_id=body.get("new_patch_id"),
+                reason=required["reason"],
+                actor=body.get("actor") or "user",
+            )
+        except ValueError as e:
+            return JSONResponse({"error": str(e)}, status_code=404)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "review-reaffirm write failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"ok": True})
+
     async def post_acceptance_verdict(request: Request) -> Response:
         # #944: record an Acceptance-gate verdict (oracle loop) on the shared
         # DB. Mirrors post_test_verdict.
@@ -5092,6 +5162,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/milestone-drain", post_milestone_drain, methods=["POST"]),
         Route("/dispatched", post_dispatched, methods=["POST"]),
         Route("/test-verdict", post_test_verdict, methods=["POST"]),
+        Route("/review-reaffirm", post_review_reaffirm, methods=["POST"]),
         Route("/acceptance-verdict", post_acceptance_verdict, methods=["POST"]),
         Route("/acceptance-record", post_acceptance_record, methods=["POST"]),
         Route("/review-findings", post_review_findings, methods=["POST"]),

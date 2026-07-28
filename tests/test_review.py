@@ -3483,6 +3483,45 @@ def test_reviews_config_rejects_bool_for_int_field(tmp_path: Path) -> None:
         load(p)
 
 
+# ── #1488: review-reaffirm sanity bound config ──────────────────────────────
+
+
+def test_reviews_config_reaffirm_max_diff_lines_default(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n  - name: api\n    github: acme/api\n"
+        "machines:\n  - name: laptop\n    host: laptop.tail\n    repos: [api]\n"
+    )
+    cfg = load(p)
+    assert cfg.reviews.reaffirm_max_diff_lines == 300
+
+
+def test_reviews_config_reaffirm_max_diff_lines_custom(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n  - name: api\n    github: acme/api\n"
+        "machines:\n  - name: laptop\n    host: laptop.tail\n    repos: [api]\n"
+        "reviews:\n  reaffirm_max_diff_lines: 50\n"
+    )
+    cfg = load(p)
+    assert cfg.reviews.reaffirm_max_diff_lines == 50
+
+
+def test_reviews_config_rejects_negative_reaffirm_max_diff_lines(tmp_path: Path) -> None:
+    from coord.config import ConfigError
+
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        "repos:\n  - name: api\n    github: acme/api\n"
+        "machines:\n  - name: laptop\n    host: laptop.tail\n    repos: [api]\n"
+        "reviews:\n  reaffirm_max_diff_lines: -1\n"
+    )
+    with pytest.raises(
+        ConfigError, match="reaffirm_max_diff_lines must be a non-negative integer"
+    ):
+        load(p)
+
+
 # ── #586: branch-not-on-remote guard in dispatch_review ─────────────────────
 
 

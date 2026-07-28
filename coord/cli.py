@@ -85,6 +85,7 @@ from coord.commands.review import (
     _prompt_and_relay_test_verdict,  # noqa: F401 — re-exported for tests
     fix_briefing_cmd,
     report_result,
+    review_reaffirm,
     set_review_findings,
 )
 from coord.commands.test_gate import (
@@ -328,6 +329,7 @@ main.add_command(stop)
 main.add_command(report_result)
 main.add_command(verify_merge)
 main.add_command(set_review_findings)
+main.add_command(review_reaffirm)
 main.add_command(retry)
 main.add_command(pull_artifact)
 main.add_command(bounce)
