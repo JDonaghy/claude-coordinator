@@ -1,6 +1,6 @@
- B│ All repos              [41 ⚠2]    ╔══ ▸ command palette ════════════════════════════════════════════════════════════╗
+ B│ All repos              [41 ⚠2]    ╔══ ▸ command palette ═══════════════════════════════════════════════════════════╗
  M│ ▶ ◇ claude-coordinator  [38 ⚠1]  ║  > _______________________________________________________________              ║
- ▶│ ▶ ◇ quadraui             [3 ⚠1]  ║  ─── Plans actions ─────────────────────────────────────────────────────────── ║
+ ▶│ ▶ ◇ quadraui             [3 ⚠1]  ║  ─── Plans actions ───────────────────────────────────────────────────────────  ║
  >│ ▶ ◇ vimcode               [0]     ║  ◆ Dispatch milestone             dispatch selected plan's ready frontier      ║
  ▦│                                   ║  ◆ Open milestone chat            open a steward chat for the selected plan    ║
  ≣│                                   ║  ◆ Quick capture plan             coord milestone capture (fast stub)          ║
@@ -12,7 +12,7 @@
   │                                   ║  ─── Global ────────────────────────────────────────────────────────────────── ║
   │                                   ║  ⚙ Settings                       open settings panel                          ║
   │                                   ║  ↻ Refresh                        reload board data from daemon                ║
-  │                                   ╚══════════════════════════════════════════════════════════════════════════════════╝
+  │                                   ╚════════════════════════════════════════════════════════════════════════════════╝
   │
   │
   │
