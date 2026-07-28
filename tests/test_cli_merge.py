@@ -1334,6 +1334,110 @@ class TestMergeAutoEnqueue:
         assert "auto-enqueued" in result.output
         assert any(e.issue_number == 947 for e in mq.load_queue())
 
+    # ── #1490: one branch, N work rows, one queue entry ────────────────────
+
+    def test_three_work_rows_one_branch_produce_one_auto_enqueue_line(
+        self, config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        """The exact #1445 bug: three `type=work` rows piled up on one
+        branch through a fix cycle (one failed test_state, two passed) used
+        to print "auto-enqueued" once per row — three identical
+        announcements for what is, and always was, a single queue entry.
+        Must now print exactly one "auto-enqueued" line (for the winning
+        row) and one "superseded" line per non-winning row."""
+        from coord.models import Assignment, Board
+        from coord.state import save_board
+
+        branch = "issue-1445-fix"
+        failed = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=1445,
+            issue_title="#1445", assignment_id="31bd30875eb3", type="work",
+            status="done", branch=branch, test_state="failed",
+        )
+        passed1 = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=1445,
+            issue_title="#1445", assignment_id="12fced1dfa80", type="work",
+            status="done", branch=branch, test_state="passed",
+        )
+        passed2 = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=1445,
+            issue_title="#1445", assignment_id="5ed99d1f7edf", type="work",
+            status="done", branch=branch, test_state="passed",
+        )
+        save_board(Board(active=[], completed=[failed, passed1, passed2]))
+        self._seed_issue_state(coord_db, number=1445, state="open")
+
+        with patch(
+            "coord.github_ops.list_remote_branch_names",
+            return_value={"main", branch},
+        ), patch(
+            "coord.github_ops.work_is_terminal", return_value=False,
+        ), patch(
+            "coord.github_ops.create_pr",
+            return_value={"number": 500, "url": "u/500", "existed": False},
+        ), patch(
+            "coord.github_ops.merge_pr", return_value=(True, "ok"),
+        ), patch(
+            "coord.github_ops.get_pr_size", return_value=10,
+        ):
+            result = CliRunner().invoke(main, ["merge", "--config", str(config_file)])
+
+        assert result.exit_code == 0, result.output
+        assert result.output.count("auto-enqueued") == 1
+        assert result.output.count("not the winning row for this branch") == 2
+        assert "31bd30875eb3" in result.output  # superseded row named
+        assert "12fced1dfa80" in result.output  # superseded row named
+        items = [i for i in mq.load_queue() if i.branch == branch]
+        assert len(items) == 1
+        assert items[0].assignment_id == "5ed99d1f7edf"
+
+    def test_repeated_merge_passes_do_not_reannounce_the_branch(
+        self, config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        """#1490 regression: a second `coord merge` pass over the same
+        board must not re-print "auto-enqueued" for a branch whose queue
+        entry hasn't actually changed."""
+        from coord.models import Assignment, Board
+        from coord.state import save_board
+
+        branch = "issue-1445-fix"
+        failed = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=1445,
+            issue_title="#1445", assignment_id="31bd30875eb3", type="work",
+            status="done", branch=branch, test_state="failed",
+        )
+        passed1 = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=1445,
+            issue_title="#1445", assignment_id="12fced1dfa80", type="work",
+            status="done", branch=branch, test_state="passed",
+        )
+        passed2 = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=1445,
+            issue_title="#1445", assignment_id="5ed99d1f7edf", type="work",
+            status="done", branch=branch, test_state="passed",
+        )
+        save_board(Board(active=[], completed=[failed, passed1, passed2]))
+        self._seed_issue_state(coord_db, number=1445, state="open")
+
+        with patch(
+            "coord.github_ops.list_remote_branch_names",
+            return_value={"main", branch},
+        ), patch(
+            "coord.github_ops.work_is_terminal", return_value=False,
+        ), patch(
+            "coord.github_ops.create_pr",
+            return_value={"number": 500, "url": "u/500", "existed": False},
+        ), patch(
+            "coord.github_ops.merge_pr", return_value=(True, "ok"),
+        ), patch(
+            "coord.github_ops.get_pr_size", return_value=10,
+        ):
+            CliRunner().invoke(main, ["merge", "--config", str(config_file)])
+            second = CliRunner().invoke(main, ["merge", "--config", str(config_file)])
+
+        assert second.exit_code == 0, second.output
+        assert "auto-enqueued" not in second.output
+
 
 class TestStatusMergeQueue:
     def test_status_shows_queue_section(

@@ -771,10 +771,11 @@ def _merge_via_daemon(svc, params: dict) -> None:
     default=None,
     metavar="ASSIGNMENT_ID",
     help=(
-        "#732: Drop exactly one merge_queue entry by assignment_id (or the durable "
-        "'repo#issue' form, #1477 — survives a drop + re-enqueue that would otherwise "
-        "mint a new assignment id). Routes through the daemon so thin clients don't "
-        "need local DB access."
+        "#732: Drop exactly one merge_queue entry — accepts the assignment_id, the "
+        "durable 'repo#issue' form (#1477), a bare issue number, or the branch name "
+        "(#1490) — whichever the board printed, since assignment_id can re-key across "
+        "a drop + re-enqueue (or an auto-enqueue tick) between the read and this call. "
+        "Routes through the daemon so thin clients don't need local DB access."
     ),
 )
 
@@ -785,10 +786,14 @@ def _merge_via_daemon(svc, params: dict) -> None:
     default=None,
     metavar="ASSIGNMENT_ID",
     help=(
-        "#780: Merge exactly one entry by assignment_id — or the durable 'repo#issue' "
-        "form (#1477), e.g. 'acme/api#1461', which survives a drop + re-enqueue — "
-        "leaving the rest of the queue untouched.  Mutually exclusive with --order.  "
-        "BLOCKED entries are reported and skipped (use --force-merge to override gates)."
+        "#780: Merge exactly one entry — accepts the assignment_id, the durable "
+        "'repo#issue' form (#1477), e.g. 'acme/api#1461', a bare issue number, or the "
+        "branch name (#1490) — whichever the board printed.  Resolution falls back "
+        "through these forms in order, so an id that was re-keyed by a concurrent "
+        "auto-enqueue tick since the board was last read still resolves via issue "
+        "number or branch.  Leaves the rest of the queue untouched.  Mutually "
+        "exclusive with --order.  BLOCKED entries are reported and skipped (use "
+        "--force-merge to override gates)."
     ),
 )
 
@@ -888,7 +893,9 @@ def merge(
             click.echo(f"merge-queue: dropped entry {drop_assignment}")
         else:
             click.echo(
-                f"merge-queue: no entry found for {drop_assignment!r}", err=True
+                f"merge-queue: no entry found for {drop_assignment!r} "
+                "(tried assignment_id, repo#issue, issue number, and branch name)",
+                err=True,
             )
             sys.exit(1)
         return
@@ -987,7 +994,9 @@ def merge(
         only_entry = mq.resolve_entry_key(only_queue, only_assignment)
         if only_entry is None:
             click.echo(
-                f"merge-queue: no entry found for {only_assignment!r}", err=True
+                f"merge-queue: no entry found for {only_assignment!r} "
+                "(tried assignment_id, repo#issue, issue number, and branch name)",
+                err=True,
             )
             sys.exit(1)
         # #1251: --override-human-required is the explicit, audited escape
@@ -1134,13 +1143,27 @@ def merge(
     # terminal_cache above.
     milestone_cache: dict = {}
     if board is not None:
-        for a in board.completed:
-            if a.type not in WORK_LIKE_TYPES or a.status != "done":
-                continue
-            if not a.branch or not a.assignment_id:
-                continue
-            if repo_filter and a.repo_name != repo_filter:
-                continue
+        # #1490: resolve every branch to a single winning work-like row
+        # before any of the filters below run. A fix/bounce cycle piles up
+        # more than one WORK_LIKE_TYPES row on the same branch (the
+        # original dispatch plus every retry), and processing each
+        # independently used to call refresh_entry_assignment once per row
+        # — re-keying the branch's one queue entry, and re-printing
+        # "auto-enqueued", every single time, forever (the exact symptom
+        # #1490 reports: one branch, three identical announcements, on
+        # every `coord merge` pass). Superseded rows are reported once here
+        # and never reach refresh_entry_assignment at all.
+        scoped_completed = [
+            a for a in board.completed
+            if not repo_filter or a.repo_name == repo_filter
+        ]
+        for a, superseded in mq.group_branch_candidates(scoped_completed):
+            for row in superseded:
+                auto_enqueued.append(
+                    f"  superseded: {row.repo_name} #{row.issue_number} "
+                    f"(assignment {row.assignment_id}, branch {row.branch}) — "
+                    "not the winning row for this branch, skipped (#1490)"
+                )
             repo_cfg = cfg.repo(a.repo_name)
             if repo_cfg is None:
                 continue

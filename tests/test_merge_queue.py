@@ -2557,6 +2557,94 @@ class TestGateBypassAudit:
         assert self._audit_rows(coord_db) == []
 
 
+class TestGroupBranchCandidates:
+    """#1490: a fix/bounce cycle piles up more than one WORK_LIKE_TYPES row
+    on the same branch (the original dispatch + every retry) —
+    group_branch_candidates resolves each branch to a single winner instead
+    of every caller processing (and re-announcing) every row."""
+
+    @staticmethod
+    def _work(
+        aid: str,
+        *,
+        branch: str = "issue-1-fix",
+        test_state: str | None = None,
+        dispatched_at: float | None = None,
+        repo: str = "api",
+        status: str = "done",
+        atype: str = "work",
+    ) -> Assignment:
+        return Assignment(
+            machine_name="m1", repo_name=repo, issue_number=1, issue_title="t",
+            assignment_id=aid, type=atype, status=status, branch=branch,
+            test_state=test_state, dispatched_at=dispatched_at,
+        )
+
+    def test_single_row_is_its_own_winner(self) -> None:
+        a = self._work("a1")
+        result = mq.group_branch_candidates([a])
+        assert result == [(a, [])]
+
+    def test_three_rows_one_branch_resolve_to_latest_passed(self) -> None:
+        """The #1445 scenario verbatim: one failed test_state, two passed —
+        the latest-dispatched *passed* row wins; the other two are
+        superseded."""
+        failed = self._work("31bd30875eb3", test_state="failed", dispatched_at=1000)
+        passed1 = self._work("12fced1dfa80", test_state="passed", dispatched_at=2000)
+        passed2 = self._work("5ed99d1f7edf", test_state="passed", dispatched_at=3000)
+        result = mq.group_branch_candidates([failed, passed1, passed2])
+
+        assert len(result) == 1
+        winner, superseded = result[0]
+        assert winner is passed2
+        assert {id(x) for x in superseded} == {id(failed), id(passed1)}
+
+    def test_falls_back_to_latest_overall_when_none_passed(self) -> None:
+        """The branch is still mid-cycle (nothing has passed yet) — it must
+        still resolve to a single winner (the most recent row) rather than
+        disappearing entirely."""
+        a1 = self._work("a1", dispatched_at=1000)
+        a2 = self._work("a2", dispatched_at=2000)
+        winner, superseded = mq.group_branch_candidates([a1, a2])[0]
+        assert winner is a2
+        assert superseded == [a1]
+
+    def test_distinct_branches_are_separate_groups(self) -> None:
+        a1 = self._work("a1", branch="issue-1-fix")
+        a2 = self._work("a2", branch="issue-2-fix")
+        result = mq.group_branch_candidates([a1, a2])
+        assert len(result) == 2
+        assert {w.assignment_id for w, _ in result} == {"a1", "a2"}
+        assert all(superseded == [] for _, superseded in result)
+
+    def test_filters_non_work_like_and_incomplete_rows(self) -> None:
+        review = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="r1", type="review", status="done", branch="issue-1-fix",
+        )
+        not_done = self._work("nd", status="running")
+        no_branch = self._work("nb", branch=None)
+        no_aid = self._work("", branch="issue-1-fix")
+        result = mq.group_branch_candidates([review, not_done, no_branch, no_aid])
+        assert result == []
+
+    def test_mock_author_and_test_author_are_grouped_too(self) -> None:
+        """#930/#1141: WORK_LIKE_TYPES is 'work', 'mock-author', 'test-author'
+        — all three flow through the same auto-enqueue path and must be
+        grouped the same way."""
+        ma = self._work("ma1", atype="mock-author", branch="ms-5-gate-a")
+        ta = self._work("ta1", atype="test-author", branch="ms-37-test-author")
+        result = mq.group_branch_candidates([ma, ta])
+        assert len(result) == 2
+
+    def test_order_is_stable_first_seen(self) -> None:
+        a1 = self._work("a1", branch="issue-1-fix")
+        b1 = self._work("b1", branch="issue-2-fix")
+        a2 = self._work("a2", branch="issue-1-fix")
+        result = mq.group_branch_candidates([a1, b1, a2])
+        assert [w.branch for w, _ in result] == ["issue-1-fix", "issue-2-fix"]
+
+
 class TestRefreshEntryAssignment:
     """#292: refresh_entry_assignment creates or updates queue entries."""
 
@@ -2952,6 +3040,60 @@ class TestResolveEntryKey:
         new.issue_number = 1461
         items = [old, new]
         assert mq.resolve_entry_key(items, "api#1461") is new
+
+    # ── #1490: bare issue number + branch-name fallbacks ────────────────────
+
+    def test_resolves_bare_issue_number(self, coord_db) -> None:
+        entry = _q("aid1")
+        entry.issue_number = 1461
+        items = [entry]
+        assert mq.resolve_entry_key(items, "1461") is entry
+
+    def test_resolves_branch_name(self, coord_db) -> None:
+        entry = _q("aid1", branch="issue-1461-fix")
+        items = [entry]
+        assert mq.resolve_entry_key(items, "issue-1461-fix") is entry
+
+    def test_branch_resolves_even_when_assignment_id_was_rekeyed(self, coord_db) -> None:
+        """#1490's actual failure mode: an operator reads assignment_id
+        'X' off the board, but a concurrent auto-enqueue tick re-keys the
+        entry to 'Y' before ``--only X`` runs. The stale id now matches
+        nothing — but the branch, which never changes for the life of the
+        entry, still resolves it."""
+        entry = _q("Y", branch="issue-1445-fix")
+        items = [entry]
+        assert mq.resolve_entry_key(items, "X") is None  # the stale id: a hard miss
+        assert mq.resolve_entry_key(items, "issue-1445-fix") is entry  # the stable fallback
+
+    def test_bare_issue_number_takes_priority_over_a_coincidental_branch_name(
+        self, coord_db
+    ) -> None:
+        """When a numeric key resolves via the issue-number form, that match
+        wins outright — the branch fallback is never even consulted."""
+        decoy = _q("aid1", branch="1461")
+        decoy.issue_number = 9999
+        target = _q("aid2")
+        target.issue_number = 1461
+        items = [decoy, target]
+        assert mq.resolve_entry_key(items, "1461") is target
+
+    def test_assignment_id_takes_priority_over_issue_number_and_branch(
+        self, coord_db
+    ) -> None:
+        exact = _q("1461")  # assignment_id happens to look numeric
+        exact.issue_number = 42
+        other = _q("aid2")
+        other.issue_number = 1461
+        items = [exact, other]
+        assert mq.resolve_entry_key(items, "1461") is exact
+
+    def test_ambiguous_bare_issue_number_prefers_most_recent(self, coord_db) -> None:
+        old = _q("old-aid", state=MERGED)
+        old.issue_number = 1461
+        new = _q("new-aid", state=PENDING)
+        new.issue_number = 1461
+        items = [old, new]
+        assert mq.resolve_entry_key(items, "1461") is new
 
 
 class TestDropEntryDurableKey:
@@ -3418,6 +3560,81 @@ class TestEnqueueApprovedWork:
         assert changed == ["w1"]
         items = load_queue()
         assert items[0].target_branch == "main"
+
+    # ── #1490: one branch, N work rows, one queue entry ────────────────────
+
+    def test_three_work_rows_one_branch_produce_one_entry(self, coord_db) -> None:
+        """The exact #1445 scenario: one failed test_state, two passed, all
+        on the same branch. Must produce exactly one queue entry, keyed to
+        the winning (approved + test-passed) row — not whichever row the
+        board happened to list last."""
+        cfg = self._config()
+        branch = "issue-1445-fix"
+        failed = self._work("31bd30875eb3", test_state="failed", branch=branch)
+        failed.dispatched_at = 1000
+        passed1 = self._work("12fced1dfa80", test_state="passed", branch=branch)
+        passed1.dispatched_at = 2000
+        passed2 = self._work("5ed99d1f7edf", test_state="passed", branch=branch)
+        passed2.dispatched_at = 3000
+        # An approval anywhere in the branch's chain covers the whole branch
+        # (has_approved_review scans by shared branch) — point it at the
+        # winning row, matching what actually happened on #1445.
+        rev = self._review("5ed99d1f7edf", verdict="approve")
+        board = self._board(completed=[failed, passed1, passed2, rev])
+
+        changed = mq.enqueue_approved_work(cfg, board)
+
+        assert changed == ["5ed99d1f7edf"]
+        items = load_queue()
+        assert len(items) == 1
+        assert items[0].assignment_id == "5ed99d1f7edf"
+        assert items[0].branch == branch
+
+    def test_repeated_ticks_do_not_reannounce_same_branch(self, coord_db) -> None:
+        """#1490 regression: before the fix, every tick re-keyed the one
+        queue entry to whichever row was processed last in board.completed
+        order and reported it as a change — forever, even with zero new
+        work. A second call with the same board must be a true no-op."""
+        cfg = self._config()
+        branch = "issue-1445-fix"
+        failed = self._work("31bd30875eb3", test_state="failed", branch=branch)
+        passed1 = self._work("12fced1dfa80", test_state="passed", branch=branch)
+        passed2 = self._work("5ed99d1f7edf", test_state="passed", branch=branch)
+        failed.dispatched_at, passed1.dispatched_at, passed2.dispatched_at = (
+            1000, 2000, 3000,
+        )
+        rev = self._review("5ed99d1f7edf", verdict="approve")
+        board = self._board(completed=[failed, passed1, passed2, rev])
+
+        first = mq.enqueue_approved_work(cfg, board)
+        second = mq.enqueue_approved_work(cfg, board)
+        third = mq.enqueue_approved_work(cfg, board)
+
+        assert first == ["5ed99d1f7edf"]
+        assert second == []
+        assert third == []
+        assert len(load_queue()) == 1
+
+    def test_iteration_order_does_not_change_the_winner(self, coord_db) -> None:
+        """The winner is picked by dispatched_at, not by position in
+        board.completed — reordering the same three rows must resolve to
+        the same winner."""
+        cfg = self._config()
+        branch = "issue-1445-fix"
+        failed = self._work("31bd30875eb3", test_state="failed", branch=branch)
+        failed.dispatched_at = 1000
+        passed1 = self._work("12fced1dfa80", test_state="passed", branch=branch)
+        passed1.dispatched_at = 2000
+        passed2 = self._work("5ed99d1f7edf", test_state="passed", branch=branch)
+        passed2.dispatched_at = 3000
+        rev = self._review("5ed99d1f7edf", verdict="approve")
+        # Deliberately out of dispatch order.
+        board = self._board(completed=[passed2, failed, passed1, rev])
+
+        changed = mq.enqueue_approved_work(cfg, board)
+
+        assert changed == ["5ed99d1f7edf"]
+        assert load_queue()[0].assignment_id == "5ed99d1f7edf"
 
 
 class TestPendingSummary:
