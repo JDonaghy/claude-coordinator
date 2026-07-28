@@ -1831,6 +1831,84 @@ class TestScopedReviewCandidate:
         entry = self._voided_entry()
         assert mq.only_conflict_fix_since_review(entry, board, review) is True
 
+    # ── intervening_work_since_review ───────────────────────────────────────
+    # #1488: `coord review-reaffirm` needs to tell only_conflict_fix_since_
+    # review's two distinct False reasons apart — "a new work/fix round landed"
+    # (hard refuse) vs "no conflict-fix explains the delta" (warn, the
+    # hand-run-rebase case the escape hatch exists for).
+
+    def test_intervening_empty_when_only_a_conflict_fix_ran(self) -> None:
+        work = self._work("w1")
+        review = self._review("w1", dispatched_at=100.0)
+        cf = self._conflict_fix("w1", dispatched_at=200.0)
+        board = self._board(completed=[work, review, cf])
+        entry = self._voided_entry()
+        assert mq.intervening_work_since_review(entry, board, review) == []
+
+    def test_intervening_empty_when_nothing_at_all_ran(self) -> None:
+        """The hand-run-rebase case: unattributable, but NOT new logic."""
+        work = self._work("w1")
+        review = self._review("w1", dispatched_at=100.0)
+        board = self._board(completed=[work, review])
+        entry = self._voided_entry()
+        assert mq.intervening_work_since_review(entry, board, review) == []
+        assert mq.only_conflict_fix_since_review(entry, board, review) is False
+
+    def test_intervening_lists_a_fix_round_dispatched_after_the_review(self) -> None:
+        work = self._work("w1")
+        review = self._review("w1", dispatched_at=100.0)
+        fix_work = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1,
+            issue_title="[fix-1] t", assignment_id="fix1", type="work",
+            status="done", branch="worker/w1",
+            review_of_assignment_id="w1", dispatched_at=250.0,
+        )
+        board = self._board(completed=[work, review, fix_work])
+        entry = self._voided_entry()
+        got = mq.intervening_work_since_review(entry, board, review)
+        assert [a.assignment_id for a in got] == ["fix1"]
+
+    def test_intervening_ignores_work_dispatched_before_the_review(self) -> None:
+        earlier_fix = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1,
+            issue_title="[fix-1] t", assignment_id="fix1", type="work",
+            status="done", branch="worker/w1",
+            review_of_assignment_id="w1", dispatched_at=50.0,
+        )
+        work = self._work("w1")
+        review = self._review("w1", dispatched_at=100.0)
+        board = self._board(completed=[work, earlier_fix, review])
+        entry = self._voided_entry()
+        assert mq.intervening_work_since_review(entry, board, review) == []
+
+    def test_intervening_ignores_work_on_another_branch(self) -> None:
+        other = Assignment(
+            machine_name="m1", repo_name="api", issue_number=9, issue_title="t",
+            assignment_id="w-other", type="work", status="done",
+            branch="worker/other", dispatched_at=250.0,
+        )
+        work = self._work("w1")
+        review = self._review("w1", dispatched_at=100.0)
+        board = self._board(completed=[work, review, other])
+        entry = self._voided_entry()
+        assert mq.intervening_work_since_review(entry, board, review) == []
+
+    def test_intervening_empty_when_review_has_no_dispatch_time(self) -> None:
+        """No dispatch anchor ⇒ nothing is provably "after" ⇒ empty (matches
+        only_conflict_fix_since_review's own pre-#1488 posture)."""
+        work = self._work("w1")
+        review = self._review("w1")
+        review.dispatched_at = None
+        fix_work = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1,
+            issue_title="[fix-1] t", assignment_id="fix1", type="work",
+            status="done", branch="worker/w1",
+            review_of_assignment_id="w1", dispatched_at=250.0,
+        )
+        board = self._board(completed=[work, review, fix_work])
+        entry = self._voided_entry()
+        assert mq.intervening_work_since_review(entry, board, review) == []
+
 
 class TestPassesMergeGates:
     """#946: passes_merge_gates() is the shared predicate composing the

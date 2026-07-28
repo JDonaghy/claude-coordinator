@@ -1108,6 +1108,7 @@ def record_review_reaffirm(
     new_patch_id: str | None,
     reason: str,
     actor: str = "user",
+    conflict_fix_only: bool | None = None,
 ) -> None:
     """Re-point an approved review's staleness anchors and audit it (#1488).
 
@@ -1120,6 +1121,11 @@ def record_review_reaffirm(
     review that ran fresh against the current SHA, while the audit row
     (``event_type="review_reaffirmed"``, distinct from ``review_approve``)
     keeps the "this was a human call, not a re-review" trail intact.
+
+    *conflict_fix_only* records whether coord could attribute the delta to a
+    completed conflict-fix (``True``), could not (``False`` — a hand-run
+    rebase the operator vouched for personally), or didn't say (``None``).
+    Audit-only; it never changes what is written to the assignment row.
     """
     svc = _board_service()
     resp = _route_write(
@@ -1131,6 +1137,7 @@ def record_review_reaffirm(
             "new_patch_id": new_patch_id,
             "reason": reason,
             "actor": actor,
+            "conflict_fix_only": conflict_fix_only,
         },
     )
     if resp is not None:
@@ -1141,6 +1148,7 @@ def record_review_reaffirm(
         new_patch_id=new_patch_id,
         reason=reason,
         actor=actor,
+        conflict_fix_only=conflict_fix_only,
     )
 
 
@@ -1151,14 +1159,24 @@ def _record_review_reaffirm_local(
     new_patch_id: str | None,
     reason: str,
     actor: str = "user",
+    conflict_fix_only: bool | None = None,
 ) -> None:
     """UPDATE the review assignment's ``review_head_sha``/``review_patch_id``
     and append the audit row.  Raises :class:`ValueError` when
     *review_assignment_id* doesn't resolve to a row — the CLI caller has
     already re-read it off the board immediately before calling this, so a
-    miss here means it vanished (or was never a review row) between the two
-    reads, and silently no-op'ing would leave the operator believing a
-    non-existent reaffirmation had happened.
+    miss here means it vanished between the two reads, and silently
+    no-op'ing would leave the operator believing a non-existent
+    reaffirmation had happened.
+
+    Also raises :class:`ValueError` when the row exists but isn't a
+    ``type="review"`` assignment. The CLI path can't hit this (the id always
+    comes from :func:`~coord.merge_queue.find_scoped_review_candidate`, which
+    only ever returns review rows), but the daemon's ``POST /review-reaffirm``
+    accepts an arbitrary id from any caller with daemon access — without the
+    guard it would stamp ``review_head_sha``/``review_patch_id`` onto a
+    ``work`` row and log a ``"Review reaffirmed: ..."`` audit entry for it.
+    Defense in depth on a feature whose entire value is audit integrity.
     """
     conn = get_connection()
     prior = conn.execute(
@@ -1168,6 +1186,12 @@ def _record_review_reaffirm_local(
     ).fetchone()
     if prior is None:
         raise ValueError(f"no assignment found for {review_assignment_id!r}")
+    if prior["type"] != "review":
+        raise ValueError(
+            f"assignment {review_assignment_id!r} is type "
+            f"{prior['type']!r}, not 'review' — refusing to reaffirm a "
+            f"non-review assignment"
+        )
     conn.execute(
         "UPDATE assignments SET review_head_sha=?, review_patch_id=? "
         "WHERE assignment_id=?",
@@ -1193,6 +1217,7 @@ def _record_review_reaffirm_local(
             "new_head_sha": new_head_sha,
             "old_patch_id": prior["review_patch_id"],
             "new_patch_id": new_patch_id,
+            "conflict_fix_only": conflict_fix_only,
         },
     )
 

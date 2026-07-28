@@ -1187,13 +1187,35 @@ def fix_briefing_cmd(aid: str, config_path: Path) -> None:
 
 def _count_diff_changed_lines(diff_text: str) -> int:
     """Count content +/- lines in a unified diff, excluding the ``+++``/``---``
-    file-header lines (which always start with the same characters but carry
-    no content). Used by ``review-reaffirm`` to size the delta against the
-    ``reviews.reaffirm_max_diff_lines`` sanity bound."""
+    file-header lines (which start with the same characters but carry no
+    content). Used by ``review-reaffirm`` to size the delta against the
+    ``reviews.reaffirm_max_diff_lines`` sanity bound.
+
+    The header exclusion is **positional**, not a bare prefix test: a header
+    only ever appears outside a hunk body (before the file's first ``@@``),
+    so once a ``@@`` hunk header is seen every ``+``/``-`` line counts until
+    the next ``diff --git`` resets the state. A naive ``startswith("---")``
+    silently drops genuine content whose own source text begins with
+    ``--``/``++`` — a removed Markdown/YAML ``---`` separator renders as
+    ``----``, an added ``++counter`` renders as ``+++counter`` — which would
+    *undercount* the delta and let a diff that should be hard-refused slip
+    under the bound. Where the input isn't recognizable as a unified diff
+    (no ``@@`` at all) this errs toward over-counting, which fails closed.
+    """
     n = 0
+    in_hunk = False
     for line in diff_text.splitlines():
-        if line.startswith("+++") or line.startswith("---"):
+        if line.startswith("@@"):
+            in_hunk = True
             continue
+        if line.startswith("diff --git "):
+            in_hunk = False
+            continue
+        if not in_hunk and (
+            line.startswith("--- ") or line.startswith("+++ ")
+            or line in ("---", "+++")
+        ):
+            continue  # unified-diff file header (never inside a hunk body)
         if line.startswith("+") or line.startswith("-"):
             n += 1
     return n
@@ -1239,12 +1261,16 @@ def review_reaffirm(
     delta exceeds `reviews.reaffirm_max_diff_lines`, so this stays an escape
     hatch for mechanical resolutions, never a review bypass.
 
-    Reuses the exact same eligibility check `dispatch_scoped_reviews_for_queue`
-    (#1476) uses to decide a *scoped re-review* is safe to dispatch
-    (`coord.merge_queue.find_scoped_review_candidate` /
-    `only_conflict_fix_since_review`'s sibling `has_approved_review`) — this
-    command takes the human-in-the-loop path through that same gap instead
-    of dispatching another `claude -p` review.
+    Reuses the exact same eligibility checks `dispatch_scoped_reviews_for_queue`
+    (#1476) uses to decide a *scoped re-review* is safe to dispatch —
+    `coord.merge_queue.has_approved_review`, `find_scoped_review_candidate`
+    **and** the `only_conflict_fix_since_review` guardrail — so this command
+    takes the human-in-the-loop path through that same gap instead of
+    dispatching another `claude -p` review. It splits that guardrail's two
+    failure modes: work/fix rounds dispatched after the approval are refused
+    outright, while a delta no coord-tracked conflict-fix can account for
+    (a hand-run rebase) warns loudly and is stamped as unattributed in the
+    audit row.
     """
     from coord import github_ops  # noqa: PLC0415
     from coord import merge_queue as mq  # noqa: PLC0415
@@ -1323,6 +1349,42 @@ def review_reaffirm(
         )
         sys.exit(1)
 
+    # #1488 review round 1: `find_scoped_review_candidate` alone does NOT
+    # establish that the delta is a mechanical rebase — its "voided ONLY by a
+    # content-changing rebase" guarantee comes from the caller pairing it with
+    # `only_conflict_fix_since_review` (exactly what the automated scoped
+    # dispatcher does at coord/review.py's "guardrail: another commit
+    # intervened" check). Without it, a bounce round carrying a genuine second
+    # batch of new logic looks identical to a conflict resolution here, and
+    # would ride through on one y/n keystroke.
+    #
+    # The guardrail's two failure modes are NOT equivalent, so they're split:
+    #   * intervening work/fix rounds dispatched after the approval ⇒ new
+    #     logic the approval provably never saw ⇒ hard refuse, no override.
+    #   * no coord-tracked conflict-fix explains the delta (the operator
+    #     rebased by hand — the single most common way to land here, and the
+    #     exact gap this escape hatch exists to fill) ⇒ unattributable but not
+    #     evidence of new logic ⇒ loud warning above the confirm prompt, and
+    #     the fact is stamped into the audit row so the trail records whether
+    #     coord could attribute the delta or the human vouched for it alone.
+    intervening = mq.intervening_work_since_review(entry, board, prior_review)
+    if intervening:
+        listed = ", ".join(
+            f"{a.assignment_id} ({a.type})" for a in intervening[:5]
+        )
+        click.echo(
+            f"error: {len(intervening)} work/fix assignment(s) were dispatched "
+            f"AFTER review {prior_review.assignment_id} approved this branch: "
+            f"{listed} — the delta is new logic that approval never saw, not a "
+            f"mechanical conflict resolution. Reaffirmation is refused (no "
+            f"override flag). Dispatch a full re-review instead: "
+            f"coord review {work_assignment_id}",
+            err=True,
+        )
+        sys.exit(1)
+
+    conflict_fix_only = mq.only_conflict_fix_since_review(entry, board, prior_review)
+
     old_sha = prior_review.review_head_sha
     new_sha = entry.branch_head_sha
     diff_text = github_ops.get_compare_diff(entry.repo_github, old_sha, new_sha)
@@ -1357,9 +1419,28 @@ def review_reaffirm(
     click.echo(f"  current head:  {new_sha}")
     click.echo(f"  delta:         {diff_lines} changed lines")
     click.echo(f"  reason:        {reason}")
+    click.echo(
+        "  attribution:   "
+        + (
+            "a completed conflict-fix accounts for this delta"
+            if conflict_fix_only
+            else "UNATTRIBUTED — no coord-tracked conflict-fix explains it"
+        )
+    )
     click.echo()
     click.echo(github_ops.truncate_diff_text(diff_text))
     click.echo()
+    if not conflict_fix_only:
+        click.echo(
+            "WARNING: coord has no completed conflict-fix on record for this "
+            "branch since the approval, so it cannot confirm the delta above "
+            "is only a mechanical rebase resolution. Nothing intervened on the "
+            "board (that would have been refused outright) — but you are "
+            "vouching for this diff yourself. Read every line before "
+            "confirming.",
+            err=True,
+        )
+        click.echo()
 
     if not yes and not click.confirm(
         "Reaffirm this approval to cover the current head?"
@@ -1376,6 +1457,7 @@ def review_reaffirm(
             new_head_sha=new_sha,
             new_patch_id=new_patch_id,
             reason=reason,
+            conflict_fix_only=conflict_fix_only,
         )
     except Exception as e:  # noqa: BLE001
         click.echo(f"error: reaffirm write failed: {e}", err=True)

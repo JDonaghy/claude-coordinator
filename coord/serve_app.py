@@ -3636,9 +3636,16 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 new_patch_id=body.get("new_patch_id"),
                 reason=required["reason"],
                 actor=body.get("actor") or "user",
+                conflict_fix_only=body.get("conflict_fix_only"),
             )
         except ValueError as e:
-            return JSONResponse({"error": str(e)}, status_code=404)
+            # No such row ⇒ 404. A row that exists but isn't a `type="review"`
+            # assignment ⇒ 409: this endpoint takes an arbitrary id from any
+            # caller with daemon access, and stamping review anchors onto a
+            # `work` row (plus a misleading "Review reaffirmed" audit entry)
+            # would quietly corrupt the audit trail this feature exists for.
+            status = 404 if str(e).startswith("no assignment found") else 409
+            return JSONResponse({"error": str(e)}, status_code=status)
         except Exception as e:  # noqa: BLE001
             return JSONResponse(
                 {"error": "review-reaffirm write failed", "detail": str(e)},
