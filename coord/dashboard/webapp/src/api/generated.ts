@@ -147,4 +147,5 @@ export interface Assignment {
   audit_bottom_line: string | null
   audit_run_number: number | null
   for_issue_number: number | null
+  driven_by: string | null
 }
