@@ -1161,7 +1161,68 @@ def _extract_pr_number(pr_url: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
-def _escalate_merge(state: IssueState, status: str) -> Action:
+# ── #1526: driver/gate divergence ───────────────────────────────────────────
+#
+# `coord drive` decides `test=`/`review=` are satisfied from
+# `work_test_state`/`review_verdict` — the same fields `_decide_test`/
+# `_decide_review` above already let through (that is WHY `decide()` ever
+# reaches `_decide_merge` at all). `coord merge` enforces a DIFFERENT, fresher
+# check (`merge_queue.has_smoke_verdict`/`has_approved_review` — SHA/patch-id
+# -anchored freshness for smoke, patch-id voiding for review) and can refuse
+# for a reason this driver's own view never sees coming. When it does, the
+# refusal text is left on the board as `merge_reason` — persisted on the raw
+# queue row's `.error` by `merge_queue.process()` — even while `merge_status`
+# itself often still reads a RETRYABLE value like READY, because the
+# board-render gate check in `merge_queue.plan()`'s `_entry_gate_status`
+# doesn't have the live SHA data a real merge attempt fetches (see that
+# function's docstring). Retrying `coord merge` unchanged cannot resolve two
+# READS of the board disagreeing with each other; only a human (or a fresh
+# verdict) can — see `_merge_gate_divergence`.
+_SMOKE_GATE_MARKERS = ("smoke test required", "test verdict missing")
+_REVIEW_GATE_MARKERS = ("review required", "review not approved")
+
+
+def _merge_gate_kind(reason: str) -> str | None:
+    """Classify a merge-queue block *reason* as the gate it names, or
+    ``None`` when it isn't one of the two this module knows a corrective
+    action for.
+
+    Matches both `merge_queue.process()`'s live-attempt wording ("smoke test
+    required but no verdict recorded" / "review required but not approved")
+    and `merge_queue.plan()`'s board-render wording ("test verdict missing" /
+    "review not approved") — the two functions describe the identical gates
+    in different words.
+    """
+    r = (reason or "").lower()
+    if any(marker in r for marker in _SMOKE_GATE_MARKERS):
+        return "smoke"
+    if any(marker in r for marker in _REVIEW_GATE_MARKERS):
+        return "review"
+    return None
+
+
+def _merge_gate_divergence(state: IssueState) -> str | None:
+    """``"smoke"``/``"review"`` when *state* shows the #1526 divergence,
+    else ``None``.
+
+    The divergence: `state.merge_reason` names a smoke/review block while
+    this SAME state's `work_test_state`/`review_verdict` says the opposite.
+    That contradiction can only come from `coord merge` checking something
+    this driver's view does not (freshness against the CURRENT branch/base,
+    not just the terminal verdict) — never from a retry, since neither
+    input changes by running `coord merge` again unchanged.
+    """
+    kind = _merge_gate_kind(state.merge_reason)
+    if kind == "smoke" and state.work_test_state in ("passed", "skipped"):
+        return "smoke"
+    if kind == "review" and state.review_verdict == "approve":
+        return "review"
+    return None
+
+
+def _escalate_merge(
+    state: IssueState, status: str, *, gate_kind: str | None = None
+) -> Action:
     """Build the EXIT action for a merge status retrying cannot fix (#1505).
 
     Escalates on the FIRST encounter rather than after exhausting
@@ -1177,14 +1238,33 @@ def _escalate_merge(state: IssueState, status: str) -> Action:
     driver performs (``coord escalate record ...``, never a direct
     ``coord.state`` call).
 
-    The proposed command mirrors the #1477 resolution this issue was opened
-    over: when a PR is known, ``gh pr merge --rebase`` + ``coord
+    *gate_kind* (#1526) is set by :func:`_decide_merge` when
+    :func:`_merge_gate_divergence` fired — a smoke/review gate refusal this
+    driver's own ``work_test_state``/``review_verdict`` view contradicts. The
+    proposed command in that case names the specific, safe corrective action
+    (re-confirm the test verdict, or a scoped/full re-review) rather than the
+    generic "inspect the plan" fallback below.
+
+    Otherwise, the proposed command mirrors the #1477 resolution this issue
+    was opened over: when a PR is known, ``gh pr merge --rebase`` + ``coord
     reconcile-merges`` is the sanctioned escape hatch (also documented in
     docs/OPERATING_GOTCHAS.md). Without a known PR number there is nothing
     concrete to propose beyond pointing at the plan for a human to read.
     """
     pr_number = _extract_pr_number(state.merge_pr_url)
-    if pr_number is not None:
+    if gate_kind == "smoke":
+        proposed = (
+            f"coord test {state.work_aid} --passed   # ONLY if the suite "
+            "genuinely still passes against the CURRENT base — otherwise "
+            f"dispatch a fresh smoke test for {state.work_aid}"
+        )
+    elif gate_kind == "review":
+        proposed = (
+            f"coord review-reaffirm {state.work_aid} --reason '<why this "
+            f"delta is safe>'   # or a full re-review: coord review "
+            f"{state.work_aid}"
+        )
+    elif pr_number is not None:
         proposed = f"gh pr merge {pr_number} --rebase && coord reconcile-merges"
     else:
         proposed = (
@@ -1192,11 +1272,25 @@ def _escalate_merge(state: IssueState, status: str) -> Action:
             "# inspect the gates, then decide"
         )
 
-    reason = (
-        f"merge_status={status or '(empty)'} — no number of retries changes "
-        "this; escalating on first encounter instead of burning the "
-        "merge-attempt budget (#1505)"
-    )
+    if gate_kind is not None:
+        driver_view = (
+            f"test_state={state.work_test_state!r}"
+            if gate_kind == "smoke"
+            else f"review_verdict={state.review_verdict!r}"
+        )
+        reason = (
+            f"{gate_kind}_required — coord merge's own gate reports "
+            f"{state.merge_reason!r}, but this driver's OWN view already "
+            f"shows {driver_view} — the two cannot converge by retrying the "
+            "identical `coord merge` command (#1526); a human must "
+            "reconcile them"
+        )
+    else:
+        reason = (
+            f"merge_status={status or '(empty)'} — no number of retries changes "
+            "this; escalating on first encounter instead of burning the "
+            "merge-attempt budget (#1505)"
+        )
     gate_pairs = (
         ("merge_status", status or "(empty)"),
         ("merge_reason", state.merge_reason or "(none)"),
@@ -1264,7 +1358,24 @@ def _decide_merge(
     :func:`coord.conflict_fix.has_prior_conflict_fix` /
     :func:`~coord.conflict_fix._has_active_conflict_fix` are the belt-and-
     braces guard inside ``dispatch_conflict_fix`` itself.
+
+    #1526: the driver/gate divergence (:func:`_merge_gate_divergence`) is
+    checked FIRST, before the status switch below — it can hide behind
+    EITHER a nominally-blocking status (BLOCKED, if ``merge_queue.plan()``'s
+    own render-time gate check caught the same disagreement) or a
+    nominally-retryable one (READY/PENDING/"", if only a live ``coord
+    merge`` attempt caught it and left its reason on the board — see that
+    function's docstring for why the two checks can disagree). Escalating
+    here, before either branch runs, is what stops the driver from spending
+    its whole ``--max-merge-attempts`` budget retrying a merge that cannot
+    succeed until a human — or a fresh verdict — reconciles the two
+    readings; retrying the identical ``coord merge`` command changes neither
+    side of the disagreement.
     """
+    divergence = _merge_gate_divergence(state)
+    if divergence is not None:
+        return _escalate_merge(state, state.merge_status, gate_kind=divergence)
+
     status = state.merge_status
     if status.upper() == "HUMAN_REQUIRED":
         return _die(
@@ -1667,6 +1778,33 @@ class Driver:
         finally:
             lock.release()
 
+    def _post_escalation_comment(self, state: IssueState, message: str) -> None:
+        """#1526: durably surface an escalation's reason onto the issue
+        itself, not just this run's tmux pane and the ``coord escalate``
+        board row.
+
+        Best-effort and never raises: a failed post must not mask the
+        escalation that already happened via the exit code (``EXIT_
+        ESCALATED``) and the board record `action.command` just wrote — the
+        two durable channels this already has. This is a THIRD channel, not
+        a replacement for either.
+        """
+        if not state.repo_github:
+            return
+        try:
+            from coord import github_ops  # noqa: PLC0415
+
+            github_ops.post_issue_comment(
+                state.repo_github,
+                state.issue,
+                "🚧 **`coord drive` escalated — a human decision is needed.**\n\n"
+                f"{message}\n\n"
+                f"Run it: `coord escalate run {state.repo} {state.issue}`\n"
+                f"Dismiss it: `coord escalate dismiss {state.repo} {state.issue}`",
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort, never mask the exit
+            self.warn(f"could not post the escalation comment to GitHub: {exc}")
+
     # ── audit boundaries (#1499) ────────────────────────────────────────
     def _record_drive_audit(
         self,
@@ -1877,8 +2015,14 @@ class Driver:
                     f"review={state.review_status or '-'}/"
                     f"{state.review_verdict or '-'} "
                     f"iter={state.work_review_iter} "
-                    f"merge={state.merge_status or '-'} "
-                    f"active={state.active_count}"
+                    f"merge={state.merge_status or '-'}"
+                    # #1526: print the merge gate's OWN reason right next to
+                    # its status — this is the line the 2026-07-27/28 stalls
+                    # never carried, so a "test=passed" operator watching the
+                    # pane had no way to see `coord merge` disagreeing until
+                    # it had already burned the whole retry budget.
+                    + (f" ({state.merge_reason})" if state.merge_reason else "")
+                    + f" active={state.active_count}"
                 )
             elif now - last_change > self.opts.stall_secs and not nudged:
                 self.warn(
@@ -1916,6 +2060,14 @@ class Driver:
                             action.error_message
                             or f"coord {' '.join(action.command)} exited {rc}"
                         )
+                # #1526: an escalation's reason must reach the issue itself,
+                # not just this tmux pane (gone the moment the session ends)
+                # and the `coord escalate` board row (invisible unless an
+                # operator thinks to run `coord escalate list`). This is what
+                # turned "drive died without closing the issue" into three
+                # unexplained deaths during the 2026-07-27/28 overnight run.
+                if action.exit_code == EXIT_ESCALATED:
+                    self._post_escalation_comment(state, action.message)
                 if action.exit_code == EXIT_OK:
                     for line in action.message.splitlines():
                         self.log(line)
