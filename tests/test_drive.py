@@ -1783,6 +1783,67 @@ def test_driver_escalates_and_writes_the_record_via_the_cli(driver_factory):
     assert not any(" merge --only" in a for a in argvs), argvs
 
 
+def test_driver_retries_a_conflict_originated_needs_attention_instead_of_escalating(
+    driver_factory,
+):
+    """#1505 review fix, end to end: a normal daemon-backed board populates
+    `merge_plan` on nearly every `/board` build, and `merge_queue.plan()`
+    collapses a fresh CONFLICT into "NEEDS_ATTENTION" for display — that is
+    the value `_decide_merge` actually receives for a still-auto-fixable
+    conflict, NOT the literal string "CONFLICT". If the raw `merge_queue`
+    row isn't cross-checked (`drive_state._merge_entry`), this escalates
+    immediately and never gives `coord merge --only` (and the
+    `classify_conflict`/`dispatch_conflict_fix` machinery it runs, #1474)
+    another poll to clear the conflict — the same failure shape #1505 was
+    opened to fix, just moved from HUMAN_REQUIRED onto every ordinary
+    conflict. The board here never actually changes state (no fake merge
+    lands), so the run must exhaust its bounded attempt cap and die with
+    the generic exhaustion message — never the escalate branch.
+    """
+    payload = board(
+        status="done", test_state="passed", review_state="done", review_iteration=0
+    )
+    payload["assignments"].append(
+        {
+            "repo_name": REPO,
+            "issue_number": ISSUE,
+            "type": "review",
+            "assignment_id": "r1",
+            "dispatched_at": 2.0,
+            "status": "done",
+            "review_of_assignment_id": "w1",
+            "review_verdict": "approve",
+        }
+    )
+    payload["merge_plan"] = [
+        {
+            "repo_name": REPO,
+            "issue_number": ISSUE,
+            "status": "NEEDS_ATTENTION",
+            "assignment_id": "w1",
+        }
+    ]
+    payload["merge_queue"] = [
+        {
+            "repo_name": REPO,
+            "issue_number": ISSUE,
+            "state": "conflict",
+            "error": "rebase failed",
+            "assignment_id": "w1",
+        }
+    ]
+    driver = driver_factory(
+        [payload],
+        opts=DriveOptions(
+            machine="precision", poll=1.0, max_merge_attempts=2, deadline_mins=1.0
+        ),
+    )
+    assert driver.run() == EXIT_TERMINAL_FAILURE  # cap reached, never escalated
+    argvs = [" ".join(a) for a in driver.recorded]  # type: ignore[attr-defined]
+    assert any("merge --only w1 --method rebase" in a for a in argvs), argvs
+    assert not any("escalate record" in a for a in argvs), argvs
+
+
 def test_driver_returns_the_deadline_code_when_time_runs_out(driver_factory, capsys):
     driver = driver_factory(
         [board(status="done", test_state="")],

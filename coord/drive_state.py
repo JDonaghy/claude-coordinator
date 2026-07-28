@@ -292,23 +292,79 @@ def project(payload: dict, repo: str, issue: int, config: Any) -> IssueState:
 
 
 def _merge_entry(payload: dict, repo: str, issue: int) -> dict | None:
-    """Merge state for (*repo*, *issue*) from the plan, else the raw queue.
+    """Merge state for (*repo*, *issue*): the plan entry, cross-checked
+    against the raw queue row.
 
     Matched on (repo, issue) rather than assignment id on purpose: the
     enqueued entry may be keyed to an earlier work row in a fix chain.
+
+    #1505 review fix: ``merge_queue.plan()``'s ``_state_to_plan_status``
+    deliberately collapses CONFLICT, HUMAN_REQUIRED, and SKIPPED into a
+    single "NEEDS_ATTENTION" bucket for operator-facing display (see that
+    function's docstring). But ``_decide_merge``'s retry-vs-escalate branch
+    needs exactly the distinction that collapse erases: CONFLICT is still
+    auto-fixable (a ``coord merge --only`` retry dispatches
+    ``classify_conflict``/``dispatch_conflict_fix``, #1474) while
+    HUMAN_REQUIRED and SKIPPED are terminal. ``merge_plan`` is populated on
+    nearly every ``/board`` build (``serve_app.board()`` calls
+    ``merge_queue.plan()`` unconditionally, falling back to ``[]`` only on
+    an exception), so without this cross-check a fresh, still-retryable
+    conflict presents to ``_decide_merge`` as NEEDS_ATTENTION and escalates
+    on first sight instead of retrying — reintroducing the #1453/#1461
+    stall in a new shape (immediate give-up instead of infinite wait).  When
+    the plan reports NEEDS_ATTENTION, this looks up the SAME entry's raw
+    state in ``merge_queue`` and reports that instead, recovering the
+    distinction.
+
+    Also recovers ``pr_url``: the ``PlannedMerge`` dataclass ``merge_plan``
+    entries are serialized from carries ``pr_number``, not a URL — this
+    falls back to the raw queue row's ``pr_url``, then reconstructs one from
+    ``repo_github`` + ``pr_number`` when neither is present, so the
+    escalation record's proposed ``gh pr merge`` command still gets a PR
+    number on a normal daemon-backed board.
     """
+    plan_entry = None
     for entry in payload.get("merge_plan") or []:
         if entry.get("repo_name") == repo and entry.get("issue_number") == issue:
-            return entry
+            plan_entry = entry
+            break
+
+    raw_entry = None
     for entry in payload.get("merge_queue") or []:
         if entry.get("repo_name") == repo and entry.get("issue_number") == issue:
-            return {
-                "status": (entry.get("state") or "").upper(),
-                "reason": entry.get("error"),
-                "pr_url": entry.get("pr_url"),
-                "assignment_id": entry.get("assignment_id"),
-            }
-    return None
+            raw_entry = entry
+            break
+
+    if plan_entry is None:
+        if raw_entry is None:
+            return None
+        return {
+            "status": (raw_entry.get("state") or "").upper(),
+            "reason": raw_entry.get("error"),
+            "pr_url": raw_entry.get("pr_url"),
+            "assignment_id": raw_entry.get("assignment_id"),
+        }
+
+    status = (plan_entry.get("status") or "").upper()
+    if status == "NEEDS_ATTENTION" and raw_entry is not None:
+        # Recover the pre-collapse state (CONFLICT / HUMAN_REQUIRED /
+        # SKIPPED) so a retryable conflict doesn't masquerade as a terminal
+        # NEEDS_ATTENTION and escalate prematurely.
+        status = (raw_entry.get("state") or status).upper()
+
+    pr_url = plan_entry.get("pr_url") or (raw_entry or {}).get("pr_url")
+    if not pr_url and plan_entry.get("pr_number") and plan_entry.get("repo_github"):
+        pr_url = (
+            f"https://github.com/{plan_entry['repo_github']}"
+            f"/pull/{plan_entry['pr_number']}"
+        )
+
+    return {
+        "status": status,
+        "reason": plan_entry.get("reason") or (raw_entry or {}).get("error"),
+        "pr_url": pr_url,
+        "assignment_id": plan_entry.get("assignment_id"),
+    }
 
 
 def pick_machine(payload: dict, repo: str, config: Any) -> str:

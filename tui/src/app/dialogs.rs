@@ -831,9 +831,16 @@ impl CoordApp {
                     );
                     reason_item.disabled = true;
                     items.push(reason_item);
+                    // #1505 review nit: 40 chars clipped the tail of the
+                    // sanctioned `gh pr merge <n> --rebase && coord
+                    // reconcile-merges` recipe for larger PR numbers (a
+                    // 6-digit PR number already runs to 53 chars). This
+                    // isn't gated behind a confirmation dialog, so the
+                    // operator should be able to read the whole command
+                    // here before clicking — widen the budget accordingly.
                     items.push(ContextMenuItem::action(
                         "run-escalation",
-                        &format!("Run proposed fix: {}", trunc(&esc.proposed_command, 40)),
+                        &format!("Run proposed fix: {}", trunc(&esc.proposed_command, 56)),
                     ));
                     let has_pr = self
                         .pipeline_issues

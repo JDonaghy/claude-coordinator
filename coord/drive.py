@@ -1134,11 +1134,20 @@ def _decide_review(
 # next `coord merge` tick is expected to move them forward. CONFLICT is
 # retried too, deliberately: that's what runs `classify_conflict` +
 # `dispatch_conflict_fix` (#1474, see this function's docstring). Everything
-# else — most commonly NEEDS_ATTENTION (what a HUMAN_REQUIRED/SKIPPED queue
-# entry surfaces as once `merge_queue.plan()` is in the payload — see
-# `_state_to_plan_status`), or any status this driver has never seen before
-# — cannot be resolved by retrying, so it escalates instead of spinning the
-# attempt cap down to zero on a no-op.
+# else — most commonly NEEDS_ATTENTION, or any status this driver has never
+# seen before — cannot be resolved by retrying, so it escalates instead of
+# spinning the attempt cap down to zero on a no-op.
+#
+# #1505 review fix: `merge_queue.plan()`'s `_state_to_plan_status` collapses
+# CONFLICT, HUMAN_REQUIRED, and SKIPPED into a single "NEEDS_ATTENTION"
+# status for operator display, and `merge_plan` (not the raw `merge_queue`
+# table) is what a normal daemon-backed `/board` build actually populates —
+# so a literal `status == "CONFLICT"` almost never reaches this function
+# without help. `drive_state._merge_entry` is where that help lives: it
+# cross-checks the raw `merge_queue` row and reports its un-collapsed state
+# whenever the plan says NEEDS_ATTENTION, so a fresh, still-auto-fixable
+# conflict lands here as "CONFLICT" (retried) rather than "NEEDS_ATTENTION"
+# (escalated on sight). See `_merge_entry`'s docstring for the full story.
 _RETRYABLE_MERGE_STATUSES = frozenset({"", "PENDING", "READY", "MERGING", "CONFLICT"})
 
 _PR_NUMBER_RE = re.compile(r"/pull/(\d+)")
