@@ -160,6 +160,21 @@ impl CoordApp {
             .any(|s| s.issue == issue_number && s.repo == repo_name)
     }
 
+    /// #1499: whether ANY assignment on the board for this `(issue_number,
+    /// repo_name)` carries `Assignment::driven_by` — i.e. was dispatched by
+    /// `coord drive` at some point, regardless of whether that driver
+    /// process is still alive. Unlike `issue_has_live_drive` (a live tmux
+    /// sweep that goes blank the instant the process exits), this reads
+    /// straight off the durable board data (`self.data.assignments`), so it
+    /// still answers "was this driven?" after the driver has exited and the
+    /// tmux session is long gone — the exact gap #1499 reported: a dead
+    /// driver's stall was indistinguishable from an issue nobody ever drove.
+    pub(crate) fn issue_has_drive_provenance(&self, issue_number: u64, repo_name: &str) -> bool {
+        self.data.assignments.iter().any(|a| {
+            a.repo == repo_name && a.issue_number == issue_number && a.driven_by.is_some()
+        })
+    }
+
     /// Resolve the coord-local repo name for a per-issue terminal key
     /// `(repo_slug, issue_number)`. Mirrors the lookup `detail_terminal_cwd`
     /// does — needed here because `drive_detail_terminals`'s lazy-spawn only
@@ -186,20 +201,37 @@ impl CoordApp {
         None
     }
 
-    /// Badge span for a Pipeline row currently being driven — spliced
-    /// between `#N` and the title, mirroring `epic_badge_span`'s placement
-    /// so it can't be clipped by a long title or overwritten by the row's
-    /// right-aligned repo-tag badge.
+    /// Badge span for a Pipeline row currently (or previously) being driven —
+    /// spliced between `#N` and the title, mirroring `epic_badge_span`'s
+    /// placement so it can't be clipped by a long title or overwritten by
+    /// the row's right-aligned repo-tag badge.
+    ///
+    /// #1499: three distinguishable states, checked in order —
+    /// 1. **live**: a `coord-drive-*` tmux session is running right now →
+    ///    `" [driving]"`.
+    /// 2. **exited unfinished**: no live session, but some assignment for
+    ///    this issue carries `driven_by` (durable board provenance) → `"
+    ///    [drive exited]"` — the stall signal #1499/#50 want surfaced: a
+    ///    driver ran here and is no longer running, yet the issue is still
+    ///    sitting in the Pipeline (a merged/closed issue simply has no
+    ///    Pipeline row left to hang this badge on).
+    /// 3. **never driven**: neither of the above → no badge (today's
+    ///    behaviour, unchanged).
     pub(crate) fn drive_badge_span(&self, issue: &PipelineIssue) -> Option<StyledSpan> {
         let repo = issue.coord_repo.as_deref()?;
         if self.issue_has_live_drive(issue.number, repo) {
-            Some(StyledSpan::with_fg(
+            return Some(StyledSpan::with_fg(
                 " [driving]".to_string(),
                 Color::rgb(120, 200, 255),
-            ))
-        } else {
-            None
+            ));
         }
+        if self.issue_has_drive_provenance(issue.number, repo) {
+            return Some(StyledSpan::with_fg(
+                " [drive exited]".to_string(),
+                Color::rgb(230, 160, 60),
+            ));
+        }
+        None
     }
 
     /// Launch `coord drive <repo> <issue> --tmux` for the selected Pipeline
@@ -422,7 +454,7 @@ impl CoordApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::fixtures::make_test_app;
+    use crate::app::fixtures::{make_assignment_typed, make_test_app};
 
     fn pipeline_issue(number: u64, coord_repo: Option<&str>) -> PipelineIssue {
         PipelineIssue {
@@ -553,6 +585,187 @@ mod tests {
         assert!(
             app.drive_badge_span(&issue).is_none(),
             "an issue with no coord_repo can never match a repo-scoped drive session"
+        );
+    }
+
+    // ── #1499: durable drive provenance (issue_has_drive_provenance / the
+    // "drive exited" badge state) ────────────────────────────────────────────
+
+    fn driven_assignment(issue: u64, repo: &str) -> Assignment {
+        let mut a = make_assignment_typed("done", issue, repo, Some("work"));
+        a.driven_by = Some(format!("drive:{repo}#{issue}"));
+        a
+    }
+
+    #[test]
+    fn issue_has_drive_provenance_true_when_an_assignment_carries_driven_by() {
+        let app = make_test_app(BoardData {
+            assignments: vec![driven_assignment(42, "myrepo")],
+            ..Default::default()
+        });
+        assert!(app.issue_has_drive_provenance(42, "myrepo"));
+    }
+
+    #[test]
+    fn issue_has_drive_provenance_false_when_no_assignment_carries_driven_by() {
+        let app = make_test_app(BoardData {
+            assignments: vec![make_assignment_typed("done", 42, "myrepo", Some("work"))],
+            ..Default::default()
+        });
+        assert!(
+            !app.issue_has_drive_provenance(42, "myrepo"),
+            "a hand-dispatched assignment (driven_by=None) must not read as drive provenance"
+        );
+    }
+
+    #[test]
+    fn issue_has_drive_provenance_scoped_to_repo_and_issue() {
+        let app = make_test_app(BoardData {
+            assignments: vec![driven_assignment(42, "myrepo")],
+            ..Default::default()
+        });
+        assert!(
+            !app.issue_has_drive_provenance(42, "other-repo"),
+            "must not cross repos"
+        );
+        assert!(
+            !app.issue_has_drive_provenance(7, "myrepo"),
+            "must not cross issues"
+        );
+    }
+
+    #[test]
+    fn drive_badge_span_shows_drive_exited_when_provenance_but_not_live() {
+        let app = make_test_app(BoardData {
+            assignments: vec![driven_assignment(42, "myrepo")],
+            ..Default::default()
+        });
+        let issue = pipeline_issue(42, Some("myrepo"));
+        let span = app
+            .drive_badge_span(&issue)
+            .expect("a driven, no-longer-live issue must still carry a badge");
+        assert_eq!(span.text, " [drive exited]");
+    }
+
+    #[test]
+    fn drive_badge_span_prefers_live_over_drive_exited() {
+        let mut app = make_test_app(BoardData {
+            assignments: vec![driven_assignment(42, "myrepo")],
+            ..Default::default()
+        });
+        app.drive_sessions = vec![DriveSession {
+            repo: "myrepo".to_string(),
+            issue: 42,
+            attached: false,
+            pending: false,
+            pending_sweep_count: 0,
+        }];
+        let issue = pipeline_issue(42, Some("myrepo"));
+        let span = app.drive_badge_span(&issue).expect("must carry a badge");
+        assert_eq!(
+            span.text, " [driving]",
+            "a live session must win over stale provenance from an earlier run"
+        );
+    }
+
+    #[test]
+    fn drive_badge_span_none_when_never_driven() {
+        let app = make_test_app(BoardData {
+            assignments: vec![make_assignment_typed("done", 42, "myrepo", Some("work"))],
+            ..Default::default()
+        });
+        let issue = pipeline_issue(42, Some("myrepo"));
+        assert!(
+            app.drive_badge_span(&issue).is_none(),
+            "an issue with no drive_sessions entry and no driven_by provenance must carry no badge"
+        );
+    }
+
+    /// Black-box `TuiDriver` coverage (#1499): the same board state must
+    /// render THREE distinguishable Pipeline rows side by side — a live
+    /// drive, a drive that exited without finishing, and an issue that was
+    /// never driven — through the real `event → handle → render` path
+    /// (`quadraui::tui::testing::driver_with_shell`), matching this repo's
+    /// CLAUDE.md policy for coord-tui behaviour changes. Asserts straight
+    /// off the rendered screen grid, not the internal `drive_badge_span`
+    /// return value the unit tests above already pin.
+    #[test]
+    fn tuidriver_pipeline_distinguishes_live_exited_and_never_driven() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        // All three get a plain "done" work assignment (only #43's carries
+        // `driven_by`) so all three land in the SAME Pipeline lifecycle
+        // bucket ("No milestone" under one repo group) — otherwise an
+        // issue with no board assignment at all sorts into a different
+        // top-level bucket ("New") than one with a completed assignment
+        // ("In-progress"), and the test would need to expand two separate
+        // collapsed headers instead of one.
+        let mut app = make_test_app(BoardData {
+            assignments: vec![
+                make_assignment_typed("done", 42, "myrepo", Some("work")),
+                driven_assignment(43, "myrepo"),
+                make_assignment_typed("done", 44, "myrepo", Some("work")),
+            ],
+            ..Default::default()
+        });
+        app.drive_sessions = vec![DriveSession {
+            repo: "myrepo".to_string(),
+            issue: 42,
+            attached: false,
+            pending: false,
+            pending_sweep_count: 0,
+        }];
+        app.pipeline_issues = vec![
+            pipeline_issue(42, Some("myrepo")),
+            pipeline_issue(43, Some("myrepo")),
+            pipeline_issue(44, Some("myrepo")),
+        ];
+        app.pipeline_sel = Some(0);
+        app.active_view = SidebarView::Pipeline;
+        // Bakes the sidebar tree (including drive badge spans) from the
+        // fixture's `pipeline_issues` — mirrors what a real board refresh /
+        // selection change does before any row is ever on screen.
+        app.rebuild_pipeline_sidebar(None);
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+
+        // All three land in the "No milestone" bucket, collapsed by default —
+        // expand it so the rows are actually on screen (mirrors the
+        // `tuidriver_drive_automated_menu_item_switches_to_terminal_and_shows_badge`
+        // precedent above).
+        let screen_before = driver.screen();
+        let (label_x, label_y) = driver.find("No milestone").unwrap_or_else(|| {
+            panic!("'No milestone' bucket header not found:\n{screen_before}")
+        });
+        // The chevron hit-test region is `[row + 0.5, row + 1.5)` here (three
+        // grouped issues push the fractional-anchor boundary down half a
+        // row versus the single-issue precedent above) — same nudge
+        // rationale as the context-menu click adjustments elsewhere in this
+        // file/`tests.rs`; verified empirically against this exact fixture.
+        driver.click((label_x - 2.0).max(0.0), label_y + 0.5);
+
+        let screen = driver.screen();
+        assert!(
+            driver.find("#42").is_some(),
+            "issue #42 (live drive) must be on screen:\n{screen}"
+        );
+        assert!(
+            driver.find("#43").is_some(),
+            "issue #43 (drive exited) must be on screen:\n{screen}"
+        );
+        assert!(
+            driver.find("#44").is_some(),
+            "issue #44 (never driven) must be on screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("[driving]"),
+            "the live drive (#42) must render the '[driving]' badge:\n{screen}"
+        );
+        assert!(
+            screen.contains("[drive exited]"),
+            "the drive that exited without finishing (#43) must render the \
+             '[drive exited]' badge, distinguishable from both '[driving]' \
+             and no badge at all:\n{screen}"
         );
     }
 

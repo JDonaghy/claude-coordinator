@@ -438,6 +438,19 @@ class Assignment:
     # friction log). None for milestone-mode (Gate A) authoring and for
     # every other assignment type; only test-author's JIT mode sets it.
     for_issue_number: int | None = None
+    # #1499: durable provenance — set when this assignment was dispatched by
+    # `coord drive` (never by a hand `coord assign`). Carries
+    # `f"drive:{repo_name}#{issue_number}"` (the DRIVEN issue, which for most
+    # assignment types is the same repo/issue this row is already keyed on,
+    # but is spelled out explicitly so the value is self-describing on its
+    # own in the audit log / board without a join). `None` means "dispatched
+    # by hand" (or predates this column) — the whole point is that a drive's
+    # own dispatches are distinguishable from a human's after the driver
+    # process has exited and left nothing else behind. Threaded through
+    # `coord assign --driven-by` (`coord.commands.dispatch.assign`), which
+    # `coord/drive.py`'s work-stage `Action` sets on every `coord assign` it
+    # shells out to.
+    driven_by: str | None = None
 
 
 @dataclass
@@ -495,6 +508,13 @@ class Proposal:
     # already set by the caller.  Empty by default — callers that don't
     # populate it simply get today's ``models.default`` behavior.
     issue_labels: list[str] = field(default_factory=list)
+    # #1499: mirrors `Assignment.driven_by` — set by `coord/drive.py`'s
+    # work-stage dispatch so the resulting assignment row (recorded via
+    # `_record_dispatched_local`, the Proposal-based INSERT path every plain
+    # non-`--interactive` `coord assign` — including `coord drive`'s — goes
+    # through) carries durable provenance. `None` for every other caller
+    # (brain-proposed, milestone dispatch, ...).
+    driven_by: str | None = None
 
 
 @dataclass

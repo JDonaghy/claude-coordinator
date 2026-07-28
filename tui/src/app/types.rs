@@ -404,6 +404,16 @@ pub struct Assignment {
     /// right member issue's row.
     #[serde(default)]
     pub(crate) for_issue_number: Option<u64>,
+    /// #1499: durable provenance — `Some("drive:<repo>#<issue>")` when this
+    /// assignment was dispatched by `coord drive` (via `coord assign
+    /// --driven-by`), `None` for a hand `coord assign` and for rows
+    /// predating this column. This is what lets the Pipeline distinguish a
+    /// drive-dispatched row from a hand dispatch (and, combined with
+    /// `drive_sessions`, "drive exited unfinished" from "never driven")
+    /// even after the driver's tmux session is long gone — see
+    /// `CoordApp::issue_has_drive_provenance` in `drive.rs`.
+    #[serde(default)]
+    pub(crate) driven_by: Option<String>,
 }
 
 /// Deserialize a boolean the daemon may send as a SQLite-style integer (0/1)

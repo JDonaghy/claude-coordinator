@@ -148,6 +148,9 @@ def row_to_assignment(row: object) -> Assignment:
         # #1084: JIT test-author's per-member-issue correlation; None for
         # Gate A / every other type and for rows predating this column.
         for_issue_number=d.get("for_issue_number"),
+        # #1499: durable drive provenance; None for a hand `coord assign`
+        # and for rows predating this column.
+        driven_by=d.get("driven_by"),
     )
 
 

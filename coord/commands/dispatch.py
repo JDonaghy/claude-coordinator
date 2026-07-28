@@ -405,6 +405,19 @@ def approve(
 
 @click.option("--dry-run", is_flag=True, help="Show what would be dispatched.")
 @click.option(
+    "--driven-by",
+    "driven_by",
+    default=None,
+    hidden=True,
+    help=(
+        "#1499: internal — stamps durable provenance (`Assignment.driven_by` / "
+        "`Proposal.driven_by`) on the dispatched assignment so it stays "
+        "distinguishable from a hand `coord assign` in the board/audit log "
+        "after the driver process exits. Set by `coord drive`'s work-stage "
+        "dispatch (`drive:<repo>#<issue>`); not meant to be typed by hand."
+    ),
+)
+@click.option(
     "--plan-only",
     is_flag=True,
     help=(
@@ -647,6 +660,7 @@ def assign(
     briefing: str,
     model: str | None,
     dry_run: bool,
+    driven_by: str | None,
     plan_only: bool,
     no_plan: bool,
     force: bool,
@@ -940,7 +954,7 @@ def assign(
         model=model, dry_run=dry_run, plan_only=plan_only, no_plan=no_plan,
         force=force, no_pull=no_pull, skip_freshness=skip_freshness,
         cfg=cfg, machine_obj=machine_obj, repo_cfg=repo_cfg,
-        issue_data=issue_data, issue_title=issue_title,
+        issue_data=issue_data, issue_title=issue_title, driven_by=driven_by,
     )
 
 

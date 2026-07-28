@@ -470,6 +470,12 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # (non-scoped) reviews.
         "ALTER TABLE assignments ADD COLUMN review_scoped INTEGER DEFAULT 0",
         "ALTER TABLE assignments ADD COLUMN review_scope_base_sha TEXT",
+        # #1499: durable provenance — `f"drive:{repo}#{issue}"` when this
+        # assignment was dispatched by `coord drive` (via `coord assign
+        # --driven-by`), NULL for a hand `coord assign` and for every row
+        # predating this column. This is the piece that survives the
+        # driver process exiting — see coord.models.Assignment.driven_by.
+        "ALTER TABLE assignments ADD COLUMN driven_by TEXT",
     ]
     for sql in migrations:
         try:

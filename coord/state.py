@@ -508,6 +508,8 @@ def _dispatched_dict_from_payload(a: dict) -> dict:
         "status": a.get("status"),
         "review_iteration": a.get("review_iteration", 0) or 0,
         "provider_name": a.get("provider_name"),
+        # #1499: durable drive provenance; None for a hand `coord assign`.
+        "driven_by": a.get("driven_by"),
     }
 
 
@@ -550,6 +552,8 @@ def _row_to_dispatched_dict(row: object) -> dict:
         # review_of_assignment_id set) — was previously absent from this
         # dict even though the column is populated at dispatch time.
         "provider_name": d.get("provider_name"),
+        # #1499: durable drive provenance; None for a hand `coord assign`.
+        "driven_by": d.get("driven_by"),
     }
 
 
@@ -697,8 +701,8 @@ def _record_dispatched_local(
             assignment_id, machine_name, repo_name, repo_github,
             issue_number, issue_title, status, type, briefing,
             files_allowed, model, dispatched_at, required_gates,
-            provider_name, branch
-        ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?)
+            provider_name, branch, driven_by
+        ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(assignment_id) DO NOTHING""",
         (
             assignment_id,
@@ -715,6 +719,7 @@ def _record_dispatched_local(
             json.dumps(list(proposal.required_gates)),
             provider_name,
             branch,
+            proposal.driven_by,
         ),
     )
     conn.commit()
@@ -730,14 +735,23 @@ def _record_dispatched_local(
             tier="business",
             category="dispatch",
             event_type="dispatched",
-            actor="coordinator",
+            # #1499: this is the path `coord drive`'s work stage goes
+            # through (a plain, non-`--interactive` `coord assign`) — an
+            # `actor="drive"` row here is what makes a drive-dispatched
+            # Work assignment distinguishable from a hand `coord assign` in
+            # the audit log alone, after the driver process has exited.
+            actor="drive" if proposal.driven_by else "coordinator",
             summary=f"Dispatched {proposal.type} to {proposal.machine_name}: "
             f"{proposal.repo_name}#{proposal.issue_number}",
             repo=proposal.repo_name,
             issue=proposal.issue_number,
             assignment_id=assignment_id,
             machine=proposal.machine_name,
-            details={"type": proposal.type, "branch": branch},
+            details={
+                "type": proposal.type,
+                "branch": branch,
+                "driven_by": proposal.driven_by,
+            },
         )
 
 
@@ -769,8 +783,8 @@ def _record_dispatched_assignment_local(
             issue_number, issue_title, status, type, briefing,
             files_allowed, model, dispatched_at, review_of_assignment_id,
             review_target, required_gates, review_iteration,
-            provider_name, branch, for_issue_number
-        ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            provider_name, branch, for_issue_number, driven_by
+        ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(assignment_id) DO UPDATE SET
             status = 'running',
             machine_name = excluded.machine_name,
@@ -791,7 +805,10 @@ def _record_dispatched_assignment_local(
             branch = COALESCE(excluded.branch, branch),
             -- #1084: COALESCE so a re-dispatch/reload doesn't clear the JIT
             -- per-issue correlation already recorded for this assignment.
-            for_issue_number = COALESCE(excluded.for_issue_number, for_issue_number)""",
+            for_issue_number = COALESCE(excluded.for_issue_number, for_issue_number),
+            -- #1499: COALESCE so a re-dispatch/reload doesn't clear the
+            -- drive provenance already recorded for this assignment.
+            driven_by = COALESCE(excluded.driven_by, driven_by)""",
         (
             assignment.assignment_id or "",
             assignment.machine_name,
@@ -811,6 +828,7 @@ def _record_dispatched_assignment_local(
             assignment.provider_name,
             assignment.branch,
             assignment.for_issue_number,
+            assignment.driven_by,
         ),
     )
     conn.commit()
@@ -818,7 +836,10 @@ def _record_dispatched_assignment_local(
         tier="business",
         category="dispatch",
         event_type="dispatched",
-        actor="coordinator",
+        # #1499: a drive-dispatched assignment carries its own actor so the
+        # audit log agrees with `driven_by` rather than reading identically
+        # to a human `coord assign` (the exact gap #1499 reported).
+        actor="drive" if assignment.driven_by else "coordinator",
         summary=f"Dispatched {assignment.type} to {assignment.machine_name}: "
         f"{assignment.repo_name}#{assignment.issue_number}",
         repo=assignment.repo_name,
@@ -830,6 +851,7 @@ def _record_dispatched_assignment_local(
             "review_of_assignment_id": assignment.review_of_assignment_id,
             "review_target": assignment.review_target,
             "review_iteration": assignment.review_iteration,
+            "driven_by": assignment.driven_by,
         },
     )
 

@@ -4537,10 +4537,15 @@ def _dispatch_headless(
     repo_cfg: object,
     issue_data: dict,
     issue_title: str,
+    driven_by: str | None = None,
 ) -> None:
     """The plain (non --interactive) HTTP-dispatch path: build a Proposal,
     run the claim + dependency-freshness checks, POST to the agent server,
     and record + post the briefing.
+
+    ``driven_by`` (#1499): durable provenance threaded from ``coord assign
+    --driven-by`` (set by ``coord drive``'s work-stage dispatch). ``None``
+    for a hand ``coord assign`` — the overwhelming majority of callers.
     """
     from coord.board_service import read_board, write_board  # noqa: PLC0415
     from coord.dispatch import dispatch, post_briefing  # noqa: PLC0415
@@ -4590,9 +4595,12 @@ def _dispatch_headless(
         type="plan" if effective_plan_only else "work",
         required_gates=resolved_gates,
         issue_labels=issue_labels,
+        driven_by=driven_by,
     )
 
     click.echo(f"{machine} → {repo} #{issue}: {issue_title}")
+    if driven_by:
+        click.echo(f"  driven by: {driven_by}")
     if effective_plan_only:
         if cfg.dispatch.require_plan and not plan_only:
             click.echo("  mode: plan-only (dispatch.require_plan=true; use --no-plan to override)")

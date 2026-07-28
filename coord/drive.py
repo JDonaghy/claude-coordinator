@@ -860,9 +860,17 @@ def _dispatch_work_stage(
         if gate is not None:
             return gate
 
+    # #1499: durable provenance stamped on every assignment this driver
+    # dispatches via `coord assign` — the piece that survives the driver
+    # process exiting (see coord.models.Assignment.driven_by / Proposal.driven_by).
+    driven_by = f"drive:{state.repo}#{state.issue}"
+
     if opts.do_plan:
         if not state.plan_aid:
-            args = ["assign", "--plan-only", machine, state.repo, str(state.issue)]
+            args = [
+                "assign", "--plan-only", machine, state.repo, str(state.issue),
+                "--driven-by", driven_by,
+            ]
             if opts.model:
                 args += ["--model", opts.model]
             return Action(
@@ -886,7 +894,7 @@ def _dispatch_work_stage(
             )
         return _wait()
 
-    args = ["assign", machine, state.repo, str(state.issue)]
+    args = ["assign", machine, state.repo, str(state.issue), "--driven-by", driven_by]
     if opts.model:
         args += ["--model", opts.model]
     if opts.briefing_file:
@@ -1394,6 +1402,13 @@ class Driver:
     clock: Callable[[], float] = time.monotonic
 
     _run_log: Path | None = field(default=None, init=False, repr=False)
+    # #1499: the terminating Action's own message, captured by `_loop()` right
+    # before it returns — `run()` folds this into the `drive_exited` audit
+    # summary/details so a non-exceptional terminal exit (e.g. `decide()`
+    # returning a `_die(...)` Action for a genuinely failed work assignment,
+    # as opposed to a raised DriveError) still narrates WHY, not just the
+    # bare exit code.
+    _last_exit_message: str = field(default="", init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.out = self.out or sys.stdout
@@ -1503,6 +1518,61 @@ class Driver:
         finally:
             lock.release()
 
+    # ── audit boundaries (#1499) ────────────────────────────────────────
+    def _record_drive_audit(
+        self,
+        event_type: str,
+        summary: str,
+        *,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        """Emit a ``category="drive"``, ``actor="drive"`` audit row.
+
+        ``coord.audit.record_audit`` is itself best-effort (never raises into
+        the caller — disk-full/locked-DB/schema-drift are swallowed there),
+        so this needs no try/except of its own: a broken audit_log must never
+        take down the drive loop.
+        """
+        from coord.audit import record_audit  # noqa: PLC0415
+
+        record_audit(
+            tier="business",
+            category="drive",
+            event_type=event_type,
+            actor="drive",
+            summary=summary,
+            repo=self.repo,
+            issue=self.issue,
+            details=details,
+        )
+
+    def _drive_exit_summary(
+        self, exit_code: int | None, exc: BaseException | None
+    ) -> tuple[str, dict[str, Any]]:
+        """Human summary + machine details for the terminating ``drive_exited``
+        row — the piece that answers "what did the driver do, and why did it
+        stop?" retroactively, after the tmux session (if any) is long gone."""
+        ident = f"{self.repo}#{self.issue}"
+        if exc is not None:
+            if isinstance(exc, DriveError):
+                summary = f"drive exited for {ident}: {exc} (exit_code={exc.exit_code})"
+                return summary, {"exit_code": exc.exit_code, "error": str(exc)}
+            summary = f"drive exited for {ident}: unexpected error ({exc!r})"
+            return summary, {"exit_code": None, "error": repr(exc)}
+        # Non-exceptional terminal exit — decide() returned a `_die(...)` (or
+        # `_succeed(...)`) Action directly (`_loop`'s `action.is_exit` branch
+        # returns the code without raising). `_last_exit_message` carries that
+        # Action's own `message` — the same text this run's log already
+        # printed via self.log/self.warn — so the audit row narrates WHY,
+        # not just the bare exit code.
+        reason = self._last_exit_message.strip()
+        if not reason:
+            reason = {EXIT_OK: "ok", EXIT_DEADLINE: "deadline exceeded"}.get(
+                exit_code, f"exit_code={exit_code}"
+            )
+        summary = f"drive exited for {ident} (exit_code={exit_code}): {reason}"
+        return summary, {"exit_code": exit_code, "reason": reason}
+
     # ── the loop ────────────────────────────────────────────────────────
     def run(self) -> int:
         scratch = scratch_dir()
@@ -1520,6 +1590,9 @@ class Driver:
                 who = holder.read_text().strip()
             except OSError:
                 who = "another run"
+            # No `drive_started`/`drive_exited` pair here — this run never
+            # actually started (another driver already holds the per-issue
+            # lock), so there is nothing new to narrate in the audit log.
             raise DriveError(
                 f"already driving {self.repo} #{self.issue} ({who}).\n"
                 "   A second driver on the SAME issue would double-dispatch work.\n"
@@ -1531,8 +1604,19 @@ class Driver:
             holder.write_text(f"{self.repo} #{self.issue} (pid {os.getpid()})\n")
         except OSError:
             pass
+        self._record_drive_audit(
+            "drive_started", f"drive started for {self.repo}#{self.issue}"
+        )
         try:
-            return self._loop()
+            exit_code = self._loop()
+        except BaseException as exc:  # noqa: BLE001 — narrate every exit, then re-raise unchanged
+            summary, details = self._drive_exit_summary(None, exc)
+            self._record_drive_audit("drive_exited", summary, details=details)
+            raise
+        else:
+            summary, details = self._drive_exit_summary(exit_code, None)
+            self._record_drive_audit("drive_exited", summary, details=details)
+            return exit_code
         finally:
             try:
                 holder.unlink()
@@ -1607,7 +1691,10 @@ class Driver:
         while True:
             now = self.clock()
             if now > deadline:
-                self.warn(f"deadline of {self.opts.deadline_mins:g}m exceeded")
+                self._last_exit_message = (
+                    f"deadline of {self.opts.deadline_mins:g}m exceeded"
+                )
+                self.warn(self._last_exit_message)
                 if state is not None:
                     print(
                         json.dumps(state.as_flat_dict(), indent=2, default=str),
@@ -1652,6 +1739,7 @@ class Driver:
                 self.warn(warning)
 
             if action.is_exit:
+                self._last_exit_message = action.message
                 if action.exit_code == EXIT_OK:
                     for line in action.message.splitlines():
                         self.log(line)
