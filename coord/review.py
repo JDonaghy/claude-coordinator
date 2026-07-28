@@ -1616,9 +1616,18 @@ def dispatch_review(
         # Fix #2 (PREVENTATIVE): pre-filter against the agent's /health
         # ``repos`` list so a drifted local config can't pick a machine that
         # will 400.  Fail-open: None means "probe failed, include anyway".
+        # #1485: an empty list is NOT the same as None here — it means "this
+        # agent has no local coordinator.yml at all" (the expected, correct
+        # state for a worker-only machine — coordinator.yml lives on
+        # dellserver only), which matches the agent's own interpretation in
+        # AgentServer.assign (`if self.repos and spec.repo_name not in
+        # self.repos`, coord/agent.py) where an empty list is falsy and means
+        # "no restriction, accept everything." Treat `[]` the same way here —
+        # only a *non-empty* advertised list that omits the repo is a genuine
+        # drift signal worth skipping the candidate for.
         _hc = health_checker if health_checker is not None else _fetch_agent_advertised_repos
         advertised = _hc(machine.host)
-        if advertised is not None and completed.repo_name not in advertised:
+        if advertised and completed.repo_name not in advertised:
             log.warning(
                 "[review] skipping candidate %s: /health advertises repos %r "
                 "but repo %r is not listed — possible config drift",
