@@ -1229,6 +1229,7 @@ def test_dispatch_review_captures_branch_sha(
         issue_body_fetcher=lambda repo, num: "",
         remote_branch_checker=lambda repo, branch: True,
         branch_sha_fetcher=lambda repo, branch: "deadbeef1234",  # injected for test
+        diff_fetcher=lambda repo, num, **kw: None,  # #1484: no live `gh pr diff`
     )
 
     assert result is not None
@@ -1321,7 +1322,7 @@ def test_dispatch_review_tolerates_patch_id_fetch_failure(
 
 
 def test_dispatch_review_patch_id_hashes_untruncated_diff(
-    monkeypatch, two_machine_config: Config,
+    two_machine_config: Config,
 ) -> None:
     """#1475 blocking finding: review_patch_id must be computed from the full,
     untruncated diff — not the display-truncated text with a trailing
@@ -1329,12 +1330,9 @@ def test_dispatch_review_patch_id_hashes_untruncated_diff(
     ``branch_patch_id`` (computed from an uncapped compare-API diff) for any
     PR whose diff exceeds the 60000-char display cap. The briefing shown to
     the reviewer must still get the truncated copy."""
-    from coord import github_ops
-
     # A diff comfortably over the 60000-char display truncation threshold.
     big_diff = "diff --git a/f.py b/f.py\n" + ("+x\n" * 30000)
     assert len(big_diff) > 60000
-    monkeypatch.setattr(github_ops, "_gh", lambda *args, **kwargs: big_diff)
 
     board = Board()
     completed = _completed_assignment(machine="laptop")
@@ -1356,6 +1354,10 @@ def test_dispatch_review_patch_id_hashes_untruncated_diff(
         remote_branch_checker=lambda repo, branch: True,
         branch_sha_fetcher=lambda repo, branch: "deadbeef1234",
         patch_id_computer=_capture_patch_id,
+        # #1484: inject the diff directly rather than monkeypatching the
+        # `_gh` subprocess boundary — closes the live `gh pr diff` seam this
+        # test used to reach through `github_ops.pr_diff`.
+        diff_fetcher=lambda repo, num, **kw: big_diff,
     )
 
     assert result is not None

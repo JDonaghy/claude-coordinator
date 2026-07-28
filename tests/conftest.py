@@ -3,9 +3,24 @@
 from __future__ import annotations
 
 import sqlite3
+import subprocess
 from pathlib import Path
 
 import pytest
+
+from coord import github_ops
+
+# Captured at import time — the pristine ``subprocess.run`` / ``_gh``, before
+# any test or fixture has monkeypatched either. ``_no_live_gh`` below compares
+# the live ``subprocess.run`` against this reference to tell "a test mocked
+# the subprocess boundary itself" (delegate to the real ``_gh``, which will
+# hit that mock) apart from "nothing mocked anything" (raise instead of
+# shelling out for real). ``subprocess`` is a singleton module, so this is the
+# same object whether reached via ``subprocess.run`` or
+# ``coord.github_ops.subprocess.run`` — the two spellings tests use
+# interchangeably to patch it.
+_REAL_SUBPROCESS_RUN = subprocess.run
+_REAL_GH = github_ops._gh
 
 
 @pytest.fixture(autouse=True)
@@ -98,6 +113,66 @@ def _no_real_usage_probe(monkeypatch):
         "coord.usage_limits.get_plan_limits",
         lambda *a, **k: PlanLimits(status="unknown"),
     )
+
+
+@pytest.fixture(autouse=True)
+def _no_live_gh(monkeypatch):
+    """#1484: default every ``coord.github_ops`` helper to fail exactly as it
+    would on a host where ``gh`` isn't on PATH (raise ``GhError``, a
+    ``RuntimeError`` subclass) instead of shelling out to a real, live,
+    authenticated ``gh`` subprocess — regardless of whether ``gh`` happens to
+    be installed on the machine running pytest.
+
+    Found via #1472 (elitebook lacked ``gh`` on PATH and ~98 tests that
+    inject every *other* dependency still crashed reaching a live ``gh``) and
+    confirmed by direct measurement while fixing #1484: running the full
+    suite with a real, authenticated ``gh`` on PATH shows ~280 tests reaching
+    ``coord.github_ops._gh`` for real (mostly resolving fast via 404s against
+    the fixture repo names, but a live authenticated network round-trip all
+    the same) — this is the general form of the seam
+    ``test_dispatch_review_captures_branch_sha`` illustrates: tests that
+    inject every DI seam a function exposes can still fall through an
+    uninjected one straight to a real subprocess.
+
+    Mirrors ``_non_terminal_work`` / ``_no_agent_health_probe`` /
+    ``_no_real_usage_probe`` above: the seam most callers already treat as
+    best-effort/fail-open (``pr_diff`` -> None, ``work_is_terminal`` ->
+    False, etc. — see the many ``except RuntimeError`` guards in
+    ``coord/github_ops.py`` and its callers) gets a safe default here, and
+    tests exercising real ``gh`` behavior inject their own fake via the DI
+    parameter the caller already exposes (``pr_lookup``,
+    ``branch_sha_fetcher``, ``diff_fetcher``, ...) or monkeypatch
+    ``coord.github_ops._gh`` directly themselves — either takes priority
+    over this default since it runs after fixture setup.
+
+    A large minority of tests (``tests/test_github_ops.py`` and friends —
+    ``test_milestone_seam.py``, ``test_cli_milestone_assign.py``,
+    ``test_coord_test.py``, ``test_cli_queue.py``, ``test_cli_track.py``,
+    ...) instead mock one level deeper, at ``subprocess.run`` itself, to
+    exercise ``_gh()``'s *real* body (its argv building, its
+    FileNotFoundError/TimeoutExpired/non-zero-exit handling, #1483). A flat
+    ``_gh`` replacement would shadow that real body and break every one of
+    them. So the replacement below only raises when ``subprocess.run`` is
+    STILL the pristine function captured at collection time — i.e. nothing
+    in the test has mocked the subprocess boundary; when a test has (either
+    spelling: ``subprocess.run`` or ``coord.github_ops.subprocess.run`` — the
+    same singleton module attribute either way), it delegates to the real
+    ``_gh``, which then runs against that mock exactly as the test intends.
+    """
+
+    def _gh_guard(*args, **kwargs):
+        if subprocess.run is _REAL_SUBPROCESS_RUN:
+            raise github_ops.GhError(
+                f"gh {' '.join(args)} reached the real coord.github_ops._gh() "
+                "seam from a test (#1484). Inject the dependency the caller "
+                "already exposes (pr_lookup, branch_sha_fetcher, "
+                "diff_fetcher, ...), monkeypatch coord.github_ops._gh "
+                "directly, or mock subprocess.run to exercise _gh()'s own "
+                "body — relying on a live gh subprocess is not allowed."
+            )
+        return _REAL_GH(*args, **kwargs)
+
+    monkeypatch.setattr(github_ops, "_gh", _gh_guard)
 
 
 def output_and_stderr(result) -> str:
