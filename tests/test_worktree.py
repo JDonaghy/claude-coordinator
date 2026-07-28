@@ -12,7 +12,9 @@ from coord.agent import (
     ADVISORY,
     DONE,
     FAILED,
+    PENDING,
     RUNNING,
+    AgentAssignment,
     AgentServer,
     AssignmentSpec,
     _slugify,
@@ -497,3 +499,136 @@ class TestParallelWorktrees:
         assert final1.branch == "issue-10-first"
         assert final2.branch == "issue-11-second"
         server.shutdown()
+
+
+# ── #1468: rescued WIP commit must not poison the branch with a merge ──────
+
+
+class TestPullRebaseDefault:
+    """#1468: a rescued WIP commit (coordinator-authored, pushed to the
+    branch by `_rescue_uncommitted_work` when a worker dies mid-flight) can
+    leave the remote branch ahead of a fresh worktree's local branch. If the
+    next worker's own push is then rejected non-fast-forward and it reaches
+    for a plain `git pull`, git's default `pull.rebase=false` merges —
+    producing a two-parent commit that GitHub refuses to rebase-merge
+    forever (#1467). Setting `pull.rebase=true` on the worktree at creation
+    time makes that same `git pull` rebase instead, keeping history linear.
+    """
+
+    def _assignment(self, spec: AssignmentSpec, log_path: Path) -> AgentAssignment:
+        a = AgentAssignment(id="a-" + spec.branch, spec=spec, status=PENDING)
+        a.log_path = str(log_path)
+        return a
+
+    def test_pull_rebase_set_on_worktree_not_on_base_checkout(
+        self, tmp_path: Path, repo_with_remote: tuple[Path, Path]
+    ) -> None:
+        local, _remote = repo_with_remote
+        server = _server(tmp_path, local)
+        spec = _spec(local, issue_number=1468, issue_title="pull rebase config")
+        assignment = self._assignment(spec, tmp_path / "a.log")
+
+        wt = server._setup_worktree(assignment, local)
+
+        assert _git(wt, "config", "--get", "pull.rebase") == "true"
+        # `local` is the operator's own checkout (the `repo_path` argument) —
+        # its config must be left alone, never mutated as a side effect of
+        # dispatching work into a worktree of it.
+        base_cfg = subprocess.run(
+            ["git", "config", "--get", "pull.rebase"],
+            cwd=str(local), capture_output=True, text=True,
+        )
+        assert base_cfg.returncode != 0, (
+            f"pull.rebase leaked onto the base checkout: {base_cfg.stdout!r}"
+        )
+
+    def test_rescued_wip_commit_then_pull_stays_linear(
+        self, tmp_path: Path, repo_with_remote: tuple[Path, Path]
+    ) -> None:
+        """Drives the exact step-3-to-5 chain from #1468: a rescue commit is
+        already on the remote branch; a second, freshly-branched assignment
+        makes its own commit, its push is rejected non-fast-forward, and it
+        `git pull`s. With `pull.rebase=true` on the worktree, the resulting
+        history has no merge commit."""
+        local, remote = repo_with_remote
+        branch_name = "issue-1468-fix-poison"
+
+        # Step 1-2: the coordinator's rescue path committed and pushed a WIP
+        # snapshot to the branch, from a worktree that has since been torn
+        # down. Simulate that directly on `local` without going through
+        # `_setup_worktree`/`_rescue_uncommitted_work` — this test is about
+        # what the *next* worktree does when it meets that commit on origin.
+        _git(local, "checkout", "-b", branch_name)
+        (local / "rescued.txt").write_text("rescued work\n")
+        _git(local, "add", "rescued.txt")
+        _git(
+            local, "commit", "-m",
+            "WIP [coord-rescue] #1468: uncommitted worker changes preserved "
+            "by the coordinator",
+        )
+        _git(local, "push", "-u", "origin", branch_name)
+        _git(local, "checkout", "main")
+        _git(local, "branch", "-D", branch_name)
+
+        # Step 3: a second assignment is dispatched fresh off main (as the
+        # coordinator's retry does) for the SAME branch name.
+        server = _server(tmp_path, local)
+        spec = _spec(
+            local, issue_number=1468, issue_title="fix poison",
+            fresh_branch=True,
+        )
+        assert spec.branch != branch_name  # sanity: default_branch, not target
+        assignment = self._assignment(spec, tmp_path / "a2.log")
+        wt = server._setup_worktree(assignment, local)
+        assert _git(wt, "rev-parse", "--abbrev-ref", "HEAD") == branch_name
+        # Freshly branched off main — must NOT already contain the rescue
+        # commit, or the push below would be a fast-forward and prove nothing.
+        assert not (wt / "rescued.txt").exists()
+        assert _git(wt, "config", "--get", "pull.rebase") == "true"
+
+        # The worker "reimplements cleanly" — its own, divergent commit.
+        (wt / "clean.py").write_text("def clean():\n    return 2\n")
+        _git(wt, "add", "clean.py")
+        _git(wt, "commit", "-m", "Fix #1468: clean reimplementation")
+
+        # Step 4: push is rejected — origin/branch_name already moved (the
+        # rescue commit) past this worktree's start point.
+        push = subprocess.run(
+            ["git", "push", "-u", "origin", "HEAD"],
+            cwd=str(wt), capture_output=True, text=True,
+        )
+        assert push.returncode != 0, f"expected non-fast-forward rejection: {push.stdout}"
+
+        # Step 5: the worker reaches for `git pull`. This fresh branch has no
+        # upstream tracking configured (it was never pushed successfully), so
+        # a *bare* `git pull` would itself fail with "no tracking
+        # information" rather than merge — the worker's realistic next move
+        # is the explicit form, `git pull origin <branch>`, which needs no
+        # tracking and is exactly what still respects `pull.rebase`.
+        pull = subprocess.run(
+            ["git", "pull", "origin", branch_name],
+            cwd=str(wt), capture_output=True, text=True,
+        )
+        assert pull.returncode == 0, f"git pull failed: {pull.stderr}"
+
+        # Acceptance: linear history — no merge (two-parent) commit.
+        merges = _git(wt, "log", "--merges", "--oneline")
+        assert merges == "", f"merge commit created: {merges!r}"
+        parents = _git(wt, "log", "-1", "--format=%P").split()
+        assert len(parents) == 1, f"HEAD has {len(parents)} parents (expected 1, i.e. no merge)"
+
+        # Both commits' content survived the rebase.
+        subjects = _git(wt, "log", "--format=%s")
+        assert "coord-rescue" in subjects
+        assert "clean reimplementation" in subjects
+        assert (wt / "rescued.txt").exists()
+        assert (wt / "clean.py").exists()
+
+        # The rebased branch now pushes cleanly (fast-forward).
+        final_push = subprocess.run(
+            ["git", "push", "-u", "origin", "HEAD"],
+            cwd=str(wt), capture_output=True, text=True,
+        )
+        assert final_push.returncode == 0, f"final push failed: {final_push.stderr}"
+        remote_merges = _git(remote, "log", "--merges", "--oneline", branch_name)
+        assert remote_merges == ""

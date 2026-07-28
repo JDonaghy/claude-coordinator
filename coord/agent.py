@@ -1619,6 +1619,40 @@ def _git_worktree_add(
     _git(repo_path, "worktree", "add", *add_args)
 
 
+def _set_worktree_pull_rebase(repo_path: Path, worktree_path: Path) -> None:
+    """Default *worktree_path*'s ``pull.rebase`` to true, scoped to that
+    worktree only (#1468).
+
+    If this worktree's own push later gets rejected non-fast-forward — most
+    commonly because a ``coord-rescue`` WIP commit (see
+    :meth:`AgentServer._rescue_uncommitted_work`) landed on the branch from a
+    prior, killed assignment — and it reaches for a plain ``git pull``, git
+    rebases onto the remote tip instead of creating a merge commit. That
+    merge commit is the only reason #1454/#1456 needed a human: GitHub
+    refuses to rebase-merge a branch that already contains one (#1467).
+
+    A linked worktree has no config file of its own by default — a plain
+    ``git config`` run with ``cwd=worktree_path`` resolves to the *shared*
+    ``$GIT_DIR/config``, the same file the base checkout (``repo_path``)
+    reads. Setting ``pull.rebase`` that way would leak it onto the operator's
+    own checkout as a side effect of dispatching work, which the issue
+    explicitly rules out. ``git config --worktree`` writes to a genuinely
+    per-worktree file (``$GIT_DIR/worktrees/<id>/config.worktree``) instead —
+    but that file is only consulted once ``extensions.worktreeConfig`` is
+    enabled on the repo, so that has to be turned on first (idempotent; a
+    repeat call from a later worktree setup is a no-op).
+
+    Best-effort throughout: any failure here just means a future ``git
+    pull`` in this worktree merges as before, same as pre-#1468 behavior —
+    never worth failing the whole worktree setup over.
+    """
+    try:
+        _git(repo_path, "config", "extensions.worktreeConfig", "true")
+        _git(worktree_path, "config", "--worktree", "pull.rebase", "true")
+    except _GitError:
+        pass
+
+
 def setup_interactive_worktree(
     repo_path: Path,
     issue_number: int,
@@ -1781,6 +1815,12 @@ def setup_interactive_worktree(
             ["-b", branch_name, str(worktree_path), start_point],
             log_path=log_path,
         )
+
+    # #1468: same worktree-scoped `pull.rebase` default as
+    # `AgentServer._setup_worktree` — see `_set_worktree_pull_rebase` for why.
+    # An interactive session's worktree can hit the same rejected-push-then-
+    # `git pull` sequence as a headless worker's.
+    _set_worktree_pull_rebase(repo_path, worktree_path)
 
     return worktree_path, branch_name
 
@@ -3632,6 +3672,13 @@ class AgentServer:
         except Exception:  # noqa: BLE001 — must never break /status
             _log.warning("_prune_terminal_advisory failed", exc_info=True)
 
+        # #1468: clear any ADVISORY entry superseded by a later DONE retry
+        # for the same issue — see `_prune_superseded_advisory` docstring.
+        try:
+            self._prune_superseded_advisory()
+        except Exception:  # noqa: BLE001 — must never break /status
+            _log.warning("_prune_superseded_advisory failed", exc_info=True)
+
         with self._lock:
             assignments = list(self._assignments.values())
         active = []
@@ -4201,6 +4248,11 @@ class AgentServer:
                 ["-b", branch_name, str(worktree_path), start_point],
                 log_path=assignment.log_path,
             )
+
+        # #1468: default this worktree's `pull.rebase` to true — see
+        # `_set_worktree_pull_rebase` for why and how it's scoped so
+        # `repo_path` (the operator's own checkout) is never touched.
+        _set_worktree_pull_rebase(repo_path, worktree_path)
 
         return worktree_path
 
@@ -5544,6 +5596,61 @@ class AgentServer:
 
         with self._lock:
             for aid in terminal_ids:
+                self._assignments.pop(aid, None)
+                lock = self._cleanup_locks.get(aid)
+                if lock is not None and not lock.locked():
+                    self._cleanup_locks.pop(aid, None)
+                self._reap_complete.pop(aid, None)
+        self._persist()
+
+    def _prune_superseded_advisory(self) -> None:
+        """Drop ADVISORY assignments superseded by a later DONE retry (#1468).
+
+        `_prune_terminal_advisory` above clears an advisory once the work
+        goes terminal **on GitHub** (issue closed / PR merged) — but that's
+        a post-merge signal. #1468's rescued-WIP-commit chain exposes a gap
+        strictly earlier than that: assignment A dies mid-flight, its
+        uncommitted work gets rescued into a WIP commit and the assignment
+        lands on ADVISORY ("UNVERIFIED — review before merging"); assignment
+        B is then dispatched for the *same issue*, reimplements cleanly, and
+        reaches DONE. Nothing on GitHub has closed or merged yet — the PR is
+        sitting there waiting for review/merge — so `_prune_terminal_advisory`
+        leaves A's advisory in place, still reading as a live warning against
+        exactly the branch B just finished.
+
+        Matches on ``(repo_name, issue_number)`` rather than branch, since a
+        retry may deliberately use a *different* branch (e.g.
+        ``fresh_branch``) than the assignment it supersedes — the rescue
+        banner is scoped to the issue, not to one branch name.
+
+        "Later" is determined by position in ``self._assignments``, which
+        (being a plain dict) preserves insertion order and is only ever
+        appended to at dispatch time (see ``assign()``) — never reordered or
+        re-inserted. So a later dict position is unambiguously a later
+        dispatch on this agent, with no wall-clock or cross-machine
+        assumption required. Unlike `_prune_terminal_advisory` this makes no
+        GitHub round-trip (pure in-memory comparison), so it needs no rate
+        limiting and can run on every `/status` poll.
+        """
+        with self._lock:
+            ordered = list(self._assignments.values())
+            superseded_ids: list[str] = []
+            for i, a in enumerate(ordered):
+                if a.status != ADVISORY:
+                    continue
+                key = (a.spec.repo_name, a.spec.issue_number)
+                for later in ordered[i + 1 :]:
+                    if (
+                        later.status == DONE
+                        and (later.spec.repo_name, later.spec.issue_number) == key
+                    ):
+                        superseded_ids.append(a.id)
+                        break
+
+            if not superseded_ids:
+                return
+
+            for aid in superseded_ids:
                 self._assignments.pop(aid, None)
                 lock = self._cleanup_locks.get(aid)
                 if lock is not None and not lock.locked():
