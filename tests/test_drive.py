@@ -1331,6 +1331,137 @@ def test_the_escalate_branch_runs_before_the_attempt_cap_is_checked():
     assert "attempted" not in action.message
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# #1526: driver/gate divergence — `coord merge`'s own reason overrides a
+# stale-green `work_test_state`/`review_verdict` reading instead of being
+# retried against blind.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def test_smoke_required_with_a_passed_test_state_escalates_instead_of_retrying():
+    """#1526 instance 1 (#1412): board shows test=passed, but `coord merge`
+    left 'smoke test required but no verdict recorded' as the merge_reason
+    (`merge_queue.process()`'s wording when `has_smoke_verdict` fails closed
+    on a fresher check than `work_test_state` reflects). Retrying `coord
+    merge --only` unchanged reproduces the identical refusal every time — the
+    driver must name the gate and stop, not spend the retry budget on it.
+    """
+    counters = DriveCounters()
+    action = step(
+        approved_work(
+            merge_status="READY",
+            merge_reason="smoke test required but no verdict recorded",
+        ),
+        counters=counters,
+    )
+    assert action.is_exit
+    assert action.exit_code == EXIT_ESCALATED
+    assert counters.merge_attempts == 0  # never even tried the doomed merge
+    assert "smoke" in action.message.lower()
+    assert "coord test w1 --passed" in " ".join(action.command)
+
+
+def test_smoke_gate_agreeing_with_a_missing_verdict_still_retries():
+    """Sanity check for the divergence gate: when `work_test_state` is
+    genuinely blank (no verdict at all — the OTHER, non-divergent way to see
+    a smoke_required reason), `_decide_test` — called earlier in `decide()`
+    — already parks the run on a wait; `_decide_merge` is never even
+    reached, so this never becomes an escalate-vs-retry question at all."""
+    action = step(done_work(work_test_state=""))
+    assert action.kind == WAIT
+
+
+def test_review_required_with_an_approved_verdict_escalates_instead_of_retrying():
+    """#1526 instance 2 (#1483): board shows review=approve, but a rebase
+    onto a moved `main` correctly voided the approval (#1475's patch-id
+    gate) — `coord merge` leaves 'review required but not approved' as the
+    merge_reason. Retrying cannot reconcile the two readings; the driver
+    must name the gate and propose the safe corrective action (a scoped
+    reaffirm or a full re-review) instead of burning the merge-attempt
+    budget three times over.
+    """
+    counters = DriveCounters()
+    action = step(
+        approved_work(
+            merge_status="READY",
+            merge_reason="review required but not approved",
+        ),
+        counters=counters,
+    )
+    assert action.is_exit
+    assert action.exit_code == EXIT_ESCALATED
+    assert counters.merge_attempts == 0
+    assert "review" in action.message.lower()
+    command_str = " ".join(action.command)
+    assert "review-reaffirm w1" in command_str
+    assert "coord review w1" in command_str
+
+
+def test_divergence_is_named_even_when_plans_own_gate_check_already_blocked():
+    """The divergence can hide behind BLOCKED too — when `merge_queue.
+    plan()`'s OWN render-time gate check caught the same disagreement (see
+    `_entry_gate_status`) — not only behind a nominally-retryable status
+    like READY. Either way this must escalate, never fall into the passive
+    `_wait()` the plain BLOCKED branch uses for a merge-unrelated reason
+    like 'CI running' (see `test_a_blocked_merge_waits_and_reports_the_gate`).
+    """
+    action = step(
+        approved_work(
+            merge_status="BLOCKED",
+            merge_reason="test verdict missing",
+        )
+    )
+    assert action.is_exit
+    assert action.exit_code == EXIT_ESCALATED
+
+
+def test_two_identical_merge_refusals_in_a_row_escalate_without_a_third_attempt():
+    """#1526 black-box scenario (c): simulates the actual polling sequence —
+    attempt 1 runs (merge_reason is still empty going in, so the divergence
+    can't be seen yet), then `coord merge` leaves its refusal on the board.
+    The SECOND `decide()` call, reading that refusal back against an
+    unchanged 'passed' test_state, must escalate rather than spend a second
+    (of three) attempts retrying the identical command."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_merge_attempts=3)
+
+    # Poll 1: nothing has run yet — merge_reason is empty, so there is
+    # nothing to diverge from. A real attempt is still the right call.
+    first = step(
+        approved_work(merge_status="READY", merge_reason=""),
+        opts,
+        counters=counters,
+    )
+    assert first.kind == RUN
+    assert counters.merge_attempts == 1
+
+    # Poll 2: that attempt's own refusal is now on the board, and it
+    # contradicts this same state's work_test_state="passed" — escalate
+    # instead of burning attempt 2 (or, worse, all the way to 3).
+    second = step(
+        approved_work(
+            merge_status="READY",
+            merge_reason="smoke test required but no verdict recorded",
+        ),
+        opts,
+        counters=counters,
+    )
+    assert second.is_exit
+    assert second.exit_code == EXIT_ESCALATED
+    assert counters.merge_attempts == 1  # unchanged — no second attempt spent
+
+
+def test_merge_gate_kind_recognises_both_process_and_plan_wordings():
+    from coord.drive import _merge_gate_kind
+
+    assert _merge_gate_kind("smoke test required but no verdict recorded") == "smoke"
+    assert _merge_gate_kind("test verdict missing") == "smoke"
+    assert _merge_gate_kind("review required but not approved") == "review"
+    assert _merge_gate_kind("review not approved") == "review"
+    assert _merge_gate_kind("checks failed: build (failure)") is None
+    assert _merge_gate_kind("") is None
+
+
 # ── terminal: merged, verified ───────────────────────────────────────────────
 
 
@@ -1781,6 +1912,120 @@ def test_driver_escalates_and_writes_the_record_via_the_cli(driver_factory):
     assert any("escalate record" in a for a in argvs), argvs
     assert any("gh pr merge 1496 --rebase" in a for a in argvs), argvs
     assert not any(" merge --only" in a for a in argvs), argvs
+
+
+def test_driver_escalates_a_gate_divergence_without_ever_attempting_the_merge(
+    driver_factory,
+):
+    """#1526 end to end: `/board`'s `merge_plan` reads READY (a normal
+    daemon-backed board build — `merge_queue.plan()`'s own render-time gate
+    check didn't have the live SHA data to catch the staleness a REAL `coord
+    merge` attempt would), but its `reason` already carries a smoke refusal
+    left over from state persisted on the raw queue row. `work_test_state`
+    reads 'passed'. `coord merge --only` must never even run — the
+    divergence escalates on the very first poll.
+    """
+    payload = board(
+        status="done", test_state="passed", review_state="done", review_iteration=0
+    )
+    payload["assignments"].append(
+        {
+            "repo_name": REPO,
+            "issue_number": ISSUE,
+            "type": "review",
+            "assignment_id": "r1",
+            "dispatched_at": 2.0,
+            "status": "done",
+            "review_of_assignment_id": "w1",
+            "review_verdict": "approve",
+        }
+    )
+    payload["merge_plan"] = [
+        {
+            "repo_name": REPO,
+            "issue_number": ISSUE,
+            "status": "READY",
+            "reason": "smoke test required but no verdict recorded",
+            "assignment_id": "w1",
+        }
+    ]
+    driver = driver_factory(
+        [payload],
+        opts=DriveOptions(
+            machine="precision", poll=1.0, max_merge_attempts=3, deadline_mins=1.0
+        ),
+    )
+    assert driver.run() == EXIT_ESCALATED
+    argvs = [" ".join(a) for a in driver.recorded]  # type: ignore[attr-defined]
+    assert any("escalate record" in a for a in argvs), argvs
+    assert any("coord test w1 --passed" in a for a in argvs), argvs
+    assert not any(" merge --only" in a for a in argvs), argvs
+
+
+def test_driver_posts_a_durable_comment_when_a_gate_divergence_escalates(
+    driver_factory, monkeypatch,
+):
+    """#1526: the tmux pane and the `coord escalate` board row are not
+    enough — both disappear the moment the drive session ends unless an
+    operator already knows to look. The escalation must also reach the
+    issue itself. Stubs `github_ops.post_issue_comment` so this never
+    shells out to a real `gh`.
+    """
+    posted: list[tuple[str, int, str]] = []
+    monkeypatch.setattr(
+        "coord.github_ops.post_issue_comment",
+        lambda repo, issue, body: posted.append((repo, issue, body)),
+    )
+    payload = board(
+        status="done", test_state="passed", review_state="done", review_iteration=0
+    )
+    payload["assignments"].append(
+        {
+            "repo_name": REPO,
+            "issue_number": ISSUE,
+            "type": "review",
+            "assignment_id": "r1",
+            "dispatched_at": 2.0,
+            "status": "done",
+            "review_of_assignment_id": "w1",
+            "review_verdict": "approve",
+        }
+    )
+    payload["merge_plan"] = [
+        {
+            "repo_name": REPO,
+            "issue_number": ISSUE,
+            "status": "READY",
+            "reason": "smoke test required but no verdict recorded",
+            "assignment_id": "w1",
+        }
+    ]
+    driver = driver_factory(
+        [payload],
+        opts=DriveOptions(
+            machine="precision", poll=1.0, max_merge_attempts=3, deadline_mins=1.0
+        ),
+    )
+    assert driver.run() == EXIT_ESCALATED
+    assert len(posted) == 1
+    repo_github, issue_number, body = posted[0]
+    assert repo_github == "john/claude-coordinator"
+    assert issue_number == ISSUE
+    assert "smoke" in body.lower()
+
+
+def test_driver_does_not_post_a_comment_on_a_normal_merge(driver_factory, monkeypatch):
+    """The new #1526 comment channel is scoped to escalations only — a
+    normal verified merge must not grow a GitHub side-effect it never had
+    before."""
+    posted: list[tuple[str, int, str]] = []
+    monkeypatch.setattr(
+        "coord.github_ops.post_issue_comment",
+        lambda repo, issue, body: posted.append((repo, issue, body)),
+    )
+    driver = driver_factory([board(status="merged")])
+    assert driver.run() == EXIT_OK
+    assert posted == []
 
 
 def test_driver_retries_a_conflict_originated_needs_attention_instead_of_escalating(

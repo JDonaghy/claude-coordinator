@@ -512,6 +512,25 @@ def test_fingerprint_ignores_fields_the_state_machine_does_not_branch_on():
     assert a.fingerprint == b.fingerprint
 
 
+def test_fingerprint_changes_when_only_merge_reason_changes():
+    """#1526: `_merge_gate_divergence` branches on `merge_reason` even when
+    `merge_status` itself is unchanged (e.g. a `coord merge` attempt that
+    leaves the board at 'READY' but writes a NEW smoke/review refusal onto
+    it). Before this, the fingerprint only tracked `merge_status`, so that
+    transition was invisible to both the `state:` log line and the stall
+    timer in `Driver._loop` — the driver would look "stalled" through the
+    exact moment it most needed to react.
+    """
+    a = IssueState(repo=REPO, issue=1, merge_status="READY", merge_reason="")
+    b = IssueState(
+        repo=REPO,
+        issue=1,
+        merge_status="READY",
+        merge_reason="smoke test required but no verdict recorded",
+    )
+    assert a.fingerprint != b.fingerprint
+
+
 def test_flat_dict_uses_the_legacy_upper_case_key_names():
     state = IssueState(
         repo=REPO, issue=1392, active_types=("review", "smoke"), auto_loop=False

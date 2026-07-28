@@ -286,3 +286,39 @@ row's right-click menu) — a `gh pr merge` on a PR that ISN'T actually clean
 (a failed check, an unapproved review) just moves the mess onto GitHub. Once
 resolved, `coord escalate dismiss <repo> <issue>` clears the record (`coord
 escalate run` does this automatically on a zero exit).
+
+## 11. A `smoke_required`/`review_required` merge refusal that contradicts the board's own `test=`/`review=` reading escalates too (#1526)
+
+`coord drive` decides the Test/Review gates are satisfied from
+`work_test_state`/`review_verdict` — but `coord merge` enforces a fresher
+check (`merge_queue.has_smoke_verdict`/`has_approved_review`: SHA/patch-id
+-anchored freshness for smoke, patch-id voiding for a rebased review) and can
+refuse for a reason the driver's own view never saw coming — most often a
+rebase onto a moved `main` that correctly voids an already-"passed"/"approve"
+verdict. Two real overnight stalls (2026-07-27/28, `#1412` and `#1483`) hit
+exactly this: the board showed a green `test=`/`review=` line, `coord merge`
+printed `smoke_required`/`review_required` into the tmux pane, and the driver
+spent its entire `max_merge_attempts` budget re-running the identical
+`coord merge --only` — which can never change either side of that
+disagreement — before dying without naming which gate blocked it.
+
+`_decide_merge` now detects this divergence (`_merge_gate_divergence` in
+`coord/drive.py`) and escalates on the FIRST encounter, exactly like rule #10
+above, with a gate-specific proposed command:
+
+```
+# smoke divergence:
+coord test <work_aid> --passed   # ONLY if the suite genuinely still passes
+                                  # against the CURRENT base — otherwise
+                                  # dispatch a fresh smoke test
+
+# review divergence:
+coord review-reaffirm <work_aid> --reason '<why this delta is safe>'
+# or a full re-review:
+coord review <work_aid>
+```
+
+Neither command runs automatically — same one-key-human-decision posture as
+every other escalation. The escalation is also posted as a comment on the
+GitHub issue itself (not just the tmux pane and the `coord escalate` board
+row), so it survives the drive session ending.

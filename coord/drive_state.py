@@ -131,6 +131,14 @@ class IssueState:
 
         Used to tell a *stall* (no transition) apart from "still working" —
         the bash ``state_fingerprint`` function, field-for-field.
+
+        #1526: ``merge_reason`` is included alongside ``merge_status`` — once
+        ``_merge_gate_divergence`` started branching on it too, a
+        ``coord merge`` attempt that leaves ``merge_status`` unchanged (e.g.
+        still ``READY``) but writes a NEW refusal reason onto the board is a
+        real transition the driver just reacted to, not a stall. Omitting it
+        would both mute the ``state:`` log line for that change and let the
+        stall timer keep counting through it.
         """
         return "|".join(
             str(v)
@@ -143,6 +151,7 @@ class IssueState:
                 self.review_status,
                 self.review_verdict,
                 self.merge_status,
+                self.merge_reason,
             )
         )
 
