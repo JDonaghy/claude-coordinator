@@ -9,7 +9,7 @@ import pytest
 from click.testing import CliRunner
 
 from coord.models import Assignment, Board, Machine, Repo
-from coord.state import save_board, load_board, build_board
+from coord.state import save_board, load_board, build_board, record_test_verdict
 
 
 # ── Board save/load roundtrip ──────────────────────────────────────────────────
@@ -1383,6 +1383,121 @@ def test_save_board_allows_newer_terminal_transition_over_older(coord_db) -> Non
 
     reloaded = load_board()
     assert reloaded.completed[0].status == "merged"
+
+
+# ── #1482: save_board must not clobber a newer Test-gate verdict ───────────
+#
+# Regression for the #1451 race "one column family over": `test_state` and
+# `smoke_test` were still blindly overwritten by the whole-board upsert even
+# though `test_reason` was already excluded (#1337). A stale `save_board()`
+# snapshot read before a `record_test_verdict` seam write landed would
+# silently revert `test_state`/`smoke_test` back to their earlier value
+# while leaving `test_reason` alone — producing an impossible on-disk
+# combination (`test_reason='headless smoke'` paired with
+# `test_state='running'`, `smoke_test=NULL`) and permanently stalling
+# `test_precedes_review()` with no error anywhere. Observed live on #1472.
+
+
+def test_save_board_does_not_clobber_a_newer_passed_verdict(coord_db) -> None:
+    """A stale in-memory snapshot (test_state='running' as of an earlier
+    read) must not overwrite a verdict that `record_test_verdict` recorded
+    as 'passed' in between the read and the `save_board()` write."""
+    from coord.db import get_connection
+
+    aid = "wedge1482pass"
+    # 1. Dispatch marks the Test stage running, same as smoke.dispatch_smoke.
+    save_board(
+        Board(
+            completed=[
+                Assignment(
+                    machine_name="m", repo_name="r", issue_number=1,
+                    issue_title="t", briefing="b", assignment_id=aid,
+                    status="done", finished_at=1000.0,
+                    test_state="running", test_reason="dispatched: Test stage running",
+                )
+            ]
+        )
+    )
+
+    # 2. A stale board snapshot is read — held in memory while, e.g., a slow
+    #    reconcile tick does other work.
+    stale_board = build_board()
+    assert stale_board.completed[0].test_state == "running"
+
+    # 3. Meanwhile the smoke worker completes and notify.py records the real
+    #    verdict via the single-row seam writer.
+    record_test_verdict(
+        assignment_id=aid, test_state="passed", test_reason="headless smoke",
+    )
+
+    # 4. The slow tick finally calls save_board() with its stale snapshot —
+    #    this must NOT revert the correction.
+    save_board(stale_board)
+
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT test_state, test_reason, smoke_test FROM assignments "
+        "WHERE assignment_id=?",
+        (aid,),
+    ).fetchone()
+    assert row["test_state"] == "passed", (
+        "save_board() clobbered a newer Test-gate verdict with a stale "
+        "in-memory snapshot (#1482)"
+    )
+    assert row["test_reason"] == "headless smoke"
+    assert row["smoke_test"] == "pass", "smoke_test mirror must survive too"
+
+    reloaded = load_board()
+    assert reloaded.completed[0].test_state == "passed"
+    assert reloaded.completed[0].smoke_test == "pass"
+
+
+def test_save_board_does_not_clobber_a_newer_failed_verdict(coord_db) -> None:
+    """The failure direction: a stale snapshot must not revert a recorded
+    'failed' verdict back to 'running', and `smoke_test` must stay 'fail' so
+    `coord fix` / `--fix-of` stay reachable (the #1384 dead end)."""
+    from coord.db import get_connection
+
+    aid = "wedge1482fail"
+    save_board(
+        Board(
+            completed=[
+                Assignment(
+                    machine_name="m", repo_name="r", issue_number=2,
+                    issue_title="t", briefing="b", assignment_id=aid,
+                    status="done", finished_at=1000.0,
+                    test_state="running", test_reason="dispatched: Test stage running",
+                )
+            ]
+        )
+    )
+
+    stale_board = build_board()
+    assert stale_board.completed[0].test_state == "running"
+
+    record_test_verdict(
+        assignment_id=aid, test_state="failed", test_reason="pytest: 2 failed",
+    )
+
+    save_board(stale_board)
+
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT test_state, test_reason, smoke_test FROM assignments "
+        "WHERE assignment_id=?",
+        (aid,),
+    ).fetchone()
+    assert row["test_state"] == "failed", (
+        "save_board() reverted a recorded 'failed' verdict back to 'running' (#1482)"
+    )
+    assert row["test_reason"] == "pytest: 2 failed"
+    assert row["smoke_test"] == "fail", (
+        "smoke_test mirror reverting to NULL would re-open the #1384 --fix-of dead end"
+    )
+
+    reloaded = load_board()
+    assert reloaded.completed[0].test_state == "failed"
+    assert reloaded.completed[0].smoke_test == "fail"
 
 
 # ── #1451: mark_notified(EVENT_ADVISORY) must not stamp status='failed' ────
