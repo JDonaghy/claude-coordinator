@@ -112,20 +112,11 @@ def _maybe_reconcile_branch(
         return None
 
     # Fetch the PR's actual head ref from GitHub.  Returns the real
-    # branch name even when the DB has a stale slug.
-    try:
-        gh = subprocess.run(
-            [
-                "gh", "pr", "view", str(pr_number),
-                "--repo", repo_github,
-                "--json", "headRefName",
-                "--jq", ".headRefName",
-            ],
-            check=True, capture_output=True, text=True,
-        )
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return None
-    real_branch = gh.stdout.strip()
+    # branch name even when the DB has a stale slug.  Routed through the
+    # github_ops seam (#1483) rather than a direct `gh` invocation here.
+    from coord import github_ops  # noqa: PLC0415
+
+    real_branch = github_ops.get_pr_head_ref(repo_github, pr_number) or ""
     if not real_branch:
         return None
     if real_branch == assignment.branch:
@@ -190,7 +181,7 @@ def _maybe_reconcile_branch(
 @_CONFIG_OPTION
 def set_test_mode(repo: str, issue: int, mode: str, config_path: Path) -> None:
     """#685: TUI test-mode dialog and right-click flip fire this command."""
-    import subprocess as _sp  # noqa: PLC0415
+    from coord import github_ops  # noqa: PLC0415
 
     cfg = _load_config(config_path)
     repo_entry = cfg.repo(repo)
@@ -202,18 +193,17 @@ def set_test_mode(repo: str, issue: int, mode: str, config_path: Path) -> None:
     # Ensure the test-mode:* labels exist in the repo before we try to add
     # them — `gh issue edit --add-label` fails with "label not found" when the
     # label has never been created.  `gh label create --force` is idempotent
-    # (no-ops if the label already exists, creates it if absent).
+    # (no-ops if the label already exists, creates it if absent).  Routed
+    # through the github_ops seam (#1483) rather than a direct `gh` call here.
     _TEST_MODE_LABEL_COLOR = "0075ca"  # default blue; matches GitHub's "documentation" label
     for lbl in ("test-mode:smoke", "test-mode:auto"):
         try:
-            _sp.run(
-                ["gh", "label", "create", lbl, "--repo", slug,
-                 "--color", _TEST_MODE_LABEL_COLOR,
-                 "--description", "coord: per-issue test-mode policy",
-                 "--force"],
-                capture_output=True, text=True, timeout=15,
+            github_ops.create_label(
+                slug, lbl,
+                color=_TEST_MODE_LABEL_COLOR,
+                description="coord: per-issue test-mode policy",
             )
-        except (_sp.TimeoutExpired, OSError):
+        except RuntimeError:
             pass  # best-effort — label creation failure is surfaced when add-label fails
 
     _apply_label_change(

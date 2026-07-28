@@ -808,6 +808,33 @@ def add_issue_labels(repo: str, issue_number: int, labels: list[str]) -> None:
     _gh(*args)
 
 
+def create_label(
+    repo: str,
+    label: str,
+    *,
+    color: str | None = None,
+    description: str | None = None,
+    force: bool = True,
+) -> None:
+    """Create *label* in *repo* via ``gh label create``.
+
+    ``force=True`` (the default) makes this idempotent — ``gh`` overwrites
+    the color/description if the label already exists instead of erroring.
+    Raises ``RuntimeError`` on ``gh`` failure; callers that treat label
+    pre-creation as best-effort (e.g. a concurrent-create race) should catch
+    it. Used by ``coord set-test-mode`` (#1483) to ensure the ``test-mode:*``
+    labels exist before ``change_issue_labels`` tries to add one.
+    """
+    args = ["label", "create", label, "--repo", repo]
+    if color:
+        args.extend(["--color", color])
+    if description:
+        args.extend(["--description", description])
+    if force:
+        args.append("--force")
+    _gh(*args)
+
+
 def remove_issue_label(repo: str, issue_number: int, label: str) -> None:
     """Remove a label from an issue via ``gh issue edit --remove-label``.
 
@@ -1072,6 +1099,65 @@ def find_pr_for_branch(repo: str, branch: str) -> dict | None:
     )
     items = json.loads(raw)
     return items[0] if items else None
+
+
+def get_pr_state_for_branch(repo: str, branch: str) -> str | None:
+    """Return the current lifecycle state (``OPEN``/``MERGED``/``CLOSED``) of
+    the PR whose head is *branch*, or ``None`` when no such PR exists (or
+    ``gh`` fails).
+
+    Unlike :func:`find_pr_for_branch` (``pr list --state open`` — only ever
+    finds *open* PRs), this resolves the branch directly via ``gh pr view``,
+    which answers regardless of state. Used by
+    :meth:`coord.drive.GitMergeVerifier.verify_merged` (#1483) to confirm a
+    MERGED PR whose branch may since have been deleted from the remote.
+    """
+    try:
+        state = _gh("pr", "view", branch, "--repo", repo, "--json", "state", "-q", ".state")
+    except RuntimeError:
+        return None
+    return state or None
+
+
+def get_pr_head_ref(repo: str, number: int) -> str | None:
+    """Return PR *number*'s head branch name, or ``None`` on any ``gh``
+    failure (including "no such PR").
+
+    Used by ``coord test``'s branch-reconciliation fallback (#349, #1483) to
+    recover the PR's actual head ref when the DB's recorded branch name has
+    gone stale.
+    """
+    try:
+        head_ref = _gh(
+            "pr", "view", str(number), "--repo", repo,
+            "--json", "headRefName", "--jq", ".headRefName",
+        )
+    except RuntimeError:
+        return None
+    return head_ref or None
+
+
+def get_pr_checks(repo: str, number: int) -> list[dict]:
+    """Return ``gh pr checks``' raw check-run list for PR *number*.
+
+    ``gh pr checks`` exits non-zero when any check has failed, but its JSON
+    stdout is still valid in that case — only raise when stdout is genuinely
+    empty (a real lookup failure: bad PR number, auth, rate-limit, ...).
+    The single ``gh`` sink for :class:`coord.ci_github.GitHubCi`, the CI
+    backend behind the merge gate (#1483).
+    """
+    result = subprocess.run(
+        [
+            "gh", "pr", "checks", str(number),
+            "--repo", repo,
+            "--json", "name,state,conclusion,link,startedAt,completedAt",
+        ],
+        capture_output=True, text=True, timeout=30,
+    )
+    stdout = (result.stdout or "").strip()
+    if result.returncode != 0 and not stdout:
+        raise RuntimeError(f"gh pr checks failed: {result.stderr.strip()}")
+    return json.loads(stdout or "[]")
 
 
 def truncate_diff_text(diff: str, max_chars: int = 60000) -> str:

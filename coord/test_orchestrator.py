@@ -221,7 +221,8 @@ def _fetch_artifact_manifest(
 
 
 def _get_pr_diff(pr_url: str, repo_github: str) -> str:
-    """Fetch the diff via ``gh pr diff``.
+    """Fetch the diff via the ``github_ops`` seam (#1483 — no direct ``gh``
+    invocations outside ``coord.github_ops``).
 
     Returns an empty string when the PR URL is missing, the gh CLI is
     unavailable, or the command fails.
@@ -231,17 +232,15 @@ def _get_pr_diff(pr_url: str, repo_github: str) -> str:
     m = re.search(r"/pull/(\d+)", pr_url)
     if not m:
         return ""
-    pr_number = m.group(1)
+    pr_number = int(m.group(1))
+    from coord import github_ops  # noqa: PLC0415
+
     try:
-        result = subprocess.run(
-            ["gh", "pr", "diff", pr_number, "--repo", repo_github],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
+        diff = github_ops.pr_diff(repo_github, pr_number)
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
         log.debug("gh pr diff failed: %s", exc)
-    return ""
+        return ""
+    return (diff or "").strip()
 
 
 def _get_git_diff(branch: str, default_branch: str, repo_dir: Path) -> str:
@@ -265,29 +264,23 @@ def _get_git_diff(branch: str, default_branch: str, repo_dir: Path) -> str:
 
 
 def _get_issue_body(repo_github: str, issue_number: int) -> str:
-    """Fetch issue title + body via ``gh issue view``.
+    """Fetch issue title + body via the ``github_ops`` seam (#1483).
 
     Returns a markdown string "## <title>\\n\\n<body>" or empty string on error.
     """
     if not repo_github or not issue_number:
         return ""
+    from coord import github_ops  # noqa: PLC0415
+
     try:
-        result = subprocess.run(
-            [
-                "gh", "issue", "view", str(issue_number),
-                "--repo", repo_github,
-                "--json", "body,title",
-            ],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode == 0:
-            data = json.loads(result.stdout)
-            title = data.get("title", "")
-            body = (data.get("body") or "").strip()
-            return f"## {title}\n\n{body}" if body else f"## {title}"
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError, json.JSONDecodeError) as exc:
+        data = github_ops.get_issue(repo_github, issue_number)
+    except (RuntimeError, subprocess.TimeoutExpired, FileNotFoundError, OSError,
+            json.JSONDecodeError) as exc:
         log.debug("gh issue view failed: %s", exc)
-    return ""
+        return ""
+    title = data.get("title", "")
+    body = (data.get("body") or "").strip()
+    return f"## {title}\n\n{body}" if body else f"## {title}"
 
 
 def local_machine(config: Config) -> Machine | None:
