@@ -3577,24 +3577,67 @@ def test_dispatch_review_passes_through_normally_when_branch_on_remote(
 # ── #904: fall-through loop + health-check pre-filter ───────────────────────
 
 
-def test_dispatch_review_skips_machine_not_advertising_repo_in_health(
+def test_dispatch_review_includes_machine_advertising_empty_repos_list(
     two_machine_config: Config,
 ) -> None:
-    """Fix #2 (PREVENTATIVE, #904): a candidate whose /health does not list the
-    target repo is skipped before any POST attempt.
+    """#1485: an empty ``/health`` ``repos`` list means "no local
+    coordinator.yml" (the expected state for a worker-only machine —
+    coordinator.yml lives on dellserver only), NOT "handles nothing". This
+    matches the agent's own semantics in ``AgentServer.assign``
+    (``if self.repos and ...`` — empty is falsy, meaning unrestricted).
 
     When ``server`` (the preferred different-machine candidate) advertises an
-    empty repo list, ``dispatch_review`` should skip it and fall through to
-    ``laptop`` (the worker's own machine) rather than dispatching a guaranteed-
-    400 POST."""
+    empty repo list, ``dispatch_review`` must still select it — not skip it
+    and fall through to ``laptop``."""
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    client = _FakeHTTPClient({"id": "empty-health-1"})
+
+    def _health(host: str) -> list[str] | None:
+        # server correctly has no local coordinator.yml — advertises [].
+        if "server" in host:
+            return []
+        return ["api"]
+
+    result = dispatch_review(
+        completed, board, two_machine_config,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {"number": 7, "url": "u", "existed": True},
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+        remote_branch_checker=lambda repo, branch: True,
+        health_checker=_health,
+    )
+
+    assert result is not None
+    # server was NOT filtered — empty repos list means "unrestricted".
+    assert result.machine_name == "server"
+    assert result.assignment_id == "empty-health-1"
+    assert len(client.calls) == 1
+    url, _ = client.calls[0]
+    assert "server.tail" in url
+
+
+def test_dispatch_review_skips_machine_advertising_other_repo_in_health(
+    two_machine_config: Config,
+) -> None:
+    """Fix #2 (PREVENTATIVE, #904), preserved by #1485: a candidate whose
+    /health advertises a *non-empty* repos list that omits the target repo is
+    still a genuine config-drift signal and is skipped before any POST
+    attempt.
+
+    When ``server`` (the preferred different-machine candidate) advertises
+    ``["other-repo"]``, ``dispatch_review`` should skip it and fall through to
+    ``laptop`` (the worker's own machine) rather than dispatching a
+    guaranteed-400 POST."""
     board = Board()
     completed = _completed_assignment(machine="laptop")
     client = _FakeHTTPClient({"id": "health-filter-1"})
 
     def _health(host: str) -> list[str] | None:
-        # server is drifted: /health omits "api" from its repos list.
+        # server is genuinely drifted: /health lists a different repo set.
         if "server" in host:
-            return []           # reachable but "api" is absent
+            return ["other-repo"]
         return ["api"]          # laptop advertises "api" correctly
 
     result = dispatch_review(
@@ -3616,6 +3659,32 @@ def test_dispatch_review_skips_machine_not_advertising_repo_in_health(
     url, _ = client.calls[0]
     assert "laptop.tail" in url
     assert "server.tail" not in url
+
+
+def test_dispatch_review_includes_machine_when_health_probe_fails(
+    two_machine_config: Config,
+) -> None:
+    """Fail-open must not regress (#1485): when the health probe itself fails
+    (returns ``None``, e.g. network error or timeout), the candidate is still
+    included rather than excluded."""
+    board = Board()
+    completed = _completed_assignment(machine="laptop")
+    client = _FakeHTTPClient({"id": "probe-failed-1"})
+
+    result = dispatch_review(
+        completed, board, two_machine_config,
+        http_client=client,
+        pr_lookup=lambda repo_github, **kw: {"number": 7, "url": "u", "existed": True},
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+        remote_branch_checker=lambda repo, branch: True,
+        health_checker=lambda host: None,
+    )
+
+    assert result is not None
+    # server (the preferred candidate) was included despite the failed probe.
+    assert result.machine_name == "server"
+    assert result.assignment_id == "probe-failed-1"
 
 
 def test_dispatch_review_falls_through_to_second_candidate_on_400(
