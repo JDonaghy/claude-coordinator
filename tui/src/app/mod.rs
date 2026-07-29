@@ -2217,11 +2217,27 @@ pub struct CoordApp {
     chat_spinner_throttle: u8,
     /// #pause: set of machine names the user has paused via
     /// right-click → Pause routing.  Loaded from
-    /// `~/.coord/paused_machines.json` (shared with the Python coordinator)
-    /// and refreshed each periodic data load so out-of-band changes
+    /// `~/.coord/paused_machines.json` when this TUI is talking to a local
+    /// daemon/DB, refreshed each periodic data load so out-of-band changes
     /// (`coord pause foo` from another terminal) propagate within a few
     /// seconds.
+    ///
+    /// #1563: on a thin client (board service configured) this is instead
+    /// populated from the daemon's `GET /pause` — mirrors
+    /// `coord.machine_pause.paused_set()`'s daemon-aware routing on the
+    /// Python side. A thin-client TUI's own copy of `paused_machines.json`
+    /// is never written to by `coord pause` anymore (that now goes straight
+    /// to the daemon), so reading it directly here would silently revert
+    /// the optimistic update in the `p` keybind handler and let
+    /// `best_machine_for()` keep selecting a machine the operator just
+    /// paused — see `spawn_paused_machines_fetch`/`poll_paused_machines`.
     paused_machines: std::collections::HashSet<String>,
+    /// #1563: in-flight background fetch of the paused-machine set (local
+    /// file read or daemon `GET /pause`, whichever `spawn_paused_machines_fetch`
+    /// determined applies). Armed at startup and re-armed by `refresh()` on
+    /// the same cadence as `pending_remote_sessions`/`pending_drive_sessions`;
+    /// `poll_paused_machines()` drains it into `paused_machines`.
+    pending_paused_machines: Option<std::sync::mpsc::Receiver<std::collections::HashSet<String>>>,
     /// #245: pending `coord merge --force-merge` confirmation.  `Some(repo)`
     /// means the user pressed `m` while the "Checks failed" hint was visible
     /// and we're waiting for one-key confirmation before bypassing the CI
@@ -3311,6 +3327,7 @@ impl CoordApp {
             chat_last_activity: None,
             chat_spinner_throttle: 0,
             paused_machines: read_paused_machines(),
+            pending_paused_machines: Some(spawn_paused_machines_fetch()),
             pending_force_merge: None,
             pending_merge_all_ready: None,
             pending_context_menu: None,
@@ -3748,6 +3765,20 @@ impl CoordApp {
         if self.pending_drive_sessions.is_none() {
             self.pending_drive_sessions = Some(spawn_drive_sessions_fetch());
         }
+        // #1563: the paused-machine sweep is deliberately NOT re-armed here.
+        // Unlike the sweeps above (which shell out to `coord` and are
+        // stubbed/harmless under `CommandRunner::new_for_test()`),
+        // `spawn_paused_machines_fetch` makes a REAL `ureq` HTTP call when a
+        // board service is configured — re-arming it from every mutation
+        // that calls `refresh()` (label changes, dispatches, …) would fire
+        // an extra `GET /pause` against whatever board-service mock a test
+        // happens to have wired up via `set_test_board_service`, breaking
+        // exact-request-count assertions unrelated to pausing. It's instead
+        // re-armed on the plain periodic cadence in `settings_ui.rs`'s
+        // `should_refresh` block, exactly where the pre-#1563 local-file
+        // rescan used to live — same cadence, same "picks up out-of-band
+        // changes within a few seconds" guarantee, just not from every
+        // mutation-triggered `refresh()` call too.
     }
 
     /// Push a new toast with the given title, body, and severity. Toasts
@@ -7531,11 +7562,28 @@ fn today_yyyy_mm_dd() -> String {
 }
 
 
-/// #pause: read the set of paused machines from disk.  Shared with the
-/// Python coordinator (`coord pause` / `coord unpause` write the same
-/// file) so the TUI's filter agrees with `coord plan`, auto_loop,
-/// reconcile, review, and refine-chat dispatches.  Returns empty on any
-/// I/O or parse failure — failure to read should never block routing.
+/// #pause: read the set of paused machines from the LOCAL
+/// `~/.coord/paused_machines.json`.  Shared with the Python coordinator
+/// when this process and the daemon are the same host (`coord pause` /
+/// `coord unpause` write the same file there) so the TUI's filter agrees
+/// with `coord plan`, auto_loop, reconcile, review, and refine-chat
+/// dispatches.  Returns empty on any I/O or parse failure — failure to
+/// read should never block routing.
+///
+/// #1563: on a thin client (board service configured) this file is no
+/// longer authoritative — `coord pause` on such a client now writes
+/// straight to the daemon instead. `CoordApp::new`/`make_test_app` still
+/// call this directly for the *initial* synchronous `paused_machines`
+/// snapshot (mirroring `live_tmux_sessions`/`fleet_terminals`/
+/// `drive_sessions` further up this file, each seeded from a cheap local
+/// read before their background remote sweep is armed), but every
+/// *periodic* refresh after that goes through
+/// [`data::fetch_paused_machines`] / [`data::spawn_paused_machines_fetch`]
+/// instead, which route to the daemon's `GET /pause` when a board service
+/// is configured and fall back to this function otherwise — so a
+/// thin-client TUI's view converges to the daemon's copy within one
+/// refresh cycle of startup rather than reading this stale local file
+/// forever.
 fn read_paused_machines() -> std::collections::HashSet<String> {
     let mut out = std::collections::HashSet::new();
     let home = match std::env::var_os("HOME") {

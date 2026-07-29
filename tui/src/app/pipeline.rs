@@ -7688,4 +7688,32 @@ impl CoordApp {
             }
         }
     }
+
+    /// #1563: drain the background paused-machine sweep armed by
+    /// `refresh()` (`spawn_paused_machines_fetch` — local file read or
+    /// daemon `GET /pause`, whichever applies). Replaces `paused_machines`
+    /// wholesale rather than merging: unlike the optimistic-pending merges
+    /// above, there's no local-only speculative entry to preserve here —
+    /// the landed result IS the full authoritative set. Returns `true` on
+    /// update.
+    pub(crate) fn poll_paused_machines(&mut self) -> bool {
+        let Some(rx) = self.pending_paused_machines.as_ref() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(fresh) => {
+                self.pending_paused_machines = None;
+                if fresh != self.paused_machines {
+                    self.paused_machines = fresh;
+                    return true;
+                }
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.pending_paused_machines = None;
+                false
+            }
+        }
+    }
 }

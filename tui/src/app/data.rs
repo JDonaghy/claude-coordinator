@@ -1809,6 +1809,91 @@ pub(crate) fn fetch_remote_config_to_cache() -> Option<std::path::PathBuf> {
     Some(path)
 }
 
+/// #1563: fetch the set of paused machine names, background-thread version
+/// of [`super::read_paused_machines`] for use in `refresh()`'s periodic
+/// re-arm — mirrors `spawn_remote_tmux_sessions_fetch`/
+/// `spawn_drive_sessions_fetch`'s "spawn a thread, hand back a receiver"
+/// shape so the caller never blocks the render loop on the (possibly
+/// remote) read.
+///
+/// On a thin client (board service configured) this reads through the
+/// daemon's `GET /pause` instead of the local
+/// `~/.coord/paused_machines.json` — mirrors
+/// `coord.machine_pause.paused_set()`'s daemon-aware routing on the Python
+/// side. Without this, a thin-client TUI's `read_paused_machines()` rescan
+/// kept reading a copy of the file `coord pause` no longer writes once a
+/// board service is configured (that now goes straight to the daemon, see
+/// `coord/machine_pause.py`), so the TUI's badge/dispatch-candidate filter
+/// silently reverted an operator's pause a few seconds after they set it.
+///
+/// `resolve_board_service()` is called HERE, on the caller's thread, before
+/// spawning — not inside the spawned closure. `resolve_board_service`'s
+/// test-mode override (`set_test_board_service`) is a thread-local
+/// specifically so a mock server opted into by one test is invisible to
+/// concurrently-running unrelated tests (see its doc comment); resolving
+/// inside a freshly spawned `std::thread::spawn` closure would run on a
+/// thread that never saw the caller's thread-local and would always
+/// observe `None`. Mirrors `spawn_audit_fetch`'s identical
+/// resolve-before-spawn shape.
+pub(crate) fn spawn_paused_machines_fetch()
+-> std::sync::mpsc::Receiver<std::collections::HashSet<String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let resolved = resolve_board_service();
+    std::thread::spawn(move || {
+        let _ = tx.send(fetch_paused_machines_resolved(resolved));
+    });
+    rx
+}
+
+/// #1563: the synchronous half of [`spawn_paused_machines_fetch`] — daemon
+/// `GET /pause` when a board service is configured, otherwise the local
+/// file via [`super::read_paused_machines`]. Fails soft (empty set) on any
+/// network/parse error, matching `paused_set()`'s documented fail-open
+/// contract for reads (a pause that can't be confirmed should never wedge
+/// the read side the way it must fail loudly on the write side).
+///
+/// Safe to call directly on any thread (unlike `spawn_paused_machines_fetch`,
+/// this resolves the board service itself rather than expecting it
+/// pre-resolved). Only a test convenience today — every production call
+/// site goes through `spawn_paused_machines_fetch` so the render loop never
+/// blocks on the (possibly remote) read — hence `#[cfg(test)]` rather than
+/// `pub(crate)` unconditionally, to avoid an unused-in-release warning.
+#[cfg(test)]
+pub(crate) fn fetch_paused_machines() -> std::collections::HashSet<String> {
+    fetch_paused_machines_resolved(resolve_board_service())
+}
+
+/// Shared fetch body for [`fetch_paused_machines`] /
+/// [`spawn_paused_machines_fetch`], parameterized on an already-resolved
+/// board service so the latter can resolve on the caller's thread and pass
+/// the result into its spawned closure (see that function's doc comment).
+fn fetch_paused_machines_resolved(
+    resolved: Option<(String, Option<String>)>,
+) -> std::collections::HashSet<String> {
+    let Some((url, token)) = resolved else {
+        return super::read_paused_machines();
+    };
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(5))
+        .build();
+    let mut req = agent.get(&format!("{url}/pause"));
+    if let Some(t) = token.as_deref() {
+        req = req.set("Authorization", &format!("Bearer {t}"));
+    }
+    (|| -> Option<std::collections::HashSet<String>> {
+        let text = req.call().ok()?.into_string().ok()?;
+        let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+        let arr = v.get("paused")?.as_array()?;
+        Some(
+            arr.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect(),
+        )
+    })()
+    .unwrap_or_default()
+}
+
 /// #584: parse the pipeline_* keys out of a `board_meta` map fetched over the
 /// /board wire.  Mirrors [`load_pipeline_meta`] (the SQLite reader) field for
 /// field, including the documented fallbacks, so the remote path fills the
