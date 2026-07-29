@@ -207,6 +207,39 @@ def post_record(
     return resp.json()
 
 
+def fetch_paused_machines(
+    svc: ServiceConfig, *, timeout: float = _DEFAULT_TIMEOUT
+) -> set[str]:
+    """GET /pause → the daemon's current paused-machine set (#1563).
+
+    Raises ``httpx.HTTPError`` on transport/HTTP failure. This is the read
+    side of the thin-client pause fix: `coord.machine_pause.paused_set()`
+    catches the error itself and degrades to "nothing is paused" (fail-soft,
+    matching every other daemon read-through helper here) — this function
+    stays strict so a caller that DOES want to distinguish "confirmed empty"
+    from "couldn't ask" still can.
+    """
+    resp = httpx.get(f"{svc.url}/pause", headers=_headers(svc), timeout=timeout)
+    resp.raise_for_status()
+    data = resp.json()
+    items = data.get("paused") if isinstance(data, dict) else None
+    return {str(x) for x in items if isinstance(x, str) and x} if isinstance(items, list) else set()
+
+
+def post_pause(
+    svc: ServiceConfig, machine: str, action: str, *, timeout: float = _WRITE_TIMEOUT
+) -> dict:
+    """POST /pause {machine, action} → {"paused": [...], "changed": bool} (#1563).
+
+    *action* is ``"pause"`` or ``"unpause"``. Raises ``httpx.HTTPError`` on
+    transport/HTTP failure — deliberately NOT fail-soft: `coord pause` on a
+    thin client that can't reach the daemon must fail loudly, not print
+    "paused: X" while the daemon never hears about it (the root cause of
+    #1563).
+    """
+    return post_record(svc, "/pause", {"machine": machine, "action": action}, timeout=timeout)
+
+
 def fetch_remote_config(svc: ServiceConfig, *, timeout: float = _DEFAULT_TIMEOUT) -> Path:
     """GET /config, cache it to ``~/.coord/coordinator.remote.yml``, return the path.
 

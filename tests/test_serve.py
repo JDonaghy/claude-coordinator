@@ -122,6 +122,126 @@ def test_serve_bearer_auth(file_db: Path, valid_config_path: Path):
         assert ok.status_code == 200
 
 
+# ── Pause (#1563) ─────────────────────────────────────────────────────────────
+#
+# `coord pause` on a thin client used to write only to the operator's own
+# `~/.coord/paused_machines.json` — a file the daemon (which runs the
+# autonomous dispatch tick) never read, so the fleet kept dispatching to
+# machines the operator believed were paused. `/pause` below is the fix: it
+# always operates on the daemon's own local-only store
+# (`coord.machine_pause.local_pause`/`local_paused_set`), so a thin client
+# routed through it and the daemon's own tick loop agree on one copy.
+
+
+def test_pause_endpoints_roundtrip(
+    file_db: Path, valid_config_path: Path, monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "daemon_home"))
+    (tmp_path / "daemon_home" / ".coord").mkdir(parents=True)
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(file_db), cfg)
+    with TestClient(app) as cli:
+        assert cli.get("/pause").json() == {"paused": []}
+
+        resp = cli.post("/pause", json={"machine": "laptop", "action": "pause"})
+        assert resp.status_code == 200
+        assert resp.json() == {"paused": ["laptop"], "changed": True}
+        assert cli.get("/pause").json() == {"paused": ["laptop"]}
+
+        # Pausing an already-paused machine is idempotent: changed=False.
+        resp = cli.post("/pause", json={"machine": "laptop", "action": "pause"})
+        assert resp.json() == {"paused": ["laptop"], "changed": False}
+
+        resp = cli.post("/pause", json={"machine": "laptop", "action": "unpause"})
+        assert resp.status_code == 200
+        assert resp.json() == {"paused": [], "changed": True}
+
+
+def test_pause_endpoint_validates_body(
+    file_db: Path, valid_config_path: Path, monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "daemon_home"))
+    (tmp_path / "daemon_home" / ".coord").mkdir(parents=True)
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(file_db), cfg)
+    with TestClient(app) as cli:
+        assert cli.post("/pause", json={"action": "pause"}).status_code == 400
+        assert (
+            cli.post("/pause", json={"machine": "laptop", "action": "bogus"}).status_code
+            == 400
+        )
+        assert cli.post("/pause", content=b"not json").status_code == 400
+
+
+def test_pause_on_thin_client_reaches_daemon_and_blocks_dispatch(
+    file_db: Path, valid_config_path: Path, monkeypatch, tmp_path: Path
+) -> None:
+    """Black-box repro + fix verification for #1563.
+
+    Sequence: (1) a "reconcile tick" finds the only capable machine a valid
+    reviewer candidate; (2) a "thin client" pauses that machine using the
+    REAL `coord.machine_pause.pause()` call site — with a board service
+    configured and `coord.client`'s HTTP calls routed to this exact daemon
+    instance (not a second, disconnected local file — the literal #1563
+    bug); (3) the same daemon process, now acting as its own tick loop (no
+    board_service — the real daemon never points at itself), must see the
+    pause and refuse to pick that machine, i.e. no review assignment would
+    be created.
+    """
+    from coord.config import Config, ReviewsConfig
+    from coord.machine_pause import pause, paused_set
+    from coord.models import Board, Machine, Repo
+    from coord.review import pick_reviewer_machine
+
+    monkeypatch.setenv("HOME", str(tmp_path / "daemon_home"))
+    (tmp_path / "daemon_home" / ".coord").mkdir(parents=True)
+
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(file_db), cfg)
+
+    review_cfg = Config(
+        repos=[Repo(name="api", github="acme/api", depends_on=[], default_branch="main")],
+        machines=[
+            Machine(
+                name="solo", host="solo.tail", capabilities=["python"],
+                repos=["api"], repo_paths={"api": "/work/api"},
+            ),
+        ],
+        reviews=ReviewsConfig(enabled=True, auto_dispatch=True),
+    )
+    board = Board()  # a pending review needs a reviewer for repo "api"
+
+    with TestClient(app) as cli:
+        # Before any pause: "solo" is the (only) reviewer candidate.
+        choice = pick_reviewer_machine("someone-else", "api", board, review_cfg)
+        assert choice is not None and choice.machine.name == "solo"
+
+        # Simulate the operator's thin client: point coord.client's HTTP
+        # calls at THIS daemon instance and configure a board service, then
+        # call the real pause() — exactly what `coord pause solo` runs.
+        monkeypatch.setattr(coord_client.httpx, "get", cli.get)
+        monkeypatch.setattr(coord_client.httpx, "post", cli.post)
+        monkeypatch.setattr(
+            coord_client, "resolve_board_service",
+            lambda *a, **k: coord_client.ServiceConfig(url="http://testserver"),
+        )
+
+        changed = pause("solo")
+        assert changed is True
+        # The thin client's own read confirms the daemon accepted it.
+        assert paused_set() == {"solo"}
+
+        # Now become "the daemon's own tick loop": no board_service (the
+        # real daemon never configures one for itself), so paused_set()
+        # reads the local file directly — the SAME file /pause just wrote.
+        monkeypatch.setattr(coord_client, "resolve_board_service", lambda *a, **k: None)
+        assert paused_set() == {"solo"}
+
+        # The dispatch decision the reconcile tick makes: no candidate left,
+        # so no review assignment would be created.
+        assert pick_reviewer_machine("someone-else", "api", board, review_cfg) is None
+
+
 def test_serve_merge_passes_show_plan_to_callback(file_db: Path, valid_config_path: Path):
     """#684 regression: ``post_merge`` must pass ``show_plan`` to the merge
     callback.  #684 added ``--plan``/``show_plan`` to ``coord merge`` (routing

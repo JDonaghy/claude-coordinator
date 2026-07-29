@@ -120,6 +120,12 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
             )
             sys.exit(2)
 
+    # #1563: paused_set() is daemon-aware — on a thin client it fetches the
+    # daemon's own `/pause` copy, so this renders the state that actually
+    # governs dispatch instead of a host-local file the daemon never reads.
+    from coord.machine_pause import paused_set
+    paused = paused_set()
+
     statuses = check_all(machines, timeout=timeout)
     agent_completed: dict[str, dict] = {}
     click.echo("Machines:")
@@ -161,6 +167,14 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
         else:
             status_result = None
             label = f"{s.state} — {s.reason}{latency}"
+
+        # #1563: surface pause state the same way regardless of whether
+        # `paused_set()` resolved it locally or from the daemon — a thin
+        # client that just ran `coord pause` needs to SEE that it took,
+        # otherwise a pause that silently didn't reach the daemon looks
+        # identical to one that did (the whole bug this closes).
+        if m.name in paused:
+            label = f"PAUSED — {label}"
 
         # Extract agent version from /status response (added in #104).
         agent_version: str | None = None
