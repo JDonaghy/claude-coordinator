@@ -4646,7 +4646,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             return JSONResponse({"error": "invalid JSON body"}, status_code=400)
         machine = body.get("machine")
         action = body.get("action")
-        if not machine:
+        if not machine or not isinstance(machine, str):
             return JSONResponse({"error": "missing field: machine"}, status_code=400)
         if action == "pause":
             changed = local_pause(machine)

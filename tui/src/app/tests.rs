@@ -39108,3 +39108,133 @@ Milestone tracking issue.
             "app must render a non-empty screen on boot",
         );
     }
+
+    // ── #1563: paused-machine set stays daemon-aware on a thin client ───────
+    //
+    // Before this, `read_paused_machines()` always read the LOCAL
+    // `~/.coord/paused_machines.json` directly, unconditionally, on every
+    // periodic refresh — including on a thin client, where `coord pause`
+    // now writes straight to the daemon instead of that file. The TUI's own
+    // rescan would silently revert the optimistic `p`-keybind update a few
+    // seconds later, so a machine the operator just paused kept being
+    // selected by `best_machine_for()`. `poll_paused_machines` (the
+    // `pending_paused_machines` receiver, armed by `spawn_paused_machines_fetch`)
+    // replaces that direct read; these tests cover the merge logic and the
+    // real network round trip separately from the local-file fallback,
+    // which is unchanged from before this issue.
+
+    #[test]
+    fn poll_paused_machines_replaces_snapshot_when_ready() {
+        let mut app = make_app_default();
+        assert!(app.paused_machines.is_empty());
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(
+            ["dellserver".to_string(), "elitebook".to_string()]
+                .into_iter()
+                .collect(),
+        )
+        .unwrap();
+        app.pending_paused_machines = Some(rx);
+
+        assert!(app.poll_paused_machines(), "should report an update");
+        assert_eq!(app.paused_machines.len(), 2);
+        assert!(app.paused_machines.contains("dellserver"));
+        assert!(app.paused_machines.contains("elitebook"));
+        // The receiver is consumed — no repeat updates.
+        assert!(app.pending_paused_machines.is_none());
+        assert!(!app.poll_paused_machines());
+    }
+
+    #[test]
+    fn poll_paused_machines_reverts_an_operator_pause_the_stale_local_file_would_have_undone() {
+        // #1563's actual failure mode: the operator paused "dellserver"
+        // (optimistic local update, mirroring the `p` keybind handler in
+        // `events.rs`), then the daemon-aware sweep lands and must NOT wipe
+        // it back out just because it agrees — this asserts the daemon's
+        // response is what the badge/dispatch filter ends up reflecting,
+        // not a stale local snapshot.
+        let mut app = make_app_default();
+        app.paused_machines.insert("dellserver".to_string());
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(["dellserver".to_string()].into_iter().collect())
+            .unwrap();
+        app.pending_paused_machines = Some(rx);
+
+        // Same set both sides agree on → no redundant update reported, but
+        // the pause must still be in force afterward.
+        assert!(!app.poll_paused_machines());
+        assert!(app.paused_machines.contains("dellserver"));
+    }
+
+    #[test]
+    fn poll_paused_machines_noop_while_empty() {
+        let mut app = make_app_default();
+        let (_tx, rx) = std::sync::mpsc::channel::<std::collections::HashSet<String>>();
+        app.pending_paused_machines = Some(rx);
+        // Nothing sent yet → no update, receiver retained for a later poll.
+        assert!(!app.poll_paused_machines());
+        assert!(app.pending_paused_machines.is_some());
+    }
+
+    #[test]
+    fn poll_paused_machines_disconnected_clears_pending() {
+        let mut app = make_app_default();
+        let (tx, rx) = std::sync::mpsc::channel::<std::collections::HashSet<String>>();
+        drop(tx);
+        app.pending_paused_machines = Some(rx);
+        assert!(!app.poll_paused_machines());
+        assert!(
+            app.pending_paused_machines.is_none(),
+            "a disconnected sender must not wedge the sweep forever"
+        );
+    }
+
+    /// End-to-end: with the board service pointed at a live
+    /// [`MockBoardService`], `spawn_paused_machines_fetch` must perform a
+    /// real HTTP `GET /pause` and deliver the daemon's parsed set back over
+    /// its channel — the network branch `coord.machine_pause.paused_set()`
+    /// exercises on the Python side, now mirrored on the TUI side (#1563).
+    #[test]
+    fn spawn_paused_machines_fetch_hits_real_mock_server() {
+        let mock = MockBoardService::start(r#"{"paused": ["dellserver", "precision"]}"#);
+        let _guard = set_test_board_service(mock.url(), None);
+
+        let rx = spawn_paused_machines_fetch();
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("spawn_paused_machines_fetch must deliver a result before the timeout");
+
+        assert_eq!(got.len(), 2);
+        assert!(got.contains("dellserver"));
+        assert!(got.contains("precision"));
+
+        let requests = mock.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "expected exactly one request to reach the mock server; got {:?}",
+            requests
+        );
+        assert!(
+            requests[0].starts_with("GET /pause"),
+            "spawn_paused_machines_fetch must GET /pause; got {:?}",
+            requests[0]
+        );
+    }
+
+    /// A malformed/unreachable daemon response must fail soft to an empty
+    /// set — matching `coord.machine_pause.paused_set()`'s documented
+    /// fail-open read contract — rather than propagating an error that
+    /// could wedge the periodic refresh sweep.
+    #[test]
+    fn fetch_paused_machines_fails_soft_on_malformed_response() {
+        let mock = MockBoardService::start("not json");
+        let _guard = set_test_board_service(mock.url(), None);
+
+        let got = fetch_paused_machines();
+        assert!(
+            got.is_empty(),
+            "a malformed daemon response must degrade to an empty set, got {:?}",
+            got
+        );
+    }

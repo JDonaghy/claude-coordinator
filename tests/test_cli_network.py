@@ -202,8 +202,8 @@ class TestStatus:
         operator can see whether a pause they just ran actually took —
         previously nothing about pause showed up anywhere in status."""
         statuses = [
-            network.MachineStatus(machine=MagicMock(name="laptop", host="laptop.tailnet", repos=["api"]), state=network.ONLINE, latency_ms=12.0, health=_online_health()),
-            network.MachineStatus(machine=MagicMock(name="server", host="server.tailnet", repos=["api"]), state=network.ONLINE, latency_ms=20.0, health=_online_health("server")),
+            network.MachineStatus(machine=MagicMock(host="laptop.tailnet", repos=["api"]), state=network.ONLINE, latency_ms=12.0, health=_online_health()),
+            network.MachineStatus(machine=MagicMock(host="server.tailnet", repos=["api"]), state=network.ONLINE, latency_ms=20.0, health=_online_health("server")),
         ]
         statuses[0].machine.name = "laptop"
         statuses[0].machine.host = "laptop.tailnet"

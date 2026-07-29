@@ -123,7 +123,7 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
     # #1563: paused_set() is daemon-aware — on a thin client it fetches the
     # daemon's own `/pause` copy, so this renders the state that actually
     # governs dispatch instead of a host-local file the daemon never reads.
-    from coord.machine_pause import paused_set
+    from coord.machine_pause import paused_set  # noqa: PLC0415
     paused = paused_set()
 
     statuses = check_all(machines, timeout=timeout)

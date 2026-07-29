@@ -172,13 +172,17 @@ impl CoordApp {
             if self.active_view == SidebarView::Pipeline {
                 self.maybe_kick_pipeline_loader();
             }
-            // #pause: rescan the paused-machines file at the same cadence
-            // as the rest of the data refresh.  Picks up out-of-band edits
-            // (`coord pause foo` from another terminal) without polling on
-            // every tick.
-            let fresh = read_paused_machines();
-            if fresh != self.paused_machines {
-                self.paused_machines = fresh;
+            // #1563: re-arm the paused-machine sweep at the same cadence as
+            // the rest of the periodic refresh — picks up out-of-band edits
+            // (`coord pause foo` from another terminal or thin client)
+            // without polling on every tick. Deliberately NOT folded into
+            // `refresh()` itself (see that function's doc comment): unlike
+            // the sweeps `refresh()` re-arms, this one makes a real network
+            // call on a thin client, and `refresh()` is also called
+            // reactively from many single-mutation call sites where that
+            // extra request isn't wanted.
+            if self.pending_paused_machines.is_none() {
+                self.pending_paused_machines = Some(spawn_paused_machines_fetch());
             }
             needs_redraw = true;
         }
@@ -734,6 +738,12 @@ impl CoordApp {
         }
         // #1398: drain the background drive-session discovery sweep.
         if self.pending_drive_sessions.is_some() && self.poll_drive_sessions() {
+            needs_redraw = true;
+        }
+        // #1563: drain the background paused-machine sweep (local file or
+        // daemon `GET /pause` on a thin client — see
+        // `spawn_paused_machines_fetch`).
+        if self.pending_paused_machines.is_some() && self.poll_paused_machines() {
             needs_redraw = true;
         }
 
