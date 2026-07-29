@@ -396,20 +396,134 @@ def test_backfills_branch_for_test_author_type(monkeypatch, config) -> None:
     assert any("backfill branch" in s for s in actions)
 
 
-def test_test_author_not_marked_merged_by_sweep_b(monkeypatch, config) -> None:
-    """Sweep (a)'s branch backfill covers test-author (#1083), but sweep (b)'s
-    out-of-band-merge / review-state-settle semantics are pipeline-specific
-    (Work → Test → Review → Merge) and stay type='work'-only — a test-author
-    row must never get silently flipped to 'merged' by this sweep."""
+def test_test_author_marked_merged_by_sweep_b(monkeypatch, config) -> None:
+    """#1574: sweep (b)'s type filter was scoped to `type='work'` only
+    (#1083 left it that way deliberately, "out of scope"), so a
+    `type='test-author'` row — every oracle-loop acceptance slice — could
+    never reach `status='merged'` no matter how completely its branch
+    landed. `work_is_terminal` is branch/commit-scoped (#1150) and already
+    answers correctly for these rows, so there's nothing pipeline-specific
+    left to gate on: a landed branch is a landed branch. Widened to
+    `WORK_LIKE_TYPES` (work, mock-author, test-author).
+
+    The `review_state='pending'` -> `'done'` ghost-clear that sweep (b) also
+    does for `type='work'` (#951) stays `type='work'`-only (see the
+    `test_test_author_review_state_not_settled_by_sweep_b` test below) — only
+    the `status` flip widens here, per the issue's own fallback proposal."""
     a = _done_work(assignment_id="ta2", issue_number=1041, branch="issue-1041-ta")
     a.type = "test-author"
+    a.review_state = "pending"
     board = Board(completed=[a])
     writes = _patch_probes(monkeypatch, terminal=True)
 
     reconcile_board_merges(board, config)
 
+    assert a.status == "merged"
+    assert ("merged", "ta2") in writes
+
+
+def test_mock_author_marked_merged_by_sweep_b(monkeypatch, config) -> None:
+    """Same #1574 widening applies to `type='mock-author'` (#930 Gate A) —
+    it is structurally identical to test-author for this purpose (see
+    `coord.models.WORK_LIKE_TYPES`)."""
+    a = _done_work(assignment_id="ma1", issue_number=1041, branch="issue-1041-ma")
+    a.type = "mock-author"
+    a.review_state = "pending"
+    board = Board(completed=[a])
+    writes = _patch_probes(monkeypatch, terminal=True)
+
+    reconcile_board_merges(board, config)
+
+    assert a.status == "merged"
+    assert ("merged", "ma1") in writes
+
+
+def test_test_author_review_state_not_settled_by_sweep_b(monkeypatch, config) -> None:
+    """#1574: unlike `type='work'`, a test-author/mock-author row's
+    `review_state='pending'` is deliberately left untouched by sweep (b)'s
+    mark-merged step, even though `status` does flip to 'merged'. A
+    test-author row's `review_state='done'` is exactly what sweep (f)'s
+    #1180 wedged-review repair polices (a stray 'done' with no real review
+    behind it) — settling it here would immediately be flagged as wedged
+    and reset back to 'pending' by that sweep, pointless churn this fix
+    doesn't need to introduce."""
+    a = _done_work(assignment_id="ta2b", issue_number=1041, branch="issue-1041-ta")
+    a.type = "test-author"
+    a.review_state = "pending"
+    board = Board(completed=[a])
+    writes = _patch_probes(monkeypatch, terminal=True)
+
+    reconcile_board_merges(board, config)
+
+    assert a.status == "merged"
+    assert a.review_state == "pending"
+    assert ("work_review_settled", "ta2b") not in writes
+
+
+def test_test_author_wedged_review_repair_still_fires_alongside_mark_merged(
+    monkeypatch, config
+) -> None:
+    """End-to-end #1574 repro: a test-author row whose `review_state` was
+    already wedged 'done' (the pre-#1150 `work_is_terminal` false-positive,
+    #1180) with no real review ever having run. Before this fix,
+    `reconcile-merges` only proposed the #1180 repair (done -> pending) and
+    never `mark merged` for it — the exact symptom from the issue's live
+    repro (ms-38 slice for #1124). After this fix both sweeps fire in the
+    same pass: sweep (b) flips `status` to 'merged', sweep (f) independently
+    resets the still-wedged `review_state` to 'pending' so the (now-fixed)
+    review dispatch loop can retry a real review."""
+    a = _done_work(assignment_id="ta2c", issue_number=1041, branch="issue-1041-ta")
+    a.type = "test-author"
+    a.review_state = "done"
+    a.review_verdict = None
+    board = Board(completed=[a])
+    writes = _patch_probes(monkeypatch, terminal=True)
+
+    actions = reconcile_board_merges(board, config)
+
+    assert a.status == "merged"
+    assert a.review_state == "pending"
+    assert ("merged", "ta2c") in writes
+    assert ("wedged_review_reset", "ta2c") in writes
+    assert any("mark merged" in s for s in actions)
+    assert any("repair wedged review_state" in s for s in actions)
+
+
+def test_test_author_reconcile_converges_after_merge(monkeypatch, config) -> None:
+    """#1574 acceptance: once a test-author row is flipped to 'merged', a
+    second `reconcile_board_merges` pass proposes no further action for it —
+    it has permanently dropped out of sweep (b)'s `status='done'` candidate
+    list, same as a type='work' row does."""
+    a = _done_work(assignment_id="ta3", issue_number=1041, branch="issue-1041-ta")
+    a.type = "test-author"
+    a.review_state = "pending"
+    board = Board(completed=[a])
+    _patch_probes(monkeypatch, terminal=True)
+
+    reconcile_board_merges(board, config)
+    assert a.status == "merged"
+
+    writes_second = _patch_probes(monkeypatch, terminal=True)
+    actions_second = reconcile_board_merges(board, config)
+
+    assert writes_second == []
+    assert actions_second == []
+
+
+def test_review_type_still_excluded_from_mark_merged(monkeypatch, config) -> None:
+    """Regression (#1574 acceptance): `type='review'` rows must remain
+    excluded from sweep (b)'s terminal-merge check — the widening to
+    `WORK_LIKE_TYPES` must not accidentally sweep in review rows too."""
+    a = _done_work(assignment_id="rev1", issue_number=1041, branch="issue-1041-rev")
+    a.type = "review"
+    board = Board(completed=[a])
+    writes = _patch_probes(monkeypatch, terminal=True)
+
+    actions = reconcile_board_merges(board, config)
+
     assert a.status == "done"
-    assert ("merged", "ta2") not in writes
+    assert ("merged", "rev1") not in writes
+    assert actions == []
 
 
 # ── #1110 interactive merge session terminal detection ─────────────────────
