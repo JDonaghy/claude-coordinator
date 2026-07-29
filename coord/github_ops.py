@@ -1161,6 +1161,22 @@ def get_pr_head_ref(repo: str, number: int) -> str | None:
     return head_ref or None
 
 
+# #1564: `gh pr checks --json` does NOT have a `conclusion` field — it never
+# has. Requesting it makes `gh` exit 1 with empty stdout, which used to make
+# every single merge look like an unreadable CI status (fail-closed, so it
+# blocked every merge rather than passing every one, but neither is correct).
+# `bucket` is gh's own pass/fail/pending/skipping/cancel rollup of `state`
+# (which is a per-check verdict like SUCCESS/FAILURE, not a lifecycle phase)
+# and is exactly what the merge gate wants. Pinned in a regression test
+# (tests/test_github_ops.py::TestPrChecksJsonFieldsAreValid) that shells out
+# to `gh pr checks --help` and asserts every field here is one `gh` advertises,
+# so the next `gh` schema change fails a test instead of silently breaking
+# the gate again.
+PR_CHECKS_JSON_FIELDS: tuple[str, ...] = (
+    "name", "state", "bucket", "link", "startedAt", "completedAt",
+)
+
+
 def get_pr_checks(repo: str, number: int) -> list[dict]:
     """Return ``gh pr checks``' raw check-run list for PR *number*.
 
@@ -1174,7 +1190,7 @@ def get_pr_checks(repo: str, number: int) -> list[dict]:
         [
             "gh", "pr", "checks", str(number),
             "--repo", repo,
-            "--json", "name,state,conclusion,link,startedAt,completedAt",
+            "--json", ",".join(PR_CHECKS_JSON_FIELDS),
         ],
         capture_output=True, text=True, timeout=30,
     )

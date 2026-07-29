@@ -9,6 +9,8 @@ failure never blocks a legitimate dispatch.
 from __future__ import annotations
 
 import json
+import re
+import shutil
 import subprocess
 from unittest.mock import patch
 
@@ -1366,3 +1368,51 @@ class TestGetPrChecks:
         with patch("coord.github_ops.subprocess.run", side_effect=FileNotFoundError):
             with pytest.raises(FileNotFoundError):
                 github_ops.get_pr_checks("acme/api", 42)
+
+    def test_requested_json_fields_omit_conclusion(self) -> None:
+        """#1564: `conclusion` is not, and never has been, a valid `gh pr
+        checks --json` field — requesting it makes `gh` exit 1 with empty
+        stdout, which reads as a total lookup failure."""
+        assert "conclusion" not in github_ops.PR_CHECKS_JSON_FIELDS
+
+    def test_get_pr_checks_requests_the_pinned_field_list(self) -> None:
+        with patch(
+            "coord.github_ops.subprocess.run",
+            return_value=type(
+                "R", (), {"returncode": 0, "stdout": "[]", "stderr": ""}
+            )(),
+        ) as mock_run:
+            github_ops.get_pr_checks("acme/api", 42)
+        args = mock_run.call_args.args[0]
+        json_flag_index = args.index("--json")
+        requested = args[json_flag_index + 1].split(",")
+        assert requested == list(github_ops.PR_CHECKS_JSON_FIELDS)
+
+
+class TestPrChecksJsonFieldsAreValid:
+    """#1564 regression: `coord.github_ops.PR_CHECKS_JSON_FIELDS` must stay a
+    subset of what the installed `gh` actually advertises via
+    `gh pr checks --help`'s "JSON FIELDS" line — this is what would have
+    caught `conclusion` (never a valid field) before it shipped, and catches
+    the next `gh` schema change as a test failure instead of a silently
+    broken merge gate.
+    """
+
+    def test_requested_fields_are_advertised_by_gh(self) -> None:
+        gh = shutil.which("gh")
+        if gh is None:
+            pytest.skip("gh not installed in this environment")
+        result = subprocess.run(
+            ["gh", "pr", "checks", "--help"],
+            capture_output=True, text=True, timeout=10,
+        )
+        help_text = f"{result.stdout}\n{result.stderr}"
+        match = re.search(r"JSON FIELDS\s*\n\s*(.+)", help_text)
+        assert match, f"could not find a JSON FIELDS section in gh help:\n{help_text}"
+        advertised = {f.strip() for f in match.group(1).split(",")}
+        requested = set(github_ops.PR_CHECKS_JSON_FIELDS)
+        missing = requested - advertised
+        assert not missing, (
+            f"{sorted(missing)} requested by github_ops.PR_CHECKS_JSON_FIELDS "
+            f"but not advertised by this gh's `--json` help ({sorted(advertised)})"
+        )
