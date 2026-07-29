@@ -9,7 +9,13 @@ import pytest
 from click.testing import CliRunner
 
 from coord.models import Assignment, Board, Machine, Repo
-from coord.state import save_board, load_board, build_board, record_test_verdict
+from coord.state import (
+    save_board,
+    load_board,
+    build_board,
+    record_test_verdict,
+    record_work_review_verdict,
+)
 
 
 # ── Board save/load roundtrip ──────────────────────────────────────────────────
@@ -1539,3 +1545,98 @@ def test_mark_notified_advisory_sets_advisory_not_failed(coord_db) -> None:
         "mark_notified(EVENT_ADVISORY) must record 'advisory', not 'failed' "
         "(#1451)"
     )
+
+
+# ── #1565: save_board must not clobber a newer review verdict ──────────────
+#
+# Same clobber shape as #1482 (test_state), one column family over:
+# `review_state` was blindly overwritten by the whole-board upsert. A stale
+# `save_board()` snapshot read before a review's verdict landed on the
+# parent work row would silently revert `review_state` from a terminal value
+# back to 'pending' — which makes the row eligible again in
+# `dispatch_pending_reviews` and re-dispatches a metered review for a
+# verdict that already exists (the #1565 incident: 4 redundant reviews /
+# $5.36 re-deriving the same approval, two of them against an
+# already-merged PR).
+
+
+def test_save_board_does_not_clobber_a_settled_review_state(coord_db) -> None:
+    """A stale in-memory snapshot (review_state='pending' as of an earlier
+    read) must not overwrite a review_state that `record_work_review_verdict`
+    already settled to 'done' in between the read and the `save_board()`
+    write."""
+    from coord.db import get_connection
+
+    aid = "wedge1565"
+    # 1. Work completes; reconcile's Pass 1 marks it pending review.
+    save_board(
+        Board(
+            completed=[
+                Assignment(
+                    machine_name="m", repo_name="r", issue_number=1,
+                    issue_title="t", briefing="b", assignment_id=aid,
+                    status="done", finished_at=1000.0,
+                    type="work", review_state="pending",
+                )
+            ]
+        )
+    )
+
+    # 2. A stale board snapshot is read — held in memory while, e.g., a slow
+    #    reconcile tick does other work.
+    stale_board = build_board()
+    assert stale_board.completed[0].review_state == "pending"
+
+    # 3. Meanwhile the review completes and approves; the single-row seam
+    #    writer records the verdict on the parent work row.
+    record_work_review_verdict(aid, "approve")
+
+    # 4. The slow tick finally calls save_board() with its stale snapshot —
+    #    this must NOT revert the settled review_state.
+    save_board(stale_board)
+
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT review_state, review_verdict FROM assignments WHERE assignment_id=?",
+        (aid,),
+    ).fetchone()
+    assert row["review_state"] == "done", (
+        "save_board() clobbered a settled review_state with a stale "
+        "in-memory snapshot (#1565)"
+    )
+    assert row["review_verdict"] == "approve"
+
+    reloaded = load_board()
+    settled = reloaded.find_by_id(aid)
+    assert settled is not None
+    assert settled.review_state == "done"
+    assert settled.review_verdict == "approve"
+
+
+def test_save_board_allows_forward_review_state_transitions(coord_db) -> None:
+    """The CAS guard must not freeze review_state forever — a genuine
+    forward transition (e.g. 'pending' -> 'dispatched') from a fresh,
+    non-stale board write still takes effect."""
+    from coord.db import get_connection
+
+    aid = "wedge1565-forward"
+    board = Board(
+        completed=[
+            Assignment(
+                machine_name="m", repo_name="r", issue_number=2,
+                issue_title="t", briefing="b", assignment_id=aid,
+                status="done", finished_at=1000.0,
+                type="work", review_state="pending",
+            )
+        ]
+    )
+    save_board(board)
+
+    board.completed[0].review_state = "dispatched"
+    save_board(board)
+
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT review_state FROM assignments WHERE assignment_id=?", (aid,),
+    ).fetchone()
+    assert row["review_state"] == "dispatched"

@@ -1936,6 +1936,15 @@ def dispatch_pending_reviews(board, config, *, test_gate_active: bool = False, n
     automatic path. Sets ``review_state="dispatched"`` on each row it
     dispatches and returns the dispatched review ``Assignment``s. The caller
     persists the board.
+
+    #1565: before the eligibility filter runs, any row whose ``review_state``
+    reads ``pending``/``None`` but that already has a *terminal* verdict on a
+    completed ``type="review"`` assignment targeting it is excluded and
+    self-healed (``review_state`` set to ``"done"``) rather than trusted at
+    face value — see the guard immediately below. This is the backstop for a
+    row whose ``review_state`` regressed to ``pending`` after a review already
+    rendered a verdict (a stale whole-board ``save_board()`` clobber, or a
+    verdict that was never propagated to the parent row).
     """
     import logging
     import os
@@ -1994,6 +2003,51 @@ def dispatch_pending_reviews(board, config, *, test_gate_active: bool = False, n
                     ),
                 )
                 c.test_state = "skipped"
+
+    # #1565: dispatch-side backstop. review_state is supposed to be the
+    # single source of truth for "does this row still need a review", but
+    # it has been observed to regress to "pending" out from under a row that
+    # already carries a real, terminal verdict on a completed review
+    # assignment (a stale whole-board save_board() clobber, or a code path
+    # that forgot to propagate the verdict onto the parent — see
+    # `_advance_pipeline`'s #1565 fix). Before trusting review_state, check
+    # for that shape directly and refuse to burn a second metered review
+    # re-deriving a verdict that already exists — log loudly (a guard that
+    # trips silently teaches nobody) and self-heal the row instead of
+    # leaving it to trip this same guard every pass.
+    for c in board.completed:
+        if (
+            c.review_state not in (None, "pending")
+            or c.type not in WORK_LIKE_TYPES
+            or c.assignment_id is None
+        ):
+            continue
+        prior_verdict = next(
+            (
+                r.review_verdict
+                for r in board.active + board.completed
+                if r.type == "review"
+                and r.review_of_assignment_id == c.assignment_id
+                and r.review_verdict is not None
+            ),
+            None,
+        )
+        if prior_verdict is None:
+            continue
+        logger.warning(
+            "dispatch guard (#1565): %s (%s #%s) already has a terminal "
+            "review verdict %r recorded on a prior review assignment, but "
+            "its own review_state=%r would make it eligible for another "
+            "metered review — refusing to re-dispatch and self-healing "
+            "review_state='done' instead.",
+            c.assignment_id, c.repo_name, c.issue_number,
+            prior_verdict, c.review_state,
+        )
+        from coord.state import record_work_review_verdict
+
+        c.review_state = "done"
+        c.review_verdict = prior_verdict
+        record_work_review_verdict(c.assignment_id, prior_verdict)
 
     eligible = [
         c

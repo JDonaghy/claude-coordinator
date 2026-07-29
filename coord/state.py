@@ -34,7 +34,14 @@ from coord.audit import record_audit as _record_audit
 from coord.board_service import resolve as _board_service_resolve
 from coord.board_service import route_write as _route_write
 from coord.db import get_connection
-from coord.models import Assignment, Board, Proposal, SplitChunk, SplitProposal
+from coord.models import (
+    WORK_LIKE_TYPES,
+    Assignment,
+    Board,
+    Proposal,
+    SplitChunk,
+    SplitProposal,
+)
 
 # Re-exported for backward compatibility (these moved to coord._board_mapping in
 # #584 so the daemon/client can share the one mapping):
@@ -199,7 +206,32 @@ _UPSERT_SQL = """
         -- non-NULL and would still clobber a recorded `'passed'`/`'failed'`.
         -- The INSERT column list above is unaffected and still stores both
         -- for NEW rows (dispatch time, before any seam write exists).
-        review_state       = excluded.review_state,
+        --
+        -- #1565: same clobber shape as #1482, one column over. A completed
+        -- review's verdict is supposed to flip the parent work row's
+        -- review_state to a terminal value ('done', 'advisory', ...), but a
+        -- whole-board save_board() carries an in-memory snapshot that can be
+        -- stale by the time it writes (the same staleness window #1451's
+        -- status CAS exists to close). A stale snapshot's review_state is
+        -- almost always 'pending'/NULL (that's the row's state before the
+        -- review landed), so blindly taking `excluded.review_state` here
+        -- silently reverts a just-recorded terminal verdict back to
+        -- 'pending' — which makes the row eligible again and re-dispatches
+        -- a metered review (the #1565 incident: 4 reviews / $5.36 re-
+        -- deriving the same approval). Once a row holds a non-NULL,
+        -- non-'pending' review_state, only accept an incoming write that is
+        -- ALSO non-NULL/non-'pending' (a real forward transition); an
+        -- incoming NULL/'pending' is exactly the stale-snapshot shape and is
+        -- discarded. Deliberate resets back to 'pending' (#1180's wedged-
+        -- review repair, `coord bounce`'s review reset) go through their own
+        -- scoped single-row UPDATEs, not this whole-board upsert, so they are
+        -- unaffected by this guard.
+        review_state = CASE
+            WHEN review_state IS NOT NULL AND review_state != 'pending'
+                 AND (excluded.review_state IS NULL OR excluded.review_state = 'pending')
+            THEN review_state
+            ELSE excluded.review_state
+        END,
         review_of_assignment_id = excluded.review_of_assignment_id,
         review_target      = excluded.review_target,
         unreachable_count  = excluded.unreachable_count,
@@ -2148,6 +2180,42 @@ def mark_work_review_settled(assignment_id: str) -> None:
         "UPDATE assignments SET review_state='done' WHERE assignment_id=? "
         "AND type='work' AND review_state='pending'",
         (assignment_id,),
+    )
+    conn.commit()
+
+
+def record_work_review_verdict(assignment_id: str, verdict: str) -> None:
+    """#1565: stamp a completed review's verdict directly on the PARENT work
+    row, immediately, as a single scoped UPDATE.
+
+    ``auto_loop.process_review_completion`` has always recorded the parsed
+    verdict on the *review* assignment (``review.review_verdict``) and left
+    the parent work row's own ``review_verdict`` NULL forever — nothing ever
+    wrote it. That gap meant #1180's wedged-review repair (which treats
+    ``review_verdict IS NOT NULL`` as "a real review already happened, leave
+    it alone") could never actually trust the work row's own column and had
+    to fall back to a fragile same-branch lookup among ``type='review'``
+    rows.  It also meant persisting the verdict onto the parent depended
+    entirely on a *later*, whole-board ``save_board()`` call reaching the DB
+    before anything else raced it — exactly the staleness window #1451/#1482
+    (and now the ``review_state`` CAS above) exist to close.
+
+    Called from ``_advance_pipeline`` the moment the pipeline decides to
+    advance (approve / approve-with-nits), so the parent's terminal state is
+    durable independent of whether/when the caller's own ``write_board()``
+    lands.  Idempotent and narrow: only touches :data:`coord.models.
+    WORK_LIKE_TYPES` rows, and always writes the winning terminal verdict
+    (there is nothing to preserve — a work row's ``review_verdict`` is only
+    ever set here).
+    """
+    if not assignment_id:
+        return
+    conn = get_connection()
+    placeholders = ",".join("?" for _ in WORK_LIKE_TYPES)
+    conn.execute(
+        "UPDATE assignments SET review_state='done', review_verdict=? "
+        f"WHERE assignment_id=? AND type IN ({placeholders})",
+        (verdict, assignment_id, *WORK_LIKE_TYPES),
     )
     conn.commit()
 

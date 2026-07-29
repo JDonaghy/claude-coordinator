@@ -3227,6 +3227,102 @@ def test_flood_guard_dispatches_all_below_cap(fake_dispatch) -> None:
     assert all(c.review_state == "dispatched" for c in board.completed)
 
 
+def test_approved_review_does_not_redispatch_across_two_reconcile_ticks(
+    fake_dispatch, tmp_path,
+) -> None:
+    """#1565 black-box acceptance test: dispatch a review, approve it through
+    the real auto-loop verdict-processing path, then run the
+    ``dispatch_pending_reviews`` "reconcile tick" twice more. Exactly zero
+    additional review assignments must be created — the #1565 incident was
+    an approved review getting re-dispatched (4 times, $5.36) because
+    ``review_state`` regressed back to ``'pending'`` after the approval."""
+    from coord.auto_loop import process_review_completion
+    from coord.config import PipelineConfig as _PipelineConfig
+
+    work = _pending_work(1)[0]
+    board = Board(completed=[work])
+    cfg = _flood_config(max_auto_dispatch_per_pass=5, flood_threshold=12)
+    cfg = replace(
+        cfg,
+        pipeline=_PipelineConfig(
+            default_gates=["review", "test", "merge"], auto_loop=True,
+        ),
+    )
+
+    # Tick 1: work is eligible, review gets dispatched (the fake stub moves
+    # it onto board.active).
+    first = dispatch_pending_reviews(board, cfg)
+    assert len(first) == 1
+    assert len(fake_dispatch) == 1
+    assert work.review_state == "dispatched"
+
+    review = board.active[0]
+    assert review.type == "review" and review.review_of_assignment_id == work.assignment_id
+
+    # The review "finishes" with an approve verdict — route it through the
+    # real process_review_completion (same call reconcile()/notify() make).
+    review.status = "done"
+    log_file = tmp_path / "review.log"
+    log_file.write_text(
+        "REVIEW_VERDICT: approve\nREVIEW_BODY:\nLGTM.\nEND_REVIEW\n"
+    )
+    actions = process_review_completion(
+        review, board, cfg, log_path=str(log_file),
+    )
+    assert actions[0].kind == "approved"
+    assert work.review_state == "done"
+    assert work.review_verdict == "approve"
+
+    # Ticks 2 and 3: the "reconcile tick" (dispatch_pending_reviews) must
+    # find nothing new to dispatch — the approved work row is no longer
+    # eligible, and even if review_state had regressed to 'pending' the
+    # #1565 dispatch-side guard would catch the recorded terminal verdict.
+    second = dispatch_pending_reviews(board, cfg)
+    third = dispatch_pending_reviews(board, cfg)
+    assert second == []
+    assert third == []
+    assert len(fake_dispatch) == 1, (
+        "dispatch_pending_reviews re-dispatched a review for already-"
+        "approved work across reconcile ticks (#1565)"
+    )
+
+
+def test_redispatch_guard_self_heals_a_regressed_pending_review_state(
+    fake_dispatch,
+) -> None:
+    """#1565 direct guard test: even if review_state regresses to 'pending'
+    out from under a work row that already has a terminal verdict recorded
+    on a completed review assignment, dispatch_pending_reviews must refuse
+    to re-dispatch and must self-heal review_state back to 'done'."""
+    work = _pending_work(1)[0]
+    review = Assignment(
+        machine_name="server",
+        repo_name=work.repo_name,
+        issue_number=work.issue_number,
+        issue_title="[review] work",
+        assignment_id="rev-w1",
+        status="done",
+        type="review",
+        review_of_assignment_id=work.assignment_id,
+        review_verdict="approve",
+        dispatched_at=0.0,
+        finished_at=1.0,
+    )
+    # Simulate the clobber shape directly: the work row's review_state is
+    # back at 'pending' despite the review above already carrying a
+    # terminal verdict.
+    work.review_state = "pending"
+    board = Board(completed=[work, review])
+    cfg = _flood_config(max_auto_dispatch_per_pass=5, flood_threshold=12)
+
+    out = dispatch_pending_reviews(board, cfg)
+
+    assert out == []
+    assert fake_dispatch == []
+    assert work.review_state == "done"
+    assert work.review_verdict == "approve"
+
+
 def test_dispatch_pending_reviews_includes_mock_author(fake_dispatch) -> None:
     """#930 fix: the bulk/auto dispatch path (`coord notify`, `reconcile()`)
     must pick up a completed `type="mock-author"` (Gate A) row the same as
