@@ -481,10 +481,40 @@ def _decide_acceptance_author(
             ),
         )
 
-    # "" / running / done: still landing through Test → Review → Merge —
-    # coord's own tick loop drives that, exactly like a normal work row;
-    # this only observes (same posture as every other gate in this module).
-    return _wait(label=f"ACCEPTANCE: JIT slice {aid} authoring/merging in progress")
+    if status == "done":
+        # #1535: `done` is TERMINAL (drive_state.TERMINAL_STATUSES) exactly
+        # like `advisory` — it will never transition to `merged` on its own
+        # if nothing was ever pushed (a #1534-style false "done", a reap, or
+        # a worker that forgot to push, the recurring shape). Re-polling
+        # can't help a terminal status, so waiting to `--deadline` with no
+        # diagnosis is the #1526 merge-gate defect reborn here. Mirror the
+        # `advisory` branch's probe exactly.
+        branch = state.acceptance_author_branch
+        probe = replace(state, work_branch=branch) if branch else state
+        if not branch or not verifier.branch_has_commits(probe):
+            branch_display = repr(branch) if branch else "(none)"
+            return _die(
+                f"acceptance author {aid} exited DONE, but its branch "
+                f"{branch_display} carries no commits — nothing was "
+                "authored, so there is no slice to land, and DONE is "
+                "terminal: it will never change on its own.\n"
+                f"   inspect: coord log {aid} --machine "
+                f"{state.acceptance_author_machine or machine}\n"
+                "   Re-author by hand: coord acceptance author "
+                f"{state.repo} {oracle.tracking_issue} --issue "
+                f"{state.issue}\n"
+                "   or re-run coord drive with --no-acceptance to skip JIT "
+                "authoring."
+            )
+
+    # "" / running: still authoring. done (with commits, checked above):
+    # authoring finished, now landing through Test → Review → Merge — coord's
+    # own tick loop drives that, exactly like a normal work row; this only
+    # observes (same posture as every other gate in this module).
+    verb = "authoring" if status in ("", "running") else "landing (Test → Review → Merge)"
+    return _wait(
+        label=f"ACCEPTANCE: JIT slice {aid} status={status or '(none)'} — {verb}"
+    )
 
 
 # ── merge verification ───────────────────────────────────────────────────────
