@@ -831,6 +831,87 @@ def test_oracle_active_advisory_never_falls_through_to_a_bare_wait_label():
     assert "authoring/merging in progress" not in (action.label or "")
 
 
+# ── #1535: a DONE JIT slice must not spin to --deadline on zero commits ─────
+
+
+def test_oracle_active_done_with_no_commits_is_terminal():
+    """The advisory-path guard, applied to `done`: a terminal status whose
+    branch has zero commits can never reach `merged` on its own — waiting
+    burns the deadline with no diagnosis (#1526's defect, reborn here)."""
+    oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
+    verifier = FakeVerifier(has_commits=False)
+    action = step(
+        oracle_state(
+            acceptance_author_aid="ta1",
+            acceptance_author_status="done",
+            acceptance_author_branch="test-author-ms-38-slice-1124",
+        ),
+        oracle=oracle,
+        verifier=verifier,
+    )
+    assert action.is_exit
+    assert action.exit_code == EXIT_TERMINAL_FAILURE
+    assert "test-author-ms-38-slice-1124" in action.message
+    assert "no commits" in action.message
+    assert "ta1" in action.message
+
+
+def test_oracle_active_done_with_no_branch_is_terminal():
+    oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
+    verifier = FakeVerifier(has_commits=False)
+    action = step(
+        oracle_state(
+            acceptance_author_aid="ta1",
+            acceptance_author_status="done",
+            acceptance_author_branch="",
+        ),
+        oracle=oracle,
+        verifier=verifier,
+    )
+    assert action.is_exit
+    assert action.exit_code == EXIT_TERMINAL_FAILURE
+    assert "no commits" in action.message
+
+
+def test_oracle_active_done_with_commits_waits():
+    """The common case is unaffected: a DONE slice whose branch actually
+    carries commits keeps waiting for coord's own Test/Review/Merge loop to
+    land it."""
+    oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
+    verifier = FakeVerifier(has_commits=True)
+    action = step(
+        oracle_state(
+            acceptance_author_aid="ta1",
+            acceptance_author_status="done",
+            acceptance_author_branch="test-author-ms-38-slice-1124",
+        ),
+        oracle=oracle,
+        verifier=verifier,
+    )
+    assert action.kind == WAIT
+    assert not action.is_exit
+    assert verifier.commits_calls == 1
+
+
+def test_oracle_active_advisory_behaviour_is_unchanged_by_the_done_fix():
+    """Regression guard: the `done` probe must not leak into the `advisory`
+    branch's own handling."""
+    oracle = OracleDecision(True, "ORACLE DRIVE", tracking_issue=1120)
+    verifier = FakeVerifier(has_commits=False)
+    action = step(
+        oracle_state(
+            acceptance_author_aid="ta1",
+            acceptance_author_status="advisory",
+            acceptance_author_branch="",
+        ),
+        oracle=oracle,
+        verifier=verifier,
+    )
+    assert action.is_exit
+    assert action.exit_code == EXIT_TERMINAL_FAILURE
+    assert "ADVISORY" in action.message
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # work-stage terminal states
 # ═══════════════════════════════════════════════════════════════════════════
