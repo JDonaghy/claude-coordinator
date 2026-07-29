@@ -360,6 +360,21 @@ def _advance_pipeline(
         work = board.find_by_id(review.review_of_assignment_id)
         if work is not None:
             work.review_state = "done"
+            # #1565: propagate the verdict onto the parent work row itself —
+            # it used to live only on the review assignment, which left the
+            # work row's own review_verdict NULL forever. Persist it as an
+            # immediate, scoped single-row write (not deferred to whichever
+            # caller happens to save the whole board afterward) so a crash,
+            # a skipped persist step, or a stale concurrent save_board()
+            # elsewhere can't leave the parent stuck at review_state=
+            # 'pending' with a real approval sitting unreferenced on the
+            # review row — the #1565 incident (4 redundant metered reviews
+            # re-deriving the same approval).
+            work.review_verdict = review.review_verdict
+            if work.assignment_id:
+                from coord.state import record_work_review_verdict  # noqa: PLC0415
+
+                record_work_review_verdict(work.assignment_id, review.review_verdict)
             # #292 (Defect 2): proactively enqueue/refresh the merge queue
             # entry so the TUI shows the Merge stage as ready without requiring
             # a manual `coord merge` run first. If the entry was keyed to an
