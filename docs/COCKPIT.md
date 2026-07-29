@@ -4,8 +4,10 @@
 > human developer stays genuinely in the loop — reading the code, driving the gates — instead of
 > an unattended autopilot no one reviews.**
 >
-> _Status: RFC / proposed — 2026-07-23._ This is the **intent** layer (cf. [`GOAL.md`](../GOAL.md));
-> it should bias the near-term TUI roadmap and, once accepted, update GOAL.md's horizon.
+> _Status: RFC / proposed — 2026-07-23; reconciled with the web control-center program 2026-07-28
+> (see §7)._ This is the **intent** layer (cf. [`GOAL.md`](../GOAL.md)) — the standing argument for
+> *why* a trust surface wins. It is deliberately **surface-independent**: GOAL.md's near-term slot
+> now belongs to the web control center, and §7 explains why that does not change this thesis.
 
 ## 1. The wedge
 
@@ -103,3 +105,43 @@ a cycle key ships value *before* the polished tab strip and the whole review epi
 - How the "human confirms AI review" verdict is recorded so it's auditable (ties to the Audit Trail
   epic #1041) — the gate should log *that a human read it*, not just the outcome.
 - Does the review chat get read-only code tools (grep/graph/read) so it can answer beyond the diff?
+
+## 7. Relationship to the web control center (added 2026-07-28)
+
+Five days after this thesis was written, the near-term direction was repointed to the **web control
+center** ([`WEB_CONTROL_CENTER.md`](WEB_CONTROL_CENTER.md)): a responsive browser app growing toward
+full `coord-tui` parity, and eventually the primary surface for anyone who is not the author. Read
+alongside §3's Pillar 1 and Pillar 3, that looks like a contradiction. It mostly isn't — but one part
+of it genuinely is, and that part is now a decision rather than an assumption.
+
+**What survives unchanged.** The wedge (§1) and the moat (§2) are arguments about *posture*, not
+about pixels. "A human demonstrably read the code before it merged" is equally true in a terminal, a
+GTK window, or a browser tab. Nothing in §1–§2 depends on the seat being a TUI.
+
+**What the web program actually helps.** Pillar 3's real requirement is *reach* — the cockpit has to
+be usable wherever the developer is. A browser delivers that more completely than four native builds
+do: zero install, any machine, and — the point that matters for the commercial thesis — **it is the
+only surface you can put in front of a client without asking them to install anything.** A
+risk-averse org evaluating a trust surface will not start by building a Rust binary.
+
+**What genuinely conflicts.** Pillar 3's engineering argument was *leverage*: put the review surface
+in quadraui as backend-neutral primitives and it rides the TUI/GTK/mac/Windows port for free. **A web
+client does not ride that port.** `DiffView`, the review pane, the embedded chat — none of it
+transfers to React. So Pillar 2, the trust feature itself, now faces a real fork: build the review
+seat in quadraui (four native surfaces, not the browser), in the web app (the browser and nothing
+else), or accept building it twice. This thesis assumed the first without knowing the third option
+would exist.
+
+**How to keep the decision cheap.** The trust guarantee does not live in the UI. It lives in the
+*record* — that a human read the diff, at which gate, with what verdict, auditable afterwards
+(§6's fourth open question, tying to the Audit Trail epic #1041). **Build that record
+surface-neutrally, in the coord backend, before either review seat is built.** Then "which surface
+gets the review pane first" becomes a UX scheduling question rather than an architectural
+commitment, and whichever surface loses the race can be added later without re-litigating the trust
+model.
+
+**Sequencing, as of 2026-07-28.** Neither program is dispatched. The web program (milestones #51/#52)
+is authored and gated on #1440; the cockpit program (#45/#46) is a stub. GOAL.md's near-term priority
+is the web program, on the grounds that it is simultaneously a product and the real-world trial of
+`epic → oracle → drive`. This thesis stays the intent layer for the trust wedge and should be
+revisited — not rewritten — when the cockpit program is scheduled.
