@@ -140,27 +140,31 @@ def _gh_result(stdout: str = "[]", returncode: int = 0) -> subprocess.CompletedP
     return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr="")
 
 
+# #1564: this is the *real* shape `gh pr checks --json name,state,bucket,
+# link,startedAt,completedAt` returns — no `conclusion` field, and `state`
+# is a verdict (SUCCESS/FAILURE/...), not a lifecycle phase. `bucket` is
+# gh's own pass/fail/pending rollup and is what GitHubCi now keys off.
 GH_SAMPLE = json.dumps([
     {
         "name": "test (3.12)",
-        "state": "COMPLETED",
-        "conclusion": "FAILURE",
+        "state": "FAILURE",
+        "bucket": "fail",
         "link": "https://github.com/acme/api/actions/runs/123/job/456",
         "startedAt": "2026-05-24T12:00:00Z",
         "completedAt": "2026-05-24T12:05:00Z",
     },
     {
         "name": "lint",
-        "state": "completed",
-        "conclusion": "success",
+        "state": "SUCCESS",
+        "bucket": "pass",
         "link": "",
         "startedAt": "",
         "completedAt": "",
     },
     {
         "name": "deploy-preview",
-        "state": "IN_PROGRESS",
-        "conclusion": "",
+        "state": "PENDING",
+        "bucket": "pending",
         "link": "https://github.com/acme/api/actions/runs/789",
         "startedAt": "2026-05-24T12:10:00Z",
         "completedAt": "",
@@ -184,6 +188,70 @@ class TestGitHubCi:
         # Timestamps are parsed to floats when present.
         assert isinstance(by_name["test (3.12)"].started_at, float)
         assert by_name["lint"].started_at is None
+
+    def test_real_gh_shape_all_pass_yields_zero_failed_and_zero_inflight(self) -> None:
+        """#1564 addendum acceptance test: feed exactly the JSON shape a real
+        `gh pr checks --json name,state,bucket,...` call returns for an
+        all-green PR (no `conclusion` field at all) through GitHubCi and
+        confirm it reads as green — the pre-fix code failed this on both
+        counts (every check normalised to "in_progress" forever)."""
+        payload = json.dumps([
+            {
+                "name": "test (3.13)", "state": "SUCCESS", "bucket": "pass",
+                "link": "https://github.com/acme/api/actions/runs/1/job/1",
+                "startedAt": "2026-07-28T00:00:00Z", "completedAt": "2026-07-28T00:01:00Z",
+            },
+            {
+                "name": "e2e", "state": "SUCCESS", "bucket": "pass",
+                "link": "https://github.com/acme/api/actions/runs/1/job/2",
+                "startedAt": "2026-07-28T00:00:00Z", "completedAt": "2026-07-28T00:01:00Z",
+            },
+        ])
+        store = GitHubCi()
+        with patch("coord.ci_github.subprocess.run", return_value=_gh_result(payload)):
+            checks = store.list_checks_for_pr("acme/api", 1562)
+        assert failed_checks(checks) == []
+        assert in_flight_checks(checks) == []
+
+    def test_bucket_maps_to_conclusion_and_status(self) -> None:
+        """#1564: gh's documented buckets (pass/fail/pending/skipping/cancel)
+        map to CheckRun's status/conclusion — this is the mapping the merge
+        gate actually reads."""
+        payload = json.dumps([
+            {"name": "a", "state": "SUCCESS", "bucket": "pass",
+             "link": "", "startedAt": "", "completedAt": ""},
+            {"name": "b", "state": "FAILURE", "bucket": "fail",
+             "link": "", "startedAt": "", "completedAt": ""},
+            {"name": "c", "state": "SKIPPED", "bucket": "skipping",
+             "link": "", "startedAt": "", "completedAt": ""},
+            {"name": "d", "state": "CANCELLED", "bucket": "cancel",
+             "link": "", "startedAt": "", "completedAt": ""},
+            {"name": "e", "state": "PENDING", "bucket": "pending",
+             "link": "", "startedAt": "", "completedAt": ""},
+        ])
+        store = GitHubCi()
+        with patch("coord.ci_github.subprocess.run", return_value=_gh_result(payload)):
+            checks = store.list_checks_for_pr("acme/api", 1)
+        by_name = {c.name: c for c in checks}
+        assert (by_name["a"].status, by_name["a"].conclusion) == ("completed", "success")
+        assert (by_name["b"].status, by_name["b"].conclusion) == ("completed", "failure")
+        assert (by_name["c"].status, by_name["c"].conclusion) == ("completed", "skipped")
+        assert (by_name["d"].status, by_name["d"].conclusion) == ("completed", "cancelled")
+        assert (by_name["e"].status, by_name["e"].conclusion) == ("in_progress", None)
+
+    def test_unrecognised_bucket_is_unknown_not_passing(self) -> None:
+        """#1525's fail-closed rule extended to `bucket`: a future gh bucket
+        value this code has never seen must not be silently read as passing."""
+        payload = json.dumps([
+            {"name": "weird", "state": "SOMETHING_NEW", "bucket": "mystery",
+             "link": "", "startedAt": "", "completedAt": ""},
+        ])
+        store = GitHubCi()
+        with patch("coord.ci_github.subprocess.run", return_value=_gh_result(payload)):
+            checks = store.list_checks_for_pr("acme/api", 1)
+        assert checks[0].status == "completed"
+        assert checks[0].conclusion == "unknown"
+        assert failed_checks(checks) == checks
 
     def test_handles_failing_gh_with_valid_json(self) -> None:
         """gh exits non-zero when checks fail but stdout is still valid JSON."""
@@ -422,6 +490,55 @@ class TestMergeGate:
         merged_prs = [c[0] for c in gh.merge_calls]
         assert 100 not in merged_prs
         assert 101 in merged_prs
+
+
+class TestMergeGateThroughGitHubCi:
+    """#1564 acceptance: black-box through the *real* :class:`GitHubCi`
+    backend (not the ``FakeCi`` stub above) with `gh`'s actual
+    ``--json name,state,bucket,...`` shape — green merges, red refuses and
+    names the failing check, and an unreachable ``gh`` refuses as
+    "unavailable" rather than silently allowing the merge."""
+
+    def test_green_allows_merge(self) -> None:
+        items = [_entry("a")]
+        gh = FakeGh()
+        payload = json.dumps([
+            {"name": "test (3.13)", "state": "SUCCESS", "bucket": "pass",
+             "link": "", "startedAt": "", "completedAt": ""},
+        ])
+        ci = GitHubCi()
+        with patch("coord.ci_github.subprocess.run", return_value=_gh_result(payload)):
+            process(items, gh, ci_store=ci)
+        assert gh.merge_calls == [(100, "rebase")]
+        assert items[0].state == MERGED
+
+    def test_red_refuses_and_names_failing_check(self) -> None:
+        items = [_entry("a")]
+        gh = FakeGh()
+        payload = json.dumps([
+            {"name": "test (3.13)", "state": "FAILURE", "bucket": "fail",
+             "link": "https://github.com/acme/api/actions/runs/1/job/1",
+             "startedAt": "", "completedAt": ""},
+        ])
+        ci = GitHubCi()
+        with patch("coord.ci_github.subprocess.run", return_value=_gh_result(payload)):
+            events = process(items, gh, ci_store=ci)
+        assert gh.merge_calls == []
+        assert items[0].state == PENDING
+        failed_event = next(e for e in events if e.kind == "checks_failed")
+        assert "test (3.13)" in failed_event.message
+        assert "failure" in failed_event.message
+
+    def test_unreachable_gh_refuses_as_unavailable(self) -> None:
+        items = [_entry("a")]
+        gh = FakeGh()
+        ci = GitHubCi()
+        with patch("coord.ci_github.subprocess.run", side_effect=FileNotFoundError):
+            events = process(items, gh, ci_store=ci)
+        assert gh.merge_calls == []
+        assert items[0].state == PENDING
+        failed_event = next(e for e in events if e.kind == "checks_failed")
+        assert "could not read CI status" in failed_event.message
 
 
 # ── Config ───────────────────────────────────────────────────────────────────

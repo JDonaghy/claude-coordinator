@@ -35,29 +35,45 @@ def _parse_ts(raw: str | None) -> float | None:
         return None
 
 
-def _normalize_status(state: str) -> str:
-    """Map gh's ``state`` field to the lifecycle enum used by CheckRun.
+# #1564: `gh pr checks --json` has no `conclusion` field, and its `state`
+# field is a per-check *verdict* (SUCCESS/FAILURE/SKIPPED/...), not a
+# lifecycle phase — feeding `state` through a QUEUED/IN_PROGRESS/COMPLETED
+# normaliser made every check fall through to the "unknown → in_progress"
+# branch forever, so `failed_checks()` (which only looks at `status ==
+# "completed"` checks) never evaluated anything and the gate blocked every
+# merge unconditionally. `bucket` is gh's own normalisation of `state` into
+# pass / fail / pending / skipping / cancel and is exactly the lifecycle +
+# verdict split CheckRun wants: `pending` is the only in-flight bucket,
+# everything else is a completed verdict.
+_BUCKET_CONCLUSIONS: dict[str, str] = {
+    "pass": "success",
+    "fail": "failure",
+    "skipping": "skipped",
+    "cancel": "cancelled",
+}
 
-    gh's ``state`` is one of QUEUED / IN_PROGRESS / COMPLETED / PENDING and
-    historically the casing varies between gh versions. We normalise to lower
-    snake-case so the merge gate's predicates are stable.
+
+def _status_from_bucket(bucket: str) -> str:
+    """Map gh's ``bucket`` to the CheckRun lifecycle enum ("in_progress" or
+    "completed" — gh's own `--json bucket` doc lists no other pending-like
+    value, so anything other than "pending" is treated as decided)."""
+    return "in_progress" if (bucket or "").lower() == "pending" else "completed"
+
+
+def _conclusion_from_bucket(bucket: str) -> str | None:
+    """Map gh's ``bucket`` to a CheckRun conclusion.
+
+    "pending" has no conclusion yet (status is in-flight, see
+    :func:`_status_from_bucket`). Anything that isn't one of gh's
+    documented buckets (pass/fail/pending/skipping/cancel — e.g. a future
+    bucket value this code has never seen) maps to "unknown" rather than
+    being silently treated as passing, mirroring #1525's fail-closed
+    synthetic-unreadable-check conclusion.
     """
-    s = (state or "").lower()
-    if s in ("queued", "pending"):
-        return "queued"
-    if s in ("in_progress", "running"):
-        return "in_progress"
-    if s in ("completed", "complete"):
-        return "completed"
-    # Unknown — treat as in-flight so the gate refuses rather than allowing.
-    return "in_progress"
-
-
-def _normalize_conclusion(raw: str | None) -> str | None:
-    """gh emits an empty string for ``conclusion`` until the check finishes."""
-    if not raw:
+    b = (bucket or "").lower()
+    if b == "pending":
         return None
-    return raw.lower()
+    return _BUCKET_CONCLUSIONS.get(b, "unknown")
 
 
 @dataclass
@@ -120,8 +136,8 @@ class GitHubCi:
         return [
             CheckRun(
                 name=str(entry.get("name", "")),
-                status=_normalize_status(str(entry.get("state", ""))),
-                conclusion=_normalize_conclusion(entry.get("conclusion")),
+                status=_status_from_bucket(str(entry.get("bucket", ""))),
+                conclusion=_conclusion_from_bucket(str(entry.get("bucket", ""))),
                 url=str(entry.get("link", "")),
                 run_id=str(entry.get("link", "")).rstrip("/").rsplit("/", 1)[-1],
                 started_at=_parse_ts(entry.get("startedAt")),
