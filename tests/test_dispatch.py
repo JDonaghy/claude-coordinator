@@ -369,6 +369,38 @@ class TestDispatch:
         assert payload["files_forbidden"].count("tests/acceptance/") == 1
 
     @patch("coord.dispatch.httpx.post")
+    def test_payload_seals_driver_entrypoint_too(
+        self, mock_post: MagicMock, proposal: Proposal,
+    ) -> None:
+        """#1552: the driver's crate-root entry point is part of the oracle —
+        a `type="work"` worker can unwire (or re-point) the very slice it is
+        graded against by editing `tui/tests/acceptance.rs`, without ever
+        touching `tests/acceptance/**`."""
+        from coord.config import AcceptanceConfig, AcceptanceDriverConfig
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+            )],
+            acceptance=AcceptanceConfig(drivers={
+                "api": AcceptanceDriverConfig(
+                    kind="tui-tuidriver", run="cargo test",
+                    entrypoint="tui/tests/acceptance.rs",
+                ),
+            }),
+        )
+        dispatch(proposal, cfg)
+        payload = mock_post.call_args.kwargs["json"]
+        assert "tests/acceptance/" in payload["files_forbidden"]
+        assert "tui/tests/acceptance.rs" in payload["files_forbidden"]
+
+    @patch("coord.dispatch.httpx.post")
     def test_payload_prepends_oracle_loop_contract_when_slice_authored(
         self, mock_post: MagicMock, proposal: Proposal, tmp_path, coord_db,
     ) -> None:

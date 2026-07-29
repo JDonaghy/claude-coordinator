@@ -76,6 +76,14 @@ not exist, STOP and output:
 2. Author (or extend) the acceptance suite in `tests/acceptance/ms-NN/`, \
 using the repo's declared driver framework (kind + run command are in your \
 briefing) — the tests must be runnable by that exact command.
+2b. WIRE THE SLICE IN. If your briefing names an `ENTRY POINT:` path, that \
+file is the driver's crate root and is part of your sealed surface: your \
+slice does NOT execute until you register it there (for a Rust/cargo \
+driver, an `include!("../../tests/acceptance/ms-NN/<slice>.rs");` line). \
+ADD that line. Do not rewrite, reorder, or delete anything already in the \
+file, and register nothing beyond your own new slice files. If the briefing \
+says the driver has no entry point, it discovers tests by directory and \
+there is nothing to wire.
 3. Update `tests/acceptance/ms-NN/manifest.(yml|json)` mapping every test id \
 you added/kept to its issue number, in either accepted shape:
      tests: {<test-id>: <issue-number>, ...}
@@ -86,9 +94,16 @@ issues' slices may already be authored.
 4. Your tests MUST be RED right now (the implementation doesn't exist yet). \
 Run the driver's run command yourself and confirm the new/changed tests \
 fail (not error out from a missing framework hookup) — a red suite that \
-doesn't even execute is not useful to the worker who inherits it.
-5. Do NOT touch anything outside `tests/acceptance/ms-NN/**` — you are not \
-implementing, refactoring, or fixing anything else in the repo.
+doesn't even execute is not useful to the worker who inherits it. If the \
+run reports ZERO tests for your ids, your slice is not wired in (see 2b) — \
+that is a failure, not a pass.
+5. Do NOT touch anything outside `tests/acceptance/ms-NN/**`, with exactly \
+ONE exception: the `ENTRY POINT:` file named in your briefing, and only to \
+ADD the registration lines for your own slice (step 2b). You are not \
+implementing, refactoring, or fixing anything else in the repo. NEVER drop \
+the registration line to make your diff look narrower — an unwired slice is \
+dead code that reports zero tests and fails the gate late and expensively \
+(#1552).
 6. Commit and push your branch. Do not open a PR — the coordinator handles \
 that.
 
@@ -174,6 +189,7 @@ def build_test_author_briefing(
     issue_number: int | None,
     issue_title: str | None,
     issue_body: str | None,
+    driver_entrypoint: str = "",
 ) -> str:
     """Compose the test-author's briefing (its first/only user message).
 
@@ -181,6 +197,14 @@ def build_test_author_briefing(
     work, then extended just-in-time": *milestone mode* (`issue_number` is
     None) authors the full initial suite from the contract; *JIT mode*
     (`issue_number` set) extends just that issue's slice.
+
+    *driver_entrypoint* (#1552) is the driver's declared ``entrypoint:`` —
+    the crate root a slice must be registered in before the run command can
+    see it, for a framework that links tests through an entry point rather
+    than discovering them by directory. Stated explicitly in BOTH directions:
+    naming it authorises the one out-of-tree write the author needs, and
+    saying "none" stops an author on a directory-discovered route (pytest)
+    from inventing one.
     """
     contract_path = f"{ACCEPTANCE_DIRNAME}/{ms_dir}/contract.md"
     manifest_glob = f"{ACCEPTANCE_DIRNAME}/{ms_dir}/manifest.(yml|json)"
@@ -193,6 +217,26 @@ def build_test_author_briefing(
     parts.append(f"CONTRACT: {contract_path}")
     parts.append(f"MANIFEST: {manifest_glob}")
     parts.append(f"DRIVER: kind={driver_kind!r}  run={driver_run!r}")
+    if driver_entrypoint:
+        parts.append(f"ENTRY POINT: {driver_entrypoint}")
+        parts.append(
+            f"  This driver links its slices through `{driver_entrypoint}` — "
+            "your slice files are INVISIBLE to the run command above until "
+            "they are registered there (for cargo: an "
+            f"`include!(\"../../{ACCEPTANCE_DIRNAME}/{ms_dir}/<slice>.rs\");` "
+            "line). Adding those registration lines is part of your job and "
+            "is explicitly allowed even though the file sits outside "
+            f"`{ACCEPTANCE_DIRNAME}/{ms_dir}/` — it is part of the sealed "
+            "oracle, declared as this driver's `entrypoint:` (#1552). ADD "
+            "only; do not rewrite, reorder, or delete what is already there, "
+            "and never remove a registration line to narrow your diff."
+        )
+    else:
+        parts.append(
+            "ENTRY POINT: (none — this driver discovers tests by directory, "
+            "so there is nothing to wire up and nothing to touch outside "
+            f"`{ACCEPTANCE_DIRNAME}/{ms_dir}/`)"
+        )
     parts.append(
         f"MILESTONE WORK-ORDER ISSUES: {milestone_issue_numbers or '(none recorded yet)'}"
     )
@@ -221,7 +265,9 @@ def build_test_author_briefing(
     parts.append("---")
     parts.append(
         "Follow the steps in your system prompt (read contract → author/"
-        "extend → update manifest → verify red → commit + push, no PR)."
+        "extend → "
+        + ("wire into the entry point → " if driver_entrypoint else "")
+        + "update manifest → verify red → commit + push, no PR)."
     )
     return "\n".join(parts)
 
@@ -336,6 +382,7 @@ def dispatch_test_author(
         milestone_issue_numbers=list(ctx.work_order.issue_numbers),
         driver_kind=driver_cfg.kind,
         driver_run=driver_cfg.run,
+        driver_entrypoint=driver_cfg.entrypoint,
         issue_number=issue_number,
         issue_title=issue_title,
         issue_body=issue_body,
@@ -631,6 +678,7 @@ def dispatch_test_author_interactive(
         milestone_issue_numbers=list(ctx.work_order.issue_numbers),
         driver_kind=driver_cfg.kind,
         driver_run=driver_cfg.run,
+        driver_entrypoint=driver_cfg.entrypoint,
         issue_number=issue_number,
         issue_title=issue_title,
         issue_body=issue_body,

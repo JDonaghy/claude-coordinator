@@ -184,14 +184,29 @@ class AcceptanceDriverConfig:
     driver, intended to be routed the same way ``smoke_tests.capability_rules``
     routes smoke tests.
 
+    ``entrypoint`` (#1552) is the repo-root-relative file this driver's
+    ``run`` command links its slices through — the sealed oracle's *crate
+    root*, for a driver whose framework discovers tests via an entry point
+    rather than by walking a directory. ``tui-tuidriver``'s
+    ``cargo test --test acceptance`` cannot see
+    ``tests/acceptance/ms-NN/slice.rs`` at all until
+    ``tui/tests/acceptance.rs`` ``include!``s it, so that file is part of
+    the oracle and must be declared here: it is folded into the sealed set
+    (:meth:`AcceptanceConfig.sealed_paths`) so a ``test-author`` registering
+    its slice there is expected rather than a scope violation, and a
+    ``type="work"`` worker touching it still trips oracle tamper. Leave it
+    empty for a directory-discovered suite — ``cli-pytest``'s
+    ``pytest tests/acceptance/{ms}`` legitimately has no entry point, which
+    is exactly why #1175's blanket refusal only ever broke the Rust route.
+
     ``match`` and ``routes`` implement #1125's in-repo path routing: a repo
     entry with a non-empty ``routes`` list is a *router* — its own
-    ``kind``/``run``/``mock``/``capability`` are unused and each element of
-    ``routes`` is itself an ``AcceptanceDriverConfig`` with ``match`` set (a
-    repo-root-relative glob, e.g. ``"coord/**"``). A route entry's own
-    ``routes`` is always empty — nesting one level is the whole feature, not
-    a recursive router. See :meth:`AcceptanceConfig.driver_for` for the
-    resolution rule.
+    ``kind``/``run``/``mock``/``capability``/``entrypoint`` are unused and
+    each element of ``routes`` is itself an ``AcceptanceDriverConfig`` with
+    ``match`` set (a repo-root-relative glob, e.g. ``"coord/**"``). A route
+    entry's own ``routes`` is always empty — nesting one level is the whole
+    feature, not a recursive router. See :meth:`AcceptanceConfig.driver_for`
+    for the resolution rule.
 
     NOTE (#944 review): parsed and validated here, but not yet *consulted* —
     ``coord acceptance record``'s daemon-routed run (#944) always executes on
@@ -206,8 +221,16 @@ class AcceptanceDriverConfig:
     run: str = ""
     mock: str = ""
     capability: str = ""
+    entrypoint: str = ""
     match: str = ""
     routes: list["AcceptanceDriverConfig"] = field(default_factory=list)
+
+
+# #944 sealing v1: the sealed acceptance tree, relative to the repo root.
+# Kept here (rather than imported from `coord.acceptance`) so config parsing
+# stays dependency-free; `coord.acceptance.ACCEPTANCE_DIRNAME` is the same
+# directory without the trailing slash.
+SEALED_ACCEPTANCE_DIR = "tests/acceptance/"
 
 
 @dataclass
@@ -215,6 +238,54 @@ class AcceptanceConfig:
     """``acceptance.drivers`` — repo name -> :class:`AcceptanceDriverConfig`."""
 
     drivers: dict[str, AcceptanceDriverConfig] = field(default_factory=dict)
+
+    def entrypoints(self, repo_name: str) -> list[str]:
+        """Every ``entrypoint:`` declared by *repo_name*'s acceptance driver
+        (#1552), deduped, declaration order preserved.
+
+        Path-independent by design, exactly like :meth:`has_driver` and for
+        the same reason: the callers (sealing, the reviewer's scope rule,
+        ``dispatch``'s forbid list) are deciding what the *whole repo's*
+        oracle covers, not which single route a given file resolves to. A
+        routed repo contributes one entry per route that declares one; a
+        flat repo contributes at most its own. Repos with no driver — and
+        drivers whose suite is directory-discovered (``cli-pytest``) —
+        return ``[]``.
+        """
+        entry = self.drivers.get(repo_name)
+        if entry is None:
+            return []
+        out: list[str] = []
+        for cfg in [entry, *entry.routes]:
+            ep = cfg.entrypoint.strip()
+            if ep and ep not in out:
+                out.append(ep)
+        return out
+
+    def sealed_paths(self, repo_name: str) -> list[str]:
+        """The full sealed-oracle path set for *repo_name* (#944 sealing v1,
+        #1552) — ``[]`` when the repo has no acceptance driver at all.
+
+        Two kinds of entry, distinguished by the trailing slash:
+
+        - ``"tests/acceptance/"`` — a directory prefix; everything under it
+          is sealed.
+        - each declared driver ``entrypoint`` (e.g.
+          ``"tui/tests/acceptance.rs"``) — an exact file.
+
+        #1552: before this was derived, the set was a single hardcoded
+        literal in ``coord.review``, which happened to fit ``cli-pytest``
+        (pytest walks the directory) and was structurally unsatisfiable for
+        ``tui-tuidriver`` (cargo needs a crate root that ``include!``s each
+        slice). A ``test-author`` on the Rust route could either wire its
+        slice in and trip a mandatory ``request-changes``, or leave it
+        unwired and ship 476 lines of dead code. Deriving the set from the
+        driver definition lets each route declare its own entry point
+        instead.
+        """
+        if not self.has_driver(repo_name):
+            return []
+        return [SEALED_ACCEPTANCE_DIR, *self.entrypoints(repo_name)]
 
     def driver_for(
         self, repo_name: str, path: str | None = None,
@@ -1505,7 +1576,8 @@ def _parse_acceptance(raw: Any) -> AcceptanceConfig:
             # other, so reject it rather than silently discarding the flat
             # fields.
             flat_fields = [
-                f for f in ("kind", "run", "mock", "capability") if entry.get(f)
+                f for f in ("kind", "run", "mock", "capability", "entrypoint")
+                if entry.get(f)
             ]
             if flat_fields:
                 raise ConfigError(
@@ -1537,8 +1609,13 @@ def _parse_acceptance(raw: Any) -> AcceptanceConfig:
                 f"acceptance.drivers[{repo_name!r}].capability must be a string"
             )
 
+        entrypoint = _acceptance_entrypoint(
+            entry, f"acceptance.drivers[{repo_name!r}].entrypoint"
+        )
+
         drivers[repo_name] = AcceptanceDriverConfig(
             kind=kind, run=run, mock=mock, capability=capability,
+            entrypoint=entrypoint,
         )
 
     return AcceptanceConfig(drivers=drivers)
@@ -1596,13 +1673,47 @@ def _parse_acceptance_routes(
                 f"acceptance.drivers[{repo_name!r}].routes[{i}].capability must be a string"
             )
 
+        entrypoint = _acceptance_entrypoint(
+            route_entry, f"acceptance.drivers[{repo_name!r}].routes[{i}].entrypoint"
+        )
+
         routes.append(
             AcceptanceDriverConfig(
                 kind=kind, run=run, mock=mock, capability=capability, match=match,
+                entrypoint=entrypoint,
             )
         )
 
     return routes
+
+
+def _acceptance_entrypoint(entry: dict, label: str) -> str:
+    """Validate an acceptance driver's optional ``entrypoint:`` (#1552).
+
+    Must be a repo-root-relative *file* path — it is folded into the sealed
+    set as an exact-match entry (:meth:`AcceptanceConfig.sealed_paths`), so
+    an absolute path or a trailing-slash directory would silently seal
+    nothing at all. Reject both here rather than at review time, where the
+    only symptom would be a `test-author` bounced for a scope violation it
+    cannot fix.
+    """
+    raw = entry.get("entrypoint", "") or ""
+    if not isinstance(raw, str):
+        raise ConfigError(f"{label} must be a string")
+    value = raw.strip()
+    if not value:
+        return ""
+    if value.startswith("/") or value.startswith("~"):
+        raise ConfigError(
+            f"{label} must be repo-root-relative, not an absolute path "
+            f"(got {value!r})"
+        )
+    if value.endswith("/"):
+        raise ConfigError(
+            f"{label} must name a FILE (the driver's crate-root/entry point), "
+            f"not a directory (got {value!r})"
+        )
+    return value
 
 
 def _parse_models(raw: Any) -> ModelsConfig:

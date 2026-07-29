@@ -111,9 +111,26 @@ def _check_local_capability(driver_cfg, repo: str, cfg) -> None:
     sys.exit(1)
 
 
-def _scoped_verdict(tests: list[dict], acceptance_root: Path, issue_number: int) -> dict:
+def _scoped_verdict(
+    tests: list[dict],
+    acceptance_root: Path,
+    issue_number: int,
+    *,
+    entrypoint: str = "",
+) -> dict:
     """Filter *tests* down to *issue_number*'s manifest slice, or exit(1) with
-    a clear message when the manifest / slice doesn't exist yet."""
+    a clear message when the manifest / slice doesn't exist yet.
+
+    #1552: when the manifest's test-ids don't all show up in the driver's
+    output, name the failure instead of leaving it as a bare
+    ``total=0, green=false``. That combination has exactly one common cause
+    on an entry-point-linked driver — the slice was authored but never
+    registered in the driver's crate root, so cargo compiled it into
+    nothing — and a verdict that only says "not green" sends the next round
+    hunting for a test failure that never ran. The missing ids are recorded
+    on the verdict as ``missing_ids`` and, when nothing at all ran, as a
+    ``reason`` string.
+    """
     manifest = load_manifest(acceptance_root)
     if not manifest:
         click.echo(f"error: {dump_manifest_error_hint(acceptance_root)}", err=True)
@@ -127,7 +144,36 @@ def _scoped_verdict(tests: list[dict], acceptance_root: Path, issue_number: int)
         )
         sys.exit(1)
     scoped = [t for t in tests if t["id"] in ids]
-    return build_verdict(scoped, scope="issue", issue_number=issue_number)
+    verdict = build_verdict(scoped, scope="issue", issue_number=issue_number)
+
+    missing = sorted(ids - {t["id"] for t in scoped})
+    if missing:
+        verdict["missing_ids"] = missing
+        wiring_hint = (
+            f" Register it in the driver's entry point `{entrypoint}` "
+            "(acceptance.drivers.<repo>[.routes[]].entrypoint) — a slice that "
+            "isn't registered there is compiled into nothing and reports no "
+            "tests at all."
+            if entrypoint else
+            " The slice is not being discovered by the driver's run command."
+        )
+        if not scoped:
+            reason = (
+                f"issue #{issue_number}'s manifest lists {len(ids)} test-id(s) "
+                f"({', '.join(sorted(ids))}), NONE of which appeared in the "
+                "driver output — the slice is authored but never executed, so "
+                "this is a wiring failure, not a test failure." + wiring_hint
+            )
+            verdict["reason"] = reason
+            click.echo(f"error: {reason}", err=True)
+        else:
+            click.echo(
+                f"warning: {len(missing)} of issue #{issue_number}'s "
+                f"{len(ids)} manifest test-id(s) did not appear in the driver "
+                f"output ({', '.join(missing)}) — they never ran." + wiring_hint,
+                err=True,
+            )
+    return verdict
 
 
 @acceptance_group.command("run")
@@ -209,7 +255,10 @@ def acceptance_run(
     if run_all:
         verdict = build_verdict(result.tests, scope="all")
     else:
-        verdict = _scoped_verdict(result.tests, cwd / ACCEPTANCE_DIRNAME, issue_number)
+        verdict = _scoped_verdict(
+            result.tests, cwd / ACCEPTANCE_DIRNAME, issue_number,
+            entrypoint=driver_cfg.entrypoint,
+        )
 
     click.echo(json.dumps(verdict, indent=2))
     if verdict["total"] == 0 or not verdict["green"]:
@@ -498,7 +547,10 @@ def _acceptance_record_local(
     # configuration error, not a real (kept-for-inspection) test failure, so
     # the throwaway worktree must still be cleaned up on the way out.
     try:
-        verdict = _scoped_verdict(result.tests, wt_path / ACCEPTANCE_DIRNAME, issue_number)
+        verdict = _scoped_verdict(
+            result.tests, wt_path / ACCEPTANCE_DIRNAME, issue_number,
+            entrypoint=driver_cfg.entrypoint,
+        )
     except SystemExit:
         _remove_acceptance_worktree(repo_dir, wt_path)
         raise

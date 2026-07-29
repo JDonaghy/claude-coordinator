@@ -944,6 +944,22 @@ def _diff_file_paths(diff_text: str) -> list[str]:
     return paths
 
 
+def _path_is_sealed(path: str, sealed: str) -> bool:
+    """Does *path* fall under the sealed entry *sealed*?
+
+    #1552: the sealed set is no longer uniformly directory prefixes. An
+    entry ending in ``/`` (``tests/acceptance/``) is a prefix — everything
+    beneath it is sealed. Anything else is a driver ``entrypoint:`` naming
+    exactly one FILE (``tui/tests/acceptance.rs``), and must match exactly:
+    a bare ``startswith`` would also swallow ``tui/tests/acceptance.rs.bak``
+    and ``tui/tests/acceptance.rs.orig``, quietly widening the one narrow
+    allowance a `test-author` gets.
+    """
+    if sealed.endswith("/"):
+        return path.startswith(sealed)
+    return path == sealed
+
+
 def _diff_touched_sealed_paths(diff_text: str, sealed_paths: list[str]) -> list[str]:
     """Return the sealed path prefixes actually touched by *diff_text*.
 
@@ -953,7 +969,7 @@ def _diff_touched_sealed_paths(diff_text: str, sealed_paths: list[str]) -> list[
     touched: set[str] = set()
     for c in _diff_file_paths(diff_text):
         for sealed in sealed_paths:
-            if c.startswith(sealed):
+            if _path_is_sealed(c, sealed):
                 touched.add(sealed)
     return sorted(touched)
 
@@ -962,14 +978,15 @@ def _diff_paths_outside_sealed(diff_text: str, sealed_paths: list[str]) -> list[
     """Return diff file paths that fall OUTSIDE every sealed prefix.
 
     #1175: for a ``type="test-author"``/``"mock-author"`` PR, writing under
-    *sealed_paths* (``tests/acceptance/ms-NN/**``) is the assignment's entire
-    job, not a violation — the oracle-tamper rule inverts for these types, so
-    the reviewer needs the paths touched OUTSIDE the sealed prefix instead of
+    *sealed_paths* (``tests/acceptance/ms-NN/**`` plus, #1552, each driver's
+    declared ``entrypoint:``) is the assignment's entire job, not a
+    violation — the oracle-tamper rule inverts for these types, so the
+    reviewer needs the paths touched OUTSIDE the sealed prefix instead of
     the ones inside it.
     """
     return sorted(
         p for p in _diff_file_paths(diff_text)
-        if not any(p.startswith(sealed) for sealed in sealed_paths)
+        if not any(_path_is_sealed(p, sealed) for sealed in sealed_paths)
     )
 
 
@@ -991,6 +1008,7 @@ def build_review_briefing(
     review_iteration: int = 0,
     diff_text: str | None = None,
     sealed_paths: list[str] | None = None,
+    sealed_entrypoints: list[str] | None = None,
     assignment_type: str = "work",
 ) -> str:
     """Assemble the reviewer's prompt. Pure function — easy to test.
@@ -1009,13 +1027,23 @@ def build_review_briefing(
     spurious deletions and flag it as a regression (#546). When *diff_text* is
     None the existing three-dot ``git diff`` fallback instructions stand.
 
-    *sealed_paths* (#944, docs/ORACLE_LOOP.md sealing v1) lists path prefixes
-    the worker must never touch — today just ``tests/acceptance/`` for repos
-    with an oracle-loop acceptance driver configured. When non-empty a
-    reviewer instruction is always appended; if *diff_text* is also given and
-    actually touches one of the paths, a blocking "TAMPER DETECTED" banner is
-    prepended instead of a soft reminder — this is the "reviewer flags any
-    diff that touches tests/acceptance/**" tamper-detection policy.
+    *sealed_paths* (#944, docs/ORACLE_LOOP.md sealing v1) lists the paths the
+    worker must never touch — ``tests/acceptance/`` plus, since #1552, each
+    acceptance driver's declared ``entrypoint:``, derived from the driver
+    definition by :meth:`coord.config.AcceptanceConfig.sealed_paths`. When
+    non-empty a reviewer instruction is always appended; if *diff_text* is
+    also given and actually touches one of the paths, a blocking "TAMPER
+    DETECTED" banner is prepended instead of a soft reminder — this is the
+    "reviewer flags any diff that touches tests/acceptance/**"
+    tamper-detection policy.
+
+    *sealed_entrypoints* (#1552) is the subset of *sealed_paths* that are
+    driver entry points rather than the sealed tree itself. They get a
+    narrower rule in the author branch below: a slice file is invisible to
+    an entry-point-linked runner (``cargo test --test acceptance``) until
+    something registers it in the crate root, so a ``test-author`` ADDING a
+    registration line there is doing its job, while rewriting or deleting
+    what is already in the file is still tamper.
 
     *assignment_type* (#1175) gates which direction that rule runs. For
     :data:`coord.models.SEALED_PATH_AUTHOR_TYPES` (``"test-author"``,
@@ -1133,6 +1161,41 @@ def build_review_briefing(
                     "violation. Do **not** request-changes solely because this "
                     "diff touches the sealed acceptance tree — only flag it if the "
                     "diff also touches anything outside that tree."
+                )
+            if sealed_entrypoints:
+                # #1552: the entry point is sealed, but the allowance on it is
+                # narrower than on the suite dir — additive registration only.
+                lines.append("")
+                lines.append("### Driver entry point — additive registration only")
+                lines.append("")
+                lines.append(
+                    ", ".join(f"`{p}`" for p in sealed_entrypoints)
+                    + " is this repo's acceptance driver **entry point** "
+                    "(declared as `entrypoint:` on the driver in "
+                    "coordinator.yml, #1552) — the crate root the runner "
+                    "links slices through, and part of the sealed oracle for "
+                    "that reason. A slice file under the sealed tree is "
+                    "INVISIBLE to the runner until it is registered there "
+                    "(e.g. an `include!(...)` line), so a slice with no "
+                    "registration line is dead code that never executes."
+                )
+                lines.append("")
+                lines.append(
+                    "- **Expected, do NOT flag:** this diff ADDS registration "
+                    "lines for its own new slice files."
+                )
+                lines.append(
+                    "- **request-changes:** the entry-point hunk does anything "
+                    "more than that — rewriting, reordering, or deleting "
+                    "existing lines, registering files that are not part of "
+                    "this slice, or any other edit to that file."
+                )
+                lines.append(
+                    "- **request-changes:** the diff adds slice files under the "
+                    "sealed tree but does NOT register them in the entry "
+                    "point. Deleting the registration line to make a diff look "
+                    "clean is not a fix — it ships a suite that silently "
+                    "contributes zero tests."
                 )
         else:
             touched = _diff_touched_sealed_paths(diff_text, sealed_paths) if diff_text else []
@@ -1607,9 +1670,18 @@ def dispatch_review(
     # #944 sealing v1: flag tests/acceptance/ as sealed when this repo has an
     # oracle-loop acceptance driver configured — the reviewer must reject any
     # diff that touches it (docs/ORACLE_LOOP.md).
-    sealed_paths: list[str] = []
-    if config.acceptance.has_driver(completed.repo_name):
-        sealed_paths.append("tests/acceptance/")
+    #
+    # #1552: the set is DERIVED from the driver definition rather than
+    # hardcoded to that one literal. `tests/acceptance/` alone fits a
+    # directory-discovered suite (`pytest tests/acceptance/{ms}`) and is
+    # structurally unsatisfiable for an entry-point-linked one
+    # (`cargo test --test acceptance` sees nothing until `tui/tests/
+    # acceptance.rs` include!s the slice) — under #1175's blanket refusal a
+    # `test-author` on the Rust route could only wire its slice in and be
+    # bounced, or leave it unwired and ship dead code. Each route now
+    # declares its own `entrypoint:`.
+    sealed_paths = config.acceptance.sealed_paths(completed.repo_name)
+    sealed_entrypoints = config.acceptance.entrypoints(completed.repo_name)
 
     client = http_client or httpx
 
@@ -1676,6 +1748,7 @@ def dispatch_review(
             review_iteration=getattr(completed, "review_iteration", 0) or 0,
             diff_text=diff_text,
             sealed_paths=sealed_paths,
+            sealed_entrypoints=sealed_entrypoints,
             assignment_type=completed.type,
         )
 

@@ -239,12 +239,17 @@ def dispatch(
     # #930: exempt `mock-author` — the one type whose entire job IS writing
     # under tests/acceptance/ms-NN/ (Gate A). A future `test-author` (#931)
     # gets the same exemption when it lands.
+    # #1552: forbid the driver's declared `entrypoint:` alongside the tree.
+    # It is the oracle's crate root — a `type="work"` worker editing
+    # `tui/tests/acceptance.rs` can unwire (or re-point) the very slice it is
+    # being graded against without ever touching `tests/acceptance/**`.
     if (
         proposal.type != "mock-author"
         and config.acceptance.has_driver(proposal.repo_name)
     ):
-        if "tests/acceptance/" not in files_forbidden:
-            files_forbidden.append("tests/acceptance/")
+        for sealed in config.acceptance.sealed_paths(proposal.repo_name):
+            if sealed not in files_forbidden:
+                files_forbidden.append(sealed)
 
     # Resolve model: proposal override → models.labels (type="work" only) →
     # config default. The board/DB stores the alias for legibility; only the

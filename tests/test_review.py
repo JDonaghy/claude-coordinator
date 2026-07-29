@@ -607,6 +607,154 @@ def test_briefing_work_type_still_trips_tamper_on_sealed_touch() -> None:
     assert "SCOPE VIOLATION" not in briefing
 
 
+# ── #1552: the driver entry point is part of the sealed oracle ─────────────
+#
+# Since #1175 a `test-author` on the `tui-tuidriver` route could not author a
+# runnable slice AT ALL: `cargo test --test acceptance` cannot see
+# `tests/acceptance/ms-38/slice.rs` until `tui/tests/acceptance.rs`
+# `include!`s it, and that file sits outside the only sealed path there was,
+# so wiring the slice in was a mandatory request-changes and not wiring it in
+# shipped dead code. The real branch is `test-author-ms-38-slice-1124`
+# (PR #1536): commit 91d5b42 is the shape these tests say must be ALLOWED,
+# 7f48bcf ("delete the include! line to pass review") is the degenerate
+# outcome that must no longer be the only legal option.
+
+_TUI_SEALED = ["tests/acceptance/", "tui/tests/acceptance.rs"]
+
+
+def _author_briefing(diff: str, **kwargs) -> str:
+    return build_review_briefing(
+        pr_number=1536, pr_url=None, repo_github="acme/claude-coordinator",
+        repo_name="claude-coordinator",
+        issue_number=1124, issue_title="X", issue_body="",
+        branch="test-author-ms-38-slice-1124", worker_machine="laptop",
+        same_as_worker=False,
+        reviews_cfg=ReviewsConfig(enabled=True), repo_claude_md=None,
+        diff_text=diff,
+        sealed_paths=_TUI_SEALED,
+        sealed_entrypoints=["tui/tests/acceptance.rs"],
+        assignment_type="test-author",
+        **kwargs,
+    )
+
+
+def test_briefing_test_author_may_wire_slice_into_declared_entrypoint() -> None:
+    """#1552 primary goal: slice files + the declared driver entry point is a
+    LEGAL test-author diff — no mandatory request-changes."""
+    diff = (
+        "diff --git a/tests/acceptance/ms-38/plans_help_1124.rs "
+        "b/tests/acceptance/ms-38/plans_help_1124.rs\n"
+        "--- /dev/null\n"
+        "+++ b/tests/acceptance/ms-38/plans_help_1124.rs\n"
+        "@@ -0,0 +1,3 @@\n"
+        "+fn plans_help_overlay() {}\n"
+        "diff --git a/tui/tests/acceptance.rs b/tui/tests/acceptance.rs\n"
+        "--- a/tui/tests/acceptance.rs\n"
+        "+++ b/tui/tests/acceptance.rs\n"
+        "@@ -1,2 +1,3 @@\n"
+        '+include!("../../tests/acceptance/ms-38/plans_help_1124.rs");\n'
+    )
+    briefing = _author_briefing(diff)
+    assert "SEALED ORACLE SCOPE VIOLATION" not in briefing
+    assert "TAMPER DETECTED" not in briefing
+    assert "request-changes is mandatory" not in briefing
+    assert "expected writes for type='test-author'" in briefing
+    # The narrower entry-point rule is stated, not just silence.
+    assert "Driver entry point — additive registration only" in briefing
+
+
+def test_briefing_test_author_entrypoint_allowance_is_narrow() -> None:
+    """#1552: the allowance is 'add a registration line', not 'rewrite the
+    crate root' — and deleting it to narrow the diff is called out as the
+    non-fix it is (the 7f48bcf outcome)."""
+    diff = (
+        "diff --git a/tests/acceptance/ms-38/plans_help_1124.rs "
+        "b/tests/acceptance/ms-38/plans_help_1124.rs\n"
+        "diff --git a/tui/tests/acceptance.rs b/tui/tests/acceptance.rs\n"
+    )
+    briefing = _author_briefing(diff)
+    assert "rewriting, reordering, or deleting" in briefing
+    assert "Deleting the registration line to make a diff look" in briefing
+
+
+def test_briefing_test_author_other_paths_still_refused_with_entrypoint() -> None:
+    """#1552: widening the sealed set to the entry point must NOT weaken the
+    rule for anything else — an implementation file still trips it."""
+    diff = (
+        "diff --git a/tests/acceptance/ms-38/plans_help_1124.rs "
+        "b/tests/acceptance/ms-38/plans_help_1124.rs\n"
+        "diff --git a/tui/tests/acceptance.rs b/tui/tests/acceptance.rs\n"
+        "diff --git a/tui/src/app.rs b/tui/src/app.rs\n"
+        "--- a/tui/src/app.rs\n"
+        "+++ b/tui/src/app.rs\n"
+        "@@ -1,2 +1,3 @@\n"
+        "+let cheated = true;\n"
+    )
+    briefing = _author_briefing(diff)
+    assert "SEALED ORACLE SCOPE VIOLATION" in briefing
+    assert "tui/src/app.rs" in briefing
+    assert "request-changes is mandatory" in briefing
+
+
+def test_briefing_entrypoint_is_exact_match_not_a_prefix() -> None:
+    """#1552: an entrypoint names one FILE. A near-miss sibling
+    (`...rs.bak`) must not slip through on a `startswith` match."""
+    diff = "diff --git a/tui/tests/acceptance.rs.bak b/tui/tests/acceptance.rs.bak\n"
+    briefing = _author_briefing(diff)
+    assert "SEALED ORACLE SCOPE VIOLATION" in briefing
+    assert "tui/tests/acceptance.rs.bak" in briefing
+
+
+def test_briefing_work_type_trips_tamper_on_entrypoint() -> None:
+    """#1552, the other direction: a `type="work"` worker editing the oracle's
+    crate root is tamper — it can unwire the slice it is graded against
+    without ever touching `tests/acceptance/**`."""
+    diff = (
+        "diff --git a/tui/tests/acceptance.rs b/tui/tests/acceptance.rs\n"
+        "--- a/tui/tests/acceptance.rs\n"
+        "+++ b/tui/tests/acceptance.rs\n"
+        "@@ -1,3 +1,2 @@\n"
+        '-include!("../../tests/acceptance/ms-38/plans_help_1124.rs");\n'
+    )
+    briefing = build_review_briefing(
+        pr_number=42, pr_url=None, repo_github="acme/claude-coordinator",
+        repo_name="claude-coordinator",
+        issue_number=1124, issue_title="X", issue_body="",
+        branch="my-branch", worker_machine="laptop", same_as_worker=False,
+        reviews_cfg=ReviewsConfig(enabled=True), repo_claude_md=None,
+        diff_text=diff,
+        sealed_paths=_TUI_SEALED,
+        sealed_entrypoints=["tui/tests/acceptance.rs"],
+        assignment_type="work",
+    )
+    assert "SEALED ORACLE TAMPER DETECTED" in briefing
+    assert "tui/tests/acceptance.rs" in briefing
+    assert "request-changes is mandatory" in briefing
+
+
+def test_briefing_pytest_route_has_no_entrypoint_section() -> None:
+    """#1552: the pytest route legitimately declares no entry point (pytest
+    discovers by directory), so nothing extra is said and #1175's rule is
+    completely unchanged for it."""
+    diff = (
+        "diff --git a/tests/acceptance/ms-37/test_usage_cli_1115.py "
+        "b/tests/acceptance/ms-37/test_usage_cli_1115.py\n"
+    )
+    briefing = build_review_briefing(
+        pr_number=42, pr_url=None, repo_github="acme/claude-coordinator",
+        repo_name="claude-coordinator",
+        issue_number=1115, issue_title="X", issue_body="",
+        branch="my-branch", worker_machine="laptop", same_as_worker=False,
+        reviews_cfg=ReviewsConfig(enabled=True), repo_claude_md=None,
+        diff_text=diff,
+        sealed_paths=["tests/acceptance/"],
+        sealed_entrypoints=[],
+        assignment_type="test-author",
+    )
+    assert "Driver entry point" not in briefing
+    assert "SCOPE VIOLATION" not in briefing
+
+
 def test_pr_diff_truncates_at_max_chars(monkeypatch) -> None:
     """#612: github_ops.pr_diff caps a huge diff and appends a truncation note."""
     from coord import github_ops

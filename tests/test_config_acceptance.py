@@ -454,3 +454,174 @@ acceptance:
     )
     with pytest.raises(ConfigError, match="sets both 'routes' and flat field"):
         load(p)
+
+
+# ── #1552: driver `entrypoint:` + the derived sealed set ─────────────────────
+#
+# Before this, `sealed_paths` was a single hardcoded literal
+# (`tests/acceptance/`) in coord/review.py. That fits a directory-discovered
+# suite (`pytest tests/acceptance/{ms}`) and is structurally unsatisfiable for
+# an entry-point-linked one: `cargo test --test acceptance` cannot see a slice
+# until `tui/tests/acceptance.rs` `include!`s it, and that file was outside the
+# sealed set — so a `test-author` had to choose between a mandatory
+# request-changes and shipping a slice that never runs. Each route now declares
+# its own entry point.
+
+ROUTED_WITH_ENTRYPOINT = """\
+acceptance:
+  drivers:
+    claude-coordinator:
+      routes:
+        - match: "coord/**"
+          kind: cli-pytest
+          run: "pytest tests/acceptance/{ms}"
+        - match: "tui/**"
+          kind: tui-tuidriver
+          run: "cd tui && cargo test --test acceptance"
+          entrypoint: "tui/tests/acceptance.rs"
+"""
+
+
+def test_route_entrypoint_parses(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(BASE.replace("coord-tui", "claude-coordinator") + ROUTED_WITH_ENTRYPOINT)
+    cfg = load(p)
+    rust = cfg.acceptance.driver_for("claude-coordinator", "tui/src/app.rs")
+    assert rust is not None
+    assert rust.entrypoint == "tui/tests/acceptance.rs"
+    py = cfg.acceptance.driver_for("claude-coordinator", "coord/review.py")
+    assert py is not None
+    assert py.entrypoint == ""
+
+
+def test_flat_driver_entrypoint_parses(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE
+        + """\
+acceptance:
+  drivers:
+    coord-tui:
+      kind: tui-tuidriver
+      run: "cargo test --test acceptance"
+      entrypoint: "tests/acceptance.rs"
+"""
+    )
+    cfg = load(p)
+    assert cfg.acceptance.entrypoints("coord-tui") == ["tests/acceptance.rs"]
+    assert cfg.acceptance.sealed_paths("coord-tui") == [
+        "tests/acceptance/", "tests/acceptance.rs",
+    ]
+
+
+def test_entrypoints_are_path_independent_across_routes(tmp_path: Path) -> None:
+    """Mirrors has_driver's rationale: sealing is a whole-repo question, so it
+    must not depend on which route a given file resolves to."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(BASE.replace("coord-tui", "claude-coordinator") + ROUTED_WITH_ENTRYPOINT)
+    cfg = load(p)
+    assert cfg.acceptance.entrypoints("claude-coordinator") == ["tui/tests/acceptance.rs"]
+    assert cfg.acceptance.sealed_paths("claude-coordinator") == [
+        "tests/acceptance/", "tui/tests/acceptance.rs",
+    ]
+
+
+def test_sealed_paths_without_entrypoint_is_just_the_tree(tmp_path: Path) -> None:
+    """Back-compat: the pytest route declares none, and #1175's rule is
+    completely unchanged for it."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE
+        + """\
+acceptance:
+  drivers:
+    coord-tui:
+      kind: cli-pytest
+      run: "pytest tests/acceptance/{ms}"
+"""
+    )
+    cfg = load(p)
+    assert cfg.acceptance.entrypoints("coord-tui") == []
+    assert cfg.acceptance.sealed_paths("coord-tui") == ["tests/acceptance/"]
+
+
+def test_sealed_paths_empty_for_unconfigured_repo(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(BASE)
+    cfg = load(p)
+    assert cfg.acceptance.sealed_paths("coord-tui") == []
+    assert cfg.acceptance.entrypoints("coord-tui") == []
+
+
+def test_entrypoint_absolute_path_raises(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE
+        + """\
+acceptance:
+  drivers:
+    coord-tui:
+      kind: tui-tuidriver
+      run: "cargo test"
+      entrypoint: "/home/john/src/coord-tui/tests/acceptance.rs"
+"""
+    )
+    with pytest.raises(ConfigError, match="repo-root-relative"):
+        load(p)
+
+
+def test_entrypoint_directory_raises(tmp_path: Path) -> None:
+    """A trailing slash would be read as a directory prefix by the sealed-set
+    matcher, silently sealing something other than the entry point."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE
+        + """\
+acceptance:
+  drivers:
+    coord-tui:
+      kind: tui-tuidriver
+      run: "cargo test"
+      entrypoint: "tui/tests/"
+"""
+    )
+    with pytest.raises(ConfigError, match="must name a FILE"):
+        load(p)
+
+
+def test_entrypoint_non_string_raises(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE
+        + """\
+acceptance:
+  drivers:
+    coord-tui:
+      kind: tui-tuidriver
+      run: "cargo test"
+      entrypoint: 42
+"""
+    )
+    with pytest.raises(ConfigError, match="must be a string"):
+        load(p)
+
+
+def test_routes_and_flat_entrypoint_raises(tmp_path: Path) -> None:
+    """A routed entry's driver is entirely per-route (#1125 finding 5) — that
+    now covers `entrypoint` too, or it would be silently discarded."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE.replace("coord-tui", "claude-coordinator")
+        + """\
+acceptance:
+  drivers:
+    claude-coordinator:
+      entrypoint: "tui/tests/acceptance.rs"
+      routes:
+        - match: "tui/**"
+          kind: tui-tuidriver
+          run: "cargo test"
+"""
+    )
+    with pytest.raises(ConfigError, match="sets both 'routes' and flat field"):
+        load(p)
