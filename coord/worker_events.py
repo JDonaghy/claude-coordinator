@@ -67,6 +67,20 @@ class WorkerSummary:
     output_tokens: int = 0
     cache_creation_tokens: int = 0
     cache_read_tokens: int = 0
+    # #1584: `is_error` off the LAST `result` event seen (update_summary
+    # overwrites these on every `result` line it processes, in log order —
+    # never OR'd together), so a worker that hit a transient API error,
+    # retried internally, and finished cleanly ends with `is_error=False`
+    # here, exactly like any other successful run. `terminal_reason` and
+    # `api_error_status` are the same event's diagnostic fields (e.g.
+    # `"api_error"` / `529`); `result_text` is its raw `result` string, kept
+    # so :func:`format_api_error_reason` can pull a human phrase (e.g.
+    # "Overloaded") out of it. All four are blank/False for a log with no
+    # `result` event at all, or whose last one wasn't an error.
+    is_error: bool = False
+    terminal_reason: str | None = None
+    api_error_status: int | None = None
+    result_text: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -87,6 +101,10 @@ class WorkerSummary:
             "output_tokens": self.output_tokens,
             "cache_creation_tokens": self.cache_creation_tokens,
             "cache_read_tokens": self.cache_read_tokens,
+            "is_error": self.is_error,
+            "terminal_reason": self.terminal_reason,
+            "api_error_status": self.api_error_status,
+            "result_text": self.result_text,
         }
 
 
@@ -255,6 +273,66 @@ def detect_usage_limit_kill_in_log(
     except OSError:
         return None
     return detect_usage_limit_kill(data.decode("utf-8", errors="replace"))
+
+
+# ── Terminal API-error classification (#1584) ───────────────────────────────
+#
+# `is_error: true` on a worker's TERMINAL `result` event (`WorkerSummary
+# .is_error`, populated above) means the session ended on a real failure —
+# most often a transient upstream problem (529 Overloaded, 500, a network
+# drop) that killed the worker before it did anything:
+#
+#   {"is_error": true, "num_turns": 1, "stop_reason": "stop_sequence",
+#    "terminal_reason": "api_error", "api_error_status": 529,
+#    "result": "API Error: 529 Overloaded. This is a server-side issue,
+#    usually temporary...", "total_cost_usd": 0.026247}
+#
+# Before this, nothing mapped `is_error` to assignment status (it was read
+# only for `coord watch`'s display string — see `format_important_event`
+# below) so this recorded a clean `done`, indistinguishable from a real
+# success. `format_api_error_reason` renders the three diagnostic fields
+# into the one-line reason `AgentServer._reap` stamps onto
+# `AgentAssignment.api_error_reason` when it flips the assignment to FAILED.
+
+# Pulls the short phrase (e.g. "Overloaded") out of the raw `result` text
+# that follows an "API Error: <status>" prefix, when present.
+_API_ERROR_PHRASE_RE = re.compile(r"API Error:\s*\d+\s+([^.\r\n]+)")
+
+
+def format_api_error_reason(
+    *,
+    terminal_reason: str | None,
+    api_error_status: int | None,
+    result_text: str | None = None,
+) -> str:
+    """Render a terminal API-error `result` event as a one-line failure reason.
+
+    Prefers ``"<status> <phrase>"`` (e.g. ``"529 Overloaded"``) when both the
+    structured *api_error_status* and a matching phrase in *result_text* are
+    available — the shape from #1584's own worked example. Falls back to
+    whatever subset of the three fields is present, so a future
+    ``terminal_reason``/status combination this doesn't specifically
+    recognise still renders something greppable rather than raising or
+    going silent.
+    """
+    phrase: str | None = None
+    if result_text:
+        m = _API_ERROR_PHRASE_RE.search(result_text)
+        if m:
+            phrase = m.group(1).strip().rstrip(".") or None
+    if api_error_status is not None and phrase:
+        return f"{api_error_status} {phrase}"
+    if api_error_status is not None:
+        # Only append the parenthetical when `terminal_reason` says something
+        # `"api_error"` alone doesn't already — the common case (this exact
+        # field is almost always the literal string `"api_error"`) would
+        # otherwise render the redundant `"api_error 500 (api_error)"`.
+        if terminal_reason and terminal_reason != "api_error":
+            return f"api_error {api_error_status} ({terminal_reason})"
+        return f"api_error {api_error_status}"
+    if terminal_reason:
+        return f"api_error: {terminal_reason}"
+    return "api_error"
 
 
 # ── Field extraction helpers ────────────────────────────────────────────────
@@ -477,6 +555,19 @@ def update_summary(summary: WorkerSummary, event: WorkerEvent) -> None:
         return
 
     if event.type == "result":
+        # #1584: overwrite (never OR/append) on every `result` event so the
+        # final state after a full parse reflects only the LAST one — a
+        # worker that hit a transient API error, retried internally, and
+        # finished cleanly has an earlier `result` line with `is_error: true`
+        # followed by a final one without it, and only the latter must
+        # survive.
+        summary.is_error = bool(raw.get("is_error"))
+        tr = raw.get("terminal_reason")
+        summary.terminal_reason = tr if isinstance(tr, str) else None
+        aes = raw.get("api_error_status")
+        summary.api_error_status = aes if isinstance(aes, int) else None
+        rtext = raw.get("result")
+        summary.result_text = rtext if isinstance(rtext, str) else None
         cost = raw.get("total_cost_usd") or raw.get("cost_usd")
         if isinstance(cost, (int, float)):
             summary.total_cost_usd = float(cost)

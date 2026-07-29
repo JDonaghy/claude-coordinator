@@ -14,6 +14,7 @@ from coord.worker_events import (
     detect_anomalies,
     detect_usage_limit_kill,
     detect_usage_limit_kill_in_log,
+    format_api_error_reason,
     format_important_event,
     format_usage_limit_reason,
     is_stream_json,
@@ -279,6 +280,79 @@ class TestParseLog:
         )
         summary = parse_log(p)
         assert summary.permission_denials == ["Bash(rm -rf /)"]
+
+    # ── #1584: terminal `is_error` classification ───────────────────────
+
+    def test_terminal_result_is_error_extracted(self, tmp_path: Path) -> None:
+        """The #1563 evidence shape: a 529 that killed the worker at turn 1."""
+        p = tmp_path / "log.log"
+        p.write_text(
+            _ndjson(
+                [
+                    _init_event(),
+                    _result_event(
+                        is_error=True,
+                        num_turns=1,
+                        stop_reason="stop_sequence",
+                        terminal_reason="api_error",
+                        api_error_status=529,
+                        result=(
+                            "API Error: 529 Overloaded. This is a "
+                            "server-side issue, usually temporary…"
+                        ),
+                        total_cost_usd=0.026247,
+                    ),
+                ]
+            )
+        )
+        summary = parse_log(p)
+        assert summary.is_error is True
+        assert summary.terminal_reason == "api_error"
+        assert summary.api_error_status == 529
+        assert "Overloaded" in summary.result_text
+
+    def test_normal_result_event_is_not_error(self, tmp_path: Path) -> None:
+        """Regression: a plain successful result (`is_error` absent) must
+        never be misread as an error."""
+        p = tmp_path / "log.log"
+        p.write_text(
+            _ndjson(
+                [
+                    _init_event(),
+                    _assistant_text_event("hi"),
+                    _result_event(total_cost_usd=0.01, stop_reason="end_turn"),
+                ]
+            )
+        )
+        summary = parse_log(p)
+        assert summary.is_error is False
+        assert summary.terminal_reason is None
+        assert summary.api_error_status is None
+
+    def test_only_the_last_result_events_is_error_wins(self, tmp_path: Path) -> None:
+        """A worker that hit a transient API error, retried internally, and
+        finished successfully still has an earlier `result` line with
+        `is_error: true` — only the LAST one may decide the outcome."""
+        p = tmp_path / "log.log"
+        p.write_text(
+            _ndjson(
+                [
+                    _init_event(),
+                    _result_event(
+                        is_error=True,
+                        terminal_reason="api_error",
+                        api_error_status=529,
+                        result="API Error: 529 Overloaded.",
+                    ),
+                    _assistant_text_event("retrying..."),
+                    _result_event(total_cost_usd=0.05, stop_reason="end_turn"),
+                ]
+            )
+        )
+        summary = parse_log(p)
+        assert summary.is_error is False
+        assert summary.terminal_reason is None
+        assert summary.api_error_status is None
 
     def test_rate_limit_event_allowed_does_not_set_flag(self, tmp_path: Path) -> None:
         """#1466: `status: "allowed"` is the healthy, common case — Claude
@@ -648,3 +722,39 @@ class TestDetectUsageLimitKill:
         assert is_usage_limit_reason(None) is False
         assert is_usage_limit_reason("") is False
         assert is_usage_limit_reason("some other failure") is False
+
+
+# ── Terminal API-error classification (#1584) ───────────────────────────────
+
+
+class TestFormatApiErrorReason:
+    def test_status_and_phrase_from_result_text(self) -> None:
+        """The #1563 evidence shape — status code plus a matching phrase in
+        the raw `result` text renders as `"529 Overloaded"`."""
+        reason = format_api_error_reason(
+            terminal_reason="api_error",
+            api_error_status=529,
+            result_text=(
+                "API Error: 529 Overloaded. This is a server-side issue, "
+                "usually temporary…"
+            ),
+        )
+        assert reason == "529 Overloaded"
+
+    def test_status_only_no_matching_phrase(self) -> None:
+        reason = format_api_error_reason(
+            terminal_reason="api_error", api_error_status=500, result_text=None
+        )
+        assert reason == "api_error 500"
+
+    def test_terminal_reason_only_no_status(self) -> None:
+        reason = format_api_error_reason(
+            terminal_reason="network_error", api_error_status=None, result_text=None
+        )
+        assert reason == "api_error: network_error"
+
+    def test_nothing_at_all_falls_back(self) -> None:
+        reason = format_api_error_reason(
+            terminal_reason=None, api_error_status=None, result_text=None
+        )
+        assert reason == "api_error"
