@@ -214,6 +214,21 @@ def probe(prereq: Prereq, *, timeout: float = DEFAULT_PROBE_TIMEOUT) -> ToolProb
             version=None, min_version=prereq.min_version, meets_floor=None,
             what_breaks=prereq.what_breaks,
         )
+    if result.returncode != 0:
+        # The binary exists (`which` found it) but the version probe itself
+        # failed — e.g. `pkg-config --modversion gtk4` exits nonzero with a
+        # "not found in the pkg-config search path" message on stdout/stderr
+        # when the dev libs aren't installed. That error text is not a
+        # version string, and for a subcommand-lookup probe like this one a
+        # nonzero exit *is* the "not present" signal for the capability
+        # being probed — treat it as not found rather than risk
+        # `_parse_version` extracting a bogus token (e.g. "Package") from
+        # the error message and reporting a garbage version as ok=True.
+        return ToolProbe(
+            tool=prereq.tool, capability=prereq.capability, found=False,
+            version=None, min_version=prereq.min_version, meets_floor=None,
+            what_breaks=prereq.what_breaks,
+        )
     version = _parse_version((result.stdout or "") + (result.stderr or ""), prereq.version_re)
     floor_ok = None
     if version is not None and prereq.min_version is not None:
