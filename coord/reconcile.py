@@ -37,6 +37,39 @@ _AGENT_TERMINAL_STATUS = {
 }
 
 
+def effective_agent_status(entry: dict) -> str:
+    """The agent-reported status for *entry*, with #1534's ``done`` refusal.
+
+    An agent ``completed`` entry that reports ``status="done"`` while ALSO
+    carrying a ``usage_limit_reason`` is self-contradictory: the worker was
+    killed mid-task by the account's Claude session/weekly usage limit (its
+    transcript ends on "You've hit your session limit · resets <time>"), so
+    whatever it did or didn't push, it did not *finish*.  Recording that as
+    ``done`` is the silent corruption #1534 was filed for — it burns money and
+    reports success, and every downstream gate (review dispatch, the
+    acceptance gate, the Pipeline view) then behaves as if the slice exists.
+
+    The agent-side reap (``AgentServer._reap``) already refuses this at the
+    source as of #1534, but that fix only reaches the fleet after a PyPI
+    release and ``coord agent update``.  This is the coordinator-side backstop
+    for the interim — and permanently, for agents pinned to an older build.
+
+    Downgraded to ``failed`` rather than ``advisory`` for the same reason
+    ``_record_usage_limit_reason`` normalises to ``failed``: a usage-limit kill
+    is the one terminal state known safe to re-dispatch unchanged once the
+    window resets, whereas ``advisory`` means "a human needs to look".
+
+    Any truthy ``usage_limit_reason`` counts — not just one matching
+    :func:`coord.worker_events.is_usage_limit_reason`'s prefix — because
+    refusing a ``done`` is the fail-safe direction and the field is only ever
+    written by the kill detector.
+    """
+    raw = (entry.get("status") or "").lower()
+    if raw == "done" and entry.get("usage_limit_reason"):
+        return "failed"
+    return raw
+
+
 def reconcile_completed_assignments(
     config: Config,
     *,
@@ -107,7 +140,12 @@ def reconcile_completed_assignments(
         )
         if entry is None:
             continue  # still active on the agent (or rolled off history) → leave it
-        terminal = _AGENT_TERMINAL_STATUS.get((entry.get("status") or "").lower())
+        # #1534: `effective_agent_status` refuses an agent-reported `done`
+        # that also carries a usage-limit-kill reason — the daemon's passive
+        # tick is the FIRST place most completions are observed, so without
+        # this the corrupt `done` is persisted here before any other path
+        # gets a chance to look at it.
+        terminal = _AGENT_TERMINAL_STATUS.get(effective_agent_status(entry))
         if terminal is None:
             continue
 
@@ -840,7 +878,13 @@ def reconcile(board: Board, config: Config) -> list[str]:
         if entry is None:
             continue
         branch = entry.get("branch")
-        if entry.get("status") == "done":
+        # #1534: read the status through the `done`-refusal helper so a
+        # usage-limit kill the agent mislabelled `done` lands in the `failed`
+        # branch below (which stamps `failure_reason` via
+        # `_record_usage_limit_reason`) instead of being recorded as a clean,
+        # unmarked completion that auto-dispatches a review.
+        agent_status = effective_agent_status(entry)
+        if agent_status == "done":
             done = board.mark_done_by_id(
                 a.assignment_id,
                 finished_at=entry.get("finished_at"),
@@ -866,7 +910,7 @@ def reconcile(board: Board, config: Config) -> list[str]:
                 elif done.type == "conflict-fix":
                     # #241: re-enqueue the parent merge entry for retry.
                     _on_conflict_fix_done(done, succeeded=True)
-        elif entry.get("status") == "advisory":
+        elif agent_status == "advisory":
             # #448: worker exited cleanly but pushed 0 commits. Move to
             # completed with status "advisory" — NOT "failed" — so that
             # auto_reassign does not loop on it. Review is also skipped
@@ -905,7 +949,7 @@ def reconcile(board: Board, config: Config) -> list[str]:
             # the agent reports cancelled (e.g. after POST /cancel cleanup
             # of a hung reap). The work succeeded; cancellation here is
             # bookkeeping noise.
-            if (entry.get("status") == "cancelled"
+            if (agent_status == "cancelled"
                     and (a.status or "").lower() == "done"):
                 continue
             failed = board.mark_failed_by_id(
