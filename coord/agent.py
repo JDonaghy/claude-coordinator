@@ -100,6 +100,24 @@ ADVISORY = "advisory"
 # zero-commit case above.
 _ADVISORY_TYPES = ("work",)
 
+# #1534: spec types that MUST move their branch for the assignment to mean
+# anything.  This is the zero-commit half of `_ADVISORY_TYPES` widened to the
+# full `coord.models.WORK_LIKE_TYPES` set — a `test-author` or `mock-author`
+# that exits cleanly having pushed nothing is exactly as much of a
+# contradiction as a `work` one, and until #1534 those two types were silently
+# excluded: the observed incident was a `test-author` killed by the Claude
+# session usage limit that landed on the board as a clean `done` with zero
+# commits, which then auto-dispatched a metered review against an empty diff.
+#
+# Deliberately a SEPARATE constant from `_ADVISORY_TYPES` rather than a
+# widening of it: `_ADVISORY_TYPES` also gates the #1357 diagnostic-only
+# `stash_unmatched_globs` note, which is about artifact globs, not commit
+# counts, and whose "work"-only scoping was chosen for its own reasons.
+# Kept as a literal tuple (not an import of WORK_LIKE_TYPES) because
+# `coord/agent.py` is the agent-side module and must stay importable on a
+# fleet machine without the coordinator's model layer.
+_ZERO_COMMIT_TYPES = ("work", "mock-author", "test-author")
+
 # #1394: assignment types whose worktree, when left dirty, holds real source
 # the worker meant to ship — so an automatic WIP commit on the assignment
 # branch is strictly better than deleting it.  Everything else is excluded on
@@ -5330,13 +5348,16 @@ class AgentServer:
         # advisory check doesn't stall other threads.  Only runs when
         # exit_code==0 and a worktree exists to inspect.  None → unknown
         # (git failed) → treat as non-zero to avoid false advisories.
-        # _ADVISORY_TYPES (module constant) gates this on spec.type so that
+        # _ZERO_COMMIT_TYPES (module constant) gates this on spec.type so that
         # review/smoke workers — which commit nothing by design — are
-        # never falsely flagged as advisory.
+        # never falsely flagged as advisory.  #1534 widened that constant from
+        # ("work",) to the full work-like set so `test-author`/`mock-author`
+        # get the same downgrade; before that they could land on `done` with
+        # an empty branch.
         _zero_commit_reason: str | None = None
         if (exit_code == 0 and assignment is not None
                 and assignment.worktree_path
-                and assignment.spec.type in _ADVISORY_TYPES):
+                and assignment.spec.type in _ZERO_COMMIT_TYPES):
             _wt_advisory = Path(assignment.worktree_path)
             if _wt_advisory.exists():
                 _base = assignment.spec.branch or "main"
@@ -5373,7 +5394,20 @@ class AgentServer:
             # Cancel sets status before this runs; respect it.
             if assignment.status == RUNNING:
                 if exit_code == 0:
-                    if _zero_commit_reason is not None:
+                    if _usage_limit_reason is not None:
+                        # #1534: a worker killed by the account's Claude
+                        # session/weekly usage limit is NEVER `done`, whatever
+                        # its exit code says.  The transcript ends mid-task
+                        # ("You've hit your session limit · resets <time>") and
+                        # the wrapper can still exit 0 — that combination used
+                        # to record a clean, unmarked completion, which every
+                        # downstream gate then read as "the work is finished".
+                        # FAILED (not ADVISORY) because per #1461 a usage-limit
+                        # kill is the one terminal state known safe to
+                        # re-dispatch unchanged once the window resets, whereas
+                        # ADVISORY means "a human needs to look at this".
+                        assignment.status = FAILED
+                    elif _zero_commit_reason is not None:
                         # #448: clean exit but no commits → advisory, not done.
                         assignment.status = ADVISORY
                         assignment.zero_commit_reason = _zero_commit_reason
@@ -5381,9 +5415,9 @@ class AgentServer:
                         assignment.status = DONE
                 else:
                     assignment.status = FAILED
-                # #1461: only ever attaches to a FAILED/ADVISORY transition
-                # (the `not _log_has_result_fn` gate above already excludes
-                # DONE in practice; this is defense in depth).
+                # #1461: only ever attaches to a FAILED/ADVISORY transition —
+                # the branch above now guarantees that whenever
+                # `_usage_limit_reason` is set, so this is belt-and-braces.
                 if (_usage_limit_reason is not None
                         and assignment.status in (FAILED, ADVISORY)):
                     assignment.usage_limit_reason = _usage_limit_reason

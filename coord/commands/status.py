@@ -463,6 +463,10 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
         "cap_hit": "[⚠ iteration cap hit — manual action required]",
         "branch_not_on_remote": "[⚠ branch not on remote — push required]",
         "no_eligible_reviewer": "[⚠ no reviewer available — check agent /health vs coordinator.yml]",
+        # #1534: the branch carries no commits over its base, so there is
+        # nothing to review. Almost always means the work assignment produced
+        # nothing (e.g. a usage-limit kill) and should be re-dispatched.
+        "zero_commits": "[⚠ branch has 0 commits — nothing to review, re-dispatch the work]",
     }
     work_completed = [a for a in board.completed if a.type == "work"]
     if work_completed:

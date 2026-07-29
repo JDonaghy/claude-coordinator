@@ -1273,6 +1273,39 @@ def get_compare_diff(repo: str, base: str, head: str) -> str | None:
         return None
 
 
+def branch_commits_ahead(repo: str, base: str, branch: str) -> int | None:
+    """Commits *branch* is ahead of *base* on the remote, or ``None``.
+
+    #1534: the coordinator usually has no local checkout of a worker's branch,
+    so the zero-commit question has to be asked of GitHub.  Uses the same
+    three-dot compare API as :func:`get_branch_diff_size` and reads
+    ``ahead_by`` — no PR required.
+
+    Returns ``None`` (never 0) on any ``gh`` failure, an unparseable payload,
+    or a missing ``ahead_by`` field.  Callers MUST treat ``None`` as "unknown,
+    assume non-zero": this exists to *refuse* work on a provably empty branch,
+    and a network blip must not silently become a refusal — that would strand
+    real reviews.  This is the opposite polarity from
+    :func:`branch_is_fully_merged`, which returns a plain ``False`` on error
+    because *its* fail-safe direction is "keep the PR open".
+    """
+    if not branch or not base:
+        return None
+    if branch == base:
+        return 0
+    try:
+        raw = _gh("api", f"repos/{repo}/compare/{base}...{branch}")
+        cmp = json.loads(raw)
+    except Exception:  # noqa: BLE001 — unknown, not zero
+        return None
+    if not isinstance(cmp, dict):
+        return None
+    ahead = cmp.get("ahead_by")
+    if not isinstance(ahead, int) or isinstance(ahead, bool):
+        return None
+    return ahead
+
+
 def get_branch_patch_id(repo: str, base: str, branch: str) -> str | None:
     """Return the content-addressed patch-id for *branch*'s diff against *base*.
 

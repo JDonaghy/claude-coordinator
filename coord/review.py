@@ -1383,6 +1383,7 @@ def dispatch_review(
     milestone_fetcher=None,
     patch_id_computer=None,
     diff_fetcher=None,
+    commits_ahead_checker=None,
 ) -> Assignment | None:
     """Open a PR for `completed` and dispatch a review assignment.
 
@@ -1408,6 +1409,12 @@ def dispatch_review(
     ``gh pr diff`` subprocess call); inject a stub in tests so a PR-having
     dispatch never shells out to a live ``gh`` — mirrors
     :func:`dispatch_scoped_review`'s ``diff_fetcher`` for the same reason.
+
+    *commits_ahead_checker* is an optional ``(repo_github: str, base: str,
+    branch: str) -> int | None`` callable (#1534) used by the zero-commit gate
+    below. Defaults to :func:`coord.github_ops.branch_commits_ahead` (a real
+    ``gh api compare`` call); inject a stub in tests so the gate is exercised
+    without network.
     """
     if not config.reviews.enabled or not config.reviews.auto_dispatch:
         return None
@@ -1493,6 +1500,37 @@ def dispatch_review(
         fetch_milestone = milestone_fetcher or _fetch_issue_milestone_number
         milestone_number = fetch_milestone(repo.github, completed.issue_number)
         base_branch = resolve_base_branch(repo, milestone_number)
+
+    # #1534: ZERO-COMMIT GATE.  Refuse to spend a metered review on a branch
+    # that carries no commits over its base — there is literally nothing to
+    # review, and every second of that reviewer's budget is wasted.  This is
+    # the same reasoning as #946's merge enqueue gate, one stage earlier.
+    #
+    # The observed incident: a `test-author` killed by the Claude session
+    # usage limit was recorded `done` with an empty branch, and a review was
+    # auto-dispatched against it.  The reviewer diffed nothing against nothing
+    # and (thanks to #873) returned a null verdict, so even that produced no
+    # signal — the empty slice looked authored *and* reviewed for two days.
+    #
+    # Deliberately placed AFTER the `work_is_terminal` chokepoint (so an
+    # already-merged branch keeps its existing `review_state="done"`
+    # resolution) but BEFORE `pr_lookup` (which would otherwise open a PR for
+    # the empty branch as a side effect of the check).
+    #
+    # FAIL-OPEN: `branch_commits_ahead` returns None — never 0 — on any gh
+    # failure, so a network blip can never strand a real review.  Only a
+    # definite `ahead_by == 0` from GitHub blocks.
+    _ahead_check = commits_ahead_checker or github_ops.branch_commits_ahead
+    _ahead = _ahead_check(repo.github, base_branch, completed.branch)
+    if _ahead == 0:
+        log.warning(
+            "[review] branch %r for %s has 0 commits ahead of %s — refusing to "
+            "auto-dispatch a review against an empty diff (#1534). The work "
+            "assignment did not produce anything; re-dispatch it instead.",
+            completed.branch, completed.assignment_id, base_branch,
+        )
+        completed.review_state = "zero_commits"
+        return None
 
     pr = pr_lookup(
         repo.github,
@@ -1889,6 +1927,15 @@ def dispatch_pending_reviews(board, config, *, test_gate_active: bool = False, n
         for c in board.completed
         if c.review_state in (None, "pending")
         and c.type in WORK_LIKE_TYPES
+        # #1534: only a genuinely SUCCESSFUL completion is review-eligible.
+        # `dispatch_review` has always refused a non-`done` row internally,
+        # but the bulk loop used to feed it every `failed`/`advisory` row on
+        # the board on every pass (they carry `review_state=None`), which
+        # made this loop's own eligibility list read as "review is pending
+        # for these" when it was not — and made the surge/flood counters
+        # below count rows that could never dispatch. Stating the invariant
+        # here keeps the loop and the chokepoint agreeing.
+        and c.status == "done"
         # #555: NEVER auto-dispatch a headless `claude -p` review for an
         # *interactive* (`provider_name="claude-pty"`) work completion. The
         # interactive Work→Review handoff is human-attended (TUI confirm →
