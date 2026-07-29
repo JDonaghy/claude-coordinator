@@ -948,6 +948,34 @@ class TestAgentVersionsCLI:
         assert "split-brain" in result.output.lower()
         assert "mismatch" in result.output.lower()
 
+    def test_versions_flags_uniform_mismatch_with_coordinator(
+        self, config_file: Path, coord_db
+    ) -> None:
+        """Every agent agrees with every other agent (no split-brain among
+        them), but the whole fleet is stale relative to the coordinator's
+        own __version__ — e.g. the coordinator bumped locally but `coord
+        agent update --all` hasn't landed yet. This must still exit
+        non-zero: it's exactly the "confirm the rollout actually landed
+        everywhere" case the docs promise, and versions_seen having only
+        one element must not let it slip through as a false all-clear."""
+        stale = "0.0.1-stale"
+        assert stale != __version__
+
+        def fake_get(url, *args, **kwargs):
+            r = MagicMock()
+            r.status_code = 200
+            r.json.return_value = {"version": stale}
+            return r
+
+        with patch("coord.cli.httpx.get", side_effect=fake_get):
+            result = CliRunner().invoke(
+                main, ["agent", "versions", "--all", "--config", str(config_file)],
+            )
+
+        assert result.exit_code != 0, result.output
+        assert "split-brain" not in result.output.lower()
+        assert "mismatch" in result.output.lower()
+
     def test_versions_flags_unreachable_machine(self, config_file: Path, coord_db) -> None:
         with patch(
             "coord.cli.httpx.get", side_effect=httpx.ConnectError("connection refused")
