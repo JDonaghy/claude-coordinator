@@ -2920,6 +2920,14 @@ class AgentServer:
         self._artifact_bytes_cache: tuple[float, int] | None = None  # (computed_at, bytes)
         self._artifact_bytes_ttl: float = 30.0  # seconds
 
+        # #1570 B: cache for /health tool_versions — each probe shells out
+        # (`git --version`, `gh --version`, ...), so a naive per-poll probe
+        # would spawn a handful of subprocesses on every TUI health tick.
+        # Tool versions only change on an upgrade + restart, which resets
+        # this cache anyway (fresh process), so a long TTL is safe.
+        self._tool_versions_cache: tuple[float, dict] | None = None  # (computed_at, summary)
+        self._tool_versions_ttl: float = 300.0  # seconds
+
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self._load_state()
@@ -2951,7 +2959,30 @@ class AgentServer:
             "worktree_bytes": worktree_bytes,
             # #305: total disk usage of all stashed artifact directories.
             "artifact_bytes": artifact_bytes,
+            # #1570 B: resolved versions of the external tools coord shells
+            # out to on this machine — baseline (git, gh) plus whatever this
+            # machine's declared `capabilities` claim (cargo for rust, GTK4
+            # for gtk, ...). Makes version skew observable fleet-wide
+            # (`coord doctor`) instead of only discoverable by SSHing in
+            # after a mysterious failure, the way #1564's gh skew was.
+            "tool_versions": self._cached_tool_versions(),
         }
+
+    def _cached_tool_versions(self) -> dict:
+        """Return `/health`'s `tool_versions` with a long TTL cache.
+
+        See `_tool_versions_ttl` for why: probing shells out per tool, and
+        `/health` is polled frequently.
+        """
+        now = time.time()
+        cached = self._tool_versions_cache
+        if cached is not None and (now - cached[0]) < self._tool_versions_ttl:
+            return cached[1]
+        from coord.prereqs import probe_all, tool_versions_summary
+
+        summary = tool_versions_summary(probe_all(self.capabilities))
+        self._tool_versions_cache = (now, summary)
+        return summary
 
     def _cached_worktree_bytes(self) -> int:
         """Return total worktree disk usage with a short TTL cache.

@@ -439,6 +439,47 @@ and after `coord agent update --all` to confirm the rollout actually landed
 everywhere — a split-brain fleet is only detectable by comparing versions
 directly, not by whether the last `coord agent update` reported success.
 
+## External-tool prereqs (`coord doctor`, #1570 B/D/E)
+
+coord shells out to external tools it never used to check — `gh` was the
+first to bite (#1564: a 3-year-old `gh` on the daemon silently blocked every
+merge for a night). `coord/prereqs.py` generalizes that into a manifest:
+baseline tools required on every machine (`git`, `gh` — floor is
+`coord.github_ops.GH_PR_CHECKS_JSON_MIN_VERSION`, currently `2.86.0`) plus
+per-capability tools (`rust` → `cargo`, `gtk` → GTK4 dev libs via
+`pkg-config`, `python` → `python3`, `browser` → a Chromium-family binary,
+for consuming projects that use the `browser` capability example in
+`coordinator.example.yml`).
+
+Each agent self-probes at startup (cached ~5 min — see
+`AgentServer._cached_tool_versions`) and publishes the result as
+`tool_versions` in its `/health` response — one entry per baseline prereq
+plus every prereq backing that machine's declared `capabilities:`. An agent
+older than this release simply omits the key; callers must treat a missing
+`tool_versions` as "unknown," not as a failure (see below).
+
+```bash
+coord doctor                  # whole fleet
+coord doctor --machine precision
+```
+
+Prints, per machine: online/offline, each probed tool's found/version/floor
+status, and any declared `capabilities:` entry whose backing tool the
+machine's own probe disagrees with (e.g. `gtk` claimed but `pkg-config
+gtk4` isn't found). Exits non-zero if anything is wrong anywhere in the
+fleet — this is the one-command answer the #1564 incident took a full night
+to reach by hand.
+
+The smoke-test dispatcher (`coord.smoke.dispatch_smoke`) uses the same
+manifest to cross-check a candidate machine's live probe against the
+capability a diff needs *before* routing to it — a machine that claims
+`gtk` in `coordinator.yml` but fails its GTK4 probe is refused with the
+specific reason, not silently dispatched to fail 20 minutes into a smoke
+run. This fails **open**, not closed, on missing telemetry: a machine
+running an agent that predates this feature (no `tool_versions` in
+`/health`) is still routable — only an *explicit* probe failure refuses
+routing, so a partially-upgraded fleet doesn't go dark on smoke dispatch.
+
 ## Upgrade via the raw `/update` endpoint (reliable fallback)
 
 `coord agent update` is a thin wrapper over the agent's `POST /update`

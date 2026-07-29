@@ -214,6 +214,68 @@ def pick_smoke_machine(
     return None
 
 
+def _capability_probe_reasons(
+    machine: Machine,
+    required_caps: list[str],
+    *,
+    http_client: httpx.Client | None = None,
+    timeout: float = 5.0,
+) -> dict[str, list[str]]:
+    """Cross-reference `machine`'s live `/health` tool probes (#1570 B)
+    against `required_caps` before routing smoke work to it (#1570 D).
+
+    `pick_smoke_machine` only checks `machine.capabilities` — a hand-written
+    claim in `coordinator.yml` that nothing has ever verified (#1570's whole
+    point: `gh` was simply the first claim to bite). This asks the machine
+    itself.
+
+    Returns `{capability: [reason, ...]}` for any required capability whose
+    backing tool the machine's own probe says is missing or too old — empty
+    when everything checks out *or* when `/health` doesn't publish
+    `tool_versions` yet (an agent that predates #1570 B). The latter fails
+    OPEN, not closed: during rollout most of the fleet won't have the probe
+    immediately, and refusing every smoke dispatch on missing telemetry
+    would be strictly worse than the blind trust this replaces. Only an
+    *explicit* probe failure refuses routing.
+
+    Never raises — a connectivity hiccup here just skips the extra check;
+    the POST to `/assign` right after this call in `dispatch_smoke` is the
+    real reachability test and fails closed on its own if the machine is
+    down.
+    """
+    client = http_client or httpx
+    try:
+        resp = client.get(f"http://{machine.host}:{AGENT_PORT}/health", timeout=timeout)
+        resp.raise_for_status()
+        health = resp.json()
+    except (httpx.HTTPError, httpx.TimeoutException, ValueError, AttributeError):
+        # AttributeError: a caller's `http_client` double (real ones are
+        # always full httpx.Client-shaped) implements .post but not .get —
+        # e.g. tests exercising the POST /assign failure path. Same "skip
+        # the extra check" outcome as any other reachability problem.
+        return {}
+    raw_probes = health.get("tool_versions") if isinstance(health, dict) else None
+    if not raw_probes:
+        return {}
+
+    from coord.prereqs import ToolProbe, unmet_capabilities
+
+    probes = {
+        tool: ToolProbe(
+            tool=tool,
+            capability=info.get("capability"),
+            found=bool(info.get("found", False)),
+            version=info.get("version"),
+            min_version=info.get("min_version"),
+            meets_floor=info.get("meets_floor"),
+            what_breaks="",
+        )
+        for tool, info in raw_probes.items()
+        if isinstance(info, dict)
+    }
+    return unmet_capabilities(required_caps, probes)
+
+
 # ── Briefing ────────────────────────────────────────────────────────────────
 
 
@@ -396,6 +458,25 @@ def dispatch_smoke(
             completed.repo_name,
         )
         return None
+
+    if required_caps:
+        unmet = _capability_probe_reasons(
+            choice.machine, required_caps, http_client=http_client
+        )
+        if unmet:
+            # #1570 D: the machine *claims* every required capability in
+            # `coordinator.yml`, but its own `/health` probe (#1570 B) says
+            # otherwise — refuse to route here rather than dispatch a worker
+            # that fails 20 minutes in with a confusing, unrelated error.
+            logger.warning(
+                "dispatch_smoke: chose machine %s for %s#%s but its own "
+                "/health probe disagrees with its declared capabilities "
+                "%s — %s — refusing to route (#1570 D). Run `coord doctor` "
+                "to check the fleet.",
+                choice.machine.name, completed.repo_name,
+                completed.issue_number, required_caps, unmet,
+            )
+            return None
 
     repo_path = choice.machine.repo_path(completed.repo_name)
     if repo_path is None:

@@ -128,6 +128,44 @@ def test_health_reports_machine(tmp_path: Path) -> None:
     assert h["completed"] == 0
 
 
+def test_health_includes_tool_versions_for_baseline_and_capabilities(
+    tmp_path: Path,
+) -> None:
+    """#1570 B: /health publishes resolved tool versions — baseline (git,
+    gh) plus whatever this machine's declared capabilities gate. `_server`
+    declares `capabilities=["python"]`, so `python3` should show up
+    alongside the baseline tools; `cargo`/`gtk4` (gated on capabilities this
+    fixture doesn't declare) should not."""
+    server = _server(tmp_path)
+    tool_versions = server.health()["tool_versions"]
+    assert "git" in tool_versions
+    assert "gh" in tool_versions
+    assert "python3" in tool_versions
+    assert "cargo" not in tool_versions
+    assert "gtk4" not in tool_versions
+    # git is virtually guaranteed present in any dev/CI environment this
+    # test suite runs in.
+    assert tool_versions["git"]["found"] is True
+
+
+def test_health_tool_versions_is_cached(tmp_path: Path) -> None:
+    """Probing shells out per tool — /health must not re-probe on every
+    call (mirrors worktree_bytes/artifact_bytes caching just above)."""
+    server = _server(tmp_path)
+    first = server.health()["tool_versions"]
+    # Corrupt the cache's cached value in place to prove the second call
+    # reused it rather than re-probing.
+    sentinel = {"git": {"found": False, "version": "sentinel"}}
+    server._tool_versions_cache = (server._tool_versions_cache[0], sentinel)
+    second = server.health()["tool_versions"]
+    assert second == sentinel
+
+    # Force-expire the cache and a fresh probe runs.
+    server._tool_versions_cache = None
+    third = server.health()["tool_versions"]
+    assert third == first
+
+
 def test_assign_success(tmp_path: Path) -> None:
     repo = _init_repo(tmp_path / "repo")
     server = _server(tmp_path, repo_path=repo)
