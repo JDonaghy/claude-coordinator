@@ -5125,10 +5125,38 @@ impl CoordApp {
             };
         };
 
+        // #1581: `coord/dao.py`'s `TERMINAL_STATUSES` is {done, merged, failed,
+        // cancelled, advisory} — every terminal value an assignment can settle
+        // into. This match must account for all of them, not just the "done"/
+        // "failed" pair a plain Work assignment cycles through, or a terminal
+        // status silently falls through the `_` arm to `StageStatus::Pending`
+        // with `since: None` — which #1572 defined to mean "never dispatched"
+        // and renders as "not started" even though the track fully ran.
         let author_status = match author.status.as_str() {
             "running" => StageStatus::Active,
-            "done" => StageStatus::Done,
-            "failed" => StageStatus::Failed,
+            // "merged" strictly implies "done": the daemon's merge-reconcile
+            // tick (coord/reconcile.py, #609/#1574) flips a completed
+            // mock-author/test-author assignment straight to status="merged"
+            // once its branch lands — it never passes back through "done" the
+            // way a normal Work assignment does. Missing this arm was the
+            // root cause of #1581 (a fully merged track rendering all four
+            // stages "not started"). Deliberately mapped to the same
+            // `StageStatus::Done` the Merge stage below already uses for a
+            // `merge_queue` entry in state "merged" (no distinct "Merged"
+            // variant exists on `quadraui::StageStatus` to render otherwise).
+            "done" | "merged" => StageStatus::Done,
+            // "cancelled" (an operator's explicit cancel of a running/pending
+            // assignment) is terminal but unsuccessful — Failed keeps it
+            // visually distinct from "never dispatched", same reasoning as
+            // "merged" above: silently defaulting a terminal status to
+            // Pending is exactly the bug class this issue fixed.
+            "failed" | "cancelled" => StageStatus::Failed,
+            // "advisory" is restricted to `type="work"` assignments
+            // (`_ADVISORY_TYPES` in coord/agent.py) and never appears on the
+            // mock-author/test-author rows this function resolves, so it (and
+            // "pending"/any future value) falls through to Pending here —
+            // correct for "never dispatched", but re-audit this match if a
+            // new terminal status is ever added for these assignment types.
             _ => StageStatus::Pending,
         };
         let author_since = match author_status {

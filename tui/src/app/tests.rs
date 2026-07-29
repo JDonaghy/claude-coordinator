@@ -7386,6 +7386,61 @@
     }
 
     #[test]
+    fn acceptance_authoring_prereq_status_all_done_when_author_merged() {
+        // #1581: operator-observed on #1124 — a test-author assignment that
+        // passed Test, was approved, and whose branch merged reaches
+        // `status="merged"` (coord/reconcile.py's merge-reconcile tick),
+        // never "done". Before the fix, the unhandled "merged" string fell
+        // to `prereq_pipeline_status_from`'s `_ => StageStatus::Pending` arm,
+        // which — because every downstream stage gates on its predecessor
+        // being exactly `Done` — blanked all four stages to "not started"
+        // despite the track having fully completed.
+        let mut app = make_pipeline_app_for_prereq_test();
+        let mut author = _stage_assignment("ta-1124", "test-author", 100.0, "merged");
+        author.issue_number = 751;
+        author.for_issue_number = Some(42);
+        author.finished_at = Some(160.0);
+        author.test_state = Some("passed".to_string());
+        author.branch = Some("tests/acceptance/ms-38/plans_help_1124".to_string());
+        app.data.assignments.push(author);
+
+        let mut review = _stage_assignment("rev-1124", "review", 200.0, "done");
+        review.issue_number = 751;
+        review.review_of_assignment_id = Some("ta-1124".to_string());
+        review.review_verdict = Some("approve".to_string());
+        app.data.assignments.push(review);
+
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "ta-1124".to_string(),
+            issue_number: Some(751),
+            state: "merged".to_string(),
+            pr_number: Some(9),
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: None,
+            branch: Some("tests/acceptance/ms-38/plans_help_1124".to_string()),
+            milestone_title: None,
+            last_attempt: None,
+        });
+
+        let member42 = &app.pipeline_issues[1];
+        let status = app.acceptance_authoring_prereq_status(member42, 751);
+        assert_eq!(status.author_id.as_deref(), Some("ta-1124"));
+        for (name, stage) in ["Author", "Test", "Review", "Merge"]
+            .iter()
+            .zip(status.stages.iter())
+        {
+            assert_eq!(
+                stage.status,
+                StageStatus::Done,
+                "{name} stage should be Done, got {:?}",
+                stage.status
+            );
+        }
+    }
+
+    #[test]
     fn acceptance_authoring_prereq_guidance_rows_silent_outside_work_order() {
         let app = make_pipeline_app_for_prereq_test();
         // The epic/tracking issue row itself is not a work-order *member*.
@@ -7516,6 +7571,101 @@
             screen.contains("waiting"),
             "Test is reachable (Author done) and has no verdict yet — expected a \
              'waiting' clock:\n{screen}"
+        );
+    }
+
+    /// #1581 acceptance: a fully merged Acceptance-Authoring track (operator-
+    /// observed on #1124) must render every one of the four stages as
+    /// settled — none of them may read "not started", since all four
+    /// genuinely ran (Author merged, Test passed, Review approved, Merge
+    /// landed). Uses `find()`, not hardcoded coordinates, per this repo's
+    /// TuiDriver convention.
+    #[test]
+    fn tuidriver_acceptance_authoring_merged_track_renders_no_not_started() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_pipeline_app_for_prereq_test();
+        let mut author = _stage_assignment("ta-1124", "test-author", 100.0, "merged");
+        author.issue_number = 751;
+        author.for_issue_number = Some(42);
+        author.finished_at = Some(160.0);
+        author.test_state = Some("passed".to_string());
+        author.branch = Some("tests/acceptance/ms-38/plans_help_1124".to_string());
+        app.data.assignments.push(author);
+
+        let mut review = _stage_assignment("rev-1124", "review", 200.0, "done");
+        review.issue_number = 751;
+        review.review_of_assignment_id = Some("ta-1124".to_string());
+        review.review_verdict = Some("approve".to_string());
+        app.data.assignments.push(review);
+
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "ta-1124".to_string(),
+            issue_number: Some(751),
+            state: "merged".to_string(),
+            pr_number: Some(9),
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: None,
+            branch: Some("tests/acceptance/ms-38/plans_help_1124".to_string()),
+            milestone_title: None,
+            last_attempt: None,
+        });
+
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(1); // member issue #42
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        let screen = driver.screen();
+        assert!(
+            driver.find("Acceptance Authoring").is_some(),
+            "expected the Acceptance Authoring block to render:\n{screen}"
+        );
+        assert!(
+            !screen.contains("not started"),
+            "every stage of a fully merged track genuinely ran — 'not started' \
+             must not appear anywhere:\n{screen}"
+        );
+    }
+
+    /// #1581 regression: the #1572 behaviour this fix must not disturb — a
+    /// genuinely un-run (never-reached) stage still reads "not started".
+    /// Author here is only "running", so Test/Review/Merge have never been
+    /// dispatched and must still render "not started", not a "waiting"
+    /// clock (which would wrongly imply something is stalled).
+    #[test]
+    fn tuidriver_acceptance_authoring_unrun_track_still_renders_not_started() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_pipeline_app_for_prereq_test();
+        let mut author = _stage_assignment("ta-42", "test-author", 100.0, "running");
+        author.issue_number = 751;
+        author.for_issue_number = Some(42);
+        author.finished_at = None;
+        app.data.assignments.push(author);
+
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(1); // member issue #42
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        let screen = driver.screen();
+        assert!(
+            driver.find("Acceptance Authoring").is_some(),
+            "expected the Acceptance Authoring block to render:\n{screen}"
+        );
+        assert!(
+            screen.contains("running"),
+            "expected the Author row to show 'running':\n{screen}"
+        );
+        assert!(
+            screen.contains("not started"),
+            "Test/Review/Merge have never been reached — expected 'not started' \
+             to still appear (#1572 regression):\n{screen}"
+        );
+        assert!(
+            !screen.contains("waiting"),
+            "an unreached stage must never show a 'waiting' clock:\n{screen}"
         );
     }
 
