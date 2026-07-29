@@ -1,0 +1,92 @@
+/* coord web — design tokens (mock reference copy)
+ *
+ * This file is the shared reference for the three mocks in this directory.
+ * The mocks themselves INLINE these tokens, because a Gate-A mock must be a
+ * single self-contained file that opens in a browser with no build step and no
+ * external requests. Keep this file in sync when a mock's tokens change; it is
+ * the seed for W1-1's real token layer (#1546).
+ *
+ * Dark is the default and the preferred reading mode. Light is a real,
+ * designed second theme, not an inversion.
+ */
+
+:root {
+  /* ── ground & surfaces ──────────────────────────────────────────────
+     Cool slate, biased slightly toward the cyan accent so the neutral
+     reads as chosen rather than inherited. Never pure black. */
+  --ground:      #101418;
+  --surface:     #171c22;
+  --surface-2:   #1e242b;
+  --surface-3:   #252d36;
+  --line:        #2a323b;
+  --line-strong: #3a444f;
+
+  /* ── text ─────────────────────────────────────────────────────────── */
+  --text:      #dfe6ee;
+  --text-dim:  #8b97a5;
+  --text-faint:#5f6b78;
+
+  /* ── accent: "work is happening here" ─────────────────────────────── */
+  --accent:      #4fb8cf;
+  --accent-dim:  #2d7688;
+  --accent-wash: rgba(79, 184, 207, 0.12);
+
+  /* ── semantic state (deliberately desaturated — easy on the eyes) ─── */
+  --pass:      #4ea87a;
+  --pass-wash: rgba(78, 168, 122, 0.14);
+  --attn:      #d9a54c;   /* needs a human */
+  --attn-wash: rgba(217, 165, 76, 0.14);
+  --fail:      #d9605e;
+  --fail-wash: rgba(217, 96, 94, 0.14);
+  --idle:      #55606d;
+  --idle-wash: rgba(85, 96, 109, 0.14);
+
+  /* ── type ─────────────────────────────────────────────────────────── */
+  --font-ui: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+             "Helvetica Neue", Arial, sans-serif;
+  /* mono is reserved for values the machine owns: issue numbers, branches,
+     SHAs, machine names, durations, costs. Never for chrome. */
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+               "Liberation Mono", monospace;
+
+  --step--1: 0.75rem;
+  --step-0:  0.875rem;
+  --step-1:  1rem;
+  --step-2:  1.25rem;
+  --step-3:  1.5rem;
+
+  /* ── geometry ─────────────────────────────────────────────────────── */
+  --r-sm: 5px;
+  --r-md: 8px;
+  --r-lg: 12px;
+
+  --rail-w: 216px;
+  --rail-w-collapsed: 60px;
+  --panel-w: 360px;
+}
+
+:root[data-theme="light"] {
+  --ground:      #f5f7f9;
+  --surface:     #ffffff;
+  --surface-2:   #eef1f5;
+  --surface-3:   #e3e8ee;
+  --line:        #dde3ea;
+  --line-strong: #c3ccd6;
+
+  --text:       #1a212a;
+  --text-dim:   #5b6672;
+  --text-faint: #8a95a1;
+
+  --accent:      #1d7f96;
+  --accent-dim:  #8fc9d6;
+  --accent-wash: rgba(29, 127, 150, 0.10);
+
+  --pass:      #2f7d55;
+  --pass-wash: rgba(47, 125, 85, 0.11);
+  --attn:      #a4741d;
+  --attn-wash: rgba(164, 116, 29, 0.12);
+  --fail:      #b8403e;
+  --fail-wash: rgba(184, 64, 62, 0.11);
+  --idle:      #97a1ac;
+  --idle-wash: rgba(151, 161, 172, 0.14);
+}

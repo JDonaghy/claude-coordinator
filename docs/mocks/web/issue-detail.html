@@ -1,0 +1,495 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>coord web — Issue detail (review findings)</title>
+<!--
+  Gate-A mock · coord web control center · Issue detail
+  docs/WEB_CONTROL_CENTER.md · seeds milestone #52 (#1547 shell, #1548 tabs)
+  and previews the M-W3 action surface.
+
+  Shows the state that matters most: a review came back with findings and the
+  issue is waiting on a human. Demonstrates the detail tab set
+  (Overview / Issue / Log / Summary), the findings design, and the action menu.
+  Rail is shown collapsed to icons to give the detail room.
+-->
+<style>
+:root{
+  --ground:#101418; --surface:#171c22; --surface-2:#1e242b; --surface-3:#252d36;
+  --line:#2a323b; --line-strong:#3a444f;
+  --text:#dfe6ee; --text-dim:#8b97a5; --text-faint:#5f6b78;
+  --accent:#4fb8cf; --accent-dim:#2d7688; --accent-wash:rgba(79,184,207,.12);
+  --pass:#4ea87a; --pass-wash:rgba(78,168,122,.14);
+  --attn:#d9a54c; --attn-wash:rgba(217,165,76,.14);
+  --fail:#d9605e; --fail-wash:rgba(217,96,94,.14);
+  --idle:#55606d; --idle-wash:rgba(85,96,109,.14);
+  --font-ui:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  --font-mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+  --r-sm:5px; --r-md:8px; --r-lg:12px;
+}
+:root[data-theme="light"]{
+  --ground:#f5f7f9; --surface:#fff; --surface-2:#eef1f5; --surface-3:#e3e8ee;
+  --line:#dde3ea; --line-strong:#c3ccd6;
+  --text:#1a212a; --text-dim:#5b6672; --text-faint:#8a95a1;
+  --accent:#1d7f96; --accent-dim:#8fc9d6; --accent-wash:rgba(29,127,150,.10);
+  --pass:#2f7d55; --pass-wash:rgba(47,125,85,.11);
+  --attn:#a4741d; --attn-wash:rgba(164,116,29,.12);
+  --fail:#b8403e; --fail-wash:rgba(184,64,62,.11);
+  --idle:#97a1ac; --idle-wash:rgba(151,161,172,.14);
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:var(--ground);color:var(--text);font-family:var(--font-ui);
+  font-size:.875rem;line-height:1.5;-webkit-font-smoothing:antialiased}
+button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:3px}
+.mono{font-family:var(--font-mono);font-variant-numeric:tabular-nums}
+
+.app{height:100dvh;display:grid;grid-template-columns:60px 300px minmax(0,1fr)}
+
+/* ── rail, collapsed ───────────────────────────────────────────────── */
+.rail{background:var(--surface);border-right:1px solid var(--line);
+  display:flex;flex-direction:column;align-items:center;padding:14px 0 10px;gap:2px}
+.mark{width:28px;height:28px;border-radius:7px;margin-bottom:14px;
+  background:linear-gradient(150deg,var(--accent),var(--accent-dim));
+  display:grid;place-items:center;color:#0b1013;font-weight:700;font-size:.72rem;
+  font-family:var(--font-mono)}
+.rail button{width:40px;height:38px;display:grid;place-items:center;border-radius:var(--r-sm);
+  color:var(--text-dim);position:relative}
+.rail button:hover{background:var(--surface-2);color:var(--text)}
+.rail button[aria-current="page"]{background:var(--accent-wash);color:var(--accent)}
+.rail button svg{width:18px;height:18px}
+.rail .spacer{flex:1}
+
+/* ── panel ─────────────────────────────────────────────────────────── */
+.panel{border-right:1px solid var(--line);display:flex;flex-direction:column;overflow:hidden}
+.panel-head{padding:13px 13px 11px;border-bottom:1px solid var(--line);
+  display:flex;align-items:center;gap:9px}
+.panel-head h1{font-size:.95rem;font-weight:600;margin:0;letter-spacing:-.01em}
+.panel-head .n{font-family:var(--font-mono);font-size:.72rem;color:var(--text-faint)}
+.icon-btn{width:27px;height:27px;display:grid;place-items:center;border-radius:var(--r-sm);color:var(--text-dim)}
+.icon-btn:hover{background:var(--surface-2);color:var(--text)}
+.icon-btn svg{width:15px;height:15px}
+.list{flex:1;overflow-y:auto;padding:9px;display:flex;flex-direction:column;gap:3px}
+.row{display:block;width:100%;text-align:left;padding:9px 11px;border-radius:var(--r-md);
+  border:1px solid transparent;position:relative}
+.row:hover{background:var(--surface)}
+.row[aria-selected="true"]{background:var(--surface);border-color:var(--line-strong)}
+.row[aria-selected="true"]::before{content:"";position:absolute;left:0;top:10px;bottom:10px;
+  width:2px;border-radius:0 2px 2px 0;background:var(--attn)}
+.row-top{display:flex;align-items:center;gap:7px;margin-bottom:4px}
+.row-id{font-family:var(--font-mono);font-size:.71rem;color:var(--text-faint)}
+.row-repo{font-family:var(--font-mono);font-size:.67rem;color:var(--text-dim);
+  background:var(--surface-2);padding:1px 5px;border-radius:4px}
+.row-title{font-size:.8rem;line-height:1.4;margin-bottom:7px;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.row-bot{display:flex;align-items:center;gap:8px}
+.row-state{font-size:.69rem;color:var(--text-dim);display:flex;align-items:center;gap:5px}
+.dot{width:6px;height:6px;border-radius:50%;flex:none;background:var(--idle)}
+.dot.run{background:var(--accent);box-shadow:0 0 0 3px var(--accent-wash)}
+.dot.pass{background:var(--pass)}
+.dot.attn{background:var(--attn);box-shadow:0 0 0 3px var(--attn-wash)}
+.dot.fail{background:var(--fail);box-shadow:0 0 0 3px var(--fail-wash)}
+.strip-mini{display:flex;gap:2px}
+.strip-mini i{display:block;width:15px;height:3px;border-radius:2px;background:var(--idle-wash)}
+.strip-mini i[data-s="pass"]{background:var(--pass)}
+.strip-mini i[data-s="run"]{background:var(--accent)}
+.strip-mini i[data-s="attn"]{background:var(--attn)}
+.strip-mini i[data-s="fail"]{background:var(--fail)}
+
+/* ── main ──────────────────────────────────────────────────────────── */
+.main{display:flex;flex-direction:column;overflow:hidden}
+.main-head{padding:14px 22px 0;border-bottom:1px solid var(--line)}
+.head-row{display:flex;align-items:flex-start;gap:14px;margin-bottom:12px}
+.main-head h2{font-size:1.22rem;font-weight:600;margin:0 0 6px;letter-spacing:-.015em;
+  line-height:1.3;text-wrap:balance}
+.crumbs{display:flex;align-items:center;gap:8px;font-size:.74rem;color:var(--text-dim);flex-wrap:wrap}
+.crumbs .mono{color:var(--text-faint)}
+.crumbs a{color:var(--accent);text-decoration:none}
+.crumbs a:hover{text-decoration:underline}
+.tag{display:inline-flex;align-items:center;gap:5px;font-size:.69rem;padding:2px 8px;
+  border-radius:20px;background:var(--surface-2);color:var(--text-dim)}
+.tag.ok{background:var(--pass-wash);color:var(--pass)}
+.tag.warn{background:var(--attn-wash);color:var(--attn)}
+.tag.bad{background:var(--fail-wash);color:var(--fail)}
+
+.head-actions{margin-left:auto;display:flex;gap:8px;flex:none;position:relative}
+.btn{display:flex;align-items:center;gap:7px;padding:6px 13px;border-radius:var(--r-md);
+  border:1px solid var(--line-strong);font-size:.78rem;font-weight:500}
+.btn:hover{background:var(--surface-2)}
+.btn svg{width:14px;height:14px}
+.btn-attn{background:var(--attn);border-color:var(--attn);color:#181206;font-weight:600}
+.btn-attn:hover{background:#e6b45f}
+
+/* the action surface — M-W3's ~20 actions, as a menu */
+.menu{
+  position:absolute;top:calc(100% + 7px);right:0;width:246px;z-index:20;
+  background:var(--surface);border:1px solid var(--line-strong);border-radius:var(--r-md);
+  padding:5px;box-shadow:0 18px 44px -12px rgba(0,0,0,.66);
+  display:flex;flex-direction:column;gap:1px;text-align:left;
+}
+.menu[hidden]{display:none}
+.menu-label{padding:8px 10px 4px;font-size:.63rem;font-weight:600;letter-spacing:.09em;
+  text-transform:uppercase;color:var(--text-faint)}
+.menu button{display:flex;align-items:center;gap:9px;padding:6px 10px;border-radius:var(--r-sm);
+  font-size:.79rem;color:var(--text-dim);width:100%;text-align:left}
+.menu button:hover{background:var(--surface-2);color:var(--text)}
+.menu button svg{width:14px;height:14px;flex:none;opacity:.8}
+.menu button .k{margin-left:auto;font-family:var(--font-mono);font-size:.67rem;color:var(--text-faint)}
+.menu button.hot{color:var(--attn)}
+.menu button.danger{color:var(--fail)}
+.menu hr{border:0;border-top:1px solid var(--line);margin:4px 2px}
+
+/* tabs */
+.tabs{display:flex;gap:2px}
+.tab{padding:9px 13px 10px;font-size:.8rem;color:var(--text-dim);border-bottom:2px solid transparent;
+  display:flex;align-items:center;gap:7px}
+.tab:hover{color:var(--text)}
+.tab[aria-selected="true"]{color:var(--text);border-bottom-color:var(--accent)}
+.tab .c{font-family:var(--font-mono);font-size:.67rem;background:var(--surface-2);
+  padding:1px 6px;border-radius:20px;color:var(--text-faint)}
+.tab[data-attn="1"] .c{background:var(--attn-wash);color:var(--attn)}
+
+.main-body{flex:1;overflow-y:auto;padding:20px 22px}
+.wrap{max-width:880px;display:flex;flex-direction:column;gap:18px}
+
+/* stage strip */
+.stages{display:grid;grid-template-columns:repeat(4,1fr);gap:9px}
+.stage{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-md);
+  padding:11px 13px 12px;position:relative;overflow:hidden;text-align:left;width:100%}
+.stage::before{content:"";position:absolute;inset:0 0 auto;height:2px;background:var(--idle)}
+.stage[data-s="pass"]::before{background:var(--pass)}
+.stage[data-s="attn"]::before{background:var(--attn)}
+.stage[data-s="idle"]{background:transparent;border-style:dashed}
+.stage[aria-current="true"]{border-color:rgba(217,165,76,.45);background:var(--attn-wash)}
+.stage-top{display:flex;align-items:center;gap:7px;margin-bottom:7px}
+.stage-name{font-size:.82rem;font-weight:600}
+.stage-ico{width:16px;height:16px;flex:none;color:var(--idle)}
+.stage[data-s="pass"] .stage-ico{color:var(--pass)}
+.stage[data-s="attn"] .stage-ico{color:var(--attn)}
+.stage-verdict{font-size:.73rem;margin-bottom:3px;color:var(--text-faint)}
+.stage[data-s="pass"] .stage-verdict{color:var(--pass)}
+.stage[data-s="attn"] .stage-verdict{color:var(--attn)}
+.stage-meta{font-family:var(--font-mono);font-size:.68rem;color:var(--text-faint)}
+
+/* the decision banner — what the human is here to do */
+.decision{
+  display:flex;align-items:center;gap:14px;padding:15px 17px;border-radius:var(--r-lg);
+  background:var(--attn-wash);border:1px solid rgba(217,165,76,.3);
+}
+.decision svg{width:20px;height:20px;color:var(--attn);flex:none}
+.decision .t{flex:1;min-width:0}
+.decision b{display:block;font-size:.88rem;font-weight:600;margin-bottom:2px}
+.decision p{margin:0;font-size:.79rem;color:var(--text-dim)}
+
+/* findings */
+.card{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-lg);overflow:hidden}
+.card-head{padding:12px 16px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px}
+.card-head h3{font-size:.84rem;font-weight:600;margin:0}
+.card-head .mono{font-size:.7rem;color:var(--text-faint);margin-left:auto}
+.finding{padding:14px 16px;border-bottom:1px solid var(--line);display:flex;gap:13px}
+.finding:last-child{border-bottom:0}
+.sev{width:3px;border-radius:2px;flex:none;background:var(--fail)}
+.sev.warn{background:var(--attn)}
+.sev.info{background:var(--idle)}
+.finding-b{flex:1;min-width:0}
+.finding-top{display:flex;align-items:center;gap:9px;margin-bottom:5px;flex-wrap:wrap}
+.finding-top .where{font-family:var(--font-mono);font-size:.72rem;color:var(--accent)}
+.finding h4{font-size:.83rem;font-weight:600;margin:0 0 5px;line-height:1.4}
+.finding p{margin:0;font-size:.79rem;color:var(--text-dim);line-height:1.55}
+.finding pre{
+  margin:9px 0 0;padding:10px 12px;background:var(--ground);border:1px solid var(--line);
+  border-radius:var(--r-sm);font-family:var(--font-mono);font-size:.72rem;
+  color:var(--text-dim);overflow-x:auto;line-height:1.6;
+}
+.finding pre .del{color:var(--fail)}
+.finding pre .add{color:var(--pass)}
+
+.kv{display:grid;grid-template-columns:auto 1fr;gap:9px 20px;font-size:.78rem;padding:15px 16px}
+.kv dt{color:var(--text-dim)}
+.kv dd{margin:0;font-family:var(--font-mono);font-size:.75rem}
+
+.statusbar{border-top:1px solid var(--line);background:var(--surface);padding:6px 22px;
+  display:flex;align-items:center;gap:16px;font-family:var(--font-mono);
+  font-size:.69rem;color:var(--text-faint)}
+.statusbar .live-dot{width:6px;height:6px;border-radius:50%;background:var(--pass)}
+.statusbar .sep{margin-left:auto}
+
+@media (max-width:1000px){
+  .app{grid-template-columns:60px minmax(0,1fr)}
+  .panel{display:none}
+}
+@media (max-width:700px){
+  .stages{grid-template-columns:1fr 1fr}
+  .main-body{padding:16px}
+  .main-head{padding-inline:16px}
+}
+</style>
+</head>
+<body>
+
+<svg style="display:none" aria-hidden="true">
+  <symbol id="i-pipeline" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7h6M15 7h6M3 17h6M15 17h6"/><circle cx="12" cy="7" r="2.5"/><circle cx="12" cy="17" r="2.5"/></symbol>
+  <symbol id="i-board" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="5" height="16" rx="1.5"/><rect x="10" y="4" width="5" height="11" rx="1.5"/><rect x="17" y="4" width="4" height="7" rx="1.5"/></symbol>
+  <symbol id="i-term" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="m7 10 2.5 2L7 14M13 15h4"/></symbol>
+  <symbol id="i-machines" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="14" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 17.5h.01"/></symbol>
+  <symbol id="i-merge" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="7" cy="6" r="2.5"/><circle cx="7" cy="18" r="2.5"/><circle cx="17" cy="12" r="2.5"/><path d="M7 8.5v7M9.5 6.8c3 .9 4.6 2.4 5.2 4.4"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 8h14M5 16h14"/><circle cx="9" cy="8" r="2.2"/><circle cx="15" cy="16" r="2.2"/></symbol>
+  <symbol id="i-expand" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m10 6 6 6-6 6"/></symbol>
+  <symbol id="i-collapse" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m14 6-6 6 6 6"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8v5M12 16.5v.01"/><circle cx="12" cy="12" r="9"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="m8 12.4 2.6 2.6L16 9.6"/></symbol>
+  <symbol id="i-wait" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-dasharray="3 3.2"><circle cx="12" cy="12" r="9"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12Z"/><circle cx="12" cy="12" r="2.6"/></symbol>
+  <symbol id="i-more" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></symbol>
+  <symbol id="i-wrench" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5.5a4.5 4.5 0 0 0-5.9 5.7L4 16.3 7.7 20l5.1-5.1a4.5 4.5 0 0 0 5.7-5.9L16 11.5 12.5 8Z"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M7 4.8v14.4L19 12z"/></symbol>
+  <symbol id="i-flask" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10 3v6.2L4.6 18A2 2 0 0 0 6.3 21h11.4a2 2 0 0 0 1.7-3L14 9.2V3M9 3h6M7.6 14h8.8"/></symbol>
+  <symbol id="i-pr" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="6.5" cy="5.5" r="2.5"/><circle cx="6.5" cy="18.5" r="2.5"/><circle cx="17.5" cy="18.5" r="2.5"/><path d="M6.5 8v8M17.5 16V9a3 3 0 0 0-3-3h-2.5"/></symbol>
+  <symbol id="i-archive" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="4.5" rx="1.5"/><path d="M5 8.5V19a1.5 1.5 0 0 0 1.5 1.5h11A1.5 1.5 0 0 0 19 19V8.5M10 12.5h4"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="2"/></symbol>
+  <symbol id="i-theme" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5"/></symbol>
+</svg>
+
+<div class="app">
+
+  <nav class="rail" aria-label="Views">
+    <div class="mark">co</div>
+    <button aria-current="page" title="Pipeline"><svg><use href="#i-pipeline"/></svg></button>
+    <button title="Board"><svg><use href="#i-board"/></svg></button>
+    <button title="Sessions"><svg><use href="#i-term"/></svg></button>
+    <button title="Machines"><svg><use href="#i-machines"/></svg></button>
+    <button title="Merge queue"><svg><use href="#i-merge"/></svg></button>
+    <div class="spacer"></div>
+    <button id="theme" title="Theme"><svg><use href="#i-theme"/></svg></button>
+    <button title="Settings"><svg><use href="#i-settings"/></svg></button>
+    <button title="Expand"><svg><use href="#i-expand"/></svg></button>
+  </nav>
+
+  <section class="panel" aria-label="Pipeline issues">
+    <div class="panel-head">
+      <h1>Pipeline</h1><span class="n">7</span>
+      <button class="icon-btn" style="margin-left:auto" title="Minimize list" aria-label="Minimize list">
+        <svg><use href="#i-collapse"/></svg>
+      </button>
+    </div>
+    <div class="list">
+      <button class="row">
+        <div class="row-top"><span class="row-id mono">#1538</span><span class="row-repo mono">coordinator</span></div>
+        <div class="row-title">W0-1: coord web --fixture — deterministic seeded-board server</div>
+        <div class="row-bot">
+          <span class="strip-mini"><i data-s="run"></i><i></i><i></i><i></i></span>
+          <span class="row-state"><span class="dot run"></span>Work</span>
+        </div>
+      </button>
+      <button class="row">
+        <div class="row-top"><span class="row-id mono">#1547</span><span class="row-repo mono">coordinator</span></div>
+        <div class="row-title">W1-2: responsive shell — rail + list + detail on wide</div>
+        <div class="row-bot">
+          <span class="strip-mini"><i data-s="pass"></i><i data-s="fail"></i><i></i><i></i></span>
+          <span class="row-state"><span class="dot fail"></span>Test failed</span>
+        </div>
+      </button>
+      <button class="row" aria-selected="true">
+        <div class="row-top"><span class="row-id mono">#1289</span><span class="row-repo mono">quadraui</span></div>
+        <div class="row-title">Tab-group focus ring is invisible on the inactive group</div>
+        <div class="row-bot">
+          <span class="strip-mini"><i data-s="pass"></i><i data-s="pass"></i><i data-s="attn"></i><i></i></span>
+          <span class="row-state"><span class="dot attn"></span>3 findings</span>
+        </div>
+      </button>
+      <button class="row">
+        <div class="row-top"><span class="row-id mono">#1502</span><span class="row-repo mono">vimcode</span></div>
+        <div class="row-title">GTK4: buffer switch drops the cursor column on reopen</div>
+        <div class="row-bot">
+          <span class="strip-mini"><i data-s="pass"></i><i data-s="pass"></i><i data-s="pass"></i><i data-s="run"></i></span>
+          <span class="row-state"><span class="dot run"></span>Merge · 2nd</span>
+        </div>
+      </button>
+    </div>
+  </section>
+
+  <main class="main">
+    <div class="main-head">
+      <div class="head-row">
+        <div style="min-width:0">
+          <h2>Tab-group focus ring is invisible on the inactive group</h2>
+          <div class="crumbs">
+            <span class="mono">quadraui</span><span>·</span>
+            <a href="#">#1289</a><span>·</span>
+            <span class="mono">issue-1289-focus-ring</span><span>·</span>
+            <a href="#">PR #372</a>
+            <span class="tag ok">CI green</span>
+            <span class="tag warn">review: changes requested</span>
+          </div>
+        </div>
+        <div class="head-actions">
+          <button class="icon-btn" id="menuBtn" aria-label="More actions" aria-expanded="false"><svg><use href="#i-more"/></svg></button>
+          <button class="btn"><svg><use href="#i-eye"/></svg>Read diff</button>
+          <button class="btn btn-attn"><svg><use href="#i-wrench"/></svg>Address findings</button>
+
+          <div class="menu" id="menu" hidden role="menu">
+            <div class="menu-label">Start — interactive</div>
+            <button role="menuitem"><svg><use href="#i-play"/></svg>Work<span class="k">W</span></button>
+            <button role="menuitem"><svg><use href="#i-eye"/></svg>Review<span class="k">R</span></button>
+            <button role="menuitem"><svg><use href="#i-flask"/></svg>Testing<span class="k">T</span></button>
+            <button role="menuitem"><svg><use href="#i-merge"/></svg>Merge<span class="k">M</span></button>
+            <hr>
+            <div class="menu-label">Start — automated</div>
+            <button role="menuitem"><svg><use href="#i-play"/></svg>Drive</button>
+            <button role="menuitem"><svg><use href="#i-flask"/></svg>Author acceptance tests</button>
+            <hr>
+            <button role="menuitem" class="hot"><svg><use href="#i-wrench"/></svg>Address review findings</button>
+            <button role="menuitem"><svg><use href="#i-check"/></svg>Record acceptance</button>
+            <button role="menuitem"><svg><use href="#i-pr"/></svg>Open PR on GitHub</button>
+            <hr>
+            <button role="menuitem"><svg><use href="#i-archive"/></svg>Drop to backlog</button>
+            <button role="menuitem" class="danger"><svg><use href="#i-stop"/></svg>Stop session</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="tabs" role="tablist">
+        <button class="tab" role="tab" aria-selected="true">Overview</button>
+        <button class="tab" role="tab" aria-selected="false">Issue</button>
+        <button class="tab" role="tab" aria-selected="false">Log</button>
+        <button class="tab" role="tab" aria-selected="false" data-attn="1">Findings <span class="c">3</span></button>
+        <button class="tab" role="tab" aria-selected="false">Summary <span class="c">4</span></button>
+      </div>
+    </div>
+
+    <div class="main-body">
+      <div class="wrap">
+
+        <div class="stages" role="group" aria-label="Pipeline stages">
+          <button class="stage" data-s="pass">
+            <div class="stage-top"><svg class="stage-ico"><use href="#i-check"/></svg><span class="stage-name">Work</span></div>
+            <div class="stage-verdict">Done</div>
+            <div class="stage-meta">precision · 41m · $2.06</div>
+          </button>
+          <button class="stage" data-s="pass">
+            <div class="stage-top"><svg class="stage-ico"><use href="#i-check"/></svg><span class="stage-name">Test</span></div>
+            <div class="stage-verdict">Passed</div>
+            <div class="stage-meta">612 tests · 3m 18s</div>
+          </button>
+          <button class="stage" data-s="attn" aria-current="true">
+            <div class="stage-top"><svg class="stage-ico"><use href="#i-alert"/></svg><span class="stage-name">Review</span></div>
+            <div class="stage-verdict">Changes requested</div>
+            <div class="stage-meta">elitebook · iteration 1</div>
+          </button>
+          <button class="stage" data-s="idle">
+            <div class="stage-top"><svg class="stage-ico"><use href="#i-wait"/></svg><span class="stage-name">Merge</span></div>
+            <div class="stage-verdict">Blocked by review</div>
+            <div class="stage-meta">queue: not entered</div>
+          </button>
+        </div>
+
+        <div class="decision">
+          <svg><use href="#i-alert"/></svg>
+          <div class="t">
+            <b>The reviewer asked for changes</b>
+            <p>2 blocking, 1 suggestion. Addressing them continues the same branch and PR — the next review will be incremental.</p>
+          </div>
+          <button class="btn btn-attn"><svg><use href="#i-wrench"/></svg>Address findings</button>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h3>Review findings</h3>
+            <span class="mono">elitebook · 4m 51s · $0.38</span>
+          </div>
+
+          <div class="finding">
+            <div class="sev"></div>
+            <div class="finding-b">
+              <div class="finding-top">
+                <span class="tag bad">blocking</span>
+                <span class="where">quadraui/src/tabs/focus.rs:214</span>
+              </div>
+              <h4>The focus ring is drawn before the group's active state is resolved</h4>
+              <p>On the inactive group, <span class="mono">draw_focus_ring</span> reads <span class="mono">self.active</span> while it is still the previous frame's value, so the ring renders with the inactive palette and disappears against the surface. Resolve the active state first, then draw.</p>
+              <pre><span class="del">- let style = if self.active { RING_ACTIVE } else { RING_IDLE };</span>
+<span class="add">+ let active = self.resolve_active(ctx);</span>
+<span class="add">+ let style = if active { RING_ACTIVE } else { RING_IDLE };</span></pre>
+            </div>
+          </div>
+
+          <div class="finding">
+            <div class="sev"></div>
+            <div class="finding-b">
+              <div class="finding-top">
+                <span class="tag bad">blocking</span>
+                <span class="where">no test added</span>
+              </div>
+              <h4>Behavior change ships without a black-box test</h4>
+              <p>The repo's acceptance bar requires a test that drives the running app and asserts on rendered output. This changes what the user sees on screen, so it is not exempt as an internal refactor. A <span class="mono">TuiDriver</span> case asserting the ring's cells on the inactive group would cover it.</p>
+            </div>
+          </div>
+
+          <div class="finding">
+            <div class="sev warn"></div>
+            <div class="finding-b">
+              <div class="finding-top">
+                <span class="tag warn">suggestion</span>
+                <span class="where">quadraui/src/tabs/focus.rs:198</span>
+              </div>
+              <h4>RING_IDLE and RING_DIM are now identical</h4>
+              <p>Both resolve to the same token after this change. Not blocking, but one of them is now dead and will confuse the next reader.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h3>Session</h3><span class="mono">4 sessions</span></div>
+          <dl class="kv">
+            <dt>Branch</dt><dd>issue-1289-focus-ring · 5 commits ahead of develop</dd>
+            <dt>PR</dt><dd>#372 · mergeable · CI green</dd>
+            <dt>Acceptance</dt><dd>ms-08 slice · 12 passed · 0 failed</dd>
+            <dt>Total spend</dt><dd>$2.44 · 51m wall-clock</dd>
+            <dt>Interventions</dt><dd>1 (this review)</dd>
+          </dl>
+        </div>
+
+      </div>
+    </div>
+
+    <div class="statusbar">
+      <span class="live-dot"></span><span>live</span>
+      <span>3 sessions</span>
+      <span>dellserver · precision · elitebook</span>
+      <span class="sep">$14.82 today</span>
+    </div>
+  </main>
+</div>
+
+<script>
+const menu = document.getElementById('menu');
+const menuBtn = document.getElementById('menuBtn');
+menuBtn.addEventListener('click', e => {
+  e.stopPropagation();
+  const open = menu.hidden;
+  menu.hidden = !open;
+  menuBtn.setAttribute('aria-expanded', String(open));
+});
+document.addEventListener('click', () => {
+  menu.hidden = true;
+  menuBtn.setAttribute('aria-expanded', 'false');
+});
+menu.addEventListener('click', e => e.stopPropagation());
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') { menu.hidden = true; menuBtn.setAttribute('aria-expanded', 'false'); }
+});
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(t => t.setAttribute('aria-selected', 'false'));
+    tab.setAttribute('aria-selected', 'true');
+  });
+});
+document.getElementById('theme').addEventListener('click', () => {
+  const root = document.documentElement;
+  root.dataset.theme = root.dataset.theme === 'dark' ? 'light' : 'dark';
+});
+</script>
+</body>
+</html>
