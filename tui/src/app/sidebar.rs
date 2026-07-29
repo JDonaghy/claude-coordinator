@@ -210,6 +210,10 @@ impl CoordApp {
             || self.pending_kill_session.is_some()
             || self.pending_usage_range_start.is_some()
             || self.pending_usage_range_end.is_some()
+            // #1124: Plans `?` help overlay / `/` command palette — both
+            // own ALL input while open (see `events.rs`'s dispatch block).
+            || self.help_overlay.is_open()
+            || self.command_palette.is_some()
     }
 
     /// an `action_id` of the form `"toolbar:<verb>"` resolved by

@@ -209,6 +209,26 @@ impl SidebarView {
             SidebarView::MilestoneDag => None,
         }
     }
+
+    /// The [`quadraui::HelpRegistry`] key this view's `?` cheatsheet / `/`
+    /// command-palette content is registered under (#1124), or `None` for
+    /// views that haven't adopted the reusable quadraui help-layer pattern
+    /// yet (`JDonaghy/quadraui#431`) — see the module docs at the top of
+    /// `plans.rs` for the pattern other panels are meant to copy. Reuses
+    /// the exact same `"panel:X"` string `panel_widget_id` returns as a
+    /// `WidgetId`, kept as a bare `&str` here because `HelpRegistry` keys
+    /// on plain strings, not `WidgetId`.
+    ///
+    /// `CoordApp`'s shared `help_overlay`/`command_palette` machinery
+    /// (`plans.rs`, `events.rs`, `render.rs`) is entirely driven off this
+    /// method: a future panel adopts `?`/`/` by registering a `ViewHelp`
+    /// under the id returned here — no other wiring changes required.
+    pub(crate) fn help_view_id(self) -> Option<&'static str> {
+        match self {
+            SidebarView::Plans => Some("panel:plans"),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, serde::Deserialize)]

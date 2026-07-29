@@ -600,6 +600,14 @@ impl ShellApp for CoordApp {
         if self.issue_finder.is_some() {
             self.render_issue_finder(backend, dialog_viewport);
         }
+
+        // ── #1124: Plans `?` help overlay / `/` command palette ────────
+        // Same topmost z-order reasoning as the issue finder just above —
+        // modal overlays scoped to the main content area of whichever view
+        // registered help content (today only Plans; see
+        // `SidebarView::help_view_id`). Both are no-ops when closed.
+        self.render_help_overlay(backend, layout.main_content_bounds, lh);
+        self.render_command_palette(backend, layout.main_content_bounds, lh);
     }
 
     fn handle(
@@ -673,6 +681,15 @@ impl ShellApp for CoordApp {
             "panel:usage" => SidebarView::Usage,
             _ => return,
         };
+        // #1124: the `?` help overlay / `/` command palette are scoped to
+        // whichever view opened them — a real ActivityBar click is always
+        // an explicit "leave this view" choice (same reasoning as the
+        // `terminal_return_view` clear above), so close them rather than
+        // let them silently bleed into the newly-active view's screen.
+        if self.help_overlay.is_open() {
+            self.help_overlay.close();
+        }
+        self.command_palette = None;
     }
 
     /// #1029 bug A: hand quadraui the panel queued by

@@ -684,6 +684,92 @@ impl CoordApp {
             }
         }
 
+        // ── #1124: `?` help overlay + `/` command palette ─────────────────────
+        // Modeled on the #541 issue-finder "owns ALL input while open"
+        // pattern above. Scoped to whichever view has registered help
+        // content (today only `SidebarView::Plans` — see
+        // `SidebarView::help_view_id`); other views fall through this
+        // block entirely until they adopt the same pattern (`plans.rs`
+        // module docs).
+        if self.active_view.help_view_id().is_some() {
+            // The palette owns ALL input while open (mirrors quadraui's own
+            // "click intercept is mandatory" Palette contract).
+            if let Some(mut palette) = self.command_palette.take() {
+                if let UiEvent::KeyPressed { .. } = &event {
+                    let main = ctx.main_bounds();
+                    let lh = backend.line_height();
+                    let popup = Self::command_palette_popup_rect(main, lh);
+                    let visible_rows = if lh > 0.0 {
+                        ((popup.height / lh) as usize).saturating_sub(PALETTE_CHROME_ROWS)
+                    } else {
+                        10
+                    };
+                    match palette.handle(&event, visible_rows) {
+                        DualModePaletteEvent::Cancelled => {}
+                        DualModePaletteEvent::ItemConfirmed { idx } => {
+                            let query = palette.query().to_string();
+                            let matched = self.active_view_command_actions(&query);
+                            if let Some(action) = matched.get(idx) {
+                                let action_id = action.id.as_str().to_string();
+                                self.activate_command_palette_action(&action_id);
+                            }
+                        }
+                        DualModePaletteEvent::QueryChanged { value } => {
+                            let matched = self.active_view_command_actions(&value);
+                            palette.set_items(help_actions_to_palette_items(&matched, &value));
+                            self.command_palette = Some(palette);
+                        }
+                        DualModePaletteEvent::TextConfirmed { .. }
+                        | DualModePaletteEvent::ModeToggled { .. }
+                        | DualModePaletteEvent::Consumed
+                        | DualModePaletteEvent::Ignored => {
+                            self.command_palette = Some(palette);
+                        }
+                    }
+                } else {
+                    self.command_palette = Some(palette);
+                }
+                return Reaction::Redraw;
+            }
+
+            // The help overlay owns ALL input while open, and also claims
+            // the `?` open trigger while closed (contract §5a) — but the
+            // open trigger only fires when no OTHER blocking modal already
+            // owns the keyboard (e.g. the #977 plan-capture title prompt),
+            // exactly like the `/` trigger below: otherwise a literal `?`
+            // typed into that prompt's title text would be hijacked into
+            // opening the cheatsheet instead of landing in the field.
+            // `self.help_overlay.is_open()` is checked first so Esc/`?`
+            // still closes an ALREADY-open overlay unconditionally (once
+            // open, it's the only modal — `any_blocking_modal_active()`
+            // is true only because of `help_overlay` itself).
+            if self.help_overlay.is_open() || !self.any_blocking_modal_active() {
+                match self.help_overlay.handle(&event) {
+                    HelpOverlayEvent::Opened
+                    | HelpOverlayEvent::Closed
+                    | HelpOverlayEvent::Consumed => {
+                        return Reaction::Redraw;
+                    }
+                    HelpOverlayEvent::Ignored => {}
+                }
+            }
+
+            // `/` opens the command palette (contract §5e) — checked only
+            // once neither surface above already claimed the event, and
+            // gated the same way the `L`/Ctrl+P triggers above are (no
+            // other blocking modal already up).
+            if let UiEvent::KeyPressed { key, modifiers, .. } = &event {
+                if matches!(key, Key::Char('/'))
+                    && !modifiers.ctrl
+                    && !modifiers.alt
+                    && !self.any_blocking_modal_active()
+                {
+                    self.open_command_palette();
+                    return Reaction::Redraw;
+                }
+            }
+        }
+
         // ── #316 Phase B: file-issue modal owns ALL input while open ───
         // Esc cancels; Ctrl+Y submits via `gh issue create`.
         if self.file_issue_modal.is_some() {
