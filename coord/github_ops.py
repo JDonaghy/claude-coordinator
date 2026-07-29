@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import socket
 import subprocess
 
 
@@ -26,6 +27,24 @@ class GhNotFound(GhError):
     "the resource doesn't exist" (a 4xx-class client error) from transient
     backend failures (auth, network, rate-limit — which are 5xx) should
     catch this specifically and return an appropriate HTTP status code.
+    """
+
+
+class GhTooOldForJsonChecks(GhError):
+    """Raised when the installed ``gh`` doesn't support ``gh pr checks --json``
+    *at all* (#1564 Addendum 2), as opposed to supporting ``--json`` but
+    rejecting one of the requested field names (a plain :class:`RuntimeError`
+    from :func:`get_pr_checks`, e.g. the original ``conclusion`` bug).
+
+    The fleet that surfaced this issue runs the merge gate across hosts with
+    wildly different ``gh`` versions — and because ``coord merge`` re-invokes
+    itself on the daemon host (``COORD_MERGE_ON_DAEMON``, see ``serve_app.py``),
+    it is the *daemon's* ``gh`` that decides every production merge, not the
+    thin client's. A daemon stuck on a too-old ``gh`` must fail with a message
+    that names the problem and the fix, not the same undiagnosable
+    "could not read CI status" text used for auth/network flakes — see
+    :func:`coord.ci_github.GitHubCi._fetch`, which catches this subclass
+    ahead of the generic ``RuntimeError`` branch for exactly that reason.
     """
 
 
@@ -1176,15 +1195,83 @@ PR_CHECKS_JSON_FIELDS: tuple[str, ...] = (
     "name", "state", "bucket", "link", "startedAt", "completedAt",
 )
 
+# #1564 Addendum 2: the fleet that surfaced this issue runs `gh` versions that
+# disagree about whether `gh pr checks` even *has* a `--json` flag —
+# dellserver's 2.45.0 (Ubuntu's apt package) does not: `gh pr checks --json
+# name,state,bucket` fails with `unknown flag: --json`, exit 1, empty stdout.
+# 2.86.0 (elitebook) and 2.92.0 (precision) both support `--json` fine. There
+# is no gh version floor documented anywhere else in this codebase, so this
+# constant is the single source of truth for it — surfaced in the actionable
+# error message below (:func:`_gh_too_old_message`) and in
+# ``docs/AGENT_OPERATIONS.md``'s daemon-host prerequisites.
+#
+# 2.86.0 is simply the *oldest version this fleet has directly observed
+# working* — nobody has bisected the actual gh release that first shipped
+# `pr checks --json` support, so treat this as a confirmed-good floor, not a
+# precisely-researched one. Lower it if a narrower floor is ever confirmed.
+GH_PR_CHECKS_JSON_MIN_VERSION = "2.86.0"
+
+# The exact, stable cobra/pflag message `gh` emits for a flag it doesn't
+# recognise at all — confirmed verbatim against dellserver's gh 2.45.0.
+# Distinct from (and must be checked before assuming) the "field not valid"
+# failure a newer gh gives for a bad field *name* (e.g. the original
+# `conclusion` bug), which instead exits 1 with a "Unknown JSON field" body.
+_GH_UNKNOWN_JSON_FLAG_MARKER = "unknown flag: --json"
+
+
+def _gh_version() -> str | None:
+    """Best-effort parse of ``gh --version``'s version string (e.g. "2.45.0").
+
+    Returns ``None`` if ``gh`` is missing, times out, or prints something
+    this can't parse — callers must treat that as "unknown", never fail on it.
+    """
+    try:
+        result = subprocess.run(
+            ["gh", "--version"], capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    match = re.search(r"gh version (\S+)", result.stdout or "")
+    return match.group(1) if match else None
+
+
+def _gh_too_old_message(stderr: str) -> str:
+    """Build the actionable error text for :class:`GhTooOldForJsonChecks`.
+
+    Names the host and the installed (if determinable) and required gh
+    versions explicitly — this is the whole point of #1564 Addendum 2: an
+    operator reading a merge refusal should never have to guess whether the
+    gate found a red check, hit a network blip, or is simply running on a
+    `gh` too old to ask the question at all.
+    """
+    host = socket.gethostname()
+    version = _gh_version() or "unknown"
+    return (
+        f"gh on host {host!r} (version {version}) does not support "
+        f"`gh pr checks --json` at all ({stderr!r}) — gh >= "
+        f"{GH_PR_CHECKS_JSON_MIN_VERSION} is required on whichever host runs "
+        f"the CI merge gate. Since `coord merge` re-invokes itself on the "
+        f"daemon (COORD_MERGE_ON_DAEMON), that means the *daemon* host's gh, "
+        f"not the client's. See docs/AGENT_OPERATIONS.md's daemon-host "
+        f"prerequisites."
+    )
+
 
 def get_pr_checks(repo: str, number: int) -> list[dict]:
     """Return ``gh pr checks``' raw check-run list for PR *number*.
 
     ``gh pr checks`` exits non-zero when any check has failed, but its JSON
     stdout is still valid in that case — only raise when stdout is genuinely
-    empty (a real lookup failure: bad PR number, auth, rate-limit, ...).
-    The single ``gh`` sink for :class:`coord.ci_github.GitHubCi`, the CI
-    backend behind the merge gate (#1483).
+    empty (a real lookup failure: bad PR number, auth, rate-limit, an old gh
+    that doesn't support ``--json`` at all, ...). The single ``gh`` sink for
+    :class:`coord.ci_github.GitHubCi`, the CI backend behind the merge gate
+    (#1483).
+
+    Raises :class:`GhTooOldForJsonChecks` — instead of the generic
+    ``RuntimeError`` below — when the installed ``gh`` doesn't recognise
+    ``--json`` on ``pr checks`` at all (#1564 Addendum 2), so callers can
+    surface a distinct, actionable "upgrade gh" message rather than lumping
+    it in with ordinary read failures.
     """
     result = subprocess.run(
         [
@@ -1196,7 +1283,10 @@ def get_pr_checks(repo: str, number: int) -> list[dict]:
     )
     stdout = (result.stdout or "").strip()
     if result.returncode != 0 and not stdout:
-        raise RuntimeError(f"gh pr checks failed: {result.stderr.strip()}")
+        stderr = result.stderr.strip()
+        if _GH_UNKNOWN_JSON_FLAG_MARKER in stderr:
+            raise GhTooOldForJsonChecks(_gh_too_old_message(stderr))
+        raise RuntimeError(f"gh pr checks failed: {stderr}")
     return json.loads(stdout or "[]")
 
 

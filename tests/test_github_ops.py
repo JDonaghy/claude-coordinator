@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import socket
 import subprocess
 from unittest.mock import patch
 
@@ -1387,6 +1388,77 @@ class TestGetPrChecks:
         json_flag_index = args.index("--json")
         requested = args[json_flag_index + 1].split(",")
         assert requested == list(github_ops.PR_CHECKS_JSON_FIELDS)
+
+    def test_gh_too_old_for_json_flag_raises_distinct_error(self) -> None:
+        """#1564 Addendum 2: dellserver's gh 2.45.0 doesn't support `--json`
+        on `pr checks` at all — confirmed real-world shape: exit 1, empty
+        stdout, stderr `unknown flag: --json`. This must raise a distinct,
+        actionable error (not the generic `RuntimeError` used for auth/
+        network failures) naming the required version floor and the host.
+        """
+
+        class _ChecksResult:
+            returncode = 1
+            stdout = ""
+            stderr = (
+                "unknown flag: --json\n\n"
+                "Usage:  gh pr checks [<number> | <url> | <branch>] [flags]\n"
+            )
+
+        class _VersionResult:
+            returncode = 0
+            stdout = "gh version 2.45.0 (2024-01-01)\nhttps://github.com/cli/cli/releases/tag/v2.45.0\n"
+            stderr = ""
+
+        with patch(
+            "coord.github_ops.subprocess.run",
+            side_effect=[_ChecksResult(), _VersionResult()],
+        ):
+            with pytest.raises(github_ops.GhTooOldForJsonChecks) as exc_info:
+                github_ops.get_pr_checks("acme/api", 42)
+        message = str(exc_info.value)
+        assert github_ops.GH_PR_CHECKS_JSON_MIN_VERSION in message
+        assert "2.45.0" in message
+        assert socket.gethostname() in message
+
+    def test_gh_too_old_error_is_a_runtime_error(self) -> None:
+        """Subclasses RuntimeError so any existing `except RuntimeError`
+        call site keeps failing closed even if it doesn't know about this
+        specific subclass yet."""
+        assert issubclass(github_ops.GhTooOldForJsonChecks, RuntimeError)
+
+    def test_gh_too_old_message_handles_unparseable_version_probe(self) -> None:
+        """`gh --version` itself failing (missing/timeout/unparseable) must
+        not blow up the error path — the message just says "unknown"."""
+
+        class _ChecksResult:
+            returncode = 1
+            stdout = ""
+            stderr = "unknown flag: --json"
+
+        with patch(
+            "coord.github_ops.subprocess.run",
+            side_effect=[_ChecksResult(), FileNotFoundError],
+        ):
+            with pytest.raises(github_ops.GhTooOldForJsonChecks) as exc_info:
+                github_ops.get_pr_checks("acme/api", 42)
+        assert "unknown" in str(exc_info.value)
+
+    def test_regular_unrecognised_field_error_stays_generic_runtime_error(self) -> None:
+        """A newer gh that supports `--json` but rejects one field name
+        (the original `conclusion` bug) is a different failure mode than
+        "gh doesn't have `--json` at all" — must stay the plain
+        `RuntimeError` this always was, not the too-old subclass."""
+
+        class _ChecksResult:
+            returncode = 1
+            stdout = ""
+            stderr = 'Unknown JSON field: "conclusion"\nAvailable fields:\n  bucket\n'
+
+        with patch("coord.github_ops.subprocess.run", return_value=_ChecksResult()):
+            with pytest.raises(RuntimeError) as exc_info:
+                github_ops.get_pr_checks("acme/api", 42)
+        assert not isinstance(exc_info.value, github_ops.GhTooOldForJsonChecks)
 
 
 class TestPrChecksJsonFieldsAreValid:

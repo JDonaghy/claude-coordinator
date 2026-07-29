@@ -155,6 +155,19 @@ from the daemon.
   `mv ~/coordinator.yml ~/.coord/coordinator.yml` to move to the canonical spot.)
   `coord serve` prints the resolved config path on startup.
 - **`~/.coord/coord.db` present** (after the one-time cutover below).
+- **`gh` >= 2.86.0 on the daemon host.** `coord merge`'s CI gate re-invokes
+  itself on the daemon (`COORD_MERGE_ON_DAEMON`), so it's the *daemon's* `gh`
+  that runs `gh pr checks --json ...` (`coord/github_ops.py::get_pr_checks`)
+  for every production merge — the thin client's `gh` version is irrelevant.
+  Fleet versions have diverged badly enough to matter: dellserver's apt
+  package (2.45.0) doesn't recognise `pr checks --json` at all (`unknown
+  flag: --json`), while elitebook (2.86.0) and precision (2.92.0) both
+  support it. An old-enough `gh` now fails loudly with an explicit "gh too
+  old" merge refusal naming this floor and the host
+  (`coord.github_ops.GhTooOldForJsonChecks`) instead of the generic
+  unreadable-CI message (#1564). The floor is a module constant,
+  `coord.github_ops.GH_PR_CHECKS_JSON_MIN_VERSION` — update both places
+  together if a narrower one is ever confirmed.
 
 ### Install the service
 
