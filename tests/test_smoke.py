@@ -394,13 +394,25 @@ class _FakeResp:
 
 
 class _FakeClient:
-    def __init__(self, payload: dict) -> None:
+    def __init__(self, payload: dict, *, health: dict | None = None) -> None:
         self._p = payload
         self.calls: list[tuple[str, dict]] = []
+        # #1570 D: dispatch_smoke's capability-probe check GETs /health
+        # before it POSTs /assign. Default: no `tool_versions` key, mirroring
+        # an agent that predates #1570 B — the check fails OPEN on that, so
+        # existing tests (none of which care about this) are unaffected.
+        # `get_calls` is tracked separately so `.calls`-based assertions
+        # elsewhere (POST /assign only) don't need touching.
+        self._health = health if health is not None else {}
+        self.get_calls: list[str] = []
 
     def post(self, url, *, json, timeout) -> _FakeResp:
         self.calls.append((url, json))
         return _FakeResp(self._p)
+
+    def get(self, url, *, timeout) -> _FakeResp:
+        self.get_calls.append(url)
+        return _FakeResp(self._health)
 
 
 def test_dispatch_smoke_skipped_when_auto_queue_off(
@@ -542,6 +554,55 @@ def test_dispatch_smoke_sends_to_capable_different_machine(
     assert payload["repo_path"] == "/d/api"
     # Briefing should mention the test_command fallback (make test).
     assert "make test" in payload["briefing"]
+
+
+def test_dispatch_smoke_refuses_machine_whose_probe_contradicts_its_capability(
+    gtk_and_server_config: Config,
+) -> None:
+    """#1570 D: desktop-a *claims* gtk in coordinator.yml, but its own
+    /health probe (#1570 B) says GTK4 isn't actually installed there —
+    dispatch_smoke must refuse to route rather than dispatch a worker that
+    fails deep into a smoke run for an unrelated-looking reason."""
+    board = Board()
+    client = _FakeClient(
+        {"id": "smoke-1"},
+        health={
+            "tool_versions": {
+                "gtk4": {
+                    "found": False, "version": None, "min_version": None,
+                    "meets_floor": None, "capability": "gtk", "ok": False,
+                },
+            }
+        },
+    )
+    result = dispatch_smoke(
+        _completed(machine="server"), board, gtk_and_server_config,
+        http_client=client,
+        diff_lookup=lambda repo, branch: ["src/gtk/window.c"],
+    )
+    assert result is None
+    assert board.active == []
+    # Refused before ever POSTing /assign.
+    assert client.calls == []
+    assert client.get_calls == ["http://desktop-a.tail:7433/health"]
+
+
+def test_dispatch_smoke_proceeds_when_health_has_no_tool_versions(
+    gtk_and_server_config: Config,
+) -> None:
+    """#1570 D fails OPEN on missing telemetry: an agent that predates
+    #1570 B (no `tool_versions` in /health) must not block smoke dispatch
+    fleet-wide during rollout — only an explicit probe failure refuses."""
+    board = Board()
+    client = _FakeClient({"id": "smoke-2"}, health={})
+    result = dispatch_smoke(
+        _completed(machine="server"), board, gtk_and_server_config,
+        http_client=client,
+        diff_lookup=lambda repo, branch: ["src/gtk/window.c"],
+    )
+    assert result is not None
+    assert result.machine_name == "desktop-a"
+    assert len(client.calls) == 1
 
 
 def test_dispatch_smoke_marks_parent_test_state_running(

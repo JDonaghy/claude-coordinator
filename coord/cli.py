@@ -52,7 +52,7 @@ from coord.commands.setup import (
     version,
 )
 from coord.commands.agent_ops import agent, pause, unpause
-from coord.commands.status import diagnose, show_plan, status, usage
+from coord.commands.status import diagnose, doctor, show_plan, status, usage
 from coord.commands.dispatch import (
     approve,
     assign,
@@ -351,6 +351,7 @@ main.add_command(refine)
 main.add_command(reconcile_merges)
 main.add_command(housekeeping)
 main.add_command(diagnose)
+main.add_command(doctor)
 main.add_command(issue_group)
 main.add_command(context_group)
 main.add_command(audit)

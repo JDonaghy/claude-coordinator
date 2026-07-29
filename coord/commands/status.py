@@ -525,6 +525,100 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
         pass  # Never let usage tracking break the status command.
 
 
+@click.command(
+    help=(
+        "Probe external-tool prereqs fleet-wide — baseline (git, gh) plus "
+        "each machine's declared capabilities (#1570 E)."
+    )
+)
+@_CONFIG_OPTION
+@click.option("--machine", "machine_filter", default=None, help="Only check this machine.")
+@click.option(
+    "--timeout", default=3.0, show_default=True, type=float,
+    help="Per-machine /health timeout (seconds).",
+)
+def doctor(config_path: Path, machine_filter: str | None, timeout: float) -> None:
+    """Fleet-wide prereq report: is this machine fit to be routed work?
+
+    #1570 E — "One command, whole fleet, prereq status per machine. Would
+    have answered [the #1564 gh-version incident] in seconds." Reads each
+    machine's already-probed `tool_versions` straight out of `/health`
+    (#1570 B), so it costs exactly what `coord status` costs — no SSHing
+    around the fleet by hand.
+
+    Exits 1 if any machine is unreachable, hasn't upgraded to publish
+    `tool_versions` yet, fails a baseline prereq, or claims a capability its
+    own probe can't back up.
+    """
+    from coord.network import check_all
+    from coord.prereqs import ToolProbe, unmet_capabilities
+
+    cfg = _load_config(config_path)
+    machines = cfg.machines
+    if machine_filter:
+        machines = [m for m in machines if m.name == machine_filter]
+        if not machines:
+            click.echo(
+                f"error: machine {machine_filter!r} not in coordinator.yml "
+                f"(have: {[m.name for m in cfg.machines]})",
+                err=True,
+            )
+            sys.exit(2)
+
+    statuses = check_all(machines, timeout=timeout)
+    any_problem = False
+    for s in statuses:
+        m = s.machine
+        click.echo(f"{m.name} ({m.host}):")
+        if not s.is_online:
+            click.echo(f"  ✗ unreachable — {s.reason}")
+            any_problem = True
+            continue
+
+        health = s.health or {}
+        raw_probes = health.get("tool_versions")
+        if not raw_probes:
+            click.echo(
+                "  ⚠ no tool_versions in /health — agent predates #1570 B "
+                "(`coord agent update` to see prereq status)"
+            )
+            any_problem = True
+            continue
+
+        probes = {
+            tool: ToolProbe(
+                tool=tool,
+                capability=info.get("capability"),
+                found=bool(info.get("found", False)),
+                version=info.get("version"),
+                min_version=info.get("min_version"),
+                meets_floor=info.get("meets_floor"),
+                what_breaks="",
+            )
+            for tool, info in raw_probes.items()
+            if isinstance(info, dict)
+        }
+        for tool, p in sorted(probes.items()):
+            marker = "✓" if p.ok else "✗"
+            if not p.ok:
+                any_problem = True
+            if not p.found:
+                detail = "not found"
+            else:
+                detail = p.version or "found (version unknown)"
+            floor = f"  (>= {p.min_version} required)" if p.min_version else ""
+            click.echo(f"  {marker} {tool}: {detail}{floor}")
+
+        unmet = unmet_capabilities(m.capabilities, probes)
+        for cap, reasons in unmet.items():
+            any_problem = True
+            for reason in reasons:
+                click.echo(f"  ✗ capability {cap!r} claimed but unmet — {reason}")
+
+    if any_problem:
+        sys.exit(1)
+
+
 @click.command("show-plan", help="Pretty-print the structured plan for a plan-only assignment.")
 @click.argument("assignment_id")
 def show_plan(assignment_id: str) -> None:
