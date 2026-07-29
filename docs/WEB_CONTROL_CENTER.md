@@ -137,6 +137,11 @@ Two ways out, and the choice matters for dogfood cadence:
 **Recommend (b) for the duration of this program** — a dogfood loop wants the latest
 merged commit live, not the latest release — then switch to (a) when the program ends.
 
+**Either way, auto-deploy needs a rehearsed rollback (#1560) landing with it.** Pushing
+merged `main` straight onto a tool the operator relies on from a phone, while M-W1 is
+restructuring that tool's shell, is only safe if getting back is one command that has
+actually been exercised.
+
 **7. Auth + ToS.** Tailnet-only HTTP, optional bearer (as the terminal bridge already
 does). No user accounts, no public exposure in this program. The web terminal stays
 **human-attended takeover only** (ToS §3.7, #437) — reviewers must reject any
@@ -160,9 +165,24 @@ Ordered. `M-W0` and `M-W1` run concurrently; everything after is sequential.
 | **#1539** | `web-playwright` driver — add to `SUPPORTED_KINDS`; parse Playwright's report into the normalized `{id,status,message}` list; tests over **recorded** reporter output | A |
 | **#1541** | `browser` capability on dellserver (headless Chromium) — stop funnelling all web testing through elitebook | A |
 | **#1543** | Deploy cadence — `coord-web.service` still runs the pre-#758 editable checkout (see decision 6) | A |
+| **#1559** | **Dogfood scorecard capture** — make the program produce evidence, not just code | A |
 | **#1540** | `acceptance.drivers` route for `coord/dashboard/webapp/**` + route-precedence over `coord/**` | B ← 1539 |
+| **#1560** | Last-known-good rollback for the live web deploy | B ← 1543 |
 | **#1542** | Gate-A mock shape: hand-authored HTML mock pages | C ← 1540 |
 | **#1544** | **Exit gate** — one sealed slice proven end-to-end, including a deliberate red run | D ← 1538,1540,1541,1542 |
+
+Two of these are **program infrastructure** rather than oracle work, and both were added
+after the first pass missed them:
+
+- **#1559** exists because the scorecard below named five metrics that nothing captured.
+  A program whose stated purpose is *evidence* cannot leave measurement implicit. It
+  validates against an already-complete milestone (#49 or #50) rather than waiting for
+  this program to generate data — if the numbers are unobtainable for a milestone that
+  already happened, they will be unobtainable here.
+- **#1560** exists because #1543 auto-deploys merged `main` to a tool the operator uses
+  daily from a phone, and M-W1 restructures that tool's shell. Auto-deploy without a
+  rehearsed rollback is a hazard, not a convenience. **Do not land #1543 without it** —
+  hence the `after` edge.
 
 Docs (`ORACLE_LOOP.md` driver table + the `CLAUDE.md` correction) are **coordinator-owned
 close-out**, not a dispatched story — workers must not edit shared docs.
@@ -206,6 +226,12 @@ no evidence, which defeats half its purpose.
 | **Cost + wall-clock per issue** | Spend & Time (ms #37) |
 | **Escaped defects** — caught at review vs Gate-B vs after merge vs by the human in the live app | manual tag |
 | **Process bugs surfaced** — coord bugs the program exposed, and whether each got a regression test | issue label |
+
+**Capturing this is #1559**, not an exercise left to the reader. Two of the five rows —
+escaped defects and process bugs — have no automatic signal and need a labelling
+convention cheap enough that it survives contact with a real program. The report must
+also distinguish *unknown* from *zero*: a scorecard that renders missing data as a good
+score is worse than no scorecard.
 
 **Protocol (standing):** a dogfood story is a *test vehicle*. When it surfaces a
 process bug in coord itself, **halt the story**, file the bug, fix it **with a test**,
