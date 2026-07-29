@@ -243,7 +243,7 @@ pub(crate) struct FixPreflightTarget {
 /// from "reached and stalled" — `since: None` renders as "not started" (no
 /// clock), `since: Some(_)` as "pending" with a mounting "waiting Xm Ys" —
 /// so a running clock always means the stage should be moving.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct PrereqStage {
     pub(crate) status: StageStatus,
     pub(crate) since: Option<f64>,
@@ -5219,6 +5219,23 @@ impl CoordApp {
         // entries once both exist under the same tracking issue.
         let (merge_status, merge_since) = if review_status != StageStatus::Done {
             (StageStatus::Pending, None)
+        } else if author.status == "merged" {
+            // #1589: `coord reconcile-merges` prunes the `merge_queue` entry
+            // once a branch lands (coord/reconcile.py) — the very entry the
+            // lookup below depends on is deleted precisely when the merge
+            // succeeds, so treating its absence as "not yet merged" is
+            // guaranteed wrong for every merged track, not merely stale.
+            // The author row's own `status="merged"` — set directly by the
+            // merge-reconcile tick (#609/#1574) — is authoritative on its
+            // own and needs no queue corroboration. A completed stage has
+            // nothing left to wait for, so no `since` is attached (mirrors
+            // the `Some("merged")` queue-entry arm below, and the
+            // Author-stage `since: None` for Done from #1581). This mirrors
+            // the precedent `merge_stage_status_for_local` already set for
+            // the normal Work track (#775: a `status="merged"` assignment is
+            // sufficient evidence even with no surviving queue entry) — that
+            // fallback just never got extended to this prereq-pipeline path.
+            (StageStatus::Done, None)
         } else {
             match author.branch.as_deref() {
                 None => (StageStatus::Pending, review_since.or(review.and_then(|r| r.finished_at))),
