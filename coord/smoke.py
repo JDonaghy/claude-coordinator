@@ -248,11 +248,12 @@ def _capability_probe_reasons(
         resp = client.get(f"http://{machine.host}:{AGENT_PORT}/health", timeout=timeout)
         resp.raise_for_status()
         health = resp.json()
-    except (httpx.HTTPError, httpx.TimeoutException, ValueError, AttributeError):
-        # AttributeError: a caller's `http_client` double (real ones are
-        # always full httpx.Client-shaped) implements .post but not .get —
-        # e.g. tests exercising the POST /assign failure path. Same "skip
-        # the extra check" outcome as any other reachability problem.
+    except (httpx.HTTPError, httpx.TimeoutException, ValueError):
+        # Any connectivity/parsing hiccup here just skips the extra check —
+        # not widened to AttributeError: a caller's `http_client` double
+        # should implement `.get` (real httpx.Client always does), so a
+        # missing-method bug on our side surfaces instead of silently
+        # degrading like a genuine reachability problem.
         return {}
     raw_probes = health.get("tool_versions") if isinstance(health, dict) else None
     if not raw_probes:

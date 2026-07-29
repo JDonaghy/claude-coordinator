@@ -527,8 +527,15 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
 
 @click.command(
     help=(
-        "Probe external-tool prereqs fleet-wide — baseline (git, gh) plus "
-        "each machine's declared capabilities (#1570 E)."
+        "Fleet-wide prereq report: is this machine fit to be routed work?\n\n"
+        "#1570 E -- \"One command, whole fleet, prereq status per machine. "
+        "Would have answered [the #1564 gh-version incident] in seconds.\" "
+        "Reads each machine's already-probed tool_versions straight out of "
+        "/health (#1570 B), so it costs exactly what `coord status` costs "
+        "-- no SSHing around the fleet by hand.\n\n"
+        "Exits 1 if any machine is unreachable, hasn't upgraded to publish "
+        "tool_versions yet, fails a baseline prereq, or claims a capability "
+        "its own probe can't back up."
     )
 )
 @_CONFIG_OPTION
@@ -538,18 +545,6 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
     help="Per-machine /health timeout (seconds).",
 )
 def doctor(config_path: Path, machine_filter: str | None, timeout: float) -> None:
-    """Fleet-wide prereq report: is this machine fit to be routed work?
-
-    #1570 E — "One command, whole fleet, prereq status per machine. Would
-    have answered [the #1564 gh-version incident] in seconds." Reads each
-    machine's already-probed `tool_versions` straight out of `/health`
-    (#1570 B), so it costs exactly what `coord status` costs — no SSHing
-    around the fleet by hand.
-
-    Exits 1 if any machine is unreachable, hasn't upgraded to publish
-    `tool_versions` yet, fails a baseline prereq, or claims a capability its
-    own probe can't back up.
-    """
     from coord.network import check_all
     from coord.prereqs import ToolProbe, unmet_capabilities
 

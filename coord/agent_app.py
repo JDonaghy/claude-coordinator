@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess
@@ -348,7 +349,14 @@ def build_app(
         exec_restart = _default_exec_restart
 
     async def health(request: Request) -> JSONResponse:
-        data = server.health()
+        # server.health() can shell out to probe tool versions (#1570 B,
+        # via AgentServer._cached_tool_versions -> probe_all) — real
+        # subprocess.run calls with a per-tool timeout. Running that inline
+        # would block this event loop (and every in-flight /assign) for up
+        # to the probe timeout on a slow/hung tool. Cache TTL means this
+        # only bites the first /health after a restart or every few
+        # minutes, but push it off-loop regardless.
+        data = await asyncio.to_thread(server.health)
         data["version"] = __version__
         # Surface the most recent /update attempt so the CLI can show
         # "0.3.0 → 0.4.0" or "no_change (0.3.0)" or "failed: <error>".

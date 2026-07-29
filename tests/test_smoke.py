@@ -653,6 +653,9 @@ def test_dispatch_smoke_returns_none_on_http_failure(
         def post(self, url, *, json, timeout):
             raise httpx.ConnectError("unreachable")
 
+        def get(self, url, *, timeout):
+            raise httpx.ConnectError("unreachable")
+
     board = Board()
     result = dispatch_smoke(
         _completed(), board, gtk_and_server_config,

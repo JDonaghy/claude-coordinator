@@ -105,6 +105,34 @@ class TestProbe:
         assert result.meets_floor is None
         assert result.ok is True  # unknown, assume fine — not a false failure
 
+    def test_nonzero_returncode_reports_not_found_not_bogus_version(self) -> None:
+        """The gtk4 flagship example: `pkg-config --modversion gtk4` prints
+        a descriptive "Package ... was not found" error and exits nonzero
+        when the dev libs aren't installed. Before the returncode check,
+        `_parse_version`'s `(\\S+)` pattern happily extracted "Package" from
+        that error text as a bogus version, reporting found=True/ok=True for
+        a machine with no GTK4 dev libs at all."""
+        prereq = prereqs.Prereq(
+            tool="gtk4", binary="pkg-config",
+            version_args=("--modversion", "gtk4"), version_re=r"(\S+)",
+            min_version=None, capability="gtk", what_breaks="gtk build breaks",
+        )
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/pkg-config"), \
+             patch(
+                 "coord.prereqs.subprocess.run",
+                 return_value=_Result(
+                     stderr=(
+                         "Package gtk4 was not found in the pkg-config "
+                         "search path.\n"
+                     ),
+                     returncode=1,
+                 ),
+             ):
+            result = prereqs.probe(prereq)
+        assert result.found is False
+        assert result.version is None
+        assert result.ok is False
+
     def test_hang_or_missing_process_degrades_gracefully(self) -> None:
         prereq = prereqs.Prereq(
             tool="gh", binary="gh", version_args=("--version",),
