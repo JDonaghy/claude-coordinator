@@ -390,7 +390,14 @@ From the coordinator machine:
 coord agent update --all
 ```
 
-This POSTs to `/update` on every machine in `coordinator.yml`. Each agent runs `pip install --upgrade claude-coordinator` and re-execs the process. The CLI waits up to 120 s for each agent to come back online and reports `version_before → version_after`.
+This POSTs to `/update` on every machine in `coordinator.yml`, telling each agent exactly which version the coordinator wants (`target_version`, the coordinator's own version). Each agent pins its pip install to that exact release (`pip install --upgrade --no-cache-dir claude-coordinator==<target_version>`) and re-execs the process.
+
+**#1568: success is judged by the version the agent actually reports back, not by the POST being accepted and not by a liveness ping.** The CLI polls `/health` until the reported version equals `target_version` (or `--timeout` elapses) and reports `version_before → version_after` only for machines that actually got there. This closes two failure modes that used to both report as "the update worked":
+
+- A stale PyPI index/cache resolving `pip install --upgrade` to the *same* old version while exiting 0 — pinning to `target_version` turns that into a loud pip failure instead of a silent no-op.
+- The `os.execv` self-restart not taking under systemd (#404) — the agent's pip step genuinely succeeded but the *old* process kept answering `/health`. When `last_update.result == "upgraded"` but the version hasn't advanced by the end of the poll window, the CLI automatically escalates with a driven `ssh <host> 'XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart coord-agent'` (see "The `XDG_RUNTIME_DIR=...` prefix is load-bearing" below) and gives it one more short window before reporting failure.
+
+If a machine still doesn't end up on `target_version`, `coord agent update` exits non-zero and prints why (`no change`, `failed`, still-stuck-after-escalation, or never came back online) instead of a bare success.
 
 To target one machine:
 
@@ -419,18 +426,29 @@ Skip this and the fix ships to the fleet but the daemon silently keeps serving
 the old behaviour — the failure mode that stranded #850 (a `serve_app.py` fix)
 even though every agent already reported the new version.
 
+## Fleet-wide version check
+
+```bash
+coord agent versions --all
+```
+
+Prints the coordinator's own version alongside every agent's self-reported
+version and flags any mismatch as a **split-brain** (exit non-zero). Run it
+before trusting a rule change made against the coordinator's local version,
+and after `coord agent update --all` to confirm the rollout actually landed
+everywhere — a split-brain fleet is only detectable by comparing versions
+directly, not by whether the last `coord agent update` reported success.
+
 ## Upgrade via the raw `/update` endpoint (reliable fallback)
 
 `coord agent update` is a thin wrapper over the agent's `POST /update`
-HTTP endpoint plus a 120 s "wait for it to come back" loop. That loop is
-the source of the `✗ did not come back` **false negative**: the upgrade
-triggers an `os.execv` restart, and on a slow machine (or slow pip) the
-agent can take longer than 120 s to rebind the port — the CLI gives up
-and reports failure even though the agent recovers seconds later and is
-actually on the new version.
-
-When that happens, drive the endpoint directly and poll `/health`
-yourself — no artificial timeout:
+HTTP endpoint plus a "poll `/health` until the version matches, escalating
+via `systemctl --user restart` if needed" loop (#1568). If a machine is
+slower than `--timeout` (default 120 s) to converge even after the
+automatic escalation — very slow pip mirrors, a host that isn't running
+`coord-agent` under systemd (so the escalation itself can't help), etc. —
+drive the endpoint directly and poll `/health` yourself with no artificial
+timeout:
 
 ```bash
 # 1. Fire the upgrade. Returns 202 immediately; the pip install + restart

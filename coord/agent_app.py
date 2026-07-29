@@ -517,9 +517,33 @@ def build_app(
         succeeds.  The upgrade and restart run in a daemon-less background
         thread so the HTTP response is returned to the caller before the
         process is replaced.
+
+        Request body (JSON, optional)::
+
+            {"target_version": "0.4.85"}
+
+        #1568: when the caller (``coord agent update``) knows exactly which
+        release it's asking for, it passes ``target_version``.  For a
+        non-editable install this pins the pip install to that exact
+        version (``claude-coordinator==0.4.85``) instead of the bare
+        ``--upgrade``, so a stale PyPI index/cache produces a loud pip
+        failure ("no matching distribution") rather than a silent no-op
+        that pip reports as success.  ``target_version`` is also echoed
+        back in ``last_update`` so ``/health`` lets the caller verify the
+        upgrade actually landed rather than inferring success from the
+        POST being accepted or the process merely answering pings again.
         """
         is_editable, project_path = _detect_install_mode()
         mode = "editable (git pull)" if is_editable else "pip install --upgrade"
+
+        body: dict = {}
+        try:
+            body = await request.json()
+        except Exception:
+            pass
+        if not isinstance(body, dict):
+            body = {}
+        target_version = body.get("target_version") or None
 
         # Capture argv now — os.execv replaces the process later.
         saved_argv = list(sys.argv)
@@ -533,6 +557,7 @@ def build_app(
                 "started_at": started_at,
                 "version_before": version_before,
                 "version_after": version_before,
+                "target_version": target_version,
                 "result": "failed",
                 "error": None,
                 "log_excerpt": "",
@@ -550,11 +575,19 @@ def build_app(
                     # --no-cache-dir bypasses pip's local wheel cache, which
                     # has caused stale-version resolutions on at least one
                     # machine (PyPI metadata races with `pip install --upgrade`).
+                    # Pinning to target_version (when the caller supplied one)
+                    # turns "PyPI hasn't propagated yet" into a hard pip
+                    # failure instead of a quiet resolve-to-old-version.
+                    pkg_spec = (
+                        f"claude-coordinator=={target_version}"
+                        if target_version
+                        else "claude-coordinator"
+                    )
                     result = subprocess.run(
                         [
                             sys.executable, "-m", "pip", "install",
                             "--upgrade", "--no-cache-dir",
-                            "claude-coordinator",
+                            pkg_spec,
                         ],
                         capture_output=True,
                         text=True,
