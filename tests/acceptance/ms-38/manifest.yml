@@ -6,6 +6,14 @@
 # (module-qualified fn path). The slice files live in this directory and are
 # `include!`d at crate root by `tui/tests/acceptance.rs`.
 #
+# WIRING: `tui/tests/acceptance.rs` is OUTSIDE `sealed_paths`, so the
+# `include!("../../tests/acceptance/ms-38/plans_help_1124.rs");` line these
+# ids depend on is deliberately NOT part of this test-author diff (#1175
+# makes any out-of-seal touch a mandatory request-changes). It must be added
+# by a separate non-test-author step before these ids can run at all — see
+# the ⚠ WIRING REQUIRED block at the top of plans_help_1124.rs. Until then
+# `cargo test --test acceptance` silently reports zero ms-38 tests.
+#
 # Merged (never clobbered) across issues by coord.acceptance.load_manifest —
 # the sibling children's slices (#1122 CC-2 detail pane, #1123 CC-3
 # right-click menus) append their own entries here against the same contract.

@@ -8,42 +8,47 @@
 // ratatui's headless `TestBackend` (docs/ORACLE_LOOP.md, coord-tui
 // `tui-tuidriver` driver).
 //
-// This file is `include!`d at crate root by `tui/tests/acceptance.rs` (the
-// #1042 seam target). It is compiled only under `--features test-support`.
-// It is SEALED: the worker implementing #1124 may run it
-// (`coord acceptance run --issue 1124`) but may not read or edit it.
+// This file is designed to be `include!`d at crate root by
+// `tui/tests/acceptance.rs` (the #1042 seam target). It is compiled only
+// under `--features test-support`. It is SEALED: the worker implementing
+// #1124 may run it (`coord acceptance run --issue 1124`) but may not read or
+// edit it.
 //
-// ── Review round 1 (fix iteration 1/5) — blocking finding NOT resolved ────
-// The reviewer correctly flagged that the single additive
-// `include!("../../tests/acceptance/ms-38/plans_help_1124.rs");` line this
-// slice needs in `tui/tests/acceptance.rs` falls outside `sealed_paths`
-// (`tests/acceptance/**`), which is a mandatory `request-changes` under
-// `coord/review.py`'s `SEALED_PATH_AUTHOR_TYPES` rule (#1175) for a
-// `type="test-author"` diff, full stop.
+// ── ⚠ WIRING REQUIRED — one line, NOT part of this sealed diff ────────────
+// This slice is NOT self-wiring. For `cargo test --test acceptance` to
+// compile and run it, exactly one additive line must exist at the end of
+// `tui/tests/acceptance.rs`, alongside the ms-33 slice's identical line:
 //
-// This test-author session's mandate is bounded to
-// `tests/acceptance/ms-38/**` only (both by the sealed-oracle rule itself
-// and by this session's own instructions), so it has no diff available that
-// both (a) stays inside that boundary and (b) wires this file into the
-// `--test acceptance` target so it can be run and verified RED — the #1042
-// seam requires exactly one line outside the boundary to do that, and no
-// milestone-agnostic (glob/build.rs-based) wiring mechanism exists today.
-// Removing the line instead would leave these tests uncompiled and
-// unverifiable, which is strictly worse. The line is therefore left exactly
-// as committed in the prior round (matching the ms-33 precedent,
-// `3bb4585`, which landed the identical pattern three days before #1175
-// introduced this check).
+//     include!("../../tests/acceptance/ms-38/plans_help_1124.rs");
 //
-// This is the same structural gap the reviewer described: it recurs for
-// every milestone's *first* test-author dispatch and cannot be closed by a
-// test-author diff. Resolving it requires one of the reviewer's own two
-// recommendations — (a) a documented human-approved exception for this PR
-// (as was done for #1312), or (b) a coordinator-level fix that either
-// carves this wiring-seam file out of `sealed_paths` enforcement for
-// additive `include!` lines, or has the coordinator apply that one line as
-// a separate mechanical step outside the test-author dispatch. Flagging
-// for the coordinator/operator rather than silently resubmitting an
-// unchanged diff across the remaining fix iterations.
+// That file is OUTSIDE `sealed_paths` (`tests/acceptance/`), so a
+// `type="test-author"` diff that contains it is a mandatory
+// `request-changes` under `coord/review.py`'s `SEALED_PATH_AUTHOR_TYPES`
+// rule (#1175) — regardless of how small or correct the change is. Review
+// round 1 flagged it; round 2 removed it. **This branch therefore ships a
+// diff confined entirely to `tests/acceptance/ms-38/**`, and the wiring line
+// is not in it.**
+//
+// Whoever lands this branch must add that line as a separate, mechanical,
+// non-test-author step — the coordinator applying it directly, a
+// human-approved exception recorded on the PR (the way #1312 was handled),
+// or, better, a tooling fix to the #1042 seam (glob- or `build.rs`-based
+// auto-registration of `tests/acceptance/ms-NN/*.rs`) so no milestone's
+// first slice ever needs a non-sealed edit again. Until one of those lands,
+// the tests below are inert: `cargo test --test acceptance` will report the
+// ms-33 slice only and exit as if ms-38 had no acceptance coverage at all.
+// Do not read that green as "#1124 is done".
+//
+// RED verification (this fix round): the wiring line was applied locally,
+// UNCOMMITTED, purely to run the driver command, and reverted before
+// committing. Under
+//   cd tui && RUSTC_BOOTSTRAP=1 cargo test --test acceptance \
+//       --features test-support -- -Z unstable-options --format json
+// all 11 `plans_help_1124::*` tests below compile and FAIL on assertions
+// (not on a harness/compile error) against the pre-implementation tree. The
+// one other failure in that run, `audit_1039::populated_list_rows_are_
+// relative_time`, is a pre-existing ms-33 failure on the base commit and is
+// unrelated to this slice.
 //
 // Scope: contract §5 (CC-4) only — §5a–§5i. The sibling children's surfaces
 // (§3 CC-2 detail pane / #1122, §4 CC-3 right-click menus / #1123) are NOT
@@ -64,6 +69,19 @@
 // required string in §5b–§5g is *static chrome* (cheatsheet text, chip
 // legend, action labels) rather than roster-derived data. So the whole CC-4
 // surface is reachable with `BoardData::default()`.
+//
+// FORWARD FLAG (raised by review round 1, restated so it is not lost): the
+// sibling slices will NOT get off this lightly. §3 (CC-2 / #1122, detail
+// pane) and §4 (CC-3 / #1123, right-click menus) both assert against real
+// plan ROWS — a selected milestone, its health chip, its context-menu items
+// — which an external integration-test crate cannot construct today. Before
+// either of those slices is dispatched, a fixture seam has to exist: a
+// `coord_tui::fixtures::make_test_app_with_plan_roster(...)` (or `BoardData`
+// roster fields made `pub` behind `test-support`). That is a fixture/harness
+// change in `tui/src/app/`, i.e. outside `sealed_paths`, so it must be
+// scheduled as its own work item — a test-author dispatch cannot make it.
+// This is the second milestone to hit the same wall (ms-33 documented it for
+// audit entries), so it will keep recurring until it is fixed properly.
 //
 // ── The exact state these tests run in (verified, not assumed) ────────────
 // Because `BoardData::default()` also leaves `plan_roster_supported` false,
