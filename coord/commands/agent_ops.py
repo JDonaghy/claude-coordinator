@@ -145,10 +145,13 @@ def _start_agent_server(
 @agent.command(
     "update",
     help=(
-        "POST /update to one or all agent servers.  The agent upgrades the "
-        "claude-coordinator package (git pull for editable installs, "
-        "pip install --upgrade otherwise) then restarts itself.  Waits up to "
-        "--timeout seconds for the agent(s) to come back online."
+        "POST /update to one or all agent servers, pinning the upgrade to "
+        "this coordinator's own version (git pull for editable installs, "
+        "pip install --no-cache-dir --upgrade claude-coordinator==<version> "
+        "otherwise).  Polls each agent's self-reported version for up to "
+        "--timeout seconds and reports success only once it matches the "
+        "requested version, escalating to a `systemctl --user restart "
+        "coord-agent` if the version is stuck."
     ),
 )
 
@@ -484,6 +487,7 @@ def agent_versions(
 
     versions_seen: set[str] = set()
     any_offline = False
+    any_mismatch = False
     for machine in targets:
         version: str | None
         try:
@@ -498,7 +502,9 @@ def agent_versions(
             continue
 
         versions_seen.add(version)
-        marker = "" if version == __version__ else "  ⚠ mismatch"
+        mismatch = version != __version__
+        any_mismatch = any_mismatch or mismatch
+        marker = "  ⚠ mismatch" if mismatch else ""
         click.echo(f"  {machine.name}: v{version}{marker}")
 
     if len(versions_seen) > 1:
@@ -506,6 +512,14 @@ def agent_versions(
             f"\n⚠ split-brain: {len(versions_seen)} distinct versions across the "
             f"fleet ({', '.join(sorted(versions_seen))}). Do not trust a rule "
             "change until `coord agent update --all` brings everyone in line.",
+            err=True,
+        )
+        sys.exit(1)
+    if any_mismatch:
+        click.echo(
+            f"\n⚠ mismatch: fleet is uniformly on a version that differs from "
+            f"the coordinator's own v{__version__}. Run `coord agent update "
+            "--all` to bring the fleet in line.",
             err=True,
         )
         sys.exit(1)
@@ -561,6 +575,10 @@ def _wait_agents_online(
 
     Returns ``{machine_name: came_back_online}`` for every machine.
     """
+    # Scale the sleep down for short timeouts (e.g. tests passing
+    # --timeout 1) so a tiny deadline isn't dominated by a single fixed
+    # 2s sleep — callers that want the full 2s just pass a bigger timeout.
+    poll_interval = min(poll_interval, max(timeout / 5, 0.05))
     deadline = time.time() + timeout
     online: set[str] = set()
     pre = pre_started_at or {}
@@ -638,6 +656,10 @@ def _wait_agents_updated(
     Returns ``{machine_name: {matched, came_online, version_now,
     version_before, result, error, escalated}}``.
     """
+    # Scale the sleep down for short timeouts (e.g. tests passing
+    # --timeout 1) so a tiny deadline isn't dominated by a single fixed
+    # 2s sleep — callers that want the full 2s just pass a bigger timeout.
+    poll_interval = min(poll_interval, max(timeout / 5, 0.05))
     pre = pre_started_at or {}
     out: dict[str, dict] = {
         m.name: {
