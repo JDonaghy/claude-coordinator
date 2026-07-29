@@ -2553,7 +2553,7 @@ impl CoordApp {
         ));
         const STAGE_NAMES: [&str; 4] = ["Author", "Test", "Review", "Merge"];
         for (name, stage) in STAGE_NAMES.iter().zip(status.stages.iter()) {
-            let (label, color) = prereq_stage_label(&stage.status);
+            let (label, color) = prereq_stage_label(stage);
             let suffix = match (&stage.status, stage.since) {
                 (StageStatus::Active, Some(since)) => {
                     format!(" — running {}", elapsed_since_now(since))

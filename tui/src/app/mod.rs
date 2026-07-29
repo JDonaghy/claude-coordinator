@@ -1149,14 +1149,25 @@ fn kv_item(key: &str, val: &str, val_color: Option<Color>) -> ListItem {
 /// rest of the Pipeline detail panel uses for [`StageStatus`] (Done/Failed
 /// green/red; Active a distinct blue since it's genuinely different from a
 /// settled verdict; Pending/Skipped/Stale muted).
-fn prereq_stage_label(status: &StageStatus) -> (&'static str, Color) {
-    match status {
-        StageStatus::Done => ("done", Color::rgb(120, 200, 120)),
-        StageStatus::Active => ("running", Color::rgb(120, 170, 220)),
-        StageStatus::Failed => ("failed", Color::rgb(220, 100, 100)),
-        StageStatus::Stale => ("stale", Color::rgb(220, 150, 80)),
-        StageStatus::Skipped => ("skipped", Color::rgb(160, 160, 180)),
-        StageStatus::Pending => ("pending", Color::rgb(160, 160, 180)),
+///
+/// #1572: a `Pending` stage whose `since` is `None` has never been
+/// reached — its predecessor hasn't settled, so nothing has been
+/// dispatched and nothing is being waited on (see the doc comment on
+/// [`crate::app::pipeline::PrereqStage::since`]). Labelling that "not
+/// started" rather than "pending" keeps it visually distinct from a
+/// `Pending` stage that IS reachable but stalled, which `since: Some(_)`
+/// pairs with a mounting "waiting Xm Ys" clock in
+/// `append_prereq_pipeline_rows` — a running clock should always mean
+/// "this should be moving," never "nothing has happened yet."
+fn prereq_stage_label(stage: &PrereqStage) -> (&'static str, Color) {
+    match (&stage.status, stage.since) {
+        (StageStatus::Done, _) => ("done", Color::rgb(120, 200, 120)),
+        (StageStatus::Active, _) => ("running", Color::rgb(120, 170, 220)),
+        (StageStatus::Failed, _) => ("failed", Color::rgb(220, 100, 100)),
+        (StageStatus::Stale, _) => ("stale", Color::rgb(220, 150, 80)),
+        (StageStatus::Skipped, _) => ("skipped", Color::rgb(160, 160, 180)),
+        (StageStatus::Pending, None) => ("not started", Color::rgb(110, 110, 125)),
+        (StageStatus::Pending, Some(_)) => ("pending", Color::rgb(160, 160, 180)),
     }
 }
 
