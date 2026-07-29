@@ -160,7 +160,27 @@ def _openapi_spec() -> dict:
         "/cancel/{id}": {
             "post": {
                 "summary": "Cancel a running/pending assignment",
-                "parameters": [_path_param("id", "assignment id")],
+                "description": (
+                    "#1567: by default, any uncommitted worker changes are "
+                    "committed locally but NOT pushed anywhere — the "
+                    "worker's remote branch is left unchanged. Pass "
+                    "?rescue=1 to push the WIP commit to a disposable "
+                    "rescue/<id> ref instead (the worker's own branch is "
+                    "still never touched)."
+                ),
+                "parameters": [
+                    _path_param("id", "assignment id"),
+                    {
+                        "name": "rescue",
+                        "in": "query",
+                        "required": False,
+                        "schema": {"type": "boolean", "default": False},
+                        "description": (
+                            "Push the WIP commit to rescue/<id> instead of "
+                            "leaving it local-only."
+                        ),
+                    },
+                ],
                 "responses": {
                     "200": {
                         "description": "OK",
@@ -364,8 +384,22 @@ def build_app(
 
     async def cancel(request: Request) -> JSONResponse:
         assignment_id = request.path_params["id"]
+        # #1567: ?rescue=1 opts into pushing the WIP commit to a disposable
+        # rescue/<id> ref. Default (no query param, or any falsy value) is
+        # to commit locally only and leave the remote branch untouched.
+        rescue_param = request.query_params.get("rescue", "")
+        rescue = rescue_param.strip().lower() in ("1", "true", "yes")
+        # ``push_mode``, when given, overrides the rescue-derived default —
+        # an internal-only escape hatch for callers that are not an operator
+        # `coord stop` (e.g. `coord resume-stuck`, which cancels a stuck
+        # worker but immediately dispatches a continuation onto the SAME
+        # branch and needs the WIP pushed there, not withheld or diverted to
+        # a rescue ref — see coord/commands/plan_followup.py::resume_stuck).
+        push_mode = request.query_params.get("push_mode") or None
         try:
-            assignment = server.cancel(assignment_id)
+            assignment = server.cancel(
+                assignment_id, rescue=rescue, push_mode=push_mode
+            )
         except KeyError:
             return JSONResponse({"error": f"unknown assignment {assignment_id}"}, status_code=404)
         return JSONResponse(assignment.to_dict())
@@ -708,7 +742,11 @@ def build_app(
                 ]
             for aid in pending_ids:
                 try:
-                    server.cancel(aid)
+                    # #1567: this is an infra-triggered restart, not an
+                    # operator `coord stop` — nobody decided this work was
+                    # unwanted, so keep the pre-#1567 behaviour of pushing
+                    # any WIP straight onto the worker's own branch.
+                    server.cancel(aid, push_mode="branch")
                 except Exception:
                     pass
 
