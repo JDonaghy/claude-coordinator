@@ -1,0 +1,489 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>coord web — Pipeline (phone)</title>
+<!--
+  Gate-A mock · coord web control center · Pipeline panel, narrow viewport
+  docs/WEB_CONTROL_CENTER.md · seeds milestone #52 (#1546 tokens, #1547 shell)
+
+  Same design system as pipeline-wide.html at phone width: the rail has become
+  the bottom row, and the list/detail split has become a drill-in.
+  Tap a row to drill in; back returns. On a desktop this renders inside a phone
+  frame; on a real phone it goes full-bleed and IS the experience.
+-->
+<style>
+:root{
+  --ground:#101418; --surface:#171c22; --surface-2:#1e242b; --surface-3:#252d36;
+  --line:#2a323b; --line-strong:#3a444f;
+  --text:#dfe6ee; --text-dim:#8b97a5; --text-faint:#5f6b78;
+  --accent:#4fb8cf; --accent-dim:#2d7688; --accent-wash:rgba(79,184,207,.12);
+  --pass:#4ea87a; --pass-wash:rgba(78,168,122,.14);
+  --attn:#d9a54c; --attn-wash:rgba(217,165,76,.14);
+  --fail:#d9605e; --fail-wash:rgba(217,96,94,.14);
+  --idle:#55606d; --idle-wash:rgba(85,96,109,.14);
+  --font-ui:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  --font-mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+  --r-sm:5px; --r-md:8px; --r-lg:12px;
+}
+:root[data-theme="light"]{
+  --ground:#f5f7f9; --surface:#fff; --surface-2:#eef1f5; --surface-3:#e3e8ee;
+  --line:#dde3ea; --line-strong:#c3ccd6;
+  --text:#1a212a; --text-dim:#5b6672; --text-faint:#8a95a1;
+  --accent:#1d7f96; --accent-dim:#8fc9d6; --accent-wash:rgba(29,127,150,.10);
+  --pass:#2f7d55; --pass-wash:rgba(47,125,85,.11);
+  --attn:#a4741d; --attn-wash:rgba(164,116,29,.12);
+  --fail:#b8403e; --fail-wash:rgba(184,64,62,.11);
+  --idle:#97a1ac; --idle-wash:rgba(151,161,172,.14);
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0;background:var(--ground);color:var(--text);font-family:var(--font-ui);
+  font-size:.875rem;line-height:1.5;-webkit-font-smoothing:antialiased;
+}
+button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:3px}
+.mono{font-family:var(--font-mono);font-variant-numeric:tabular-nums}
+
+/* ── desktop: show the phone in a frame + a caption ─────────────────── */
+.stage-wrap{
+  min-height:100dvh;display:grid;place-items:center;gap:20px;padding:32px 20px;
+  grid-auto-flow:row;
+  background:
+    radial-gradient(1200px 600px at 50% -10%, rgba(79,184,207,.06), transparent 60%),
+    var(--ground);
+}
+.caption{text-align:center;max-width:44ch}
+.caption h1{font-size:1.05rem;font-weight:600;margin:0 0 6px;letter-spacing:-.01em}
+.caption p{margin:0;font-size:.8rem;color:var(--text-dim)}
+.caption .hint{
+  display:inline-block;margin-top:11px;font-family:var(--font-mono);font-size:.7rem;
+  color:var(--text-faint);border:1px solid var(--line);border-radius:20px;padding:3px 11px;
+}
+.frame{
+  width:392px;height:800px;max-height:calc(100dvh - 150px);
+  border:1px solid var(--line-strong);border-radius:34px;background:var(--ground);
+  box-shadow:0 30px 70px -20px rgba(0,0,0,.6);overflow:hidden;position:relative;
+  display:flex;flex-direction:column;
+}
+.notch{
+  position:absolute;top:9px;left:50%;translate:-50% 0;width:96px;height:22px;
+  border-radius:20px;background:var(--surface);z-index:5;
+}
+.frame .app{padding-top:34px}
+
+/* on a real phone: drop the frame entirely, go full-bleed */
+@media (max-width:640px){
+  .stage-wrap{display:block;padding:0;background:var(--ground)}
+  .caption{display:none}
+  .frame{
+    width:100%;height:100dvh;max-height:none;border:0;border-radius:0;box-shadow:none;
+  }
+  .notch{display:none}
+  .frame .app{padding-top:env(safe-area-inset-top,0)}
+}
+
+/* ── the app itself ─────────────────────────────────────────────────── */
+.app{flex:1;display:flex;flex-direction:column;min-height:0;overflow:hidden}
+.view{flex:1;display:none;flex-direction:column;min-height:0}
+.app[data-view="list"] .view-list{display:flex}
+.app[data-view="detail"] .view-detail{display:flex}
+
+/* top bar */
+.topbar{
+  display:flex;align-items:center;gap:11px;padding:12px 15px 10px;
+  border-bottom:1px solid var(--line);flex:none;
+}
+.topbar h1{font-size:1.05rem;font-weight:600;margin:0;letter-spacing:-.01em}
+.topbar .n{font-family:var(--font-mono);font-size:.72rem;color:var(--text-faint)}
+.icon-btn{width:32px;height:32px;display:grid;place-items:center;border-radius:var(--r-sm);color:var(--text-dim)}
+.icon-btn:hover{background:var(--surface-2);color:var(--text)}
+.icon-btn svg{width:17px;height:17px}
+.topbar .right{margin-left:auto;display:flex;gap:2px}
+
+.scroll{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch}
+
+/* attention first — the whole point of a phone glance */
+.attn-bar{
+  margin:12px 13px 2px;display:flex;align-items:center;gap:10px;
+  background:var(--attn-wash);border:1px solid rgba(217,165,76,.28);
+  border-radius:var(--r-md);padding:11px 12px;color:var(--attn);font-size:.8rem;
+  width:calc(100% - 26px);text-align:left;
+}
+.attn-bar svg{width:16px;height:16px;flex:none}
+.attn-bar strong{font-weight:600}
+.attn-bar .go{margin-left:auto;font-size:1rem;line-height:1}
+
+.filters{display:flex;gap:7px;padding:13px 13px 3px;overflow-x:auto;scrollbar-width:none}
+.filters::-webkit-scrollbar{display:none}
+.chip{
+  font-size:.75rem;padding:5px 12px;border-radius:20px;white-space:nowrap;flex:none;
+  border:1px solid var(--line);color:var(--text-dim);
+}
+.chip[aria-pressed="true"]{background:var(--surface-3);border-color:var(--line-strong);color:var(--text)}
+
+.sec{padding:16px 15px 7px;font-size:.66rem;font-weight:600;letter-spacing:.09em;
+  text-transform:uppercase;color:var(--text-faint)}
+.list{padding:0 11px 14px;display:flex;flex-direction:column;gap:7px}
+
+/* rows are cards on a phone — bigger targets, more air */
+.row{
+  display:block;width:100%;text-align:left;padding:13px 14px;border-radius:var(--r-lg);
+  background:var(--surface);border:1px solid var(--line);position:relative;overflow:hidden;
+}
+.row::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--idle)}
+.row[data-s="run"]::before{background:var(--accent)}
+.row[data-s="pass"]::before{background:var(--pass)}
+.row[data-s="attn"]::before{background:var(--attn)}
+.row[data-s="fail"]::before{background:var(--fail)}
+.row[data-s="none"]::before{background:transparent}
+.row-top{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+.row-id{font-family:var(--font-mono);font-size:.74rem;color:var(--text-faint)}
+.row-repo{font-family:var(--font-mono);font-size:.69rem;color:var(--text-dim);
+  background:var(--surface-2);padding:1px 6px;border-radius:4px}
+.row-age{margin-left:auto;font-family:var(--font-mono);font-size:.69rem;color:var(--text-faint)}
+.row-title{font-size:.87rem;line-height:1.4;margin-bottom:11px;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.row-bot{display:flex;align-items:center;gap:10px}
+.row-state{font-size:.74rem;color:var(--text-dim);display:flex;align-items:center;gap:6px}
+.dot{width:6px;height:6px;border-radius:50%;flex:none;background:var(--idle)}
+.dot.run{background:var(--accent);box-shadow:0 0 0 3px var(--accent-wash)}
+.dot.pass{background:var(--pass)}
+.dot.attn{background:var(--attn);box-shadow:0 0 0 3px var(--attn-wash)}
+.dot.fail{background:var(--fail);box-shadow:0 0 0 3px var(--fail-wash)}
+.row-machine{margin-left:auto;font-family:var(--font-mono);font-size:.68rem;color:var(--text-faint)}
+.strip-mini{display:flex;gap:2px;align-items:center}
+.strip-mini i{display:block;width:19px;height:3px;border-radius:2px;background:var(--idle-wash)}
+.strip-mini i[data-s="pass"]{background:var(--pass)}
+.strip-mini i[data-s="run"]{background:var(--accent)}
+.strip-mini i[data-s="attn"]{background:var(--attn)}
+.strip-mini i[data-s="fail"]{background:var(--fail)}
+
+/* ── detail view ───────────────────────────────────────────────────── */
+.detail-head{padding:13px 15px;border-bottom:1px solid var(--line);flex:none}
+.detail-head .back{
+  display:flex;align-items:center;gap:6px;color:var(--accent);font-size:.79rem;
+  margin-bottom:9px;padding:0;
+}
+.detail-head .back svg{width:15px;height:15px}
+.detail-head h2{font-size:1rem;font-weight:600;margin:0 0 7px;letter-spacing:-.01em;line-height:1.35;text-wrap:balance}
+.crumbs{display:flex;align-items:center;gap:7px;font-size:.73rem;color:var(--text-dim);flex-wrap:wrap}
+.crumbs .mono{color:var(--text-faint)}
+
+/* stage strip stacks into rows on a phone — still the signature element */
+.stages{display:flex;flex-direction:column;gap:7px;padding:14px 13px 4px}
+.stage{
+  display:flex;align-items:center;gap:12px;padding:11px 13px;width:100%;text-align:left;
+  background:var(--surface);border:1px solid var(--line);border-radius:var(--r-md);
+  position:relative;overflow:hidden;
+}
+.stage::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--idle)}
+.stage[data-s="pass"]::before{background:var(--pass)}
+.stage[data-s="run"]::before{background:var(--accent)}
+.stage[data-s="attn"]::before{background:var(--attn)}
+.stage[data-s="fail"]::before{background:var(--fail)}
+.stage[data-s="idle"]{background:transparent;border-style:dashed}
+.stage-ico{width:17px;height:17px;flex:none;color:var(--idle)}
+.stage[data-s="pass"] .stage-ico{color:var(--pass)}
+.stage[data-s="run"] .stage-ico{color:var(--accent)}
+.stage-name{font-size:.84rem;font-weight:600;width:56px;flex:none}
+.stage-verdict{font-size:.78rem;color:var(--text-dim)}
+.stage[data-s="run"] .stage-verdict{color:var(--accent)}
+.stage-meta{margin-left:auto;font-family:var(--font-mono);font-size:.69rem;color:var(--text-faint);flex:none}
+
+.live{display:flex;align-items:flex-start;gap:11px;margin:13px;padding:13px;
+  background:var(--accent-wash);border:1px solid rgba(79,184,207,.25);border-radius:var(--r-lg)}
+.pulse{width:8px;height:8px;border-radius:50%;background:var(--accent);flex:none;margin-top:5px;animation:p 2s ease-in-out infinite}
+@keyframes p{0%,100%{opacity:1}50%{opacity:.5}}
+@media (prefers-reduced-motion:reduce){.pulse{animation:none}}
+.live b{display:block;font-size:.8rem;font-weight:600;margin-bottom:3px}
+.live p{margin:0;font-family:var(--font-mono);font-size:.73rem;color:var(--text-dim);line-height:1.45}
+
+.card{margin:0 13px 13px;background:var(--surface);border:1px solid var(--line);border-radius:var(--r-lg);overflow:hidden}
+.card-head{padding:11px 14px;border-bottom:1px solid var(--line);font-size:.8rem;font-weight:600}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:9px 16px;font-size:.78rem;padding:14px}
+.kv dt{color:var(--text-dim)}
+.kv dd{margin:0;font-family:var(--font-mono);font-size:.75rem;text-align:right}
+.tag{display:inline-flex;align-items:center;font-size:.69rem;padding:2px 8px;border-radius:20px;
+  background:var(--surface-2);color:var(--text-dim);font-family:var(--font-ui)}
+.tag.ok{background:var(--pass-wash);color:var(--pass)}
+.tag.warn{background:var(--attn-wash);color:var(--attn)}
+
+/* sticky action bar — thumb reach */
+.actions{
+  flex:none;display:flex;gap:9px;padding:11px 13px;border-top:1px solid var(--line);
+  background:var(--surface);
+}
+.btn{flex:1;display:flex;align-items:center;justify-content:center;gap:7px;
+  padding:11px;border-radius:var(--r-md);border:1px solid var(--line-strong);
+  font-size:.83rem;font-weight:500}
+.btn svg{width:16px;height:16px}
+.btn-primary{background:var(--accent);border-color:var(--accent);color:#08161a;font-weight:600}
+
+/* ── bottom row — the rail, collapsed ──────────────────────────────── */
+.bottomrow{
+  flex:none;display:flex;border-top:1px solid var(--line);background:var(--surface);
+  padding:5px 4px calc(5px + env(safe-area-inset-bottom,0));
+}
+.nav-item{
+  flex:1;display:flex;flex-direction:column;align-items:center;gap:3px;padding:6px 2px;
+  color:var(--text-faint);border-radius:var(--r-sm);position:relative;
+}
+.nav-item svg{width:19px;height:19px}
+.nav-item .label{font-size:.62rem;letter-spacing:.01em}
+.nav-item[aria-current="page"]{color:var(--accent)}
+.nav-item .badge{
+  position:absolute;top:3px;right:calc(50% - 17px);min-width:15px;height:15px;
+  border-radius:20px;background:var(--attn);color:#181206;font-family:var(--font-mono);
+  font-size:.6rem;font-weight:700;display:grid;place-items:center;padding:0 4px;
+}
+</style>
+</head>
+<body>
+
+<svg style="display:none" aria-hidden="true">
+  <symbol id="i-pipeline" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7h6M15 7h6M3 17h6M15 17h6"/><circle cx="12" cy="7" r="2.5"/><circle cx="12" cy="17" r="2.5"/></symbol>
+  <symbol id="i-board" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="5" height="16" rx="1.5"/><rect x="10" y="4" width="5" height="11" rx="1.5"/><rect x="17" y="4" width="4" height="7" rx="1.5"/></symbol>
+  <symbol id="i-term" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="m7 10 2.5 2L7 14M13 15h4"/></symbol>
+  <symbol id="i-machines" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="14" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 17.5h.01"/></symbol>
+  <symbol id="i-more" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4.5 4.5"/></symbol>
+  <symbol id="i-back" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m14 6-6 6 6 6"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8v5M12 16.5v.01"/><circle cx="12" cy="12" r="9"/></symbol>
+  <symbol id="i-run" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7.5V12l3 2"/></symbol>
+  <symbol id="i-wait" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-dasharray="3 3.2"><circle cx="12" cy="12" r="9"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M7 4.8v14.4L19 12z"/></symbol>
+  <symbol id="i-theme" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5"/></symbol>
+</svg>
+
+<div class="stage-wrap">
+  <div class="caption">
+    <h1>Pipeline at phone width</h1>
+    <p>The rail has become the bottom row; the list/detail split has become a drill-in. Same tokens, same components as the wide mock.</p>
+    <span class="hint">tap a row to drill in · open on a phone for the real thing</span>
+  </div>
+
+  <div class="frame">
+    <div class="notch"></div>
+    <div class="app" id="app" data-view="list">
+
+      <!-- list -->
+      <section class="view view-list">
+        <div class="topbar">
+          <h1>Pipeline</h1>
+          <span class="n">7</span>
+          <div class="right">
+            <button class="icon-btn" aria-label="Search"><svg><use href="#i-search"/></svg></button>
+            <button class="icon-btn" id="theme" aria-label="Theme"><svg><use href="#i-theme"/></svg></button>
+          </div>
+        </div>
+
+        <div class="scroll">
+          <button class="attn-bar">
+            <svg><use href="#i-alert"/></svg>
+            <span><strong>2 need you</strong><br>a failed test and a review with findings</span>
+            <span class="go">→</span>
+          </button>
+
+          <div class="filters">
+            <button class="chip" aria-pressed="true">All</button>
+            <button class="chip">Needs me</button>
+            <button class="chip">Running</button>
+            <button class="chip">Blocked</button>
+            <button class="chip">Merged</button>
+          </div>
+
+          <div class="sec">In flight</div>
+          <div class="list">
+            <button class="row" data-s="run" data-open="1">
+              <div class="row-top">
+                <span class="row-id mono">#1538</span>
+                <span class="row-repo mono">coordinator</span>
+                <span class="row-age mono">18m</span>
+              </div>
+              <div class="row-title">W0-1: <span class="mono">coord web --fixture</span> — deterministic seeded-board server</div>
+              <div class="row-bot">
+                <span class="strip-mini"><i data-s="run"></i><i></i><i></i><i></i></span>
+                <span class="row-state"><span class="dot run"></span>Work</span>
+                <span class="row-machine mono">dellserver</span>
+              </div>
+            </button>
+
+            <button class="row" data-s="fail">
+              <div class="row-top">
+                <span class="row-id mono">#1547</span>
+                <span class="row-repo mono">coordinator</span>
+                <span class="row-age mono">1h</span>
+              </div>
+              <div class="row-title">W1-2: responsive shell — rail + list + detail on wide, phone layout on narrow</div>
+              <div class="row-bot">
+                <span class="strip-mini"><i data-s="pass"></i><i data-s="fail"></i><i></i><i></i></span>
+                <span class="row-state"><span class="dot fail"></span>Test failed</span>
+                <span class="row-machine mono">elitebook</span>
+              </div>
+            </button>
+
+            <button class="row" data-s="attn">
+              <div class="row-top">
+                <span class="row-id mono">#1289</span>
+                <span class="row-repo mono">quadraui</span>
+                <span class="row-age mono">3h</span>
+              </div>
+              <div class="row-title">Tab-group focus ring is invisible on the inactive group</div>
+              <div class="row-bot">
+                <span class="strip-mini"><i data-s="pass"></i><i data-s="pass"></i><i data-s="attn"></i><i></i></span>
+                <span class="row-state"><span class="dot attn"></span>3 findings</span>
+                <span class="row-machine mono">precision</span>
+              </div>
+            </button>
+
+            <button class="row" data-s="run">
+              <div class="row-top">
+                <span class="row-id mono">#1502</span>
+                <span class="row-repo mono">vimcode</span>
+                <span class="row-age mono">5h</span>
+              </div>
+              <div class="row-title">GTK4: buffer switch drops the cursor column on reopen</div>
+              <div class="row-bot">
+                <span class="strip-mini"><i data-s="pass"></i><i data-s="pass"></i><i data-s="pass"></i><i data-s="run"></i></span>
+                <span class="row-state"><span class="dot run"></span>Merge · 2nd</span>
+                <span class="row-machine mono">precision</span>
+              </div>
+            </button>
+          </div>
+
+          <div class="sec">Ready</div>
+          <div class="list">
+            <button class="row" data-s="none">
+              <div class="row-top">
+                <span class="row-id mono">#1541</span>
+                <span class="row-repo mono">coordinator</span>
+                <span class="row-age mono">2d</span>
+              </div>
+              <div class="row-title">W0-4: add browser capability to dellserver (headless Chromium)</div>
+              <div class="row-bot">
+                <span class="strip-mini"><i></i><i></i><i></i><i></i></span>
+                <span class="row-state"><span class="dot"></span>Not started</span>
+                <span class="row-machine mono">tier:small</span>
+              </div>
+            </button>
+            <button class="row" data-s="none">
+              <div class="row-top">
+                <span class="row-id mono">#1550</span>
+                <span class="row-repo mono">coordinator</span>
+                <span class="row-age mono">2d</span>
+              </div>
+              <div class="row-title">W1-5: generate the API types from the OpenAPI spec + fail CI on drift</div>
+              <div class="row-bot">
+                <span class="strip-mini"><i></i><i></i><i></i><i></i></span>
+                <span class="row-state"><span class="dot"></span>Not started</span>
+              </div>
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <!-- detail -->
+      <section class="view view-detail">
+        <div class="detail-head">
+          <button class="back" id="back"><svg><use href="#i-back"/></svg>Pipeline</button>
+          <h2>W0-1: <span class="mono" style="font-size:.92em">coord web --fixture</span> — deterministic seeded-board server</h2>
+          <div class="crumbs">
+            <span class="mono">claude-coordinator</span><span>·</span>
+            <span class="mono">#1538</span><span>·</span>
+            <span class="tag">milestone #51</span>
+          </div>
+        </div>
+
+        <div class="scroll">
+          <div class="stages">
+            <button class="stage" data-s="run">
+              <svg class="stage-ico"><use href="#i-run"/></svg>
+              <span class="stage-name">Work</span>
+              <span class="stage-verdict">Running</span>
+              <span class="stage-meta">18m · $1.24</span>
+            </button>
+            <button class="stage" data-s="idle">
+              <svg class="stage-ico"><use href="#i-wait"/></svg>
+              <span class="stage-name">Test</span>
+              <span class="stage-verdict">Waiting on work</span>
+              <span class="stage-meta">browser</span>
+            </button>
+            <button class="stage" data-s="idle">
+              <svg class="stage-ico"><use href="#i-wait"/></svg>
+              <span class="stage-name">Review</span>
+              <span class="stage-verdict">Waiting on test</span>
+              <span class="stage-meta">—</span>
+            </button>
+            <button class="stage" data-s="idle">
+              <svg class="stage-ico"><use href="#i-wait"/></svg>
+              <span class="stage-name">Merge</span>
+              <span class="stage-verdict">Waiting on review</span>
+              <span class="stage-meta">—</span>
+            </button>
+          </div>
+
+          <div class="live">
+            <span class="pulse"></span>
+            <div>
+              <b>Worker is running</b>
+              <p>STATUS: wiring the fixture loader into build_app() — 3 endpoints migrated, /events next</p>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head">Session</div>
+            <dl class="kv">
+              <dt>Machine</dt><dd>dellserver</dd>
+              <dt>Branch</dt><dd>issue-1538-fixture-server</dd>
+              <dt>Commits</dt><dd>3 ahead</dd>
+              <dt>Model</dt><dd>sonnet</dd>
+              <dt>Spend</dt><dd>$1.24</dd>
+              <dt>Acceptance</dt><dd><span class="tag warn">blocked on #1539</span></dd>
+            </dl>
+          </div>
+        </div>
+
+        <div class="actions">
+          <button class="btn"><svg><use href="#i-term"/></svg>Attach</button>
+          <button class="btn btn-primary"><svg><use href="#i-play"/></svg>Drive</button>
+        </div>
+      </section>
+
+      <!-- the rail, collapsed to a bottom row -->
+      <nav class="bottomrow" aria-label="Views">
+        <button class="nav-item" aria-current="page">
+          <svg><use href="#i-pipeline"/></svg><span class="label">Pipeline</span>
+        </button>
+        <button class="nav-item">
+          <svg><use href="#i-board"/></svg><span class="badge">2</span><span class="label">Board</span>
+        </button>
+        <button class="nav-item">
+          <svg><use href="#i-term"/></svg><span class="label">Sessions</span>
+        </button>
+        <button class="nav-item">
+          <svg><use href="#i-machines"/></svg><span class="label">Machines</span>
+        </button>
+        <button class="nav-item">
+          <svg><use href="#i-more"/></svg><span class="label">More</span>
+        </button>
+      </nav>
+    </div>
+  </div>
+</div>
+
+<script>
+const app = document.getElementById('app');
+document.querySelectorAll('.row').forEach(r => {
+  r.addEventListener('click', () => { app.dataset.view = 'detail'; });
+});
+document.getElementById('back').addEventListener('click', () => { app.dataset.view = 'list'; });
+document.getElementById('theme').addEventListener('click', () => {
+  const root = document.documentElement;
+  root.dataset.theme = root.dataset.theme === 'dark' ? 'light' : 'dark';
+});
+</script>
+</body>
+</html>

@@ -96,6 +96,12 @@ assertions against the mock; the real app must then satisfy them. Alternative
 considered and rejected as a *contract*: Playwright screenshot baselines — too
 brittle, and unreadable as a spec.
 
+**The first three mocks are already authored** — [`docs/mocks/web/`](mocks/web/):
+Pipeline on desktop, Pipeline on phone, and the issue detail in its review-findings
+state. They were written **before dispatch on purpose**: design direction has the longest
+feedback loop in the program, and everything downstream (M-W1's shell, M-W2's Pipeline
+panel) is built to satisfy a design that should be settled first. Approved 2026-07-28.
+
 *Known limit, accepted for now:* a static HTML page is a fine **engineering** contract
 but a weak **client-facing** artifact. If these mocks ever need to double as something
 shown to a client, that wants a different tool (a real design surface, or a
