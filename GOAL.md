@@ -13,6 +13,11 @@
 > ([`docs/ARCH_SECURITY_GATES.md`](docs/ARCH_SECURITY_GATES.md)) — a living per-repo `ARCHITECTURE.md`
 > (intended-map paired with the graphify graph), an approval-gated epic architecture guide, and
 > independent `security` / `architecture` review lenses on the post-work audit.
+>
+> _Current near-term intent (2026-07-28):_ **prove the machinery on a real project** —
+> the **coord web control center** ([`docs/WEB_CONTROL_CENTER.md`](docs/WEB_CONTROL_CENTER.md)),
+> a multi-milestone React app that is simultaneously the deliverable and the deliberate
+> real-world trial of `epic → oracle → drive`. See the near-term section below.
 
 ## 🎯 North star
 
@@ -73,7 +78,45 @@ the critical path** (demoted to Horizon).
 - 📋 **Next, in order:** local interactive lifecycle (Work→Review→Test→Merge) is now complete end-to-end; **leg 4 cont. is remote Test/Merge over SSH (Track B)**. The merge agent supersedes #306's reactive-only conflict-fix with a proactive interactive rebase; #277/#567 (conflict-fix orphan branch, NULL-branch verdict gate) remain open backend hygiene. A1 follow-ups to fold in: the briefing emits both the `REVIEW_VERDICT` block and the report-result reminder; `coord report-result` needs a `--body-file` for full review bodies (see `project_a1_interactive_review`).
 - ✅ **Resolved — where do automated tests gate?** The old open question (CI is pytest-only, so Rust repos had no automated gate) is answered by the **oracle loop** ([`docs/ORACLE_LOOP.md`](docs/ORACLE_LOOP.md), 2026-07-04): acceptance runs above **pluggable framework drivers** (`tui-tuidriver` for Rust/TUI via quadraui's `TuiDriver`, Playwright for web/Electron), routed to a capability-matched machine via `smoke_tests.capability_rules` — so each repo gets a real acceptance+test gate regardless of what CI covers. The worker iterates against a sealed, independently-authored oracle **in-session**, then the coordinator re-runs it externally as the trust gate.
 
-## Near-term priority — Tech Debt sweep (2026-06-25)
+## Near-term priority — prove the machinery on a real project (2026-07-28)
+
+The interactive lifecycle is built. The unattended lifecycle (`coord drive`, milestones
+#49/#50) is close. The open question is no longer *can it run* — it's **whether what it
+produces is good enough to sell**. The user will not offer to build software for clients
+on top of this until the machinery has been proven on a **long, real, multi-epic project
+with a genuine user-visible surface**, rather than on small self-referential stories
+inside the tool that implements it.
+
+**That project is the [coord web control center](docs/WEB_CONTROL_CENTER.md)** — a modern
+responsive React app (phone → 32" monitor), served over Tailscale from dellserver, growing
+toward full `coord-tui` parity and eventually becoming the primary surface for anyone who
+is not the author. It replaces the phone PWA and, for most users, the TUI. The web app is
+the **deliverable**; the **confidence** is the outcome. These two goals are coupled on
+purpose: a dogfood vehicle that is a toy proves nothing, and a product built without
+instrumentation teaches nothing.
+
+**Authored, gated, not dispatched:**
+
+- **M-W0 — web acceptance oracle** (milestone #51, epic #1537). The blocking discovery:
+  `coord/acceptance_drivers.py` supports only `tui-tuidriver` and `cli-pytest` —
+  **`web-playwright` does not exist**, despite `CLAUDE.md` describing it as shipped. The
+  oracle cannot currently gate a line of React. Keystone story #1538: a deterministic
+  seeded-board fixture server (the web twin of `make_test_app(BoardData)`), because
+  acceptance tests that read live fleet state are a flake generator, not an oracle.
+- **M-W1 — responsive shell + design system** (milestone #52, epic #1545).
+- Then: Pipeline read → Pipeline actions → desktop sessions → the remaining panels.
+
+**Dispatch gate: nothing is driven until #1440 lands** (sequence the oracle gates for a
+whole milestone A→work→B→C→D unattended). The point of the trial is to exercise
+*unattended milestone driving*; starting before that gate is manual driving with extra
+steps.
+
+**Standing protocol:** a dogfood story that surfaces a coord process bug **halts** — file
+it, fix it **with a test**, then resume. Shipping around a known process bug forfeits the
+evidence, which is half the point. The scorecard (first-pass acceptance rate, human
+interventions per issue, cost + wall-clock, escaped defects by stage) is in the RFC.
+
+## Near-term priority — Tech Debt sweep (2026-06-25, 17/18 done)
 
 Before new feature work resumes (once the current pipeline clears), the committed near-term objective is the **Tech Debt milestone** (#19, epic #751): decompose the two god-files — `tui/src/app.rs` (~48.7k lines, 97% of the Rust crate) and `coord/cli.py` (~10.6k) — and harden the hand-mirrored cross-language `/board` seams (the #632 blank-board class). Every decomposition issue is a **behavior-preserving** refactor gated on a green black-box regression net (#741); drive the set (#741–#750) to completion as one unit. This is a structural-health investment, not a drift from the north star — it pays down the cost of the very surfaces (the TUI, the CLI, the wire contracts) the interactive control-center is built on.
 
