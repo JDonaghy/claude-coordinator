@@ -253,7 +253,69 @@ class TestReviewRequestChangesNoFix:
         assert detection.reason == "review_request_changes_no_fix"
 
 
-# ── Candidate stall state 2: done, test verdict present, no review ever ────
+# ── Candidate stall state 2: review done, no verdict ever captured (#1582) ──
+
+
+class TestReviewDoneNoVerdict:
+    def test_flags_when_review_done_with_no_verdict(self, config: Config) -> None:
+        """#1582/#812: a review that finalised `done` with `review_verdict
+        IS NULL` matched none of the original three arms — this is the fix."""
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict=None),
+        )
+        results = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        )
+        assert len(results) == 1
+        detection, work = results[0]
+        assert detection.reason == "review_done_no_verdict"
+        assert detection.assignment_id == "work-1"
+        assert "review-1" in detection.detail
+        assert work.assignment_id == "work-1"
+
+    def test_not_flagged_when_review_still_running_no_verdict(
+        self, config: Config
+    ) -> None:
+        """A verdict-less review that hasn't finished yet is not a stall —
+        it's just not done. Distinguishes this arm from a live session."""
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", status="running", review_verdict=None),
+        )
+        results = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        )
+        assert results == []
+
+    def test_not_flagged_when_verdict_is_request_changes(self, config: Config) -> None:
+        """Regression: a real `request-changes` verdict must keep going
+        through `review_request_changes_no_fix`, not this arm."""
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="request-changes"),
+        )
+        results = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        )
+        assert len(results) == 1
+        assert results[0][0].reason == "review_request_changes_no_fix"
+
+    def test_not_flagged_when_verdict_is_approve(self, config: Config) -> None:
+        """Regression: a real `approve` verdict must keep going through the
+        merge-queue checks, not this arm."""
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict="approve"),
+        )
+        results = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        )
+        assert len(results) == 1
+        assert results[0][0].reason == "approved_not_queued"
+
+
+# ── Candidate stall state 3: done, test verdict present, no review ever ────
 
 
 class TestDoneNoReview:
@@ -831,6 +893,172 @@ class TestDispatchPerReason:
         assert action.kind == "no_action"
         assert action.kind not in notify_mod._STALLED_DISPATCH_KINDS
 
+    def test_review_done_no_verdict_recovered_verdict_dispatches_fix(
+        self, config: Config, monkeypatch
+    ) -> None:
+        """#1582: a verdict recovered from the reviewing session's own
+        transcript is run through the SAME auto-loop chokepoint a live
+        review completion would use — a recovered `request-changes` still
+        gets its fix worker."""
+        config.pipeline.auto_dispatch_stalled = True
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict=None),
+        )
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        )[0]
+        assert detection.reason == "review_done_no_verdict"
+
+        monkeypatch.setattr(
+            "coord.diagnose._recover_review_findings",
+            MagicMock(return_value="request-changes"),
+        )
+        stub = MagicMock(return_value=[
+            LoopAction(
+                kind="fix_dispatched", assignment_id="review-1",
+                detail="fix worker fix-9 dispatched to mac-mini (iteration 1/5)",
+            ),
+        ])
+        monkeypatch.setattr("coord.auto_loop.process_review_completion", stub)
+
+        action = notify_mod.dispatch_stalled_pipeline_action(detection, work, board, config)
+
+        assert action.kind == "fix_dispatch_attempted"
+        assert "recovered verdict" in action.detail
+        stub.assert_called_once()
+
+    def test_review_done_no_verdict_recovered_approve_is_not_no_action(
+        self, config: Config, monkeypatch
+    ) -> None:
+        """A recovered `approve` (no fix dispatched) still mutates `board`
+        in place via `process_review_completion` — must classify as
+        `review_transition_applied`, not `no_action` (mirrors the #1478
+        review fix for the `review_request_changes_no_fix` arm)."""
+        config.pipeline.auto_dispatch_stalled = True
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict=None),
+        )
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        )[0]
+
+        monkeypatch.setattr(
+            "coord.diagnose._recover_review_findings", MagicMock(return_value="approve"),
+        )
+        stub = MagicMock(return_value=[
+            LoopAction(
+                kind="approved", assignment_id="review-1",
+                detail="Review verdict: approve — pipeline advancing",
+            ),
+        ])
+        monkeypatch.setattr("coord.auto_loop.process_review_completion", stub)
+
+        action = notify_mod.dispatch_stalled_pipeline_action(detection, work, board, config)
+
+        assert action.kind == "review_transition_applied"
+        assert action.kind in notify_mod._STALLED_DISPATCH_KINDS
+
+    def test_review_done_no_verdict_recovered_but_auto_loop_disabled(
+        self, config: Config, monkeypatch
+    ) -> None:
+        """Recovery still counts as a real dispatch (the verdict was
+        durably persisted) even when `process_review_completion` itself
+        declines outright (e.g. `pipeline.auto_loop` off) — surfaced as its
+        own kind rather than misreported as `no_action`."""
+        config.pipeline.auto_dispatch_stalled = True
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict=None),
+        )
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        )[0]
+
+        monkeypatch.setattr(
+            "coord.diagnose._recover_review_findings", MagicMock(return_value="approve"),
+        )
+        monkeypatch.setattr(
+            "coord.auto_loop.process_review_completion",
+            MagicMock(return_value=[LoopAction(kind="disabled", assignment_id="review-1")]),
+        )
+
+        action = notify_mod.dispatch_stalled_pipeline_action(detection, work, board, config)
+
+        assert action.kind == "review_verdict_recovered"
+        assert action.kind in notify_mod._STALLED_DISPATCH_KINDS
+
+    def test_review_done_no_verdict_resets_and_redispatches(
+        self, config: Config, monkeypatch
+    ) -> None:
+        """#1582 core case: nothing recoverable from the transcript — reset
+        the review stage (delete the review row, clear review_state) and
+        re-dispatch a fresh review. Branch/commits are never touched (the
+        existing `--reset` contract)."""
+        config.pipeline.auto_dispatch_stalled = True
+        work = _work("work-1", test_state="passed")
+        review = _review("work-1", aid="review-1", review_verdict=None)
+        board = _board(work, review)
+        original_branch = work.branch
+
+        detection, work_row = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        )[0]
+        assert detection.reason == "review_done_no_verdict"
+
+        monkeypatch.setattr(
+            "coord.diagnose._recover_review_findings", MagicMock(return_value=None),
+        )
+        new_review = _review(
+            "work-1", aid="review-99", status="pending", review_verdict=None,
+        )
+        dispatch_stub = MagicMock(return_value=new_review)
+        monkeypatch.setattr("coord.review.dispatch_review", dispatch_stub)
+
+        action = notify_mod.dispatch_stalled_pipeline_action(
+            detection, work_row, board, config,
+        )
+
+        assert action.kind == "review_reset_redispatched"
+        assert "review-99" in action.detail
+        dispatch_stub.assert_called_once()
+
+        # The stale review row is gone from the in-memory board (mirrors the
+        # DB delete `_reset_review_stage` performed) — otherwise a later
+        # `write_board` would resurrect it.
+        assert all(
+            a.assignment_id != "review-1" for a in board.active + board.completed
+        )
+        assert work_row.review_state == "pending"
+        assert work_row.review_verdict is None
+        # Branch/commits preserved — the existing `--reset` contract.
+        assert work_row.branch == original_branch
+
+    def test_review_done_no_verdict_reset_declines_when_redispatch_fails(
+        self, config: Config, monkeypatch
+    ) -> None:
+        """`dispatch_review` declining post-reset (no capable machine, etc.)
+        must not be misreported as a successful dispatch."""
+        config.pipeline.auto_dispatch_stalled = True
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict=None),
+        )
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        )[0]
+
+        monkeypatch.setattr(
+            "coord.diagnose._recover_review_findings", MagicMock(return_value=None),
+        )
+        monkeypatch.setattr("coord.review.dispatch_review", MagicMock(return_value=None))
+
+        action = notify_mod.dispatch_stalled_pipeline_action(detection, work, board, config)
+
+        assert action.kind == "no_action"
+        assert action.kind not in notify_mod._STALLED_DISPATCH_KINDS
+
     def test_done_no_review_dispatches_review(self, config: Config, monkeypatch) -> None:
         config.pipeline.auto_dispatch_stalled = True
         board = _board(_work("work-1", test_state="passed"))
@@ -1125,3 +1353,50 @@ class TestSweepStalledPipeline:
         mock_post.assert_not_called()
         notified = state_mod.load_notified()
         assert "work-1:stalled" not in notified
+
+    def test_review_done_no_verdict_reset_persists_and_does_not_refire(
+        self, config: Config, coord_db, monkeypatch
+    ) -> None:
+        """#1582 acceptance: end-to-end through the sweep — the reset is
+        persisted to the canonical DB (old review row gone, work re-
+        reviewable, branch untouched) and a second tick does not re-detect
+        `review_done_no_verdict` while the replacement review is live (in
+        fact not at all — the one-shot ledger locks the row exactly like
+        every other stalled-pipeline reason)."""
+        config.pipeline.auto_dispatch_stalled = True
+        board = _board(
+            _work("work-1", test_state="passed"),
+            _review("work-1", aid="review-1", review_verdict=None),
+        )
+        state_mod.save_board(board)
+
+        monkeypatch.setattr(
+            "coord.diagnose._recover_review_findings", MagicMock(return_value=None),
+        )
+        new_review = _review(
+            "work-1", aid="review-99", status="pending", review_verdict=None,
+        )
+        monkeypatch.setattr(
+            "coord.review.dispatch_review", MagicMock(return_value=new_review),
+        )
+
+        with patch("coord.notify.github_ops.post_issue_comment") as mock_post:
+            first = notify_mod._sweep_stalled_pipeline(config, terminal_cache={})
+            second = notify_mod._sweep_stalled_pipeline(config, terminal_cache={})
+
+        assert len(first) == 1
+        assert first[0].reason == "review_done_no_verdict"
+        assert second == []
+        mock_post.assert_called_once()
+        args, _kwargs = mock_post.call_args
+        assert "auto-dispatched" in args[2].lower()
+
+        persisted = state_mod.load_board()
+        assert persisted.find_by_id("review-1") is None
+        persisted_work = persisted.find_by_id("work-1")
+        assert persisted_work.review_state == "pending"
+        assert persisted_work.review_verdict is None
+        assert persisted_work.branch == "issue-602-fix"
+
+        notified = state_mod.load_notified()
+        assert "work-1:stalled" in notified

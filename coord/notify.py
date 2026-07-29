@@ -111,8 +111,9 @@ class StalledDetection:
     machine_name: str
     repo_name: str
     issue_number: int
-    reason: str  # "review_request_changes_no_fix" | "done_no_review" |
-    # "approved_not_queued" | "merge_conflict_unresolved" (#1478)
+    reason: str  # "review_request_changes_no_fix" | "review_done_no_verdict" |
+    # "done_no_review" | "approved_not_queued" | "merge_conflict_unresolved"
+    # (#1478, #1582)
     detail: str
 
 
@@ -326,7 +327,7 @@ def detect_stalled_pipeline(
     """Scan the board for *done* work chains stuck on an unmet precondition
     that a fresh review/fix transition would already have resolved (#1441).
 
-    Four candidate stall states, checked per pipeline "head" (the most
+    Five candidate stall states, checked per pipeline "head" (the most
     recent work-like assignment for a given (repo, issue) — see
     :func:`_pipeline_heads`):
 
@@ -335,16 +336,27 @@ def detect_stalled_pipeline(
        ever dispatched in response (the vimcode #602 reference case: the
        review's transition fired and was consumed while some other
        precondition was outstanding, and nothing has re-examined it since).
-    2. ``done_no_review`` — the head carries a terminal Test verdict
+    2. ``review_done_no_verdict`` (#1582) — the head's linked review is
+       ``status="done"`` but ``review_verdict IS NULL``: the reviewing
+       session finalised without ever capturing a verdict (#812 — a session
+       that failed to start, or exited before ``coord report-result``/the
+       transcript-floor ran; elitebook's documented ~14% review-verdict
+       drop rate, #873). This matches NONE of the other three arms — it
+       isn't ``request-changes`` (no verdict at all), a review WAS
+       dispatched (so not ``done_no_review``), and there is no approval (so
+       not ``approved_not_queued``) — so before this arm existed it fell
+       through every check and parked the drive forever (#1582's own
+       observed case, #1563).
+    3. ``done_no_review`` — the head carries a terminal Test verdict
        (``passed``/``skipped``), the "review" gate is required, the
        completion is not an interactive (``provider_name="claude-pty"``)
        session (interactive completions are deliberately excluded from
        automatic review dispatch — #555), and yet no review assignment was
        ever dispatched for it.
-    3. ``approved_not_queued`` — the head satisfies every merge gate
+    4. ``approved_not_queued`` — the head satisfies every merge gate
        (:func:`coord.merge_queue.passes_merge_gates` — reused rather than
        re-derived, per #1441's own request) but has no merge-queue entry.
-    4. ``merge_conflict_unresolved`` (#1478) — the head already HAS a
+    5. ``merge_conflict_unresolved`` (#1478) — the head already HAS a
        merge-queue entry, but that entry is parked ``CONFLICT`` with an
        error :func:`coord.merge_queue.classify_conflict` calls
        ``"rebaseable"`` and no conflict-fix attempt is active or already
@@ -445,6 +457,23 @@ def detect_stalled_pipeline(
                     "for it."
                 )
         elif (
+            review is not None
+            and review.status == "done"
+            and review.review_verdict is None
+        ):
+            # #1582: a review that finalised `done` with NO verdict ever
+            # captured. Checked BEFORE the `review is None or review.status
+            # == "done"` catch-all below — that branch's merge-gate check
+            # (`passes_merge_gates`) never fires for a `None` verdict (no
+            # approval), so this row would otherwise fall all the way
+            # through with `reason` left unset.
+            reason = "review_done_no_verdict"
+            detail = (
+                f"Review {review.assignment_id} finalised as done but no "
+                "verdict was ever captured — the session likely failed to "
+                "start or exited before recording one (#812)."
+            )
+        elif (
             review is None
             and "review" in required_gates
             and work.provider_name != "claude-pty"
@@ -535,11 +564,14 @@ class StalledDispatchAction:
     """One of:
     - ``"fix_dispatch_attempted"`` — re-ran the review-completion transition
       (:func:`coord.auto_loop.process_review_completion`) for
-      ``review_request_changes_no_fix`` and it dispatched a fix worker; see
-      *detail* for what it did.
+      ``review_request_changes_no_fix`` (or, #1582, for a
+      ``review_done_no_verdict`` whose verdict was just recovered from the
+      transcript) and it dispatched a fix worker; see *detail* for what it
+      did.
     - ``"review_transition_applied"`` — re-ran
       :func:`coord.auto_loop.process_review_completion` for
-      ``review_request_changes_no_fix`` and it resolved as ``approved``,
+      ``review_request_changes_no_fix`` (or a transcript-recovered
+      ``review_done_no_verdict``, #1582) and it resolved as ``approved``,
       ``approved_with_nits`` (the #476 advisory-only gate), or
       ``terminal_skip`` — no fix worker was dispatched, but the call still
       mutated *board* in place (``review.review_verdict``,
@@ -547,6 +579,18 @@ class StalledDispatchAction:
       per that function's own "the caller is responsible for persisting the
       board after this returns" contract. Must be persisted exactly like a
       real dispatch even though no agent was launched.
+    - ``"review_verdict_recovered"`` — ``review_done_no_verdict``: a verdict
+      was recovered from the reviewing session's own transcript (#617's
+      ``_review_findings_from_transcript``, the same recovery
+      ``coord diagnose --stage review`` runs) and durably persisted, but
+      ``process_review_completion`` made no further board mutation from it
+      (e.g. ``pipeline.auto_loop`` is off). See *detail* for the recovered
+      verdict.
+    - ``"review_reset_redispatched"`` — ``review_done_no_verdict``: nothing
+      was recoverable from the transcript, so the review stage was reset
+      (the review rows deleted, ``work.review_state`` cleared — #1180's
+      ``_reset_review_stage``, branch/commits always kept) and a fresh
+      review dispatched for the same work.
     - ``"review_dispatched"``       — a review was dispatched for
       ``done_no_review``.
     - ``"enqueued"``                — the work was enqueued for merge for
@@ -584,6 +628,8 @@ class StalledDispatchAction:
 _STALLED_DISPATCH_KINDS = frozenset({
     "fix_dispatch_attempted", "review_transition_applied", "review_dispatched",
     "enqueued", "conflict_fix_dispatched",
+    # #1582
+    "review_verdict_recovered", "review_reset_redispatched",
 })
 
 # process_review_completion (and the _dispatch_fix_for_review it may call)
@@ -639,6 +685,15 @@ def dispatch_stalled_pipeline_action(
       on it — the exact function the auto-loop calls the instant a review
       transitions to done, complete with its iteration cap and terminal
       guard.
+    - ``review_done_no_verdict`` (#1582) → :func:`coord.diagnose._recover_review`
+      (the exact recovery ``coord diagnose --stage review`` runs: try the
+      session transcript first). A recovered verdict is then run through
+      :func:`coord.auto_loop.process_review_completion` like a normal
+      transition; nothing recoverable falls through to
+      :func:`coord.diagnose._reset_review_stage` (the exact reset
+      ``coord diagnose --stage review --reset`` runs — keeps the branch,
+      wipes the review rows + review_state) followed by a fresh
+      :func:`coord.review.dispatch_review` call.
     - ``done_no_review`` → :func:`coord.review.dispatch_review`, the same
       call ``detect_transitions``/``dispatch_pending_reviews`` make on a
       fresh work completion.
@@ -715,6 +770,135 @@ def dispatch_stalled_pipeline_action(
         if kind_set & _MUTATING_REVIEW_COMPLETION_KINDS:
             return StalledDispatchAction(kind="review_transition_applied", detail=detail_msg)
         return StalledDispatchAction(kind="no_action", detail=detail_msg)
+
+    if detection.reason == "review_done_no_verdict":
+        # #1582: a review finalised `done` with no verdict ever captured
+        # (#812). Reuse the SAME two steps `coord diagnose --stage review
+        # [--reset]` runs for this exact shape, rather than re-deriving new
+        # recovery/reset logic — `_recover_review`/`_reset_review_stage` are
+        # the private functions behind that command for this branch. Called
+        # directly (not through the full `diagnose_stage` orchestration),
+        # which skips that command's tmux session-state probe and
+        # issue-wide phantom-row cleanup — the review here is already
+        # terminal, so neither applies, and both would add real
+        # subprocess/ssh cost to every notify sweep tick.
+        from coord.diagnose import (  # noqa: PLC0415
+            DiagnoseResult,
+            _recover_review,
+            _reset_review_stage,
+        )
+
+        all_assignments = list(board.active) + list(board.completed)
+        review = next(
+            (
+                a for a in all_assignments
+                if a.review_of_assignment_id == work.assignment_id and a.type == "review"
+            ),
+            None,
+        )
+        if review is None:
+            return StalledDispatchAction(
+                kind="no_action", detail="review no longer found on board",
+            )
+
+        diag = DiagnoseResult(
+            repo_name=work.repo_name, issue_number=work.issue_number, stage="review",
+        )
+        # `state="unknown"` is safe: `_recover_review`'s live/dead-session
+        # branches are only reached when `latest.status != "done"`, which
+        # can't happen here (`detect_stalled_pipeline` only flags this
+        # reason for a `status="done"` review).
+        _recover_review(board, config, review, "unknown", diag, dry_run=False)
+
+        if diag.recovered:
+            # A verdict was recovered from the session transcript and
+            # durably persisted (#617's `_review_findings_from_transcript` →
+            # `issue_store.post_result`). Run it through the SAME auto-loop
+            # chokepoint a live review completion would have used — mirrors
+            # `review_request_changes_no_fix` just above — so a recovered
+            # `request-changes` still gets its fix worker and a recovered
+            # `approve` still advances the pipeline.
+            from coord.auto_loop import process_review_completion  # noqa: PLC0415
+
+            machine_host = next(
+                (m.host for m in config.machines if m.name == review.machine_name), None,
+            )
+            actions = process_review_completion(
+                review, board, config,
+                machine_host=machine_host, terminal_cache=terminal_cache,
+            )
+            kind_set = {a.kind for a in actions}
+            kinds = ", ".join(a.kind for a in actions) or "no_action"
+            details = "; ".join(a.detail for a in actions if a.detail)
+            detail_msg = (
+                "recovered verdict from the session transcript → "
+                f"process_review_completion → {kinds}" + (f" ({details})" if details else "")
+            )
+            if "fix_dispatched" in kind_set:
+                return StalledDispatchAction(kind="fix_dispatch_attempted", detail=detail_msg)
+            if kind_set & _MUTATING_REVIEW_COMPLETION_KINDS:
+                return StalledDispatchAction(kind="review_transition_applied", detail=detail_msg)
+            return StalledDispatchAction(kind="review_verdict_recovered", detail=detail_msg)
+
+        if not diag.needs_reset:
+            return StalledDispatchAction(
+                kind="no_action", detail="; ".join(diag.findings) or "nothing to do",
+            )
+
+        # Nothing recoverable — reset the review stage (delete the review
+        # rows, clear review_state — #1180's `_reset_review_stage`, KEEPS
+        # the branch/commits) and re-dispatch a fresh review.
+        reset_res = DiagnoseResult(
+            repo_name=work.repo_name, issue_number=work.issue_number, stage="review",
+        )
+        _reset_review_stage(
+            config, work.repo_name, work.issue_number, reset_res,
+            dry_run=False, assignment_id=work.assignment_id,
+        )
+        if not reset_res.reset_performed:
+            return StalledDispatchAction(
+                kind="no_action",
+                detail="reset did not complete: " + "; ".join(reset_res.findings),
+            )
+
+        # `_reset_review_stage` writes the canonical DB directly (the same
+        # seam `coord diagnose --reset` uses — see commands/status.py's
+        # "NOTE: deliberately NO save_board" comment for why) WITHOUT
+        # touching `board`. Mirror the same two writes on `board` in place
+        # so a later `write_board` upsert of the now-stale `review`/`work`
+        # objects doesn't resurrect the just-deleted review row or clobber
+        # the just-cleared review_state back to its wedged value.
+        board.active[:] = [
+            a for a in board.active
+            if not (a.type == "review" and a.review_of_assignment_id == work.assignment_id)
+        ]
+        board.completed[:] = [
+            a for a in board.completed
+            if not (a.type == "review" and a.review_of_assignment_id == work.assignment_id)
+        ]
+        work.review_state = "pending"
+        work.review_verdict = None
+        work.review_posted_at = None
+
+        from coord.review import dispatch_review  # noqa: PLC0415
+
+        new_review = dispatch_review(work, board, config, terminal_cache=terminal_cache)
+        if new_review is None:
+            return StalledDispatchAction(
+                kind="no_action",
+                detail=(
+                    "review stage reset (no verdict recoverable) but "
+                    "re-dispatch declined (no machine / already in flight / gate)"
+                ),
+            )
+        return StalledDispatchAction(
+            kind="review_reset_redispatched",
+            detail=(
+                "no verdict recoverable from transcript — reset the review "
+                f"stage and re-dispatched as {new_review.assignment_id} to "
+                f"{new_review.machine_name}"
+            ),
+        )
 
     if detection.reason == "done_no_review":
         from coord.review import dispatch_review  # noqa: PLC0415

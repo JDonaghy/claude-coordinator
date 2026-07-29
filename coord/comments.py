@@ -414,6 +414,7 @@ def format_needs_attention(
 
 _STALLED_REASON_LABELS = {
     "review_request_changes_no_fix": "Review requested changes, no fix dispatched",
+    "review_done_no_verdict": "Review finished with no verdict ever captured (#812)",
     "done_no_review": "Work done, no review ever dispatched",
     "approved_not_queued": "Approved + tested, but not queued for merge",
     "merge_conflict_unresolved": "Merge entry stuck in CONFLICT, no fix attempted",
