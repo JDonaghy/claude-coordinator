@@ -75,6 +75,11 @@ use quadraui::{
     // #953: Terminal-view left-pane machine tree — the app's first direct
     // `backend.draw_tree` sidebar (bypassing `SidebarSystem`).
     SelectionMode, TreePath, TreeStyle, TreeView,
+    // #1124: reusable quadraui help layer (#431) — `?` cheatsheet registry
+    // + `/` command palette. See `plans.rs` module docs.
+    DualModePaletteController, DualModePaletteEvent, HelpAction, HelpNote, HelpOverlayController,
+    HelpOverlayEvent, HelpRegistry, ViewHelp, filter_help_actions, help_actions_to_palette_items,
+    PALETTE_CHROME_ROWS,
 };
 use quadraui::terminal_engine::TerminalMouseKind;
 
@@ -2858,6 +2863,23 @@ pub struct CoordApp {
     /// `merge_queue_sel`.
     milestone_dag_sel: usize,
 
+    // ── #1124: reusable quadraui help layer (`?` cheatsheet + `/` palette) ───
+    /// Registered per-view help content (cheatsheet notes + palette
+    /// actions), keyed by [`SidebarView::help_view_id`]. Populated once in
+    /// [`CoordApp::new`] — currently only `"panel:plans"` is registered;
+    /// see the module docs at the top of `plans.rs` for the pattern other
+    /// panels copy as they adopt `?`/`/`.
+    help_registry: HelpRegistry,
+    /// `?`-triggered cheatsheet overlay state machine, shared across every
+    /// view that registers help content — only one can be open at a time.
+    /// Painted by `plans.rs::render_help_overlay` rather than
+    /// [`HelpOverlayController::render`] — see that function's doc comment
+    /// for why (contract §5b's exact title-string ordering).
+    help_overlay: HelpOverlayController,
+    /// `/`-triggered command palette, shared the same way as
+    /// `help_overlay` above. `None` when closed.
+    command_palette: Option<DualModePaletteController>,
+
     // ── #975: Plans ActivityBar panel ────────────────────────────────────────
     /// Selected plan-roster index (0-based) into `plans_visible_entries()`'s
     /// return order (#1001: the currently-*rendered* rows, not the full
@@ -3468,6 +3490,15 @@ impl CoordApp {
             merge_queue_scroll: 0,
             // #771: Milestone DAG panel — selection starts at the top.
             milestone_dag_sel: 0,
+            // #1124: reusable help layer — registered once at startup;
+            // see `plans.rs::plans_view_help`.
+            help_registry: {
+                let mut registry = HelpRegistry::new();
+                registry.register("panel:plans", CoordApp::plans_view_help());
+                registry
+            },
+            help_overlay: HelpOverlayController::new(),
+            command_palette: None,
             // #975: Plans panel — selection starts at the top.
             plans_sel: 0,
             // #1001: no repo starts expanded — untracked milestones default
@@ -7433,13 +7464,25 @@ impl CoordApp {
                 " j/k=nav  a=merge-all-ready  m=merge-only-this  M=force-merge  d=drop  s=interactive{}  q=quit ",
                 attn
             )
+        } else if self.active_view == SidebarView::Plans
+            && (self.help_overlay.is_open() || self.command_palette.is_some())
+        {
+            // #1124 contract §5i: both the `?` cheatsheet and the `/`
+            // command palette are modal overlays over the Plans panel —
+            // Esc closes whichever is open. Must precede the general
+            // Plans-view arm just below, which this shadows while either
+            // surface is up. No `q=quit` here — both surfaces own ALL
+            // input while open (`events.rs`), so a typed `q` is swallowed
+            // (or filters the palette query), not a quit.
+            " Esc=close ".to_string()
         } else if self.active_view == SidebarView::Plans {
             // #977 review: the fast plan-capture key (`c`) had no visible
             // hint anywhere — surface it here alongside the other Plans
             // panel bindings so it's discoverable without reading the diff.
             // #1001: `u` toggles the "+N without a work order" collapse for
             // the selected row's repo — same discoverability bar.
-            " j/k=nav  Enter=open epic  c=capture plan  u=toggle untracked  q=quit ".to_string()
+            // #1124: `?`/`/` open the help overlay / command palette.
+            " j/k=nav  Enter=open epic  c=capture plan  u=toggle untracked  ?=help  /=palette  q=quit ".to_string()
         } else if self.active_view == SidebarView::Sessions {
             // #1033: mirrors the retired #628 live-sessions overlay's
             // footer hint verbatim ([r]eattach / [K]ill / [f]stop), now

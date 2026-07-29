@@ -42,6 +42,37 @@
 //! show one of two distinct messages: "No plans yet" for a true-empty
 //! roster, or a "Plans unavailable" pointer to upgrade/connect a daemon
 //! otherwise.
+//!
+//! **`?` help overlay + `/` command palette (#1124).** Populates the
+//! reusable quadraui help layer (#431 — `HelpRegistry` / `ViewHelp` /
+//! `HelpOverlayController` / `DualModePaletteController`) for this panel —
+//! the pattern other panels are meant to copy as they adopt `?`/`/`:
+//!
+//! 1. Register a [`ViewHelp`] under a `"panel:X"` key in
+//!    [`CoordApp::new`] (`SidebarView::help_view_id` is the inverse lookup
+//!    from the active view back to that key).
+//! 2. That's it — the shared `help_overlay`/`command_palette` fields and
+//!    the generic open-trigger / owns-all-input dispatch in `events.rs`,
+//!    the `Esc=close` status-bar hint in `mod.rs::status_bar`, and the
+//!    paint calls in `render.rs::render_content` all key off
+//!    `help_view_id()` already, so a newly-registered view gets `?`/`/`
+//!    for free.
+//!
+//! **Why the cheatsheet is painted by a local `render_help_overlay`
+//! instead of [`HelpOverlayController::render`].** That method hardcodes
+//! the title format as `"Help — {title}"`; ms-38 contract §5b pins the
+//! *opposite* order, `"Plans — Help"`. quadraui is a dependency here, not
+//! modified in place (see CLAUDE.md) — a title-order override belongs in a
+//! follow-up quadraui PR, not an inline edit — so this file reuses the
+//! `HelpRegistry`/`ViewHelp` *data* model (the reusable part of #431) but
+//! rolls its own small paint routine (built from this file's existing
+//! `ListView` pattern, not quadraui's `Panel`/`TextDisplay`) to get the
+//! exact required title. The overlay's open/close *state machine*
+//! (`HelpOverlayController::handle`) is reused as-is — only rendering is
+//! local. Likewise the command palette reuses
+//! `DualModePaletteController`'s state machine verbatim and only adds a
+//! thin "{title} actions" section-label strip above its popup, since
+//! `PaletteItem` has no header/separator concept to hang that label on.
 #[allow(unused_imports)]
 use super::*;
 
@@ -1137,6 +1168,427 @@ impl CoordApp {
             format!("\"{label_title}\" ({repo}) — opening steward chat…")
         };
         self.push_toast("New milestone chat", &msg, ToastSeverity::Info);
+    }
+
+    // ─── #1124: `?` help overlay + `/` command palette ────────────────────
+
+    /// The reusable quadraui help-layer content for the Plans panel
+    /// (contract §5, ms-38 CC-4), registered under `"panel:plans"` in
+    /// [`CoordApp::new`]. See the module docs above for the overall
+    /// pattern.
+    ///
+    /// `notes` carries the keyboard-binding cheatsheet entries (contract
+    /// §5c) — reference-only, so they're never offered as palette
+    /// commands. `actions` carries the 8 real Plans commands (contract
+    /// §5g) and feeds BOTH the cheatsheet's "Actions" section AND the `/`
+    /// palette — one registration, two surfaces (quadraui #431's design
+    /// intent). Three actions (`capture-plan-quick`, `capture-plan-chat`,
+    /// `toggle-untracked`) double as §5c cheatsheet entries too: their
+    /// `description` is deliberately worded to start with the exact
+    /// lowercase phrase §5c requires (`"quick capture plan"`, `"guided
+    /// chat (new plan)"`, `"toggle untracked milestones"`) while still
+    /// reading as a real description rather than an echo of the label.
+    ///
+    /// The health-chip legend (contract §5d) is intentionally NOT part of
+    /// this `ViewHelp` — `needs_you` chip iconography
+    /// (`health_chip_for_signal`) is a Plans-domain concept, not a generic
+    /// one every future panel would have, so `render_help_overlay` appends
+    /// it directly for `SidebarView::Plans` rather than modeling it here.
+    pub(crate) fn plans_view_help() -> ViewHelp {
+        ViewHelp::new("Plans")
+            .with_notes(vec![
+                HelpNote::new("j / k", "up / down"),
+                HelpNote::new("right-click", "open context menu"),
+                HelpNote::new("Enter", "open detail pane"),
+                HelpNote::new("Esc", "close / back"),
+                HelpNote::new("?", "this help overlay"),
+                HelpNote::new("/", "command palette"),
+                HelpNote::new("r", "refresh"),
+                HelpNote::new("q", "quit"),
+            ])
+            .with_actions(vec![
+                HelpAction::new(
+                    "dispatch-milestone",
+                    "Dispatch milestone",
+                    "dispatch selected plan's ready frontier",
+                ),
+                HelpAction::new(
+                    "open-milestone-chat",
+                    "Open milestone chat",
+                    "open a steward chat for the selected plan",
+                ),
+                HelpAction::new(
+                    "capture-plan-quick",
+                    "Quick capture plan",
+                    "quick capture plan (coord milestone capture, fast stub)",
+                )
+                .with_accelerator("c"),
+                HelpAction::new(
+                    "capture-plan-chat",
+                    "Guided chat (new plan)",
+                    "guided chat (new plan) — coord milestone chat --new",
+                )
+                .with_accelerator("C"),
+                HelpAction::new(
+                    "view-milestone-order",
+                    "View order / DAG",
+                    "show work-order dependency graph",
+                ),
+                HelpAction::new(
+                    "edit-milestone",
+                    "Edit milestone…",
+                    "edit milestone title / description",
+                ),
+                HelpAction::new(
+                    "add-issue-to-milestone",
+                    "Add issue to milestone…",
+                    "attach an issue to this plan",
+                ),
+                HelpAction::new(
+                    "toggle-untracked",
+                    "Toggle untracked milestones",
+                    "toggle untracked milestones (show/hide milestones without a work order)",
+                )
+                .with_accelerator("u"),
+            ])
+    }
+
+    /// Popup geometry shared by the `?` cheatsheet and the `/` palette
+    /// (#1124): inset from the main content rect rather than the quadraui
+    /// demo's 70% — the cheatsheet alone runs to ~20 lines once the
+    /// health-chip legend is appended, and a small popup would silently
+    /// clip content with no scroll implemented (see `render_help_overlay`).
+    fn help_overlay_rect(main: Rect) -> Rect {
+        let w = (main.width - 4.0).max(20.0).min(main.width);
+        let h = (main.height - 2.0).max(10.0).min(main.height);
+        let x = main.x + (main.width - w) * 0.5;
+        let y = main.y + (main.height - h) * 0.5;
+        Rect::new(x, y, w, h)
+    }
+
+    /// Paint the `?` help-overlay cheatsheet (contract §5a-§5d) — a no-op
+    /// when closed, or when the active view has no registered help
+    /// content (shouldn't happen for any view that can actually open the
+    /// overlay — see `events.rs`'s open-trigger gate on `help_view_id`).
+    ///
+    /// Built directly from this file's existing `ListView`/`ListItem`
+    /// pattern rather than `HelpOverlayController::render` — see the
+    /// module docs for why (contract §5b's title-string ordering).
+    pub(crate) fn render_help_overlay(&self, backend: &mut dyn Backend, main: Rect, lh: f32) {
+        if !self.help_overlay.is_open() {
+            return;
+        }
+        let Some(view_id) = self.active_view.help_view_id() else {
+            return;
+        };
+        let Some(help) = self.help_registry.get(view_id) else {
+            return;
+        };
+        let rect = Self::help_overlay_rect(main);
+
+        let mut items = Vec::with_capacity(help.notes.len() + help.actions.len() + 8);
+        if !help.notes.is_empty() {
+            items.push(cheatsheet_header_item("Reference"));
+            for note in &help.notes {
+                items.push(cheatsheet_entry_item(&note.label, None, &note.description));
+            }
+        }
+        if !help.actions.is_empty() {
+            items.push(cheatsheet_header_item("Actions"));
+            for action in &help.actions {
+                items.push(cheatsheet_entry_item(
+                    &action.label,
+                    action.accelerator.as_deref(),
+                    &action.description,
+                ));
+            }
+        }
+        // Plans-specific health-chip legend (contract §5d) — see the
+        // `plans_view_help` doc comment for why this isn't part of the
+        // registered `ViewHelp` itself.
+        if self.active_view == SidebarView::Plans {
+            items.push(cheatsheet_header_item("Health chips"));
+            for signal in ["ready_waiting", "stalled", "chat_pending", "no_work_order"] {
+                let (label, color) = Self::health_chip_for_signal(signal);
+                items.push(chip_legend_item(&label, color, health_chip_description(signal)));
+            }
+        }
+        items.push(ListItem {
+            text: StyledText {
+                spans: vec![StyledSpan::with_fg(
+                    "(Esc to close)".to_string(),
+                    Color::rgb(140, 140, 150),
+                )],
+            },
+            icon: None,
+            detail: None,
+            decoration: Decoration::Muted,
+        });
+
+        let visible_rows = if lh > 0.0 {
+            (rect.height / lh).floor() as usize
+        } else {
+            usize::MAX
+        };
+        let total = items.len();
+        backend.draw_list(
+            rect,
+            &ListView {
+                id: WidgetId::new("help-overlay"),
+                // Contract §5b: the exact title is "Plans — Help" (title
+                // first) — the reverse of `HelpOverlayController::render`'s
+                // baked-in "Help — {title}" (see the module docs).
+                title: Some(StyledText::plain(format!("{} — Help", help.title))),
+                items,
+                selected_idx: 0,
+                scroll_offset: 0,
+                has_focus: false,
+                bordered: true,
+                h_scroll: 0,
+                max_content_width: None,
+                show_v_scrollbar: total > visible_rows,
+            },
+        );
+    }
+
+    /// Shared geometry: the `/` command-palette's inner popup rect, below
+    /// the "{title} actions" section-label strip — used by both the paint
+    /// path (`render_command_palette`) and the `visible_rows` calculation
+    /// in `dispatch_handle`'s palette key routing, so the two can never
+    /// drift apart (mirrors `plans_list_rect_below_goal_header`'s existing
+    /// reasoning in this file).
+    pub(crate) fn command_palette_popup_rect(main: Rect, lh: f32) -> Rect {
+        let outer = Self::help_overlay_rect(main);
+        let label_h = lh.max(1.0);
+        Rect::new(
+            outer.x,
+            outer.y + label_h,
+            outer.width,
+            (outer.height - label_h).max(0.0),
+        )
+    }
+
+    /// Paint the `/` command palette (contract §5e-§5h) — a no-op when
+    /// closed.
+    ///
+    /// The palette's own title is left as the generic `"command palette"`
+    /// (contract §5f); the view-specific `"{title} actions"` section label
+    /// (also required by §5f, and what distinguishes this from the help
+    /// overlay's own `"command palette"` mention, see §5c) is painted as a
+    /// thin non-bordered strip immediately above the `Palette` primitive's
+    /// popup rather than as a `PaletteItem` row — `PaletteItem` has no
+    /// header/separator concept (unlike `ListItem`'s `Decoration::Header`),
+    /// so a label baked into the item list would occupy a real,
+    /// keyboard-selectable slot and would reset-select to it on every
+    /// keystroke (`DualModePaletteController::set_items` always resets
+    /// `selected` to 0).
+    pub(crate) fn render_command_palette(&self, backend: &mut dyn Backend, main: Rect, lh: f32) {
+        let Some(palette) = &self.command_palette else {
+            return;
+        };
+        let Some(view_id) = self.active_view.help_view_id() else {
+            return;
+        };
+        let Some(help) = self.help_registry.get(view_id) else {
+            return;
+        };
+        let outer = Self::help_overlay_rect(main);
+        let label_h = lh.max(1.0);
+        let label_rect = Rect::new(
+            outer.x + 1.0,
+            outer.y,
+            (outer.width - 2.0).max(0.0),
+            label_h,
+        );
+        backend.draw_list(
+            label_rect,
+            &ListView {
+                id: WidgetId::new("command-palette-section-label"),
+                title: None,
+                items: vec![ListItem {
+                    text: StyledText {
+                        spans: vec![StyledSpan::with_fg(
+                            format!(" {} actions ", help.title),
+                            Color::rgb(140, 180, 210),
+                        )],
+                    },
+                    icon: None,
+                    detail: None,
+                    decoration: Decoration::Header,
+                }],
+                selected_idx: 0,
+                scroll_offset: 0,
+                has_focus: false,
+                bordered: false,
+                h_scroll: 0,
+                max_content_width: None,
+                show_v_scrollbar: false,
+            },
+        );
+        let popup = Self::command_palette_popup_rect(main, lh);
+        palette.render(popup, backend);
+    }
+
+    /// Registered actions for the currently active help-registry view
+    /// (today only Plans), filtered by `query` (empty = unfiltered — see
+    /// [`filter_help_actions`]). Shared by `open_command_palette` (initial
+    /// build) and the `QueryChanged` re-filter as the user types (contract
+    /// §5h), and by `ItemConfirmed` to map the confirmed index back to the
+    /// `HelpAction` it displayed (mirrors quadraui's own
+    /// `examples/common/help_layer_demo.rs` recompute-on-query pattern).
+    pub(crate) fn active_view_command_actions(&self, query: &str) -> Vec<HelpAction> {
+        let all = self
+            .active_view
+            .help_view_id()
+            .and_then(|id| self.help_registry.get(id))
+            .map(|h| h.actions.clone())
+            .unwrap_or_default();
+        filter_help_actions(&all, query).into_iter().cloned().collect()
+    }
+
+    /// Open the `/` command palette for the active help-registry view
+    /// (contract §5e-§5h). No-ops silently if the active view has no
+    /// registered help — callers gate on `help_view_id().is_some()` first
+    /// (`events.rs`), so this should always find content in practice.
+    pub(crate) fn open_command_palette(&mut self) {
+        let items = help_actions_to_palette_items(&self.active_view_command_actions(""), "");
+        self.command_palette = Some(
+            DualModePaletteController::new("command palette", None, items)
+                .with_id("plans-command-palette"),
+        );
+    }
+
+    /// Execute the command bound to `action_id` when a `/` palette entry
+    /// is confirmed (contract §5g). Three of the eight registered Plans
+    /// actions (`capture-plan-quick`, `capture-plan-chat`,
+    /// `toggle-untracked`) are Plans-native and already have dedicated
+    /// handlers in this file; the other five (`dispatch-milestone`,
+    /// `open-milestone-chat`, `view-milestone-order`, `edit-milestone`,
+    /// `add-issue-to-milestone`) are the existing MilestoneHeader
+    /// context-menu actions (`dialogs.rs::dispatch_context_menu_action`) —
+    /// reused here rather than re-implemented, building the same
+    /// `ContextMenuTarget::MilestoneHeader` that right-clicking a Plans row
+    /// already builds in `context_menu_target_for_selection`. Those five
+    /// require the selected plan to carry a tracking epic
+    /// (`tracking_issue: Some`) — the same precondition the context-menu
+    /// path enforces — so a stub row (no epic yet) gets an explanatory
+    /// toast instead of silently no-op-ing, matching this file's existing
+    /// `open_selected_plan_tracking_epic` convention.
+    pub(crate) fn activate_command_palette_action(&mut self, action_id: &str) {
+        match action_id {
+            "capture-plan-quick" => {
+                self.pending_plan_capture = Some(String::new());
+            }
+            "capture-plan-chat" => {
+                self.pending_new_milestone_chat = Some(String::new());
+            }
+            "toggle-untracked" => {
+                self.toggle_plans_repo_expansion();
+            }
+            "dispatch-milestone" | "open-milestone-chat" | "view-milestone-order"
+            | "edit-milestone" | "add-issue-to-milestone" => {
+                match self
+                    .plans_selected()
+                    .and_then(|e| e.tracking_issue.map(|t| (e, t)))
+                {
+                    Some((entry, tracking_issue)) => {
+                        let target = ContextMenuTarget::MilestoneHeader {
+                            repo_name: entry.repo.clone(),
+                            tracking_issue,
+                            milestone_title: entry.title.clone(),
+                            milestone_number: entry.milestone_number,
+                        };
+                        self.dispatch_context_menu_action(action_id, &target);
+                    }
+                    None => {
+                        self.push_toast(
+                            "Plans action",
+                            "Select a plan with a tracking epic first.",
+                            ToastSeverity::Info,
+                        );
+                    }
+                }
+            }
+            _ => {
+                self.push_toast(
+                    "Plans action",
+                    &format!("No handler for `{action_id}` — likely a stale id."),
+                    ToastSeverity::Warning,
+                );
+            }
+        }
+    }
+}
+
+/// Health-chip legend description text (contract §5d) — kept alongside
+/// `health_chip_for_signal` in spirit (same signal vocabulary) but
+/// separate since the icon/color and the legend prose are independent
+/// concerns. Falls back to a generic phrase for an unrecognised signal so
+/// a newer daemon's not-yet-known `needs_you` value still gets *some*
+/// legend text instead of an empty description.
+fn health_chip_description(signal: &str) -> &'static str {
+    match signal {
+        "ready_waiting" => "issues ready to dispatch now",
+        "stalled" => "work order exists but nothing moving",
+        "chat_pending" => "a milestone-chat steward is open",
+        "no_work_order" => "milestone has no ## Work order block",
+        _ => "unrecognised signal",
+    }
+}
+
+/// Bold section-header `ListItem` for the `?` cheatsheet (#1124) — mirrors
+/// this file's other `Decoration::Header` rows (e.g. the repo-group header
+/// in `render_plans_panel`).
+fn cheatsheet_header_item(text: &str) -> ListItem {
+    ListItem {
+        text: StyledText {
+            spans: vec![StyledSpan {
+                bold: true,
+                ..StyledSpan::with_fg(text.to_string(), Color::rgb(140, 180, 210))
+            }],
+        },
+        icon: None,
+        detail: None,
+        decoration: Decoration::Header,
+    }
+}
+
+/// One cheatsheet row: `label` (padded), optional `accelerator` (padded),
+/// then `description` — same fixed-character-width column layout as
+/// quadraui's own `build_cheatsheet_lines` (`compose/help_layer.rs`), so
+/// the two visually match if a reader compares this panel against a
+/// future one that DOES use the stock `HelpOverlayController::render`.
+fn cheatsheet_entry_item(label: &str, accelerator: Option<&str>, description: &str) -> ListItem {
+    let text = format!(
+        "  {:<28}{:<14}{}",
+        label,
+        accelerator.unwrap_or(""),
+        description
+    );
+    ListItem {
+        text: StyledText {
+            spans: vec![StyledSpan::with_fg(text, Color::rgb(200, 200, 200))],
+        },
+        icon: None,
+        detail: None,
+        decoration: Decoration::Normal,
+    }
+}
+
+/// One health-chip legend row: the coloured chip label (matching
+/// `health_chip_for_signal`'s on-screen rendering exactly) followed by its
+/// description.
+fn chip_legend_item(chip_label: &str, chip_color: Color, description: &str) -> ListItem {
+    ListItem {
+        text: StyledText {
+            spans: vec![
+                StyledSpan::with_fg(format!("  {:<20}", chip_label), chip_color),
+                StyledSpan::with_fg(description.to_string(), Color::rgb(180, 180, 190)),
+            ],
+        },
+        icon: None,
+        detail: None,
+        decoration: Decoration::Normal,
     }
 }
 

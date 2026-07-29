@@ -261,6 +261,16 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         merge_queue_scroll: 0,
         // #771
         milestone_dag_sel: 0,
+        // #1124: same registration `CoordApp::new()` does — fixtures must
+        // not skip it, or a test driving the Plans `?`/`/` surfaces would
+        // find an empty registry regardless of what it exercises.
+        help_registry: {
+            let mut registry = HelpRegistry::new();
+            registry.register("panel:plans", CoordApp::plans_view_help());
+            registry
+        },
+        help_overlay: HelpOverlayController::new(),
+        command_palette: None,
         // #975
         plans_sel: 0,
         // #1001
