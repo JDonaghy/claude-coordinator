@@ -53,11 +53,18 @@ _BUCKET_CONCLUSIONS: dict[str, str] = {
 }
 
 
+def _normalize_bucket(bucket: str) -> str:
+    """Lowercase/None-safe normalisation of gh's ``bucket`` field, shared by
+    :func:`_status_from_bucket` and :func:`_conclusion_from_bucket` so the two
+    don't each repeat the same ``(bucket or "").lower()`` guard."""
+    return (bucket or "").lower()
+
+
 def _status_from_bucket(bucket: str) -> str:
     """Map gh's ``bucket`` to the CheckRun lifecycle enum ("in_progress" or
     "completed" — gh's own `--json bucket` doc lists no other pending-like
     value, so anything other than "pending" is treated as decided)."""
-    return "in_progress" if (bucket or "").lower() == "pending" else "completed"
+    return "in_progress" if _normalize_bucket(bucket) == "pending" else "completed"
 
 
 def _conclusion_from_bucket(bucket: str) -> str | None:
@@ -70,7 +77,7 @@ def _conclusion_from_bucket(bucket: str) -> str | None:
     being silently treated as passing, mirroring #1525's fail-closed
     synthetic-unreadable-check conclusion.
     """
-    b = (bucket or "").lower()
+    b = _normalize_bucket(bucket)
     if b == "pending":
         return None
     return _BUCKET_CONCLUSIONS.get(b, "unknown")
@@ -118,6 +125,18 @@ class GitHubCi:
     def _fetch(self, repo: str, number: int) -> list[CheckRun]:
         try:
             raw = github_ops.get_pr_checks(repo, number)
+        except github_ops.GhTooOldForJsonChecks as e:
+            # #1564 Addendum 2: caught *ahead of* the generic RuntimeError
+            # branch below — a `gh` too old to support `pr checks --json` at
+            # all is a known, fixable host misconfiguration (upgrade gh on
+            # whichever host runs the merge gate), not an auth/network flake.
+            # `str(e)` already carries the actionable host + version-floor
+            # message built by `github_ops._gh_too_old_message`; surfacing it
+            # through a distinctly-named synthetic check (rather than folding
+            # it into `_unreadable_check`'s generic wording) means an operator
+            # reading the merge refusal never has to guess which of the two
+            # this was.
+            return [_gh_too_old_check(repo, number, str(e))]
         except (FileNotFoundError, subprocess.TimeoutExpired, RuntimeError, ValueError) as e:
             # #1525: a `gh pr checks` read that outright failed (gh missing,
             # timeout, non-zero exit with no stdout, unparseable JSON) used
@@ -158,6 +177,32 @@ def _unreadable_check(repo: str, number: int, detail: str) -> CheckRun:
     """
     return CheckRun(
         name=f"coord: could not read CI status for {repo}#{number} ({detail})",
+        status="completed",
+        conclusion="unknown",
+        url="",
+        run_id="",
+        started_at=None,
+        completed_at=None,
+    )
+
+
+def _gh_too_old_check(repo: str, number: int, detail: str) -> CheckRun:
+    """Synthetic :class:`CheckRun` for "gh is too old to support `pr checks
+    --json` at all" (#1564 Addendum 2) — deliberately worded and named
+    differently from :func:`_unreadable_check` so the merge gate's refusal
+    is unambiguous about *which* of the two this is: a known, fixable host
+    misconfiguration (wrong gh version on the host running the gate), not a
+    generic/transient read failure (auth, network, rate-limit). ``detail``
+    is :class:`coord.github_ops.GhTooOldForJsonChecks`'s message, which
+    already names the offending host and the required gh version.
+
+    Still ``conclusion="unknown"`` (not in
+    :data:`coord.ci_store._PASSING_CONCLUSIONS`) so the gate still fails
+    closed and blocks the merge — #1525's fail-closed rule is not weakened,
+    only the diagnosis attached to the block is sharper.
+    """
+    return CheckRun(
+        name=f"coord: gh is too old to read CI status for {repo}#{number} ({detail})",
         status="completed",
         conclusion="unknown",
         url="",

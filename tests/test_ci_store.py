@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 import pytest
 
+from coord import github_ops
 from coord.ci_github import GitHubCi
 from coord.ci_store import (
     CheckRun,
@@ -136,8 +137,10 @@ class TestBuildCiStore:
 
 # ── GitHubCi backend (subprocess mocked) ─────────────────────────────────────
 
-def _gh_result(stdout: str = "[]", returncode: int = 0) -> subprocess.CompletedProcess:
-    return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr="")
+def _gh_result(
+    stdout: str = "[]", returncode: int = 0, stderr: str = ""
+) -> subprocess.CompletedProcess:
+    return subprocess.CompletedProcess(args=[], returncode=returncode, stdout=stdout, stderr=stderr)
 
 
 # #1564: this is the *real* shape `gh pr checks --json name,state,bucket,
@@ -262,6 +265,32 @@ class TestGitHubCi:
         ):
             checks = store.list_checks_for_pr("acme/api", 42)
         assert len(checks) == 3
+
+    def test_gh_too_old_for_json_flag_yields_distinct_actionable_check(self) -> None:
+        """#1564 Addendum 2: dellserver's gh 2.45.0 doesn't support `--json`
+        on `pr checks` at all — confirmed real-world shape is `unknown flag:
+        --json`, rc=1, empty stdout. That must fail closed (same as any
+        other unreadable-CI read failure) but be surfaced *distinctly* —
+        naming the version floor and gh's actual version — instead of the
+        same undiagnosable "could not read CI status" text used for
+        auth/network flakes.
+        """
+        store = GitHubCi()
+        checks_result = _gh_result("", returncode=1, stderr="unknown flag: --json")
+        version_result = _gh_result("gh version 2.45.0 (2024-01-01)\n")
+        with patch(
+            "coord.ci_github.subprocess.run",
+            side_effect=[checks_result, version_result],
+        ):
+            checks = store.list_checks_for_pr("acme/api", 42)
+        assert len(checks) == 1
+        assert checks[0].conclusion == "unknown"
+        assert failed_checks(checks) == checks  # still fails closed, #1525
+        assert "2.45.0" in checks[0].name
+        assert github_ops.GH_PR_CHECKS_JSON_MIN_VERSION in checks[0].name
+        # Distinguishable from the generic unreadable-check wording so an
+        # operator never has to guess which of the two this was.
+        assert "could not read CI status" not in checks[0].name
 
     def test_handles_missing_gh(self) -> None:
         # #1525: a read failure must fail CLOSED — a synthetic "unknown"
