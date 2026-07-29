@@ -1,0 +1,33 @@
+# Acceptance manifest for milestone ms-38 ("Plans panel -> rich client",
+# tracking issue #1120). Maps each acceptance test-id -> the work-order issue
+# it covers.
+#
+# Test-ids are the libtest `name` emitted by `cargo test --test acceptance`
+# (module-qualified fn path). The slice files live in this directory and are
+# `include!`d at crate root by `tui/tests/acceptance.rs`.
+#
+# Merged (never clobbered) across issues by coord.acceptance.load_manifest —
+# #1122 (CC-2 detail pane) and #1123 (CC-3 right-click menus) append their own
+# entries here when their slices are authored just-in-time.
+tests:
+  # ── #1124 (CC-4) — `?` help overlay + command palette (contract §5) ──────
+  # §5a/§5b — overlay trigger + title
+  plans_help_1124::help_overlay_opens_on_question_mark: 1124
+  # §5c — required key entries
+  plans_help_1124::help_overlay_lists_key_entries: 1124
+  # §5d — health-chip legend
+  plans_help_1124::help_overlay_health_chip_legend: 1124
+  # §5i — status bar while the overlay is open
+  plans_help_1124::help_overlay_status_bar_shows_esc_close: 1124
+  # §5a — Esc closes the overlay
+  plans_help_1124::help_overlay_esc_closes: 1124
+  # §5e/§5f — palette trigger (`/`, locked 2026-07-28) + title
+  plans_help_1124::palette_opens_on_slash: 1124
+  # §5g — registered Plans action entries
+  plans_help_1124::palette_lists_plans_actions: 1124
+  # §5h — search filtering
+  plans_help_1124::palette_search_filters_entries: 1124
+  # §5i — status bar while the palette is open
+  plans_help_1124::palette_status_bar_shows_esc_close: 1124
+  # §5e — Esc closes the palette
+  plans_help_1124::palette_esc_closes: 1124
