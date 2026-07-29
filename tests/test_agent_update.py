@@ -255,6 +255,53 @@ class TestUpdateEndpoint:
         assert any("install" in c and "--upgrade" in c for c in pip_cmds)
         server.shutdown()
 
+    def test_update_pins_target_version_when_supplied(self, tmp_path: Path) -> None:
+        """#1568: when the caller supplies target_version, pip must be
+        pinned to that exact release (claude-coordinator==X.Y.Z) instead
+        of a bare --upgrade — this turns a stale PyPI index/cache into a
+        loud pip failure instead of a silent no-op resolving to old code."""
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **_kwargs):
+            calls.append(list(cmd))
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with (
+            patch("coord.agent_app._detect_install_mode", return_value=(False, None)),
+            patch("coord.agent_app.subprocess.run", side_effect=fake_run),
+        ):
+            client, server = _make_client(tmp_path)
+            client.post("/update", json={"target_version": "9.9.9"})
+            _wait_until(lambda: any("install" in c for c in calls))
+
+        pip_cmds = [c for c in calls if "pip" in " ".join(c) or "install" in c]
+        assert pip_cmds, "expected a pip call"
+        assert any("claude-coordinator==9.9.9" in c for c in pip_cmds[0]), pip_cmds
+        server.shutdown()
+
+    def test_update_omits_pin_when_no_target_version(self, tmp_path: Path) -> None:
+        """Backward compat: no target_version in the request body means a
+        bare --upgrade, same as before #1568."""
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **_kwargs):
+            calls.append(list(cmd))
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with (
+            patch("coord.agent_app._detect_install_mode", return_value=(False, None)),
+            patch("coord.agent_app.subprocess.run", side_effect=fake_run),
+        ):
+            client, server = _make_client(tmp_path)
+            client.post("/update")
+            _wait_until(lambda: any("install" in c for c in calls))
+
+        pip_cmds = [c for c in calls if "install" in c]
+        assert pip_cmds, "expected a pip call"
+        assert "claude-coordinator" in pip_cmds[0]
+        assert not any("==" in arg for arg in pip_cmds[0])
+        server.shutdown()
+
     def test_update_last_update_shows_upgraded_even_if_exec_restart_raises(
         self, tmp_path: Path
     ) -> None:
@@ -481,6 +528,58 @@ class TestDetectInstallMode:
         assert path is None
 
 
+# ── _escalate_restart ────────────────────────────────────────────────────
+
+
+class TestEscalateRestart:
+    def test_runs_systemctl_restart_with_load_bearing_env_prefix(self) -> None:
+        """#404 / #1568: XDG_RUNTIME_DIR=/run/user/$(id -u) is load-bearing —
+        a bare `systemctl --user restart` silently no-ops over SSH."""
+        from coord.commands.agent_ops import _escalate_restart
+
+        machine = MagicMock()
+        machine.host = "dellserver.tailnet"
+
+        with patch("coord.commands.agent_ops.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            ok = _escalate_restart(machine)
+
+        assert ok is True
+        cmd = mock_run.call_args[0][0]
+        assert cmd[0] == "ssh"
+        assert "dellserver.tailnet" in cmd
+        joined = " ".join(cmd)
+        assert "XDG_RUNTIME_DIR=/run/user/$(id -u)" in joined
+        assert "systemctl --user restart coord-agent" in joined
+
+    def test_returns_false_on_nonzero_exit(self) -> None:
+        from coord.commands.agent_ops import _escalate_restart
+
+        machine = MagicMock()
+        machine.host = "dellserver.tailnet"
+
+        with patch("coord.commands.agent_ops.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=255, stdout="", stderr="ssh: connect timeout")
+            ok = _escalate_restart(machine)
+
+        assert ok is False
+
+    def test_returns_false_when_ssh_raises(self) -> None:
+        """Unreachable host, no ssh binary, etc. must not crash the CLI."""
+        from coord.commands.agent_ops import _escalate_restart
+
+        machine = MagicMock()
+        machine.host = "dellserver.tailnet"
+
+        with patch(
+            "coord.commands.agent_ops.subprocess.run",
+            side_effect=FileNotFoundError("no ssh binary"),
+        ):
+            ok = _escalate_restart(machine)
+
+        assert ok is False
+
+
 # ── CLI: coord agent update / restart ─────────────────────────────────────
 
 
@@ -518,6 +617,8 @@ class TestAgentUpdateCLI:
     def test_update_single_machine(
         self, config_file: Path, coord_db
     ) -> None:
+        """#1568: success requires the agent to actually report the
+        requested version — not just that the POST was accepted."""
         def fake_post(url, *args, **kwargs):
             r = MagicMock()
             r.status_code = 202
@@ -527,7 +628,15 @@ class TestAgentUpdateCLI:
         def fake_get(url, *args, **kwargs):
             r = MagicMock()
             r.status_code = 200
-            r.json.return_value = {"machine": "laptop"}
+            r.json.return_value = {
+                "machine": "laptop",
+                "version": __version__,
+                "last_update": {
+                    "result": "upgraded",
+                    "version_before": "0.0.1",
+                    "version_after": __version__,
+                },
+            }
             return r
 
         with (
@@ -543,11 +652,13 @@ class TestAgentUpdateCLI:
         assert result.exit_code == 0, result.output
         assert "laptop" in result.output
         assert "accepted" in result.output
-        assert "online" in result.output
+        assert __version__ in result.output
 
     def test_update_all_machines(
         self, config_file: Path, coord_db
     ) -> None:
+        """#1568: success requires the agent to actually report the
+        requested version — not just that the POST was accepted."""
         posted_to: list[str] = []
 
         def fake_post(url, *args, **kwargs):
@@ -560,7 +671,14 @@ class TestAgentUpdateCLI:
         def fake_get(url, *args, **kwargs):
             r = MagicMock()
             r.status_code = 200
-            r.json.return_value = {}
+            r.json.return_value = {
+                "version": __version__,
+                "last_update": {
+                    "result": "upgraded",
+                    "version_before": "0.0.1",
+                    "version_after": __version__,
+                },
+            }
             return r
 
         with (
@@ -630,6 +748,217 @@ class TestAgentUpdateCLI:
             )
         # Should report error, not crash
         assert "error" in result.output.lower() or "refused" in result.output.lower() or "✗" in result.output
+
+    def test_update_sends_target_version(
+        self, config_file: Path, coord_db
+    ) -> None:
+        """#1568: the CLI must tell the agent which version it's asking for
+        so the agent can pin its pip install instead of a bare --upgrade
+        that can silently resolve to a stale cached version."""
+        posted_bodies: list[dict] = []
+
+        def fake_post(url, *args, **kwargs):
+            posted_bodies.append(kwargs.get("json", {}))
+            r = MagicMock()
+            r.status_code = 202
+            r.json.return_value = {"status": "updating", "mode": "pip install --upgrade"}
+            return r
+
+        def fake_get(url, *args, **kwargs):
+            r = MagicMock()
+            r.status_code = 200
+            r.json.return_value = {"version": __version__, "last_update": {"result": "upgraded"}}
+            return r
+
+        with (
+            patch("coord.cli.httpx.post", side_effect=fake_post),
+            patch("coord.cli.httpx.get", side_effect=fake_get),
+        ):
+            CliRunner().invoke(
+                main,
+                ["agent", "update", "--machine", "laptop", "--timeout", "5",
+                 "--config", str(config_file)],
+            )
+
+        assert posted_bodies
+        assert posted_bodies[0].get("target_version") == __version__
+
+    def test_update_no_op_reports_failure(
+        self, config_file: Path, coord_db
+    ) -> None:
+        """Cause A (#1568): pip resolves to a cached/stale version and
+        exits 0. The POST is accepted but the agent's reported version
+        never advances — `coord agent update` must NOT report success."""
+        def fake_post(url, *args, **kwargs):
+            r = MagicMock()
+            r.status_code = 202
+            r.json.return_value = {"status": "updating", "mode": "pip install --upgrade"}
+            return r
+
+        def fake_get(url, *args, **kwargs):
+            r = MagicMock()
+            r.status_code = 200
+            r.json.return_value = {
+                "version": "0.4.84",
+                "last_update": {
+                    "result": "no_change",
+                    "version_before": "0.4.84",
+                    "version_after": "0.4.84",
+                    "error": "pip resolved to 0.4.84 (same as installed).",
+                },
+            }
+            return r
+
+        with (
+            patch("coord.cli.httpx.post", side_effect=fake_post),
+            patch("coord.cli.httpx.get", side_effect=fake_get),
+            patch("coord.commands.agent_ops._escalate_restart", return_value=False),
+        ):
+            result = CliRunner().invoke(
+                main,
+                ["agent", "update", "--machine", "laptop", "--timeout", "1",
+                 "--config", str(config_file)],
+            )
+
+        assert result.exit_code != 0, result.output
+        assert "no change" in result.output.lower()
+
+    def test_update_stubbed_agent_never_changes_version_reports_failure(
+        self, config_file: Path, coord_db
+    ) -> None:
+        """Acceptance criterion from #1568: a stubbed agent that accepts
+        the POST but never changes version must produce a failure, not a
+        success — regardless of whether it exposes last_update at all."""
+        def fake_post(url, *args, **kwargs):
+            r = MagicMock()
+            r.status_code = 202
+            r.json.return_value = {"status": "updating", "mode": "pip install --upgrade"}
+            return r
+
+        def fake_get(url, *args, **kwargs):
+            # A stub agent: accepts /update, always answers /health, but
+            # its version field never moves and it exposes no last_update.
+            r = MagicMock()
+            r.status_code = 200
+            r.json.return_value = {"version": "0.1.0"}
+            return r
+
+        with (
+            patch("coord.cli.httpx.post", side_effect=fake_post),
+            patch("coord.cli.httpx.get", side_effect=fake_get),
+            patch("coord.commands.agent_ops._escalate_restart", return_value=False),
+        ):
+            result = CliRunner().invoke(
+                main,
+                ["agent", "update", "--machine", "laptop", "--timeout", "1",
+                 "--config", str(config_file)],
+            )
+
+        assert result.exit_code != 0, result.output
+        assert "✗" in result.output
+
+    def test_update_escalates_when_upgrade_succeeds_but_process_is_stuck(
+        self, config_file: Path, coord_db
+    ) -> None:
+        """Cause B (#404 / #1568): pip genuinely succeeded (last_update.result
+        == "upgraded") but the os.execv self-restart doesn't take under
+        systemd, so the OLD process keeps answering /health. The CLI must
+        escalate to a driven `systemctl --user restart` and re-check —
+        not report a bare "did not come back"."""
+        restarted = {"done": False}
+
+        def fake_post(url, *args, **kwargs):
+            r = MagicMock()
+            r.status_code = 202
+            r.json.return_value = {"status": "updating", "mode": "pip install --upgrade"}
+            return r
+
+        def fake_get(url, *args, **kwargs):
+            r = MagicMock()
+            r.status_code = 200
+            version = __version__ if restarted["done"] else "0.4.84"
+            r.json.return_value = {
+                "version": version,
+                "last_update": {
+                    "result": "upgraded",
+                    "version_before": "0.4.84",
+                    "version_after": __version__,
+                },
+            }
+            return r
+
+        def fake_escalate(machine):
+            restarted["done"] = True
+            return True
+
+        with (
+            patch("coord.cli.httpx.post", side_effect=fake_post),
+            patch("coord.cli.httpx.get", side_effect=fake_get),
+            patch(
+                "coord.commands.agent_ops._escalate_restart",
+                side_effect=fake_escalate,
+            ) as mock_escalate,
+        ):
+            result = CliRunner().invoke(
+                main,
+                ["agent", "update", "--machine", "laptop", "--timeout", "1",
+                 "--config", str(config_file)],
+            )
+
+        assert mock_escalate.called, "expected an escalation attempt"
+        assert result.exit_code == 0, result.output
+        assert __version__ in result.output
+
+
+class TestAgentVersionsCLI:
+    """#1568 suggested fix #4: a fleet-wide check the operator can run to
+    prove version uniformity before trusting a rule change — a split-brain
+    is only detectable by comparing versions."""
+
+    def test_versions_all_match(self, config_file: Path, coord_db) -> None:
+        def fake_get(url, *args, **kwargs):
+            r = MagicMock()
+            r.status_code = 200
+            r.json.return_value = {"version": __version__}
+            return r
+
+        with patch("coord.cli.httpx.get", side_effect=fake_get):
+            result = CliRunner().invoke(
+                main, ["agent", "versions", "--all", "--config", str(config_file)],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert result.output.count(__version__) >= 2  # coordinator line + machines
+        assert "mismatch" not in result.output.lower()
+
+    def test_versions_flags_split_brain(self, config_file: Path, coord_db) -> None:
+        def fake_get(url, *args, **kwargs):
+            r = MagicMock()
+            r.status_code = 200
+            version = __version__ if "laptop" in url else "0.4.84"
+            r.json.return_value = {"version": version}
+            return r
+
+        with patch("coord.cli.httpx.get", side_effect=fake_get):
+            result = CliRunner().invoke(
+                main, ["agent", "versions", "--all", "--config", str(config_file)],
+            )
+
+        assert result.exit_code != 0
+        assert "split-brain" in result.output.lower()
+        assert "mismatch" in result.output.lower()
+
+    def test_versions_flags_unreachable_machine(self, config_file: Path, coord_db) -> None:
+        with patch(
+            "coord.cli.httpx.get", side_effect=httpx.ConnectError("connection refused")
+        ):
+            result = CliRunner().invoke(
+                main, ["agent", "versions", "--machine", "laptop",
+                       "--config", str(config_file)],
+            )
+
+        assert result.exit_code != 0
+        assert "unreachable" in result.output.lower()
 
 
 class TestAgentRestartCLI:

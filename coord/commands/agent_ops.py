@@ -5,6 +5,7 @@ Extracted from coord/cli.py (#747)."""
 from __future__ import annotations
 
 import socket
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -12,6 +13,7 @@ from pathlib import Path
 import click
 import httpx
 
+from coord import __version__
 from coord.config import Config
 
 from coord.commands._common import AGENT_PORT, _CONFIG_OPTION, _load_config
@@ -183,11 +185,24 @@ def agent_update(
     all_machines: bool,
     timeout: int,
 ) -> None:
+    # #1568: the coordinator's own version IS the requested version — the
+    # whole point of `coord agent update` is to bring the fleet in line
+    # with whatever's running here.  Sending it lets the agent pin its pip
+    # install to that exact release (turning a stale-index no-op into a
+    # loud pip failure) and lets THIS command verify success by polling
+    # for that exact version, instead of inferring success from "the POST
+    # was accepted" (false positive on a cache-stale no-op) or failure
+    # from "the process stopped answering pings" (false negative on the
+    # execv-under-systemd restart, #404).
+    target_version = __version__
+
     cfg = _load_config(config_path)
     targets = _resolve_agent_targets(cfg, machine_filter, all_machines)
     if not targets:
         click.echo("No machines to update.", err=True)
         sys.exit(2)
+
+    click.echo(f"Requesting upgrade to v{target_version}...")
 
     # Capture each agent's start time BEFORE we trigger /update so the
     # wait loop can distinguish "old agent still answering during pip"
@@ -198,7 +213,9 @@ def agent_update(
         url = f"http://{machine.host}:{AGENT_PORT}/update"
         click.echo(f"  {machine.name}: POST {url} ...", nl=False)
         try:
-            resp = httpx.post(url, timeout=10)
+            resp = httpx.post(
+                url, json={"target_version": target_version}, timeout=10
+            )
             if resp.status_code == 202:
                 data = resp.json()
                 click.echo(f" accepted (mode: {data.get('mode', '?')})")
@@ -208,47 +225,54 @@ def agent_update(
             click.echo(f" error: {e}")
 
     if targets:
-        click.echo(f"\nWaiting up to {timeout}s for agent(s) to come back online...")
-        results = _wait_agents_online(
-            targets, timeout=timeout, pre_started_at=pre_started_at
+        click.echo(
+            f"\nWaiting up to {timeout}s for agent(s) to report v{target_version}..."
         )
-        for name, came_back in results.items():
-            tag = "✓ online" if came_back else "✗ did not come back"
-            click.echo(f"  {name}: {tag}")
-        # Fetch each agent's /health to report what actually happened —
-        # version delta or the recorded failure reason.
+        outcomes = _wait_agents_updated(
+            targets,
+            target_version=target_version,
+            timeout=timeout,
+            pre_started_at=pre_started_at,
+        )
+
         click.echo("")
+        all_matched = True
         for machine in targets:
-            if not results.get(machine.name):
+            outcome = outcomes[machine.name]
+            version_now = outcome["version_now"]
+            if outcome["matched"]:
+                vbefore = outcome.get("version_before") or "?"
+                click.echo(f"  {machine.name}: ✓ {vbefore} → {target_version}")
                 continue
-            try:
-                resp = httpx.get(
-                    f"http://{machine.host}:{AGENT_PORT}/health",
-                    timeout=5,
-                )
-                health = resp.json() if resp.status_code == 200 else {}
-            except (httpx.HTTPError, httpx.TimeoutException):
-                health = {}
-            version_now = health.get("version") or "?"
-            last = health.get("last_update") or {}
-            result = last.get("result")
-            if result == "upgraded":
-                vbefore = last.get("version_before", "?")
-                vafter = last.get("version_after", version_now)
-                click.echo(f"  {machine.name}: {vbefore} → {vafter}")
-            elif result == "no_change":
+
+            all_matched = False
+            result = outcome.get("result")
+            if result == "no_change":
                 click.echo(
-                    f"  {machine.name}: no change (still {version_now}) — "
-                    f"{last.get('error', 'pip resolved to the same version')}"
+                    f"  {machine.name}: ✗ no change (still {version_now}) — "
+                    f"{outcome.get('error') or 'pip resolved to the same version'}",
+                    err=True,
                 )
             elif result == "failed":
-                err = last.get("error") or "pip failed; see ~/.coord/last_update.log"
+                err = outcome.get("error") or "pip failed; see ~/.coord/last_update.log"
                 click.echo(f"  {machine.name}: ✗ failed — {err}", err=True)
+            elif outcome.get("escalated"):
+                click.echo(
+                    f"  {machine.name}: ✗ pip upgraded to {target_version} but the "
+                    f"process is stuck reporting {version_now} even after a "
+                    "`systemctl --user restart` — needs manual investigation",
+                    err=True,
+                )
+            elif not outcome.get("came_online"):
+                click.echo(f"  {machine.name}: ✗ did not come back online", err=True)
             else:
-                # Old agent build (no last_update payload yet) — just
-                # report the version it's now reporting.
-                click.echo(f"  {machine.name}: now reporting v{version_now}")
-        if not all(results.values()):
+                click.echo(
+                    f"  {machine.name}: ✗ still reporting {version_now}, "
+                    f"expected {target_version}",
+                    err=True,
+                )
+
+        if not all_matched:
             sys.exit(1)
 
 
@@ -421,6 +445,74 @@ def agent_clean_worktrees(
         sys.exit(1)
 
 
+@agent.command(
+    "versions",
+    help=(
+        "GET /health from one or all agent servers and print each one's "
+        "self-reported version alongside the coordinator's own.  #1568: "
+        "a version split-brain across the fleet is only detectable by "
+        "comparing versions directly — this is the fleet-wide check to "
+        "run before trusting a rule change, and after `coord agent "
+        "update` to confirm it actually landed everywhere."
+    ),
+)
+@_CONFIG_OPTION
+@click.option(
+    "--machine",
+    "machine_filter",
+    default=None,
+    help="Name of a single machine to check (from coordinator.yml).",
+)
+@click.option(
+    "--all",
+    "all_machines",
+    is_flag=True,
+    help="Check all machines (mutually exclusive with --machine).",
+)
+def agent_versions(
+    config_path: Path,
+    machine_filter: str | None,
+    all_machines: bool,
+) -> None:
+    cfg = _load_config(config_path)
+    targets = _resolve_agent_targets(cfg, machine_filter, all_machines)
+    if not targets:
+        click.echo("No machines to check.", err=True)
+        sys.exit(2)
+
+    click.echo(f"coordinator: v{__version__}\n")
+
+    versions_seen: set[str] = set()
+    any_offline = False
+    for machine in targets:
+        version: str | None
+        try:
+            resp = httpx.get(f"http://{machine.host}:{AGENT_PORT}/health", timeout=5)
+            version = resp.json().get("version") if resp.status_code == 200 else None
+        except (httpx.HTTPError, httpx.TimeoutException):
+            version = None
+
+        if version is None:
+            click.echo(f"  {machine.name}: ✗ unreachable", err=True)
+            any_offline = True
+            continue
+
+        versions_seen.add(version)
+        marker = "" if version == __version__ else "  ⚠ mismatch"
+        click.echo(f"  {machine.name}: v{version}{marker}")
+
+    if len(versions_seen) > 1:
+        click.echo(
+            f"\n⚠ split-brain: {len(versions_seen)} distinct versions across the "
+            f"fleet ({', '.join(sorted(versions_seen))}). Do not trust a rule "
+            "change until `coord agent update --all` brings everyone in line.",
+            err=True,
+        )
+        sys.exit(1)
+    if any_offline:
+        sys.exit(1)
+
+
 def _resolve_agent_targets(cfg, machine_filter: str | None, all_machines: bool):
     """Return the list of Machine objects to target for update/restart.
 
@@ -510,6 +602,145 @@ def _wait_agents_online(
         time.sleep(poll_interval)
 
     return {m.name: m.name in online for m in machines}
+
+
+def _wait_agents_updated(
+    machines: list,
+    *,
+    target_version: str,
+    timeout: float = 120.0,
+    poll_interval: float = 2.0,
+    pre_started_at: dict[str, float | None] | None = None,
+) -> dict[str, dict]:
+    """Poll /health on each machine until its self-reported version equals
+    ``target_version``, escalating to a driven restart if needed.
+
+    #1568: success is judged by the version the agent actually reports —
+    never by "the POST was accepted" and never by "the process answers
+    pings again."  Those liveness signals fail in opposite directions:
+
+    - Cause A: pip resolves to a cached/stale version and exits 0.  The
+      POST is accepted, the process never restarts, but nothing changed —
+      the old ``_wait_agents_online``-based check reported success anyway.
+    - Cause B (#404): the update's ``os.execv`` self-restart doesn't take
+      under systemd, so the OLD process keeps answering /health after a
+      real upgrade.  ``_wait_agents_online`` reported "did not come back"
+      even though the new version was installed and the service was
+      active.
+
+    When a machine's pip step genuinely succeeded (``last_update.result
+    == "upgraded"``) but the version still hasn't advanced once the
+    normal poll window elapses, escalate once with an SSH-driven
+    ``systemctl --user restart coord-agent`` — the documented fix for the
+    execv-under-systemd stall (see docs/AGENT_OPERATIONS.md) — and give
+    it one more short window before giving up.
+
+    Returns ``{machine_name: {matched, came_online, version_now,
+    version_before, result, error, escalated}}``.
+    """
+    pre = pre_started_at or {}
+    out: dict[str, dict] = {
+        m.name: {
+            "matched": False,
+            "came_online": False,
+            "version_now": "?",
+            "version_before": None,
+            "result": None,
+            "error": None,
+            "escalated": False,
+        }
+        for m in machines
+    }
+    pending = {m.name: m for m in machines}
+
+    def _poll_once(machine) -> bool:
+        """Fetch /health once, update out[machine.name], return True on match."""
+        info = out[machine.name]
+        try:
+            resp = httpx.get(f"http://{machine.host}:{AGENT_PORT}/health", timeout=3.0)
+            if resp.status_code != 200:
+                return False
+            health = resp.json()
+        except Exception:
+            return False
+
+        version_now = health.get("version")
+        info["version_now"] = version_now or "?"
+        last = health.get("last_update") or {}
+        info["result"] = last.get("result")
+        info["error"] = last.get("error")
+        info["version_before"] = last.get("version_before")
+
+        if machine.name in pre:
+            pre_val = pre[machine.name]
+            cur = health.get("agent_started_at")
+            if cur is None or pre_val is None or cur != pre_val:
+                info["came_online"] = True
+        else:
+            info["came_online"] = True
+
+        if version_now == target_version:
+            info["matched"] = True
+            return True
+        return False
+
+    deadline = time.time() + timeout
+    while time.time() < deadline and pending:
+        for name in list(pending):
+            if _poll_once(pending[name]):
+                del pending[name]
+        if not pending:
+            break
+        time.sleep(poll_interval)
+
+    # Escalate the machines still stuck on the old version whose pip step
+    # actually succeeded — the classic execv-under-systemd stall.  Give
+    # each a short follow-up window after the driven restart.
+    escalate_timeout = min(30.0, max(timeout / 2, 15.0))
+    for name in list(pending):
+        machine = pending[name]
+        info = out[name]
+        if info["result"] != "upgraded":
+            continue
+        info["escalated"] = _escalate_restart(machine)
+        if not info["escalated"]:
+            continue
+        sub_deadline = time.time() + escalate_timeout
+        while time.time() < sub_deadline:
+            if _poll_once(machine):
+                del pending[name]
+                break
+            time.sleep(poll_interval)
+
+    return out
+
+
+def _escalate_restart(machine) -> bool:
+    """Best-effort ``systemctl --user restart coord-agent`` over SSH.
+
+    #404 / #1568: ``/update``'s ``os.execv`` self-restart does not take
+    under systemd — same PID, stale version.  ``XDG_RUNTIME_DIR=/run/user/
+    $(id -u)`` is load-bearing: a bare ``systemctl --user restart``
+    silently no-ops in a non-interactive SSH session.  See
+    docs/AGENT_OPERATIONS.md for the manual runbook this automates.
+
+    Returns True if the ssh command itself exited 0 — NOT whether the
+    agent actually came back on the new version; the caller re-polls
+    /health afterwards to confirm that.
+    """
+    cmd = [
+        "ssh",
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=10",
+        "-o", "StrictHostKeyChecking=accept-new",
+        machine.host,
+        "XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart coord-agent",
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+    except Exception:
+        return False
+    return result.returncode == 0
 
 
 def _fetch_pre_started_at(machines: list) -> dict[str, float | None]:
