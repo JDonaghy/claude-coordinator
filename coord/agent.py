@@ -1912,6 +1912,15 @@ class AgentAssignment:
     # `failure_reason` column so `coord status` and `coord drive` (#1392) can
     # both recognise it without re-parsing the log themselves.
     usage_limit_reason: str | None = None
+    # #1584: set when the worker's LAST `result` event carried `is_error:
+    # true` — e.g. a transient upstream 529/500 that killed the session
+    # before it did anything.  Formatted with
+    # coord.worker_events.format_api_error_reason (e.g. "529 Overloaded").
+    # Only ever set alongside `status == FAILED`; `None` on every other
+    # outcome, including a worker that hit the same transient error, retried
+    # internally, and finished cleanly (its LAST `result` event carries no
+    # `is_error`, so this never fires for it).
+    api_error_reason: str | None = None
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -5431,6 +5440,53 @@ class AgentServer:
             except Exception:  # noqa: BLE001 — best-effort, never break reap
                 pass
 
+        # #1584: read `is_error` off the log's LAST `result` event and, when
+        # set, treat it as authoritative — a transient upstream failure
+        # (529 Overloaded, 500, a network drop) that killed the worker is
+        # NEVER `done`, whatever the wrapper's own exit code says.  Uses the
+        # same provider resolved for the wait loop above (`_reap_provider`,
+        # falling back to the plain `coord.worker_events.parse_log`) so a
+        # non-default provider's own log shape is honoured here exactly as it
+        # is for the claude_session_id parse further down.  `WorkerSummary
+        # .is_error`/`.terminal_reason`/`.api_error_status`/`.result_text`
+        # are overwritten on every `result` event a full parse walks through
+        # (see `update_summary`), so this reflects only the LAST one: a
+        # worker that hit the same transient error, retried internally, and
+        # finished cleanly is unaffected — its final `result` event carries
+        # no `is_error`.  Best-effort throughout; any parse failure just
+        # leaves this `False`/`None`, i.e. today's pre-#1584 behaviour.
+        _result_is_error = False
+        _api_error_reason: str | None = None
+        if log_path:
+            try:
+                from coord.worker_events import (  # noqa: PLC0415
+                    format_api_error_reason,
+                    is_stream_json,
+                )
+                if is_stream_json(log_path):
+                    if _reap_provider is not None:
+                        _err_summary = _reap_provider.parse_log(log_path, tail_bytes=0)
+                    else:
+                        from coord.worker_events import parse_log  # noqa: PLC0415
+                        _err_summary = parse_log(log_path, tail_bytes=0)
+                    if _err_summary.is_error:
+                        _result_is_error = True
+                        _api_error_reason = format_api_error_reason(
+                            terminal_reason=_err_summary.terminal_reason,
+                            api_error_status=_err_summary.api_error_status,
+                            result_text=_err_summary.result_text,
+                        )
+                        try:
+                            with open(log_path, "a") as reopen:
+                                reopen.write(
+                                    "# reap: terminal API error detected — "
+                                    f"{_api_error_reason} (#1584)\n"
+                                )
+                        except OSError:
+                            pass
+            except Exception:  # noqa: BLE001 — best-effort, never break reap
+                pass
+
         # Capture the branch the worker left the repo on. For worktree-based
         # assignments we read from the worktree; for legacy assignments (no
         # worktree_path) we fall back to the main repo clone.
@@ -5543,6 +5599,17 @@ class AgentServer:
                         # re-dispatch unchanged once the window resets, whereas
                         # ADVISORY means "a human needs to look at this".
                         assignment.status = FAILED
+                    elif _result_is_error:
+                        # #1584: `is_error: true` on the transcript's LAST
+                        # `result` event is authoritative, even on a clean
+                        # exit_code — a transient upstream failure (529/500/a
+                        # network drop) that killed the worker at turn 1
+                        # used to fall through to the `else: DONE` below,
+                        # silently recording a $0.03, zero-work session as a
+                        # clean success. Checked BEFORE the zero-commit
+                        # advisory downgrade: a real error is worse than "no
+                        # commits", not merely equivalent to it.
+                        assignment.status = FAILED
                     elif _zero_commit_reason is not None:
                         # #448: clean exit but no commits → advisory, not done.
                         assignment.status = ADVISORY
@@ -5557,6 +5624,12 @@ class AgentServer:
                 if (_usage_limit_reason is not None
                         and assignment.status in (FAILED, ADVISORY)):
                     assignment.usage_limit_reason = _usage_limit_reason
+                # #1584: only ever attaches to a FAILED transition. A non-zero
+                # exit_code with `_result_is_error` also lands here (the
+                # `else: assignment.status = FAILED` above), so this is
+                # checked independently of which branch set FAILED.
+                if _result_is_error and assignment.status == FAILED:
+                    assignment.api_error_reason = _api_error_reason
             self._processes.pop(assignment_id, None)
 
         # #315/#324: parse the log for the worker's claude session_id (from the
