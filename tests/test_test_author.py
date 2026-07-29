@@ -140,6 +140,41 @@ class TestBuildBriefing:
         assert "Add foo" in briefing
         assert "Body text" in briefing
 
+    # ── #1552: the driver's crate-root entry point ─────────────────────────
+
+    def test_entrypoint_is_named_and_authorised(self) -> None:
+        """A cargo slice is invisible until the crate root include!s it. The
+        author has to be TOLD that, and told the write is allowed — otherwise
+        the only two moves are 'wire it in and get bounced' or 'ship dead
+        code' (#1552, the $7.90 ms-38/#1124 bind)."""
+        briefing = build_test_author_briefing(**self._kwargs(
+            driver_entrypoint="tui/tests/acceptance.rs",
+            issue_number=101, issue_title="Add foo", issue_body="Body",
+        ))
+        assert "ENTRY POINT: tui/tests/acceptance.rs" in briefing
+        assert "INVISIBLE to the run command" in briefing
+        assert "explicitly allowed" in briefing
+        assert "never remove a registration line to narrow your diff" in briefing
+        assert "wire into the entry point" in briefing
+
+    def test_no_entrypoint_says_so_explicitly(self) -> None:
+        """Stated in BOTH directions: an author on the pytest route must not
+        invent an entry point to wire itself into."""
+        briefing = build_test_author_briefing(**self._kwargs())
+        assert "ENTRY POINT: (none" in briefing
+        assert "discovers tests by directory" in briefing
+        assert "wire into the entry point" not in briefing
+
+    def test_system_prompt_carves_out_the_entrypoint_exception(self) -> None:
+        """The 'do NOT touch anything outside tests/acceptance/ms-NN/**' rule
+        is what made 7f48bcf (delete the include! line) look correct."""
+        from coord.test_author import TEST_AUTHOR_SYSTEM_PROMPT
+
+        assert "WIRE THE SLICE IN" in TEST_AUTHOR_SYSTEM_PROMPT
+        assert "ONE exception" in TEST_AUTHOR_SYSTEM_PROMPT
+        assert "NEVER drop the registration line" in TEST_AUTHOR_SYSTEM_PROMPT
+        assert "Do not rewrite, reorder, or delete" in TEST_AUTHOR_SYSTEM_PROMPT
+
 
 # ── dispatch_test_author ────────────────────────────────────────────────────
 

@@ -29,12 +29,21 @@ acceptance:
     coord-tui:
       kind: tui-tuidriver
       run: {run_cmd}
-"""
+{entrypoint}"""
 
 
-def _write_config(tmp_path: Path, *, repo_path: str, run_cmd: str) -> Path:
+def _write_config(
+    tmp_path: Path, *, repo_path: str, run_cmd: str, entrypoint: str = "",
+) -> Path:
     p = tmp_path / "coordinator.yml"
-    p.write_text(CONFIG_YAML.format(repo_path=repo_path, run_cmd=json.dumps(run_cmd)))
+    p.write_text(CONFIG_YAML.format(
+        repo_path=repo_path,
+        run_cmd=json.dumps(run_cmd),
+        # #1552: the driver's crate-root entry point, omitted entirely by
+        # default so every pre-existing fixture keeps exercising the
+        # no-entrypoint (directory-discovered) shape.
+        entrypoint=f"      entrypoint: {json.dumps(entrypoint)}\n" if entrypoint else "",
+    ))
     return p
 
 
@@ -168,6 +177,105 @@ class TestAcceptanceRun:
         ])
         assert result.exit_code == 1
         assert "no acceptance slice" in result.output
+
+    # ── #1552: name a wiring failure instead of a bare green=false ──────────
+
+    def test_run_names_unwired_slice_when_no_manifest_ids_ran(
+        self, tmp_path: Path
+    ) -> None:
+        """A slice authored but never registered in the driver's entry point
+        compiles into nothing and emits no verdicts at all. `total=0,
+        green=false` sends the next round hunting a test failure that never
+        ran — say what actually happened, and name the entry point."""
+        blob = json.dumps({"tests": [{"id": "ms01::unrelated", "status": "pass"}]})
+        cwd = tmp_path / "repo"
+        cwd.mkdir()
+        _write_manifest(
+            cwd / "tests" / "acceptance",
+            {"ms01::a": 944, "ms01::b": 944, "ms01::unrelated": 900},
+        )
+        config_path = _write_config(
+            tmp_path, repo_path=str(cwd), run_cmd=f"echo '{blob}'",
+            entrypoint="tui/tests/acceptance.rs",
+        )
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "run", "--repo", "coord-tui", "--issue", "944",
+            "--path", str(cwd), "--config", str(config_path),
+        ])
+        assert result.exit_code == 1
+        assert "none of which appeared in the driver output" in result.output.lower()
+        assert "wiring failure, not a test failure" in result.output
+        assert "tui/tests/acceptance.rs" in result.output
+        # Both missing ids are named so the author knows exactly what to wire.
+        assert "ms01::a" in result.output
+        assert "ms01::b" in result.output
+
+    def test_run_flags_partially_missing_ids_without_changing_the_verdict(
+        self, tmp_path: Path
+    ) -> None:
+        """A partial miss (one of two slice files wired) still reports the
+        driver's own verdict — but the vanished id is named rather than
+        silently dropped from the denominator."""
+        blob = json.dumps({"tests": [{"id": "ms01::a", "status": "pass"}]})
+        cwd = tmp_path / "repo"
+        cwd.mkdir()
+        _write_manifest(
+            cwd / "tests" / "acceptance", {"ms01::a": 944, "ms01::b": 944},
+        )
+        config_path = _write_config(
+            tmp_path, repo_path=str(cwd), run_cmd=f"echo '{blob}'",
+            entrypoint="tui/tests/acceptance.rs",
+        )
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "run", "--repo", "coord-tui", "--issue", "944",
+            "--path", str(cwd), "--config", str(config_path),
+        ])
+        assert "1 of issue #944's 2 manifest test-id(s) did not appear" in result.output
+        assert "ms01::b" in result.output
+        payload = json.loads(result.output[result.output.index("{"):])
+        assert payload["missing_ids"] == ["ms01::b"]
+        assert payload["total"] == 1
+        assert payload["green"] is True
+
+    def test_run_says_nothing_extra_when_every_id_ran(self, tmp_path: Path) -> None:
+        blob = json.dumps({"tests": [{"id": "ms01::a", "status": "pass"}]})
+        cwd = tmp_path / "repo"
+        cwd.mkdir()
+        _write_manifest(cwd / "tests" / "acceptance", {"ms01::a": 944})
+        config_path = _write_config(tmp_path, repo_path=str(cwd), run_cmd=f"echo '{blob}'")
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "run", "--repo", "coord-tui", "--issue", "944",
+            "--path", str(cwd), "--config", str(config_path),
+        ])
+        assert result.exit_code == 0, result.output
+        assert "did not appear" not in result.output
+        payload = json.loads(result.output)
+        assert "missing_ids" not in payload
+        assert "reason" not in payload
+
+    def test_run_unwired_message_degrades_without_an_entrypoint(
+        self, tmp_path: Path
+    ) -> None:
+        """The pytest route declares no entry point — still name the failure,
+        just without a registration hint that wouldn't apply."""
+        cwd = tmp_path / "repo"
+        cwd.mkdir()
+        _write_manifest(cwd / "tests" / "acceptance", {"ms01::a": 944})
+        config_path = _write_config(
+            tmp_path, repo_path=str(cwd), run_cmd="echo '{\"tests\": []}'",
+        )
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "run", "--repo", "coord-tui", "--issue", "944",
+            "--path", str(cwd), "--config", str(config_path),
+        ])
+        assert result.exit_code == 1
+        assert "wiring failure, not a test failure" in result.output
+        assert "not being discovered by the driver's run command" in result.output
+        assert "entrypoint" not in result.output
 
 
 ROUTED_CONFIG_YAML = """\
