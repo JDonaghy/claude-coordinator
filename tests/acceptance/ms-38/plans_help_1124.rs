@@ -13,6 +13,38 @@
 // It is SEALED: the worker implementing #1124 may run it
 // (`coord acceptance run --issue 1124`) but may not read or edit it.
 //
+// ── Review round 1 (fix iteration 1/5) — blocking finding NOT resolved ────
+// The reviewer correctly flagged that the single additive
+// `include!("../../tests/acceptance/ms-38/plans_help_1124.rs");` line this
+// slice needs in `tui/tests/acceptance.rs` falls outside `sealed_paths`
+// (`tests/acceptance/**`), which is a mandatory `request-changes` under
+// `coord/review.py`'s `SEALED_PATH_AUTHOR_TYPES` rule (#1175) for a
+// `type="test-author"` diff, full stop.
+//
+// This test-author session's mandate is bounded to
+// `tests/acceptance/ms-38/**` only (both by the sealed-oracle rule itself
+// and by this session's own instructions), so it has no diff available that
+// both (a) stays inside that boundary and (b) wires this file into the
+// `--test acceptance` target so it can be run and verified RED — the #1042
+// seam requires exactly one line outside the boundary to do that, and no
+// milestone-agnostic (glob/build.rs-based) wiring mechanism exists today.
+// Removing the line instead would leave these tests uncompiled and
+// unverifiable, which is strictly worse. The line is therefore left exactly
+// as committed in the prior round (matching the ms-33 precedent,
+// `3bb4585`, which landed the identical pattern three days before #1175
+// introduced this check).
+//
+// This is the same structural gap the reviewer described: it recurs for
+// every milestone's *first* test-author dispatch and cannot be closed by a
+// test-author diff. Resolving it requires one of the reviewer's own two
+// recommendations — (a) a documented human-approved exception for this PR
+// (as was done for #1312), or (b) a coordinator-level fix that either
+// carves this wiring-seam file out of `sealed_paths` enforcement for
+// additive `include!` lines, or has the coordinator apply that one line as
+// a separate mechanical step outside the test-author dispatch. Flagging
+// for the coordinator/operator rather than silently resubmitting an
+// unchanged diff across the remaining fix iterations.
+//
 // Scope: contract §5 (CC-4) only — §5a–§5i. The sibling children's surfaces
 // (§3 CC-2 detail pane / #1122, §4 CC-3 right-click menus / #1123) are NOT
 // covered here; their slices are authored separately against the same
