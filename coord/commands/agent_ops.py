@@ -577,7 +577,19 @@ def _resolve_machine(cfg: Config, explicit_name: str | None):
 @click.argument("machine")
 def pause(config_path: Path, machine: str) -> None:
     from coord.machine_pause import pause as _pause
-    changed = _pause(machine)
+
+    # #1563: on a thin client this routes to the daemon's `/pause` endpoint
+    # and can raise (network/HTTP failure) — surface that loudly rather than
+    # letting a bare traceback stand in for "coord pause silently no-oped",
+    # which is exactly the failure mode this fix closes.
+    try:
+        changed = _pause(machine)
+    except Exception as e:  # noqa: BLE001
+        click.echo(
+            f"error: could not confirm pause of {machine!r} with the daemon: {e}",
+            err=True,
+        )
+        sys.exit(1)
     if changed:
         click.echo(f"paused: {machine}")
     else:
@@ -596,7 +608,16 @@ def pause(config_path: Path, machine: str) -> None:
 @click.argument("machine")
 def unpause(config_path: Path, machine: str) -> None:
     from coord.machine_pause import unpause as _unpause
-    changed = _unpause(machine)
+
+    # #1563: fail loudly, see the matching comment on pause() above.
+    try:
+        changed = _unpause(machine)
+    except Exception as e:  # noqa: BLE001
+        click.echo(
+            f"error: could not confirm unpause of {machine!r} with the daemon: {e}",
+            err=True,
+        )
+        sys.exit(1)
     if changed:
         click.echo(f"resumed: {machine}")
     else:

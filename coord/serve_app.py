@@ -2628,6 +2628,46 @@ def _openapi_spec() -> dict:
                 },
             },
         },
+        "/pause": {
+            "get": {
+                "summary": (
+                    "#1563: the daemon's own paused-machine set — the copy "
+                    "its dispatch tick actually reads."
+                ),
+                "responses": {
+                    "200": {"description": "OK"},
+                },
+            },
+            "post": {
+                "summary": (
+                    "#1563: pause or unpause a machine on the daemon's "
+                    "local-only store, so a thin client's `coord pause` "
+                    "reaches the same state the daemon's dispatch tick reads."
+                ),
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "machine": {"type": "string"},
+                                    "action": {
+                                        "type": "string",
+                                        "enum": ["pause", "unpause"],
+                                    },
+                                },
+                                "required": ["machine", "action"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {"description": "OK"},
+                    "400": {"description": "Missing field / unknown action"},
+                },
+            },
+        },
         "/issue-comments": {
             "get": {
                 "summary": "#873: read an issue's captured comments (oldest-first) from the durable mirror",
@@ -4581,6 +4621,41 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             )
         return JSONResponse({"error": f"unknown action: {action!r}"}, status_code=400)
 
+    async def get_pause(request: Request) -> Response:  # noqa: ARG001
+        # #1563: the daemon's own view of the paused-machine set. ALWAYS the
+        # local-only store (coord.machine_pause.local_paused_set()), never
+        # routed back out over HTTP — this endpoint runs *inside* the daemon,
+        # which is the one place that store is authoritative. This is what
+        # both `coord status`/`coord pause` on a thin client AND the daemon's
+        # own tick loop (`_tick_loop` → reconcile/dispatch) ultimately read.
+        from coord.machine_pause import local_paused_set  # noqa: PLC0415
+
+        return JSONResponse({"paused": sorted(local_paused_set())})
+
+    async def post_pause(request: Request) -> Response:
+        # #1563: pause/unpause a machine on the daemon's local-only store —
+        # the fix for "coord pause on a thin client never reaches the
+        # daemon". See get_pause() above for why this always uses the
+        # local-only helpers rather than coord.machine_pause.pause()/
+        # unpause() (which would re-route back out over HTTP if this daemon
+        # process happened to have its own board_service configured).
+        from coord.machine_pause import local_pause, local_unpause, local_paused_set  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        machine = body.get("machine")
+        action = body.get("action")
+        if not machine:
+            return JSONResponse({"error": "missing field: machine"}, status_code=400)
+        if action == "pause":
+            changed = local_pause(machine)
+        elif action == "unpause":
+            changed = local_unpause(machine)
+        else:
+            return JSONResponse({"error": f"unknown action: {action!r}"}, status_code=400)
+        return JSONResponse({"paused": sorted(local_paused_set()), "changed": changed})
+
     async def get_issue_comments(request: Request) -> Response:
         # #873: read an issue's captured comments (oldest-first) from the
         # durable mirror.
@@ -5467,6 +5542,8 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/issue-context", post_issue_context, methods=["POST"]),
         Route("/drive-escalations", get_drive_escalations, methods=["GET"]),
         Route("/drive-escalations", post_drive_escalations, methods=["POST"]),
+        Route("/pause", get_pause, methods=["GET"]),
+        Route("/pause", post_pause, methods=["POST"]),
         Route("/issue-comments", get_issue_comments, methods=["GET"]),
         Route("/issue-comments", post_issue_comments, methods=["POST"]),
         Route("/merge", post_merge, methods=["POST"]),

@@ -197,6 +197,32 @@ class TestStatus:
         assert len(updated_board.completed) == 1
         assert updated_board.completed[0].branch == "issue-42-fix-auth"
 
+    def test_paused_machine_shown_as_paused(self, config_file: Path, coord_dir: Path) -> None:
+        """#1563 acceptance: `coord status` must render pause state so an
+        operator can see whether a pause they just ran actually took —
+        previously nothing about pause showed up anywhere in status."""
+        statuses = [
+            network.MachineStatus(machine=MagicMock(name="laptop", host="laptop.tailnet", repos=["api"]), state=network.ONLINE, latency_ms=12.0, health=_online_health()),
+            network.MachineStatus(machine=MagicMock(name="server", host="server.tailnet", repos=["api"]), state=network.ONLINE, latency_ms=20.0, health=_online_health("server")),
+        ]
+        statuses[0].machine.name = "laptop"
+        statuses[0].machine.host = "laptop.tailnet"
+        statuses[0].machine.repos = ["api"]
+        statuses[1].machine.name = "server"
+        statuses[1].machine.host = "server.tailnet"
+        statuses[1].machine.repos = ["api"]
+
+        with patch("coord.network.check_all", return_value=statuses), \
+             patch("coord.network.fetch_status", return_value=network.StatusResult(data={"active": [], "completed": []})), \
+             patch("coord.machine_pause.paused_set", return_value={"laptop"}):
+            result = CliRunner().invoke(main, ["status", "--config", str(config_file)])
+        assert result.exit_code == 0, result.output
+        lines = result.output.splitlines()
+        laptop_line = next(l for l in lines if l.strip().startswith("laptop"))
+        server_line = next(l for l in lines if l.strip().startswith("server"))
+        assert "PAUSED" in laptop_line
+        assert "PAUSED" not in server_line
+
     def test_no_reconcile_flag_skips_reconcile(self, config_file: Path, coord_dir: Path) -> None:
         """--no-reconcile should skip board updates even when agent reports completions."""
         from coord.models import Assignment, Board
