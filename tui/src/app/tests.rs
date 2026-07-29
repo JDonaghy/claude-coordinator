@@ -7669,6 +7669,167 @@
         );
     }
 
+    /// #1589: `coord reconcile-merges` prunes a `merge_queue` entry once its
+    /// branch has landed (coord/reconcile.py) — the entry the pre-fix Merge
+    /// lookup depended on is deleted precisely when the merge succeeds, so
+    /// every merged track (not merely a stale minority) hit this. The
+    /// author row's own `status="merged"` (set directly by the
+    /// merge-reconcile tick, #609/#1574) is authoritative on its own and
+    /// must resolve Merge to Done even with ZERO corroborating
+    /// `merge_queue` rows — unlike #1581's fixture, which still had a live
+    /// "merged" queue entry and so didn't exercise this path.
+    #[test]
+    fn acceptance_authoring_prereq_status_merge_done_when_queue_entry_pruned() {
+        let mut app = make_pipeline_app_for_prereq_test();
+        let mut author = _stage_assignment("ta-1124", "test-author", 100.0, "merged");
+        author.issue_number = 751;
+        author.for_issue_number = Some(42);
+        author.finished_at = Some(160.0);
+        author.test_state = Some("passed".to_string());
+        author.branch = Some("tests/acceptance/ms-38/slice_1124".to_string());
+        app.data.assignments.push(author);
+
+        let mut review = _stage_assignment("rev-1124", "review", 200.0, "done");
+        review.issue_number = 751;
+        review.review_of_assignment_id = Some("ta-1124".to_string());
+        review.review_verdict = Some("approve".to_string());
+        app.data.assignments.push(review);
+
+        // No `merge_queue` entry at all for this branch — reconcile-merges
+        // already pruned it on success.
+        assert!(app.data.merge_queue.is_empty());
+
+        let member42 = &app.pipeline_issues[1];
+        let status = app.acceptance_authoring_prereq_status(member42, 751);
+        assert_eq!(status.author_id.as_deref(), Some("ta-1124"));
+        assert_eq!(
+            status.stages[3].status,
+            StageStatus::Done,
+            "Merge stage must be Done from author.status=\"merged\" alone, \
+             with no merge_queue corroboration: {:?}",
+            status.stages[3]
+        );
+        assert_eq!(
+            status.stages[3].since, None,
+            "a Done stage must carry no `since` — nothing left to wait for"
+        );
+    }
+
+    /// #1589 acceptance: same pruned-queue scenario, rendered end-to-end via
+    /// `TuiDriver`. Before the fix this rendered "Merge  pending — waiting
+    /// Xm Ys" forever, because the Merge lookup treated the queue's silence
+    /// as "not yet merged" rather than "no information". Uses `find()`, not
+    /// hardcoded coordinates, per this repo's TuiDriver convention.
+    #[test]
+    fn tuidriver_acceptance_authoring_merge_done_when_queue_entry_pruned() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_pipeline_app_for_prereq_test();
+        let mut author = _stage_assignment("ta-1124", "test-author", 100.0, "merged");
+        author.issue_number = 751;
+        author.for_issue_number = Some(42);
+        author.finished_at = Some(160.0);
+        author.test_state = Some("passed".to_string());
+        author.branch = Some("tests/acceptance/ms-38/slice_1124".to_string());
+        app.data.assignments.push(author);
+
+        let mut review = _stage_assignment("rev-1124", "review", 200.0, "done");
+        review.issue_number = 751;
+        review.review_of_assignment_id = Some("ta-1124".to_string());
+        review.review_verdict = Some("approve".to_string());
+        app.data.assignments.push(review);
+
+        // No `merge_queue` entry — pruned by reconcile-merges.
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(1); // member issue #42
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        let screen = driver.screen();
+        assert!(
+            driver.find("Acceptance Authoring").is_some(),
+            "expected the Acceptance Authoring block to render:\n{screen}"
+        );
+        assert!(
+            !screen.contains("waiting"),
+            "a merged track's Merge stage must never show a mounting \
+             'waiting' clock — it has nothing left to wait for:\n{screen}"
+        );
+        assert!(
+            !screen.contains("not started"),
+            "every stage of a fully merged track genuinely ran:\n{screen}"
+        );
+    }
+
+    /// #1589 regression: an author row that has NOT merged (still "done")
+    /// with a live `queued` merge-queue entry must still render Merge as
+    /// Active — the new `author.status == "merged"` shortcut must not
+    /// swallow the ordinary in-flight case this stage existed to handle.
+    #[test]
+    fn acceptance_authoring_prereq_status_merge_active_when_not_merged_and_queued() {
+        let mut app = make_pipeline_app_for_prereq_test();
+        let mut author = _stage_assignment("ta-42", "test-author", 100.0, "done");
+        author.issue_number = 751;
+        author.for_issue_number = Some(42);
+        author.finished_at = Some(160.0);
+        author.test_state = Some("passed".to_string());
+        author.branch = Some("tests/acceptance/ms-38/slice_42".to_string());
+        app.data.assignments.push(author);
+
+        let mut review = _stage_assignment("rev-42", "review", 200.0, "done");
+        review.issue_number = 751;
+        review.review_of_assignment_id = Some("ta-42".to_string());
+        review.review_verdict = Some("approve".to_string());
+        app.data.assignments.push(review);
+
+        app.data.merge_queue.push(MergeQueueEntry {
+            assignment_id: "ta-42".to_string(),
+            issue_number: Some(751),
+            state: "queued".to_string(),
+            pr_number: Some(11),
+            pr_url: None,
+            repo_github: "acme/api".to_string(),
+            target_branch: None,
+            error: None,
+            branch: Some("tests/acceptance/ms-38/slice_42".to_string()),
+            milestone_title: None,
+            last_attempt: None,
+        });
+
+        let member42 = &app.pipeline_issues[1];
+        let status = app.acceptance_authoring_prereq_status(member42, 751);
+        assert_eq!(status.stages[3].status, StageStatus::Active);
+    }
+
+    /// #1589 regression: an author row that has NOT merged with NO queue
+    /// entry at all is the #1572-correct "genuinely still pending" case —
+    /// must keep rendering Merge as Pending, not Done. This is the
+    /// behaviour the #1589 fix must not disturb: absence of a queue entry
+    /// only means "no information" when the author row itself says
+    /// "merged"; here it doesn't, so Pending remains correct.
+    #[test]
+    fn acceptance_authoring_prereq_status_merge_pending_when_not_merged_and_no_queue_entry() {
+        let mut app = make_pipeline_app_for_prereq_test();
+        let mut author = _stage_assignment("ta-42", "test-author", 100.0, "done");
+        author.issue_number = 751;
+        author.for_issue_number = Some(42);
+        author.finished_at = Some(160.0);
+        author.test_state = Some("passed".to_string());
+        author.branch = Some("tests/acceptance/ms-38/slice_42".to_string());
+        app.data.assignments.push(author);
+
+        let mut review = _stage_assignment("rev-42", "review", 200.0, "done");
+        review.issue_number = 751;
+        review.review_of_assignment_id = Some("ta-42".to_string());
+        review.review_verdict = Some("approve".to_string());
+        app.data.assignments.push(review);
+
+        assert!(app.data.merge_queue.is_empty());
+
+        let member42 = &app.pipeline_issues[1];
+        let status = app.acceptance_authoring_prereq_status(member42, 751);
+        assert_eq!(status.stages[3].status, StageStatus::Pending);
+    }
+
     // ── #200: Test gate ──────────────────────────────────────────────────────
 
     /// Build a pipeline app whose default gates include "test" (the production
