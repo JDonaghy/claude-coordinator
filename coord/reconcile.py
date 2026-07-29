@@ -1526,21 +1526,22 @@ def reconcile_board_merges(
     Two conservative sweeps, returning a list of human-readable action (and
     skip) strings:
 
-    (a) #611/#1083 branch backfill — runs over ``status='done'`` rows of
-        ``type='work'`` *or* ``type='test-author'``.  A remote interactive
-        work session (or a headless ``test-author`` session finalized by the
-        #625 passive reconcile tick before its branch was known — #1083) can
-        finish ``status=done`` with ``branch=None`` even though it pushed
+    (a) #611/#1083 branch backfill — runs over ``status='done'`` rows whose
+        ``type`` is in :data:`coord.models.WORK_LIKE_TYPES` (``work``,
+        ``mock-author``, ``test-author``).  A remote interactive work session
+        (or a headless ``test-author``/``mock-author`` session finalized by
+        the #625 passive reconcile tick before its branch was known — #1083)
+        can finish ``status=done`` with ``branch=None`` even though it pushed
         ``issue-{N}-*`` to origin, which greys the TUI Start review/test/merge
         buttons (they require a done work assignment WITH a branch) and makes
         ``coord pr <aid>`` refuse outright.  When exactly one remote branch
         matches ``issue-{N}-*`` for the issue, the branch is backfilled via
         :func:`state.update_assignment_branch`.  More than one candidate (or
-        none) is left untouched and logged.  ``test-author`` is included here
-        only — sweep (b) below stays ``type='work'``-only (plus interactive
-        merge sessions, #1110) since the out-of-band-merge / review-settlement
-        semantics it encodes are specific to the Work → Test → Review → Merge
-        pipeline.
+        none) is left untouched and logged.  #1574: sweep (b) below now shares
+        this same ``WORK_LIKE_TYPES`` scope (plus interactive merge sessions,
+        #1110) — a landed branch is a landed branch regardless of which
+        work-like type authored it; only ``type='review'`` (and other
+        non-work-like types) stay out of scope for the terminal-merge check.
 
     (b) #609/#951 record out-of-band merges — work merged directly on GitHub,
         or a ``merge_queue`` row that drained without flipping the board, is
@@ -1582,7 +1583,7 @@ def reconcile_board_merges(
     candidates = [
         a
         for a in board.active + board.completed
-        if (a.type in ("work", "test-author") or is_interactive_merge_session(a))
+        if (a.type in WORK_LIKE_TYPES or is_interactive_merge_session(a))
         and a.status == "done"
         and (repo is None or a.repo_name == repo)
         and (issue is None or a.issue_number == issue)
@@ -1638,18 +1639,28 @@ def reconcile_board_merges(
 
         # (b) #609/#951 — flip done work whose branch is merged on GitHub, OR
         # whose issue is closed even when no branch could be resolved above
-        # (work_is_terminal's issue-closed check needs no branch).  #1083:
-        # scoped to type='work' — test-author rows were added to `candidates`
-        # above for sweep (a)'s branch backfill alone; the merged/review-
-        # settled semantics here are pipeline-specific and out of scope for
-        # that fix.  #1110: interactive merge sessions (type='conflict-fix',
+        # (work_is_terminal's issue-closed check needs no branch).  #1083
+        # originally scoped this to type='work' only — test-author rows were
+        # added to `candidates` above for sweep (a)'s branch backfill alone,
+        # with the merged/review-settled semantics here deliberately left
+        # out of scope.  #1574: that scope limit meant a `type='test-author'`
+        # row (every oracle-loop acceptance slice, and by the same token
+        # `type='mock-author'`, #930 Gate A) could never reach `status=
+        # 'merged'` no matter how completely its branch landed, since
+        # `work_is_terminal` — branch/commit-scoped since #1150 — already
+        # answers correctly for these rows too.  There's nothing pipeline-
+        # specific about "this branch merged"; widened to the same
+        # :data:`coord.models.WORK_LIKE_TYPES` set sweep (a) uses.  #1110:
+        # interactive merge sessions (type='conflict-fix',
         # provider_name='claude-pty', review_of_assignment_id set — see
         # :func:`is_interactive_merge_session`) reach 'done' the same way work
         # sessions do, so they get the same terminal-detection sweep so the
         # auto-reaper can pick them up.  Automated #241 conflict-fix workers
         # are deliberately excluded (they never set provider_name='claude-pty').
+        # `type='review'` rows never reach this point at all — they aren't in
+        # `candidates` (sweep (a) above is also WORK_LIKE_TYPES-scoped).
         if (
-            a.type == "work" or is_interactive_merge_session(a)
+            a.type in WORK_LIKE_TYPES or is_interactive_merge_session(a)
         ) and github_ops.work_is_terminal(
             repo_cfg.github, a.issue_number, a.branch, cache=terminal_cache
         ):
@@ -1664,7 +1675,19 @@ def reconcile_board_merges(
                 # #951: mark_assignment_merged only flips status — clear a
                 # lingering review_state='pending' ghost too, or the row keeps
                 # showing "[awaiting review]" forever despite being merged.
-                if a.review_state == "pending":
+                # #1574: kept ``type == "work"``-only (not widened to
+                # WORK_LIKE_TYPES like the status flip above) — a
+                # test-author/mock-author row's review_state is exactly what
+                # sweep (f)'s #1180 wedged-review repair polices (a stray
+                # review_state='done' with no real review behind it), and
+                # settling it to 'done' here would immediately be flagged as
+                # wedged and reset back to 'pending' by that sweep, an
+                # unhelpful churn this fix doesn't need to introduce. Only
+                # `is_interactive_merge_session` rows share sweep (b)'s
+                # type='work' review-settle path, same as before #1574.
+                if a.review_state == "pending" and (
+                    a.type == "work" or is_interactive_merge_session(a)
+                ):
                     a.review_state = "done"
                     state.mark_work_review_settled(a.assignment_id or "")
 
