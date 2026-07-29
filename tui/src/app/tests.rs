@@ -7423,6 +7423,102 @@
         );
     }
 
+    /// #1572: while Gate A's Author stage is still running, Test/Review/
+    /// Merge have never been dispatched — they must read "not started"
+    /// (no elapsed clock), not "pending" with a ticking "waiting Xm Ys"
+    /// that implies something is stalled when nothing has even been
+    /// attempted yet.
+    #[test]
+    fn pipeline_tab_body_gate_a_unreached_stages_render_not_started() {
+        let mut app = make_pipeline_app_for_prereq_test();
+        let mut a = _stage_assignment("mock1", "mock-author", 100.0, "running");
+        a.issue_number = 751;
+        a.finished_at = None;
+        app.data.assignments.push(a);
+        app.pipeline_sel = Some(0); // the epic row
+        let body = app.pipeline_tab_body_list();
+        let rendered: Vec<String> = body
+            .items
+            .iter()
+            .map(|i| i.text.spans.iter().map(|s| s.text.clone()).collect::<String>())
+            .collect();
+        assert!(
+            rendered.iter().any(|line| line.contains("Author") && line.contains("running")),
+            "expected the Author row to show 'running', got: {rendered:?}"
+        );
+        for name in ["Test", "Review", "Merge"] {
+            assert!(
+                rendered.iter().any(|line| line.contains(name) && line.contains("not started")),
+                "expected the {name} row to read 'not started', got: {rendered:?}"
+            );
+        }
+        assert!(
+            !rendered.iter().any(|line| line.contains("waiting")),
+            "an unreached stage must never show a 'waiting' clock, got: {rendered:?}"
+        );
+    }
+
+    /// #1572 acceptance: black-box `TuiDriver` coverage (not just the
+    /// internal `ListItem` model above) — a stage that has never been
+    /// dispatched must not render "waiting" anywhere on screen, while a
+    /// stage that IS reachable but hasn't progressed yet must still show
+    /// the "waiting Xm Ys" clock (claude-coordinator#947's stall signal).
+    /// Uses `find()`/`screen()` rather than hardcoded coordinates, per this
+    /// repo's TuiDriver convention.
+    #[test]
+    fn tuidriver_pipeline_unreached_stage_has_no_waiting_clock() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        // Not-reached case: Author is running; Test/Review/Merge have
+        // never been dispatched.
+        let mut app = make_pipeline_app_for_prereq_test();
+        let mut a = _stage_assignment("mock1", "mock-author", 100.0, "running");
+        a.issue_number = 751;
+        a.finished_at = None;
+        app.data.assignments.push(a);
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0); // the epic row
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        let screen = driver.screen();
+        assert!(
+            driver.find("Gate A").is_some(),
+            "expected the Gate A block to render:\n{screen}"
+        );
+        assert!(
+            !screen.contains("waiting"),
+            "no stage has been reached yet — 'waiting' must not appear anywhere:\n{screen}"
+        );
+    }
+
+    /// #1572 acceptance (reachable-but-stalled half): once Author is done,
+    /// Test IS reachable and — with no verdict recorded yet — genuinely
+    /// stalled, so the screen must show its "waiting Xm Ys" clock.
+    #[test]
+    fn tuidriver_pipeline_reachable_stalled_stage_shows_waiting_clock() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_pipeline_app_for_prereq_test();
+        let mut a = _stage_assignment("mock1", "mock-author", 100.0, "done");
+        a.issue_number = 751;
+        a.finished_at = Some(160.0);
+        app.data.assignments.push(a);
+        app.active_view = SidebarView::Pipeline;
+        app.pipeline_sel = Some(0); // the epic row
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        let screen = driver.screen();
+        assert!(
+            driver.find("Gate A").is_some(),
+            "expected the Gate A block to render:\n{screen}"
+        );
+        assert!(
+            screen.contains("waiting"),
+            "Test is reachable (Author done) and has no verdict yet — expected a \
+             'waiting' clock:\n{screen}"
+        );
+    }
+
     // ── #200: Test gate ──────────────────────────────────────────────────────
 
     /// Build a pipeline app whose default gates include "test" (the production

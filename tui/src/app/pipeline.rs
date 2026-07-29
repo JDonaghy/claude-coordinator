@@ -237,6 +237,12 @@ pub(crate) struct FixPreflightTarget {
 /// show elapsed time for both "running" and "stuck waiting" without a
 /// separate lookup. `None` for Done/Failed/Skipped stages, and for a
 /// Pending stage whose predecessor hasn't settled either.
+///
+/// #1572: this `Pending`+`since` pairing is exactly what
+/// `crate::app::prereq_stage_label` keys off to tell "never reached" apart
+/// from "reached and stalled" — `since: None` renders as "not started" (no
+/// clock), `since: Some(_)` as "pending" with a mounting "waiting Xm Ys" —
+/// so a running clock always means the stage should be moving.
 #[derive(Clone)]
 pub(crate) struct PrereqStage {
     pub(crate) status: StageStatus,
