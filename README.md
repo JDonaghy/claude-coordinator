@@ -293,7 +293,7 @@ Verdict-relay helpers: `coord report-result`, `coord set-review-findings`, `coor
 | Command | Description |
 |---------|-------------|
 | `coord retry <id>` | Re-dispatch a failed assignment to a different machine |
-| `coord stop <id>` | Cancel a running assignment |
+| `coord stop <id> [--rescue]` | Cancel a running assignment. Uncommitted work is committed locally only (remote branch untouched); `--rescue` publishes it to a disposable `rescue/<id>` ref instead — the worker's own branch is never pushed to (#1567) |
 | `coord resume-stuck <id> --guidance "..."` | Cancel a stuck worker, dispatch a continuation |
 | `coord resume` | Reconcile board state after a crash |
 | `coord diagnose [repo issue] [--stage S] [--reset] [--orphan-worktrees]` | Diagnose / recover a stuck pipeline stage or sweep orphaned worktrees |

@@ -1313,8 +1313,18 @@ def chat_continue(
 
 @click.command(help="Cancel a running assignment.")
 @click.argument("assignment_id")
+@click.option(
+    "--rescue",
+    is_flag=True,
+    default=False,
+    help=(
+        "Push any uncommitted WIP to a disposable rescue/<id> ref instead "
+        "of leaving it local-only on the worker machine. Never touches the "
+        "worker's own branch (#1567)."
+    ),
+)
 @_CONFIG_OPTION
-def stop(assignment_id: str, config_path: Path) -> None:
+def stop(assignment_id: str, rescue: bool, config_path: Path) -> None:
     from coord.board_service import read_board, write_board
 
     cfg = _load_config(config_path)
@@ -1335,10 +1345,26 @@ def stop(assignment_id: str, config_path: Path) -> None:
     try:
         resp = httpx.post(
             f"http://{machine.host}:{AGENT_PORT}/cancel/{assignment_id}",
+            params={"rescue": "1"} if rescue else None,
             timeout=10,
         )
         resp.raise_for_status()
         click.echo(f"Assignment {assignment_id} cancelled on {machine.name}")
+        # #1567: print exactly what happened to the worktree/branch — a
+        # `coord stop` that silently pushed (or silently didn't) is the
+        # whole reason this issue exists.
+        try:
+            payload = resp.json()
+        except ValueError:
+            payload = {}
+        dirty_reason = payload.get("dirty_worktree_reason")
+        if dirty_reason:
+            click.echo(f"Worktree: {dirty_reason}")
+        elif not rescue:
+            click.echo(
+                "Worktree: clean or already removed — nothing to rescue; "
+                "the worker's remote branch is unchanged."
+            )
     except (httpx.HTTPError, httpx.TimeoutException) as e:
         click.echo(f"warning: could not reach agent on {machine.name}: {e}", err=True)
 

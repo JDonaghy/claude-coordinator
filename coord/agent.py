@@ -3927,8 +3927,33 @@ class AgentServer:
             self._spawn(assignment, worktree_path)
         return assignment
 
-    def cancel(self, assignment_id: str) -> AgentAssignment:
-        """Terminate a running assignment. Idempotent for already-finished work."""
+    def cancel(
+        self,
+        assignment_id: str,
+        *,
+        rescue: bool = False,
+        push_mode: str | None = None,
+    ) -> AgentAssignment:
+        """Terminate a running assignment. Idempotent for already-finished work.
+
+        #1567: any uncommitted work is still committed locally so it is never
+        silently destroyed, but by default it is NOT pushed anywhere — an
+        operator stopping an assignment has usually decided its in-progress
+        work is unwanted, so the old behaviour of publishing it straight onto
+        the worker's own branch (replacing the remote tip with exactly the
+        thing being stopped) was backwards. Pass ``rescue=True`` (``coord
+        stop --rescue``) to push the WIP commit to a disposable
+        ``rescue/<assignment_id>`` ref instead — the worker's branch is never
+        touched either way.
+
+        *push_mode* is an internal-only escape hatch for callers that are NOT
+        an operator-initiated `coord stop` — currently only the agent's own
+        ``/restart`` handler, which cancels still-running workers as part of
+        a graceful self-restart and should keep publishing their WIP onto the
+        worker's own branch exactly as before #1567 (nobody decided that
+        work was unwanted; the agent process just needs to come back up).
+        When given, it overrides the ``rescue``-derived default.
+        """
         with self._lock:
             assignment = self._assignments.get(assignment_id)
             if assignment is None:
@@ -3957,8 +3982,13 @@ class AgentServer:
             assignment.finished_at = time.time()
         self._persist()
 
-        # Clean up worktree after cancellation
-        self._cleanup_worktree(assignment)
+        # Clean up worktree after cancellation. #1567: default push_mode is
+        # "none" — commit locally only, do not touch the remote — unless the
+        # caller explicitly asked to rescue the work onto a disposable ref,
+        # or passed an explicit push_mode (see the /restart escape hatch
+        # documented above).
+        resolved_push_mode = push_mode or ("rescue" if rescue else "none")
+        self._cleanup_worktree(assignment, push_mode=resolved_push_mode)
 
         return assignment
 
@@ -4309,9 +4339,33 @@ class AgentServer:
         self._persist()
 
     def _rescue_uncommitted_work(
-        self, assignment: AgentAssignment, wt_path: Path
+        self,
+        assignment: AgentAssignment,
+        wt_path: Path,
+        *,
+        push_mode: str = "branch",
     ) -> bool:
         """Preserve uncommitted work in *wt_path*. Returns "safe to remove".
+
+        *push_mode* controls what happens to the remote AFTER the WIP commit
+        is made locally (#1567):
+
+        * ``"branch"`` — push straight to the worker's own branch (``origin
+          HEAD``), same as before #1567. Used by the natural-completion /
+          crash reap path, where nobody has decided the work is unwanted —
+          rescuing it onto the branch it was headed for is the right default.
+        * ``"none"`` — commit locally only, never touch the remote. This is
+          the ``coord stop`` default: an operator reaching for ``stop`` has
+          usually decided the in-progress work is NOT wanted, so publishing
+          it — worse, replacing the remote branch tip with it — is the wrong
+          thing to do by default. The commit still lands on the local branch
+          ref (shared with the parent repo's git dir), so it survives the
+          worktree being removed and is recoverable with plain git commands.
+        * ``"rescue"`` — commit locally, then push to a dedicated
+          ``rescue/<assignment.id>`` ref instead of the worker's branch.
+          Used by ``coord stop --rescue``. Never force-pushes — a rescue ref
+          is disposable but still shouldn't silently clobber a same-named ref
+          from a previous rescue attempt.
 
         #1394.  ``_cleanup_worktree`` used to force-remove and ``rmtree`` the
         worktree with no dirty check at all, so a worker that ended its turn
@@ -4450,11 +4504,51 @@ class AgentServer:
             return False
 
         # The commit now lives on the branch ref in the shared object store,
-        # so the worktree is expendable from here on.  Push is best-effort:
-        # its failure downgrades the message, not the safety of the work.
+        # so the worktree is expendable from here on regardless of what
+        # happens next — removal is safe even if push_mode is "none" or the
+        # push below fails.
+        if push_mode == "none":
+            # #1567: `coord stop`'s default. Do NOT touch the remote — the
+            # operator stopping the assignment has typically decided this
+            # work is unwanted, and pushing it would publish (and, if the
+            # remote tip has since moved, replace) exactly what they meant to
+            # stop. The commit is still safe: it's on the local branch ref,
+            # which survives worktree removal and is recoverable with plain
+            # git commands even after the worktree is gone.
+            where = (
+                f"committed to local branch {branch} only — NOT pushed "
+                f"(coord stop default, #1567); the remote branch is "
+                "unchanged. Recover with `git log " + branch + "` in the "
+                "repo, or re-run with `--rescue` to publish it"
+            )
+            self._log_line(assignment, f"# cleanup: {where} (#1394) (#1567)")
+            reason = (
+                f"worker left {total} uncommitted file(s) ({tracked} "
+                f"tracked, {untracked} new); {where} as a "
+                f"{_WIP_COMMIT_PREFIX} commit. The work is UNVERIFIED — "
+                "review it before testing or merging."
+            )
+            self._record_dirty_worktree(assignment, reason)
+            return True
+
+        if push_mode == "rescue":
+            rescue_ref = f"rescue/{assignment.id}"
+            push_spec = f"HEAD:refs/heads/{rescue_ref}"
+            push_target_desc = f"{rescue_ref} (worker branch {branch} left untouched)"
+        else:
+            push_spec = "HEAD"
+            push_target_desc = branch
+
+        # Push is best-effort: its failure downgrades the message, not the
+        # safety of the work. Never force — a rejected push just means the
+        # rescue stays local-only rather than clobbering whatever is already
+        # on the remote ref (#1567).
         pushed = False
         try:
-            _git(wt_path, "push", "-u", "origin", "HEAD", timeout=60.0)
+            if push_mode == "rescue":
+                _git(wt_path, "push", "origin", push_spec, timeout=60.0)
+            else:
+                _git(wt_path, "push", "-u", "origin", push_spec, timeout=60.0)
             pushed = True
         except (_GitError, subprocess.TimeoutExpired, OSError) as e:
             self._log_line(
@@ -4462,10 +4556,11 @@ class AgentServer:
             )
 
         where = (
-            f"committed to {branch} and pushed"
+            f"committed to {branch} and pushed to {push_target_desc}"
             if pushed
-            else f"committed to local branch {branch} (push failed — the "
-            "commit exists only on this agent)"
+            else f"committed to local branch {branch} (push to "
+            f"{push_target_desc} failed — the commit exists only on this "
+            "agent)"
         )
         reason = (
             f"worker left {total} uncommitted file(s) ({tracked} tracked, "
@@ -4502,7 +4597,9 @@ class AgentServer:
                 self._reap_complete[assignment_id] = event
             return event
 
-    def _cleanup_worktree(self, assignment: AgentAssignment) -> None:
+    def _cleanup_worktree(
+        self, assignment: AgentAssignment, *, push_mode: str = "branch"
+    ) -> None:
         """Remove the worktree for a finished assignment. Best-effort.
 
         #460 (Part 3 — synchronous teardown): always ensures git's worktree
@@ -4522,13 +4619,21 @@ class AgentServer:
         both call this for the same assignment — without serialization the
         `wt_path.exists()` check here is a TOCTOU against the other thread's
         `git worktree remove`/`rmtree`.
+
+        #1567: *push_mode* is forwarded to :meth:`_rescue_uncommitted_work`
+        verbatim — see there for the "branch" / "none" / "rescue" meanings.
+        Callers other than `cancel()` (the natural-completion `_reap` path,
+        and the worktree-not-writable dispatch failure) keep the original
+        "branch" default; only an explicit `coord stop` changes it.
         """
         if not assignment.worktree_path:
             return
         with self._cleanup_lock_for(assignment.id):
-            self._cleanup_worktree_locked(assignment)
+            self._cleanup_worktree_locked(assignment, push_mode=push_mode)
 
-    def _cleanup_worktree_locked(self, assignment: AgentAssignment) -> None:
+    def _cleanup_worktree_locked(
+        self, assignment: AgentAssignment, *, push_mode: str = "branch"
+    ) -> None:
         """Body of `_cleanup_worktree`, run under the assignment's lock."""
         wt_path = Path(assignment.worktree_path)
         repo_path = Path(assignment.spec.repo_path).expanduser()
@@ -4537,7 +4642,7 @@ class AgentServer:
         # `except _GitError` fallback below runs `shutil.rmtree`, which no
         # amount of git-level care would survive, so the gate has to be here.
         if wt_path.exists() and not self._rescue_uncommitted_work(
-            assignment, wt_path
+            assignment, wt_path, push_mode=push_mode
         ):
             # Work preserved only inside this worktree — keep it.  Prune stale
             # admin entries for OTHER worktrees; this one stays registered on

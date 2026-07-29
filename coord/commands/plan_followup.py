@@ -840,10 +840,18 @@ def resume_stuck(assignment_id: str, config_path: Path, guidance: str) -> None:
         )
         sys.exit(1)
 
-    # Stop the current worker
+    # Stop the current worker. #1567 changed `coord stop`'s default to NOT
+    # push a worker's uncommitted WIP anywhere — but resume-stuck is not a
+    # `coord stop`: it immediately dispatches a continuation onto this same
+    # branch (below) and that continuation's fresh worktree is built from
+    # `origin/<branch>` (see AgentServer._setup_worktree's continuation
+    # path), so any uncommitted work MUST reach the branch on the remote or
+    # the continuation silently starts over from before it. push_mode=branch
+    # keeps the pre-#1567 behaviour here on purpose.
     try:
         resp = httpx.post(
             f"http://{machine.host}:{AGENT_PORT}/cancel/{assignment_id}",
+            params={"push_mode": "branch"},
             timeout=10,
         )
         resp.raise_for_status()

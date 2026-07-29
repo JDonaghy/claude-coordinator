@@ -363,7 +363,10 @@ class TestResumeStuck:
             ],
         }
 
+        post_calls = []
+
         def mock_post(url, **kwargs):
+            post_calls.append((url, kwargs))
             return cancel_mock
 
         def mock_get(url, **kwargs):
@@ -386,6 +389,16 @@ class TestResumeStuck:
         assert result.exit_code == 0, result.output
         assert "new-456" in result.output
         assert "Continuation dispatched" in result.output
+
+        # #1567: `coord stop`'s new default (don't push WIP anywhere) must
+        # NOT apply here — resume-stuck immediately dispatches a
+        # continuation onto this same branch, which needs any uncommitted
+        # work actually on the branch upstream. The cancel call must opt
+        # back into the pre-#1567 "push straight to the branch" behaviour.
+        cancel_calls = [c for c in post_calls if "/cancel/" in c[0]]
+        assert cancel_calls, "resume-stuck never called /cancel"
+        _, cancel_kwargs = cancel_calls[0]
+        assert cancel_kwargs.get("params") == {"push_mode": "branch"}
 
         # Verify the briefing contains guidance
         disp.assert_called_once()
