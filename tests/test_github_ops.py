@@ -1154,6 +1154,75 @@ class TestComputePatchId:
             assert github_ops.compute_patch_id(_unified_diff("hello")) is None
 
 
+class TestBranchCommitsAheadForAssignment:
+    """#1606: the one shared implementation of "branch empty -> 0, repo
+    missing -> None, else ask GitHub" — `coord retry`'s advisory gate
+    (coord/commands/dispatch.py) and `coord diagnose --stage work`'s
+    ADVISORY-row recovery (coord/diagnose.py) both call this instead of
+    each keeping an independent inline copy. Duck-typed: *assignment* only
+    needs `.branch`/`.repo_name`, *config* only needs `.repo(name)`."""
+
+    class _Assignment:
+        def __init__(self, branch: str | None, repo_name: str = "myrepo") -> None:
+            self.branch = branch
+            self.repo_name = repo_name
+
+    class _RepoCfg:
+        def __init__(self, github: str, default_branch: str = "main") -> None:
+            self.github = github
+            self.default_branch = default_branch
+
+    class _Config:
+        def __init__(self, repo_cfg) -> None:
+            self._repo_cfg = repo_cfg
+
+        def repo(self, name: str):
+            return self._repo_cfg
+
+    def test_empty_branch_is_zero_without_calling_github(self) -> None:
+        assignment = self._Assignment(branch="")
+        config = self._Config(self._RepoCfg("acme/api"))
+        with patch("coord.github_ops._gh") as gh:
+            result = github_ops.branch_commits_ahead_for_assignment(assignment, config)
+        assert result == 0
+        gh.assert_not_called()
+
+    def test_none_branch_is_zero_without_calling_github(self) -> None:
+        assignment = self._Assignment(branch=None)
+        config = self._Config(self._RepoCfg("acme/api"))
+        with patch("coord.github_ops._gh") as gh:
+            result = github_ops.branch_commits_ahead_for_assignment(assignment, config)
+        assert result == 0
+        gh.assert_not_called()
+
+    def test_unknown_repo_is_none(self) -> None:
+        assignment = self._Assignment(branch="issue-1-x", repo_name="not-configured")
+        config = self._Config(None)
+        with patch("coord.github_ops._gh") as gh:
+            result = github_ops.branch_commits_ahead_for_assignment(assignment, config)
+        assert result is None
+        gh.assert_not_called()
+
+    def test_delegates_to_branch_commits_ahead_for_a_real_branch(self) -> None:
+        assignment = self._Assignment(branch="issue-1-x")
+        config = self._Config(self._RepoCfg("acme/api", default_branch="main"))
+        with patch(
+            "coord.github_ops._gh",
+            return_value=json.dumps({"ahead_by": 7}),
+        ) as gh:
+            result = github_ops.branch_commits_ahead_for_assignment(assignment, config)
+        assert result == 7
+        args = gh.call_args.args
+        assert args[1] == "repos/acme/api/compare/main...issue-1-x"
+
+    def test_gh_failure_is_none(self) -> None:
+        assignment = self._Assignment(branch="issue-1-x")
+        config = self._Config(self._RepoCfg("acme/api"))
+        with patch("coord.github_ops._gh", side_effect=RuntimeError("gh boom")):
+            result = github_ops.branch_commits_ahead_for_assignment(assignment, config)
+        assert result is None
+
+
 class TestGetBranchPatchId:
     """#1475: fetches the three-dot compare diff (no PR required, mirroring
     get_branch_diff_size) and hashes it."""

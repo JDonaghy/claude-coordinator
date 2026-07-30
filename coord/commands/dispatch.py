@@ -1396,8 +1396,9 @@ def retry(assignment_id: str, config_path: Path) -> None:
         sys.exit(1)
     if assignment.status not in ("failed", "advisory"):
         click.echo(
-            f"error: assignment {assignment_id} is {assignment.status!r}, not failed. "
-            f"Only failed assignments can be retried.",
+            f"error: assignment {assignment_id} is {assignment.status!r}, not "
+            f"'failed' or 'advisory'. Only a failed assignment, or a genuine "
+            f"zero-commit advisory (#1606), can be retried.",
             err=True,
         )
         sys.exit(1)
@@ -1409,16 +1410,12 @@ def retry(assignment_id: str, config_path: Path) -> None:
         # carries real commits is the #1357 false-positive signature and
         # must go through `coord drive --accept-advisory` instead, so real
         # work is never silently discarded by a retry that assumes it's
-        # empty.
-        branch = (assignment.branch or "").strip()
-        repo_cfg = cfg.repo(assignment.repo_name)
-        if not branch:
-            ahead = 0
-        elif repo_cfg is None:
-            ahead = None
-        else:
-            base = repo_cfg.default_branch or "main"
-            ahead = github_ops.branch_commits_ahead(repo_cfg.github, base, branch)
+        # empty. Shared with `coord diagnose --stage work`'s identical
+        # question (coord/diagnose.py's `_work_advisory_commits_ahead`) via
+        # `github_ops.branch_commits_ahead_for_assignment` — this used to be
+        # an independent inline copy of the same "branch empty → 0, repo
+        # missing → None, else ask GitHub" logic.
+        ahead = github_ops.branch_commits_ahead_for_assignment(assignment, cfg)
         if ahead != 0:
             detail = (
                 "its commit count could not be confirmed (gh lookup failed)"

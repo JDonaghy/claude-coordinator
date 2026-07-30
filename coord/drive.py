@@ -1785,6 +1785,20 @@ def launch_drive_in_tmux(
     past whatever it held before this launch. Either check failing raises
     :class:`DriveError` instead of returning a session name — the caller
     must then report failure, not the success banner.
+
+    The growth check relies on ``Driver.run()`` writing a start marker to
+    that log the instant its per-issue lock is acquired (see the
+    ``drive loop started`` line in ``Driver.run()``) — independent of
+    whether a ``RUN`` action (the *only other* writer of this file, via
+    ``Driver._spawn``) ever actually fires. Without that marker, "log
+    grew" would really mean "a subprocess happened to run first", which is
+    false for the ordinary, majority-case launch of attaching to an issue
+    that already has another assignment active: ``decide()``'s very first
+    branch after "merged" is a pure ``WAIT`` with no command whenever
+    ``state.active_count > 0``, so that loop could legitimately sit
+    alive-but-log-silent for a full ``--poll`` interval (default 60s) —
+    far longer than this function's ~8s verification window — and get
+    misdiagnosed as stuck.
     """
     if not tmux_available():
         raise DriveError("tmux is not available on this machine.", EXIT_USAGE)
@@ -2101,6 +2115,22 @@ class Driver:
             pass
         self._record_drive_audit(
             "drive_started", f"drive started for {self.repo}#{self.issue}"
+        )
+        # #1606: a start marker, written the instant the loop legitimately
+        # begins — independent of whether a RUN action (`_spawn`, the only
+        # other writer of this file) ever fires. `decide()`'s very first
+        # branch after "merged" is a pure WAIT with no command whenever
+        # another assignment is already active (coord/drive.py `decide()`),
+        # so a drive attached to healthy in-flight work could sit
+        # alive-but-log-silent for its entire first `--poll` interval
+        # (default 60s). `launch_drive_in_tmux`'s post-launch verification
+        # only waits ~8s for the log to grow, so without this marker it
+        # would misdiagnose that ordinary, majority-case attach as a stuck
+        # loop and kill a perfectly healthy session. This line makes "the
+        # log grew" mean "the loop started", not "a subprocess happened to
+        # run first".
+        self._append_run_log(
+            f"{self._stamp()}  drive loop started for {self.repo}#{self.issue}\n"
         )
         try:
             exit_code = self._loop()

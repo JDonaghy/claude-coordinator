@@ -2415,6 +2415,33 @@ def test_driver_writes_the_per_issue_run_log(driver_factory, tmp_path):
     assert log.exists() and "ok" in log.read_text()
 
 
+def test_driver_writes_a_start_marker_even_when_the_loop_never_spawns_anything(
+    driver_factory, tmp_path
+):
+    """#1606: `decide()`'s very first branch after "merged" is a pure `WAIT`
+    with no command whenever `state.active_count > 0` — the ordinary,
+    majority-case shape of attaching to an issue that already has another
+    assignment active (a review or merge dispatched via the TUI's
+    interactive-agent flow, or a drive re-attached after a previous tmux
+    session died mid-run). That loop never calls `_spawn` (the only other
+    writer of the run log), so it must sit alive-but-log-silent for the
+    whole `--poll` interval — UNLESS `Driver.run()` itself stamps a start
+    marker the instant its per-issue lock is acquired, which is what
+    `launch_drive_in_tmux`'s post-launch verification (~8s window) actually
+    relies on to avoid killing this exact healthy session."""
+    payload = board(status="dispatched")  # non-terminal → counted in `active`
+    driver = driver_factory(
+        [payload],
+        opts=DriveOptions(machine="precision", poll=1.0, deadline_mins=0.001),
+    )
+    exit_code = driver.run()
+    assert exit_code == EXIT_DEADLINE
+    assert driver.recorded == []  # never spawned a `coord` subcommand
+    log = tmp_path / f"{REPO}-{ISSUE}.log"
+    assert log.exists()
+    assert "drive loop started" in log.read_text()
+
+
 def test_a_die_on_error_action_raises_a_drive_error(driver_factory, monkeypatch):
     driver = driver_factory([board(status="failed", failure_reason="boom")])
 
