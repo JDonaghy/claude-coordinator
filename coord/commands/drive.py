@@ -254,8 +254,12 @@ def _rebuild_drive_argv(
     is_flag=True,
     help=(
         "Launch the drive loop DETACHED in a `coord-drive-<repo>-<issue>` tmux "
-        "session instead of running inline (#1398). This invocation exits "
-        "immediately once the session exists — the run survives this terminal "
+        "session instead of running inline (#1398). Waits a few seconds to "
+        "confirm the session is still alive and has started writing its run "
+        "log (#1606) before exiting 0 — a launch that dies immediately (e.g. "
+        "nothing left to do) exits non-zero with the reason instead of "
+        "printing a false success banner. Once confirmed live, this "
+        "invocation exits immediately — the run survives this terminal "
         "closing, a TUI restart, or an ssh drop. Reattach with `coord "
         "drive-attach <repo> <issue>`; list live runs with `coord "
         "drive-sessions`; stop with `coord drive-stop <repo> <issue>` — killing "

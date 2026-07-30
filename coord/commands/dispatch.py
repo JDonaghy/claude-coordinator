@@ -1373,7 +1373,14 @@ def stop(assignment_id: str, rescue: bool, config_path: Path) -> None:
     click.echo(f"Board updated: {assignment.repo_name} #{assignment.issue_number} marked failed")
 
 
-@click.command(help="Re-dispatch a failed assignment to a different machine.")
+@click.command(
+    help=(
+        "Re-dispatch a failed assignment to a different machine. Also "
+        "accepts a genuine zero-commit ADVISORY (#1606) — an advisory whose "
+        "branch carries real commits is refused; use `coord drive "
+        "--accept-advisory` for that shape instead."
+    )
+)
 @click.argument("assignment_id")
 @_CONFIG_OPTION
 def retry(assignment_id: str, config_path: Path) -> None:
@@ -1387,13 +1394,46 @@ def retry(assignment_id: str, config_path: Path) -> None:
     if assignment is None:
         click.echo(f"error: assignment {assignment_id!r} not found in board", err=True)
         sys.exit(1)
-    if assignment.status != "failed":
+    if assignment.status not in ("failed", "advisory"):
         click.echo(
             f"error: assignment {assignment_id} is {assignment.status!r}, not failed. "
             f"Only failed assignments can be retried.",
             err=True,
         )
         sys.exit(1)
+
+    if assignment.status == "advisory":
+        # #1606: an ADVISORY row is TERMINAL — nothing else on the board ever
+        # re-dispatches it. Only the genuine zero-commit exit (nothing
+        # pushed) is safe to blindly retry here; an advisory whose branch
+        # carries real commits is the #1357 false-positive signature and
+        # must go through `coord drive --accept-advisory` instead, so real
+        # work is never silently discarded by a retry that assumes it's
+        # empty.
+        branch = (assignment.branch or "").strip()
+        repo_cfg = cfg.repo(assignment.repo_name)
+        if not branch:
+            ahead = 0
+        elif repo_cfg is None:
+            ahead = None
+        else:
+            base = repo_cfg.default_branch or "main"
+            ahead = github_ops.branch_commits_ahead(repo_cfg.github, base, branch)
+        if ahead != 0:
+            detail = (
+                "its commit count could not be confirmed (gh lookup failed)"
+                if ahead is None
+                else f"{ahead} commit(s) present on its branch"
+            )
+            click.echo(
+                f"error: assignment {assignment_id} is 'advisory', and {detail} "
+                "— coord retry only re-dispatches a GENUINE zero-commit "
+                "advisory. This looks like the #1357 false-positive "
+                "signature instead; use `coord drive --accept-advisory` to "
+                "proceed with the existing commits, or inspect by hand.",
+                err=True,
+            )
+            sys.exit(1)
 
     # Determine escalated model for the retry.
     original_model = assignment.model or cfg.models.default

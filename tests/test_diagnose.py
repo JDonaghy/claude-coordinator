@@ -1194,6 +1194,65 @@ def test_done_work_with_real_branch_is_healthy(monkeypatch, config) -> None:
     assert res.recovered is True
 
 
+# ── #1606: ADVISORY work row must never report "stage looks healthy" ───────
+
+
+def test_zero_commit_advisory_is_not_reported_healthy(monkeypatch, config) -> None:
+    """The #1606 defect: a genuine zero-commit ADVISORY used to fall through
+    to the same 'stage looks healthy' catch-all as a real done row, making
+    the wedge invisible to `coord diagnose`. Must name the zero-commit shape
+    and point at `coord retry` instead."""
+    _stub(monkeypatch, session="dead")
+    monkeypatch.setattr(diagnose, "_work_advisory_commits_ahead", lambda a, c: 0)
+
+    a = _assign(aid="w-advisory-empty", status="advisory", branch="issue-42-empty")
+    board = Board(completed=[a])
+    res = diagnose.diagnose_stage(board, config, "api", 42, "work")
+
+    assert not any("looks healthy" in f for f in res.findings), res.findings
+    assert any("0 commits" in f for f in res.findings), res.findings
+    assert any("coord retry w-advisory-empty" in f for f in res.findings), res.findings
+    assert res.recovered is False
+
+
+def test_advisory_with_unknown_commit_count_is_not_reported_healthy(
+    monkeypatch, config
+) -> None:
+    """A `gh` lookup failure returns None — fail closed: never claim
+    healthy, but also don't assert a zero-commit finding that isn't
+    confirmed."""
+    _stub(monkeypatch, session="dead")
+    monkeypatch.setattr(diagnose, "_work_advisory_commits_ahead", lambda a, c: None)
+
+    a = _assign(aid="w-advisory-unknown", status="advisory", branch="issue-42-x")
+    board = Board(completed=[a])
+    res = diagnose.diagnose_stage(board, config, "api", 42, "work")
+
+    assert not any("looks healthy" in f for f in res.findings), res.findings
+    assert any("could not be confirmed" in f for f in res.findings), res.findings
+    assert res.recovered is False
+
+
+def test_advisory_with_real_commits_is_the_1357_shape_and_recovered(
+    monkeypatch, config
+) -> None:
+    """An advisory WITH real commits is the #1357 false-positive signature —
+    reported distinctly (not "healthy", not a zero-commit finding) and
+    `recovered=True` since it just needs `--accept-advisory`, not a diagnose
+    fix."""
+    _stub(monkeypatch, session="dead")
+    monkeypatch.setattr(diagnose, "_work_advisory_commits_ahead", lambda a, c: 4)
+
+    a = _assign(aid="w-advisory-real", status="advisory", branch="issue-42-real")
+    board = Board(completed=[a])
+    res = diagnose.diagnose_stage(board, config, "api", 42, "work")
+
+    assert not any("looks healthy" in f for f in res.findings), res.findings
+    assert any("4 commit(s)" in f for f in res.findings), res.findings
+    assert any("--accept-advisory" in f for f in res.findings), res.findings
+    assert res.recovered is True
+
+
 # ── #618: _prune_orphan_for_failed integration ──────────────────────────────
 
 

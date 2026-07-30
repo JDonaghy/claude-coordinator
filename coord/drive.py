@@ -1751,6 +1751,9 @@ def launch_drive_in_tmux(
     repo: str,
     issue: int,
     host: TmuxHost = TmuxHost(None),
+    verify_checks: int = 16,
+    verify_interval: float = 0.5,
+    sleeper: Callable[[float], None] = time.sleep,
 ) -> str:
     """Create a detached tmux session named for *(repo, issue)* running *cmd*.
 
@@ -1760,9 +1763,28 @@ def launch_drive_in_tmux(
     containing spaces (``--briefing-file``, ``--config``) survives intact.
 
     Returns the session name.  Raises :class:`DriveError` when tmux is
-    unavailable or a session for this *(repo, issue)* is already alive — the
+    unavailable, a session for this *(repo, issue)* is already alive (the
     CLI checks aliveness first for a friendlier message, but this guards
-    direct/test callers too.
+    direct/test callers too), or — #1606 — ``tmux new-session`` succeeded
+    but the launched process never actually got a drive loop running.
+
+    #1606: ``tmux new-session`` returning 0 only proves tmux itself started
+    a process; it says nothing about whether *that* process stayed up. The
+    observed failure (drive dispatched with ``--accept-advisory`` onto a
+    zero-commit advisory, decided there was nothing to do, and exited
+    immediately) left the session dead and ``Driver.run()``'s own log
+    untouched — while this function still returned success and the CLI
+    printed the "driving ... in tmux session" banner. ``~/.coord/drive-
+    epic.py`` treats *any* zero-exit ``coord drive --tmux`` as a live
+    attempt and increments its ledger, so an unreported instant-death here
+    silently burns a retry budget without ever running the issue once.
+    After the session is created, poll (up to ``verify_checks *
+    verify_interval`` seconds, default 8s) for the session to still be
+    alive AND ``Driver.run()``'s own run log (``scratch_dir()/<repo>-
+    <issue>.log`` — the same path ``Driver.run()`` computes) to have grown
+    past whatever it held before this launch. Either check failing raises
+    :class:`DriveError` instead of returning a session name — the caller
+    must then report failure, not the success banner.
     """
     if not tmux_available():
         raise DriveError("tmux is not available on this machine.", EXIT_USAGE)
@@ -1773,6 +1795,11 @@ def launch_drive_in_tmux(
             f"   attach with: coord drive-attach {repo} {issue}",
             EXIT_USAGE,
         )
+    log_path = scratch_dir() / f"{repo}-{issue}.log"
+    try:
+        before_mtime = log_path.stat().st_mtime
+    except OSError:
+        before_mtime = None
     try:
         result = subprocess.run(
             host.cmd(["new-session", "-d", "-s", session, *cmd]),
@@ -1785,6 +1812,39 @@ def launch_drive_in_tmux(
     if result.returncode != 0:
         raise DriveError(
             f"tmux new-session failed: {(result.stderr or '').strip()}", EXIT_USAGE
+        )
+
+    alive = True
+    grew = False
+    for _ in range(max(verify_checks, 1)):
+        sleeper(verify_interval)
+        alive = tmux_session_alive(session, host=host)
+        try:
+            grew = log_path.stat().st_mtime > (before_mtime or 0)
+        except OSError:
+            grew = False
+        if grew or not alive:
+            break
+    if not alive:
+        detail = (
+            "it did write to its log before exiting" if grew
+            else "it never wrote anything to its log"
+        )
+        raise DriveError(
+            f"tmux session {session!r} for {repo} #{issue} already exited "
+            f"({detail}) — the drive loop did not stay running, so this is "
+            f"not a live background run. Check the log: {log_path}\n"
+            "   Re-run without --tmux to see the failure inline instead.",
+            EXIT_USAGE,
+        )
+    if not grew:
+        raise DriveError(
+            f"tmux session {session!r} for {repo} #{issue} is running but its "
+            f"log ({log_path}) was never written to within "
+            f"{verify_checks * verify_interval:.0f}s — the drive loop may be "
+            f"stuck before its first log line. Attach to inspect: coord "
+            f"drive-attach {repo} {issue}",
+            EXIT_USAGE,
         )
     return session
 

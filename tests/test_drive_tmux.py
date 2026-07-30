@@ -123,14 +123,25 @@ class TestListDriveSessions:
 
 
 class TestLaunchDriveInTmux:
-    def test_happy_path_creates_session(self) -> None:
+    def test_happy_path_creates_session(self, tmp_path: Path) -> None:
+        """#1606: a session that stays alive AND grows its run log passes
+        the post-launch verification and returns normally."""
+        log_path = tmp_path / "myrepo-42.log"
+
+        def fake_sleeper(_: float) -> None:
+            # Simulate `Driver.run()`'s first `self.log()` call landing
+            # during the verify window.
+            log_path.write_text("driving myrepo #42\n")
+
         with (
             patch("coord.drive.tmux_available", return_value=True),
-            patch("coord.drive.tmux_session_alive", return_value=False),
+            patch("coord.drive.tmux_session_alive", side_effect=[False, True]),
+            patch("coord.drive.scratch_dir", return_value=tmp_path),
             patch("coord.drive.subprocess.run", return_value=_completed(0)) as run,
         ):
             session = launch_drive_in_tmux(
-                ["coord", "drive", "myrepo", "42"], repo="myrepo", issue=42
+                ["coord", "drive", "myrepo", "42"], repo="myrepo", issue=42,
+                sleeper=fake_sleeper,
             )
         assert session == "coord-drive-myrepo-42"
         argv = run.call_args[0][0]
@@ -163,6 +174,44 @@ class TestLaunchDriveInTmux:
         ):
             with pytest.raises(DriveError, match="some tmux error"):
                 launch_drive_in_tmux(["sleep", "1"], repo="myrepo", issue=42)
+
+    def test_session_dies_immediately_raises_instead_of_reporting_success(
+        self, tmp_path: Path
+    ) -> None:
+        """#1606: `tmux new-session` returning 0 only proves tmux itself
+        started a process — this is the observed shape from the issue
+        (`--accept-advisory` onto a zero-commit advisory decided there was
+        nothing to do and exited instantly). The session dying before the
+        first verify check must raise, never return a session name."""
+        with (
+            patch("coord.drive.tmux_available", return_value=True),
+            # pre-check: not already driving; verify loop: already dead.
+            patch("coord.drive.tmux_session_alive", side_effect=[False, False]),
+            patch("coord.drive.scratch_dir", return_value=tmp_path),
+            patch("coord.drive.subprocess.run", return_value=_completed(0)),
+        ):
+            with pytest.raises(DriveError, match="already exited"):
+                launch_drive_in_tmux(
+                    ["coord", "drive", "myrepo", "42"], repo="myrepo", issue=42,
+                    verify_checks=1, sleeper=lambda _: None,
+                )
+
+    def test_session_alive_but_log_never_grows_raises(self, tmp_path: Path) -> None:
+        """#1606: still tmux-alive but never wrote a single log line within
+        the verify window — stuck before `Driver.run()`'s first `self.log()`
+        call — must also raise rather than report success."""
+        with (
+            patch("coord.drive.tmux_available", return_value=True),
+            # pre-check: not already driving; both verify-loop checks: alive.
+            patch("coord.drive.tmux_session_alive", side_effect=[False, True, True]),
+            patch("coord.drive.scratch_dir", return_value=tmp_path),
+            patch("coord.drive.subprocess.run", return_value=_completed(0)),
+        ):
+            with pytest.raises(DriveError, match="was never written to"):
+                launch_drive_in_tmux(
+                    ["coord", "drive", "myrepo", "42"], repo="myrepo", issue=42,
+                    verify_checks=2, sleeper=lambda _: None,
+                )
 
 
 # ── regression: assignment-session discovery excludes coord-drive-* ────────────
