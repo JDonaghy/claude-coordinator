@@ -4186,7 +4186,9 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             return JSONResponse({"error": "invalid JSON body"}, status_code=400)
         try:
             state._mark_notified_local(
-                body["assignment_id"], body["event"], branch=body.get("branch")
+                body["assignment_id"], body["event"], branch=body.get("branch"),
+                failure_reason=body.get("failure_reason"),
+                exit_code=body.get("exit_code"),
             )
         except KeyError as e:
             return JSONResponse({"error": f"missing field: {e}"}, status_code=400)

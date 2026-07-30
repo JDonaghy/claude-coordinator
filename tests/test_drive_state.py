@@ -339,6 +339,29 @@ def test_smoke_row_is_keyed_on_the_work_row_too():
     assert state.smoke_status == "running"
 
 
+def test_smoke_failure_reason_is_projected_from_the_smoke_row():
+    """#1605: `_decide_test` needs the Test-stage WORKER's own
+    failure_reason (usage-limit-kill or terminal-API-error diagnostic) to
+    recognise an environmental death and report why a stranded Test stage
+    died — mirrors `review_failure_reason` (#1584)."""
+    payload = {
+        "assignments": [
+            row(assignment_id="w1", dispatched_at=100.0),
+            row(
+                assignment_id="s1",
+                type="smoke",
+                status="failed",
+                dispatched_at=110.0,
+                review_of_assignment_id="w1",
+                failure_reason="api_error: aborted_streaming",
+            ),
+        ]
+    }
+    state = project(payload, REPO, 1392, make_config())
+    assert state.smoke_status == "failed"
+    assert state.smoke_failure_reason == "api_error: aborted_streaming"
+
+
 # ── active rows ──────────────────────────────────────────────────────────────
 
 

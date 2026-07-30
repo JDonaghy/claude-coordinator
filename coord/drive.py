@@ -1062,6 +1062,35 @@ def _decide_test(
     if test_state in ("passed", "skipped"):
         return None
 
+    # #1605: the Test-stage CHILD assignment (`type="smoke"`) itself reached
+    # a terminal FAILED/cancelled status — a dead agent, a killed process
+    # group, a terminal API error, anything short of the worker actually
+    # printing `SMOKE: pass`/`SMOKE: fail` — without ever producing a
+    # verdict. Before this, `test_state` could be left at `"running"`
+    # (`dispatch_smoke`'s own marker, #1426) forever: every gate treats
+    # `"running"` as "no verdict yet" (#1395), so nothing downstream ever
+    # resolves it and this function prints "TEST: in progress" every poll,
+    # unbounded — the exact #1598 incident this closes (2.5 hours against
+    # three idle machines). `reconcile_completed_assignments` /
+    # `coord diagnose --stage test` normally resolve this from the daemon's
+    # own tick, but a live `coord drive` loop must not depend on that
+    # timing — detect the contradiction directly from the child's own board
+    # fields and stop with an actionable message rather than poll forever.
+    # Scoped to smoke FAILED/cancelled (not "done"): a fresh `done` smoke
+    # completion has an expected, bounded propagation lag before `coord
+    # notify` records its verdict — that is NOT this bug.
+    if state.smoke_status in ("failed", "cancelled") and test_state == "running":
+        return _die(
+            "test stage is stuck: work.test_state='running' but its "
+            f"Test-stage worker {state.smoke_aid} already finished "
+            f"(status={state.smoke_status!r}, reason="
+            f"{state.smoke_failure_reason or 'none recorded'!r}) — the "
+            "parent verdict was never resolved (#1605).\n"
+            f"   Recover: coord diagnose {state.repo} {state.issue} --stage "
+            "test\n"
+            "   (add --reset if the diagnosis alone doesn't clear it)"
+        )
+
     if test_state == "":
         if opts.skip_test:
             return Action(

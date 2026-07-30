@@ -997,7 +997,7 @@ def _record_acceptance_verdict_local(
 def record_test_verdict(
     *,
     assignment_id: str,
-    test_state: str,
+    test_state: str | None,
     test_reason: str | None = None,
     smoke_test: str | None = None,
     smoke_test_reason: str | None = None,
@@ -1013,6 +1013,12 @@ def record_test_verdict(
     (``passed``→``pass``, ``failed``→``fail``, ``skipped``→ untouched).  Both
     the local and the daemon ``/test-verdict`` route funnel through
     :func:`_record_test_verdict_local`, so the derivation applies either way.
+
+    ``test_state=None`` (#1605) clears the verdict back to ``NULL`` — used to
+    un-stick a Test stage whose worker died environmentally (#1590) rather
+    than reporting pass/fail, so :func:`coord.smoke.dispatch_pending_smoke`'s
+    ``test_state is not None`` eligibility check picks the work row back up
+    for a fresh dispatch instead of leaving it wedged or wrongly `failed`.
     """
     svc = _board_service()
     resp = _route_write(
@@ -1040,7 +1046,7 @@ def record_test_verdict(
 def _record_test_verdict_local(
     *,
     assignment_id: str,
-    test_state: str,
+    test_state: str | None,
     test_reason: str | None = None,
     smoke_test: str | None = None,
     smoke_test_reason: str | None = None,
@@ -1106,7 +1112,10 @@ def _record_test_verdict_local(
             issue_number=row["issue_number"],
             branch=row["branch"],
         )
-    if row is not None:
+    if row is not None and test_state is not None:
+        # #1605: `test_state=None` (clearing a verdict for re-dispatch, not
+        # recording one) isn't a verdict to audit — `f"test_{test_state}"`
+        # would otherwise log a nonsensical "test_None" event type.
         _record_audit(
             tier="business",
             category="test",
@@ -1340,6 +1349,8 @@ def mark_notified(
     event: str,
     *,
     branch: str | None = None,
+    failure_reason: str | None = None,
+    exit_code: int | None = None,
 ) -> None:
     """Record that a GitHub comment was posted for this assignment.
 
@@ -1359,16 +1370,35 @@ def mark_notified(
     directly by ``coord post-pending-reviews`` and the dashboard's
     "post findings" action — both of which had been silently writing to a
     thin client's empty local ledger.
+
+    ``failure_reason``/``exit_code`` (#1605) are optional and only ever
+    applied on an ``EVENT_FAILURE``-flavoured write (see
+    :func:`_mark_notified_local`) — omitting them leaves those columns
+    untouched, exactly like every call site before this parameter existed.
+    Before #1605 this was the ONE terminal-status writer that could set
+    ``status='failed'`` on a board row while never recording why: a smoke/
+    Test-stage worker dying on a terminal API error printed the cause to its
+    own log, but nothing carried it onto the row `coord status`/`coord
+    drive`/the TUI actually read.
     """
     svc = _board_service()
     resp = _route_write(
         svc,
         "/notified",
-        {"assignment_id": assignment_id, "event": event, "branch": branch},
+        {
+            "assignment_id": assignment_id,
+            "event": event,
+            "branch": branch,
+            "failure_reason": failure_reason,
+            "exit_code": exit_code,
+        },
     )
     if resp is not None:
         return
-    _mark_notified_local(assignment_id, event, branch=branch)
+    _mark_notified_local(
+        assignment_id, event, branch=branch,
+        failure_reason=failure_reason, exit_code=exit_code,
+    )
 
 
 def _mark_notified_local(
@@ -1376,6 +1406,8 @@ def _mark_notified_local(
     event: str,
     *,
     branch: str | None = None,
+    failure_reason: str | None = None,
+    exit_code: int | None = None,
 ) -> None:
     """Local-DB write for :func:`mark_notified`.
 
@@ -1426,9 +1458,28 @@ def _mark_notified_local(
             (now, assignment_id),
         )
     else:
+        # #1605: this bare `else` (EVENT_FAILURE and anything else
+        # unrecognized) used to write ONLY `status='failed'` — never
+        # `failure_reason`, never `exit_code` — even when the caller had
+        # both in hand (`coord.notify.post_transition` reads them straight
+        # off the agent's `/status` completed entry). A failed row with
+        # both null is undiagnosable from the board alone; the #1598
+        # incident (a smoke worker dying on a terminal API error) had to be
+        # explained by reading a raw worker transcript because of exactly
+        # this gap. Both remain optional/additive so every pre-#1605 caller
+        # (which never passes them) is unaffected.
+        fields = ["status='failed'", "finished_at=?"]
+        params: list[object] = [now]
+        if failure_reason is not None:
+            fields.append("failure_reason=?")
+            params.append(failure_reason[:512])  # cap at 512 chars — one-liner
+        if exit_code is not None:
+            fields.append("exit_code=?")
+            params.append(exit_code)
+        params.append(assignment_id)
         conn.execute(
-            "UPDATE assignments SET status='failed', finished_at=? WHERE assignment_id=?",
-            (now, assignment_id),
+            f"UPDATE assignments SET {', '.join(fields)} WHERE assignment_id=?",
+            tuple(params),
         )
     conn.commit()
 

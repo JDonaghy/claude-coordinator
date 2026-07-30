@@ -1103,6 +1103,8 @@ class TestThinClientLocalBoardGuard:
             "assignment_id": "aid-1493",
             "event": "completion",
             "branch": "issue-1-foo",
+            "failure_reason": None,
+            "exit_code": None,
         }
 
         # Local DB must NOT have been written (empty local DB, thin-client).

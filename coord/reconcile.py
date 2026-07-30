@@ -195,15 +195,39 @@ def reconcile_completed_assignments(
         # detected from a TRUNCATED log with no terminal `result` event,
         # while an API-error is read OFF that terminal `result` event — so
         # this `or` never picks the wrong one.
+        _failure_reason = (
+            entry.get("usage_limit_reason") or entry.get("api_error_reason")
+        )
         update_state_fn(
             assignment_id=aid,
             terminal_status=terminal,
             branch=a.branch or entry.get("branch"),
             review_state=None,
-            failure_reason=(
-                entry.get("usage_limit_reason") or entry.get("api_error_reason")
-            ),
+            failure_reason=_failure_reason,
+            # #1605: the reap already computed the exit code (AgentServer._reap,
+            # agent.py) and it rides on this same `/status` `completed` entry —
+            # nothing downstream of THIS write path ever persisted it, so a
+            # failed Test-stage row was undiagnosable from the board (both
+            # `failure_reason` AND `exit_code` null) even when the reap knew
+            # exactly why it died.
+            exit_code=entry.get("exit_code"),
         )
+
+        # #1605: a `type="smoke"` (Test-stage) assignment reaching a terminal
+        # FAILED status must resolve the PARENT work row's `test_state` —
+        # never leave it `running` forever. `running` is a documented
+        # transient non-verdict marker (#1395) that every gate treats as "no
+        # verdict yet", so a stranded child leaves the issue permanently
+        # unresolvable and invisible to every instrument except a worker
+        # transcript. See `propagate_smoke_terminal_failure` for the
+        # environmental-vs-work classification (#1590) that decides whether
+        # this clears the verdict for a fresh auto-dispatch or records a real
+        # test failure.
+        if a.type == "smoke" and terminal == "failed":
+            propagate_smoke_terminal_failure(
+                parent_assignment_id=a.review_of_assignment_id,
+                failure_reason=_failure_reason,
+            )
 
         # #666 Gap A: best-effort cost/token capture from the agent completed
         # entry.  Must never raise — a tick crash breaks the daemon.
@@ -232,6 +256,70 @@ def reconcile_completed_assignments(
         )
 
     return reconciled
+
+
+def propagate_smoke_terminal_failure(
+    *, parent_assignment_id: str | None, failure_reason: str | None,
+) -> None:
+    """#1605: resolve a work row's ``test_state`` when its Test-stage
+    (``type="smoke"``) child dies without ever reporting pass/fail.
+
+    Before this, a smoke assignment landing on ``status="failed"`` (a dead
+    agent, a killed process group, a terminal API error — anything short of
+    the worker itself printing ``SMOKE: pass``/``SMOKE: fail``) left the
+    parent's ``test_state`` at whatever it was — almost always ``"running"``,
+    the marker `dispatch_smoke` stamps the instant it dispatches (#1426).
+    Every downstream gate treats ``"running"`` as "no verdict yet" (#1395),
+    so the work sits in a state nothing will ever resolve: `coord drive`
+    polls it forever, the merge gate never sees a verdict, and `coord
+    diagnose --stage test` had nothing to say because it never looked past
+    the (terminal, `status="done"`) work row itself.
+
+    Classified through :func:`coord.failure_class.classify_failure` — the
+    same #1590 environmental-vs-work split already used for the work/review
+    stages, applied here for the first time to the Test stage:
+
+    * **environmental** (usage limit, an API 5xx, a network drop) — the
+      provider's fault, not the work's. Clears ``test_state`` back to
+      ``NULL`` (not ``"failed"``) so the daemon's normal
+      :func:`coord.smoke.dispatch_pending_smoke` auto-queue picks the work
+      row back up on its next tick and re-dispatches a fresh Test stage —
+      never spending the bounded ``coord fix`` retry budget on a code defect
+      that never existed.
+    * **work** (an unclassifiable crash, a real defect) — records
+      ``test_state="failed"`` exactly like a normal non-zero-exit smoke
+      completion already does (`coord/notify.py`'s completion handler), so
+      the existing bounded `coord fix` loop picks it up from there.
+
+    A no-op when *parent_assignment_id* is falsy (a smoke row somehow
+    missing its ``review_of_assignment_id`` — should not happen in practice,
+    but this must never raise on it).
+    """
+    if not parent_assignment_id:
+        return
+    from coord.failure_class import classify_failure  # noqa: PLC0415
+    from coord.state import record_test_verdict  # noqa: PLC0415
+
+    classification = classify_failure(failure_reason=failure_reason)
+    if classification.is_environmental:
+        record_test_verdict(
+            assignment_id=parent_assignment_id,
+            test_state=None,
+            test_reason=(
+                "Test stage worker died environmentally "
+                f"({classification.reason}) — cleared for automatic "
+                "re-dispatch, not recorded as a work failure (#1605)"
+            ),
+        )
+    else:
+        record_test_verdict(
+            assignment_id=parent_assignment_id,
+            test_state="failed",
+            test_reason=(
+                failure_reason
+                or "Test stage worker failed with no reason recorded (#1605)"
+            ),
+        )
 
 
 def _capture_plan_best_effort(host: str, assignment_id: str) -> bool:

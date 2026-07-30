@@ -1135,6 +1135,54 @@ def test_a_running_test_stage_just_waits():
     assert action.kind == WAIT
 
 
+def test_a_running_test_stage_with_no_smoke_child_still_just_waits():
+    """A plain in-flight Test stage (smoke child still running, or none
+    dispatched yet) is not the #1605 contradiction — must not be confused
+    with a stranded one."""
+    action = step(done_work(work_test_state="running", smoke_aid="s1", smoke_status="running"))
+    assert action.kind == WAIT
+
+
+def test_stuck_test_state_with_a_terminal_smoke_child_is_actionable_not_a_loop():
+    """#1605: the Test-stage CHILD assignment (`type="smoke"`) already
+    finished FAILED (a dead agent, a killed process group, a terminal API
+    error — the #1598 incident's exact shape) but `test_state` was never
+    resolved off it — stuck at `"running"` forever. Before this, `_decide_test`
+    only ever looked at `work_test_state` and returned an unbounded `_wait()`
+    here, which is exactly how #1598 polled a phantom Test stage for 2.5
+    hours against three idle machines. This must terminate the drive loop
+    with an actionable message instead."""
+    action = step(done_work(
+        work_test_state="running",
+        smoke_aid="smoke-1605",
+        smoke_status="failed",
+        smoke_failure_reason="api_error: aborted_streaming",
+    ))
+    assert action.is_exit
+    assert action.exit_code == EXIT_TERMINAL_FAILURE
+    assert "smoke-1605" in action.message
+    assert "api_error: aborted_streaming" in action.message
+    assert "coord diagnose" in action.message
+
+
+def test_stuck_test_state_with_a_cancelled_smoke_child_is_also_actionable():
+    action = step(done_work(
+        work_test_state="running", smoke_aid="smoke-2", smoke_status="cancelled",
+    ))
+    assert action.is_exit
+    assert action.exit_code == EXIT_TERMINAL_FAILURE
+
+
+def test_a_done_smoke_child_with_lagging_test_state_still_just_waits():
+    """A fresh `done` smoke completion has an expected, bounded propagation
+    lag before `coord notify` records its verdict on the parent — that is
+    NOT the #1605 bug and must not trip the contradiction check."""
+    action = step(done_work(
+        work_test_state="running", smoke_aid="smoke-3", smoke_status="done",
+    ))
+    assert action.kind == WAIT
+
+
 def test_a_failed_test_loops_through_coord_fix_on_the_same_branch():
     """`coord fix` gates on the legacy smoke_test field and dispatches with
     inherit_branch=True — the same branch, model escalated (#1445)."""

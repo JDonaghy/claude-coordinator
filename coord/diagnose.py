@@ -546,7 +546,9 @@ def diagnose_stage(
         _recover_review(board, config, latest, state, res, dry_run=dry_run)
     elif stage in ("merge",):
         _recover_merge(board, config, repo_name, issue_number, latest, res, dry_run=dry_run)
-    else:  # work / plan / test
+    elif stage == "test":
+        _recover_test(board, latest, state, res, config=config, dry_run=dry_run)
+    else:  # work / plan
         _recover_work_like(board, config, latest, state, res, dry_run=dry_run)
 
     _cleanup_issue(
@@ -722,6 +724,76 @@ def _diagnose_unqueued_merge(
             "(e.g. already merged/closed on GitHub, or repo not in config)"
         )
         res.recovered = False
+
+
+def _recover_test(
+    board, latest, state, res: DiagnoseResult, *, config, dry_run: bool
+) -> None:
+    """#1605: the Test-gate check.
+
+    ``latest`` here is the WORK row (``STAGE_ASSIGNMENT_TYPES["test"] ==
+    ("work", "plan")`` — ``test_state`` lives on it, not on the
+    ``type="smoke"`` child that actually ran the suite). Before this,
+    nothing here ever looked past the work row itself: a work row wedged at
+    ``test_state="running"`` with its smoke child already dead/failed fell
+    straight through to :func:`_recover_work_like`'s catch-all
+    ("stage looks healthy", since ``latest.status`` is already ``"done"``)
+    — exactly the #1598 incident's "nothing to reconcile" symptom, and
+    exactly why the daemon restart mentioned in that report didn't clear it
+    either: nothing was ever looking at the CHILD row.
+    """
+    if latest.test_state == "running":
+        smoke = next(
+            (
+                a
+                for a in (board.active + board.completed)
+                if a.type == "smoke"
+                and a.review_of_assignment_id == latest.assignment_id
+            ),
+            None,
+        )
+        if smoke is None:
+            res.findings.append(
+                "⚠ test_state='running' but no Test-stage (smoke) assignment "
+                "exists for this work row at all — the 'running' marker is "
+                "set at dispatch (#1426) so the child row should exist "
+                "(#1605 class)."
+            )
+            res.needs_reset = True
+            return
+        if (smoke.status or "") in ("failed", "cancelled"):
+            res.findings.append(
+                f"⚠ test_state='running' but the Test-stage worker "
+                f"{smoke.assignment_id} already finished "
+                f"(status={smoke.status!r}, failure_reason="
+                f"{smoke.failure_reason or 'none recorded'!r}) — the parent "
+                "verdict was never resolved (#1605)."
+            )
+            if dry_run:
+                res.findings.append(
+                    "(dry-run) would resolve test_state from the smoke "
+                    "child's terminal status — passed, failed, or cleared "
+                    "for re-dispatch depending on the #1590 environmental "
+                    "classification"
+                )
+                res.needs_reset = True
+                return
+            from coord.reconcile import (  # noqa: PLC0415
+                propagate_smoke_terminal_failure,
+            )
+
+            propagate_smoke_terminal_failure(
+                parent_assignment_id=latest.assignment_id,
+                failure_reason=smoke.failure_reason,
+            )
+            res.actions_taken.append(
+                f"resolved stuck test_state='running' from smoke child "
+                f"{smoke.assignment_id}'s terminal status={smoke.status!r} "
+                "(#1605)"
+            )
+            res.recovered = True
+            return
+    _recover_work_like(board, config, latest, state, res, dry_run=dry_run)
 
 
 def _recover_work_like(

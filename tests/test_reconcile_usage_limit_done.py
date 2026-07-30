@@ -51,7 +51,7 @@ class _Recorder:
 
     def __call__(
         self, *, assignment_id, terminal_status, branch, review_state,
-        failure_reason=None,
+        failure_reason=None, exit_code=None,
     ) -> None:
         self.calls.append(
             {
