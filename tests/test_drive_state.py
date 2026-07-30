@@ -256,6 +256,28 @@ def test_review_is_keyed_on_the_current_work_row_not_the_issue():
     assert state.review_verdict == ""
 
 
+def test_review_failure_reason_is_projected_from_the_review_row():
+    """#1584: `_decide_review` needs the review WORKER's own failure_reason
+    (usage-limit-kill or terminal-API-error diagnostic) to report why a
+    failed review died — mirrors `work_failure_reason`."""
+    payload = {
+        "assignments": [
+            row(assignment_id="w1", dispatched_at=100.0),
+            row(
+                assignment_id="r1",
+                type="review",
+                status="failed",
+                dispatched_at=110.0,
+                review_of_assignment_id="w1",
+                failure_reason="529 Overloaded",
+            ),
+        ]
+    }
+    state = project(payload, REPO, 1392, make_config())
+    assert state.review_status == "failed"
+    assert state.review_failure_reason == "529 Overloaded"
+
+
 def test_smoke_row_is_keyed_on_the_work_row_too():
     payload = {
         "assignments": [

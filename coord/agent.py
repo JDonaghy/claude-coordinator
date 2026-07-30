@@ -5440,50 +5440,58 @@ class AgentServer:
             except Exception:  # noqa: BLE001 — best-effort, never break reap
                 pass
 
-        # #1584: read `is_error` off the log's LAST `result` event and, when
-        # set, treat it as authoritative — a transient upstream failure
-        # (529 Overloaded, 500, a network drop) that killed the worker is
-        # NEVER `done`, whatever the wrapper's own exit code says.  Uses the
-        # same provider resolved for the wait loop above (`_reap_provider`,
-        # falling back to the plain `coord.worker_events.parse_log`) so a
-        # non-default provider's own log shape is honoured here exactly as it
-        # is for the claude_session_id parse further down.  `WorkerSummary
-        # .is_error`/`.terminal_reason`/`.api_error_status`/`.result_text`
-        # are overwritten on every `result` event a full parse walks through
-        # (see `update_summary`), so this reflects only the LAST one: a
-        # worker that hit the same transient error, retried internally, and
-        # finished cleanly is unaffected — its final `result` event carries
-        # no `is_error`.  Best-effort throughout; any parse failure just
-        # leaves this `False`/`None`, i.e. today's pre-#1584 behaviour.
-        _result_is_error = False
-        _api_error_reason: str | None = None
+        # #1584: parse the worker's full terminal log ONCE here and share the
+        # result with the claude_session_id capture further down (both used
+        # to run an independent `tail_bytes=0` full-transcript parse of the
+        # SAME log on every single reap — wasteful, and worth avoiding since
+        # transcripts can be large). Uses the same provider resolved for the
+        # wait loop above (`_reap_provider`, falling back to the plain
+        # `coord.worker_events.parse_log`) so a non-default provider's own
+        # log shape is honoured consistently for both consumers.
+        # `WorkerSummary.is_error`/`.terminal_reason`/`.api_error_status`/
+        # `.result_text` are overwritten on every `result` event a full parse
+        # walks through (see `update_summary`), so `is_error` below reflects
+        # only the LAST one: a worker that hit a transient error, retried
+        # internally, and finished cleanly is unaffected — its final
+        # `result` event carries no `is_error`. Best-effort throughout; any
+        # parse failure (or a non-stream-json log) just leaves this `None`,
+        # and each consumer falls back to its own pre-#1584 behaviour.
+        _worker_summary = None
         if log_path:
             try:
-                from coord.worker_events import (  # noqa: PLC0415
-                    format_api_error_reason,
-                    is_stream_json,
-                )
+                from coord.worker_events import is_stream_json  # noqa: PLC0415
                 if is_stream_json(log_path):
                     if _reap_provider is not None:
-                        _err_summary = _reap_provider.parse_log(log_path, tail_bytes=0)
+                        _worker_summary = _reap_provider.parse_log(log_path, tail_bytes=0)
                     else:
                         from coord.worker_events import parse_log  # noqa: PLC0415
-                        _err_summary = parse_log(log_path, tail_bytes=0)
-                    if _err_summary.is_error:
-                        _result_is_error = True
-                        _api_error_reason = format_api_error_reason(
-                            terminal_reason=_err_summary.terminal_reason,
-                            api_error_status=_err_summary.api_error_status,
-                            result_text=_err_summary.result_text,
+                        _worker_summary = parse_log(log_path, tail_bytes=0)
+            except Exception:  # noqa: BLE001 — best-effort, never break reap
+                _worker_summary = None
+
+        # Treat `is_error: true` on that LAST `result` event as authoritative
+        # — a transient upstream failure (529 Overloaded, 500, a network
+        # drop) that killed the worker is NEVER `done`, whatever the
+        # wrapper's own exit code says.
+        _result_is_error = False
+        _api_error_reason: str | None = None
+        if _worker_summary is not None and _worker_summary.is_error:
+            try:
+                from coord.worker_events import format_api_error_reason  # noqa: PLC0415
+                _result_is_error = True
+                _api_error_reason = format_api_error_reason(
+                    terminal_reason=_worker_summary.terminal_reason,
+                    api_error_status=_worker_summary.api_error_status,
+                    result_text=_worker_summary.result_text,
+                )
+                try:
+                    with open(log_path, "a") as reopen:
+                        reopen.write(
+                            "# reap: terminal API error detected — "
+                            f"{_api_error_reason} (#1584)\n"
                         )
-                        try:
-                            with open(log_path, "a") as reopen:
-                                reopen.write(
-                                    "# reap: terminal API error detected — "
-                                    f"{_api_error_reason} (#1584)\n"
-                                )
-                        except OSError:
-                            pass
+                except OSError:
+                    pass
             except Exception:  # noqa: BLE001 — best-effort, never break reap
                 pass
 
@@ -5640,24 +5648,34 @@ class AgentServer:
         # #324: route through provider.parse_log() when a provider is registered
         # so future providers can customise log parsing.  ClaudeProvider delegates
         # to coord.worker_events.parse_log — byte-identical to the old path.
+        # #1584: reuse `_worker_summary` (parsed once, above) instead of
+        # parsing the same full transcript a second time — it was built from
+        # `log_path`, which is this same assignment's log for the run just
+        # reaped, via the identical provider-resolution rule. Only re-parses
+        # (the pre-#1584 behaviour) when that parse is unavailable — e.g. a
+        # non-stream-json log, or a parse failure best-effort-swallowed above
+        # — so this never becomes LESS reliable than before, only less
+        # redundant on the common path.
         if assignment is not None and assignment.claude_session_id is None:
             try:
-                from coord.worker_events import is_stream_json  # noqa: PLC0415
-                lp = assignment.log_path
-                if lp and is_stream_json(lp):
-                    _parse_provider_name = assignment.spec.provider
-                    if (
-                        _parse_provider_name is not None
-                        and _parse_provider_name in self._providers
-                    ):
-                        summary = self._providers[_parse_provider_name].parse_log(
-                            lp, tail_bytes=0
-                        )
-                    else:
-                        from coord.worker_events import parse_log  # noqa: PLC0415
-                        summary = parse_log(lp, tail_bytes=0)
-                    if summary.session_id:
-                        assignment.claude_session_id = summary.session_id
+                summary = _worker_summary
+                if summary is None:
+                    from coord.worker_events import is_stream_json  # noqa: PLC0415
+                    lp = assignment.log_path
+                    if lp and is_stream_json(lp):
+                        _parse_provider_name = assignment.spec.provider
+                        if (
+                            _parse_provider_name is not None
+                            and _parse_provider_name in self._providers
+                        ):
+                            summary = self._providers[_parse_provider_name].parse_log(
+                                lp, tail_bytes=0
+                            )
+                        else:
+                            from coord.worker_events import parse_log  # noqa: PLC0415
+                            summary = parse_log(lp, tail_bytes=0)
+                if summary is not None and summary.session_id:
+                    assignment.claude_session_id = summary.session_id
             except Exception:  # noqa: BLE001
                 pass  # best-effort; a missing session_id just means chat-continue will refuse
 

@@ -145,6 +145,49 @@ def test_usage_limit_reason_propagated_from_agent_entry() -> None:
     }
 
 
+def test_api_error_reason_propagated_from_agent_entry() -> None:
+    """#1584: a terminal `is_error: true` result event (transient API error,
+    e.g. 529 Overloaded) is carried on the agent's completed entry
+    (AgentServer._reap stamps `api_error_reason`) and must be forwarded to
+    `_update_local_state` as `failure_reason` exactly like `usage_limit_reason`
+    — this is the primary production path (the daemon's passive tick) for
+    getting the reason out of the ephemeral agent-side JSON and into the
+    persisted, drive.py-visible `failure_reason` column so `coord status`,
+    the TUI, and GitHub failure comments show "529 Overloaded" instead of a
+    bare "failed"."""
+    rec = _Recorder()
+    reconcile_completed_assignments(
+        _config(),
+        board=_board(_running("w1", atype="review")),
+        agent_status_fn=lambda host: {"completed": [
+            {"id": "w1", "status": "failed", "api_error_reason": "529 Overloaded"},
+        ]},
+        update_state_fn=rec, capture_plan=False,
+    )
+    assert rec.calls[0]["failure_reason"] == "529 Overloaded"
+
+
+def test_usage_limit_reason_preferred_over_api_error_reason() -> None:
+    """The two are mutually exclusive by construction (see
+    `AgentServer._reap`), but if an entry somehow carried both,
+    `usage_limit_reason` — the #1461 kill diagnostic — must win, matching
+    `reconcile._record_usage_limit_reason`'s own `or` ordering."""
+    rec = _Recorder()
+    reconcile_completed_assignments(
+        _config(),
+        board=_board(_running("w1", atype="work")),
+        agent_status_fn=lambda host: {"completed": [
+            {
+                "id": "w1", "status": "failed",
+                "usage_limit_reason": "usage limit — resets 8:30pm (America/Chicago)",
+                "api_error_reason": "529 Overloaded",
+            },
+        ]},
+        update_state_fn=rec, capture_plan=False,
+    )
+    assert rec.calls[0]["failure_reason"] == "usage limit — resets 8:30pm (America/Chicago)"
+
+
 def test_no_failure_reason_when_agent_entry_lacks_usage_limit() -> None:
     """A normal failure (no usage-limit kill detected) must not synthesize a
     failure_reason out of nothing — None flows through unchanged."""

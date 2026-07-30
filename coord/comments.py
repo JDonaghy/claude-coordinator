@@ -418,6 +418,7 @@ _STALLED_REASON_LABELS = {
     "done_no_review": "Work done, no review ever dispatched",
     "approved_not_queued": "Approved + tested, but not queued for merge",
     "merge_conflict_unresolved": "Merge entry stuck in CONFLICT, no fix attempted",
+    "review_failed_no_verdict": "Review worker failed before producing a verdict",
 }
 
 
@@ -433,8 +434,10 @@ def format_stalled_pipeline(
     """Format a "stalled pipeline row" comment (#1441).
 
     *reason* is one of ``"review_request_changes_no_fix"``,
-    ``"done_no_review"``, or ``"approved_not_queued"``; *detail* is a
-    human-readable one-liner naming the unmet precondition.
+    ``"done_no_review"``, ``"approved_not_queued"``,
+    ``"merge_conflict_unresolved"``, or ``"review_failed_no_verdict"``
+    (#1584); *detail* is a human-readable one-liner naming the unmet
+    precondition.
     """
     marker = _marker(
         EVENT_STALLED,

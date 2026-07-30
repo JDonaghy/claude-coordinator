@@ -113,7 +113,7 @@ class StalledDetection:
     issue_number: int
     reason: str  # "review_request_changes_no_fix" | "review_done_no_verdict" |
     # "done_no_review" | "approved_not_queued" | "merge_conflict_unresolved"
-    # (#1478, #1582)
+    # (#1478, #1582) | "review_failed_no_verdict" (#1584)
     detail: str
 
 
@@ -368,6 +368,14 @@ def detect_stalled_pipeline(
        ``--only``): a ``coord merge`` invocation that dispatched a
        conflict-fix which then failed to actually attempt (no idle
        machine) leaves the entry parked with nothing watching it.
+    5. ``review_failed_no_verdict`` (#1584) — the head's linked review
+       WORKER died (transient API error, network drop, ...) before ever
+       producing a verdict — ``status="failed"`` with no
+       ``review_verdict``. Before #1584 this could not happen (a dying
+       review was mislabelled ``done``, silently masquerading as a real
+       completion); now that it is correctly ``failed``, it needs its own
+       arm here so it is not silently skipped (``reason`` staying ``None``)
+       the way an unrecognized status would be.
 
     Every candidate is checked against the shared #522 terminal-state guard
     (:func:`coord.github_ops.work_is_terminal`, via *terminal_cache* — the
@@ -483,6 +491,18 @@ def detect_stalled_pipeline(
             detail = (
                 f"Work is done with test_state={work.test_state!r} but no "
                 "review assignment was ever dispatched for it."
+            )
+        elif review is not None and review.status == "failed":
+            # #1584: the review worker died (transient API error, network
+            # drop, ...) before producing a verdict. Checked before the
+            # `review is None or review.status == "done"` catch-all below so
+            # a failed review is never mistaken for "no review dispatched"
+            # or "review approved" — neither of which is true here.
+            reason = "review_failed_no_verdict"
+            detail = (
+                f"Review {review.assignment_id} failed "
+                f"({review.failure_reason or 'no reason recorded'}) before "
+                "producing a verdict, and no retry was dispatched."
             )
         elif review is None or review.status == "done":
             # Either the review gate doesn't apply, or a review already
@@ -702,6 +722,10 @@ def dispatch_stalled_pipeline_action(
       runs on every interval.
     - ``merge_conflict_unresolved`` → :func:`coord.conflict_fix.dispatch_conflict_fix`,
       the #1474 ``_dispatch_conflict_fixes`` path.
+    - ``review_failed_no_verdict`` (#1584) → :func:`coord.review.dispatch_review`
+      again, the SAME call as ``done_no_review`` — the failed review left no
+      verdict behind, so recovery is identical to "no review was ever
+      dispatched": open a fresh one against the still-``done`` work row.
 
     Never re-entrant across ticks: the caller only reaches this after
     :func:`detect_stalled_pipeline` has already filtered out any row whose
@@ -901,6 +925,27 @@ def dispatch_stalled_pipeline_action(
         )
 
     if detection.reason == "done_no_review":
+        from coord.review import dispatch_review  # noqa: PLC0415
+
+        review = dispatch_review(work, board, config, terminal_cache=terminal_cache)
+        if review is None:
+            return StalledDispatchAction(
+                kind="no_action",
+                detail="dispatch_review declined (no machine / already in flight / gate)",
+            )
+        return StalledDispatchAction(
+            kind="review_dispatched",
+            detail=f"review {review.assignment_id} dispatched to {review.machine_name}",
+        )
+
+    if detection.reason == "review_failed_no_verdict":
+        # #1584: the previous review died with no verdict — recovery is
+        # identical to `done_no_review` above: `work` itself is still
+        # `status="done"` (only the review it spawned failed), so a fresh
+        # `dispatch_review` call is a normal, ungated re-dispatch. Reusing
+        # the same call (rather than e.g. `coord retry` against the dead
+        # review row) also picks up any board state that changed since —
+        # same reasoning `done_no_review` already relies on.
         from coord.review import dispatch_review  # noqa: PLC0415
 
         review = dispatch_review(work, board, config, terminal_cache=terminal_cache)

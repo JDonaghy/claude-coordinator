@@ -368,6 +368,46 @@ class TestDoneNoReview:
         assert results == []
 
 
+# ── Candidate stall state 5: review worker died, no verdict (#1584) ────────
+
+
+class TestReviewFailedNoVerdict:
+    def test_flags_when_review_worker_failed_with_no_verdict(self, config: Config) -> None:
+        """#1584: before this fix, a review worker that died (transient API
+        error, network drop, ...) landed here unrecognised — `reason`
+        stayed `None` and the row was silently skipped, disabling #1582's
+        auto-recovery for exactly the failure mode #1582 was built around."""
+        review = _review(
+            "work-1", aid="review-1", status="failed", review_verdict=None,
+        )
+        review.failure_reason = "529 Overloaded"
+        board = _board(_work("work-1", test_state="passed"), review)
+        results = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        )
+        assert len(results) == 1
+        detection, work = results[0]
+        assert detection.reason == "review_failed_no_verdict"
+        assert work.assignment_id == "work-1"
+        assert "529 Overloaded" in detection.detail
+
+    def test_not_flagged_when_review_still_pending(self, config: Config) -> None:
+        """A review that's simply still running is not a stall — distinct
+        from a review that already died."""
+        board = _board(
+            _work("work-1", test_state="passed"),
+            Assignment(
+                machine_name="mac-mini", repo_name="vimcode", issue_number=602,
+                issue_title="[review]", assignment_id="review-1", status="running",
+                type="review", review_of_assignment_id="work-1",
+            ),
+        )
+        results = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        )
+        assert results == []
+
+
 # ── Candidate stall state 3: approved + tested, not in the merge queue ─────
 
 
@@ -518,6 +558,18 @@ class TestFormatStalledPipeline:
         assert "#602" in body
         assert "Review requested changes, no fix dispatched" in body
         assert f"<!-- coord:event={EVENT_STALLED}" in body
+
+    def test_renders_review_failed_no_verdict_label(self) -> None:
+        """#1584."""
+        body = format_stalled_pipeline(
+            assignment_id="work-602",
+            machine_name="mac-mini",
+            repo_name="vimcode",
+            issue_number=602,
+            reason="review_failed_no_verdict",
+            detail="Review review-602 failed (529 Overloaded)...",
+        )
+        assert "Review worker failed before producing a verdict" in body
 
 
 # ── Reachable from `coord notify`, not only `reconcile()` (§7) ─────────────
@@ -1076,6 +1128,53 @@ class TestDispatchPerReason:
         assert action.kind == "review_dispatched"
         assert "review-99" in action.detail
         stub.assert_called_once()
+
+    def test_review_failed_no_verdict_dispatches_a_fresh_review(
+        self, config: Config, monkeypatch
+    ) -> None:
+        """#1584: recovery for a review worker that died with no verdict is
+        identical to `done_no_review` — the underlying `work` row is still
+        `status="done"`, so a fresh `dispatch_review` call is a normal,
+        ungated re-dispatch."""
+        config.pipeline.auto_dispatch_stalled = True
+        review = _review(
+            "work-1", aid="review-1", status="failed", review_verdict=None,
+        )
+        review.failure_reason = "529 Overloaded"
+        board = _board(_work("work-1", test_state="passed"), review)
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        )[0]
+        assert detection.reason == "review_failed_no_verdict"
+
+        new_review = _review("work-1", aid="review-99", status="pending")
+        stub = MagicMock(return_value=new_review)
+        monkeypatch.setattr("coord.review.dispatch_review", stub)
+
+        action = notify_mod.dispatch_stalled_pipeline_action(detection, work, board, config)
+
+        assert action.kind == "review_dispatched"
+        assert action.kind in notify_mod._STALLED_DISPATCH_KINDS
+        assert "review-99" in action.detail
+        stub.assert_called_once()
+
+    def test_review_failed_no_verdict_no_action_when_dispatch_declines(
+        self, config: Config, monkeypatch
+    ) -> None:
+        config.pipeline.auto_dispatch_stalled = True
+        review = _review(
+            "work-1", aid="review-1", status="failed", review_verdict=None,
+        )
+        board = _board(_work("work-1", test_state="passed"), review)
+        detection, work = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        )[0]
+
+        monkeypatch.setattr(
+            "coord.review.dispatch_review", MagicMock(return_value=None)
+        )
+        action = notify_mod.dispatch_stalled_pipeline_action(detection, work, board, config)
+        assert action.kind == "no_action"
 
     def test_approved_not_queued_enqueues(self, config: Config, monkeypatch) -> None:
         config.pipeline.auto_dispatch_stalled = True

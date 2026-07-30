@@ -87,6 +87,12 @@ class IssueState:
     review_aid: str = ""
     review_status: str = ""
     review_verdict: str = ""
+    # #1584: mirrors `work_failure_reason` — surfaces a review worker's
+    # persisted `failure_reason` (usage-limit-kill or terminal-API-error
+    # diagnostic; see `coord.reconcile._record_usage_limit_reason`) so
+    # `_decide_review` can report *why* a failed review died instead of a
+    # bare "failed".
+    review_failure_reason: str = ""
 
     smoke_aid: str = ""
     smoke_status: str = ""
@@ -282,6 +288,7 @@ def project(payload: dict, repo: str, issue: int, config: Any) -> IssueState:
         review_aid=g(review, "assignment_id"),
         review_status=g(review, "status"),
         review_verdict=g(review, "review_verdict"),
+        review_failure_reason=g(review, "failure_reason"),
         smoke_aid=g(smoke, "assignment_id"),
         smoke_status=g(smoke, "status"),
         active_count=len(active),

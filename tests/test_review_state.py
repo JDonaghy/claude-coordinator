@@ -391,6 +391,61 @@ class TestDoneTransition:
 
         assert completed_work.review_state == "done"
 
+    def test_review_worker_failure_also_sets_work_review_state_done(
+        self, two_machine_config: Config
+    ) -> None:
+        """#1584: a review WORKER that died (transient API error, network
+        drop, ...) before producing a verdict now correctly lands
+        status='failed' rather than the pre-#1584 'done'. The parent work
+        row's review_state must still advance out of 'dispatched' — mirroring
+        the done/advisory branches this failed branch was missing — or the
+        row parks forever exactly like #1563's own motivating evidence for
+        this issue. 'done' (not 'failed') to match
+        `coord._board_mapping.infer_review_state`'s existing convention,
+        which already treats review status in ('done', 'failed')
+        identically for this field; `review_verdict` (left empty) is what
+        actually distinguishes "no verdict" downstream.
+        """
+        completed_work = _work_assignment(
+            status="done", branch="issue-1-fix", review_state="dispatched"
+        )
+        review_assignment = Assignment(
+            machine_name="server",
+            repo_name="api",
+            issue_number=1,
+            issue_title="[review] Fix the thing",
+            assignment_id="rev-001",
+            status="running",
+            type="review",
+            review_of_assignment_id="work-001",
+        )
+        board = Board(
+            active=[review_assignment],
+            completed=[completed_work],
+        )
+
+        # Agent reports the review assignment as FAILED (a terminal
+        # is_error:true result event — see AgentServer._reap, #1584) with
+        # api_error_reason stamped.
+        fake_status = {
+            "active": [],
+            "completed": [{
+                "id": "rev-001", "status": "failed", "finished_at": 200.0,
+                "api_error_reason": "529 Overloaded",
+            }],
+        }
+        stamped: list[tuple[str, str]] = []
+        with patch("coord.reconcile._query_agent", return_value=fake_status), \
+             patch("coord.review.dispatch_review", return_value=None), \
+             patch("coord.state.set_assignment_failure_reason",
+                   lambda aid, reason: stamped.append((aid, reason))):
+            reconcile(board, two_machine_config)
+
+        assert completed_work.review_state == "done"
+        # #1584: the review's own api_error_reason must reach the persisted
+        # failure_reason column, mirroring the #1461 usage-limit-kill path.
+        assert stamped == [("rev-001", "529 Overloaded")]
+
     def test_review_done_state_not_overwritten_on_next_reconcile(
         self, two_machine_config: Config
     ) -> None:
