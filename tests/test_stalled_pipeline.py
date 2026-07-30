@@ -28,6 +28,11 @@ from coord.config import Config, PipelineConfig
 from coord.github_ops import work_is_terminal as _real_work_is_terminal
 from coord.merge_queue import CONFLICT, PENDING, QueuedMerge
 from coord.models import Assignment, Board, Machine, Repo
+from coord.worker_events import (
+    UsageLimitKill,
+    format_usage_limit_reason,
+    is_usage_limit_reason,
+)
 
 
 # ── Fixtures / helpers ──────────────────────────────────────────────────────
@@ -390,6 +395,47 @@ class TestReviewFailedNoVerdict:
         assert detection.reason == "review_failed_no_verdict"
         assert work.assignment_id == "work-1"
         assert "529 Overloaded" in detection.detail
+
+    def test_usage_limit_killed_review_is_not_flagged(self, config: Config) -> None:
+        """#1461/#1584: a usage-limit kill is an account-wide exhausted
+        budget, not a per-review defect. `AgentServer._reap` lands it on
+        FAILED exactly like an api_error kill, so without a guard the sweep
+        would spend this work row's one-shot auto-recovery on a
+        `dispatch_review` guaranteed to die the same way until the reset —
+        the anti-pattern `reconcile.py`'s `auto_reassign` and `drive.py`'s
+        `_decide_review` are both already hardened against. Skipped at
+        classification so the `notified` ledger is left untouched."""
+        review = _review(
+            "work-1", aid="review-1", status="failed", review_verdict=None,
+        )
+        review.failure_reason = format_usage_limit_reason(
+            UsageLimitKill(reset_at_raw="3pm", excerpt="…hit your session limit")
+        )
+        assert is_usage_limit_reason(review.failure_reason)
+        board = _board(_work("work-1", test_state="passed"), review)
+        results = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        )
+        assert results == []
+
+    def test_usage_limit_killed_review_does_not_fall_through_to_approved(
+        self, config: Config
+    ) -> None:
+        """Guarding the failed-review branch must not let the row slide into
+        the `review is None or review.status == "done"` catch-all below it —
+        that would misreport a dead review as `approved_not_queued` and
+        enqueue unreviewed work for merge."""
+        review = _review(
+            "work-1", aid="review-1", status="failed", review_verdict="approve",
+        )
+        review.failure_reason = format_usage_limit_reason(
+            UsageLimitKill(reset_at_raw="3pm", excerpt="…hit your session limit")
+        )
+        board = _board(_work("work-1", test_state="passed"), review)
+        results = notify_mod.detect_stalled_pipeline(
+            config, board=board, merge_queue_items=[]
+        )
+        assert results == []
 
     def test_not_flagged_when_review_still_pending(self, config: Config) -> None:
         """A review that's simply still running is not a stall — distinct
@@ -1157,6 +1203,41 @@ class TestDispatchPerReason:
         assert action.kind in notify_mod._STALLED_DISPATCH_KINDS
         assert "review-99" in action.detail
         stub.assert_called_once()
+
+    def test_review_failed_no_verdict_declines_on_a_usage_limit_kill(
+        self, config: Config, monkeypatch
+    ) -> None:
+        """#1461/#1584 belt-and-braces: `detect_stalled_pipeline` already
+        skips these rows, but `dispatch_stalled_pipeline_action` is public
+        and reachable with a caller-built detection (or after a race that
+        stamps the usage-limit reason between detection and dispatch). It
+        must never re-dispatch into an account-wide exhausted budget."""
+        config.pipeline.auto_dispatch_stalled = True
+        review = _review(
+            "work-1", aid="review-1", status="failed", review_verdict=None,
+        )
+        review.failure_reason = format_usage_limit_reason(
+            UsageLimitKill(reset_at_raw="3pm", excerpt="…hit your session limit")
+        )
+        work = _work("work-1", test_state="passed")
+        board = _board(work, review)
+        detection = notify_mod.StalledDetection(
+            assignment_id="work-1", machine_name="mac-mini", repo_name="vimcode",
+            issue_number=602, reason="review_failed_no_verdict",
+            detail="review-1 failed before producing a verdict",
+        )
+
+        stub = MagicMock(return_value=_review("work-1", aid="review-99", status="pending"))
+        monkeypatch.setattr("coord.review.dispatch_review", stub)
+
+        action = notify_mod.dispatch_stalled_pipeline_action(
+            detection, work, board, config
+        )
+
+        assert action.kind == "no_action"
+        assert action.kind not in notify_mod._STALLED_DISPATCH_KINDS
+        assert "usage limit" in action.detail
+        stub.assert_not_called()
 
     def test_review_failed_no_verdict_no_action_when_dispatch_declines(
         self, config: Config, monkeypatch
