@@ -1,0 +1,84 @@
+{
+  "config": {
+    "argv": [
+      "/home/john/.nvm/versions/node/v24.8.0/bin/node",
+      "/tmp/pw-scratch/node_modules/.bin/playwright",
+      "test",
+      "--config=playwright.globalfail.config.ts"
+    ],
+    "configFile": "/tmp/pw-scratch/playwright.globalfail.config.ts",
+    "rootDir": "/tmp/pw-scratch/tests",
+    "failOnFlakyTests": false,
+    "forbidOnly": false,
+    "fullyParallel": false,
+    "globalSetup": "/tmp/pw-scratch/global-setup.js",
+    "globalTeardown": null,
+    "globalTimeout": 0,
+    "grep": {},
+    "grepInvert": null,
+    "maxFailures": 0,
+    "metadata": {},
+    "preserveOutput": "always",
+    "projects": [
+      {
+        "outputDir": "/tmp/pw-scratch/test-results",
+        "repeatEach": 1,
+        "retries": 0,
+        "metadata": {},
+        "id": "chromium",
+        "name": "chromium",
+        "testDir": "/tmp/pw-scratch/tests",
+        "testIgnore": [],
+        "testMatch": [
+          "**/all_pass.spec.ts"
+        ],
+        "timeout": 30000
+      }
+    ],
+    "quiet": false,
+    "reporter": [
+      [
+        "list",
+        null
+      ],
+      [
+        "json",
+        {
+          "outputFile": "report.json"
+        }
+      ]
+    ],
+    "reportSlowTests": {
+      "max": 5,
+      "threshold": 300000
+    },
+    "shard": null,
+    "tags": [],
+    "updateSnapshots": "missing",
+    "updateSourceMethod": "patch",
+    "version": "1.61.1",
+    "workers": 1,
+    "webServer": null
+  },
+  "suites": [],
+  "errors": [
+    {
+      "message": "Error: global setup exploded: DATABASE_URL not set",
+      "stack": "Error: global setup exploded: DATABASE_URL not set\n    at module.exports (/tmp/pw-scratch/global-setup.js:2:9)",
+      "location": {
+        "file": "/tmp/pw-scratch/global-setup.js",
+        "column": 9,
+        "line": 2
+      },
+      "snippet": "   at ../global-setup.js:2\n\n  1 | module.exports = async () => {\n> 2 |   throw new Error('global setup exploded: DATABASE_URL not set')\n    |         ^\n  3 | }\n  4 |"
+    }
+  ],
+  "stats": {
+    "startTime": "2026-07-30T01:54:40.799Z",
+    "duration": 25.963000000000022,
+    "expected": 0,
+    "skipped": 0,
+    "unexpected": 0,
+    "flaky": 0
+  }
+}

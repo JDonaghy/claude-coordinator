@@ -1,28 +1,87 @@
-"""Tests for coord/acceptance_drivers.py — the tui-tuidriver and cli-pytest
-(#1125) adapters (#944).
+"""Tests for coord/acceptance_drivers.py — the tui-tuidriver, cli-pytest
+(#1125), and web-playwright (#1539) adapters (#944).
 
 Covers ``parse_test_output``'s two accepted shapes (a single JSON blob, and
 libtest's `--format json` JSON-lines event stream), ``parse_pytest_report_log``
-(pytest's built-in ``--report-log`` JSON-lines shape), ``render_run_command``'s
+(pytest's built-in ``--report-log`` JSON-lines shape), ``parse_playwright_json_report``
+(Playwright Test's built-in ``--reporter=json`` shape), ``render_run_command``'s
 ``{ms}`` templating, and ``run_driver``'s unsupported-kind guard + real
-subprocess path for both kinds.
+subprocess path for all three kinds.
+
+Fixtures under tests/fixtures/playwright/ are CAPTURED REAL OUTPUT (Playwright
+Test 1.61.1, Node 24.8.0), not hand-written strings shaped to look like a
+Playwright report — each was produced by running ``npx playwright test``
+against a small scratch project (``npm init -y && npm install
+@playwright/test@1.61.1``) with this ``playwright.config.ts``:
+
+    export default defineConfig({
+      testDir: './tests',
+      fullyParallel: false,
+      workers: 1,
+      retries: 1,
+      reporter: [['list'], ['json', {outputFile: 'report.json'}],
+                 ['junit', {outputFile: 'report.xml'}]],
+      projects: [{name: 'chromium'}, {name: 'firefox'}],
+    })
+
+None of the scratch spec files reference Playwright's ``page`` fixture, so
+none of these runs needed a real browser binary installed — Playwright's
+fixtures are lazy and only launch a browser when a test actually asks for
+one. How each fixture was produced:
+
+- all_pass.json: `npx playwright test tests/all_pass.spec.ts` — a
+  `describe` block with 2 passing tests, run under both `chromium` and
+  `firefox` projects (4 total results) — covers multiple `projects:`.
+- mixed_fail.json: `npx playwright test tests/mixed.spec.ts --project=chromium`
+  — 1 pass + 1 genuine `expect(1+1).toBe(3)` failure, retried once per
+  config (both attempts fail) — the failure message carries Playwright's
+  baked-in ANSI color codes verbatim (present even though stdout was piped,
+  not a tty — confirmed `NO_COLOR=1`/`FORCE_COLOR=0` do not suppress them
+  for this formatter).
+- skip.json: `npx playwright test tests/skip.spec.ts --project=chromium` —
+  1 pass, 1 bare `test.skip('reason', ...)`-style static skip, 1
+  `test.fixme(true, 'blocked on #1541 browser capability')`.
+- retry_then_pass.json / retry_then_pass.junit.xml: `npx playwright test
+  tests/retry.spec.ts --project=chromium` — a test that throws when
+  `testInfo.retry === 0` and passes otherwise, captured from the SAME run
+  with both the `json` and `junit` reporters active simultaneously (see
+  TestParsePlaywrightJsonReport.test_junit_sibling_loses_the_flake_signal
+  for why json was chosen over junit — this pair is the evidence).
+- global_setup_crash.json: a `globalSetup` hook that
+  `throw new Error(...)`, run against `all_pass.spec.ts`. Playwright still
+  writes a well-formed report — `"suites": []` and a non-empty top-level
+  `"errors"` — exit code 1. The same shape shows up for a `--grep` that
+  matches no tests without `--pass-with-no-tests`.
+- truncated.json: `head -c 4000 mixed_fail.json` — a real report file cut
+  off mid-write, the shape a killed/OOM-killed process leaves behind.
+
+Regenerate by re-running the commands above against an equivalent scratch
+project; nothing here depends on a live worktree or a real browser install.
 """
 
 from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
 
 import pytest
 
 from coord.acceptance_drivers import (
     DriverError,
     SUPPORTED_KINDS,
+    parse_playwright_json_report,
     parse_pytest_junit_xml,
     parse_test_output,
     render_run_command,
     run_driver,
 )
+
+FIXTURES = Path(__file__).parent / "fixtures" / "playwright"
+
+
+def _read(name: str) -> str:
+    return (FIXTURES / name).read_text()
 
 
 class TestParseTestOutputBlob:
@@ -91,8 +150,25 @@ class TestParseTestOutputLibtestJsonLines:
 
 class TestRunDriver:
     def test_unsupported_kind_raises(self) -> None:
+        # "native" is the one kind ORACLE_LOOP.md documents as declarable in
+        # coordinator.yml but not yet implemented — see docs/WEB_CONTROL_CENTER.md
+        # M-W0. web-playwright landed in #1539 and must NOT raise here anymore
+        # (see TestRunDriverWebPlaywright.test_web_playwright_no_longer_raises_not_implemented).
         with pytest.raises(DriverError, match="not implemented yet"):
-            run_driver("web-playwright", "npx playwright test", cwd=".")
+            run_driver("native", "some-native-runner", cwd=".")
+
+    def test_not_implemented_message_no_longer_lists_web_playwright_as_pending(self) -> None:
+        # #1539 acceptance criterion: the "not implemented" message itself
+        # must stop describing web-playwright as pending — it's fine (and
+        # correct) for the "(supported: ...)" clause to name it now that
+        # it's a real, working kind, so only the sentence BEFORE that
+        # clause (the "is not implemented yet ... lands in a later issue"
+        # part) is checked here.
+        with pytest.raises(DriverError) as exc_info:
+            run_driver("native", "some-native-runner", cwd=".")
+        message = str(exc_info.value)
+        pending_clause = message.split("(supported:")[0]
+        assert "web-playwright" not in pending_clause
 
     def test_supported_kinds_tuple_has_tui_tuidriver(self) -> None:
         assert "tui-tuidriver" in SUPPORTED_KINDS
@@ -315,3 +391,174 @@ class TestRunDriverCliPytest:
         )
         assert result.exit_code == 2
         assert result.tests == []
+
+
+class TestParsePlaywrightJsonReport:
+    def test_all_pass_across_two_projects(self) -> None:
+        tests = parse_playwright_json_report(_read("all_pass.json"))
+        assert len(tests) == 4
+        assert all(t["status"] == "pass" for t in tests)
+        assert all(t["message"] == "" for t in tests)
+        ids = {t["id"] for t in tests}
+        # Same two test titles run under both projects must not collide.
+        assert len(ids) == 4
+        assert any(i.startswith("[chromium]") for i in ids)
+        assert any(i.startswith("[firefox]") for i in ids)
+
+    def test_mixed_fail_reports_pass_and_fail(self) -> None:
+        tests = parse_playwright_json_report(_read("mixed_fail.json"))
+        assert {t["status"] for t in tests} == {"pass", "fail"}
+        failing = next(t for t in tests if t["status"] == "fail")
+        assert "selects an item" in failing["id"]
+        assert "Expected: 3" in failing["message"]
+        assert "Received: 2" in failing["message"]
+        # Playwright bakes ANSI SGR codes into this message (see the
+        # module docstring at the top of this file) — must be stripped.
+        assert "\x1b[" not in failing["message"]
+
+    def test_skip_and_fixme_map_to_skip_with_reason(self) -> None:
+        tests = parse_playwright_json_report(_read("skip.json"))
+        by_title = {t["id"].rsplit(" › ", 1)[-1]: t for t in tests}
+        assert by_title["shows issue list"]["status"] == "pass"
+        assert by_title["not yet implemented"]["status"] == "skip"
+        assert by_title["not yet implemented"]["message"] == ""
+        assert by_title["needs staging env"]["status"] == "skip"
+        assert (
+            by_title["needs staging env"]["message"]
+            == "blocked on #1541 browser capability"
+        )
+
+    def test_retry_then_pass_is_a_pass_but_notes_the_flake(self) -> None:
+        tests = parse_playwright_json_report(_read("retry_then_pass.json"))
+        assert len(tests) == 1
+        test = tests[0]
+        assert test["status"] == "pass"  # eventually green — gate lets it through
+        assert "flaky" in test["message"]
+        assert "1 failed attempt" in test["message"]
+        assert "flaked on first attempt" in test["message"]  # first failure preserved
+
+    def test_junit_sibling_loses_the_flake_signal(self) -> None:
+        # The SAME run, same test, captured by Playwright's OTHER built-in
+        # reporter — this is the empirical justification for choosing json
+        # over junit (see the module docstring / parse_playwright_json_report
+        # docstring), not just an assertion in prose. junit collapses every
+        # retry attempt into one <testcase> with no failure element at all
+        # once the test eventually passes — the flake is invisible.
+        tests = parse_pytest_junit_xml(_read("retry_then_pass.junit.xml"))
+        assert len(tests) == 1
+        assert tests[0]["status"] == "pass"
+        assert tests[0]["message"] == ""
+
+    def test_global_setup_crash_raises_not_empty_list(self) -> None:
+        # A well-formed report — valid JSON, "suites": [] — must still raise
+        # rather than come back as an innocuous empty list, because Playwright's
+        # top-level "errors" says the run never actually exercised any tests.
+        with pytest.raises(DriverError, match="top-level error"):
+            parse_playwright_json_report(_read("global_setup_crash.json"))
+
+    def test_truncated_report_raises(self) -> None:
+        with pytest.raises(DriverError, match="not valid JSON"):
+            parse_playwright_json_report(_read("truncated.json"))
+
+    def test_empty_input_raises(self) -> None:
+        with pytest.raises(DriverError, match="empty"):
+            parse_playwright_json_report("")
+        with pytest.raises(DriverError, match="empty"):
+            parse_playwright_json_report(None)  # type: ignore[arg-type]
+
+    def test_missing_suites_key_raises(self) -> None:
+        with pytest.raises(DriverError, match="unrecognized shape"):
+            parse_playwright_json_report(json.dumps({"not": "a report"}))
+
+    def test_legitimate_zero_tests_with_no_errors_returns_empty_list(self) -> None:
+        # Playwright's own `--pass-with-no-tests` opt-in: valid report,
+        # genuinely zero tests, no top-level errors, exit 0. Not a crash —
+        # build_verdict() already treats an empty tests list as not-green,
+        # so this doesn't need to raise to avoid a false "all green".
+        report = json.dumps({"suites": [], "errors": [], "stats": {}})
+        assert parse_playwright_json_report(report) == []
+
+
+class TestRunDriverWebPlaywright:
+    def test_web_playwright_no_longer_raises_not_implemented(self, tmp_path) -> None:
+        # A crashing fake command still exercises run_driver's kind-routing
+        # (proving "web-playwright" is no longer rejected up front) without
+        # needing node/playwright installed — the DriverError it does raise
+        # is about the missing report, not about the kind being unsupported.
+        with pytest.raises(DriverError) as exc_info:
+            run_driver("web-playwright", "exit 2", cwd=str(tmp_path))
+        assert "not implemented" not in str(exc_info.value)
+        assert "wrote no report" in str(exc_info.value)
+
+    def test_supported_kinds_tuple_has_web_playwright(self) -> None:
+        assert "web-playwright" in SUPPORTED_KINDS
+
+    def test_appends_reporter_json_flag_and_honors_output_file_env(self, tmp_path) -> None:
+        # Proves the two things _run_web_playwright is responsible for
+        # wiring: appending `--reporter=json` (so a repo's own
+        # playwright.config.ts reporter choice doesn't matter) and setting
+        # PLAYWRIGHT_JSON_OUTPUT_FILE (so the report lands at a path coord
+        # controls) — without needing a real `npx playwright`/node install
+        # in this test environment. This tiny shell function stands in for
+        # Playwright: it only copies the fixture into place if it actually
+        # received "--reporter=json" as an argument, so the test fails if
+        # that flag is ever dropped.
+        fixture = FIXTURES / "all_pass.json"
+        run_command = (
+            'pw() { if [ "$1" = "--reporter=json" ]; then '
+            f'cp "{fixture}" "$PLAYWRIGHT_JSON_OUTPUT_FILE"; else exit 9; fi; }}; pw'
+        )
+        result = run_driver("web-playwright", run_command, cwd=str(tmp_path))
+        assert result.exit_code == 0
+        assert result.ok is True
+        assert len(result.tests) == 4
+
+    def test_runs_shell_command_and_parses_json_report(self, tmp_path) -> None:
+        fixture = FIXTURES / "mixed_fail.json"
+        # Trailing "#" comments out coord's own appended `--reporter=json`
+        # so this simple `cp` command stays valid either way.
+        run_command = f'cp "{fixture}" "$PLAYWRIGHT_JSON_OUTPUT_FILE" #'
+        result = run_driver("web-playwright", run_command, cwd=str(tmp_path))
+        assert result.exit_code == 0
+        assert {t["status"] for t in result.tests} == {"pass", "fail"}
+
+    def test_crash_before_report_written_raises(self, tmp_path) -> None:
+        # Unlike cli-pytest's equivalent test (a missing report there is a
+        # benign "0 tests found"), web-playwright must never treat a
+        # crashed run as an empty pass list — see #1539.
+        with pytest.raises(DriverError, match="wrote no report"):
+            run_driver("web-playwright", "exit 2", cwd=str(tmp_path))
+
+    def test_truncated_report_raises_driver_error(self, tmp_path) -> None:
+        fixture = FIXTURES / "truncated.json"
+        run_command = f'cp "{fixture}" "$PLAYWRIGHT_JSON_OUTPUT_FILE" #'
+        with pytest.raises(DriverError, match="not valid JSON"):
+            run_driver("web-playwright", run_command, cwd=str(tmp_path))
+
+    def test_global_setup_crash_report_raises_driver_error(self, tmp_path) -> None:
+        fixture = FIXTURES / "global_setup_crash.json"
+        run_command = f'cp "{fixture}" "$PLAYWRIGHT_JSON_OUTPUT_FILE" #'
+        with pytest.raises(DriverError, match="top-level error"):
+            run_driver("web-playwright", run_command, cwd=str(tmp_path))
+
+    def test_timeout_raises_driver_error(self, tmp_path) -> None:
+        # Trailing "#" comments out coord's own appended `--reporter=json`,
+        # which `sleep` would otherwise reject outright (no timeout needed
+        # to observe that failure — this test wants an actual timeout).
+        with pytest.raises(DriverError, match="timed out"):
+            run_driver("web-playwright", "sleep 5 #", cwd=str(tmp_path), timeout=1)
+
+    def test_ms_template_rendered_before_running(self, tmp_path) -> None:
+        # The {ms} substitution mechanics themselves are already covered
+        # generically (TestRenderRunCommand) and per-kind for cli-pytest
+        # (test_ms_template_rendered_before_running above); this just proves
+        # run_driver plumbs ms= through to the web-playwright path too, by
+        # asserting the substituted text survives into the executed command
+        # (inside a comment, since this fake driver doesn't consume it).
+        fixture = FIXTURES / "all_pass.json"
+        run_command = f'cp "{fixture}" "$PLAYWRIGHT_JSON_OUTPUT_FILE" # {{ms}}'
+        result = run_driver(
+            "web-playwright", run_command, cwd=str(tmp_path), ms="ms-37",
+        )
+        assert result.exit_code == 0
+        assert len(result.tests) == 4
