@@ -103,6 +103,13 @@ from coord.interactive import (
 )
 from coord.failure_class import classify_failure, plan_usage_limit_resume
 from coord.usage_limits import PlanLimits, evaluate_usage_gate, get_plan_limits
+# Lost in the #1584-onto-#1590 rebase: _decide_review() calls this, but the
+# import lived in a hunk #1590 rewrote, so the merge came out textually clean
+# and semantically broken (NameError at coord/drive.py:1162). Same symbol and
+# same source as coord/notify.py:53 — deliberately NOT re-pointed at #1590's
+# newer classify_failure(), which would change reviewed behaviour during a
+# conflict resolution.
+from coord.worker_events import is_usage_limit_reason
 
 # ── exit codes (unchanged from drive-issue.sh) ───────────────────────────────
 
