@@ -1,0 +1,82 @@
+#!/bin/sh
+# Versioned post-checkout hook — enabled per machine with:
+#
+#     git config core.hooksPath .githooks
+#
+# Purpose: make the graphify knowledge graph usable from a *linked worktree*.
+#
+# `graphify-out/` is gitignored by design (only `graphify-out/.gitignore` is
+# tracked — the graph is multi-MB, rewritten on every commit, and would
+# conflict across parallel worker branches).  So `git worktree add` gives a
+# worktree an EMPTY `graphify-out/`, and `graphify query` — which resolves
+# `graphify-out/graph.json` strictly relative to cwd, with no upward walk and
+# no `--graph` override — fails there.  Every agent working in a worktree is
+# graph-blind.
+#
+# Git runs this hook on `git worktree add` (verified: cwd = the new worktree,
+# $3 = 1), which is why the bootstrap lives here rather than in coord's
+# dispatch code: one implementation covers coord's remote `worktree add` call
+# sites, Claude Code's `.claude/worktrees/`, review worktrees, and anything
+# created by hand — on every machine, with no creator-side changes.
+#
+# The fix is a symlink to the base checkout's graph.  A worker branch differs
+# from the base by a handful of files, so the base graph is the right answer
+# for "where is X handled / what calls this" navigation.  It is NOT the right
+# answer for "did my change land" — the linked graph reflects the base
+# checkout's HEAD, not the worktree's edits.
+#
+# This hook chains to the machine-local graphify hook rather than replacing
+# it: graphify's generated block pins an absolute interpreter path
+# (`_PINNED='/home/.../pipx/venvs/...'`) that is machine-specific and must not
+# be committed, so it stays in $GIT_COMMON_DIR/hooks/ where `graphify hook
+# install` put it.
+
+set -u
+
+# $3 == 1 means a branch checkout (not a file checkout).  `git worktree add`
+# sets it.  Anything else is not our business — chain and exit.
+if [ "${3:-0}" != "1" ]; then
+    exit 0
+fi
+
+_abs() {
+    # git may return a path relative to cwd (it does for `.git` in the main
+    # worktree).  --path-format=absolute would be cleaner but needs git 2.31+,
+    # and older git echoes the flag back as a literal argument.
+    case "$1" in
+        /*) printf '%s\n' "$1" ;;
+        *)  printf '%s\n' "$PWD/$1" ;;
+    esac
+}
+
+_git_dir=$(_abs "$(git rev-parse --git-dir 2>/dev/null || echo .git)")
+_common_dir=$(_abs "$(git rev-parse --git-common-dir 2>/dev/null || echo .git)")
+
+if [ "$_git_dir" != "$_common_dir" ]; then
+    # ── Linked worktree ──────────────────────────────────────────────────
+    # The base checkout is the parent of the common git dir.
+    _base=$(CDPATH= cd -- "$(dirname -- "$_common_dir")" 2>/dev/null && pwd) || _base=""
+    if [ -n "$_base" ] && [ -f "$_base/graphify-out/graph.json" ] && [ ! -L graphify-out ]; then
+        # Only ever replace the stub that `git worktree add` materialises
+        # (a directory holding just the tracked .gitignore).  If a real graph
+        # was built here, leave it alone.
+        if [ ! -e graphify-out ] || [ ! -f graphify-out/graph.json ]; then
+            rm -rf graphify-out 2>/dev/null
+            ln -sfn "$_base/graphify-out" graphify-out 2>/dev/null &&
+                echo "[graphify] linked graphify-out -> $_base/graphify-out (read-only base graph)"
+        fi
+    fi
+    # Never rebuild in a linked worktree.  Two reasons, both load-bearing:
+    #   1. graphify-out is now a symlink to the SHARED base graph — a rebuild
+    #      here would overwrite it from a feature-branch tree.
+    #   2. A worktree can be reaped mid-rebuild, which is how the graphify
+    #      hook's own "burns a full AST pass and then dies with ENOENT"
+    #      comment came to be.
+    exit 0
+fi
+
+# ── Main worktree: chain to the machine-local graphify hook ──────────────
+if [ -x "$_common_dir/hooks/post-checkout" ]; then
+    exec "$_common_dir/hooks/post-checkout" "$@"
+fi
+exit 0

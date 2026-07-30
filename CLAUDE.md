@@ -9,11 +9,34 @@ CLI tool + per-machine agent server that coordinates Claude Code workers across 
 ## Codebase navigation — query the graph first
 
 This repo ships a **graphify** knowledge graph in `graphify-out/` (`graph.json`,
-`GRAPH_REPORT.md`), kept current automatically by `post-commit` / `post-checkout`
-git hooks. For any architecture / "where is this handled" / "what calls this" /
-file-relationship question, **query the graph first** (the `graphify` skill, or the
-graphify CLI) before reaching for grep/Read. Grep/Read are for exact-string or
-line-level confirmation — not the first move.
+`GRAPH_REPORT.md`), kept current on a best-effort basis by `post-commit` /
+`post-checkout` git hooks. For any architecture / "where is this handled" / "what
+calls this" / file-relationship question, **query the graph first** (the `graphify`
+skill, or the graphify CLI) before reaching for grep/Read. Grep/Read are for
+exact-string or line-level confirmation — not the first move.
+
+**In a worktree the graph is the base checkout's, not yours.** `graphify-out/` is
+gitignored (only its `.gitignore` is tracked), so `git worktree add` yields an empty
+one — and `graphify query` resolves `graphify-out/graph.json` strictly relative to
+cwd, with no upward walk and no `--graph` override. `.githooks/post-checkout`
+therefore symlinks a worktree's `graphify-out` at the base checkout's graph.
+Consequences worth knowing while working in one: the graph reflects the **base
+checkout's HEAD, not your edits** — trust it for *"where is X handled"*, never for
+*"did my change land"* — and rebuilds are deliberately disabled inside worktrees
+(a rebuild there would overwrite the shared graph from a feature branch). The
+bootstrap only runs where `core.hooksPath` is set: `git config core.hooksPath
+.githooks`, once per machine.
+
+**The graph drifts, and the hooks cannot prevent it.** They `exit 0` during
+rebase/merge/cherry-pick (so the merge agent's proactive rebase never rebuilds),
+nothing fires at all for `git reset --hard`, every failure path is a silent
+`exit 0` behind a detached 600s-timeout background process, concurrent triggers
+coalesce, and their `[ ! -f graphify-out/graph.json ]` guard is a permanent
+off-switch once the graph is purged. Treat the hooks as an optimization and check
+freshness instead — `GRAPH_REPORT.md` records its source commit, and
+**`coord diagnose --graph`** compares that to HEAD for every local checkout (and
+flags an unset `core.hooksPath`). If it reports STALE, `graphify update .` in that
+checkout.
 
 ## Architecture
 

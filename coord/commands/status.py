@@ -814,6 +814,16 @@ def _diagnose_via_daemon(svc, params: dict) -> None:
         "no uncommitted work.  Dirty worktrees are reported but never deleted."
     ),
 )
+@click.option(
+    "--graph",
+    "graph_health",
+    is_flag=True,
+    help=(
+        "Report graphify knowledge-graph freshness for this machine's local "
+        "checkouts: whether the graph matches HEAD, and whether "
+        "core.hooksPath is set so worktrees get a linked graph.  Read-only."
+    ),
+)
 
 
 @_CONFIG_OPTION
@@ -826,8 +836,14 @@ def diagnose(
     config_path: Path,
     output_json: bool = False,
     orphan_worktrees: bool = False,
+    graph_health: bool = False,
 ) -> None:
     """Per-stage doctor — diagnose, best-effort recover, optional reset."""
+    # ── graphify graph freshness sweep (read-only) ───────────────────────────
+    if graph_health:
+        _diagnose_graph_health(config_path)
+        return
+
     # ── #618: --orphan-worktrees fleet sweep ─────────────────────────────────
     if orphan_worktrees:
         _diagnose_orphan_worktrees(config_path, dry_run=dry_run)
@@ -891,6 +907,63 @@ def diagnose(
         import json  # noqa: PLC0415
         click.echo("DIAGNOSE_JSON:" + json.dumps(res.to_json_dict()))
     click.echo(res.summary_line())
+
+
+def _diagnose_graph_health(config_path: Path) -> None:
+    """Report graphify graph freshness for this machine's local checkouts.
+
+    Read-only by design.  The graph is a *navigation* aid, so a stale one is a
+    warning, not a failure — the point is to make drift visible in a routine
+    health check instead of leaving an agent to discover it mid-task.  It also
+    checks ``core.hooksPath``, the one-time per-machine setting that decides
+    whether worktrees on this box get a linked graph at all.
+
+    Local-machine only, same scope as ``--orphan-worktrees``: it inspects the
+    checkouts named in ``coordinator.yml`` that actually exist here.
+    """
+    from coord.graph_health import (  # noqa: PLC0415
+        format_status_lines,
+        graph_status,
+        hooks_path_status,
+    )
+
+    cfg = _load_config(config_path)
+
+    seen: set[Path] = set()
+    checkouts: list[tuple[str, Path]] = []
+    for machine in cfg.machines:
+        for repo_cfg in cfg.repos:
+            rp = machine.repo_path(repo_cfg.name)
+            if not rp:
+                continue
+            path = Path(rp).expanduser()
+            if path in seen or not (path / ".git").exists():
+                continue
+            seen.add(path)
+            checkouts.append((repo_cfg.name, path))
+
+    if not checkouts:
+        click.echo("no local checkouts from coordinator.yml exist on this machine.")
+        return
+
+    stale_count = 0
+    for repo_name, path in checkouts:
+        click.echo(f"── {repo_name}")
+        st = graph_status(path)
+        for line in format_status_lines(st):
+            click.echo(f"  {line}")
+        if st.stale:
+            stale_count += 1
+            click.echo(
+                "    fix: run `graphify update .` in the checkout "
+                "(the hooks skip rebase/merge/cherry-pick and reset --hard)"
+            )
+        ok, detail = hooks_path_status(path)
+        click.echo(f"  {'✓' if ok else '⚠'} {detail}")
+
+    click.echo(
+        f"GRAPH_HEALTH: checkouts={len(checkouts)} stale={stale_count}"
+    )
 
 
 def _diagnose_orphan_worktrees(config_path: Path, *, dry_run: bool) -> None:
