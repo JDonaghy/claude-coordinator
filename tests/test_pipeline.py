@@ -140,6 +140,28 @@ class TestComputePipeline:
         assert review.status == "active"
         assert review.is_current
 
+    def test_done_with_finalizing_review_gives_review_running_not_review_done(self) -> None:
+        """#1566: a review lands on status='finalizing' (agent finished, but
+        `coord notify` hasn't parsed/posted its verdict yet) for a few
+        minutes before it flips to 'done'. compute_pipeline backs the phone
+        dashboard's /api/pipeline endpoint (dashboard/server.py) — treating
+        'finalizing' as review_done here would report a finished review with
+        review_verdict=None, which is exactly the "verdict dropped" state
+        #1566 was filed over, and would additionally surface a live
+        "record-review-verdict" gate inviting an operator to manually stamp
+        a verdict for a review still being parsed."""
+        a = _work(status="done")
+        rev = _review(of_aid="work-1", status="finalizing")
+        board = _board(rev)
+        board.completed.append(a)
+        pv = compute_pipeline(a, board, [], _config())
+        assert pv.current_stage == "review_running"
+        review = next(s for s in pv.stages if s.name == "review")
+        assert review.status == "active"
+        assert review.is_current
+        gate_actions = {g.action for g in pv.available_gates}
+        assert "record-review-verdict" not in gate_actions
+
     def test_done_with_completed_review_gives_review_done(self) -> None:
         a = _work(status="done")
         rev = _review(of_aid="work-1", status="done")

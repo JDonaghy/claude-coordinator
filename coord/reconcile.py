@@ -1951,7 +1951,15 @@ def reconcile_board_merges(
             r.type == "review"
             and r.repo_name == a.repo_name
             and r.branch == a.branch
-            and r.status == "done"
+            # #1566: "finalizing" is a review row whose agent already
+            # finished but whose verdict hasn't been parsed/posted by
+            # `coord notify` yet — it must count as "has a review" here too,
+            # or a review that lands on 'finalizing' the instant its
+            # candidate check above resolves triggers a spurious "repair
+            # wedged review_state ... done -> pending" and a duplicate
+            # dispatch_pending_reviews pass while the first review is still
+            # wrapping up.
+            and r.status in ("done", "finalizing")
             for r in board.active + board.completed
         )
         if has_review:

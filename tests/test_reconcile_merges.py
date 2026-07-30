@@ -1227,6 +1227,35 @@ def test_wedged_review_left_alone_when_a_review_actually_ran(monkeypatch, config
     assert not any("repair wedged review_state" in s for s in actions)
 
 
+def test_wedged_review_left_alone_when_review_still_finalizing(monkeypatch, config) -> None:
+    """#1566: a review that just finished lands on status='finalizing' (not
+    'done') until `coord notify` parses and posts its verdict. That window
+    must NOT be mistaken for "no review ever ran" — the #1180 sweep repairing
+    it out from under a review that is still actively wrapping up would
+    trigger a spurious repair + a duplicate dispatch_pending_reviews pass
+    racing the one already in flight."""
+    a = _wedged_test_author()
+    review = Assignment(
+        machine_name="laptop",
+        repo_name="api",
+        issue_number=1117,
+        issue_title="t",
+        status="finalizing",
+        assignment_id="rev-finalizing",
+        branch=a.branch,
+        type="review",
+        review_verdict=None,
+    )
+    board = Board(completed=[a, review])
+    writes = _patch_probes(monkeypatch, terminal=False)
+
+    actions = reconcile_board_merges(board, config)
+
+    assert a.review_state == "done"
+    assert ("wedged_review_reset", "ta-wedged") not in writes
+    assert not any("repair wedged review_state" in s for s in actions)
+
+
 def test_wedged_review_left_alone_when_review_state_not_done(monkeypatch, config) -> None:
     """review_state='pending' is already the eligible/healthy state for the
     normal dispatch loop — sweep (f) only repairs review_state='done'."""
