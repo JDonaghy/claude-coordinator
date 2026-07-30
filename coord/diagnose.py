@@ -854,8 +854,8 @@ def _recover_work_like(
                 f"({_downgrade_empty_branch_done(latest, config)})"
             )
         res.recovered = True
-    elif latest.type == "work" and latest.status == "advisory":
-        # #1606: an ADVISORY work row is TERMINAL — no session is running and
+    elif latest.type in ("work", "plan") and latest.status == "advisory":
+        # #1606: an ADVISORY row is TERMINAL — no session is running and
         # nothing else on the board will ever move it forward, so this must
         # NOT fall through to "stage looks healthy" (that false-healthy read
         # is exactly what made the state invisible: `coord retry` refused it,
@@ -865,27 +865,41 @@ def _recover_work_like(
         # pushed — `coord retry` now handles this) is reported distinctly
         # from the #1357 false-positive shape (real commits present — that
         # one needs `coord drive --accept-advisory`, not a diagnose fix).
+        #
+        # Deliberately `latest.type in ("work", "plan")`, not just "work":
+        # `_recover_work_like` also runs for `stage in ("plan", "test",
+        # "merge")` (STAGE_ASSIGNMENT_TYPES["work"] itself is `("work",
+        # "plan")` — a plan row can be `latest` for `--stage work` too), and
+        # `reconcile.py`'s advisory transition sets `done.status =
+        # "advisory"` unconditionally before its type-specific branches, so
+        # a zero-commit `type="plan"` row CAN land here. Without this it
+        # would silently fall through to the "stage looks healthy" catch-all
+        # below — the exact false-healthy read this fix exists to close.
+        stage_label = "work" if latest.type == "work" else "plan"
         ahead = _work_advisory_commits_ahead(latest, config)
         if ahead == 0:
             res.findings.append(
-                "work stage is 'advisory' with 0 commits on its branch — "
-                "nothing was pushed, so there is nothing to test, review, or "
-                f"merge; re-dispatch with `coord retry {latest.assignment_id}`"
+                f"{stage_label} stage is 'advisory' with 0 commits on its "
+                "branch — nothing was pushed, so there is nothing to test, "
+                f"review, or merge; re-dispatch with `coord retry "
+                f"{latest.assignment_id}`"
             )
             res.recovered = False
         elif ahead is None:
             res.findings.append(
-                "work stage is 'advisory' but its commit count against the "
-                "base branch could not be confirmed (gh lookup failed) — not "
-                f"reporting healthy; inspect by hand: coord log {latest.assignment_id}"
+                f"{stage_label} stage is 'advisory' but its commit count "
+                "against the base branch could not be confirmed (gh lookup "
+                f"failed) — not reporting healthy; inspect by hand: coord "
+                f"log {latest.assignment_id}"
             )
             res.recovered = False
         else:
             res.findings.append(
-                f"work stage is 'advisory' with {ahead} commit(s) on its "
-                "branch — the #1357 false-positive signature, not a genuine "
-                "zero-commit exit; `coord retry` refuses to touch it on "
-                "purpose, use `coord drive --accept-advisory` to proceed"
+                f"{stage_label} stage is 'advisory' with {ahead} commit(s) "
+                "on its branch — the #1357 false-positive signature, not a "
+                "genuine zero-commit exit; `coord retry` refuses to touch "
+                "it on purpose, use `coord drive --accept-advisory` to "
+                "proceed"
             )
             res.recovered = True
     else:
@@ -897,21 +911,20 @@ def _work_advisory_commits_ahead(assignment: "Assignment", config: "Config") -> 
     """#1606: commits *assignment*'s branch carries over the repo's base
     branch, or ``None`` when it cannot be confirmed.
 
-    Reuses :func:`coord.github_ops.branch_commits_ahead` (the same ``gh api
-    compare`` call #1534's review zero-commit gate uses) rather than a local
-    git checkout — `coord diagnose` runs on the daemon host, which has no
-    guarantee of a local clone of every worker's branch.
+    Thin wrapper (kept as its own name so tests can monkeypatch it without
+    reaching into ``github_ops``) around
+    :func:`coord.github_ops.branch_commits_ahead_for_assignment` — the one
+    shared implementation `coord retry`'s advisory gate
+    (``coord/commands/dispatch.py``) also calls, rather than each keeping
+    its own copy of "branch empty -> 0, repo missing -> None, else ask
+    GitHub". Reuses the ``gh api compare`` call (the same one #1534's review
+    zero-commit gate uses) rather than a local git checkout — `coord
+    diagnose` runs on the daemon host, which has no guarantee of a local
+    clone of every worker's branch.
     """
     from coord import github_ops  # noqa: PLC0415
 
-    branch = (assignment.branch or "").strip()
-    if not branch:
-        return 0
-    repo_cfg = next((r for r in config.repos if r.name == assignment.repo_name), None)
-    if repo_cfg is None:
-        return None
-    base = repo_cfg.default_branch or "main"
-    return github_ops.branch_commits_ahead(repo_cfg.github, base, branch)
+    return github_ops.branch_commits_ahead_for_assignment(assignment, config)
 
 
 def _prune_orphan_for_failed(

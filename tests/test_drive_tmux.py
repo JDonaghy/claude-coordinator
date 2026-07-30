@@ -25,15 +25,20 @@ from click.testing import CliRunner
 from coord.cli import main
 from coord.commands.drive import _rebuild_drive_argv
 from coord.drive import (
+    EXIT_DEADLINE,
+    Driver,
     DriveError,
+    DriveOptions,
     drive_session_name,
     launch_drive_in_tmux,
     list_drive_sessions,
     parse_drive_session_name,
 )
 from coord.interactive import DRIVE_SESSION_PREFIX, list_coord_tmux_sessions
+from coord.usage_limits import PlanLimits
 
 from .conftest import output_and_stderr
+from .test_drive import FakeFetcher, ISSUE, REPO, board, make_config
 
 
 def _completed(returncode: int = 0, stdout: str = "", stderr: str = "") -> MagicMock:
@@ -212,6 +217,43 @@ class TestLaunchDriveInTmux:
                     ["coord", "drive", "myrepo", "42"], repo="myrepo", issue=42,
                     verify_checks=2, sleeper=lambda _: None,
                 )
+
+
+class TestStartMarkerAgainstAWaitOnlyLoop:
+    """#1606 blocking finding: the earlier version of this fix simulated log
+    growth via a fake `sleeper` in every test above, which never exercised
+    the failure mode the reviewer flagged — a REAL drive loop that never
+    calls `_spawn` (the only writer of the run log *before* this fix) still
+    has to grow that log inside the ~8s verify window, or every launch onto
+    an issue with an already-active assignment (a review/merge dispatched
+    interactively, or a drive re-attached mid-run) gets misdiagnosed as
+    stuck. This drives an actual `Driver.run()` through `decide()`'s
+    `state.active_count > 0` → bare `_wait()` branch (coord/drive.py) —
+    zero `coord` subcommands ever run — and checks the SAME log file
+    `launch_drive_in_tmux` polls."""
+
+    def test_real_driver_grows_the_log_with_no_run_action_ever_firing(
+        self, tmp_path: Path
+    ) -> None:
+        payload = board(status="dispatched")  # non-terminal → active_count=1 → WAIT
+        clock = {"t": 0.0}
+        driver = Driver(
+            repo=REPO,
+            issue=ISSUE,
+            opts=DriveOptions(machine="precision", poll=1.0, deadline_mins=0.001),
+            config=make_config(),
+            fetcher=FakeFetcher([payload]),
+            usage_prober=lambda: PlanLimits(status="unknown"),
+            sleeper=lambda secs: clock.__setitem__("t", clock["t"] + secs),
+            clock=lambda: clock["t"],
+        )
+        with patch("coord.drive.scratch_dir", return_value=tmp_path):
+            exit_code = driver.run()
+        assert exit_code == EXIT_DEADLINE
+
+        log_path = tmp_path / f"{REPO}-{ISSUE}.log"
+        assert log_path.exists(), "launch_drive_in_tmux polls exactly this path"
+        assert "drive loop started" in log_path.read_text()
 
 
 # ── regression: assignment-session discovery excludes coord-drive-* ────────────

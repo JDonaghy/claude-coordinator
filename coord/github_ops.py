@@ -6,6 +6,7 @@ import json
 import re
 import socket
 import subprocess
+from typing import Any
 
 
 # ── Typed gh errors ─────────────────────────────────────────────────────────
@@ -1410,6 +1411,42 @@ def branch_commits_ahead(repo: str, base: str, branch: str) -> int | None:
     if not isinstance(ahead, int) or isinstance(ahead, bool):
         return None
     return ahead
+
+
+def branch_commits_ahead_for_assignment(assignment: Any, config: Any) -> int | None:
+    """:func:`branch_commits_ahead` for a board *assignment*, or ``None``.
+
+    #1606: `coord retry`'s advisory zero-commit gate
+    (``coord/commands/dispatch.py``'s ``retry()``) and `coord diagnose
+    --stage work`'s ADVISORY-row recovery (``coord/diagnose.py``'s
+    ``_work_advisory_commits_ahead``) both ask GitHub this exact question —
+    they used to do it via two independently-written inline copies of
+    "branch empty -> 0, repo missing -> None, else ask GitHub", which even
+    diverged in how they looked up the repo config (``cfg.repo(name)`` vs.
+    a hand-rolled scan over ``config.repos`` — equivalent, but two copies is
+    how they drift apart later). This is the one copy both now call.
+
+    *assignment* needs only ``.branch`` and ``.repo_name``; *config* needs
+    only ``.repo(name)`` returning an object with ``.github`` /
+    ``.default_branch`` (both ``coord.models.Assignment`` and
+    ``coord.config.Config`` satisfy this — left untyped here to avoid
+    github_ops.py importing either module).
+
+    An assignment with no branch (or a blank one) is treated as 0 commits
+    ahead without ever calling GitHub — there is nothing to compare. A repo
+    that ``config`` doesn't know about returns ``None`` ("cannot confirm"),
+    never a bare 0, matching :func:`branch_commits_ahead`'s own fail-closed
+    polarity: an unconfirmable commit count must never be silently read as
+    "empty branch, safe to touch".
+    """
+    branch = (getattr(assignment, "branch", None) or "").strip()
+    if not branch:
+        return 0
+    repo_cfg = config.repo(assignment.repo_name)
+    if repo_cfg is None:
+        return None
+    base = repo_cfg.default_branch or "main"
+    return branch_commits_ahead(repo_cfg.github, base, branch)
 
 
 def get_branch_patch_id(repo: str, base: str, branch: str) -> str | None:

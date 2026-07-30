@@ -134,4 +134,7 @@ class TestRetryAcceptsZeroCommitAdvisory:
             )
         out = output_and_stderr(result)
         assert result.exit_code == 1
-        assert "not failed" in out
+        # #1606 review nit: the refusal message now names BOTH accepted
+        # statuses ('failed' and 'advisory') instead of just 'failed', since
+        # a genuine zero-commit advisory is retryable too.
+        assert "not 'failed' or 'advisory'" in out

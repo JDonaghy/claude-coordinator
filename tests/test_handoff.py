@@ -572,7 +572,9 @@ class TestCoordRetry:
         runner = CliRunner()
         result = runner.invoke(main, ["retry", "a1", "--config", str(config_file)])
         assert result.exit_code != 0
-        assert "not failed" in result.output
+        # #1606: the message now names both accepted statuses ('failed' and
+        # 'advisory' — a genuine zero-commit advisory is retryable too).
+        assert "not 'failed' or 'advisory'" in result.output
 
     def test_retry_no_available_machine_names_busy_machine(
         self, tmp_path: Path, coord_db,

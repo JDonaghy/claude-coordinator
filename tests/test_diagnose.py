@@ -1215,6 +1215,29 @@ def test_zero_commit_advisory_is_not_reported_healthy(monkeypatch, config) -> No
     assert res.recovered is False
 
 
+def test_zero_commit_advisory_on_a_plan_row_is_not_reported_healthy(
+    monkeypatch, config
+) -> None:
+    """#1606 review: `STAGE_ASSIGNMENT_TYPES["work"] == ("work", "plan")`, so
+    `latest` for `--stage work` can be a `type="plan"` row — and
+    `reconcile.py`'s advisory transition sets `status="advisory"`
+    unconditionally, before its `WORK_LIKE_TYPES`-only branches, so a
+    zero-commit PLAN row can reach this same terminal shape. Must be named
+    exactly like the work-row case, not silently fall through to 'stage
+    looks healthy'."""
+    _stub(monkeypatch, session="dead")
+    monkeypatch.setattr(diagnose, "_work_advisory_commits_ahead", lambda a, c: 0)
+
+    a = _assign(aid="p-advisory-empty", typ="plan", status="advisory", branch="issue-42-empty")
+    board = Board(completed=[a])
+    res = diagnose.diagnose_stage(board, config, "api", 42, "work")
+
+    assert not any("looks healthy" in f for f in res.findings), res.findings
+    assert any("0 commits" in f for f in res.findings), res.findings
+    assert any("coord retry p-advisory-empty" in f for f in res.findings), res.findings
+    assert res.recovered is False
+
+
 def test_advisory_with_unknown_commit_count_is_not_reported_healthy(
     monkeypatch, config
 ) -> None:
