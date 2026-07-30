@@ -19,11 +19,25 @@
 # sites, Claude Code's `.claude/worktrees/`, review worktrees, and anything
 # created by hand — on every machine, with no creator-side changes.
 #
-# The fix is a symlink to the base checkout's graph.  A worker branch differs
-# from the base by a handful of files, so the base graph is the right answer
-# for "where is X handled / what calls this" navigation.  It is NOT the right
-# answer for "did my change land" — the linked graph reflects the base
-# checkout's HEAD, not the worktree's edits.
+# The fix is symlinking the base checkout's graph *contents* into the
+# worktree's `graphify-out/` — never replacing the directory itself.  A
+# worker branch differs from the base by a handful of files, so the base
+# graph is the right answer for "where is X handled / what calls this"
+# navigation.  It is NOT the right answer for "did my change land" — the
+# linked graph reflects the base checkout's HEAD, not the worktree's edits.
+#
+# #1617: an earlier version of this hook replaced the whole `graphify-out/`
+# directory with a symlink to the base checkout.  `git worktree add`
+# materialises `graphify-out/` with only the tracked `.gitignore` checked
+# out (everything else in the directory is untracked-and-ignored), and
+# `rm -rf graphify-out` before `ln -sfn` deleted that tracked file out from
+# under git — leaving `git status` showing a deleted tracked file *and* an
+# untracked, machine-local, absolute-path symlink.  Every worktree's own
+# rescue-commit machinery then committed both.  `graphify-out/.gitignore` is
+# `*` / `!.gitignore`, so anything placed *inside* the directory is already
+# invisible to git for free — the fix is to keep the directory (and its
+# tracked `.gitignore`) and symlink each entry of the base graph into it
+# instead of swapping the directory out from under git.
 #
 # See .githooks/_lib.sh for why every graphify hook needs a shim here.
 
@@ -39,19 +53,34 @@ fi
 if gfy_is_linked_worktree; then
     # The base checkout is the parent of the common git dir.
     _base=$(CDPATH= cd -- "$(dirname -- "$(gfy_common_dir)")" 2>/dev/null && pwd) || _base=""
-    if [ -n "$_base" ] && [ -f "$_base/graphify-out/graph.json" ] && [ ! -L graphify-out ]; then
-        # Only ever replace the stub that `git worktree add` materialises
-        # (a directory holding just the tracked .gitignore).  If a real graph
-        # was built here, leave it alone.
-        if [ ! -e graphify-out ] || [ ! -f graphify-out/graph.json ]; then
-            rm -rf graphify-out 2>/dev/null
-            ln -sfn "$_base/graphify-out" graphify-out 2>/dev/null &&
-                echo "[graphify] linked graphify-out -> $_base/graphify-out (read-only base graph)"
+    if [ -n "$_base" ] && [ -f "$_base/graphify-out/graph.json" ]; then
+        # Only bootstrap when graph.json here is absent, or is itself a
+        # symlink from a previous run of this hook (idempotent re-link on a
+        # later checkout in the same worktree).  If a REAL graph was built
+        # in this worktree, leave it alone.
+        if [ ! -e graphify-out/graph.json ] || [ -L graphify-out/graph.json ]; then
+            # `git worktree add` already checked out the tracked
+            # graphify-out/.gitignore, materialising the directory — never
+            # remove it, only add symlinks alongside it.
+            mkdir -p graphify-out 2>/dev/null
+            _linked=0
+            for _entry in "$_base"/graphify-out/* "$_base"/graphify-out/.[!.]*; do
+                [ -e "$_entry" ] || continue
+                _name=$(basename -- "$_entry")
+                # .gitignore is the tracked file that keeps this directory
+                # self-ignoring — never shadow it with a symlink to the
+                # base's copy.
+                [ "$_name" = ".gitignore" ] && continue
+                ln -sfn "$_entry" "graphify-out/$_name" 2>/dev/null && _linked=1
+            done
+            [ "$_linked" = "1" ] &&
+                echo "[graphify] linked graphify-out/* -> $_base/graphify-out/* (read-only base graph)"
         fi
     fi
     # Never rebuild in a linked worktree.  Two reasons, both load-bearing:
-    #   1. graphify-out is now a symlink to the SHARED base graph — a rebuild
-    #      here would overwrite it from a feature-branch tree.
+    #   1. graphify-out/graph.json (and friends) are symlinks to the SHARED
+    #      base graph — a rebuild here would overwrite it from a
+    #      feature-branch tree.
     #   2. A worktree can be reaped mid-rebuild, which is how the graphify
     #      hook's own "burns a full AST pass and then dies with ENOENT"
     #      comment came to be.

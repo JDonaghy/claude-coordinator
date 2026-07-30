@@ -19,7 +19,10 @@ exact-string or line-level confirmation — not the first move.
 gitignored (only its `.gitignore` is tracked), so `git worktree add` yields an empty
 one — and `graphify query` resolves `graphify-out/graph.json` strictly relative to
 cwd, with no upward walk and no `--graph` override. `.githooks/post-checkout`
-therefore symlinks a worktree's `graphify-out` at the base checkout's graph.
+therefore symlinks the *contents* of a worktree's `graphify-out/` (`graph.json`,
+`manifest.json`, `cache/`, ...) at the base checkout's graph — the directory
+itself, and its tracked `.gitignore`, are left alone so the worktree stays
+`git status`-clean.
 Consequences worth knowing while working in one: the graph reflects the **base
 checkout's HEAD, not your edits** — trust it for *"where is X handled"*, never for
 *"did my change land"* — and rebuilds are deliberately disabled inside worktrees
