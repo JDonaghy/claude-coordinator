@@ -50,6 +50,7 @@ from coord.state import (
     mark_review_posted,
     save_plan,
 )
+from coord.worker_events import is_usage_limit_reason
 
 
 @dataclass
@@ -498,6 +499,23 @@ def detect_stalled_pipeline(
             # `review is None or review.status == "done"` catch-all below so
             # a failed review is never mistaken for "no review dispatched"
             # or "review approved" — neither of which is true here.
+            #
+            # ...UNLESS it was killed by the account's usage limit. That is
+            # an account-wide exhausted budget, not a per-review defect:
+            # `AgentServer._reap` lands a usage-limit kill on FAILED exactly
+            # like an api_error kill, so without this guard the sweep would
+            # spend this work row's ONE auto-recovery action (the
+            # `_stalled_notified_key` ledger is one-shot per work row) on a
+            # `dispatch_review` that is guaranteed to die the same way until
+            # the reset — the precise anti-pattern `reconcile.py`'s
+            # `auto_reassign` block was hardened against in #1461, and the
+            # one `coord/drive.py`'s `_decide_review` already guards with
+            # this same predicate. Skipped at CLASSIFICATION rather than
+            # declined at dispatch so the row is never marked notified: a
+            # later review attempt that fails for a *different* (genuinely
+            # recoverable) reason can still be picked up by a future tick.
+            if is_usage_limit_reason(review.failure_reason):
+                continue
             reason = "review_failed_no_verdict"
             detail = (
                 f"Review {review.assignment_id} failed "
@@ -947,6 +965,34 @@ def dispatch_stalled_pipeline_action(
         # review row) also picks up any board state that changed since —
         # same reasoning `done_no_review` already relies on.
         from coord.review import dispatch_review  # noqa: PLC0415
+
+        # Belt-and-braces against the usage-limit kill (#1461/#1584):
+        # `detect_stalled_pipeline` already skips those rows at
+        # classification, but this function is public and is also reachable
+        # with a caller-built detection, or after a race in which the
+        # usage-limit `failure_reason` was stamped onto the review row
+        # between detection and dispatch. Re-dispatching into an
+        # account-wide exhausted budget only produces another corpse, so
+        # decline — mirroring `_decide_review`'s WAIT in `coord/drive.py`.
+        all_assignments = list(board.active) + list(board.completed)
+        dead_review = next(
+            (
+                a for a in all_assignments
+                if a.review_of_assignment_id == work.assignment_id
+                and a.type == "review"
+                and a.status == "failed"
+            ),
+            None,
+        )
+        if dead_review is not None and is_usage_limit_reason(dead_review.failure_reason):
+            return StalledDispatchAction(
+                kind="no_action",
+                detail=(
+                    f"review {dead_review.assignment_id} was killed by the "
+                    f"usage limit ({dead_review.failure_reason}) — waiting "
+                    "for the reset instead of re-dispatching"
+                ),
+            )
 
         review = dispatch_review(work, board, config, terminal_cache=terminal_cache)
         if review is None:
