@@ -62,6 +62,29 @@ PyPI propagation can lag a minute or two after the workflow goes green.
 `no_change` until the new version is visible — wait and retry rather
 than assuming the publish failed.
 
+**Poll the SIMPLE index, not the JSON API — they flip independently, in
+both directions.** `pip` resolves against
+`https://pypi.org/simple/<pkg>/`, so that is the only endpoint that
+answers the question you actually care about. Measured twice:
+
+| release | JSON API (`/pypi/<pkg>/json`) | simple index | outcome |
+|---|---|---|---|
+| v0.4.88 (2026-07-29) | already `0.4.88` | still `0.4.87` | `pip install ==0.4.88` failed: *No matching distribution found* |
+| v0.4.89 (2026-07-30) | still `0.4.88` | already `0.4.89` | install succeeded while the JSON API looked stale |
+
+Neither one leads reliably. Ask "can pip resolve it?", not "is it
+published?":
+
+```bash
+curl -s https://pypi.org/simple/claude-coordinator/ | grep -q 'claude_coordinator-X\.Y\.Z' && echo installable
+```
+
+Expect per-machine variation even after that: a mirror/resolver on one
+host can still miss the release for a minute or two after another host
+installs it cleanly. Retry that machine rather than concluding the
+publish broke. **After every install, verify `coord --version` — never
+infer success from pip's exit code.**
+
 **Anything that changes `coord/agent.py` (e.g. the worker system
 prompts) only takes effect on agents after a release + rollout.**
 Coordinator-only Python (CLI, `notify.py`, `merge_queue.py`, parsers) is
@@ -425,6 +448,46 @@ coord status            # thin clients should reconnect to the daemon
 Skip this and the fix ships to the fleet but the daemon silently keeps serving
 the old behaviour — the failure mode that stranded #850 (a `serve_app.py` fix)
 even though every agent already reported the new version.
+
+### The fourth lane: `~/.coord-cli-venv` (the epic sequencer's `COORD_BIN`)
+
+**`coord agent update --all` does not touch this, and nothing else does either.**
+
+`drive-epic.service` on elitebook runs the unattended epic sequencer with an
+explicit binary override:
+
+```
+Environment=COORD_BIN=/home/john/.coord-cli-venv/bin/coord
+```
+
+That is a **separate, pinned PyPI install** — distinct from the agent venv on the
+same machine *and* from the editable CLI in `~/src/claude-coordinator`. It is
+upgraded by exactly one thing: someone remembering to do it.
+
+```bash
+~/.coord-cli-venv/bin/pip install --upgrade --no-cache-dir claude-coordinator==X.Y.Z
+~/.coord-cli-venv/bin/coord --version    # verify — never infer from pip's exit code
+```
+
+**Why this is the nastiest lane to miss.** The editable CLI in the checkout is live
+the instant a PR merges, so every `coord` command *you* type picks up the new code
+and the deploy looks complete. But every drive the sequencer launches on its
+30-minute timer resolves `coord` through `COORD_BIN` — the stale copy. Hand-testing
+confirms the fix while automation keeps hitting the bug, and both are "the same
+command."
+
+Found stale on 2026-07-29 at **0.4.84 while the fleet was on 0.4.87** — three
+releases behind. Every timer-launched drive in that window had been running without
+#1564's CI merge gate, #1565, #1567, and #1568, all of which were believed live.
+
+**Add it to every release.** The complete deploy surface is four lanes:
+
+| # | lane | how it updates | needed when |
+|---|---|---|---|
+| 1 | `~/.coord-venv` × N (agents) | `coord agent update --all`, or per-machine pip + `systemctl --user restart coord-agent` | any `coord/agent.py` change; always safe to do |
+| 2 | `coord serve` (daemon host) | `systemctl --user restart coord-serve` **after** lane 1 upgraded the on-disk code | any `serve_app.py` / `state.py` / `review.py` / `merge_queue.py` change |
+| 3 | `coord-tui` | local `cargo build && cp target/debug/coord-tui ~/.local/bin/` | any `tui/**` change — never PyPI |
+| 4 | **`~/.coord-cli-venv`** | manual `pip install --upgrade` + verify `coord --version` | **every release**, because the sequencer drives through it |
 
 ## Fleet-wide version check
 
