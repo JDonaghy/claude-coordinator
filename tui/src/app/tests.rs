@@ -5501,6 +5501,41 @@
         );
     }
 
+    #[test]
+    fn review_stage_status_finalizing_with_no_verdict_is_active_not_failed() {
+        // #1566: a review agent that reports "done" doesn't have its verdict
+        // parsed + posted until `coord notify`'s separate, slower step runs —
+        // the board persists the intermediate "finalizing" status for that
+        // window (see `coord.reconcile.reconcile_completed_assignments`).
+        // Without the "finalizing" guard alongside "running" here, this would
+        // hit the #812 "terminal done, no verdict" arm and render Failed —
+        // indistinguishable from a genuinely dropped verdict, which is
+        // exactly the false reading #1566 was filed over.
+        let issue = PipelineIssue {
+            number: 700,
+            title: "x".to_string(),
+            body: String::new(),
+            repo_slug: "acme/api".to_string(),
+            coord_repo: Some("api".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: false,
+        };
+        let mut a = make_assignment_typed("finalizing", 700, "api", Some("review"));
+        a.review_verdict = None;
+        a.dispatched_at = Some(100.0);
+        let mut app = make_app_default();
+        app.data.assignments = vec![a];
+        let s = app.stage_status_for(&issue, "review");
+        assert_ne!(s, StageStatus::Failed, "a still-finalizing review must not render Failed");
+        assert_ne!(s, StageStatus::Done, "a still-finalizing review must not render Done either");
+        assert_eq!(
+            s,
+            StageStatus::Active,
+            "a review still wrapping up its verdict must render Active, distinct from both Done and Failed"
+        );
+    }
+
     // ── #550: server-computed issue_stage_projection consumption ───────────
 
     fn projection_issue() -> PipelineIssue {

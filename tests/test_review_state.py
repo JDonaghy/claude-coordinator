@@ -391,6 +391,50 @@ class TestDoneTransition:
 
         assert completed_work.review_state == "done"
 
+    def test_review_completion_status_is_finalizing_not_done(
+        self, two_machine_config: Config
+    ) -> None:
+        """#1566: the review assignment's OWN status must land on
+        "finalizing", not "done", the instant the agent reports it finished —
+        the verdict is parsed + posted by `coord notify`, a separate, slower
+        step. Landing straight on "done" here (as `mark_done_by_id` would,
+        unless this reconcile branch corrects it) leaves a window where the
+        board shows a finished review with `review_verdict IS NULL`,
+        indistinguishable from a genuinely dropped verdict.
+
+        `completed_work.review_state` (asserted "done" in the sibling test
+        above) is a DIFFERENT field with a deliberately different meaning —
+        "the review PROCESS is over" — and is unaffected by this fix.
+        """
+        completed_work = _work_assignment(
+            status="done", branch="issue-1-fix", review_state="dispatched"
+        )
+        review_assignment = Assignment(
+            machine_name="server",
+            repo_name="api",
+            issue_number=1,
+            issue_title="[review] Fix the thing",
+            assignment_id="rev-001",
+            status="running",
+            type="review",
+            review_of_assignment_id="work-001",
+        )
+        board = Board(
+            active=[review_assignment],
+            completed=[completed_work],
+        )
+
+        fake_status = {
+            "active": [],
+            "completed": [{"id": "rev-001", "status": "done", "finished_at": 200.0}],
+        }
+        with patch("coord.reconcile._query_agent", return_value=fake_status), \
+             patch("coord.review.dispatch_review", return_value=None):
+            reconcile(board, two_machine_config)
+
+        assert review_assignment.status == "finalizing"
+        assert review_assignment.review_verdict is None
+
     def test_review_worker_failure_also_sets_work_review_state_done(
         self, two_machine_config: Config
     ) -> None:

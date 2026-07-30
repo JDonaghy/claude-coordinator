@@ -321,6 +321,28 @@ def test_every_terminal_status_is_inactive(status):
     assert project(payload, REPO, 1392, make_config()).active_count == 0
 
 
+def test_review_finalizing_counts_as_active_not_a_dead_end():
+    """#1566: a review row lands on "finalizing" the instant its agent
+    finishes, before `coord notify` has parsed + posted the verdict (see
+    `coord.reconcile.reconcile_completed_assignments`). "finalizing" is
+    deliberately absent from `TERMINAL_STATUSES` so `active_count` still
+    counts it — that's what makes `coord drive`'s `decide()` take its
+    pre-existing "something is running: just wait" branch (`state.
+    active_count > 0`) instead of falling through to `_decide_review`'s
+    "review finished but recorded NO verdict" dead end, which would
+    otherwise misfire on a review that's simply still wrapping up.
+    """
+    payload = {
+        "assignments": [
+            row(assignment_id="w1", status="done"),
+            row(assignment_id="r1", type="review", status="finalizing"),
+        ]
+    }
+    state = project(payload, REPO, 1392, make_config())
+    assert state.active_count == 1
+    assert state.active_types == ("review",)
+
+
 # ── merge entry ──────────────────────────────────────────────────────────────
 
 

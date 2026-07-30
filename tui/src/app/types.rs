@@ -462,13 +462,17 @@ impl Assignment {
     /// active theme palette.
     ///
     /// Mapping (semantic → `quadraui::Theme` field):
-    /// - `"running"` → `theme.badge_running`  (active worker — green on dark)
-    /// - `"done"`    → `theme.muted_fg`        (completed, no longer active)
-    /// - `"failed"`  → `theme.badge_blocked`   (hard failure — red)
-    /// - other       → `theme.warning_fg`      (pending / unknown — yellow)
+    /// - `"running"`    → `theme.badge_running`  (active worker — green on dark)
+    /// - `"finalizing"` → `theme.diagnostic_info` (#1566: review agent done,
+    ///   verdict not yet captured/posted — distinct from both "done" and
+    ///   "failed" so it never reads as a dropped verdict)
+    /// - `"done"`       → `theme.muted_fg`        (completed, no longer active)
+    /// - `"failed"`     → `theme.badge_blocked`   (hard failure — red)
+    /// - other          → `theme.warning_fg`      (pending / unknown — yellow)
     pub(crate) fn status_color(&self, theme: &quadraui::Theme) -> Color {
         match self.status.as_str() {
             "running" => theme.badge_running,
+            "finalizing" => theme.diagnostic_info,
             "done" => theme.muted_fg,
             "failed" => theme.badge_blocked,
             _ => theme.warning_fg,
@@ -478,6 +482,7 @@ impl Assignment {
     pub(crate) fn status_label(&self) -> &str {
         match self.status.as_str() {
             "running" => "RUN ",
+            "finalizing" => "WRAP",
             "done" => "DONE",
             "failed" => "FAIL",
             _ => "PEND",
