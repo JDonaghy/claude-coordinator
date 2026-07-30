@@ -220,7 +220,15 @@ def compute_pipeline(
             # Smoke assignment completed but smoke_test not yet set — treat as passed.
             current_stage = "smoke_passed"
         elif review_assignment is not None:
-            if review_assignment.status in ("running", "pending"):
+            if review_assignment.status in ("running", "pending", "finalizing"):
+                # #1566: "finalizing" is a review row whose agent finished but
+                # whose verdict hasn't been parsed/posted by `coord notify`
+                # yet. Treating it as "review_done" here would surface the
+                # exact "no verdict, indistinguishable from dropped" gap
+                # #1566 was filed over — on the phone dashboard this also
+                # matters because review_done + no verdict adds the
+                # "record-review-verdict" gate below, inviting an operator to
+                # manually stamp a verdict for a review still being parsed.
                 current_stage = "review_running"
             elif review_assignment.status == "failed":
                 current_stage = "review_failed"

@@ -442,6 +442,17 @@ def detect_stalled_pipeline(
             None,
         )
 
+        # #1566: a review that just finished lands on status="finalizing"
+        # (not "done") until `coord notify`'s own _try_parse_and_post_review
+        # promotes it — i.e. THIS function is what closes that window. None
+        # of the `review.status == "done"` checks below match "finalizing",
+        # so a still-finalizing review falls through this whole if/elif
+        # chain with `reason` left unset (no stall reported), which is
+        # correct as long as the finalizing window stays short. That relies
+        # on `coord notify` actually running again soon — nothing here
+        # guards against `coord notify` itself never running (e.g. daemon
+        # down), which would leave the row on "finalizing" forever without
+        # ever tripping this stall detector.
         reason: str | None = None
         detail = ""
 

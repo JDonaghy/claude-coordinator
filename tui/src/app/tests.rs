@@ -3939,6 +3939,14 @@
     }
 
     #[test]
+    fn status_label_finalizing() {
+        // #1566: a review row whose agent finished but whose verdict hasn't
+        // been parsed/posted by `coord notify` yet renders "WRAP", distinct
+        // from both "DONE" and "FAIL".
+        assert_eq!(make_assignment("finalizing").status_label(), "WRAP");
+    }
+
+    #[test]
     fn status_label_done() {
         assert_eq!(make_assignment("done").status_label(), "DONE");
     }
@@ -4169,6 +4177,31 @@
         assert_eq!(
             make_assignment("running").status_color(&theme),
             Color::rgb(80, 220, 80)
+        );
+    }
+
+    #[test]
+    fn status_color_finalizing() {
+        // #1566: "finalizing" maps to diagnostic_info so a review that's
+        // done-but-unverdicted never shares a color with "done" (muted_fg)
+        // or "failed" (badge_blocked) — that visual distinction is the
+        // whole point of the intermediate status. dark_palette() doesn't
+        // override diagnostic_info, so the Dark theme's value comes straight
+        // from quadraui::Theme::default() — assert against that rather than
+        // a hardcoded literal that would silently drift from the real
+        // default.
+        let theme = crate::settings::Theme::Dark.to_quadraui_theme();
+        assert_eq!(
+            make_assignment("finalizing").status_color(&theme),
+            quadraui::Theme::default().diagnostic_info
+        );
+        assert_ne!(
+            make_assignment("finalizing").status_color(&theme),
+            make_assignment("done").status_color(&theme)
+        );
+        assert_ne!(
+            make_assignment("finalizing").status_color(&theme),
+            make_assignment("failed").status_color(&theme)
         );
     }
 
@@ -25288,6 +25321,54 @@
             driver.screen_contains("Issue 42") || driver.screen_contains("#42"),
             "Issue title / number must appear in the board sidebar:\n{}",
             driver.screen()
+        );
+    }
+
+    /// #1566 acceptance criterion for the "finalizing" intermediate status:
+    /// "a TuiDriver test asserting the finalizing state renders differently
+    /// from both done and failed". `review_stage_status_finalizing_with_no_verdict_is_active_not_failed`
+    /// (below) covers the underlying `stage_status_for_local` business logic
+    /// directly; this test drives the actual render path — full
+    /// `ShellAdapter → handle → render_frame` via `TuiDriver` — so the
+    /// per-assignment status badge on the Board detail panel is exercised
+    /// end-to-end, not just the pure function behind it.
+    #[test]
+    fn tuidriver_finalizing_review_badge_differs_from_done_and_failed() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        // One issue, three assignments in three different terminal-ish
+        // statuses: the work itself is "done", its review is stuck in the
+        // #1566 "finalizing" gap (agent finished, verdict not yet parsed by
+        // `coord notify`), and its smoke run genuinely "failed". The Board
+        // detail panel's ASSIGNMENTS section (`detail_list`, `mod.rs`
+        // ~L6601) renders one row per assignment via `status_label()` — if
+        // "finalizing" fell into the same bucket as "done" or "failed" (the
+        // exact ambiguity #1566 was filed over) this test would see a
+        // duplicate DONE/FAIL instead of the distinct WRAP badge.
+        let assignments = vec![
+            make_assignment_typed("done", 77, "repo-a", Some("work")),
+            make_assignment_typed("finalizing", 77, "repo-a", Some("review")),
+            make_assignment_typed("failed", 77, "repo-a", Some("smoke")),
+        ];
+        let mut app = make_app_with_assignments(assignments);
+        // Pre-select the issue row (single milestone → single issue group,
+        // same path shape as `tuidriver_board_issue_body_renders` above).
+        app.board_sidebar.set_selected_path(1, Some(vec![0, 0]));
+
+        let driver = driver_with_shell(app, CoordApp::shell_config(), 120, 40);
+        let screen = driver.screen();
+
+        assert!(
+            driver.screen_contains("WRAP"),
+            "finalizing review must render its own distinct WRAP badge:\n{screen}"
+        );
+        assert!(
+            driver.screen_contains("DONE"),
+            "done work assignment must still render DONE alongside it:\n{screen}"
+        );
+        assert!(
+            driver.screen_contains("FAIL"),
+            "failed smoke assignment must still render FAIL alongside it:\n{screen}"
         );
     }
 
