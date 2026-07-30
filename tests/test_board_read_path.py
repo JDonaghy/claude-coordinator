@@ -236,6 +236,172 @@ def test_stale_concurrent_rebuild_is_never_published(
         assert r3.status_code == 304
 
 
+# ── #1597: single-flight rebuild + serialize-once ────────────────────────────
+
+
+def test_board_single_flight_rebuild_runs_once(
+    detail_db: Path, valid_config_path: Path, monkeypatch
+) -> None:
+    """#1597 Part 1: N concurrent GET /board requests racing an expired
+    cache must trigger exactly ONE ``board_projection()`` rebuild — every
+    caller awaits that build's outcome and gets the same payload/ETag,
+    rather than each starting its own independent, whole-board rebuild
+    (the herd-thundering bug: drives went blind >60 s waiting on it)."""
+    import asyncio
+    import threading
+
+    import httpx
+
+    monkeypatch.setenv("COORD_BOARD_CACHE_TTL", "60")  # only the one build matters
+    original_projection = SqliteStore.board_projection
+
+    call_count = 0
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_projection(self):  # noqa: ANN001
+        nonlocal call_count
+        call_count += 1
+        started.set()
+        assert release.wait(timeout=5), "test driver never released the build"
+        return original_projection(self)
+
+    monkeypatch.setattr(SqliteStore, "board_projection", slow_projection)
+
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(detail_db), cfg)
+    n_callers = 8
+
+    async def _run():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+            tasks = [asyncio.create_task(cli.get("/board")) for _ in range(n_callers)]
+            # Give every caller a beat to reach the daemon and queue up
+            # behind the single in-flight build before it's released.
+            await asyncio.sleep(0.2)
+            assert started.is_set(), "the build never started"
+            release.set()
+            return await asyncio.gather(*tasks)
+
+    responses = asyncio.run(_run())
+
+    assert call_count == 1, (
+        f"board_projection() ran {call_count}x for {n_callers} concurrent "
+        "callers — expected exactly 1 (single-flight not enforced)"
+    )
+    assert all(r.status_code == 200 for r in responses), [r.status_code for r in responses]
+    etags = {r.headers.get("etag") for r in responses}
+    assert len(etags) == 1 and None not in etags, f"waiters got different ETags: {etags}"
+    bodies = {r.content for r in responses}
+    assert len(bodies) == 1, "waiters got different response bytes for the same build"
+
+
+def test_board_single_flight_failure_reaches_all_waiters(
+    detail_db: Path, valid_config_path: Path, monkeypatch
+) -> None:
+    """#1597 Part 1: when the single in-flight build fails, every concurrent
+    waiter must get the 503 (not hang) — and the failure must not wedge the
+    single-flight slot: the next request retries the build rather than
+    replaying the cached error."""
+    import asyncio
+    import threading
+
+    import httpx
+
+    monkeypatch.setenv("COORD_BOARD_CACHE_TTL", "60")
+    original_projection = SqliteStore.board_projection
+
+    call_count = 0
+    started = threading.Event()
+    release = threading.Event()
+
+    def failing_projection(self):  # noqa: ANN001
+        nonlocal call_count
+        call_count += 1
+        started.set()
+        assert release.wait(timeout=5), "test driver never released the build"
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(SqliteStore, "board_projection", failing_projection)
+
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(detail_db), cfg)
+    n_callers = 5
+
+    async def _run():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+            tasks = [asyncio.create_task(cli.get("/board")) for _ in range(n_callers)]
+            await asyncio.sleep(0.2)
+            assert started.is_set(), "the build never started"
+            release.set()
+            return await asyncio.gather(*tasks)
+
+    responses = asyncio.run(_run())
+
+    assert call_count == 1, f"the failing build ran {call_count}x — expected exactly 1"
+    assert all(r.status_code == 503 for r in responses), [r.status_code for r in responses]
+    for r in responses:
+        assert "board read failed" in r.json()["error"]
+
+    # The in-flight slot was cleared on failure: a later request retries the
+    # build (fixed now) rather than hanging or replaying the stale error.
+    monkeypatch.setattr(SqliteStore, "board_projection", original_projection)
+    with TestClient(app) as cli:
+        resp = cli.get("/board")
+    assert resp.status_code == 200
+    assert resp.json()["round_number"] == 3
+    assert call_count == 1, "the retry must run its own fresh build_projection() call"
+
+
+def test_board_stamp_serializes_payload_once(
+    app_client: TestClient, monkeypatch
+) -> None:
+    """#1597 Part 2: the ~5 MB board payload is JSON-encoded exactly ONCE per
+    build — the same bytes serve as both the ETag's content-hash input and
+    the wire body, instead of once for the hash and again for the response
+    (the "~10 MB of JSON work per rebuild" amplifier named in the issue).
+
+    Targets the full-payload dumps() call specifically (its distinctive
+    ``separators=(",", ":")`` signature) so per-field encodes elsewhere in
+    the build (e.g. board_wire's truncation-preview sizing) don't confound
+    the count.
+    """
+    import json as _json
+
+    calls = []
+    original_dumps = _json.dumps
+
+    def counting_dumps(*args, **kwargs):  # noqa: ANN002, ANN003
+        if kwargs.get("separators") == (",", ":"):
+            calls.append((args, kwargs))
+        return original_dumps(*args, **kwargs)
+
+    monkeypatch.setattr(_json, "dumps", counting_dumps)
+    resp = app_client.get("/board")
+
+    assert resp.status_code == 200
+    assert len(calls) == 1, (
+        f"the full-board payload was JSON-encoded {len(calls)}x for one "
+        "build — expected exactly 1"
+    )
+
+
+def test_board_body_matches_plain_jsonresponse_rendering(
+    app_client: TestClient,
+) -> None:
+    """#1597 Part 2 (payload equivalence): the pre-rendered fast-path body
+    must be byte-identical to what plain ``JSONResponse(result)`` — the
+    pre-#1597 renderer — would have produced for the same content. The
+    optimization changes HOW the bytes are produced, never WHAT they say."""
+    from starlette.responses import JSONResponse
+
+    resp = app_client.get("/board")
+    assert resp.status_code == 200
+    reference = JSONResponse(json.loads(resp.content)).body
+    assert resp.content == reference
+
+
 # ── Invariant 1: read endpoints perform no third-party I/O ───────────────────
 
 
