@@ -1,0 +1,12 @@
+F                                                                        [100%]
+=================================== FAILURES ===================================
+______________ test_worker_spawn_exports_shared_cargo_target_dir _______________
+tests/test_cargo_cache.py:246: in test_worker_spawn_exports_shared_cargo_target_dir
+    assert target == str(server.state_dir / "cargo-target" / "api")
+E   AssertionError: assert '/home/john/....e-coordinator' == '/tmp/pytest-...go-target/api'
+E     
+E     - /tmp/pytest-of-john/pytest-735/test_worker_spawn_exports_shar0/state/cargo-target/api
+E     + /home/john/.coord/cargo-target/claude-coordinator
+=========================== short test summary info ============================
+FAILED tests/test_cargo_cache.py::test_worker_spawn_exports_shared_cargo_target_dir
+1 failed in 0.95s

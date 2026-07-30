@@ -359,7 +359,32 @@ class TestLifecycleCommandsAfterRefactor:
     """coord ready / backlog still work after _apply_label_change was refactored
     to delegate to state.apply_issue_labels (#802)."""
 
-    def test_coord_ready_sets_status_ready(self, config_file: Path) -> None:
+    def test_coord_ready_sets_both_coord_and_status_ready(self, config_file: Path) -> None:
+        """#544: coord ready must add both `coord` and `status:ready` to ensure
+        Pipeline membership. Issues with only `status:ready` (no `coord`) are
+        silently not pulled into the Pipeline."""
+        _seed_issue(labels=[])
+        with patch(
+            "coord.github_ops.change_issue_labels",
+            return_value=(["coord", "status:ready"], True),
+        ) as mock_change:
+            result = CliRunner().invoke(
+                main,
+                ["ready", "api", "10", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        assert "ready" in result.output.lower()
+        # The seam received the right add/remove sets
+        call_kwargs = mock_change.call_args.kwargs
+        assert "coord" in call_kwargs["add"], "coord label must be added"
+        assert "status:ready" in call_kwargs["add"], "status:ready label must be added"
+        assert "status:refining" in call_kwargs["remove"]
+
+    def test_coord_ready_idempotent_with_coord_already_present(
+        self, config_file: Path
+    ) -> None:
+        """When `coord` is already present, `coord ready` still adds `status:ready`
+        (idempotent: _apply_label_change handles re-adding an already-present label)."""
         _seed_issue(labels=["coord"])
         with patch(
             "coord.github_ops.change_issue_labels",
@@ -373,8 +398,8 @@ class TestLifecycleCommandsAfterRefactor:
         assert "ready" in result.output.lower()
         # The seam received the right add/remove sets
         call_kwargs = mock_change.call_args.kwargs
+        assert "coord" in call_kwargs["add"]
         assert "status:ready" in call_kwargs["add"]
-        assert "status:refining" in call_kwargs["remove"]
 
     def test_coord_backlog_reports_noop_when_already_backlog(
         self, config_file: Path
