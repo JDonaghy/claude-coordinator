@@ -31,3 +31,21 @@ tests:
   plans_help_1124::palette_status_bar_shows_esc_close: 1124
   # §5e — Esc closes the palette
   plans_help_1124::palette_esc_closes: 1124
+
+  # ── #1123 (CC-3) — right-click menus everywhere (contract §4) ───────────
+  # §4c — right-click empty main-panel space → "New plan > Quick capture"
+  plans_rightclick_1123::right_click_empty_main_area_offers_new_plan_quick_capture: 1123
+  # §4c — …and "New plan > Guided chat…"
+  plans_rightclick_1123::right_click_empty_main_area_offers_new_plan_guided_chat: 1123
+  # §4c/§4e — "Refresh" item carries its `r` accelerator inside the menu
+  plans_rightclick_1123::right_click_empty_main_area_menu_shows_refresh_with_r_accelerator: 1123
+  # §4f — status bar advertises the context menu
+  plans_rightclick_1123::plans_status_bar_advertises_right_click_menu: 1123
+  # §4f — status bar points at the `?` help overlay
+  plans_rightclick_1123::plans_status_bar_advertises_help_key: 1123
+  #
+  # NOT YET SEALED (see the TODO block at the foot of plans_rightclick_1123.rs):
+  # contract §4a / §4b / §4d need a *seeded plan row*, and no public fixture
+  # seam exposes `plan_roster` to this external `--test acceptance` crate.
+  # Needs a contract amendment pinning such a seam before those clauses can
+  # be authored.
