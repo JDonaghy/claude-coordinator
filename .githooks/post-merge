@@ -1,0 +1,19 @@
+#!/bin/sh
+# Versioned post-merge shim.
+#
+# core.hooksPath REPLACES .git/hooks wholesale, so without this file
+# graphify's post-merge rebuild is silently DISABLED on any machine that opts
+# into the versioned hooks.  See .githooks/_lib.sh.
+#
+# Linked worktrees never rebuild: graphify-out there is a symlink to the base
+# checkout's SHARED graph, so a rebuild would overwrite it from a
+# feature-branch tree — and a worktree can be reaped mid-rebuild.
+
+set -u
+. "$(dirname "$0")/_lib.sh"
+
+if gfy_is_linked_worktree; then
+    exit 0
+fi
+
+gfy_chain post-merge "$@"

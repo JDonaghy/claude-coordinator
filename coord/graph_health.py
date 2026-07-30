@@ -252,7 +252,54 @@ def hooks_path_status(repo_path: Path) -> tuple[bool, str]:
             f"core.hooksPath={value} but {HOOKS_PATH}/post-checkout is missing "
             f"(stale checkout?)"
         )
+    orphaned = orphaned_hooks(repo_path)
+    if orphaned:
+        return False, (
+            f"core.hooksPath={value} but {', '.join(orphaned)} exist(s) only in "
+            f".git/hooks — git no longer runs them, so those graphify rebuilds "
+            f"are SILENTLY DISABLED. Add a shim in {HOOKS_PATH}/"
+        )
     return True, f"core.hooksPath={value}"
+
+
+def orphaned_hooks(repo_path: Path) -> list[str]:
+    """Hooks installed in the machine-local hooks dir with no counterpart in
+    :data:`HOOKS_PATH`.
+
+    Setting ``core.hooksPath`` makes git ignore ``.git/hooks`` **entirely** —
+    it does not merge or fall back.  So any hook graphify installed there
+    (``post-commit``, ``post-checkout``, ``post-merge``) that has no shim in
+    the versioned directory stops running, with no error and no log line.
+    This shipped exactly once: only ``post-checkout`` had a shim, which
+    silently killed graphify's commit- and merge-triggered rebuilds.
+
+    Returns hook names, sorted.  Empty when nothing is orphaned (including
+    when ``core.hooksPath`` isn't set — then ``.git/hooks`` is live and
+    there is nothing to orphan).
+    """
+    local_dir = _git_out(repo_path, "rev-parse", "--git-common-dir")
+    if not local_dir:
+        return []
+    common = Path(local_dir)
+    if not common.is_absolute():
+        common = repo_path / common
+    hooks_dir = common / "hooks"
+    versioned = repo_path / HOOKS_PATH
+    if not hooks_dir.is_dir() or not versioned.is_dir():
+        return []
+
+    out: list[str] = []
+    for entry in hooks_dir.iterdir():
+        name = entry.name
+        # graphify keeps .bak copies alongside; only real, executable hooks
+        # matter, and only ones git would actually invoke.
+        if name.endswith(".sample") or name.endswith(".bak") or "." in name:
+            continue
+        if not entry.is_file():
+            continue
+        if not (versioned / name).is_file():
+            out.append(name)
+    return sorted(out)
 
 
 def format_status_lines(st: GraphStatus) -> list[str]:
