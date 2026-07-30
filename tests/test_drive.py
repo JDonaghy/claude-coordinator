@@ -969,6 +969,47 @@ def test_usage_limit_kill_on_advisory_also_waits():
     assert action.kind == WAIT
 
 
+def test_usage_limit_wait_surfaces_the_earliest_resume_time():
+    """#1590 part 3/6: the `reset_at_raw` the detector has always parsed is now
+    turned into an absolute earliest-resume instant and surfaced, so the
+    operator knows when the node comes back rather than just that it's parked."""
+    action = step(
+        state(
+            work_aid="w1", work_status="failed",
+            work_failure_reason="usage limit — resets 8:30pm (America/Chicago)",
+        ),
+    )
+    assert action.kind == WAIT
+    joined = "\n".join(action.warnings)
+    assert "environmental (usage limit)" in joined
+    assert "earliest resume 20" in joined  # ISO-8601, 20:30 local to Chicago
+
+
+def test_retry_cap_death_names_the_failure_class():
+    """#1590 part 6: 'drive died 3x' used to send the next person looking at
+    the work. The exhausted-retry message now states which class it was."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_work_retries=0)
+
+    work = step(
+        state(work_aid="w1", work_status="failed", work_failure_reason="tests failed"),
+        opts, counters=counters,
+    )
+    assert work.is_exit
+    assert "cause: work failure" in work.message
+
+    env = step(
+        state(
+            work_aid="w1", work_status="failed",
+            work_failure_reason='API Error: 529 {"type":"overloaded_error"}',
+        ),
+        opts, counters=DriveCounters(),
+    )
+    assert env.is_exit
+    assert "cause: environmental" in env.message
+    assert "529" in env.message
+
+
 def test_normal_advisory_failure_reason_is_not_mistaken_for_a_usage_limit():
     """A failure_reason that doesn't carry the exact stamped prefix must fall
     through to the ordinary retry-or-die path unchanged."""

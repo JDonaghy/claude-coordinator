@@ -1016,7 +1016,8 @@ def reconcile(board: Board, config: Config) -> list[str]:
 
     # Auto-reassign failed work assignments to a different machine.
     if newly_failed and getattr(config.concurrency, "auto_reassign", False):
-        from coord.worker_events import is_usage_limit_reason  # noqa: PLC0415
+        # #1590: one decision point for "was this the weather or the work".
+        from coord.failure_class import classify_failure  # noqa: PLC0415
 
         for failed_a in newly_failed:
             if getattr(failed_a, "type", "work") != "work":
@@ -1031,11 +1032,19 @@ def reconcile(board: Board, config: Config) -> list[str]:
             # already-persisted `failure_reason` (a prior pass already
             # stamped it, e.g. after a race with `reconcile_completed_
             # assignments`'s own tick).
+            #
+            # #1590 deliberately does NOT widen this skip to every
+            # `environmental` class: an API 5xx/network failure genuinely can
+            # be machine-local (one agent host's DNS, one flaky link), so
+            # moving it to another machine is a reasonable first move and the
+            # bounded `auto_reassign` retry still terminates. Only the
+            # usage limit is provably account-wide, and only it is skipped.
             entry = agent_completed.get(failed_a.assignment_id)
-            usage_limit = (entry or {}).get("usage_limit_reason") or getattr(
-                failed_a, "failure_reason", None,
+            classification = classify_failure(
+                usage_limit_reason=(entry or {}).get("usage_limit_reason"),
+                failure_reason=getattr(failed_a, "failure_reason", None),
             )
-            if is_usage_limit_reason(usage_limit):
+            if classification.is_usage_limit:
                 continue
             reassigned = _reassign(failed_a, board, config)
             if reassigned is not None and reassigned.assignment_id is not None:

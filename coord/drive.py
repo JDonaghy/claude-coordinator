@@ -101,8 +101,8 @@ from coord.interactive import (
     tmux_available,
     tmux_session_alive,
 )
+from coord.failure_class import classify_failure, plan_usage_limit_resume
 from coord.usage_limits import PlanLimits, evaluate_usage_gate, get_plan_limits
-from coord.worker_events import is_usage_limit_reason
 
 # ── exit codes (unchanged from drive-issue.sh) ───────────────────────────────
 
@@ -802,28 +802,51 @@ def decide(
     # session). Deliberately does NOT auto-retry here — retrying before the
     # reset only produces more of the same; a human (or a future reset-aware
     # auto-retry) re-runs `coord retry` once the window reopens.
-    if state.work_status in ("failed", "advisory") and is_usage_limit_reason(
-        state.work_failure_reason
-    ):
-        return Action(
-            kind=WAIT,
-            label=(
-                f"WORK: {state.work_aid} killed by the usage limit — waiting "
-                "for the reset, not retrying"
-            ),
-            warnings=(
-                f"usage-limit kill detected on {state.work_aid}: "
-                f"{state.work_failure_reason} — waiting for the reset instead "
-                "of retrying (#1461)",
-            ),
+    #
+    # #1590: routed through `coord.failure_class` so this branch and the
+    # sequencer's budget agree on what "environmental" means, and the surfaced
+    # warning now names *when* the node could resume — the `reset_at_raw` the
+    # detector has always parsed and nobody ever used.
+    if state.work_status in ("failed", "advisory"):
+        classification = classify_failure(
+            failure_reason=state.work_failure_reason or None
         )
+        if classification.is_usage_limit:
+            resume = plan_usage_limit_resume(
+                reset_at_raw=classification.reset_at_raw
+            )
+            when = (
+                resume.resume_at.isoformat(timespec="minutes")
+                if resume.from_reset_time
+                else "unknown (reset time not parseable)"
+            )
+            return Action(
+                kind=WAIT,
+                label=(
+                    f"WORK: {state.work_aid} killed by the usage limit — waiting "
+                    "for the reset, not retrying"
+                ),
+                warnings=(
+                    f"usage-limit kill detected on {state.work_aid}: "
+                    f"{state.work_failure_reason} — waiting for the reset instead "
+                    "of retrying (#1461)",
+                    f"{classification.reason}; earliest resume {when} (#1590)",
+                ),
+            )
 
     # ---- work failed: bounded retry ----------------------------------------
     if state.work_status == "failed":
         if counters.work_retries >= opts.max_work_retries:
+            # #1590 part 6: name the actual cause. "failed 3 retries in: <prose>"
+            # sent the morning triage looking at the work even when the provider
+            # was the problem; the class is now stated up front.
+            classification = classify_failure(
+                failure_reason=state.work_failure_reason or None
+            )
             return _die(
                 f"work {state.work_aid} failed {counters.work_retries} retr(ies) in: "
                 f"{state.work_failure_reason or 'no reason recorded'}\n"
+                f"   cause: {classification.reason}\n"
                 f"   inspect: coord log {state.work_aid} --machine "
                 f"{state.work_machine or machine}"
             )
