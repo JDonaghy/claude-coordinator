@@ -526,6 +526,64 @@ pub(crate) fn globs_overlap(allowed: &str, route: &str) -> bool {
     })
 }
 
+/// #1598: why [`CoordApp::pipeline_jump_target`] couldn't resolve a Board
+/// issue to a real, currently-rendered Pipeline row.
+///
+/// Exists because the Board's "View in Pipeline" affordance used to gate
+/// purely on `pipeline_issues` membership — broader than what the Pipeline
+/// sidebar actually renders (#815 built a disabled state for the *untracked*
+/// case, but a *tracked* issue can still render nowhere: dismissed, filtered
+/// out by an active Pipeline search, or — the case that motivated this fix —
+/// classified "done" via a stale `merge_queue` row (e.g. closed then
+/// reopened, no fresh assignment yet) and older than the Done section's
+/// current time window). The menu predicate and the jump handler both call
+/// `pipeline_jump_target` so they can't drift on the answer again.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PipelineNotVisible {
+    /// Not a `pipeline_issues` member at all — no tracked (`coord`) label.
+    Untracked,
+    /// A member, but dismissed from the Pipeline sidebar this session.
+    Dismissed,
+    /// A member, but hidden by the currently-typed Pipeline search filter.
+    SearchFiltered,
+    /// A member classified into the "done" bucket (e.g. a stale
+    /// `merge_queue` row) but older than the Done section's current time
+    /// window (`self.done_window`), so it's dropped from every rendered
+    /// section.
+    OutsideDoneWindow,
+}
+
+impl PipelineNotVisible {
+    /// Short, menu-column-width reason shown as the disabled "View in
+    /// Pipeline" item's right-aligned hint.
+    pub(crate) fn menu_hint(self) -> &'static str {
+        match self {
+            Self::Untracked => "no coord label",
+            Self::Dismissed => "dismissed",
+            Self::SearchFiltered => "search-filtered",
+            Self::OutsideDoneWindow => "outside Done window",
+        }
+    }
+
+    /// Full-sentence explanation for the `jump_board_to_pipeline` toast.
+    pub(crate) fn toast_body(self, issue_number: u64) -> String {
+        match self {
+            Self::Untracked => format!(
+                "#{issue_number} has no coord tracking label — add one to dispatch it."
+            ),
+            Self::Dismissed => {
+                format!("#{issue_number} was dismissed from the Pipeline this session.")
+            }
+            Self::SearchFiltered => {
+                format!("#{issue_number} is hidden by the active Pipeline search filter.")
+            }
+            Self::OutsideDoneWindow => format!(
+                "#{issue_number} is Done, but older than the Pipeline's current Done time window."
+            ),
+        }
+    }
+}
+
 /// Status badge text + colour for the Pipeline sidebar row.
 ///
 /// Colour mapping (semantic → `quadraui::Theme` field, overridden per palette):
@@ -757,6 +815,66 @@ impl CoordApp {
             return "in-progress";
         }
         "new"
+    }
+
+    /// #1598: resolve a Board issue's real, currently-rendered Pipeline
+    /// row, if it has one.
+    ///
+    /// Single source of truth for "is this issue visible in the Pipeline
+    /// right now" — called by BOTH the Board right-click menu's "View in
+    /// Pipeline" enablement check (`context_menu_items_for_board_row`) and
+    /// `jump_board_to_pipeline`, so they can't independently drift on the
+    /// answer again. Delegates the actual gating to the exact functions the
+    /// sidebar rebuild uses (`pipeline_active_issues`, `pipeline_repos_for_state`,
+    /// `pipeline_done_windowed`) rather than re-deriving their exclusion
+    /// rules, so a future change to any of those stays in sync here for free.
+    /// See [`PipelineNotVisible`] for what "not visible" can mean.
+    pub(crate) fn pipeline_jump_target(
+        &self,
+        repo: &str,
+        number: u64,
+    ) -> Result<usize, PipelineNotVisible> {
+        let idx = self
+            .pipeline_issues
+            .iter()
+            .position(|pi| {
+                pi.number == number && pi.coord_repo.as_deref().unwrap_or(&pi.repo_slug) == repo
+            })
+            .ok_or(PipelineNotVisible::Untracked)?;
+        let issue = &self.pipeline_issues[idx];
+        // Attribute *why* below before checking `visible` — both dismissal
+        // and the search filter are also applied inside the per-bucket
+        // functions themselves, so checking them here doesn't change the
+        // gating decision; it only lets us report the specific cause
+        // instead of a generic "not visible".
+        if self
+            .pipeline_dismissed
+            .contains(&(issue.repo_slug.clone(), issue.number))
+        {
+            return Err(PipelineNotVisible::Dismissed);
+        }
+        if !self.pipeline_search.matches(issue.number, &issue.title) {
+            return Err(PipelineNotVisible::SearchFiltered);
+        }
+        let visible = match self.pipeline_lifecycle_section(issue) {
+            "in-progress" => self.pipeline_active_issues().contains(&idx),
+            "done" => self.pipeline_done_windowed().contains(&idx),
+            lc => self
+                .pipeline_repos_for_state(lc)
+                .iter()
+                .any(|(_, idxs)| idxs.contains(&idx)),
+        };
+        if visible {
+            Ok(idx)
+        } else {
+            // The only exclusion beyond dismissal/search that any bucket
+            // applies today is the Done section's time window (#1598: an
+            // issue closed-then-reopened with no fresh assignment resolves
+            // to "done" via a stale `merge_queue` row, but is older than
+            // `self.done_window` and so is dropped from every rendered
+            // section even though it's still a `pipeline_issues` member).
+            Err(PipelineNotVisible::OutsideDoneWindow)
+        }
     }
 
     /// #1500: numbers of `children` (an epic's `## Sub-issues` list) that

@@ -28587,6 +28587,282 @@
         );
     }
 
+    // ── #1598: enablement predicate == Pipeline render source ──────────────
+
+    /// #1598 baseline: a `coord`-labelled issue with no `status:*` label, no
+    /// assignments, and no `issue_stage_projection` entry (the exact shape
+    /// #1598 reported) must, when run through the REAL computation chain
+    /// (`pipeline_issues_from_cache` + `rebuild_pipeline_sidebar` — not a
+    /// hand-set `pipeline_issues`, which is what let the #815 tests miss
+    /// this class of drift), resolve to a real "New" row: the Board menu
+    /// shows "View in Pipeline" enabled with no disabled-reason hint, and
+    /// the `p` jump keybinding actually lands on it. Asserted on the
+    /// rendered screen, not just a `disabled == true` field read.
+    #[test]
+    fn tuidriver_view_in_pipeline_enabled_and_lands_for_plain_backlog_issue() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(BoardData {
+            pipeline_tracked_labels: vec!["coord".to_string()],
+            pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
+            open_issues: vec![OpenIssue {
+                repo_name: "myrepo".to_string(),
+                number: 1107,
+                title: "Backlog only issue".to_string(),
+                body: String::new(),
+                labels: vec!["coord".to_string()],
+                state: "open".to_string(),
+                milestone_number: None,
+                milestone_title: None,
+            }],
+            ..BoardData::default()
+        });
+        app.pipeline_issues = app.pipeline_issues_from_cache();
+        // #857: a milestone group with no in-flight issue defaults to
+        // collapsed on the Board — force it open (before the rebuild below
+        // reads it) so the row is clickable.
+        app.board_milestone_expanded
+            .insert(("myrepo".to_string(), "no-milestone".to_string()), true);
+        app.rebuild_board_sidebar();
+        app.rebuild_pipeline_sidebar(None);
+        app.active_view = SidebarView::Board;
+        app.select_issue("myrepo", 1107);
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+
+        // Find the sidebar row by its title, not "1107" — that substring
+        // also matches the detail pane's "myrepo #1107" breadcrumb, which
+        // isn't a right-clickable Board row.
+        let (x, y) = driver.find("#1107 Backlog only issue").unwrap_or_else(|| {
+            panic!(
+                "#1598: could not find board row #1107 on initial render:\n{}",
+                driver.screen()
+            )
+        });
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: MouseButton::Right,
+            position: Point::new(x, y),
+            modifiers: Modifiers::default(),
+        });
+        let menu_screen = driver.screen();
+        assert!(
+            menu_screen.contains("View in Pipeline"),
+            "#1598: 'View in Pipeline' must appear in the menu:\n{menu_screen}"
+        );
+        assert!(
+            !menu_screen.contains("no coord label") && !menu_screen.contains("outside Done"),
+            "#1598: a genuinely-visible issue's menu item must carry no \
+             disabled-reason hint:\n{menu_screen}"
+        );
+        driver.press_named(quadraui::NamedKey::Escape); // dismiss the menu
+
+        driver.press(quadraui::Key::Char('p'));
+        let pipeline_screen = driver.screen();
+        assert!(
+            pipeline_screen.contains("PIPELINE"),
+            "#1598: jump must switch to the Pipeline view:\n{pipeline_screen}"
+        );
+        assert!(
+            pipeline_screen.contains("1107"),
+            "#1598: jumping to a genuinely-tracked backlog issue must land \
+             on its row:\n{pipeline_screen}"
+        );
+    }
+
+    /// #1598 core regression: a `coord`-labelled issue with no `status:*`
+    /// label and no assignments, but a STALE `merge_queue` "merged" row
+    /// (e.g. closed then reopened, no fresh work dispatched yet).  This
+    /// resolves to the Pipeline's "done" lifecycle bucket, but the Done
+    /// section is time-windowed (`pipeline_done_windowed`, default 2h) and
+    /// drops anything older, so the issue renders in NO Pipeline section at
+    /// all even though it's still a `pipeline_issues` member.
+    ///
+    /// Before #1598's fix, the Board menu's "View in Pipeline" read raw
+    /// `pipeline_issues` membership and showed **enabled** here; pressing it
+    /// switched to the Pipeline view and left the operator on the empty
+    /// "Select an issue…" placeholder with no explanation — #1598's exact
+    /// reported symptom ("navigates … but the issue is not there … dropped
+    /// at an unrelated spot with no explanation"). The fix must show the
+    /// item disabled with a visible reason, and the `p` jump keybinding
+    /// must toast that reason and stay on the Board rather than land nowhere.
+    #[test]
+    fn tuidriver_view_in_pipeline_disabled_with_reason_for_done_outside_window() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(BoardData {
+            pipeline_tracked_labels: vec!["coord".to_string()],
+            pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
+            open_issues: vec![OpenIssue {
+                repo_name: "myrepo".to_string(),
+                number: 1107,
+                title: "Reopened issue".to_string(),
+                body: String::new(),
+                labels: vec!["coord".to_string()],
+                state: "open".to_string(),
+                milestone_number: None,
+                milestone_title: None,
+            }],
+            merge_queue: vec![MergeQueueEntry {
+                assignment_id: "stale-merge".to_string(),
+                issue_number: Some(1107),
+                state: "merged".to_string(),
+                pr_number: None,
+                pr_url: None,
+                repo_github: "acme/myrepo".to_string(),
+                target_branch: None,
+                error: None,
+                branch: None,
+                milestone_title: None,
+                last_attempt: Some(1.0), // near-epoch — ancient, outside the default 2h window
+            }],
+            ..BoardData::default()
+        });
+        app.pipeline_issues = app.pipeline_issues_from_cache();
+        // #857: a milestone group with no in-flight issue defaults to
+        // collapsed on the Board — force it open (before the rebuild below
+        // reads it) so the row is clickable.
+        app.board_milestone_expanded
+            .insert(("myrepo".to_string(), "no-milestone".to_string()), true);
+        app.rebuild_board_sidebar();
+        app.rebuild_pipeline_sidebar(None);
+        app.active_view = SidebarView::Board;
+        app.select_issue("myrepo", 1107);
+
+        // Sanity: this issue really is classified "done" and really renders
+        // in NO Pipeline section — the exact drift #1598 reports.
+        assert_eq!(
+            app.pipeline_lifecycle_section(&app.pipeline_issues[0]),
+            "done"
+        );
+        assert!(
+            app.pipeline_state_section_names.is_empty(),
+            "#1598: the stale-merged, outside-window issue must render in \
+             no Pipeline section: {:?}",
+            app.pipeline_state_section_names
+        );
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+
+        // Find the sidebar row by its title, not "1107" — that substring
+        // also matches the detail pane's "myrepo #1107" breadcrumb, which
+        // isn't a right-clickable Board row.
+        let (x, y) = driver.find("#1107 Reopened issue").unwrap_or_else(|| {
+            panic!(
+                "#1598: could not find board row #1107 on initial render:\n{}",
+                driver.screen()
+            )
+        });
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: MouseButton::Right,
+            position: Point::new(x, y),
+            modifiers: Modifiers::default(),
+        });
+        let menu_screen = driver.screen();
+        assert!(
+            menu_screen.contains("View in Pipeline"),
+            "#1598: 'View in Pipeline' must still appear in the menu:\n{menu_screen}"
+        );
+        assert!(
+            menu_screen.contains("outside Done window"),
+            "#1598: the disabled item must show a visible reason instead of \
+             a silent disabled==true with no explanation:\n{menu_screen}"
+        );
+        driver.press_named(quadraui::NamedKey::Escape); // dismiss the menu
+
+        // The `p` jump keybinding must toast the same reason and stay on
+        // the Board — not silently switch to the Pipeline's empty
+        // "Select an issue…" placeholder with no explanation (#1598's
+        // reported symptom).
+        driver.press(quadraui::Key::Char('p'));
+        let after_jump = driver.screen();
+        assert!(
+            after_jump.contains("Not in Pipeline"),
+            "#1598: the jump must toast an explanation instead of silently \
+             doing nothing:\n{after_jump}"
+        );
+        assert!(
+            after_jump.contains("BOARD"),
+            "#1598: jumping to a tracked-but-unrendered issue must NOT switch \
+             to the Pipeline view — there's no row to land on:\n{after_jump}"
+        );
+        assert!(
+            !after_jump.contains("Select an issue on the left"),
+            "#1598: must not land on the Pipeline's empty-selection \
+             placeholder with no explanation:\n{after_jump}"
+        );
+    }
+
+    /// #1598: an issue that genuinely IS in the Pipeline — has a real work
+    /// assignment and a server-computed `issue_stage_projection` entry —
+    /// must still jump correctly after the #1598 fix. Guards against the
+    /// shared `pipeline_jump_target` query becoming over-strict.
+    #[test]
+    fn tuidriver_view_in_pipeline_lands_for_issue_with_stage_projection() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let running = make_assignment_typed("running", 7, "myrepo", Some("work"));
+        let mut app = make_test_app(BoardData {
+            assignments: vec![running],
+            open_issues: vec![OpenIssue {
+                repo_name: "myrepo".to_string(),
+                number: 7,
+                title: "In-flight issue".to_string(),
+                body: String::new(),
+                labels: vec!["coord".to_string()],
+                state: "open".to_string(),
+                milestone_number: None,
+                milestone_title: None,
+            }],
+            pipeline_repos: vec![("myrepo".to_string(), "acme/myrepo".to_string())],
+            issue_stage_projection: vec![IssueStageProjection {
+                repo_name: "myrepo".to_string(),
+                issue_number: 7,
+                issue_title: "In-flight issue".to_string(),
+                stages: std::collections::HashMap::from([(
+                    "work".to_string(),
+                    "active".to_string(),
+                )]),
+                has_approved_review: false,
+            }],
+            ..BoardData::default()
+        });
+        app.pipeline_issues = vec![PipelineIssue {
+            number: 7,
+            title: "In-flight issue".to_string(),
+            body: String::new(),
+            repo_slug: "acme/myrepo".to_string(),
+            coord_repo: Some("myrepo".to_string()),
+            matched_labels: vec!["coord".to_string()],
+            all_labels: vec!["coord".to_string()],
+            is_closed: false,
+        }];
+        app.rebuild_board_sidebar();
+        app.rebuild_pipeline_sidebar(None);
+        app.active_view = SidebarView::Board;
+        app.select_issue("myrepo", 7);
+
+        assert!(
+            app.pipeline_jump_target("myrepo", 7).is_ok(),
+            "#1598: an in-progress issue with a stage projection must resolve \
+             to a real Pipeline row"
+        );
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        driver.press(quadraui::Key::Char('p'));
+        let pipeline_screen = driver.screen();
+        assert!(
+            pipeline_screen.contains("PIPELINE"),
+            "#1598: jump must switch to the Pipeline view:\n{pipeline_screen}"
+        );
+        assert!(
+            pipeline_screen.contains("#7") || pipeline_screen.contains("In-flight issue"),
+            "#1598: jumping to a real in-progress issue must still land on \
+             its row:\n{pipeline_screen}"
+        );
+    }
+
     // ── #815: Board context menu — "View in Pipeline" disabled state ──────────
 
     /// #815: "View in Pipeline" must appear in the Board right-click menu for
