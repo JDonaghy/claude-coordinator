@@ -312,6 +312,132 @@ def test_merge_stage_reconciles(monkeypatch, config) -> None:
     assert res.recovered is True
 
 
+# ── #1601: approved-but-unqueued merge detection ─────────────────────────────
+#
+# The exact board topology from the #1566 incident: a fix round's review
+# verdict lands on a row the *parent* work row's own `review_state` never
+# reflects (stuck at "dispatched"/no verdict forever), the daemon's periodic
+# enqueue sweep misses its window, and the branch is left approved + done with
+# an EMPTY merge_queue. `_reconcile_issue_merges` (branch-backfill +
+# out-of-band-merge detection only) is a no-op for this shape — before this
+# fix, `_recover_merge` reported "merge stage: nothing to reconcile", which
+# was indistinguishable from the branch actually being healthy.
+
+
+def _seed_1566_topology(*, fix_test_state: str | None = None):
+    """The #1566 board shape: parent (done, tested+smoked, review_state stuck
+    at 'dispatched') -> review 1 (request-changes) -> fix (done, approved,
+    no fresh test verdict by default) -> review 2 (approve). All on one
+    branch. Returns the Board."""
+    parent = _assign(
+        aid="8b26520edabb", typ="work", status="done", issue=1566,
+        branch="issue-1566-fix", review_state="dispatched", verdict=None,
+        dispatched_at=1.0,
+    )
+    parent.test_state = "passed"
+    parent.smoke_test = "pass"
+    review1 = _assign(
+        aid="ea92c1dcc436", typ="review", status="done", issue=1566,
+        branch="issue-1566-fix", verdict="request-changes", dispatched_at=2.0,
+        review_of="8b26520edabb",
+    )
+    fix = _assign(
+        aid="adaff508c83d", typ="work", status="done", issue=1566,
+        branch="issue-1566-fix", review_state="done", verdict="approve",
+        dispatched_at=3.0, review_of="8b26520edabb",
+    )
+    fix.test_state = fix_test_state
+    review2 = _assign(
+        aid="8051cc74ad3b", typ="review", status="done", issue=1566,
+        branch="issue-1566-fix", verdict="approve", dispatched_at=4.0,
+        review_of="adaff508c83d",
+    )
+    return Board(completed=[parent, review1, fix, review2])
+
+
+def test_merge_stage_detects_and_enqueues_approved_unqueued_work(
+    monkeypatch, config
+) -> None:
+    """#1601: gates already pass (the parent's own smoke/test verdict, plus
+    the fix round's approval, are found by `passes_merge_gates` exactly as
+    `coord merge --plan`/`--only` would) but there is no merge_queue entry at
+    all — diagnose must enqueue it, not shrug."""
+    from coord import github_ops
+    from coord import merge_queue as mq
+
+    monkeypatch.setattr(github_ops, "work_is_terminal", lambda *a, **k: False)
+    _stub(monkeypatch, session="dead")  # merge_actions defaults to [] — no-op
+    board = _seed_1566_topology()
+
+    res = diagnose.diagnose_stage(board, config, "api", 1566, "merge")
+
+    assert res.recovered is True
+    assert not any("nothing to reconcile" in f for f in res.findings)
+    assert any("enqueued" in a for a in res.actions_taken), res.actions_taken
+
+    items = mq.load_queue()
+    assert any(i.branch == "issue-1566-fix" for i in items)
+
+
+def test_merge_stage_reports_gate_blocked_unqueued_work_not_wedged(
+    monkeypatch, config
+) -> None:
+    """#1601: when the branch genuinely does NOT pass every merge gate yet
+    (here: no fresh Test-stage verdict anywhere on the branch — the parent's
+    own smoke never ran either), diagnose must say so specifically rather
+    than the misleading "nothing to reconcile" — but this is "waiting on the
+    pipeline", not a wedge, so it still reports healthy (`recovered=True`,
+    `needs_reset=False`) and must NOT enqueue anything."""
+    from coord import github_ops
+    from coord import merge_queue as mq
+
+    monkeypatch.setattr(github_ops, "work_is_terminal", lambda *a, **k: False)
+    _stub(monkeypatch, session="dead")
+    board = _seed_1566_topology()
+    # No row on the branch has ever had a smoke/test verdict.
+    for a in board.completed:
+        if a.type == "work":
+            a.test_state = None
+            a.smoke_test = None
+
+    res = diagnose.diagnose_stage(board, config, "api", 1566, "merge")
+
+    assert res.recovered is True
+    assert res.needs_reset is False
+    assert not any("nothing to reconcile" in f for f in res.findings)
+    assert any("does not (yet) pass" in f for f in res.findings), res.findings
+    assert res.actions_taken == []
+    assert mq.load_queue() == []
+
+
+def test_merge_stage_already_queued_is_still_a_noop(monkeypatch, config) -> None:
+    """#1601: the new detection must not re-enqueue (or otherwise touch) a
+    branch that already has a merge_queue entry — same "nothing to
+    reconcile" outcome as before this fix."""
+    from coord import merge_queue as mq
+
+    _stub(monkeypatch, session="dead")
+    board = _seed_1566_topology()
+    mq.save_queue([
+        mq.QueuedMerge(
+            assignment_id="8b26520edabb",
+            repo_name="api",
+            repo_github="acme/api",
+            branch="issue-1566-fix",
+            target_branch="main",
+            issue_number=1566,
+            issue_title="t",
+        )
+    ])
+
+    res = diagnose.diagnose_stage(board, config, "api", 1566, "merge")
+
+    assert res.recovered is True
+    assert any("nothing to reconcile" in f for f in res.findings)
+    assert res.actions_taken == []
+    assert len(mq.load_queue()) == 1
+
+
 # ── reset is non-destructive (keeps the branch) ──────────────────────────────
 
 
