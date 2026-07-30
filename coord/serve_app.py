@@ -202,6 +202,19 @@ _stdio_capture_install_lock = threading.Lock()
 _merge_lock = threading.Lock()
 
 
+class _BoardReadError(Exception):
+    """Sentinel: board_projection() (or a downstream board build step) failed.
+
+    Raised inside ``_build()`` (run in a threadpool) and propagated back to
+    ``board()``. Defined at module scope — not inside ``board()`` — because
+    #1597's single-flight guard shares one build's outcome across every
+    concurrent waiter via an ``asyncio.Future``; an ``except`` clause in a
+    follower coroutine must be able to recognize an exception raised inside a
+    DIFFERENT invocation of ``board()`` (the leader's), which a class
+    redefined fresh on every call could never match.
+    """
+
+
 def _ensure_stdio_capture_proxies() -> tuple[_ThreadLocalCapture, _ThreadLocalCapture]:
     """Idempotently install the #1278 thread-local stdout/stderr proxies.
 
@@ -3006,6 +3019,12 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
     # action is visible on the very next poll without waiting out the TTL.
     _board_cache: dict | None = None
     _board_cache_at: float = 0.0
+    # #1597 Part 2: the fully-rendered JSON bytes for the currently-cached
+    # build, shared verbatim by every response that serves ``_board_cache``
+    # (a fresh build's own responses, every single-flight follower, and
+    # every TTL cache-hit poll) so the ~5 MB payload is encoded by
+    # ``json.dumps`` exactly ONCE per build rather than once per response.
+    _board_body: bytes | None = None
     # #1336 invariant 5: polling is cache-validated.  The board carries a
     # monotonically-increasing version (per daemon lifetime; a restart starts
     # a new ETag lineage so clients simply refetch once) and every /board
@@ -3020,36 +3039,68 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
     # snapshot can never be stamped with a newer version/ETag and served for
     # a TTL window (review finding on #1336).
     _board_cache_built_at: float = 0.0
-    # Guards every read/write of the cache + version/etag/hash quadruple so
-    # they are always published and read as one consistent unit.
+    # Guards every read/write of the cache + version/etag/hash/body quintuple
+    # so they are always published and read as one consistent unit.
     _board_lock = threading.Lock()
+    # #1597 Part 1: single-flight guard.  At most one ``_build()`` may be in
+    # flight at a time; every concurrent cache-miss caller awaits THIS build
+    # rather than starting its own.  Holds the ``(status, ...)`` tuple result
+    # described on ``board()`` below.  Set/cleared only from synchronous
+    # spans of ``board()`` with no ``await`` in between, so the check-then-set
+    # is race-free on the single-threaded event loop.
+    _board_inflight: object | None = None  # asyncio.Future | None
 
-    def _stamp_board_version(result: dict) -> str:
-        """Hash *result*, bump the version when the content changed, stamp
-        ``board_version`` into the payload, and return the ETag.
+    def _stamp_board_version(result: dict) -> tuple[str, bytes]:
+        """Serialize *result* to JSON exactly once, bump the version when the
+        content changed, stamp ``board_version`` into the payload, and
+        return ``(etag, body_bytes)`` — the SAME bytes serve as both the
+        content-hash input and the wire body (#1597 Part 2: previously this
+        hashed a separate ``sort_keys=True`` dump and the caller re-encoded
+        the dict a second time via ``JSONResponse`` — ~10 MB of JSON work per
+        build for a 5 MB board).
 
-        Mutates the version/etag/hash triple — callers MUST hold
-        ``_board_lock`` so the stamp and the cache store publish atomically.
+        ``board_version`` can't be known before the hash is computed (it
+        depends on whether the hash changed), so it is deliberately excluded
+        from the hashed/rendered bytes and spliced into the closing brace
+        afterward — a cheap bytes append, not a second encoder pass.
+
+        Mutates the version/etag/hash triple (the returned body is the
+        caller's responsibility to publish as ``_board_body``) — callers
+        MUST hold ``_board_lock`` so the stamp and the cache store publish
+        atomically.
         """
         nonlocal _board_version, _board_etag, _board_hash
         import hashlib  # noqa: PLC0415
         import json as _json  # noqa: PLC0415
 
-        result.pop("board_version", None)  # hash content, not the stamp
+        result.pop("board_version", None)  # hash/render content, not the stamp
         try:
-            digest = hashlib.sha256(
-                _json.dumps(result, sort_keys=True, default=str).encode()
-            ).hexdigest()[:16]
+            # Same dumps() params Starlette's JSONResponse.render() uses, so
+            # the wire body is unchanged from before this fix (no sort_keys —
+            # dict insertion order is deterministic within a process/build).
+            body = _json.dumps(
+                result, ensure_ascii=False, allow_nan=False,
+                indent=None, separators=(",", ":"),
+            ).encode("utf-8")
         except (TypeError, ValueError):
             # Unhashable content: treat every build as new (never serve a
-            # stale 304 because versioning failed).
+            # stale 304 because versioning failed) and fall back to the
+            # slower per-response encoder (default=str) for this one body.
             digest = f"unhashable-{_time_ns()}"
+            body = _json.dumps(result, default=str).encode("utf-8")
+        else:
+            digest = hashlib.sha256(body).hexdigest()[:16]
         if digest != _board_hash:
             _board_hash = digest
             _board_version += 1
             _board_etag = f'W/"board-{_board_version}-{digest}"'
+        _version_field = f'"board_version":{_board_version}'.encode("utf-8")
         result["board_version"] = _board_version
-        return _board_etag or ""
+        if body.endswith(b"}") and len(body) >= 2:
+            body = body[:-1] + (b"," if body != b"{}" else b"") + _version_field + b"}"
+        else:  # pragma: no cover — defensive: result is always a dict/object
+            body = _json.dumps(result, default=str).encode("utf-8")
+        return _board_etag or "", body
 
     def _time_ns() -> int:
         import time as _t  # noqa: PLC0415
@@ -3098,22 +3149,67 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         import time as _time  # noqa: PLC0415
         _ttl = float(os.getenv("COORD_BOARD_CACHE_TTL", "1.5"))
         _now = _time.monotonic()
-        nonlocal _board_cache, _board_cache_at, _board_cache_built_at
+        nonlocal _board_cache, _board_cache_at, _board_cache_built_at, _board_body
+        nonlocal _board_inflight
         _client_etag = request.headers.get("if-none-match")
-        # Read the cache + its ETag as one consistent unit — a concurrent
-        # publish must never let a response pair one build's body with
-        # another build's ETag.
+
+        def _respond(result: dict, etag: str | None, body: bytes | None) -> Response:
+            if _client_etag and etag and _client_etag == etag:
+                # STILL identical to what the client holds — spare the wire
+                # (the common steady-board poll, and the common single-flight
+                # follower whose fetch happened to race a no-op rebuild).
+                return Response(status_code=304, headers={"ETag": etag})
+            if body is not None:
+                return Response(
+                    body, media_type="application/json",
+                    headers={"ETag": etag} if etag else {},
+                )
+            # Only reachable for a build that lost the out-of-order publish
+            # race below (never stamped, so no pre-rendered body either) —
+            # serve it ad hoc to its own requester.
+            return JSONResponse(result, headers={"ETag": etag} if etag else {})
+
+        # Read the cache + its ETag + its pre-rendered body as one consistent
+        # unit — a concurrent publish must never let a response pair one
+        # build's body with another build's ETag.
         with _board_lock:
             _cached = _board_cache
             _cached_etag = _board_etag
             _cached_at = _board_cache_at
+            _cached_body = _board_body
         if _cached is not None and (_now - _cached_at) < _ttl:
-            if _client_etag and _cached_etag and _client_etag == _cached_etag:
-                return Response(status_code=304, headers={"ETag": _cached_etag})
-            return JSONResponse(
-                _cached,
-                headers={"ETag": _cached_etag} if _cached_etag else {},
-            )
+            return _respond(_cached, _cached_etag, _cached_body)
+
+        # #1597 Part 1: single-flight the rebuild.  On a cache miss, at most
+        # one ``_build()`` may be in flight at a time; every other concurrent
+        # cache-miss caller awaits THIS build's outcome instead of starting
+        # its own (previously every caller that raced the TTL rebuilt the
+        # whole ~5 MB board independently, competing for the same cores and
+        # SQLite connection pool). Check-then-set has no ``await`` between
+        # the two lines, so it's race-free on the single-threaded event loop
+        # — a coroutine can only be pre-empted at an ``await``.
+        _fut = _board_inflight
+        _is_leader = _fut is None or _fut.done()
+        if _is_leader:
+            import asyncio  # noqa: PLC0415
+            _fut = asyncio.get_running_loop().create_future()
+            _board_inflight = _fut
+
+        if not _is_leader:
+            # A build is already in flight for this cache-miss window — wait
+            # for it rather than starting a second one. The leader's outcome
+            # is a ``("ok", result, etag, body)`` / ``("error", detail)``
+            # tuple (never an exception on the future itself: nothing else is
+            # guaranteed to await it, and an unretrieved Future exception
+            # logs an unhandled-exception warning on GC).
+            outcome = await _fut
+            if outcome[0] == "error":
+                return JSONResponse(
+                    {"error": "board read failed", "detail": outcome[1]},
+                    status_code=503,
+                )
+            _, _result, _etag, _body = outcome
+            return _respond(_result, _etag, _body)
 
         # Part 1 (threadpool): offload all synchronous computation to a worker
         # thread so the async event loop stays free for /healthz, POST handlers,
@@ -3126,9 +3222,6 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         # snapshot throughout — prevents a mid-computation config swap if another
         # concurrent request calls _refresh_config() while _build() is running.
         _cfg = config
-
-        class _BoardReadError(Exception):
-            """Sentinel: board_projection() failed; propagated from threadpool."""
 
         def _build() -> tuple[float, dict]:
             # Snapshot-order stamp: captured immediately before the DB read so
@@ -3537,30 +3630,41 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             _bound(projection)
             return _built_at, projection
 
+        # This coroutine is the single-flight leader: it alone runs _build(),
+        # then fans its outcome out to every waiter (itself plus every
+        # follower queued on ``_fut`` above) — the "count invocations" half
+        # of the acceptance test, and why a failed build must reach every
+        # waiter rather than wedging the followers.
         try:
             built_at, result = await run_in_threadpool(_build)
         except _BoardReadError as e:
+            _board_inflight = None  # clear FIRST: a retry must build fresh,
+            # never see a "done" future and think it must wait on this one.
+            _fut.set_result(("error", str(e)))
             return JSONResponse(
                 {"error": "board read failed", "detail": str(e)}, status_code=503
             )
-        # Publish atomically: stamp + cache + built-at move as one unit under
-        # the lock, and a build whose DB snapshot is OLDER than the cached one
-        # is not published at all (concurrent rebuilds finishing out of order
-        # must never stamp a newer version/ETag onto older content — review
-        # finding on #1336).  The losing build's result is still served to its
-        # own requester, but unstamped and uncacheable.
+        # Publish atomically: stamp + cache + built-at + body move as one unit
+        # under the lock, and a build whose DB snapshot is OLDER than the
+        # cached one is not published at all (concurrent rebuilds finishing
+        # out of order must never stamp a newer version/ETag onto older
+        # content — review finding on #1336). With single-flight this now
+        # only fires across two SEPARATE leader cycles (a new leader's build
+        # racing an older one's slow publish), never among one cycle's own
+        # followers. The losing build's result is still served to its own
+        # requester (and any of ITS followers), but unstamped and uncacheable.
         etag: str | None = None
+        body: bytes | None = None
         with _board_lock:
             if built_at >= _board_cache_built_at:
-                etag = _stamp_board_version(result)
+                etag, body = _stamp_board_version(result)
                 _board_cache = result
+                _board_body = body
                 _board_cache_at = _time.monotonic()
                 _board_cache_built_at = built_at
-        if _client_etag and etag and _client_etag == etag:
-            # Freshly rebuilt and STILL identical to what the client holds —
-            # spare the wire (the common steady-board poll).
-            return Response(status_code=304, headers={"ETag": etag})
-        return JSONResponse(result, headers={"ETag": etag} if etag else {})
+        _board_inflight = None
+        _fut.set_result(("ok", result, etag, body))
+        return _respond(result, etag, body)
 
     async def get_assignment(request: Request) -> Response:
         """#1336/#1337: single-assignment detail — the point lookup for what the
