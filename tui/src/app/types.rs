@@ -869,6 +869,12 @@ pub(crate) struct ContextMenuItem {
     /// Optional right-aligned shortcut hint (e.g. `"r"`).
     pub(crate) shortcut: Option<String>,
     pub(crate) disabled: bool,
+    /// #1598: short reason this item is disabled, shown as its
+    /// right-aligned hint (via [`super::dialogs::coord_item_to_qui`]) in
+    /// place of `shortcut` — a disabled item with no explanation is a dead
+    /// end for the operator. `None` for a disabled item just means no
+    /// reason was given (falls back to `shortcut`, if any).
+    pub(crate) disabled_reason: Option<String>,
     /// Pull-right submenu (#607).  When `Some`, activating the item opens
     /// the child menu instead of dispatching an action.
     pub(crate) submenu: Option<Vec<ContextMenuItem>>,
@@ -881,6 +887,7 @@ impl ContextMenuItem {
             label: label.to_string(),
             shortcut: None,
             disabled: false,
+            disabled_reason: None,
             submenu: None,
         }
     }
@@ -890,6 +897,7 @@ impl ContextMenuItem {
             label: String::new(),
             shortcut: None,
             disabled: false,
+            disabled_reason: None,
             submenu: None,
         }
     }
@@ -900,11 +908,19 @@ impl ContextMenuItem {
             label: label.to_string(),
             shortcut: None,
             disabled: false,
+            disabled_reason: None,
             submenu: Some(children),
         }
     }
     pub(crate) fn with_shortcut(mut self, s: &str) -> Self {
         self.shortcut = Some(s.to_string());
+        self
+    }
+    /// #1598: mark this item disabled and attach a short reason, shown as
+    /// its right-aligned hint in place of `shortcut`.
+    pub(crate) fn disabled_because(mut self, reason: &str) -> Self {
+        self.disabled = true;
+        self.disabled_reason = Some(reason.to_string());
         self
     }
     /// True iff this item is a visual separator (neither action nor parent).

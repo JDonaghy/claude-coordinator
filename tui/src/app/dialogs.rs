@@ -99,18 +99,23 @@ impl CoordApp {
         // stays the default-selected item.
         if issue_number.is_some() {
             items.push(ContextMenuItem::action("chat-about-issue", "Chat about issue"));
-            // #815: "View in Pipeline" — navigate from the Board to the matching
-            // Pipeline entry.  Disabled when the issue isn't tracked in the
-            // Pipeline (no coord label / no matching entry).
-            let in_pipeline = issue_number.zip(repo_name).map_or(false, |(num, repo)| {
-                self.pipeline_issues.iter().any(|pi| {
-                    pi.number == num
-                        && pi.coord_repo.as_deref().unwrap_or(&pi.repo_slug) == repo
-                })
-            });
+            // #815/#1598: "View in Pipeline" — navigate from the Board to
+            // the matching Pipeline entry.  Disabled when
+            // `pipeline_jump_target` can't resolve a real, currently-
+            // rendered row for it — the SAME query `jump_board_to_pipeline`
+            // uses, so this can never again say "enabled" for an issue the
+            // jump then fails to land on (#1598's regression: raw
+            // `pipeline_issues` membership is broader than what actually
+            // renders).
+            let jump_result = issue_number
+                .zip(repo_name)
+                .map(|(num, repo)| self.pipeline_jump_target(repo, num))
+                .unwrap_or(Err(PipelineNotVisible::Untracked));
             let mut jump_item =
                 ContextMenuItem::action("jump-to-pipeline", "View in Pipeline");
-            jump_item.disabled = !in_pipeline;
+            if let Err(reason) = jump_result {
+                jump_item = jump_item.disabled_because(reason.menu_hint());
+            }
             items.push(jump_item);
             items.push(ContextMenuItem::separator());
         }
@@ -5079,87 +5084,86 @@ impl CoordApp {
     }
 
     /// #815: Jump from the Board to the Pipeline for the currently-selected
-    /// issue.  If the issue has a coord tracking label and appears in
-    /// `pipeline_issues`, the Pipeline view is activated and the issue is
-    /// highlighted.  If the issue is not in the Pipeline (no tracked label),
-    /// a toast explains why and the Board view stays active.
+    /// issue.  If the issue resolves to a real, currently-rendered Pipeline
+    /// row (per [`Self::pipeline_jump_target`] — #1598: the same query the
+    /// right-click menu's enablement check uses), the Pipeline view is
+    /// activated and the issue is highlighted.  Otherwise a toast names the
+    /// specific reason ([`PipelineNotVisible`]) and the Board view stays
+    /// active.
     pub(crate) fn jump_board_to_pipeline(&mut self) {
         let Some((repo_name, issue_number)) = self.board_selected_issue() else {
             return;
         };
         // Kick the pipeline loader so data is current — in particular, if the
         // user has never visited the Pipeline view this session, pipeline_issues
-        // is empty and the find() below would always return None (false negative).
+        // is empty and the lookup below would always miss (false negative).
         self.maybe_kick_pipeline_loader();
         // Match by coord_repo (the local repo name from coordinator.yml) just
         // like `confirm_issue_finder` does — `board_active_repo` returns the
         // local name, not the GitHub owner/name slug.
-        let pipeline_entry = self.pipeline_issues.iter().find(|pi| {
-            pi.number == issue_number
-                && pi.coord_repo.as_deref().unwrap_or(&pi.repo_slug) == repo_name
-        });
-        if let Some(pi) = pipeline_entry {
-            let repo_slug = pi.repo_slug.clone();
-            // #815: capture is_closed before calling mutable methods that
-            // require &mut self and would end the borrow of pipeline_issues.
-            let is_closed = pi.is_closed;
-            // #869: New's milestone sub-header defaults to collapsed (#857),
-            // so a jump into New would land on a hidden row just like the
-            // pre-#815-fix Done case did.  Resolve the target's
-            // (lifecycle_key, repo_key, milestone_key) bucket now — before
-            // the rebuild below reads `pipeline_milestone_expanded` to decide
-            // each header's expanded state — so we can force it open.
-            //
-            // #1069: In-progress has the same milestone tier, nested under a
-            // repo node (#1487 — it used to be a Live/Idle liveness node).
-            // Its headers default *expanded*, but a user may have explicitly
-            // collapsed one, so apply the same reveal fix — force both the
-            // repo group and the milestone group open.
-            let lc_key = self.pipeline_lifecycle_section(pi);
-            let repo_key = Self::pipeline_repo_key(pi).to_string();
-            let mil_key = match self.pipeline_issue_milestone(pi) {
-                Some((n, _)) => n.to_string(),
-                None => "no-milestone".to_string(),
-            };
-            if lc_key == "new" {
-                self.pipeline_milestone_expanded
-                    .insert((lc_key.to_string(), repo_key, mil_key), true);
-            } else if lc_key == "in-progress" {
-                self.pipeline_lifecycle_expanded
-                    .insert(("in-progress".to_string(), repo_key.clone()), true);
-                self.pipeline_milestone_expanded.insert(
-                    ("in-progress".to_string(), repo_key, mil_key),
-                    true,
-                );
-            }
-            // #1029 bug A: keep the ActivityBar/header chrome in sync too.
-            self.switch_active_view(SidebarView::Pipeline);
-            self.rebuild_pipeline_sidebar(Some((repo_slug, issue_number)));
-            self.pipeline_focused_stage = self.default_focused_stage_for_selected_issue();
-            self.pipeline_stage_content_scroll = 0;
-            // #815: if the matched issue is in the Done section, expand Done so
-            // the selection is visible (rebuild_pipeline_sidebar defaults Done
-            // to collapsed, so without this the user would see no change).
-            if is_closed {
-                let search_offset = 1usize;
-                if let Some(done_idx) = self
-                    .pipeline_state_section_names
-                    .iter()
-                    .position(|&k| k == "done")
-                {
-                    self.pipeline_sidebar
-                        .set_collapsed(done_idx + search_offset, false);
+        match self.pipeline_jump_target(&repo_name, issue_number) {
+            Ok(idx) => {
+                let pi = &self.pipeline_issues[idx];
+                let repo_slug = pi.repo_slug.clone();
+                // #815: capture is_closed before calling mutable methods that
+                // require &mut self and would end the borrow of pipeline_issues.
+                let is_closed = pi.is_closed;
+                // #869: New's milestone sub-header defaults to collapsed (#857),
+                // so a jump into New would land on a hidden row just like the
+                // pre-#815-fix Done case did.  Resolve the target's
+                // (lifecycle_key, repo_key, milestone_key) bucket now — before
+                // the rebuild below reads `pipeline_milestone_expanded` to decide
+                // each header's expanded state — so we can force it open.
+                //
+                // #1069: In-progress has the same milestone tier, nested under a
+                // repo node (#1487 — it used to be a Live/Idle liveness node).
+                // Its headers default *expanded*, but a user may have explicitly
+                // collapsed one, so apply the same reveal fix — force both the
+                // repo group and the milestone group open.
+                let lc_key = self.pipeline_lifecycle_section(pi);
+                let repo_key = Self::pipeline_repo_key(pi).to_string();
+                let mil_key = match self.pipeline_issue_milestone(pi) {
+                    Some((n, _)) => n.to_string(),
+                    None => "no-milestone".to_string(),
+                };
+                if lc_key == "new" {
+                    self.pipeline_milestone_expanded
+                        .insert((lc_key.to_string(), repo_key, mil_key), true);
+                } else if lc_key == "in-progress" {
+                    self.pipeline_lifecycle_expanded
+                        .insert(("in-progress".to_string(), repo_key.clone()), true);
+                    self.pipeline_milestone_expanded.insert(
+                        ("in-progress".to_string(), repo_key, mil_key),
+                        true,
+                    );
+                }
+                // #1029 bug A: keep the ActivityBar/header chrome in sync too.
+                self.switch_active_view(SidebarView::Pipeline);
+                self.rebuild_pipeline_sidebar(Some((repo_slug, issue_number)));
+                self.pipeline_focused_stage = self.default_focused_stage_for_selected_issue();
+                self.pipeline_stage_content_scroll = 0;
+                // #815: if the matched issue is in the Done section, expand Done so
+                // the selection is visible (rebuild_pipeline_sidebar defaults Done
+                // to collapsed, so without this the user would see no change).
+                if is_closed {
+                    let search_offset = 1usize;
+                    if let Some(done_idx) = self
+                        .pipeline_state_section_names
+                        .iter()
+                        .position(|&k| k == "done")
+                    {
+                        self.pipeline_sidebar
+                            .set_collapsed(done_idx + search_offset, false);
+                    }
                 }
             }
-        } else {
-            self.push_toast(
-                "Not in Pipeline",
-                &format!(
-                    "#{} has no coord tracking label — add one to dispatch it.",
-                    issue_number
-                ),
-                ToastSeverity::Info,
-            );
+            Err(reason) => {
+                self.push_toast(
+                    "Not in Pipeline",
+                    &reason.toast_body(issue_number),
+                    ToastSeverity::Info,
+                );
+            }
         }
     }
 
@@ -6737,7 +6741,14 @@ pub(crate) fn coord_item_to_qui(it: &ContextMenuItem) -> QuiContextMenuItem {
         QuiContextMenuItem {
             id: it.action_id.as_ref().map(WidgetId::new),
             label: StyledText::plain(it.label.clone()),
-            detail: it.shortcut.as_ref().map(|s| StyledText::plain(s.clone())),
+            // #1598: a disabled reason wins over the plain shortcut hint —
+            // an item is never both disabled and mid-action, so there's no
+            // case where losing the shortcut display would matter.
+            detail: it
+                .disabled_reason
+                .as_ref()
+                .or(it.shortcut.as_ref())
+                .map(|s| StyledText::plain(s.clone())),
             disabled: it.disabled,
             ..Default::default()
         }
@@ -6773,7 +6784,13 @@ pub(crate) fn items_at_depth(state: &ContextMenuState, depth: usize) -> Vec<Cont
 }
 
 /// Compute a menu-popup width from a slice of coord-tui items:
-/// longest label + longest shortcut hint + 6 cells of padding, clamped to [20, 60].
+/// longest label + longest right-aligned hint + 6 cells of padding, clamped
+/// to [20, 60].
+///
+/// #1598: the right-aligned hint is `disabled_reason` when set, else
+/// `shortcut` — mirrors [`coord_item_to_qui`]'s own precedence exactly, so a
+/// long disabled-reason string (e.g. "outside Done window") can't overlap
+/// the label the way a plain shortcut ("r") never grew long enough to.
 pub(crate) fn compute_menu_width(items: &[ContextMenuItem]) -> f32 {
     let max_label = items
         .iter()
@@ -6782,7 +6799,7 @@ pub(crate) fn compute_menu_width(items: &[ContextMenuItem]) -> f32 {
         .unwrap_or(4);
     let max_shortcut = items
         .iter()
-        .filter_map(|it| it.shortcut.as_ref())
+        .filter_map(|it| it.disabled_reason.as_ref().or(it.shortcut.as_ref()))
         .map(|s| s.chars().count())
         .max()
         .unwrap_or(0);
