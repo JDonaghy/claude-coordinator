@@ -1202,6 +1202,50 @@ def test_a_review_that_finished_with_no_verdict_is_terminal():
     assert "NO verdict" in action.message
 
 
+def test_a_review_worker_that_died_retries_through_the_cli_then_stops_at_the_cap():
+    """#1584: the review WORKER itself failed (transient API error, network
+    drop, ...) before ever producing a verdict — `review_status="failed"`
+    with `review_verdict=""`. Before #1584's reconcile-side fix, this could
+    not be told apart from "no review dispatched yet" and silently waited
+    out the full 240-minute deadline. Mirrors the WORK failed-retry bounded
+    loop, but re-dispatches via `coord review <work_aid>` (NOT `coord retry
+    <review_aid>` — that command's `_reassign` hardcodes `type="work"` on
+    every re-dispatch and would silently create a bogus work assignment
+    instead of a review) up to `max_work_retries`, then dies with the reason.
+    """
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_work_retries=1)
+    s = work_tested(
+        review_aid="r1", review_status="failed",
+        review_failure_reason="529 Overloaded",
+    )
+
+    first = step(s, opts, counters=counters)
+    assert first.command == ("review", "w1")
+    assert counters.review_retries == 1
+
+    second = step(s, opts, counters=counters)
+    assert second.is_exit
+    assert second.exit_code == EXIT_TERMINAL_FAILURE
+    assert "529 Overloaded" in second.message
+
+
+def test_a_usage_limit_killed_review_waits_instead_of_retrying_or_dying():
+    """#1461/#1584: a review worker killed by the account's usage limit must
+    WAIT like the work-side case — retrying before the reset just burns the
+    same exhausted budget again."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_work_retries=1)
+    s = work_tested(
+        review_aid="r1", review_status="failed",
+        review_failure_reason="usage limit — resets 8:30pm (America/Chicago)",
+    )
+    action = step(s, opts, counters=counters)
+    assert action.kind == WAIT
+    assert counters.review_retries == 0
+    assert any("usage-limit" in w for w in action.warnings)
+
+
 def test_request_changes_waits_for_coords_auto_loop_to_dispatch_the_fix():
     """This driver must NOT dispatch a review fix itself — #476/#477."""
     action = step(

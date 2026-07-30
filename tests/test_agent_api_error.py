@@ -259,3 +259,91 @@ def test_terminal_api_error_with_nonzero_exit(
     assert final.status == FAILED
     assert final.api_error_reason == "529 Overloaded"
     server.shutdown()
+
+
+def test_terminal_api_error_still_captures_claude_session_id(
+    tmp_path: Path, repo_local_only: Path
+) -> None:
+    """#1584 review (non-blocking perf finding): the is_error check and the
+    claude_session_id capture now share a single full-log parse instead of
+    each parsing the transcript independently — this regression-guards that
+    the merge didn't drop the session_id capture for a FAILED/api-error
+    assignment (a plausible way to break it: only wiring the shared parse's
+    result into the is_error branch and forgetting the second consumer)."""
+    server = AgentServer(
+        machine_name="t",
+        repos=["api"],
+        repo_paths={"api": str(repo_local_only)},
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: [
+            "/bin/sh", "-c",
+            _printf_lines(_INIT_EVENT, _ERROR_RESULT_EVENT),
+        ],
+    )
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path=str(repo_local_only),
+        issue_number=5,
+        issue_title="review that never ran",
+        briefing="b",
+        branch="main",
+        type="review",
+    )
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=10)
+
+    assert final.status == FAILED
+    assert final.api_error_reason == "529 Overloaded"
+    assert final.claude_session_id == "sess-1"
+    server.shutdown()
+
+
+def test_reap_parses_the_terminal_log_only_once(
+    tmp_path: Path, repo_local_only: Path, monkeypatch
+) -> None:
+    """#1584 review (non-blocking perf finding): before this fix, `_reap`
+    ran an independent `tail_bytes=0` full-transcript parse for the
+    is_error check AND another one for the claude_session_id capture — two
+    full parses of the same (potentially large) log on every single reap.
+    They must now share one `coord.worker_events.parse_log` call."""
+    import coord.worker_events as worker_events_mod
+
+    calls: list[str] = []
+    real_parse_log = worker_events_mod.parse_log
+
+    def counting_parse_log(log_path, **kwargs):
+        calls.append(log_path)
+        return real_parse_log(log_path, **kwargs)
+
+    monkeypatch.setattr(worker_events_mod, "parse_log", counting_parse_log)
+    # coord.agent imports `parse_log` lazily (function-local `from coord.worker_events
+    # import parse_log`), so patching the module attribute above is enough —
+    # it's resolved at call time, not import time.
+
+    server = AgentServer(
+        machine_name="t",
+        repos=["api"],
+        repo_paths={"api": str(repo_local_only)},
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: [
+            "/bin/sh", "-c",
+            _printf_lines(_INIT_EVENT, _ERROR_RESULT_EVENT),
+        ],
+    )
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path=str(repo_local_only),
+        issue_number=6,
+        issue_title="review that never ran",
+        briefing="b",
+        branch="main",
+        type="review",
+    )
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=10)
+    assert final.status == FAILED
+
+    assert len(calls) == 1, (
+        f"expected exactly one full-transcript parse per reap, got {len(calls)}: {calls}"
+    )
+    server.shutdown()

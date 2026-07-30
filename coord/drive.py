@@ -179,6 +179,10 @@ class DriveCounters:
     fix_rounds: int = 0
     merge_attempts: int = 0
     review_dispatches: int = 0
+    # #1584: bounded retry for a review WORKER that died (transient API
+    # error, network drop, ...) before producing a verdict — the review-side
+    # analogue of `work_retries`, bounded the same way (`opts.max_work_retries`).
+    review_retries: int = 0
 
 
 # ── actions ──────────────────────────────────────────────────────────────────
@@ -1130,6 +1134,61 @@ def _decide_review(
     verdict = state.review_verdict
     if verdict == "approve":
         return None
+
+    # #1584: the review WORKER itself died (transient API error, network
+    # drop, ...) before ever producing a verdict. Before #1584 that worker
+    # was mislabelled `done` with `review_verdict == ""`, which fell through
+    # to the `verdict == ""` branch below and either waited for a dispatch
+    # that would never come or (if `state.work_review_state == "done"`)
+    # died with a "REVIEW_VERDICT block failed to parse" message that no
+    # longer applies now that the review is correctly `failed`. Checked
+    # BEFORE `verdict == ""` so it can never fall through to that stale
+    # message or to a silent `_wait()` — the exact regression this issue's
+    # own evidence (#1563) was filed over.
+    #
+    # Re-dispatch via ``coord review <work_aid>`` — NOT ``coord retry
+    # <review_aid>``. ``coord retry``'s underlying `_reassign` (coord/
+    # reconcile.py) hardcodes `type="work"` on every re-dispatch regardless
+    # of the failed assignment's own type (it exists solely to retry WORK
+    # rows); pointing it at a review assignment id would silently create a
+    # bogus fresh `type="work"` assignment on this issue instead of a
+    # review. ``coord review`` is the existing #555 escape-hatch command
+    # (already used a few lines below for the interactive case) — a thin,
+    # type-correct wrapper over `coord.review.dispatch_review` keyed on the
+    # WORK row, which is still `status="done"` (only the review it spawned
+    # failed). Bounded the same way as the WORK failed-retry loop in
+    # `decide()` (usage-limit-aware wait, then a bounded re-dispatch).
+    if state.review_status == "failed":
+        if is_usage_limit_reason(state.review_failure_reason):
+            return Action(
+                kind=WAIT,
+                label=(
+                    f"REVIEW: {state.review_aid} killed by the usage limit — "
+                    "waiting for the reset, not retrying"
+                ),
+                warnings=(
+                    f"usage-limit kill detected on {state.review_aid}: "
+                    f"{state.review_failure_reason} — waiting for the reset "
+                    "instead of retrying (#1461/#1584)",
+                ),
+            )
+        if counters.review_retries >= opts.max_work_retries:
+            return _die(
+                f"review {state.review_aid} failed "
+                f"{counters.review_retries} retr(ies) in: "
+                f"{state.review_failure_reason or 'no reason recorded'}\n"
+                f"   inspect: coord log {state.review_aid}"
+            )
+        counters.review_retries += 1
+        return Action(
+            kind=RUN,
+            label=(
+                f"REVIEW: failed → coord review {state.work_aid} "
+                f"(attempt {counters.review_retries}/{opts.max_work_retries})"
+            ),
+            command=("review", state.work_aid),
+            error_message=f"coord review failed for {state.work_aid}",
+        )
 
     if verdict == "request-changes":
         if state.work_review_iter >= state.max_review_iterations:

@@ -169,12 +169,23 @@ def reconcile_completed_assignments(
         # (the daemon's passive tick) for getting the reason out of the
         # ephemeral agent-side JSON and into the persisted, drive.py-visible
         # `failure_reason` column.
+        # #1584: `api_error_reason` (a terminal `is_error: true` result event
+        # — e.g. "529 Overloaded") is the SAME `failure_reason` column,
+        # stamped by `AgentServer._reap` exactly like `usage_limit_reason`
+        # (see `coord.agent.AgentAssignment`, both surfaced on the same
+        # `/status` `completed` entry via `to_status_dict`'s `asdict`). The
+        # two are mutually exclusive by construction — a usage-limit kill is
+        # detected from a TRUNCATED log with no terminal `result` event,
+        # while an API-error is read OFF that terminal `result` event — so
+        # this `or` never picks the wrong one.
         update_state_fn(
             assignment_id=aid,
             terminal_status=terminal,
             branch=a.branch or entry.get("branch"),
             review_state=None,
-            failure_reason=entry.get("usage_limit_reason"),
+            failure_reason=(
+                entry.get("usage_limit_reason") or entry.get("api_error_reason")
+            ),
         )
 
         # #666 Gap A: best-effort cost/token capture from the agent completed
@@ -769,8 +780,9 @@ def describe_no_candidate_machines(
 
 
 def _record_usage_limit_reason(assignment_id: str | None, entry: dict) -> None:
-    """#1461: stamp a usage-limit-kill diagnostic (if the agent flagged one
-    on *entry*) onto *assignment_id*'s persisted ``failure_reason``.
+    """#1461/#1584: stamp a usage-limit-kill or terminal-API-error diagnostic
+    (whichever the agent flagged on *entry*) onto *assignment_id*'s
+    persisted ``failure_reason``.
 
     Used by :func:`reconcile`'s (``coord resume``) FAILED/ADVISORY branches.
     ``reconcile_completed_assignments`` — the daemon's own passive tick and
@@ -785,16 +797,27 @@ def _record_usage_limit_reason(assignment_id: str | None, entry: dict) -> None:
     than a raw ``get_connection()`` write that would silently land on a thin
     client's empty local DB instead.
 
+    ``usage_limit_reason`` is tried first, then ``api_error_reason`` (#1584 —
+    a terminal `is_error: true` result event, e.g. "529 Overloaded"; see
+    `coord.agent.AgentAssignment.api_error_reason`). The two never coexist on
+    the same entry — a usage-limit kill is detected from a truncated log with
+    no terminal `result` event, an API error is read OFF that terminal
+    `result` event — so trying one then the other never picks the wrong
+    reason.
+
     This also normalises the row's status to ``'failed'`` (that helper's own
     behaviour) even when the agent's reap landed on ADVISORY — a usage-limit
     kill is, per #1461, the ONE terminal state known safe to re-dispatch
     unchanged, which is what `coord/drive.py`'s FAILED bucket already means;
     ADVISORY otherwise implies "needs a human look", which a kill does not.
+    (An `api_error_reason` entry is never ADVISORY — `AgentServer._reap`
+    always lands it on FAILED directly — so this normalisation is a no-op for
+    that case, not a behaviour change.)
 
     Best-effort: never raises — a diagnostic write must not break a real
     status transition.
     """
-    reason = entry.get("usage_limit_reason")
+    reason = entry.get("usage_limit_reason") or entry.get("api_error_reason")
     if not reason or not assignment_id:
         return
     try:
@@ -965,6 +988,28 @@ def reconcile(board: Board, config: Config) -> list[str]:
                         failed, succeeded=False,
                         agent_entry=entry, board=board, config=config,
                     )
+                elif failed.type == "review":
+                    # #1584: a review worker that died (transient API error,
+                    # network drop, ...) before producing a verdict is now
+                    # correctly recorded FAILED (not the pre-#1584 silent
+                    # `done`) — but without this, the ORIGINAL work row's
+                    # `review_state` is left at "dispatched" forever, exactly
+                    # like the `done` (above) and `advisory` branches this
+                    # mirrors would leave it if THEY skipped this update.
+                    # "done" (not "failed") to match the existing
+                    # `coord._board_mapping.infer_review_state` convention,
+                    # which already treats a review row's `status in ("done",
+                    # "failed")` identically when inferring this same field —
+                    # the review PROCESS is over either way; `review_verdict`
+                    # (left empty here) is what actually distinguishes "no
+                    # verdict" from an approval, and `coord/drive.py`'s
+                    # `_decide_review` reads `review_status`/`review_verdict`
+                    # directly rather than this field for that distinction.
+                    orig_id = failed.review_of_assignment_id
+                    if orig_id:
+                        orig = board.find_by_id(orig_id)
+                        if orig is not None:
+                            orig.review_state = "done"
                 _record_usage_limit_reason(a.assignment_id, entry)
         changed.append(a.assignment_id)
 
