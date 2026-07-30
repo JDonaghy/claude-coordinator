@@ -8,10 +8,14 @@ visible from the code:
 design (only its ``.gitignore`` is tracked), so ``git worktree add`` produces
 an empty one — and ``graphify query`` resolves ``graphify-out/graph.json``
 strictly relative to cwd, with no upward walk and no ``--graph`` override.
-``.githooks/post-checkout`` fixes this by symlinking a worktree's
-``graphify-out`` at the base checkout's graph, but that hook only runs where
-``core.hooksPath`` points at ``.githooks`` — a one-time, per-machine
-``git config`` that nothing enforces.  :func:`hooks_path_status` checks it.
+``.githooks/post-checkout`` fixes this by symlinking each entry of the base
+checkout's graph (``graph.json``, ``manifest.json``, ``cache/``, ...) into
+the worktree's ``graphify-out/`` — the directory itself, and its tracked
+``.gitignore``, are never touched (#1617: replacing the whole directory with
+a symlink deleted the tracked ``.gitignore`` out from under git).  This hook
+only runs where ``core.hooksPath`` points at ``.githooks`` — a one-time,
+per-machine ``git config`` that nothing enforces.  :func:`hooks_path_status`
+checks it.
 
 **2. The graph drifts out of sync with HEAD.**  graphify's own hooks are
 best-effort and structurally cannot cover every ref-moving operation:
@@ -63,9 +67,16 @@ class GraphStatus:
 
     repo_path: Path
     present: bool = False
-    # True when graphify-out is a symlink — i.e. a worktree borrowing the base
-    # checkout's graph (the .githooks/post-checkout bootstrap ran).
+    # True when graphify-out/graph.json is a symlink — i.e. a worktree
+    # borrowing the base checkout's graph (the .githooks/post-checkout
+    # bootstrap ran).  graphify-out/ itself is always a real directory (its
+    # tracked .gitignore has to survive — see #1617); only the entries
+    # inside it are symlinked.
     is_symlink: bool = False
+    # The base checkout's graphify-out/ directory (graph.json's resolved
+    # parent), not graph.json itself — kept as a directory path so existing
+    # "owner checkout" math (``link_target.parent``) still lands on the base
+    # checkout root.
     link_target: Path | None = None
     built_sha: str | None = None
     head_sha: str | None = None
@@ -168,15 +179,17 @@ def graph_status(repo_path: Path) -> GraphStatus:
     """
     st = GraphStatus(repo_path=repo_path)
     out_dir = repo_path / "graphify-out"
+    graph_file = out_dir / "graph.json"
 
-    st.is_symlink = out_dir.is_symlink()
+    # A borrowed graph symlinks graph.json (and friends) individually;
+    # graphify-out/ itself is always a real directory (#1617).
+    st.is_symlink = graph_file.is_symlink()
     if st.is_symlink:
         try:
-            st.link_target = out_dir.resolve()
+            st.link_target = graph_file.resolve().parent
         except OSError:
             st.link_target = None
 
-    graph_file = out_dir / "graph.json"
     if not graph_file.is_file():
         st.unknown_reason = "no graphify-out/graph.json (graph never built here)"
         return st

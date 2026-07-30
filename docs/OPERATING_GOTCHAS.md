@@ -379,13 +379,15 @@ override (only `path`/`explain`/`diagnose` do). Every agent in a worktree —
 coord's `~/.coord/worktrees/*`, Claude Code's `.claude/worktrees/*`, review
 worktrees — silently falls back to grep.
 
-The fix is `.githooks/post-checkout`, which symlinks the worktree's
-`graphify-out` at the base checkout's graph. It lives in a **hook**, not in
-coord's dispatch code, because `git worktree add` fires `post-checkout` with
-cwd set to the new worktree — so one implementation covers every creator
-(coord's two remote `worktree add` sites, Claude Code, and anything by hand) on
-every machine. It chains to `$GIT_COMMON_DIR/hooks/post-checkout` in the main
-worktree, leaving graphify's own machine-pinned block alone.
+The fix is `.githooks/post-checkout`, which symlinks each entry of the base
+checkout's graph (`graph.json`, `manifest.json`, `cache/`, ...) into the
+worktree's `graphify-out/` — it never replaces the directory itself. It lives
+in a **hook**, not in coord's dispatch code, because `git worktree add` fires
+`post-checkout` with cwd set to the new worktree — so one implementation
+covers every creator (coord's two remote `worktree add` sites, Claude Code,
+and anything by hand) on every machine. It chains to
+`$GIT_COMMON_DIR/hooks/post-checkout` in the main worktree, leaving
+graphify's own machine-pinned block alone.
 
 **It only runs where `core.hooksPath` points at it** — one command per machine,
 and nothing enforces it:
@@ -394,11 +396,24 @@ and nothing enforces it:
 git -C ~/src/claude-coordinator config core.hooksPath .githooks
 ```
 
-Rebuilds stay disabled inside worktrees deliberately: `graphify-out` is now a
-symlink to the *shared* graph, so a rebuild there would overwrite it from a
-feature-branch tree — and a worktree can be reaped mid-rebuild, which is where
-graphify's own "burns a full AST pass and then dies with ENOENT" comment came
-from.
+**#1617:** an earlier version of this hook did `rm -rf graphify-out && ln -sfn
+$base/graphify-out graphify-out` — replacing the *whole directory* with a
+machine-local, absolute-path symlink. `graphify-out/` is only invisible to
+git because of the tracked file inside it, `graphify-out/.gitignore` (`*` /
+`!.gitignore`); the `rm -rf` deleted that tracked file, so every worktree got
+a spurious diff (a deleted tracked `.gitignore` plus an untracked absolute
+symlink) that coord's own worktree-rescue commit then committed verbatim.
+The fix keeps `graphify-out/` a real, tracked-`.gitignore`-holding directory
+and symlinks only what's *inside* it — the self-ignoring `.gitignore` rule
+does the rest for free. The acceptance bar for any change here is `git
+status --porcelain` being empty in a fresh linked worktree; test that with a
+real `git worktree add`, not a mock.
+
+Rebuilds stay disabled inside worktrees deliberately: `graphify-out`'s
+contents are symlinks to the *shared* graph, so a rebuild there would
+overwrite it from a feature-branch tree — and a worktree can be reaped
+mid-rebuild, which is where graphify's own "burns a full AST pass and then
+dies with ENOENT" comment came from.
 
 ### The hooks cannot keep the graph in sync, and fail silently when they try
 

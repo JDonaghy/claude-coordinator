@@ -69,6 +69,15 @@ def _make_repo(root: Path, *, with_hooks: bool = True) -> Path:
         _git("add", "-f", ".githooks", cwd=root)
         _git("commit", "-q", "-m", "add versioned hooks", cwd=root)
         _git("config", "core.hooksPath", ".githooks", cwd=root)
+    # graphify-out/.gitignore is tracked in the real repo REGARDLESS of
+    # whether a graph has been built yet — it's what makes graphify-out/
+    # self-ignoring.  Fixtures that skip this pass vacuously on any
+    # `git status` assertion, which is exactly how #1617 shipped.
+    out = root / "graphify-out"
+    out.mkdir(exist_ok=True)
+    (out / ".gitignore").write_text("*\n!.gitignore\n", encoding="utf-8")
+    _git("add", "-f", "graphify-out/.gitignore", cwd=root)
+    _git("commit", "-q", "-m", "track graphify-out/.gitignore", cwd=root)
     return root
 
 
@@ -123,9 +132,11 @@ def test_the_checked_in_hook_is_executable() -> None:
 
 
 def test_worktree_add_links_graphify_out_to_the_base_graph(tmp_path: Path) -> None:
-    """The core behaviour: `git worktree add` leaves the worktree with a
-    graphify-out symlink pointing at the base checkout's graph, so an agent
-    working there can query it."""
+    """The core behaviour: `git worktree add` leaves the worktree's
+    graphify-out/ populated with symlinks into the base checkout's graph, so
+    an agent working there can query it — and, per #1617, `graphify-out/`
+    itself stays a real, git-clean directory rather than becoming a
+    machine-local symlink."""
     base = _make_repo(tmp_path / "base")
     _seed_graph(base)
 
@@ -133,28 +144,54 @@ def test_worktree_add_links_graphify_out_to_the_base_graph(tmp_path: Path) -> No
     res = _git("worktree", "add", "-q", "-b", "feat", str(wt), cwd=base)
     assert res.returncode == 0, res.stderr
 
-    link = wt / "graphify-out"
-    assert link.is_symlink(), "worktree graphify-out should be a symlink"
-    assert link.resolve() == (base / "graphify-out").resolve()
+    out = wt / "graphify-out"
+    assert out.is_dir() and not out.is_symlink(), (
+        "graphify-out/ must stay a real directory, not become a symlink"
+    )
+    graph_link = out / "graph.json"
+    assert graph_link.is_symlink(), "graph.json should be linked to the base graph"
+    assert graph_link.resolve() == (base / "graphify-out" / "graph.json").resolve()
     # And it is actually usable — the graph resolves through the link.
-    assert (link / "graph.json").is_file()
+    assert graph_link.is_file()
 
 
-def test_worktree_link_replaces_the_tracked_gitignore_stub(tmp_path: Path) -> None:
-    """`graphify-out/.gitignore` is tracked, so `git worktree add` materialises
-    a non-empty stub directory.  The hook must replace it, not give up."""
+def test_worktree_add_git_status_is_empty(tmp_path: Path) -> None:
+    """The acceptance bar for #1617: a fresh linked worktree must be
+    `git status` clean immediately after `git worktree add` runs the hook.
+    The original bug showed up here as a deleted tracked
+    `graphify-out/.gitignore` plus a new untracked, absolute-path symlink —
+    both invisible to any check that only looks at what the symlink points
+    to, which is why this specific assertion is the whole point of the
+    issue."""
     base = _make_repo(tmp_path / "base")
-    out = _seed_graph(base)
-    (out / ".gitignore").write_text("*\n!.gitignore\n", encoding="utf-8")
-    _git("add", "-f", "graphify-out/.gitignore", cwd=base)
-    _git("commit", "-q", "-m", "track gitignore", cwd=base)
+    _seed_graph(base)
 
     wt = tmp_path / "wt"
     _git("worktree", "add", "-q", "-b", "feat", str(wt), cwd=base)
 
-    link = wt / "graphify-out"
-    assert link.is_symlink()
-    assert (link / "graph.json").is_file()
+    status = _git("status", "--porcelain", cwd=wt)
+    assert status.returncode == 0, status.stderr
+    assert status.stdout == "", (
+        f"expected a clean worktree, got:\n{status.stdout}"
+    )
+
+
+def test_worktree_link_preserves_the_tracked_gitignore(tmp_path: Path) -> None:
+    """`graphify-out/.gitignore` is tracked, so `git worktree add` materialises
+    a non-empty stub directory.  The hook must add symlinks alongside it
+    without ever deleting or shadowing the tracked file."""
+    base = _make_repo(tmp_path / "base")  # tracks graphify-out/.gitignore
+    _seed_graph(base)
+
+    wt = tmp_path / "wt"
+    _git("worktree", "add", "-q", "-b", "feat", str(wt), cwd=base)
+
+    gitignore = wt / "graphify-out" / ".gitignore"
+    assert gitignore.is_file() and not gitignore.is_symlink()
+    assert "!.gitignore" in gitignore.read_text(encoding="utf-8")
+    tracked = _git("ls-files", "graphify-out/.gitignore", cwd=wt).stdout.strip()
+    assert tracked == "graphify-out/.gitignore"
+    assert (wt / "graphify-out" / "graph.json").is_file()
 
 
 def test_no_link_when_the_base_checkout_has_no_graph(tmp_path: Path) -> None:
@@ -164,8 +201,12 @@ def test_no_link_when_the_base_checkout_has_no_graph(tmp_path: Path) -> None:
     wt = tmp_path / "wt"
     _git("worktree", "add", "-q", "-b", "feat", str(wt), cwd=base)
 
-    link = wt / "graphify-out"
-    assert not link.is_symlink()
+    graph_link = wt / "graphify-out" / "graph.json"
+    assert not graph_link.exists()
+    assert not graph_link.is_symlink()
+    # And the worktree is still clean — nothing half-linked left behind.
+    status = _git("status", "--porcelain", cwd=wt)
+    assert status.stdout == ""
 
 
 def test_a_real_graph_in_the_worktree_is_never_clobbered(tmp_path: Path) -> None:
@@ -175,18 +216,42 @@ def test_a_real_graph_in_the_worktree_is_never_clobbered(tmp_path: Path) -> None
     _seed_graph(base)
     wt = tmp_path / "wt"
     _git("worktree", "add", "-q", "-b", "feat", str(wt), cwd=base)
-    # Replace the link with a real graph, then switch branches to re-fire.
-    link = wt / "graphify-out"
-    if link.is_symlink():
-        link.unlink()
+    # Replace the linked graph.json with a real one, then switch branches to
+    # re-fire the hook.
     own = wt / "graphify-out"
-    own.mkdir(exist_ok=True)
-    (own / "graph.json").write_text('{"nodes": ["mine"]}', encoding="utf-8")
+    graph_link = own / "graph.json"
+    if graph_link.is_symlink():
+        graph_link.unlink()
+    graph_link.write_text('{"nodes": ["mine"]}', encoding="utf-8")
 
     _git("checkout", "-q", "-b", "feat2", cwd=wt)
 
-    assert not own.is_symlink()
-    assert "mine" in (own / "graph.json").read_text(encoding="utf-8")
+    assert not graph_link.is_symlink()
+    assert "mine" in graph_link.read_text(encoding="utf-8")
+    assert own.is_dir() and not own.is_symlink()
+
+
+def test_worktree_remove_leaves_the_base_graph_intact(tmp_path: Path) -> None:
+    """#1617/#1295: the per-entry symlinks must never cause worktree cleanup
+    to reach into the base checkout — `git worktree remove` (and, by
+    extension, coord's `shutil.rmtree` cleanup sweep, which unlinks rather
+    than recurses into directory symlinks) must leave the base graph
+    untouched."""
+    base = _make_repo(tmp_path / "base")
+    out = _seed_graph(base)
+    (out / "cache").mkdir(exist_ok=True)
+    (out / "cache" / "foo").write_text("x", encoding="utf-8")
+
+    wt = tmp_path / "wt"
+    _git("worktree", "add", "-q", "-b", "feat", str(wt), cwd=base)
+    assert (wt / "graphify-out" / "cache" / "foo").is_file()
+
+    res = _git("worktree", "remove", "--force", str(wt), cwd=base)
+    assert res.returncode == 0, res.stderr
+
+    assert (out / "graph.json").is_file()
+    assert (out / "cache" / "foo").is_file()
+    assert not out.is_symlink()
 
 
 def test_main_worktree_chains_to_the_machine_local_graphify_hook(
@@ -247,9 +312,11 @@ def test_the_hook_actually_runs_on_an_in_worktree_checkout(tmp_path: Path) -> No
 
     # Remove the link, then switch branches from inside the worktree: the hook
     # must run and recreate it.
-    (wt / "graphify-out").unlink()
+    (wt / "graphify-out" / "graph.json").unlink()
     _git("checkout", "-q", "-b", "feat3", cwd=wt)
-    assert (wt / "graphify-out").is_symlink(), "hook did not run in the worktree"
+    assert (wt / "graphify-out" / "graph.json").is_symlink(), (
+        "hook did not run in the worktree"
+    )
 
 
 # ── unit: freshness detection ────────────────────────────────────────────────

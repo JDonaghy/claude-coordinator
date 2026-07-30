@@ -480,7 +480,7 @@ Found stale on 2026-07-29 at **0.4.84 while the fleet was on 0.4.87** — three
 releases behind. Every timer-launched drive in that window had been running without
 #1564's CI merge gate, #1565, #1567, and #1568, all of which were believed live.
 
-**Add it to every release.** The complete deploy surface is four lanes:
+**Add it to every release.** The complete deploy surface is five lanes:
 
 | # | lane | how it updates | needed when |
 |---|---|---|---|
@@ -488,6 +488,28 @@ releases behind. Every timer-launched drive in that window had been running with
 | 2 | `coord serve` (daemon host) | `systemctl --user restart coord-serve` **after** lane 1 upgraded the on-disk code | any `serve_app.py` / `state.py` / `review.py` / `merge_queue.py` change |
 | 3 | `coord-tui` | local `cargo build && cp target/debug/coord-tui ~/.local/bin/` | any `tui/**` change — never PyPI |
 | 4 | **`~/.coord-cli-venv`** | manual `pip install --upgrade` + verify `coord --version` | **every release**, because the sequencer drives through it |
+| 5 | `.githooks/` hooks | nothing to run — live on the next `git fetch` (given `core.hooksPath` is already set) | any `.githooks/**` change — see below, this lane's failure mode is the opposite of 1–4 |
+
+### The fifth surface: `.githooks/**` — the opposite failure mode
+
+Lanes 1–4 exist to make deploys *slower and deliberate*: a merged fix sits
+inert until someone runs `coord agent update`, restarts `coord-serve`,
+rebuilds `coord-tui`, or bumps `~/.coord-cli-venv`. `.githooks/**` is the
+opposite. It is **repo-tracked and takes effect on the next `git fetch`** on
+any machine with `core.hooksPath=.githooks` set — no PyPI release, no daemon
+restart, no rebuild. A merged hook is live everywhere immediately, which
+means a bad hook is *also* live everywhere immediately.
+
+This bit on 2026-07-30 (#1617): a `.githooks/post-checkout` regression
+(`rm -rf graphify-out && ln -sfn ...` deleting the tracked
+`graphify-out/.gitignore`) went from merge to affecting **every new worker
+worktree on every machine** in about 30 minutes, with no canary and no
+rollout to stagger it — because there was no rollout to stagger. The only
+practical mitigation was `git config --unset core.hooksPath` on all three
+machines, which also disables every *other* hook in `.githooks/`, not just
+the broken one. Treat `.githooks/**` changes with the same caution as a
+schema migration: they need to be right on merge, because there is no lane 5
+"upgrade" step to catch them first.
 
 ## Fleet-wide version check
 
