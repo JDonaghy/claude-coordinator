@@ -37,3 +37,4 @@ fn make_test_app_builds_from_board_data_with_no_live_daemon() {
 // relative to this file (`tui/tests/`), so `../../` is the repo root.
 include!("../../tests/acceptance/ms-33/audit_1039.rs");
 include!("../../tests/acceptance/ms-38/plans_help_1124.rs");
+include!("../../tests/acceptance/ms-38/plans_rightclick_1123.rs");
