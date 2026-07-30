@@ -362,3 +362,68 @@ Neither command runs automatically — same one-key-human-decision posture as
 every other escalation. The escalation is also posted as a comment on the
 GitHub issue itself (not just the tmux pane and the `coord escalate` board
 row), so it survives the drive session ending.
+
+## 12. The graphify graph is silently stale more often than you think — and worktree agents have none at all
+
+Two failures, both invisible from the code, both costing agent time on wrong
+answers rather than money.
+
+### Worktree agents are graph-blind by construction
+
+`graphify-out/` is gitignored on purpose — only `graphify-out/.gitignore` is
+tracked (the graph is multi-MB, rewritten every commit, and would conflict
+across parallel worker branches). So `git worktree add` materialises an *empty*
+`graphify-out/`, and `graphify query` resolves `graphify-out/graph.json`
+**strictly relative to cwd** — no upward walk, and `query` has no `--graph`
+override (only `path`/`explain`/`diagnose` do). Every agent in a worktree —
+coord's `~/.coord/worktrees/*`, Claude Code's `.claude/worktrees/*`, review
+worktrees — silently falls back to grep.
+
+The fix is `.githooks/post-checkout`, which symlinks the worktree's
+`graphify-out` at the base checkout's graph. It lives in a **hook**, not in
+coord's dispatch code, because `git worktree add` fires `post-checkout` with
+cwd set to the new worktree — so one implementation covers every creator
+(coord's two remote `worktree add` sites, Claude Code, and anything by hand) on
+every machine. It chains to `$GIT_COMMON_DIR/hooks/post-checkout` in the main
+worktree, leaving graphify's own machine-pinned block alone.
+
+**It only runs where `core.hooksPath` points at it** — one command per machine,
+and nothing enforces it:
+
+```bash
+git -C ~/src/claude-coordinator config core.hooksPath .githooks
+```
+
+Rebuilds stay disabled inside worktrees deliberately: `graphify-out` is now a
+symlink to the *shared* graph, so a rebuild there would overwrite it from a
+feature-branch tree — and a worktree can be reaped mid-rebuild, which is where
+graphify's own "burns a full AST pass and then dies with ENOENT" comment came
+from.
+
+### The hooks cannot keep the graph in sync, and fail silently when they try
+
+Do not assume "the hooks handle it." Structurally they don't:
+
+- `post-commit` / `post-checkout` / `post-merge` all `exit 0` during a
+  **rebase, merge, or cherry-pick** — so the merge agent's proactive rebase
+  (#306), the most common ref move in the fleet, never rebuilds.
+- **`git reset --hard` fires nothing.** Git has no post-reset hook.
+- Every failure path is `exit 0`, and the rebuild is a detached background
+  process with a 600s `SIGALRM` timeout logging to
+  `~/.cache/graphify-rebuild.log`. A timeout, an OOM, or an ENOENT all fail
+  invisibly.
+- Concurrent triggers coalesce (`Rebuild already in progress — changes queued`).
+- The hooks' own `[ ! -f graphify-out/graph.json ] && exit 0` guard is a
+  **permanent off-switch**: purge the graph once and they no-op forever.
+
+So check, don't assume. `GRAPH_REPORT.md` records the commit it was built from,
+which makes staleness a one-line comparison:
+
+```bash
+coord diagnose --graph     # every local checkout: in-sync vs STALE, + hooksPath
+```
+
+It prints a `GRAPH_HEALTH: checkouts=N stale=M` trailer. Fix a stale one with
+`graphify update .` in that checkout. Worth running after any `reset --hard`,
+after a rebase-heavy session, and on each machine periodically — the first real
+run of it caught `~/src/vimcode` sitting 55 commits behind its own graph.
