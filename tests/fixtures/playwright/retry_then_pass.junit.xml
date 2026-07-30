@@ -1,0 +1,11 @@
+<testsuites id="" name="" tests="1" failures="0" skipped="0" errors="0" time="1.231139">
+<testsuite name="retry.spec.ts" timestamp="2026-07-30T01:49:14.564Z" hostname="chromium" tests="1" failures="0" skipped="0" time="0.008" errors="0">
+<testcase name="pipeline panel › flaky selection" classname="retry.spec.ts" time="0.008">
+<system-out>
+<![CDATA[
+[[ATTACHMENT|test-results/retry-pipeline-panel-flaky-selection-chromium/error-context.md]]
+]]>
+</system-out>
+</testcase>
+</testsuite>
+</testsuites>

@@ -406,7 +406,11 @@ class TestIssueOracleReady:
         assert readiness.reason is None
 
     def test_blocked_when_driver_kind_unsupported(self) -> None:
-        cfg = _oracle_cfg(kind="web-playwright")
+        # "native" is the one acceptance_drivers.py kind still undelivered
+        # (docs/WEB_CONTROL_CENTER.md M-W0) — web-playwright landed in #1539
+        # and is a real SUPPORTED_KINDS entry now, so it can no longer stand
+        # in as "some unsupported kind" here.
+        cfg = _oracle_cfg(kind="native")
         repo = cfg.repo("api")
         fetch = _manifest_fetch({
             "tests/acceptance/ms-37/manifest.yml": "tests:\n  ms37::a: 1118\n",
@@ -416,12 +420,12 @@ class TestIssueOracleReady:
             file_exists=lambda *a: True, fetch_manifest=fetch,
         )
         assert readiness.has_slice is True
-        assert readiness.unsupported_kinds == ("web-playwright",)
+        assert readiness.unsupported_kinds == ("native",)
         assert readiness.reason is not None
-        assert "web-playwright" in readiness.reason
+        assert "native" in readiness.reason
 
     def test_exempt_bypasses_unsupported_kind_check(self) -> None:
-        cfg = _oracle_cfg(kind="web-playwright")
+        cfg = _oracle_cfg(kind="native")
         repo = cfg.repo("api")
         fetch = _manifest_fetch({
             "tests/acceptance/ms-37/manifest.yml": "exempt: [1118]\n",
