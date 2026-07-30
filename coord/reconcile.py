@@ -148,6 +148,23 @@ def reconcile_completed_assignments(
         terminal = _AGENT_TERMINAL_STATUS.get(effective_agent_status(entry))
         if terminal is None:
             continue
+        # #1566: a review agent reporting `done` has only finished the LLM
+        # session — the verdict itself is parsed + persisted by `coord
+        # notify` (`_try_parse_and_post_review`), a separate, slower step
+        # that can run minutes after this tick observes the completion (this
+        # passive tick runs on a short ~30s cadence; `coord notify` runs on
+        # whatever cadence its caller configures). Writing `status="done"`
+        # straight away leaves a window where the board shows a finished
+        # review with `review_verdict IS NULL` — indistinguishable from the
+        # verdict having been dropped (the #1346/#1348/#1563 failure mode).
+        # `finalizing` closes that window: it reads as "still wrapping up"
+        # (not in `drive_state.TERMINAL_STATUSES`, so `coord drive` correctly
+        # waits rather than declaring a dead end) until `coord notify`'s own
+        # `mark_notified` advances it to the real `done` alongside the
+        # verdict. Other terminal outcomes (`failed`, `advisory`) never go
+        # through that verdict-capture step, so they are unaffected.
+        if terminal == "done" and a.type == "review":
+            terminal = "finalizing"
 
         # #1083: prefer the board's already-known branch, but fall back to
         # the agent's live ``completed`` entry (populated by AgentServer._reap
@@ -924,6 +941,20 @@ def reconcile(board: Board, config: Config) -> list[str]:
                     # backlog, the same shape as dispatch_pending_reviews.)
                     done.review_state = "pending"
                 elif done.type == "review":
+                    # #1566: `mark_done_by_id` just stamped `done.status =
+                    # "done"` — correct it to "finalizing". The review
+                    # AGENT finished, but the verdict is parsed + persisted
+                    # by `coord notify` (a separate, slower step — see the
+                    # matching comment in `reconcile_completed_assignments`
+                    # above), so calling this row "done" before that lands
+                    # would show a finished review with no verdict, which is
+                    # indistinguishable from a dropped one. `orig.review_state`
+                    # below is intentionally left "done" immediately (that
+                    # field means "the review PROCESS is over", not "verdict
+                    # known" — see #1584 — and `drive_state.TERMINAL_STATUSES`
+                    # not listing "finalizing" is what keeps `coord drive`
+                    # from misreading this row as a dead end in the meantime).
+                    done.status = "finalizing"
                     # A review finished — update the original work assignment.
                     orig_id = done.review_of_assignment_id
                     if orig_id:

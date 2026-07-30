@@ -77,6 +77,15 @@ def test_stage_status_review_no_verdict_is_failed():
     assert sp.stage_status_for(a, "review", stage_names=["work", "review"], is_closed=False, require_plan=False) == sp.FAILED
 
 
+def test_stage_status_review_finalizing_is_active_not_failed():
+    """#1566: a review agent that finished but hasn't had its verdict parsed
+    + posted yet (`coord notify`'s separate, slower step) must render as
+    still in-progress — NOT as the #812 "terminal done, no verdict" dead
+    end, which is indistinguishable from a genuinely dropped verdict."""
+    a = [_review(status="finalizing", review_verdict=None, dispatched_at=1.0)]
+    assert sp.stage_status_for(a, "review", stage_names=["work", "review"], is_closed=False, require_plan=False) == sp.ACTIVE
+
+
 def test_stage_status_no_assignment_open_issue_is_pending():
     assert sp.stage_status_for([], "review", stage_names=["work", "review"], is_closed=False, require_plan=False) == sp.PENDING
 

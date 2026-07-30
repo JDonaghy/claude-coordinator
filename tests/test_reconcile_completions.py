@@ -76,6 +76,54 @@ def test_flips_running_to_done_when_agent_reports_completed() -> None:
     ]
 
 
+def test_review_completion_maps_to_finalizing_not_done() -> None:
+    """#1566: a review agent reporting "done" must NOT be persisted as
+    status="done" straight away — the verdict is parsed + posted by
+    `coord notify`, a separate, slower step. Landing on the intermediate
+    "finalizing" status here closes the window where the board shows a
+    finished review with no verdict, indistinguishable from a dropped one.
+    """
+    rec = _Recorder()
+    out = reconcile_completed_assignments(
+        _config(),
+        board=_board(_running("r1", atype="review")),
+        agent_status_fn=lambda host: {"completed": [{"id": "r1", "status": "done"}]},
+        update_state_fn=rec,
+        capture_plan=False,
+    )
+    assert len(out) == 1
+    assert out[0]["to_status"] == "finalizing"
+    assert rec.calls == [
+        {"assignment_id": "r1", "terminal_status": "finalizing",
+         "branch": "issue-1-x", "review_state": None, "failure_reason": None}
+    ]
+
+
+def test_review_advisory_and_failed_are_unaffected_by_finalizing() -> None:
+    """Only a clean "done" completion has a pending verdict-capture step —
+    advisory/failed reviews never go through `coord notify`'s findings
+    parse, so they stay their normal terminal status."""
+    rec = _Recorder()
+    reconcile_completed_assignments(
+        _config(),
+        board=_board(_running("r-adv", atype="review")),
+        agent_status_fn=lambda host: {"completed": [{"id": "r-adv", "status": "advisory"}]},
+        update_state_fn=rec,
+        capture_plan=False,
+    )
+    assert rec.calls[0]["terminal_status"] == "advisory"
+
+    rec2 = _Recorder()
+    reconcile_completed_assignments(
+        _config(),
+        board=_board(_running("r-fail", atype="review")),
+        agent_status_fn=lambda host: {"completed": [{"id": "r-fail", "status": "failed"}]},
+        update_state_fn=rec2,
+        capture_plan=False,
+    )
+    assert rec2.calls[0]["terminal_status"] == "failed"
+
+
 def test_no_write_when_agent_still_running() -> None:
     # The assignment isn't in the agent's completed list → leave it alone.
     rec = _Recorder()

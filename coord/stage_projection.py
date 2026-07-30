@@ -337,7 +337,15 @@ def stage_status_for(
         )
 
     matching = assignments_for_stage(assignments_for_issue, stage, require_plan=require_plan)
-    if any(a.status == "running" for a in matching):
+    # #1566: "finalizing" is a review row whose agent finished but whose
+    # verdict hasn't been parsed + persisted yet (`coord notify`'s slower,
+    # separate step — see `coord.reconcile.reconcile_completed_assignments`).
+    # Treat it exactly like "running" here: without this, the #473/#812
+    # verdict-based mapping below would read a still-in-flight review as a
+    # terminal "done" with no verdict and paint it FAILED — the same
+    # dead-end misread #1566 was filed over, just in the board's colours
+    # instead of `coord drive`'s exit.
+    if any(a.status in ("running", "finalizing") for a in matching):
         return ACTIVE
 
     latest = _latest_by_dispatch(matching)

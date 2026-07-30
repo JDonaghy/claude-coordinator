@@ -220,11 +220,20 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
             branch = entry.get("branch")
             agent_status = entry.get("status")
             if agent_status == "done":
-                board.mark_done_by_id(
+                done = board.mark_done_by_id(
                     a.assignment_id,
                     finished_at=entry.get("finished_at"),
                     branch=branch,
                 )
+                # #1566: mirror reconcile.py — a review agent reporting
+                # "done" has only finished the LLM session; the verdict is
+                # parsed + persisted by `coord notify`, a separate, slower
+                # step. Leaving status="done" here would show a finished
+                # review with no verdict, indistinguishable from a dropped
+                # one. "finalizing" isn't in drive_state.TERMINAL_STATUSES,
+                # so `coord drive` still correctly waits on it.
+                if done is not None and done.type == "review":
+                    done.status = "finalizing"
             elif agent_status == "advisory":
                 # #448: 0-commit clean exit — treat as done on the board so
                 # the assignment doesn't block; the advisory section below

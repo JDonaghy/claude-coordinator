@@ -4705,7 +4705,14 @@ impl CoordApp {
     /// net against older daemons.
     pub(crate) fn stage_status_for_local(&self, issue: &PipelineIssue, stage: &str) -> StageStatus {
         let matching = self.assignments_for_stage(issue, stage);
-        if matching.iter().any(|a| a.status == "running") {
+        // #1566: "finalizing" is a review row whose agent finished but whose
+        // verdict hasn't been parsed + persisted yet (`coord notify`'s
+        // slower, separate step). Treat it like "running" — without this,
+        // the #473/#812 verdict-based match below reads a still-in-flight
+        // review as a terminal "done" with no verdict and paints it FAILED,
+        // indistinguishable from a genuinely dropped verdict. Mirrors
+        // `coord.stage_projection.stage_status_for`.
+        if matching.iter().any(|a| a.status == "running" || a.status == "finalizing") {
             return StageStatus::Active;
         }
         let latest = matching.iter().max_by(|a, b| {
