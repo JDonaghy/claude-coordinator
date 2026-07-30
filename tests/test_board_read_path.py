@@ -354,6 +354,133 @@ def test_board_single_flight_failure_reaches_all_waiters(
     assert call_count == 1, "the retry must run its own fresh build_projection() call"
 
 
+def test_board_single_flight_survives_non_board_read_error(
+    detail_db: Path, valid_config_path: Path, monkeypatch
+) -> None:
+    """#1597 review (blocking finding): the leader only fanned failure out
+    for ``_BoardReadError``. ``_build()`` has call sites NOT wrapped in that
+    sentinel — e.g. ``_gate_refresher.snapshot()`` — so any other exception
+    there (or a cancellation) used to propagate straight out of ``board()``
+    without ever clearing ``_board_inflight`` or resolving ``_fut``: every
+    follower's ``await _fut`` hangs forever, and the daemon is wedged for
+    every future ``/board`` request until restart. Simulate exactly that by
+    making the (unwrapped) gate-snapshot read raise a plain ``RuntimeError``
+    instead of ``board_projection()`` (whose exceptions ARE already wrapped
+    and covered by ``test_board_single_flight_failure_reaches_all_waiters``
+    above)."""
+    import asyncio
+    import threading
+
+    import httpx
+
+    from coord.gate_snapshot import GateSnapshotRefresher
+
+    monkeypatch.setenv("COORD_BOARD_CACHE_TTL", "60")
+    original_snapshot = GateSnapshotRefresher.snapshot
+
+    call_count = 0
+    started = threading.Event()
+    release = threading.Event()
+
+    def failing_snapshot(self):  # noqa: ANN001
+        nonlocal call_count
+        call_count += 1
+        started.set()
+        assert release.wait(timeout=5), "test driver never released the build"
+        raise RuntimeError("boom-not-a-board-read-error")
+
+    monkeypatch.setattr(GateSnapshotRefresher, "snapshot", failing_snapshot)
+
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(detail_db), cfg)
+    n_callers = 5
+
+    async def _run():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as cli:
+            tasks = [asyncio.create_task(cli.get("/board")) for _ in range(n_callers)]
+            await asyncio.sleep(0.2)
+            assert started.is_set(), "the build never started"
+            release.set()
+            return await asyncio.gather(*tasks, return_exceptions=True)
+
+    responses = asyncio.run(_run())
+
+    assert call_count == 1, f"the failing build ran {call_count}x — expected exactly 1"
+
+    # Exactly one of the n_callers tasks IS the single-flight leader: its
+    # request re-raises the RuntimeError exactly like pre-#1597 (no shared
+    # state existed then to protect — an unhandled exception just failed
+    # that one request). Every OTHER task is a FOLLOWER: it must get a
+    # clean 503 — never hang, never see the raw exception.
+    exceptions = [r for r in responses if isinstance(r, BaseException)]
+    followers = [r for r in responses if not isinstance(r, BaseException)]
+    assert len(exceptions) == 1, (
+        f"expected exactly one leader exception, got: {responses}"
+    )
+    assert len(followers) == n_callers - 1
+    for r in followers:
+        assert r.status_code == 503, f"follower did not get a clean 503: {r.status_code}"
+        assert "boom-not-a-board-read-error" in r.json()["detail"]
+
+    # The in-flight slot was cleared despite the non-_BoardReadError
+    # failure: a later request retries the build fresh rather than hanging
+    # behind a future that would otherwise never resolve.
+    monkeypatch.setattr(GateSnapshotRefresher, "snapshot", original_snapshot)
+    with TestClient(app) as cli:
+        resp = cli.get("/board")
+    assert resp.status_code == 200
+    assert resp.json()["round_number"] == 3
+    assert call_count == 1, "the retry must run its own fresh build"
+
+
+def test_board_stamp_falls_back_for_unserializable_content(
+    detail_db: Path, valid_config_path: Path, monkeypatch
+) -> None:
+    """#1597 review (non-blocking): content json.dumps can't natively encode
+    (e.g. a stray ``set`` that slipped past bound_board_payload) must still
+    fall back to the ``default=str`` encoder and serve 200 — not 500."""
+    original_projection = SqliteStore.board_projection
+
+    def patched(self):  # noqa: ANN001
+        result = original_projection(self)
+        result["_unserializable_marker"] = {1, 2, 3}  # a set → TypeError
+        return result
+
+    monkeypatch.setattr(SqliteStore, "board_projection", patched)
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(detail_db), cfg)
+    with TestClient(app) as cli:
+        resp = cli.get("/board")
+    assert resp.status_code == 200
+    assert isinstance(resp.json().get("_unserializable_marker"), str)
+
+
+def test_board_stamp_raises_on_nan_instead_of_silently_encoding_it(
+    detail_db: Path, valid_config_path: Path, monkeypatch
+) -> None:
+    """#1597 review (non-blocking): a NaN/Infinity float anywhere in the
+    board payload must still fail loudly — matching pre-#1597 behavior,
+    where Starlette's ``JSONResponse.render()`` (same ``allow_nan=False``)
+    raised — instead of silently falling back to a more permissive re-encode
+    that would emit non-spec-compliant ``NaN``/``Infinity`` tokens on the
+    wire for a strict JSON parser (e.g. the Rust TUI's ``serde_json``) to
+    choke on."""
+    original_projection = SqliteStore.board_projection
+
+    def patched(self):  # noqa: ANN001
+        result = original_projection(self)
+        result["_nan_marker"] = float("nan")
+        return result
+
+    monkeypatch.setattr(SqliteStore, "board_projection", patched)
+    cfg = load_config(valid_config_path)
+    app = build_app(SqliteStore(detail_db), cfg)
+    with TestClient(app, raise_server_exceptions=False) as cli:
+        resp = cli.get("/board")
+    assert resp.status_code == 500
+
+
 def test_board_stamp_serializes_payload_once(
     app_client: TestClient, monkeypatch
 ) -> None:
