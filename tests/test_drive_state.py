@@ -256,6 +256,49 @@ def test_review_is_keyed_on_the_current_work_row_not_the_issue():
     assert state.review_verdict == ""
 
 
+def test_review_verdict_resolves_to_fix_round_approval_not_parent_null(): # noqa: E501
+    """#1601 (the #1566 incident): the PARENT work row's own `review_state`
+    can be stuck at "dispatched" with no verdict forever once a fix round's
+    review supersedes it (the auto-loop bounce never rewrites the parent's
+    own `review_state`/`review_verdict` — only the fix round's review is
+    "the" review now). `project()` must resolve `work_aid` to the fix round
+    (already true, see `test_project_picks_the_most_recently_dispatched_work_row`)
+    AND resolve its verdict from the review keyed to THAT row — never fall
+    back to reading the parent's null verdict, which is what caused `coord
+    drive` to park indefinitely reading `review=done/-` on #1566 (5.1m then
+    48.7m stalls, board mergeable, CI green, nothing enqueued)."""
+    payload = {
+        "assignments": [
+            row(
+                assignment_id="8b26520edabb", dispatched_at=1.0,
+                review_state="dispatched", review_verdict=None,
+                test_state="passed",
+            ),
+            row(
+                assignment_id="ea92c1dcc436", type="review", dispatched_at=2.0,
+                review_of_assignment_id="8b26520edabb",
+                review_verdict="request-changes",
+            ),
+            row(
+                assignment_id="adaff508c83d", dispatched_at=3.0,
+                review_state="done", review_verdict="approve",
+                review_of_assignment_id="8b26520edabb", review_iteration=1,
+                test_state=None,
+            ),
+            row(
+                assignment_id="8051cc74ad3b", type="review", dispatched_at=4.0,
+                review_of_assignment_id="adaff508c83d",
+                review_verdict="approve",
+            ),
+        ]
+    }
+    state = project(payload, REPO, 1392, make_config())
+    assert state.work_aid == "adaff508c83d"
+    assert state.review_aid == "8051cc74ad3b"
+    assert state.review_verdict == "approve"
+    assert state.work_review_state == "done"
+
+
 def test_review_failure_reason_is_projected_from_the_review_row():
     """#1584: `_decide_review` needs the review WORKER's own failure_reason
     (usage-limit-kill or terminal-API-error diagnostic) to report why a

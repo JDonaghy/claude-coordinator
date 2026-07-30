@@ -1523,6 +1523,33 @@ class TestReviewGate:
         entry = _q("orig", branch="worker/orig")
         assert mq.has_approved_review(entry, board) is True
 
+    def test_has_approved_review_entry_keyed_to_child_finds_parent_approval(
+        self,
+    ) -> None:
+        """#1601: the backward-chain companion to the smoke-gate regression
+        above, isolated the same way — no branch bridge at all (both rows'
+        branches deliberately differ from the entry's), so ONLY the
+        review_of_assignment_id id-chain can connect a CHILD-keyed entry back
+        to an approval recorded against its PARENT. Before #1601 the walk was
+        forward-only (a known parent pulled in its child) and could not
+        resolve this direction."""
+        orig_work = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="orig", type="work", status="done",
+            branch="worker/orig-real",
+        )
+        fix_work = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1,
+            issue_title="[fix-1] t", assignment_id="fix1", type="work",
+            status="done", branch=None, review_of_assignment_id="orig",
+        )
+        orig_review = self._review("orig", verdict="approve")
+        board = self._board(completed=[orig_work, fix_work, orig_review])
+        # Entry keyed to the CHILD; its own `.branch` matches neither row, so
+        # branch equality contributes nothing — only the id-chain can bridge.
+        entry = _q("fix1", branch="worker/entry-only")
+        assert mq.has_approved_review(entry, board) is True
+
     def test_has_approved_review_multi_hop_null_branch_chain(self) -> None:
         """#567: a fix-of-a-fix chain (both branch=NULL) resolves via the
         fixed-point expansion, not just one hop."""
@@ -2197,6 +2224,35 @@ class TestSmokeGate:
         )
         board = self._board(completed=[orig_work, fix_work])
         entry = _q("orig", branch="worker/orig")
+        assert mq.has_smoke_verdict(entry, board) is True
+
+    def test_has_smoke_verdict_entry_keyed_to_child_finds_parent_verdict(self) -> None:
+        """#1601: the #567 chain walk was forward-only — a known PARENT
+        pulled in its child, but an entry keyed to the CHILD (the fix round,
+        e.g. after #292's re-keying) could not walk *backward* to reach a
+        parent whose own smoke/test verdict is the only one on the branch —
+        exactly the #1566 incident shape (a fix round approved by review but
+        never re-tested). Isolated with NO branch bridge at all (both rows'
+        branches deliberately differ from the entry's) so only the
+        review_of_assignment_id id-chain can connect them — the chain must
+        be symmetric: it should not matter which round it's keyed to."""
+        orig_work = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="orig", type="work", status="done",
+            branch="worker/orig-real", test_state="passed",
+        )
+        fix_work = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="[fix] t",
+            assignment_id="fix1", type="work", status="done",
+            branch=None,  # #557 remote-interactive-rework gap
+            review_of_assignment_id="orig",
+            test_state=None,  # the fix round never re-ran its own test/smoke
+        )
+        board = self._board(completed=[orig_work, fix_work])
+        # Entry keyed to the CHILD (fix1) — the #292 re-key direction. Its own
+        # `.branch` matches neither row, so branch equality contributes
+        # nothing — only the id-chain can bridge to orig_work's verdict.
+        entry = _q("fix1", branch="worker/entry-only")
         assert mq.has_smoke_verdict(entry, board) is True
 
     # ── #1479: test-verdict staleness (base-moved vs content-changed) ──
@@ -3714,6 +3770,53 @@ class TestEnqueueApprovedWork:
         assert changed == ["5ed99d1f7edf"]
         assert load_queue()[0].assignment_id == "5ed99d1f7edf"
 
+    # ── #1601: sweep on a condition, not an event ───────────────────────────
+
+    def test_enqueues_1566_topology_without_any_transition_event(
+        self, coord_db, monkeypatch
+    ) -> None:
+        """#1601 (the #1566 incident): a review verdict written with no
+        corresponding transition event still results in an enqueued merge on
+        the next sweep. This board is constructed directly — no
+        `process_review_completion`/`_advance_pipeline` call ever ran — the
+        exact "the transition that would have triggered enqueue was missed"
+        shape #1441 fixed for reviews, applied here to the merge queue.
+
+        Board shape (from the #1566 incident): parent work is done, tested,
+        and smoked, but its own `review_state` is stuck at "dispatched" with
+        no verdict (superseded by a fix round); the fix round is done and
+        approved but never re-tested; a second review approved the fix.
+        `enqueue_approved_work` must resolve the branch's winner (the
+        parent — it's the only row with a fresh terminal test_state) and
+        find the fix round's approval through the chain."""
+        from coord import github_ops
+
+        monkeypatch.setattr(github_ops, "work_is_terminal", lambda *a, **k: False)
+        cfg = self._config()
+
+        parent = self._work("8b26520edabb", test_state="passed", branch="issue-1566-fix")
+        parent.review_state = "dispatched"
+        parent.review_verdict = None
+        parent.dispatched_at = 1.0
+        review1 = self._review("8b26520edabb", verdict="request-changes")
+        review1.dispatched_at = 2.0
+        fix = self._work("adaff508c83d", test_state=None, branch="issue-1566-fix")
+        fix.review_of_assignment_id = "8b26520edabb"
+        fix.review_state = "done"
+        fix.review_verdict = "approve"
+        fix.dispatched_at = 3.0
+        review2 = self._review("adaff508c83d", verdict="approve")
+        review2.dispatched_at = 4.0
+        board = self._board(completed=[parent, review1, fix, review2])
+
+        changed = mq.enqueue_approved_work(cfg, board)
+
+        assert changed == ["8b26520edabb"]
+        items = load_queue()
+        assert len(items) == 1
+        assert items[0].assignment_id == "8b26520edabb"
+        assert items[0].branch == "issue-1566-fix"
+
 
 class TestPendingSummary:
     def test_groups_by_repo_excludes_terminal(self) -> None:
@@ -4111,6 +4214,57 @@ class TestPlan:
         plan = mq.plan(board, cfg)
         assert plan[0].status == mq.PLAN_BLOCKED
         assert "test" in (plan[0].reason or "").lower()
+
+    def test_plan_and_only_agree_on_stale_parent_smoke_verdict(self, coord_db) -> None:
+        """#1601 (the #1566 incident): a fix round is approved by review but
+        never re-tested; the only test verdict anywhere on the branch is the
+        PARENT's, and it's stale relative to the fix commit (its
+        `test_head_sha` doesn't match the branch's live head). Before #1601,
+        `has_smoke_verdict` only ever saw a freshly-enqueued entry's own
+        (always-`None`) `branch_head_sha`/`branch_patch_id` fields — the
+        staleness check silently no-op'd — so `coord merge --plan` showed
+        READY for exactly the entry `coord merge --only` (whose `process()`
+        DOES live-fetch those fields first) then refused as stale. Passing
+        `gh_ops` into `has_smoke_verdict` (mirroring `has_approved_review`)
+        closes that plan-vs-enforcement split: both must now see the SAME
+        stale verdict and agree it's BLOCKED."""
+        cfg = self._config()
+        parent = self._work("8b26520edabb", test_state="passed")
+        parent.branch = "issue-1566-fix"
+        parent.test_head_sha = "sha-before-fix"
+        parent.test_base_sha = "sha-base"
+        parent.test_patch_id = "patch-before-fix"
+        fix = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1,
+            issue_title="[fix] t", assignment_id="adaff508c83d", type="work",
+            status="done", branch="issue-1566-fix", test_state=None,
+            review_of_assignment_id="8b26520edabb",
+        )
+        review2 = self._review("adaff508c83d", verdict="approve")
+        board = self._board(completed=[parent, fix, review2])
+
+        class _FixShaGh(FakeGh):
+            def get_branch_sha(self, repo, branch):
+                return "sha-base" if branch == "main" else "sha-after-fix"
+
+            def get_branch_patch_id(self, repo, base, branch):
+                return "patch-after-fix"
+
+        gh = _FixShaGh()
+
+        save_queue([_q("8b26520edabb", branch="issue-1566-fix", size=10)])
+        plan_result = mq.plan(board, cfg, gh_ops=gh)
+        assert plan_result[0].status == mq.PLAN_BLOCKED
+        assert "test" in (plan_result[0].reason or "").lower()
+
+        # `plan()` never persists its in-memory SHA backfill (read-only, no
+        # DB writes) — reload a fresh entry so `--only`'s process() sees
+        # exactly what a real invocation would: nothing pre-populated.
+        save_queue([_q("8b26520edabb", branch="issue-1566-fix", size=10)])
+        only_items = mq.load_queue()
+        events = mq.process(only_items, gh, dry_run=True, config=cfg, board=board)
+        kinds = [e.kind for e in events]
+        assert "smoke_required" in kinds
 
     def test_blocked_ci_failed(self, coord_db) -> None:
         """Entry with a failed CI check appears as BLOCKED with CI reason."""

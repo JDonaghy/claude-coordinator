@@ -633,9 +633,95 @@ def _recover_merge(
     if actions:
         res.actions_taken.extend(actions)
         res.recovered = True
-    else:
+        return
+
+    # #1601: reconcile_board_merges (above) only ever does two things —
+    # backfill a missing `branch` and detect an out-of-band GitHub merge. It
+    # has never asked the one question this issue is about: "is this done,
+    # approved work even IN the merge queue at all?" A fix round's terminal
+    # review verdict routinely lands on a *different* board row than
+    # `latest`/the parent work row's own `review_state` (which can be stuck
+    # at "dispatched" forever once a later round supersedes it — see the
+    # #1566 incident this fixed), and when the periodic enqueue sweep
+    # (`merge_queue.enqueue_approved_work`, run from the daemon passive tick)
+    # misses its window, the branch is left approved-and-done with an EMPTY
+    # merge_queue. Before this, that state was indistinguishable here from
+    # actually healthy ("nothing to reconcile"). Ask the same question the
+    # merge gate itself asks (`passes_merge_gates`) so this can never
+    # disagree with what `coord merge --plan`/`--only` decide.
+    _diagnose_unqueued_merge(
+        board, config, repo_name, issue_number, latest, res, dry_run=dry_run
+    )
+
+
+def _diagnose_unqueued_merge(
+    board, config, repo_name, issue_number, latest, res: DiagnoseResult, *, dry_run: bool
+) -> None:
+    """#1601: detect (and, when possible, fix) a done+approved branch with
+    no merge_queue entry — the "nothing ever enqueued the merge" failure
+    mode. Reuses `merge_queue`'s own winner-resolution
+    (`group_branch_candidates`) and gate predicate (`passes_merge_gates`) so
+    this reports the exact same verdict `coord merge --plan`/`--only` would,
+    never a re-derived one."""
+    from coord import merge_queue as mq  # noqa: PLC0415
+
+    branch = getattr(latest, "branch", None)
+    if not branch:
         res.findings.append("merge stage: nothing to reconcile")
         res.recovered = True
+        return
+
+    existing_queue = mq.load_queue()
+    if any(getattr(e, "branch", None) == branch for e in existing_queue):
+        res.findings.append("merge stage: nothing to reconcile")
+        res.recovered = True
+        return
+
+    scoped_completed = [
+        a for a in board.completed
+        if a.repo_name == repo_name and getattr(a, "branch", None) == branch
+    ]
+    winners = mq.group_branch_candidates(scoped_completed)
+    if not winners:
+        res.findings.append("merge stage: nothing to reconcile")
+        res.recovered = True
+        return
+    winner, _superseded = winners[0]
+
+    if not mq.passes_merge_gates(winner, config, board):
+        res.findings.append(
+            f"merge stage: {branch} is done but not queued for merge, and does "
+            f"not (yet) pass the review/smoke gates — winning row "
+            f"{winner.assignment_id}: review_state={getattr(winner, 'review_state', None)!r} "
+            f"review_verdict={getattr(winner, 'review_verdict', None)!r} "
+            f"test_state={getattr(winner, 'test_state', None)!r}. Waiting on the "
+            "pipeline, not wedged."
+        )
+        res.recovered = True
+        return
+
+    if dry_run:
+        res.findings.append(
+            f"merge stage: {branch} passes every merge gate but has NO "
+            f"merge_queue entry — (dry-run) would enqueue {winner.assignment_id} now"
+        )
+        res.recovered = True
+        return
+
+    changed = mq.enqueue_approved_work(config, board)
+    if changed:
+        res.actions_taken.append(
+            f"merge stage: {branch} passed every merge gate but had no "
+            f"merge_queue entry (#1601) — enqueued {', '.join(changed)}"
+        )
+        res.recovered = True
+    else:
+        res.findings.append(
+            f"merge stage: {branch} appears to pass every merge gate but "
+            "enqueue_approved_work made no change for it — inspect by hand "
+            "(e.g. already merged/closed on GitHub, or repo not in config)"
+        )
+        res.recovered = False
 
 
 def _recover_work_like(

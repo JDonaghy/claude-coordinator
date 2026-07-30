@@ -145,6 +145,16 @@ def _chain_work_ids(entry: "QueuedMerge", pool: list) -> set[str]:
     fixes (``auto_loop.py`` fix dispatch), so the chain is reconstructable
     without a branch match. Expansion runs to a fixed point so multi-hop
     bounce chains (a fix of a fix) are fully covered, not just one hop.
+
+    #1601: the walk used to be forward-only — a known PARENT pulled in its
+    CHILD (the fix round), but not the reverse. An entry keyed to the child
+    (e.g. the fix round's own approved re-review, per #292 Defect 2's
+    re-keying) could not walk *backward* to reach the parent's still-useful
+    fields (its ``test_state``/``smoke_test`` verdict, when the fix round
+    never re-ran one) whenever branch equality alone didn't already bridge
+    the two — the same ``branch=NULL`` gap #567 fixed for the forward
+    direction. The expansion is now symmetric: a known row pulls in both its
+    recorded children AND its own ``review_of_assignment_id`` parent.
     """
     work_ids: set[str] = set()
     if entry.assignment_id:
@@ -160,15 +170,22 @@ def _chain_work_ids(entry: "QueuedMerge", pool: list) -> set[str]:
             work_ids.add(aid)
 
     # review_of_assignment_id chain — covers fix workers with branch=NULL,
-    # and multi-iteration bounce chains via a fixed-point expansion.
+    # and multi-iteration bounce chains via a fixed-point expansion. Runs in
+    # BOTH directions (#1601) so the chain is the same set regardless of
+    # which round in it the entry happens to be keyed to.
     changed = True
     while changed:
         changed = False
         for a in work_assignments:
             aid = getattr(a, "assignment_id", None)
             parent = getattr(a, "review_of_assignment_id", None)
+            # Forward: a known parent pulls in its child.
             if aid and parent in work_ids and aid not in work_ids:
                 work_ids.add(aid)
+                changed = True
+            # Backward (#1601): a known child pulls in its own parent.
+            if aid and aid in work_ids and parent and parent not in work_ids:
+                work_ids.add(parent)
                 changed = True
 
     return work_ids
@@ -710,7 +727,7 @@ def _record_gate_bypass_audit(entry: "QueuedMerge", config) -> list[str]:
     return bypassed
 
 
-def passes_merge_gates(a, config, board) -> bool:
+def passes_merge_gates(a, config, board, gh_ops: "GhOps | None" = None) -> bool:
     """True when *a* (a work ``Assignment`` or ``QueuedMerge`` entry) has
     satisfied every gate required before it may enter the merge queue.
 
@@ -725,15 +742,21 @@ def passes_merge_gates(a, config, board) -> bool:
     ``Assignment`` and ``QueuedMerge`` have them), matching
     :func:`requires_review` / :func:`has_approved_review` / :func:`requires_smoke`
     / :func:`has_smoke_verdict`, which this composes.
+
+    *gh_ops* (optional, #1601) is forwarded to both gates so a live SHA/
+    patch-id lookup can back a fresh ``QueuedMerge`` entry that hasn't been
+    through :func:`process` yet — see :func:`has_smoke_verdict`'s docstring.
     """
-    if requires_review(a, config) and not has_approved_review(a, board):
+    if requires_review(a, config) and not has_approved_review(a, board, gh_ops):
         return False
-    if requires_smoke(a, config) and not has_smoke_verdict(a, board):
+    if requires_smoke(a, config) and not has_smoke_verdict(a, board, gh_ops):
         return False
     return True
 
 
-def has_smoke_verdict(entry: "QueuedMerge", board) -> bool:
+def has_smoke_verdict(
+    entry: "QueuedMerge", board, gh_ops: "GhOps | None" = None
+) -> bool:
     """True when the smoke requirement for *entry* is satisfied.
 
     The gate **fails open**: if no work assignment can be found on the board
@@ -765,6 +788,19 @@ def has_smoke_verdict(entry: "QueuedMerge", board) -> bool:
     anchor missing on either side skips that half of the check (fail open —
     #821/#1475's existing convention), so rows/entries predating this
     feature behave exactly as before.
+
+    #1601: *gh_ops* (optional, mirroring :func:`has_approved_review`) fetches
+    the branch's/base's *live* SHA (and, via :func:`_backfill_branch_patch_id`,
+    the live patch-id) on demand when *entry* doesn't already carry them.
+    Without it, an entry that has never been through a live :func:`process`
+    pass has ``branch_head_sha``/``target_branch_head_sha``/``branch_patch_id``
+    all ``None``, which makes every staleness check above a no-op — so
+    ``coord merge --plan`` (which calls this via :func:`_entry_gate_status`
+    on a freshly-enqueued entry) could show READY for a verdict that
+    ``coord merge --only`` (whose :func:`process` DOES backfill these before
+    checking) then correctly refuses as stale. Passing *gh_ops* through
+    closes that "plan says ready, only refuses" disagreement — the #1566
+    incident's reader 3 vs. reader 4 split.
     """
     pool = list(getattr(board, "completed", []) or []) + list(
         getattr(board, "active", []) or []
@@ -785,6 +821,12 @@ def has_smoke_verdict(entry: "QueuedMerge", board) -> bool:
     current_base_sha = getattr(entry, "target_branch_head_sha", None)
     current_branch_sha = getattr(entry, "branch_head_sha", None)
     current_patch_id = getattr(entry, "branch_patch_id", None)
+    repo_github = getattr(entry, "repo_github", None)
+    entry_branch = getattr(entry, "branch", None)
+    target_branch = getattr(entry, "target_branch", None)
+    base_sha_attempted = current_base_sha is not None
+    branch_sha_attempted = current_branch_sha is not None
+    patch_id_attempted = current_patch_id is not None
 
     # Work found — check whether any carries a fresh terminal smoke verdict.
     for a in branch_work:
@@ -794,6 +836,19 @@ def has_smoke_verdict(entry: "QueuedMerge", board) -> bool:
         # Merge base moved: the tested combination (this branch + that base)
         # no longer exists, even if the branch's own diff is unchanged.
         test_base_sha = getattr(a, "test_base_sha", None)
+        if (
+            test_base_sha is not None
+            and current_base_sha is None
+            and not base_sha_attempted
+            and gh_ops is not None
+            and repo_github
+            and target_branch
+        ):
+            try:
+                current_base_sha = gh_ops.get_branch_sha(repo_github, target_branch)
+            except Exception:  # noqa: BLE001 — fail-safe: unknown SHA is not blocking
+                current_base_sha = None
+            base_sha_attempted = True
         if (
             test_base_sha is not None
             and current_base_sha is not None
@@ -807,10 +862,31 @@ def has_smoke_verdict(entry: "QueuedMerge", board) -> bool:
         test_head_sha = getattr(a, "test_head_sha", None)
         if (
             test_head_sha is not None
+            and current_branch_sha is None
+            and not branch_sha_attempted
+            and gh_ops is not None
+            and repo_github
+            and entry_branch
+        ):
+            try:
+                current_branch_sha = gh_ops.get_branch_sha(repo_github, entry_branch)
+            except Exception:  # noqa: BLE001 — fail-safe: unknown SHA is not blocking
+                current_branch_sha = None
+            branch_sha_attempted = True
+        if (
+            test_head_sha is not None
             and current_branch_sha is not None
             and test_head_sha != current_branch_sha
         ):
             test_patch_id = getattr(a, "test_patch_id", None)
+            if (
+                test_patch_id is not None
+                and current_patch_id is None
+                and not patch_id_attempted
+                and gh_ops is not None
+            ):
+                current_patch_id = _backfill_branch_patch_id(entry, gh_ops)
+                patch_id_attempted = True
             if not (
                 test_patch_id is not None
                 and current_patch_id is not None
@@ -1569,7 +1645,7 @@ def _entry_gate_status(
         # than displaying a stale "review not approved" the plan can't fix.
         if requires_review(entry, config) and not has_approved_review(entry, board, gh_ops):
             return PLAN_BLOCKED, "review not approved"
-        if requires_smoke(entry, config) and not has_smoke_verdict(entry, board):
+        if requires_smoke(entry, config) and not has_smoke_verdict(entry, board, gh_ops):
             return PLAN_BLOCKED, "test verdict missing"
     if ci_store is not None and ci_store.is_available and entry.pr_number:
         checks = ci_store.list_checks_for_pr(entry.repo_github, entry.pr_number)
@@ -2301,7 +2377,7 @@ def process(
                     not skip_smoke
                     and config is not None
                     and requires_smoke(entry, config)
-                    and (board is None or not has_smoke_verdict(entry, board))
+                    and (board is None or not has_smoke_verdict(entry, board, gh_ops))
                 ):
                     _why = (
                         "board unavailable to confirm smoke verdict"
@@ -2454,7 +2530,7 @@ def process(
                 not skip_smoke
                 and config is not None
                 and requires_smoke(entry, config)
-                and (board is None or not has_smoke_verdict(entry, board))
+                and (board is None or not has_smoke_verdict(entry, board, gh_ops))
             ):
                 msg = (
                     "smoke test required but board unavailable to confirm verdict"
