@@ -2101,7 +2101,18 @@ class Driver:
         deadline = start + self.opts.deadline_secs
         last_fingerprint = ""
         last_change = start
-        nudged = False
+        # #1593: the nudge cadence is tracked SEPARATELY from `last_change`.
+        # The one-shot latch (`nudged = False`/`True`, cleared only on a
+        # fingerprint change) let a stage that stalls for 30-40 real minutes
+        # get exactly one nudge near the start, then go completely silent —
+        # `coord notify` correctly finds nothing to settle while the worker
+        # is still running, and nothing ever re-checks after that. Re-nudging
+        # every `stall_secs` while the fingerprint stays put, without
+        # resetting `last_change`, keeps the staleness clock honest (so
+        # `--stall` measures real elapsed idle time, not time-since-last-
+        # nudge) while guaranteeing a stalled stage is never more than one
+        # `stall_secs` window away from a fresh check.
+        last_nudge: float | None = None
 
         while True:
             now = self.clock()
@@ -2127,7 +2138,7 @@ class Driver:
             if fingerprint != last_fingerprint:
                 last_fingerprint = fingerprint
                 last_change = now
-                nudged = False
+                last_nudge = None
                 self.log(
                     f"state: work={state.work_status or '-'} "
                     f"test={state.work_test_state or '-'} "
@@ -2143,14 +2154,22 @@ class Driver:
                     + (f" ({state.merge_reason})" if state.merge_reason else "")
                     + f" active={state.active_count}"
                 )
-            elif now - last_change > self.opts.stall_secs and not nudged:
+            elif now - last_change > self.opts.stall_secs and (
+                last_nudge is None or now - last_nudge > self.opts.stall_secs
+            ):
+                # #1593: re-nudge on a `stall_secs` cadence for as long as the
+                # fingerprint stays put, instead of firing once and going
+                # silent. `last_change` is deliberately left untouched here —
+                # only `last_nudge` advances — so the elapsed time below (and
+                # `--stall`'s own monotonicity: smaller stall never means
+                # FEWER nudges) keeps reflecting genuine staleness rather than
+                # resetting every time this branch fires.
                 self.warn(
-                    f"no state change in {self.opts.stall_mins:g}m "
+                    f"no state change in {(now - last_change) / 60.0:g}m "
                     f"({','.join(state.active_types) or 'nothing'} active)"
                 )
                 self.run_notify()
-                nudged = True
-                last_change = now
+                last_nudge = now
 
             action = decide(
                 state, self.opts, counters, self.verifier,

@@ -197,7 +197,11 @@ def _rebuild_drive_argv(
     "stall_mins",
     default=20.0,
     show_default=True,
-    help="Warn (and nudge, with --notify) after this long with no state change.",
+    help=(
+        "Warn (and nudge, with --notify) after this long with no state "
+        "change, repeating on the same cadence for as long as the stall "
+        "continues."
+    ),
 )
 @click.option(
     "--notify",
