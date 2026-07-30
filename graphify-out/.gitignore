@@ -1,0 +1,9 @@
+# graphify-out/ is a regenerable, machine-local cache rebuilt by the
+# post-commit / post-checkout git hooks — we do NOT commit it:
+#   - every machine rebuilds locally (one-time `/graphify` seed, then free
+#     AST refresh on each commit), so sharing the built copy is redundant
+#   - graph.json is multi-MB and rewritten every commit -> history bloat and
+#     guaranteed merge conflicts across parallel worker branches
+# Only this .gitignore is tracked, so the rule reaches every clone.
+*
+!.gitignore
