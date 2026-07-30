@@ -2367,6 +2367,62 @@ def test_notify_nudges_coord_notify_under_the_shared_lock(driver_factory, tmp_pa
     assert seen == [("notify",)]
 
 
+def test_stalled_stage_gets_re_nudged_on_every_stall_window(driver_factory, capsys):
+    """#1593: a stage stuck at the same fingerprint (the worker is still
+    running) must be nudged repeatedly, not just once. The old one-shot latch
+    (``nudged = False``/``True``, cleared only on a fingerprint change) fired
+    a single nudge near the start of the stall and then went silent for the
+    rest of it — `coord notify` correctly finds nothing to settle while the
+    worker is mid-run, and nothing else ever re-checks. Observed live as
+    30-40 minute dead-air gaps at every stage boundary."""
+    driver = driver_factory(
+        [board(status="running")],
+        opts=DriveOptions(
+            machine="precision",
+            poll=1.0,
+            stall_mins=1.0 / 60.0,  # 1 "second" in the fake clock's units
+            deadline_mins=8.0 / 60.0,  # 8 units — spans several stall windows
+            notify=True,
+        ),
+    )
+    notify_calls: list[tuple] = []
+    driver.run_coord = lambda args, **kw: notify_calls.append(args) or 0  # type: ignore[assignment]
+
+    assert driver.run() == EXIT_DEADLINE
+    assert notify_calls.count(("notify",)) > 1, notify_calls
+
+    err = capsys.readouterr().err
+    assert err.count("no state change in") > 1, err
+
+
+def test_smaller_stall_never_produces_fewer_nudges(driver_factory):
+    """Regression pin for the #1593 inversion: a SMALLER ``--stall`` must
+    never yield fewer nudges than a larger one over the same run. Under the
+    one-shot latch, lowering ``--stall`` made things actively worse — the
+    single available nudge fired earlier, while the worker was reliably still
+    busy, guaranteeing no follow-up ever recorded the completion."""
+
+    def nudge_count(stall_mins: float) -> int:
+        driver = driver_factory(
+            [board(status="running")],
+            opts=DriveOptions(
+                machine="precision",
+                poll=1.0,
+                stall_mins=stall_mins,
+                deadline_mins=12.0 / 60.0,
+                notify=True,
+            ),
+        )
+        calls: list[tuple] = []
+        driver.run_coord = lambda args, **kw: calls.append(args) or 0  # type: ignore[assignment]
+        driver.run()
+        return calls.count(("notify",))
+
+    small = nudge_count(1.0 / 60.0)
+    large = nudge_count(5.0 / 60.0)
+    assert small >= large > 0, (small, large)
+
+
 def test_the_config_path_is_threaded_onto_every_coord_subprocess(driver_factory):
     """A `coord drive --config X` run must not dispatch against a different
     config than it reads. The bash driver ran a bare `coord` and had this gap."""
