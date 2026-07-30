@@ -25,37 +25,20 @@
 # answer for "did my change land" — the linked graph reflects the base
 # checkout's HEAD, not the worktree's edits.
 #
-# This hook chains to the machine-local graphify hook rather than replacing
-# it: graphify's generated block pins an absolute interpreter path
-# (`_PINNED='/home/.../pipx/venvs/...'`) that is machine-specific and must not
-# be committed, so it stays in $GIT_COMMON_DIR/hooks/ where `graphify hook
-# install` put it.
+# See .githooks/_lib.sh for why every graphify hook needs a shim here.
 
 set -u
+. "$(dirname "$0")/_lib.sh"
 
 # $3 == 1 means a branch checkout (not a file checkout).  `git worktree add`
-# sets it.  Anything else is not our business — chain and exit.
+# sets it.  Anything else is not our business.
 if [ "${3:-0}" != "1" ]; then
     exit 0
 fi
 
-_abs() {
-    # git may return a path relative to cwd (it does for `.git` in the main
-    # worktree).  --path-format=absolute would be cleaner but needs git 2.31+,
-    # and older git echoes the flag back as a literal argument.
-    case "$1" in
-        /*) printf '%s\n' "$1" ;;
-        *)  printf '%s\n' "$PWD/$1" ;;
-    esac
-}
-
-_git_dir=$(_abs "$(git rev-parse --git-dir 2>/dev/null || echo .git)")
-_common_dir=$(_abs "$(git rev-parse --git-common-dir 2>/dev/null || echo .git)")
-
-if [ "$_git_dir" != "$_common_dir" ]; then
-    # ── Linked worktree ──────────────────────────────────────────────────
+if gfy_is_linked_worktree; then
     # The base checkout is the parent of the common git dir.
-    _base=$(CDPATH= cd -- "$(dirname -- "$_common_dir")" 2>/dev/null && pwd) || _base=""
+    _base=$(CDPATH= cd -- "$(dirname -- "$(gfy_common_dir)")" 2>/dev/null && pwd) || _base=""
     if [ -n "$_base" ] && [ -f "$_base/graphify-out/graph.json" ] && [ ! -L graphify-out ]; then
         # Only ever replace the stub that `git worktree add` materialises
         # (a directory holding just the tracked .gitignore).  If a real graph
@@ -75,8 +58,4 @@ if [ "$_git_dir" != "$_common_dir" ]; then
     exit 0
 fi
 
-# ── Main worktree: chain to the machine-local graphify hook ──────────────
-if [ -x "$_common_dir/hooks/post-checkout" ]; then
-    exec "$_common_dir/hooks/post-checkout" "$@"
-fi
-exit 0
+gfy_chain post-checkout "$@"

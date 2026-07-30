@@ -59,12 +59,15 @@ def _make_repo(root: Path, *, with_hooks: bool = True) -> Path:
     _git("init", "-q", ".", cwd=root)
     _git("commit", "-q", "--allow-empty", "-m", "init", cwd=root)
     if with_hooks:
-        hooks_dir = root / ".githooks"
-        hooks_dir.mkdir()
-        shutil.copy2(HOOK_SRC, hooks_dir / "post-checkout")
-        (hooks_dir / "post-checkout").chmod(0o755)
-        _git("add", "-f", ".githooks/post-checkout", cwd=root)
-        _git("commit", "-q", "-m", "add versioned hook", cwd=root)
+        # Install the REAL hook set, not just post-checkout: the hooks source
+        # _lib.sh, and copying one file in isolation would test a shape that
+        # does not exist.
+        shutil.copytree(HOOK_SRC.parent, root / ".githooks")
+        for p in (root / ".githooks").iterdir():
+            if not p.name.endswith(".sh"):
+                p.chmod(0o755)
+        _git("add", "-f", ".githooks", cwd=root)
+        _git("commit", "-q", "-m", "add versioned hooks", cwd=root)
         _git("config", "core.hooksPath", ".githooks", cwd=root)
     return root
 
@@ -398,3 +401,75 @@ def test_hooks_path_status_flags_a_missing_hook_file(tmp_path: Path) -> None:
     ok, detail = hooks_path_status(repo)
     assert ok is False
     assert "missing" in detail
+
+
+# ── the core.hooksPath replacement hazard ────────────────────────────────────
+
+
+def test_orphaned_hooks_detects_a_locally_installed_hook_with_no_shim(
+    tmp_path: Path,
+) -> None:
+    """core.hooksPath makes git ignore .git/hooks ENTIRELY — no merge, no
+    fallback.  A graphify hook with no shim in .githooks/ stops running with
+    no error and no log line.  This shipped exactly once (only post-checkout
+    had a shim, silently killing the commit/merge rebuilds)."""
+    from coord.graph_health import orphaned_hooks
+
+    repo = _make_repo(tmp_path / "repo", with_hooks=True)
+    # Simulate the shipped-broken state: only post-checkout has a shim.
+    for name in ("post-commit", "post-merge"):
+        (repo / ".githooks" / name).unlink()
+    local = repo / ".git" / "hooks"
+    local.mkdir(parents=True, exist_ok=True)
+    for name in ("post-commit", "post-merge"):
+        (local / name).write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        (local / name).chmod(0o755)
+
+    assert orphaned_hooks(repo) == ["post-commit", "post-merge"]
+
+    ok, detail = hooks_path_status(repo)
+    assert ok is False
+    assert "SILENTLY DISABLED" in detail
+
+
+def test_orphaned_hooks_is_empty_once_every_hook_has_a_shim(tmp_path: Path) -> None:
+    from coord.graph_health import orphaned_hooks
+
+    # _make_repo installs the real .githooks/, which already ships shims for
+    # every hook kind graphify installs.
+    repo = _make_repo(tmp_path / "repo", with_hooks=True)
+    local = repo / ".git" / "hooks"
+    local.mkdir(parents=True, exist_ok=True)
+    for name in ("post-commit", "post-merge"):
+        (local / name).write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        (local / name).chmod(0o755)
+
+    assert orphaned_hooks(repo) == []
+    ok, _ = hooks_path_status(repo)
+    assert ok is True
+
+
+def test_orphaned_hooks_ignores_samples_and_backups(tmp_path: Path) -> None:
+    """graphify leaves .pre-guard-upgrade.bak copies next to its hooks, and git
+    ships .sample files — neither is ever executed."""
+    from coord.graph_health import orphaned_hooks
+
+    repo = _make_repo(tmp_path / "repo", with_hooks=True)
+    local = repo / ".git" / "hooks"
+    local.mkdir(parents=True, exist_ok=True)
+    (local / "post-commit.pre-guard-upgrade.bak").write_text("x", encoding="utf-8")
+    (local / "pre-push.sample").write_text("x", encoding="utf-8")
+
+    assert orphaned_hooks(repo) == []
+
+
+def test_every_graphify_hook_in_this_repo_has_a_versioned_shim() -> None:
+    """Guard on the REAL .githooks/: adding a graphify hook kind without a shim
+    silently disables it for everyone who opted into core.hooksPath."""
+    versioned = HOOK_SRC.parent
+    present = {p.name for p in versioned.iterdir() if p.is_file()}
+    for required in ("post-checkout", "post-commit", "post-merge"):
+        assert required in present, f".githooks/{required} is missing"
+        assert os.access(versioned / required, os.X_OK), (
+            f".githooks/{required} is not executable — git will ignore it"
+        )
