@@ -47,6 +47,10 @@ import sys
 import threading
 from dataclasses import asdict, fields
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import asyncio
 
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -3048,7 +3052,12 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
     # described on ``board()`` below.  Set/cleared only from synchronous
     # spans of ``board()`` with no ``await`` in between, so the check-then-set
     # is race-free on the single-threaded event loop.
-    _board_inflight: object | None = None  # asyncio.Future | None
+    # Real runtime type is asyncio.Future[tuple] | None; the module-level
+    # import stays TYPE_CHECKING-only (this file otherwise has no need for
+    # `asyncio` at import time) — safe because `from __future__ import
+    # annotations` (top of file) means this annotation is never evaluated
+    # at runtime, only read by type checkers.
+    _board_inflight: asyncio.Future[tuple] | None = None
 
     def _stamp_board_version(result: dict) -> tuple[str, bytes]:
         """Serialize *result* to JSON exactly once, bump the version when the
@@ -3074,6 +3083,16 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         import json as _json  # noqa: PLC0415
 
         result.pop("board_version", None)  # hash/render content, not the stamp
+        # NOTE: only ``TypeError`` (an object json.dumps doesn't know how to
+        # serialize, e.g. a stray dataclass/Enum that slipped past
+        # bound_board_payload) falls back to the slower ``default=str``
+        # encoder below. A ``ValueError`` here means a NaN/Infinity float
+        # somewhere in the payload — with ``allow_nan=False`` that must
+        # raise, exactly as it did pre-#1597 inside Starlette's
+        # ``JSONResponse(result).render()`` (same dumps() params), rather
+        # than being silently swallowed into a permissive re-encode that
+        # would emit non-spec-compliant ``NaN``/``Infinity`` tokens on the
+        # wire.
         try:
             # Same dumps() params Starlette's JSONResponse.render() uses, so
             # the wire body is unchanged from before this fix (no sort_keys —
@@ -3082,12 +3101,18 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 result, ensure_ascii=False, allow_nan=False,
                 indent=None, separators=(",", ":"),
             ).encode("utf-8")
-        except (TypeError, ValueError):
+        except TypeError:
             # Unhashable content: treat every build as new (never serve a
             # stale 304 because versioning failed) and fall back to the
-            # slower per-response encoder (default=str) for this one body.
+            # slower per-response encoder (default=str) for this one body —
+            # keeping the same allow_nan/ensure_ascii/separators contract so
+            # a NaN/Infinity float STILL raises here rather than sneaking
+            # through under the fallback's more permissive defaults.
             digest = f"unhashable-{_time_ns()}"
-            body = _json.dumps(result, default=str).encode("utf-8")
+            body = _json.dumps(
+                result, ensure_ascii=False, allow_nan=False,
+                indent=None, separators=(",", ":"), default=str,
+            ).encode("utf-8")
         else:
             digest = hashlib.sha256(body).hexdigest()[:16]
         if digest != _board_hash:
@@ -3644,6 +3669,28 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             return JSONResponse(
                 {"error": "board read failed", "detail": str(e)}, status_code=503
             )
+        except BaseException as e:
+            # Any OTHER failure out of _build() — e.g. ``_gate_refresher.
+            # snapshot()`` or ``bound_board_payload()`` near the top/bottom of
+            # _build(), neither of which is wrapped in a _BoardReadError
+            # ``try/except`` — or task cancellation from a client disconnect
+            # on the ``await`` itself (``asyncio.CancelledError`` is a
+            # BaseException, not an Exception, so a bare ``except Exception``
+            # would miss it and leave this branch unreachable for that case).
+            # Pre-#1597 there was no shared state for such an exception to
+            # corrupt: it just failed the one in-flight request. Post-#1597,
+            # leaving ``_board_inflight``/``_fut`` untouched here would wedge
+            # EVERY future ``/board`` request behind a future that never
+            # resolves, permanently, until the daemon restarts. Clear the
+            # slot and resolve every follower exactly like the
+            # ``_BoardReadError`` branch above, then re-raise so the leader's
+            # OWN request still surfaces the way it did before single-flight
+            # existed (Starlette's default unhandled-exception 500) — only
+            # the wedge is new, and only the wedge is fixed here.
+            _board_inflight = None
+            if not _fut.done():
+                _fut.set_result(("error", str(e)))
+            raise
         # Publish atomically: stamp + cache + built-at + body move as one unit
         # under the lock, and a build whose DB snapshot is OLDER than the
         # cached one is not published at all (concurrent rebuilds finishing
@@ -3655,13 +3702,23 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         # requester (and any of ITS followers), but unstamped and uncacheable.
         etag: str | None = None
         body: bytes | None = None
-        with _board_lock:
-            if built_at >= _board_cache_built_at:
-                etag, body = _stamp_board_version(result)
-                _board_cache = result
-                _board_body = body
-                _board_cache_at = _time.monotonic()
-                _board_cache_built_at = built_at
+        try:
+            with _board_lock:
+                if built_at >= _board_cache_built_at:
+                    etag, body = _stamp_board_version(result)
+                    _board_cache = result
+                    _board_body = body
+                    _board_cache_at = _time.monotonic()
+                    _board_cache_built_at = built_at
+        except BaseException as e:
+            # Same wedge risk as above, just on the publish side (e.g. a
+            # surprise failure inside ``_stamp_board_version``): the build
+            # itself succeeded but stamping/publishing blew up. Followers
+            # must still be released rather than hang forever.
+            _board_inflight = None
+            if not _fut.done():
+                _fut.set_result(("error", str(e)))
+            raise
         _board_inflight = None
         _fut.set_result(("ok", result, etag, body))
         return _respond(result, etag, body)
