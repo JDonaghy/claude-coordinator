@@ -1058,6 +1058,22 @@ def test_advisory_with_no_commits_on_the_branch_is_terminal():
     assert verifier.commits_calls == 1
 
 
+def test_advisory_with_no_commits_is_terminal_even_with_accept_advisory():
+    """#1606: `--accept-advisory` exists to unblock the #1357 false-positive
+    (real commits, downgraded status) — it must NOT adopt a genuine
+    zero-commit advisory as though it were completed work. The zero-commit
+    check runs before the accept_advisory branch is ever consulted."""
+    verifier = FakeVerifier(has_commits=False)
+    action = step(
+        state(work_aid="w1", work_status="advisory", work_branch="b"),
+        DriveOptions(machine="precision", accept_advisory=True),
+        verifier=verifier,
+    )
+    assert action.is_exit
+    assert "no commits on its branch" in action.message
+    assert verifier.commits_calls == 1
+
+
 def test_advisory_with_commits_stops_and_names_1357_without_accept_advisory():
     action = step(
         state(work_aid="w1", work_status="advisory", work_branch="b"),
