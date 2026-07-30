@@ -96,6 +96,13 @@ class IssueState:
 
     smoke_aid: str = ""
     smoke_status: str = ""
+    # #1605: mirrors `work_failure_reason`/`review_failure_reason` — the Test
+    # stage's own child (`type="smoke"`) assignment's persisted
+    # `failure_reason`, so `_decide_test` can recognise an environmental
+    # death (#1590) or report *why* a stranded Test stage died instead of
+    # polling `test_state == "running"` forever against a child that has
+    # already finished.
+    smoke_failure_reason: str = ""
 
     active_count: int = 0
     active_types: tuple[str, ...] = ()
@@ -291,6 +298,7 @@ def project(payload: dict, repo: str, issue: int, config: Any) -> IssueState:
         review_failure_reason=g(review, "failure_reason"),
         smoke_aid=g(smoke, "assignment_id"),
         smoke_status=g(smoke, "status"),
+        smoke_failure_reason=g(smoke, "failure_reason"),
         active_count=len(active),
         active_types=tuple(sorted({(a.get("type") or "?") for a in active})),
         merge_status=(merge_entry or {}).get("status") or "",

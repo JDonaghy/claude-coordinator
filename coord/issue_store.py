@@ -196,6 +196,7 @@ def _update_local_state(
     branch: str | None,
     review_state: str | None,
     failure_reason: str | None = None,
+    exit_code: int | None = None,
 ) -> None:
     """Update the local assignments row + notifications ledger.
 
@@ -210,6 +211,16 @@ def _update_local_state(
     ``coord status`` and ``coord drive`` can recognise it without re-parsing
     the worker log themselves. It never forces or implies a particular
     ``terminal_status`` — the caller decides that independently.
+
+    ``exit_code`` (#1605) is likewise optional. Before this, NO write path
+    ever persisted the ``assignments.exit_code`` column for a headless
+    completion — the field existed in the schema (read directly by the Rust
+    TUI, ``tui/src/app/data.rs``) but was always ``NULL``, which is exactly
+    why a failed Test-stage worker's reap left both ``failure_reason`` AND
+    ``exit_code`` null and undiagnosable from the board (#1605). Written
+    verbatim when given; omitted (``None``) leaves the column untouched, so
+    callers with no exit code available (e.g. a launch failure) behave
+    exactly as before this parameter existed.
     """
     # Import inside the function so test fixtures that stub the seam can
     # still import this module without dragging in the DB layer.
@@ -230,6 +241,9 @@ def _update_local_state(
     if failure_reason is not None:
         fields.append("failure_reason=?")
         params.append(failure_reason[:512])  # cap at 512 chars — one-liner
+    if exit_code is not None:
+        fields.append("exit_code=?")
+        params.append(exit_code)
     params.append(assignment_id)
     conn.execute(
         f"UPDATE assignments SET {', '.join(fields)} WHERE assignment_id=?",

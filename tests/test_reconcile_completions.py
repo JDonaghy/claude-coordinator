@@ -45,7 +45,7 @@ class _Recorder:
 
     def __call__(
         self, *, assignment_id, terminal_status, branch, review_state,
-        failure_reason=None,
+        failure_reason=None, exit_code=None,
     ) -> None:
         self.calls.append(
             {
@@ -54,6 +54,7 @@ class _Recorder:
                 "branch": branch,
                 "review_state": review_state,
                 "failure_reason": failure_reason,
+                "exit_code": exit_code,
             }
         )
 
@@ -72,7 +73,8 @@ def test_flips_running_to_done_when_agent_reports_completed() -> None:
     assert out[0]["issue_number"] == 411
     assert rec.calls == [
         {"assignment_id": "w1", "terminal_status": "done",
-         "branch": "issue-1-x", "review_state": None, "failure_reason": None}
+         "branch": "issue-1-x", "review_state": None, "failure_reason": None,
+         "exit_code": None}
     ]
 
 
@@ -95,7 +97,8 @@ def test_review_completion_maps_to_finalizing_not_done() -> None:
     assert out[0]["to_status"] == "finalizing"
     assert rec.calls == [
         {"assignment_id": "r1", "terminal_status": "finalizing",
-         "branch": "issue-1-x", "review_state": None, "failure_reason": None}
+         "branch": "issue-1-x", "review_state": None, "failure_reason": None,
+         "exit_code": None}
     ]
 
 
@@ -323,7 +326,7 @@ def test_captures_branch_from_agent_entry_when_board_branch_missing() -> None:
     assert rec.calls == [
         {"assignment_id": "ta1", "terminal_status": "done",
          "branch": "issue-1041-test-author-ms-33-acceptance-suite",
-         "review_state": None, "failure_reason": None}
+         "review_state": None, "failure_reason": None, "exit_code": None}
     ]
 
 
@@ -612,3 +615,117 @@ def test_daemon_tick_disabled_when_interval_zero(monkeypatch, tmp_path) -> None:
     with TestClient(app):
         time.sleep(0.2)
     assert calls == []  # interval 0 → no background tick at all
+
+
+# ---------------------------------------------------------------------------
+# #1605: a Test-stage (`type="smoke"`) child reaching a terminal FAILED
+# status must resolve the parent work row's `test_state` instead of leaving
+# it stranded at "running" forever.
+# ---------------------------------------------------------------------------
+
+
+def test_exit_code_persisted_on_terminal_write(coord_db) -> None:
+    """#1605: before this, NO write path on the daemon's passive tick ever
+    persisted `assignments.exit_code` — the column existed (read directly by
+    the Rust TUI, tui/src/app/data.rs) but was always NULL. The reap already
+    computes it; it just needs to ride along on this same write."""
+    from coord.state import _record_dispatched_assignment_local
+
+    _record_dispatched_assignment_local(
+        assignment=_running("w1", atype="work"), repo_github="acme/cc",
+    )
+    reconcile_completed_assignments(
+        _config(),
+        board=_board(_running("w1", atype="work")),
+        agent_status_fn=lambda host: {
+            "completed": [{"id": "w1", "status": "failed", "exit_code": 17}]
+        },
+        capture_plan=False,
+    )
+    row = coord_db.execute(
+        "SELECT exit_code FROM assignments WHERE assignment_id='w1'"
+    ).fetchone()
+    assert row["exit_code"] == 17
+
+
+def _seed_smoke_topology(
+    coord_db, *, work_test_state: str = "running",
+) -> Assignment:
+    """Seed the exact #1605 bug-report topology in the DB: a `done` work row
+    with `test_state` still `"running"`, and its `type="smoke"` child
+    (status still `"running"`) about to be observed terminal by the agent
+    poll below. Returns the smoke Assignment so callers can put it on the
+    in-memory board too (`reconcile_completed_assignments` reads `board`,
+    not the DB, for the RUNNING row it polls)."""
+    from coord.state import _record_dispatched_assignment_local
+
+    work = Assignment(
+        machine_name="dellserver", repo_name="cc", issue_number=411,
+        issue_title="t", status="done", assignment_id="work-1605",
+        type="work", branch="issue-411-x", test_state=work_test_state,
+    )
+    _record_dispatched_assignment_local(assignment=work, repo_github="acme/cc")
+
+    smoke = Assignment(
+        machine_name="dellserver", repo_name="cc", issue_number=411,
+        issue_title="[smoke] t", status="running", assignment_id="smoke-1605",
+        type="smoke", branch="issue-411-x",
+        review_of_assignment_id="work-1605",
+    )
+    _record_dispatched_assignment_local(assignment=smoke, repo_github="acme/cc")
+    return smoke
+
+
+def test_smoke_environmental_failure_clears_stuck_test_state(coord_db) -> None:
+    """#1605 acceptance: seed the exact reported topology (work done +
+    test_state='running'; smoke about to land FAILED with an environmental
+    cause) and assert the parent's test_state resolves to a real
+    verdict-or-retry state — NULL here, so the daemon's normal
+    dispatch_pending_smoke re-dispatches a fresh Test stage — rather than
+    staying wedged at 'running' forever."""
+    smoke = _seed_smoke_topology(coord_db)
+    out = reconcile_completed_assignments(
+        _config(),
+        board=_board(smoke),
+        agent_status_fn=lambda host: {"completed": [
+            {
+                "id": "smoke-1605", "status": "failed", "exit_code": 0,
+                "api_error_reason": "api_error: aborted_streaming",
+            },
+        ]},
+        capture_plan=False,
+    )
+    assert out and out[0]["to_status"] == "failed"
+
+    work_row = coord_db.execute(
+        "SELECT test_state FROM assignments WHERE assignment_id='work-1605'"
+    ).fetchone()
+    assert work_row["test_state"] is None  # resolved, not stuck at 'running'
+
+    smoke_row = coord_db.execute(
+        "SELECT status, failure_reason, exit_code FROM assignments "
+        "WHERE assignment_id='smoke-1605'"
+    ).fetchone()
+    assert smoke_row["status"] == "failed"
+    assert smoke_row["failure_reason"] == "api_error: aborted_streaming"
+    assert smoke_row["exit_code"] == 0
+
+
+def test_smoke_work_failure_records_test_failed(coord_db) -> None:
+    """#1605: a smoke worker that dies with NO environmental signal is a
+    genuine work failure — `test_state="failed"`, exactly like a normal
+    non-zero-exit smoke completion, so `coord fix` still picks it up."""
+    smoke = _seed_smoke_topology(coord_db)
+    reconcile_completed_assignments(
+        _config(),
+        board=_board(smoke),
+        agent_status_fn=lambda host: {"completed": [
+            {"id": "smoke-1605", "status": "failed", "exit_code": 1},
+        ]},
+        capture_plan=False,
+    )
+    work_row = coord_db.execute(
+        "SELECT test_state, smoke_test FROM assignments WHERE assignment_id='work-1605'"
+    ).fetchone()
+    assert work_row["test_state"] == "failed"
+    assert work_row["smoke_test"] == "fail"

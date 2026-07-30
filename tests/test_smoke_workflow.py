@@ -646,6 +646,171 @@ class TestFix:
         assert "issue-42-feature-x" in captured["briefing"]  # same branch
         assert "headless smoke" in captured["briefing"]  # the failure story
 
+    def test_headless_smoke_environmental_failure_clears_test_state(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """#1605: a smoke WORKER dying on a terminal API error (#1584) must
+        NOT strand the parent's `test_state` at `"running"` forever, and
+        must NOT be recorded as a work failure (that would burn the bounded
+        `coord fix` retry budget on a code defect that never existed — the
+        #1590 environmental/work split, applied to the Test stage for the
+        first time). This is the #1598 incident's exact shape: exit_code=0
+        (the wrapper itself exited clean) but the transcript's last `result`
+        event carried `is_error: true`.
+        """
+        from coord.models import Assignment as _A
+        from coord.notify import EVENT_FAILURE, Transition, post_transition
+        from coord.state import (
+            _record_dispatched_assignment_local,
+            get_connection,
+        )
+
+        # The parent work row, Test stage already dispatched and "running"
+        # (dispatch_smoke's own #1426 marker) — the exact stuck topology
+        # from the bug report.
+        work = _done_assignment(test_state="running")
+        state_mod.save_board(_make_board(work))
+
+        _record_dispatched_assignment_local(
+            assignment=_A(
+                assignment_id="smoke-1605-env",
+                machine_name="laptop",
+                repo_name="api",
+                issue_number=42,
+                issue_title="[smoke] Add feature X",
+                type="smoke",
+                status="running",
+                review_of_assignment_id="abc-123",
+                branch="issue-42-feature-x",
+            ),
+            repo_github="acme/api",
+        )
+
+        transition = Transition(
+            assignment_id="smoke-1605-env",
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=42,
+            event=EVENT_FAILURE,
+            exit_code=0,
+        )
+        record = {
+            "repo_github": "acme/api",
+            "type": "smoke",
+            "review_of_assignment_id": "abc-123",
+        }
+        entry = {
+            "started_at": 1000.0,
+            "finished_at": 1010.0,
+            "branch": "issue-42-feature-x",
+            "log_path": None,
+            # The literal format `format_api_error_reason` stamps for a
+            # terminal `aborted_streaming` result event with no HTTP status
+            # (`coord.worker_events.format_api_error_reason`) — matches the
+            # #1598 incident's own worker log line verbatim: "reap: terminal
+            # API error detected — api_error: aborted_streaming (#1584)".
+            "api_error_reason": "api_error: aborted_streaming",
+        }
+
+        with (
+            patch("coord.notify.post_failure"),
+            patch("coord.notify._capture_cost"),
+            patch("coord.notify._capture_smoke_tests"),
+            patch("coord.notify._capture_completion_summary"),
+            patch("coord.notify._capture_claude_session_id"),
+        ):
+            post_transition(transition, record, entry)
+
+        conn = get_connection()
+
+        # The parent verdict is cleared (NULL), not left "running" and not
+        # recorded as a work failure — `dispatch_pending_smoke`'s
+        # `test_state is not None` eligibility gate now picks it back up.
+        work_row = conn.execute(
+            "SELECT test_state FROM assignments WHERE assignment_id='abc-123'"
+        ).fetchone()
+        assert work_row["test_state"] is None
+
+        # The smoke CHILD row itself records a non-null failure_reason and
+        # exit_code — undiagnosable-from-the-board was the #1605 report's
+        # third gap.
+        smoke_row = conn.execute(
+            "SELECT status, failure_reason, exit_code FROM assignments "
+            "WHERE assignment_id='smoke-1605-env'"
+        ).fetchone()
+        assert smoke_row["status"] == "failed"
+        assert smoke_row["failure_reason"] == "api_error: aborted_streaming"
+        assert smoke_row["exit_code"] == 0
+
+    def test_headless_smoke_work_failure_records_test_failed(
+        self, config_file: Path, coord_dir: Path
+    ) -> None:
+        """#1605: a smoke worker that dies for a reason with NO environmental
+        signal (an unclassifiable crash, not a provider blip) records a real
+        `test_state="failed"` — exactly like a normal non-zero-exit smoke
+        completion already does — so the existing bounded `coord fix` loop
+        still picks it up.
+        """
+        from coord.models import Assignment as _A
+        from coord.notify import EVENT_FAILURE, Transition, post_transition
+        from coord.state import (
+            _record_dispatched_assignment_local,
+            get_connection,
+        )
+
+        work = _done_assignment(test_state="running")
+        state_mod.save_board(_make_board(work))
+
+        _record_dispatched_assignment_local(
+            assignment=_A(
+                assignment_id="smoke-1605-work",
+                machine_name="laptop",
+                repo_name="api",
+                issue_number=42,
+                issue_title="[smoke] Add feature X",
+                type="smoke",
+                status="running",
+                review_of_assignment_id="abc-123",
+                branch="issue-42-feature-x",
+            ),
+            repo_github="acme/api",
+        )
+
+        transition = Transition(
+            assignment_id="smoke-1605-work",
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=42,
+            event=EVENT_FAILURE,
+            exit_code=1,
+        )
+        record = {
+            "repo_github": "acme/api",
+            "type": "smoke",
+            "review_of_assignment_id": "abc-123",
+        }
+        entry = {
+            "started_at": 1000.0,
+            "finished_at": 1010.0,
+            "branch": "issue-42-feature-x",
+            "log_path": None,
+        }
+
+        with (
+            patch("coord.notify.post_failure"),
+            patch("coord.notify._capture_cost"),
+            patch("coord.notify._capture_smoke_tests"),
+            patch("coord.notify._capture_completion_summary"),
+            patch("coord.notify._capture_claude_session_id"),
+        ):
+            post_transition(transition, record, entry)
+
+        row = get_connection().execute(
+            "SELECT test_state, smoke_test FROM assignments WHERE assignment_id='abc-123'"
+        ).fetchone()
+        assert row["test_state"] == "failed"
+        assert row["smoke_test"] == "fail"
+
     def test_fix_not_found(
         self, config_file: Path, coord_dir: Path
     ) -> None:

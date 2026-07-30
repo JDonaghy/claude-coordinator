@@ -1872,6 +1872,42 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
                     test_state="passed" if succeeded else "failed",
                     test_reason="headless smoke",
                 )
+    elif transition.event == EVENT_FAILURE and assignment_type == "smoke":
+        # #1605: the Test-stage WORKER itself died (a dead agent, a killed
+        # process group, a terminal API error — anything short of the
+        # worker actually printing `SMOKE: pass`/`SMOKE: fail`) without ever
+        # producing a verdict. Mirrors the EVENT_COMPLETION branch above
+        # (#1021) but for the terminal-FAILED case that branch never
+        # covered: before this, a failed smoke row left the parent's
+        # `test_state` at whatever `dispatch_smoke` set it to (almost always
+        # `"running"`, #1426) — forever, since no gate ever resolves
+        # `"running"` on its own. That is the #1598 incident: a smoke worker
+        # died on a terminal API error and the issue was permanently
+        # stranded with the board reporting a plausible in-progress state.
+        _failure_reason = (
+            entry.get("usage_limit_reason") or entry.get("api_error_reason")
+        )
+        post_failure(
+            exit_code=transition.exit_code,
+            error=entry.get("error") or _failure_reason or "",
+            **common,
+        )
+        mark_notified(
+            transition.assignment_id,
+            transition.event,
+            branch=entry.get("branch"),
+            failure_reason=_failure_reason,
+            exit_code=transition.exit_code,
+        )
+        parent_id = record.get("review_of_assignment_id")
+        if parent_id:
+            from coord.reconcile import (  # noqa: PLC0415
+                propagate_smoke_terminal_failure,
+            )
+            propagate_smoke_terminal_failure(
+                parent_assignment_id=parent_id,
+                failure_reason=_failure_reason,
+            )
     elif transition.event == EVENT_COMPLETION:
         post_completion(exit_code=transition.exit_code or 0, **common)
         mark_notified(
@@ -1893,6 +1929,15 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
             branch=entry.get("branch"),
         )
     else:
+        # #1605: carry the agent's own diagnostic (a usage-limit kill or a
+        # terminal API-error classification, both stamped by
+        # `AgentServer._reap` onto this same `/status` completed entry —
+        # see `coord.reconcile.reconcile_completed_assignments`'s identical
+        # `or`) through to `mark_notified` so a `status='failed'` row is
+        # never left with both `failure_reason` and `exit_code` null.
+        _failure_reason = (
+            entry.get("usage_limit_reason") or entry.get("api_error_reason")
+        )
         post_failure(
             exit_code=transition.exit_code,
             error=entry.get("error") or "",
@@ -1902,6 +1947,8 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
             transition.assignment_id,
             transition.event,
             branch=entry.get("branch"),
+            failure_reason=_failure_reason,
+            exit_code=transition.exit_code,
         )
 
 

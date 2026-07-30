@@ -646,6 +646,88 @@ def test_reset_test_clears_test_state(monkeypatch, config) -> None:
     assert calls["test"] == ("api", 42)
 
 
+# ── #1605: stuck test_state with a terminal smoke child ─────────────────────
+
+
+def test_stuck_test_state_with_terminal_smoke_child_is_recovered(monkeypatch, config) -> None:
+    """#1605 acceptance: seed the exact reported topology (work done +
+    test_state='running'; smoke failed, no live assignment) and assert
+    `coord diagnose --stage test` reports the contradiction and resolves it
+    — instead of the pre-#1605 'stage looks healthy' (nothing to reconcile,
+    since `_recover_work_like` never looked past the already-`done` work
+    row)."""
+    _stub(monkeypatch, session="dead")  # the work row's own session is irrelevant here
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        "coord.reconcile.propagate_smoke_terminal_failure",
+        lambda *, parent_assignment_id, failure_reason: calls.append(
+            {"parent_assignment_id": parent_assignment_id, "failure_reason": failure_reason}
+        ),
+    )
+    work = _assign(aid="w1", typ="work", status="done")
+    work.test_state = "running"
+    smoke = _assign(
+        aid="s1", typ="smoke", status="failed", review_of="w1",
+        failure_reason="api_error: aborted_streaming",
+    )
+    board = Board(completed=[work, smoke])
+
+    res = diagnose.diagnose_stage(board, config, "api", 42, "test")
+
+    assert any("test_state='running'" in f and "s1" in f for f in res.findings)
+    assert calls == [
+        {"parent_assignment_id": "w1", "failure_reason": "api_error: aborted_streaming"}
+    ]
+    assert any("resolved stuck test_state" in a for a in res.actions_taken)
+    assert res.recovered is True
+
+
+def test_stuck_test_state_dry_run_reports_without_writing(monkeypatch, config) -> None:
+    _stub(monkeypatch, session="dead")
+
+    def _boom(*a, **k):  # noqa: ANN002, ANN003
+        raise AssertionError("dry-run must not write")
+
+    monkeypatch.setattr("coord.reconcile.propagate_smoke_terminal_failure", _boom)
+    work = _assign(aid="w1", typ="work", status="done")
+    work.test_state = "running"
+    smoke = _assign(aid="s1", typ="smoke", status="failed", review_of="w1")
+    board = Board(completed=[work, smoke])
+
+    res = diagnose.diagnose_stage(board, config, "api", 42, "test", dry_run=True)
+    assert res.needs_reset is True
+    assert any("would resolve" in f for f in res.findings)
+
+
+def test_stuck_test_state_with_no_smoke_child_flags_a_finding(monkeypatch, config) -> None:
+    """No smoke row exists at all for the work row — the #1426 'running'
+    marker is set at dispatch time, so a missing child is itself a
+    contradiction worth surfacing, distinct from the terminal-child case."""
+    _stub(monkeypatch, session="dead")
+    work = _assign(aid="w1", typ="work", status="done")
+    work.test_state = "running"
+    board = Board(completed=[work])
+
+    res = diagnose.diagnose_stage(board, config, "api", 42, "test")
+    assert any("no Test-stage (smoke) assignment" in f for f in res.findings)
+    assert res.needs_reset is True
+
+
+def test_stuck_test_state_with_a_live_smoke_child_is_not_a_contradiction(monkeypatch, config) -> None:
+    """A smoke child still genuinely running is the ordinary in-flight Test
+    stage — must fall through to the normal work-like recovery, not be
+    mistaken for the #1605 stranded case."""
+    _stub(monkeypatch, session="dead")
+    work = _assign(aid="w1", typ="work", status="done")
+    work.test_state = "running"
+    smoke = _assign(aid="s1", typ="smoke", status="running", review_of="w1")
+    board = Board(active=[smoke], completed=[work])
+
+    res = diagnose.diagnose_stage(board, config, "api", 42, "test")
+    assert any("stage looks healthy" in f for f in res.findings)
+    assert res.recovered is True
+
+
 def test_reset_dry_run_does_nothing(monkeypatch, config) -> None:
     calls = _stub(monkeypatch, session="live")
     a = _assign(aid="w1", typ="work", status="running")
