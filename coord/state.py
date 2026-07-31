@@ -3636,6 +3636,59 @@ def _close_issue_local(
     github_ops.close_issue(slug, issue_number, comment=comment, force=force)
 
 
+def reopen_issue(
+    repo_name: str,
+    issue_number: int,
+    *,
+    comment: str | None = None,
+    repo_github: str | None = None,
+) -> None:
+    """Reopen an issue through the issue-tracker seam (#1078, mirrors
+    ``close_issue``).
+
+    Routes to the daemon (``POST /issue-reopen``) when ``board_service`` is
+    set, else writes locally. The actual TRACKER write (GitHub via ``gh``
+    today) lives in the ``_local`` impl, so the backend stays behind one
+    seam.
+
+    Idempotent — reopening an already-open issue is a no-op.
+    """
+    svc = _board_service()
+    if svc is not None:
+        from coord.client import post_record  # noqa: PLC0415
+
+        post_record(svc, "/issue-reopen", {
+            "repo_name": repo_name,
+            "issue_number": issue_number,
+            "comment": comment,
+            "repo_github": repo_github,
+        })
+        return
+    _reopen_issue_local(
+        repo_name, issue_number, comment=comment, repo_github=repo_github,
+    )
+
+
+def _reopen_issue_local(
+    repo_name: str,
+    issue_number: int,
+    *,
+    comment: str | None = None,
+    repo_github: str | None = None,
+) -> None:
+    """Backend adapter (GitHub today): reopen the issue via ``github_ops``.
+
+    The daemon endpoint (``POST /issue-reopen``) calls this function directly
+    — it never recurses back out over HTTP. Like ``_close_issue_local``, the
+    local ``issues`` cache only tracks *open* issues, so a reopened issue will
+    be picked up on the next ``coord sync``.
+    """
+    from coord import github_ops  # noqa: PLC0415
+
+    slug = repo_github or repo_name
+    github_ops.reopen_issue(slug, issue_number, comment=comment)
+
+
 def upsert_open_issues(repo_name: str, issues: list[dict]) -> None:
     """Persist open issues for a repo into the issues table — routes to the
     daemon when ``board_service`` is set (#601), else writes the local DB.

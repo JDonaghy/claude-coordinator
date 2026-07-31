@@ -2454,6 +2454,33 @@ def _openapi_spec() -> dict:
                 },
             }
         },
+        "/issue-reopen": {
+            "post": {
+                "summary": "Reopen an issue (optionally with a comment) through the tracker seam (#1078)",
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "repo_name": {"type": "string"},
+                                    "issue_number": {"type": "integer"},
+                                    "comment": {"type": "string", "nullable": True},
+                                    "repo_github": {"type": "string", "nullable": True},
+                                },
+                                "required": ["repo_name", "issue_number"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {"description": "OK"},
+                    "400": {"description": "Missing field"},
+                    "503": {"description": "GitHub write failed"},
+                },
+            }
+        },
         "/milestone-edit": {
             "post": {
                 "summary": "Create or edit a GitHub milestone through the tracker seam (#645)",
@@ -4590,6 +4617,32 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             )
         return JSONResponse({"updated": True})
 
+    async def post_issue_reopen(request: Request) -> Response:
+        # #1078: reopen an issue (optionally posting a comment first) through
+        # the tracker seam — the complement to /issue-close. Client sends
+        # (repo_name, issue_number, comment?, repo_github?) and gets back
+        # {"updated": true}.
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        try:
+            state._reopen_issue_local(
+                body["repo_name"],
+                body["issue_number"],
+                comment=body.get("comment"),
+                repo_github=body.get("repo_github"),
+            )
+        except KeyError as e:
+            return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "issue-reopen write failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"updated": True})
+
     async def post_issue_label(request: Request) -> Response:
         # #802: generic add/remove of arbitrary labels through the seam.
         # The actual gh call runs HERE on the daemon so the tracker stays
@@ -5700,6 +5753,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             "/issue-milestone-remove", post_issue_milestone_remove, methods=["POST"]
         ),
         Route("/issue-close", post_issue_close, methods=["POST"]),
+        Route("/issue-reopen", post_issue_reopen, methods=["POST"]),
         Route("/milestone-edit", post_milestone_edit, methods=["POST"]),
         Route("/issue-context", get_issue_context, methods=["GET"]),
         Route("/issue-context", post_issue_context, methods=["POST"]),

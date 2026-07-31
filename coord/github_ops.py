@@ -536,6 +536,32 @@ def close_issue(
         )
 
 
+def reopen_issue(
+    repo: str, issue_number: int, *, comment: str | None = None,
+) -> None:
+    """Reopen a GitHub issue, optionally posting *comment* first.
+
+    Idempotent — reopening an already-open issue is a no-op. Raises
+    RuntimeError on any other ``gh`` failure. Part of the issue-tracker seam
+    (GitHub backend); GitLab / bare-DB adapters slot in alongside this later
+    (#806).
+
+    Mirror of :func:`close_issue` for the complement operation (issue #1078).
+    """
+    if comment:
+        post_issue_comment(repo, issue_number, comment)
+    result = subprocess.run(
+        ["gh", "issue", "reopen", str(issue_number), "--repo", repo],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0 and "already open" not in result.stderr.lower():
+        raise RuntimeError(
+            f"gh issue reopen #{issue_number} failed: {result.stderr.strip()}"
+        )
+
+
 def check_pr_mergeable(repo: str, number: int) -> bool | None:
     """Return GitHub's current mergeability verdict for PR *number* (#1477).
 
