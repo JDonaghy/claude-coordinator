@@ -1028,22 +1028,27 @@ impl CoordApp {
             }),
             // #1003: Plans-panel row — reuses `MilestoneHeader` rather than a
             // new parallel target (the Plans panel's own doc comment says it
-            // "elevates and subsumes" the old MilestoneDag view). Only rows
-            // that already have a tracking epic (`tracking_issue: Some`) get
-            // a menu — a milestone surfaced purely because member issues
-            // reference it (no epic yet, `PlanRosterEntry::tracking_issue ==
-            // None`) has no issue for `coord milestone dispatch`/`chat`/
-            // `order`/"Close" to act on. Right-click on such a row is a
-            // silent no-op for now (matches pre-#1003 behaviour — not a
-            // regression); promoting a stub to a full epic is `coord
-            // milestone chat` today, same as before this issue.
-            SidebarView::Plans => self.plans_selected().and_then(|e| {
-                e.tracking_issue.map(|tracking_issue| ContextMenuTarget::MilestoneHeader {
+            // "elevates and subsumes" the old MilestoneDag view).
+            //
+            // #1123 (contract §4a): the old gate that only built a target
+            // for rows with a tracking epic (`tracking_issue: Some`) is
+            // dropped — every Plans row is now right-clickable. A milestone
+            // surfaced purely because member issues reference it (no epic
+            // yet, `PlanRosterEntry::tracking_issue == None`) builds a
+            // `PlansStub` target instead of `MilestoneHeader`, which offers
+            // "Create work order / promote to epic…" (contract §4b) rather
+            // than a silent no-op.
+            SidebarView::Plans => self.plans_selected().map(|e| match e.tracking_issue {
+                Some(tracking_issue) => ContextMenuTarget::MilestoneHeader {
                     repo_name: e.repo.clone(),
                     tracking_issue,
                     milestone_title: e.title.clone(),
                     milestone_number: e.milestone_number,
-                })
+                },
+                None => ContextMenuTarget::PlansStub {
+                    repo_name: Some(e.repo.clone()),
+                    milestone: Some((e.milestone_number, e.title.clone())),
+                },
             }),
             // #956: Terminal-view tree — only terminal rows get a menu; a
             // machine row (or nothing selected) has no verb defined yet.
@@ -1093,6 +1098,9 @@ impl CoordApp {
                 *milestone_number,
             ),
             ContextMenuTarget::TerminalRow { .. } => self.context_menu_items_for_terminal_row(),
+            ContextMenuTarget::PlansStub { repo_name, milestone } => {
+                self.context_menu_items_for_plans_stub(repo_name.as_deref(), milestone.as_ref())
+            }
         };
         if items.is_empty() {
             return false;
@@ -5879,6 +5887,7 @@ impl CoordApp {
                     ContextMenuTarget::MachineRow { .. } => 0,
                     ContextMenuTarget::MilestoneHeader { tracking_issue, .. } => *tracking_issue,
                     ContextMenuTarget::TerminalRow { .. } => 0,
+                    ContextMenuTarget::PlansStub { .. } => 0,
                 };
                 self.push_toast(
                     "Copy",
@@ -5892,6 +5901,44 @@ impl CoordApp {
             }
             "refresh" => {
                 self.refresh();
+                true
+            }
+            // #1123 (contract §4c): "New plan > Quick capture" — the
+            // labelled menu equivalent of the bare `c` key. Opens the same
+            // title-entry prompt `c` arms (`pending_plan_capture`); submit
+            // handling (`capture_plan_stub`) is unchanged.
+            "capture-plan-quick" => {
+                self.pending_plan_capture = Some(String::new());
+                true
+            }
+            // #1123 (contract §4c): "New plan > Guided chat…" — the
+            // labelled menu equivalent of the bare `C` key. Opens the same
+            // (optional) title-entry prompt `C` arms
+            // (`pending_new_milestone_chat`); submit handling
+            // (`capture_plan_chat`) is unchanged.
+            "capture-plan-chat" => {
+                self.pending_new_milestone_chat = Some(String::new());
+                true
+            }
+            // #1123 (contract §4b / §8 note 2): "Create work order /
+            // promote to epic…" on an epic-less stub row. The contract
+            // pins only the menu label, not the action — this routes
+            // directly to the same guided-chat flow "New plan > Guided
+            // chat…" uses, pre-filled with the stub's own title (when
+            // known) rather than inventing a bespoke "promote" CLI verb
+            // that `coord milestone` doesn't have. `capture_plan_chat`
+            // resolves its target repo from `plans_selected()`, which
+            // already points at this row (mouse right-click pre-selects it
+            // in `events.rs` before building the target).
+            "promote-milestone-to-epic" => {
+                let title = match target {
+                    ContextMenuTarget::PlansStub {
+                        milestone: Some((_, title)),
+                        ..
+                    } => title.clone(),
+                    _ => String::new(),
+                };
+                self.capture_plan_chat(title);
                 true
             }
             // #260: Refine — move a Backlog row into the Refining

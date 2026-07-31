@@ -8477,12 +8477,16 @@
     }
 
     #[test]
-    fn status_bar_hints_advertise_plan_capture_keybind() {
+    fn status_bar_hints_advertise_plan_right_click_menu() {
         // #977 review: pressing `c` in the Plans panel silently opened the
         // capture prompt with no visible hint anywhere the operator could
-        // find it. The status-bar hint strip must name it for this view —
-        // matching how Machines/MergeQueue/Pipeline already advertise their
-        // own bindings — instead of falling through to the generic default.
+        // find it, so the status bar grew a bare `c=capture plan` hint.
+        // #1123 (contract §4f) supersedes that: every Plans row is now
+        // right-clickable and `c` survives only as an accelerator *inside*
+        // the labelled "New plan > Quick capture" menu item (contract
+        // §4e), so the cryptic bare-letter hint is replaced with
+        // `right-click=menu` (backed by `?=help`, whose cheatsheet still
+        // lists every binding — #1124).
         let mut app = make_test_app(BoardData::default());
         app.active_view = SidebarView::Plans;
         let right_text = app
@@ -8493,8 +8497,13 @@
             .collect::<Vec<_>>()
             .join(" ");
         assert!(
-            right_text.contains("c=capture plan"),
-            "expected the Plans panel hint to advertise `c=capture plan`, got: {}",
+            right_text.contains("right-click=menu"),
+            "expected the Plans panel hint to advertise `right-click=menu`, got: {}",
+            right_text,
+        );
+        assert!(
+            right_text.contains("?=help"),
+            "expected the Plans panel hint to advertise `?=help`, got: {}",
             right_text,
         );
     }
@@ -29183,12 +29192,16 @@ Milestone tracking issue.
         );
     }
 
-    /// #1003: a Plans row with no tracking epic yet (`tracking_issue: None`
-    /// — a #977 fast-capture stub) has no issue for `coord milestone
-    /// dispatch`/`chat`/`order`/close to act on, so the menu stays absent —
-    /// matching pre-#1003 behaviour (not a regression), not a crash.
+    /// #1003 (updated by #1123): an untracked/no-work-order milestone is
+    /// collapsed behind the "+N without a work order" summary line by
+    /// default (#1001) — `plans_visible_entries()` filters it out, so
+    /// `plans_sel` never lands on it and there's nothing to right-click yet.
+    /// This is a visibility precondition, NOT the `tracking_issue` gate
+    /// #1123 removed (see `plans_panel_stub_row_builds_plans_stub_target_
+    /// when_visible` just below for the gate-dropped behaviour once the
+    /// row *is* on screen).
     #[test]
-    fn plans_panel_row_without_tracking_issue_has_no_menu() {
+    fn plans_panel_row_without_tracking_issue_has_no_menu_when_collapsed() {
         let mut app = make_test_app(BoardData {
             pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
             plan_roster: vec![PlanRosterEntry {
@@ -29211,6 +29224,47 @@ Milestone tracking issue.
         app.plans_sel = 0;
 
         assert_eq!(app.context_menu_target_for_selection(), None);
+    }
+
+    /// #1123 (contract §4a): the `tracking_issue: Some(_)` gate at
+    /// `context_menu_target_for_selection` is dropped — once an epic-less
+    /// stub row is actually on screen (repo expanded via `u`, mirroring
+    /// `plans_panel_row_without_tracking_issue_has_no_menu_when_collapsed`'s
+    /// sibling scenario), right-clicking it resolves a `PlansStub` target
+    /// instead of `None`.
+    #[test]
+    fn plans_panel_stub_row_builds_plans_stub_target_when_visible() {
+        let mut app = make_test_app(BoardData {
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            plan_roster: vec![PlanRosterEntry {
+                repo: "api".to_string(),
+                title: "Bare Milestone".to_string(),
+                milestone_number: 9,
+                tracking_issue: None,
+                has_work_order: false,
+                ready_frontier: 0,
+                blocked: 0,
+                in_flight: 0,
+                done: 0,
+                total: 0,
+                needs_you: vec!["no_work_order".to_string()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        app.active_view = SidebarView::Plans;
+        app.plans_expanded_repos.insert("api".to_string());
+        app.plans_sel = 0;
+
+        assert_eq!(
+            app.context_menu_target_for_selection(),
+            Some(ContextMenuTarget::PlansStub {
+                repo_name: Some("api".to_string()),
+                milestone: Some((9, "Bare Milestone".to_string())),
+            }),
+            "#1123 §4a: an epic-less stub row must resolve a PlansStub \
+             target, not None, once the gate is dropped"
+        );
     }
 
     /// #1003: the milestone-header context menu now carries the full row +
@@ -29237,6 +29291,119 @@ Milestone tracking issue.
                 "expected `{expected}` in milestone-header menu ids {ids:?}"
             );
         }
+    }
+
+    /// #1123 (contract §4b): the stub-row variant of the Plans "no epic
+    /// yet" menu offers "Create work order / promote to epic…" plus
+    /// Refresh — not the eleven-item CRUD set (which requires a
+    /// `tracking_issue` this row doesn't have).
+    #[test]
+    fn plans_stub_context_menu_offers_create_work_order_and_refresh() {
+        let app = make_milestone_dag_app();
+        let items = app
+            .context_menu_items_for_plans_stub(Some("coord-repo"), Some(&(9, "Bare Milestone".to_string())));
+        let ids: Vec<String> = items.iter().filter_map(|i| i.action_id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec!["promote-milestone-to-epic".to_string(), "refresh".to_string()],
+            "unexpected stub-row menu ids: {ids:?}"
+        );
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            labels.contains(&"Create work order / promote to epic…"),
+            "expected the exact contract §4b label, got {labels:?}"
+        );
+        let refresh = items
+            .iter()
+            .find(|i| i.action_id.as_deref() == Some("refresh"))
+            .expect("refresh item must be present");
+        assert_eq!(
+            refresh.shortcut.as_deref(),
+            Some("r"),
+            "#4e: Refresh must carry its `r` accelerator inside the item"
+        );
+    }
+
+    /// #1123 (contract §4c): the header/empty-space variant offers the two
+    /// labelled "New plan" items plus Refresh, each carrying its bare-key
+    /// accelerator inside the item (contract §4e) rather than only in the
+    /// status bar.
+    #[test]
+    fn plans_stub_context_menu_offers_new_plan_items_when_no_milestone() {
+        let app = make_milestone_dag_app();
+        let items = app.context_menu_items_for_plans_stub(Some("coord-repo"), None);
+        let ids: Vec<String> = items.iter().filter_map(|i| i.action_id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "capture-plan-quick".to_string(),
+                "capture-plan-chat".to_string(),
+                "refresh".to_string(),
+            ],
+            "unexpected header/empty-space menu ids: {ids:?}"
+        );
+        let quick = items
+            .iter()
+            .find(|i| i.action_id.as_deref() == Some("capture-plan-quick"))
+            .expect("capture-plan-quick item must be present");
+        assert_eq!(quick.label, "New plan > Quick capture");
+        assert_eq!(quick.shortcut.as_deref(), Some("c"));
+        let chat = items
+            .iter()
+            .find(|i| i.action_id.as_deref() == Some("capture-plan-chat"))
+            .expect("capture-plan-chat item must be present");
+        assert_eq!(chat.label, "New plan > Guided chat…");
+        assert_eq!(chat.shortcut.as_deref(), Some("C"));
+    }
+
+    /// #1123: "New plan > Quick capture" (`capture-plan-quick`) opens the
+    /// same title-entry prompt the bare `c` key arms.
+    #[test]
+    fn dispatch_capture_plan_quick_arms_pending_plan_capture() {
+        let mut app = make_milestone_dag_app();
+        assert!(app.pending_plan_capture.is_none());
+        let target = ContextMenuTarget::PlansStub { repo_name: None, milestone: None };
+        assert!(app.dispatch_context_menu_action("capture-plan-quick", &target));
+        assert_eq!(app.pending_plan_capture, Some(String::new()));
+    }
+
+    /// #1123: "New plan > Guided chat…" (`capture-plan-chat`) opens the
+    /// same (optional) title-entry prompt the bare `C` key arms.
+    #[test]
+    fn dispatch_capture_plan_chat_arms_pending_new_milestone_chat() {
+        let mut app = make_milestone_dag_app();
+        assert!(app.pending_new_milestone_chat.is_none());
+        let target = ContextMenuTarget::PlansStub { repo_name: None, milestone: None };
+        assert!(app.dispatch_context_menu_action("capture-plan-chat", &target));
+        assert_eq!(app.pending_new_milestone_chat, Some(String::new()));
+    }
+
+    /// #1123 (contract §4b / §8 note 2): "Create work order / promote to
+    /// epic…" on a stub row routes to the guided-chat flow, pre-filled with
+    /// the stub milestone's own title, rather than a bespoke "promote" CLI
+    /// verb `coord milestone` doesn't have.
+    #[test]
+    fn dispatch_promote_milestone_to_epic_spawns_milestone_chat_new_with_title() {
+        let mut app = make_test_app(make_plan_roster_board_data());
+        app.command_runner = crate::commands::CommandRunner::new_for_test();
+        app.active_view = SidebarView::Plans;
+        let target = ContextMenuTarget::PlansStub {
+            repo_name: Some("api".to_string()),
+            milestone: Some((6, "Follow-up".to_string())),
+        };
+        assert!(app.dispatch_context_menu_action("promote-milestone-to-epic", &target));
+        assert_eq!(
+            app.command_runner.spawned_calls,
+            vec![vec![
+                "milestone".to_string(),
+                "chat".to_string(),
+                "api".to_string(),
+                "--new".to_string(),
+                "--title".to_string(),
+                "Follow-up".to_string(),
+            ]],
+            "promote-milestone-to-epic must dispatch `coord milestone chat <repo> --new --title <title>`",
+        );
     }
 
     /// #1003, #1029: "Open milestone chat" launches a genuine tmux-attached
@@ -33912,6 +34079,119 @@ Milestone tracking issue.
             screen.contains("Open milestone chat"),
             "#1003: right-click on a Plans row must open the CRUD context menu:\n{}",
             screen
+        );
+    }
+
+    /// #1123 (contract §4d): the same real mouse right-click on an epic row
+    /// (has a tracking issue) must also surface "Dispatch milestone" and
+    /// "Close / archive plan" — the two other load-bearing §4d strings the
+    /// sealed acceptance slice couldn't assert externally (no public
+    /// plan-roster fixture seam reaches `--test acceptance`; see the
+    /// slice's own TODO). `tuidriver_right_click_on_plans_row_opens_
+    /// context_menu` just above already covers "Open milestone chat".
+    #[test]
+    fn tuidriver_right_click_on_plans_epic_row_shows_full_crud_menu() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_test_app(make_plan_roster_board_data());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "◆");
+
+        let (x, y) = driver.find("Substrate").unwrap_or_else(|| {
+            panic!(
+                "#1123 §4d: could not find Plans row 'Substrate' on initial render:\n{}",
+                driver.screen()
+            )
+        });
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: MouseButton::Right,
+            position: Point::new(x, y),
+            modifiers: Modifiers::default(),
+        });
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Dispatch milestone"),
+            "#1123 §4d: epic-row right-click menu must contain 'Dispatch milestone':\n{screen}",
+        );
+        assert!(
+            screen.contains("Close / archive plan"),
+            "#1123 §4d: epic-row right-click menu must contain 'Close / archive plan':\n{screen}",
+        );
+    }
+
+    /// #1123 (contract §4a/§4b): dropping the `tracking_issue` gate means a
+    /// real mouse right-click on an epic-less stub row ("Follow-up", no
+    /// tracking issue) offers "Create work order / promote to epic…"
+    /// instead of the pre-#1123 silent no-op. `Follow-up` is collapsed by
+    /// default (#1001), so `u` expands its repo first — same precondition
+    /// `plans_panel_u_toggles_untracked_milestones_for_selected_repo` uses.
+    #[test]
+    fn tuidriver_right_click_on_plans_stub_row_offers_create_work_order() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_test_app(make_plan_roster_board_data());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "◆");
+        driver.press(quadraui::Key::Char('u'));
+
+        let (x, y) = driver.find("Follow-up").unwrap_or_else(|| {
+            panic!(
+                "#1123 §4b: could not find expanded stub row 'Follow-up':\n{}",
+                driver.screen()
+            )
+        });
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: MouseButton::Right,
+            position: Point::new(x, y),
+            modifiers: Modifiers::default(),
+        });
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Create work order / promote to epic…"),
+            "#1123 §4a/§4b: right-click on an epic-less stub row must offer \
+             'Create work order / promote to epic…', not a silent no-op:\n{screen}",
+        );
+    }
+
+    /// #1123 (contract §4c): a real mouse right-click on the repo-header
+    /// row itself (e.g. `▾ api  (1 tracked)…`) — as distinct from empty
+    /// main-panel space, which the sealed acceptance slice already covers
+    /// externally — must also offer the "New plan" menu.
+    #[test]
+    fn tuidriver_right_click_on_plans_repo_header_offers_new_plan_menu() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_test_app(make_plan_roster_board_data());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "◆");
+
+        let (x, y) = driver.find("tracked)").unwrap_or_else(|| {
+            panic!(
+                "#1123 §4c: could not find the repo-header '(N tracked)' badge:\n{}",
+                driver.screen()
+            )
+        });
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: MouseButton::Right,
+            position: Point::new(x, y),
+            modifiers: Modifiers::default(),
+        });
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("New plan > Quick capture"),
+            "#1123 §4c: right-click on the repo-header row must offer \
+             'New plan > Quick capture':\n{screen}",
+        );
+        assert!(
+            screen.contains("New plan > Guided chat…"),
+            "#1123 §4c: right-click on the repo-header row must offer \
+             'New plan > Guided chat…':\n{screen}",
         );
     }
 

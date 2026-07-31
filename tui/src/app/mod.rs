@@ -7507,13 +7507,17 @@ impl CoordApp {
             // (or filters the palette query), not a quit.
             " Esc=close ".to_string()
         } else if self.active_view == SidebarView::Plans {
-            // #977 review: the fast plan-capture key (`c`) had no visible
-            // hint anywhere — surface it here alongside the other Plans
-            // panel bindings so it's discoverable without reading the diff.
-            // #1001: `u` toggles the "+N without a work order" collapse for
-            // the selected row's repo — same discoverability bar.
-            // #1124: `?`/`/` open the help overlay / command palette.
-            " j/k=nav  Enter=open epic  c=capture plan  u=toggle untracked  ?=help  /=palette  q=quit ".to_string()
+            // #1123 (contract §4f): the CC-1 status bar advertised the
+            // bare `c`/`u` letters directly (see the old comment this
+            // replaces); that's now cryptic since #1123 makes every Plans
+            // row right-clickable and moves those bindings into a labelled
+            // context menu (`c`/`C`/`u`/`r` all still work as accelerators
+            // *inside* the menu — contract §4e). The status bar instead
+            // points at the two ways to discover them: `right-click=menu`
+            // and `?=help` (the cheatsheet lists every binding, #1124).
+            // `/=palette` and `Enter=open epic` are kept as additional
+            // hints — the contract only requires the two substrings above.
+            " j/k=nav  Enter=open epic  right-click=menu  ?=help  /=palette  q=quit ".to_string()
         } else if self.active_view == SidebarView::Sessions {
             // #1033: mirrors the retired #628 live-sessions overlay's
             // footer hint verbatim ([r]eattach / [K]ill / [f]stop), now
