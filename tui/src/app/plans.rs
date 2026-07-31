@@ -92,6 +92,39 @@ pub(crate) enum PlansTreeRow {
     Milestone(usize, usize),
 }
 
+/// One #1122 detail-pane row's kind, as needed by `plan_detail_action_at`'s
+/// hit-test to know which rows are clickable action buttons (vs.
+/// header/checklist rows, which aren't). Parallel (same length, same
+/// order) to the `Vec<ListItem>` `CoordApp::plan_detail_items` returns,
+/// mirroring the `PlansTreeRow`/`TreeRow` pairing above and
+/// `plans_row_at`'s `row_targets` pattern already used elsewhere in this
+/// file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DetailRowKind {
+    /// Header / health / "Work order" heading / checklist row — no click
+    /// action.
+    Other,
+    /// The `CoordApp::plan_detail_actions_row1()` button strip.
+    ActionsRow1,
+    /// The `CoordApp::plan_detail_actions_row2()` button strip.
+    ActionsRow2,
+}
+
+/// One rendered row of the #1122 detail pane's "Work order" checklist
+/// (contract §3c) — either a real per-issue row (sourced from
+/// `milestone_dag::MilestoneDagNode` when the tracking issue's body has
+/// synced far enough to parse) or a coarse aggregate-count row (the
+/// `PlanRosterEntry`-only fallback contract §8 note 1 permits). `label` is
+/// the already-formatted left-hand text (issue ref + title, or a bare
+/// count like `"3 done"`); `status_word` is the right-aligned state word
+/// rendered via `ListItem::detail`.
+struct DetailWorkOrderRow {
+    glyph: char,
+    label: String,
+    status_word: &'static str,
+    color: Color,
+}
+
 // ─── impl CoordApp — sidebar/main-panel rendering + actions ──────────────────
 
 impl CoordApp {
@@ -533,6 +566,16 @@ impl CoordApp {
     /// `Default`), so `list_rect == rect` and nothing changes from before
     /// this field existed.
     pub(crate) fn render_plans_panel(&self, backend: &mut dyn Backend, rect: Rect, lh: f32) {
+        // #1122 (contract §3a): the detail pane is the FULL main-area
+        // content, not a sub-split of the list — replace the roster
+        // entirely rather than carving out a corner of `rect` for it (which
+        // is what the #978 goal-header strip below does). Must precede the
+        // goal-header carve-out too: the mock (`plans-detail-pane.screen`)
+        // shows no pinned north-star strip while the pane is open.
+        if self.plans_detail_open {
+            self.render_plan_detail_pane(backend, rect, lh);
+            return;
+        }
         let list_rect = if self.data.goal_header.available {
             let goal_rect = Self::plans_goal_header_rect(rect, lh);
             self.render_goal_header_strip(backend, goal_rect);
@@ -772,6 +815,327 @@ impl CoordApp {
         );
     }
 
+    // ─── #1122: in-app plan detail pane ───────────────────────────────────
+
+    /// Build the #1122 detail pane's content — header (contract §3b),
+    /// work-order checklist (§3c) and actions row(s) (§3d) — as a
+    /// `ListView`-ready item list, alongside a same-length `DetailRowKind`
+    /// index so `plan_detail_action_at`'s hit-test and
+    /// `render_plan_detail_pane`'s paint call share exactly one source of
+    /// row layout (the `plans_row_at` pattern this file already uses for
+    /// the roster list, applied here to the detail pane instead).
+    fn plan_detail_items(&self, entry: &PlanRosterEntry) -> (Vec<ListItem>, Vec<DetailRowKind>) {
+        let mut items = Vec::with_capacity(16);
+        let mut kinds = Vec::with_capacity(16);
+
+        // §3b: milestone number + title header.
+        items.push(ListItem {
+            text: StyledText {
+                spans: vec![StyledSpan {
+                    bold: true,
+                    ..StyledSpan::with_fg(
+                        format!("#{} {}", entry.milestone_number, entry.title),
+                        Color::rgb(230, 230, 230),
+                    )
+                }],
+            },
+            icon: None,
+            detail: None,
+            decoration: Decoration::Header,
+        });
+        kinds.push(DetailRowKind::Other);
+
+        // §3b: tracking-epic ref + done% + health (issue text: "health
+        // (`(warn) needs you`, blocked count)" — §3b's own table doesn't
+        // pin exact wording for the health part, so this reuses the
+        // existing `health_chip_for_signal` chips plus a bare "N blocked"
+        // suffix, same vocabulary the roster list already renders).
+        let tracking_str = entry
+            .tracking_issue
+            .map(|n| format!("epic:#{}", n))
+            .unwrap_or_else(|| "epic:—".to_string());
+        let mut spans = vec![StyledSpan::with_fg(tracking_str, Color::rgb(140, 180, 210))];
+        if entry.has_work_order && entry.total > 0 {
+            let pct = (entry.done * 100) / entry.total;
+            let pct_color = if pct >= 100 {
+                Color::rgb(120, 210, 120)
+            } else {
+                Color::rgb(150, 150, 160)
+            };
+            spans.push(StyledSpan::with_fg(format!("   {pct}% done"), pct_color));
+        }
+        for signal in &entry.needs_you {
+            let (label, color) = Self::health_chip_for_signal(signal);
+            spans.push(StyledSpan::with_fg(format!("   [{label}]"), color));
+        }
+        if entry.blocked > 0 {
+            spans.push(StyledSpan::with_fg(
+                format!("   {} blocked", entry.blocked),
+                Color::rgb(220, 140, 90),
+            ));
+        }
+        items.push(ListItem {
+            text: StyledText { spans },
+            icon: None,
+            detail: None,
+            decoration: Decoration::Normal,
+        });
+        kinds.push(DetailRowKind::Other);
+
+        // §3c: "Work order" section heading + checklist rows.
+        items.push(cheatsheet_header_item("Work order"));
+        kinds.push(DetailRowKind::Other);
+        let rows = self.plan_detail_work_order_rows(entry);
+        if rows.is_empty() {
+            items.push(ListItem {
+                text: StyledText::plain(
+                    "  No work-order detail available.".to_string(),
+                ),
+                icon: None,
+                detail: None,
+                decoration: Decoration::Muted,
+            });
+            kinds.push(DetailRowKind::Other);
+        } else {
+            for row in &rows {
+                items.push(ListItem {
+                    text: StyledText {
+                        spans: vec![StyledSpan::with_fg(
+                            format!("  {} {}", row.glyph, row.label),
+                            row.color,
+                        )],
+                    },
+                    icon: None,
+                    detail: Some(StyledText {
+                        spans: vec![StyledSpan::with_fg(row.status_word.to_string(), row.color)],
+                    }),
+                    decoration: Decoration::Normal,
+                });
+                kinds.push(DetailRowKind::Other);
+            }
+        }
+
+        // §3d: actions row(s). Row 1 carries the five labels the contract
+        // requires verbatim (in its own order); row 2 carries the
+        // remaining actions the issue text lists ("Add/remove issue -
+        // Close") that the contract's table doesn't individually require.
+        let (row1_line, _) = build_action_row_line(&Self::plan_detail_actions_row1());
+        items.push(ListItem {
+            text: StyledText::plain(row1_line),
+            icon: None,
+            detail: None,
+            decoration: Decoration::Normal,
+        });
+        kinds.push(DetailRowKind::ActionsRow1);
+        let (row2_line, _) = build_action_row_line(&Self::plan_detail_actions_row2());
+        items.push(ListItem {
+            text: StyledText::plain(row2_line),
+            icon: None,
+            detail: None,
+            decoration: Decoration::Normal,
+        });
+        kinds.push(DetailRowKind::ActionsRow2);
+
+        (items, kinds)
+    }
+
+    /// Contract §3d's five required action labels, in the exact order
+    /// `mocks/plans-detail-pane.screen` line 13 renders them. Action ids
+    /// match `dialogs.rs::dispatch_context_menu_action`'s existing
+    /// vocabulary (see `activate_command_palette_action`) except
+    /// `"open-in-browser"`, which `activate_plan_detail_action` special-cases.
+    fn plan_detail_actions_row1() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("Dispatch next", "dispatch-milestone-next"),
+            ("Open chat", "open-milestone-chat"),
+            ("View DAG", "view-milestone-order"),
+            ("Edit", "edit-milestone"),
+            ("Open in browser", "open-in-browser"),
+        ]
+    }
+
+    /// The remaining actions the issue text lists ("Add/remove issue -
+    /// Close") that aren't individually required by contract §3d's table —
+    /// a second row below `plan_detail_actions_row1` rather than crowding
+    /// them onto one line.
+    fn plan_detail_actions_row2() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("Add issue", "add-issue-to-milestone"),
+            ("Remove issue", "remove-issue-from-milestone"),
+            ("Close", "close-plan"),
+        ]
+    }
+
+    /// Render one actions row's text plus each button's `(action_id,
+    /// start_col, end_col)` char-offset range within that text (0-based,
+    /// `end` exclusive) — shared by `plan_detail_items` (paint) and
+    /// `plan_detail_action_at` (hit-test) so the two can never drift apart,
+    /// the same reasoning `plans_row_at`'s doc comment gives for mirroring
+    /// `render_plans_panel`'s row shape exactly.
+    fn plan_detail_work_order_rows(&self, entry: &PlanRosterEntry) -> Vec<DetailWorkOrderRow> {
+        // Prefer the client-side-parsed `## Work order` DAG (#771/#795,
+        // `milestone_dag.rs`) when the tracking issue's body has synced far
+        // enough to parse it — it carries real per-issue rows (number,
+        // title, live Done/InFlight/Ready/Blocked state), which is strictly
+        // richer than the roster's own aggregate counts and needs no wire
+        // changes at all (contract §8 note 1 permits either approach; this
+        // is the "add per-child data" option, sourced from data the TUI
+        // already has on the wire via `open_issues`/`assignments`).
+        if let Some(tracking) = entry.tracking_issue {
+            if let Some(view) = self
+                .milestone_dag_views()
+                .into_iter()
+                .find(|v| v.repo_name == entry.repo && v.tracking_issue == tracking)
+            {
+                if !view.nodes.is_empty() {
+                    return view
+                        .nodes
+                        .iter()
+                        .map(|n| {
+                            let (glyph, word, color) = match &n.state {
+                                NodeState::Done => ('✓', "done", Color::rgb(120, 210, 120)),
+                                NodeState::InFlight => {
+                                    ('▶', "in-flight", Color::rgb(120, 190, 230))
+                                }
+                                NodeState::Ready => ('·', "ready", Color::rgb(150, 150, 160)),
+                                NodeState::Blocked(_) => {
+                                    ('—', "blocked", Color::rgb(220, 140, 90))
+                                }
+                            };
+                            DetailWorkOrderRow {
+                                glyph,
+                                label: format!("#{}  {}", n.issue_number, trunc(&n.title, 40)),
+                                status_word: word,
+                                color,
+                            }
+                        })
+                        .collect();
+                }
+            }
+        }
+        // Fallback (contract §8 note 1's "derive from aggregate counts"
+        // option): the tracking issue hasn't synced a parseable body yet
+        // (older cache, or the daemon hasn't refreshed `open_issues` since
+        // this milestone's epic was created) — still surface *something*
+        // under "Work order" rather than an empty section, straight from
+        // `PlanRosterEntry`'s own counts.
+        let mut rows = Vec::with_capacity(4);
+        if entry.done > 0 {
+            rows.push(DetailWorkOrderRow {
+                glyph: '✓',
+                label: format!("{} done", entry.done),
+                status_word: "done",
+                color: Color::rgb(120, 210, 120),
+            });
+        }
+        if entry.in_flight > 0 {
+            rows.push(DetailWorkOrderRow {
+                glyph: '▶',
+                label: format!("{} in-flight", entry.in_flight),
+                status_word: "in-flight",
+                color: Color::rgb(120, 190, 230),
+            });
+        }
+        if entry.ready_frontier > 0 {
+            rows.push(DetailWorkOrderRow {
+                glyph: '·',
+                label: format!("{} ready", entry.ready_frontier),
+                status_word: "ready",
+                color: Color::rgb(150, 150, 160),
+            });
+        }
+        if entry.blocked > 0 {
+            rows.push(DetailWorkOrderRow {
+                glyph: '—',
+                label: format!("{} blocked", entry.blocked),
+                status_word: "blocked",
+                color: Color::rgb(220, 140, 90),
+            });
+        }
+        rows
+    }
+
+    /// Render the #1122 in-app plan detail pane (contract §3) — the FULL
+    /// main-area content while `plans_detail_open`, built from
+    /// `plan_detail_items`. Falls back to a plain message on the (should be
+    /// unreachable — `open_selected_plan_detail` only sets
+    /// `plans_detail_open` when a row is selected) case of no selection.
+    fn render_plan_detail_pane(&self, backend: &mut dyn Backend, rect: Rect, _lh: f32) {
+        let Some(entry) = self.plans_selected() else {
+            backend.draw_list(
+                rect,
+                &plain_list("plans-detail-empty", "  No plan selected.", 0),
+            );
+            return;
+        };
+        let (items, _kinds) = self.plan_detail_items(&entry);
+        let total = items.len();
+        backend.draw_list(
+            rect,
+            &ListView {
+                id: WidgetId::new("plans-detail"),
+                title: Some(StyledText::plain(format!(
+                    " #{} {} ",
+                    entry.milestone_number,
+                    trunc(&entry.title, 60),
+                ))),
+                items,
+                selected_idx: 0,
+                scroll_offset: 0,
+                has_focus: true,
+                bordered: true,
+                h_scroll: 0,
+                max_content_width: None,
+                show_v_scrollbar: total > 10,
+            },
+        );
+    }
+
+    /// Hit-test a click in the detail pane's actions row(s) (contract §3d)
+    /// back to the action id under `pos`, or `None` when the click missed
+    /// every button (header/checklist row, or between-button padding).
+    /// Mirrors `plans_row_at`'s use of quadraui's `ListView::layout` for
+    /// the row index, then resolves the sub-row column locally since
+    /// `ListViewHit::Item` carries no column info — the same 1-cell
+    /// `bordered` inset `plans_row_at` accounts for via `list_rect`.
+    pub(crate) fn plan_detail_action_at(&self, pos: Point, main_b: Rect, lh: f32) -> Option<String> {
+        let entry = self.plans_selected()?;
+        let (items, kinds) = self.plan_detail_items(&entry);
+        let list = ListView {
+            id: WidgetId::new("plans-detail"),
+            title: Some(StyledText::plain(String::new())),
+            items,
+            selected_idx: 0,
+            scroll_offset: 0,
+            has_focus: true,
+            bordered: true,
+            h_scroll: 0,
+            max_content_width: None,
+            show_v_scrollbar: false,
+        };
+        let layout = list.layout(main_b.width, main_b.height, lh, |_| ListItemMeasure::new(lh));
+        let local_x = pos.x - main_b.x;
+        let local_y = pos.y - main_b.y;
+        let ListViewHit::Item(idx) = layout.hit_test(local_x, local_y) else {
+            return None;
+        };
+        let actions = match kinds.get(idx)? {
+            DetailRowKind::ActionsRow1 => Self::plan_detail_actions_row1(),
+            DetailRowKind::ActionsRow2 => Self::plan_detail_actions_row2(),
+            DetailRowKind::Other => return None,
+        };
+        let (_, buttons) = build_action_row_line(&actions);
+        // `bordered` reserves a 1-cell inset on each side (quadraui
+        // `ListView::layout`'s `inset_x`) before the item's own text
+        // starts — `build_action_row_line`'s char offsets are relative to
+        // that text, not the widget-local column `hit_test` used above.
+        let content_x = (local_x - 1.0).max(0.0) as usize;
+        buttons
+            .into_iter()
+            .find(|(_, start, end)| content_x >= *start && content_x < *end)
+            .map(|(id, _, _)| id)
+    }
+
     /// Shared geometry helper: the roster's `list_rect` once the optional
     /// pinned GOAL.md header strip (#978) has been carved off the top of
     /// `rect`. Split out of `render_plans_panel` so `plans_row_at`'s
@@ -987,11 +1351,48 @@ impl CoordApp {
         );
     }
 
-    /// Enter / "open selected plan" — spawn `gh issue view <tracking_issue>
-    /// --repo <slug> --web` for the selected plan.  Silently noops when
-    /// nothing is selected or the plan has no tracking epic yet (a "create
-    /// an epic" workflow lives in #977 / #978).  Returns `true` when the
-    /// tracking-epic open was attempted so the caller can request a redraw.
+    /// Enter / "open selected plan" (#1122, contract §3a) — opens the
+    /// in-app detail pane (`plans_detail_open`) for the selected plan
+    /// **instead of** spawning `gh issue view --web` (that's demoted to the
+    /// pane's own "Open in browser" action, `open_selected_plan_tracking_epic`
+    /// below). Only fires for a row with `tracking_issue: Some(_)` — a stub
+    /// row (no tracking epic yet) keeps the pre-#1122 toast pointing at
+    /// `coord milestone chat` instead, since there's no epic to show a
+    /// detail pane *of*. Returns `true` when the pane was opened (redraw
+    /// needed).
+    pub(crate) fn open_selected_plan_detail(&mut self) -> bool {
+        let Some(entry) = self.plans_selected() else {
+            self.push_toast(
+                "Open plan",
+                "No plan selected — highlight a row first.",
+                ToastSeverity::Info,
+            );
+            return false;
+        };
+        if entry.tracking_issue.is_none() {
+            self.push_toast(
+                "No tracking epic yet",
+                &format!(
+                    "{} #{}: {} has no `epic`-labelled tracking issue. \
+                     Create one with `coord milestone chat`.",
+                    entry.repo, entry.milestone_number, entry.title,
+                ),
+                ToastSeverity::Info,
+            );
+            return false;
+        }
+        self.plans_detail_open = true;
+        true
+    }
+
+    /// "Open in browser" — spawn `gh issue view <tracking_issue> --repo
+    /// <slug> --web` for the selected plan. Pre-#1122 this was Enter's
+    /// direct behaviour; contract §3a demotes it to one action among
+    /// several on the detail pane's actions row (`plan_detail_actions_row1`).
+    /// Silently noops when nothing is selected or the plan has no tracking
+    /// epic yet (a "create an epic" workflow lives in #977 / #978).  Returns
+    /// `true` when the tracking-epic open was attempted so the caller can
+    /// request a redraw.
     ///
     /// Mirrors `dispatch_open_pr_for_selected_pipeline_row` — bypasses the
     /// command runner because `gh` isn't a `coord` subcommand and the runner
@@ -1485,8 +1886,17 @@ impl CoordApp {
             "toggle-untracked" => {
                 self.toggle_plans_repo_expansion();
             }
+            // #1122: `dispatch-milestone-next`, `remove-issue-from-milestone`
+            // and `close-plan` are added to this list alongside the
+            // original five so the detail-pane actions row
+            // (`activate_plan_detail_action` below) can reuse this same
+            // MilestoneHeader-target dispatch rather than duplicating it —
+            // none of the three are registered as palette entries
+            // (`plans_view_help`), so this is a superset, not a contract
+            // §5g change.
             "dispatch-milestone" | "open-milestone-chat" | "view-milestone-order"
-            | "edit-milestone" | "add-issue-to-milestone" => {
+            | "edit-milestone" | "add-issue-to-milestone" | "dispatch-milestone-next"
+            | "remove-issue-from-milestone" | "close-plan" => {
                 match self
                     .plans_selected()
                     .and_then(|e| e.tracking_issue.map(|t| (e, t)))
@@ -1518,6 +1928,48 @@ impl CoordApp {
             }
         }
     }
+
+    /// Execute the action bound to a #1122 detail-pane actions-row button
+    /// (`plan_detail_action_at`'s hit-test, or a future keyboard binding).
+    /// `"open-in-browser"` is the one action that isn't a MilestoneHeader
+    /// context-menu action (contract §3d demotes it from Enter's old
+    /// behaviour, see `open_selected_plan_tracking_epic`); every other
+    /// button id is one of the ids `activate_command_palette_action`
+    /// already knows how to dispatch, so this just special-cases the one
+    /// exception and delegates the rest.
+    pub(crate) fn activate_plan_detail_action(&mut self, action_id: &str) {
+        if action_id == "open-in-browser" {
+            self.open_selected_plan_tracking_epic();
+            return;
+        }
+        self.activate_command_palette_action(action_id);
+    }
+}
+
+/// Gap between adjacent buttons on a #1122 detail-pane actions row
+/// (`build_action_row_line` below) — mirrors `mocks/plans-detail-pane.screen`
+/// line 13's spacing (`Dispatch next    Open chat    ...`).
+const DETAIL_ACTION_GAP: &str = "    ";
+
+/// Render one #1122 detail-pane actions row's text plus each button's
+/// `(action_id, start_col, end_col)` char-offset range within that text
+/// (0-based, `end` exclusive, relative to the text itself — NOT the
+/// widget-local column `ListView::hit_test` uses). Shared by
+/// `CoordApp::plan_detail_items` (paint) and
+/// `CoordApp::plan_detail_action_at` (hit-test) so the two can never drift
+/// apart — the same reasoning `plans_row_at`'s doc comment gives for
+/// mirroring `render_plans_panel`'s row shape exactly.
+fn build_action_row_line(actions: &[(&'static str, &'static str)]) -> (String, Vec<(String, usize, usize)>) {
+    let mut line = String::from(" ");
+    let mut buttons = Vec::with_capacity(actions.len());
+    for (label, action_id) in actions {
+        let start = line.chars().count();
+        line.push_str(label);
+        let end = line.chars().count();
+        buttons.push((action_id.to_string(), start, end));
+        line.push_str(DETAIL_ACTION_GAP);
+    }
+    (line, buttons)
 }
 
 /// Health-chip legend description text (contract §5d) — kept alongside

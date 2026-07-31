@@ -276,6 +276,8 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         plans_sel: 0,
         // #1001
         plans_expanded_repos: std::collections::HashSet::new(),
+        // #1122
+        plans_detail_open: false,
         // #1121
         plans_tree_expanded: std::collections::HashMap::new(),
         plans_tree_selected: None,
