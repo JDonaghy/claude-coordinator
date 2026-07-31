@@ -92,6 +92,12 @@ class LoopAction:
     - ``"interactive_skip"``   — the fix was an interactive (claude-pty) session;
                                  its re-review is human-attended, so no headless
                                  review was dispatched (#555)
+    - ``"test_gate_held"``     — pipeline.default_gates orders test before review
+                                 and the fix's test verdict isn't in yet
+                                 (``running``/``None``/``failed``); review_state
+                                 was set to ``"pending"`` so
+                                 ``dispatch_pending_reviews`` picks it up once a
+                                 ``passed``/``skipped`` verdict lands (#1612)
     """
     assignment_id: str | None
     detail: str = ""
@@ -1115,6 +1121,42 @@ def run_for_fix_transition(
                 f"fix iteration {fix.review_iteration} >= "
                 f"max_review_iterations {max_iter}; "
                 "not dispatching another review"
+            ),
+        )]
+
+    # #1612: this is the *other* auto-dispatch path — `dispatch_pending_reviews`
+    # (reached from reconcile()/`coord notify`) holds review dispatch until the
+    # work carries a passed/skipped test verdict whenever
+    # `pipeline.default_gates` orders Test before Review, but this fix-transition
+    # path called `dispatch_review` directly, bypassing that gate entirely. A
+    # fix round's review was therefore dispatched while its smoke test was
+    # still `running` (or before it had even started), burning a metered
+    # review on code of unknown quality. Mirror the gate here — but holding
+    # cannot just `return []`: this function fires once, on the fix worker's
+    # completion transition (`notify.py`'s `fix_completions`), and is never
+    # re-entered, so a bare return would strand the row with no review ever
+    # dispatched. Instead, set `review_state="pending"` so the row becomes
+    # eligible for `dispatch_pending_reviews`, which runs every pass and
+    # already carries the correct gate — this is a deferral to that path, not
+    # a drop.
+    if config.pipeline.test_precedes_review() and fix.test_state not in (
+        "passed", "skipped",
+    ):
+        log.info(
+            "auto_loop: NOT dispatching re-review for %s yet — test gate is "
+            "active and fix.test_state=%r is not a passed/skipped verdict; "
+            "deferring to dispatch_pending_reviews",
+            assignment_id, fix.test_state,
+        )
+        fix.review_state = "pending"
+        write_board(board)
+        return [LoopAction(
+            kind="test_gate_held",
+            assignment_id=assignment_id,
+            detail=(
+                f"test gate active — fix.test_state={fix.test_state!r} is not "
+                "passed/skipped; review_state set to 'pending' for "
+                "dispatch_pending_reviews to pick up once the verdict lands"
             ),
         )]
 
