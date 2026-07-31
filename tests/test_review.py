@@ -3425,6 +3425,55 @@ def test_dispatch_pending_reviews_skips_interactive_work(fake_dispatch) -> None:
     assert headless.review_state == "dispatched"
 
 
+def test_dispatch_pending_reviews_enforces_max_review_iterations(fake_dispatch) -> None:
+    """#1612 step 2: dispatch_pending_reviews must enforce
+    ``max_review_iterations`` itself, not only rely on
+    ``run_for_fix_transition`` having checked it upstream — defense in depth
+    for the fix-loop cap now that a held fix row is routed through here (the
+    #1612 test-gate deferral hands review_state back to "pending" for this
+    function to pick up). A row at/over the cap must not get a review even
+    though it is otherwise perfectly eligible; a row still under the cap
+    dispatches normally."""
+    capped = Assignment(
+        machine_name="laptop",
+        repo_name="api",
+        issue_number=1612,
+        issue_title="[fix-2] capped fix round",
+        assignment_id="fix-capped",
+        status="done",
+        branch="issue-1612-fix",
+        type="work",
+        review_state=None,
+        review_iteration=2,
+        dispatched_at=0.0,
+        finished_at=1.0,
+    )
+    under_cap = Assignment(
+        machine_name="laptop",
+        repo_name="api",
+        issue_number=1613,
+        issue_title="[fix-1] under-cap fix round",
+        assignment_id="fix-under-cap",
+        status="done",
+        branch="issue-1613-fix",
+        type="work",
+        review_state=None,
+        review_iteration=1,
+        dispatched_at=0.0,
+        finished_at=1.0,
+    )
+    board = Board(completed=[capped, under_cap])
+    cfg = _flood_config(max_auto_dispatch_per_pass=5, flood_threshold=12)
+    cfg.pipeline.max_review_iterations = 2
+
+    out = dispatch_pending_reviews(board, cfg)
+
+    assert fake_dispatch == ["fix-under-cap"]  # capped row never reaches dispatch_review
+    assert len(out) == 1
+    assert under_cap.review_state == "dispatched"
+    assert capped.review_state == "cap_hit"  # not left "pending" forever
+
+
 def test_flood_guard_caps_per_pass(fake_dispatch) -> None:
     board = Board(completed=_pending_work(10))
     cfg = _flood_config(max_auto_dispatch_per_pass=5, flood_threshold=12)

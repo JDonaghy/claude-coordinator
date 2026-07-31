@@ -1862,11 +1862,32 @@ def _fix_assignment(
     assignment_id: str = "fix-1",
     review_iteration: int = 1,
     review_of: str = "work-abc",
+    test_state: str | None = "passed",
 ) -> Assignment:
-    """Build a bounce-fix work assignment (the type dispatched by process_review_completion)."""
+    """Build a bounce-fix work assignment (the type dispatched by process_review_completion).
+
+    ``test_state`` defaults to ``"passed"`` so callers that aren't exercising
+    the #1612 test gate get the pre-#1612 dispatch-proceeds behaviour without
+    having to think about it; tests targeting the gate itself pass an
+    explicit ``test_state`` (``None``/``"running"``/``"failed"``).
+
+    ``review_state`` is reset to ``None`` here (overriding
+    ``_work_assignment``'s ``"dispatched"`` default, which models the
+    *original* work row after its first review went out -- not a freshly
+    completed fix worker, which carries ``review_state=None`` until
+    ``run_for_fix_transition``/``dispatch_pending_reviews`` first touches
+    it). This matters for #1612: the DB's whole-board upsert has a CAS
+    guard (state.py's ``_UPSERT_SQL``, #1565) that refuses to revert an
+    already-non-pending, non-NULL ``review_state`` back to ``"pending"`` --
+    exactly what the #1612 gate-hold path writes. Seeding the fixture with
+    the unrealistic ``"dispatched"`` default would trip that guard and mask
+    a real write with a silently-discarded one.
+    """
     a = _work_assignment(assignment_id=assignment_id, review_iteration=review_iteration)
     a.review_of_assignment_id = review_of
     a.issue_title = f"[fix-{review_iteration}] Fix the thing"
+    a.test_state = test_state
+    a.review_state = None
     return a
 
 
@@ -2038,6 +2059,149 @@ class TestRunForFixTransition:
 
         with patch("coord.auto_loop.dispatch_review", return_value=stub_review):
             actions = run_for_fix_transition("fix-2", config)
+
+        assert len(actions) == 1
+        assert actions[0].kind == "review_dispatched"
+
+    # ── #1612: fix-round reviews must not bypass the Test gate ─────────────
+
+    @pytest.mark.parametrize("test_state", [None, "running", "failed"])
+    def test_run_for_fix_transition_holds_for_untested_fix(
+        self, config: Config, coord_db, test_state: str | None
+    ) -> None:
+        """#1612: default_gates=[test, review, merge] (test precedes review) and
+        the fix carries no passed/skipped verdict → no review dispatched, and
+        the row is handed to the ``dispatch_pending_reviews`` gated path
+        instead of stranded (review_state set back to "pending"), not
+        dispatched directly via the ungated path this function used to take.
+        """
+        from coord.state import load_board, save_board
+
+        assert config.pipeline.test_precedes_review()  # sanity: default_gates order
+
+        fix = _fix_assignment(assignment_id="fix-untested", test_state=test_state)
+        board = Board(completed=[fix])
+        save_board(board)
+
+        with patch("coord.auto_loop.dispatch_review") as mock_dispatch:
+            actions = run_for_fix_transition("fix-untested", config)
+
+        mock_dispatch.assert_not_called()
+        assert len(actions) == 1
+        assert actions[0].kind == "test_gate_held"
+        assert actions[0].assignment_id == "fix-untested"
+
+        loaded = load_board()
+        assert loaded is not None
+        entry = loaded.find_by_id("fix-untested")
+        assert entry is not None
+        assert entry.review_state == "pending"
+
+    def test_run_for_fix_transition_held_fix_then_picked_up_by_dispatch_pending_reviews(
+        self, config: Config, coord_db
+    ) -> None:
+        """#1612 regression: the hold is a deferral, not a drop. Once the
+        held row's test verdict lands (passed), ``dispatch_pending_reviews``
+        — the always-gated bulk path — must dispatch the review it deferred.
+
+        ``run_for_fix_transition`` reads/writes the board through its own
+        ``read_board()``/``write_board()`` calls (#749 routing), which is a
+        distinct ``Board``/``Assignment`` object graph from whatever the test
+        constructed locally — so the persisted state has to be re-fetched via
+        ``load_board()`` afterward rather than asserted on the original local
+        ``fix`` object, which ``run_for_fix_transition`` never touches.
+        """
+        from coord.review import dispatch_pending_reviews
+        from coord.state import load_board, save_board
+
+        fix = _fix_assignment(assignment_id="fix-deferred", test_state="running")
+        board = Board(completed=[fix])
+        save_board(board)
+
+        with patch("coord.auto_loop.dispatch_review") as mock_dispatch:
+            actions = run_for_fix_transition("fix-deferred", config)
+        assert actions[0].kind == "test_gate_held"
+        mock_dispatch.assert_not_called()
+
+        board = load_board()
+        assert board is not None
+        held = board.find_by_id("fix-deferred")
+        assert held is not None
+        assert held.review_state == "pending"
+
+        # Test verdict lands.
+        held.test_state = "passed"
+
+        stub_review = _stub_review_assignment(assignment_id="re-review-deferred")
+        with patch("coord.review.dispatch_review", return_value=stub_review):
+            dispatched = dispatch_pending_reviews(board, config)
+
+        assert len(dispatched) == 1
+        assert dispatched[0].assignment_id == "re-review-deferred"
+        assert held.review_state == "dispatched"
+
+    def test_run_for_fix_transition_held_fix_stays_held_when_test_fails(
+        self, config: Config, coord_db
+    ) -> None:
+        """#1612: a "failed" verdict is still not a passed/skipped verdict —
+        no review dispatched by either the fix-transition path or the bulk
+        ``dispatch_pending_reviews`` path once the failure lands.
+
+        See the previous test's docstring for why the board is re-fetched
+        via ``load_board()`` rather than asserted on the local ``fix``.
+        """
+        from coord.review import dispatch_pending_reviews
+        from coord.state import load_board, save_board
+
+        fix = _fix_assignment(assignment_id="fix-failed", test_state="running")
+        board = Board(completed=[fix])
+        save_board(board)
+
+        with patch("coord.auto_loop.dispatch_review") as mock_dispatch:
+            actions = run_for_fix_transition("fix-failed", config)
+        assert actions[0].kind == "test_gate_held"
+        mock_dispatch.assert_not_called()
+
+        board = load_board()
+        assert board is not None
+        held = board.find_by_id("fix-failed")
+        assert held is not None
+        held.test_state = "failed"
+
+        with patch("coord.review.dispatch_review") as mock_bulk_dispatch:
+            dispatched = dispatch_pending_reviews(board, config)
+
+        assert dispatched == []
+        mock_bulk_dispatch.assert_not_called()
+        assert held.review_state == "pending"
+
+    def test_run_for_fix_transition_test_after_review_gate_dispatches_immediately(
+        self, repo: Repo, machine: Machine, coord_db
+    ) -> None:
+        """#1612: when default_gates orders review before test, the fix
+        round must dispatch immediately — the configurable ordering itself
+        must not regress."""
+        from coord.state import save_board
+
+        config = Config(
+            repos=[repo],
+            machines=[machine],
+            reviews=ReviewsConfig(enabled=True, auto_dispatch=True),
+            pipeline=PipelineConfig(
+                auto_loop=True,
+                max_review_iterations=3,
+                default_gates=["review", "test", "merge"],
+            ),
+        )
+        assert not config.pipeline.test_precedes_review()
+
+        fix = _fix_assignment(assignment_id="fix-untested-2", test_state=None)
+        board = Board(completed=[fix])
+        save_board(board)
+
+        stub_review = _stub_review_assignment(assignment_id="re-review-3")
+        with patch("coord.auto_loop.dispatch_review", return_value=stub_review):
+            actions = run_for_fix_transition("fix-untested-2", config)
 
         assert len(actions) == 1
         assert actions[0].kind == "review_dispatched"

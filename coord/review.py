@@ -2049,6 +2049,37 @@ def dispatch_pending_reviews(board, config, *, test_gate_active: bool = False, n
         c.review_verdict = prior_verdict
         record_work_review_verdict(c.assignment_id, prior_verdict)
 
+    # #1612 step 2: enforce max_review_iterations here too, not just in
+    # run_for_fix_transition. A fix row whose test verdict isn't in yet gets
+    # deferred to this function (its review_state is set back to "pending"
+    # rather than dispatching directly — see run_for_fix_transition's #1612
+    # fix), so by the time it reaches the eligibility filter below its
+    # review_iteration has normally already been checked once, upstream. This
+    # is the defense-in-depth duplicate of that guard: without it, a row that
+    # reaches review_state="pending" through any other path (a future code
+    # path, a manual edit) would silently bypass the fix-loop cap instead of
+    # stopping it here the same way the other bulk-path guards are duplicated
+    # (claude-pty, terminal-work).
+    _max_review_iter = config.pipeline.max_review_iterations
+    for c in board.completed:
+        if (
+            c.review_state in (None, "pending")
+            and c.type in WORK_LIKE_TYPES
+            and c.status == "done"
+            and (c.review_iteration or 0) >= _max_review_iter
+        ):
+            logger.warning(
+                "dispatch_pending_reviews cap guard (#1612): %s (%s #%s) has "
+                "review_iteration=%d >= max_review_iterations=%d — not "
+                "dispatching another review.",
+                c.assignment_id, c.repo_name, c.issue_number,
+                c.review_iteration or 0, _max_review_iter,
+            )
+            from coord.auto_loop import _post_max_iterations_notice
+
+            _post_max_iterations_notice(c, config)
+            c.review_state = "cap_hit"
+
     eligible = [
         c
         for c in board.completed
