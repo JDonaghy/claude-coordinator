@@ -267,9 +267,9 @@ def refine_board(repo: str, machine: str | None, config_path: Path) -> None:
 @click.command(
     help=(
         "Mark a refined issue as ready for dispatch.\n\n"
-        "Sets the GitHub `status:ready` label and removes `status:refining` / "
-        "`status:backlog` if present. After this the issue appears in the "
-        "Pipeline panel as Pending with a [Go] button.\n\n"
+        "Sets the GitHub `status:ready` and `coord` labels and removes "
+        "`status:refining` / `status:backlog` if present. After this the "
+        "issue appears in the Pipeline panel as Pending with a [Go] button.\n\n"
         "REPO is the local repo name from coordinator.yml; ISSUE is the GH "
         "issue number."
     )
@@ -285,7 +285,7 @@ def ready(repo: str, issue: int, config_path: Path) -> None:
     slug = repo_entry.github if repo_entry else repo
     _apply_label_change(
         repo, issue, config_path,
-        add={"status:ready"},
+        add={"status:ready", "coord"},
         remove_if_present={"status:refining", "status:backlog"},
         success_message=f"#{issue} ({slug}) marked ready for dispatch",
     )
