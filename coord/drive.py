@@ -88,6 +88,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Protocol, Sequence
 
+from coord.filelock import FileLock, LockBusy, notify_lock_path
 from coord.drive_state import (
     BoardFetcher,
     DriveStateError,
@@ -1594,52 +1595,13 @@ def _decide_merge(
 
 # ── locking ──────────────────────────────────────────────────────────────────
 
-
-class LockBusy(Exception):
-    """Someone else holds the lock."""
-
-
-@dataclass
-class FileLock:
-    """``flock``-based advisory lock, the Python twin of the bash ``flock -n``."""
-
-    path: Path
-    _fd: int | None = field(default=None, init=False, repr=False)
-
-    def acquire(self, timeout: float | None = 0.0) -> None:
-        """Take the lock.  ``timeout=0`` is non-blocking; ``None`` blocks forever."""
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o644)
-        deadline = None if timeout is None else time.monotonic() + timeout
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                self._fd = fd
-                return
-            except OSError as exc:
-                if exc.errno not in (errno.EACCES, errno.EAGAIN):
-                    os.close(fd)
-                    raise
-                if deadline is not None and time.monotonic() >= deadline:
-                    os.close(fd)
-                    raise LockBusy(str(self.path)) from exc
-                time.sleep(0.25)
-
-    def release(self) -> None:
-        if self._fd is None:
-            return
-        try:
-            fcntl.flock(self._fd, fcntl.LOCK_UN)
-        finally:
-            os.close(self._fd)
-            self._fd = None
-
-    def __enter__(self) -> FileLock:
-        self.acquire(timeout=None)
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        self.release()
+# #1616: ``FileLock``/``LockBusy`` moved to :mod:`coord.filelock` so the daemon's
+# pipeline-clock drain (``coord.notify.run_drain``) takes literally the same lock
+# class this module's ``run_notify()`` takes on ``~/.coord/notify.lock`` — a
+# second implementation agreeing on a filename is not mutual exclusion, it is a
+# coincidence.  Re-exported here so every existing ``from coord.drive import
+# FileLock`` (tests included) keeps working unchanged.
+_ = (FileLock, LockBusy, notify_lock_path)  # re-export; see coord.filelock
 
 
 # ── the driver (I/O) ─────────────────────────────────────────────────────────
@@ -1988,7 +1950,7 @@ class Driver:
         if not self.opts.notify:
             return
         self.log("nudging: coord notify (flock ~/.coord/notify.lock)")
-        lock = FileLock(Path.home() / ".coord" / "notify.lock")
+        lock = FileLock(notify_lock_path())
         try:
             lock.acquire(timeout=300.0)
         except LockBusy:

@@ -199,6 +199,50 @@ thin-client setup driven by the `coord-notify.timer` may be *never*.
 proven otherwise**, and check the notify/tick mirrors when a stage mysteriously
 never advances.
 
+### 7a. #1616 — the daemon now has a clock, and the contract moved
+
+The fifth instance of the shape above was the worst: `reconcile_completed_assignments`
+set `status=done` and stopped *by contract*, and the only thing on this fleet that
+ran everything downstream (`finished_at`, the completion comment, the #1076/#1152
+test-gate backfill, Test/Review dispatch) was **a live `coord drive`'s stall nudge**
+— `coord-notify.timer` is deliberately disabled. Boundaries cost 9 min (#1123) and
+47 min (#1122); rows with no drive at all (vimcode#611/#613) waited for a human.
+
+The fix deliberately did **not** widen `reconcile_completed_assignments`. The daemon
+`_tick_loop` gained a sibling step:
+
+```
+Step 1  reconcile_completed_assignments   (passive; unchanged)
+Step 1b _notify_drain_tick -> notify.run_drain   <-- the clock (#1616)
+Step 2  enqueue_approved_work
+```
+
+`run_drain` is a **scoped** subset of `coord notify`, and the scope is the design:
+
+| side effect | on the daemon's clock? |
+|---|---|
+| `finished_at`, completion comment, test-gate backfill | yes |
+| Test-stage smoke dispatch, review dispatch, orphaned findings | yes (existing gates apply) |
+| merge enqueue | already Step 2 |
+| **work dispatch** | **no** |
+| **fix-round dispatch** (`auto_loop`), stalled-pipeline dispatch | **no** — this is #476/#477 |
+
+A duplicate *review* costs a few dollars; a duplicate *fix-worker* creates conflicting
+branches, which is the incident that got the timer disabled. That asymmetry is the
+whole argument — do not "simplify" `run_drain` into a call to `notify.run()`.
+
+Knobs and consequences:
+
+- `COORD_NOTIFY_DRAIN_INTERVAL` (default `60`, `0` disables — the escape hatch).
+- The whole pass holds `~/.coord/notify.lock` (`coord.filelock.FileLock`, the same
+  class `coord drive`'s `run_notify()` takes). The daemon's `/notify` endpoint takes
+  it too — before #1616 a drive on a *remote* host held its own local file while the
+  real work ran on the daemon, which serialized nothing.
+- A `type="review"` `done` still parks in `finalizing` until the drain captures the
+  verdict, but that window is now bounded by the interval instead of unbounded (#1610).
+- `coord drive`'s stall detector is no longer load-bearing on the happy path. It is a
+  stall detector again. (#1593, nudge-fires-once, is a real but separate bug.)
+
 ---
 
 ## 8. `coordinator.remote.yml` is a cache — your config edit will revert

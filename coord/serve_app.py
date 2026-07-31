@@ -419,6 +419,63 @@ def _audit_enqueued(enqueued: list[str]) -> None:
         )
 
 
+def _audit_notify_drain(result) -> None:  # noqa: ANN001 — coord.notify.DrainResult
+    """One operational row per transition the daemon's pipeline clock posted
+    (#1616).  Deliberately mirrors :func:`_audit_reconciled`: the passive
+    reconcile row says "the board learned this row is terminal", this one says
+    "its side effects actually ran" — the pair is what makes the #1610/#1122
+    "advanced on the board but nothing happened" window visible in the audit
+    trail instead of being invisible between two ticks."""
+    from coord.audit import record_audit  # noqa: PLC0415
+
+    for t in result.transitions:
+        record_audit(
+            tier="operational",
+            category="notify",
+            event_type="drain_transition",
+            actor="daemon",
+            summary=f"notify drain: {t.repo_name}#{t.issue_number} → {t.event}",
+            repo=t.repo_name,
+            issue=t.issue_number,
+            assignment_id=t.assignment_id,
+            details={"event": t.event, "machine": t.machine_name},
+        )
+
+
+def _notify_drain_tick(config: Config):  # noqa: ANN201 — coord.notify.DrainResult
+    """Run the pipeline clock for one tick (#1616).
+
+    Calls :func:`coord.notify.run_drain`, which posts completion comments,
+    stamps ``finished_at``, backfills the #1076/#1152 test gate, dispatches the
+    Test stage and pending reviews — all under ``~/.coord/notify.lock`` — and
+    which pointedly does **not** dispatch work or a fix round.  See that
+    function's docstring for why the line sits exactly there.
+
+    ``COORD_NOTIFY_ON_DAEMON=1`` is set for the duration, mirroring
+    ``post_notify``: it stops any nested ``coord``-command reroute from
+    POSTing back to this same daemon.  The variable is restored (not just
+    popped) so a concurrently-rerouted ``coord notify`` in another threadpool
+    worker can't observe it disappear.
+
+    Extracted as a module-level function so tests can call it directly without
+    wiring up the async ``_tick_loop`` infrastructure (mirrors ``_passive_tick``
+    / ``_reconcile_merges_tick`` / ``_reap_merged_sessions_tick``).
+    """
+    from coord.notify import run_drain  # noqa: PLC0415
+
+    prev = os.environ.get("COORD_NOTIFY_ON_DAEMON")
+    os.environ["COORD_NOTIFY_ON_DAEMON"] = "1"
+    try:
+        result = run_drain(config)
+    finally:
+        if prev is None:
+            os.environ.pop("COORD_NOTIFY_ON_DAEMON", None)
+        else:
+            os.environ["COORD_NOTIFY_ON_DAEMON"] = prev
+    _audit_notify_drain(result)
+    return result
+
+
 def _audit_housekeeping_sweep(swept: dict) -> None:
     """One operational row summarizing a housekeeping archival sweep
     (#762's ``housekeeping.sweep()``, #1038's audit).  Called only when the
@@ -4355,6 +4412,11 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             import os  # noqa: PLC0415
 
             from coord.cli import notify as notify_cmd  # noqa: PLC0415
+            from coord.filelock import (  # noqa: PLC0415
+                FileLock,
+                LockBusy,
+                notify_lock_path,
+            )
 
             stdout_proxy, _stderr_proxy = _ensure_stdio_capture_proxies()
             buf = io.StringIO()
@@ -4362,6 +4424,32 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             err = None
             prev = os.environ.get("COORD_NOTIFY_ON_DAEMON")
             os.environ["COORD_NOTIFY_ON_DAEMON"] = "1"
+            # #1616: serialize against the daemon's own pipeline-clock drain
+            # (`_notify_drain_tick`) on the SAME lock.  Before this the lock was
+            # taken only by `coord drive`'s wrapper, on the drive's host — which
+            # means a drive on a remote host held its own local file while the
+            # real work ran here, so nothing actually serialized the work.  Both
+            # passes call `dispatch_pending_reviews`, which reads
+            # `review_state == 'pending'` and writes `'dispatched'`
+            # non-atomically: two concurrent passes both see `pending` and burn
+            # two metered reviews.  Blocking (not skip-if-busy) because this is
+            # an explicit human/drive-requested notify — it should wait its turn
+            # rather than silently no-op; the timeout is well under the drain's
+            # own runtime budget and a miss falls back to running unlocked
+            # rather than failing the request.
+            lock = FileLock(notify_lock_path())
+            locked = True
+            try:
+                lock.acquire(timeout=120.0)
+            except LockBusy:
+                locked = False
+                log.warning(
+                    "/notify: could not take %s within 120s — running anyway",
+                    lock.path,
+                )
+            except OSError:
+                locked = False
+                log.warning("/notify: could not open %s", lock.path, exc_info=True)
             try:
                 with stdout_proxy.capture(buf):
                     notify_cmd.callback(config_path=config.path)
@@ -4371,6 +4459,8 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 err = str(e)
                 code = 1
             finally:
+                if locked:
+                    lock.release()
                 if prev is None:
                     os.environ.pop("COORD_NOTIFY_ON_DAEMON", None)
                 else:
@@ -5314,6 +5404,30 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         # merged-but-grey work should resolve immediately, not after 5 minutes.
         last_merge_reconcile = 0.0
 
+        # #1616: the pipeline's CLOCK.  Before this the daemon's passive
+        # reconcile set `status=done` and stopped by contract, and the only
+        # thing on this fleet that ran the downstream side effects was a live
+        # `coord drive`'s STALL nudge — so every headless stage boundary cost a
+        # full stall interval (9 min on #1123, 47 min on #1122), and rows with
+        # no drive at all (vimcode#611/#613) waited until a human poked the
+        # daemon.  Own cadence rather than every `interval` because the pass
+        # polls every machine's agent and can hit GitHub; 60 s bounds a stage
+        # boundary at ~1 min instead of tens of minutes.  0 disables (reverting
+        # to the pre-#1616 "nothing advances unless someone runs a command"
+        # behaviour, which is the escape hatch, not the default).
+        try:
+            notify_drain_interval = float(
+                os.environ.get("COORD_NOTIFY_DRAIN_INTERVAL", "60")
+            )
+        except ValueError:
+            notify_drain_interval = 60.0
+        # Start at 0 so a freshly (re)started daemon drains on its very first
+        # tick.  A restart is exactly when a backlog of un-drained terminal
+        # rows is most likely to exist, and #1616 is precisely "nothing ever
+        # advances them automatically" — waiting a full interval first would
+        # reproduce the bug for one more minute on every deploy.
+        last_notify_drain = 0.0
+
         # #1220: fleet-wide orphaned-worktree sweep on its own slow cadence
         # (default hourly; 0 disables).  Separate timer from housekeeping/
         # merges above since it's a different kind of maintenance (per-machine
@@ -5365,6 +5479,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
 
         async def _tick_loop() -> None:
             nonlocal last_housekeeping, last_merge_reconcile, last_worktree_clean, last_wal_checkpoint
+            nonlocal last_notify_drain
             from coord.reconcile import reconcile_completed_assignments  # noqa: PLC0415
             from coord import merge_queue as _mq  # noqa: PLC0415
 
@@ -5395,6 +5510,44 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                         _audit_reconciled(reconciled)
                 except Exception:  # noqa: BLE001 — a tick must never crash the daemon
                     log.warning("passive reconcile tick failed", exc_info=True)
+                # Step 1b: #1616 — THE PIPELINE'S CLOCK.  Runs immediately after
+                # the passive reconcile (which just flipped agent-finished rows
+                # to `done`/`finalizing` but, by contract, posted nothing and
+                # dispatched nothing) and BEFORE the enqueue step below, so a
+                # review this drain approves is picked up by `enqueue_approved_
+                # work` in the SAME tick rather than 30 s later.
+                #
+                # Scope: completion comments + `finished_at` + the #1076/#1152
+                # test-gate backfill + Test-stage smoke + review dispatch, all
+                # under ~/.coord/notify.lock.  NOT work dispatch and NOT the
+                # fix round — that asymmetry is the #476/#477 duplicate-fix-
+                # worker risk, and is argued in `coord.notify.run_drain`'s
+                # docstring.  Independent try/except so a drain failure never
+                # silences the reconcile/enqueue steps.
+                if notify_drain_interval > 0 and (
+                    _time.monotonic() - last_notify_drain >= notify_drain_interval
+                ):
+                    last_notify_drain = _time.monotonic()
+                    try:
+                        drained = await run_in_threadpool(
+                            _notify_drain_tick, config
+                        )
+                        if drained.skipped_locked:
+                            log.debug(
+                                "notify drain: skipped — ~/.coord/notify.lock "
+                                "held by a drive or another drain"
+                            )
+                        elif drained.transitions:
+                            log.info(
+                                "notify drain: %d transition(s) posted (%s)",
+                                len(drained.transitions),
+                                ", ".join(
+                                    f"{t.repo_name}#{t.issue_number}:{t.event}"
+                                    for t in drained.transitions
+                                ),
+                            )
+                    except Exception:  # noqa: BLE001
+                        log.warning("notify drain tick failed", exc_info=True)
                 # Step 2: enqueue approved work (#736 / #217 invisible limbo fix).
                 # Runs AFTER reconcile so freshly-completed work is on the board
                 # when we scan for approved assignments.  Independent try/except
