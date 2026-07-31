@@ -43,6 +43,32 @@ tests:
   plans_rightclick_1123::plans_status_bar_advertises_right_click_menu: 1123
   # §4f — status bar points at the `?` help overlay
   plans_rightclick_1123::plans_status_bar_advertises_help_key: 1123
+
+  # ── #1122 (CC-2) — rich in-app plan detail pane (contract §3) ───────────
+  #
+  # ⚠ ALL FIVE ARE CURRENTLY BLOCKED ON A HARNESS GAP, NOT ON #1122.
+  # Every §3 clause is predicated on a *selected plan row*, and no plan row
+  # can be seeded from this external `--test acceptance` crate
+  # (`BoardData::plan_roster` / `PlanRosterEntry` are `pub(crate)`;
+  # `BoardData` derives only `Default`; no public fixture seam takes plan
+  # data; the `set_test_board_service` seam cannot help because
+  # `start_data_load` resolves on a spawned thread). They therefore fail at a
+  # shared precondition that prints the full diagnosis, rather than on a §3
+  # assertion. See the HARNESS BLOCKER banner at the head of
+  # plans_detail_1122.rs. Needs `make_app_with_plan_roster_json` (mirroring
+  # the existing `make_app_with_audit_json`) landed + a contract amendment
+  # pinning it, then a re-authored slice — only `plans_driver()` changes.
+  #
+  # §3a/§3b — Enter opens the detail pane; required header strings
+  plans_detail_1122::detail_pane_opens_on_enter_with_header: 1122
+  # §3c — work-order checklist heading + status glyphs
+  plans_detail_1122::detail_pane_shows_work_order_checklist: 1122
+  # §3d — actions row (incl. demoted "Open in browser")
+  plans_detail_1122::detail_pane_shows_actions_row: 1122
+  # §3f — status bar shows "Esc=back" while the pane is open
+  plans_detail_1122::detail_pane_status_bar_shows_esc_back: 1122
+  # §3a — Esc returns to the list view
+  plans_detail_1122::detail_pane_esc_returns_to_list: 1122
   #
   # NOT YET SEALED (see the TODO block at the foot of plans_rightclick_1123.rs):
   # contract §4a / §4b / §4d need a *seeded plan row*, and no public fixture
