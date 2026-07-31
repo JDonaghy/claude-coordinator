@@ -75,8 +75,6 @@ decision half, which is why that half is where the tests are.
 
 from __future__ import annotations
 
-import errno
-import fcntl
 import json
 import os
 import re
