@@ -2202,6 +2202,17 @@ impl CoordApp {
                         self.usage_collapse();
                         needs_redraw = true;
                     }
+                    // #1122 (contract §3a): Esc closes the Plans detail pane
+                    // back to the roster list instead of quitting — must
+                    // precede the unguarded catch-all below, same reasoning
+                    // as the Audit/Usage detail-close arms just above.
+                    Key::Named(NamedKey::Escape)
+                        if self.active_view == SidebarView::Plans
+                            && self.plans_detail_open =>
+                    {
+                        self.plans_detail_open = false;
+                        needs_redraw = true;
+                    }
                     Key::Char('q') | Key::Named(NamedKey::Escape) => return Reaction::Exit,
 
                     // §3 (#782): numeric keys 1-7 used to switch sidebar views
@@ -2240,8 +2251,13 @@ impl CoordApp {
                     // — the currently-rendered rows — not the full roster, so
                     // navigation never lands on a collapsed no-work-order
                     // milestone that isn't on screen.
+                    // #1122: all of these guard on `!plans_detail_open` — the
+                    // roster list isn't painted at all while the detail pane
+                    // is open (contract §3a), so moving `plans_sel`/toggling
+                    // expansion/popping a capture prompt underneath it would
+                    // desync the selection from what's on screen.
                     Key::Char('j') | Key::Named(NamedKey::Down)
-                        if self.active_view == SidebarView::Plans =>
+                        if self.active_view == SidebarView::Plans && !self.plans_detail_open =>
                     {
                         let n = self.plans_visible_entries().len();
                         if n > 0 {
@@ -2250,7 +2266,7 @@ impl CoordApp {
                         needs_redraw = true;
                     }
                     Key::Char('k') | Key::Named(NamedKey::Up)
-                        if self.active_view == SidebarView::Plans =>
+                        if self.active_view == SidebarView::Plans && !self.plans_detail_open =>
                     {
                         self.plans_sel = self.plans_sel.saturating_sub(1);
                         needs_redraw = true;
@@ -2258,18 +2274,22 @@ impl CoordApp {
                     // #1001: `u` toggles whether the currently-selected row's
                     // repo shows its "without a work order" milestones
                     // (default: collapsed into a "+N" summary line).
-                    Key::Char('u') if self.active_view == SidebarView::Plans => {
+                    Key::Char('u')
+                        if self.active_view == SidebarView::Plans && !self.plans_detail_open =>
+                    {
                         self.toggle_plans_repo_expansion();
                         needs_redraw = true;
                     }
-                    // Enter — open the tracking epic of the selected plan in
-                    // the browser via `gh issue view --web`.  A no-op with a
-                    // toast when the plan has no epic yet (#977 / #978 cover
-                    // the create-epic workflow).
+                    // Enter (#1122, contract §3a) — opens the in-app detail
+                    // pane for the selected plan (`plans_detail_open`)
+                    // instead of spawning `gh issue view --web` (demoted to
+                    // the pane's own "Open in browser" action). A no-op with
+                    // a toast when the plan has no epic yet (#977 / #978
+                    // cover the create-epic workflow).
                     Key::Named(NamedKey::Enter)
-                        if self.active_view == SidebarView::Plans =>
+                        if self.active_view == SidebarView::Plans && !self.plans_detail_open =>
                     {
-                        self.open_selected_plan_tracking_epic();
+                        self.open_selected_plan_detail();
                         needs_redraw = true;
                     }
                     // "Capture a plan" (#977) — one-key fast-jot: pops the
@@ -2278,6 +2298,7 @@ impl CoordApp {
                     // on modifiers.ctrl; 'n' is taken globally by `notify`).
                     Key::Char('c')
                         if self.active_view == SidebarView::Plans
+                            && !self.plans_detail_open
                             && self.pending_plan_capture.is_none() =>
                     {
                         self.pending_plan_capture = Some(String::new());
@@ -2291,6 +2312,7 @@ impl CoordApp {
                     // gated on modifiers.ctrl).
                     Key::Char('C')
                         if self.active_view == SidebarView::Plans
+                            && !self.plans_detail_open
                             && self.pending_new_milestone_chat.is_none() =>
                     {
                         self.pending_new_milestone_chat = Some(String::new());
@@ -4278,7 +4300,15 @@ impl CoordApp {
                     // Pre-select the row under the cursor (mirrors the
                     // synthetic-left-click pattern above) before resolving
                     // the target from the now-current selection.
-                    if self.active_view == SidebarView::Plans {
+                    if self.active_view == SidebarView::Plans && !self.plans_detail_open {
+                        // #1122: while the detail pane is open the roster
+                        // list isn't painted at all, so `plans_row_at`
+                        // (below) can't resolve a target — right-click on a
+                        // work-order row is explicitly deferred to CC-3
+                        // (contract §3c), so this arm just no-ops rather
+                        // than falling through to the unrelated "New plan"
+                        // stub menu `plans_row_at`'s `None` case would
+                        // otherwise open.
                         let main_b = ctx.main_bounds();
                         let lh = backend.line_height();
                         // #1123 §4c: a right-click that misses every
@@ -5311,6 +5341,17 @@ impl CoordApp {
         // pre-select, leaving the #1003 CRUD context menu unreachable by
         // mouse entirely.
         if self.active_view == SidebarView::Plans {
+            // #1122: while the detail pane is open it replaces the roster
+            // list entirely (contract §3a) — hit-test its actions row
+            // instead of `plans_row_at` (which assumes the list is what's
+            // painted).
+            if self.plans_detail_open {
+                if let Some(action_id) = self.plan_detail_action_at(pos, main_b, lh) {
+                    self.activate_plan_detail_action(&action_id);
+                    return true;
+                }
+                return false;
+            }
             if let Some(idx) = self.plans_row_at(pos, main_b, lh) {
                 self.plans_sel = idx;
                 return true;

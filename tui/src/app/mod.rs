@@ -2909,6 +2909,12 @@ pub struct CoordApp {
     /// trailing "+N without a work order" summary line instead. Toggled with
     /// `u` on the repo of the currently-selected row.
     plans_expanded_repos: std::collections::HashSet<String>,
+    /// `true` when the #1122 in-app plan detail pane is open, replacing the
+    /// roster list in the Plans main panel — `Enter` on a row whose
+    /// `tracking_issue` is `Some(_)` opens it (`open_selected_plan_detail`,
+    /// `plans.rs`); `Esc` closes it back to the list (mirrors
+    /// `audit_detail_open`'s list/detail toggle).
+    plans_detail_open: bool,
 
     // ── #1121: Plans sidebar repo→plan tree + repo scoping ──────────────────
     /// Per-repo expand state for the Plans sidebar `TreeView`, keyed by repo
@@ -3521,6 +3527,8 @@ impl CoordApp {
             // #1001: no repo starts expanded — untracked milestones default
             // to collapsed everywhere.
             plans_expanded_repos: std::collections::HashSet::new(),
+            // #1122: starts on the roster list, not the detail pane.
+            plans_detail_open: false,
             // #1121: sidebar tree — nothing scoped yet ("All repos"), no
             // explicit expand overrides (falls back to collapsed).
             plans_tree_expanded: std::collections::HashMap::new(),
@@ -7506,6 +7514,14 @@ impl CoordApp {
             // input while open (`events.rs`), so a typed `q` is swallowed
             // (or filters the palette query), not a quit.
             " Esc=close ".to_string()
+        } else if self.active_view == SidebarView::Plans && self.plans_detail_open {
+            // #1122 (contract §3f): the detail pane replaces the roster
+            // list, so its own hint set replaces the list-mode one just
+            // below rather than layering onto it — `Esc=back` (to the list)
+            // is the load-bearing substring §3f requires; `right-click=menu`
+            // and `?=help` remain true (the cheatsheet/palette still open
+            // over the pane) so they're kept for discoverability.
+            " j/k=nav  Esc=back to list  right-click=menu  ?=help  q=quit ".to_string()
         } else if self.active_view == SidebarView::Plans {
             // #1123 (contract §4f): the CC-1 status bar advertised the
             // bare `c`/`u` letters directly (see the old comment this
@@ -7515,9 +7531,13 @@ impl CoordApp {
             // *inside* the menu — contract §4e). The status bar instead
             // points at the two ways to discover them: `right-click=menu`
             // and `?=help` (the cheatsheet lists every binding, #1124).
-            // `/=palette` and `Enter=open epic` are kept as additional
-            // hints — the contract only requires the two substrings above.
-            " j/k=nav  Enter=open epic  right-click=menu  ?=help  /=palette  q=quit ".to_string()
+            // `/=palette` is kept as an additional hint. `Enter=detail`
+            // (#1122) replaces the old `Enter=open epic` — Enter now opens
+            // the in-app detail pane, not the browser (that's demoted to
+            // the pane's own "Open in browser" action) — the contract only
+            // requires the `right-click=menu`/`?=help` substrings, so this
+            // rewording doesn't affect §4f's assertions.
+            " j/k=nav  Enter=detail  right-click=menu  ?=help  /=palette  q=quit ".to_string()
         } else if self.active_view == SidebarView::Sessions {
             // #1033: mirrors the retired #628 live-sessions overlay's
             // footer hint verbatim ([r]eattach / [K]ill / [f]stop), now

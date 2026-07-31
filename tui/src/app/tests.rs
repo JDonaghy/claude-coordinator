@@ -34471,6 +34471,214 @@ Milestone tracking issue.
         );
     }
 
+    // ── #1122 (contract §3): Plans panel — in-app detail pane ────────────
+
+    /// Select the "Substrate" plan row (milestone #5, `tracking_issue:
+    /// Some(500)` — `make_plan_roster_board_data()`) and press Enter,
+    /// contract §3a's trigger for the in-app detail pane.
+    fn open_substrate_detail_pane() -> quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic> {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_test_app(make_plan_roster_board_data());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "◆");
+        let (x, y) = driver.find("Substrate").unwrap_or_else(|| {
+            panic!(
+                "#1122: could not find Plans row 'Substrate' on initial render:\n{}",
+                driver.screen()
+            )
+        });
+        driver.click(x, y);
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver
+    }
+
+    /// Contract §3a (trigger) + §3b (required header strings): Enter on a
+    /// plan row with `tracking_issue: Some(_)` opens the in-app detail pane
+    /// instead of spawning `gh issue view --web` — the header carries the
+    /// milestone number, title, tracking-epic ref, and done percentage.
+    /// `entry.total == 3`/`entry.done == 0` (`make_plan_roster_board_data`)
+    /// ⇒ `0% done`, so `"% done"` (not a pinned digit) is what's asserted,
+    /// matching contract §3b's own worked example.
+    #[test]
+    fn plans_detail_pane_opens_on_enter_with_header() {
+        let driver = open_substrate_detail_pane();
+        let screen = driver.screen();
+        for needle in ["#5", "Substrate", "epic:#500", "% done"] {
+            assert!(
+                screen.contains(needle),
+                "contract §3a/§3b: Enter on a plan row with `tracking_issue: \
+                 Some(_)` must open the in-app detail pane, whose header \
+                 contains {needle:?}:\n{screen}",
+            );
+        }
+    }
+
+    /// Contract §3c: with `has_work_order == true` the detail pane renders
+    /// the "Work order" section heading plus at least one status-glyph
+    /// row. `make_plan_roster_board_data`'s Substrate entry has no
+    /// client-side-parseable `## Work order` body synced into
+    /// `open_issues` (no `OpenIssue` seeded at all), so this exercises the
+    /// contract §8 note 1 aggregate-counts fallback
+    /// (`ready_frontier=2`/`blocked=1` ⇒ `·`/`—` rows) rather than the
+    /// richer per-issue `milestone_dag` path — both paths are permitted by
+    /// the contract, and the richer path is unit-tested directly via
+    /// `milestone_dag::build_dag_nodes` already.
+    #[test]
+    fn plans_detail_pane_shows_work_order_checklist() {
+        let driver = open_substrate_detail_pane();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Work order"),
+            "contract §3c: the detail pane must render the \"Work order\" \
+             checklist section heading:\n{screen}",
+        );
+        let glyphs = ['✓', '▶', '·', '—'];
+        assert!(
+            screen.lines().any(|line| glyphs.iter().any(|g| line.contains(*g))),
+            "contract §3c: at least one work-order row must carry a status \
+             glyph — `✓` (done), `▶` (in-flight), `·` (ready) or `—` \
+             (blocked):\n{screen}",
+        );
+        assert!(
+            screen.contains("ready") && screen.contains("blocked"),
+            "contract §8 note 1: the aggregate-counts fallback must surface \
+             the roster's own ready/blocked counts under \"Work order\":\n{screen}",
+        );
+    }
+
+    /// Contract §3d: the detail pane's actions row carries every required
+    /// action label.
+    #[test]
+    fn plans_detail_pane_shows_actions_row() {
+        let driver = open_substrate_detail_pane();
+        let screen = driver.screen();
+        for needle in [
+            "Dispatch next",
+            "Open chat",
+            "View DAG",
+            "Edit",
+            "Open in browser",
+        ] {
+            assert!(
+                screen.contains(needle),
+                "contract §3d: the detail pane's actions row must offer \
+                 {needle:?}:\n{screen}",
+            );
+        }
+    }
+
+    /// Contract §3f: with the detail pane open the status bar shows
+    /// "Esc=back" (this implementation's exact wording is "Esc=back to
+    /// list").
+    #[test]
+    fn plans_detail_pane_status_bar_shows_esc_back() {
+        let driver = open_substrate_detail_pane();
+        assert!(
+            driver.screen_contains("Esc=back"),
+            "contract §3f: with the detail pane open the status bar must \
+             contain \"Esc=back\":\n{}",
+            driver.screen(),
+        );
+    }
+
+    /// Contract §3a: "Pressing Esc returns to the list view." Asserted via
+    /// "Work order" / "Open in browser" (detail-pane-only strings) rather
+    /// than `"epic:#500"`, which legitimately survives in the list view
+    /// too (`render_plans_panel`'s own tracked-row label already shows
+    /// `epic:#500`) — unlike the sealed external acceptance slice's
+    /// `plans_detail_1122.rs`, which asserts on `epic:#1120` under the
+    /// (here, wrong) assumption that string is detail-pane-exclusive.
+    #[test]
+    fn plans_detail_pane_esc_returns_to_list() {
+        let mut driver = open_substrate_detail_pane();
+        assert!(
+            driver.screen_contains("Work order"),
+            "precondition: Enter must open the detail pane before Esc can \
+             close it:\n{}",
+            driver.screen(),
+        );
+        driver.press_named(quadraui::NamedKey::Escape);
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("Open in browser"),
+            "contract §3a: Esc must return to the list view — the detail \
+             pane's actions row must no longer be rendered:\n{screen}",
+        );
+        assert!(
+            screen.contains("Substrate") && screen.contains("epic:#500"),
+            "contract §3a: after Esc the roster list (with its own \
+             'epic:#500' row label) must be showing again:\n{screen}",
+        );
+        assert!(
+            driver.screen_contains(" PLANS "),
+            "contract §3a: after Esc the Plans panel must still be the \
+             active view:\n{screen}",
+        );
+    }
+
+    /// #1122: a stub row (`tracking_issue: None`) keeps the pre-#1122 "no
+    /// tracking epic yet" toast on Enter rather than opening a detail pane
+    /// with nothing to show — contract §3a only wires Enter to the detail
+    /// pane for rows with `tracking_issue: Some(_)`.
+    #[test]
+    fn plans_detail_pane_enter_on_stub_row_shows_toast_not_pane() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_test_app(make_plan_roster_board_data());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "◆");
+        // "Follow-up" (no tracking issue) is collapsed by default (#1001).
+        driver.press(quadraui::Key::Char('u'));
+        let (x, y) = driver.find("Follow-up").unwrap_or_else(|| {
+            panic!(
+                "#1122: could not find expanded stub row 'Follow-up':\n{}",
+                driver.screen()
+            )
+        });
+        driver.click(x, y);
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("Open in browser"),
+            "#1122: Enter on a stub row (no tracking epic) must NOT open \
+             the detail pane:\n{screen}",
+        );
+        assert!(
+            screen.contains("No tracking epic yet"),
+            "#1122: Enter on a stub row must keep the pre-#1122 \
+             \"no tracking epic yet\" toast:\n{screen}",
+        );
+    }
+
+    /// #1122: clicking the "Open in browser" button on the detail pane's
+    /// actions row dispatches the same `gh issue view --web` action Enter
+    /// used to fire directly pre-#1122 (`open_selected_plan_tracking_epic`,
+    /// which pushes an "Opening plan" toast under `#[cfg(test)]` instead of
+    /// really spawning `gh`) — proves `plan_detail_action_at`'s click
+    /// hit-test resolves the button under the cursor rather than just
+    /// rendering inert text.
+    #[test]
+    fn plans_detail_pane_open_in_browser_button_is_clickable() {
+        let mut driver = open_substrate_detail_pane();
+        let (x, y) = driver.find("Open in browser").unwrap_or_else(|| {
+            panic!(
+                "#1122: could not find the 'Open in browser' button on the \
+                 detail pane:\n{}",
+                driver.screen()
+            )
+        });
+        driver.click(x, y);
+        assert!(
+            driver.screen_contains("Opening plan"),
+            "#1122: clicking 'Open in browser' must dispatch \
+             `open_selected_plan_tracking_epic` (toasts \"Opening plan\" \
+             under #[cfg(test)]):\n{}",
+            driver.screen(),
+        );
+    }
+
     /// #1029 fix-iteration regression (bug A): opening milestone chat from
     /// the Plans panel must update quadraui's ActivityBar highlight AND
     /// sidebar panel header, not just the main-pane content. Before this
@@ -34806,36 +35014,36 @@ Milestone tracking issue.
         driver.click(x, y);
         driver.press_named(quadraui::NamedKey::Enter);
 
+        // #1122: Enter now opens the in-app detail pane (contract §3a)
+        // rather than firing "gh issue view" directly — the detail pane's
+        // own header ("epic:#<N>") is the proxy for "which row got
+        // selected" this test now checks instead of a toast line.
         let screen = driver.screen();
         assert!(
-            screen.contains("Opening plan"),
-            "clicking a Plans row then pressing Enter must fire the 'Opening \
-             plan' toast:\n{}",
+            screen.contains("Open in browser"),
+            "clicking a Plans row then pressing Enter must open the #1122 \
+             detail pane:\n{}",
             screen,
         );
-        // Both #500 (Substrate) and #1200 (Frontend Revamp) are always
-        // visible as static row text regardless of selection, so scope the
-        // assertion to the toast line itself rather than the whole screen.
-        let toast_line = screen
-            .lines()
-            .find(|line| line.contains("gh issue view"))
-            .unwrap_or_else(|| panic!("no 'gh issue view' toast line found:\n{screen}"));
         assert!(
-            toast_line.contains("#1200"),
+            screen.contains("epic:#1200"),
             "clicking the second repo's row then pressing Enter must open ITS \
-             tracking epic (#1200), not the first repo's (#500) — a \
-             header/summary-row count mismatch in `plans_row_at` mis-maps \
-             the click to the wrong row:\n{}",
+             detail pane (tracking epic #1200), not the first repo's \
+             (#500) — a header/summary-row count mismatch in `plans_row_at` \
+             mis-maps the click to the wrong row:\n{}",
             screen,
         );
     }
 
     /// After landing on Plans, pressing Enter on the selected row opens the
-    /// tracking epic (visible as an "Opening plan" toast in-test — the real
-    /// `gh` spawn is `#[cfg(not(test))]`-gated to keep the sandbox hermetic).
-    /// Pressing j once first moves selection to the second row (Follow-up),
-    /// which has no epic — that path must surface a "No tracking epic yet"
-    /// toast rather than opening a bogus URL.
+    /// #1122 in-app detail pane for its tracking epic (pre-#1122 this fired
+    /// `gh issue view --web` directly, visible as an "Opening plan" toast —
+    /// that's now demoted to the pane's own "Open in browser" action, see
+    /// `plans_detail_pane_opens_on_enter_with_header` for the full header
+    /// assertion). Pressing j once first moves selection to the second row
+    /// (Follow-up), which has no epic — that path must surface a "No
+    /// tracking epic yet" toast rather than opening a pane with nothing to
+    /// show.
     #[test]
     fn plans_panel_enter_opens_tracking_epic() {
         use quadraui::tui::testing::driver_with_shell;
@@ -34844,16 +35052,17 @@ Milestone tracking issue.
         let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
         click_activity_icon(&mut driver, "◆");
 
-        // Row 0 (Substrate) is selected by default → Enter opens epic #500.
+        // Row 0 (Substrate) is selected by default → Enter opens its detail
+        // pane (tracking epic #500).
         driver.press_named(quadraui::NamedKey::Enter);
         assert!(
-            driver.screen_contains("Opening plan"),
-            "#975: Enter on a plan with an epic must fire the 'Opening plan' toast:\n{}",
+            driver.screen_contains("Open in browser"),
+            "#1122: Enter on a plan with an epic must open the detail pane:\n{}",
             driver.screen(),
         );
         assert!(
-            driver.screen_contains("#500"),
-            "#975: the 'Opening plan' toast must name the tracking epic (#500):\n{}",
+            driver.screen_contains("epic:#500"),
+            "#1122: the detail pane header must name the tracking epic (#500):\n{}",
             driver.screen(),
         );
     }
