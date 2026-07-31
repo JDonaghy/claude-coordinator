@@ -374,7 +374,27 @@ class TestLifecycleCommandsAfterRefactor:
         # The seam received the right add/remove sets
         call_kwargs = mock_change.call_args.kwargs
         assert "status:ready" in call_kwargs["add"]
+        assert "coord" in call_kwargs["add"], "coord ready must add the 'coord' label"
         assert "status:refining" in call_kwargs["remove"]
+
+    def test_coord_ready_adds_coord_label_when_missing(self, config_file: Path) -> None:
+        """#544: coord ready must add coord label even if issue doesn't have it."""
+        _seed_issue(labels=["status:backlog"])
+        with patch(
+            "coord.github_ops.change_issue_labels",
+            return_value=(["status:ready", "coord"], True),
+        ) as mock_change:
+            result = CliRunner().invoke(
+                main,
+                ["ready", "api", "10", "--config", str(config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        assert "ready" in result.output.lower()
+        # Verify both labels are in the add set
+        call_kwargs = mock_change.call_args.kwargs
+        assert call_kwargs["add"] == {"status:ready", "coord"}, (
+            "coord ready must add both status:ready and coord labels"
+        )
 
     def test_coord_backlog_reports_noop_when_already_backlog(
         self, config_file: Path
