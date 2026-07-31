@@ -653,6 +653,53 @@ impl CoordApp {
         ]
     }
 
+    /// #1123 (contract §4b/§4c): context-menu items for a Plans-panel
+    /// right-click that has no tracking epic to act on yet — either a
+    /// specific epic-less milestone row (`milestone: Some`, §4b) or the
+    /// repo-header row / empty main-panel space (`milestone: None`, §4c).
+    /// Distinct from [`Self::context_menu_items_for_milestone_header`]'s
+    /// eleven-item CRUD menu, which requires a `tracking_issue` to build
+    /// `coord milestone dispatch`/`chat`/`edit`/... calls against.
+    ///
+    /// `repo_name` is accepted (not yet read) for the day
+    /// `promote-milestone-to-epic` needs to pass `--repo` explicitly rather
+    /// than relying on `capture_plan_chat`'s own selection-based lookup —
+    /// see `dispatch_context_menu_action`.
+    pub(crate) fn context_menu_items_for_plans_stub(
+        &self,
+        _repo_name: Option<&str>,
+        milestone: Option<&(i64, String)>,
+    ) -> Vec<ContextMenuItem> {
+        if milestone.is_some() {
+            // §4b: a specific epic-less milestone row under the cursor —
+            // offer to bootstrap it into a real tracking epic. The action
+            // itself is deliberately unpinned by the contract ("TBD — new
+            // action"); see `dispatch_context_menu_action` for the chosen
+            // implementation (routes to the guided-chat flow).
+            vec![
+                ContextMenuItem::action(
+                    "promote-milestone-to-epic",
+                    "Create work order / promote to epic…",
+                ),
+                ContextMenuItem::separator(),
+                ContextMenuItem::action("refresh", "Refresh").with_shortcut("r"),
+            ]
+        } else {
+            // §4c: repo-header row or empty main-panel space — the
+            // discoverable replacement for the cryptic `c`/`C` bare-key
+            // bindings, with the accelerators surfaced inside the menu
+            // (contract §4e) instead.
+            vec![
+                ContextMenuItem::action("capture-plan-quick", "New plan > Quick capture")
+                    .with_shortcut("c"),
+                ContextMenuItem::action("capture-plan-chat", "New plan > Guided chat…")
+                    .with_shortcut("C"),
+                ContextMenuItem::separator(),
+                ContextMenuItem::action("refresh", "Refresh").with_shortcut("r"),
+            ]
+        }
+    }
+
     /// Promote the target milestone's whole declared work order into the
     /// pipeline: `coord milestone dispatch <repo> <tracking_issue>` (#769,
     /// Phase 1 — already shipped; this just spawns it the same way every

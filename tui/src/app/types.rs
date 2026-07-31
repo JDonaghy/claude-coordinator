@@ -792,6 +792,25 @@ pub(crate) enum ContextMenuTarget {
     /// machine row — those have no menu yet). Carries what "Kill terminal"
     /// needs to dispatch `coord terminal kill <machine>:<name>`.
     TerminalRow { machine: String, name: String },
+    /// #1123: right-click on a Plans-panel row with no tracking epic yet
+    /// (`PlanRosterEntry::tracking_issue == None`), or on the repo-header
+    /// row / empty main-panel space. Kept distinct from `MilestoneHeader`
+    /// (which requires a `tracking_issue: u64` to act on) because none of
+    /// these targets have an epic yet for the eleven-item CRUD menu to
+    /// operate on — the menu offered instead is either "create one" for a
+    /// specific stub row, or "New plan" for no specific row (contract
+    /// §4b/§4c, `tests/acceptance/ms-38/contract.md`).
+    PlansStub {
+        /// Coord-local repo name to scope a new plan into, when known:
+        /// the repo of the stub milestone under the cursor, or (for a
+        /// repo-header/empty-space click) whichever repo the Plans sidebar
+        /// is currently scoped to. `None` when nothing can be inferred.
+        repo_name: Option<String>,
+        /// `Some((milestone_number, title))` when a specific epic-less
+        /// milestone row was under the cursor (contract §4b). `None` for
+        /// the repo-header/empty-space case (contract §4c).
+        milestone: Option<(i64, String)>,
+    },
 }
 
 /// #262: lifecycle bucket for a Pipeline sidebar row at right-click

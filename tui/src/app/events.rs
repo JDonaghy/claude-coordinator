@@ -4281,10 +4281,27 @@ impl CoordApp {
                     if self.active_view == SidebarView::Plans {
                         let main_b = ctx.main_bounds();
                         let lh = backend.line_height();
-                        if let Some(idx) = self.plans_row_at(pos, main_b, lh) {
-                            self.plans_sel = idx;
-                        }
-                        if let Some(target) = self.context_menu_target_for_selection() {
+                        // #1123 §4c: a right-click that misses every
+                        // selectable row (the repo-header row, the "+N
+                        // without a work order" summary line, or truly
+                        // empty space) opens the discoverable "New plan"
+                        // menu instead of falling through to whatever row
+                        // was selected before this click —
+                        // `context_menu_target_for_selection` has no way to
+                        // distinguish "nothing under the cursor" from "the
+                        // previous selection", so that case is built
+                        // directly here rather than reused.
+                        let target = match self.plans_row_at(pos, main_b, lh) {
+                            Some(idx) => {
+                                self.plans_sel = idx;
+                                self.context_menu_target_for_selection()
+                            }
+                            None => Some(ContextMenuTarget::PlansStub {
+                                repo_name: self.plans_scope_repo(),
+                                milestone: None,
+                            }),
+                        };
+                        if let Some(target) = target {
                             if self.open_context_menu(pos, target) {
                                 return true;
                             }
