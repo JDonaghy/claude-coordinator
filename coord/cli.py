@@ -73,6 +73,11 @@ from coord.commands.sessions import (
     watch,
 )
 from coord.commands.terminal import terminal_group
+
+# #1628: the health check engine ships its own CLI surface inside
+# coord/health/ so the whole feature — registry, probes, renderer, command —
+# stays in one package. Registered here like any other command.
+from coord.health.cli import health
 from coord.commands.merge import (
     bounce,
     merge,
@@ -352,6 +357,7 @@ main.add_command(reconcile_merges)
 main.add_command(housekeeping)
 main.add_command(diagnose)
 main.add_command(doctor)
+main.add_command(health)
 main.add_command(issue_group)
 main.add_command(context_group)
 main.add_command(audit)
