@@ -275,6 +275,16 @@ class Assignment:
     # "dispatched" — review assignment is in flight
     # "done"       — review assignment completed
     review_state: str | None = None
+    # #1627: human-readable reason `dispatch_review()` set on THIS assignment
+    # the last time it returned ``None`` without dispatching a review — e.g.
+    # "assignment is type 'smoke', not reviewable work" or "a work/fix
+    # assignment is actively rewriting the branch for this issue". Transient:
+    # set in-memory on every early-return guard so a caller in the same
+    # process (the `coord review` CLI, chiefly) can report *why* nothing was
+    # dispatched instead of guessing. Not read back out of storage by
+    # `row_to_assignment` — it isn't meant to survive a reload, only the one
+    # dispatch_review() call that produced it.
+    review_dispatch_reason: str | None = None
     # Pipeline gate requirements — controls which approval steps are enforced.
     # Empty list means "use config.pipeline.default_gates".
     # Examples: ["review", "merge"], ["merge"], ["review", "smoke", "merge"]

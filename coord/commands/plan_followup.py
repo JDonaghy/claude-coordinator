@@ -372,7 +372,10 @@ def pr(assignment_id: str, config_path: Path, no_review: bool) -> None:
             click.echo(f"Review dispatched (assignment {review.assignment_id})")
             click.echo(f"  reviewer: {review.machine_name}")
         else:
-            click.echo("  review not dispatched (no eligible machine or reviews disabled)")
+            # #1627: report the specific guard dispatch_review hit rather
+            # than a generic guess.
+            reason = assignment.review_dispatch_reason or "reason not recorded"
+            click.echo(f"  review not dispatched: {reason}")
 
 
 @click.command(
@@ -442,16 +445,17 @@ def review(assignment_id: str, config_path: Path) -> None:
 
     review_assignment = dispatch_review(assignment, board, cfg)
     if review_assignment is None:
-        # dispatch_review logs its own reason (no eligible reviewer machine,
-        # branch not on remote, an active fix/work re-run for the same issue,
-        # the work is already terminal on GitHub, ...) — see the coordinator
-        # log for specifics.
-        click.echo(
-            f"error: no review dispatched for {assignment_id} — no eligible "
-            "reviewer machine, or a guard in dispatch_review blocked it "
-            "(see the coordinator log for the specific reason)",
-            err=True,
+        # #1627: dispatch_review() records *why* it declined on the
+        # assignment itself (review_dispatch_reason) — print that verbatim
+        # instead of guessing at a cause. (It used to be a bare `return
+        # None` from any of 11 guards, most of which never logged anything,
+        # so this message used to send operators chasing a log entry that
+        # didn't exist — see #1627.)
+        reason = assignment.review_dispatch_reason or (
+            "no reason recorded — this is itself a bug in dispatch_review; "
+            "please report it"
         )
+        click.echo(f"error: no review dispatched for {assignment_id} — {reason}", err=True)
         sys.exit(1)
 
     # Persist only on success: dispatch_review mutates the board in place

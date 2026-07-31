@@ -1479,17 +1479,47 @@ def dispatch_review(
     ``gh api compare`` call); inject a stub in tests so the gate is exercised
     without network.
     """
+    # #1627: every early-exit guard below used to be a bare `return None`,
+    # collapsing 11 distinct outcomes into one signal the caller couldn't
+    # distinguish (see coord/commands/plan_followup.py's `review` command,
+    # which used to print "no eligible reviewer machine, or a guard ...
+    # blocked it — see the coordinator log" for every one of them, even
+    # though most never logged anything). `_deny` records *why* on the
+    # assignment itself (`review_dispatch_reason`, transient/in-memory —
+    # see its docstring in models.py) and logs at info level, then returns
+    # None so call sites can keep writing `return _deny(...)`.
+    def _deny(reason: str) -> None:
+        completed.review_dispatch_reason = reason
+        log.info(
+            "[review] not dispatching for %s: %s", completed.assignment_id, reason
+        )
+        return None
+
     if not config.reviews.enabled or not config.reviews.auto_dispatch:
-        return None
+        return _deny(
+            f"reviews disabled (reviews.enabled={config.reviews.enabled!r}, "
+            f"reviews.auto_dispatch={config.reviews.auto_dispatch!r})"
+        )
     if completed.type not in WORK_LIKE_TYPES:
-        return None
+        return _deny(
+            f"assignment {completed.assignment_id} is type {completed.type!r}, "
+            f"not reviewable work (reviewable types: {sorted(WORK_LIKE_TYPES)}). "
+            "Did you mean the work assignment for this issue? Try: "
+            f"coord diagnose {completed.repo_name} {completed.issue_number}"
+        )
     if completed.status != "done":
-        return None
+        return _deny(
+            f"assignment {completed.assignment_id} has status "
+            f"{completed.status!r}, not 'done' — nothing to review yet"
+        )
     if not completed.branch:
         # Without a branch we can't open a PR or diff. Skip silently — this
         # usually means the worker forgot to switch off main, which the
         # branch-capture code in agent._reap will have left as None.
-        return None
+        return _deny(
+            f"assignment {completed.assignment_id} has no branch recorded — "
+            "the worker may not have pushed yet"
+        )
 
     # Dedupe: don't fire a second review if one's already in flight for this
     # completed work assignment.
@@ -1498,7 +1528,9 @@ def dispatch_review(
     if has_active_followup(
         board, of_assignment_id=completed.assignment_id, assignment_type="review"
     ):
-        return None
+        return _deny(
+            f"a review is already in flight for {completed.assignment_id}"
+        )
 
     # #459: skip review if a work or conflict-fix is actively rewriting the
     # branch for this issue (e.g. a coord-bounce fix iteration). Reviewing
@@ -1510,11 +1542,18 @@ def dispatch_review(
         repo_name=completed.repo_name,
         issue_number=completed.issue_number,
     ):
-        return None
+        return _deny(
+            "a work or fix assignment is actively rewriting the branch for "
+            f"issue #{completed.issue_number} in {completed.repo_name!r} — "
+            "review deferred until it finishes. If nothing is actually "
+            "running, this may be a phantom 'running' row left by a worker "
+            "that died mid-fix; check with: coord diagnose "
+            f"{completed.repo_name} {completed.issue_number}"
+        )
 
     repo = config.repo(completed.repo_name)
     if repo is None:
-        return None
+        return _deny(f"repo {completed.repo_name!r} not found in config")
 
     # #522: the review chokepoint. Never (re)dispatch a review for work that
     # is already done on GitHub — issue closed OR PR merged. This is the second
@@ -1526,7 +1565,10 @@ def dispatch_review(
         repo.github, completed.issue_number, completed.branch, cache=terminal_cache
     ):
         completed.review_state = "done"
-        return None
+        return _deny(
+            f"issue #{completed.issue_number} is already closed or its PR "
+            "already merged on GitHub — review is moot"
+        )
 
     # #437: STRUCTURAL TOS-COMPLIANCE GATE — auto-dispatched reviews are
     # an unattended path, so refuse to route them through a provider
@@ -1547,7 +1589,7 @@ def dispatch_review(
         )
     except ValueError as exc:
         print(f"[review] skipping auto-dispatch review: {exc}")
-        return None
+        return _deny(f"blocked by human-attended-only policy: {exc}")
 
     # #934: resolve this issue's base branch — `feature/ms-NN` when it
     # belongs to a milestone and the repo opted into the git model,
@@ -1593,7 +1635,10 @@ def dispatch_review(
             completed.branch, completed.assignment_id, base_branch,
         )
         completed.review_state = "zero_commits"
-        return None
+        return _deny(
+            f"branch {completed.branch!r} has 0 commits ahead of {base_branch} "
+            "— refusing to review an empty diff; re-dispatch the work instead"
+        )
 
     pr = pr_lookup(
         repo.github,
@@ -1613,7 +1658,10 @@ def dispatch_review(
         completed.machine_name, completed.repo_name, board, config
     )
     if not candidates:
-        return None
+        return _deny(
+            f"no eligible reviewer machine configured for repo "
+            f"{completed.repo_name!r}"
+        )
 
     # #586: if the branch isn't on the remote, only the original worker machine
     # has it locally — any cross-machine reviewer would crash on git-fetch.
@@ -1650,7 +1698,12 @@ def dispatch_review(
                     completed.branch, completed.assignment_id, completed.machine_name,
                 )
                 completed.review_state = "branch_not_on_remote"
-                return None
+                return _deny(
+                    f"branch {completed.branch!r} not on remote and original "
+                    f"worker machine {completed.machine_name!r} is unavailable "
+                    "(paused or not configured) — push the branch to origin "
+                    "or unpause the worker machine"
+                )
 
     # Compute the parts that are constant across all candidate machines.
 
@@ -1897,6 +1950,11 @@ def dispatch_review(
             completed.repo_name,
         )
         completed.review_state = "no_eligible_reviewer"
+        completed.review_dispatch_reason = (
+            f"all reviewer candidates rejected dispatch for repo "
+            f"{completed.repo_name!r} (config drift — check every agent's "
+            "repos list)"
+        )
     else:
         # Only transient failures — leave review_state unchanged so the next
         # reconcile/notify pass retries automatically.
@@ -1904,6 +1962,10 @@ def dispatch_review(
             "[review] all reviewer candidates unreachable for %s "
             "(repo=%r) — will retry on next reconcile/notify pass",
             completed.assignment_id, completed.repo_name,
+        )
+        completed.review_dispatch_reason = (
+            f"all reviewer candidates unreachable for repo "
+            f"{completed.repo_name!r} — transient, will retry automatically"
         )
     return None
 

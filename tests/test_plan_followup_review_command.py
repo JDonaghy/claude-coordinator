@@ -163,6 +163,34 @@ class TestCoordReviewGuards:
         assert "no review dispatched" in result.output
         disp.assert_called_once()
 
+    def test_reports_dispatch_review_reason_verbatim(
+        self, config_file: Path, coord_db
+    ) -> None:
+        """#1627: the CLI must print dispatch_review's own reason instead of
+        the old generic "no eligible reviewer machine, or a guard ... (see
+        the coordinator log)" guess — that message pointed at a log entry
+        the early guards never wrote."""
+        a = _make_assignment("work-007")
+        state_mod.save_board(Board(active=[], completed=[a]))
+
+        def _fake_dispatch_review(assignment, board, cfg, **kwargs):
+            assignment.review_dispatch_reason = (
+                "assignment work-007 is type 'smoke', not reviewable work"
+            )
+            return None
+
+        with patch(
+            "coord.review.dispatch_review", side_effect=_fake_dispatch_review
+        ) as disp:
+            result = CliRunner().invoke(
+                main, ["review", "work-007", "--config", str(config_file)]
+            )
+
+        assert result.exit_code != 0
+        assert "is type 'smoke', not reviewable work" in result.output
+        assert "see the coordinator log" not in result.output
+        disp.assert_called_once()
+
 
 class TestCoordReviewSuccess:
     def test_dispatches_exactly_one_review(self, config_file: Path, coord_db) -> None:

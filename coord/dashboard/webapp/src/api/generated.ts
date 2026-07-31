@@ -114,6 +114,7 @@ export interface Assignment {
   model: string | null
   plan: Record<string, unknown> | null
   review_state: 'pending' | 'dispatched' | 'done' | null
+  review_dispatch_reason: string | null
   required_gates: string[]
   review_iteration: number
   review_posted_at: number | null
