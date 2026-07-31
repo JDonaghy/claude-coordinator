@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -2263,6 +2263,176 @@ def _sweep_stalled_pipeline(
             log.exception("write_board failed after stalled-pipeline dispatch")
 
     return posted
+
+
+@dataclass(frozen=True)
+class DrainResult:
+    """What one :func:`run_drain` pass actually did.
+
+    ``skipped_locked`` is the "someone else is draining" outcome, which is a
+    success, not an error — the next tick picks the work up.
+    """
+
+    transitions: list[Transition] = field(default_factory=list)
+    orphaned_findings: list[str] = field(default_factory=list)
+    skipped_locked: bool = False
+
+    def __bool__(self) -> bool:
+        """Truthy when this pass advanced something (for terse log guards)."""
+        return bool(self.transitions or self.orphaned_findings)
+
+
+def run_drain(
+    config: Config,
+    *,
+    lock_path: "Path | None" = None,
+    lock_timeout: float = 0.0,
+) -> DrainResult:
+    """The pipeline's **clock** (#1616) — advance terminal rows' side effects.
+
+    ``reconcile_completed_assignments`` (the daemon's passive tick) writes
+    ``status='done'`` and stops there, by contract.  Everything downstream —
+    ``finished_at``, the completion comment, the #1076/#1152 test-gate
+    backfill, the Test-stage smoke dispatch, the review dispatch, the #1610
+    ``finalizing`` → verdict capture — is a side effect of ``coord notify``.
+    On this fleet ``coord-notify.timer`` is deliberately disabled and the only
+    caller of ``coord notify`` is a live ``coord drive``'s **stall nudge**, so
+    a completed stage sat until the stall detector gave up (9 min on #1123,
+    47 min on #1122) — and rows with no drive at all (vimcode#611/#613) sat
+    until a human poked the daemon.  This function is what the daemon tick
+    calls so the pipeline advances on a clock instead of on an accident.
+
+    **Scope is the whole point — this is deliberately NOT ``run()``.**
+    ``coord notify`` triggers five side effects; four are bookkeeping with no
+    race and no cost if repeated, and one spawns a metered worker.  The line
+    sits at exactly one place:
+
+    ==========================================  =======  ===================================
+    side effect                                 here?    why
+    ==========================================  =======  ===================================
+    ``finished_at`` stamped                     yes      no race, no cost
+    completion comment posted                   yes      ``coord:`` markers make it idempotent
+    test-gate backfill (#1076/#1152)            yes      no race, no cost
+    Test-stage smoke dispatch (#1426)           yes      the gate review waits on; see below
+    orphaned review findings posted             yes      comment + verdict capture only
+    review dispatch                             yes      guarded; see below
+    merge enqueue                               n/a      the daemon tick already runs
+                                                         ``enqueue_approved_work`` right after
+    **work dispatch**                           **no**   stays with a drive or a human
+    **fix-round dispatch** (``auto_loop``)      **no**   this is where #476/#477 lives
+    **stalled-pipeline sweep/dispatch**         **no**   can dispatch work (#1478)
+    ==========================================  =======  ===================================
+
+    Why review dispatch is in and fix dispatch is out — the asymmetry is the
+    whole argument.  #476/#477, the incident that got ``coord-notify.timer``
+    disabled, was duplicate **fix-workers**: they create conflicting branches
+    on the same issue and cost real recovery work.  A duplicate *review* costs
+    a few dollars and a redundant comment.  Withholding reviews inherits a
+    mitigation for a risk that does not apply to them.  And bookkeeping-only
+    is not sufficient: work→review is the most frequent boundary in the
+    pipeline and the one that stalled #1122, so a drain that stamps state but
+    will not dispatch reviews fixes the *watched* half and leaves the
+    unwatched half exactly as broken as before.
+
+    Smoke dispatch rides along because ``dispatch_pending_reviews`` holds
+    review dispatch until ``test_state`` is passed/skipped when
+    ``pipeline.test_precedes_review()`` (#1612).  Draining reviews without
+    ever dispatching the Test stage would just move the stall one box left —
+    that is #1605.  It is a Test-stage worker on the work's own branch, not a
+    second author on a fresh branch, so it carries none of the #476/#477
+    shape.
+
+    Stuck / needs-attention detection is deliberately absent: those are
+    *notifications*, not pipeline advancement, and giving the daemon a
+    periodic detector is #1632's job (which is blocked on this).
+
+    **Concurrency.**  The whole pass runs under ``~/.coord/notify.lock`` —
+    literally :class:`coord.filelock.FileLock`, the same class on the same
+    path ``coord drive``'s ``run_notify()`` takes — so a drive's nudge and the
+    daemon's clock can never both be inside ``dispatch_pending_reviews``,
+    which reads ``review_state == 'pending'`` and writes ``'dispatched'``
+    non-atomically (two concurrent passes would both see ``pending`` and
+    dispatch two reviews).  ``lock_timeout`` defaults to **0.0**
+    (non-blocking): if another drain holds it, return ``skipped_locked`` and
+    let the next tick retry rather than pinning a threadpool worker.
+
+    Every step is independently try/except'd — one failing side effect must
+    never sink the rest of the pass, and a drain must never crash the daemon.
+    """
+    from coord.filelock import FileLock, LockBusy, notify_lock_path  # noqa: PLC0415
+
+    lock = FileLock(lock_path if lock_path is not None else notify_lock_path())
+    try:
+        lock.acquire(timeout=lock_timeout)
+    except LockBusy:
+        log.debug("notify drain: %s held elsewhere — skipping this pass", lock.path)
+        return DrainResult(skipped_locked=True)
+    try:
+        return _run_drain_locked(config)
+    finally:
+        lock.release()
+
+
+def _run_drain_locked(config: Config) -> DrainResult:
+    """:func:`run_drain`'s body, with the lock already held.
+
+    Split out so tests can exercise the side effects without the lock and the
+    lock without the side effects.
+    """
+    # Refresh the agent-host cache so _try_parse_and_post_review (and any other
+    # helper using _agent_host) can resolve hostnames without threading config
+    # through every call.  Mirrors run().
+    global _AGENT_HOSTS
+    _AGENT_HOSTS = {m.name: m.host for m in config.machines}
+
+    # Step 1: post completion/failure/advisory/plan/review comments for rows
+    # the agent reports terminal.  This is what stamps `finished_at` (via
+    # mark_notified) and captures cost / SMOKE_TESTS / summary / session id /
+    # the review verdict + findings.  Idempotent: detect_transitions skips any
+    # assignment already in the `notifications` table, so a second drain over
+    # the same board posts nothing.
+    posted: list[Transition] = []
+    try:
+        for transition, record, entry in detect_transitions(config):
+            try:
+                post_transition(transition, record, entry)
+            except Exception:  # noqa: BLE001 — one bad row must not sink the pass
+                log.exception(
+                    "notify drain: post_transition failed for %s",
+                    transition.assignment_id,
+                )
+                continue
+            posted.append(transition)
+    except Exception:  # noqa: BLE001
+        log.exception("notify drain: detect_transitions failed")
+
+    # Step 2: dispatch pending Test-stage smoke (#1426).  Runs BEFORE review
+    # dispatch to mirror the pipeline's Work -> Test -> Review order.
+    try:
+        _dispatch_board_pending_smoke(config)
+    except Exception:  # noqa: BLE001
+        log.exception("notify drain: smoke dispatch failed")
+
+    # Step 3: dispatch pending reviews.  Carries the #1612 test-precedes-review
+    # gate, the #1076/#1152 test-gate backfill, the #946 enqueue gate, the
+    # 2026-06-08 flood guard (per-pass cap + surge gate) and the #459 active-fix
+    # dedupe — this is calling existing machinery from a clock, not new
+    # machinery.
+    try:
+        _dispatch_board_pending_reviews(config)
+    except Exception:  # noqa: BLE001
+        log.exception("notify drain: review dispatch failed")
+
+    # Step 4: post findings for done-review assignments that were never
+    # processed (agent reported 'cancelled', a human marked the row done, or
+    # notify ran at the wrong time).  Comment + verdict capture only.
+    orphaned: list[str] = []
+    try:
+        orphaned = post_orphaned_review_findings(config) or []
+    except Exception:  # noqa: BLE001
+        log.exception("notify drain: post_orphaned_review_findings failed")
+
+    return DrainResult(transitions=posted, orphaned_findings=orphaned)
 
 
 def run(

@@ -93,10 +93,41 @@ def reconcile_completed_assignments(
     never re-introduce the dispatch flood:
 
     * NEVER dispatches work/review.
-    * NEVER posts a GitHub comment (the single completion/plan comment is left
-      to an explicit ``coord notify``; this only writes board state).
+    * NEVER posts a GitHub comment.
     * Only acts on ``status == "running"`` rows, so it is idempotent — once a
       row is flipped terminal a later tick skips it.
+
+    **#1616 — what runs the side effects this function refuses to (CONTRACT
+    CHANGE, read this before adding anything here).**  This function's scope is
+    unchanged and must stay unchanged; what changed is *who runs the rest*.
+    Until #1616 the parenthetical here read "the single completion/plan comment
+    is left to an explicit ``coord notify``" — and on a fleet where
+    ``coord-notify.timer`` is deliberately disabled, "an explicit ``coord
+    notify``" meant *a live* ``coord drive``'s **stall nudge**, and nothing
+    else.  So this function advancing a row to ``done`` was the LAST thing that
+    happened to it for as long as 47 minutes (#1122), or forever when no drive
+    was running at all (vimcode#611/#613).  ``status`` said done; ``finished_at``
+    was NULL, no comment was posted, no review was dispatched, and every surface
+    rendered the stage as complete.
+
+    The fix was **not** to widen this function.  The daemon ``_tick_loop`` now
+    calls :func:`coord.serve_app._notify_drain_tick` →
+    :func:`coord.notify.run_drain` as a SIBLING step immediately after this one,
+    which posts the comment, stamps ``finished_at``, backfills the #1076/#1152
+    test gate, and dispatches Test + Review under ``~/.coord/notify.lock``.
+    That is where pipeline-advancing behaviour belongs; this stays passive.
+
+    This is the failure shape ``docs/OPERATING_GOTCHAS.md`` §7 already names —
+    "``reconcile()`` accretes behaviour the automatic drivers never invoke".
+    If you are about to add a side effect here because "nothing else runs it",
+    that is the bug, not the fix: add it to ``run_drain`` instead, and decide
+    deliberately whether it belongs on the daemon's clock at all (work dispatch
+    and fix-round dispatch explicitly do NOT — see that docstring).
+
+    One consequence worth knowing when reading a board: a ``type="review"``
+    ``done`` is downgraded to ``"finalizing"`` below and only leaves that state
+    when the drain captures the verdict.  Pre-#1616 that window was unbounded
+    (#1610); it is now bounded by ``COORD_NOTIFY_DRAIN_INTERVAL`` (default 60s).
 
     Interactive sessions are tmux launches, not agent subprocesses, so they
     never appear in the agent's ``completed`` list — a live attended session
