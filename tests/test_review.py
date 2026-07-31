@@ -954,6 +954,13 @@ def test_dispatch_review_skipped_for_review_type(two_machine_config: Config) -> 
         issue_body_fetcher=lambda repo, num: "",
     )
     assert result is None
+    # #1627: passing a non-work id (e.g. a "smoke" assignment mistaken for
+    # the work row — the vimcode #613 incident) used to be a bare
+    # `return None` with zero diagnostic trail. It now names itself and
+    # points at the escape hatch for "what IS the work row for this issue".
+    assert review.review_dispatch_reason is not None
+    assert "not reviewable work" in review.review_dispatch_reason
+    assert "coord diagnose" in review.review_dispatch_reason
 
 
 def test_dispatch_review_dispatches_for_mock_author_type(

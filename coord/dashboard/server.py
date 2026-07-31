@@ -1033,9 +1033,12 @@ def build_app(
                     "machine_name": result.machine_name,
                     "assignment_id": result.assignment_id,
                 })
+            # #1627: report the specific guard dispatch_review hit instead of
+            # a generic guess — it's recorded on the assignment itself.
             return JSONResponse({
                 "ok": False,
-                "error": "could not find a suitable reviewer machine (check reviews config and machine availability)",
+                "error": assignment.review_dispatch_reason
+                or "could not find a suitable reviewer machine (check reviews config and machine availability)",
             })
 
         elif action == "dispatch_smoke":

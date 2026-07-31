@@ -427,6 +427,13 @@ def test_dispatch_review_skipped_when_active_work_rewriting_branch() -> None:
         issue_body_fetcher=lambda repo, num: "",
     )
     assert result is None
+    # #1627: the guard names itself on the assignment so a caller (the
+    # `coord review` CLI, chiefly) can report why instead of guessing —
+    # and points at the phantom-row remedy (`coord diagnose`) since a dead
+    # fix worker leaving status=running behind looks identical to this.
+    assert completed.review_dispatch_reason is not None
+    assert "actively rewriting the branch" in completed.review_dispatch_reason
+    assert "coord diagnose api 16" in completed.review_dispatch_reason
 
 
 def test_dispatch_review_proceeds_when_no_active_work() -> None:
