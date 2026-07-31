@@ -5,7 +5,7 @@ from __future__ import annotations
 import fnmatch
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -1070,6 +1070,86 @@ class ProvidersConfig:
             self.definitions["claude"] = ProviderDef(type="claude")
 
 
+# #1628: default disk mount points the health engine probes.  "/" and "/home"
+# are usually the two that matter (and were the two that mattered on
+# 2026-07-30 — elitebook's /home hit 0 bytes free); "~/.coord" is separate
+# because on some layouts the coordinator state dir is its own filesystem.
+# Probing the same *device* twice is deduped at run time, so a machine with
+# one big root filesystem still reports one line.
+_DEFAULT_HEALTH_DISK_PATHS = ("/", "/home", "~/.coord")
+
+
+@dataclass
+class HealthConfig:
+    """Thresholds for the fleet-health check engine (#1628, ``coord health``).
+
+    Every number here is a *default that would have caught the 2026-07-30
+    incidents* — see ``tests/test_health_incident_regression.py``, which
+    replays the recorded values against these defaults.  Loosening one is
+    therefore a decision to stop catching a class of failure that has
+    already happened once, not a tuning preference; the regression test is
+    there to make that trade explicit rather than accidental.
+
+    Disk thresholds are expressed as **percent free remaining** (headroom),
+    not percent used, because headroom is the question the engine answers.
+    """
+
+    # Master switch.  False makes `coord health` report nothing rather than
+    # being removed from the CLI — a disabled check must still be visible.
+    enabled: bool = True
+    # Check ids to skip, e.g. ["plan_usage"] on a machine with no OAuth login.
+    disabled_checks: list[str] = field(default_factory=list)
+
+    # ── disk free ─────────────────────────────────────────────────────────
+    disk_paths: list[str] = field(
+        default_factory=lambda: list(_DEFAULT_HEALTH_DISK_PATHS)
+    )
+    disk_warn_free_pct: float = 15.0
+    disk_crit_free_pct: float = 7.0
+
+    # ── cargo target/ total across known dirs ─────────────────────────────
+    cargo_target_warn_gb: float = 40.0
+    cargo_target_crit_gb: float = 60.0
+    # Extra target dirs to total beyond the shared per-machine cache and each
+    # known checkout's own target/.
+    cargo_target_extra_dirs: list[str] = field(default_factory=list)
+    # Walking a 78G target dir is not free.  The probe totals what it can in
+    # this many seconds and reports a partial scan rather than blowing the
+    # ~2s registry budget; a partial total is a *lower bound*, so a CRIT
+    # derived from one is still trustworthy.
+    cargo_scan_budget_secs: float = 1.5
+
+    # ── stale worktrees under ~/.coord/worktrees ──────────────────────────
+    # "Stale" here is deliberately DB-free (see the probe's docstring): a
+    # worktree directory untouched for this long.  Counting live assignments
+    # would need board state, which is H-3's job, not this child's.
+    worktree_stale_hours: float = 48.0
+    worktree_warn_count: int = 3
+    worktree_crit_count: int = 10
+
+    # ── agent install ─────────────────────────────────────────────────────
+    # Absolute path to the agent venv's python.  None → autodetect
+    # (~/.coord-venv/bin/python3, else the running interpreter).
+    agent_venv_python: str | None = None
+    agent_version_warn_behind: int = 1
+    agent_version_crit_behind: int = 2
+    # The *simple index*, not the JSON API: they flip independently in both
+    # directions and only the simple index is what pip actually resolves
+    # against, so a JSON-API answer can say "current" while pip disagrees.
+    pypi_index_url: str = "https://pypi.org/simple"
+    network_timeout_secs: float = 3.0
+
+    # ── graphify graph freshness ──────────────────────────────────────────
+    # A stale graph whose checkout has hooks disabled is CRIT regardless of
+    # age: it structurally cannot self-heal, so time only makes it worse.
+    graph_stale_warn_hours: float = 24.0
+    graph_stale_crit_hours: float = 72.0
+
+    # ── Max-plan usage windows (wraps coord.usage_limits) ─────────────────
+    plan_usage_warn_pct: float = 85.0
+    plan_usage_crit_pct: float = 95.0
+
+
 @dataclass
 class Config:
     repos: list[Repo]
@@ -1089,6 +1169,7 @@ class Config:
     providers: ProvidersConfig = field(default_factory=ProvidersConfig)
     audit: AuditConfig = field(default_factory=AuditConfig)
     pricing: PricingConfig = field(default_factory=PricingConfig)
+    health: HealthConfig = field(default_factory=HealthConfig)
     path: Path | None = None
 
     def repo(self, name: str) -> Repo | None:
@@ -1139,6 +1220,7 @@ def load(path: str | Path | None = None) -> Config:
     providers = _parse_providers(raw.get("providers"))
     audit = _parse_audit(raw.get("audit"))
     pricing = _parse_pricing(raw.get("pricing"))
+    health = _parse_health(raw.get("health"))
 
     return Config(
         repos=repos,
@@ -1158,6 +1240,7 @@ def load(path: str | Path | None = None) -> Config:
         providers=providers,
         audit=audit,
         pricing=pricing,
+        health=health,
         path=p,
     )
 
@@ -1939,6 +2022,132 @@ def _parse_usage_gate(raw: Any) -> UsageGateConfig:
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not (0 <= value <= 100):
                 raise ConfigError(f"usage_gate.{key} must be a number between 0 and 100")
             setattr(cfg, key, float(value))
+
+    return cfg
+
+
+# #1628: (field name, minimum) for every numeric knob in the `health:` block.
+# A single table rather than a per-field branch, because the whole point of
+# the block is that adding a check adds a threshold — and if adding one meant
+# hand-writing another eight-line validator, the "adding a check touches one
+# file" property would rot on the config side instead.
+_HEALTH_FLOAT_FIELDS: dict[str, float] = {
+    "disk_warn_free_pct": 0.0,
+    "disk_crit_free_pct": 0.0,
+    "cargo_target_warn_gb": 0.0,
+    "cargo_target_crit_gb": 0.0,
+    "cargo_scan_budget_secs": 0.0,
+    "worktree_stale_hours": 0.0,
+    "network_timeout_secs": 0.0,
+    "graph_stale_warn_hours": 0.0,
+    "graph_stale_crit_hours": 0.0,
+    "plan_usage_warn_pct": 0.0,
+    "plan_usage_crit_pct": 0.0,
+}
+_HEALTH_INT_FIELDS: tuple[str, ...] = (
+    "worktree_warn_count",
+    "worktree_crit_count",
+    "agent_version_warn_behind",
+    "agent_version_crit_behind",
+)
+_HEALTH_STR_LIST_FIELDS: tuple[str, ...] = (
+    "disabled_checks",
+    "disk_paths",
+    "cargo_target_extra_dirs",
+)
+# Pairs that must not be inverted.  A config where warn is stricter than crit
+# silently makes the crit level unreachable — the check keeps reporting WARN
+# for a machine that is actually on fire, which is exactly the failure this
+# milestone exists to prevent.  Reject it at load rather than at 3am.
+_HEALTH_ORDERED_PAIRS: tuple[tuple[str, str, str], ...] = (
+    # (warn_field, crit_field, direction) — "asc": crit must be >= warn.
+    ("cargo_target_warn_gb", "cargo_target_crit_gb", "asc"),
+    ("graph_stale_warn_hours", "graph_stale_crit_hours", "asc"),
+    ("plan_usage_warn_pct", "plan_usage_crit_pct", "asc"),
+    ("worktree_warn_count", "worktree_crit_count", "asc"),
+    ("agent_version_warn_behind", "agent_version_crit_behind", "asc"),
+    # Disk thresholds are *headroom* percentages, so crit must be the lower
+    # number: warn at 15% free, crit at 7% free.
+    ("disk_warn_free_pct", "disk_crit_free_pct", "desc"),
+)
+
+
+def _parse_health(raw: Any) -> HealthConfig:
+    """Parse the optional ``health:`` block from coordinator.yml (#1628).
+
+    An absent block returns :class:`HealthConfig` defaults — the thresholds
+    that would have fired on the 2026-07-30 incidents.
+    """
+    if raw is None:
+        return HealthConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("'health' must be a mapping")
+
+    cfg = HealthConfig()
+    known = {f.name for f in fields(HealthConfig)}
+    unknown = sorted(set(raw) - known)
+    if unknown:
+        raise ConfigError(
+            f"unknown health option(s): {', '.join(unknown)} "
+            f"(valid: {', '.join(sorted(known))})"
+        )
+
+    if "enabled" in raw:
+        if not isinstance(raw["enabled"], bool):
+            raise ConfigError("health.enabled must be a boolean")
+        cfg.enabled = raw["enabled"]
+
+    if "agent_venv_python" in raw:
+        value = raw["agent_venv_python"]
+        if value is not None and not isinstance(value, str):
+            raise ConfigError("health.agent_venv_python must be a string or null")
+        cfg.agent_venv_python = value
+
+    if "pypi_index_url" in raw:
+        value = raw["pypi_index_url"]
+        if not isinstance(value, str) or not value.strip():
+            raise ConfigError("health.pypi_index_url must be a non-empty string")
+        # Canonicalise the trailing slash here so the value that ends up in
+        # the check's reported `values["index_url"]` is the same string
+        # whichever way the operator wrote it.
+        cfg.pypi_index_url = value.strip().rstrip("/")
+
+    for key in _HEALTH_STR_LIST_FIELDS:
+        if key in raw:
+            value = raw[key]
+            if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+                raise ConfigError(f"health.{key} must be a list of strings")
+            setattr(cfg, key, list(value))
+
+    for key, minimum in _HEALTH_FLOAT_FIELDS.items():
+        if key in raw:
+            value = raw[key]
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ConfigError(f"health.{key} must be a number")
+            if value < minimum:
+                raise ConfigError(f"health.{key} must be >= {minimum}")
+            if key.endswith("_pct") and value > 100:
+                raise ConfigError(f"health.{key} must be between 0 and 100")
+            setattr(cfg, key, float(value))
+
+    for key in _HEALTH_INT_FIELDS:
+        if key in raw:
+            value = raw[key]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ConfigError(f"health.{key} must be a non-negative integer")
+            setattr(cfg, key, value)
+
+    for warn_key, crit_key, direction in _HEALTH_ORDERED_PAIRS:
+        warn_value = getattr(cfg, warn_key)
+        crit_value = getattr(cfg, crit_key)
+        inverted = crit_value < warn_value if direction == "asc" else crit_value > warn_value
+        if inverted:
+            relation = ">=" if direction == "asc" else "<="
+            raise ConfigError(
+                f"health.{crit_key} ({crit_value}) must be {relation} "
+                f"health.{warn_key} ({warn_value}) — otherwise the crit level "
+                f"is unreachable and a failing machine only ever reports WARN"
+            )
 
     return cfg
 

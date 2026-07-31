@@ -1,0 +1,208 @@
+"""Value types for the fleet-health check engine (#1628).
+
+The whole point of this module is :class:`CheckResult`.  A result carries
+**both** the raw values a probe measured **and** the already-rendered
+headroom string — because the moment a renderer starts re-deriving "is 86%
+used bad?" from ``values["used_pct"]``, the severity logic has forked and
+every new surface (the CLI here, the board projection in H-3, the TUI/web
+renderers in H-4) gets to disagree about what WARN means.
+
+So the contract is:
+
+* A **probe** owns thresholds.  It is the only thing allowed to turn raw
+  numbers into a :class:`Severity`.
+* A **renderer** owns layout.  It may reorder, truncate, colour, or drop
+  results; it may NOT look at ``values`` to decide severity, and it may not
+  reformat ``headroom`` from the raw numbers.
+* ``values`` exists for machine consumers (trend series, alert routing,
+  whoever comes next) — never as a second source of truth for "how bad".
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+from typing import Any
+
+
+class Severity(str, Enum):
+    """How much headroom is left, worst-first when sorted by :attr:`rank`.
+
+    ``UNKNOWN`` is deliberately not "fine": a probe that could not run tells
+    you nothing, and treating that as OK is how a silently-broken check
+    becomes indistinguishable from a healthy machine.  It ranks *above* OK
+    (so it surfaces) and *below* WARN (so it never pages).
+    """
+
+    OK = "ok"
+    UNKNOWN = "unknown"
+    WARN = "warn"
+    CRIT = "crit"
+
+    @property
+    def rank(self) -> int:
+        return _SEVERITY_RANK[self]
+
+    @property
+    def label(self) -> str:
+        """Fixed-width-ish display token: ``OK`` / ``WARN`` / ``CRIT`` / ``?``."""
+        return "?" if self is Severity.UNKNOWN else self.value.upper()
+
+    def __lt__(self, other: object) -> bool:  # type: ignore[override]
+        if isinstance(other, Severity):
+            return self.rank < other.rank
+        return NotImplemented
+
+
+_SEVERITY_RANK = {
+    Severity.OK: 0,
+    Severity.UNKNOWN: 1,
+    Severity.WARN: 2,
+    Severity.CRIT: 3,
+}
+
+# The three scopes a check can answer for.  ``fleet`` is defined here (so the
+# registry shape is settled — that is this child's whole job) but no seed
+# probe uses it; fleet-scope probes land in H-3.
+SCOPES = ("machine", "checkout", "fleet")
+
+
+def worst(severities: "list[Severity] | tuple[Severity, ...]") -> Severity:
+    """The most severe of *severities* (``OK`` when empty)."""
+    out = Severity.OK
+    for s in severities:
+        if s.rank > out.rank:
+            out = s
+    return out
+
+
+@dataclass(frozen=True)
+class CheckResult:
+    """One answer to "how much headroom is left?".
+
+    ``headroom`` is the load-bearing field for every renderer: a short,
+    already-formatted phrase such as ``"86% used (22G free)"`` or
+    ``"128.8h stale, hooks disabled -> will not self-heal"``.  It is produced
+    by the probe, which is also the thing that chose ``severity`` — the two
+    can never disagree because nothing downstream recomputes either.
+    """
+
+    check_id: str
+    scope: str
+    severity: Severity
+    headroom: str
+    # Display prefix, e.g. "disk" / "cargo targets" / "graph".  Defaults to
+    # ``check_id`` when a probe doesn't override it.
+    title: str = ""
+    # What this result is *about* within the check: "/home", "vimcode", ...
+    # ``None`` for whole-machine singletons like the claude-binary check.
+    subject: str | None = None
+    # Rendered threshold reminder, e.g. "crit at 93%".  Optional.
+    threshold: str = ""
+    # Extra rendered context shown under/after the headroom.  Optional.
+    detail: str = ""
+    # Rendered trend, where a probe can get one cheaply ("+4G since 6h ago").
+    trend: str | None = None
+    # Raw measurements, for machine consumers only.  NOT a severity source.
+    values: dict[str, Any] = field(default_factory=dict)
+    # Set iff the probe failed soft; ``severity`` is then UNKNOWN.
+    error: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.title:
+            object.__setattr__(self, "title", self.check_id)
+
+    @property
+    def key(self) -> str:
+        """Stable identity for this row: ``<check_id>`` or ``<check_id>:<subject>``."""
+        return f"{self.check_id}:{self.subject}" if self.subject else self.check_id
+
+    @property
+    def label(self) -> str:
+        """Human row label, e.g. ``"disk /home"`` or ``"claude binary"``."""
+        return f"{self.title} {self.subject}" if self.subject else self.title
+
+    def to_dict(self) -> dict[str, Any]:
+        """The JSON contract H-3/H-4 consume.  Keys here are load-bearing."""
+        return {
+            "key": self.key,
+            "check_id": self.check_id,
+            "scope": self.scope,
+            "subject": self.subject,
+            "title": self.title,
+            "label": self.label,
+            "severity": self.severity.value,
+            "headroom": self.headroom,
+            "threshold": self.threshold,
+            "detail": self.detail,
+            "trend": self.trend,
+            "values": dict(self.values),
+            "error": self.error,
+        }
+
+
+def unknown_result(
+    check_id: str,
+    *,
+    scope: str,
+    error: str,
+    title: str = "",
+    subject: str | None = None,
+) -> CheckResult:
+    """A fail-soft placeholder: the probe blew up, the run carries on.
+
+    Never raise out of a probe — a health engine that dies on its own
+    weakest check reports nothing at all, which is strictly worse than
+    reporting eight checks and one ``?``.
+    """
+    return CheckResult(
+        check_id=check_id,
+        scope=scope,
+        severity=Severity.UNKNOWN,
+        headroom=f"probe failed: {error}",
+        title=title or check_id,
+        subject=subject,
+        error=error,
+    )
+
+
+@dataclass(frozen=True)
+class Checkout:
+    """One local git checkout a ``checkout``-scoped probe can run against."""
+
+    name: str
+    path: Path
+    default_branch: str = "main"
+    # #934's opt-in develop branch.  A repo parked on *this* is not "parked
+    # on a non-default branch" — it's the configured integration branch.
+    develop_branch: str | None = None
+
+    @property
+    def home_branches(self) -> tuple[str, ...]:
+        out = [self.default_branch]
+        if self.develop_branch:
+            out.append(self.develop_branch)
+        return tuple(out)
+
+
+@dataclass
+class HealthContext:
+    """Everything a probe is allowed to know about the machine it's on.
+
+    Passing this rather than letting probes reach for ``Path.home()`` /
+    ``coord.config.load()`` directly is what makes them unit-testable
+    without a real filesystem or a real ``coordinator.yml``.
+    """
+
+    thresholds: Any  # coord.config.HealthConfig — untyped to avoid an import cycle
+    home: Path
+    coord_dir: Path
+    now: float
+    checkouts: tuple[Checkout, ...] = ()
+    # The loaded coordinator.yml, when there is one.  Probes must tolerate
+    # ``None`` (``coord health`` on a machine with no config still works).
+    config: Any = None
+    # False on a timer/offline run: probes marked ``cost="network"`` are
+    # skipped entirely rather than left to time out.
+    allow_network: bool = True
