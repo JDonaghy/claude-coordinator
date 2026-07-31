@@ -172,6 +172,40 @@ def issue_close_cmd(
 
 
 @issue_group.command(
+    "reopen",
+    help=(
+        "Reopen a closed issue, optionally posting --comment first (#1078). "
+        "REPO is the local repo name from coordinator.yml; ISSUE is the GH "
+        "issue number. Mirror of the `close` command for the complement "
+        "operation. Idempotent — reopening an already-open issue is a no-op."
+    ),
+)
+@click.argument("repo")
+@click.argument("issue", type=int)
+@click.option(
+    "--comment", default=None, help="Comment to post before reopening (markdown)."
+)
+@_CONFIG_OPTION
+def issue_reopen_cmd(
+    repo: str,
+    issue: int,
+    comment: str | None,
+    config_path: Path,
+) -> None:
+    cfg = _load_config(config_path)
+    repo_entry = cfg.repo(repo)
+    slug = repo_entry.github if repo_entry else repo
+    from coord.state import reopen_issue  # noqa: PLC0415
+
+    try:
+        reopen_issue(repo, issue, comment=comment, repo_github=slug)
+    except Exception as e:  # noqa: BLE001
+        click.echo(f"error: issue reopen failed: {e}", err=True)
+        sys.exit(1)
+    click.echo(f"#{issue} ({slug}) reopened")
+
+
+@issue_group.command(
     "create",
     help=(
         "Create a new GitHub issue through the backend-agnostic seam. REPO "
