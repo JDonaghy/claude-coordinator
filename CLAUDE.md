@@ -41,6 +41,14 @@ freshness instead — `GRAPH_REPORT.md` records its source commit, and
 flags an unset `core.hooksPath`). If it reports STALE, `graphify update .` in that
 checkout.
 
+**Setting this up on a new machine: [`docs/GRAPHIFY_SETUP.md`](docs/GRAPHIFY_SETUP.md).** Four
+layers (pipx CLI → built graph → machine-local `.git/hooks` → versioned `.githooks/` shims), all
+of which fail *silently* when missing — a half-installed machine looks identical to a working
+one, it just answers from grep. Includes the ordering constraint (`graphify hook install` before
+`core.hooksPath`), why `core.hooksPath` replacing `.git/hooks` wholesale needs a shim per hook,
+and why `.githooks/**` is a **fifth deploy surface** whose failure mode is the opposite of the
+other four — a merged hook is live on every machine at the next fetch, no release, no restart.
+
 ## Architecture
 
 ```
