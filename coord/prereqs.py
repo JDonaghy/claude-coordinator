@@ -289,10 +289,9 @@ CAPABILITY_PREREQS: tuple[Prereq, ...] = (
         tool="node", binary="node", version_args=("--version",),
         version_re=r"v?(\d\S*)", min_version=None, capability="browser",
         what_breaks=(
-            "the Playwright acceptance suite cannot run — `playwright test` "
-            "is a Node program, and a worker inherits this agent's PATH "
-            "with the venv stripped (#402), so nvm's version-stamped bin "
-            "directory must be reachable via a stable shim (#1678)"
+            "the Playwright suite cannot start — a worker inherits this "
+            "agent's PATH (#402), so install the ~/.local/bin Node shim "
+            "(deploy/node-shim.sh, #1678)"
         ),
     ),
     Prereq(
