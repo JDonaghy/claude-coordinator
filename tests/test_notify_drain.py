@@ -786,3 +786,240 @@ class TestDrainIsNonFatal:
             notify_mod.run_drain(cfg, lock_path=lock_path)
 
         assert dispatched == ["still-reviewed"]
+
+
+# ── #1663: the verdict must reach the parent WORK row ────────────────────────
+
+
+def _seed_work_and_review(
+    tmp_path: Path,
+    verdict: str,
+    *,
+    work_aid: str = "wk-1",
+    review_aid: str = "rev-1",
+    body: str = "Blocking findings\n\n- 1. src/a.py:1 — boom",
+) -> tuple[Config, str]:
+    """Seed a done ``work`` row whose review is finishing with *verdict*.
+
+    Mirrors the production shape the 2026-08-01 batch died in: the work row is
+    at ``review_state='dispatched'`` (set when the review was dispatched) with
+    no verdict of its own, and the reviewer's log is the only place the verdict
+    exists until the drain captures it.
+    """
+    state_mod.record_dispatched_assignment(
+        assignment=Assignment(
+            machine_name="laptop", repo_name="api",
+            issue_number=42, issue_title="[review] t",
+            assignment_id=review_aid, type="review", status="running",
+            review_of_assignment_id=work_aid,
+        ),
+        repo_github="acme/api",
+    )
+    work = Assignment(
+        machine_name="laptop", repo_name="api",
+        issue_number=42, issue_title="t",
+        assignment_id=work_aid, type="work", status="done",
+        branch="feature/api-42", review_state="dispatched",
+        test_state="passed",
+    )
+    review = Assignment(
+        machine_name="laptop", repo_name="api",
+        issue_number=42, issue_title="[review] t",
+        assignment_id=review_aid, type="review", status="done",
+        review_of_assignment_id=work_aid,
+    )
+    state_mod.save_board(Board(completed=[work, review]))
+
+    log = tmp_path / f"{review_aid}.log"
+    log.write_text(
+        f"REVIEW_VERDICT: {verdict}\nREVIEW_BODY:\n{body}\nEND_REVIEW\n",
+        encoding="utf-8",
+    )
+    cfg = Config(
+        repos=[Repo(name="api", github="acme/api")],
+        machines=[Machine(name="laptop", host="laptop.tailnet", repos=["api"])],
+    )
+    return cfg, str(log)
+
+
+def _work_row(aid: str = "wk-1") -> dict:
+    row = state_mod.get_connection().execute(
+        "SELECT review_state, review_verdict FROM assignments WHERE assignment_id=?",
+        (aid,),
+    ).fetchone()
+    assert row is not None, f"{aid} vanished from the assignments table"
+    return {"review_state": row["review_state"], "review_verdict": row["review_verdict"]}
+
+
+class TestDrainPropagatesTheVerdictToTheWorkRow:
+    """#1663.
+
+    ``run_drain`` captured the verdict onto the *review* row and stopped, because
+    the only path to the parent-row write ran through
+    ``auto_loop.process_review_completion`` — which also dispatches fix workers,
+    so the drain refused to enter it at all.  The exclusion was at *function*
+    granularity when it needed to be at *side-effect* granularity, and the
+    bookkeeping half went out with the metered half.
+
+    Cost, measured: the 2026-08-01 overnight batch (#1527 #1624 #1658 #1633
+    #1353) reviewed five issues, four of them a clean ``approve``, and left every
+    single work row at ``dispatched``/NULL — ``done: none``, five deadline
+    expiries, 4h02m of wall clock, zero merges.
+    """
+
+    def test_approve_reaches_the_parent_work_row(
+        self, coord_dir: Path, lock_path: Path, tmp_path: Path
+    ) -> None:
+        cfg, log_path = _seed_work_and_review(tmp_path, "approve", body="LGTM.")
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("rev-1", log_path=log_path)],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.notify.github_ops.post_pr_review"), \
+             patch("coord.dispatch.github_ops.post_issue_comment"), \
+             patch("coord.merge_queue.refresh_entry_assignment") as mock_refresh:
+            result = notify_mod.run_drain(cfg, lock_path=lock_path)
+
+        assert _work_row() == {"review_state": "done", "review_verdict": "approve"}
+        assert result.propagated_verdicts == ["rev-1"]
+        assert mock_refresh.called, (
+            "#292 (Defect 2): an approve must also refresh the merge-queue entry "
+            "so the Merge stage becomes reachable from the daemon's clock"
+        )
+
+    def test_request_changes_reaches_the_parent_work_row(
+        self, coord_dir: Path, lock_path: Path, tmp_path: Path
+    ) -> None:
+        cfg, log_path = _seed_work_and_review(tmp_path, "request-changes")
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("rev-1", log_path=log_path)],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.notify.github_ops.post_pr_review"), \
+             patch("coord.dispatch.github_ops.post_issue_comment"), \
+             patch("coord.merge_queue.refresh_entry_assignment") as mock_refresh:
+            result = notify_mod.run_drain(cfg, lock_path=lock_path)
+
+        assert _work_row() == {
+            "review_state": "done", "review_verdict": "request-changes",
+        }
+        assert result.propagated_verdicts == ["rev-1"]
+        assert not mock_refresh.called, (
+            "a request-changes row can never satisfy has_approved_review — "
+            "queueing it would only add a permanently-blocked PENDING entry"
+        )
+
+    def test_request_changes_still_dispatches_no_fix_worker(
+        self, coord_dir: Path, lock_path: Path, tmp_path: Path
+    ) -> None:
+        """The scope line is unmoved.  #476/#477 (duplicate fix workers on
+        conflicting branches) is why ``coord-notify.timer`` is disabled; the
+        propagation must buy legibility without buying that back."""
+        cfg, log_path = _seed_work_and_review(tmp_path, "request-changes")
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("rev-1", log_path=log_path)],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.notify.github_ops.post_pr_review"), \
+             patch("coord.dispatch.github_ops.post_issue_comment"), \
+             patch("coord.merge_queue.refresh_entry_assignment"), \
+             patch("coord.auto_loop._dispatch_fix_for_review") as mock_fix, \
+             patch("coord.auto_loop._dispatch_fix") as mock_fix_inner, \
+             patch("coord.dispatch.dispatch") as mock_dispatch:
+            notify_mod.run_drain(cfg, lock_path=lock_path)
+
+        mock_fix.assert_not_called()
+        mock_fix_inner.assert_not_called()
+        mock_dispatch.assert_not_called()
+        assert _work_row()["review_verdict"] == "request-changes"
+
+    def test_propagation_is_idempotent_across_passes(
+        self, coord_dir: Path, lock_path: Path, tmp_path: Path
+    ) -> None:
+        """A second drain over the same board must be a no-op, not a re-write
+        that resurrects a stale verdict."""
+        cfg, log_path = _seed_work_and_review(tmp_path, "approve", body="LGTM.")
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("rev-1", log_path=log_path)],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.notify.github_ops.post_pr_review"), \
+             patch("coord.dispatch.github_ops.post_issue_comment"), \
+             patch("coord.merge_queue.refresh_entry_assignment"):
+            notify_mod.run_drain(cfg, lock_path=lock_path)
+            second = notify_mod.run_drain(cfg, lock_path=lock_path)
+
+        assert second.transitions == []
+        assert _work_row() == {"review_state": "done", "review_verdict": "approve"}
+
+    def test_a_failed_propagation_does_not_sink_the_pass(
+        self, coord_dir: Path, lock_path: Path, tmp_path: Path
+    ) -> None:
+        cfg, log_path = _seed_work_and_review(tmp_path, "approve", body="LGTM.")
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("rev-1", log_path=log_path)],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.notify.github_ops.post_pr_review"), \
+             patch("coord.dispatch.github_ops.post_issue_comment"), \
+             patch(
+                 "coord.auto_loop.propagate_review_verdict_for_transition",
+                 side_effect=RuntimeError("board service down"),
+             ):
+            result = notify_mod.run_drain(cfg, lock_path=lock_path)
+
+        assert len(result.transitions) == 1
+        assert result.propagated_verdicts == []
+        assert result.skipped_locked is False
+
+
+class TestNotifyPathAlsoWritesTheParentRow:
+    """The second, independent #1663 gap: ``_dispatch_fix_for_review`` wrote the
+    parent row ONLY inside its ``_work_is_terminal`` early return, so a
+    request-changes that actually dispatched a fix left the row illegible —
+    ``dispatched``/NULL after a real rejection, invisible to ``coord drive``,
+    the TUI's Review stage, and any state-derived recovery sweep.  #1565 fixed
+    the approve branch and left this one."""
+
+    def test_request_changes_via_coord_notify_writes_the_parent_row(
+        self, coord_dir: Path, tmp_path: Path
+    ) -> None:
+        cfg, log_path = _seed_work_and_review(tmp_path, "request-changes")
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("rev-1", log_path=log_path)],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.notify.github_ops.post_pr_review"), \
+             patch("coord.dispatch.github_ops.post_issue_comment"), \
+             patch("coord.auto_loop._work_is_terminal", return_value=False), \
+             patch("coord.auto_loop._dispatch_fix", return_value=None) as mock_fix:
+            notify_mod.run(cfg)
+
+        assert mock_fix.called, "the notify path still owns fix dispatch"
+        assert _work_row() == {
+            "review_state": "done", "review_verdict": "request-changes",
+        }
+
+    def test_approve_via_coord_notify_still_writes_the_parent_row(
+        self, coord_dir: Path, tmp_path: Path
+    ) -> None:
+        """#1565's guarantee, re-pinned: the refactor that made the propagation
+        separately callable must not have changed the approve path."""
+        cfg, log_path = _seed_work_and_review(tmp_path, "approve", body="LGTM.")
+        agent_status = {
+            "active": [],
+            "completed": [_agent_completed("rev-1", log_path=log_path)],
+        }
+        with patch.object(notify_mod, "_agent_status", return_value=agent_status), \
+             patch("coord.notify.github_ops.post_pr_review"), \
+             patch("coord.dispatch.github_ops.post_issue_comment"), \
+             patch("coord.merge_queue.refresh_entry_assignment"):
+            notify_mod.run(cfg)
+
+        assert _work_row() == {"review_state": "done", "review_verdict": "approve"}

@@ -40,6 +40,7 @@ def _open(path: Path) -> sqlite3.Connection:
     _ensure_schema(conn)
     _maybe_migrate_json(conn)
     _migrate_gate_order(conn)
+    _backfill_orphaned_review_verdicts(conn)
     return conn
 
 
@@ -821,3 +822,66 @@ def _migrate_gate_order(conn: sqlite3.Connection) -> None:
         (_NEW, _OLD),
     )
     conn.commit()
+
+
+def _backfill_orphaned_review_verdicts(conn: sqlite3.Connection) -> int:
+    """#1663: copy a captured review verdict onto its parent WORK row.
+
+    ``run_drain`` (#1616) captured the verdict onto the ``type='review'`` row
+    and never propagated it to the parent, because the only path to that write
+    ran through ``auto_loop.process_review_completion`` — which also dispatches
+    fix workers, so the daemon's clock refused to enter it at all.  Every
+    verdict the drain consumed instead of a human's ``coord notify`` therefore
+    left its work row at ``review_state='dispatched'`` / ``review_verdict``
+    NULL.  The code fix is in ``coord.notify._run_drain_locked`` +
+    ``coord.auto_loop.propagate_review_verdict``; this repairs the rows already
+    stranded when it landed (the 2026-08-01 batch — #1527 #1624 #1658 #1633
+    #1353 — plus #544, #1078 and #1122), so none of them needs a re-review at
+    $1-3 a head.
+
+    **Copies only.**  The verdict is read from the existing review row via
+    ``review_of_assignment_id``; nothing is synthesised, re-derived from a
+    findings body, or inferred from pipeline state.  A work row whose review
+    row never captured a verdict (#1122's ``188ae219aca3``, lost to #1636/#1658
+    and recovered by hand onto PR #1656) has nothing to copy and is left
+    exactly as it is — a fabricated verdict there would overwrite hand-recovered
+    findings with a guess.
+
+    Scoped to work rows that are actually stranded: a work-like ``type``, a NULL
+    ``review_verdict`` of their own, and a review stage that demonstrably ran
+    (``review_state`` in ``dispatched``/``done``).  Rows at ``pending`` /
+    ``advisory`` / NULL are untouched — their review hasn't run or was waived.
+
+    Idempotent, and runs on every connection open like
+    :func:`_migrate_gate_order`: after the first pass every candidate has a
+    non-NULL ``review_verdict``, so the ``UPDATE`` matches nothing.  Returns the
+    number of rows repaired (0 on the steady state) for logging/tests.
+    """
+    # Latest verdict-carrying review for this work row.  `dispatched_at DESC`
+    # picks the most recent round when a work row was reviewed more than once.
+    # Deliberately NOT filtered on `r.status='done'`: #1122's review row is
+    # `failed`, and a verdict recovered onto a failed row by hand (#617's
+    # transcript recovery, `coord diagnose --stage review`) was still earned by
+    # a real review and is exactly what we want to preserve.
+    _LATEST_VERDICT = """
+        SELECT r.review_verdict FROM assignments r
+         WHERE r.review_of_assignment_id = assignments.assignment_id
+           AND r.type = 'review'
+           AND r.review_verdict IS NOT NULL
+           AND r.review_verdict != ''
+         ORDER BY r.dispatched_at DESC
+         LIMIT 1
+    """
+    cur = conn.execute(
+        f"""
+        UPDATE assignments
+           SET review_verdict = ({_LATEST_VERDICT}),
+               review_state = 'done'
+         WHERE type IN ('work', 'mock-author', 'test-author')
+           AND review_verdict IS NULL
+           AND review_state IN ('dispatched', 'done')
+           AND ({_LATEST_VERDICT}) IS NOT NULL
+        """
+    )
+    conn.commit()
+    return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0

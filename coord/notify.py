@@ -2271,15 +2271,22 @@ class DrainResult:
 
     ``skipped_locked`` is the "someone else is draining" outcome, which is a
     success, not an error — the next tick picks the work up.
+
+    ``propagated_verdicts`` (#1663) lists the review assignment IDs whose
+    verdict this pass wrote through onto the parent **work** row.  Never
+    implies a fix worker was dispatched — the drain cannot dispatch one.
     """
 
     transitions: list[Transition] = field(default_factory=list)
     orphaned_findings: list[str] = field(default_factory=list)
+    propagated_verdicts: list[str] = field(default_factory=list)
     skipped_locked: bool = False
 
     def __bool__(self) -> bool:
         """Truthy when this pass advanced something (for terse log guards)."""
-        return bool(self.transitions or self.orphaned_findings)
+        return bool(
+            self.transitions or self.orphaned_findings or self.propagated_verdicts
+        )
 
 
 def run_drain(
@@ -2316,12 +2323,29 @@ def run_drain(
     Test-stage smoke dispatch (#1426)           yes      the gate review waits on; see below
     orphaned review findings posted             yes      comment + verdict capture only
     review dispatch                             yes      guarded; see below
+    verdict → parent work row (#1663)           yes      no race, no cost; see below
     merge enqueue                               n/a      the daemon tick already runs
                                                          ``enqueue_approved_work`` right after
     **work dispatch**                           **no**   stays with a drive or a human
     **fix-round dispatch** (``auto_loop``)      **no**   this is where #476/#477 lives
     **stalled-pipeline sweep/dispatch**         **no**   can dispatch work (#1478)
     ==========================================  =======  ===================================
+
+    #1663 is what the "verdict → parent work row" row costs to learn.  That
+    write — ``work.review_state='done'``, ``work.review_verdict=<verdict>``,
+    ``record_work_review_verdict``, the merge-queue refresh — is bookkeeping by
+    every criterion in this table, but it lived *inside*
+    ``auto_loop.process_review_completion`` alongside the fix dispatch, and
+    excluding the function excluded both.  So every verdict the daemon consumed
+    instead of a human's ``coord notify`` was captured on the review row and
+    dropped on the way to the work row, for **both** verdicts — the approve
+    case stayed invisible only because ``merge_queue.has_approved_review``
+    reads the *review* row.  ``coord drive``, the TUI's Review stage and the
+    auto-loop all read the *work* row, so an approved issue simply stopped:
+    2026-08-01's overnight batch reviewed five issues clean and merged none of
+    them in 4h02m.  The propagation half is now separately callable
+    (``auto_loop.propagate_review_verdict_for_transition``) and step 5 calls
+    only that; fix dispatch is as unreachable from here as it ever was.
 
     Why review dispatch is in and fix dispatch is out — the asymmetry is the
     whole argument.  #476/#477, the incident that got ``coord-notify.timer``
@@ -2392,7 +2416,12 @@ def _run_drain_locked(config: Config) -> DrainResult:
     # assignment already in the `notifications` table, so a second drain over
     # the same board posts nothing.
     posted: list[Transition] = []
+    # #1663: (transition, record, entry) for every review that completed in
+    # THIS pass, so step 5 can propagate its verdict onto the parent work row.
+    review_completions: list[tuple[Transition, dict, dict]] = []
     try:
+        from coord.comments import EVENT_COMPLETION  # noqa: PLC0415
+
         for transition, record, entry in detect_transitions(config):
             try:
                 post_transition(transition, record, entry)
@@ -2403,6 +2432,11 @@ def _run_drain_locked(config: Config) -> DrainResult:
                 )
                 continue
             posted.append(transition)
+            if (
+                record.get("type") == "review"
+                and transition.event == EVENT_COMPLETION
+            ):
+                review_completions.append((transition, record, entry))
     except Exception:  # noqa: BLE001
         log.exception("notify drain: detect_transitions failed")
 
@@ -2432,7 +2466,70 @@ def _run_drain_locked(config: Config) -> DrainResult:
     except Exception:  # noqa: BLE001
         log.exception("notify drain: post_orphaned_review_findings failed")
 
-    return DrainResult(transitions=posted, orphaned_findings=orphaned)
+    # Step 5 (#1663): propagate each captured verdict onto its parent WORK row.
+    #
+    # Steps 1 and 4 both stamp the verdict on the *review* row and stop there.
+    # Everything that reads the *work* row — `coord drive`, the TUI's Review
+    # stage, `_stalled_pipeline`, any state-derived recovery — therefore saw
+    # `review_state='dispatched'` / `review_verdict=NULL` for every verdict the
+    # daemon consumed instead of a human's `coord notify`.  The 2026-08-01
+    # overnight batch is the receipt: five issues reviewed, four clean approves,
+    # not one reached its work row, 4h02m of wall clock and zero merges.
+    #
+    # This is the bookkeeping half ONLY — `propagate_review_verdict_for_
+    # transition` cannot reach `_dispatch_fix_for_review`, so the #476/#477
+    # line (no metered fix worker from a clock) is exactly where it was.  The
+    # exclusion used to sit at function granularity and took the parent-row
+    # write down with the dispatch; it now sits at side-effect granularity,
+    # which is where the table above always said it belonged.
+    _propagated: list[str] = []
+    if review_completions or orphaned:
+        try:
+            from coord.auto_loop import (  # noqa: PLC0415
+                propagate_review_verdict_for_transition,
+            )
+
+            seen: set[str] = set()
+            # Orphaned rows have no transition tuple (their comment was posted
+            # on an earlier pass, or never).  `_load_review_findings` reads the
+            # DB findings cache first — which step 4 just populated — so an
+            # empty record/entry still resolves the verdict without any I/O.
+            pending: list[tuple[str, dict, dict]] = [
+                (t.assignment_id, record, entry)
+                for t, record, entry in review_completions
+            ] + [(aid, {"type": "review"}, {}) for aid in orphaned]
+
+            for aid, record, entry in pending:
+                if not aid or aid in seen:
+                    continue
+                seen.add(aid)
+                try:
+                    actions = propagate_review_verdict_for_transition(
+                        aid, record, entry, config,
+                    )
+                except Exception:  # noqa: BLE001 — never sink the pass
+                    log.exception(
+                        "notify drain: verdict propagation failed for %s", aid,
+                    )
+                    continue
+                for action in actions:
+                    log.info(
+                        "notify drain: verdict propagation %s: %s (assignment=%s)",
+                        action.kind, action.detail, action.assignment_id,
+                    )
+                    if action.kind in (
+                        "approved", "approved_with_nits", "verdict_propagated",
+                        "terminal_skip",
+                    ):
+                        _propagated.append(aid)
+        except Exception:  # noqa: BLE001
+            log.exception("notify drain: verdict propagation loop failed")
+
+    return DrainResult(
+        transitions=posted,
+        orphaned_findings=orphaned,
+        propagated_verdicts=_propagated,
+    )
 
 
 def run(

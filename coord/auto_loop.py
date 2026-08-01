@@ -98,6 +98,12 @@ class LoopAction:
                                  was set to ``"pending"`` so
                                  ``dispatch_pending_reviews`` picks it up once a
                                  ``passed``/``skipped`` verdict lands (#1612)
+    - ``"verdict_propagated"`` — #1663: the ``request-changes`` verdict was
+                                 written onto the parent work row but NO fix
+                                 worker was dispatched, because the caller asked
+                                 for bookkeeping only (``dispatch_fixes=False``
+                                 — the daemon drain, which must never spawn a
+                                 fix worker; #476/#477)
     """
     assignment_id: str | None
     detail: str = ""
@@ -216,6 +222,7 @@ def process_review_completion(
     machine_host: str | None = None,
     http_client: httpx.Client | None = None,
     terminal_cache: dict | None = None,
+    dispatch_fixes: bool = True,
 ) -> list[LoopAction]:
     """Process a completed review assignment through the auto-loop.
 
@@ -230,6 +237,18 @@ def process_review_completion(
       loop has run too many times.
 
     The caller is responsible for persisting the board after this returns.
+
+    **#1663 —** *dispatch_fixes* is the bookkeeping/dispatch seam.  With
+    ``dispatch_fixes=False`` every verdict-determination step still runs (the
+    #476 approve-with-nits gate, the #1456 fail-closed rule, the
+    ``review_verdict`` capture) and the verdict is still propagated onto the
+    parent work row via :func:`propagate_review_verdict` — but a genuine
+    ``request-changes`` returns ``verdict_propagated`` instead of entering
+    :func:`_dispatch_fix_for_review`.  No metered worker is ever spawned.  This
+    is what the daemon drain calls: the drain's responsibility table puts the
+    parent-row write squarely in the "bookkeeping, no race, no cost if
+    repeated" class and fix dispatch squarely outside it, and before #1663 the
+    only way to get the former was to accept the latter.
     """
     if not config.pipeline.auto_loop:
         return [LoopAction(kind="disabled", assignment_id=review.assignment_id)]
@@ -342,10 +361,132 @@ def process_review_completion(
         )
 
     # Genuine blocking findings (or counts unparseable) → dispatch a fix worker.
+    if not dispatch_fixes:
+        # #1663: the caller (the daemon drain) is explicitly not allowed to
+        # spawn a fix worker — that is the #476/#477 blast radius. Do the
+        # bookkeeping half anyway so the work row says `request-changes`
+        # instead of lying about being `dispatched` with no verdict: a drive,
+        # a human, or the #1441 stalled sweep can then act on a legible row.
+        # No merge-queue refresh — a request-changes row can never satisfy
+        # `has_approved_review`.
+        work = propagate_review_verdict(
+            review, board, config, refresh_merge_queue=False,
+        )
+        return [LoopAction(
+            kind="verdict_propagated",
+            assignment_id=review.assignment_id,
+            detail=(
+                "Review verdict: request-changes — propagated to work "
+                f"{work.assignment_id if work is not None else '<not on board>'}; "
+                "fix dispatch withheld (caller is bookkeeping-only)"
+            ),
+        )]
+
     return _dispatch_fix_for_review(
         review, findings, board, config,
         http_client=http_client, terminal_cache=terminal_cache,
     )
+
+
+def propagate_review_verdict(
+    review: Assignment,
+    board: Board,
+    config: Config,
+    *,
+    refresh_merge_queue: bool = True,
+) -> "Assignment | None":
+    """Write *review*'s verdict onto the parent **work** row. Bookkeeping only.
+
+    This is the half of :func:`process_review_completion` that is pure
+    bookkeeping — no metered worker, no race, no cost if repeated:
+
+    - ``work.review_state = "done"``
+    - ``work.review_verdict = review.review_verdict``
+    - :func:`coord.state.record_work_review_verdict` (durable single-row write)
+    - the merge-queue entry refresh (*refresh_merge_queue*, approve only)
+
+    **#1663** is why this is a separate function.  The exclusion that keeps
+    fix-worker dispatch out of the daemon drain (#476/#477) used to sit at
+    *function* granularity — the drain refused to enter
+    ``process_review_completion`` at all, which silently took the parent-row
+    write with it.  Every verdict consumed by the drain instead of by a human's
+    ``coord notify`` left its work row at ``review_state='dispatched'`` /
+    ``review_verdict=NULL`` forever (the 2026-08-01 overnight batch: five
+    issues, four clean approves, 4h02m of wall clock, zero merges).  Splitting
+    the bookkeeping out lets the drain call *this* without ever reaching
+    ``_dispatch_fix_for_review``.
+
+    Returns the parent work assignment when one was found and written, else
+    ``None`` (no ``review_of_assignment_id``, or it isn't on *board*).
+
+    *refresh_merge_queue* is ``True`` on the approve paths — #292 (Defect 2)
+    wants the entry created/re-keyed so the TUI shows Merge as ready without a
+    manual ``coord merge`` — and ``False`` on the request-changes paths, where
+    creating a PENDING queue entry would only add a row that
+    ``has_approved_review`` is guaranteed to reject.
+    """
+    if not review.review_of_assignment_id:
+        return None
+    work = board.find_by_id(review.review_of_assignment_id)
+    if work is None:
+        return None
+
+    work.review_state = "done"
+    # #1565: propagate the verdict onto the parent work row itself —
+    # it used to live only on the review assignment, which left the
+    # work row's own review_verdict NULL forever. Persist it as an
+    # immediate, scoped single-row write (not deferred to whichever
+    # caller happens to save the whole board afterward) so a crash,
+    # a skipped persist step, or a stale concurrent save_board()
+    # elsewhere can't leave the parent stuck at review_state=
+    # 'pending' with a real approval sitting unreferenced on the
+    # review row — the #1565 incident (4 redundant metered reviews
+    # re-deriving the same approval).
+    work.review_verdict = review.review_verdict
+    if work.assignment_id and review.review_verdict:
+        from coord.state import record_work_review_verdict  # noqa: PLC0415
+
+        record_work_review_verdict(work.assignment_id, review.review_verdict)
+
+    if not refresh_merge_queue:
+        return work
+
+    # #292 (Defect 2): proactively enqueue/refresh the merge queue
+    # entry so the TUI shows the Merge stage as ready without requiring
+    # a manual `coord merge` run first. If the entry was keyed to an
+    # earlier work assignment (the original pre-bounce assignment),
+    # refresh_entry_assignment updates its assignment_id so
+    # has_approved_review can find this approval.
+    try:
+        from coord import merge_queue as mq  # noqa: PLC0415
+        repo_cfg = config.repo(work.repo_name)
+        if repo_cfg is not None and work.branch:
+            # #934: target `feature/ms-NN` when this issue belongs
+            # to a milestone and the repo opted into the git model —
+            # the milestone lookup itself is skipped (no `gh` call)
+            # when it hasn't, falling back to `default_branch`.
+            target_branch = repo_cfg.default_branch
+            if getattr(repo_cfg, "develop_branch", None):
+                from coord.branch_model import (  # noqa: PLC0415
+                    fetch_issue_milestone_number,
+                    resolve_base_branch,
+                )
+
+                milestone_number = fetch_issue_milestone_number(
+                    repo_cfg.github, work.issue_number,
+                )
+                target_branch = resolve_base_branch(repo_cfg, milestone_number)
+            mq.refresh_entry_assignment(
+                work,
+                repo_github=repo_cfg.github,
+                target_branch=target_branch,
+            )
+    except Exception as exc:  # noqa: BLE001 — best-effort; merge gate still works
+        log.warning(
+            "auto_loop: refresh_entry_assignment failed for %s: %s",
+            work.assignment_id, exc,
+        )
+    return work
 
 
 def _advance_pipeline(
@@ -362,60 +503,7 @@ def _advance_pipeline(
     both advance the pipeline identically (the only difference is the action
     ``kind``/``detail`` reported back to the caller).
     """
-    if review.review_of_assignment_id:
-        work = board.find_by_id(review.review_of_assignment_id)
-        if work is not None:
-            work.review_state = "done"
-            # #1565: propagate the verdict onto the parent work row itself —
-            # it used to live only on the review assignment, which left the
-            # work row's own review_verdict NULL forever. Persist it as an
-            # immediate, scoped single-row write (not deferred to whichever
-            # caller happens to save the whole board afterward) so a crash,
-            # a skipped persist step, or a stale concurrent save_board()
-            # elsewhere can't leave the parent stuck at review_state=
-            # 'pending' with a real approval sitting unreferenced on the
-            # review row — the #1565 incident (4 redundant metered reviews
-            # re-deriving the same approval).
-            work.review_verdict = review.review_verdict
-            if work.assignment_id:
-                from coord.state import record_work_review_verdict  # noqa: PLC0415
-
-                record_work_review_verdict(work.assignment_id, review.review_verdict)
-            # #292 (Defect 2): proactively enqueue/refresh the merge queue
-            # entry so the TUI shows the Merge stage as ready without requiring
-            # a manual `coord merge` run first. If the entry was keyed to an
-            # earlier work assignment (the original pre-bounce assignment),
-            # refresh_entry_assignment updates its assignment_id so
-            # has_approved_review can find this approval.
-            try:
-                from coord import merge_queue as mq  # noqa: PLC0415
-                repo_cfg = config.repo(work.repo_name)
-                if repo_cfg is not None and work.branch:
-                    # #934: target `feature/ms-NN` when this issue belongs
-                    # to a milestone and the repo opted into the git model —
-                    # the milestone lookup itself is skipped (no `gh` call)
-                    # when it hasn't, falling back to `default_branch`.
-                    target_branch = repo_cfg.default_branch
-                    if getattr(repo_cfg, "develop_branch", None):
-                        from coord.branch_model import (  # noqa: PLC0415
-                            fetch_issue_milestone_number,
-                            resolve_base_branch,
-                        )
-
-                        milestone_number = fetch_issue_milestone_number(
-                            repo_cfg.github, work.issue_number,
-                        )
-                        target_branch = resolve_base_branch(repo_cfg, milestone_number)
-                    mq.refresh_entry_assignment(
-                        work,
-                        repo_github=repo_cfg.github,
-                        target_branch=target_branch,
-                    )
-            except Exception as exc:  # noqa: BLE001 — best-effort; merge gate still works
-                log.warning(
-                    "auto_loop: refresh_entry_assignment failed for %s: %s",
-                    work.assignment_id, exc,
-                )
+    propagate_review_verdict(review, board, config)
     return [LoopAction(kind=kind, assignment_id=review.assignment_id, detail=detail)]
 
 
@@ -592,6 +680,21 @@ def _dispatch_fix_for_review(
                 f"work assignment {review.review_of_assignment_id!r} not on board"
             ),
         )]
+
+    # #1663 (second gap): write the verdict onto the parent work row on the
+    # request-changes path too. `_advance_pipeline` has always done this for
+    # approve (#1565) but there was no request-changes twin — the only place
+    # this function ever touched the parent was the `_work_is_terminal` early
+    # return below, and even that set `review_state` without `review_verdict`.
+    # The fix worker is dispatched off the *transition* and doesn't need the
+    # row, so nothing broke loudly; what it cost was legibility — a row that
+    # still reads `dispatched`/NULL after a real rejection is invisible to
+    # `coord drive`, to the TUI's Review stage, and to any state-derived
+    # recovery sweep. Done BEFORE the terminal/iteration-cap branches so every
+    # outcome of this function leaves an honest parent row, not just the happy
+    # one. No merge-queue refresh: request-changes can never satisfy
+    # `has_approved_review`.
+    propagate_review_verdict(review, board, config, refresh_merge_queue=False)
 
     # #522: never dispatch a fix for work that is already done on GitHub.
     # A merged PR / closed issue must not re-enter the review→fix loop — this
@@ -1202,6 +1305,12 @@ def run_for_review_transition(
     the board if a fix worker was dispatched, and returns the list of actions
     taken.
 
+    **May dispatch a metered fix worker** — this is the ``coord notify`` /
+    drive-nudge entry point.  Callers that must not spawn one (the daemon
+    drain) want :func:`propagate_review_verdict_for_transition` instead;
+    ``tests/test_notify_drain.py::test_does_not_run_the_review_auto_loop``
+    patches *this* name and asserts it is never called from a drain pass.
+
     Parameters
     ----------
     assignment_id:
@@ -1213,6 +1322,49 @@ def run_for_review_transition(
     config:
         Parsed coordinator config.
     """
+    return _run_for_review_transition(
+        assignment_id, record, entry, config,
+        terminal_cache=terminal_cache, dispatch_fixes=True,
+    )
+
+
+def propagate_review_verdict_for_transition(
+    assignment_id: str,
+    record: dict,
+    entry: dict,
+    config: Config,
+) -> list[LoopAction]:
+    """#1663: the drain-safe half of :func:`run_for_review_transition`.
+
+    Same board load / verdict resolution / parent-row write / persist, with
+    :func:`_dispatch_fix_for_review` unreachable — a genuine ``request-changes``
+    comes back as ``verdict_propagated`` rather than ``fix_dispatched``.
+
+    A deliberately *separate public name*, not a keyword argument on
+    ``run_for_review_transition``: the #476/#477 guard tests patch that symbol
+    and assert it is never called from ``notify.run_drain``, and a flag would
+    have made "the drain called the auto-loop entry point" indistinguishable
+    from "the drain dispatched a fix worker" at the seam the guard watches.
+
+    No ``terminal_cache``: nothing on this path calls ``_work_is_terminal``, so
+    a drain pass makes no ``gh`` round-trips on behalf of this function.
+    """
+    return _run_for_review_transition(
+        assignment_id, record, entry, config,
+        terminal_cache=None, dispatch_fixes=False,
+    )
+
+
+def _run_for_review_transition(
+    assignment_id: str,
+    record: dict,
+    entry: dict,
+    config: Config,
+    *,
+    terminal_cache: dict | None = None,
+    dispatch_fixes: bool = True,
+) -> list[LoopAction]:
+    """Shared body of the two review-transition entry points above."""
     if not config.pipeline.auto_loop:
         return [LoopAction(kind="disabled", assignment_id=assignment_id)]
 
@@ -1250,6 +1402,7 @@ def run_for_review_transition(
         log_path=log_path,
         machine_host=machine_host,
         terminal_cache=terminal_cache,
+        dispatch_fixes=dispatch_fixes,
     )
 
     # Save when a fix was dispatched (new assignment), an approve was parsed
@@ -1257,8 +1410,13 @@ def run_for_review_transition(
     # advisory-only review advanced the pipeline (#476 — review_verdict flips to
     # approve + review_state="done" so the merge gate unblocks; without this the
     # gate suppresses the fix but the advance is never persisted and the PR
-    # silently can't merge), or the work was found terminal (#522).
-    _persist_kinds = ("fix_dispatched", "approved", "approved_with_nits", "terminal_skip")
+    # silently can't merge), the work was found terminal (#522), or (#1663) a
+    # request-changes verdict was propagated onto the parent row without a fix
+    # dispatch.
+    _persist_kinds = (
+        "fix_dispatched", "approved", "approved_with_nits", "terminal_skip",
+        "verdict_propagated",
+    )
     if any(a.kind in _persist_kinds for a in actions):
         write_board(board)
 

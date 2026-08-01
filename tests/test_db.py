@@ -458,3 +458,191 @@ class TestMigrateGateOrder:
             "SELECT value FROM board_meta WHERE key='pipeline_default_gates'"
         ).fetchone()
         assert row is None
+
+
+# ── #1663: stranded review verdicts ───────────────────────────────────────────
+
+
+class TestBackfillOrphanedReviewVerdicts:
+    """#1663: ``run_drain`` captured verdicts on the review row and never
+    propagated them to the parent work row, stranding eight rows across the
+    2026-08-01 overnight batch (#1527 #1624 #1658 #1633 #1353) plus #544, #1078
+    and #1122.  The backfill copies each verdict from the review row that
+    actually earned it — it never synthesises one."""
+
+    @staticmethod
+    def _work(
+        conn: sqlite3.Connection,
+        aid: str,
+        *,
+        atype: str = "work",
+        review_state: str | None = "dispatched",
+        review_verdict: str | None = None,
+    ) -> None:
+        conn.execute(
+            "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+            "issue_number, issue_title, type, status, review_state, review_verdict) "
+            "VALUES (?, 'laptop', 'api', 42, 't', ?, 'done', ?, ?)",
+            (aid, atype, review_state, review_verdict),
+        )
+
+    @staticmethod
+    def _review(
+        conn: sqlite3.Connection,
+        aid: str,
+        work_aid: str,
+        verdict: str | None,
+        *,
+        status: str = "done",
+        dispatched_at: float = 1000.0,
+    ) -> None:
+        conn.execute(
+            "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+            "issue_number, issue_title, type, status, review_of_assignment_id, "
+            "review_verdict, dispatched_at) "
+            "VALUES (?, 'laptop', 'api', 42, '[review] t', 'review', ?, ?, ?, ?)",
+            (aid, status, work_aid, verdict, dispatched_at),
+        )
+
+    @staticmethod
+    def _row(conn: sqlite3.Connection, aid: str) -> dict:
+        r = conn.execute(
+            "SELECT review_state, review_verdict FROM assignments "
+            "WHERE assignment_id=?",
+            (aid,),
+        ).fetchone()
+        return {"review_state": r["review_state"], "review_verdict": r["review_verdict"]}
+
+    def test_copies_approve_from_the_review_row(
+        self, isolated_conn: sqlite3.Connection
+    ) -> None:
+        """#1527's shape: work at dispatched/NULL, review at done/approve."""
+        self._work(isolated_conn, "28d54c5b8873")
+        self._review(isolated_conn, "6415c03e6ea2", "28d54c5b8873", "approve")
+
+        assert db_mod._backfill_orphaned_review_verdicts(isolated_conn) == 1
+        assert self._row(isolated_conn, "28d54c5b8873") == {
+            "review_state": "done", "review_verdict": "approve",
+        }
+
+    def test_copies_request_changes_from_the_review_row(
+        self, isolated_conn: sqlite3.Connection
+    ) -> None:
+        """#544 / #1078's shape.  A request-changes must be copied verbatim, not
+        normalised to approve — the row is what tells a human a fix is owed."""
+        self._work(isolated_conn, "ff4927937695")
+        self._review(
+            isolated_conn, "cb64561942fc", "ff4927937695", "request-changes",
+        )
+
+        assert db_mod._backfill_orphaned_review_verdicts(isolated_conn) == 1
+        assert self._row(isolated_conn, "ff4927937695") == {
+            "review_state": "done", "review_verdict": "request-changes",
+        }
+
+    def test_never_synthesises_a_verdict_the_review_row_does_not_carry(
+        self, isolated_conn: sqlite3.Connection
+    ) -> None:
+        """#1122's shape: the review row ``188ae219aca3`` FAILED and its verdict
+        was lost entirely (#1636/#1658).  Its findings were recovered from the
+        worker transcript by hand and posted to PR #1656 — a fabricated verdict
+        here would overwrite that with a guess.  Nothing to copy ⇒ no write."""
+        self._work(isolated_conn, "a822bbd9eae3")
+        self._review(
+            isolated_conn, "188ae219aca3", "a822bbd9eae3", None, status="failed",
+        )
+
+        assert db_mod._backfill_orphaned_review_verdicts(isolated_conn) == 0
+        assert self._row(isolated_conn, "a822bbd9eae3") == {
+            "review_state": "dispatched", "review_verdict": None,
+        }
+
+    def test_copies_a_verdict_recovered_onto_a_failed_review_row(
+        self, isolated_conn: sqlite3.Connection
+    ) -> None:
+        """The converse: when a verdict WAS recovered by hand onto a failed
+        review row (#617's transcript recovery), it was earned by a real review
+        and must be carried across.  Hence no ``status='done'`` filter."""
+        self._work(isolated_conn, "wk-recovered")
+        self._review(
+            isolated_conn, "rev-recovered", "wk-recovered", "request-changes",
+            status="failed",
+        )
+
+        assert db_mod._backfill_orphaned_review_verdicts(isolated_conn) == 1
+        assert self._row(isolated_conn, "wk-recovered")["review_verdict"] == (
+            "request-changes"
+        )
+
+    def test_takes_the_latest_round_when_a_row_was_reviewed_twice(
+        self, isolated_conn: sqlite3.Connection
+    ) -> None:
+        self._work(isolated_conn, "wk-2rounds")
+        self._review(
+            isolated_conn, "rev-r1", "wk-2rounds", "request-changes",
+            dispatched_at=1000.0,
+        )
+        self._review(
+            isolated_conn, "rev-r2", "wk-2rounds", "approve", dispatched_at=2000.0,
+        )
+
+        db_mod._backfill_orphaned_review_verdicts(isolated_conn)
+        assert self._row(isolated_conn, "wk-2rounds")["review_verdict"] == "approve"
+
+    def test_leaves_a_work_row_that_already_has_a_verdict_alone(
+        self, isolated_conn: sqlite3.Connection
+    ) -> None:
+        self._work(
+            isolated_conn, "wk-has", review_state="done", review_verdict="approve",
+        )
+        self._review(
+            isolated_conn, "rev-has", "wk-has", "request-changes",
+        )
+
+        assert db_mod._backfill_orphaned_review_verdicts(isolated_conn) == 0
+        assert self._row(isolated_conn, "wk-has")["review_verdict"] == "approve"
+
+    def test_leaves_rows_whose_review_stage_never_ran_alone(
+        self, isolated_conn: sqlite3.Connection
+    ) -> None:
+        """``pending`` / ``advisory`` / NULL means no review ran or it was
+        waived — not stranded, and not ours to stamp."""
+        for state in ("pending", "advisory", None):
+            aid = f"wk-{state}"
+            self._work(isolated_conn, aid, review_state=state)
+            self._review(isolated_conn, f"rev-{state}", aid, "approve")
+
+        assert db_mod._backfill_orphaned_review_verdicts(isolated_conn) == 0
+        for state in ("pending", "advisory", None):
+            assert self._row(isolated_conn, f"wk-{state}")["review_verdict"] is None
+
+    def test_ignores_non_work_like_rows(
+        self, isolated_conn: sqlite3.Connection
+    ) -> None:
+        """Only WORK_LIKE_TYPES carry a parent review verdict.  A ``review`` or
+        ``smoke`` row must never be rewritten by its own children."""
+        self._work(isolated_conn, "sm-1", atype="smoke")
+        self._review(isolated_conn, "rev-sm", "sm-1", "approve")
+
+        assert db_mod._backfill_orphaned_review_verdicts(isolated_conn) == 0
+        assert self._row(isolated_conn, "sm-1")["review_verdict"] is None
+
+    def test_covers_every_work_like_type(
+        self, isolated_conn: sqlite3.Connection
+    ) -> None:
+        for atype in ("work", "mock-author", "test-author"):
+            self._work(isolated_conn, f"wk-{atype}", atype=atype)
+            self._review(isolated_conn, f"rev-{atype}", f"wk-{atype}", "approve")
+
+        assert db_mod._backfill_orphaned_review_verdicts(isolated_conn) == 3
+
+    def test_is_idempotent(self, isolated_conn: sqlite3.Connection) -> None:
+        self._work(isolated_conn, "wk-idem")
+        self._review(isolated_conn, "rev-idem", "wk-idem", "approve")
+
+        assert db_mod._backfill_orphaned_review_verdicts(isolated_conn) == 1
+        assert db_mod._backfill_orphaned_review_verdicts(isolated_conn) == 0
+        assert self._row(isolated_conn, "wk-idem")["review_verdict"] == "approve"
+
+    def test_empty_db_is_a_noop(self, isolated_conn: sqlite3.Connection) -> None:
+        assert db_mod._backfill_orphaned_review_verdicts(isolated_conn) == 0
