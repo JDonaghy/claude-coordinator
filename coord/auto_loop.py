@@ -67,6 +67,26 @@ log = logging.getLogger(__name__)
 FIX_DISPATCH_TYPES: frozenset[str] = frozenset({"work", "test-author"})
 
 
+# Every :class:`LoopAction` kind whose production means the in-memory board was
+# mutated and must be written back.  A fix was dispatched (new assignment row),
+# an approve was parsed (so ``review_verdict`` is persisted for the merge gate,
+# #253), an advisory-only review advanced the pipeline (#476 — ``review_verdict``
+# flips to approve + ``review_state="done"`` so the merge gate unblocks; without
+# this the gate suppresses the fix but the advance is never persisted and the PR
+# silently can't merge), the work was found terminal (#522), or (#1663) a
+# request-changes verdict was propagated onto the parent row without a fix
+# dispatch.
+#
+# #1622: module-level rather than a local in ``_run_for_review_transition``
+# because ``coord fix`` is now a second caller of
+# :func:`process_review_completion` and has the same persist obligation.  Two
+# copies of this tuple is exactly the drift shape #1601/#1624 keep hitting.
+PERSIST_ACTION_KINDS: tuple[str, ...] = (
+    "fix_dispatched", "approved", "approved_with_nits", "terminal_skip",
+    "verdict_propagated",
+)
+
+
 # ── Action reporting ──────────────────────────────────────────────────────────
 
 @dataclass
@@ -1405,19 +1425,8 @@ def _run_for_review_transition(
         dispatch_fixes=dispatch_fixes,
     )
 
-    # Save when a fix was dispatched (new assignment), an approve was parsed
-    # (so review_verdict is persisted for the merge gate, #253), an
-    # advisory-only review advanced the pipeline (#476 — review_verdict flips to
-    # approve + review_state="done" so the merge gate unblocks; without this the
-    # gate suppresses the fix but the advance is never persisted and the PR
-    # silently can't merge), the work was found terminal (#522), or (#1663) a
-    # request-changes verdict was propagated onto the parent row without a fix
-    # dispatch.
-    _persist_kinds = (
-        "fix_dispatched", "approved", "approved_with_nits", "terminal_skip",
-        "verdict_propagated",
-    )
-    if any(a.kind in _persist_kinds for a in actions):
+    # See PERSIST_ACTION_KINDS for why each kind implies a board write.
+    if any(a.kind in PERSIST_ACTION_KINDS for a in actions):
         write_board(board)
 
     return actions
