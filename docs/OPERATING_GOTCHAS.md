@@ -292,9 +292,10 @@ independent issues sequentially on one machine, in one tmux session, overnight.
 (#1660) and should be deleted when that lands.
 
 ```bash
-ssh dellserver && tmux new -s drive
-MACHINE=dellserver ~/drive-batch.sh 1645 1650 1654      # or repo#issue
-# Ctrl-b d
+ssh dellserver
+tmux new -s drive          # inside the ssh session, not chained with &&
+MACHINE=dellserver ~/src/claude-coordinator/scripts/drive-batch.sh 1645 1650 1654
+# Ctrl-b d, then log out; tmux owns the run
 ```
 
 **Budget ~120 minutes per issue, and never lower it to "save time."** Measured
@@ -345,9 +346,12 @@ Known limits, tracked under milestone #49 / epic #1406:
 - **The failure path is still lightly exercised.** Most drives pass their
   tests, so the `coord fix` loop on a genuine test failure has had few
   end-to-end runs.
-- **Review verdicts consumed by the daemon drain do not reach the work row**
-  (#1663) — the drive then waits out its full deadline on an issue that was
-  approved. Independent of the deadline sizing above; both bite the same run.
+- **Review verdicts consumed by the daemon drain did not reach the work row**
+  (#1663) — the drive then waited out its full deadline on an issue that was
+  already approved. **Fixed in `dbf5ee4`, but it is daemon-side**: per the
+  merged≠live rule at the top of this file, it keeps biting until
+  `coord-serve` is restarted on the daemon host. Independent of the deadline
+  sizing above; both hit the same run.
 - **Never edit `drive-batch.sh` while a batch is running.** bash reads a script
   lazily by byte offset, so an in-place edit shifts them under every live
   interpreter and can corrupt a run mid-flight. Copy, edit the copy, swap after.

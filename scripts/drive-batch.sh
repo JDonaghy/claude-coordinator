@@ -18,6 +18,20 @@
 # -e is deliberately NOT set: the loop must survive a failed issue.
 set -uo pipefail
 
+# Linux / bash 4+ only. `declare -A`, `date -Is` and `flock` are all
+# bash-4/GNU-coreutils/util-linux; macOS ships bash 3.2 and BSD date, and has
+# no flock(1) — so on the Mac mini (docs/MAC_MINI.md) every one of those fails,
+# and the flock loss silently removes the single-instance guard. Fail loudly
+# here rather than halfway through an unattended night.
+if (( BASH_VERSINFO[0] < 4 )); then
+  echo "FATAL: needs bash 4+ (found $BASH_VERSION). This script is Linux-only;" >&2
+  echo "       on macOS: brew install bash util-linux coreutils, or drive from a Linux host." >&2
+  exit 2
+fi
+for _need in flock git python3; do
+  command -v "$_need" >/dev/null || { echo "FATAL: '$_need' not found on PATH" >&2; exit 2; }
+done
+
 # ── Config ───────────────────────────────────────────────────────────────────
 # Resolved to an absolute path, never left to PATH: a non-interactive shell or
 # a systemd unit does not source your rc. Prefer the agent venv because that is
@@ -182,6 +196,17 @@ say "coord:    $COORD ($("$COORD" --version 2>&1 | tail -1))"
 # the checkout tracks `origin/develop`, so trusting origin/HEAD merges the
 # wrong branch into a develop checkout (caught exactly this way in testing).
 # quadraui is develop-tracking too. Only fall back when there is no upstream.
+#
+# Two known imprecisions, both tolerable ONLY because this is advisory (see
+# the caller — nothing here gates dispatch):
+#   - it is the upstream of whatever branch the checkout is currently ON, so a
+#     base checkout parked on a feature branch resolves to that branch. The
+#     caller skips the fast-forward in that case rather than advancing it.
+#   - coord itself resolves the default branch from `coordinator.yml`'s
+#     repos.<name>.default_branch, a different source that could disagree.
+#     Reading the config would be exact; it is not worth a YAML parse in bash
+#     for a line that only prints a WARNING.
+# Also assumes the remote is named `origin`.
 default_branch() {
   local co="$1" up ref
   up=$(git -C "$co" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null) \
@@ -194,38 +219,63 @@ default_branch() {
   echo main
 }
 
-# Workers create worktrees from the repo's checkout. If it is behind, every
-# branch forks from a stale default branch and every merge then needs a rebase.
-# Done once per DISTINCT repo in the batch.
+# Report each distinct repo's checkout, and opportunistically fast-forward it.
+#
+# ADVISORY ONLY — nothing here may abort the batch. The worker does NOT branch
+# from this checkout's HEAD: both worktree paths (`AgentServer._setup_worktree`
+# and `setup_interactive_worktree`) `git fetch origin --prune` and branch from
+# the resolved `origin/<default_branch>` SHA (`coord/agent.py:1821`, #255),
+# precisely so local checkout state cannot ride into a worker. `coord drive`
+# fetches for its own verification too.
+#
+# So a stray local commit, or a base checkout left parked on a feature branch
+# — both recurring here — must NOT take the night down before a single
+# dispatch. This used to `exit 2`. The fast-forward is a courtesy to whoever
+# opens the checkout in the morning, nothing more.
 declare -A SEEN_REPO=()
 for r in "${ISSUE_REPOS[@]}"; do
   [[ -n "${SEEN_REPO[$r]:-}" ]] && continue
   SEEN_REPO[$r]=1
   co="$SRC_ROOT/$r"
   if [[ ! -d "$co/.git" ]]; then
-    say "WARNING: $co is not a git checkout — worktree creation for $r will fail"
+    say "WARNING: $co is not a git checkout — worktree creation for $r may fail"
     continue
   fi
   db=$(default_branch "$co")
-  git -C "$co" fetch --quiet origin 2>>"$LOG"
+  cur=$(git -C "$co" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
+  git -C "$co" fetch --quiet origin 2>>"$LOG" || say "$r: WARNING: fetch failed (offline?)"
   behind=$(git -C "$co" rev-list --count "HEAD..origin/$db" 2>/dev/null || echo "?")
-  if [[ "$behind" != "0" ]]; then
-    say "$r: $behind commit(s) behind origin/$db — fast-forwarding"
-    if ! git -C "$co" merge --ff-only "origin/$db" >>"$LOG" 2>&1; then
-      say "FATAL: could not fast-forward $co (local changes?). Resolve by hand."
-      exit 2
+  if [[ "$cur" != "$db" ]]; then
+    say "$r: on '$cur', not '$db' — NOT fast-forwarding (advisory only; workers branch from origin)"
+  elif [[ "$behind" != "0" && "$behind" != "?" ]]; then
+    if git -C "$co" merge --ff-only "origin/$db" >>"$LOG" 2>&1; then
+      say "$r: fast-forwarded $behind commit(s) to origin/$db"
+    else
+      say "$r: WARNING: $behind behind origin/$db and could not fast-forward (local changes?) — continuing; workers branch from origin anyway"
     fi
   fi
-  say "$r: $(git -C "$co" log --oneline -1)  [$db]"
+  say "$r: $(git -C "$co" log --oneline -1)  [$cur]"
 done
 
 # A live drive from an earlier run would contend for the same machine.
-# Count only lines that look like a session row. `grep -c .` counts the
-# "No live drive sessions." line too — that false positive fired on the
-# 2026-08-01 run and is exactly the CLI-prose parsing #1523 forbids on a
-# control path. It is a warning, not a gate, which is the only reason this
-# is tolerable here at all.
-live=$("$COORD" drive-sessions 2>/dev/null | grep -cE '^[[:space:]]*[a-z0-9-]+[[:space:]]+#?[0-9]+' || true)
+#
+# Read the declared machine contract, not the prose. `coord drive-sessions
+# --json` emits an array of {repo, issue, session_name, attached} and is
+# already consumed by coord-tui (`coord/commands/drive.py:394-398`). The
+# human output is NOT parseable: `grep -c .` counts the literal "No live
+# drive sessions." as one session — that false positive fired on the
+# 2026-08-01 run — and each real row is followed by two "attach with:" /
+# "stop with:" continuation lines. #1523 forbids CLI-prose parsing on a
+# control path; a --json contract one flag away leaves no excuse.
+#
+# Degrades to 0 (not a spurious warning) on any older coord without --json.
+live=$("$COORD" drive-sessions --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    print(len(json.load(sys.stdin)))
+except Exception:
+    print(0)
+' 2>/dev/null || echo 0)
 (( live > 0 )) && say "WARNING: $live live drive session(s) already exist — check before continuing"
 
 # Validate every issue before dispatching any of them: config, machine, repo
@@ -276,6 +326,31 @@ for pos in "${!RUN_IDX[@]}"; do
   rc=${PIPESTATUS[0]}
 
   elapsed=$(( SECONDS - issue_start ))
+
+  # rc=3 is coord drive's EXIT_DEADLINE (`coord/drive.py:118`). It means the
+  # OBSERVER gave up; `coord drive` just returns, so the work is STILL LIVE on
+  # the fleet — worker, test and review all keep running.
+  #
+  # Starting the next issue here is the 2026-08-01 incident exactly: five
+  # drives expired, the fleet approved all five 21-133 min later, and the loop
+  # had already stacked the next issue on top of each one. Sequential in this
+  # script, concurrent on the fleet.
+  #
+  # So a deadline STOPS THE BATCH unconditionally — it is not a "failure" that
+  # STOP_ON_FAIL governs, it is an unknown state with live work attached, and
+  # the one thing we must not do is dispatch on top of it. Same "hold, don't
+  # kill" posture #1660 requires: the running work is left completely alone.
+  if [[ $rc -eq 3 ]]; then
+    say "──────── $r#$n DEADLINE after $(hms $elapsed) ────────"
+    say "  work is STILL RUNNING on the fleet — not starting the next issue."
+    say "  check it with:  $COORD status   /   $COORD merge --dry-run"
+    FAILED+=("$r#$n")
+    for later in "${RUN_IDX[@]:$((pos + 1))}"; do
+      SKIPPED+=("${ISSUE_REPOS[$later]}#${ISSUE_NUMS[$later]}")
+    done
+    break
+  fi
+
   if [[ $rc -eq 0 ]]; then
     say "──────── $r#$n DONE in $(hms $elapsed) ────────"
     DONE+=("$r#$n")
@@ -305,4 +380,8 @@ say "                             # only in the count (conflict=N), not as a row
 say "  tail -200 $LOG_LATEST"
 say "  grep -E '════|────────|FAILED|DONE' $LOG_LATEST   # just the milestones"
 
-(( ${#FAILED[@]} == 0 ))
+# Exit non-zero if ANYTHING did not complete — a skipped issue (preflight
+# failure, or abandoned after a deadline/STOP_ON_FAIL) is not a success, and
+# an unattended runner has only this code to go on. 2 of 3 issues skipped plus
+# 1 success used to exit 0.
+(( ${#FAILED[@]} == 0 && ${#SKIPPED[@]} == 0 ))
