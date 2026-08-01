@@ -477,6 +477,7 @@ models:
   default: sonnet
   escalation: [haiku, sonnet, opus]
   labels:
+    enhancement: sonnet
     tier:small: haiku
     tier:large: opus
 """
@@ -615,6 +616,79 @@ class TestCliAssignModelLabels:
         assert result.exit_code == 0, result.output
         proposal = disp.call_args[0][0]
         assert proposal.model == "sonnet"
+
+
+class TestCliAssignDryRunTwoLabelShadowing:
+    """#1633 acceptance (black-box): `coord assign --dry-run` on an issue
+    carrying BOTH a tier label and a type label must print the tier-derived
+    model and name which label shadowed which — this is the exact CLI
+    surface the original bug report (#1633) reproduced against: an issue
+    labelled `enhancement` + `tier:large` dry-ran as `sonnet` instead of the
+    expected `opus` because resolution walked GitHub's issue-label order
+    instead of a deterministic precedence."""
+
+    def test_tier_large_wins_over_enhancement_and_dry_run_names_both(
+        self, cli_config_file_with_labels: Path, cli_coord_dir: Path,
+    ) -> None:
+        with patch(
+            "coord.github_ops.get_issue",
+            return_value={
+                "title": "t",
+                "labels": [{"name": "enhancement"}, {"name": "tier:large"}],
+            },
+        ), patch(
+            "coord.dispatch.dispatch", return_value={"id": "abc-123"}
+        ) as disp, patch(
+            "coord.github_ops.post_issue_comment"
+        ), patch(
+            "coord.github_ops.check_branch_exists", return_value=False
+        ), patch(
+            "coord.claim.find_work_claim", return_value=None
+        ):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "assign", "laptop", "api", "42",
+                    "--config", str(cli_config_file_with_labels),
+                    "--dry-run",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        disp.assert_not_called()  # --dry-run must not actually dispatch
+        assert "model: opus (via label 'tier:large', shadowing 'enhancement')" in result.output
+
+    def test_order_independent_enhancement_listed_before_or_after_tier(
+        self, cli_config_file_with_labels: Path, cli_coord_dir: Path,
+    ) -> None:
+        """Same two labels, reversed GitHub order — must resolve identically
+        (opus, `tier:large` named as the winner) since precedence is no
+        longer decided by issue-label order."""
+        with patch(
+            "coord.github_ops.get_issue",
+            return_value={
+                "title": "t",
+                "labels": [{"name": "tier:large"}, {"name": "enhancement"}],
+            },
+        ), patch(
+            "coord.dispatch.dispatch", return_value={"id": "abc-123"}
+        ) as disp, patch(
+            "coord.github_ops.post_issue_comment"
+        ), patch(
+            "coord.github_ops.check_branch_exists", return_value=False
+        ), patch(
+            "coord.claim.find_work_claim", return_value=None
+        ):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "assign", "laptop", "api", "42",
+                    "--config", str(cli_config_file_with_labels),
+                    "--dry-run",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        disp.assert_not_called()  # --dry-run must not actually dispatch
+        assert "model: opus (via label 'tier:large', shadowing 'enhancement')" in result.output
 
 
 # ── #1454: `coord approve` re-checks CURRENT labels, not a plan-time cache ──

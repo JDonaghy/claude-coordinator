@@ -8,7 +8,7 @@ resolver methods every dispatch site now consults.
 
 from __future__ import annotations
 
-from coord.config import ModelsConfig
+from coord.config import ModelsConfig, describe_model_choice
 
 
 class TestModelForLabels:
@@ -88,6 +88,56 @@ class TestModelForLabels:
         the caller's job (mirrors `resolve()`'s None-passthrough style)."""
         cfg = ModelsConfig(default="sonnet", labels={})
         assert cfg.model_for_labels(["documentation"]) is None
+
+
+class TestDescribeModelChoiceShadowing:
+    """#1633 acceptance: "The dry-run output names the matched label, and
+    names the shadowed one when a match was ambiguous." These exercise the
+    exact string dispatch sites print (`coord assign --dry-run` /
+    `coord approve` / `coord milestone dispatch` all funnel through
+    `describe_model_choice`)."""
+
+    def test_unambiguous_match_names_only_the_matched_label(self) -> None:
+        reason = describe_model_choice(
+            resolved_model="opus", matched_label="tier:large", shadowed_labels=[],
+        )
+        assert reason == "opus (via label 'tier:large')"
+        assert "shadow" not in reason
+
+    def test_ambiguous_match_names_matched_and_shadowed_label(self) -> None:
+        """Two configured labels on one issue: the winner is named, and the
+        loser is named too so the route is self-explaining."""
+        reason = describe_model_choice(
+            resolved_model="opus",
+            matched_label="tier:large",
+            shadowed_labels=["enhancement"],
+        )
+        assert reason == "opus (via label 'tier:large', shadowing 'enhancement')"
+
+    def test_multiple_shadowed_labels_all_named(self) -> None:
+        reason = describe_model_choice(
+            resolved_model="opus",
+            matched_label="tier:large",
+            shadowed_labels=["bug", "enhancement"],
+        )
+        assert reason == (
+            "opus (via label 'tier:large', shadowing 'bug', 'enhancement')"
+        )
+
+    def test_explicit_reason_wins_even_with_shadowed_labels(self) -> None:
+        """An explicit --model always wins the phrasing outright, regardless
+        of what label matching found underneath it."""
+        reason = describe_model_choice(
+            resolved_model="haiku",
+            explicit_reason="explicit --model",
+            matched_label="tier:large",
+            shadowed_labels=["enhancement"],
+        )
+        assert reason == "haiku (explicit --model)"
+
+    def test_no_match_ignores_shadowed_labels(self) -> None:
+        reason = describe_model_choice(resolved_model="sonnet", shadowed_labels=[])
+        assert reason == "sonnet (default; no label match)"
 
 
 class TestModelForEstimate:
