@@ -2915,6 +2915,32 @@ pub struct CoordApp {
     /// `plans.rs`); `Esc` closes it back to the list (mirrors
     /// `audit_detail_open`'s list/detail toggle).
     plans_detail_open: bool,
+    /// #1122 fix-iteration-1 (review finding): real scroll offset for the
+    /// detail pane's `ListView`, shared by the paint path
+    /// (`render_plan_detail_pane`) and the click hit-test path
+    /// (`plan_detail_action_at`) — both previously hardcoded
+    /// `scroll_offset: 0`, which meant any row past the first screenful
+    /// (including the contract §3d actions row, on any plan whose work
+    /// order was long enough to fill the viewport) could never be revealed
+    /// or clicked. Kept following `plans_detail_sel` by
+    /// `fix_plans_detail_scroll`, same structural pattern as
+    /// `audit_scroll`/`fix_audit_scroll` (#1094). Reset to 0 whenever the
+    /// pane (re)opens.
+    plans_detail_scroll: usize,
+    /// Selected row index (0-based) into the #1122 detail pane's flattened
+    /// item list (`CoordApp::plan_detail_items`) — moved by `j`/`k` while
+    /// the pane is open (events.rs) and kept inside the visible window by
+    /// `fix_plans_detail_scroll`. Reset to 0 whenever the pane (re)opens.
+    plans_detail_sel: usize,
+    /// The `(repo, milestone_number)` identity of the plan the #1122 detail
+    /// pane was opened for, captured once by `open_selected_plan_detail`.
+    /// `plans_selected()` resolves through this — instead of `plans_sel`
+    /// indexing into `plans_visible_entries()` — whenever `plans_detail_open`
+    /// is true, so a board refresh that reorders/shrinks/grows the visible
+    /// roster while the pane is open can never silently swap the pane onto a
+    /// different plan than the one the operator opened (review finding on
+    /// #1122's non-blocking concerns). `None` when the pane is closed.
+    plans_detail_target: Option<(String, i64)>,
 
     // ── #1121: Plans sidebar repo→plan tree + repo scoping ──────────────────
     /// Per-repo expand state for the Plans sidebar `TreeView`, keyed by repo
@@ -3529,6 +3555,11 @@ impl CoordApp {
             plans_expanded_repos: std::collections::HashSet::new(),
             // #1122: starts on the roster list, not the detail pane.
             plans_detail_open: false,
+            // #1122 fix-iteration-1: no scroll/selection/target until the
+            // pane is actually opened.
+            plans_detail_scroll: 0,
+            plans_detail_sel: 0,
+            plans_detail_target: None,
             // #1121: sidebar tree — nothing scoped yet ("All repos"), no
             // explicit expand overrides (falls back to collapsed).
             plans_tree_expanded: std::collections::HashMap::new(),

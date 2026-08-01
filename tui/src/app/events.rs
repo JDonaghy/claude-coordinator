@@ -2211,6 +2211,15 @@ impl CoordApp {
                             && self.plans_detail_open =>
                     {
                         self.plans_detail_open = false;
+                        // #1122 fix: drop the stable-identity/scroll state
+                        // the pane was using — nothing reads it while the
+                        // pane is closed (`plans_selected()` only consults
+                        // `plans_detail_target` when `plans_detail_open`),
+                        // but leaving it set would let a stale scroll
+                        // position leak into a differently-scrolled reopen.
+                        self.plans_detail_target = None;
+                        self.plans_detail_sel = 0;
+                        self.plans_detail_scroll = 0;
                         needs_redraw = true;
                     }
                     Key::Char('q') | Key::Named(NamedKey::Escape) => return Reaction::Exit,
@@ -2269,6 +2278,33 @@ impl CoordApp {
                         if self.active_view == SidebarView::Plans && !self.plans_detail_open =>
                     {
                         self.plans_sel = self.plans_sel.saturating_sub(1);
+                        needs_redraw = true;
+                    }
+                    // #1122 fix (review): the companion `plans_detail_open`
+                    // arms — before this fix `j`/`k` had NO handler at all
+                    // while the detail pane was open (every nav arm above
+                    // is gated `!plans_detail_open`), so they were a
+                    // complete no-op and any row past the first screenful
+                    // (including the contract §3d actions row) could never
+                    // be scrolled into view by keyboard OR mouse. The row
+                    // list lives in the MAIN panel here (like Audit's
+                    // detail pane), so `content_visible_rows` uses
+                    // `ctx.main_bounds()`, same as the Audit arms below.
+                    Key::Char('j') | Key::Named(NamedKey::Down)
+                        if self.active_view == SidebarView::Plans && self.plans_detail_open =>
+                    {
+                        let n = self.plan_detail_row_count();
+                        if n > 0 {
+                            self.plans_detail_sel = (self.plans_detail_sel + 1).min(n - 1);
+                        }
+                        self.fix_plans_detail_scroll(content_visible_rows(ctx.main_bounds(), lh));
+                        needs_redraw = true;
+                    }
+                    Key::Char('k') | Key::Named(NamedKey::Up)
+                        if self.active_view == SidebarView::Plans && self.plans_detail_open =>
+                    {
+                        self.plans_detail_sel = self.plans_detail_sel.saturating_sub(1);
+                        self.fix_plans_detail_scroll(content_visible_rows(ctx.main_bounds(), lh));
                         needs_redraw = true;
                     }
                     // #1001: `u` toggles whether the currently-selected row's

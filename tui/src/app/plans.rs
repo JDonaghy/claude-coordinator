@@ -207,7 +207,26 @@ impl CoordApp {
     /// The currently-selected plan-roster row (`plans_sel`, clamped against
     /// the *visible* roster — see `plans_visible_entries`), or `None` when
     /// nothing is currently rendered/selectable.
+    ///
+    /// **#1122 fix (review non-blocking concern):** while the detail pane is
+    /// open (`plans_detail_open`), resolution goes through the stable
+    /// `(repo, milestone_number)` identity captured in `plans_detail_target`
+    /// at open time instead of `plans_sel`/`plans_visible_entries()`. The
+    /// roster list isn't even painted while the pane is open, and this is a
+    /// polling TUI — a board refresh mid-pane can reorder, shrink, or grow
+    /// the visible-entry set, which would otherwise make the same raw index
+    /// silently resolve to a *different* plan than the one the operator
+    /// opened, misdirecting the pane's (potentially destructive) actions.
+    /// Returns `None` if that plan has since dropped out of the roster
+    /// entirely (e.g. the milestone closed).
     pub(crate) fn plans_selected(&self) -> Option<PlanRosterEntry> {
+        if self.plans_detail_open {
+            let (repo, milestone_number) = self.plans_detail_target.as_ref()?;
+            return self
+                .plans_entries()
+                .into_iter()
+                .find(|e| &e.repo == repo && &e.milestone_number == milestone_number);
+        }
         let entries = self.plans_visible_entries();
         if entries.is_empty() {
             return None;
@@ -1055,11 +1074,53 @@ impl CoordApp {
         rows
     }
 
+    /// Row count of the #1122 detail pane's flattened item list
+    /// (`plan_detail_items`) for the plan the pane is currently open on
+    /// (`plans_selected()`), or `0` when nothing is selected. `plan_
+    /// detail_items` is private to this file, so `events.rs`'s `j`/`k`
+    /// handlers go through this instead of reconstructing the item list
+    /// (or the row-kind bookkeeping) themselves.
+    pub(crate) fn plan_detail_row_count(&self) -> usize {
+        self.plans_selected()
+            .map(|entry| self.plan_detail_items(&entry).0.len())
+            .unwrap_or(0)
+    }
+
+    /// #1122 fix (review): keep `plans_detail_scroll` following
+    /// `plans_detail_sel` so every row of the detail pane — including a
+    /// work-order checklist or actions row that would otherwise sit past
+    /// the first screenful — can actually be scrolled into view. Same
+    /// structural pattern as `fix_audit_scroll` (#1094) / `fix_machine_
+    /// scroll` (`mod.rs`). Must be called after every keyboard nav that
+    /// moves `plans_detail_sel` (`j`/`k`/`Down`/`Up` in events.rs, while
+    /// `plans_detail_open`).
+    pub(crate) fn fix_plans_detail_scroll(&mut self, visible: usize) {
+        if visible == 0 {
+            return;
+        }
+        if self.plans_detail_sel < self.plans_detail_scroll {
+            self.plans_detail_scroll = self.plans_detail_sel;
+        } else if self.plans_detail_sel >= self.plans_detail_scroll + visible {
+            self.plans_detail_scroll = self.plans_detail_sel + 1 - visible;
+        }
+    }
+
     /// Render the #1122 in-app plan detail pane (contract §3) — the FULL
     /// main-area content while `plans_detail_open`, built from
     /// `plan_detail_items`. Falls back to a plain message on the (should be
     /// unreachable — `open_selected_plan_detail` only sets
     /// `plans_detail_open` when a row is selected) case of no selection.
+    ///
+    /// **#1122 fix (review):** `selected_idx`/`scroll_offset` now come from
+    /// `plans_detail_sel`/`plans_detail_scroll` instead of being hardcoded
+    /// to `0` — previously every row past the first screenful (including
+    /// the contract §3d actions row, on any plan whose work order was long
+    /// enough to fill the viewport) was silently dropped from
+    /// `visible_items` by quadraui's `ListView::layout` with no way to
+    /// scroll it into view. `plan_detail_action_at` below builds the
+    /// identical `ListView` (same `scroll_offset`) for its hit-test, so the
+    /// two can never drift apart — same reasoning this file already gives
+    /// for `build_action_row_line`.
     fn render_plan_detail_pane(&self, backend: &mut dyn Backend, rect: Rect, _lh: f32) {
         let Some(entry) = self.plans_selected() else {
             backend.draw_list(
@@ -1070,6 +1131,7 @@ impl CoordApp {
         };
         let (items, _kinds) = self.plan_detail_items(&entry);
         let total = items.len();
+        let selected_idx = self.plans_detail_sel.min(total.saturating_sub(1));
         backend.draw_list(
             rect,
             &ListView {
@@ -1080,8 +1142,8 @@ impl CoordApp {
                     trunc(&entry.title, 60),
                 ))),
                 items,
-                selected_idx: 0,
-                scroll_offset: 0,
+                selected_idx,
+                scroll_offset: self.plans_detail_scroll,
                 has_focus: true,
                 bordered: true,
                 h_scroll: 0,
@@ -1098,20 +1160,36 @@ impl CoordApp {
     /// the row index, then resolves the sub-row column locally since
     /// `ListViewHit::Item` carries no column info — the same 1-cell
     /// `bordered` inset `plans_row_at` accounts for via `list_rect`.
+    ///
+    /// **#1122 fix (review):** `scroll_offset`/`selected_idx`/`title`/
+    /// `show_v_scrollbar` now match `render_plan_detail_pane`'s `ListView`
+    /// exactly (`plans_detail_scroll`/`plans_detail_sel`, the real title
+    /// text, `total > 10`) — previously this hit-test always built its copy
+    /// with `scroll_offset: 0`, so a click on a scrolled-into-view action
+    /// button (once scrolling was wired up) would have resolved against the
+    /// wrong row entirely; the empty title and unconditional
+    /// `show_v_scrollbar: false` were also a latent paint/hit-test
+    /// divergence this file's own doc comments say must never happen.
     pub(crate) fn plan_detail_action_at(&self, pos: Point, main_b: Rect, lh: f32) -> Option<String> {
         let entry = self.plans_selected()?;
         let (items, kinds) = self.plan_detail_items(&entry);
+        let total = items.len();
+        let selected_idx = self.plans_detail_sel.min(total.saturating_sub(1));
         let list = ListView {
             id: WidgetId::new("plans-detail"),
-            title: Some(StyledText::plain(String::new())),
+            title: Some(StyledText::plain(format!(
+                " #{} {} ",
+                entry.milestone_number,
+                trunc(&entry.title, 60),
+            ))),
             items,
-            selected_idx: 0,
-            scroll_offset: 0,
+            selected_idx,
+            scroll_offset: self.plans_detail_scroll,
             has_focus: true,
             bordered: true,
             h_scroll: 0,
             max_content_width: None,
-            show_v_scrollbar: false,
+            show_v_scrollbar: total > 10,
         };
         let layout = list.layout(main_b.width, main_b.height, lh, |_| ListItemMeasure::new(lh));
         let local_x = pos.x - main_b.x;
@@ -1382,6 +1460,14 @@ impl CoordApp {
             return false;
         }
         self.plans_detail_open = true;
+        // #1122 fix: pin the stable identity this pane was opened for
+        // (`plans_selected()` resolves through it while the pane is open —
+        // see that method's doc comment) and reset the pane's own
+        // scroll/selection state so a previous pane's leftover scroll
+        // position never leaks into a freshly-opened one.
+        self.plans_detail_target = Some((entry.repo.clone(), entry.milestone_number));
+        self.plans_detail_sel = 0;
+        self.plans_detail_scroll = 0;
         true
     }
 
