@@ -469,11 +469,233 @@ def review(assignment_id: str, config_path: Path) -> None:
         click.echo(f"  pr: {assignment.pr_url}")
 
 
-@click.command(help="Dispatch a fix-up worker for a failed smoke test.")
+def _ci_failure_story(cfg: Config, assignment) -> str | None:
+    """#1622 (part 3): a rendered summary of *assignment*'s FAILED CI checks.
+
+    The third legitimate fix trigger, alongside a request-changes review and a
+    failed local test gate.  CI reports failures the local Test stage cannot
+    see — vimcode #613 was a sibling path-dep that only breaks in a clean
+    checkout — and the fix has to land on the *existing* branch, because the
+    thing being fixed is what gates the merge.
+
+    Read-only and fail-quiet: returns ``None`` when CI is not configured
+    (``ci_store.type: none`` ⇒ :class:`coord.ci_store.NoOpCi`, whose
+    ``is_available`` is False), when the branch has no PR to read checks for,
+    when the read raises, or when every completed check is affirmatively
+    passing.  ``None`` therefore means "no CI evidence of a failure", never
+    "CI is green" — the caller must not treat it as a verdict.
+    """
+    from coord.ci_store import build_ci_store, failed_checks, summarize
+    from coord.drive import _extract_pr_number
+
+    repo = cfg.repo(assignment.repo_name)
+    if repo is None or not repo.github:
+        return None
+
+    pr_number = _extract_pr_number(assignment.pr_url or "")
+    if pr_number is None:
+        return None
+
+    store = build_ci_store(cfg.ci_store.type)
+    if not store.is_available:
+        return None
+
+    try:
+        checks = store.list_checks_for_pr(repo.github, pr_number)
+    except Exception as exc:  # noqa: BLE001 — CI read is advisory, never fatal
+        click.echo(f"warning: could not read CI checks for PR #{pr_number}: {exc}", err=True)
+        return None
+
+    failed = failed_checks(checks)
+    if not failed:
+        return None
+
+    lines = [
+        f"CI on PR #{pr_number} is RED ({summarize(checks)}).",
+        "",
+        "Failed checks:",
+    ]
+    for c in failed:
+        lines.append(f"- {c.name} — conclusion={c.conclusion!r}{(' — ' + c.url) if c.url else ''}")
+    lines += [
+        "",
+        "These failures were NOT visible to the local Test stage. Read the run "
+        "logs (`gh run view <id> --log-failed`, or open the URLs above), "
+        "reproduce locally where you can, and fix the root cause on THIS "
+        "branch — a new branch would not carry the change CI is gating on.",
+    ]
+    return "\n".join(lines)
+
+
+def _fix_from_review(
+    cfg: Config,
+    board,
+    review,
+    *,
+    guidance: str,
+    force: bool,
+) -> None:
+    """#1622: dispatch a HEADLESS fix round for a request-changes review.
+
+    This is a CLI **door** onto the review→fix auto-loop, not a second
+    implementation of same-branch dispatch.  It hands the review row straight
+    to :func:`coord.auto_loop.process_review_completion`, the same function the
+    ``coord notify`` transition path calls, so the fix worker is produced by the
+    one and only :func:`coord.auto_loop._dispatch_fix` — which pins
+    ``target_branch`` to the reviewed work's branch and bumps
+    ``review_iteration``.  Every guard that path applies applies here unchanged:
+    ``pipeline.auto_loop``, the #476/#1456 approve-with-nits gate, the #522
+    terminal-work guard, and the ``max_review_iterations`` cap.
+
+    Two things are added on top, both *before* the shared call:
+
+    - the #555 interactive exclusion, checked against the reviewed WORK row so
+      an interactive completion is never followed by a headless fix; and
+    - resolution of the review's log path / machine host, which the transition
+      path gets handed by ``coord notify`` and a CLI invocation does not.
+
+    Never returns — always exits via :func:`sys.exit`.
+    """
+    from coord import auto_loop
+    from coord.board_service import write_board
+    from coord.state import COORD_DIR
+
+    if guidance:
+        click.echo(
+            "warning: --guidance is ignored for a review id — the reviewer's "
+            "findings ARE the fix briefing. To brief a fix in your own words "
+            f"use `coord assign <machine> <repo> <issue> --fix-of "
+            f"{review.assignment_id} --interactive --briefing ...`.",
+            err=True,
+        )
+
+    work = None
+    if review.review_of_assignment_id:
+        work = board.find_by_id(review.review_of_assignment_id)
+    if work is None:
+        click.echo(
+            f"error: review {review.assignment_id} has no linked work assignment "
+            f"on the board (review_of_assignment_id="
+            f"{review.review_of_assignment_id!r}) — nothing to fix",
+            err=True,
+        )
+        sys.exit(1)
+
+    # #555: an INTERACTIVE work completion must never be silently followed by a
+    # headless fix.  The human at the tmux pane owns that branch and may still
+    # be mid-edit; a `claude -p` worker pushing over them is the incident that
+    # exclusion exists to prevent.  The auto-loop enforces this on the
+    # re-review side (`run_for_fix_transition`); a CLI door onto the *dispatch*
+    # side needs its own check, because `process_review_completion` never sees
+    # the provider.  `--force` is the deliberate override for the case the
+    # exclusion cannot detect: the session is genuinely gone.
+    if (work.provider_name or "") == "claude-pty" and not force:
+        click.echo(
+            f"error: work {work.assignment_id} ran INTERACTIVELY "
+            "(provider=claude-pty); refusing to follow it with a headless fix "
+            "(#555). Continue in that session, or run `coord assign ... "
+            f"--fix-of {review.assignment_id} --interactive`, or pass --force "
+            "if the interactive session is really gone.",
+            err=True,
+        )
+        sys.exit(1)
+
+    # The transition path is handed these by `coord notify`; reconstruct them
+    # so the findings loader keeps all four of its sources (DB cache → local
+    # log → agent HTTP → GitHub message bus) rather than only the first and last.
+    _log = COORD_DIR / "logs" / f"{review.assignment_id}.log"
+    log_path = str(_log) if _log.exists() else None
+    machine_host = None
+    _machine = next(
+        (m for m in cfg.machines if m.name == review.machine_name), None
+    )
+    if _machine is not None and _machine.host:
+        machine_host = _machine.host
+
+    before = {a.assignment_id for a in board.active}
+    actions = auto_loop.process_review_completion(
+        review, board, cfg, log_path=log_path, machine_host=machine_host,
+    )
+
+    # `process_review_completion` mutates the board and leaves persistence to
+    # its caller — same contract, same kind list, as the transition path.
+    if any(a.kind in auto_loop.PERSIST_ACTION_KINDS for a in actions):
+        write_board(board)
+
+    kinds = {a.kind for a in actions}
+    detail = "; ".join(a.detail for a in actions if a.detail)
+
+    if "fix_dispatched" in kinds:
+        max_iter = cfg.pipeline.max_review_iterations
+        click.echo(f"Fix worker dispatched ({detail})")
+        for row in board.active:
+            if row.assignment_id in before:
+                continue
+            click.echo(f"  assignment: {row.assignment_id}")
+            click.echo(f"  branch: {row.branch}")
+            click.echo(f"  review iteration: {row.review_iteration}/{max_iter}")
+        click.echo(f"  issue: #{work.issue_number}: {work.issue_title}")
+        if work.pr_url:
+            click.echo(f"  pr: {work.pr_url}")
+        return
+
+    # Everything else is a refusal.  Each one is a guard doing its job, so say
+    # which guard and exit non-zero — a headless drive keys off the exit code.
+    _why = {
+        "disabled": (
+            "pipeline.auto_loop is disabled in coordinator.yml — the review→fix "
+            "path this command opens is switched off"
+        ),
+        "no_findings": (
+            "no structured review findings could be resolved (DB cache, local "
+            "log, agent HTTP and the GitHub findings comment were all empty)"
+        ),
+        "approved": "review verdict is approve — nothing to fix",
+        "approved_with_nits": (
+            "review raised no blocking findings, only advisory ones — the #476 "
+            "gate advanced the pipeline instead of dispatching a fix"
+        ),
+        "max_iterations": (
+            "pipeline.max_review_iterations reached — raise it in "
+            "coordinator.yml or take the branch over by hand"
+        ),
+        "terminal_skip": (
+            "the reviewed work is already merged/closed on GitHub (#522)"
+        ),
+        "no_work_found": "fix dispatch failed",
+    }
+    reason = next(
+        (_why[a.kind] for a in actions if a.kind in _why),
+        f"auto-loop returned {sorted(kinds) or 'nothing'}",
+    )
+    click.echo(f"error: no fix dispatched for review {review.assignment_id}: {reason}", err=True)
+    if detail:
+        click.echo(f"  {detail}", err=True)
+    sys.exit(1)
+
+
+@click.command(
+    help=(
+        "Dispatch a headless same-branch fix worker.\n\n"
+        "ASSIGNMENT_ID is either a WORK assignment whose test gate FAILED (or "
+        "whose PR has red CI), or a REVIEW assignment whose verdict was "
+        "request-changes. Either way the fix lands on the ORIGINAL branch and "
+        "updates the ORIGINAL PR — no new issue-N-* branch, no orphan PR."
+    )
+)
 @click.argument("assignment_id")
 @_CONFIG_OPTION
 @click.option("--guidance", default="", help="Additional guidance for the fix-up worker.")
-def fix(assignment_id: str, config_path: Path, guidance: str) -> None:
+@click.option(
+    "--force",
+    is_flag=True,
+    help=(
+        "Override the #555 interactive-work exclusion when fixing a review of "
+        "work that ran under claude-pty. Does NOT override "
+        "max_review_iterations or the #522 terminal-work guard."
+    ),
+)
+def fix(assignment_id: str, config_path: Path, guidance: str, force: bool) -> None:
     from coord.board_service import read_board
     from coord.state import COORD_DIR
 
@@ -485,17 +707,32 @@ def fix(assignment_id: str, config_path: Path, guidance: str) -> None:
         click.echo(f"error: assignment {assignment_id!r} not found in board", err=True)
         sys.exit(1)
 
+    # #1622: a REVIEW id is the request-changes door.  It routes through
+    # `coord.auto_loop`, which owns same-branch fix dispatch — this command
+    # deliberately does not grow a second implementation of it.
+    if assignment.type == "review":
+        _fix_from_review(cfg, board, assignment, guidance=guidance, force=force)
+        return
+
     # #1384: gate on the canonical `test_state` with the legacy `smoke_test`
     # mirror as fallback, so the two fields can never drift apart again.  The
     # writer (`state._record_test_verdict_local`) now derives the mirror, but
     # rows recorded before that fix — a headless smoke failure via #1021's
     # `coord/notify.py` propagation — carry `test_state='failed'` with
     # `smoke_test=NULL` and must still be fixable.
-    if assignment.test_state != "failed" and assignment.smoke_test != "fail":
+    test_failed = assignment.test_state == "failed" or assignment.smoke_test == "fail"
+
+    # #1622 (part 3): red CI is the third trigger.  Only consulted when the
+    # local test gate has NOT already failed, so the cheap in-DB path stays
+    # zero-I/O and the existing failure story keeps priority.
+    ci_story = None if test_failed else _ci_failure_story(cfg, assignment)
+
+    if not test_failed and ci_story is None:
         click.echo(
             f"error: assignment {assignment_id} test_state is "
             f"{assignment.test_state!r} / smoke_test is "
-            f"{assignment.smoke_test!r}, expected a failed test verdict",
+            f"{assignment.smoke_test!r}, expected a failed test verdict "
+            "(or red CI on its PR, or a request-changes review id)",
             err=True,
         )
         sys.exit(1)
@@ -510,7 +747,9 @@ def fix(assignment_id: str, config_path: Path, guidance: str) -> None:
     # Load stored test output if available
     test_output = ""
     test_output_file = COORD_DIR / "test_output" / f"{assignment_id}.txt"
-    if test_output_file.exists():
+    if ci_story is not None:
+        test_output = ci_story
+    elif test_output_file.exists():
         test_output = test_output_file.read_text()
     elif assignment.smoke_test_reason or assignment.test_reason:
         # #1337: the board wire carries a bounded PREVIEW of the reason text;
@@ -528,16 +767,18 @@ def fix(assignment_id: str, config_path: Path, guidance: str) -> None:
         )
 
     guidance_text = guidance or "Fix the failing tests and push."
+    _what = "red CI" if ci_story is not None else "a failed smoke test"
+    _failure_heading = "CI failure" if ci_story is not None else "Test failure"
 
     briefing = (
-        f"You are fixing a failed smoke test for issue #{assignment.issue_number}: {assignment.issue_title}\n\n"
+        f"You are fixing {_what} for issue #{assignment.issue_number}: {assignment.issue_title}\n\n"
         f"The previous worker created branch {assignment.branch}. You are already on that branch.\n"
         f"Do NOT start over — work from the existing code.\n\n"
         f"## What was done\n"
         f"The previous worker's changes are already committed on this branch.\n"
         f"Run `git fetch origin && git log --oneline origin/{default_branch}..HEAD` to see what was done.\n"
         f"Run `git diff origin/{default_branch}...HEAD` to see the full diff.\n\n"
-        f"## Test failure\n"
+        f"## {_failure_heading}\n"
         f"{test_output}\n\n"
         f"## Guidance\n"
         f"{guidance_text}\n\n"
@@ -566,7 +807,8 @@ def fix(assignment_id: str, config_path: Path, guidance: str) -> None:
     click.echo(f"  branch: {assignment.branch}")
     click.echo(f"  issue: #{assignment.issue_number}: {assignment.issue_title}")
     if test_output:
-        click.echo(f"  test output included in briefing ({len(test_output)} chars)")
+        _label = "CI failure summary" if ci_story is not None else "test output"
+        click.echo(f"  {_label} included in briefing ({len(test_output)} chars)")
 
 
 @click.command(
