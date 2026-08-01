@@ -630,7 +630,23 @@ class TestProcessReviewCompletion:
         assert review.review_verdict == "request-changes"
         assert review.review_verdict_original is None
         assert review.review_verdict_override_reason is None
-        assert work.review_state != "done"
+        # #1663 changed how "the pipeline was NOT advanced as an approval" is
+        # spelled here.  This used to read `work.review_state != "done"`, on the
+        # reasoning that only `_advance_pipeline` ever wrote that column — but
+        # `review_state` is a *stage* marker, not a verdict, and the fix path
+        # now writes it too (the second #1663 gap: a real rejection used to
+        # leave the parent row at `dispatched`/NULL, illegible to `coord drive`,
+        # the TUI's Review stage, and any state-derived sweep).  What #1445 is
+        # actually about is the VERDICT: a prose request-changes must never be
+        # rewritten to `approve` and marked merge-ready.  Assert that directly,
+        # plus the merge gate it feeds — neither of which `review_state` was
+        # ever an input to.
+        assert work.review_verdict == "request-changes"
+        from coord.merge_queue import has_approved_review
+
+        assert not has_approved_review(work, board), (
+            "#1445: a prose request-changes must not satisfy the merge gate"
+        )
 
     def test_nits_zero_alone_never_downgrades(
         self, config: Config, tmp_path
