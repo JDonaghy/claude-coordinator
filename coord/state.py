@@ -3662,15 +3662,17 @@ def reopen_issue(
     Idempotent — reopening an already-open issue is a no-op.
     """
     svc = _board_service()
-    if svc is not None:
-        from coord.client import post_record  # noqa: PLC0415
-
-        post_record(svc, "/issue-reopen", {
+    resp = _route_write(
+        svc,
+        "/issue-reopen",
+        {
             "repo_name": repo_name,
             "issue_number": issue_number,
             "comment": comment,
             "repo_github": repo_github,
-        })
+        },
+    )
+    if resp is not None:
         return
     _reopen_issue_local(
         repo_name, issue_number, comment=comment, repo_github=repo_github,
