@@ -98,6 +98,39 @@ def test_briefing_handles_no_issues():
     assert "(none fetched)" in out
 
 
+# ── #1542: web-playwright (`.html`) mock kind ────────────────────────────────
+
+
+def test_briefing_threads_the_html_mock_glob_for_a_web_playwright_driver():
+    """The briefing builder is fully kind-agnostic — no `.screen`/`.out`
+    special-casing — so a `web-playwright` repo just needs its own
+    `kind`/`mock` passed through like any other driver."""
+    out = mock_author.build_mock_author_briefing(
+        repo_slug="acme/webapp",
+        milestone_title="M",
+        milestone_number=9,
+        tracking_issue_number=100,
+        tracking_issue_body="",
+        issues=[],
+        driver_kind="web-playwright",
+        driver_mock_glob="*.html",
+    )
+    assert "web-playwright" in out
+    assert "*.html" in out
+    assert "tests/acceptance/ms-9/mocks/" in out
+
+
+def test_mock_author_system_prompt_pins_the_locked_html_mock_shape():
+    """docs/ORACLE_LOOP.md's locked (2026-07-28) decision: a `.html` mock
+    must be self-contained, open in a browser, and LOOK like the screen —
+    not a bare DOM skeleton. Inline CSS is required, one file per screen
+    state, and real markup the test-author can assert against."""
+    assert "PER SCREEN STATE" in MOCK_AUTHOR_SYSTEM_PROMPT
+    assert "OPEN IN A BROWSER AND LOOK LIKE THE SCREEN" in MOCK_AUTHOR_SYSTEM_PROMPT
+    assert "inline" in MOCK_AUTHOR_SYSTEM_PROMPT.lower()
+    assert "data-testid" in MOCK_AUTHOR_SYSTEM_PROMPT
+
+
 # ── dispatch_acceptance_mock ─────────────────────────────────────────────────
 
 

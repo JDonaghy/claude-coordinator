@@ -23,6 +23,7 @@ from coord.models import Machine, Repo, WorkerPermissionsConfig
 from coord.test_author import (
     TEST_AUTHOR_DENY_COMMANDS,
     TEST_AUTHOR_INTERACTIVE_SYSTEM_PROMPT,
+    TEST_AUTHOR_SYSTEM_PROMPT,
     build_test_author_briefing,
     dispatch_test_author,
     dispatch_test_author_interactive,
@@ -168,12 +169,33 @@ class TestBuildBriefing:
     def test_system_prompt_carves_out_the_entrypoint_exception(self) -> None:
         """The 'do NOT touch anything outside tests/acceptance/ms-NN/**' rule
         is what made 7f48bcf (delete the include! line) look correct."""
-        from coord.test_author import TEST_AUTHOR_SYSTEM_PROMPT
-
         assert "WIRE THE SLICE IN" in TEST_AUTHOR_SYSTEM_PROMPT
         assert "ONE exception" in TEST_AUTHOR_SYSTEM_PROMPT
         assert "NEVER drop the registration line" in TEST_AUTHOR_SYSTEM_PROMPT
         assert "Do not rewrite, reorder, or delete" in TEST_AUTHOR_SYSTEM_PROMPT
+
+    # ── #1542: web-playwright mock shape ────────────────────────────────────
+
+    def test_mocks_line_names_the_driver_mock_glob(self) -> None:
+        briefing = build_test_author_briefing(**self._kwargs(
+            driver_kind="web-playwright", driver_mock="*.html",
+        ))
+        assert "MOCKS: tests/acceptance/ms-25/mocks/*.html" in briefing
+
+    def test_mocks_line_falls_back_when_no_glob_declared(self) -> None:
+        briefing = build_test_author_briefing(**self._kwargs())
+        assert "MOCKS: tests/acceptance/ms-25/mocks/ (glob not declared)" in briefing
+
+    def test_system_prompt_tells_author_to_read_html_mocks_for_dom_assertions(
+        self,
+    ) -> None:
+        """#1542: unlike `.screen` (mock == assertion, consumed directly),
+        a `.html` mock is a hand-authored wireframe the author must read
+        itself and transcribe into Playwright DOM assertions — contract.md
+        alone isn't guaranteed to spell out every role/text/test-id."""
+        assert "MOCKS:" in TEST_AUTHOR_SYSTEM_PROMPT
+        assert "web-playwright" in TEST_AUTHOR_SYSTEM_PROMPT
+        assert "data-testid" in TEST_AUTHOR_SYSTEM_PROMPT
 
 
 # ── dispatch_test_author ────────────────────────────────────────────────────
