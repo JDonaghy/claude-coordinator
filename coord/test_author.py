@@ -72,6 +72,15 @@ Your job:
 (`tests/acceptance/ms-NN/contract.md`) from YOUR OWN checkout. If it does \
 not exist, STOP and output:
      STUCK: contract.md missing at <path> — Gate-A hasn't produced it yet
+1b. Also open the rendered mock(s) named `MOCKS:` in your briefing (under \
+`tests/acceptance/ms-NN/mocks/`), if any exist. For a `tui-tuidriver` \
+driver the `.screen` grid IS the assertion fixture (compare against it \
+directly). For a `web-playwright` driver the `.html` file(s) are \
+hand-authored wireframes, NOT auto-consumed fixtures — read their markup \
+yourself and write your Playwright assertions (roles, visible text, \
+`data-testid` locators, structure) against exactly what the mock renders. \
+The mock is part of the contract; contract.md alone may not spell out \
+every DOM detail.
    Do not invent a contract yourself.
 2. Author (or extend) the acceptance suite in `tests/acceptance/ms-NN/`, \
 using the repo's declared driver framework (kind + run command are in your \
@@ -190,6 +199,7 @@ def build_test_author_briefing(
     issue_title: str | None,
     issue_body: str | None,
     driver_entrypoint: str = "",
+    driver_mock: str = "",
 ) -> str:
     """Compose the test-author's briefing (its first/only user message).
 
@@ -205,9 +215,22 @@ def build_test_author_briefing(
     naming it authorises the one out-of-tree write the author needs, and
     saying "none" stops an author on a directory-discovered route (pytest)
     from inventing one.
+
+    *driver_mock* (#1542) is the driver's declared ``mock:`` glob (e.g.
+    ``"*.screen"``, ``"*.html"``) — named explicitly so the author knows
+    which files under ``mocks/`` to open. For a mock-format whose kind
+    treats the mock as source (``tui-tuidriver``'s ``.screen`` grid IS the
+    assertion fixture), this is just where to find it; for ``web-playwright``
+    the ``.html`` mock is a hand-authored wireframe the author must read and
+    transcribe into DOM assertions (see :data:`TEST_AUTHOR_SYSTEM_PROMPT`
+    step 1b) — contract.md alone is not guaranteed to spell out every
+    role/text/test-id.
     """
     contract_path = f"{ACCEPTANCE_DIRNAME}/{ms_dir}/contract.md"
     manifest_glob = f"{ACCEPTANCE_DIRNAME}/{ms_dir}/manifest.(yml|json)"
+    mocks_glob = f"{ACCEPTANCE_DIRNAME}/{ms_dir}/mocks/{driver_mock}" if driver_mock else (
+        f"{ACCEPTANCE_DIRNAME}/{ms_dir}/mocks/ (glob not declared)"
+    )
 
     parts: list[str] = []
     parts.append(
@@ -215,6 +238,7 @@ def build_test_author_briefing(
         f"milestone #{milestone_number} (tracking issue #{tracking_issue}) ===\n"
     )
     parts.append(f"CONTRACT: {contract_path}")
+    parts.append(f"MOCKS: {mocks_glob}")
     parts.append(f"MANIFEST: {manifest_glob}")
     parts.append(f"DRIVER: kind={driver_kind!r}  run={driver_run!r}")
     if driver_entrypoint:
@@ -383,6 +407,7 @@ def dispatch_test_author(
         driver_kind=driver_cfg.kind,
         driver_run=driver_cfg.run,
         driver_entrypoint=driver_cfg.entrypoint,
+        driver_mock=driver_cfg.mock,
         issue_number=issue_number,
         issue_title=issue_title,
         issue_body=issue_body,
@@ -679,6 +704,7 @@ def dispatch_test_author_interactive(
         driver_kind=driver_cfg.kind,
         driver_run=driver_cfg.run,
         driver_entrypoint=driver_cfg.entrypoint,
+        driver_mock=driver_cfg.mock,
         issue_number=issue_number,
         issue_title=issue_title,
         issue_body=issue_body,

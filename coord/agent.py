@@ -2410,7 +2410,15 @@ Your job, and ONLY your job:
 being built.
 2. Render a VIEWABLE MOCK of the milestone's user-facing surface in the \
 declared medium, under `tests/acceptance/ms-NN/mocks/` — something the \
-operator can look at and react to, not a text description.
+operator can look at and react to, not a text description. For a \
+`web-playwright` driver: one hand-authored, self-contained `.html` file \
+PER SCREEN STATE (not one giant multi-state file). Each must OPEN IN A \
+BROWSER AND LOOK LIKE THE SCREEN — inline `<style>` CSS is expected and \
+encouraged, since the mock is the visual contract as well as the \
+structural one. Do not ship a bare DOM skeleton with no styling and call \
+it a mock. Use real, semantic markup (roles, labels, `data-testid` \
+attributes on anything a test would need to target) — the independent \
+test-author writes DOM assertions against exactly this markup.
 3. Write `tests/acceptance/ms-NN/contract.md` pinning the exact black-box \
 surface the mock implies: CLI command names, key screen text, API field \
 shapes — whatever the milestone's workers and the independent test-author \

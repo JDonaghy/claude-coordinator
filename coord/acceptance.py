@@ -56,12 +56,16 @@ def _mocks_dir(milestone_number: int) -> str:
 # Mock-fixture file extension -> the driver ``kind`` it implies (the SAME
 # rule each ``AcceptanceDriverConfig.mock`` glob already encodes in
 # coordinator.yml / docs/ORACLE_LOOP.md: ``"*.screen"`` for ``tui-tuidriver``,
-# ``"*.out"`` for ``cli-pytest``). Single source of truth for the
-# mock-kind -> ``--for-path`` derivation (#1453 review) — do not re-derive
-# this mapping a second time anywhere else.
+# ``"*.out"`` for ``cli-pytest``, ``"*.html"`` for ``web-playwright`` (#1542
+# — hand-authored, self-contained wireframes; see
+# ``coord.agent.MOCK_AUTHOR_SYSTEM_PROMPT`` for the authoring rules and
+# ``tests/acceptance/ms-example/mocks/`` for a worked example). Single
+# source of truth for the mock-kind -> ``--for-path`` derivation (#1453
+# review) — do not re-derive this mapping a second time anywhere else.
 MOCK_EXT_TO_DRIVER_KIND: dict[str, str] = {
     ".screen": "tui-tuidriver",
     ".out": "cli-pytest",
+    ".html": "web-playwright",
 }
 
 
@@ -301,14 +305,19 @@ def oracle_loop_contract_block(
         return ""
 
     contract_path = f"{ACCEPTANCE_DIRNAME}/{ms_dir}/contract.md"
+    mocks_dir = f"{ACCEPTANCE_DIRNAME}/{ms_dir}/mocks"
     return (
         "## 🔒 Oracle-loop acceptance contract — READ THIS FIRST\n\n"
         "This issue has a sealed acceptance slice authored for it. Treat "
-        f"`{contract_path}` (the black-box surface) as the spec — not "
-        "guesswork.\n\n"
-        f"- You **may not** edit `{ACCEPTANCE_DIRNAME}/**`. It is the sealed "
-        "oracle, authored independently of your work — touching it fails "
-        "the gate.\n"
+        f"`{contract_path}` (the black-box surface) — and, if present, "
+        f"the rendered mock(s) under `{mocks_dir}/` — as the spec — not "
+        "guesswork. For a web slice the mocks ARE part of the contract "
+        "(hand-authored HTML wireframes, one per screen state): the app "
+        "must satisfy the sealed assertions written against them, not the "
+        "other way around.\n\n"
+        f"- You **may not** edit `{ACCEPTANCE_DIRNAME}/**` (contract, "
+        "mocks, or the sealed suite). It is the sealed oracle, authored "
+        "independently of your work — touching it fails the gate.\n"
         f"- Run `coord acceptance run --repo {repo_name} --issue "
         f"{issue_number}` to check yourself; iterate in this warm session "
         "until your slice is green, then release.\n"

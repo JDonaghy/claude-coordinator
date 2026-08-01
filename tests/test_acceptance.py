@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from coord.acceptance import (
+    MOCK_EXT_TO_DRIVER_KIND,
     ForPathResolutionError,
     ManifestData,
     ManifestError,
@@ -229,6 +230,22 @@ class TestOracleLoopContractBlock:
         # stall` (in addition to a STUCK: line for the interactive log).
         assert "coord acceptance stall --repo api --issue 945" in block
 
+    def test_block_points_at_the_mocks_dir_and_says_satisfy_not_edit(
+        self, tmp_path: Path
+    ) -> None:
+        """#1542: for a web slice the `.html` mocks under `mocks/` are part
+        of the sealed contract, not just `contract.md` — the worker briefing
+        must say so plainly, and must not soften "may not edit
+        tests/acceptance/**" into something that reads as "edit the
+        assertions to match the app."""
+        root = tmp_path / "tests" / "acceptance"
+        (root / "ms25").mkdir(parents=True)
+        (root / "ms25" / "manifest.yml").write_text("tests:\n  ms25::a: 945\n")
+        block = oracle_loop_contract_block(root, "api", 945)
+        assert "tests/acceptance/ms25/mocks/" in block
+        assert "must satisfy" in block
+        assert "not the other way around" in block
+
 
 class TestAcceptanceCapabilityGap:
     """#966: cheap detection mirroring `coord.smoke.pick_smoke_machine`'s
@@ -297,6 +314,60 @@ class TestAcceptanceCapabilityGap:
         assert acceptance_capability_gap("browser", "webapp", cfg) is None
 
 
+class TestWorkedExampleWebMock:
+    """#1542: `tests/acceptance/ms-example/mocks/home-active.html` is the
+    committed worked example the "next test-author copies a real file, not
+    a description" — this pins the acceptance criteria that make it a valid
+    `web-playwright` mock rather than just some HTML file: self-contained
+    (no external assets it can't render without), carries its own CSS, and
+    exposes hooks (`data-testid`) a test-author would actually assert
+    against. `ms-example` is deliberately NOT a real milestone number so it
+    is inert to every milestone-scanning code path (`load_manifest`,
+    `ms_dir_for_issue`, `resolve_for_path`'s GitHub-dir listing) — this test
+    reads it straight off disk instead."""
+
+    MOCK_PATH = (
+        Path(__file__).resolve().parent.parent
+        / "tests" / "acceptance" / "ms-example" / "mocks" / "home-active.html"
+    )
+
+    def test_mock_file_exists(self) -> None:
+        assert self.MOCK_PATH.is_file(), f"missing worked example: {self.MOCK_PATH}"
+
+    def test_mock_is_self_contained_no_external_assets(self) -> None:
+        html = self.MOCK_PATH.read_text()
+        assert "<link" not in html.lower(), "no external stylesheet — CSS must be inline"
+        assert "src=\"http" not in html.lower()
+        assert "src='http" not in html.lower()
+
+    def test_mock_carries_its_own_inline_css(self) -> None:
+        html = self.MOCK_PATH.read_text()
+        assert "<style>" in html
+
+    def test_mock_exposes_testable_hooks(self) -> None:
+        html = self.MOCK_PATH.read_text()
+        assert 'data-testid="pipeline-card"' in html
+        assert 'role="tab"' in html
+        assert 'aria-selected="true"' in html
+
+    def test_mock_extension_resolves_to_web_playwright(self) -> None:
+        assert MOCK_EXT_TO_DRIVER_KIND[self.MOCK_PATH.suffix] == "web-playwright"
+
+
+class TestMockExtToDriverKindRegistry:
+    """#1542: the single source of truth for mock-suffix -> driver-kind
+    resolution — every consumer (`resolve_for_path`, and the mock-author /
+    test-author briefings' human-facing descriptions) must agree with this
+    table rather than re-deriving it."""
+
+    def test_html_maps_to_web_playwright(self) -> None:
+        assert MOCK_EXT_TO_DRIVER_KIND[".html"] == "web-playwright"
+
+    def test_screen_and_out_are_unchanged(self) -> None:
+        assert MOCK_EXT_TO_DRIVER_KIND[".screen"] == "tui-tuidriver"
+        assert MOCK_EXT_TO_DRIVER_KIND[".out"] == "cli-pytest"
+
+
 class TestResolveForPath:
     """#1453 review finding 1: the ONE place ``--for-path`` is derived from
     a milestone's Gate-A mock kind (``*.screen`` -> ``tui-tuidriver``,
@@ -318,6 +389,10 @@ class TestResolveForPath:
                             ),
                             AcceptanceDriverConfig(
                                 match="tui/**", kind="tui-tuidriver", run="cargo test",
+                            ),
+                            AcceptanceDriverConfig(
+                                match="coord/dashboard/webapp/**", kind="web-playwright",
+                                run="npx playwright test",
                             ),
                         ]
                     )
@@ -360,6 +435,18 @@ class TestResolveForPath:
             list_mock_dir=lambda *a: ("usage_by_issue.out",),
         )
         assert result == "coord/**"
+
+    def test_html_mocks_resolve_to_the_web_playwright_route(self) -> None:
+        """#1542: the hand-authored HTML wireframe shape (docs/ORACLE_LOOP.md)
+        resolves the same way `.screen`/`.out` already do — the whole point
+        of registering `.html` in `MOCK_EXT_TO_DRIVER_KIND` is that this
+        derivation needs no kind-specific code path."""
+        cfg = self._routed_config()
+        result = resolve_for_path(
+            cfg, cfg.repo("claude-coordinator"), 42,
+            list_mock_dir=lambda *a: ("home-active.html", "home-empty.html"),
+        )
+        assert result == "coord/dashboard/webapp/**"
 
     def test_passes_repo_github_mocks_path_and_default_branch_to_the_lister(self) -> None:
         cfg = self._routed_config()

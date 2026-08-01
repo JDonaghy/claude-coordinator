@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<!--
+  WORKED EXAMPLE — Gate A `web-playwright` mock shape (#1542).
+
+  This is NOT a real milestone. `ms-example` is a permanent, inert
+  reference fixture: nothing in `coord/` scans it (no `contract.md`, no
+  `manifest.*`, so `coord.acceptance.load_manifest` / `ms_dir_for_issue`
+  never see it) — it exists purely so the next `mock-author` / test-author
+  can copy a REAL file instead of working from a description.
+
+  Shape contract this file demonstrates (docs/ORACLE_LOOP.md, #1542):
+    - One hand-authored, self-contained `.html` file PER SCREEN STATE.
+    - Opens directly in a browser and LOOKS like the screen — inline CSS
+      only, no build step, no external assets, no JS framework.
+    - Real, semantic markup (roles, visible text, `data-testid` hooks) —
+      this is what the independent test-author writes Playwright DOM
+      assertions against, not a prose description of the screen.
+
+  Screen state: coord phone Control Center, "Home" view, "Active" filter
+  tab selected, two in-flight pipeline items (mirrors the SEEDED_PIPELINE
+  fixture in coord/dashboard/webapp/e2e/smoke.spec.ts so the shape matches
+  a real, already-shipped screen rather than an invented one).
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>coord — Home (mock)</title>
+<style>
+  :root {
+    --background: #0d1117;
+    --foreground: #c9d1d9;
+    --card: #161b22;
+    --primary: #1f6feb;
+    --primary-foreground: #ffffff;
+    --secondary: #21262d;
+    --muted-foreground: #8b949e;
+    --destructive: #da3633;
+    --border: #30363d;
+    --done: #ca8a04;
+    --merged: #15803d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--background);
+    color: var(--foreground);
+    max-width: 480px;
+    margin: 0 auto;
+    min-height: 100vh;
+  }
+  header {
+    position: sticky;
+    top: 0;
+    padding: 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--background);
+  }
+  h1 {
+    margin: 0 0 12px;
+    font-size: 18px;
+    font-weight: 600;
+  }
+  main { padding: 12px 16px 32px; }
+  section + section { margin-top: 24px; }
+  h2.section-title {
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted-foreground);
+    margin: 0 0 8px;
+  }
+
+  /* Filter tabs */
+  [role="tablist"] {
+    display: flex;
+    gap: 8px;
+  }
+  [role="tab"] {
+    appearance: none;
+    border: 1px solid var(--border);
+    background: var(--secondary);
+    color: var(--foreground);
+    border-radius: 999px;
+    padding: 6px 14px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  [role="tab"][aria-selected="true"] {
+    background: var(--primary);
+    border-color: var(--primary);
+    color: var(--primary-foreground);
+  }
+
+  /* Session cards (#1067 live sessions) */
+  .session-card {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    border: 1px solid var(--border);
+    background: var(--card);
+    border-radius: 8px;
+    padding: 12px;
+    margin-bottom: 8px;
+  }
+  .session-card .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--merged);
+    display: inline-block;
+    margin-right: 8px;
+    flex-shrink: 0;
+  }
+  .session-card .label { font-size: 13px; font-weight: 500; }
+  .session-card .sub { font-size: 11px; color: var(--muted-foreground); }
+  .session-card button {
+    appearance: none;
+    border: none;
+    background: var(--primary);
+    color: var(--primary-foreground);
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  /* Pipeline cards */
+  .pipeline-list { display: flex; flex-direction: column; gap: 10px; }
+  .pipeline-card {
+    display: block;
+    width: 100%;
+    text-align: left;
+    border: 1px solid var(--border);
+    background: var(--card);
+    border-radius: 10px;
+    padding: 14px;
+    cursor: pointer;
+  }
+  .pipeline-card .top-row {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 10px;
+  }
+  .pipeline-card .title {
+    font-size: 14px;
+    font-weight: 500;
+    margin: 0;
+    flex: 1;
+  }
+  .status-badge {
+    flex-shrink: 0;
+    border-radius: 999px;
+    padding: 2px 8px;
+    font-size: 11px;
+    font-weight: 700;
+    color: #fff;
+  }
+  .status-badge.running { background: var(--primary); }
+  .status-badge.failed { background: var(--destructive); }
+  .status-badge.done-ish { background: var(--done); color: #000; }
+
+  .pipeline-card .meta {
+    margin: 4px 0 0;
+    font-size: 12px;
+    color: var(--muted-foreground);
+  }
+  .pipeline-card .meta .issue-number { font-family: monospace; }
+
+  .stage-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+  .stage-chip {
+    border-radius: 4px;
+    padding: 2px 6px;
+    font-size: 11px;
+    font-weight: 500;
+  }
+  .stage-chip.completed { background: var(--merged); color: #fff; }
+  .stage-chip.active { background: var(--primary); color: #fff; }
+  .stage-chip.waiting { border: 1px solid var(--border); color: var(--muted-foreground); }
+
+  .needs-me-flag {
+    display: inline-block;
+    margin-top: 8px;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--done);
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>coord</h1>
+  <div role="tablist" aria-label="Pipeline filters">
+    <button type="button" role="tab" aria-selected="true" data-testid="filter-tab-active">
+      Active
+    </button>
+    <button type="button" role="tab" aria-selected="false" data-testid="filter-tab-needs-me">
+      Needs me
+    </button>
+  </div>
+</header>
+
+<main>
+
+  <section aria-label="Live sessions">
+    <h2 class="section-title">Live sessions</h2>
+    <div class="session-card" data-testid="session-card" data-session-id="sess-7">
+      <div>
+        <span class="dot" aria-hidden="true"></span>
+        <span class="label">claude-coordinator — interactive review</span>
+        <div class="sub">laptop &middot; 00:12:41</div>
+      </div>
+      <button type="button" data-testid="session-takeover-button">Take over</button>
+    </div>
+  </section>
+
+  <section aria-label="Pipeline">
+    <h2 class="section-title">Pipeline</h2>
+    <div class="pipeline-list" data-testid="pipeline-list" role="list">
+
+      <button type="button" class="pipeline-card" role="listitem"
+              data-testid="pipeline-card" data-issue-number="42">
+        <div class="top-row">
+          <p class="title">Fix the dashboard rendering</p>
+          <span class="status-badge running">running</span>
+        </div>
+        <p class="meta">
+          api <span class="issue-number">#42</span> &middot; laptop
+        </p>
+        <div class="stage-chips">
+          <span class="stage-chip active">work</span>
+          <span class="stage-chip waiting">test</span>
+          <span class="stage-chip waiting">review</span>
+          <span class="stage-chip waiting">merge</span>
+        </div>
+      </button>
+
+      <button type="button" class="pipeline-card" role="listitem"
+              data-testid="pipeline-card" data-issue-number="99">
+        <div class="top-row">
+          <p class="title">Refactor merge queue</p>
+          <span class="status-badge running">running</span>
+        </div>
+        <p class="meta">
+          api <span class="issue-number">#99</span> &middot; server
+        </p>
+        <div class="stage-chips">
+          <span class="stage-chip completed">work</span>
+          <span class="stage-chip active">review</span>
+          <span class="stage-chip waiting">merge</span>
+        </div>
+        <span class="needs-me-flag">&#9679; needs me</span>
+      </button>
+
+    </div>
+  </section>
+
+</main>
+
+</body>
+</html>
