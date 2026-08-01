@@ -960,6 +960,16 @@ pub(crate) fn tcp_probe(host: &str, port: u16) -> bool {
 ///    Items that fail this gate appear as BLOCKED with reason
 ///    `"test verdict missing"`.
 ///
+/// #1640 scope note: this local path deliberately does NOT apply the #1479
+/// freshness binding the server's `staging_items()` now does.  Deciding that
+/// a recorded verdict is *stale* requires the target branch's CURRENT head
+/// SHA, which only exists behind a live `gh` call — and this function is the
+/// no-daemon fallback whose entire contract is "answer from what is already
+/// in memory".  Consequence: without a daemon the staging section can show
+/// READY for a verdict `coord merge` refuses as stale.  The daemon-backed
+/// path (`merge_staging` in the `/board` payload) is authoritative and does
+/// apply the check; prefer it when the two disagree.
+///
 /// Items already in the merge queue (any state) and items from issues that
 /// already have a MERGED queue entry are excluded.
 pub(crate) fn compute_staging_local(

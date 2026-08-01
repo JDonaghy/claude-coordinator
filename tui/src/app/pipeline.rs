@@ -2269,6 +2269,16 @@ impl CoordApp {
         entry: &MergeQueueEntry,
     ) -> Option<String> {
         let err = entry.error.as_deref().filter(|e| !e.is_empty())?;
+        // #1640: a "recorded but stale against the current base" refusal is
+        // NOT recomputable here. This view's only smoke evidence is
+        // `test_stage_status_for`, which reads the terminal verdict and
+        // knows nothing about the #1479 freshness anchors — so recomputing
+        // would clear the message on exactly the entry `coord merge`
+        // refuses, reinstating the false green from the other direction.
+        // Render the server's wording (which names the SHAs) verbatim.
+        if err.starts_with("smoke test verdict is stale:") {
+            return Some(err.to_string());
+        }
         let is_stale_review = matches!(
             err,
             "review required but not approved"

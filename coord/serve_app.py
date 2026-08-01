@@ -3396,8 +3396,12 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 # queue.  Reuses the same _board snapshot built above.
                 # Fail-open: any error returns an empty list rather than 503.
                 try:
+                    # #1640: same tick-refreshed gh_ops view the plan above
+                    # uses, so the staging section can't show green for a
+                    # verdict the merge gate rejects as stale.
                     projection["merge_staging"] = [
-                        _asdict(si) for si in _mq.staging_items(_board, _cfg)
+                        _asdict(si)
+                        for si in _mq.staging_items(_board, _cfg, gh_ops=_ci)
                     ]
                 except Exception:  # noqa: BLE001
                     projection["merge_staging"] = []

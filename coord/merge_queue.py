@@ -754,17 +754,112 @@ def passes_merge_gates(a, config, board, gh_ops: "GhOps | None" = None) -> bool:
     return True
 
 
+# ── Smoke-verdict outcome kinds (#1640) ─────────────────────────────────────
+# The gate has always been a bool; #1640 splits the *failure* into the two
+# cases an operator has to act on differently:
+#
+#   SMOKE_MISSING — nothing terminal was ever recorded. Run the Test stage.
+#   SMOKE_STALE   — a passing/skipped verdict EXISTS but was recorded against
+#                   a branch/base combination that no longer exists (#1479).
+#                   Re-verify against the current base, then re-record.
+#
+# Before #1640 both collapsed to "smoke test required but no verdict
+# recorded", which is a false statement in the stale case and is exactly what
+# made #1640 get filed as a lost DB write.
+SMOKE_OK = "ok"
+SMOKE_MISSING = "missing"
+SMOKE_STALE = "stale"
+
+
+def _short_sha(sha: str | None) -> str:
+    """7-char display form of *sha*, or ``"unknown"`` when it isn't known."""
+    if not sha:
+        return "unknown"
+    return sha[:7]
+
+
+@dataclass(frozen=True)
+class SmokeVerdictStatus:
+    """Structured outcome of the smoke gate for one entry (#1640).
+
+    ``ok`` is what :func:`has_smoke_verdict` returns; the remaining fields
+    exist so every surface that renders the refusal (``coord merge``, ``coord
+    merge --plan``, the ``/board`` staging section, the TUI) can say *which*
+    failure it is and against what, instead of all of them printing the
+    "no verdict recorded" wording that only fits :data:`SMOKE_MISSING`.
+
+    ``anchor`` is ``"base"`` when the merge base moved out from under the
+    verdict (the #1479-specific condition — the common one on a sequential
+    drain, since every merge moves the base for the next entry) and
+    ``"branch"`` when the branch's own content changed since the test ran.
+    """
+
+    ok: bool
+    kind: str  # SMOKE_OK | SMOKE_MISSING | SMOKE_STALE
+    assignment_id: str | None = None
+    anchor: str | None = None  # "base" | "branch" (SMOKE_STALE only)
+    recorded_sha: str | None = None
+    current_sha: str | None = None
+
+    @property
+    def short_reason(self) -> str | None:
+        """Compact wording for plan / staging rows (``PlannedMerge.reason``).
+
+        ``None`` when the gate passes.
+        """
+        if self.ok:
+            return None
+        if self.kind == SMOKE_STALE:
+            noun = "base" if self.anchor == "base" else "branch"
+            return (
+                f"test verdict stale (recorded against {noun} "
+                f"{_short_sha(self.recorded_sha)}, {noun} now "
+                f"{_short_sha(self.current_sha)})"
+            )
+        return "test verdict missing"
+
+    @property
+    def message(self) -> str | None:
+        """Full wording for a merge attempt (``QueuedMerge.error`` / the
+        ``smoke_required`` event message). ``None`` when the gate passes."""
+        if self.ok:
+            return None
+        if self.kind == SMOKE_STALE:
+            noun = "base" if self.anchor == "base" else "branch"
+            aid = self.assignment_id or "<assignment>"
+            return (
+                f"smoke test verdict is stale: recorded against {noun} "
+                f"{_short_sha(self.recorded_sha)}, {noun} is now "
+                f"{_short_sha(self.current_sha)} — re-verify against the "
+                f"current base, then `coord test {aid} --passed`"
+            )
+        return "smoke test required but no verdict recorded"
+
+
 def has_smoke_verdict(
     entry: "QueuedMerge", board, gh_ops: "GhOps | None" = None
 ) -> bool:
     """True when the smoke requirement for *entry* is satisfied.
 
+    Thin ``.ok`` projection of :func:`evaluate_smoke_verdict` — kept as the
+    boolean seam every existing gate call site already uses. Callers that
+    need to *render* a refusal should call :func:`evaluate_smoke_verdict`
+    directly so they can distinguish stale from missing (#1640).
+    """
+    return evaluate_smoke_verdict(entry, board, gh_ops).ok
+
+
+def evaluate_smoke_verdict(
+    entry: "QueuedMerge", board, gh_ops: "GhOps | None" = None
+) -> SmokeVerdictStatus:
+    """Evaluate the smoke requirement for *entry*, with the reason it failed.
+
     The gate **fails open**: if no work assignment can be found on the board
     for the entry's branch (e.g. board was cleared, manual queue entry, or
-    the assignment pre-dates board persistence), this returns ``True`` so that
-    the merge is not silently blocked without evidence.
+    the assignment pre-dates board persistence), this returns ``ok=True`` so
+    that the merge is not silently blocked without evidence.
 
-    The gate **fails closed** (returns ``False``) only when we can positively
+    The gate **fails closed** (``ok=False``) only when we can positively
     identify the work assignment(s) on the branch and none of them carries a
     *fresh* ``test_state in ('passed', 'skipped')`` verdict.
 
@@ -801,6 +896,21 @@ def has_smoke_verdict(
     checking) then correctly refuses as stale. Passing *gh_ops* through
     closes that "plan says ready, only refuses" disagreement — the #1566
     incident's reader 3 vs. reader 4 split.
+
+    #1640: a *gh_ops* that cannot answer ``get_branch_sha`` /
+    ``get_branch_patch_id`` (the daemon's :class:`coord.gate_snapshot.
+    GateSnapshot` used to be exactly that) reopens the same disagreement
+    through a different door — the ``except Exception`` fallbacks below
+    swallow the ``AttributeError`` and every staleness check silently
+    degrades to a no-op, so ``/board``'s plan shows READY while a live
+    ``coord merge --only`` refuses. ``GateSnapshot`` now serves both lookups
+    from its tick-refreshed data; keep that in lockstep if a new gh_ops
+    stand-in is ever introduced.
+
+    Returns a :class:`SmokeVerdictStatus`: ``ok`` plus, when it fails,
+    whether the verdict is :data:`SMOKE_MISSING` (never recorded) or
+    :data:`SMOKE_STALE` (recorded, but against a branch/base combination
+    that no longer exists) and the SHAs that disagree.
     """
     pool = list(getattr(board, "completed", []) or []) + list(
         getattr(board, "active", []) or []
@@ -816,7 +926,7 @@ def has_smoke_verdict(
     ]
     # Fail open: no work assignment found → can't block without evidence.
     if not branch_work:
-        return True
+        return SmokeVerdictStatus(ok=True, kind=SMOKE_OK)
 
     current_base_sha = getattr(entry, "target_branch_head_sha", None)
     current_branch_sha = getattr(entry, "branch_head_sha", None)
@@ -827,6 +937,12 @@ def has_smoke_verdict(
     base_sha_attempted = current_base_sha is not None
     branch_sha_attempted = current_branch_sha is not None
     patch_id_attempted = current_patch_id is not None
+
+    # #1640: the first row rejected purely for staleness, so a refusal can
+    # name the case ("recorded at X, base now Y") instead of claiming no
+    # verdict exists. Only set when a terminal verdict was actually found —
+    # a board with no terminal verdict at all stays SMOKE_MISSING.
+    stale: SmokeVerdictStatus | None = None
 
     # Work found — check whether any carries a fresh terminal smoke verdict.
     for a in branch_work:
@@ -854,7 +970,17 @@ def has_smoke_verdict(
             and current_base_sha is not None
             and test_base_sha != current_base_sha
         ):
-            continue  # stale: re-verify against the new base
+            # stale: re-verify against the new base
+            if stale is None:
+                stale = SmokeVerdictStatus(
+                    ok=False,
+                    kind=SMOKE_STALE,
+                    assignment_id=getattr(a, "assignment_id", None),
+                    anchor="base",
+                    recorded_sha=test_base_sha,
+                    current_sha=current_base_sha,
+                )
+            continue
 
         # Branch content changed since the test ran. Same SHA-then-patch-id
         # fallback as has_approved_review: a content-identical rebase (SHA
@@ -892,11 +1018,29 @@ def has_smoke_verdict(
                 and current_patch_id is not None
                 and test_patch_id == current_patch_id
             ):
-                continue  # stale: branch content changed since the test ran
+                # stale: branch content changed since the test ran
+                if stale is None:
+                    stale = SmokeVerdictStatus(
+                        ok=False,
+                        kind=SMOKE_STALE,
+                        assignment_id=getattr(a, "assignment_id", None),
+                        anchor="branch",
+                        recorded_sha=test_head_sha,
+                        current_sha=current_branch_sha,
+                    )
+                continue
 
-        return True
+        return SmokeVerdictStatus(
+            ok=True, kind=SMOKE_OK, assignment_id=getattr(a, "assignment_id", None)
+        )
 
-    return False
+    if stale is not None:
+        return stale
+    return SmokeVerdictStatus(
+        ok=False,
+        kind=SMOKE_MISSING,
+        assignment_id=getattr(branch_work[0], "assignment_id", None),
+    )
 
 
 # Stored error strings that only reflect the gate state *at the moment a
@@ -909,6 +1053,19 @@ _STALE_GATE_ERRORS = frozenset({
     "smoke test required but no verdict recorded",
     "smoke test required but board unavailable to confirm verdict",
 })
+
+# #1640: the stale-verdict wording carries live SHAs, so it can't be matched
+# by equality against a fixed set. It goes stale for exactly the same reason
+# the strings above do (recording a fresh verdict clears the condition
+# without any merge attempt running), so it gets the same recomputation.
+_STALE_GATE_ERROR_PREFIXES = ("smoke test verdict is stale:",)
+
+
+def _is_recomputable_gate_error(err: str | None) -> bool:
+    """True when *err* is a gate refusal :func:`display_error` may recompute."""
+    if not err:
+        return False
+    return err in _STALE_GATE_ERRORS or err.startswith(_STALE_GATE_ERROR_PREFIXES)
 
 
 def display_error(entry: "QueuedMerge", board, config) -> str | None:
@@ -931,7 +1088,7 @@ def display_error(entry: "QueuedMerge", board, config) -> str | None:
     CI on every ``coord status`` would mean a live ``gh`` call per queue
     entry just to render a status line.
     """
-    if entry.error not in _STALE_GATE_ERRORS:
+    if not _is_recomputable_gate_error(entry.error):
         return entry.error
     if board is None or config is None:
         # Can't recompute without both — fall back to the stored string.
@@ -941,7 +1098,22 @@ def display_error(entry: "QueuedMerge", board, config) -> str | None:
             return entry.error
         return None
     if entry.error.startswith("smoke"):
-        if requires_smoke(entry, config) and not has_smoke_verdict(entry, board):
+        if not requires_smoke(entry, config):
+            return None
+        smoke = evaluate_smoke_verdict(entry, board)
+        if not smoke.ok:
+            # Prefer the freshly-computed wording — it names stale-vs-missing
+            # (#1640) even when the stored string predates that distinction.
+            return smoke.message
+        # #1640: this recomputation is deliberately I/O-free (no gh_ops), so
+        # the #1479 freshness anchors are only populated on an entry that a
+        # live `process()` pass already backfilled. Without them "ok" means
+        # "found a terminal verdict", NOT "found a fresh one" — so a stored
+        # staleness refusal must not be cleared on that evidence, or this
+        # read-only surface starts showing green for exactly the entry
+        # `coord merge` refuses. The plain "no verdict recorded" string keeps
+        # its original #420 clear-on-recompute behaviour.
+        if entry.error.startswith(_STALE_GATE_ERROR_PREFIXES):
             return entry.error
         return None
     return entry.error  # pragma: no cover — unreachable, kept for safety
@@ -1663,8 +1835,14 @@ def _entry_gate_status(
         # than displaying a stale "review not approved" the plan can't fix.
         if requires_review(entry, config) and not has_approved_review(entry, board, gh_ops):
             return PLAN_BLOCKED, "review not approved"
-        if requires_smoke(entry, config) and not has_smoke_verdict(entry, board, gh_ops):
-            return PLAN_BLOCKED, "test verdict missing"
+        if requires_smoke(entry, config):
+            # #1640: render the specific failure. A stale verdict used to be
+            # reported with the same "test verdict missing" wording as one
+            # that was never recorded, which sent operators hunting a lost
+            # write instead of re-verifying against the moved base.
+            smoke = evaluate_smoke_verdict(entry, board, gh_ops)
+            if not smoke.ok:
+                return PLAN_BLOCKED, smoke.short_reason
     if ci_store is not None and ci_store.is_available and entry.pr_number:
         checks = ci_store.list_checks_for_pr(entry.repo_github, entry.pr_number)
         failed = failed_checks(checks)
@@ -2107,7 +2285,43 @@ def _work_has_approved_review_a(a, board) -> bool:
     return False
 
 
-def staging_items(board, config) -> list[StagingItem]:
+def _staging_smoke_entry(a, config):
+    """Build the minimal duck-typed entry :func:`evaluate_smoke_verdict` needs
+    for a staging candidate (#1640).
+
+    A staging item is by definition *not* in the merge queue, so there is no
+    :class:`QueuedMerge` row carrying ``branch_head_sha`` /
+    ``target_branch_head_sha`` / ``branch_patch_id``. The shim supplies the
+    identity fields (``assignment_id``/``branch``/``repo_github``/
+    ``target_branch``) the evaluator needs to *look those up* through a
+    ``gh_ops``, and leaves the SHA fields ``None`` so a ``gh_ops=None`` call
+    stays I/O-free.
+
+    ``target_branch`` is the repo's ``default_branch``, not the #934
+    milestone feature branch: resolving the latter costs a ``gh`` call, and
+    this function is on the ``/board`` read path. A staging candidate on a
+    milestone repo therefore compares against the wrong base and simply fails
+    the freshness check open — the same "anchor missing → skip that half"
+    convention the evaluator already uses, never a false *block*.
+    """
+    repo_cfg = None
+    if config is not None:
+        try:
+            repo_cfg = config.repo(getattr(a, "repo_name", None) or "")
+        except Exception:  # noqa: BLE001 — unknown repo: no live lookup possible
+            repo_cfg = None
+    return QueuedMerge(
+        assignment_id=getattr(a, "assignment_id", None) or "",
+        repo_name=getattr(a, "repo_name", None) or "",
+        repo_github=getattr(repo_cfg, "github", None) or "",
+        branch=getattr(a, "branch", None) or "",
+        target_branch=getattr(repo_cfg, "default_branch", None) or "",
+        issue_number=int(getattr(a, "issue_number", 0) or 0),
+        issue_title=getattr(a, "issue_title", None) or "",
+    )
+
+
+def staging_items(board, config, gh_ops: "GhOps | None" = None) -> list[StagingItem]:
     """Return work assignments that are done+approved but not yet in the queue.
 
     Scans ``board.completed`` for ``status=done`` assignments whose ``type``
@@ -2126,9 +2340,24 @@ def staging_items(board, config) -> list[StagingItem]:
     Items that have NOT received an approved review are silently excluded so
     that the staging section only shows work the pipeline has already green-lit.
 
-    The function is intentionally **read-only**: no DB writes, no GitHub API
-    calls.  Pass ``board=None`` or ``config=None`` to skip gate evaluation
-    (useful in tests that only care about filtering logic).
+    The function is intentionally **read-only**: no DB writes.  Pass
+    ``board=None`` or ``config=None`` to skip gate evaluation (useful in
+    tests that only care about filtering logic).
+
+    #1640: the smoke gate here used to read the raw ``test_state`` column
+    with no freshness check at all, so it printed READY (and ``/board``'s
+    staging section showed green) for an assignment whose verdict
+    :func:`has_smoke_verdict` — the reader ``coord merge`` actually uses —
+    rejects as stale under the #1479 binding. It now routes through the same
+    :func:`evaluate_smoke_verdict` helper as every other smoke reader, so the
+    two can no longer disagree, and reports *which* failure it is.
+
+    *gh_ops* is optional and, when ``None`` (the default), no GitHub call is
+    made: the freshness anchors simply aren't available, and the evaluation
+    degrades to the terminal-verdict check it has always performed. Callers
+    that can supply a client — or the daemon's tick-refreshed
+    :class:`coord.gate_snapshot.GateSnapshot`, which serves the same two
+    lookups without live I/O — get the full freshness binding.
     """
     existing_queue = load_queue()
 
@@ -2183,17 +2412,18 @@ def staging_items(board, config) -> list[StagingItem]:
             if requires_review(a, config) and not _work_has_approved_review_a(a, board):
                 continue
 
-        # Gate: smoke.  When the test gate is enabled and no verdict exists,
-        # the item appears as BLOCKED rather than being silently excluded.
+        # Gate: smoke.  When the test gate is enabled and no *fresh* verdict
+        # exists, the item appears as BLOCKED rather than being silently
+        # excluded.  #1640: shared reader — see the docstring.
         status = STAGING_READY
         reason: str | None = None
-        if config is not None and board is not None:
-            if requires_smoke(a, config) and getattr(a, "test_state", None) not in (
-                "passed",
-                "skipped",
-            ):
+        if config is not None and board is not None and requires_smoke(a, config):
+            smoke = evaluate_smoke_verdict(
+                _staging_smoke_entry(a, config), board, gh_ops
+            )
+            if not smoke.ok:
                 status = STAGING_BLOCKED
-                reason = "test verdict missing"
+                reason = smoke.short_reason
 
         result.append(StagingItem(
             assignment_id=aid,
@@ -2432,22 +2662,30 @@ def process(
                     ))
                     continue
                 # #465/#821: smoke gate in dry-run — same fail-closed logic.
+                # #1640: when a verdict exists but failed the #1479 freshness
+                # binding, say so (and against which SHA) rather than
+                # reporting it as never recorded.
                 if (
                     not skip_smoke
                     and config is not None
                     and requires_smoke(entry, config)
-                    and (board is None or not has_smoke_verdict(entry, board, gh_ops))
                 ):
-                    _why = (
-                        "board unavailable to confirm smoke verdict"
+                    _smoke = (
+                        None
                         if board is None
-                        else "smoke test required but no verdict"
+                        else evaluate_smoke_verdict(entry, board, gh_ops)
                     )
-                    events.append(MergeEvent(
-                        entry, "smoke_required",
-                        f"(dry run) would be blocked: {_why} for {entry.branch}",
-                    ))
-                    continue
+                    if _smoke is None or not _smoke.ok:
+                        _why = (
+                            "board unavailable to confirm smoke verdict"
+                            if _smoke is None
+                            else _smoke.message
+                        )
+                        events.append(MergeEvent(
+                            entry, "smoke_required",
+                            f"(dry run) would be blocked: {_why} for {entry.branch}",
+                        ))
+                        continue
                 # CI gate (#240) preview, added by #1624: same check the real
                 # path runs, evaluated here so a dry run can't claim
                 # "would merge" for a PR whose checks are already failing.
@@ -2621,20 +2859,25 @@ def process(
             # as the review gate above.
             # #821: fail closed — when smoke is required but board is None
             # the verdict cannot be confirmed; block rather than silently merge.
+            # #1640: distinguish "never recorded" from "recorded but stale
+            # against the current base" — both used to print the former.
             if (
                 not skip_smoke
                 and config is not None
                 and requires_smoke(entry, config)
-                and (board is None or not has_smoke_verdict(entry, board, gh_ops))
             ):
-                msg = (
-                    "smoke test required but board unavailable to confirm verdict"
-                    if board is None
-                    else "smoke test required but no verdict recorded"
+                smoke = (
+                    None if board is None else evaluate_smoke_verdict(entry, board, gh_ops)
                 )
-                entry.error = msg
-                events.append(MergeEvent(entry, "smoke_required", msg))
-                continue  # skip this entry; try the next in the group
+                if smoke is None or not smoke.ok:
+                    msg = (
+                        "smoke test required but board unavailable to confirm verdict"
+                        if smoke is None
+                        else smoke.message
+                    )
+                    entry.error = msg
+                    events.append(MergeEvent(entry, "smoke_required", msg))
+                    continue  # skip this entry; try the next in the group
             # CI gate (#240): refuse to merge when checks are failed or
             # still running.  --force-merge overrides for the case where the
             # user has seen the failures and wants to merge anyway.
