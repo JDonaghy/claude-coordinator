@@ -107,6 +107,15 @@ Order matters loosely; the coord agent goes last.
    fleet `claude` lives at `~/.local/bin/claude` and is zsh-only, which has bitten us over ssh/tmux
    — use absolute paths and verify `ssh <host> 'which claude'` before trusting it. macOS runtime
    parity (`shutil.which("claude")` resolution + launchd) is issue **#1158 / CP-3**.
+
+   **This is not just about `claude` — it applies to every tool the agent shells out to** (#1671).
+   What matters is the PATH of the agent's *service* process, which is far narrower than your login
+   shell's. On Linux the fix is `Environment=PATH=` in the systemd unit; **the launchd equivalent is
+   an `EnvironmentVariables` dict in the plist, so nothing from the Linux fleet's units ports
+   across.** Whatever plist this box ends up with must reach `~/.cargo/bin` (rustup, step 4 above)
+   and Homebrew's prefix (`/opt/homebrew/bin` on Apple silicon — not on any default PATH systemd or
+   launchd hands you). Verify with `coord doctor --machine <name>` before declaring the box ready:
+   every capability you give it in step 9 must show a probed version, not "not found".
 6. **Tailscale** — join the tailnet; the agent is reached at `:7433` over MagicDNS like any other
    machine.
 7. **Clone the repos** into `~/src/` — `quadraui`, `vimcode`, `claude-coordinator`. Remember
@@ -114,7 +123,12 @@ Order matters loosely; the coord agent goes last.
 8. **coord agent last.** Follow [`AGENT_OPERATIONS.md`](AGENT_OPERATIONS.md) end-to-end — do not
    re-derive it. **INVARIANT: `~/.coord-venv` must be a PyPI install
    (`pip install claude-coordinator`), never editable.** Service supervision on mac is launchd, not
-   systemd (also #1158 / CP-3).
+   systemd (also #1158 / CP-3) — so `install-agent.sh` and `deploy/coord-agent.service`, which are
+   the Linux fleet's source of truth for the agent's PATH (#1671), **do not apply here**. There is
+   no checked-in launchd plist yet; writing one, with the PATH entry from step 5, is part of #1158 /
+   CP-3. Until then this box's PATH is hand-rolled and will fail *silently* if it's wrong — the
+   agent starts, `/health` answers, capabilities read "not found", and smoke dispatch quietly
+   refuses to route.
 9. **Register in `coordinator.yml`** with `concurrency: 1` and an `os:macos` capability, then route
    the macOS suites to it via `smoke_tests.capability_rules` (#1159 / CP-4 adds the `os:*`
    capability convention and the CI matrix).

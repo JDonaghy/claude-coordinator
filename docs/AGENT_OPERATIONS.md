@@ -113,9 +113,45 @@ Verify:
 
 ```bash
 curl -s http://<host>:7433/health | python3 -m json.tool
+coord doctor --machine <name>     # <-- do NOT skip this; see below
 ```
 
-The `version` field should match the latest PyPI release.
+The `version` field should match the latest PyPI release, and `coord doctor` must report a probed
+version for **every** tool backing a capability you declared for this machine in `coordinator.yml`.
+
+### The agent's PATH is narrower than your login shell (#1671)
+
+**A tool being installed does not mean the agent can run it.** A systemd *user* unit gets a minimal
+PATH — it omits everything installed under `$HOME` by rustup, pipx, nvm and friends. The unit
+therefore sets `Environment=PATH=` explicitly, and anything missing from that line is invisible to
+the agent **and to every worker it spawns** (#402: a worker's PATH is the agent's, with the venv
+stripped).
+
+`install-agent.sh` and `deploy/coord-agent.service` both include `~/.cargo/bin` and `~/.local/bin`
+as of #1671. **An agent installed before that has a unit without `~/.cargo/bin`** — fix it with a
+drop-in rather than replacing the unit:
+
+```bash
+mkdir -p ~/.config/systemd/user/coord-agent.service.d
+printf '[Service]\nEnvironment=PATH=%h/.coord-venv/bin:%h/.cargo/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin\n' \
+    > ~/.config/systemd/user/coord-agent.service.d/path.conf
+systemctl --user daemon-reload && systemctl --user restart coord-agent
+```
+
+`Environment=PATH=` **replaces** the whole PATH, so read the machine's current value first
+(`systemctl --user show -p Environment --value coord-agent.service`) and add to *that* — the order
+is not identical across machines, `~/.coord-venv/bin` must stay first so `coord` resolves to the
+agent venv, and `~/.local/bin` must keep its slot because that is where `claude` lives.
+
+**What this costs when it's wrong:** the `rust` capability probe reads "cargo not found" even though
+cargo is installed, `dispatch_smoke` refuses to route any `tui/**` work to that machine (#1570 D),
+and the Test stage retries every 30s forever with **no smoke row and no board-visible reason**. On
+2026-08-01 that silently blocked two issues for hours. `coord doctor` is the check that finds it,
+which is why it belongs in the verify step above.
+
+Since #1671 the agent also logs its **resolved PATH and install location** at startup, so
+`journalctl --user -u coord-agent` answers "what can this agent actually see" without a `pip show` /
+`grep` expedition.
 
 ## Install coordinator skills (`coord install-skills`, #319)
 
@@ -564,6 +600,33 @@ run. This fails **open**, not closed, on missing telemetry: a machine
 running an agent that predates this feature (no `tool_versions` in
 `/health`) is still routable — only an *explicit* probe failure refuses
 routing, so a partially-upgraded fleet doesn't go dark on smoke dispatch.
+
+### "not found" usually means "not on the agent's PATH", not "not installed" (#1671)
+
+The probe resolves a **literal binary name** through the *agent process's* PATH. A systemd user
+unit's PATH is minimal and set explicitly in the unit, so a rustup toolchain under `~/.cargo/bin`
+is invisible to it while being perfectly present on the box and on your login shell's PATH. Before
+concluding a tool is missing, check where it actually is:
+
+```bash
+coord doctor --machine <name>                                     # what the agent's probe sees
+systemctl --user show -p Environment --value coord-agent.service  # what the agent can reach
+```
+
+If the binary exists but isn't on that PATH, the fix is in
+[Install a new agent](#install-a-new-agent-first-time) — widen the unit's PATH, then restart.
+
+**Do NOT fix this by making the probe search harder.** Symlinking `cargo` onto the existing PATH, or
+teaching `prereqs.py` to look in `~/.cargo/bin`, satisfies the probe while `cargo build` still fails
+inside the worker — `cargo` shells out to `rustc`, which lives in the same directory the worker
+still can't reach. That converts an honest refusal into a **false green**, which is strictly worse:
+the capability reports met and the failure resurfaces 20 minutes into a smoke run as an unrelated
+error. Probe-side and worker-side resolution must move together, which they only do when the
+*agent's own* PATH is widened.
+
+This failure mode is **silent by construction** — the probe is right, the refusal is right, and
+nothing surfaces either until someone runs `coord doctor`. Treat that command as part of
+provisioning, not as a debugging tool.
 
 ## Upgrade via the raw `/update` endpoint (reliable fallback)
 
