@@ -1536,6 +1536,25 @@ def _parse_worktree_porcelain(output: str) -> list[dict[str, str]]:
     return worktrees
 
 
+def _is_same_path(candidate: str, resolved_target: Path) -> bool:
+    """True when *candidate* points at the same directory as *resolved_target*.
+
+    #1659: used to keep :func:`_free_branch_in_worktrees` from ever treating
+    the base checkout as a removable worktree.  Both sides are resolved so a
+    symlinked path (``~/.coord/worktrees/<repo> -> ~/src/<repo>`` is an
+    established convention on this fleet) compares equal to its target rather
+    than sliding past a string comparison.  Resolution failures fall back to a
+    plain comparison and are never fatal — a wrong answer here costs a
+    checkout, so the only acceptable failure mode is "skip it anyway".
+    """
+    if not candidate:
+        return False
+    try:
+        return Path(candidate).resolve() == resolved_target
+    except OSError:
+        return candidate == str(resolved_target)
+
+
 def _free_branch_in_worktrees(
     repo_path: Path,
     branch_name: str,
@@ -1554,18 +1573,54 @@ def _free_branch_in_worktrees(
 
     Silently tolerates git errors — if the list or removal fails, the
     subsequent ``worktree add`` will still surface a clear error.
+
+    #1659: this function must NEVER remove the **main** worktree (the base
+    checkout, ``repo_path``).  ``git worktree list --porcelain`` always lists
+    it first, and it matches the branch filter like any other entry whenever
+    the base happens to be parked on *branch_name* — which #1623 makes routine
+    and #1636's ``branch=failed.branch`` re-dispatch makes near-certain on a
+    retry.  It is skipped explicitly below.
+
+    #1659: there is also no ``shutil.rmtree`` fallback.  ``git worktree
+    remove`` refusing a path is git *protecting* something — most often with
+    ``fatal: '<path>' is a main working tree`` — and overriding that refusal
+    with ``rm -rf`` destroyed precision's base checkout on 2026-07-31.  A
+    failed removal is logged and left alone, which is exactly what this
+    docstring already promised: the subsequent ``worktree add`` surfaces it.
     """
     try:
         output = _git(repo_path, "worktree", "list", "--porcelain")
     except _GitError:
         return
 
+    # #1659: the base checkout, resolved so a symlinked ~/src/<repo> (see the
+    # `worktrees/<repo>` symlink convention) can't slip past the comparison.
+    try:
+        main_path = repo_path.resolve()
+    except OSError:
+        main_path = repo_path
+
     removed = 0
-    for wt in _parse_worktree_porcelain(output):
+    for index, wt in enumerate(_parse_worktree_porcelain(output)):
         wt_path = wt.get("worktree", "")
         if wt.get("branch", "") != branch_name:
             continue
         if wt_path == exclude_path:
+            continue
+        # #1659: never the main worktree.  Belt and braces — `git worktree
+        # list --porcelain` documents the main worktree as the first entry,
+        # and it is also `repo_path` itself; either check alone is sufficient,
+        # and the cost of a false negative here is a deleted base checkout.
+        if index == 0 or _is_same_path(wt_path, main_path):
+            if log_path:
+                _append_log_line(
+                    log_path,
+                    f"# worktree-free: NOT removing {wt_path!r} — it is the "
+                    f"base checkout, not a linked worktree, even though it "
+                    f"holds branch {branch_name!r} (#1659). The `worktree "
+                    f"add` below will fail loudly if the branch is truly "
+                    f"unavailable.\n",
+                )
             continue
         # Found a conflicting worktree — force-remove it.
         if log_path:
@@ -1577,12 +1632,15 @@ def _free_branch_in_worktrees(
         try:
             _git(repo_path, "worktree", "remove", wt_path, "--force")
             removed += 1
-        except _GitError:
-            try:
-                shutil.rmtree(wt_path, ignore_errors=True)
-                removed += 1
-            except OSError:
-                pass
+        except _GitError as exc:
+            # #1659: NO rmtree fallback.  Report and move on.
+            if log_path:
+                _append_log_line(
+                    log_path,
+                    f"# worktree-free: `git worktree remove {wt_path}` failed "
+                    f"({exc}) — leaving it on disk (#1659). If the branch is "
+                    f"still held, the `worktree add` below will say so.\n",
+                )
 
     if removed:
         try:

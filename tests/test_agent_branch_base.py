@@ -569,3 +569,73 @@ def test_clean_worktrees_bypasses_cooldown_for_pending_branch(tmp_path: Path) ->
     assert not term_wt.exists(), (
         "terminal worktree directory was not removed despite PENDING branch need"
     )
+
+
+def test_free_branch_never_removes_the_base_checkout(tmp_path: Path) -> None:
+    """#1659: the base checkout survives when it is parked on the target branch.
+
+    This is the regression test for the 2026-07-31 data loss on precision. The
+    base checkout was parked on `issue-1122-...` (#1623), a re-dispatch aimed a
+    worktree add at that same branch (#1636), and `_free_branch_in_worktrees`
+    matched the main worktree, had `git worktree remove` refuse it as a main
+    working tree, and then `shutil.rmtree`'d it in the error fallback.
+
+    Before the fix this test deletes the entire repo — `.git` and all.
+    """
+    repo = _init_local_repo(tmp_path / "repo")
+    # Park the BASE checkout on the branch a worktree is about to be created
+    # for — exactly the #1623 state that arms the bug.
+    subprocess.run(
+        ["git", "checkout", "-b", "issue-1122-parked"],
+        cwd=str(repo), check=True, capture_output=True,
+    )
+    sentinel = repo / "sentinel.txt"
+    sentinel.write_text("must survive")
+
+    _free_branch_in_worktrees(repo, "issue-1122-parked", str(tmp_path / "new"))
+
+    assert repo.exists(), "base checkout directory was deleted (#1659)"
+    assert (repo / ".git").exists(), "base checkout .git was deleted (#1659)"
+    assert sentinel.read_text() == "must survive", (
+        "base checkout contents were destroyed (#1659)"
+    )
+    # And it is still a usable checkout, still on its branch.
+    branch = subprocess.run(
+        ["git", "branch", "--show-current"],
+        cwd=str(repo), capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert branch == "issue-1122-parked"
+
+
+def test_free_branch_does_not_rmtree_when_git_refuses(tmp_path: Path) -> None:
+    """#1659: a `git worktree remove` failure leaves the directory on disk.
+
+    The removed fallback was `shutil.rmtree(wt_path, ignore_errors=True)`. Any
+    reason git declines — not just the main-worktree case — used to escalate to
+    an unconditional recursive delete of a path taken from git's own output.
+    """
+    repo = _init_local_repo(tmp_path / "repo")
+    stale = tmp_path / "stale"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "issue-42-fix", str(stale), "HEAD"],
+        cwd=str(repo), check=True, capture_output=True,
+    )
+    canary = stale / "canary.txt"
+    canary.write_text("still here")
+
+    import coord.agent as agent_mod
+
+    def _always_fail(path: Path, *args: str, **kwargs: object) -> str:
+        if args[:2] == ("worktree", "remove"):
+            raise agent_mod._GitError("simulated refusal")
+        return _real_git(path, *args, **kwargs)
+
+    _real_git = agent_mod._git
+    agent_mod._git = _always_fail  # type: ignore[assignment]
+    try:
+        _free_branch_in_worktrees(repo, "issue-42-fix", str(tmp_path / "new"))
+    finally:
+        agent_mod._git = _real_git  # type: ignore[assignment]
+
+    assert stale.exists(), "worktree was rmtree'd after git refused (#1659)"
+    assert canary.read_text() == "still here"
