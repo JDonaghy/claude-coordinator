@@ -254,6 +254,16 @@ class FakeGh:
     # pre-flight squash fallback never fires unless a test opts in.
     merge_commit_results: dict[int, bool | None] = field(default_factory=dict)
     merge_commit_calls: list[tuple[str, int]] = field(default_factory=list)
+    # #1624: branch name -> already-open PR dict ({"number", "url"}). Defaults
+    # keep every prior test (none of which set this) inert —
+    # find_pr_for_branch returns None so the dry-run "no PR yet" path runs,
+    # matching pre-#1624 behavior.
+    existing_prs: dict[str, dict] = field(default_factory=dict)
+    find_pr_calls: list[tuple[str, str]] = field(default_factory=list)
+
+    def find_pr_for_branch(self, repo: str, branch: str) -> dict | None:
+        self.find_pr_calls.append((repo, branch))
+        return self.existing_prs.get(branch)
 
     def create_pr(self, repo: str, *, base: str, head: str, title: str, body: str) -> dict:
         self.create_calls.append((repo, {"base": base, "head": head, "title": title}))

@@ -389,6 +389,11 @@ class FakeCi:
 class FakeGh:
     next_pr: int = 100
     merge_calls: list[tuple[int, str]] = dataclass_field(default_factory=list)
+    # #1624: branch name -> already-open PR dict ({"number", "url"}). Empty by
+    # default so existing tests (none of which set this) see no PR and get
+    # the pre-#1624 "no PR found" behaviour.
+    existing_prs: dict[str, dict] = dataclass_field(default_factory=dict)
+    find_pr_calls: list[tuple[str, str]] = dataclass_field(default_factory=list)
 
     def create_pr(self, repo: str, *, base: str, head: str, title: str, body: str) -> dict:
         n = self.next_pr
@@ -401,6 +406,10 @@ class FakeGh:
     def merge_pr(self, repo: str, number: int, method: str = "rebase") -> tuple[bool, str]:
         self.merge_calls.append((number, method))
         return True, "merged"
+
+    def find_pr_for_branch(self, repo: str, branch: str) -> dict | None:
+        self.find_pr_calls.append((repo, branch))
+        return self.existing_prs.get(branch)
 
 
 def _entry(aid: str = "a") -> QueuedMerge:
@@ -519,6 +528,102 @@ class TestMergeGate:
         merged_prs = [c[0] for c in gh.merge_calls]
         assert 100 not in merged_prs
         assert 101 in merged_prs
+
+
+class TestDryRunCiGate:
+    """#1624: `coord merge --dry-run` used to unconditionally report "would
+    open PR" for every entry, even one whose branch already has an open PR —
+    so the CI gate (which needs a real PR number) was silently skipped and a
+    PR with failing checks was previewed as mergeable. These assert the fix:
+    dry-run resolves the existing PR via `find_pr_for_branch` (mirroring what
+    `create_pr` already does on the real path) and evaluates the CI gate
+    against it, same as a real merge would."""
+
+    def test_resolves_existing_pr_and_blocks_on_failed_ci(self) -> None:
+        items = [_entry("a")]
+        gh = FakeGh(existing_prs={"worker/a": {"number": 612, "url": "https://gh/x/612"}})
+        ci = FakeCi(by_pr={612: [_check("ci", conclusion="failure")]})
+        events = process(items, gh, ci_store=ci, dry_run=True)
+
+        # No real gh calls of any kind — a preview never mutates GitHub.
+        assert gh.merge_calls == []
+        assert items[0].state == PENDING
+
+        opened = next(e for e in events if e.kind == "opened")
+        assert "PR #612 (existed)" in opened.message
+        assert "would open PR" not in opened.message
+
+        kinds = [e.kind for e in events]
+        assert "checks_failed" in kinds
+        # The bug: this used to render as "would merge" with the CI gate
+        # never evaluated. It must not be reported as mergeable.
+        assert "merged" not in kinds
+
+    def test_resolves_existing_pr_and_allows_on_green_ci(self) -> None:
+        items = [_entry("a")]
+        gh = FakeGh(existing_prs={"worker/a": {"number": 612, "url": "https://gh/x/612"}})
+        ci = FakeCi(by_pr={612: [_check("ci", conclusion="success")]})
+        events = process(items, gh, ci_store=ci, dry_run=True)
+
+        assert gh.merge_calls == []
+        assert items[0].state == PENDING
+
+        opened = next(e for e in events if e.kind == "opened")
+        assert "PR #612 (existed)" in opened.message
+
+        kinds = [e.kind for e in events]
+        assert "checks_failed" not in kinds
+        assert "checks_pending" not in kinds
+        assert "merged" in kinds
+
+    def test_reports_ci_unknown_when_no_pr_yet(self) -> None:
+        """A brand-new entry has no PR to check CI against — dry-run must say
+        so explicitly rather than silently rendering "would merge" as if the
+        gate had passed."""
+        items = [_entry("a")]
+        gh = FakeGh()  # no existing_prs — branch genuinely has no open PR
+        ci = FakeCi(by_pr={})
+        events = process(items, gh, ci_store=ci, dry_run=True)
+
+        assert gh.merge_calls == []
+        opened = next(e for e in events if e.kind == "opened")
+        assert "would open PR" in opened.message
+
+        kinds = [e.kind for e in events]
+        assert "checks_failed" not in kinds
+        assert "checks_pending" not in kinds
+        merged = next(e for e in events if e.kind == "merged")
+        assert "gate: unknown (no PR yet)" in merged.message
+
+    def test_force_merge_skips_ci_gate_in_dry_run_too(self) -> None:
+        """--force-merge's real-path CI bypass is previewed identically in
+        dry-run — this issue is about honesty, not about changing
+        --force-merge semantics."""
+        items = [_entry("a")]
+        gh = FakeGh(existing_prs={"worker/a": {"number": 612, "url": "https://gh/x/612"}})
+        ci = FakeCi(by_pr={612: [_check("ci", conclusion="failure")]})
+        events = process(items, gh, ci_store=ci, dry_run=True, force_merge=True)
+
+        kinds = [e.kind for e in events]
+        assert "checks_failed" not in kinds
+        assert "merged" in kinds
+
+    def test_no_real_gh_or_merge_calls_in_dry_run(self) -> None:
+        """Regression: dry-run still opens/merges nothing, even once it looks
+        up the real PR and evaluates real CI status."""
+        items = [_entry("a")]
+        gh = FakeGh(existing_prs={"worker/a": {"number": 612, "url": "https://gh/x/612"}})
+        ci = FakeCi(by_pr={612: [_check("ci", conclusion="success")]})
+        process(items, gh, ci_store=ci, dry_run=True)
+
+        assert gh.merge_calls == []
+        assert gh.find_pr_calls == [("acme/api", "worker/a")]
+        assert items[0].state == PENDING
+        # pr_number is resolved in-memory (same pattern as branch_head_sha
+        # elsewhere in the dry-run path) — persisting it is the caller's
+        # job (cli.py only calls save_queue() when not dry_run), out of
+        # scope for process() itself.
+        assert items[0].pr_number == 612
 
 
 class TestMergeGateThroughGitHubCi:
