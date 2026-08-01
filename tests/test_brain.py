@@ -402,9 +402,11 @@ class TestResolveRequiredGates:
 
 
 class TestResolveModels:
-    """#1430: resolve_models() mirrors resolve_required_gates's shape and
-    precedence convention (issue-label order; first configured label wins)
-    for the same kind of ambiguity, applied to config.models.labels."""
+    """#1430: resolve_models() applies config.models.labels the same way
+    every other work-dispatch site does — via
+    `ModelsConfig.model_for_labels`, whose precedence is `tier:*` entries
+    first, then config declaration order (#1633; no longer the issue's own
+    label order, which GitHub does not guarantee)."""
 
     def _config_with_labels(self) -> Config:
         return Config(
@@ -459,8 +461,9 @@ class TestResolveModels:
         resolve_models([p], cfg, issues_by_repo)
         assert p.model is None  # caller (coord approve) falls back to models.default
 
-    def test_first_matching_label_wins(self) -> None:
-        """Multi-label precedence: the issue's own label order decides."""
+    def test_tier_label_wins_regardless_of_issue_label_order(self) -> None:
+        """#1633: `tier:*` beats a type label like `documentation`, and it
+        must not matter which order the issue's labels are listed in."""
         cfg = self._config_with_labels()
         p = self._proposal(issue_number=10)
         issues_by_repo = {
@@ -473,7 +476,20 @@ class TestResolveModels:
             ]
         }
         resolve_models([p], cfg, issues_by_repo)
-        assert p.model == "opus"  # tier:large listed first on the issue
+        assert p.model == "opus"  # tier:large overrides documentation
+
+        p2 = self._proposal(issue_number=11)
+        issues_by_repo2 = {
+            "api": [
+                {
+                    "number": 11,
+                    "title": "x",
+                    "labels": [{"name": "documentation"}, {"name": "tier:large"}],
+                }
+            ]
+        }
+        resolve_models([p2], cfg, issues_by_repo2)
+        assert p2.model == "opus"  # order flipped, same result
 
     def test_plan_type_is_skipped(self) -> None:
         """A plan-stage proposal must not inherit a label-derived model —

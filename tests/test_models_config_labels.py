@@ -28,18 +28,60 @@ class TestModelForLabels:
         cfg = ModelsConfig(labels={"tier:small": "haiku"})
         assert cfg.model_for_labels([]) is None
 
-    def test_multi_label_precedence_is_issue_label_order(self) -> None:
-        """#1430 acceptance: multi-label precedence must be deterministic.
-        The issue's own label order decides — the first label (in the
-        order GitHub returns them for the issue) that has a `labels` entry
-        wins, mirroring `coord.brain.resolve_required_gates`'s convention
-        for `pipeline.labels`."""
+    def test_tier_label_beats_type_label_regardless_of_issue_order(self) -> None:
+        """#1633: precedence must NOT depend on GitHub's issue-label order.
+
+        `tier:*` entries are documented size-tier *overrides* over the
+        type-label entries (`bug`/`enhancement`/...) — and must win
+        regardless of which order the issue's labels happen to be in.
+        """
         cfg = ModelsConfig(labels={"bug": "sonnet", "tier:large": "opus"})
-        # "bug" listed first on the issue -> wins, even though tier:large
-        # is "more specific" — the issue's label order is the sole knob.
-        assert cfg.model_for_labels(["bug", "tier:large"]) == "sonnet"
-        # Reverse the issue's label order -> the winner flips too.
+        assert cfg.model_for_labels(["bug", "tier:large"]) == "opus"
         assert cfg.model_for_labels(["tier:large", "bug"]) == "opus"
+
+    def test_tier_small_beats_bug_regardless_of_issue_order(self) -> None:
+        cfg = ModelsConfig(labels={"bug": "sonnet", "tier:small": "haiku"})
+        assert cfg.model_for_labels(["bug", "tier:small"]) == "haiku"
+        assert cfg.model_for_labels(["tier:small", "bug"]) == "haiku"
+
+    def test_type_label_only_is_unchanged(self) -> None:
+        """An issue with only a type label (no tier label) still resolves
+        via that label, same as before #1633."""
+        cfg = ModelsConfig(labels={"enhancement": "sonnet", "tier:large": "opus"})
+        assert cfg.model_for_labels(["enhancement"]) == "sonnet"
+
+    def test_no_matching_label_falls_through_to_default_via_caller(self) -> None:
+        """`model_for_labels` never resolves `default` itself (that's the
+        caller's job — see `test_default_never_returned_by_this_method`),
+        but an issue with no configured label present still yields `None`
+        so the `... or config.models.default` idiom falls through."""
+        cfg = ModelsConfig(default="opus", labels={"tier:large": "opus"})
+        assert cfg.model_for_labels(["documentation"]) is None
+        resolved = cfg.model_for_labels(["documentation"]) or cfg.default
+        assert resolved == "opus"
+
+    def test_with_reason_names_matched_and_shadowed_labels(self) -> None:
+        """#1633: when more than one configured label matched, the losing
+        candidate(s) are surfaced too, so a route that looks surprising is
+        self-explaining at dispatch time."""
+        cfg = ModelsConfig(labels={"bug": "sonnet", "tier:large": "opus"})
+        model, matched, shadowed = cfg.model_for_labels_with_reason(["bug", "tier:large"])
+        assert (model, matched, shadowed) == ("opus", "tier:large", ["bug"])
+        # Unambiguous match -> nothing shadowed.
+        model, matched, shadowed = cfg.model_for_labels_with_reason(["bug"])
+        assert (model, matched, shadowed) == ("sonnet", "bug", [])
+
+    def test_with_reason_tie_break_uses_config_order_not_issue_order(self) -> None:
+        """Two `tier:*` labels on the same issue (or two type labels) is an
+        edge case, but must still resolve deterministically — via the
+        config's own declaration order, not the issue's label order."""
+        cfg = ModelsConfig(
+            labels={"tier:small": "haiku", "tier:large": "opus"}
+        )
+        # tier:small declared first in the config -> wins, regardless of
+        # which order the issue lists them in.
+        assert cfg.model_for_labels(["tier:large", "tier:small"]) == "haiku"
+        assert cfg.model_for_labels(["tier:small", "tier:large"]) == "haiku"
 
     def test_default_never_returned_by_this_method(self) -> None:
         """model_for_labels never falls back to `default` itself — that's

@@ -409,13 +409,8 @@ class ModelsConfig:
         calls before falling back to ``default`` itself.
 
         Precedence when an issue carries several configured labels (e.g.
-        both ``bug`` and ``tier:large``): *issue-label order wins* — the
-        issue's own labels are walked in the order GitHub returns them, and
-        the first one with an entry in ``labels`` is used. This mirrors the
-        precedence rule ``coord.brain.resolve_required_gates`` and
-        ``coord.commands.dispatch_workers._dispatch_headless`` already use
-        for ``pipeline.labels``, so the two label-driven resolvers behave
-        the same way for the same kind of ambiguity.
+        both ``bug`` and ``tier:large``) — see
+        :meth:`model_for_labels_with_reason` for the full rule (#1633).
 
         Returns ``None`` (never ``default``) when no configured label is
         present on the issue, or ``labels`` itself is empty — mirroring the
@@ -428,22 +423,56 @@ class ModelsConfig:
 
     def model_for_labels_with_reason(
         self, issue_labels: list[str]
-    ) -> tuple[str | None, str | None]:
+    ) -> tuple[str | None, str | None, list[str]]:
         """Like :meth:`model_for_labels`, but also returns the label that
-        matched — ``(model, matched_label)``, or ``(None, None)`` under the
-        same conditions :meth:`model_for_labels` returns ``None``.
+        matched and any configured labels it shadowed.
+
+        Returns ``(model, matched_label, shadowed_labels)``, or
+        ``(None, None, [])`` under the same conditions
+        :meth:`model_for_labels` returns ``None``.
+
+        #1633: precedence used to be decided by *issue-label order* — the
+        order GitHub happens to return the issue's own labels in, which
+        nothing in this repo controls. That made ``tier:small``/
+        ``tier:large`` no-ops on any issue that also carried a type label
+        (``bug``/``enhancement``/...), and let the same issue re-route
+        just by having a label removed and re-added. Precedence is now
+        deterministic and config-driven instead:
+
+        1. ``tier:*`` entries are checked first — they are documented as
+           size-tier *overrides* over the type-label entries.
+        2. All other entries are checked next.
+
+        Within each group, ties are broken by ``labels``'s own iteration
+        order (insertion order from ``coordinator.yml``), not the issue's
+        label order — so the same issue + config always resolves to the
+        same model, regardless of what order GitHub reports the issue's
+        labels in.
 
         #1454: a silent fall-through to ``default`` (stale/missing label)
         looks identical to an intentional default from the CLI output
         alone. Callers use the matched label to print *why* a model was
-        chosen — see :func:`describe_model_choice`.
+        chosen, and *shadowed_labels* (every other configured label also
+        present on the issue, in resolution order) to print what lost —
+        see :func:`describe_model_choice`.
         """
         if not self.labels:
-            return None, None
-        for label in issue_labels:
-            if label in self.labels:
-                return self.labels[label], label
-        return None, None
+            return None, None, []
+        present_in_config_order = [
+            label for label in self.labels if label in issue_labels
+        ]
+        if not present_in_config_order:
+            return None, None, []
+        tier_candidates = [
+            label for label in present_in_config_order if label.startswith("tier:")
+        ]
+        other_candidates = [
+            label for label in present_in_config_order if not label.startswith("tier:")
+        ]
+        ordered_candidates = tier_candidates + other_candidates
+        matched = ordered_candidates[0]
+        shadowed = ordered_candidates[1:]
+        return self.labels[matched], matched, shadowed
 
     def model_for_estimate(self, estimate: str | None) -> str | None:
         """Map a plan worker's ``ESTIMATE`` to a model alias via ``escalation``.
@@ -475,6 +504,7 @@ def describe_model_choice(
     resolved_model: str,
     explicit_reason: str | None = None,
     matched_label: str | None = None,
+    shadowed_labels: list[str] | None = None,
 ) -> str:
     """Format a one-line explanation of why *resolved_model* was chosen.
 
@@ -488,10 +518,22 @@ def describe_model_choice(
     didn't come from a fresh label match. Otherwise *matched_label* (from
     :meth:`ModelsConfig.model_for_labels_with_reason`) selects between the
     "via label" and "default; no label match" phrasings.
+
+    #1633: when the issue carried more than one configured label,
+    *shadowed_labels* names the ones that lost, so a route that might look
+    surprising (e.g. ``tier:large`` winning over ``enhancement``) is
+    self-explaining at dispatch time instead of reading like the older,
+    order-dependent bug.
     """
     if explicit_reason:
         return f"{resolved_model} ({explicit_reason})"
     if matched_label:
+        if shadowed_labels:
+            shadowed_str = ", ".join(repr(label) for label in shadowed_labels)
+            return (
+                f"{resolved_model} (via label {matched_label!r}, "
+                f"shadowing {shadowed_str})"
+            )
         return f"{resolved_model} (via label {matched_label!r})"
     return f"{resolved_model} (default; no label match)"
 

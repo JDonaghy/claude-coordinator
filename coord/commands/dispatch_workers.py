@@ -4576,10 +4576,10 @@ def _dispatch_headless(
     # inherit a tier:large -> opus routing meant for the eventual work
     # dispatch, so label resolution only applies when this is a work
     # dispatch, not a plan-only one.
-    label_model, matched_label = (
+    label_model, matched_label, shadowed_labels = (
         cfg.models.model_for_labels_with_reason(issue_labels)
         if not effective_plan_only
-        else (None, None)
+        else (None, None, [])
     )
     resolved_model = model or label_model or cfg.models.default
 
@@ -4618,6 +4618,7 @@ def _dispatch_headless(
                 resolved_model=resolved_model,
                 explicit_reason="explicit --model" if model else None,
                 matched_label=matched_label,
+                shadowed_labels=shadowed_labels,
             )
         )
 
