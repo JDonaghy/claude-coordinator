@@ -191,6 +191,16 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
                 version_line = f"  agent-version: {agent_version}"
         click.echo(f"    host: {m.host}  repos: {repos}{version_line}")
 
+        # #1527: `/health`'s `degraded` dict names any configured repo whose
+        # `repo_path` is missing/unconfigured on this machine — the machine
+        # can still be green/idle above while every dispatch for that one
+        # repo silently 400s. Surface it here instead of leaving it only
+        # discoverable by sshing in and reading the filesystem.
+        degraded = (s.health or {}).get("degraded") if s.is_online else None
+        if degraded:
+            for repo_name, reason in degraded.items():
+                click.echo(f"    ⚠ degraded: {repo_name} — {reason}")
+
         if status_result and status_result.ok and status_result.data:
             for entry in status_result.data.get("active", []):
                 progress = entry.get("progress")

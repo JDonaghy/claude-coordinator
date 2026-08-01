@@ -3011,10 +3011,24 @@ class AgentServer:
             )
         worktree_bytes = self._cached_worktree_bytes()
         artifact_bytes = self._cached_artifact_bytes()
+        servable_repos, degraded_repos = self._servable_repos()
         return {
             "machine": self.machine_name,
             "capabilities": self.capabilities,
-            "repos": self.repos,
+            # #1527: only repos whose `repo_path` actually exists on this
+            # machine — a repo this agent cannot serve must not be
+            # advertised as servable (the router picks "least loaded"
+            # among `repos`, so a stale/missing checkout otherwise turns
+            # into silent 400s on every dispatch while `coord status`
+            # still shows the machine green). See `degraded` below for why.
+            "repos": servable_repos,
+            # #1527: repo_name -> reason, for every configured repo that
+            # was dropped from `repos` above (no `repo_paths` entry, or the
+            # path doesn't exist on disk). Empty dict when nothing is
+            # degraded. `coord status` renders this so the operator sees
+            # "dellserver: claude-coordinator path missing" instead of a
+            # quietly-shrunk fleet.
+            "degraded": degraded_repos,
             "active": active,
             "completed": completed,
             # Monotonic-ish stamp of when THIS Python process started.
@@ -3842,6 +3856,33 @@ class AgentServer:
                         d["cache_read_tokens"] = summary.cache_read_tokens
                 completed.append(d)
         return {"active": active, "completed": completed}
+
+    def _servable_repos(self) -> tuple[list[str], dict[str, str]]:
+        """#1527: split ``self.repos`` into servable vs degraded.
+
+        A repo is servable only when it has a ``repo_paths`` entry AND that
+        path exists on disk right now — mirrors the same two checks
+        ``list_repos`` below already makes per-repo, just collapsed to a
+        reason string instead of a full git-status dict (``/health`` is
+        polled far more often than ``/repos`` and must stay cheap — no
+        ``git rev-parse`` here, just a ``Path.exists()`` stat per repo).
+
+        Returns ``(servable_repo_names, {repo_name: reason})`` — the second
+        dict is empty when every configured repo is servable.
+        """
+        servable: list[str] = []
+        degraded: dict[str, str] = {}
+        for repo_name in self.repos:
+            path_str = self.repo_paths.get(repo_name)
+            if not path_str:
+                degraded[repo_name] = "no repo_path configured for this machine"
+                continue
+            path = Path(path_str).expanduser()
+            if not path.exists():
+                degraded[repo_name] = f"repo_path does not exist: {path}"
+                continue
+            servable.append(repo_name)
+        return servable, degraded
 
     def list_repos(self) -> dict[str, dict]:
         """Return local HEAD / branch / dirty flag for each configured repo.

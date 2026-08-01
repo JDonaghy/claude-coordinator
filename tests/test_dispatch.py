@@ -1402,6 +1402,80 @@ class TestProviderDispatch:
         assert payload.get("provider") == "spec-provider"
 
 
+class TestDispatchErrorSurfacing:
+    """#1527: a rejected dispatch must surface the agent's own reason —
+    ``AgentServer.assign`` raises a precise ``ValueError`` and
+    ``agent_app.py``'s ``/assign`` route returns it as ``{"error": ...}``
+    with a 400; plain ``resp.raise_for_status()`` used to discard it."""
+
+    @patch("coord.dispatch.httpx.post")
+    def test_400_with_json_error_body_is_surfaced(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal,
+    ) -> None:
+        import httpx
+
+        request = httpx.Request("POST", "http://laptop.tailnet:7433/assign")
+        mock_post.return_value = httpx.Response(
+            400,
+            json={"error": "repo path does not exist: /home/user/src/api"},
+            request=request,
+        )
+        with pytest.raises(httpx.HTTPStatusError) as exc_info:
+            dispatch(proposal, config)
+        message = str(exc_info.value)
+        assert "repo path does not exist: /home/user/src/api" in message
+        assert "laptop" in message
+
+    @patch("coord.dispatch.httpx.post")
+    def test_400_with_non_json_body_falls_back_to_raw_text(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal,
+    ) -> None:
+        import httpx
+
+        request = httpx.Request("POST", "http://laptop.tailnet:7433/assign")
+        mock_post.return_value = httpx.Response(
+            400, text="upstream gateway error", request=request,
+        )
+        with pytest.raises(httpx.HTTPStatusError) as exc_info:
+            dispatch(proposal, config)
+        assert "upstream gateway error" in str(exc_info.value)
+
+    @patch("coord.dispatch.httpx.post")
+    def test_400_with_empty_body_falls_back_to_status_line(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal,
+    ) -> None:
+        import httpx
+
+        request = httpx.Request("POST", "http://laptop.tailnet:7433/assign")
+        mock_post.return_value = httpx.Response(400, request=request)
+        with pytest.raises(httpx.HTTPStatusError) as exc_info:
+            dispatch(proposal, config)
+        message = str(exc_info.value)
+        assert "400 Bad Request" in message
+
+    @patch("coord.dispatch.httpx.post")
+    def test_classify_error_still_sees_status_code(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal,
+    ) -> None:
+        """The re-raised exception must keep `.response` intact so
+        `coord.network.classify_error`/`is_retryable` — which inspect
+        `exc.response.status_code` — keep working unchanged."""
+        import httpx
+
+        from coord.network import classify_error
+
+        request = httpx.Request("POST", "http://laptop.tailnet:7433/assign")
+        mock_post.return_value = httpx.Response(
+            400, json={"error": "unhandled repo"}, request=request,
+        )
+        with pytest.raises(httpx.HTTPStatusError) as exc_info:
+            dispatch(proposal, config)
+        exc = exc_info.value
+        assert exc.response.status_code == 400
+        state, reason = classify_error(exc)
+        assert "unhandled repo" in reason
+
+
 class TestProviderNamePersistence:
     """#324: record_dispatched() persists provider_name on the assignment row."""
 
