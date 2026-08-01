@@ -4,6 +4,7 @@ Extracted from coord/cli.py (#747)."""
 
 from __future__ import annotations
 
+import os
 import socket
 import subprocess
 import sys
@@ -56,6 +57,80 @@ def agent(
     )
     if ctx.invoked_subcommand is None:
         _start_agent_server(config_path, machine_name, bind_host, bind_port)
+
+
+def _startup_diagnostic_lines(
+    capabilities: list[str], *, path_env: str | None = None
+) -> list[str]:
+    """Lines to log once at agent startup so the #1671 failure class is
+    visible in `journalctl --user -u coord-agent` right after a restart —
+    no hand-run `coord doctor` (or SSH + `/proc/<pid>/environ`) required.
+
+    #1671: every machine's `rust` capability read unmet even though `cargo`
+    was installed, because the *capability probe* resolves through the
+    *agent process's* PATH — and a systemd user unit's PATH is minimal
+    (omits `~/.cargo/bin`) unless the unit says otherwise (see
+    `deploy/coord-agent.service`). The probe result alone doesn't say
+    *why* a tool is missing; logging the resolved PATH plus any declared
+    capability that its own probe contradicts turns "mysteriously unmet"
+    into "read the last agent restart's log line."
+
+    Pure function (no I/O of its own) so it's cheaply testable without
+    mocking `click.echo`/subprocess at the call site — callers pass in
+    already-probed data.
+    """
+    from coord.prereqs import probe_all, tool_versions_summary, unmet_capabilities
+
+    lines = [f"coord agent: PATH={path_env if path_env is not None else os.environ.get('PATH', '')}"]
+
+    probes = probe_all(capabilities)
+    unmet = unmet_capabilities(capabilities, probes)
+    if not unmet:
+        lines.append(
+            f"coord agent: capabilities {capabilities} all probe OK "
+            f"({tool_versions_summary(probes)})"
+        )
+    else:
+        for cap, reasons in unmet.items():
+            for reason in reasons:
+                lines.append(
+                    f"coord agent: WARNING capability '{cap}' declared in "
+                    f"coordinator.yml but its own probe disagrees: {reason} "
+                    f"— dispatch_smoke will refuse to route to this machine "
+                    f"for '{cap}'-gated work (#1570 D) until this is fixed"
+                )
+    return lines
+
+
+def _log_install_location() -> str:
+    """One line describing how *this* agent process's `claude-coordinator`
+    is installed — editable (a dev checkout, #1628's flagged risk) vs a
+    normal PyPI/site-packages install — logged once at startup so it's
+    visible without a separate `coord health` run.
+
+    Best-effort: any failure to determine this (pip missing, `pip show`
+    timing out, ...) degrades to a note saying so rather than blowing up
+    agent startup over a diagnostic.
+    """
+    from coord.health.checks.agent_install import pip_show
+
+    try:
+        fields = pip_show(Path(sys.executable))
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"coord agent: install location unknown ({type(exc).__name__}: {exc})"
+
+    if not fields:
+        return "coord agent: install location unknown (pip show returned nothing)"
+
+    version = fields.get("Version", "?")
+    editable_location = fields.get("Editable project location") or ""
+    if editable_location:
+        return (
+            f"coord agent: claude-coordinator {version} — EDITABLE at "
+            f"{editable_location} (not a PyPI install — see #1628)"
+        )
+    location = fields.get("Location", "")
+    return f"coord agent: claude-coordinator {version} — pypi install at {location}"
 
 
 def _start_agent_server(
@@ -132,6 +207,14 @@ def _start_agent_server(
         providers=providers_registry,
     )
     app = build_app(server)
+    # #1671: loud-by-default startup diagnostics — resolved PATH, install
+    # location, and any declared capability this machine's own probe
+    # contradicts — so the class of failure in #1671 shows up in
+    # `journalctl --user -u coord-agent` on the very next restart instead
+    # of needing an operator to notice a `coord doctor` red and go SSH in.
+    click.echo(_log_install_location())
+    for line in _startup_diagnostic_lines(machine.capabilities):
+        click.echo(line)
     click.echo(
         f"coord agent: machine={machine.name} repos={machine.repos} "
         f"listening on http://{bind_host}:{bind_port}"

@@ -65,7 +65,12 @@ Type=simple
 ExecStart=$VENV_DIR/bin/coord agent --machine $MACHINE_NAME --port $PORT
 Restart=on-failure
 RestartSec=5
-Environment=PATH=$VENV_DIR/bin:/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin
+# #1671: include ~/.cargo/bin so a rustup-installed toolchain resolves to
+# both this agent process (the "rust" capability probe, coord/prereqs.py)
+# and to workers it spawns (#402: worker PATH derives from the agent's,
+# venv stripped) — see deploy/coord-agent.service for the false-green trap
+# this guards against (finding cargo but not rustc).
+Environment=PATH=$VENV_DIR/bin:$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
 
 [Install]
 WantedBy=default.target
