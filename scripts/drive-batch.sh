@@ -1,0 +1,308 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+# drive-batch.sh — sequential unattended drive of INDEPENDENT issues.
+#
+#   ssh dellserver
+#   tmux new -s drive
+#   ./drive-batch.sh 1645 1650 1654
+#   <Ctrl-b d>   … go to bed
+#
+# Morning:  tmux attach -t drive     (or: tail -100 ~/drive-*.log)
+#
+# NOTE ON FAILURE POLICY: these issues are independent, so a failure does NOT
+# stop the batch — the remaining issues still run and the failure is recorded
+# in the summary. For a DEPENDENT chain (each issue needs the previous one
+# MERGED, because the next worker branches off main) set STOP_ON_FAIL=1.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# -e is deliberately NOT set: the loop must survive a failed issue.
+set -uo pipefail
+
+# ── Config ───────────────────────────────────────────────────────────────────
+# Resolved to an absolute path, never left to PATH: a non-interactive shell or
+# a systemd unit does not source your rc. Prefer the agent venv because that is
+# the "pinned, non-editable runner CLI" #1523 asks for — on an agent host an
+# editable install would let worker branch churn rewrite the runner's own code
+# mid-run.
+if [[ -z "${COORD:-}" ]]; then
+  for _c in "$HOME/.coord-venv/bin/coord" "$HOME/.coord-cli-venv/bin/coord"; do
+    [[ -x "$_c" ]] && COORD="$_c" && break
+  done
+  COORD="${COORD:-$(command -v coord || true)}"
+fi
+
+# Default repo for bare issue numbers. Individual issues may override it with
+# `repo#issue` (see below), so a batch can span repos.
+REPO="${REPO:-claude-coordinator}"
+
+# No default: dispatching a whole night to the wrong box is expensive, and the
+# right box differs per operator. Must be set explicitly.
+MACHINE="${MACHINE:-}"
+
+# Where each repo is checked out. Workers create worktrees from here, so it
+# must track the repo being driven — NOT a fixed path (that silently
+# fast-forwarded and reported the wrong repo when REPO was overridden).
+SRC_ROOT="${SRC_ROOT:-$HOME/src}"
+
+# Per-issue wall-clock cap (minutes). 3 issues x 120m = 6h worst case.
+#
+# 120, not 90, and never 45. MEASURED on the 2026-08-01 batch: a clean
+# single-round issue in this repo on sonnet is ~85m end-to-end
+# (work ~40m + test ~23m + review ~22m); a review fix round adds roughly
+# another cycle. That run used 45 and every one of the five issues was
+# abandoned seconds after its work stage landed.
+#
+# READ THIS BEFORE LOWERING IT. An expired deadline does NOT stop the work —
+# it only stops the observer. All five drives that night exited, and the
+# fleet carried all five through test and review anyway, approving each one
+# 21-133 minutes AFTER its drive was already gone. The loop then started the
+# next issue on top of the previous one's still-running test/review stages,
+# so the batch was sequential in this script and overlapped on the fleet
+# (the smoke stage even landed on elitebook, which was supposed to be
+# asleep). A short deadline does not save time; it silently converts a
+# sequential run into a concurrent one. See #1660.
+DEADLINE="${DEADLINE:-120}"
+
+STOP_ON_FAIL="${STOP_ON_FAIL:-0}"
+DRY_RUN="${DRY_RUN:-0}"
+
+# Issues come from argv, each `ISSUE` or `REPO#ISSUE`:
+#
+#   ./drive-batch.sh 1645 1650 1654
+#   ./drive-batch.sh 1645 vimcode#611 quadraui#514
+#
+# Deliberately NOT a hardcoded default. The previous list
+# (1527 1624 1658 1633 1353) was left in the file after that batch completed,
+# and re-running it would have re-dispatched five already-merged issues.
+# A stale list is worse than no list.
+#
+# Keep it to ~3: at the measured ~85m/issue plus fix rounds, three is a full
+# night. Order them to spread file surfaces — two issues touching the same
+# module (e.g. #1353 and #1624 both touch merge code) should not be adjacent,
+# so the second one's branch does not age against the first one's merge.
+usage() {
+  cat <<'USAGE'
+usage: MACHINE=<name> drive-batch.sh ISSUE|REPO#ISSUE ...
+       drive-batch.sh --help
+
+  Drives each issue to completion, one at a time, in the order given.
+  A bare ISSUE uses $REPO (default: claude-coordinator).
+
+  env: MACHINE      target machine (REQUIRED — no default)
+       DEADLINE     minutes per issue (default 120; see the note in-file
+                    before lowering it — a short deadline does not save
+                    time, it makes the run concurrent)
+       REPO         default repo for bare issue numbers
+       SRC_ROOT     checkout parent dir (default ~/src)
+       STOP_ON_FAIL=1  stop after the first failure. Use for a DEPENDENT
+                    chain, where each issue needs the previous one MERGED.
+       DRY_RUN=1    preflight only, dispatch nothing
+
+  example:  MACHINE=dellserver DEADLINE=120 ./drive-batch.sh 1645 1650 1654
+USAGE
+}
+
+# --help before every other check: it must work with no MACHINE, no coord
+# install, and no checkout. Goes to stdout (it was asked for); the error
+# paths below send the same text to stderr.
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help|help) usage; exit 0 ;;
+  esac
+done
+
+(( $# )) || { usage >&2; exit 64; }
+if [[ -z "$MACHINE" ]]; then
+  echo "FATAL: MACHINE is not set — refusing to guess which box to drive." >&2
+  usage >&2; exit 64
+fi
+if [[ -z "$COORD" || ! -x "$COORD" ]]; then
+  echo "FATAL: no usable coord binary (tried \$COORD, ~/.coord-venv, ~/.coord-cli-venv, PATH)" >&2
+  exit 2
+fi
+
+# Split each arg into a parallel (repo, issue) pair. Bash has no nested
+# arrays; two arrays indexed together is the idiomatic stand-in.
+declare -a ISSUE_REPOS=() ISSUE_NUMS=()
+for arg in "$@"; do
+  if [[ "$arg" == *"#"* ]]; then
+    r="${arg%%#*}"; n="${arg##*#}"
+  else
+    r="$REPO";     n="$arg"
+  fi
+  if [[ ! "$n" =~ ^[0-9]+$ ]]; then
+    echo "FATAL: '$arg' is not ISSUE or REPO#ISSUE" >&2; usage >&2; exit 64
+  fi
+  ISSUE_REPOS+=("$r"); ISSUE_NUMS+=("$n")
+done
+ISSUES=("$@")   # display form, for the banner and the summary
+
+LOG="${LOG:-$HOME/drive-batch-$(date +%Y%m%d-%H%M).log}"
+# Stable path for "what happened last night?" — the timestamped file is kept so
+# earlier runs aren't clobbered; this just always points at the newest.
+LOG_LATEST="$HOME/drive-batch-latest.log"
+LOCK="$HOME/.drive-batch.lock"
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+# Where a pipe IS used (the drive call below, so tmux shows live progress),
+# the exit status must come from PIPESTATUS[0] — `$?` after a pipe is tee's
+# status, not coord's, which silently defeats every failure check here (#1523
+# hit exactly this in the bash sequencer).
+say() { echo "[$(date -Is)] $*" | tee -a "$LOG" >&2; }
+log() { echo "[$(date -Is)] $*" >> "$LOG"; }
+
+hms() { printf '%dh%02dm%02ds' $(($1/3600)) $(($1%3600/60)) $(($1%60)); }
+
+# ── Single-instance guard ────────────────────────────────────────────────────
+# Stops a second invocation stacking on the first (the ad-hoc sequencer once
+# ran 4 concurrent drives against a cap of 2 and burned the 5h window from
+# 64% -> 87% in 50 minutes).
+exec 9>"$LOCK"
+if ! flock -n 9; then
+  echo "another drive-batch is already running (lock: $LOCK) — refusing to stack" >&2
+  exit 1
+fi
+
+ln -sfn "$LOG" "$LOG_LATEST"
+
+declare -a DONE=() FAILED=() SKIPPED=()
+
+say "=== drive-batch starting ==="
+say "log:      $LOG  (also: $LOG_LATEST)"
+say "issues:   ${ISSUES[*]}"
+say "machine:  $MACHINE   deadline: ${DEADLINE}m/issue   stop_on_fail: $STOP_ON_FAIL"
+
+# ── Preflight ────────────────────────────────────────────────────────────────
+say "coord:    $COORD ($("$COORD" --version 2>&1 | tail -1))"
+
+# The branch to bring this checkout up to date with — NOT assumed to be `main`.
+#
+# The checkout's own upstream is the authority, and `origin/HEAD` is NOT a
+# usable substitute: on this fleet vimcode's `origin/HEAD` says `main` while
+# the checkout tracks `origin/develop`, so trusting origin/HEAD merges the
+# wrong branch into a develop checkout (caught exactly this way in testing).
+# quadraui is develop-tracking too. Only fall back when there is no upstream.
+default_branch() {
+  local co="$1" up ref
+  up=$(git -C "$co" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null) \
+    && [[ -n "$up" ]] && { echo "${up#origin/}"; return; }
+  ref=$(git -C "$co" symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null) \
+    && { echo "${ref#refs/remotes/origin/}"; return; }
+  for b in main master develop; do
+    git -C "$co" rev-parse --verify --quiet "origin/$b" >/dev/null && { echo "$b"; return; }
+  done
+  echo main
+}
+
+# Workers create worktrees from the repo's checkout. If it is behind, every
+# branch forks from a stale default branch and every merge then needs a rebase.
+# Done once per DISTINCT repo in the batch.
+declare -A SEEN_REPO=()
+for r in "${ISSUE_REPOS[@]}"; do
+  [[ -n "${SEEN_REPO[$r]:-}" ]] && continue
+  SEEN_REPO[$r]=1
+  co="$SRC_ROOT/$r"
+  if [[ ! -d "$co/.git" ]]; then
+    say "WARNING: $co is not a git checkout — worktree creation for $r will fail"
+    continue
+  fi
+  db=$(default_branch "$co")
+  git -C "$co" fetch --quiet origin 2>>"$LOG"
+  behind=$(git -C "$co" rev-list --count "HEAD..origin/$db" 2>/dev/null || echo "?")
+  if [[ "$behind" != "0" ]]; then
+    say "$r: $behind commit(s) behind origin/$db — fast-forwarding"
+    if ! git -C "$co" merge --ff-only "origin/$db" >>"$LOG" 2>&1; then
+      say "FATAL: could not fast-forward $co (local changes?). Resolve by hand."
+      exit 2
+    fi
+  fi
+  say "$r: $(git -C "$co" log --oneline -1)  [$db]"
+done
+
+# A live drive from an earlier run would contend for the same machine.
+# Count only lines that look like a session row. `grep -c .` counts the
+# "No live drive sessions." line too — that false positive fired on the
+# 2026-08-01 run and is exactly the CLI-prose parsing #1523 forbids on a
+# control path. It is a warning, not a gate, which is the only reason this
+# is tolerable here at all.
+live=$("$COORD" drive-sessions 2>/dev/null | grep -cE '^[[:space:]]*[a-z0-9-]+[[:space:]]+#?[0-9]+' || true)
+(( live > 0 )) && say "WARNING: $live live drive session(s) already exist — check before continuing"
+
+# Validate every issue before dispatching any of them: config, machine, repo
+# path and issue state, with nothing actually dispatched.
+say "--- preflight dry-run ---"
+declare -a RUN_IDX=()
+for i in "${!ISSUE_NUMS[@]}"; do
+  r="${ISSUE_REPOS[$i]}"; n="${ISSUE_NUMS[$i]}"
+  if "$COORD" drive "$r" "$n" --machine "$MACHINE" --dry-run >>"$LOG" 2>&1; then
+    say "  $r#$n  ok"
+    RUN_IDX+=("$i")
+  else
+    say "  $r#$n  PREFLIGHT FAILED — skipping (see $LOG)"
+    SKIPPED+=("$r#$n")
+  fi
+done
+if (( ${#RUN_IDX[@]} == 0 )); then
+  say "FATAL: every issue failed preflight — nothing to drive"; exit 2
+fi
+
+if [[ "$DRY_RUN" == "1" ]]; then
+  say "DRY_RUN=1 — stopping before the real loop"; exit 0
+fi
+
+# ── Main loop ────────────────────────────────────────────────────────────────
+batch_start=$SECONDS
+
+for pos in "${!RUN_IDX[@]}"; do
+  i="${RUN_IDX[$pos]}"
+  r="${ISSUE_REPOS[$i]}"; n="${ISSUE_NUMS[$i]}"
+  say "──────── $r#$n starting ────────"
+  issue_start=$SECONDS
+
+  # Blocking, foreground, one at a time. Do NOT add --tmux: that detaches each
+  # drive and returns immediately, so they would all run concurrently.
+  # Merges happen inside drive via `coord merge --only <aid>` — scoped to this
+  # one assignment and still gated on CI + approved review + test verdict.
+  # Streamed to BOTH the terminal (so an attached tmux shows live progress)
+  # and the log. `| tee` would normally make $? the exit status of tee rather
+  # than coord — the trap that silently defeated the #1523 sequencer's failure
+  # checks — so read coord's own status out of PIPESTATUS[0] explicitly.
+  # Do NOT replace this with a bare `rc=$?`.
+  "$COORD" drive "$r" "$n" \
+      --machine "$MACHINE" \
+      --notify \
+      --deadline "$DEADLINE" \
+      2>&1 | tee -a "$LOG"
+  rc=${PIPESTATUS[0]}
+
+  elapsed=$(( SECONDS - issue_start ))
+  if [[ $rc -eq 0 ]]; then
+    say "──────── $r#$n DONE in $(hms $elapsed) ────────"
+    DONE+=("$r#$n")
+  else
+    say "──────── $r#$n FAILED (exit $rc) after $(hms $elapsed) ────────"
+    FAILED+=("$r#$n")
+    if [[ "$STOP_ON_FAIL" == "1" ]]; then
+      say "STOP_ON_FAIL=1 — abandoning the rest"
+      for later in "${RUN_IDX[@]:$((pos + 1))}"; do
+        SKIPPED+=("${ISSUE_REPOS[$later]}#${ISSUE_NUMS[$later]}")
+      done
+      break
+    fi
+  fi
+done
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+say "════════ batch finished in $(hms $((SECONDS - batch_start))) ════════"
+say "  done:    ${DONE[*]:-none}"
+say "  failed:  ${FAILED[*]:-none}"
+say "  skipped: ${SKIPPED[*]:-none}"
+say ""
+say "morning checks:"
+say "  $COORD status"
+say "  $COORD merge --dry-run     # read the SUMMARY line: a parked entry shows"
+say "                             # only in the count (conflict=N), not as a row"
+say "  tail -200 $LOG_LATEST"
+say "  grep -E '════|────────|FAILED|DONE' $LOG_LATEST   # just the milestones"
+
+(( ${#FAILED[@]} == 0 ))
