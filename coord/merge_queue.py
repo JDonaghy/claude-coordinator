@@ -1091,6 +1091,24 @@ class GhOps(Protocol):
         """
         ...
 
+    def find_pr_for_branch(self, repo: str, branch: str) -> dict | None:
+        """Return the open PR whose head ref is *branch*, or ``None``.
+
+        Used by :func:`process` (#1624) to resolve an entry's real PR in the
+        ``dry_run`` path — mirroring what ``create_pr`` already does
+        internally on the real path — so a branch with an already-open PR is
+        reported as ``PR #N (existed)`` instead of ``would open PR``, and so
+        the CI gate below has a real PR number to evaluate against instead of
+        silently skipping.
+
+        Optional on stub ``GhOps`` implementations, same contract as
+        :meth:`branch_has_merge_commit`: callers detect support via
+        ``getattr(gh_ops, "find_pr_for_branch", None)`` and treat a missing
+        method (or a lookup failure) the same as "no PR found" — fail closed,
+        never assume a PR exists that couldn't be confirmed.
+        """
+        ...
+
 
 # ── Persistence ──────────────────────────────────────────────────────────
 
@@ -2265,8 +2283,13 @@ def process(
     the verdict cannot be confirmed → block (``smoke_required`` event).
     ``skip_smoke=True`` bypasses the gate.
 
-    Dry-run applies both the review and smoke gates so output reflects what
-    a real run would do.  CI cannot be checked without a real PR number.
+    Dry-run applies the review and smoke gates, and — #1624 — resolves each
+    entry's real PR via ``find_pr_for_branch`` (the same lookup ``create_pr``
+    does internally) and applies the CI gate against it too, so output
+    reflects what a real run would do. CI genuinely cannot be checked for an
+    entry with no PR yet (nothing exists to query); that case is reported as
+    an explicit ``gate: unknown (no PR yet)`` note rather than silently
+    treated as passing.
 
     #1318: before each merge, both the PR body (#1196) and every commit
     message on the branch are scanned for a GitHub closing keyword
@@ -2302,8 +2325,44 @@ def process(
         _group_target_branch_head_sha: str | None | object = _unset
 
         if dry_run:
+            # #1624: resolve each entry's real PR the same way the non-dry
+            # path does (`create_pr` internally calls `find_pr_for_branch`
+            # before ever calling `gh pr create`) instead of unconditionally
+            # announcing "would open PR". A branch can already have an open
+            # PR — from an earlier real attempt that opened one and then
+            # stalled on a gate, or created out-of-band — and the CI gate
+            # below needs a real PR number to evaluate against; without this,
+            # the gate was silently skipped and the entry reported mergeable
+            # even with failing checks (#1624). `find_pr_for_branch` is
+            # optional on GhOps (older test stubs predate #1624): a missing
+            # probe or a lookup failure leaves the PR unresolved, same
+            # fail-closed contract as `branch_has_merge_commit` (#1467).
+            _find_pr = getattr(gh_ops, "find_pr_for_branch", None)
             for entry in group:
-                events.append(MergeEvent(entry, "opened", f"(dry run) would open PR for {entry.branch}"))
+                if entry.pr_number is not None:
+                    events.append(MergeEvent(
+                        entry, "opened",
+                        f"PR #{entry.pr_number} (existed) for {entry.branch}",
+                    ))
+                    continue
+                existing = None
+                if _find_pr is not None:
+                    try:
+                        existing = _find_pr(entry.repo_github, entry.branch)
+                    except Exception:  # noqa: BLE001
+                        existing = None
+                if existing is not None:
+                    entry.pr_number = existing.get("number")
+                    entry.pr_url = existing.get("url")
+                    events.append(MergeEvent(
+                        entry, "opened",
+                        f"PR #{entry.pr_number} (existed) for {entry.branch}",
+                    ))
+                else:
+                    events.append(MergeEvent(
+                        entry, "opened",
+                        f"(dry run) would open PR for {entry.branch}",
+                    ))
             ordered = group if presorted else sequence(group)
             for entry in ordered:
                 # #821: populate branch_head_sha for the commit-bound approval
@@ -2389,14 +2448,49 @@ def process(
                         f"(dry run) would be blocked: {_why} for {entry.branch}",
                     ))
                     continue
+                # CI gate (#240) preview, added by #1624: same check the real
+                # path runs, evaluated here so a dry run can't claim
+                # "would merge" for a PR whose checks are already failing.
+                # Only evaluable when a real PR number is known — either
+                # persisted from an earlier attempt or just resolved above
+                # via `find_pr_for_branch` — since CI is checked per-PR, not
+                # per-branch. A brand-new entry with no PR yet genuinely
+                # cannot be checked; say so explicitly in the "merged"
+                # preview below rather than silently treating "not
+                # evaluated" as "would merge" (#1624). `force_merge` skips
+                # the gate here exactly as it does in the real path.
+                _ci_note = ""
+                if not force_merge and ci.is_available:
+                    if entry.pr_number is not None:
+                        checks = ci.list_checks_for_pr(entry.repo_github, entry.pr_number)
+                        failed = failed_checks(checks)
+                        if failed:
+                            summary = ", ".join(
+                                f"{c.name} ({c.conclusion})" for c in failed
+                            )
+                            events.append(MergeEvent(
+                                entry, "checks_failed",
+                                f"(dry run) would be blocked: checks failed: {summary}",
+                            ))
+                            continue
+                        pending = in_flight_checks(checks)
+                        if pending:
+                            summary = ", ".join(c.name for c in pending)
+                            events.append(MergeEvent(
+                                entry, "checks_pending",
+                                f"(dry run) would be blocked: checks still running: {summary}",
+                            ))
+                            continue
+                    else:
+                        _ci_note = " [gate: unknown (no PR yet) — CI cannot be evaluated]"
                 # #1467-review: preview the rebase→squash fallback in
                 # dry-run too. Only reachable when this entry already has a
-                # pr_number from an earlier (non-dry-run) attempt — dry-run
-                # never opens a PR itself, and the probe needs one to query
-                # — so a first-time dry-run preview of a brand-new entry
-                # still can't foresee the fallback. Same fail-closed
-                # contract as the real merge path: an inconclusive probe
-                # leaves the previewed method unchanged.
+                # pr_number — from an earlier (non-dry-run) attempt, or just
+                # resolved above via `find_pr_for_branch` (#1624) — since the
+                # probe needs one to query. A first-time dry-run preview of a
+                # brand-new entry still can't foresee the fallback. Same
+                # fail-closed contract as the real merge path: an
+                # inconclusive probe leaves the previewed method unchanged.
                 _preview_method = method
                 if method == "rebase" and entry.pr_number is not None:
                     _probe = getattr(gh_ops, "branch_has_merge_commit", None)
@@ -2420,7 +2514,8 @@ def process(
                     entry, "merged",
                     f"(dry run) would merge {entry.branch} → {entry.target_branch} "
                     f"via --{_preview_method}"
-                    f"{_bypass_note(entry, config)}",
+                    f"{_bypass_note(entry, config)}"
+                    f"{_ci_note}",
                 ))
             continue
 
