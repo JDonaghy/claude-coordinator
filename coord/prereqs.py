@@ -26,11 +26,14 @@ A prereq's `min_version` is `None` until a floor has actually been confirmed
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
-from typing import Iterable
+from pathlib import Path
+from typing import Callable, Iterable
 
 from coord.github_ops import GH_PR_CHECKS_JSON_MIN_VERSION
 
@@ -54,6 +57,178 @@ class Prereq:
     min_version: str | None
     capability: str | None
     what_breaks: str
+    # Escape hatch for a prereq whose real signal is not "is there a binary
+    # named X on `PATH`" (#1678). When set, :func:`probe` delegates entirely
+    # to this callable and ignores `binary`/`version_args`/`version_re`.
+    # Called as `custom_probe(prereq, timeout)`; it must return a
+    # :class:`ToolProbe` and, like :func:`probe`, never raise (:func:`probe`
+    # wraps it defensively anyway).
+    custom_probe: Callable[["Prereq", float], "ToolProbe"] | None = None
+
+
+@dataclass(frozen=True)
+class ToolProbe:
+    """Result of probing one :class:`Prereq`. Never raises to build one."""
+
+    tool: str
+    capability: str | None
+    found: bool
+    version: str | None
+    min_version: str | None
+    meets_floor: bool | None  # None: no floor to check, or version unknown
+    what_breaks: str
+
+    @property
+    def ok(self) -> bool:
+        """False when the tool is missing or fails its documented floor.
+
+        A tool found but with an unparsable version (`meets_floor is None`
+        with `min_version` set) is treated as ok=True — degrade to
+        "unknown, assume fine" rather than false-failing on an output-format
+        change, matching `_gh_version()`'s existing best-effort contract.
+        """
+        if not self.found:
+            return False
+        if self.min_version is not None and self.meets_floor is False:
+            return False
+        return True
+
+    def to_dict(self) -> dict:
+        return {
+            "found": self.found,
+            "version": self.version,
+            "min_version": self.min_version,
+            "meets_floor": self.meets_floor,
+            "capability": self.capability,
+            "ok": self.ok,
+        }
+
+
+# --- `browser` capability: probe what the suite LAUNCHES (#1678) -----------
+#
+# The original `browser` prereq probed a literal `chromium` binary. That was
+# wrong twice over on the one machine that advertises the capability:
+#
+#   1. the box has `google-chrome`/`firefox` but no binary spelled
+#      `chromium`, so the capability read unmet and #1570 D refused to route
+#      any `coord/dashboard/webapp/**` Test stage anywhere — forever, with
+#      no smoke row and no board-visible reason (the #544 shape); and
+#   2. more importantly, the suite never launches a system browser at all.
+#      `coord/dashboard/webapp/playwright.config.ts` declares
+#      `use: { ...devices['Desktop Chrome'] }` with no `channel` and no
+#      `executablePath`, so `@playwright/test` runs its OWN bundled Chromium
+#      out of the Playwright browser cache that `npx playwright install`
+#      populates. Renaming the probed binary to `google-chrome` would have
+#      flipped the capability green while still checking nothing the suite
+#      touches — the same false green `deploy/coord-agent.service` warns
+#      about for `cargo`-without-`rustc`.
+#
+# So `browser` is now backed by what `npm run test:e2e` actually needs:
+# `node` + `npm` on the agent's PATH (a worker inherits it, venv-stripped —
+# #402), and a populated Playwright browser cache. The `@playwright/test`
+# package itself is deliberately NOT probed: it is a devDependency installed
+# per-checkout by `npm ci`, not machine state, so its absence is a worker's
+# problem to fix rather than a capability this machine lacks.
+
+PLAYWRIGHT_BROWSERS_PATH_ENV = "PLAYWRIGHT_BROWSERS_PATH"
+
+# `npx playwright install` writes this marker into a browser directory once
+# the download unpacks cleanly, so it is the cheapest "this build is usable,
+# not a half-extracted stub" signal.
+_PLAYWRIGHT_INSTALL_MARKER = "INSTALLATION_COMPLETE"
+
+# Chromium build directories are named `chromium-<build>` (headed) and
+# `chromium_headless_shell-<build>`. Either backs `devices['Desktop Chrome']`.
+_CHROMIUM_DIR_RE = re.compile(r"^chromium(?:_headless_shell)?-(\d+)$")
+
+# Where the Chromium executable sits inside such a directory, across the
+# layouts Playwright has shipped. Checked only as a FALLBACK for a cache
+# directory with no marker file, so a future layout rename degrades to the
+# marker rather than false-reporting the capability missing.
+_CHROMIUM_EXECUTABLES: tuple[str, ...] = (
+    "chrome-linux64/chrome",
+    "chrome-linux/chrome",
+    "chrome-headless-shell-linux64/chrome-headless-shell",
+    "chrome-mac/Chromium.app/Contents/MacOS/Chromium",
+    "chrome-mac-arm64/Chromium.app/Contents/MacOS/Chromium",
+    "chrome-headless-shell-mac/chrome-headless-shell",
+    "chrome-win/chrome.exe",
+    "chrome-headless-shell-win/chrome-headless-shell.exe",
+)
+
+
+def playwright_browsers_root() -> Path | None:
+    """Directory `npx playwright install` populates on this machine.
+
+    Honours `PLAYWRIGHT_BROWSERS_PATH`, including its documented `"0"` mode
+    ("install into the package's own directory"), which makes the cache
+    per-checkout rather than machine-wide — this machine-level probe cannot
+    see that layout, so it returns None and the capability reads unmet
+    rather than green-by-guess.
+    """
+    override = os.environ.get(PLAYWRIGHT_BROWSERS_PATH_ENV)
+    if override:
+        if override.strip() == "0":
+            return None
+        return Path(override).expanduser()
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Caches" / "ms-playwright"
+    if sys.platform.startswith("win"):
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        base = Path(local_appdata) if local_appdata else Path.home() / "AppData" / "Local"
+        return base / "ms-playwright"
+    xdg_cache = os.environ.get("XDG_CACHE_HOME")
+    base = Path(xdg_cache).expanduser() if xdg_cache else Path.home() / ".cache"
+    return base / "ms-playwright"
+
+
+def _chromium_build_is_usable(path: Path) -> bool:
+    try:
+        if (path / _PLAYWRIGHT_INSTALL_MARKER).exists():
+            return True
+        return any((path / rel).exists() for rel in _CHROMIUM_EXECUTABLES)
+    except OSError:
+        return False
+
+
+def installed_chromium_builds(root: Path | None = None) -> list[int]:
+    """Playwright Chromium build numbers usable on this machine, ascending.
+
+    Empty when the cache is absent, empty, or holds only half-extracted
+    stubs. `root` defaults to :func:`playwright_browsers_root`.
+    """
+    if root is None:
+        root = playwright_browsers_root()
+    if root is None:
+        return []
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return []
+    builds: set[int] = set()
+    for entry in entries:
+        match = _CHROMIUM_DIR_RE.match(entry.name)
+        if match is None:
+            continue
+        try:
+            if not entry.is_dir():
+                continue
+        except OSError:
+            continue
+        if _chromium_build_is_usable(entry):
+            builds.add(int(match.group(1)))
+    return sorted(builds)
+
+
+def _probe_playwright_browsers(prereq: Prereq, _timeout: float) -> ToolProbe:
+    """`custom_probe` for the Playwright browser cache — no binary to run."""
+    builds = installed_chromium_builds()
+    return ToolProbe(
+        tool=prereq.tool, capability=prereq.capability, found=bool(builds),
+        version=str(builds[-1]) if builds else None,
+        min_version=prereq.min_version, meets_floor=None,
+        what_breaks=prereq.what_breaks,
+    )
 
 
 # Required on every machine, no matter its declared capabilities — coord
@@ -101,56 +276,45 @@ CAPABILITY_PREREQS: tuple[Prereq, ...] = (
         version_re=r"(\S+)", min_version=None, capability="gtk",
         what_breaks="the tui/ `--features gtk` build cannot link against GTK4",
     ),
-    # `browser` is a worked example in coordinator.example.yml for
-    # Playwright-style acceptance suites in consuming projects — this repo
-    # doesn't use it itself. Presence-only: which browser binary a suite
-    # expects is project-specific, so this checks the most common default.
+    # `browser` gates this repo's own Playwright acceptance suite
+    # (`coord/dashboard/webapp`, npm script `test:e2e` -> `playwright test`)
+    # and the same shape in consuming projects. See the block above
+    # `PLAYWRIGHT_BROWSERS_PATH_ENV` for why these three and not `chromium`.
+    #
+    # `node` and `npm` are probed SEPARATELY on purpose: nvm ships them
+    # together, but a hand-rolled PATH fix that resolves only one of them
+    # reports the capability met while `npm run test:e2e` still dies — the
+    # cargo-without-rustc false green called out in deploy/coord-agent.service.
     Prereq(
-        tool="browser", binary="chromium", version_args=("--version",),
-        version_re=r"(\S+)", min_version=None, capability="browser",
-        what_breaks="browser-driven acceptance suites (e.g. Playwright) cannot run",
+        tool="node", binary="node", version_args=("--version",),
+        version_re=r"v?(\d\S*)", min_version=None, capability="browser",
+        what_breaks=(
+            "the Playwright acceptance suite cannot run — `playwright test` "
+            "is a Node program, and a worker inherits this agent's PATH "
+            "with the venv stripped (#402), so nvm's version-stamped bin "
+            "directory must be reachable via a stable shim (#1678)"
+        ),
+    ),
+    Prereq(
+        tool="npm", binary="npm", version_args=("--version",),
+        version_re=r"v?(\d\S*)", min_version=None, capability="browser",
+        what_breaks=(
+            "`npm ci` / `npm run test:e2e` cannot run, so the suite's own "
+            "@playwright/test devDependency can never be installed"
+        ),
+    ),
+    Prereq(
+        tool="playwright-browsers", binary="", version_args=(), version_re="",
+        min_version=None, capability="browser",
+        what_breaks=(
+            "@playwright/test has no bundled Chromium to launch — run "
+            "`npx playwright install chromium` on this machine"
+        ),
+        custom_probe=_probe_playwright_browsers,
     ),
 )
 
 ALL_PREREQS: tuple[Prereq, ...] = BASELINE_PREREQS + CAPABILITY_PREREQS
-
-
-@dataclass(frozen=True)
-class ToolProbe:
-    """Result of probing one :class:`Prereq`. Never raises to build one."""
-
-    tool: str
-    capability: str | None
-    found: bool
-    version: str | None
-    min_version: str | None
-    meets_floor: bool | None  # None: no floor to check, or version unknown
-    what_breaks: str
-
-    @property
-    def ok(self) -> bool:
-        """False when the tool is missing or fails its documented floor.
-
-        A tool found but with an unparsable version (`meets_floor is None`
-        with `min_version` set) is treated as ok=True — degrade to
-        "unknown, assume fine" rather than false-failing on an output-format
-        change, matching `_gh_version()`'s existing best-effort contract.
-        """
-        if not self.found:
-            return False
-        if self.min_version is not None and self.meets_floor is False:
-            return False
-        return True
-
-    def to_dict(self) -> dict:
-        return {
-            "found": self.found,
-            "version": self.version,
-            "min_version": self.min_version,
-            "meets_floor": self.meets_floor,
-            "capability": self.capability,
-            "ok": self.ok,
-        }
 
 
 def _parse_version(text: str, pattern: str) -> str | None:
@@ -195,6 +359,17 @@ def probe(prereq: Prereq, *, timeout: float = DEFAULT_PROBE_TIMEOUT) -> ToolProb
     degrade to a `ToolProbe` describing that, rather than blowing up a
     `/health` response or a `coord doctor` sweep over one flaky tool.
     """
+    if prereq.custom_probe is not None:
+        try:
+            return prereq.custom_probe(prereq, timeout)
+        except Exception:
+            # Same contract as the binary path: a broken probe degrades to
+            # "not found" rather than taking down /health.
+            return ToolProbe(
+                tool=prereq.tool, capability=prereq.capability, found=False,
+                version=None, min_version=prereq.min_version, meets_floor=None,
+                what_breaks=prereq.what_breaks,
+            )
     if shutil.which(prereq.binary) is None:
         return ToolProbe(
             tool=prereq.tool, capability=prereq.capability, found=False,

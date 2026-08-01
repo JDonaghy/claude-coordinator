@@ -161,7 +161,8 @@ class TestProbeAll:
             probes = prereqs.probe_all(["rust"])
         assert "cargo" in probes
         assert "gtk4" not in probes
-        assert "browser" not in probes
+        assert "node" not in probes
+        assert "playwright-browsers" not in probes
 
     def test_unrecognised_capability_probes_nothing_extra(self) -> None:
         with patch("coord.prereqs.shutil.which", return_value=None):
@@ -223,6 +224,205 @@ class TestUnmetCapabilities:
 
     def test_capability_with_no_registered_prereq_is_skipped(self) -> None:
         assert prereqs.unmet_capabilities(["some-custom-capability"], {}) == {}
+
+
+class TestCustomProbe:
+    """#1678's escape hatch for a prereq with no binary to run."""
+
+    def test_custom_probe_replaces_the_binary_path_entirely(self) -> None:
+        sentinel = prereqs.ToolProbe(
+            tool="x", capability="c", found=True, version="42",
+            min_version=None, meets_floor=None, what_breaks="",
+        )
+        prereq = prereqs.Prereq(
+            tool="x", binary="", version_args=(), version_re="",
+            min_version=None, capability="c", what_breaks="",
+            custom_probe=lambda _p, _t: sentinel,
+        )
+        # No `which` mock needed: a custom probe must never consult PATH.
+        with patch("coord.prereqs.shutil.which", side_effect=AssertionError):
+            assert prereqs.probe(prereq) is sentinel
+
+    def test_raising_custom_probe_degrades_to_not_found(self) -> None:
+        """Same "never raises" contract as the binary path — a broken probe
+        must not take down /health."""
+        def boom(_prereq, _timeout):
+            raise RuntimeError("cache scan blew up")
+
+        prereq = prereqs.Prereq(
+            tool="x", binary="", version_args=(), version_re="",
+            min_version=None, capability="c", what_breaks="nothing works",
+            custom_probe=boom,
+        )
+        result = prereqs.probe(prereq)
+        assert result.found is False
+        assert result.ok is False
+        assert result.what_breaks == "nothing works"
+
+
+def _make_chromium_cache(root, name: str, *, complete: bool = True, exe: bool = False):
+    build = root / name
+    build.mkdir(parents=True)
+    if complete:
+        (build / "INSTALLATION_COMPLETE").write_text("")
+    if exe:
+        exe_path = build / "chrome-linux64" / "chrome"
+        exe_path.parent.mkdir(parents=True)
+        exe_path.write_text("")
+    return build
+
+
+class TestPlaywrightBrowserCache:
+    """#1678: `browser` must assert what the suite LAUNCHES.
+
+    `coord/dashboard/webapp/playwright.config.ts` uses
+    `devices['Desktop Chrome']` with no `channel`/`executablePath`, so
+    @playwright/test runs its own bundled Chromium out of this cache — not
+    any system browser binary.
+    """
+
+    def test_no_cache_dir_reports_no_builds(self, tmp_path) -> None:
+        assert prereqs.installed_chromium_builds(tmp_path / "nope") == []
+
+    def test_finds_headed_and_headless_builds(self, tmp_path) -> None:
+        _make_chromium_cache(tmp_path, "chromium-1228")
+        _make_chromium_cache(tmp_path, "chromium_headless_shell-1228")
+        _make_chromium_cache(tmp_path, "ffmpeg-1011")
+        assert prereqs.installed_chromium_builds(tmp_path) == [1228]
+
+    def test_reports_the_newest_build_last(self, tmp_path) -> None:
+        _make_chromium_cache(tmp_path, "chromium-1180")
+        _make_chromium_cache(tmp_path, "chromium-1228")
+        assert prereqs.installed_chromium_builds(tmp_path) == [1180, 1228]
+
+    def test_half_extracted_stub_does_not_count(self, tmp_path) -> None:
+        """A directory with neither Playwright's INSTALLATION_COMPLETE marker
+        nor an executable is an interrupted download, not a usable browser."""
+        _make_chromium_cache(tmp_path, "chromium-1228", complete=False)
+        assert prereqs.installed_chromium_builds(tmp_path) == []
+
+    def test_executable_alone_counts_when_marker_is_absent(self, tmp_path) -> None:
+        """Fallback so a future Playwright that stops writing the marker
+        degrades to "found" rather than false-reporting the capability gone."""
+        _make_chromium_cache(tmp_path, "chromium-1228", complete=False, exe=True)
+        assert prereqs.installed_chromium_builds(tmp_path) == [1228]
+
+    def test_unrelated_directories_are_ignored(self, tmp_path) -> None:
+        _make_chromium_cache(tmp_path, "firefox-1450")
+        _make_chromium_cache(tmp_path, "webkit-2140")
+        assert prereqs.installed_chromium_builds(tmp_path) == []
+
+    def test_probe_reports_build_number_as_the_version(self, tmp_path) -> None:
+        _make_chromium_cache(tmp_path, "chromium-1228")
+        prereq = next(
+            p for p in prereqs.CAPABILITY_PREREQS if p.tool == "playwright-browsers"
+        )
+        with patch("coord.prereqs.playwright_browsers_root", return_value=tmp_path):
+            result = prereqs.probe(prereq)
+        assert result.found is True
+        assert result.version == "1228"
+        assert result.ok is True
+
+    def test_probe_reports_unmet_on_an_empty_cache(self, tmp_path) -> None:
+        prereq = next(
+            p for p in prereqs.CAPABILITY_PREREQS if p.tool == "playwright-browsers"
+        )
+        with patch("coord.prereqs.playwright_browsers_root", return_value=tmp_path):
+            result = prereqs.probe(prereq)
+        assert result.found is False
+        assert result.ok is False
+
+
+class TestPlaywrightBrowsersRoot:
+    def test_env_override_wins(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setenv(prereqs.PLAYWRIGHT_BROWSERS_PATH_ENV, str(tmp_path))
+        assert prereqs.playwright_browsers_root() == tmp_path
+
+    def test_zero_means_per_package_and_is_unprobeable(self, monkeypatch) -> None:
+        """Playwright's documented `PLAYWRIGHT_BROWSERS_PATH=0` puts browsers
+        inside node_modules — per-checkout, not machine state. Report unmet
+        rather than guessing green."""
+        monkeypatch.setenv(prereqs.PLAYWRIGHT_BROWSERS_PATH_ENV, "0")
+        assert prereqs.playwright_browsers_root() is None
+        assert prereqs.installed_chromium_builds() == []
+
+    def test_linux_default_follows_xdg_cache_home(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.delenv(prereqs.PLAYWRIGHT_BROWSERS_PATH_ENV, raising=False)
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        monkeypatch.setattr(prereqs.sys, "platform", "linux")
+        assert prereqs.playwright_browsers_root() == tmp_path / "ms-playwright"
+
+
+class TestBrowserCapabilityManifest:
+    """The #1678 regression guards on the manifest itself."""
+
+    def _browser_prereqs(self):
+        return [p for p in prereqs.CAPABILITY_PREREQS if p.capability == "browser"]
+
+    def test_browser_is_backed_by_node_npm_and_the_browser_cache(self) -> None:
+        assert {p.tool for p in self._browser_prereqs()} == {
+            "node", "npm", "playwright-browsers",
+        }
+
+    def test_no_system_browser_binary_is_probed(self) -> None:
+        """The original bug, and the tempting wrong fix for it.
+
+        Probing `chromium` read unmet on a box with google-chrome installed;
+        renaming it to `google-chrome` would have read MET while still
+        checking a binary @playwright/test never launches — a false green of
+        the family deploy/coord-agent.service warns about.
+        """
+        binaries = {p.binary for p in self._browser_prereqs()}
+        assert binaries.isdisjoint({
+            "chromium", "chromium-browser", "google-chrome",
+            "google-chrome-stable", "firefox", "chrome",
+        })
+
+    def test_probe_all_covers_all_three_when_browser_is_declared(self) -> None:
+        with patch("coord.prereqs.shutil.which", return_value=None), \
+             patch("coord.prereqs.playwright_browsers_root", return_value=None):
+            probes = prereqs.probe_all(["browser"])
+        assert {"node", "npm", "playwright-browsers"} <= set(probes)
+        assert "cargo" not in probes
+
+    def test_missing_node_makes_the_capability_unmet(self) -> None:
+        probes = {
+            "node": prereqs.ToolProbe(
+                tool="node", capability="browser", found=False, version=None,
+                min_version=None, meets_floor=None, what_breaks="",
+            ),
+            "npm": prereqs.ToolProbe(
+                tool="npm", capability="browser", found=True, version="11.6.0",
+                min_version=None, meets_floor=None, what_breaks="",
+            ),
+            "playwright-browsers": prereqs.ToolProbe(
+                tool="playwright-browsers", capability="browser", found=True,
+                version="1228", min_version=None, meets_floor=None, what_breaks="",
+            ),
+        }
+        unmet = prereqs.unmet_capabilities(["browser"], probes)
+        assert "browser" in unmet
+        assert len(unmet["browser"]) == 1
+        assert "node not found" in unmet["browser"][0]
+
+    def test_populated_cache_plus_node_and_npm_meets_the_capability(self) -> None:
+        """The elitebook case: everything the suite needs is present, so the
+        webapp Test stage must route instead of looping on a silent refusal."""
+        probes = {
+            tool: prereqs.ToolProbe(
+                tool=tool, capability="browser", found=True, version="x",
+                min_version=None, meets_floor=None, what_breaks="",
+            )
+            for tool in ("node", "npm", "playwright-browsers")
+        }
+        assert prereqs.unmet_capabilities(["browser"], probes) == {}
+
+    def test_node_what_breaks_names_the_worker_path_trap(self) -> None:
+        """#402/#1671: the reason a probe can pass while the worker still
+        fails is PATH inheritance — keep that in the operator-facing text."""
+        node = next(p for p in self._browser_prereqs() if p.tool == "node")
+        assert "#402" in node.what_breaks
+        assert "PATH" in node.what_breaks
 
 
 class TestGhFloorIsSingleSourceOfTruth:
