@@ -1325,7 +1325,17 @@ def _extract_pr_number(pr_url: str) -> int | None:
 # function's docstring). Retrying `coord merge` unchanged cannot resolve two
 # READS of the board disagreeing with each other; only a human (or a fresh
 # verdict) can — see `_merge_gate_divergence`.
-_SMOKE_GATE_MARKERS = ("smoke test required", "test verdict missing")
+# #1640 added two more wordings for the SAME smoke gate: "smoke test verdict
+# is stale: …" (merge_queue.process) and "test verdict stale (…)"
+# (merge_queue.plan / staging).  Both name a recorded-but-stale verdict, which
+# is still the smoke gate — and still the case _merge_gate_divergence exists
+# to catch, since `work_test_state` reads "passed" while the merge refuses.
+_SMOKE_GATE_MARKERS = (
+    "smoke test required",
+    "test verdict missing",
+    "smoke test verdict is stale",
+    "test verdict stale",
+)
 _REVIEW_GATE_MARKERS = ("review required", "review not approved")
 
 

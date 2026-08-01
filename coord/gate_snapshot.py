@@ -19,7 +19,22 @@ consumer seams:
   ``stage_projection``;
 * the two ``coord.github_ops`` functions ``merge_queue._entry_gate_status``
   reads for the epic-closing gate (``get_pr_commit_messages`` /
-  ``is_epic_issue``).
+  ``is_epic_issue``);
+* the two ``coord.github_ops`` functions the #821/#1475/#1479 review- and
+  smoke-freshness checks read (``get_branch_sha`` / ``get_branch_patch_id``)
+  — added by #1640, see below.
+
+#1640: the snapshot used to duck-type only the first two seams, and
+``merge_queue.has_smoke_verdict`` wraps each of its ``gh_ops`` lookups in a
+fail-open ``except Exception``.  Handing it a snapshot that had no
+``get_branch_sha`` therefore did not fail loudly — the ``AttributeError`` was
+swallowed and *every* staleness check silently degraded to a no-op.  The
+result was the exact "two readers, one truth" split #1640 reports:
+``coord merge --plan`` (served from ``/board``, i.e. this snapshot) printed
+READY for an entry that ``coord merge --only`` (live ``github_ops``, which
+does resolve the SHAs) correctly refused as stale.  The lookups are served
+here from tick-refreshed data so the read path still performs no third-party
+I/O, and the two readers now apply the identical #1479 binding.
 
 Fail-open by construction for a pair that has *never* been refreshed at all
 (no backend configured yet, ``ci_available=False``): ``commit_messages`` /
@@ -101,6 +116,15 @@ class GateSnapshot:
     checks: dict[tuple[str, int], list[CheckRun]] = field(default_factory=dict)
     commit_messages: dict[tuple[str, int], list[str]] = field(default_factory=dict)
     epic_issues: dict[tuple[str, int], bool] = field(default_factory=dict)
+    # #1640: (repo, branch) -> HEAD SHA, and (repo, base, head) -> patch-id,
+    # for the #821/#1475/#1479 review/smoke freshness checks.  A key that is
+    # absent (never refreshed, or the lookup failed) yields None, which those
+    # checks already treat as "anchor unavailable → skip that half" — the
+    # same fail-open convention they apply to a live `gh` call that errors.
+    branch_shas: dict[tuple[str, str], str | None] = field(default_factory=dict)
+    branch_patch_ids: dict[tuple[str, str, str], str | None] = field(
+        default_factory=dict
+    )
     ci_available: bool = False
     refreshed_at: float | None = None
 
@@ -129,6 +153,14 @@ class GateSnapshot:
     def is_epic_issue(self, repo: str, number: int) -> bool:
         return self.epic_issues.get((repo, number), False)
 
+    # ── github_ops view consumed by the review/smoke freshness checks ──────
+    # (#1640 — merge_queue.has_approved_review / evaluate_smoke_verdict)
+    def get_branch_sha(self, repo: str, branch: str) -> str | None:
+        return self.branch_shas.get((repo, branch))
+
+    def get_branch_patch_id(self, repo: str, base: str, branch: str) -> str | None:
+        return self.branch_patch_ids.get((repo, base, branch))
+
 
 class GateSnapshotRefresher:
     """Owns the current :class:`GateSnapshot`; refreshed by the daemon tick.
@@ -153,9 +185,18 @@ class GateSnapshotRefresher:
 
         Reads the queue from the local DB, fetches CI checks + PR commit
         messages (+ epic-ness of any closing-keyword targets) per pending
-        entry with a PR, and atomically publishes a new snapshot.  Per-entry
-        failures degrade that entry to the fail-open values; they never
-        abort the pass or unpublish other entries' data.
+        entry with a PR, plus (#1640) the branch/base HEAD SHAs and the
+        branch's patch-id for every pending entry, and atomically publishes a
+        new snapshot.  Per-entry failures degrade that entry to the fail-open
+        values; they never abort the pass or unpublish other entries' data.
+
+        Cost note (#1640): the SHA sweep adds up to two ``gh api
+        repos/…/branches/…`` calls and one ``gh api compare`` per pending
+        entry per pass.  Branch SHAs are deduped across entries, so a group
+        of N entries sharing one target branch pays for that base once.  The
+        merge queue's *pending* set is what bounds this — merged history is
+        never refreshed — so it stays proportional to work actually waiting
+        to merge, not to project age.
         """
         from coord import github_ops  # noqa: PLC0415
         from coord.merge_queue import PENDING, load_queue  # noqa: PLC0415
@@ -172,16 +213,45 @@ class GateSnapshotRefresher:
         ci_available = bool(inner is not None and inner.is_available)
 
         try:
-            entries = [
-                e for e in load_queue() if e.state == PENDING and e.pr_number
-            ]
+            # #1640: the SHA/patch-id sweep covers every PENDING entry, not
+            # just the ones with a PR — a freshly-enqueued entry has no PR
+            # yet but is exactly the one `coord merge --plan` renders, and
+            # leaving it out is what let the plan show READY for a verdict
+            # the live gate rejects as stale.
+            pending = [e for e in load_queue() if e.state == PENDING]
         except Exception:  # noqa: BLE001 — DB hiccup: keep serving the old snapshot
             log.warning("gate refresh: could not load merge queue", exc_info=True)
             return self._snapshot
+        entries = [e for e in pending if e.pr_number]
 
         checks: dict[tuple[str, int], list[CheckRun]] = {}
         messages: dict[tuple[str, int], list[str]] = {}
         epics: dict[tuple[str, int], bool] = {}
+        branch_shas: dict[tuple[str, str], str | None] = {}
+        branch_patch_ids: dict[tuple[str, str, str], str | None] = {}
+        for entry in pending:
+            # Branch HEAD + merge-base HEAD + the branch's patch-id against
+            # that base — the three anchors #821/#1475/#1479 compare a
+            # recorded review/test verdict against.  Per-lookup failures are
+            # cached as None (fail open for that half of the check), exactly
+            # as the live path treats a `gh` error.
+            for repo, branch in (
+                (entry.repo_github, entry.branch),
+                (entry.repo_github, entry.target_branch),
+            ):
+                if not repo or not branch or (repo, branch) in branch_shas:
+                    continue
+                try:
+                    branch_shas[(repo, branch)] = github_ops.get_branch_sha(repo, branch)
+                except Exception:  # noqa: BLE001 — fail-open for this branch
+                    branch_shas[(repo, branch)] = None
+            pid_key = (entry.repo_github, entry.target_branch, entry.branch)
+            if all(pid_key) and pid_key not in branch_patch_ids:
+                try:
+                    branch_patch_ids[pid_key] = github_ops.get_branch_patch_id(*pid_key)
+                except Exception:  # noqa: BLE001 — fail-open for this entry
+                    branch_patch_ids[pid_key] = None
+
         for entry in entries:
             key = (entry.repo_github, int(entry.pr_number))
             if ci_available:
@@ -210,6 +280,8 @@ class GateSnapshotRefresher:
             checks=checks,
             commit_messages=messages,
             epic_issues=epics,
+            branch_shas=branch_shas,
+            branch_patch_ids=branch_patch_ids,
             ci_available=ci_available,
             refreshed_at=time.time(),
         )

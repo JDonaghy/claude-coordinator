@@ -687,6 +687,13 @@ def test_gate_refresher_populates_snapshot_from_queue(rw_db, monkeypatch) -> Non
     monkeypatch.setattr(
         github_ops, "is_epic_issue", lambda repo, n: n == 90
     )
+    # #1640: the refresher also resolves the freshness anchors now.
+    monkeypatch.setattr(
+        github_ops, "get_branch_sha", lambda repo, branch: f"sha-{branch}"
+    )
+    monkeypatch.setattr(
+        github_ops, "get_branch_patch_id", lambda repo, base, branch: "pid-1"
+    )
 
     refresher = gs.GateSnapshotRefresher()
     # Pre-refresh: fail-open empties.
@@ -701,6 +708,78 @@ def test_gate_refresher_populates_snapshot_from_queue(rw_db, monkeypatch) -> Non
     assert snap.is_epic_issue("acme/api", 90) is True
     assert snap.is_epic_issue("acme/api", 42) is False
     assert refresher.snapshot() is snap
+
+
+def test_gate_refresher_publishes_branch_freshness_anchors(
+    rw_db, monkeypatch
+) -> None:
+    """#1640: the snapshot must answer `get_branch_sha`/`get_branch_patch_id`.
+
+    `merge_queue.evaluate_smoke_verdict` wraps each of its gh_ops lookups in
+    a fail-open `except Exception`, so a snapshot that simply *lacked* these
+    methods did not fail loudly — the AttributeError was swallowed and every
+    #1479 staleness check degraded to a no-op. That is the mechanism behind
+    "`--plan` says READY, `--only` refuses": the plan is served from this
+    snapshot, `--only` from live `github_ops`.
+    """
+    import coord.gate_snapshot as gs
+    import coord.github_ops as github_ops
+    from coord.config import Config
+
+    _seed_pending_merge(rw_db)
+
+    sha_calls: list[tuple[str, str]] = []
+    pid_calls: list[tuple[str, str, str]] = []
+
+    def _sha(repo: str, branch: str) -> str:
+        sha_calls.append((repo, branch))
+        return f"sha-{branch}"
+
+    def _pid(repo: str, base: str, branch: str) -> str:
+        pid_calls.append((repo, base, branch))
+        return "pid-1"
+
+    monkeypatch.setattr(gs, "build_ci_store", lambda t: None)
+    monkeypatch.setattr(github_ops, "get_branch_sha", _sha)
+    monkeypatch.setattr(github_ops, "get_branch_patch_id", _pid)
+    monkeypatch.setattr(github_ops, "get_pr_commit_messages", lambda repo, n: [])
+
+    # Pre-refresh: unknown, not an AttributeError — the fail-open contract.
+    assert gs.GateSnapshot().get_branch_sha("acme/api", "issue-42-fix") is None
+    assert gs.GateSnapshot().get_branch_patch_id("acme/api", "main", "b") is None
+
+    refresher = gs.GateSnapshotRefresher()
+    snap = refresher.refresh(Config(repos=[], machines=[]))
+
+    # Both the branch and its merge base were resolved.
+    assert snap.get_branch_sha("acme/api", "issue-42-fix") == "sha-issue-42-fix"
+    assert snap.get_branch_sha("acme/api", "main") == "sha-main"
+    assert snap.get_branch_patch_id("acme/api", "main", "issue-42-fix") == "pid-1"
+    assert set(sha_calls) == {("acme/api", "issue-42-fix"), ("acme/api", "main")}
+    assert pid_calls == [("acme/api", "main", "issue-42-fix")]
+
+
+def test_gate_refresher_branch_sha_failure_is_fail_open(rw_db, monkeypatch) -> None:
+    """A `gh` failure caches None for that branch — "anchor unavailable",
+    the same value the live path produces — never a crash or a false block."""
+    import coord.gate_snapshot as gs
+    import coord.github_ops as github_ops
+    from coord.config import Config
+
+    _seed_pending_merge(rw_db)
+
+    def _boom(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise RuntimeError("gh exploded")
+
+    monkeypatch.setattr(gs, "build_ci_store", lambda t: None)
+    monkeypatch.setattr(github_ops, "get_branch_sha", _boom)
+    monkeypatch.setattr(github_ops, "get_branch_patch_id", _boom)
+    monkeypatch.setattr(github_ops, "get_pr_commit_messages", lambda repo, n: [])
+
+    snap = gs.GateSnapshotRefresher().refresh(Config(repos=[], machines=[]))
+
+    assert snap.get_branch_sha("acme/api", "issue-42-fix") is None
+    assert snap.get_branch_patch_id("acme/api", "main", "issue-42-fix") is None
 
 
 # ── Invariant 2: no collection endpoint returns unbounded text ───────────────

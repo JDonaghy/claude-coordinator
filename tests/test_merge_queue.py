@@ -5205,3 +5205,354 @@ class TestDisplayError:
         entry = _q("w1")
         entry.error = "review required but not approved"
         assert mq.display_error(entry, None, None) == "review required but not approved"
+
+
+# ── #1640: stale vs missing smoke verdict, and plan/only agreement ───────────
+
+class TestStaleSmokeVerdictReporting:
+    """#1640: a verdict that EXISTS but fails the #1479 freshness check must
+    be reported as stale — never as "no verdict recorded" — and every reader
+    must reach the same conclusion for the same entry.
+
+    The scenario reproduced here is the one that made #1640 get filed as a
+    lost DB write: a passing verdict is recorded, a sibling merge moves
+    `main`, and the next merge attempt refuses. The verdict is intact on the
+    board the whole time; only the base it was recorded against has moved.
+
+    Nothing here relaxes the gate — every assertion below still expects the
+    stale verdict to BLOCK. See the "no behaviour change" clause in #1640.
+    """
+
+    # ── helpers ───────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _config(*, gates: list[str] | None = None):
+        from dataclasses import dataclass as _dc, field as _f
+
+        @_dc
+        class _Reviews:
+            enabled: bool = False
+
+        @_dc
+        class _Pipeline:
+            default_gates: list[str] | None = None
+
+        @_dc
+        class _Cfg:
+            reviews: _Reviews = _f(default_factory=_Reviews)
+            pipeline: _Pipeline = _f(default_factory=_Pipeline)
+
+        cfg = _Cfg()
+        cfg.pipeline.default_gates = gates if gates is not None else ["test", "merge"]
+        return cfg
+
+    @staticmethod
+    def _board(completed=None):
+        from coord.models import Board
+        return Board(active=[], completed=list(completed or []))
+
+    @staticmethod
+    def _tested_work(aid: str = "w1", *, base_sha: str = "base-old") -> Assignment:
+        """A done work assignment carrying a PASSING verdict, anchored (per
+        #1479) to the branch/base it was actually tested against."""
+        return Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id=aid, type="work", status="done",
+            branch=f"worker/{aid}",
+            test_state="passed",
+            test_head_sha="branch-sha",
+            test_base_sha=base_sha,
+            test_patch_id="patch-1",
+        )
+
+    @dataclass
+    class _Gh(FakeGh):
+        """FakeGh that answers the two freshness lookups. `base_sha` is what
+        the target branch reads as *now* — set it different from the
+        assignment's `test_base_sha` to simulate a sibling merge having moved
+        main under an already-tested branch."""
+
+        base_sha: str = "base-new"
+        branch_sha: str = "branch-sha"
+
+        def get_branch_sha(self, repo: str, branch: str) -> str | None:
+            return self.base_sha if branch == "main" else self.branch_sha
+
+        def get_branch_patch_id(self, repo: str, base: str, branch: str) -> str | None:
+            return "patch-1"
+
+    # ── defect 1: the message names the case ──────────────────────────────
+
+    def test_moved_base_is_reported_as_stale_not_missing(self) -> None:
+        board = self._board(completed=[self._tested_work()])
+        entry = _q("w1", target="main")
+        entry.target_branch_head_sha = "base-new"
+
+        verdict = mq.evaluate_smoke_verdict(entry, board)
+
+        assert verdict.ok is False, "a moved base must still BLOCK (#1479)"
+        assert verdict.kind == mq.SMOKE_STALE
+        assert verdict.anchor == "base"
+        assert verdict.recorded_sha == "base-old"
+        assert verdict.current_sha == "base-new"
+        # The exact wording that mis-diagnosed #1640 must not appear.
+        assert "no verdict recorded" not in (verdict.message or "")
+        assert "stale" in (verdict.message or "")
+        assert "base-old"[:7] in (verdict.message or "")
+        assert "base-new"[:7] in (verdict.message or "")
+
+    def test_no_verdict_at_all_is_still_reported_as_missing(self) -> None:
+        """The genuine "never recorded" case keeps its original wording — the
+        distinction is only useful if both halves are accurate."""
+        work = self._tested_work()
+        work.test_state = None
+        board = self._board(completed=[work])
+
+        verdict = mq.evaluate_smoke_verdict(_q("w1", target="main"), board)
+
+        assert verdict.ok is False
+        assert verdict.kind == mq.SMOKE_MISSING
+        assert verdict.message == "smoke test required but no verdict recorded"
+
+    def test_changed_branch_content_reports_the_branch_anchor(self) -> None:
+        board = self._board(completed=[self._tested_work()])
+        entry = _q("w1", target="main")
+        entry.branch_head_sha = "branch-new"
+        entry.branch_patch_id = "patch-2"  # content really did change
+
+        verdict = mq.evaluate_smoke_verdict(entry, board)
+
+        assert verdict.ok is False
+        assert verdict.kind == mq.SMOKE_STALE
+        assert verdict.anchor == "branch"
+        assert "branch" in (verdict.message or "")
+
+    def test_fresh_verdict_still_passes(self) -> None:
+        """Guard against over-blocking: an unmoved base must still merge."""
+        board = self._board(completed=[self._tested_work()])
+        entry = _q("w1", target="main")
+        entry.target_branch_head_sha = "base-old"
+
+        verdict = mq.evaluate_smoke_verdict(entry, board)
+        assert verdict.ok is True
+        assert verdict.kind == mq.SMOKE_OK
+        assert verdict.message is None
+
+    def test_has_smoke_verdict_still_returns_the_same_booleans(self) -> None:
+        """The boolean seam every gate call site uses is unchanged."""
+        board = self._board(completed=[self._tested_work()])
+        stale_entry = _q("w1", target="main")
+        stale_entry.target_branch_head_sha = "base-new"
+        fresh_entry = _q("w1", target="main")
+        fresh_entry.target_branch_head_sha = "base-old"
+
+        assert mq.has_smoke_verdict(stale_entry, board) is False
+        assert mq.has_smoke_verdict(fresh_entry, board) is True
+
+    def test_process_error_string_names_the_moved_base(self) -> None:
+        """`coord merge --only`'s wording — the string the operator reads."""
+        cfg = self._config()
+        board = self._board(completed=[self._tested_work()])
+        items = [_q("w1", target="main", size=10)]
+
+        events = process(items, self._Gh(), config=cfg, board=board)
+
+        blocked = [e for e in events if e.kind == "smoke_required"]
+        assert len(blocked) == 1
+        assert "no verdict recorded" not in blocked[0].message
+        assert "stale" in blocked[0].message
+        assert items[0].error is not None and "stale" in items[0].error
+
+    def test_dry_run_uses_the_same_stale_wording(self) -> None:
+        cfg = self._config()
+        board = self._board(completed=[self._tested_work()])
+        items = [_q("w1", target="main", size=10)]
+
+        events = process(
+            items, self._Gh(), config=cfg, board=board, dry_run=True
+        )
+
+        blocked = [e for e in events if e.kind == "smoke_required"]
+        assert len(blocked) == 1
+        assert "stale" in blocked[0].message
+        assert "no verdict recorded" not in blocked[0].message
+
+    # ── defect 2: --plan and --only agree ─────────────────────────────────
+
+    def test_plan_and_only_agree_after_the_base_moves(self, coord_db) -> None:
+        """The #1640 acceptance sequence.
+
+        Record a passing verdict, move the base, then ask both readers about
+        the SAME entry: `plan()` (what `coord merge --plan` renders) and
+        `process()` (what `coord merge --only` runs). Before #1640 the former
+        said READY and the latter refused.
+        """
+        cfg = self._config()
+        board = self._board(completed=[self._tested_work()])
+        gh = self._Gh()  # main now reads base-new; the verdict says base-old
+        save_queue([_q("w1", target="main", size=10)])
+
+        planned = mq.plan(board, cfg, gh_ops=gh)
+        assert len(planned) == 1
+        assert planned[0].status == mq.PLAN_BLOCKED, (
+            "--plan must not show READY for a verdict --only refuses"
+        )
+        assert "stale" in (planned[0].reason or "")
+        assert "missing" not in (planned[0].reason or "")
+
+        items = mq.load_queue()
+        events = process(items, gh, config=cfg, board=board)
+        refusals = [e for e in events if e.kind == "smoke_required"]
+        assert len(refusals) == 1, "the gate must still block (#1479 unchanged)"
+        assert "stale" in refusals[0].message
+
+    def test_plan_and_only_agree_when_the_verdict_is_fresh(self, coord_db) -> None:
+        """Same two readers, unmoved base → both say go. Agreement has to
+        hold in the passing direction too, or the fix is just "block more"."""
+        cfg = self._config()
+        board = self._board(completed=[self._tested_work(base_sha="base-new")])
+        gh = self._Gh()
+        save_queue([_q("w1", target="main", size=10)])
+
+        planned = mq.plan(board, cfg, gh_ops=gh)
+        assert planned[0].status == mq.PLAN_READY
+        assert planned[0].reason is None
+
+        items = mq.load_queue()
+        events = process(items, gh, config=cfg, board=board, dry_run=True)
+        assert not [e for e in events if e.kind == "smoke_required"]
+
+    def test_plan_gate_status_reason_names_staleness(self) -> None:
+        board = self._board(completed=[self._tested_work()])
+        entry = _q("w1", target="main")
+        entry.target_branch_head_sha = "base-new"
+
+        status, reason = mq._entry_gate_status(entry, board, self._config())
+
+        assert status == mq.PLAN_BLOCKED
+        assert reason is not None
+        assert "stale" in reason and "missing" not in reason
+
+    # ── the staging path (merge_queue.py's raw test_state read) ───────────
+
+    def test_staging_item_blocks_on_a_stale_verdict(self, coord_db) -> None:
+        """#1640 defect 2, staging half: the section used to read the raw
+        `test_state` column with no freshness check and show READY."""
+        from types import SimpleNamespace
+
+        cfg = self._config()
+        cfg.repo = lambda name: SimpleNamespace(  # type: ignore[attr-defined]
+            github="acme/api", default_branch="main"
+        )
+        board = self._board(completed=[self._tested_work()])
+        save_queue([])
+
+        items = mq.staging_items(board, cfg, gh_ops=self._Gh())
+
+        assert len(items) == 1
+        assert items[0].status == mq.STAGING_BLOCKED
+        assert "stale" in (items[0].reason or "")
+
+    def test_staging_item_ready_when_verdict_is_fresh(self, coord_db) -> None:
+        from types import SimpleNamespace
+
+        cfg = self._config()
+        cfg.repo = lambda name: SimpleNamespace(  # type: ignore[attr-defined]
+            github="acme/api", default_branch="main"
+        )
+        board = self._board(completed=[self._tested_work(base_sha="base-new")])
+        save_queue([])
+
+        items = mq.staging_items(board, cfg, gh_ops=self._Gh())
+
+        assert len(items) == 1
+        assert items[0].status == mq.STAGING_READY
+        assert items[0].reason is None
+
+    def test_staging_without_gh_ops_makes_no_calls(self, coord_db) -> None:
+        """The `/board` read path's no-live-I/O contract: gh_ops=None means
+        the freshness anchors are simply unavailable, never a blind `gh` call."""
+        from types import SimpleNamespace
+
+        cfg = self._config()
+        cfg.repo = lambda name: SimpleNamespace(  # type: ignore[attr-defined]
+            github="acme/api", default_branch="main"
+        )
+        board = self._board(completed=[self._tested_work()])
+        save_queue([])
+
+        items = mq.staging_items(board, cfg)
+
+        assert len(items) == 1
+        assert items[0].status == mq.STAGING_READY
+
+    # ── display_error must not clear a staleness refusal ──────────────────
+
+    def test_display_error_keeps_a_stale_refusal(self) -> None:
+        """`display_error` recomputes I/O-free, so it can see the terminal
+        verdict but not the anchors. Clearing on that evidence would put the
+        false green back on `coord status`."""
+        cfg = self._config()
+        board = self._board(completed=[self._tested_work()])
+        entry = _q("w1", target="main")
+        entry.error = (
+            "smoke test verdict is stale: recorded against base base-ol, "
+            "base is now base-ne — re-verify"
+        )
+
+        assert mq.display_error(entry, board, cfg) == entry.error
+
+    def test_display_error_still_clears_a_satisfied_missing_verdict(self) -> None:
+        """#420's original behaviour for the "never recorded" string is
+        untouched: once a verdict lands, the stored string stops showing."""
+        cfg = self._config()
+        board = self._board(completed=[self._tested_work()])
+        entry = _q("w1", target="main")
+        entry.error = "smoke test required but no verdict recorded"
+
+        assert mq.display_error(entry, board, cfg) is None
+
+    def test_plan_through_the_daemon_gate_snapshot_also_blocks(
+        self, coord_db
+    ) -> None:
+        """#1640 end-to-end for the daemon-fronted setup.
+
+        `/board` (and therefore `coord merge --plan` against a daemon) passes
+        the tick-refreshed `GateSnapshot` as gh_ops. It used not to implement
+        `get_branch_sha` at all; `evaluate_smoke_verdict` swallowed the
+        AttributeError and every staleness check became a no-op, so the plan
+        rendered READY for the entry `--only` refused. The snapshot now
+        serves the anchors from its own refreshed data.
+        """
+        from coord.gate_snapshot import GateSnapshot
+
+        cfg = self._config()
+        board = self._board(completed=[self._tested_work()])
+        save_queue([_q("w1", target="main", size=10)])
+
+        snapshot = GateSnapshot(
+            branch_shas={
+                ("acme/api", "main"): "base-new",       # a sibling merge landed
+                ("acme/api", "worker/w1"): "branch-sha",
+            },
+            branch_patch_ids={("acme/api", "main", "worker/w1"): "patch-1"},
+        )
+
+        planned = mq.plan(board, cfg, gh_ops=snapshot)
+
+        assert planned[0].status == mq.PLAN_BLOCKED
+        assert "stale" in (planned[0].reason or "")
+
+    def test_plan_through_an_empty_gate_snapshot_fails_open(self, coord_db) -> None:
+        """A snapshot that hasn't refreshed yet knows no SHAs. That must read
+        as "anchor unavailable" (fail open, today's behaviour for a `gh` that
+        errors) — a cold daemon must not blanket-block every entry."""
+        from coord.gate_snapshot import GateSnapshot
+
+        cfg = self._config()
+        board = self._board(completed=[self._tested_work()])
+        save_queue([_q("w1", target="main", size=10)])
+
+        planned = mq.plan(board, cfg, gh_ops=GateSnapshot())
+
+        assert planned[0].status == mq.PLAN_READY

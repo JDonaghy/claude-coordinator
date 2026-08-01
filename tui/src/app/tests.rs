@@ -26350,6 +26350,61 @@
         );
     }
 
+    // ── #1640: a STALE smoke verdict is not a MISSING one ────────────────────
+
+    #[test]
+    fn display_error_keeps_stale_verdict_message_even_when_test_passed() {
+        // The whole point of the #1640 wording: the work assignment DOES
+        // carry `test_state = "passed"`. This view's only smoke evidence is
+        // that column — it cannot see the #1479 freshness anchors — so the
+        // #420 recompute would clear the message and put a green row back on
+        // exactly the entry `coord merge` refuses. The server's wording,
+        // which names the SHAs, must survive verbatim.
+        let mut work = make_assignment_typed("done", 59, "api", Some("work"));
+        work.test_state = Some("passed".to_string());
+        let work_id = work.id.clone();
+        let mut app = make_app_with_assignments(vec![work]);
+        app.pipeline_issues = vec![pipeline_issue_stub(59, "acme/api", "api")];
+        let stale = "smoke test verdict is stale: recorded against base a1b2c3d, \
+                     base is now e4f5a6b — re-verify against the current base";
+        let entry = mq_entry_full(&work_id, 59, "acme/api", stale);
+
+        assert_eq!(
+            app.merge_queue_entry_display_error(&entry).as_deref(),
+            Some(stale),
+            "a staleness refusal must not be cleared by a passing test_state"
+        );
+    }
+
+    #[test]
+    fn stale_verdict_label_does_not_claim_the_verdict_is_missing() {
+        // Guards the reported mis-diagnosis at the render layer: whatever the
+        // panel truncates the reason to, it must not read as "no verdict".
+        let mut work = make_assignment_typed("done", 60, "api", Some("work"));
+        work.test_state = Some("passed".to_string());
+        let work_id = work.id.clone();
+        let mut app = make_app_with_assignments(vec![work]);
+        app.pipeline_issues = vec![pipeline_issue_stub(60, "acme/api", "api")];
+        let entry = mq_entry_full(
+            &work_id,
+            60,
+            "acme/api",
+            "smoke test verdict is stale: recorded against base a1b2c3d, base is now e4f5a6b",
+        );
+
+        let label = app.merge_queue_entry_label(&entry);
+        assert!(
+            !label.contains("no verdict recorded"),
+            "stale must never render as missing: {}",
+            label
+        );
+        assert!(
+            label.contains("stale"),
+            "the label must name the staleness: {}",
+            label
+        );
+    }
+
     // ── TuiDriver black-box: Merge Queue panel ────────────────────────────────
 
     /// #737 black-box (TuiDriver): clicking the Merge Queue activity-bar icon
