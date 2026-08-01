@@ -37264,7 +37264,7 @@ Milestone tracking issue.
         assert_eq!(
             label_change_for_subcommand("ready"),
             Some((
-                ["status:ready"].as_slice(),
+                ["status:ready", "coord"].as_slice(),
                 ["status:refining", "status:backlog"].as_slice()
             ))
         );

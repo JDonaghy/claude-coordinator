@@ -1783,7 +1783,10 @@ pub(crate) fn label_change_for_subcommand(
 ) -> Option<(&'static [&'static str], &'static [&'static str])> {
     match subcommand {
         // coord/commands/chat.py::ready
-        "ready" => Some((&["status:ready"], &["status:refining", "status:backlog"])),
+        "ready" => Some((
+            &["status:ready", "coord"],
+            &["status:refining", "status:backlog"],
+        )),
         // coord/commands/chat.py::refine
         "refine" => Some((&["status:refining"], &["status:ready"])),
         // coord/commands/issues.py::track
