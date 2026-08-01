@@ -643,6 +643,60 @@ class TestCloseIssueGuard:
             github_ops.close_issue("acme/api", 42)  # must not raise
 
 
+class TestReopenIssue:
+    # `reopen_issue` (#1078) is the complement of `close_issue`: no
+    # open-children guard, but the same "idempotent on the gh error text
+    # for the terminal-state-already-set case" contract.
+
+    def test_regular_issue_reopens(self) -> None:
+        with patch(
+            "coord.github_ops.subprocess.run",
+            return_value=_FakeCompletedProcess(),
+        ) as mock_run:
+            github_ops.reopen_issue("acme/api", 42)
+        assert mock_run.call_args.args[0] == [
+            "gh", "issue", "reopen", "42", "--repo", "acme/api",
+        ]
+
+    def test_still_idempotent_on_already_open(self) -> None:
+        with patch(
+            "coord.github_ops.subprocess.run",
+            return_value=_FakeCompletedProcess(1, "GraphQL: Issue is already open"),
+        ):
+            github_ops.reopen_issue("acme/api", 42)  # must not raise
+
+    def test_raises_on_other_gh_failure(self) -> None:
+        with patch(
+            "coord.github_ops.subprocess.run",
+            return_value=_FakeCompletedProcess(1, "gh: issue not found"),
+        ):
+            with pytest.raises(RuntimeError, match="issue not found"):
+                github_ops.reopen_issue("acme/api", 42)
+
+    def test_posts_comment_before_reopening(self) -> None:
+        calls: list = []
+        with patch(
+            "coord.github_ops.post_issue_comment",
+            lambda repo, issue, comment: calls.append((repo, issue, comment)),
+        ), patch(
+            "coord.github_ops.subprocess.run",
+            return_value=_FakeCompletedProcess(),
+        ) as mock_run:
+            github_ops.reopen_issue("acme/api", 42, comment="reopening, wrong call")
+        assert calls == [("acme/api", 42, "reopening, wrong call")]
+        mock_run.assert_called_once()
+
+    def test_no_comment_posted_when_none(self) -> None:
+        with patch(
+            "coord.github_ops.post_issue_comment",
+            side_effect=AssertionError("must not post a comment when none given"),
+        ), patch(
+            "coord.github_ops.subprocess.run",
+            return_value=_FakeCompletedProcess(),
+        ):
+            github_ops.reopen_issue("acme/api", 42)
+
+
 class TestPrBodyWrappers:
     def test_get_pr_body(self) -> None:
         with patch(
