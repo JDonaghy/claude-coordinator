@@ -13,7 +13,7 @@ import re
 import shutil
 import socket
 import subprocess
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -1309,6 +1309,58 @@ class TestGhMissingOrHung:
                 github_ops._gh("issue", "view", "1")
 
 
+class TestGhJsonHelper:
+    """#1353: `_gh` treats a `gh` call that exits 0 with empty stdout as a
+    success, indistinguishable from a real empty payload — so a bare
+    `json.loads(_gh(...))` at ~15 call sites in this module used to raise an
+    unattributable `json.JSONDecodeError: Expecting value: line 1 column 1
+    (char 0)` on that edge case (the incident that prompted this issue).
+    `_json_loads_or`/`_gh_json` are the one guarded decode every such site
+    now routes through, so this degrades to a documented *default* instead."""
+
+    def test_json_loads_or_returns_default_on_empty_string(self) -> None:
+        assert github_ops._json_loads_or("", default=[]) == []
+        assert github_ops._json_loads_or("   ", default={}) == {}
+
+    def test_json_loads_or_returns_default_on_malformed_json(self) -> None:
+        assert github_ops._json_loads_or("{not valid json", default=[]) == []
+
+    def test_json_loads_or_decodes_valid_json(self) -> None:
+        assert github_ops._json_loads_or('{"a": 1}', default={}) == {"a": 1}
+
+    def test_gh_json_fails_open_on_empty_stdout(self) -> None:
+        """The exact #1353 trigger: `gh` exits 0 with empty stdout."""
+        with patch("coord.github_ops._gh", return_value=""):
+            assert github_ops._gh_json("pr", "view", "1", default={}) == {}
+
+    def test_gh_json_still_raises_on_nonzero_gh_exit(self) -> None:
+        """Only the decode step fails open — `_gh`'s own non-zero-exit
+        contract (a real `gh` failure, not a garbage-but-successful
+        response) is unchanged."""
+        with patch(
+            "coord.github_ops.subprocess.run",
+            return_value=MagicMock(returncode=1, stdout="", stderr="boom"),
+        ):
+            with pytest.raises(RuntimeError):
+                github_ops._gh_json("pr", "view", "1", default={})
+
+    def test_get_open_issues_degrades_to_empty_list_on_empty_stdout(self) -> None:
+        """Regression: one of the explicitly-named unguarded sites (#1353) —
+        this used to crash with a bare JSONDecodeError."""
+        with patch("coord.github_ops._gh", return_value=""):
+            assert github_ops.get_open_issues("acme/api") == []
+
+    def test_get_pr_size_degrades_to_zero_on_empty_stdout(self) -> None:
+        """Regression: another explicitly-named unguarded site (#1353)."""
+        with patch("coord.github_ops._gh", return_value=""):
+            assert github_ops.get_pr_size("acme/api", 42) == 0
+
+    def test_find_pr_for_branch_degrades_to_none_on_empty_stdout(self) -> None:
+        """Regression: another explicitly-named unguarded site (#1353)."""
+        with patch("coord.github_ops._gh", return_value=""):
+            assert github_ops.find_pr_for_branch("acme/api", "some-branch") is None
+
+
 class TestCreateLabel:
     """#1483: the seam behind `coord set-test-mode`'s label pre-creation."""
 
@@ -1437,6 +1489,26 @@ class TestGetPrChecks:
         FileNotFoundError/TimeoutExpired directly (see test_ci_store.py)."""
         with patch("coord.github_ops.subprocess.run", side_effect=FileNotFoundError):
             with pytest.raises(FileNotFoundError):
+                github_ops.get_pr_checks("acme/api", 42)
+
+    def test_nonzero_length_malformed_stdout_raises_not_fails_open(self) -> None:
+        """#1353/#1525: unlike most of this module's `_gh`-backed helpers
+        (which now fail OPEN to a default on a malformed decode — see
+        `_gh_json`/`_json_loads_or`), a genuinely malformed (non-empty)
+        response here must still raise. `ci_github.GitHubCi._fetch` relies on
+        catching that `ValueError` to turn it into a synthetic *failing*
+        check — #1525's fix for a real incident where an unreadable CI
+        status silently read as "no checks" and let a merge through past a
+        real CI failure. Only truly empty stdout is a deliberate `[]`
+        default (`gh`'s normal "no checks configured" response)."""
+
+        class _FakeResult:
+            returncode = 0
+            stdout = "not json"
+            stderr = ""
+
+        with patch("coord.github_ops.subprocess.run", return_value=_FakeResult()):
+            with pytest.raises(json.JSONDecodeError):
                 github_ops.get_pr_checks("acme/api", 42)
 
     def test_requested_json_fields_omit_conclusion(self) -> None:

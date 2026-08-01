@@ -1167,72 +1167,89 @@ def merge(
             repo_cfg = cfg.repo(a.repo_name)
             if repo_cfg is None:
                 continue
-            # Issue-state filter: skip closed issues (probably merged elsewhere).
-            # We deny only when the cache has explicit evidence the issue is
-            # closed — i.e. there's a row for this (repo, number) and its
-            # state isn't 'open'.  If the cache simply has no row for this
-            # issue (e.g. it was created after the last sync), treat as
-            # unknown and allow — denying on cache miss silently skipped
-            # post-sync issues (#278/#280 hit this).
-            known_issues = known_by_repo.get(a.repo_name, set())
-            open_issues = open_by_repo.get(a.repo_name, set())
-            if a.issue_number in known_issues and a.issue_number not in open_issues:
-                continue
-            # Skip work whose branch no longer exists on origin (already
-            # merged + deleted).  Fail OPEN: only skip when we got a real
-            # (non-empty) branch list back and the branch isn't in it.
-            origin_branches = branch_cache.get(a.repo_name)
-            if origin_branches is None:
-                origin_branches = _gho.list_remote_branch_names(repo_cfg.github)
-                branch_cache[a.repo_name] = origin_branches
-            if origin_branches and a.branch not in origin_branches:
-                continue
-            # #525: never enqueue work that is already done on GitHub —
-            # issue closed OR PR merged.  Mirrors the #522 guard in
-            # review.dispatch_review.  Fail OPEN: a transient gh error
-            # must never block a real enqueue.
-            if _gho.work_is_terminal(
-                repo_cfg.github, a.issue_number, a.branch,
-                cache=terminal_cache,
-            ):
-                continue
-            # #946: review + smoke gates, via the shared predicate — this
-            # loop was the primary ungated enqueue path (#782/#795 reached
-            # the merge queue with a failed test / no review at all).  Mirrors
-            # the gate already enforced by the daemon's
-            # `enqueue_approved_work` so `coord merge` and the passive tick
-            # agree on what's allowed to queue.
-            if not mq.passes_merge_gates(a, cfg, board):
-                continue
-            # #736 / #292: use refresh_entry_assignment (not bare enqueue) so
-            # an existing PENDING entry is re-keyed to the latest fix assignment
-            # when the original assignment_id no longer matches.  Dedup by
-            # (repo_github, branch) is preserved — refresh_entry_assignment is a
-            # no-op when the entry is already correctly keyed.
-            # #934: target `feature/ms-NN` when this issue belongs to a
-            # milestone and the repo opted into the git model — the
-            # milestone lookup itself is skipped (no `gh` call) when it
-            # hasn't, falling back to `default_branch` unchanged.
-            target_branch = repo_cfg.default_branch
-            if getattr(repo_cfg, "develop_branch", None):
-                from coord.branch_model import (  # noqa: PLC0415
-                    fetch_issue_milestone_number,
-                    resolve_base_branch,
-                )
+            # #1353: isolate the rest of this assignment's scan — a bad
+            # `gh` round-trip (e.g. empty stdout on exit 0, see
+            # github_ops._gh) or a transient decode failure anywhere below
+            # used to raise straight out of this loop and abort auto-enqueue
+            # for every *other* assignment in the batch too, with the CLI
+            # printing nothing before dying. One assignment misbehaving is
+            # not a reason to skip the whole drain — catch it, report which
+            # assignment and why, and keep scanning the rest.
+            try:
+                # Issue-state filter: skip closed issues (probably merged
+                # elsewhere).  We deny only when the cache has explicit
+                # evidence the issue is closed — i.e. there's a row for this
+                # (repo, number) and its state isn't 'open'.  If the cache
+                # simply has no row for this issue (e.g. it was created
+                # after the last sync), treat as unknown and allow — denying
+                # on cache miss silently skipped post-sync issues
+                # (#278/#280 hit this).
+                known_issues = known_by_repo.get(a.repo_name, set())
+                open_issues = open_by_repo.get(a.repo_name, set())
+                if a.issue_number in known_issues and a.issue_number not in open_issues:
+                    continue
+                # Skip work whose branch no longer exists on origin (already
+                # merged + deleted).  Fail OPEN: only skip when we got a real
+                # (non-empty) branch list back and the branch isn't in it.
+                origin_branches = branch_cache.get(a.repo_name)
+                if origin_branches is None:
+                    origin_branches = _gho.list_remote_branch_names(repo_cfg.github)
+                    branch_cache[a.repo_name] = origin_branches
+                if origin_branches and a.branch not in origin_branches:
+                    continue
+                # #525: never enqueue work that is already done on GitHub —
+                # issue closed OR PR merged.  Mirrors the #522 guard in
+                # review.dispatch_review.  Fail OPEN: a transient gh error
+                # must never block a real enqueue.
+                if _gho.work_is_terminal(
+                    repo_cfg.github, a.issue_number, a.branch,
+                    cache=terminal_cache,
+                ):
+                    continue
+                # #946: review + smoke gates, via the shared predicate — this
+                # loop was the primary ungated enqueue path (#782/#795 reached
+                # the merge queue with a failed test / no review at all).
+                # Mirrors the gate already enforced by the daemon's
+                # `enqueue_approved_work` so `coord merge` and the passive
+                # tick agree on what's allowed to queue.
+                if not mq.passes_merge_gates(a, cfg, board):
+                    continue
+                # #736 / #292: use refresh_entry_assignment (not bare
+                # enqueue) so an existing PENDING entry is re-keyed to the
+                # latest fix assignment when the original assignment_id no
+                # longer matches.  Dedup by (repo_github, branch) is
+                # preserved — refresh_entry_assignment is a no-op when the
+                # entry is already correctly keyed.
+                # #934: target `feature/ms-NN` when this issue belongs to a
+                # milestone and the repo opted into the git model — the
+                # milestone lookup itself is skipped (no `gh` call) when it
+                # hasn't, falling back to `default_branch` unchanged.
+                target_branch = repo_cfg.default_branch
+                if getattr(repo_cfg, "develop_branch", None):
+                    from coord.branch_model import (  # noqa: PLC0415
+                        fetch_issue_milestone_number,
+                        resolve_base_branch,
+                    )
 
-                milestone_number = fetch_issue_milestone_number(
-                    repo_cfg.github, a.issue_number, cache=milestone_cache,
-                )
-                target_branch = resolve_base_branch(repo_cfg, milestone_number)
+                    milestone_number = fetch_issue_milestone_number(
+                        repo_cfg.github, a.issue_number, cache=milestone_cache,
+                    )
+                    target_branch = resolve_base_branch(repo_cfg, milestone_number)
 
-            if mq.refresh_entry_assignment(
-                a,
-                repo_github=repo_cfg.github,
-                target_branch=target_branch,
-            ):
+                if mq.refresh_entry_assignment(
+                    a,
+                    repo_github=repo_cfg.github,
+                    target_branch=target_branch,
+                ):
+                    auto_enqueued.append(
+                        f"  auto-enqueued: {a.repo_name} #{a.issue_number} "
+                        f"({a.branch} → {target_branch})"
+                    )
+            except Exception as e:  # noqa: BLE001
                 auto_enqueued.append(
-                    f"  auto-enqueued: {a.repo_name} #{a.issue_number} "
-                    f"({a.branch} → {target_branch})"
+                    f"  skipped: {a.repo_name} #{a.issue_number} "
+                    f"(assignment {a.assignment_id}) — auto-enqueue scan "
+                    f"failed, skipping this assignment: {e!r}"
                 )
     for line in auto_enqueued:
         click.echo(line)
