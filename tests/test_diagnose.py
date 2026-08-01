@@ -77,6 +77,102 @@ def _stub(monkeypatch, *, session="dead", recover_verdict=None, merge_actions=No
     return calls
 
 
+# ── liveness detection (#1658: headless workers have no tmux session) ──────
+
+
+def test_session_state_live_tmux_never_asks_the_agent(monkeypatch, config) -> None:
+    monkeypatch.setattr("coord.interactive.tmux_session_alive", lambda *a, **k: True)
+    probed = []
+    monkeypatch.setattr(
+        "coord.network.fetch_status",
+        lambda *a, **k: probed.append(1),
+    )
+    a = _assign(aid="w1", typ="review", status="running")
+    assert diagnose._session_state(a, config) == "live"
+    assert probed == []  # tmux already said live — no need to probe the agent
+
+
+def test_session_state_headless_worker_reported_active_by_agent_is_live(
+    monkeypatch, config
+) -> None:
+    """#1658: a headless worker never has a tmux session, so tmux always
+    reports it dead — the agent's own /status active list is authoritative."""
+    from coord.network import StatusResult
+
+    monkeypatch.setattr("coord.interactive.tmux_session_alive", lambda *a, **k: False)
+    monkeypatch.setattr(
+        "coord.network.fetch_status",
+        lambda machine, timeout=None: StatusResult(
+            data={"active": [{"id": "w1"}], "completed": []}
+        ),
+    )
+    a = _assign(aid="w1", typ="review", status="running")
+    assert diagnose._session_state(a, config) == "live"
+
+
+def test_session_state_agent_confirms_dead(monkeypatch, config) -> None:
+    from coord.network import StatusResult
+
+    monkeypatch.setattr("coord.interactive.tmux_session_alive", lambda *a, **k: False)
+    monkeypatch.setattr(
+        "coord.network.fetch_status",
+        lambda machine, timeout=None: StatusResult(
+            data={"active": [], "completed": [{"id": "w1", "status": "failed"}]}
+        ),
+    )
+    a = _assign(aid="w1", typ="review", status="running")
+    assert diagnose._session_state(a, config) == "dead"
+
+
+def test_session_state_agent_unreachable_is_unknown_not_dead(monkeypatch, config) -> None:
+    """An unreachable agent must never be treated as proof of death — that
+    would just trade a false 'dead' for a different false 'dead'."""
+    from coord.network import StatusResult
+
+    monkeypatch.setattr("coord.interactive.tmux_session_alive", lambda *a, **k: False)
+    monkeypatch.setattr(
+        "coord.network.fetch_status",
+        lambda machine, timeout=None: StatusResult(error="connection error"),
+    )
+    a = _assign(aid="w1", typ="review", status="running")
+    assert diagnose._session_state(a, config) == "unknown"
+
+
+def test_diagnose_leaves_live_headless_review_untouched(monkeypatch, config) -> None:
+    """End-to-end #1658 regression: `coord diagnose --stage test` (no
+    --reset) must not touch a DIFFERENT, currently-running headless review
+    row for the same issue just because tmux has no session for it."""
+    from coord.network import StatusResult
+
+    monkeypatch.setattr("coord.interactive.tmux_session_alive", lambda *a, **k: False)
+    monkeypatch.setattr(
+        "coord.network.fetch_status",
+        lambda machine, timeout=None: StatusResult(
+            data={"active": [{"id": "r1"}], "completed": []}
+        ),
+    )
+    finalize_calls = []
+    monkeypatch.setattr(
+        diagnose, "_finalize_dead",
+        lambda a, c: finalize_calls.append(a.assignment_id) or "advisory",
+    )
+    monkeypatch.setattr(
+        diagnose, "_reconcile_issue_merges", lambda b, c, r, i, *, dry_run: []
+    )
+
+    work = _assign(aid="w1", typ="work", status="done")
+    live_review = _assign(aid="r1", typ="review", status="running")
+    board = Board(active=[live_review], completed=[work])
+    before = Board(active=list(board.active), completed=list(board.completed))
+
+    res = diagnose.diagnose_stage(board, config, "api", 42, "test")
+
+    assert finalize_calls == []
+    assert board.active == before.active
+    assert board.completed == before.completed
+    assert not any("phantom" in f for f in res.findings)
+
+
 # ── healthy / no-op ─────────────────────────────────────────────────────────
 
 
@@ -740,9 +836,10 @@ def test_reset_dry_run_does_nothing(monkeypatch, config) -> None:
 # ── issue-wide cleanup ───────────────────────────────────────────────────────
 
 
-def test_cleanup_finalizes_other_phantom_rows(monkeypatch, config) -> None:
-    # Diagnosing the review stage should still clean up a separate phantom WORK
-    # row for the same issue (the "db world cleaned up" requirement).
+def test_cleanup_finalizes_other_phantom_rows_with_reset(monkeypatch, config) -> None:
+    # Diagnosing the review stage with --reset should still clean up a
+    # separate phantom WORK row for the same issue (the "db world cleaned
+    # up" requirement) — #1658: this now REQUIRES --reset (see below).
     calls = _stub(monkeypatch, session="dead")
     monkeypatch.setattr(
         "coord.state.load_assignment_review_findings",
@@ -751,8 +848,38 @@ def test_cleanup_finalizes_other_phantom_rows(monkeypatch, config) -> None:
     review = _assign(aid="r1", typ="review", status="done", verdict="approve")
     phantom_work = _assign(aid="w1", typ="work", status="running")
     board = Board(active=[phantom_work], completed=[review])
-    diagnose.diagnose_stage(board, config, "api", 42, "review")
+    diagnose.diagnose_stage(board, config, "api", 42, "review", reset=True)
     assert "w1" in calls["finalize"]  # the OTHER phantom row got cleaned up
+
+
+def test_cleanup_without_reset_only_recommends_does_not_write(monkeypatch, config) -> None:
+    """#1658: without --reset, `coord diagnose` must not write ANYTHING for a
+    phantom row it finds while sweeping the rest of the issue — it only
+    surfaces a recommendation. This mirrors the reported incident: a plain
+    `coord diagnose claude-coordinator 1122 --stage test` (no --reset, no
+    --dry-run) finalized an unrelated, currently-running review row to
+    'failed' just from scanning the issue's other rows."""
+    calls = _stub(monkeypatch, session="dead")
+    monkeypatch.setattr(
+        "coord.state.load_assignment_review_findings",
+        lambda aid: ("approve", "ok"),
+    )
+    review = _assign(aid="r1", typ="review", status="done", verdict="approve")
+    phantom_work = _assign(aid="w1", typ="work", status="running")
+    board = Board(active=[phantom_work], completed=[review])
+    before = Board(active=list(board.active), completed=list(board.completed))
+
+    res = diagnose.diagnose_stage(board, config, "api", 42, "review")
+
+    assert calls["finalize"] == []  # NOTHING was written
+    assert board.active == before.active
+    assert board.completed == before.completed
+    assert res.actions_taken == []
+    assert res.needs_reset is True
+    assert any(
+        "would finalize phantom" in f and "w1" in f and "--reset" in f
+        for f in res.findings
+    )
 
 
 # ── result trailer ───────────────────────────────────────────────────────────

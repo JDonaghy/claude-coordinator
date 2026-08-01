@@ -25,6 +25,15 @@ Design decisions (locked with the operator):
   preserved, so the stage re-dispatches fresh with the work intact.  (There is
   deliberately no branch-deletion code path in this module.)
 * **Cleanup is scoped to the one issue**, not a fleet-wide sweep.
+* **The issue-wide phantom-row scan never writes without ``--reset``** (#1658):
+  ``diagnose_stage``'s targeted best-effort recovery of the STAGE the operator
+  asked about may still write without ``--reset`` (that's the whole point of
+  "best-effort recover"), but :func:`_cleanup_issue`'s sweep over the issue's
+  OTHER rows only ever reports a finding + ``needs_reset=True`` unless
+  ``--reset`` was passed. That sweep touches rows the operator did not ask
+  about and did not get a tailored diagnosis for, so a wrong liveness read on
+  it is pure collateral damage — see :func:`_session_state`'s note on why
+  tmux-only liveness was itself wrong for headless workers.
 
 The side-effecting steps are factored into small module-level helpers so the
 orchestration in :func:`diagnose_stage` is unit-testable by monkeypatching them.
@@ -41,7 +50,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # avoid import cycles / heavy imports at module load
     from coord.config import Config
-    from coord.models import Assignment, Board
+    from coord.models import Assignment, Board, Machine
 
 # Stages the doctor understands.  Each maps to the assignment ``type`` that
 # carries its state; ``test`` and ``merge`` are tracked on the *work* row
@@ -209,12 +218,28 @@ def _resolve_machine(config: "Config", machine_name: str | None):
 
 
 def _session_state(assignment: "Assignment", config: "Config") -> str:
-    """``"live"`` | ``"dead"`` | ``"unknown"`` for *assignment*'s tmux session.
+    """``"live"`` | ``"dead"`` | ``"unknown"`` for *assignment*.
 
     Probes the assignment's machine (local tmux, or the remote host's tmux over
     ssh — same mechanism as ``coord reattach`` / the stale-session reaper).
     ``"unknown"`` when the machine can't be resolved or the probe errors, so the
     caller never finalizes on a false negative.
+
+    #1658: tmux liveness alone is blind to HEADLESS workers. A headless
+    assignment (the normal shape for a daemon-dispatched review/work — see
+    ``AgentServer.assign``) runs as a plain subprocess tracked by the agent's
+    own ``_assignments`` dict; it never has a tmux session at all, so
+    ``tmux_session_alive`` reads "dead" for it unconditionally, regardless of
+    whether the worker is still running. Before this fix, that false "dead"
+    made every live headless assignment look like a phantom the instant
+    ``coord diagnose`` looked at it — the incident this closes: a live review
+    worker's row was finalized to ``failed`` mid-review. Now, when tmux says
+    dead, the assignment's own agent ``/status`` is consulted before trusting
+    that — the same seam :func:`coord.reconcile.reconcile_completed_assignments`
+    uses to tell "still running" from "actually finished" — and a match in its
+    ``active`` list is authoritative: the agent is the ground truth for its
+    own subprocesses. An unreachable agent still returns "unknown" rather than
+    "dead", preserving the never-finalize-on-a-probe-failure guarantee.
     """
     import socket  # noqa: PLC0415
 
@@ -242,9 +267,35 @@ def _session_state(assignment: "Assignment", config: "Config") -> str:
     host = TmuxHost(ssh_target=ssh_target)
     sname = tmux_session_name(assignment.assignment_id)
     try:
-        return "live" if tmux_session_alive(sname, host=host) else "dead"
+        if tmux_session_alive(sname, host=host):
+            return "live"
     except Exception:  # noqa: BLE001 — never let a probe error finalize a session
         return "unknown"
+
+    # tmux says dead (or the assignment never had a tmux session at all — the
+    # headless case). Consult the agent before trusting that.
+    return _agent_liveness(assignment, machine)
+
+
+def _agent_liveness(assignment: "Assignment", machine: "Machine | None") -> str:
+    """``"dead"`` | ``"live"`` | ``"unknown"`` per the assignment's own agent
+    ``/status`` — see :func:`_session_state`'s #1658 note for why this exists.
+    ``machine`` is ``None`` when the assignment has no ``machine_name`` at all
+    (rare) — treated as genuinely dead since there's nothing to probe."""
+    if machine is None:
+        return "dead"
+    from coord.network import fetch_status  # noqa: PLC0415
+
+    result = fetch_status(machine)
+    if not result.ok or result.data is None:
+        # Agent unreachable — don't trust tmux-dead alone, but don't claim
+        # "live" either. Matches the "never finalize on a probe failure"
+        # contract the rest of this module relies on.
+        return "unknown"
+    active = result.data.get("active") or []
+    if any(isinstance(e, dict) and e.get("id") == assignment.assignment_id for e in active):
+        return "live"
+    return "dead"
 
 
 def _ssh_target_for(assignment: "Assignment", config: "Config") -> str | None:
@@ -515,7 +566,7 @@ def diagnose_stage(
         res.findings.append(f"no {stage} assignment on the board for #{issue_number}")
         res.recovered = True  # nothing wedged
         # Still run the issue-wide cleanup below.
-        _cleanup_issue(board, config, repo_name, issue_number, res, dry_run=dry_run)
+        _cleanup_issue(board, config, repo_name, issue_number, res, dry_run=dry_run, reset=reset)
         return res
 
     # The stage step owns *latest*; record it so the issue-wide cleanup pass
@@ -537,7 +588,8 @@ def diagnose_stage(
             repo_name=repo_name, issue_number=issue_number, dry_run=dry_run,
         )
         _cleanup_issue(
-            board, config, repo_name, issue_number, res, dry_run=dry_run, skip_ids=handled
+            board, config, repo_name, issue_number, res,
+            dry_run=dry_run, reset=reset, skip_ids=handled,
         )
         return res
 
@@ -552,7 +604,8 @@ def diagnose_stage(
         _recover_work_like(board, config, latest, state, res, dry_run=dry_run)
 
     _cleanup_issue(
-        board, config, repo_name, issue_number, res, dry_run=dry_run, skip_ids=handled
+        board, config, repo_name, issue_number, res,
+        dry_run=dry_run, reset=reset, skip_ids=handled,
     )
     return res
 
@@ -1219,10 +1272,25 @@ def _cleanup_issue(
     res: DiagnoseResult,
     *,
     dry_run: bool,
+    reset: bool,
     skip_ids: set | None = None,
 ) -> None:
-    """Always-on, issue-scoped DB cleanup: any OTHER phantom ``running`` rows
-    for this issue whose session is dead get finalized to a terminal state."""
+    """Always-on, issue-scoped DB *scan*: any OTHER phantom ``running`` rows for
+    this issue whose session is dead are reported. They are only FINALIZED
+    (a write) when *reset* is set.
+
+    #1658: this sweep looks past the one row the operator explicitly asked to
+    diagnose — at every other row for the issue — so a false "dead" verdict
+    here (or a genuinely-live row this scan wasn't asked about) has no
+    operator-reviewed finding backing it the way the targeted stage's own
+    best-effort recovery does. That over-reach is exactly what turned a
+    plain, no-flags ``coord diagnose --stage test`` into a write against a
+    live headless review worker's row (finalized to ``failed`` mid-review):
+    ``reset`` was ``False`` and it wrote anyway. Now a phantom found here is
+    only a *recommendation* — ``needs_reset=True`` plus a finding telling the
+    operator to re-run with ``--reset`` — unless ``--reset`` was already
+    passed, in which case the existing finalize behaviour is unchanged.
+    """
     skip = skip_ids or set()
     for a in (board.active + board.completed):
         if a.issue_number != issue_number or a.repo_name != repo_name:
@@ -1234,13 +1302,23 @@ def _cleanup_issue(
         if _session_state(a, config) != "dead":
             continue
         res.findings.append(f"cleanup: phantom {a.type} row {a.assignment_id} (session dead)")
-        if not dry_run:
-            try:
-                _finalize_dead(a, config)
-                res.actions_taken.append(f"cleanup: finalized phantom {a.type} row {a.assignment_id}")
-            except Exception as exc:  # noqa: BLE001
-                _mark_terminal(a, config)
-                res.actions_taken.append(f"cleanup: marked phantom row {a.assignment_id} terminal ({exc})")
+        if not reset:
+            res.findings.append(
+                f"cleanup: would finalize phantom {a.type} row {a.assignment_id} "
+                "— re-run with --reset to clear it"
+            )
+            res.needs_reset = True
+            continue
+        if dry_run:
+            res.findings.append(f"(dry-run) would finalize phantom {a.type} row {a.assignment_id}")
+            res.needs_reset = True
+            continue
+        try:
+            _finalize_dead(a, config)
+            res.actions_taken.append(f"cleanup: finalized phantom {a.type} row {a.assignment_id}")
+        except Exception as exc:  # noqa: BLE001
+            _mark_terminal(a, config)
+            res.actions_taken.append(f"cleanup: marked phantom row {a.assignment_id} terminal ({exc})")
 
 
 def _is_stale(assignment: "Assignment", *, max_age_hours: float = 12.0) -> bool:
