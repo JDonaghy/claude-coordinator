@@ -154,6 +154,49 @@ def enforce_epic_dispatch_guard(
     )
 
 
+def _reraise_with_body(
+    exc: httpx.HTTPStatusError, machine_name: str,
+) -> httpx.HTTPStatusError:
+    """#1527: fold the agent's rejection reason into the raised exception.
+
+    ``AgentServer.assign`` (coord/agent.py) raises a precise ``ValueError``
+    for every dispatch-time rejection — unhandled repo, missing
+    ``repo_path``, unknown ``pull_repos``, the #425/#324 provider
+    capability gates — and ``agent_app.py``'s ``assign`` route faithfully
+    returns each as ``{"error": "<reason>"}`` with a 400. Plain
+    ``resp.raise_for_status()`` discards that body: every existing caller
+    that catches ``httpx.HTTPError`` and renders ``str(e)`` (``coord/
+    commands/dispatch.py``, ``milestone_dispatch.py``, ``plan_followup.py``,
+    ``dispatch_workers.py``, ...) only ever saw the generic status line
+    ("400 Bad Request"), never the agent's own reason.
+
+    Returns a **new** ``httpx.HTTPStatusError`` — never raises one — so
+    ``dispatch()`` can ``raise ... from e`` at the call site. Carries the
+    same ``request``/``response`` as *exc* so ``classify_error``/
+    ``is_retryable`` (coord/network.py), which inspect
+    ``exc.response.status_code``, keep working unchanged; only the message
+    gains the detail.
+
+    Degrades gracefully rather than raising a *different* error out of an
+    error handler: a non-JSON or JSON-but-not-``{"error": ...}`` body falls
+    back to the raw response text (truncated); an empty body falls back to
+    the original status-line message.
+    """
+    detail = ""
+    try:
+        parsed = exc.response.json()
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, dict):
+        detail = str(parsed.get("error") or "")
+    if not detail:
+        detail = exc.response.text[:500].strip()
+    message = (
+        f"{machine_name} rejected the assignment: {detail}" if detail else str(exc)
+    )
+    return httpx.HTTPStatusError(message, request=exc.request, response=exc.response)
+
+
 def dispatch(
     proposal: Proposal,
     config: Config,
@@ -400,7 +443,10 @@ def dispatch(
         payload["provider"] = effective_provider_name
 
     resp = httpx.post(url, json=payload, timeout=15)
-    resp.raise_for_status()
+    try:
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        raise _reraise_with_body(e, machine.name) from e
     result = resp.json()
     # #324: attach the resolved provider name to the response dict so callers
     # that record the dispatched assignment (cli.py, dashboard/server.py) can

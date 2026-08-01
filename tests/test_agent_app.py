@@ -185,6 +185,36 @@ def test_inject_endpoint_rejects_bad_body(tmp_path: Path) -> None:
     assert r.status_code == 400
 
 
+def test_health_drops_repo_with_missing_path(tmp_path: Path) -> None:
+    """#1527: `/health` must not advertise a repo whose `repo_path` doesn't
+    exist on disk — a stale/missing checkout would otherwise keep looking
+    servable (router picks it as least-loaded) while every dispatch to it
+    400s. The repo should move to `degraded` with a reason instead."""
+    repo = _init_repo(tmp_path / "repo")
+    server = AgentServer(
+        machine_name="test",
+        capabilities=["python"],
+        repos=["api", "ghost", "unconfigured"],
+        state_dir=tmp_path / "state",
+        repo_paths={
+            "api": str(repo),
+            "ghost": str(tmp_path / "does-not-exist"),
+            # "unconfigured" has no repo_paths entry at all.
+        },
+    )
+    app = build_app(server)
+    client = TestClient(app)
+
+    r = client.get("/health")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["repos"] == ["api"]
+    assert "ghost" not in body["repos"]
+    assert "unconfigured" not in body["repos"]
+    assert "does-not-exist" in body["degraded"]["ghost"]
+    assert "no repo_path configured" in body["degraded"]["unconfigured"]
+
+
 def test_health_surfaces_version_and_last_update(tmp_path: Path) -> None:
     """/health includes the running version and any persisted last_update
     payload so the CLI can show a clear before/after delta."""
