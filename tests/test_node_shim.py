@@ -229,11 +229,33 @@ class TestShimResolution:
         self, tmp_path: Path
     ) -> None:
         """No nvm, no system Node: exit 127 with a diagnosable message rather
-        than re-execing itself forever (the shim must skip its own dir)."""
+        than re-execing itself forever (the shim must skip its own dir).
+
+        Deliberately does NOT reuse `_run_shim`'s PATH: GitHub's runner images
+        ship a system Node in /usr/local/bin, so a "there is no Node here"
+        assertion written against the ambient PATH passes locally and fails
+        only in CI. Build a PATH holding exactly the tools the shim itself
+        needs and nothing else.
+        """
+        sys_bin = tmp_path / "sanitised-bin"
+        sys_bin.mkdir()
+        for tool in ("bash", "dirname", "tr", "ls", "sort"):
+            found = shutil.which(tool)
+            if found is None:
+                pytest.skip(f"{tool} not on PATH; cannot build a sanitised PATH")
+            (sys_bin / tool).symlink_to(found)
+        assert shutil.which("node", path=str(sys_bin)) is None
+
         bin_dir = tmp_path / "local-bin"
         _install_shim(bin_dir)
-        result = _run_shim(bin_dir, "node")
-        assert result.returncode == 127
+        env = dict(os.environ)
+        env["PATH"] = f"{bin_dir}:{sys_bin}"
+        env["NVM_DIR"] = str(tmp_path / "no-such-nvm")
+        result = subprocess.run(
+            [str(bin_dir / "node"), "--version"],
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert result.returncode == 127, result.stdout + result.stderr
         assert "coord node shim" in result.stderr
         # And that honest failure is what the prereq probe reads as unmet:
         # a nonzero exit from the version probe means found=False, never a
