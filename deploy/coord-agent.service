@@ -36,6 +36,17 @@
 # together only if the fix is "widen the agent's PATH here," not "make
 # the probe search harder while the worker still can't find the tool."
 #
+# #1678: the `browser` capability (Playwright acceptance suites, e.g.
+# `coord/dashboard/webapp` -> `npm run test:e2e`) needs `node`/`npm` here
+# too, but Node must NOT be added the way ~/.cargo/bin was. nvm installs
+# into a version-stamped directory (~/.nvm/versions/node/vX.Y.Z/bin), so a
+# literal entry on the PATH line below would break silently at the next
+# `nvm install` and put the capability right back where #1678 found it.
+# Instead `install-agent.sh` drops run-time-resolving shims (node/npm/npx ->
+# coord-node-shim, see deploy/node-shim.sh) into ~/.local/bin, which is
+# ALREADY on the PATH line below — so nothing here changes and a Node
+# version bump is a no-op. Keep ~/.local/bin on the PATH for that reason.
+#
 # Placeholders to fill in before installing (install-agent.sh fills the
 # equivalents in automatically from its --machine/--port flags):
 #   <MACHINE_NAME>  — this machine's name in coordinator.yml (often the
