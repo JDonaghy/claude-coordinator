@@ -329,10 +329,19 @@ def resolve_models(
 ) -> None:
     """Resolve proposal.model for each work proposal from config.models.labels.
 
-    #1430: mirrors :func:`resolve_required_gates`'s shape and precedence
-    convention (issue-label order; first configured label wins) so the two
-    label-driven resolvers behave the same way for the same kind of
-    ambiguity — see :meth:`coord.config.ModelsConfig.model_for_labels`.
+    #1430: mirrors :func:`resolve_required_gates`'s shape (walk each
+    proposal's issue, resolve its labels, set a field). Precedence no
+    longer matches, though: #1633 found that issue-label order (which
+    GitHub controls, not this repo) made ``tier:small``/``tier:large``
+    silent no-ops on any issue that also carried a type label, so
+    :meth:`coord.config.ModelsConfig.model_for_labels_with_reason` now
+    resolves deterministically instead — ``tier:*`` entries first, then
+    all other entries, ties within each group broken by ``models.labels``'s
+    own declaration order in ``coordinator.yml``. ``resolve_required_gates``
+    below still uses the old issue-label-order convention for
+    ``pipeline.labels``; that's a separate, still-open instance of the same
+    bug class (tracked outside #1633's scope) and not something callers of
+    this function should assume matches.
 
     Only ``type="work"`` proposals are touched. ``_apply_require_plan``
     (called before this, in :func:`propose`) may already have upgraded a
