@@ -131,17 +131,57 @@ def _gh(*args: str) -> str:
     return result.stdout.strip()
 
 
+def _json_loads_or(raw: str | None, default: Any = None) -> Any:
+    """Decode *raw* as JSON, or return *default* on empty/malformed input.
+
+    #1353: ``_gh`` above treats a ``gh`` invocation that exits 0 with empty
+    stdout as a success — indistinguishable, from ``_gh``'s point of view,
+    from a real empty payload. Roughly half of this module's call sites used
+    to hand ``_gh``'s output straight to a bare ``json.loads``, so that empty
+    string decoded to exactly ``json.JSONDecodeError: Expecting value: line 1
+    column 1 (char 0)`` — a one-line, unattributable crash that took down an
+    entire ``coord merge`` drain in the incident that prompted this (see
+    issue #1353). This is the one guarded decode every such call site now
+    routes through, so "gh returned nothing useful" degrades to a documented
+    *default* value at every site uniformly, rather than at only the two
+    sites (``get_pr_commit_messages``, ``pr_is_merged``) that happened to
+    hand-roll their own guard beforehand.
+
+    Does **not** change ``_gh``'s own failure contract: a non-zero ``gh``
+    exit still raises ``RuntimeError``/``GhError`` same as always — this only
+    covers the exit-0-but-stdout-is-garbage case that used to reach a bare
+    ``json.loads``.
+    """
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return default
+
+
+def _gh_json(*args: str, default: Any = None) -> Any:
+    """Run ``gh`` with *args* and JSON-decode its stdout, failing open.
+
+    Composes :func:`_gh` (still raises on a non-zero ``gh`` exit / missing
+    binary / timeout) with :func:`_json_loads_or` (fails open to *default* on
+    empty/malformed stdout from an otherwise-successful invocation). See
+    :func:`_json_loads_or` for why this exists.
+    """
+    return _json_loads_or(_gh(*args), default)
+
+
 def get_open_issues(repo: str) -> list[dict]:
     # #658: raised from 100 → 500 so repos with many open issues don't silently
     # skip old issue numbers during coord sync.  GitHub paginates the REST list
     # endpoint at 100 items internally, so this costs ~5 API calls for a large
     # repo — acceptable for a background sync.
-    raw = _gh(
+    return _gh_json(
         "issue", "list", "--repo", repo, "--state", "open",
         "--json", "number,title,labels,milestone,body,assignees",
         "--limit", "500",
+        default=[],
     )
-    return json.loads(raw)
 
 
 def get_closed_epics(repo: str, *, label: str = "epic") -> list[dict]:
@@ -155,12 +195,12 @@ def get_closed_epics(repo: str, *, label: str = "epic") -> list[dict]:
     closed-only lookup rather than a full ``--state all`` issue fetch, since
     only closed *epics* are of interest here.
     """
-    raw = _gh(
+    return _gh_json(
         "issue", "list", "--repo", repo, "--state", "closed", "--label", label,
         "--json", "number,title,labels,milestone,body,assignees",
         "--limit", "500",
+        default=[],
     )
-    return json.loads(raw)
 
 
 def get_issue(repo: str, issue_number: int) -> dict:
@@ -176,11 +216,11 @@ def get_issue(repo: str, issue_number: int) -> dict:
     too, not just on the list endpoints (``get_open_issues``,
     ``get_closed_epics``).
     """
-    raw = _gh(
+    return _gh_json(
         "issue", "view", str(issue_number), "--repo", repo,
         "--json", "number,title,body,state,milestone,labels",
+        default={},
     )
-    return json.loads(raw)
 
 
 # ── Sub-issues (#1195) ───────────────────────────────────────────────────────
@@ -204,8 +244,7 @@ def get_sub_issues(repo: str, issue_number: int) -> list[dict]:
     the API's normal response, not a 404/410 — see #1195's filing notes).
     Each item is a full issue object; callers only need ``number``/``state``.
     """
-    raw = _gh("api", f"repos/{repo}/issues/{issue_number}/sub_issues")
-    return json.loads(raw)
+    return _gh_json("api", f"repos/{repo}/issues/{issue_number}/sub_issues", default=[])
 
 
 def get_issue_parent(repo: str, issue_number: int) -> dict | None:
@@ -220,7 +259,7 @@ def get_issue_parent(repo: str, issue_number: int) -> dict | None:
     stripped = raw.strip()
     if not stripped or stripped == "null":
         return None
-    return json.loads(stripped)
+    return _json_loads_or(stripped, default=None)
 
 
 def _resolve_issue_id(repo: str, issue_number: int) -> int:
@@ -308,8 +347,7 @@ def create_milestone(
         args += ["-f", f"description={description}"]
     if due_on is not None:
         args += ["-f", f"due_on={due_on}"]
-    raw = _gh(*args)
-    return json.loads(raw)
+    return _json_loads_or(_gh(*args), default={})
 
 
 def edit_milestone(
@@ -333,8 +371,7 @@ def edit_milestone(
         args += ["-f", f"description={description}"]
     if due_on is not None:
         args += ["-f", f"due_on={due_on}"]
-    raw = _gh(*args)
-    return json.loads(raw)
+    return _json_loads_or(_gh(*args), default={})
 
 
 class IssueHasOpenChildrenError(RuntimeError):
@@ -383,9 +420,8 @@ def get_issues_live_state(repo: str, numbers: list[int]) -> dict[int, str]:
         f"}} }}"
     )
     try:
-        raw = _gh("api", "graphql", "-f", f"query={query}")
-        data = json.loads(raw)
-    except (RuntimeError, ValueError):
+        data = _gh_json("api", "graphql", "-f", f"query={query}", default={})
+    except RuntimeError:
         return {}
     data_field = data.get("data") if isinstance(data, dict) else None
     repo_data = data_field.get("repository") if isinstance(data_field, dict) else None
@@ -554,8 +590,10 @@ def check_pr_mergeable(repo: str, number: int) -> bool | None:
     inconclusive read is never a green light to unpark an entry.
     """
     try:
-        raw = _gh("pr", "view", str(number), "--repo", repo, "--json", "mergeable")
-        value = json.loads(raw).get("mergeable")
+        value = _gh_json(
+            "pr", "view", str(number), "--repo", repo, "--json", "mergeable",
+            default={},
+        ).get("mergeable")
     except Exception:  # noqa: BLE001 — fail-safe: unknown mergeability blocks nothing
         return None
     if value == "MERGEABLE":
@@ -605,8 +643,9 @@ def branch_has_merge_commit(repo: str, number: int) -> bool | None:
 
 def get_pr_body(repo: str, number: int) -> str:
     """Return PR *number*'s current body text (empty string if unset)."""
-    raw = _gh("pr", "view", str(number), "--repo", repo, "--json", "body")
-    return json.loads(raw).get("body") or ""
+    return _gh_json(
+        "pr", "view", str(number), "--repo", repo, "--json", "body", default={},
+    ).get("body") or ""
 
 
 def edit_pr_body(repo: str, number: int, body: str) -> None:
@@ -631,10 +670,8 @@ def get_pr_commit_messages(repo: str, number: int) -> list[str]:
         raw = _gh("pr", "view", str(number), "--repo", repo, "--json", "commits")
     except RuntimeError:
         return []
-    try:
-        commits = json.loads(raw).get("commits") or []
-    except (json.JSONDecodeError, AttributeError):
-        return []
+    data = _json_loads_or(raw, default={})
+    commits = (data.get("commits") if isinstance(data, dict) else None) or []
     messages: list[str] = []
     for c in commits:
         headline = (c.get("messageHeadline") or "").strip()
@@ -699,9 +736,8 @@ def pr_is_merged(repo: str, branch: str) -> bool:
         )
     except RuntimeError:
         return False
-    try:
-        prs = json.loads(raw)
-    except json.JSONDecodeError:
+    prs = _json_loads_or(raw, default=[])
+    if not isinstance(prs, list):
         return False
     merged = [
         p for p in prs
@@ -803,8 +839,10 @@ def get_issue_comments(repo: str, issue_number: int) -> list[dict]:
     ``state.sync_issue_comments`` (#873) to backfill the ``issue_comments``
     mirror with human + out-of-band comments coord never wrote itself.
     """
-    raw = _gh("issue", "view", str(issue_number), "--repo", repo, "--json", "comments")
-    return json.loads(raw).get("comments", [])
+    return _gh_json(
+        "issue", "view", str(issue_number), "--repo", repo, "--json", "comments",
+        default={},
+    ).get("comments", [])
 
 
 def post_issue_comment(repo: str, issue_number: int, body: str):
@@ -907,12 +945,13 @@ def change_issue_labels(
     label list (sorted) and ``changed`` is ``True`` when any labels were
     added or removed. Raises ``RuntimeError`` on ``gh`` failure.
     """
-    view_raw = _gh(
+    view_data = _gh_json(
         "issue", "view", str(issue_number), "--repo", repo, "--json", "labels",
+        default={},
     )
     current: set[str] = {
         lbl.get("name", "")
-        for lbl in json.loads(view_raw).get("labels", [])
+        for lbl in view_data.get("labels", [])
     }
 
     to_add = add - current
@@ -1002,7 +1041,18 @@ def set_test_mode_label(
 def get_repo_file(repo: str, path: str, branch: str = "develop") -> str:
     import base64
     raw = _gh("api", f"repos/{repo}/contents/{path}?ref={branch}")
-    data = json.loads(raw)
+    data = _json_loads_or(raw, default=None)
+    # #1353: an empty/malformed-but-exit-0 response used to bare-json.loads()
+    # into an unattributable JSONDecodeError (or, post-decode, a KeyError on
+    # "content"). Both callers of this function (_default_gate_a_file_exists,
+    # _default_fetch_repo_file) already catch RuntimeError to mean "file
+    # doesn't exist" — raise that instead, so a `gh` hiccup degrades to the
+    # same handled path as a real 404 rather than an uncaught crash.
+    if not isinstance(data, dict) or "content" not in data:
+        raise RuntimeError(
+            f"gh api repos/{repo}/contents/{path}?ref={branch}: "
+            "empty or malformed response"
+        )
     return base64.b64decode(data["content"]).decode()
 
 
@@ -1016,7 +1066,7 @@ def list_repo_dir(repo: str, path: str, branch: str = "develop") -> list[str]:
     found" should catch that, mirroring ``_default_gate_a_file_exists``.
     """
     raw = _gh("api", f"repos/{repo}/contents/{path}?ref={branch}")
-    data = json.loads(raw)
+    data = _json_loads_or(raw, default=None)
     if not isinstance(data, list):
         return []
     return [entry["name"] for entry in data if entry.get("type") == "file"]
@@ -1111,7 +1161,14 @@ def create_remote_branch(repo: str, branch: str, sha: str) -> bool:
 def get_default_branch_head(repo: str, branch: str) -> str:
     """Return the full commit SHA at the tip of `branch` on `repo` (owner/name)."""
     raw = _gh("api", f"repos/{repo}/branches/{branch}")
-    data = json.loads(raw)
+    data = _json_loads_or(raw, default=None)
+    # #1353: every caller of this already catches RuntimeError to mean "HEAD
+    # lookup failed" — raise that instead of letting an empty/malformed
+    # exit-0 response crash with an unattributable JSONDecodeError/KeyError.
+    if not isinstance(data, dict) or "commit" not in data:
+        raise RuntimeError(
+            f"gh api repos/{repo}/branches/{branch}: empty or malformed response"
+        )
     return data["commit"]["sha"]
 
 
@@ -1125,7 +1182,7 @@ def get_branch_sha(repo: str, branch: str) -> str | None:
     """
     try:
         raw = _gh("api", f"repos/{repo}/branches/{branch}")
-        data = json.loads(raw)
+        data = _json_loads_or(raw, default={})
         return data["commit"]["sha"]
     except Exception:  # noqa: BLE001 — fail-safe: unknown SHA is not blocking
         return None
@@ -1135,13 +1192,13 @@ def get_branch_sha(repo: str, branch: str) -> str | None:
 
 def find_pr_for_branch(repo: str, branch: str) -> dict | None:
     """Return the first open PR whose head ref matches `branch`, or None."""
-    raw = _gh(
+    items = _gh_json(
         "pr", "list", "--repo", repo, "--state", "open",
         "--head", branch,
         "--json", "number,title,url,headRefName,baseRefName,additions,deletions,mergeable",
         "--limit", "1",
+        default=[],
     )
-    items = json.loads(raw)
     return items[0] if items else None
 
 
@@ -1288,6 +1345,16 @@ def get_pr_checks(repo: str, number: int) -> list[dict]:
         if _GH_UNKNOWN_JSON_FLAG_MARKER in stderr:
             raise GhTooOldForJsonChecks(_gh_too_old_message(stderr))
         raise RuntimeError(f"gh pr checks failed: {stderr}")
+    # #1525: unlike the fail-open sites elsewhere in this module, a malformed
+    # (non-empty) response here must NOT be swallowed to a quiet ``[]`` —
+    # ``ci_github.GitHubCi._fetch`` deliberately catches the ``ValueError``
+    # (``json.JSONDecodeError`` is a subclass) this raises and turns it into
+    # a synthetic *failing* check, so the merge gate blocks and says why
+    # instead of reading "no checks" as "clear to merge" (the exact silent
+    # fail-open that let PR #1521 merge past a real CI failure). Only the
+    # genuinely-empty-stdout case (``stdout or "[]"``, unchanged from before)
+    # is a deliberate default here — that's ``gh``'s normal "zero checks
+    # configured" response, not a decode failure.
     return json.loads(stdout or "[]")
 
 
@@ -1494,7 +1561,7 @@ def get_pr_size(repo: str, number: int) -> int:
         )
     except RuntimeError:
         return 0
-    data = json.loads(raw)
+    data = _json_loads_or(raw, default={})
     return int(data.get("additions", 0)) + int(data.get("deletions", 0))
 
 
@@ -1536,18 +1603,18 @@ def merge_pr(repo: str, number: int, method: str = "rebase") -> tuple[bool, str]
 
 
 def list_open_prs(repo: str) -> list[dict]:
-    raw = _gh(
+    return _gh_json(
         "pr", "list", "--repo", repo, "--state", "open",
         "--json", "number,title,headRefName",
+        default=[],
     )
-    return json.loads(raw)
 
 
 def get_recent_develop_commits(repo: str, count: int = 10) -> list[dict]:
-    raw = _gh(
+    commits = _gh_json(
         "api", f"repos/{repo}/commits?sha=develop&per_page={count}",
+        default=[],
     )
-    commits = json.loads(raw)
     return [
         {"sha": c["sha"][:7], "message": c["commit"]["message"].split("\n")[0]}
         for c in commits
@@ -1594,12 +1661,18 @@ def get_repo_milestones(repo: str, *, state: str = "open") -> list[dict]:
         f"repos/{repo}/milestones?state={state}",
         "--jq", ".[] | {number: .number, title: .title}",
     )
-    # --jq emits one JSON object per line when applied to an array.
+    # --jq emits one JSON object per line when applied to an array.  #1353:
+    # a single malformed line used to bare-json.loads() into an unattributable
+    # crash that discarded every other (well-formed) milestone line too — skip
+    # just the bad line instead.
     results = []
     for line in raw.splitlines():
         line = line.strip()
-        if line:
-            results.append(json.loads(line))
+        if not line:
+            continue
+        parsed = _json_loads_or(line, default=None)
+        if parsed is not None:
+            results.append(parsed)
     return results
 
 
@@ -1611,8 +1684,7 @@ def get_milestone(repo: str, milestone_number: int) -> dict:
     Raises RuntimeError (propagated from ``_gh``) when the milestone does not
     exist.
     """
-    raw = _gh("api", f"repos/{repo}/milestones/{milestone_number}")
-    return json.loads(raw)
+    return _gh_json("api", f"repos/{repo}/milestones/{milestone_number}", default={})
 
 
 def get_milestone_issues(
@@ -1628,12 +1700,12 @@ def get_milestone_issues(
     milestone's issue states for the audit briefing without a separate call
     per issue.
     """
-    raw = _gh(
+    return _gh_json(
         "issue", "list", "--repo", repo, "--milestone", milestone_title,
         "--state", state, "--json", "number,title,state,labels",
         "--limit", "200",
+        default=[],
     )
-    return json.loads(raw)
 
 
 def assign_issue_milestone(

@@ -2874,11 +2874,19 @@ def load_board() -> Board | None:
 
 def _query_board(conn: sqlite3.Connection) -> Board:
     """Build a Board from the current assignments table (no review_state inference)."""
-    # Load all plans keyed by assignment_id
+    # Load all plans keyed by assignment_id.  #1353: a single malformed
+    # plan_data row used to bare-json.loads() straight into a JSONDecodeError
+    # that aborted the *entire* board load (and thus `coord merge`'s
+    # auto-enqueue scan, which calls load_board() first) with no attribution
+    # beyond a one-line "Expecting value" message. Route through the same
+    # tolerant decoder every other JSON column in this module already uses
+    # (_board_mapping.json_loads): a bad row degrades to "no plan" for that
+    # one assignment instead of taking down every assignment's board data.
     plan_rows = conn.execute("SELECT assignment_id, plan_data FROM plans").fetchall()
     plans_by_id: dict[str, dict] = {
-        r["assignment_id"]: json.loads(r["plan_data"]) for r in plan_rows
+        r["assignment_id"]: _json_loads(r["plan_data"]) for r in plan_rows
     }
+    plans_by_id = {k: v for k, v in plans_by_id.items() if v is not None}
 
     rows = conn.execute("SELECT * FROM assignments").fetchall()
     round_number_row = conn.execute(

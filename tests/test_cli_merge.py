@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shlex
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -1452,6 +1453,70 @@ class TestMergeAutoEnqueue:
 
         assert second.exit_code == 0, second.output
         assert "auto-enqueued" not in second.output
+
+    def test_one_assignment_blowing_up_does_not_abort_the_whole_scan(
+        self, config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        """#1353: the auto-enqueue scan used to run every completed
+        assignment through one unguarded loop body — a single unexpected
+        exception (e.g. the JSONDecodeError this issue reports, from a
+        transient empty-stdout `gh` response) propagated straight out and
+        aborted the scan for *every other* assignment too, with `coord
+        merge` printing nothing at all before exiting 1. One assignment
+        misbehaving must instead be reported by name and skipped, while the
+        rest of the batch is still scanned normally."""
+        self._seed_board_with_done_work(
+            coord_db, issue_number=1500, assignment_id="boom-1500",
+            branch="issue-1500-fix",
+        )
+        from coord.models import Assignment
+        from coord.state import save_board, load_board
+
+        board = load_board()
+        board.completed.append(
+            Assignment(
+                machine_name="laptop", repo_name="api", issue_number=1501,
+                issue_title="#1501", assignment_id="ok-1501", type="work",
+                status="done", branch="issue-1501-fix", test_state="passed",
+            )
+        )
+        save_board(board)
+        self._seed_issue_state(coord_db, number=1500, state="open")
+        self._seed_issue_state(coord_db, number=1501, state="open")
+
+        def _terminal_side_effect(repo_github, issue_number, branch, *, cache=None):
+            if issue_number == 1500:
+                # Simulates the #1353 incident: an unexpected exception deep
+                # in the per-assignment `gh` round-trip (a bad decode, a
+                # transient blip) — not a RuntimeError the existing fail-open
+                # branches already handle, but a genuinely unhandled one.
+                raise json.JSONDecodeError("Expecting value", "", 0)
+            return False
+
+        with patch(
+            "coord.github_ops.list_remote_branch_names",
+            return_value={"main", "issue-1500-fix", "issue-1501-fix"},
+        ), patch(
+            "coord.github_ops.work_is_terminal", side_effect=_terminal_side_effect,
+        ), patch(
+            "coord.github_ops.create_pr",
+            return_value={"number": 500, "url": "u/500", "existed": False},
+        ) as create, patch(
+            "coord.github_ops.merge_pr", return_value=(True, "ok"),
+        ), patch(
+            "coord.github_ops.get_pr_size", return_value=10,
+        ):
+            result = CliRunner().invoke(main, ["merge", "--config", str(config_file)])
+
+        assert result.exit_code == 0, result.output
+        # The failing assignment is named and reported, not silently dropped.
+        assert "skipped" in result.output
+        assert "boom-1500" in result.output or "#1500" in result.output
+        # The OTHER assignment in the same batch still went through normally
+        # — the whole scan was not aborted by the first assignment's failure.
+        assert "auto-enqueued" in result.output
+        assert "#1501" in result.output
+        create.assert_called_once()
 
 
 class TestStatusMergeQueue:

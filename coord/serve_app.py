@@ -236,6 +236,29 @@ def _ensure_stdio_capture_proxies() -> tuple[_ThreadLocalCapture, _ThreadLocalCa
     return sys.stdout, sys.stderr  # type: ignore[return-value]
 
 
+def _log_daemon_exception(route: str, e: Exception) -> str:
+    """Log an unexpected exception from a daemon-run CLI handler and return
+    its traceback for the client-facing ``error`` field.
+
+    #1353: every ``/merge``-style handler's ``_run()`` closure used to catch
+    the broad exception with plain ``err = str(e)`` — a bare one-line message
+    such as ``Expecting value: line 1 column 1 (char 0)`` with no frame, and
+    nothing logged daemon-side either (the journal showed only the request's
+    ``200 OK``). That left an incident with *zero* attributable evidence: not
+    which call raised, not which file/line, nothing to grep for. Route every
+    such except-block through here instead: ``logging.exception`` puts a full
+    frame in the daemon journal, and returning ``traceback.format_exc()``
+    (rather than ``str(e)``) means the client-visible error carries the same
+    frame, so a bad decode or a `gh` blip is attributable from the artifact
+    alone next time, no journal spelunking required.
+    """
+    import logging  # noqa: PLC0415
+    import traceback  # noqa: PLC0415
+
+    logging.getLogger("coord.serve").exception("%s: unhandled exception", route)
+    return traceback.format_exc()
+
+
 class _BearerAuthMiddleware(BaseHTTPMiddleware):
     """Reject requests without ``Authorization: Bearer <token>`` (``/healthz`` exempt)."""
 
@@ -4151,7 +4174,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             except SystemExit as e:  # click commands sys.exit() on some paths
                 code = e.code if isinstance(e.code, int) else (1 if e.code else 0)
             except Exception as e:  # noqa: BLE001
-                err = str(e)
+                err = _log_daemon_exception("/acceptance-record", e)
                 code = 1
             finally:
                 if prev is None:
@@ -4456,7 +4479,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             except SystemExit as e:
                 code = e.code if isinstance(e.code, int) else (1 if e.code else 0)
             except Exception as e:  # noqa: BLE001
-                err = str(e)
+                err = _log_daemon_exception("/notify", e)
                 code = 1
             finally:
                 if locked:
@@ -5154,7 +5177,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 except SystemExit as e:  # click commands sys.exit() on some paths
                     code = e.code if isinstance(e.code, int) else (1 if e.code else 0)
                 except Exception as e:  # noqa: BLE001
-                    err = str(e)
+                    err = _log_daemon_exception("/merge", e)
                     code = 1
                 finally:
                     if prev is None:
@@ -5200,7 +5223,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             except SystemExit as e:  # click commands sys.exit() on some paths
                 code = e.code if isinstance(e.code, int) else (1 if e.code else 0)
             except Exception as e:  # noqa: BLE001
-                err = str(e)
+                err = _log_daemon_exception("/reconcile-merges", e)
                 code = 1
             finally:
                 if prev is None:
@@ -5250,7 +5273,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             except SystemExit as e:  # click commands sys.exit() on some paths
                 code = e.code if isinstance(e.code, int) else (1 if e.code else 0)
             except Exception as e:  # noqa: BLE001
-                err = str(e)
+                err = _log_daemon_exception("/diagnose", e)
                 code = 1
             finally:
                 if prev is None:
@@ -5297,7 +5320,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             except SystemExit as e:  # click commands sys.exit() on some paths
                 code = e.code if isinstance(e.code, int) else (1 if e.code else 0)
             except Exception as e:  # noqa: BLE001
-                err = str(e)
+                err = _log_daemon_exception("/test-plan", e)
                 code = 1
             finally:
                 if prev is None:

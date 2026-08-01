@@ -3221,6 +3221,42 @@ def test_serve_merge_relays_nonzero_exit(
     assert resp.json()["exit_code"] == 2
 
 
+def test_serve_merge_relays_traceback_not_bare_message(
+    file_db: Path, valid_config_path: Path, rw_db, monkeypatch, caplog
+):
+    """#1353: an unhandled exception from the merge callback used to reach
+    the client as a bare ``str(e)`` — e.g. exactly
+    ``"Expecting value: line 1 column 1 (char 0)"`` for a ``JSONDecodeError``
+    — with no frame, and nothing logged daemon-side either (the incident
+    this issue reports left a bare "200 OK" in the journal for the failing
+    request). The handler must now put the *traceback* in the client-facing
+    ``error`` field, and log the exception (with a frame) daemon-side, so a
+    future incident is attributable from either artifact."""
+    import json as _json
+    from coord.cli import merge as merge_cmd
+
+    def fake_callback(**kwargs):
+        raise _json.JSONDecodeError("Expecting value", "", 0)
+
+    monkeypatch.setattr(merge_cmd, "callback", fake_callback)
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with caplog.at_level("ERROR", logger="coord.serve"):
+        with TestClient(app) as cli:
+            resp = cli.post("/merge", json={})
+    out = resp.json()
+    assert out["exit_code"] == 1
+    # A bare str(e) would be exactly "Expecting value: line 1 column 1 (char 0)"
+    # with no other content -- assert the traceback frame is present too.
+    assert "Traceback (most recent call last)" in out["error"]
+    assert "JSONDecodeError" in out["error"]
+    assert "fake_callback" in out["error"]
+    # And the daemon's own journal retains a logged frame, not just the
+    # request's 200 OK.
+    assert any(
+        rec.name == "coord.serve" and rec.exc_info for rec in caplog.records
+    )
+
+
 def test_serve_merge_rejects_client_skip_review(
     file_db: Path, valid_config_path: Path, rw_db, monkeypatch
 ):

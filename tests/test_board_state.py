@@ -91,6 +91,60 @@ class TestBoardPersistence:
         assert loaded.completed[0].review_head_sha == "abc123"
         assert loaded.completed[0].review_patch_id == "patchid-xyz"
 
+    def test_load_board_tolerates_malformed_plan_data_row(self, coord_db) -> None:
+        """#1353: a single malformed ``plans.plan_data`` row used to blow up
+        the *entire* board load with a bare ``json.JSONDecodeError`` —
+        ``_query_board`` bare-``json.loads()``'d every row in one dict
+        comprehension, so one bad row (or a transient write race) took every
+        other assignment's board data down with it, with no attribution
+        beyond "Expecting value: line 1 column 1 (char 0)" (the incident that
+        prompted this issue). A malformed row must instead degrade to "no
+        plan" for *that* assignment only, matching
+        ``_board_mapping.json_loads``'s existing tolerant-decode posture used
+        everywhere else in this module."""
+        from coord.db import get_connection
+        from coord.state import save_plan
+
+        board = Board(
+            completed=[
+                Assignment(
+                    machine_name="laptop",
+                    repo_name="api",
+                    issue_number=1,
+                    issue_title="good",
+                    assignment_id="good-1",
+                    status="done",
+                ),
+                Assignment(
+                    machine_name="laptop",
+                    repo_name="api",
+                    issue_number=2,
+                    issue_title="bad",
+                    assignment_id="bad-1",
+                    status="done",
+                ),
+            ],
+        )
+        save_board(board)
+        save_plan("good-1", {"steps": ["do the thing"], "blockers": []})
+
+        # Bypass save_plan's json.dumps() to write an un-decodable row
+        # directly, simulating the transient/corrupt write this issue is
+        # about — save_plan itself always writes valid JSON.
+        conn = get_connection()
+        conn.execute(
+            "INSERT OR REPLACE INTO plans (assignment_id, plan_data) VALUES (?, ?)",
+            ("bad-1", "{not valid json"),
+        )
+        conn.commit()
+
+        loaded = load_board()  # must not raise
+
+        assert loaded is not None
+        by_id = {a.assignment_id: a for a in loaded.completed}
+        assert by_id["good-1"].plan == {"steps": ["do the thing"], "blockers": []}
+        assert by_id["bad-1"].plan is None
+
     def test_load_empty_db_returns_none(self, coord_db) -> None:
         assert load_board() is None
 
