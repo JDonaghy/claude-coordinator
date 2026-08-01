@@ -34679,6 +34679,167 @@ Milestone tracking issue.
         );
     }
 
+    // ── #1122 fix-iteration-1 (review): detail pane scroll reachability ──
+
+    /// #1122 fix-iteration-1 regression fixture (review finding): a plan
+    /// whose tracking-epic body carries a `## Work order` block long enough
+    /// (40 items) to overflow the detail pane's viewport — reproduces the
+    /// blocking finding verbatim: "any plan whose work order is long enough
+    /// to fill the viewport... makes the actions row... permanently
+    /// unreachable." The 40 child issues are deliberately left unsynced
+    /// (not seeded as their own `OpenIssue`s) — `build_dag_nodes` presumes
+    /// an unsynced issue closed/done, which is irrelevant to this fixture's
+    /// purpose (forcing overflow) and keeps it small.
+    fn make_plan_roster_board_data_with_large_work_order() -> BoardData {
+        let mut body = String::from("Epic tracking issue.\n\n## Work order\n");
+        for i in 0..40 {
+            body.push_str(&format!("- [ ] #{}\n", 300 + i));
+        }
+        let tracking = make_open_issue(
+            "coord-repo", 100, "Big epic", &body, &["epic", "coord"], "open",
+            Some(5), Some("Big epic"),
+        );
+        BoardData {
+            pipeline_repos: vec![("coord-repo".to_string(), "acme/coord-repo".to_string())],
+            plan_roster_supported: true,
+            plan_roster: vec![PlanRosterEntry {
+                repo: "coord-repo".to_string(),
+                title: "Big epic".to_string(),
+                milestone_number: 5,
+                tracking_issue: Some(100),
+                has_work_order: true,
+                ready_frontier: 0,
+                blocked: 0,
+                in_flight: 0,
+                done: 40,
+                total: 40,
+                ..PlanRosterEntry::default()
+            }],
+            open_issues: vec![tracking],
+            ..BoardData::default()
+        }
+    }
+
+    /// #1122 fix-iteration-1 (review, blocking finding): before this fix the
+    /// detail pane's `ListView` was always painted AND hit-tested with a
+    /// hardcoded `scroll_offset: 0`/`selected_idx: 0`, and no event handler
+    /// ever moved them — `j`/`k` were a complete no-op while the pane was
+    /// open. Any plan whose work order was long enough to fill the viewport
+    /// therefore made the actions row (the pane's only way to
+    /// Dispatch/Edit/Close/etc.) permanently unreachable by mouse AND
+    /// keyboard, even though the status bar advertised "j/k=nav". This
+    /// drives the exact repro: open a plan with a 40-item work order,
+    /// confirm the actions row starts off-screen, confirm `j` navigation
+    /// scrolls it into view, and confirm the now-visible button is still
+    /// clickable — proving the mouse hit-test path shares the same live
+    /// scroll offset as the paint path rather than a second hardcoded 0.
+    #[test]
+    fn plans_detail_pane_jk_scrolls_overflowing_work_order_to_reveal_actions_row() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_test_app(make_plan_roster_board_data_with_large_work_order());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "◆");
+        let (x, y) = driver.find("Big epic").unwrap_or_else(|| {
+            panic!(
+                "#1122: could not find Plans row 'Big epic' on initial render:\n{}",
+                driver.screen()
+            )
+        });
+        driver.click(x, y);
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        assert!(
+            !driver.screen_contains("Open in browser"),
+            "sanity check: a 40-item work order must overflow the viewport, \
+             so the actions row is NOT visible before any navigation:\n{}",
+            driver.screen(),
+        );
+
+        for _ in 0..50 {
+            driver.press(quadraui::Key::Char('j'));
+        }
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Open in browser") && screen.contains("Dispatch next"),
+            "#1122 fix: pressing `j` repeatedly must scroll the detail \
+             pane's viewport to reveal the actions row (previously `j`/`k` \
+             were a complete no-op while the pane was open):\n{screen}",
+        );
+
+        let (bx, by) = driver.find("Open in browser").unwrap_or_else(|| {
+            panic!(
+                "#1122: 'Open in browser' should now be on screen after \
+                 scrolling:\n{}",
+                driver.screen()
+            )
+        });
+        driver.click(bx, by);
+        assert!(
+            driver.screen_contains("Opening plan"),
+            "#1122 fix: once scrolled into view, the actions row must still \
+             be clickable — the hit-test `ListView` must share the same \
+             live scroll offset as the paint path, not a second hardcoded \
+             0:\n{}",
+            driver.screen(),
+        );
+    }
+
+    /// #1122 fix-iteration-1 (review, non-blocking concern): `plans_selected()`
+    /// must resolve the detail pane's plan via the stable `(repo,
+    /// milestone_number)` identity captured when the pane opened
+    /// (`plans_detail_target`), not by re-indexing `plans_sel` into a
+    /// possibly-reordered `plans_visible_entries()`. Before this fix, a
+    /// board refresh (this is a polling TUI) that inserted a new
+    /// `has_work_order` milestone sorting ahead of the one the pane was
+    /// opened for would silently swap the pane onto the new plan —
+    /// misdirecting whatever (potentially destructive) action the operator
+    /// clicked next.
+    #[test]
+    fn plans_detail_pane_selection_survives_roster_reorder_after_refresh() {
+        let mut app = make_test_app(make_plan_roster_board_data());
+        app.active_view = SidebarView::Plans;
+        app.plans_sel = 0;
+        assert!(
+            app.open_selected_plan_detail(),
+            "precondition: Substrate (#5) has a tracking epic, so opening \
+             the detail pane must succeed",
+        );
+        assert_eq!(
+            app.plans_selected().map(|e| e.milestone_number),
+            Some(5),
+            "precondition: the pane must have opened on Substrate (#5)",
+        );
+
+        // Simulate a board refresh inserting a new `has_work_order`
+        // milestone that sorts ahead of Substrate in
+        // `plans_visible_entries()` — the exact reorder the review finding
+        // warned about.
+        let mut roster = app.data.plan_roster.clone();
+        roster.insert(
+            0,
+            PlanRosterEntry {
+                repo: "api".to_string(),
+                title: "Newly appeared".to_string(),
+                milestone_number: 1,
+                tracking_issue: Some(999),
+                has_work_order: true,
+                ..PlanRosterEntry::default()
+            },
+        );
+        app.data.plan_roster = roster;
+
+        let selected = app.plans_selected();
+        assert_eq!(
+            selected.as_ref().map(|e| e.milestone_number),
+            Some(5),
+            "#1122 fix: the detail pane must still resolve to Substrate \
+             (#5) after the refresh — not silently swap onto the new \
+             milestone #1 that now sorts first in \
+             `plans_visible_entries()`: got {selected:?}",
+        );
+    }
+
     /// #1029 fix-iteration regression (bug A): opening milestone chat from
     /// the Plans panel must update quadraui's ActivityBar highlight AND
     /// sidebar panel header, not just the main-pane content. Before this
