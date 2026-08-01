@@ -274,15 +274,45 @@ not hot-reload — without the restart the file is changed and nothing uses it.
 
 ---
 
-## 9. The unattended driver (`scripts/`)
+## 9. The unattended driver (`coord drive`, and `scripts/drive-batch.sh`)
 
-`scripts/drive-issue.sh` drives one issue Work → Test → Review → Merge with
-nothing watching, using only normal `coord` commands. It is resumable — re-run
-it on the same issue and it picks up from wherever the board actually is.
-`--dry-run` shows state without touching anything.
+`coord drive <repo> <issue>` drives **one** issue Work → Test → Review → Merge
+with nothing watching. It is resumable — re-run it on the same issue and it
+picks up from wherever the board actually is. `--dry-run` shows state without
+touching anything.
 
-Supporting files: `coord-test-runner.sh` (the Test gate) and
-`coord_issue_state.py` (read-only per-issue state oracle, ETag-cached).
+> **`scripts/drive-issue.sh` and `scripts/coord_issue_state.py` no longer
+> exist.** #1392 ported the bash driver to `coord drive`; both files were
+> deleted and this section still described them until 2026-08-01. If you are
+> following an older note that names them, it means `coord drive`.
+
+`scripts/drive-batch.sh` is the thin layer above it: drive **several**
+independent issues sequentially on one machine, in one tmux session, overnight.
+`--help` documents it. It is the hand-rolled prototype of `coord drive-epic`
+(#1660) and should be deleted when that lands.
+
+```bash
+ssh dellserver && tmux new -s drive
+MACHINE=dellserver ~/drive-batch.sh 1645 1650 1654      # or repo#issue
+# Ctrl-b d
+```
+
+**Budget ~120 minutes per issue, and never lower it to "save time."** Measured
+on the 2026-08-01 batch: a clean single-round issue in this repo on `sonnet` is
+**~85 min** end-to-end (work ~40m + test ~23m + review ~22m); a review fix
+round roughly doubles it. That run used `--deadline 45` and lost all five.
+
+The trap is what a deadline actually does: **it stops the observer, not the
+work.** All five drives exited at 45m; the fleet carried every one of them
+through test and review anyway and approved each 21–133 minutes *after* its
+drive was gone. The loop then started the next issue on top of the previous
+one's live stages — so the batch was sequential in the script and concurrent on
+the fleet, and the smoke stage landed on a machine that was supposed to be
+asleep. A short deadline does not shorten the night; it silently makes the run
+parallel. Design consequence for #1660: an expiry must escalate and stop, never
+advance the frontier.
+
+Supporting file: `coord-test-runner.sh` (the Test gate).
 
 **The driver no longer runs the Test stage itself (#1426).** It observes
 `test_state` exactly as it already did for Review and Merge. The suite is
@@ -312,16 +342,15 @@ Known limits, tracked under milestone #49 / epic #1406:
 - Interactive (`provider_name="claude-pty"`) work **never** auto-dispatches a
   review (the #555 guard). The driver refuses at preflight; `--force-review`
   requests one explicitly, or use `coord review <aid>`.
-- **The failure path is still unproven.** Every drive so far has passed its
-  tests, so the `coord fix` loop on a genuine test failure has not run
-  end-to-end. This is the reason #1392 (port to `coord drive`) is deliberately
-  not dispatchable yet — porting now would port unexercised paths.
-- Flags must precede the positionals (`drive-issue.sh --machine precision
-  <repo> <issue>`); the parse loop `break`s at the first non-flag, so trailing
-  flags fail with a usage dump. Fixed by #1392's Click port.
-- **Never edit `drive-issue.sh` while a drive is running.** bash reads a script
+- **The failure path is still lightly exercised.** Most drives pass their
+  tests, so the `coord fix` loop on a genuine test failure has had few
+  end-to-end runs.
+- **Review verdicts consumed by the daemon drain do not reach the work row**
+  (#1663) — the drive then waits out its full deadline on an issue that was
+  approved. Independent of the deadline sizing above; both bite the same run.
+- **Never edit `drive-batch.sh` while a batch is running.** bash reads a script
   lazily by byte offset, so an in-place edit shifts them under every live
-  interpreter and can corrupt a run mid-flight.
+  interpreter and can corrupt a run mid-flight. Copy, edit the copy, swap after.
 
 Resolved since this list was first written: the runner's path routing now
 covers other repos and **refuses** rather than recording a false `skipped`
