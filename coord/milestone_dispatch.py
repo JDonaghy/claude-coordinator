@@ -609,10 +609,10 @@ def dispatch_entry(
     # `default` — read-only/cheap, must not inherit a tier:large -> opus
     # routing meant for the eventual work dispatch.
     proposal_type = "plan" if config.dispatch.require_plan else "work"
-    label_model, matched_label = (
+    label_model, matched_label, shadowed_labels = (
         config.models.model_for_labels_with_reason(issue_labels)
         if proposal_type == "work"
-        else (None, None)
+        else (None, None, [])
     )
     resolved_model = label_model or config.models.default
     # #1454: surfaced on the outcome so `coord milestone dispatch`'s CLI
@@ -624,7 +624,9 @@ def dispatch_entry(
     from coord.config import describe_model_choice  # noqa: PLC0415
 
     model_reason = describe_model_choice(
-        resolved_model=resolved_model, matched_label=matched_label,
+        resolved_model=resolved_model,
+        matched_label=matched_label,
+        shadowed_labels=shadowed_labels,
     )
 
     proposal = Proposal(

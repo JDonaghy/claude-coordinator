@@ -285,6 +285,7 @@ def approve(
         # `coord milestone dispatch` already do) before falling back.
         plan_time_model = p.model
         matched_label: str | None = None
+        shadowed_labels: list[str] = []
         if p.type == "work" and not p.model:
             repo_for_model = cfg.repo(p.repo_name)
             fresh_labels: list[str] = []
@@ -296,7 +297,9 @@ def approve(
                     ]
                 except RuntimeError:
                     fresh_labels = []  # fail open — fall back to default below
-            label_model, matched_label = cfg.models.model_for_labels_with_reason(fresh_labels)
+            label_model, matched_label, shadowed_labels = cfg.models.model_for_labels_with_reason(
+                fresh_labels
+            )
             if label_model:
                 p.model = label_model
         if not p.model:
@@ -307,6 +310,7 @@ def approve(
                 resolved_model=p.model,
                 explicit_reason="resolved at plan time" if plan_time_model else None,
                 matched_label=matched_label,
+                shadowed_labels=shadowed_labels,
             )
         )
         # Resolve required_gates: fall back to config default for proposals
