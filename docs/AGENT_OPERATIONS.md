@@ -560,6 +560,99 @@ and after `coord agent update --all` to confirm the rollout actually landed
 everywhere — a split-brain fleet is only detectable by comparing versions
 directly, not by whether the last `coord agent update` reported success.
 
+## Making a machine `browser`-capable (Playwright, #1541)
+
+Web smoke and web acceptance both route `coord/dashboard/webapp/**` to the
+`browser` capability, so **every** web test in the program lands on a machine
+that advertises it. Until 2026-08-02 that was exactly one machine (elitebook,
+the dev box), which made one flaky host able to stall a whole milestone.
+dellserver was added on 2026-08-02; this is the runbook for a third.
+
+Headless Chromium needs **no display** — a headless server is a perfectly good
+browser machine, and web tests headless-test far more cleanly than the TUI does.
+
+**1. Node.** `node`, `npm` and `npx` must resolve from the agent's PATH, not just
+your interactive shell. Ubuntu 24.04's packaged `node` (v20) is sufficient. If the
+machine uses nvm, install the run-time shim instead of baking a version-stamped
+path into the unit — see `deploy/node-shim.sh` and the #1678 note there: an nvm
+path in the unit works until the next `nvm install`, at which point `browser`
+silently goes unmet again.
+
+**2. Browsers — match the pinned version, do not take latest.** Read the pin from
+`coord/dashboard/webapp/package.json` (`@playwright/test`, currently `^1.61.1`) and
+install that exact line, so every browser machine runs the same build:
+
+```bash
+npx --yes playwright@1.61.1 install chromium
+```
+
+This populates `~/.cache/ms-playwright/` with `chromium-<build>` and
+`chromium_headless_shell-<build>`. Both existing machines are on build **1228**.
+`coord doctor` reports it as `playwright-browsers: <build>`; a mismatch between
+machines means two Test runs of the same commit are not the same experiment.
+
+**3. System libraries — check, do not assume you need `--with-deps`.** On Ubuntu
+24.04 the required shared libraries are already present and `--with-deps` (which
+needs sudo) was **not** necessary. Verify by launching rather than by inspection:
+
+On the target machine, write the probe to a file (do not try to inline it through
+an ssh quoting layer — that is how you end up debugging your own escaping instead
+of the browser):
+
+```bash
+mkdir -p /tmp/pwlaunch && cd /tmp/pwlaunch
+npm init -y >/dev/null && npm install --no-audit --no-fund playwright@1.61.1 >/dev/null
+
+cat > launch.js <<'EOF'
+const { chromium } = require('playwright');
+(async () => {
+  const b = await chromium.launch();          // headless by default
+  const p = await b.newPage();
+  await p.setContent('<h1>hello</h1>');
+  console.log('RENDERED:', await p.textContent('h1'));
+  await b.close();
+  console.log('LAUNCH_OK');
+})().catch(e => { console.log('LAUNCH_FAIL:', e.message); process.exit(1); });
+EOF
+```
+
+Then run it through a **stripped environment**, which is the whole point of the
+check:
+
+```bash
+ssh <machine> 'env -i HOME=/home/john PATH=/usr/bin:/bin \
+  node /tmp/pwlaunch/launch.js'
+# expect:  RENDERED: hello
+#          LAUNCH_OK
+```
+
+A `LAUNCH_FAIL` naming a missing `lib*.so` is the signal that this machine really
+does need `npx playwright install --with-deps chromium` (sudo). Clean up
+`/tmp/pwlaunch` afterwards.
+
+The `env -i` matters: it reproduces the agent's environment rather than your
+interactive PATH. This is the same trap as the elitebook `gh`-blind-workers case
+(#1483) — a tool that works when you ssh in by hand can be invisible to the agent.
+
+**4. Declare the capability** on the **daemon host's** `~/.coord/coordinator.yml`
+(not a local copy — see the config-cache note in `CLAUDE.md`):
+
+```yaml
+  - name: dellserver
+    capabilities: [rust, python, browser]
+```
+
+**5. Restart, in this order:** the machine's `coord-agent` (so it re-probes and
+republishes `/health`), then `coord-serve` on the daemon host (so routing sees the
+new capability). Both need the fleet idle — restarting an agent kills any headless
+worker running on it.
+
+**6. Verify** with `coord doctor`: the machine should now report `node`, `npm` and
+`playwright-browsers`. Note these probes are **capability-driven** — `probe_all()`
+only probes what the machine declares, so a machine can have Node installed and
+still show nothing until `browser` is in its `capabilities` list. An empty probe
+list is not evidence that a tool is missing.
+
 ## External-tool prereqs (`coord doctor`, #1570 B/D/E)
 
 coord shells out to external tools it never used to check — `gh` was the
