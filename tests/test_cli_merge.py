@@ -1253,11 +1253,29 @@ class TestMergeAutoEnqueue:
     # ── #946: auto-enqueue must be gated on review + test, same as the
     # daemon's enqueue_approved_work.  Prior to the fix, this loop had no
     # gate at all — untested/unreviewed work (#782/#795) reached the queue.
+    #
+    # #1695 moved *where* the refusal acts, and these two tests moved with
+    # it. The gate is no longer allowed to drop the row on the floor at
+    # enqueue time (that made `--skip-review` structurally unreachable —
+    # the flag waives the gate at merge time for an entry that could never
+    # exist). The row now enters the queue in a visibly BLOCKED state and
+    # the gate refuses at MERGE time instead.
+    #
+    # The #782/#795 protection these tests exist for is UNCHANGED and is now
+    # asserted more directly than before: previously they only proved the row
+    # was absent from the queue, which merely *implied* it could not merge.
+    # They now assert the thing that actually matters — `merge_pr` is never
+    # called and the entry never reaches MERGED — on the real (non-dry-run)
+    # path. Neither assertion was dropped in favour of a weaker one.
 
-    def test_auto_enqueue_refused_on_failed_test(
+    def test_auto_enqueue_blocks_merge_on_failed_test(
         self, config_file: Path, coord_dir: Path, coord_db
     ) -> None:
-        """A failed test verdict (and no review) must block auto-enqueue."""
+        """A failed test verdict (and no review) must never merge (#782).
+
+        Post-#1695 the row IS enqueued — visibly BLOCKED, naming the gate —
+        so an operator can address it with `--only`. It still cannot merge.
+        """
         from coord.models import Assignment, Board
         from coord.state import save_board
 
@@ -1271,22 +1289,37 @@ class TestMergeAutoEnqueue:
         with patch(
             "coord.github_ops.list_remote_branch_names",
             return_value={"main", "issue-782-fix"},
-        ):
+        ), patch("coord.github_ops.create_pr") as create, \
+             patch("coord.github_ops.merge_pr") as merge_fn, \
+             patch("coord.github_ops.get_pr_size", return_value=10), \
+             patch("coord.github_ops.get_branch_diff_size", return_value=10), \
+             patch("coord.github_ops.work_is_terminal", return_value=False):
+            create.return_value = {"number": 782, "url": "u/782", "existed": False}
+            merge_fn.return_value = (True, "ok")
             result = CliRunner().invoke(
-                main, ["merge", "--dry-run", "--config", str(config_file)],
+                main, ["merge", "--config", str(config_file)],
             )
 
         assert result.exit_code == 0, result.output
-        assert "auto-enqueued" not in result.output
-        assert not any(e.issue_number == 782 for e in mq.load_queue())
+        # #1695: visible, and the gate is named for the row.
+        assert "BLOCKED" in result.output, result.output
+        assert "#782" in result.output
+        entries = [e for e in mq.load_queue() if e.issue_number == 782]
+        assert len(entries) == 1
+        # #782's actual protection: it did NOT merge.
+        assert "smoke_required" in result.output, result.output
+        merge_fn.assert_not_called()
+        assert entries[0].state != mq.MERGED
 
-    def test_auto_enqueue_refused_with_no_verdict_and_no_review(
+    def test_auto_enqueue_blocks_merge_with_no_verdict_and_no_review(
         self, config_file: Path, coord_dir: Path, coord_db
     ) -> None:
-        """No test verdict at all + reviews required + no review → refused.
+        """No test verdict at all + reviews required + no review → the merge
+        is refused (#795).
 
         Reviews are enabled for this test (unlike the module-level
-        ``config_file`` fixture, which disables them) so both gates are live.
+        ``config_file`` fixture, which disables them) so both gates are live —
+        and both must be named on the blocked row.
         """
         from coord.models import Assignment, Board
         from coord.state import save_board
@@ -1305,14 +1338,27 @@ class TestMergeAutoEnqueue:
         with patch(
             "coord.github_ops.list_remote_branch_names",
             return_value={"main", "issue-795-fix"},
-        ):
+        ), patch("coord.github_ops.create_pr") as create, \
+             patch("coord.github_ops.merge_pr") as merge_fn, \
+             patch("coord.github_ops.get_pr_size", return_value=10), \
+             patch("coord.github_ops.get_branch_diff_size", return_value=10), \
+             patch("coord.github_ops.work_is_terminal", return_value=False):
+            create.return_value = {"number": 795, "url": "u/795", "existed": False}
+            merge_fn.return_value = (True, "ok")
             result = CliRunner().invoke(
-                main, ["merge", "--dry-run", "--config", str(config_file)],
+                main, ["merge", "--config", str(config_file)],
             )
 
         assert result.exit_code == 0, result.output
-        assert "auto-enqueued" not in result.output
-        assert not any(e.issue_number == 795 for e in mq.load_queue())
+        assert "BLOCKED" in result.output, result.output
+        assert "--skip-review" in result.output, result.output
+        assert "--skip-smoke" in result.output, result.output
+        entries = [e for e in mq.load_queue() if e.issue_number == 795]
+        assert len(entries) == 1
+        # #795's actual protection: it did NOT merge.
+        assert "review_required" in result.output, result.output
+        merge_fn.assert_not_called()
+        assert entries[0].state != mq.MERGED
 
     def test_auto_enqueue_allowed_with_passed_test_and_approved_review(
         self, config_file: Path, coord_dir: Path, coord_db
@@ -1991,3 +2037,447 @@ class TestMergePlanDaemonRouting:
         assert result.exit_code == 0, result.output
         assert "#10" in result.output
         assert "#20" not in result.output
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# #1695: `coord merge --skip-review` was structurally unreachable
+# ─────────────────────────────────────────────────────────────────────────────
+
+REVIEWS_ON_CONFIG_YAML = CONFIG_YAML.replace("reviews:\n  enabled: false\n", "")
+
+
+def _request_changes_board():
+    """A done work row whose only review verdict is ``request-changes``.
+
+    The exact #1542 shape that motivated #1695: the work is finished, the
+    reviewer refused to approve, and the operator wants to override.
+    """
+    from coord.models import Assignment, Board
+
+    work = Assignment(
+        machine_name="laptop", repo_name="api", issue_number=1695,
+        issue_title="#1695", assignment_id="w1695", type="work",
+        status="done", branch="issue-1695-blocked",
+        test_state="passed",  # smoke gate satisfied — isolate the review gate
+    )
+    review = Assignment(
+        machine_name="other", repo_name="api", issue_number=1695,
+        issue_title="[review] #1695", assignment_id="rev-w1695",
+        type="review", status="done",
+        review_of_assignment_id="w1695",
+        review_verdict="request-changes",
+    )
+    return Board(active=[], completed=[work, review]), work, review
+
+
+class TestGateBlockedRowEntersQueueBlocked:
+    """#1695: a gate-blocked row must ENTER the queue in a visibly BLOCKED
+    state rather than being silently dropped by the auto-enqueue scan.
+
+    The bug: `passes_merge_gates` was applied at ENQUEUE time, so an
+    un-approved row never became a queue entry — and `--skip-review`, which
+    waives the gate at MERGE time for an entry that already exists, had
+    nothing to waive it on. The gate that blocked you was upstream of the
+    flag that waived it.
+
+    Safety invariant asserted throughout: enqueueing changes an entry's
+    *visibility*, never its *eligibility*. Every test here that does not pass
+    `--skip-review` asserts `merge_pr` was never called.
+    """
+
+    def _run(self, config_file: Path, argv: list[str], *, merge_ok: bool = True):
+        """Invoke `coord merge` with GitHub mocked, returning (result, merge_fn)."""
+        with patch("coord.github_ops.create_pr") as create, \
+             patch("coord.github_ops.merge_pr") as merge_fn, \
+             patch("coord.github_ops.get_pr_size", return_value=10), \
+             patch("coord.github_ops.get_branch_diff_size", return_value=10), \
+             patch("coord.github_ops.work_is_terminal", return_value=False), \
+             patch(
+                 "coord.github_ops.list_remote_branch_names",
+                 return_value={"main", "issue-1695-blocked", "issue-1695-approved"},
+             ):
+            create.return_value = {"number": 1695, "url": "u/1695", "existed": False}
+            merge_fn.return_value = (True, "ok") if merge_ok else (False, "nope")
+            result = CliRunner().invoke(
+                main, ["merge", "--config", str(config_file), *argv]
+            )
+        return result, merge_fn
+
+    # ── the row enters the queue, visibly blocked ────────────────────────
+
+    def test_request_changes_row_is_enqueued_and_visibly_blocked(
+        self, config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        """The core #1695 fix: a `request-changes` row reaches the queue.
+
+        Pre-#1695 the auto-enqueue scan hit `if not passes_merge_gates(...):
+        continue` and the queue stayed empty — the operator saw the branch in
+        `--dry-run` and could not address it with `--only`.
+        """
+        from coord.state import save_board
+
+        config_file.write_text(REVIEWS_ON_CONFIG_YAML)
+        board, _work, _review = _request_changes_board()
+        save_board(board)
+
+        result, merge_fn = self._run(config_file, ["--dry-run"])
+
+        assert result.exit_code == 0, result.output
+        entries = [e for e in mq.load_queue() if e.issue_number == 1695]
+        assert len(entries) == 1, f"expected the blocked row to be enqueued: {mq.load_queue()}"
+        assert entries[0].branch == "issue-1695-blocked"
+        # Visibly blocked, naming the gate and the row — the "silent continue"
+        # that made this a 40-minute diagnosis is gone.
+        assert "BLOCKED" in result.output
+        assert "review" in result.output
+        assert "#1695" in result.output
+        assert "--skip-review" in result.output
+        merge_fn.assert_not_called()
+
+    def test_blocked_entry_is_addressable_by_only(
+        self, config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        """`--only` resolves the blocked row by every documented key form.
+
+        The #1695 symptom was that none of assignment_id / repo#issue / bare
+        issue number / branch name resolved, because no entry existed at all.
+        """
+        from coord.state import save_board
+
+        config_file.write_text(REVIEWS_ON_CONFIG_YAML)
+        board, _work, _review = _request_changes_board()
+        save_board(board)
+        self._run(config_file, ["--dry-run"])  # run the scan so the entry exists
+
+        queue = mq.load_queue()
+        for key in ("w1695", "api#1695", "1695", "issue-1695-blocked"):
+            assert mq.resolve_entry_key(queue, key) is not None, key
+
+    # ── ...but is still NOT mergeable without the waiver ─────────────────
+
+    def test_blocked_entry_does_not_merge_without_skip_review(
+        self, config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        """SAFETY: enqueueing changed visibility, not eligibility.
+
+        `--only` on the blocked entry, with no waiver flag, must refuse —
+        `passes_merge_gates` still says no at merge time.
+        """
+        from coord.state import save_board
+
+        config_file.write_text(REVIEWS_ON_CONFIG_YAML)
+        board, _work, _review = _request_changes_board()
+        save_board(board)
+        self._run(config_file, ["--dry-run"])
+
+        result, merge_fn = self._run(config_file, ["--only", "1695"])
+
+        assert "review_required" in result.output
+        merge_fn.assert_not_called()
+        assert all(e.state != mq.MERGED for e in mq.load_queue())
+
+    def test_blocked_entry_does_not_merge_on_a_plain_drain(
+        self, config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        """SAFETY: the same holds for the full-queue drain path, not just
+        `--only` — a blocked entry sitting in the queue must never be picked
+        up by an automatic pass (this is written as if `merge.auto_drain`
+        were ON; auto-drain itself only ever touches PLAN_READY entries)."""
+        from coord.state import save_board
+
+        config_file.write_text(REVIEWS_ON_CONFIG_YAML)
+        board, _work, _review = _request_changes_board()
+        save_board(board)
+
+        result, merge_fn = self._run(config_file, [])
+
+        assert "review_required" in result.output
+        merge_fn.assert_not_called()
+
+    def test_same_blocked_entry_merges_with_skip_review(
+        self, config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        """#1695's headline: the SAME row that refuses above merges with
+        `--skip-review`.
+
+        This is the flag's documented purpose (#253) and was untestable
+        end-to-end before #1695 because the entry could not exist.
+        """
+        from coord.state import save_board
+
+        config_file.write_text(REVIEWS_ON_CONFIG_YAML)
+        board, _work, _review = _request_changes_board()
+        save_board(board)
+        self._run(config_file, ["--dry-run"])
+
+        result, merge_fn = self._run(
+            config_file, ["--only", "1695", "--skip-review"]
+        )
+
+        assert result.exit_code == 0, result.output
+        merge_fn.assert_called_once()
+        assert "--skip-review" in result.output
+
+    # ── --plan / --dry-run / --only must agree ───────────────────────────
+
+    def test_plan_dry_run_and_only_agree_on_the_blocked_state(
+        self, config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        """#1479 staleness lesson: the three surfaces must not disagree.
+
+        `--plan` must not false-green a row that `--only` then refuses, and
+        neither may claim the entry does not exist.
+        """
+        from coord.state import save_board
+
+        config_file.write_text(REVIEWS_ON_CONFIG_YAML)
+        board, _work, _review = _request_changes_board()
+        save_board(board)
+
+        dry, dry_merge = self._run(config_file, ["--dry-run"])
+        plan, _ = self._run(config_file, ["--plan"])
+        only, only_merge = self._run(config_file, ["--only", "1695"])
+
+        # --dry-run: enqueued and reported as blocked, nothing merged.
+        assert "BLOCKED" in dry.output
+        dry_merge.assert_not_called()
+        # --plan: BLOCKED with the review reason — never READY.
+        assert "BLOCKED" in plan.output, plan.output
+        assert "review not approved" in plan.output, plan.output
+        assert "READY" not in plan.output, plan.output
+        # --only: finds the entry and names the gate; refuses to merge.
+        assert "no entry found" not in (only.output + (only.stderr or ""))
+        assert "gate review" in only.output, only.output
+        only_merge.assert_not_called()
+
+    # ── --only error messages distinguish the failure modes ──────────────
+
+    def test_only_on_blocked_entry_reports_the_gate_not_a_key_failure(
+        self, config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        """`--only` on a gate-blocked entry names the blocking gate and the
+        flag that waives it — not "tried assignment_id, repo#issue, ..."."""
+        from coord.state import save_board
+
+        config_file.write_text(REVIEWS_ON_CONFIG_YAML)
+        board, _work, _review = _request_changes_board()
+        save_board(board)
+        self._run(config_file, ["--dry-run"])
+
+        result, merge_fn = self._run(config_file, ["--only", "issue-1695-blocked"])
+
+        combined = result.output + (result.stderr or "")
+        assert "gate review" in combined, combined
+        assert "will block this merge" in combined, combined
+        assert "tried assignment_id" not in combined, combined
+        merge_fn.assert_not_called()
+
+    def test_only_with_no_entry_names_the_gate_that_blocked_enqueue(
+        self, config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        """When no entry exists at all (the scan has not run yet), `--only`
+        must say *which gate* blocked enqueue for *which row* rather than
+        implying the identifier was wrong."""
+        from coord.state import save_board
+
+        config_file.write_text(REVIEWS_ON_CONFIG_YAML)
+        board, _work, _review = _request_changes_board()
+        save_board(board)
+        # Deliberately do NOT run the scan — queue is empty.
+        assert mq.load_queue() == []
+
+        result, merge_fn = self._run(config_file, ["--only", "1695"])
+
+        combined = result.output + (result.stderr or "")
+        assert result.exit_code != 0
+        assert "enqueue blocked by" in combined, combined
+        assert "review" in combined, combined
+        assert "w1695" in combined, combined
+        assert "--skip-review" in combined, combined
+        merge_fn.assert_not_called()
+
+    def test_only_with_unresolvable_key_still_says_it_did_not_resolve(
+        self, config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        """The old wording is preserved for the case it was always meant for:
+        an identifier that genuinely matches nothing."""
+        from coord.state import save_board
+
+        config_file.write_text(REVIEWS_ON_CONFIG_YAML)
+        board, _work, _review = _request_changes_board()
+        save_board(board)
+
+        result, _merge_fn = self._run(config_file, ["--only", "totally-bogus"])
+
+        combined = result.output + (result.stderr or "")
+        assert result.exit_code != 0
+        assert "no entry found" in combined
+        assert "did not resolve" in combined, combined
+
+    # ── no regression for the happy path ─────────────────────────────────
+
+    def test_approved_and_smoke_passed_row_enqueues_and_merges_unchanged(
+        self, config_file: Path, coord_dir: Path, coord_db
+    ) -> None:
+        """An approved + smoke-passed row is completely unaffected: it
+        enqueues, is never labelled BLOCKED, and merges with no waiver."""
+        from coord.models import Assignment, Board
+        from coord.state import save_board
+
+        config_file.write_text(REVIEWS_ON_CONFIG_YAML)
+        work = Assignment(
+            machine_name="laptop", repo_name="api", issue_number=1696,
+            issue_title="#1696", assignment_id="w1696", type="work",
+            status="done", branch="issue-1695-approved", test_state="passed",
+        )
+        review = Assignment(
+            machine_name="other", repo_name="api", issue_number=1696,
+            issue_title="[review] #1696", assignment_id="rev-w1696",
+            type="review", status="done",
+            review_of_assignment_id="w1696", review_verdict="approve",
+        )
+        save_board(Board(active=[], completed=[work, review]))
+
+        result, merge_fn = self._run(config_file, [])
+
+        assert result.exit_code == 0, result.output
+        assert "BLOCKED" not in result.output, result.output
+        assert "review_required" not in result.output, result.output
+        merge_fn.assert_called_once()
+
+
+class TestMergeGateFailuresPredicate:
+    """#1695: `merge_gate_failures` is the reason-carrying form of
+    `passes_merge_gates`; the two must never disagree."""
+
+    @staticmethod
+    def _cfg(*, reviews: bool = True, gates: list[str] | None = None):
+        from dataclasses import dataclass, field as dc_field
+
+        @dataclass
+        class _Reviews:
+            enabled: bool = True
+
+        @dataclass
+        class _Pipeline:
+            default_gates: list[str] | None = None
+
+        @dataclass
+        class _Cfg:
+            reviews: _Reviews = dc_field(default_factory=_Reviews)
+            pipeline: _Pipeline = dc_field(default_factory=_Pipeline)
+
+        c = _Cfg()
+        c.reviews.enabled = reviews
+        c.pipeline.default_gates = gates if gates is not None else ["test", "review", "merge"]
+        return c
+
+    def test_agrees_with_passes_merge_gates(self) -> None:
+        from coord.models import Assignment, Board
+
+        cfg = self._cfg()
+        for test_state, verdict in (
+            (None, None), ("failed", None), ("passed", None),
+            (None, "approve"), ("passed", "approve"), ("passed", "request-changes"),
+        ):
+            work = Assignment(
+                machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+                assignment_id="w1", type="work", status="done",
+                branch="worker/w1", test_state=test_state,
+            )
+            completed = [work]
+            if verdict is not None:
+                completed.append(Assignment(
+                    machine_name="m2", repo_name="api", issue_number=1, issue_title="t",
+                    assignment_id="rev-w1", type="review", status="done",
+                    review_of_assignment_id="w1", review_verdict=verdict,
+                ))
+            board = Board(active=[], completed=completed)
+            failures = mq.merge_gate_failures(work, cfg, board)
+            assert (not failures) is mq.passes_merge_gates(work, cfg, board), (
+                test_state, verdict, failures
+            )
+
+    def test_reports_both_gates_when_both_fail(self) -> None:
+        from coord.models import Assignment, Board
+
+        cfg = self._cfg()
+        work = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="w1", type="work", status="done",
+            branch="worker/w1", test_state=None,
+        )
+        board = Board(active=[], completed=[work])
+
+        failures = mq.merge_gate_failures(work, cfg, board)
+
+        assert [f.gate for f in failures] == ["review", "smoke"]
+        rendered = mq.describe_merge_gate_failures(failures)
+        assert "--skip-review" in rendered
+        assert "--skip-smoke" in rendered
+
+    def test_stop_early_returns_only_the_first_failure(self) -> None:
+        from coord.models import Assignment, Board
+
+        cfg = self._cfg()
+        work = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="w1", type="work", status="done",
+            branch="worker/w1", test_state=None,
+        )
+        board = Board(active=[], completed=[work])
+
+        failures = mq.merge_gate_failures(work, cfg, board, stop_early=True)
+
+        assert [f.gate for f in failures] == ["review"]
+
+    def test_no_failures_when_gates_disabled(self) -> None:
+        from coord.models import Assignment, Board
+
+        cfg = self._cfg(reviews=False, gates=["merge"])
+        work = Assignment(
+            machine_name="m1", repo_name="api", issue_number=1, issue_title="t",
+            assignment_id="w1", type="work", status="done",
+            branch="worker/w1", test_state=None,
+        )
+        board = Board(active=[], completed=[work])
+
+        assert mq.merge_gate_failures(work, cfg, board) == []
+        assert mq.describe_merge_gate_failures([]) == ""
+
+
+class TestResolveBoardWorkKey:
+    """#1695: the board-side twin of `resolve_entry_key`, used to tell
+    "identifier did not resolve" apart from "a gate blocked enqueue"."""
+
+    @staticmethod
+    def _board():
+        from coord.models import Assignment, Board
+
+        work = Assignment(
+            machine_name="m1", repo_name="api", issue_number=42, issue_title="t",
+            assignment_id="w42", type="work", status="done", branch="issue-42",
+        )
+        review = Assignment(
+            machine_name="m2", repo_name="api", issue_number=42, issue_title="t",
+            assignment_id="rev-w42", type="review", status="done",
+            review_of_assignment_id="w42", review_verdict="request-changes",
+        )
+        return Board(active=[], completed=[work, review]), work
+
+    def test_resolves_every_key_form(self) -> None:
+        board, work = self._board()
+        for key in ("w42", "api#42", "42", "issue-42"):
+            assert [a.assignment_id for a in mq.resolve_board_work_key(board, key)] == ["w42"], key
+
+    def test_ignores_review_rows(self) -> None:
+        board, _ = self._board()
+        assert mq.resolve_board_work_key(board, "rev-w42") == []
+
+    def test_returns_empty_for_unknown_key(self) -> None:
+        board, _ = self._board()
+        assert mq.resolve_board_work_key(board, "nope") == []
+        assert mq.resolve_board_work_key(board, "other#42") == []
+
+    def test_tolerates_none_board(self) -> None:
+        assert mq.resolve_board_work_key(None, "w42") == []

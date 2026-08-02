@@ -608,6 +608,84 @@ def _print_sibling_overlap_warnings(warnings: list) -> None:
         )
 
 
+def _explain_missing_only_entry(key: str, config) -> list[str]:
+    """#1695: explain why ``coord merge --only <key>`` found no queue entry.
+
+    Returns the lines to print on stderr. The pre-#1695 message was a single
+    line — *"no entry found for 'X' (tried assignment_id, repo#issue, issue
+    number, and branch name)"* — which describes a **key-lookup** failure and
+    is what sent the #1695 operator hunting for a different identifier for 40
+    minutes. In the case that actually happens, the identifier resolved fine
+    and the row simply never became an entry because a gate blocked enqueue.
+
+    So the three cases are now stated separately:
+
+    1. **No board row either.** The identifier genuinely did not resolve —
+       the old wording, now only printed when it is true.
+    2. **A board row exists and a gate is failing.** Name the row, name the
+       gate, and point at the flag that waives it. Under #1695 the row is
+       enqueued (visibly BLOCKED) by the auto-enqueue scan, so the fix is to
+       let a plain ``coord merge`` pass run the scan and then retry ``--only``
+       with the waiver — hence the explicit next-step line.
+    3. **A board row exists and every gate passes.** Then it was one of the
+       non-gate skips (issue closed, branch gone from origin, PR already
+       merged) or the scan simply has not run yet.
+
+    Never raises: a board/config problem degrades to case 1's wording rather
+    than replacing a clear error with a traceback.
+    """
+    from coord import merge_queue as _mq  # noqa: PLC0415
+    from coord.state import load_board as _load_board  # noqa: PLC0415
+
+    not_found = (
+        f"merge-queue: no entry found for {key!r} "
+        "(tried assignment_id, repo#issue, issue number, and branch name)"
+    )
+    try:
+        board = _load_board()
+        rows = _mq.resolve_board_work_key(board, key) if board is not None else []
+    except Exception:  # noqa: BLE001 — diagnostics must never mask the error
+        rows = []
+    if not rows:
+        return [
+            not_found,
+            "  no done work row on the board matches that identifier either — "
+            "the identifier did not resolve.",
+        ]
+
+    lines = [
+        f"merge-queue: no entry found for {key!r}, but "
+        f"{len(rows)} done work row(s) on the board match it:",
+    ]
+    any_blocked = False
+    for a in rows:
+        try:
+            failures = _mq.merge_gate_failures(a, config, board)
+        except Exception:  # noqa: BLE001
+            failures = []
+        where = f"{a.repo_name} #{a.issue_number} (assignment {a.assignment_id}, branch {a.branch})"
+        if failures:
+            any_blocked = True
+            lines.append(
+                f"  {where} — enqueue blocked by "
+                f"{_mq.describe_merge_gate_failures(failures)}"
+            )
+        else:
+            lines.append(
+                f"  {where} — all merge gates pass; it was skipped for a "
+                "non-gate reason (issue closed, branch missing from origin, "
+                "or PR already merged), or the auto-enqueue scan has not run "
+                "yet."
+            )
+    if any_blocked:
+        lines.append(
+            "  next: run `coord merge --dry-run` (the auto-enqueue scan "
+            "enqueues gate-blocked rows in a visibly BLOCKED state, #1695), "
+            "then retry --only with the waiver flag named above."
+        )
+    return lines
+
+
 def _show_plan_from_daemon(
     svc,
     *,
@@ -993,11 +1071,13 @@ def merge(
         only_queue = mq.load_queue()
         only_entry = mq.resolve_entry_key(only_queue, only_assignment)
         if only_entry is None:
-            click.echo(
-                f"merge-queue: no entry found for {only_assignment!r} "
-                "(tried assignment_id, repo#issue, issue number, and branch name)",
-                err=True,
-            )
+            # #1695: the old message said only "tried assignment_id,
+            # repo#issue, issue number, and branch name", which reads as a
+            # key-lookup problem and sends the operator hunting for a
+            # different identifier. Usually the identifier was fine and a
+            # gate was the reason no entry exists — so say which.
+            for line in _explain_missing_only_entry(only_assignment, cfg_only):
+                click.echo(line, err=True)
             sys.exit(1)
         # #1251: --override-human-required is the explicit, audited escape
         # hatch for an entry an automated conflict-fix (or a permission /
@@ -1066,6 +1146,24 @@ def merge(
         _raw_board_only = load_board()
         board_only = _raw_board_only if _raw_board_only is not None else _Board(active=[], completed=[])
         ci_store_only = build_ci_store(cfg_only.ci_store.type)
+        # #1695: name the blocking gate(s) up front. Under #1695 a gate-blocked
+        # row IS enqueued (visibly BLOCKED) instead of being dropped, so
+        # `--only` now resolves it — and the operator needs to be told, before
+        # process() runs, exactly which gate stands between them and the merge
+        # and which flag waives it. process() still enforces every gate below;
+        # this is a report, not a decision.
+        _only_gate_failures = mq.merge_gate_failures(
+            only_entry, cfg_only, board_only, gh_ops,
+        )
+        for _gf in _only_gate_failures:
+            # NB: --force-merge is deliberately absent here — it waives the CI
+            # gate only (merge_queue.process), never review or smoke.
+            _waived = (
+                (_gf.gate == "review" and skip_review)
+                or (_gf.gate == "smoke" and skip_smoke)
+            )
+            _status = "waived by this run" if _waived else "will block this merge"
+            click.echo(f"  gate {_gf.gate}: {_gf.reason} — {_status}")
         if skip_review:
             click.echo("  --skip-review: review-approval gate bypassed (#253)")
         if skip_smoke:
@@ -1209,11 +1307,28 @@ def merge(
                 # #946: review + smoke gates, via the shared predicate — this
                 # loop was the primary ungated enqueue path (#782/#795 reached
                 # the merge queue with a failed test / no review at all).
-                # Mirrors the gate already enforced by the daemon's
-                # `enqueue_approved_work` so `coord merge` and the passive
-                # tick agree on what's allowed to queue.
-                if not mq.passes_merge_gates(a, cfg, board):
-                    continue
+                #
+                # #1695: the gate no longer *drops* the row here. Blocking at
+                # enqueue time made `coord merge --skip-review` structurally
+                # unreachable — the flag waives the gate for an entry that
+                # already exists, but an un-approved row could never become
+                # an entry, so `--only` had nothing to address and the silent
+                # `continue` printed nothing about why. The row is now
+                # enqueued in a visibly BLOCKED state (it will render as
+                # BLOCKED in `--plan`/`--dry-run` via `_entry_gate_status`,
+                # and `--only` can name it), and the gate is enforced where
+                # its override lives: `process()` still refuses to merge it
+                # unless `--skip-review`/`--skip-smoke` is given. Enqueueing
+                # changes visibility, never eligibility — auto-drain only
+                # ever touches PLAN_READY entries, and a blocked entry is
+                # PLAN_BLOCKED, so this is safe with `merge.auto_drain: true`.
+                gate_failures = mq.merge_gate_failures(a, cfg, board)
+                gate_note = ""
+                if gate_failures:
+                    gate_note = (
+                        " — BLOCKED: "
+                        + mq.describe_merge_gate_failures(gate_failures)
+                    )
                 # #736 / #292: use refresh_entry_assignment (not bare
                 # enqueue) so an existing PENDING entry is re-keyed to the
                 # latest fix assignment when the original assignment_id no
@@ -1243,7 +1358,20 @@ def merge(
                 ):
                     auto_enqueued.append(
                         f"  auto-enqueued: {a.repo_name} #{a.issue_number} "
-                        f"({a.branch} → {target_branch})"
+                        f"({a.branch} → {target_branch}){gate_note}"
+                    )
+                elif gate_failures:
+                    # Already queued and still blocked. Re-state it every pass
+                    # rather than once at creation: a blocked entry is exactly
+                    # the row the operator is looking for, and #1695's whole
+                    # complaint is that this state was invisible. Emitted at
+                    # most once per branch — `group_branch_candidates` has
+                    # already collapsed the fix/bounce rows (#1490).
+                    auto_enqueued.append(
+                        f"  blocked: {a.repo_name} #{a.issue_number} "
+                        f"(assignment {a.assignment_id}, {a.branch} → "
+                        f"{target_branch}) — "
+                        f"{mq.describe_merge_gate_failures(gate_failures)}"
                     )
             except Exception as e:  # noqa: BLE001
                 auto_enqueued.append(

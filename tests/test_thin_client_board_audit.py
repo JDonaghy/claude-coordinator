@@ -145,12 +145,22 @@ COMMANDS_ALLOWLIST: dict[str, set[tuple[str, str]]] = {
     # called from within `merge()`'s two bodies, both past that same guard —
     # the load_board/save_board pair just moved from `merge`'s own frame into
     # this helper's, not into a new unguarded call site.
+    # `_explain_missing_only_entry` (#1695: tells "a gate blocked enqueue"
+    # apart from "the identifier did not resolve" when `--only` finds no
+    # queue entry) is likewise only ever called from inside `merge()`'s
+    # `--only` branch, which sits below that same `if _merge_svc is not None:
+    # ...; return` guard — a thin client's `--only` is forwarded to the
+    # daemon's /merge and never reaches this frame. It is a read-only
+    # diagnostic: load_board only, no save_board, and it swallows its own
+    # exceptions so a board problem degrades the message rather than
+    # replacing the real error with a traceback.
     "merge.py": {
         ("reconcile_merges", "build_board"),
         ("reconcile_merges", "save_board"),
         ("merge", "load_board"),
         ("_dispatch_conflict_fixes", "load_board"),
         ("_dispatch_conflict_fixes", "save_board"),
+        ("_explain_missing_only_entry", "load_board"),
     },
     # #1337: `coord test` no longer calls save_board at all — the verdict is
     # recorded via the single-row `record_test_verdict` on both paths (it
