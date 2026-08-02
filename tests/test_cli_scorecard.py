@@ -208,3 +208,100 @@ def test_scorecard_board_fetch_failure_degrades_to_unknown_not_fatal(tmp_path, m
     assert issue["has_cost_data"] is False
     assert issue["process_bug"] is True
     assert issue["regression_test"] == "unknown"
+
+
+def test_scorecard_audit_log_paginates_past_the_500_row_page_size(tmp_path, monkeypatch) -> None:
+    """A repo with a long merge history shouldn't silently truncate the
+    durability cross-check to the 500 newest "merged" events — the CLI must
+    follow next_cursor/has_more back to the milestone's own creation date."""
+    config_path = _write_config(tmp_path)
+    monkeypatch.setattr(
+        github_ops,
+        "get_milestone",
+        lambda repo, number: {
+            "number": number, "title": "M49", "created_at": "2024-01-01T00:00:00Z",
+        },
+    )
+    monkeypatch.setattr(
+        github_ops,
+        "get_milestone_issues",
+        lambda repo, title, state="all": [
+            {"number": 1, "title": "clean issue", "state": "CLOSED", "labels": []},
+        ],
+    )
+    import coord.usage as usage_mod
+
+    monkeypatch.setattr(
+        usage_mod, "fetch_usage_rows",
+        lambda *a, **k: [_row(assignment_id="r1", issue_number=1, status="done")],
+    )
+
+    import coord.state as state_mod
+
+    calls = []
+
+    def _fake_list_audit_log(*, repo, category, event_type, since, limit, cursor):
+        calls.append({"since": since, "limit": limit, "cursor": cursor})
+        if cursor is None:
+            return {
+                "entries": [{"event_type": "merged", "repo": "api", "issue": 1, "ts": 999.0}],
+                "next_cursor": "page2",
+                "has_more": True,
+            }
+        return {
+            "entries": [{"event_type": "merged", "repo": "api", "issue": 1, "ts": 998.0}],
+            "next_cursor": None,
+            "has_more": False,
+        }
+
+    monkeypatch.setattr(state_mod, "list_audit_log", _fake_list_audit_log)
+
+    result = CliRunner().invoke(
+        main, ["scorecard", "api", "49", "--json", "--config", str(config_path)]
+    )
+    assert result.exit_code == 0, result.output
+    # Two pages fetched — pagination followed next_cursor/has_more rather
+    # than stopping at the first page.
+    assert len(calls) == 2
+    assert calls[0]["cursor"] is None
+    assert calls[1]["cursor"] == "page2"
+    # Bounded by the milestone's own creation date, not unbounded.
+    assert calls[0]["since"] is not None
+    body = json.loads(result.output[result.output.index("{"):])
+    (issue,) = body["issues"]
+    # The board row never flipped to "merged", but the paginated audit
+    # cross-check found a "merged" event for issue #1 — durability holds.
+    assert issue["first_pass"] == "yes"
+
+
+def test_scorecard_audit_log_page_cap_warns_instead_of_hanging(tmp_path, monkeypatch) -> None:
+    """If a repo's merge history is so long the cross-check can't reach the
+    milestone's creation date within the page cap, warn rather than loop
+    forever or silently under-report."""
+    config_path = _write_config(tmp_path)
+    monkeypatch.setattr(
+        github_ops, "get_milestone", lambda repo, number: {"number": number, "title": "M49"}
+    )
+    monkeypatch.setattr(
+        github_ops,
+        "get_milestone_issues",
+        lambda repo, title, state="all": [
+            {"number": 1, "title": "clean issue", "state": "CLOSED", "labels": []},
+        ],
+    )
+    import coord.usage as usage_mod
+
+    monkeypatch.setattr(usage_mod, "fetch_usage_rows", lambda *a, **k: [])
+
+    import coord.state as state_mod
+
+    def _always_more(*, repo, category, event_type, since, limit, cursor):
+        return {"entries": [], "next_cursor": "next", "has_more": True}
+
+    monkeypatch.setattr(state_mod, "list_audit_log", _always_more)
+
+    result = CliRunner().invoke(
+        main, ["scorecard", "api", "49", "--json", "--config", str(config_path)]
+    )
+    assert result.exit_code == 0, result.output
+    assert "audit log merge cross-check stopped after" in output_and_stderr(result)
