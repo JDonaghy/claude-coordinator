@@ -612,6 +612,62 @@ def _machine_capacity(machine: Machine, config: Config) -> int:
     return machine.max_workers if machine.max_workers is not None else config.concurrency.max_workers
 
 
+class UnsupportedRetryType(ValueError):
+    """Raised by :func:`_reassign` when *failed.type* cannot be safely
+    re-dispatched through the work-retry path (#1636).
+
+    ``_reassign`` used to hardcode ``type="work"`` on every retry regardless
+    of the failed assignment's actual type — a retried ``smoke``/``review``
+    row silently came back as a fresh WORK worker (model escalated) pointed
+    at the already-complete branch, instead of re-running the Test/Review
+    stage. Raising here — instead of silently downgrading to work — lets
+    every caller (``coord retry``, ``auto_reassign``) surface the command
+    that actually re-runs the right stage rather than quietly doing the
+    wrong thing.
+    """
+
+    def __init__(self, assignment_type: str, work_assignment_id: str | None):
+        self.assignment_type = assignment_type
+        self.work_assignment_id = work_assignment_id
+        super().__init__(
+            f"assignment type {assignment_type!r} cannot be retried "
+            "through the work-retry path"
+        )
+
+
+# #1636: types whose failed row can be re-dispatched with the exact command
+# that re-runs their stage — `review_of_assignment_id` on a smoke/review
+# assignment is the work assignment it targets, so the hint is always
+# actionable when set. Extend this map, not the work-retry path, when a new
+# non-WORK_LIKE type grows its own retry story.
+_RETRY_REDIRECT_FLAGS: dict[str, str] = {
+    "smoke": "--smoke-of",
+    "review": "--review-of",
+}
+
+
+def describe_unsupported_retry_type(exc: UnsupportedRetryType) -> str:
+    """Human-readable refusal message for :class:`UnsupportedRetryType` (#1636).
+
+    Mirrors :func:`describe_no_candidate_machines` — a caller shouldn't have
+    to hand-craft the "this can't be retried" message.
+    """
+    flag = _RETRY_REDIRECT_FLAGS.get(exc.assignment_type)
+    if flag is not None and exc.work_assignment_id:
+        return (
+            f"assignment type {exc.assignment_type!r} cannot be retried "
+            "with `coord retry` — that would silently re-dispatch it as a "
+            "fresh work worker on the already-complete branch. Re-run its "
+            f"stage instead: `coord assign --interactive {flag} "
+            f"{exc.work_assignment_id}`."
+        )
+    return (
+        f"assignment type {exc.assignment_type!r} cannot be retried with "
+        "`coord retry` — that would silently re-dispatch it as a fresh "
+        "work worker. Re-dispatch it through its own path instead."
+    )
+
+
 def _reassign(
     failed: Assignment, board: Board, config: Config,
     *,
@@ -622,7 +678,15 @@ def _reassign(
     *model* overrides the model tier on the retry. When None, the
     original assignment's model is reused (escalation happens at the call
     site).
+
+    Raises :class:`UnsupportedRetryType` when ``failed.type`` is not in
+    :data:`coord.models.WORK_LIKE_TYPES` — a ``smoke``/``review``/other
+    non-work row must not be silently re-dispatched as a fresh
+    ``type="work"`` worker (#1636).
     """
+    if failed.type not in WORK_LIKE_TYPES:
+        raise UnsupportedRetryType(failed.type, failed.review_of_assignment_id)
+
     from coord.machine_pause import paused_set
     paused = paused_set()
     running = _running_by_machine(board)
@@ -722,7 +786,11 @@ def _reassign(
         "files_allowed": failed.files_allowed,
         "files_forbidden": failed.files_forbidden,
         "pull_repos": [],
-        "type": "work",
+        # #1636: carries the failed assignment's own type (guaranteed to be
+        # in WORK_LIKE_TYPES by the guard above) instead of hardcoding
+        # "work" — a "mock-author"/"test-author" retry must not silently
+        # relabel itself as plain work.
+        "type": failed.type,
         "model": retry_model_wire,
         # #255: retry inherits the repo's configured default branch as the
         # worker's integration base (the start point / rebase target).
@@ -757,7 +825,7 @@ def _reassign(
         assignment_id=agent_response.get("id") or uuid.uuid4().hex[:12],
         status="running",
         dispatched_at=time.time(),
-        type="work",
+        type=failed.type,
         model=retry_model,
         # #1101: record the continued branch on the board immediately
         # instead of waiting for a later reconcile backfill from agent
