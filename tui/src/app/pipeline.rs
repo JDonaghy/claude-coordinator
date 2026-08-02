@@ -735,8 +735,18 @@ impl CoordApp {
         // `is_workable_type` predicate as the Board classifier; the old inline
         // list omitted `chat`, which pinned chat-only issues (e.g. #258) to
         // In-progress and made "Drop to backlog" appear to do nothing.
+        //
+        // #1553: matched on `effective_issue_number`, not the raw column. An
+        // oracle-loop child's acceptance slice (and its review/fix/smoke
+        // chain) is booked with the milestone's TRACKING issue in
+        // `issue_number`, so the raw match left a child with six live
+        // sessions classified as Pending — the operator's literal report was
+        // "I don't think #1124 is running, the TUI shows no activity". The
+        // epic itself is unaffected: it returned above via
+        // `epic_lifecycle_section`, which aggregates child state rather than
+        // reading its own assignments.
         let has_work_assignment = self.data.assignments.iter().any(|a| {
-            a.issue_number == issue.number
+            a.effective_issue_number() == issue.number
                 && issue
                     .coord_repo
                     .as_deref()
@@ -948,13 +958,19 @@ impl CoordApp {
     ///
     /// The rollup shows the coordinator the TOTAL spend for an issue across all
     /// stage iterations: plan + work + fix-1 + fix-2 + review + smoke.
+    ///
+    /// #1553: keyed on [`Assignment::effective_issue_number`], so an
+    /// oracle-loop acceptance slice's spend lands on the CHILD issue it was
+    /// authored for rather than on the milestone's tracking issue (which
+    /// otherwise absorbed every child's authoring cost — $7.90 of #1124's
+    /// work booked to epic #1120).
     pub(crate) fn issue_total_cost(&self, issue: &PipelineIssue) -> Option<f64> {
         let local_repo = issue.coord_repo.as_deref();
         let costs: Vec<f64> = self
             .data
             .assignments
             .iter()
-            .filter(|a| a.issue_number == issue.number)
+            .filter(|a| a.effective_issue_number() == issue.number)
             .filter(|a| match local_repo {
                 Some(r) => a.repo == *r,
                 None => true,
@@ -971,12 +987,14 @@ impl CoordApp {
 
     /// #546: Total token count (input + output) for an issue across all
     /// assignments.  Returns 0 when no tokens have been persisted yet.
+    ///
+    /// #1553: same effective-issue attribution as [`Self::issue_total_cost`].
     pub(crate) fn issue_total_tokens(&self, issue: &PipelineIssue) -> i64 {
         let local_repo = issue.coord_repo.as_deref();
         self.data
             .assignments
             .iter()
-            .filter(|a| a.issue_number == issue.number)
+            .filter(|a| a.effective_issue_number() == issue.number)
             .filter(|a| match local_repo {
                 Some(r) => a.repo == *r,
                 None => true,
@@ -1340,8 +1358,12 @@ impl CoordApp {
     /// against (`pipeline_repo_key`'s coord_repo-or-repo_slug fallback for a
     /// full issue; identical to `coord_repo` for a child).
     fn session_is_live(&self, coord_repo: Option<&str>, repo_key: &str, issue_number: u64) -> bool {
+        // #1553: `effective_issue_number` so the `in-flight` badge lights up
+        // on the CHILD issue whose acceptance slice is actually running,
+        // rather than on the milestone's tracking issue that the slice's
+        // `issue_number` carries.
         let repo_matches = |a: &&Assignment| {
-            a.issue_number == issue_number
+            a.effective_issue_number() == issue_number
                 && coord_repo.map(|r| r == a.repo).unwrap_or(true)
                 && a.status == "running"
         };

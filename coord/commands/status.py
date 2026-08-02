@@ -1458,15 +1458,20 @@ def _usage_issue_drill(
     for one issue's legs. Unbounded (all history) unless --today/--week/
     --month/--since is also given."""
     from coord.usage import fetch_usage_rows, format_usage_issue_drill
-    from coord.usage_rollup import leg_in_window
+    from coord.usage_rollup import leg_in_window, row_issue_number
 
     cfg = _load_config(config_path)
     has_window_flag = today or week or month or since_spec
     window = _usage_resolve_window(today, week, month, since_spec) if has_window_flag else None
+    # #1553: select by the *attributed* issue, matching the `--by issue`
+    # summary above. Selecting on the raw `issue_number` while the summary
+    # groups on `for_issue_number` would make the two views disagree — the
+    # epic's drill would list slice legs the summary had already moved to
+    # the child, and the child's drill would be empty.
     rows = [
         row
         for row in fetch_usage_rows()
-        if int(row.get("issue_number") or 0) == issue_number
+        if row_issue_number(row) == issue_number
         and (window is None or leg_in_window(row, window))
     ]
     click.echo(format_usage_issue_drill(rows, issue_number, cfg.pricing))

@@ -816,7 +816,24 @@ def _record_dispatched_assignment_local(
             files_allowed, model, dispatched_at, review_of_assignment_id,
             review_target, required_gates, review_iteration,
             provider_name, branch, for_issue_number, driven_by
-        ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            -- #1553: a follow-up dispatched off another assignment (review,
+            -- smoke, [fix-N], retry, pr-helper) inherits that parent's
+            -- oracle-loop slice attribution when it didn't set one itself.
+            -- Without this, only the originating `test-author` row knows
+            -- which CHILD issue the work is for and every derived row falls
+            -- back to the milestone's tracking issue — which is exactly the
+            -- "child's Pipeline row shows no activity while 6 sessions run"
+            -- bug. Done as a correlated subquery rather than a Python lookup
+            -- so it costs no extra round trip and covers BOTH write paths
+            -- (the daemon's `/dispatched` handler calls this same function
+            -- server-side). NULL parent / no parent row / non-slice parent
+            -- all resolve to NULL, so ordinary work is untouched.
+            COALESCE(?, (
+                SELECT p.for_issue_number FROM assignments p
+                WHERE p.assignment_id = ?
+            )),
+            ?)
         ON CONFLICT(assignment_id) DO UPDATE SET
             status = 'running',
             machine_name = excluded.machine_name,
@@ -860,6 +877,11 @@ def _record_dispatched_assignment_local(
             assignment.provider_name,
             assignment.branch,
             assignment.for_issue_number,
+            # #1553: parent id for the for_issue_number inheritance subquery
+            # above (same value already bound for the review_of_assignment_id
+            # column — bound twice because sqlite3 qmark params are
+            # positional).
+            assignment.review_of_assignment_id,
             assignment.driven_by,
         ),
     )

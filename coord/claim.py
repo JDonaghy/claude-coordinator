@@ -156,14 +156,24 @@ def has_active_work_followup(
 
     Called from both the reconcile review-dispatch loop and ``dispatch_review``
     for defence in depth.
+
+    #1553: keyed on the *effective* issue
+    (:func:`coord.models.effective_issue_number`), not the raw
+    ``issue_number``. Every oracle-loop acceptance slice under one milestone
+    shares the tracking issue's number, so keying on the raw field made an
+    in-flight fix for child A block review dispatch for child B — and for the
+    epic itself — even though they are unrelated pieces of work. With the
+    effective issue, a slice's follow-up only guards its own child.
     """
+    from coord.models import effective_issue_number  # noqa: PLC0415
+
     _WORK_TYPES = frozenset({"work", "conflict-fix"})
     for a in board.active:
         if a.type not in _WORK_TYPES:
             continue
         if a.status == "failed":
             continue
-        if a.repo_name == repo_name and a.issue_number == issue_number:
+        if a.repo_name == repo_name and effective_issue_number(a) == issue_number:
             return True
     return False
 

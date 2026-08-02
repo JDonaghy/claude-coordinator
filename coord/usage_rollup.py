@@ -310,11 +310,31 @@ def _leg_group_timestamp(row: dict) -> float | None:
     return ts
 
 
+def row_issue_number(row: dict) -> int:
+    """The issue a leg's cost is attributed to (#1553).
+
+    ``for_issue_number`` when the row carries one (an oracle-loop acceptance
+    slice and everything derived from it — its ``issue_number`` is the
+    milestone's *tracking* issue, so grouping on that booked every child's
+    authoring spend to the epic), else ``issue_number``. Rows without the
+    key — including the sealed ms-37 fixtures — are unaffected.
+
+    Mirrors :func:`coord.models.effective_issue_number`, kept local so this
+    module stays a pure dict-in/dict-out aggregator with no model import.
+    """
+    for key in ("for_issue_number", "issue_number"):
+        raw = row.get(key)
+        if raw is None or raw == "":
+            continue
+        return _to_int(raw)
+    return 0
+
+
 def _group_key_for(row: dict, group_by: str) -> Any:
     if group_by == "issue":
         return IssueKey(
             repo_name=str(row.get("repo_name") or ""),
-            issue_number=_to_int(row.get("issue_number")),
+            issue_number=row_issue_number(row),
         )
     if group_by == "repo":
         return str(row.get("repo_name") or "")
@@ -562,7 +582,8 @@ def _agg_key(row: dict, by: str) -> Any:
     update, which is out of scope for this PR.
     """
     if by == "issue":
-        return _to_int(row.get("issue_number"))
+        # #1553: attributed issue, not the raw column — see row_issue_number.
+        return row_issue_number(row)
     return _group_key_for(row, by)
 
 

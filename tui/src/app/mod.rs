@@ -963,8 +963,19 @@ struct IssueGroup {
 /// has chat-type assignments still lands in Backlog / Refining / Refined
 /// rather than being dragged into In-flight.
 fn is_workable_type(ty: &str) -> bool {
-    matches!(ty, "work" | "mock-author" | "review" | "smoke" | "conflict-fix")
-        || ty.starts_with("fix-")
+    // #1553: "test-author" belongs here for the same reason "mock-author"
+    // already does — both are pipeline execution, not a scoping conversation,
+    // and Python agrees (`coord.models.WORK_LIKE_TYPES` is
+    // {"work", "mock-author", "test-author"}). Its omission was half of why a
+    // child issue with three live acceptance-authoring rounds classified as
+    // Pending: even after the row was attributed to the child (see
+    // `Assignment::effective_issue_number`), the type itself didn't count as
+    // work. `[fix-N]` bounces of a slice reuse `type="test-author"` too
+    // (`coord.auto_loop._dispatch_fix`), so they ride along on this arm.
+    matches!(
+        ty,
+        "work" | "mock-author" | "test-author" | "review" | "smoke" | "conflict-fix"
+    ) || ty.starts_with("fix-")
 }
 
 impl IssueGroup {

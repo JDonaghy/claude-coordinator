@@ -18433,6 +18433,10 @@
         assert!(is_workable_type("review"));
         assert!(is_workable_type("smoke"));
         assert!(is_workable_type("conflict-fix"));
+        // #1553: the two authoring types are pipeline execution, matching
+        // Python's `coord.models.WORK_LIKE_TYPES`.
+        assert!(is_workable_type("mock-author"));
+        assert!(is_workable_type("test-author"));
         assert!(is_workable_type("fix-1"));
         assert!(is_workable_type("fix-42"));
         assert!(is_workable_type("fix-"));
@@ -40333,5 +40337,217 @@ Milestone tracking issue.
             got.is_empty(),
             "a malformed daemon response must degrade to an empty set, got {:?}",
             got
+        );
+    }
+
+    // ── #1553: oracle-loop slice work is attributed to the CHILD issue ──────
+    //
+    // `coord acceptance author <repo> <tracking> --issue N` books its
+    // assignment (and every review/fix/smoke derived from it) with
+    // `issue_number = <tracking>` — the whole milestone's JIT slices share one
+    // branch and one PR, so `issue_number` cannot be the child. The child
+    // lives in `for_issue_number`, and that is what "is this issue being
+    // worked?" / "what did this issue cost?" must read.
+    //
+    // Observed live: 26 assignments booked to epic #1120, 0 to child #1124,
+    // while three authoring rounds, a smoke and three reviews were in flight
+    // for #1124. The operator's report was "I don't think 1124 is running,
+    // the TUI shows no activity."
+
+    /// Pipeline app with a tracking/epic issue (#1120) and one of its work-
+    /// order children (#1124), both under coord repo "api".
+    fn make_slice_attribution_app() -> CoordApp {
+        let data = BoardData {
+            pipeline_default_gates: vec!["review".to_string(), "merge".to_string()],
+            pipeline_tracked_labels: vec!["coord".to_string()],
+            pipeline_repos: vec![("api".to_string(), "acme/api".to_string())],
+            ..BoardData::default()
+        };
+        let mut app = make_test_app(data);
+        app.pipeline_issues = vec![
+            PipelineIssue {
+                number: 1120,
+                title: "ms-38 tracking".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string(), "status:ready".to_string()],
+                is_closed: false,
+            },
+            PipelineIssue {
+                number: 1124,
+                title: "ms-38 child".to_string(),
+                body: String::new(),
+                repo_slug: "acme/api".to_string(),
+                coord_repo: Some("api".to_string()),
+                matched_labels: vec!["coord".to_string()],
+                all_labels: vec!["coord".to_string(), "status:ready".to_string()],
+                is_closed: false,
+            },
+        ];
+        app.rebuild_pipeline_sidebar(None);
+        app
+    }
+
+    /// A `test-author` slice row exactly as `coord acceptance author
+    /// <repo> 1120 --issue 1124` records it.
+    fn slice_assignment(status: &str, id: &str) -> Assignment {
+        let mut a = make_assignment_typed(status, 1120, "api", Some("test-author"));
+        a.id = id.to_string();
+        a.issue_title = "[test-author] ms-38 slice #1124".to_string();
+        a.branch = Some("ms-38-acceptance".to_string());
+        a.for_issue_number = Some(1124);
+        a
+    }
+
+    fn pipeline_issue_numbered(app: &CoordApp, number: u64) -> &PipelineIssue {
+        app.pipeline_issues
+            .iter()
+            .find(|i| i.number == number)
+            .expect("fixture issue must exist")
+    }
+
+    #[test]
+    fn effective_issue_number_prefers_the_slice_child() {
+        let a = slice_assignment("running", "author-1");
+        assert_eq!(a.effective_issue_number(), 1124);
+        // The parent link must survive — the epic still rolls up through it.
+        assert_eq!(a.issue_number, 1120);
+    }
+
+    #[test]
+    fn effective_issue_number_falls_back_for_ordinary_work() {
+        let a = make_assignment_typed("running", 42, "api", Some("work"));
+        assert_eq!(a.effective_issue_number(), 42);
+    }
+
+    #[test]
+    fn slice_work_makes_the_child_row_in_progress_not_idle() {
+        // The headline #1553 assertion: the child's Pipeline row must show
+        // activity while its acceptance slice runs, instead of sitting in
+        // Pending as though nothing had been dispatched for it.
+        let mut app = make_slice_attribution_app();
+        app.data.assignments.push(slice_assignment("running", "author-1"));
+        let child = pipeline_issue_numbered(&app, 1124);
+        assert_eq!(
+            app.pipeline_lifecycle_section(child),
+            "in-progress",
+            "a child with a live acceptance slice must not read as idle/pending"
+        );
+    }
+
+    #[test]
+    fn slice_work_does_not_make_the_tracking_row_in_progress() {
+        // "The epic row should aggregate, not absorb." With no work of its
+        // own, the tracking issue must not be promoted to In-progress purely
+        // because a child's slice is booked under its number.
+        let mut app = make_slice_attribution_app();
+        app.data.assignments.push(slice_assignment("running", "author-1"));
+        let tracking = pipeline_issue_numbered(&app, 1120);
+        assert_ne!(
+            app.pipeline_lifecycle_section(tracking),
+            "in-progress",
+            "the epic must not absorb its child's slice as its own work"
+        );
+    }
+
+    #[test]
+    fn tracking_issue_own_work_still_makes_it_in_progress() {
+        // Guardrail: re-attribution must not stop the epic's OWN work (Gate A
+        // mock-author, dispatched against the tracking issue with no
+        // `for_issue_number`) from registering on the epic's row.
+        let mut app = make_slice_attribution_app();
+        app.data
+            .assignments
+            .push(make_assignment_typed("running", 1120, "api", Some("mock-author")));
+        let tracking = pipeline_issue_numbered(&app, 1120);
+        assert_eq!(app.pipeline_lifecycle_section(tracking), "in-progress");
+    }
+
+    #[test]
+    fn ordinary_work_lifecycle_is_unchanged() {
+        let mut app = make_slice_attribution_app();
+        app.data
+            .assignments
+            .push(make_assignment_typed("running", 1124, "api", Some("work")));
+        let child = pipeline_issue_numbered(&app, 1124);
+        assert_eq!(app.pipeline_lifecycle_section(child), "in-progress");
+        let tracking = pipeline_issue_numbered(&app, 1120);
+        assert_ne!(app.pipeline_lifecycle_section(tracking), "in-progress");
+    }
+
+    #[test]
+    fn slice_cost_rolls_up_to_the_child_not_the_epic() {
+        // #1117 / milestone #37 reads per-issue cost from exactly this path.
+        // $7.90 of #1124's slice authoring was being booked to epic #1120.
+        let mut app = make_slice_attribution_app();
+        let mut author = slice_assignment("done", "author-1");
+        author.cost_usd = Some(7.90);
+        author.input_tokens = 1_000;
+        author.output_tokens = 500;
+        let mut epic_own = make_assignment_typed("done", 1120, "api", Some("mock-author"));
+        epic_own.cost_usd = Some(1.10);
+        epic_own.input_tokens = 100;
+        epic_own.output_tokens = 50;
+        app.data.assignments.push(author);
+        app.data.assignments.push(epic_own);
+
+        let child = pipeline_issue_numbered(&app, 1124);
+        let child_cost = app.issue_total_cost(child).expect("child must carry cost");
+        assert!(
+            (child_cost - 7.90).abs() < 1e-9,
+            "expected the slice's $7.90 on the child, got {child_cost}"
+        );
+        assert_eq!(app.issue_total_tokens(child), 1_500);
+
+        let tracking = pipeline_issue_numbered(&app, 1120);
+        let epic_cost = app.issue_total_cost(tracking).expect("epic keeps its own cost");
+        assert!(
+            (epic_cost - 1.10).abs() < 1e-9,
+            "the epic must keep only its own $1.10, got {epic_cost}"
+        );
+        assert_eq!(app.issue_total_tokens(tracking), 150);
+    }
+
+    #[test]
+    fn slice_usage_grid_groups_under_the_child() {
+        // The Usage panel's per-issue grid + its drill-down must agree with
+        // each other and with the Pipeline rollup above.
+        use super::usage::{aggregate_usage, issue_legs, UsageWindow};
+
+        let mut author = slice_assignment("done", "author-1");
+        author.cost_usd = Some(7.90);
+        author.dispatched_at = Some(1_000.0);
+        author.finished_at = Some(2_000.0);
+        let assignments = vec![author];
+
+        let window = UsageWindow { start: None, end: None };
+        let (rows, _totals) = aggregate_usage(&assignments, &window, UsageGroupBy::Issue);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].issue_number,
+            Some(1124),
+            "slice spend must be grouped under the child issue"
+        );
+        assert_eq!(issue_legs(&assignments, "api", 1124, &window).len(), 1);
+        assert!(
+            issue_legs(&assignments, "api", 1120, &window).is_empty(),
+            "the drill-down must not list a child's legs under the epic"
+        );
+    }
+
+    #[test]
+    fn acceptance_authoring_prereq_still_resolves_for_the_child() {
+        // Regression guard: #1553 must not disturb the #1084 mini-pipeline,
+        // which resolves the slice by (issue_number == tracking) AND
+        // (type == "test-author") AND (for_issue_number == child).
+        let mut app = make_slice_attribution_app();
+        app.data.assignments.push(slice_assignment("running", "author-1"));
+        let child = pipeline_issue_numbered(&app, 1124);
+        let status = app.acceptance_authoring_prereq_status(child, 1120);
+        assert!(
+            status.author_id.is_some(),
+            "the child's Acceptance-Authoring box must still find its slice"
         );
     }

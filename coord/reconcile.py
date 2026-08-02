@@ -773,6 +773,11 @@ def _reassign(
         # and gets retried again.
         review_iteration=failed.review_iteration,
         review_of_assignment_id=failed.review_of_assignment_id,
+        # #1553: carry the oracle-loop slice attribution across the retry
+        # too — otherwise a retried acceptance slice silently falls back to
+        # being booked against the milestone's tracking issue and the
+        # child's row goes quiet again mid-run. None for ordinary work.
+        for_issue_number=failed.for_issue_number,
     )
     board.active.append(retry_assignment)
 

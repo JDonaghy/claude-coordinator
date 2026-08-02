@@ -364,8 +364,13 @@ pub(crate) fn build_dag_nodes(
                 // execution and do NOT promote a node out of Ready — same
                 // is_workable_type predicate as the Pipeline lifecycle classifier.
                 // None assignment_type defaults to true (treated as "work").
+                // #1553: `effective_issue_number` so a member node whose
+                // acceptance slice is running reads InFlight. The slice row
+                // carries the milestone's TRACKING issue in `issue_number`,
+                // so the raw match would have promoted the epic (never a DAG
+                // node) instead of the child it was authored for.
                 a.repo == repo_name
-                    && a.issue_number == n.issue_number
+                    && a.effective_issue_number() == n.issue_number
                     && a.assignment_type.as_deref().map(is_workable_type).unwrap_or(true)
             }) {
                 NodeState::InFlight

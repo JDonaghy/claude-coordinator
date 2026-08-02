@@ -178,10 +178,16 @@ def _assignment_to_usage(
     (e.g. ``{"cost_so_far": 0.12, "model_used": "claude-sonnet-4-6", ...}``).
     """
     _logs_dir = logs_dir if logs_dir is not None else LOGS_DIR
+    from coord.models import effective_issue_number  # noqa: PLC0415
+
     usage = AssignmentUsage(
         assignment_id=a.assignment_id or "",
         repo_name=a.repo_name,
-        issue_number=a.issue_number,
+        # #1553: per-issue spend must land on the issue the work was really
+        # for. An oracle-loop acceptance slice carries the milestone's
+        # tracking issue in `issue_number`, so booking cost against it
+        # attributed every child's authoring spend to the epic.
+        issue_number=effective_issue_number(a),
         issue_title=a.issue_title,
         status=a.status,
         model=a.model,
