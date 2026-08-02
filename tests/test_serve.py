@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
 import os
 import sqlite3
 from pathlib import Path
@@ -3499,6 +3500,132 @@ def test_diagnose_routes_to_daemon_when_service_set(coord_db, monkeypatch):
     assert captured["payload"]["stage"] == "review"
     assert captured["payload"]["reset"] is True
     assert "DAEMON DIAGNOSE OUTPUT" in out.output
+
+
+def test_serve_gates_runs_callback_and_captures_output(
+    file_db: Path, valid_config_path: Path, rw_db, monkeypatch
+):
+    # POST /gates runs `coord gates` on the daemon with the recursion guard
+    # set, and relays the captured CLI output + exit code. Mirrors
+    # test_serve_diagnose_runs_callback_and_captures_output.
+    import os
+    import click
+    from coord.cli import gates as gates_cmd
+
+    def fake_callback(**kwargs):
+        assert os.environ.get("COORD_GATES_ON_DAEMON") == "1"  # guard set
+        click.echo(
+            f"gated repo={kwargs['repo']} issue={kwargs['issue']} "
+            f"as_json={kwargs['as_json']}"
+        )
+
+    monkeypatch.setattr(gates_cmd, "callback", fake_callback)
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post(
+            "/gates",
+            json={"repo": "api", "issue": 42, "as_json": False},
+        )
+    assert resp.status_code == 200
+    out = resp.json()
+    assert out["exit_code"] == 0 and out["error"] is None
+    assert "gated repo=api issue=42 as_json=False" in out["output"]
+    assert os.environ.get("COORD_GATES_ON_DAEMON") is None  # restored after
+
+
+def test_serve_gates_real_callback_end_to_end(
+    file_db: Path, valid_config_path: Path, rw_db, monkeypatch
+):
+    # Drives the REAL callback (no monkeypatching of .callback) so a kwarg
+    # mismatch between serve_app.post_gates and coord.cli.gates's signature
+    # (the exact #diagnose regression this mirrors) would fail loudly here.
+    from coord import client as cc
+    from coord import github_ops
+
+    monkeypatch.setattr(cc, "resolve_board_service", lambda *a, **k: None)
+    monkeypatch.setattr(github_ops, "get_branch_sha", lambda *a, **k: None)
+    monkeypatch.setattr(github_ops, "get_branch_patch_id", lambda *a, **k: None)
+
+    rw_db.execute(
+        "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+        "repo_github, issue_number, issue_title, status, type, branch, "
+        "test_state, review_state, review_verdict) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "work1", "laptop", "api", "acme/api", 7, "An issue", "done",
+            "work", "issue-7-foo", "passed", "done", "approve",
+        ),
+    )
+    # A real "review" row is what has_approved_review actually looks for —
+    # review_verdict mirrored onto the work row alone isn't evidence.
+    rw_db.execute(
+        "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+        "repo_github, issue_number, issue_title, status, type, "
+        "review_of_assignment_id, review_verdict) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (
+            "review1", "server", "api", "acme/api", 7, "An issue", "done",
+            "review", "work1", "approve",
+        ),
+    )
+    rw_db.commit()
+
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post("/gates", json={"repo": "api", "issue": 7, "as_json": True})
+
+    assert resp.status_code == 200
+    out = resp.json()
+    assert out["exit_code"] == 0, f"expected exit_code=0, got: {out}"
+    assert out["error"] is None, f"expected no error, got: {out['error']}"
+    payload = json.loads(out["output"])
+    assert payload["repo_name"] == "api"
+    assert payload["issue_number"] == 7
+    assert payload["decisions"][-1]["gate"] == "merge"
+    assert payload["decisions"][-1]["ok"] is True
+
+
+def test_serve_gates_relays_nonzero_exit(
+    file_db: Path, valid_config_path: Path, rw_db, monkeypatch
+):
+    import sys
+    from coord.cli import gates as gates_cmd
+    monkeypatch.setattr(gates_cmd, "callback", lambda **k: sys.exit(2))
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post("/gates", json={"repo": "api", "issue": 1, "as_json": False})
+    assert resp.json()["exit_code"] == 2
+
+
+def test_gates_routes_to_daemon_when_service_set(coord_db, monkeypatch):
+    # `coord gates` on a thin client POSTs to /gates and relays the output,
+    # instead of no-opping against an empty local board (no live gh either).
+    from coord import client as cc
+    from coord import state as coord_state
+    from click.testing import CliRunner
+    from coord.cli import main
+
+    monkeypatch.setattr(
+        cc, "resolve_board_service", lambda *a, **k: cc.ServiceConfig("http://d:7435")
+    )
+
+    def _boom(*a, **k):  # noqa: ANN002, ANN003
+        raise AssertionError("build_board must not be called on a thin client")
+
+    monkeypatch.setattr(coord_state, "build_board", _boom, raising=False)
+    captured: dict = {}
+    monkeypatch.setattr(
+        cc, "post_record",
+        lambda svc, path, payload, **kw: captured.update(path=path, payload=payload)
+        or {"output": "DAEMON GATES OUTPUT\n", "exit_code": 0},
+    )
+    out = CliRunner().invoke(main, ["gates", "api", "42", "--json"])
+    assert out.exit_code == 0, out.output
+    assert captured["path"] == "/gates"
+    assert captured["payload"]["repo"] == "api"
+    assert captured["payload"]["issue"] == 42
+    assert captured["payload"]["as_json"] is True
+    assert "DAEMON GATES OUTPUT" in out.output
 
 
 def test_serve_acceptance_record_runs_callback_and_captures_output(

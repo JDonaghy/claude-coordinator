@@ -170,6 +170,10 @@ COMMANDS_ALLOWLIST: dict[str, set[tuple[str, str]]] = {
     # (`status` also calls `load_dispatched` — no longer tracked here since
     # #1493 made it daemon-routed; see BOARD_FUNCS_EXTENDED above.)
     "status.py": {("diagnose", "build_board")},
+    # #1657-routed: `gates`'s body already routed via `daemon_reroute_target`
+    # above (mirrors `diagnose` immediately above) — this build_board() is
+    # the deliberate host-local read for the already-routed body.
+    "gates.py": {("gates", "build_board")},
     # (`sessions.py`'s `log`/`wait`/`watch` used to appear here for
     # `load_dispatched` — no longer tracked since #1493 made it daemon-routed;
     # see BOARD_FUNCS_EXTENDED above. sessions.py has no other

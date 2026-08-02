@@ -104,7 +104,7 @@ class _ThreadLocalCapture:
     process's ``sys.stdout``/``sys.stderr`` (#1278).
 
     Several daemon-write endpoints (``/merge``, ``/notify``,
-    ``/reconcile-merges``, ``/diagnose``, ``/test-plan``,
+    ``/reconcile-merges``, ``/diagnose``, ``/gates``, ``/test-plan``,
     ``/acceptance/record``) invoke a click command's ``callback`` inside a
     ``run_in_threadpool`` worker THREAD and capture its output for the JSON
     response. The old idiom did this with ``contextlib.redirect_stdout(buf)``,
@@ -3002,6 +3002,36 @@ def _openapi_spec() -> dict:
                 },
             }
         },
+        "/gates": {
+            "post": {
+                "summary": (
+                    "Run `coord gates` against the canonical DB + gh (#1657) — "
+                    "read-only gate columns + live review/test/merge decision"
+                ),
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "repo": {"type": "string"},
+                                    "issue": {"type": "integer"},
+                                    "as_json": {"type": "boolean"},
+                                },
+                                "required": ["repo", "issue"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {"application/json": {"schema": cli_output_response}},
+                    },
+                },
+            }
+        },
         "/test-plan": {
             "post": {
                 "summary": "Run `coord test-plan` against the canonical DB (#851)",
@@ -5342,6 +5372,55 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         result = await run_in_threadpool(_run)
         return JSONResponse(result)
 
+    async def post_gates(request: Request) -> Response:
+        # #1657: the canonical board + gh live on THIS host, and the #1479
+        # freshness comparison needs live gh lookups — so a thin client's
+        # `coord gates` routes the whole read here, mirroring /diagnose.
+        # Run it in a threadpool (it shells out to gh) so it doesn't block
+        # the event loop / board reads. Read-only: no save_board/save_queue
+        # call anywhere on this path (coord.gates.build_gate_report never
+        # writes).
+        from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+
+        def _run() -> dict:
+            import io  # noqa: PLC0415
+            import os  # noqa: PLC0415
+
+            from coord.cli import gates as gates_cmd  # noqa: PLC0415
+
+            stdout_proxy, _stderr_proxy = _ensure_stdio_capture_proxies()
+            buf = io.StringIO()
+            code = 0
+            err = None
+            prev = os.environ.get("COORD_GATES_ON_DAEMON")
+            os.environ["COORD_GATES_ON_DAEMON"] = "1"  # guard against re-routing
+            try:
+                with stdout_proxy.capture(buf):
+                    gates_cmd.callback(
+                        repo=body.get("repo"),
+                        issue=int(body.get("issue")),
+                        as_json=bool(body.get("as_json")),
+                        config_path=config.path,
+                    )
+            except SystemExit as e:  # click commands sys.exit() on some paths
+                code = e.code if isinstance(e.code, int) else (1 if e.code else 0)
+            except Exception as e:  # noqa: BLE001
+                err = _log_daemon_exception("/gates", e)
+                code = 1
+            finally:
+                if prev is None:
+                    os.environ.pop("COORD_GATES_ON_DAEMON", None)
+                else:
+                    os.environ["COORD_GATES_ON_DAEMON"] = prev
+            return {"output": buf.getvalue(), "exit_code": code, "error": err}
+
+        result = await run_in_threadpool(_run)
+        return JSONResponse(result)
+
     async def post_test_plan(request: Request) -> Response:
         # #851: the assignment row + cached test_plan live in THIS (canonical)
         # DB, so a thin client's `coord test-plan` routes the whole command
@@ -5946,6 +6025,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/merge", post_merge, methods=["POST"]),
         Route("/reconcile-merges", post_reconcile_merges, methods=["POST"]),
         Route("/diagnose", post_diagnose, methods=["POST"]),
+        Route("/gates", post_gates, methods=["POST"]),
         Route("/test-plan", post_test_plan, methods=["POST"]),
         Route("/housekeeping", post_housekeeping, methods=["POST"]),
         Route(
