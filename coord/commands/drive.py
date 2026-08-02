@@ -155,10 +155,13 @@ def _rebuild_drive_argv(
     default=3,
     show_default=True,
     help=(
-        "Headless `coord fix` rounds on a failing test suite. Each round "
-        "continues the SAME branch with the model escalated (sonnet → opus). "
-        "coord dispatches the Test stage itself onto a capability-matched "
-        "machine (#1426); this only observes the verdict."
+        "Headless `coord fix` rounds this run is willing to spend, shared by "
+        "BOTH fix arms: a failing test suite and a request-changes review "
+        "(#1692). Each round continues the SAME branch with the model "
+        "escalated (sonnet → opus). coord dispatches the Test stage itself "
+        "onto a capability-matched machine (#1426); this only observes the "
+        "verdict. Distinct from pipeline.max_review_iterations, which bounds "
+        "the review loop per ISSUE across every drive."
     ),
 )
 @click.option(

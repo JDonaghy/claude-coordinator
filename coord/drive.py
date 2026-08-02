@@ -182,6 +182,10 @@ class DriveCounters:
     """Bounds on every retry loop.  Unbounded merge retries was a real bug."""
 
     work_retries: int = 0
+    # ONE budget for BOTH fix arms (#1692): a failed test and a
+    # request-changes review are two shapes of the same "the work needs
+    # another round" loop, and a drive that spends three rounds bouncing
+    # between them has spent three rounds. Bounded by `opts.max_fix_rounds`.
     fix_rounds: int = 0
     merge_attempts: int = 0
     review_dispatches: int = 0
@@ -189,6 +193,18 @@ class DriveCounters:
     # error, network drop, ...) before producing a verdict — the review-side
     # analogue of `work_retries`, bounded the same way (`opts.max_work_retries`).
     review_retries: int = 0
+    # #1692: NOT a second budget — `fix_rounds` above is the budget. This is a
+    # de-duplication latch: the assignment id of the review this driver has
+    # already spent a fix round on. `coord fix` returns as soon as the fix
+    # worker is dispatched, but the board this driver polls needs a beat to
+    # show the new row; until it does, the state is byte-for-byte identical to
+    # the one that triggered the dispatch. Without this latch the next poll
+    # re-fires `coord fix` against the same review and spawns a SECOND fix
+    # worker on the same branch — the #476/#477 shape, in a new dispatcher.
+    # Cleared implicitly rather than explicitly: the next review round is a
+    # different review row (`drive_state.project` keys the review on the
+    # current work id), so its id simply doesn't match this one.
+    review_fix_dispatched_for: str = ""
 
 
 # ── actions ──────────────────────────────────────────────────────────────────
@@ -704,12 +720,12 @@ def preflight(
 
     if not state.auto_loop:
         warnings.append(
-            "pipeline.auto_loop is OFF — a request-changes review will NOT "
-            "auto-dispatch a fix."
+            "pipeline.auto_loop is OFF — the review→fix path is switched off."
         )
         warnings.append(
-            "This run will report the verdict and stop rather than dispatch one "
-            "itself."
+            "A request-changes verdict will be REPORTED and this run will stop "
+            "(#1692): `coord fix` refuses while auto_loop is off, so there is "
+            "no fix to dispatch."
         )
 
     # INTERACTIVE WORK NEVER GETS AN AUTOMATIC REVIEW.
@@ -1163,8 +1179,21 @@ def _decide_review(
     """The REVIEW gate.  ``None`` means "approved, fall through to merge".
 
     coord dispatches the review itself once the test verdict lands (the notify
-    timer's ``dispatch_pending_reviews``).  We only observe — except for the
-    #555 interactive case, which needs one explicit request.
+    timer's ``dispatch_pending_reviews``), so this mostly observes — the
+    exceptions are the #555 interactive case (one explicit request), the #1584
+    dead-reviewer retry, and the #1692 request-changes fix round.
+
+    **#1692 — a request-changes verdict dispatches ``coord fix`` here.** It
+    used to ``_wait()`` on a comment that read "the auto-loop dispatches the
+    fix", which stopped being true when #1616 replaced the ``coord notify``
+    timer with the daemon drain: the drain's responsibility table deliberately
+    excludes fix dispatch (#476/#477), ``run_for_review_transition`` never sees
+    the transition because the drain already consumed it, and the #1478 stalled
+    sweeper is off by default. Three mechanisms, three defensible declines, one
+    hole — a 50-minute park to the deadline with nothing dispatched. This arm
+    now mirrors the test arm one-for-one: same ``coord fix`` command, same
+    ``counters.fix_rounds`` budget, one extra de-duplication latch because a
+    review row (unlike a failed test) is not re-created by the fix it triggers.
     """
     verdict = state.review_verdict
     if verdict == "approve":
@@ -1226,6 +1255,12 @@ def _decide_review(
         )
 
     if verdict == "request-changes":
+        # The OUTER cap, and it stays FIRST: an exhausted review loop is
+        # terminal no matter how much of this drive's own fix budget is left,
+        # and `_dispatch_fix_for_review` would refuse the dispatch anyway
+        # (`next_iteration > max_review_iterations` → `max_iterations`, which
+        # `coord fix` turns into a non-zero exit). Dying here reports the cap
+        # instead of reporting a subprocess failure.
         if state.work_review_iter >= state.max_review_iterations:
             return _die(
                 "review requested changes and the fix loop is exhausted\n"
@@ -1235,8 +1270,96 @@ def _decide_review(
                 f"   Continue by hand: coord assign --interactive --fix-of "
                 f"{state.review_aid}"
             )
-        # The auto-loop dispatches the fix; wait for it to appear.
-        return _wait()
+        # #1692: `coord fix` routes through `auto_loop.process_review_completion`,
+        # whose very first line refuses when `pipeline.auto_loop` is off. Say so
+        # here rather than dispatching a subprocess that can only fail — and
+        # rather than the pre-#1692 infinite wait, which is what the preflight
+        # warning ("this run will report the verdict and stop") already promised
+        # not to do.
+        if not state.auto_loop:
+            return _die(
+                "review requested changes but pipeline.auto_loop is OFF — the "
+                "review→fix\n"
+                "   path is switched off in coordinator.yml, so no fix can be "
+                "dispatched.\n"
+                f"   Findings: coord log {state.review_aid}\n"
+                f"   Continue by hand: coord assign --interactive --fix-of "
+                f"{state.review_aid}"
+            )
+        # Belt-and-braces: `review_verdict` and `review_aid` are read off the
+        # SAME board row (`drive_state.project`), so a verdict without an id is
+        # impossible today. Assert it rather than assume it — everything below
+        # spends money keyed on that id, and `coord fix ""` is not a refusal
+        # this arm should ever have to interpret.
+        if not state.review_aid:
+            return _die(
+                "review verdict is 'request-changes' but no review assignment "
+                "id is on the board —\n"
+                "   refusing to guess which review to fix. Inspect: coord "
+                f"gates {state.repo} {state.issue}"
+            )
+        # Already spent a round on THIS review row and the board hasn't caught
+        # up yet. Waiting is the only safe answer: dispatching again would put
+        # a second fix worker on the same branch (#476/#477). Once the fix row
+        # lands, `decide()`'s `active_count > 0` guard takes over, and when it
+        # completes the review row changes id and this latch stops matching.
+        if counters.review_fix_dispatched_for == state.review_aid:
+            return _wait(
+                label=(
+                    f"REVIEW: fix already dispatched for {state.review_aid} — "
+                    "waiting for the fix row to appear on the board"
+                )
+            )
+        # The driver-side twin of the test arm's bound, sharing ONE budget with
+        # it (see `DriveCounters.fix_rounds`): `max_review_iterations` bounds
+        # the *issue's* review loop across every drive that ever touches it,
+        # `max_fix_rounds` bounds what THIS drive is willing to spend.
+        if counters.fix_rounds >= opts.max_fix_rounds:
+            return _die(
+                f"review requested changes after {counters.fix_rounds} fix "
+                "round(s) this drive — stopping.\n"
+                f"   (review iteration {state.work_review_iter}/"
+                f"{state.max_review_iterations} is NOT exhausted; this drive's "
+                "own --max-fix-rounds is.)\n"
+                f"   Findings: coord log {state.review_aid}\n"
+                f"   Continue by hand: coord assign --interactive --fix-of "
+                f"{state.review_aid}"
+            )
+        counters.fix_rounds += 1
+        counters.review_fix_dispatched_for = state.review_aid
+        # #1622 widened `coord fix` to take a REVIEW id whose verdict was
+        # request-changes; #1692 is the review arm finally walking through that
+        # door. The REVIEW id, not `state.work_aid`: the work-id form gates on
+        # the legacy `smoke_test == "fail"` field and would be refused here.
+        # It is not a second implementation of fix dispatch — it hands the row
+        # to `auto_loop.process_review_completion` → the single `_dispatch_fix`
+        # chokepoint, so `pipeline.auto_loop`, the #476/#1456
+        # approve-with-nits gate, the #522 terminal-work guard and
+        # `max_review_iterations` all still apply. No `sleep_after`: the test
+        # arm above dispatches the same command on the same plain poll
+        # interval, and the latch — not a timing guess — is what makes the
+        # next poll safe.
+        return Action(
+            kind=RUN,
+            label=(
+                f"REVIEW: request-changes → fix round {counters.fix_rounds}/"
+                f"{opts.max_fix_rounds} (coord fix {state.review_aid}, review "
+                f"iteration {state.work_review_iter + 1}/"
+                f"{state.max_review_iterations})"
+            ),
+            command=("fix", state.review_aid),
+            error_message=(
+                f"coord fix {state.review_aid} failed to dispatch the review "
+                "fix.\n"
+                "   Its refusals are all guards doing their job: auto_loop "
+                "disabled, no structured\n"
+                "   findings, approve-with-nits (#476), max_review_iterations, "
+                "or the #522\n"
+                "   terminal-work guard — the message above names which.\n"
+                f"   Check: coord log {state.review_aid}   /   continue by hand: "
+                f"coord assign --interactive --fix-of {state.review_aid}"
+            ),
+        )
 
     if verdict == "":
         if state.work_review_state == "done":
@@ -2155,14 +2278,18 @@ class Driver:
         self.log(
             "  auto-loop      : "
             + (
-                "on (coord dispatches review fixes; this observes)"
+                "on (request-changes → this driver runs coord fix, #1692)"
                 if state.auto_loop
-                else "off"
+                else "off (a request-changes verdict stops this run)"
             )
         )
-        self.log(f"  test fix rounds: {self.opts.max_fix_rounds} (via coord fix)")
         self.log(
-            f"  review fix cap : {state.max_review_iterations} (coord's auto-loop)"
+            f"  fix rounds     : {self.opts.max_fix_rounds} this run, shared by "
+            "the test and review arms (via coord fix)"
+        )
+        self.log(
+            f"  review fix cap : {state.max_review_iterations} "
+            "(pipeline.max_review_iterations — per issue, across every drive)"
         )
         self.log(
             "  notify nudge   : "
