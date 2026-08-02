@@ -430,6 +430,20 @@ def test_agent_puts_the_base_back_when_a_worker_parked_it(
     Simulates the #1642 shape directly — the worker runs ``git -C <base>
     checkout <its own branch>``.  At teardown the agent must notice the base
     is parked on the branch it just finished with and put it back.
+
+    ``AgentServer.assign()`` runs ``_setup_worktree`` synchronously *before*
+    spawning the worker, so by the time this shell command runs, the
+    assignment's own linked worktree already holds
+    ``issue-1694-escape-1`` — an ordinary ``git checkout`` of that branch
+    anywhere else in the repo is refused by git ("already used by worktree
+    at ...", exit 128). A prior version of this test masked that failure
+    with ``|| true``, so the base checkout was never actually parked and
+    this test passed unconditionally regardless of whether Part A's restore
+    wiring even ran. ``--ignore-other-worktrees`` bypasses that safety check
+    exactly the way a real worker's stray ``cd ~/src/<repo> && git checkout
+    <branch>`` would if the branch happened to already be checked out
+    elsewhere — reproducing the actual #1642 parked-base state so this test
+    exercises the restore for real.
     """
     base = repo_with_remote
     server = AgentServer(
@@ -438,8 +452,8 @@ def test_agent_puts_the_base_back_when_a_worker_parked_it(
         state_dir=tmp_path / "state",
         worker_command=lambda spec: [
             "sh", "-c",
-            f"git -C {base} checkout "
-            f"issue-1694-escape-{spec.issue_number} 2>/dev/null || true",
+            f"git -C {base} checkout --ignore-other-worktrees "
+            f"issue-1694-escape-{spec.issue_number}",
         ],
     )
     spec = AssignmentSpec(
@@ -451,6 +465,11 @@ def test_agent_puts_the_base_back_when_a_worker_parked_it(
     a = server.assign(spec)
     server.wait_for(a.id, timeout=30)
 
+    assert a.exit_code == 0, (
+        "the worker's own `git checkout --ignore-other-worktrees` must have "
+        "succeeded — otherwise the base was never actually parked and this "
+        "test would pass without exercising the restore at all"
+    )
     assert _current_branch(base) == "main", (
         "the agent left the base checkout parked on the worker's branch"
     )
