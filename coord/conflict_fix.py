@@ -132,10 +132,16 @@ def build_semantic_conflict_briefing(
         "",
         f"Issue: #{entry.issue_number} — {entry.issue_title}",
         "",
-        "A first conflict-fix worker attempted the rebase in "
-        f"`{repo_path}` and stopped: it judged the conflict **semantic** — "
-        "both sides changed the same behaviour in incompatible ways, so "
-        "keeping both hunks is not a resolution.",
+        "A first conflict-fix worker attempted the rebase and stopped: it "
+        "judged the conflict **semantic** — both sides changed the same "
+        "behaviour in incompatible ways, so keeping both hunks is not a "
+        "resolution.",
+        "",
+        f"You are already in a dedicated git worktree on `{entry.branch}`. "
+        f"Work here — do NOT `cd {repo_path}` (the machine's shared base "
+        "checkout) and do NOT `git checkout` / `git switch` anywhere; that is "
+        "what leaves the base parked on a feature branch and breaks later "
+        "dispatches (#1694).",
         "",
     ]
     if stuck_summary:
@@ -186,18 +192,26 @@ def build_conflict_fix_briefing(
         "",
         f"Issue: #{entry.issue_number} — {entry.issue_title}",
         "",
+        "## Where you are",
+        "",
+        f"You are already in a dedicated git worktree checked out on "
+        f"`{entry.branch}` — the coordinator created it for you. Work HERE.",
+        "",
+        f"Do **NOT** `cd {repo_path}` (that is the machine's shared base "
+        "checkout) and do NOT `git checkout` / `git switch` anywhere. Leaving "
+        f"the base checkout parked on `{entry.branch}` breaks every later "
+        "dispatch against that branch on this machine (#1694).",
+        "",
         "## Steps",
         "",
-        f"1. `cd {repo_path}`",
-        "2. `git fetch origin`",
-        f"3. `git checkout {entry.branch}`",
-        f"4. `git pull --rebase origin {entry.target_branch}`",
-        "5. Resolve any conflict markers.  Prefer additive merges; preserve",
+        "1. `git fetch origin`",
+        f"2. `git pull --rebase origin {entry.target_branch}`",
+        "3. Resolve any conflict markers.  Prefer additive merges; preserve",
         "   both sides when the conflict is in non-overlapping struct fields,",
         "   list entries, imports, or separate functions.",
-        f"6. Run tests: `{test_cmd}`",
-        f"7. `git push --force-with-lease origin {entry.branch}`",
-        "8. Exit 0 if push succeeds; non-zero otherwise.",
+        f"4. Run tests: `{test_cmd}`",
+        f"5. `git push --force-with-lease origin {entry.branch}`",
+        "6. Exit 0 if push succeeds; non-zero otherwise.",
         "",
         "## When NOT to guess",
         "",

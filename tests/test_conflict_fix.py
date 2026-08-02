@@ -155,7 +155,12 @@ class TestBuildBriefing:
             entry=_entry(), repo_path="/work/api", test_command="pytest -x",
         )
         assert "git fetch origin" in briefing
-        assert "git checkout issue-1-fix" in briefing
+        # #1694: NO `git checkout` step.  The agent dispatches this worker
+        # with `target_branch=entry.branch`, so its worktree already comes up
+        # on `issue-1-fix`; the old step 3 only ever ran in the shared base
+        # checkout (step 1 was `cd <repo_path>`) and left it parked there,
+        # which is the state #1693 has to refuse and #1694 has to clear.
+        # See tests/test_base_checkout_restore.py for the guard.
         assert "git pull --rebase origin main" in briefing
         assert "git push --force-with-lease origin issue-1-fix" in briefing
         assert "pytest -x" in briefing
