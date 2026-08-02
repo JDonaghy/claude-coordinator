@@ -565,18 +565,48 @@ directly, not by whether the last `coord agent update` reported success.
 Web smoke and web acceptance both route `coord/dashboard/webapp/**` to the
 `browser` capability, so **every** web test in the program lands on a machine
 that advertises it. Until 2026-08-02 that was exactly one machine (elitebook,
-the dev box), which made one flaky host able to stall a whole milestone.
-dellserver was added on 2026-08-02; this is the runbook for a third.
+the dev box), which made one flaky host able to stall a whole milestone. On
+2026-08-02 dellserver and precision were both added, so all three machines now
+advertise `browser` on the same Chromium build. This is the runbook for a fourth.
 
 Headless Chromium needs **no display** — a headless server is a perfectly good
 browser machine, and web tests headless-test far more cleanly than the TUI does.
 
+**Check what is actually missing before installing anything.** The two machines
+added on 2026-08-02 were missing *different* halves, and neither was obvious from
+`coord doctor`, which showed nothing for both:
+
+| machine | had | missing |
+|---|---|---|
+| dellserver | `node` v20 in `/usr/bin` | the browsers |
+| precision | the browsers (`chromium-1228`, already cached) | any `node` on the agent PATH |
+
+The reason `coord doctor` was blank in both cases is step 6 below: **probes are
+capability-driven**. Neither machine declared `browser`, so neither was probed, so
+neither reported the half it already had.
+
 **1. Node.** `node`, `npm` and `npx` must resolve from the agent's PATH, not just
-your interactive shell. Ubuntu 24.04's packaged `node` (v20) is sufficient. If the
-machine uses nvm, install the run-time shim instead of baking a version-stamped
-path into the unit — see `deploy/node-shim.sh` and the #1678 note there: an nvm
-path in the unit works until the next `nvm install`, at which point `browser`
-silently goes unmet again.
+your interactive shell. Ubuntu 24.04's packaged `node` (v20) is sufficient.
+
+If the machine uses **nvm**, do not bake the version-stamped path into the unit —
+install the run-time shim (`deploy/node-shim.sh`, #1678). precision is the worked
+example: nvm had v20.20.2, but only inside an interactive shell, so the agent saw
+no Node at all. `~/.local/bin` is already on the agent unit's PATH, so the whole
+fix is:
+
+```bash
+scp deploy/node-shim.sh <machine>:~/.local/bin/coord-node-shim
+ssh <machine> 'chmod +x ~/.local/bin/coord-node-shim
+  for c in node npm npx; do ln -sf ~/.local/bin/coord-node-shim ~/.local/bin/$c; done'
+```
+
+Confirm it resolves from the *agent's* PATH, not yours:
+
+```bash
+ssh <machine> 'env -i HOME=/home/john \
+  PATH=/home/john/.coord-venv/bin:/usr/local/bin:/usr/bin:/bin:/home/john/.local/bin \
+  sh -c "node --version; npm --version"'
+```
 
 **2. Browsers — match the pinned version, do not take latest.** Read the pin from
 `coord/dashboard/webapp/package.json` (`@playwright/test`, currently `^1.61.1`) and
