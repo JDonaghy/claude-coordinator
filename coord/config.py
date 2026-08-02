@@ -1191,6 +1191,28 @@ class HealthConfig:
     plan_usage_warn_pct: float = 85.0
     plan_usage_crit_pct: float = 95.0
 
+    # ── fleet deploy lanes, daemon host only (#1630) ──────────────────────
+    # These three name the two deploy lanes that live on the *daemon* host
+    # rather than on an agent: the operator's CLI venv, and the locally-built
+    # coord-tui binary.  All three follow `agent_venv_python`'s convention —
+    # ``None`` means "use the documented default location", NOT "disable the
+    # lane" — so the lanes are live on a stock install with no config at all,
+    # and an operator only sets them when their layout differs.
+    #
+    # Absolute path to the operator CLI venv's python.  None →
+    # ~/.coord-cli-venv/bin/python3 (what the install docs create).  This lane
+    # exists because it was found three releases stale on 2026-07-29.
+    cli_venv_python: str | None = None
+    # Absolute path to the built coord-tui binary.  None → ~/.local/bin/coord-tui
+    # (README: `cd tui && cargo build && cp target/debug/coord-tui
+    # ~/.local/bin/coord-tui`).
+    tui_binary_path: str | None = None
+    # Directory holding the tui/ Rust sources the binary was built from.  None →
+    # `<checkout>/tui/src` for the first configured local checkout that has one.
+    # Deliberately points at `src/`, not the crate root: rooting the mtime walk
+    # above `target/` would sweep a multi-GB build dir on every refresh.
+    tui_source_dir: str | None = None
+
 
 @dataclass
 class Config:
@@ -2097,6 +2119,15 @@ _HEALTH_STR_LIST_FIELDS: tuple[str, ...] = (
     "disk_paths",
     "cargo_target_extra_dirs",
 )
+# Path-ish overrides: a string, or null to mean "use the documented default".
+# Table-driven for the same reason as the numeric fields above — a new deploy
+# lane should not need its own hand-written eight-line validator.
+_HEALTH_OPT_STR_FIELDS: tuple[str, ...] = (
+    "agent_venv_python",
+    "cli_venv_python",
+    "tui_binary_path",
+    "tui_source_dir",
+)
 # Pairs that must not be inverted.  A config where warn is stricter than crit
 # silently makes the crit level unreachable — the check keeps reporting WARN
 # for a machine that is actually on fire, which is exactly the failure this
@@ -2139,11 +2170,16 @@ def _parse_health(raw: Any) -> HealthConfig:
             raise ConfigError("health.enabled must be a boolean")
         cfg.enabled = raw["enabled"]
 
-    if "agent_venv_python" in raw:
-        value = raw["agent_venv_python"]
-        if value is not None and not isinstance(value, str):
-            raise ConfigError("health.agent_venv_python must be a string or null")
-        cfg.agent_venv_python = value
+    for key in _HEALTH_OPT_STR_FIELDS:
+        if key in raw:
+            value = raw[key]
+            if value is not None and not isinstance(value, str):
+                raise ConfigError(f"health.{key} must be a string or null")
+            # An empty/whitespace string is an operator typo, not "disabled":
+            # accepting it would silently resolve the lane to the CWD.
+            if isinstance(value, str) and not value.strip():
+                raise ConfigError(f"health.{key} must be a non-empty string or null")
+            setattr(cfg, key, value.strip() if isinstance(value, str) else None)
 
     if "pypi_index_url" in raw:
         value = raw["pypi_index_url"]

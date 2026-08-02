@@ -3155,7 +3155,7 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
     # #1630: same invariant, same shape — polling every agent's /health,
     # shelling out to `pip show` for the daemon-host deploy lanes, and
     # cross-referencing /status for phantom rows are all real I/O, so they
-    # run on the tick loop's cadence (`_health_poll_tick` below) and /board
+    # run on the tick loop's cadence (`_health_refresh_loop` below) and /board
     # only ever reads the last-published snapshot.
     from coord.health.fleet_snapshot import FleetHealthRefresher  # noqa: PLC0415
 

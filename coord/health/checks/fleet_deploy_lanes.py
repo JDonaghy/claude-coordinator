@@ -137,11 +137,14 @@ def probe_tui_binary(ctx: HealthContext) -> CheckResult:
     dh = ctx.fleet.daemon_host or {}
     path = dh.get("tui_binary_path")
     if not path:
+        # The daemon always resolves a path (config override, else the README's
+        # ~/.local/bin/coord-tui), so this only fires for a snapshot assembled
+        # without daemon-host facts at all — "no data", never "in sync".
         return CheckResult(
             check_id="fleet_tui_binary",
             scope="fleet",
             severity=Severity.UNKNOWN,
-            headroom="tui_binary_path not configured",
+            headroom="no tui binary path in the daemon-host facts",
         )
 
     binary_mtime = dh.get("tui_binary_mtime")
@@ -152,6 +155,11 @@ def probe_tui_binary(ctx: HealthContext) -> CheckResult:
             scope="fleet",
             severity=Severity.UNKNOWN,
             headroom=f"no binary at {path}",
+            detail=(
+                "build and install it (`cd tui && cargo build && cp "
+                "target/debug/coord-tui ~/.local/bin/coord-tui`), or set "
+                "health.tui_binary_path if it lives elsewhere"
+            ),
             values={"path": path},
         )
     if source_mtime is None:
