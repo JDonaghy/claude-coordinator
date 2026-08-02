@@ -19,6 +19,7 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from coord import __version__
 from coord.config import Config
+from coord.dashboard.fixture import FixtureServer
 from coord.dashboard.terminal import (
     SessionAttacher,
     TmuxSessionAttacher,
@@ -502,6 +503,7 @@ def build_app(
     *,
     token: str | None = None,
     session_attacher: SessionAttacher | None = None,
+    fixture: FixtureServer | None = None,
 ) -> Starlette:
     """Build the dashboard Starlette app bound to a Config.
 
@@ -514,8 +516,34 @@ def build_app(
     ``session_attacher``: injectable seam for the ssh/tmux PTY spawn behind
     the terminal bridge (#1065 acceptance) -- defaults to the real
     :class:`~coord.dashboard.terminal.TmuxSessionAttacher`; tests pass a fake.
+
+    ``fixture`` (#1538): a :class:`~coord.dashboard.fixture.FixtureServer`
+    puts the app in **seeded-board mode** — every read is answered from the
+    fixture instead of ``~/.coord/coord.db`` / the fleet, and every write is
+    recorded rather than executed.  The routes, handlers and serialization are
+    unchanged; only the data source is swapped, so an acceptance suite built
+    on this is still testing the real contract.  ``None`` (the default) is the
+    ordinary live dashboard, byte-for-byte as before.
     """
     attacher: SessionAttacher = session_attacher or TmuxSessionAttacher()
+    _fixture = fixture
+
+    def _read_board():
+        """The board for this request — seeded fixture or the live DB/daemon.
+
+        Fixture mode rebuilds the Board from the raw payload on every call, so
+        a handler that mutates what it is handed (``unstick`` →
+        ``mark_failed_by_id``) can't leak that into the next request.
+        """
+        if _fixture is not None:
+            return _fixture.board()
+        return read_board()
+
+    def _write_board(board) -> None:  # noqa: ANN001
+        """Persist *board* — a no-op in fixture mode (writes never execute)."""
+        if _fixture is not None:
+            return
+        write_board(board)
 
     # ── Real-time event bus ────────────────────────────────────────────────
     event_source = EventSource()
@@ -573,11 +601,33 @@ def build_app(
                 pass
             await asyncio.sleep(_POLL_INTERVAL)
 
+    async def _play_event_script() -> None:
+        """Publish the fixture's scripted SSE sequence once (#1538).
+
+        Each entry's ``after`` is a delay relative to the previous one, so the
+        fixture reads as a timeline.  This is what makes live-update behaviour
+        testable: the acceptance suite subscribes to ``/events`` and then hits
+        ``POST /api/fixture/events/replay`` to run the script deterministically
+        instead of racing the server's startup — which is why the script does
+        NOT play at startup unless the fixture opts in with
+        ``autoplay_events``.
+        """
+        for scripted in _fixture.events:
+            if scripted.after:
+                await asyncio.sleep(scripted.after)
+            event_source.publish(scripted.type, scripted.data)
+
     from contextlib import asynccontextmanager
 
     @asynccontextmanager
     async def _lifespan(app):  # noqa: ANN001
-        asyncio.create_task(_background_poller())
+        # Fixture mode never polls the fleet (no network, no money); the
+        # scripted event sequence takes the background poller's place, and
+        # only auto-plays when the fixture explicitly asks for it.
+        if _fixture is None:
+            asyncio.create_task(_background_poller())
+        elif _fixture.events and _fixture.autoplay_events:
+            asyncio.create_task(_play_event_script())
         yield
         _sessions_executor.shutdown(wait=False, cancel_futures=True)
 
@@ -589,7 +639,7 @@ def build_app(
         return HTMLResponse(html)
 
     async def api_board(request: Request) -> JSONResponse:
-        board = read_board()
+        board = _read_board()
         from dataclasses import asdict
         return JSONResponse({
             "round_number": board.round_number,
@@ -598,6 +648,9 @@ def build_app(
         })
 
     async def api_machines(request: Request) -> JSONResponse:
+        if _fixture is not None:
+            # Seeded reachability — never probe the fleet in fixture mode.
+            return JSONResponse(_fixture.machines())
         statuses = check_all(config.machines, timeout=3.0)
         result = []
         for s in statuses:
@@ -664,6 +717,10 @@ def build_app(
         #1217 iteration 1 fixed a dashboard-wide hang caused by exactly this
         fan-out saturating the process's shared default executor).
         """
+        if _fixture is not None:
+            # Seeded roster — no tmux, no ssh fan-out in fixture mode.
+            return JSONResponse(_fixture.sessions())
+
         from coord.interactive import (
             TMUX_SESSION_PREFIX,
             TmuxHost,
@@ -724,7 +781,7 @@ def build_app(
         # preserves config.machines order within each group.
         sweeps = sorted(sweeps, key=lambda t: not t[2])
 
-        board = read_board()
+        board = _read_board()
         assignments_by_id = {
             a.assignment_id: a
             for a in (*board.active, *board.completed)
@@ -762,7 +819,7 @@ def build_app(
         return JSONResponse(sessions)
 
     async def api_proposals(request: Request) -> JSONResponse:
-        proposals = load_proposals()
+        proposals = _fixture.proposals() if _fixture is not None else load_proposals()
         from dataclasses import asdict
         return JSONResponse([asdict(p) for p in proposals])
 
@@ -784,6 +841,21 @@ def build_app(
 
         briefing_overrides = body.get("briefings", {})
 
+        if _fixture is not None:
+            # Recorded, not executed — the shape below matches the live path's
+            # per-proposal results array so the client can't tell the
+            # difference, but nothing is dispatched and no money is spent.
+            selected = [p for p in _fixture.proposals() if p.id in ids]
+            if not selected:
+                return JSONResponse({"error": "no matching proposals"}, status_code=404)
+            _fixture.record("/api/approve", body, action="approve")
+            return JSONResponse({
+                "results": [
+                    {"id": p.id, "assignment_id": f"fixture-{p.id}", "ok": True}
+                    for p in selected
+                ]
+            })
+
         proposals = load_p()
         selected = [p for p in proposals if p.id in ids]
         if not selected:
@@ -797,7 +869,7 @@ def build_app(
         from coord.claim import claim_message, find_work_claim
 
         in_flight = load_dispatched()
-        board_for_claim = read_board()
+        board_for_claim = _read_board()
         results = []
         for p in selected:
             repo = config.repo(p.repo_name)
@@ -832,9 +904,9 @@ def build_app(
                 results.append({"id": p.id, "ok": False, "error": str(e)})
 
         clear_proposals()
-        board = read_board()
+        board = _read_board()
         board.round_number += 1
-        write_board(board)
+        _write_board(board)
         return JSONResponse({"results": results})
 
     async def api_chat(request: Request) -> StreamingResponse:
@@ -847,7 +919,19 @@ def build_app(
         if not message:
             return JSONResponse({"error": "message required"}, status_code=400)
 
-        board = read_board()
+        if _fixture is not None:
+            # Recorded, not executed — never spawn a provider subprocess in
+            # fixture mode.  Same SSE envelope the live path streams.
+            _fixture.record("/api/chat", body, action="chat")
+            reply = _fixture.chat_reply
+
+            async def canned():
+                yield f"data: {json.dumps({'text': reply})}\n\n"
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(canned(), media_type="text/event-stream")
+
+        board = _read_board()
         from dataclasses import asdict
         board_context = json.dumps({
             "round_number": board.round_number,
@@ -909,6 +993,14 @@ def build_app(
         if not ids or not isinstance(ids, list):
             return JSONResponse({"error": "ids must be a non-empty list"}, status_code=400)
 
+        if _fixture is not None:
+            seeded = _fixture.proposals()
+            remaining = [p for p in seeded if p.id not in ids]
+            _fixture.record("/api/reject", body, action="reject")
+            return JSONResponse(
+                {"removed": len(seeded) - len(remaining), "remaining": len(remaining)}
+            )
+
         proposals = load_p()
         remaining = [p for p in proposals if p.id not in ids]
         removed = len(proposals) - len(remaining)
@@ -921,12 +1013,18 @@ def build_app(
 
     async def api_diff(request: Request) -> JSONResponse:
         assignment_id = request.path_params["id"]
-        board = read_board()
+        board = _read_board()
         assignment = board.find_by_id(assignment_id)
         if assignment is None:
             return JSONResponse({"error": "assignment not found"}, status_code=404)
         if not assignment.branch:
             return JSONResponse({"error": "no branch recorded"}, status_code=404)
+
+        if _fixture is not None:
+            # Seeded diff text — never shell out to `gh` in fixture mode.
+            return JSONResponse(
+                {"diff": _fixture.diff(assignment_id), "source": "fixture"}
+            )
 
         repo = config.repo(assignment.repo_name)
         if repo is None:
@@ -953,15 +1051,23 @@ def build_app(
             return JSONResponse({"error": str(e)}, status_code=500)
 
     async def api_pipeline(request: Request) -> JSONResponse:
-        """GET /api/pipeline — return PipelineView for every type='work' assignment."""
+        """GET /api/pipeline — return PipelineView for every type='work' assignment.
+
+        Fixture mode (#1538) swaps the three data sources below — board, merge
+        queue, cached review findings — and pins ``now``; the computation and
+        serialization underneath are the same ``compute_pipeline`` + ``asdict``
+        the live dashboard runs, which is what keeps a fixture-backed
+        acceptance suite honest.
+        """
         from dataclasses import asdict
 
         from coord.pipeline import compute_pipeline
         from coord.merge_queue import load_queue
         from coord.state import load_assignment_review_findings
 
-        board = read_board()
-        mq_items = load_queue()
+        board = _read_board()
+        mq_items = _fixture.merge_queue() if _fixture is not None else load_queue()
+        pipeline_now = _fixture.now if _fixture is not None else None
 
         # Build a lookup of review assignment id per work assignment_id so we can
         # fetch the review findings body with one pass instead of N nested loops.
@@ -983,16 +1089,135 @@ def build_app(
             findings_body: str | None = None
             rev_aid = review_by_work.get(a.assignment_id)
             if rev_aid:
-                found = load_assignment_review_findings(rev_aid)
+                found = (
+                    _fixture.review_findings(rev_aid)
+                    if _fixture is not None
+                    else load_assignment_review_findings(rev_aid)
+                )
                 if found:
                     _, findings_body = found
             pv = compute_pipeline(
                 a, board, mq_items, config,
                 review_findings_body=findings_body,
+                now=pipeline_now,
             )
             pipelines.append(asdict(pv))
 
         return JSONResponse(pipelines)
+
+    # Actions whose live handler returns a fixed-shape success envelope. The
+    # fixture branch below reproduces that envelope exactly (`ok: true` plus
+    # whatever fields the client reads) so a seeded acceptance run exercises
+    # the same client code as production — while the side effect that would
+    # have cost money is only written to the recorded-action log.
+    def _fixture_action(action, body, assignment, board) -> JSONResponse:  # noqa: ANN001
+        """POST /api/pipeline/action in fixture mode — record, never execute.
+
+        Validation that can be answered from the fixture alone (unknown
+        action, verdict enums, missing review row, merge-queue membership) is
+        replicated so the error contract holds. Checks that depend on live
+        config or the fleet (reviewer-machine availability, merge gates) are
+        deliberately not — a fixture asserts the *client* contract, and a
+        seeded board has no fleet to be unavailable.
+        """
+        aid = assignment.assignment_id or ""
+        all_assignments = list(board.active) + list(board.completed)
+        review_a = next(
+            (
+                a for a in all_assignments
+                if a.review_of_assignment_id == aid and a.type == "review"
+            ),
+            None,
+        )
+
+        # Reject before recording: an invalid request never happened.
+        if action == "retry":
+            return JSONResponse(
+                {"ok": False, "error": "'retry' is not yet implemented in the dashboard"},
+                status_code=501,
+            )
+        if action == "test-verdict":
+            verdict = body.get("verdict")
+            if verdict not in ("pass", "fail", "skip"):
+                return JSONResponse(
+                    {"error": "verdict must be one of ['fail', 'pass', 'skip']"},
+                    status_code=400,
+                )
+        elif action == "record-review-verdict":
+            if body.get("verdict") not in ("approve", "request-changes"):
+                return JSONResponse(
+                    {"error": "verdict must be one of ['approve', 'request-changes']"},
+                    status_code=400,
+                )
+            if not body.get("body"):
+                return JSONResponse(
+                    {"error": "body is required for record-review-verdict"},
+                    status_code=400,
+                )
+            if review_a is None:
+                return JSONResponse(
+                    {"error": "no review assignment found for this work assignment"},
+                    status_code=404,
+                )
+        elif action == "post_findings":
+            if review_a is None:
+                return JSONResponse({"error": "no review assignment found"}, status_code=404)
+        elif action == "merge":
+            if not any(m.assignment_id == aid for m in _fixture.merge_queue()):
+                return JSONResponse({"error": "not in merge queue"}, status_code=404)
+        elif action == "dispatch_fix":
+            if body.get("parent_type", "work") not in ("work", "review"):
+                return JSONResponse(
+                    {
+                        "error": "parent_type must be 'work' or 'review', got "
+                        f"{body.get('parent_type')!r}"
+                    },
+                    status_code=400,
+                )
+            if not assignment.branch:
+                return JSONResponse(
+                    {"ok": False, "error": "work assignment has no branch to fix"},
+                    status_code=400,
+                )
+        elif action not in (
+            "dispatch_review", "dispatch_smoke", "enqueue", "unstick",
+        ):
+            return JSONResponse({"error": f"unknown action: {action!r}"}, status_code=400)
+
+        _fixture.record("/api/pipeline/action", body, action=action)
+
+        if action in ("dispatch_review", "dispatch_smoke"):
+            kind = "review" if action == "dispatch_review" else "smoke"
+            return JSONResponse({
+                "ok": True,
+                "machine_name": assignment.machine_name,
+                "assignment_id": f"fixture-{kind}-{aid}",
+            })
+        if action == "dispatch_fix":
+            return JSONResponse({
+                "ok": True,
+                "machine_name": assignment.machine_name,
+                "assignment_id": f"fixture-fix-{aid}",
+                "branch": assignment.branch,
+            })
+        if action == "merge":
+            return JSONResponse({
+                "ok": True,
+                "events": [
+                    {"kind": "merged", "message": f"fixture: would merge {aid}"}
+                ],
+            })
+        if action == "post_findings":
+            return JSONResponse({"ok": True, "detail": "posted"})
+        if action == "unstick":
+            return JSONResponse({"ok": True, "cancelled_on_agent": False})
+        if action == "test-verdict":
+            state = {"pass": "passed", "fail": "failed", "skip": "skipped"}[
+                body["verdict"]
+            ]
+            return JSONResponse({"ok": True, "test_state": state})
+        # enqueue, record-review-verdict
+        return JSONResponse({"ok": True})
 
     async def api_pipeline_action(request: Request) -> JSONResponse:
         """POST /api/pipeline/action — advance an assignment through a gate.
@@ -1001,6 +1226,9 @@ def build_app(
 
         Supported actions: dispatch_review, dispatch_smoke, enqueue, merge,
         retry (501), dispatch_fix (501).
+
+        In fixture mode (#1538) every one of these is **recorded, not
+        executed** — see :func:`_fixture_action`.
         """
         try:
             body = await request.json()
@@ -1014,10 +1242,13 @@ def build_app(
                 {"error": "assignment_id and action are required"}, status_code=400
             )
 
-        board = read_board()
+        board = _read_board()
         assignment = board.find_by_id(assignment_id)
         if assignment is None:
             return JSONResponse({"error": "assignment not found"}, status_code=404)
+
+        if _fixture is not None:
+            return _fixture_action(action, body, assignment, board)
 
         if action == "dispatch_review":
             from coord.review import dispatch_review
@@ -1027,7 +1258,7 @@ def build_app(
             except Exception as exc:
                 return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
             if result:
-                write_board(board)
+                _write_board(board)
                 return JSONResponse({
                     "ok": True,
                     "machine_name": result.machine_name,
@@ -1049,7 +1280,7 @@ def build_app(
             except Exception as exc:
                 return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
             if result:
-                write_board(board)
+                _write_board(board)
                 return JSONResponse({
                     "ok": True,
                     "machine_name": result.machine_name,
@@ -1171,7 +1402,7 @@ def build_app(
                     pass
             # Mark failed in the board regardless of agent response.
             board.mark_failed_by_id(assignment_id, finished_at=time.time())
-            write_board(board)
+            _write_board(board)
             return JSONResponse({"ok": True, "cancelled_on_agent": cancelled_on_agent})
 
         elif action == "test-verdict":
@@ -1279,7 +1510,7 @@ def build_app(
             except Exception as exc:
                 return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
             if result:
-                write_board(board)
+                _write_board(board)
                 return JSONResponse({
                     "ok": True,
                     "machine_name": result.machine_name,
@@ -1348,7 +1579,7 @@ def build_app(
             return
 
         session_id = websocket.path_params["session_id"]
-        board = read_board()
+        board = _read_board()
         target = resolve_session_target(session_id, board, config)
         if target is None:
             await websocket.close(code=4404)
@@ -1424,6 +1655,59 @@ def build_app(
     ]
     # #757: served OpenAPI 3 spec + Swagger UI docs page.
     routes.extend(openapi_and_docs_routes(_openapi_spec()))
+
+    # ── Fixture-mode introspection (#1538) ─────────────────────────────────
+    # Registered ONLY under `coord web --fixture`, so the live dashboard's
+    # route table and OpenAPI inventory are byte-for-byte unchanged. These are
+    # the assertion surface: what would have been dispatched, and a
+    # deterministic trigger for the fixture's scripted SSE sequence.
+    if _fixture is not None:
+
+        async def api_fixture_actions(request: Request) -> JSONResponse:
+            """GET/DELETE /api/fixture/actions — the recorded-write log."""
+            if request.method == "DELETE":
+                return JSONResponse({"cleared": _fixture.clear_actions()})
+            return JSONResponse(
+                {"actions": [a.to_dict() for a in _fixture.actions]}
+            )
+
+        async def api_fixture_replay(request: Request) -> JSONResponse:
+            """POST /api/fixture/events/replay — run the scripted SSE sequence."""
+            asyncio.create_task(_play_event_script())
+            return JSONResponse({"ok": True, "count": len(_fixture.events)})
+
+        async def api_fixture_publish(request: Request) -> JSONResponse:
+            """POST /api/fixture/events — publish one ad-hoc SSE event now."""
+            try:
+                body = await request.json()
+            except ValueError:
+                return JSONResponse({"error": "invalid JSON"}, status_code=400)
+            etype = body.get("type")
+            if not etype or not isinstance(etype, str):
+                return JSONResponse({"error": "type is required"}, status_code=400)
+            event = event_source.publish(etype, body.get("data"))
+            return JSONResponse({"ok": True, "id": event.id})
+
+        routes.extend([
+            Route(
+                "/api/fixture/actions",
+                api_fixture_actions,
+                methods=["GET", "DELETE"],
+                include_in_schema=False,
+            ),
+            Route(
+                "/api/fixture/events/replay",
+                api_fixture_replay,
+                methods=["POST"],
+                include_in_schema=False,
+            ),
+            Route(
+                "/api/fixture/events",
+                api_fixture_publish,
+                methods=["POST"],
+                include_in_schema=False,
+            ),
+        ])
 
     # ── Static file serving for the built React webapp ─────────────────────
     # Only activated when `coord/dashboard/webapp/dist/` exists (i.e. after

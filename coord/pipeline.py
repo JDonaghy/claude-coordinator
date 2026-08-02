@@ -150,11 +150,19 @@ def compute_pipeline(
     config: "Config",
     *,
     review_findings_body: str | None = None,
+    now: float | None = None,
 ) -> PipelineView:
     """Return a PipelineView for a type='work' assignment.
 
     Scans ``board.active``, ``board.completed``, and ``merge_queue_items`` to
     determine downstream state.  Pure computation — no I/O.
+
+    *now* pins the clock the #846 ``needs_attention`` check reads (it is the
+    one wall-clock-dependent field in the view — its ``detail`` string embeds
+    "Running Nm"). ``None`` means ``time.time()``, i.e. today's behaviour for
+    every production caller; the ``coord web --fixture`` seeded-board server
+    (#1538) passes the fixture's frozen clock so two runs against the same
+    fixture produce byte-identical ``/api/pipeline`` output.
     """
     aid = assignment.assignment_id or ""
 
@@ -365,6 +373,7 @@ def compute_pipeline(
         dispatched_at=assignment.dispatched_at,
         review_iteration=assignment.review_iteration,
         config=config,
+        now=now,
         provider_name=assignment.provider_name,
         review_of_assignment_id=assignment.review_of_assignment_id,
     )

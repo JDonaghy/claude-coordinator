@@ -1,0 +1,327 @@
+{
+  "_comment": [
+    "#1538 — the reference seeded board for `coord web --fixture`.",
+    "Covers one pipeline row per stage: work running (and past its #846",
+    "wall-clock threshold, so the frozen `now` below is load-bearing), work",
+    "failed, test failed, review approved, merge queued, and merged/done.",
+    "Every timestamp is a fixed epoch offset from `now` — nothing here reads",
+    "the wall clock, so two runs produce byte-identical /api/pipeline output.",
+    "The `events` script below does NOT auto-play: subscribe to /events first,",
+    "then POST /api/fixture/events/replay. Schema: coord/dashboard/fixture.py."
+  ],
+  "now": 1750000000.0,
+
+  "board": {
+    "round_number": 7,
+    "assignments": [
+      {
+        "assignment_id": "work-running",
+        "machine_name": "precision",
+        "repo_name": "claude-coordinator",
+        "repo_github": "JDonaghy/claude-coordinator",
+        "issue_number": 4101,
+        "issue_title": "stage: work running",
+        "status": "running",
+        "type": "work",
+        "branch": "issue-4101-work-running",
+        "model": "sonnet",
+        "dispatched_at": 1749996400.0,
+        "required_gates": ["test", "review", "merge"],
+        "is_interactive": 0
+      },
+      {
+        "assignment_id": "work-failed",
+        "machine_name": "dellserver",
+        "repo_name": "claude-coordinator",
+        "repo_github": "JDonaghy/claude-coordinator",
+        "issue_number": 4102,
+        "issue_title": "stage: work failed",
+        "status": "failed",
+        "type": "work",
+        "branch": "issue-4102-work-failed",
+        "model": "sonnet",
+        "dispatched_at": 1749990000.0,
+        "finished_at": 1749990600.0,
+        "exit_code": 1,
+        "failure_reason": "worker exited non-zero",
+        "required_gates": ["test", "review", "merge"],
+        "is_interactive": 0
+      },
+      {
+        "assignment_id": "work-test-failed",
+        "machine_name": "precision",
+        "repo_name": "claude-coordinator",
+        "repo_github": "JDonaghy/claude-coordinator",
+        "issue_number": 4103,
+        "issue_title": "stage: test failed",
+        "status": "done",
+        "type": "work",
+        "branch": "issue-4103-test-failed",
+        "model": "sonnet",
+        "dispatched_at": 1749980000.0,
+        "finished_at": 1749981200.0,
+        "exit_code": 0,
+        "cost_usd": 0.31,
+        "test_state": "failed",
+        "test_reason": "pytest: 2 failed in tests/test_pipeline.py",
+        "required_gates": ["test", "review", "merge"],
+        "smoke_tests": ["open /pipeline and confirm the row is red"],
+        "is_interactive": 0
+      },
+      {
+        "assignment_id": "work-review-approved",
+        "machine_name": "dellserver",
+        "repo_name": "claude-coordinator",
+        "repo_github": "JDonaghy/claude-coordinator",
+        "issue_number": 4104,
+        "issue_title": "stage: review approved",
+        "status": "done",
+        "type": "work",
+        "branch": "issue-4104-review-approved",
+        "model": "sonnet",
+        "dispatched_at": 1749970000.0,
+        "finished_at": 1749971000.0,
+        "exit_code": 0,
+        "cost_usd": 0.55,
+        "test_state": "passed",
+        "required_gates": ["test", "review", "merge"],
+        "is_interactive": 0
+      },
+      {
+        "assignment_id": "rev-review-approved",
+        "machine_name": "precision",
+        "repo_name": "claude-coordinator",
+        "repo_github": "JDonaghy/claude-coordinator",
+        "issue_number": 4104,
+        "issue_title": "stage: review approved",
+        "status": "done",
+        "type": "review",
+        "review_of_assignment_id": "work-review-approved",
+        "dispatched_at": 1749971100.0,
+        "finished_at": 1749971600.0,
+        "review_verdict": "approve",
+        "review_posted_at": 1749971700.0,
+        "is_interactive": 0
+      },
+      {
+        "assignment_id": "work-merge-queued",
+        "machine_name": "precision",
+        "repo_name": "claude-coordinator",
+        "repo_github": "JDonaghy/claude-coordinator",
+        "issue_number": 4105,
+        "issue_title": "stage: merge queued",
+        "status": "done",
+        "type": "work",
+        "branch": "issue-4105-merge-queued",
+        "model": "sonnet",
+        "dispatched_at": 1749960000.0,
+        "finished_at": 1749961000.0,
+        "exit_code": 0,
+        "cost_usd": 0.72,
+        "test_state": "passed",
+        "required_gates": ["test", "review", "merge"],
+        "is_interactive": 0
+      },
+      {
+        "assignment_id": "rev-merge-queued",
+        "machine_name": "dellserver",
+        "repo_name": "claude-coordinator",
+        "repo_github": "JDonaghy/claude-coordinator",
+        "issue_number": 4105,
+        "issue_title": "stage: merge queued",
+        "status": "done",
+        "type": "review",
+        "review_of_assignment_id": "work-merge-queued",
+        "dispatched_at": 1749961100.0,
+        "finished_at": 1749961500.0,
+        "review_verdict": "approve",
+        "review_posted_at": 1749961600.0,
+        "is_interactive": 0
+      },
+      {
+        "assignment_id": "work-done",
+        "machine_name": "dellserver",
+        "repo_name": "claude-coordinator",
+        "repo_github": "JDonaghy/claude-coordinator",
+        "issue_number": 4106,
+        "issue_title": "stage: done (merged)",
+        "status": "done",
+        "type": "work",
+        "branch": "issue-4106-done",
+        "pr_url": "https://github.com/JDonaghy/claude-coordinator/pull/4106",
+        "model": "sonnet",
+        "dispatched_at": 1749950000.0,
+        "finished_at": 1749951000.0,
+        "exit_code": 0,
+        "cost_usd": 0.18,
+        "test_state": "passed",
+        "required_gates": ["test", "review", "merge"],
+        "completion_summary": "Landed the seeded-board server.",
+        "is_interactive": 0
+      },
+      {
+        "assignment_id": "rev-done",
+        "machine_name": "precision",
+        "repo_name": "claude-coordinator",
+        "repo_github": "JDonaghy/claude-coordinator",
+        "issue_number": 4106,
+        "issue_title": "stage: done (merged)",
+        "status": "done",
+        "type": "review",
+        "review_of_assignment_id": "work-done",
+        "dispatched_at": 1749951100.0,
+        "finished_at": 1749951400.0,
+        "review_verdict": "approve",
+        "review_posted_at": 1749951500.0,
+        "is_interactive": 0
+      }
+    ],
+    "plans": {},
+    "notifications": [
+      {"assignment_id": "rev-done"},
+      {"assignment_id": "rev-merge-queued"},
+      {"assignment_id": "rev-review-approved"}
+    ]
+  },
+
+  "merge_queue": [
+    {
+      "assignment_id": "work-merge-queued",
+      "repo_name": "claude-coordinator",
+      "repo_github": "JDonaghy/claude-coordinator",
+      "branch": "issue-4105-merge-queued",
+      "target_branch": "main",
+      "issue_number": 4105,
+      "issue_title": "stage: merge queued",
+      "state": "pending",
+      "pr_number": 4105,
+      "pr_url": "https://github.com/JDonaghy/claude-coordinator/pull/4105",
+      "size": 180,
+      "enqueued_at": 1749962000.0,
+      "assignment_type": "work"
+    },
+    {
+      "assignment_id": "work-done",
+      "repo_name": "claude-coordinator",
+      "repo_github": "JDonaghy/claude-coordinator",
+      "branch": "issue-4106-done",
+      "target_branch": "main",
+      "issue_number": 4106,
+      "issue_title": "stage: done (merged)",
+      "state": "merged",
+      "pr_number": 4106,
+      "pr_url": "https://github.com/JDonaghy/claude-coordinator/pull/4106",
+      "size": 96,
+      "enqueued_at": 1749952000.0,
+      "last_attempt": 1749952600.0,
+      "assignment_type": "work"
+    }
+  ],
+
+  "proposals": [
+    {
+      "id": 1,
+      "machine_name": "precision",
+      "repo_name": "claude-coordinator",
+      "issue_number": 4107,
+      "issue_title": "stage: proposed (awaiting approve)",
+      "rationale": "Seeded proposal so /api/approve and /api/reject have something to act on.",
+      "files_likely": ["coord/dashboard/server.py"],
+      "briefing": "Do not actually dispatch this — fixture mode records it.",
+      "model": "sonnet",
+      "type": "work",
+      "required_gates": ["test", "review", "merge"]
+    }
+  ],
+
+  "machines": [
+    {
+      "name": "precision",
+      "host": "precision.tailnet",
+      "repos": ["claude-coordinator"],
+      "state": "online",
+      "reason": null,
+      "latency_ms": 12,
+      "assignments": {"active": [], "completed": []}
+    },
+    {
+      "name": "dellserver",
+      "host": "dellserver.tailnet",
+      "repos": ["claude-coordinator"],
+      "state": "offline",
+      "reason": "connection refused",
+      "latency_ms": null
+    }
+  ],
+
+  "sessions": [
+    {
+      "session_id": "work-running",
+      "session_name": "coord-work-running",
+      "machine": "precision",
+      "host": "precision.tailnet",
+      "repo": "claude-coordinator",
+      "issue": 4101,
+      "issue_title": "stage: work running",
+      "stage": "work",
+      "status": "running",
+      "attached": false,
+      "pane_dead": false
+    }
+  ],
+
+  "review_findings": {
+    "rev-review-approved": {
+      "verdict": "approve",
+      "body": "## Findings\n\nNo blocking issues. The seeded read path matches the live contract."
+    },
+    "rev-merge-queued": {
+      "verdict": "approve",
+      "body": "## Findings\n\nApproved — gates satisfied."
+    },
+    "rev-done": {
+      "verdict": "approve",
+      "body": "## Findings\n\nApproved and merged."
+    }
+  },
+
+  "diffs": {
+    "work-review-approved": "diff --git a/coord/dashboard/server.py b/coord/dashboard/server.py\n@@\n+# seeded diff\n"
+  },
+
+  "chat_reply": "fixture mode: no provider is contacted and no tokens are spent.",
+
+  "events": [
+    {
+      "after": 0.0,
+      "type": "board_updated",
+      "data": {"possibly_stuck": [], "timestamp": 1750000000.0}
+    },
+    {
+      "after": 0.2,
+      "type": "assignment_needs_attention",
+      "data": {
+        "assignment_id": "work-running",
+        "repo_name": "claude-coordinator",
+        "issue_number": 4101,
+        "issue_title": "stage: work running",
+        "machine_name": "precision",
+        "reason": "wall_clock",
+        "detail": "Running 60m, past the 45m threshold for type='work'."
+      }
+    },
+    {
+      "after": 0.2,
+      "type": "assignment_completed",
+      "data": {
+        "assignment_id": "work-running",
+        "repo_name": "claude-coordinator",
+        "issue_number": 4101,
+        "issue_title": "stage: work running",
+        "machine_name": "precision",
+        "stats": {"num_turns": 34, "total_cost_usd": 0.41, "exit_code": 0},
+        "status": "done"
+      }
+    }
+  ]
+}
