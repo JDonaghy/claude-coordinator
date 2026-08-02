@@ -451,10 +451,15 @@ def test_merged_test_author_entry_does_not_mark_tracking_issue_merge_done():
     assert out[0]["stages"]["merge"] == sp.PENDING
 
 
-def test_merged_test_author_entry_attributes_to_resolved_child_issue():
-    """When the originating assignment's `for_issue_number` is set (the JIT
-    per-slice case), the merged entry should mark the *child* issue's merge
-    box done instead — not the tracking issue's."""
+def test_merged_test_author_entry_does_not_attribute_to_child_issue():
+    """#1652: #1203 stopped a merged `test-author` merge-queue row from
+    greening the *tracking* issue's Merge box, but did so by re-attributing
+    the row to the child issue named by the originating assignment's
+    `for_issue_number` — moving the false green rather than removing it. A
+    test-author/mock-author slice PR closes nothing for anyone's work (it's
+    the sealed acceptance suite, docs/ORACLE_LOOP.md); the child's own work
+    still has to be tested, reviewed, and merged on its own branch, so
+    neither issue's merge box should read done from this row."""
     issues = [
         {"repo_name": "api", "number": 1117, "title": "epic", "state": "open"},
         {"repo_name": "api", "number": 1039, "title": "slice", "state": "open"},
@@ -484,4 +489,44 @@ def test_merged_test_author_entry_attributes_to_resolved_child_issue():
     )
     by_issue = {e["issue_number"]: e for e in out}
     assert by_issue[1117]["stages"]["merge"] == sp.PENDING
-    assert by_issue[1039]["stages"]["merge"] == sp.DONE
+    assert by_issue[1039]["stages"]["merge"] == sp.PENDING
+
+
+def test_merged_test_author_entry_does_not_green_child_with_own_unmerged_work():
+    """#1652 regression, mirroring the live shape seen on ms-38/#1120 →
+    #1122: an open child issue has its own `status="done"` (but unmerged —
+    no PR, no merge-queue row) work assignment, plus a merged `test-author`
+    row on the tracking issue whose originating assignment's
+    `for_issue_number` points at the child. The child's own work has not
+    been tested, reviewed, or merged — its Merge box must read PENDING, not
+    DONE from the acceptance slice's queue row."""
+    issues = [
+        {"repo_name": "api", "number": 1120, "title": "epic", "state": "open"},
+        {"repo_name": "api", "number": 1122, "title": "child", "state": "open"},
+    ]
+    assignments = [
+        _work(assignment_id="w1", issue_number=1122, status="done"),
+        _work(
+            assignment_id="ta1",
+            issue_number=1120,
+            type="test-author",
+            status="done",
+            for_issue_number=1122,
+        ),
+    ]
+    mq_items = [
+        _entry(
+            assignment_id="ta1",
+            issue_number=1120,
+            state="merged",
+            assignment_type="test-author",
+        )
+    ]
+    out = sp.compute_board_stage_projection(
+        issues=issues,
+        assignments=assignments,
+        merge_queue_items=mq_items,
+        default_gates=["test", "review", "merge"],
+    )
+    by_issue = {e["issue_number"]: e for e in out}
+    assert by_issue[1122]["stages"]["merge"] == sp.PENDING
