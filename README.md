@@ -284,6 +284,7 @@ Verdict-relay helpers: `coord report-result`, `coord set-review-findings`, `coor
 | Command | Description |
 |---------|-------------|
 | `coord usage [--today\|--week\|--month\|--since S] [--by-issue\|--issue N\|--by repo\|week\|month\|issue] [--by-time]` | Per-issue/repo/window cost, tokens, and time-spent |
+| `coord gates <repo> <issue> [--json]` | A work row's gate columns (`test_state`, `smoke_test`, `review_verdict`, ...) plus the live review/test/merge decision — including whether a verdict is #1479-stale and the SHAs compared. Read-only |
 | `coord audit [--category C] [--repo N] [--issue N] [--since T] [--json]` | Query the durable, ordered event log |
 | `coord sessions [--remote] [--prune] [--reap-merged]` | List interactive tmux sessions; reap dead/merged ones |
 | `coord terminal new\|list\|kill\|attach` | Persistent fleet-wide shell sessions |
