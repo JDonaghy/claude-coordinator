@@ -1381,35 +1381,44 @@ def _launch_via_pty(
 # ── #466 git-floor backstop ─────────────────────────────────────────────────
 
 
+def _worktree_sandbox_root(wt_path: Path) -> Path:
+    """Directory an *unregistered* worktree must sit inside to be removable.
+
+    #1693: coord always places worktrees at ``<state_dir>/worktrees/<id>``, so
+    the sandbox is that parent when it is named ``worktrees`` and the coord
+    state dir's otherwise.  This is only the second line of defence — the
+    base-checkout identity check inside
+    :func:`coord.agent._safe_remove_worktree` is the primary one.
+    """
+    from coord.state import COORD_DIR  # noqa: PLC0415
+
+    parent = wt_path.parent
+    if parent.name == "worktrees":
+        return parent
+    return COORD_DIR / "worktrees"
+
+
 def _remove_worktree(repo_path: Path, wt_path: Path) -> bool:
     """Best-effort removal of a git worktree for an interactive session.
 
     Mirrors :meth:`coord.agent.AgentServer._cleanup_worktree` without pulling
     in the full AgentServer graph.  Returns ``True`` on success, ``False`` if
     every removal strategy fails.
-    """
-    removed = False
-    if wt_path.exists():
-        try:
-            result = subprocess.run(
-                ["git", "worktree", "remove", str(wt_path), "--force"],
-                cwd=str(repo_path),
-                capture_output=True,
-                text=True,
-                timeout=15.0,
-            )
-            removed = result.returncode == 0
-        except (subprocess.SubprocessError, OSError):
-            pass
 
-        if not removed:
-            try:
-                shutil.rmtree(wt_path, ignore_errors=True)
-                removed = True
-            except OSError:
-                pass
-    else:
-        removed = True  # already gone
+    #1693: this used to carry its own ``git worktree remove`` →
+    ``shutil.rmtree`` fallback, one of four independent copies of that idiom,
+    none of which checked whether the path was the base checkout.  It now
+    delegates to :func:`coord.agent._safe_remove_worktree`, the single place
+    allowed to recursively delete a worktree.
+    """
+    from coord.agent import _safe_remove_worktree  # noqa: PLC0415
+
+    removed = _safe_remove_worktree(
+        repo_path,
+        wt_path,
+        sandbox_root=_worktree_sandbox_root(wt_path),
+        prune=False,
+    )
 
     # Prune the stale git admin entry regardless of whether the directory
     # was physically removed — a stale entry blocks the next dispatch on
@@ -3514,7 +3523,8 @@ def reap_stale_interactive_sessions(
        the worktree is removed.  Failures are silently ignored.
     2. Removes the interactive worktree at
        ``~/.coord/worktrees/<assignment_id>`` (best-effort via
-       :func:`_remove_worktree`; falls back to ``shutil.rmtree``).
+       :func:`coord.agent._safe_remove_worktree`, which refuses any path that
+       is not a linked worktree or a sandboxed orphan — #1693).
     3. Marks the assignment in the SQLite DB (only when the row is still
        ``running`` / ``pending`` — a ``coord report-result`` that raced the
        reaper is left untouched):
@@ -3602,7 +3612,8 @@ def reap_stale_interactive_sessions(
         # else: machine_name is None/empty → coordinator-local session, proceed
 
         # Reconstruct the repo root so ``git worktree remove`` can run
-        # relative to it; fall back to shutil.rmtree when unavailable.
+        # relative to it.  When it is unavailable the removal below still
+        # runs, but only for a path strictly inside ``worktrees_dir`` (#1693).
         repo_path_val: str | None = None
         if machine is not None and a.repo_name:
             rp = machine.repo_path(a.repo_name)
@@ -3644,23 +3655,20 @@ def reap_stale_interactive_sessions(
             except Exception:  # noqa: BLE001
                 pass  # non-fatal — work may already be on the remote
 
-        # 1. Remove worktree (best-effort).
+        # 1. Remove worktree (best-effort).  #1693: both branches go through
+        #    `_safe_remove_worktree`; the no-repo_path branch used to rmtree
+        #    with no git attempt and no guard at all.
         if wt_path.exists():
-            if repo_path_val is not None:
-                try:
-                    _remove_worktree(Path(repo_path_val), wt_path)
-                except Exception:  # noqa: BLE001
-                    # Fall back to a plain directory removal so we always
-                    # make progress even when git is unavailable.
-                    try:
-                        shutil.rmtree(wt_path, ignore_errors=True)
-                    except OSError:
-                        pass
-            else:
-                try:
-                    shutil.rmtree(wt_path, ignore_errors=True)
-                except OSError:
-                    pass
+            from coord.agent import _safe_remove_worktree  # noqa: PLC0415
+
+            try:
+                _safe_remove_worktree(
+                    Path(repo_path_val) if repo_path_val is not None else None,
+                    wt_path,
+                    sandbox_root=worktrees_dir,
+                )
+            except Exception:  # noqa: BLE001 - never abort the reap sweep
+                pass
 
         # 2. Mark ``terminal_status`` in the DB if the row is still live.
         try:

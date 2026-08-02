@@ -596,10 +596,7 @@ def _prune_dead_sessions(enriched: "list[dict]", config_path: "Path") -> None:
     """
     from coord.state import COORD_DIR, get_connection  # noqa: PLC0415
     from coord.agent import _commits_ahead  # noqa: PLC0415
-    from coord.interactive import (  # noqa: PLC0415
-        tmux_session_name,
-        _remove_worktree,
-    )
+    from coord.interactive import tmux_session_name  # noqa: PLC0415
 
     _local_hn = socket.gethostname().split(".")[0].lower()
     worktrees_dir = COORD_DIR / "worktrees"
@@ -685,21 +682,20 @@ def _prune_dead_sessions(enriched: "list[dict]", config_path: "Path") -> None:
         except Exception:  # noqa: BLE001
             pass
 
-        # 4. Remove worktree (best-effort).
+        # 4. Remove worktree (best-effort).  #1693: both branches go through
+        #    `_safe_remove_worktree` — the old no-repo_path branch rmtree'd
+        #    with no git attempt and no base-checkout guard whatsoever.
         if wt_path.exists():
-            if repo_path_val is not None:
-                try:
-                    _remove_worktree(Path(repo_path_val), wt_path)
-                except Exception:  # noqa: BLE001
-                    try:
-                        shutil.rmtree(wt_path, ignore_errors=True)
-                    except OSError:
-                        pass
-            else:
-                try:
-                    shutil.rmtree(wt_path, ignore_errors=True)
-                except OSError:
-                    pass
+            from coord.agent import _safe_remove_worktree  # noqa: PLC0415
+
+            try:
+                _safe_remove_worktree(
+                    Path(repo_path_val) if repo_path_val is not None else None,
+                    wt_path,
+                    sandbox_root=worktrees_dir,
+                )
+            except Exception:  # noqa: BLE001 - never abort the reap sweep
+                pass
 
         # 5. Kill the tmux session.
         try:
