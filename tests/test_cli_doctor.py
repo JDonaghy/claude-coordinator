@@ -23,8 +23,17 @@ def _run_doctor(config_path, monkeypatch, statuses, *, extra_args=None):
     return result
 
 
-def _health(tool_versions: dict) -> dict:
-    return {"machine": "x", "capabilities": [], "tool_versions": tool_versions}
+def _health(tool_versions: dict, machine=None) -> dict:
+    """#1712: a realistic `/health` echoes back what the machine declares.
+    A stub that always published `capabilities: []` now fires doctor's
+    declared-but-unpublished CRIT in every test here, drowning out what each
+    one is actually asserting — so pass the machine and echo it."""
+    return {
+        "machine": getattr(machine, "name", "x"),
+        "capabilities": list(getattr(machine, "capabilities", None) or []),
+        "repos": list(getattr(machine, "repos", None) or []),
+        "tool_versions": tool_versions,
+    }
 
 
 def _ok_probe(capability: str | None = None) -> dict:
@@ -55,7 +64,7 @@ def test_doctor_exits_zero_when_everything_checks_out(
             health=_health({
                 "git": _ok_probe(), "gh": _ok_probe(),
                 "python3": _ok_probe("python"),
-            }),
+            }, m),
         )
         for m in machines
     ]
@@ -75,7 +84,7 @@ def test_doctor_flags_unreachable_machine(valid_config_path, monkeypatch) -> Non
         MachineStatus(machine=cfg.machines[0], state=OFFLINE, reason="connection refused"),
         MachineStatus(
             machine=cfg.machines[1], state=ONLINE,
-            health=_health({"git": _ok_probe(), "gh": _ok_probe()}),
+            health=_health({"git": _ok_probe(), "gh": _ok_probe()}, cfg.machines[1]),
         ),
     ]
     result = _run_doctor(valid_config_path, monkeypatch, statuses)
@@ -91,7 +100,7 @@ def test_doctor_flags_missing_baseline_tool(valid_config_path, monkeypatch) -> N
     statuses = [
         MachineStatus(
             machine=m, state=ONLINE,
-            health=_health({"git": _ok_probe(), "gh": _missing_probe()}),
+            health=_health({"git": _ok_probe(), "gh": _missing_probe()}, m),
         )
         for m in cfg.machines
     ]
@@ -117,7 +126,7 @@ def test_doctor_flags_claimed_capability_the_probe_contradicts(
             health=_health({
                 "git": _ok_probe(), "gh": _ok_probe(),
                 "python3": _missing_probe("python"),
-            }),
+            }, m),
         )
         for m in cfg.machines
     ]
@@ -152,7 +161,10 @@ def test_doctor_machine_filter_narrows_to_one(valid_config_path, monkeypatch) ->
     statuses = [
         MachineStatus(
             machine=laptop, state=ONLINE,
-            health=_health({"git": _ok_probe(), "gh": _ok_probe(), "python3": _ok_probe("python")}),
+            health=_health(
+                {"git": _ok_probe(), "gh": _ok_probe(), "python3": _ok_probe("python")},
+                laptop,
+            ),
         ),
     ]
     result = _run_doctor(

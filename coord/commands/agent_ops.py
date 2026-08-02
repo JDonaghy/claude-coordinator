@@ -9,13 +9,18 @@ import socket
 import subprocess
 import sys
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import click
 import httpx
 
 from coord import __version__
 from coord.config import Config
+
+if TYPE_CHECKING:  # pragma: no cover — typing only
+    from collections.abc import Callable
 
 from coord.commands._common import AGENT_PORT, _CONFIG_OPTION, _load_config
 
@@ -133,6 +138,213 @@ def _log_install_location() -> str:
     return f"coord agent: claude-coordinator {version} — pypi install at {location}"
 
 
+@dataclass(frozen=True)
+class _AgentStartup:
+    """Everything :func:`_start_agent_server` needs out of the config layer,
+    resolved in one place so the *order* of resolution is directly testable
+    without booting uvicorn (#1712).
+
+    ``config_free_reason`` is ``None`` on the normal path and a human-readable
+    explanation when the agent genuinely could not obtain a config from any
+    source — it rides into ``/health`` so a capability-less agent is
+    distinguishable from a misconfigured one.
+    """
+
+    machine: Any
+    health_config: Any | None = None
+    concurrency: Any = None
+    artifact_paths: dict[str, list[str]] = field(default_factory=dict)
+    build_commands: dict[str, str] = field(default_factory=dict)
+    providers: dict[str, object] = field(default_factory=dict)
+    config_free_reason: str | None = None
+    notices: tuple[str, ...] = ()
+
+
+def _load_agent_config(
+    config_path: Path,
+    svc: Any | None,
+    *,
+    attempts: int = 3,
+    retry_delay: float = 2.0,
+    sleep: "Callable[[float], None]" = time.sleep,
+    load_config: "Callable[[Path], Config]" = _load_config,
+) -> Config:
+    """Load the coordinator config for `coord agent`, retrying a thin-client
+    fetch before giving up — and NEVER degrading to config-free mode (#1712).
+
+    ``_load_config`` already knows how to obtain a config without a local file
+    (#1080's thin-client ``GET /config``); it exits(2) when it can't. The only
+    thing this wrapper adds is (a) a bounded retry when the config source is a
+    *network* one — the agent and the daemon often start at the same time after
+    a reboot, and a 2-second-early agent must not lose the whole fleet's
+    capability routing over it — and (b) a loud explanation of what the agent
+    refused to do, so the journal says "could not reach the daemon" rather than
+    leaving an operator to infer it from an empty ``capabilities`` list days
+    later (the #1673 / #1712 failure).
+    """
+    last_exit: SystemExit | None = None
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            return load_config(config_path)
+        except SystemExit as exc:
+            last_exit = exc
+            # Only a remote source is worth retrying; a malformed/absent local
+            # file will fail identically every time.
+            if svc is None or attempt >= attempts:
+                break
+            click.echo(
+                f"coord agent: config load failed (attempt {attempt}/{attempts}) "
+                f"— retrying in {retry_delay:g}s",
+                err=True,
+            )
+            sleep(retry_delay)
+
+    local_state = "present" if config_path.exists() else "ABSENT"
+    svc_state = f"configured ({svc.url})" if svc is not None else "not configured"
+    click.echo(
+        "coord agent: FATAL — could not load a coordinator config.\n"
+        f"  local coordinator.yml: {config_path} ({local_state})\n"
+        f"  board service: {svc_state}\n"
+        "  Refusing to fall back to config-free mode: this machine would come "
+        "up publishing capabilities=[] and repos=[], silently ineligible for "
+        "capability-matched routing with nothing anywhere reporting an error "
+        "(#1712). Fix the config source and restart.",
+        err=True,
+    )
+    raise last_exit if last_exit is not None else SystemExit(2)
+
+
+def _resolve_agent_startup(
+    config_path: Path,
+    machine_name: str | None,
+    *,
+    resolve_service: "Callable[[], Any] | None" = None,
+    load_config: "Callable[[Path], Config]" = _load_config,
+    sleep: "Callable[[float], None]" = time.sleep,
+    attempts: int = 3,
+    retry_delay: float = 2.0,
+) -> _AgentStartup:
+    """Resolve this agent's machine identity + config-derived settings.
+
+    #1712 — THE ORDER HERE IS THE FIX. The old code branched on
+    ``not config_path.exists() and machine_name`` *first*, so passing
+    ``--machine`` on a host with no local ``coordinator.yml`` entered
+    config-free mode and never even attempted the thin-client daemon fetch
+    that lives inside ``_load_config`` (#1080). Two machines with byte-identical
+    config availability (no local file, daemon reachable) published different
+    capabilities purely because one systemd unit passed ``--machine`` and the
+    other didn't — the more explicit invocation being the broken one. So:
+    ``--machine`` MUST NOT change which config source is used.
+
+    The old guard conflated two different conditions:
+
+    * *"there is no local config file"* — often true and completely fine,
+      because the daemon has one;
+    * *"there is no config obtainable at all"* — the only condition that may
+      trigger config-free mode.
+
+    Config-free mode is therefore the LAST resort: it needs no local file
+    **and** no board service configured. That genuine case (ephemeral Azure
+    workers, docs/EPHEMERAL_WORKERS.md) still starts, still publishes
+    ``capabilities=[]``, and still does not crash — it just says so out loud
+    now, and carries a reason into ``/health`` so a legitimately config-free
+    worker is distinguishable from a machine whose declared capabilities
+    vanished.
+    """
+    from coord.client import resolve_board_service  # noqa: PLC0415
+    from coord.config import ConcurrencyConfig as _ConcurrencyConfig  # noqa: PLC0415
+
+    svc = (resolve_service or resolve_board_service)()
+    has_local = config_path.exists()
+
+    if not has_local and svc is None:
+        # Genuine config-free mode: nothing to load from, anywhere.
+        if not machine_name:
+            click.echo(
+                f"error: no coordinator.yml at {config_path}, no board service "
+                "configured (~/.coord/client.toml / $COORD_SERVICE_URL), and no "
+                "--machine given — this agent cannot determine its own identity. "
+                "Pass --machine NAME to run config-free "
+                "(docs/EPHEMERAL_WORKERS.md), or configure a board service.",
+                err=True,
+            )
+            sys.exit(2)
+        from coord.models import Machine as _Machine  # noqa: PLC0415
+
+        reason = (
+            f"no local coordinator.yml at {config_path} and no board service "
+            "configured — running config-free (capabilities and repos come "
+            "from the coordinator at dispatch time)"
+        )
+        return _AgentStartup(
+            machine=_Machine(
+                name=machine_name,
+                host="localhost",
+                capabilities=[],
+                repos=[],
+                repo_paths={},
+            ),
+            concurrency=_ConcurrencyConfig(),
+            config_free_reason=reason,
+            # #1712 item 2: never let this be silent. #1671's startup
+            # diagnostics iterate over `machine.capabilities`, so with an
+            # empty list they print nothing in exactly the case that most
+            # needs a signal.
+            notices=(f"coord agent: NOTICE {reason}",),
+        )
+
+    cfg = _load_agent_config(
+        config_path,
+        svc,
+        attempts=attempts,
+        retry_delay=retry_delay,
+        sleep=sleep,
+        load_config=load_config,
+    )
+    machine = _resolve_machine(cfg, machine_name)
+
+    from coord.providers import build_provider as _build_provider  # noqa: PLC0415
+
+    providers_registry: dict[str, object] = {}
+    # #425: instantiate each named provider so the agent can dispatch to it
+    # when an assignment names it (spec.provider).  An unknown provider type
+    # raises ValueError from build_provider — surface it as a startup failure
+    # rather than silently dropping the definition, so operators notice
+    # misconfiguration early.
+    for prov_name, defn in cfg.providers.definitions.items():
+        providers_registry[prov_name] = _build_provider(prov_name, defn, cfg.models)
+
+    notices: list[str] = []
+    source = "daemon (thin client)" if svc is not None else str(config_path)
+    notices.append(
+        f"coord agent: config source={source} machine={machine.name} "
+        f"capabilities={list(machine.capabilities)}"
+    )
+    if not machine.capabilities:
+        # Declaring no capabilities is legal, but it means dispatch_smoke can
+        # never pick this machine for capability-gated work — say so once at
+        # startup rather than letting it read as "healthy, just quiet" (#1712).
+        notices.append(
+            f"coord agent: NOTICE machine {machine.name!r} declares NO "
+            "capabilities in coordinator.yml — it is ineligible for every "
+            "capability-matched dispatch (#1570 D)"
+        )
+
+    return _AgentStartup(
+        machine=machine,
+        health_config=cfg,
+        concurrency=cfg.concurrency,
+        # #305: collect artifact_paths per repo for the stash helper.
+        artifact_paths={r.name: r.artifact_paths for r in cfg.repos if r.artifact_paths},
+        # #1323 (fix #3): collect build_command per repo so _stash_artifacts
+        # can run it in the worktree before globbing, ensuring the binary
+        # exists regardless of the worker's dev-loop feature flags.
+        build_commands={r.name: r.build_command for r in cfg.repos if r.build_command},
+        providers=providers_registry,
+        notices=tuple(notices),
+    )
+
+
 def _start_agent_server(
     config_path: Path,
     machine_name: str | None,
@@ -145,63 +357,9 @@ def _start_agent_server(
     from coord.agent import AgentServer
     from coord.agent_app import build_app
 
-    # Config-free mode: when --machine is supplied and coordinator.yml doesn't
-    # exist (typical on a dedicated worker node), run with empty capabilities
-    # and repos. The coordinator sends repo details at dispatch time.
-    from coord.config import ConcurrencyConfig as _ConcurrencyConfig
-    from coord.providers import build_provider as _build_provider
-    concurrency = _ConcurrencyConfig()
-    artifact_paths_by_repo: dict[str, list[str]] = {}
-    build_commands_by_repo: dict[str, str] = {}
-    # #425: providers registry from cfg.providers.definitions.  Empty when
-    # there's no config file (config-free mode) — the agent then runs with
-    # no providers and the legacy claude -p spawn path, byte-identical to
-    # pre-#425 behaviour.
-    providers_registry: dict[str, object] = {}
-    # #1630: the loaded Config, threaded into AgentServer purely so /health's
-    # periodic local check run can resolve this machine's checkouts
-    # (coord.health.context.build_context) the same way `coord health` does.
-    # None in config-free mode — the health engine still reports every
-    # machine-scope check, just with no checkouts to sweep (same fallback
-    # `coord health` itself uses with no coordinator.yml).
-    health_config = None
-    if not config_path.exists() and machine_name:
-        from coord.models import Machine as _Machine
-        machine = _Machine(
-            name=machine_name,
-            host="localhost",
-            capabilities=[],
-            repos=[],
-            repo_paths={},
-        )
-    else:
-        cfg = _load_config(config_path)
-        health_config = cfg
-        machine = _resolve_machine(cfg, machine_name)
-        concurrency = cfg.concurrency
-        # #305: collect artifact_paths per repo for the stash helper.
-        artifact_paths_by_repo = {
-            r.name: r.artifact_paths
-            for r in cfg.repos
-            if r.artifact_paths
-        }
-        # #1323 (fix #3): collect build_command per repo so _stash_artifacts
-        # can run it in the worktree before globbing, ensuring the binary
-        # exists regardless of the worker's dev-loop feature flags.
-        build_commands_by_repo = {
-            r.name: r.build_command
-            for r in cfg.repos
-            if r.build_command
-        }
-        # #425: instantiate each named provider so the agent can dispatch
-        # to it when an assignment names it (spec.provider).  An unknown
-        # provider type raises ValueError from build_provider — surface
-        # it as a startup failure rather than silently dropping the
-        # definition, so operators notice misconfiguration early.
-        for prov_name, defn in cfg.providers.definitions.items():
-            providers_registry[prov_name] = _build_provider(
-                prov_name, defn, cfg.models
-            )
+    startup = _resolve_agent_startup(config_path, machine_name)
+    machine = startup.machine
+    concurrency = startup.concurrency
 
     server = AgentServer(
         machine_name=machine.name,
@@ -210,10 +368,21 @@ def _start_agent_server(
         repo_paths=machine.repo_paths,
         bash_wrap_spawn=concurrency.bash_wrap_spawn,
         first_output_timeout=concurrency.first_output_timeout,
-        artifact_paths=artifact_paths_by_repo,
-        build_commands=build_commands_by_repo,
-        providers=providers_registry,
-        health_config=health_config,
+        artifact_paths=startup.artifact_paths,
+        build_commands=startup.build_commands,
+        providers=startup.providers,
+        # #1630: the loaded Config, threaded into AgentServer purely so
+        # /health's periodic local check run can resolve this machine's
+        # checkouts (coord.health.context.build_context) the same way
+        # `coord health` does.  None in config-free mode — the health engine
+        # still reports every machine-scope check, just with no checkouts to
+        # sweep (same fallback `coord health` itself uses with no
+        # coordinator.yml).
+        health_config=startup.health_config,
+        # #1712: rides into /health so `coord doctor` can tell a legitimately
+        # config-free ephemeral worker from a machine whose declared
+        # capabilities went missing.
+        config_free_reason=startup.config_free_reason,
     )
     app = build_app(server)
     # #1671: loud-by-default startup diagnostics — resolved PATH, install
@@ -222,6 +391,11 @@ def _start_agent_server(
     # `journalctl --user -u coord-agent` on the very next restart instead
     # of needing an operator to notice a `coord doctor` red and go SSH in.
     click.echo(_log_install_location())
+    # #1712: config-source / capability notices go FIRST — with
+    # capabilities=[] the #1671 loop below has nothing to say, which is
+    # exactly the case that most needs a signal.
+    for line in startup.notices:
+        click.echo(line)
     for line in _startup_diagnostic_lines(machine.capabilities):
         click.echo(line)
     click.echo(

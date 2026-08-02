@@ -558,6 +558,69 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
         pass  # Never let usage tracking break the status command.
 
 
+def _health_vs_config_lines(machine, health: dict) -> list[tuple[bool, str]]:
+    """Cross-check a machine's ``/health`` against what ``coordinator.yml``
+    declares for it. Returns ``(is_problem, line)`` pairs (#1712).
+
+    A machine that publishes ``capabilities: []`` while the config declares
+    capabilities for it is a **misconfiguration**, not an absence — and the two
+    are indistinguishable from ``/health`` alone, which is exactly how #1673
+    stayed "unexplained" for so long: precision was silently ineligible for
+    every ``rust``/``python``/``gtk`` dispatch and nothing anywhere said so.
+    Same shape for ``repos: []`` (#1485's review-router misread).
+
+    Pure function — no I/O — so it's testable without a live fleet.
+    """
+    out: list[tuple[bool, str]] = []
+    # None on the normal path; a reason string when the agent came up with no
+    # config at all (#1712). Absent entirely on agents predating #1712.
+    config_free = health.get("config_free")
+
+    declared_caps = list(getattr(machine, "capabilities", None) or [])
+    published_caps = list(health.get("capabilities") or [])
+    declared_repos = list(getattr(machine, "repos", None) or [])
+    published_repos = list(health.get("repos") or [])
+    degraded = health.get("degraded") or {}
+
+    if config_free and not declared_caps and not declared_repos:
+        # Legitimately config-free (ephemeral worker) AND the config agrees
+        # there's nothing to declare — worth surfacing, but not a failure.
+        out.append((False, f"  ⚠ running config-free — {config_free}"))
+
+    if declared_caps and not published_caps:
+        out.append((
+            True,
+            f"  ✗ CRIT capabilities: coordinator.yml declares {declared_caps} "
+            "but /health publishes none — this machine is silently ineligible "
+            "for every capability-matched dispatch (#1712)",
+        ))
+        if config_free:
+            out.append((
+                True,
+                f"        the agent is running config-free — {config_free}",
+            ))
+        else:
+            out.append((
+                True,
+                "        the agent published no capabilities despite a "
+                "loadable config: check that its unit's --machine names this "
+                "machine, then `coord agent update` + restart coord-agent",
+            ))
+
+    if declared_repos and not published_repos:
+        out.append((
+            True,
+            f"  ✗ CRIT repos: coordinator.yml declares {declared_repos} but "
+            "/health advertises none — every dispatch to this machine will be "
+            "refused, and any reader trusting /health sees a repo-less machine "
+            "(#1485/#1712)",
+        ))
+        for repo, reason in sorted(degraded.items()):
+            out.append((True, f"        {repo}: {reason}"))
+
+    return out
+
+
 @click.command(
     help=(
         "Fleet-wide prereq report: is this machine fit to be routed work?\n\n"
@@ -604,6 +667,16 @@ def doctor(config_path: Path, machine_filter: str | None, timeout: float) -> Non
             continue
 
         health = s.health or {}
+        # #1712: run the config-vs-/health cross-check BEFORE the
+        # tool_versions early-continue below — "declares capabilities,
+        # publishes none" is the loudest thing this command can say about a
+        # machine, and it must not be skipped just because the agent is also
+        # too old to report tool_versions.
+        for is_problem, line in _health_vs_config_lines(m, health):
+            click.echo(line)
+            if is_problem:
+                any_problem = True
+
         raw_probes = health.get("tool_versions")
         if not raw_probes:
             click.echo(

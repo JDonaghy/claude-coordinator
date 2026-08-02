@@ -3471,6 +3471,14 @@ class AgentServer:
         # Never used for dispatch/assignment logic — that stays on
         # `repo_paths`/`capabilities`/`repos` above, exactly as before.
         health_config: "Any | None" = None,
+        # #1712: why this agent is running with no config, or None on the
+        # normal path.  Published in /health so a *legitimately* config-free
+        # ephemeral worker (docs/EPHEMERAL_WORKERS.md — no local
+        # coordinator.yml AND no board service) is distinguishable from a
+        # machine whose declared capabilities silently vanished.  An empty
+        # `capabilities` list on its own cannot tell those apart, which is
+        # precisely how #1673 stayed "unexplained".
+        config_free_reason: str | None = None,
     ) -> None:
         self.machine_name = machine_name
         self.capabilities = list(capabilities)
@@ -3495,6 +3503,7 @@ class AgentServer:
         self._providers: dict[str, object] = dict(providers or {})
         self._worktree_writable_settings_files = worktree_writable_settings_files
         self._health_config = health_config
+        self.config_free_reason = config_free_reason
 
         self._lock = threading.Lock()
         self._assignments: dict[str, AgentAssignment] = {}
@@ -3588,6 +3597,15 @@ class AgentServer:
         return {
             "machine": self.machine_name,
             "capabilities": self.capabilities,
+            # #1712: None on the normal path; a human-readable reason when
+            # this agent came up with no config at all (no local
+            # coordinator.yml AND no board service — the ephemeral-worker
+            # case).  Lets `coord doctor` say "legitimately config-free"
+            # instead of treating every `capabilities: []` the same, and
+            # makes the opposite case — config declares capabilities, agent
+            # publishes none — a reportable misconfiguration rather than an
+            # indistinguishable absence.
+            "config_free": self.config_free_reason,
             # #1527: only repos whose `repo_path` actually exists on this
             # machine — a repo this agent cannot serve must not be
             # advertised as servable (the router picks "least loaded"
