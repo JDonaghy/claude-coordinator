@@ -3152,6 +3152,15 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
 
     _gate_refresher = GateSnapshotRefresher()
 
+    # #1630: same invariant, same shape — polling every agent's /health,
+    # shelling out to `pip show` for the daemon-host deploy lanes, and
+    # cross-referencing /status for phantom rows are all real I/O, so they
+    # run on the tick loop's cadence (`_health_poll_tick` below) and /board
+    # only ever reads the last-published snapshot.
+    from coord.health.fleet_snapshot import FleetHealthRefresher  # noqa: PLC0415
+
+    _fleet_health_refresher = FleetHealthRefresher()
+
     # Short-TTL cache for the computed /board projection so burst polls from the
     # TUI don't each pay the full board_projection + merge-plan + stage-projection
     # recomputation (~465-issue load measured in the issue). Keyed to nothing
@@ -3413,6 +3422,15 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             # tests/test_board_read_path.py).
             _board = None
             _ci = _gate_refresher.snapshot()
+            # #1630: advisory-only fleet-health block — read from the tick-
+            # refreshed snapshot (no per-request agent polling/subprocess
+            # calls, same #1336 invariant as `_ci` above), and added as a
+            # SIBLING key on the plain `projection` dict, never onto `_board`
+            # (a `coord.models.Board` instance). Every dispatch/routing/
+            # merge-queue call below takes `_board` as its argument, so this
+            # key is structurally unreachable from any of them — see
+            # tests/test_health_advisory_only.py.
+            projection["fleet_health"] = _fleet_health_refresher.snapshot().to_dict()
             try:
                 from coord import merge_queue as _mq  # noqa: PLC0415
                 from coord.state import build_board as _build_board  # noqa: PLC0415
@@ -3851,6 +3869,17 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                     _board_body = body
                     _board_cache_at = _time.monotonic()
                     _board_cache_built_at = built_at
+                    # #1630: feed this build's own latency + wire size to the
+                    # fleet-health snapshot's board-latency check — read back
+                    # on the health-poll tick's own cadence, never recomputed
+                    # inline (see FleetHealthRefresher.record_board_stats).
+                    try:
+                        _fleet_health_refresher.record_board_stats(
+                            (_time.monotonic() - built_at) * 1000.0,
+                            len(body) if body is not None else 0,
+                        )
+                    except Exception:  # noqa: BLE001 — never fail a board publish over this
+                        pass
         except BaseException as e:
             # Same wedge risk as above, just on the publish side (e.g. a
             # surprise failure inside ``_stamp_board_version``): the build
@@ -5636,6 +5665,29 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 except Exception:  # noqa: BLE001 — keep serving the old snapshot
                     log.warning("gate-snapshot refresh failed", exc_info=True)
 
+        # #1630: fleet-health poll on its own cadence — default 60s (env
+        # COORD_HEALTH_POLL_INTERVAL; 0 disables). Deliberately its own loop
+        # rather than a _tick_loop step: it fans out one HTTP GET per agent
+        # (+ a /status call per machine with a live "running" row, for the
+        # phantom-row check) and must never be held up behind — or hold up —
+        # the reconcile/enqueue/drain steps below, which is exactly the
+        # isolation _gate_refresh_loop above already gets for the same
+        # reason.
+        try:
+            health_poll_interval = float(
+                os.environ.get("COORD_HEALTH_POLL_INTERVAL", "60")
+            )
+        except ValueError:
+            health_poll_interval = 60.0
+
+        async def _health_refresh_loop() -> None:
+            while True:
+                await asyncio.sleep(health_poll_interval)
+                try:
+                    await run_in_threadpool(_fleet_health_refresher.refresh, config)
+                except Exception:  # noqa: BLE001 — keep serving the old snapshot
+                    log.warning("fleet-health refresh failed", exc_info=True)
+
         async def _tick_loop() -> None:
             nonlocal last_housekeeping, last_merge_reconcile, last_worktree_clean, last_wal_checkpoint
             nonlocal last_notify_drain
@@ -5960,10 +6012,15 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 if interval > 0 and gate_refresh_interval > 0
                 else None
             )
+            health_task = (
+                asyncio.create_task(_health_refresh_loop())
+                if interval > 0 and health_poll_interval > 0
+                else None
+            )
             try:
                 yield
             finally:
-                for t in (task, gate_task):
+                for t in (task, gate_task, health_task):
                     if t is not None:
                         t.cancel()
                         with contextlib.suppress(asyncio.CancelledError):

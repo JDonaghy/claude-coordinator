@@ -187,6 +187,32 @@ class Checkout:
 
 
 @dataclass
+class FleetSnapshot:
+    """What a ``fleet``-scope probe is allowed to know about the rest of the
+    fleet (#1630).
+
+    Only ever populated by the daemon (``coord.serve_app``'s health-poll
+    tick), from data it already collected polling every agent's ``/health``
+    plus a handful of daemon-host-local facts (its own venv, the CLI venv,
+    the locally-built ``tui/`` binary).  ``coord health`` run by hand on a
+    single machine has no fleet view — ``HealthContext.fleet`` is ``None``
+    there, and ``fleet``-scope checks are simply not run (see
+    ``registry.run_all``'s ``scopes`` filter).
+    """
+
+    # machine_name -> {"state": "online"/"offline"/..., "reason": str,
+    # "latency_ms": float | None, "received_at": float,
+    # "checks": <agent's own H-1 report dict, or None if unreachable/old agent>}
+    machines: dict[str, dict] = field(default_factory=dict)
+    # Free-form daemon-host-local facts a fleet probe needs (its own
+    # coord-serve venv version, the CLI venv version, the tui/ binary's
+    # resolved path + mtime, /board latency + payload size, phantom-running
+    # assignment ids, ...).  Kept untyped/free-form (like ``values`` on
+    # CheckResult) so a new fleet fact doesn't require touching this dataclass.
+    daemon_host: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class HealthContext:
     """Everything a probe is allowed to know about the machine it's on.
 
@@ -206,3 +232,8 @@ class HealthContext:
     # False on a timer/offline run: probes marked ``cost="network"`` are
     # skipped entirely rather than left to time out.
     allow_network: bool = True
+    # Set only by the daemon for a ``scopes=("fleet",)`` run (#1630).  ``None``
+    # everywhere else, including every ``machine``/``checkout`` probe — a
+    # fleet probe that forgets to guard against ``None`` fails soft via the
+    # registry's fail-soft ``run_check`` wrapper, not by crashing the run.
+    fleet: "FleetSnapshot | None" = None

@@ -297,6 +297,28 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             UNIQUE(repo_name, issue_number)
         );
 
+        -- #1630: daemon's aggregated view of each agent's /health payload
+        -- (H-1's check-registry results, when the agent reports them) plus
+        -- the poll's own reachability verdict.  One row per machine, always
+        -- overwritten in place (`ON CONFLICT ... DO UPDATE`,
+        -- coord/state.py `save_machine_health`) — this is a live snapshot,
+        -- not a history. `received_at` is THIS daemon's clock at poll time,
+        -- not anything the agent claims, so staleness detection (an agent
+        -- that stops reporting must read `unknown`, never "still green")
+        -- can never be fooled by a stopped agent's stale self-reported
+        -- timestamp. `health_json` is NULL for an unreachable machine or an
+        -- agent too old to report a health block — advisory only, never
+        -- consulted by dispatch/routing/merge-queue code (see
+        -- tests/test_health_advisory_only.py).
+        CREATE TABLE IF NOT EXISTS machine_health (
+            machine_name TEXT PRIMARY KEY,
+            state        TEXT    NOT NULL,
+            reason       TEXT    NOT NULL DEFAULT '',
+            latency_ms   REAL,
+            health_json  TEXT,
+            received_at  REAL    NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_assignments_status ON assignments(status);
         CREATE INDEX IF NOT EXISTS idx_assignments_machine ON assignments(machine_name);
         CREATE INDEX IF NOT EXISTS idx_merge_queue_state ON merge_queue(state);
