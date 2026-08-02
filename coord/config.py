@@ -1263,9 +1263,23 @@ def load(path: str | Path | None = None) -> Config:
 
     if raw is None:
         raise ConfigError(f"Config file is empty: {p}")
+
+    return parse_mapping(raw, path=p)
+
+
+def parse_mapping(raw: Any, *, path: Path | None = None) -> Config:
+    """Validate an already-decoded coordinator.yml *mapping* into a :class:`Config`.
+
+    :func:`load` is this plus "read the YAML off disk first". Split out (#1538)
+    so callers that already hold the mapping — notably the ``coord web
+    --fixture`` seeded-board server, whose fixture JSON may carry an inline
+    ``config`` block — get the identical parsing/validation instead of a
+    second, drifting hand-rolled Config builder.
+    """
     if not isinstance(raw, dict):
         raise ConfigError(f"Top-level config must be a mapping, got {type(raw).__name__}")
 
+    p = path
     repos = _parse_repos(raw.get("repos"))
     machines = _parse_machines(raw.get("machines"), repos)
     _validate_dependencies(repos)

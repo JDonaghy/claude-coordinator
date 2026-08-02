@@ -349,15 +349,66 @@ def done(config_path: Path) -> None:
         "Unset -> open (tailnet ACL only)."
     ),
 )
-def web(config_path: Path, bind_host: str, bind_port: int, token: str | None) -> None:
+@click.option(
+    "--fixture",
+    "fixture_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help=(
+        "#1538: serve a deterministic seeded board from a JSON fixture instead "
+        "of ~/.coord/coord.db — the web twin of coord-tui's make_test_app. "
+        "Every endpoint answers through the REAL compute_pipeline/serialization; "
+        "writes are recorded (GET /api/fixture/actions), never executed. No DB, "
+        "no fleet, no network, no money. See coord/dashboard/fixture.py."
+    ),
+)
+def web(
+    config_path: Path,
+    bind_host: str,
+    bind_port: int,
+    token: str | None,
+    fixture_path: Path | None,
+) -> None:
     import uvicorn
     from coord.dashboard.server import build_app
     from coord.dashboard.terminal import resolve_web_token
 
-    cfg = _load_config(config_path)
+    fixture = None
+    if fixture_path is not None:
+        from coord.config import ConfigError  # noqa: PLC0415
+        from coord.dashboard.fixture import FixtureError, load_fixture  # noqa: PLC0415
+
+        try:
+            fixture = load_fixture(fixture_path)
+        except FixtureError as exc:
+            raise click.ClickException(str(exc)) from exc
+        # A fixture server must start on a machine with no coord.db and no
+        # coordinator.yml at all (#1538 acceptance), so a missing/invalid
+        # config is not fatal here — the fixture's own `config` block, or
+        # Config defaults, take over.  Deliberately `config.load` rather than
+        # `_load_config`: the latter exits the process on ConfigError, fetches
+        # a thin client's config over the network, and snapshots the result to
+        # the DB — all three are exactly what fixture mode must not do.
+        from coord.config import load as _load_config_file  # noqa: PLC0415
+
+        fallback = None
+        try:
+            fallback = _load_config_file(config_path)
+        except (ConfigError, OSError):
+            pass
+        cfg = fixture.config(fallback)
+    else:
+        cfg = _load_config(config_path)
+
     token = resolve_web_token(token)
-    app = build_app(cfg, token=token)
+    app = build_app(cfg, token=token, fixture=fixture)
     click.echo(f"coord web: dashboard at http://{bind_host}:{bind_port}")
+    if fixture is not None:
+        click.echo(
+            f"  fixture mode: seeded board from {fixture_path} — reads are "
+            "deterministic, writes are RECORDED not executed "
+            "(GET /api/fixture/actions)."
+        )
     if not token:
         click.echo(
             "  warning: no bearer token — the /ws/terminal PTY bridge is open "
