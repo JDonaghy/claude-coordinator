@@ -727,16 +727,104 @@ def _record_gate_bypass_audit(entry: "QueuedMerge", config) -> list[str]:
     return bypassed
 
 
+@dataclass(frozen=True)
+class MergeGateFailure:
+    """One un-satisfied merge gate for a work row / queue entry (#1695).
+
+    :func:`passes_merge_gates` collapses this to a bool, which is all the
+    gate *decision* ever needed. What it never carried was *why* — so the
+    ``coord merge`` auto-enqueue scan's ``if not passes_merge_gates(...):
+    continue`` printed nothing at all, and an operator staring at a branch
+    in ``--dry-run`` that ``--only`` could not address had no statement of
+    the cause anywhere (#1695's 40-minute diagnosis).
+
+    ``waiver_flag`` is the ``coord merge`` flag that waives this gate **at
+    merge time** — the whole point of #1695 being that the gate and its
+    override must live at the same stage. It is a display string; nothing
+    here waives anything.
+    """
+
+    gate: str          # "review" | "smoke"
+    reason: str        # short human-readable cause
+    waiver_flag: str   # "--skip-review" | "--skip-smoke"
+
+    def __str__(self) -> str:
+        return f"{self.gate} gate — {self.reason} (waive with {self.waiver_flag})"
+
+
+def merge_gate_failures(
+    a,
+    config,
+    board,
+    gh_ops: "GhOps | None" = None,
+    stop_early: bool = False,
+) -> list[MergeGateFailure]:
+    """Every merge gate *a* has NOT satisfied, in :func:`process` order.
+
+    The reason-carrying form of :func:`passes_merge_gates` — that function is
+    now literally ``not merge_gate_failures(..., stop_early=True)``, so the
+    two can never disagree about whether a row is gated (the #946 drift this
+    predicate exists to prevent).
+
+    Returns ``[]`` when every configured gate is satisfied (or none is
+    configured — each gate no-ops when ``requires_*`` is False).
+
+    *stop_early* returns as soon as the first failure is found, preserving
+    :func:`passes_merge_gates`'s original short-circuit so the boolean path
+    never pays for a second gate evaluation (and, with *gh_ops* supplied,
+    never makes a second round trip) just to answer yes/no.
+    """
+    failures: list[MergeGateFailure] = []
+    if requires_review(a, config) and not has_approved_review(a, board, gh_ops):
+        failures.append(MergeGateFailure(
+            gate="review",
+            reason="review required but not approved",
+            waiver_flag="--skip-review",
+        ))
+        if stop_early:
+            return failures
+    if requires_smoke(a, config):
+        smoke = evaluate_smoke_verdict(a, board, gh_ops)
+        if not smoke.ok:
+            failures.append(MergeGateFailure(
+                gate="smoke",
+                reason=smoke.short_reason or "test verdict missing",
+                waiver_flag="--skip-smoke",
+            ))
+            if stop_early:
+                return failures
+    return failures
+
+
+def describe_merge_gate_failures(failures: "list[MergeGateFailure]") -> str:
+    """Render *failures* as one operator-readable clause.
+
+    ``""`` when *failures* is empty, so call sites can interpolate it
+    unconditionally.
+    """
+    return "; ".join(str(f) for f in failures)
+
+
 def passes_merge_gates(a, config, board, gh_ops: "GhOps | None" = None) -> bool:
     """True when *a* (a work ``Assignment`` or ``QueuedMerge`` entry) has
-    satisfied every gate required before it may enter the merge queue.
+    satisfied every gate required before it may merge.
 
-    Shared predicate (#946) so untested/unreviewed work can never enter the
-    queue through *any* enqueue path — previously each of the three enqueue
-    call sites (the daemon's :func:`enqueue_approved_work`, the ``coord
-    merge`` auto-enqueue loop, and the raw :func:`enqueue` helper) re-derived
-    this logic and drifted: only the daemon path actually gated, so
-    untested/unreviewed work could sneak into the queue via ``coord merge``.
+    Shared predicate (#946) so untested/unreviewed work can never *merge*
+    through any path — previously each of the enqueue/merge call sites
+    (the daemon's :func:`enqueue_approved_work`, the ``coord merge``
+    auto-enqueue loop, the raw :func:`enqueue` helper, :func:`process`)
+    re-derived this logic and drifted: only the daemon path actually gated,
+    so untested/unreviewed work could sneak into the queue via
+    ``coord merge``.
+
+    #1695 narrows *where* a False answer is allowed to act. It still refuses
+    the merge (:func:`process` and :func:`_entry_gate_status` are unchanged —
+    a row that fails here can never be merged by any automatic path), but the
+    ``coord merge`` auto-enqueue scan no longer treats it as "drop this row
+    on the floor": the row is enqueued in a visibly BLOCKED state so it is
+    addressable by ``--only``, where ``--skip-review``/``--skip-smoke`` can
+    waive the gate. Enqueueing changes an entry's *visibility*, never its
+    *eligibility*.
 
     Duck-typed on ``entry.assignment_id`` / ``entry.branch`` (both
     ``Assignment`` and ``QueuedMerge`` have them), matching
@@ -747,11 +835,7 @@ def passes_merge_gates(a, config, board, gh_ops: "GhOps | None" = None) -> bool:
     patch-id lookup can back a fresh ``QueuedMerge`` entry that hasn't been
     through :func:`process` yet — see :func:`has_smoke_verdict`'s docstring.
     """
-    if requires_review(a, config) and not has_approved_review(a, board, gh_ops):
-        return False
-    if requires_smoke(a, config) and not has_smoke_verdict(a, board, gh_ops):
-        return False
-    return True
+    return not merge_gate_failures(a, config, board, gh_ops, stop_early=True)
 
 
 # ── Smoke-verdict outcome kinds (#1640) ─────────────────────────────────────
@@ -1785,6 +1869,58 @@ def resolve_entry_key(items: list["QueuedMerge"], key: str) -> "QueuedMerge | No
     if branch_matches:
         return branch_matches[-1]
     return None
+
+
+def resolve_board_work_key(board, key: str) -> "list":
+    """Every done work-like board row that *key* addresses (#1695).
+
+    The board-side twin of :func:`resolve_entry_key`, matching the **same
+    four key forms** (``assignment_id``, ``repo#issue``, bare issue number,
+    branch name) against ``board.completed`` instead of the persisted queue.
+
+    Exists purely so ``coord merge --only`` can tell the two failure modes
+    apart when the queue lookup misses:
+
+    * *no board row either* → the identifier genuinely did not resolve, which
+      is what the pre-#1695 message ("tried assignment_id, repo#issue, issue
+      number, and branch name") always claimed and was usually wrong about;
+    * *a board row exists* → the identifier is fine, and the reason there is
+      no entry is a gate — which the caller can then name via
+      :func:`merge_gate_failures`.
+
+    Returns **all** matches (not just the most recent, unlike
+    :func:`resolve_entry_key`'s tie-break) because the caller is producing a
+    diagnostic, not choosing a row to act on: it is more useful to report
+    every candidate and its gate state than to silently pick one. Ordered as
+    they appear in ``board.completed``; ``[]`` when nothing matches or
+    *board* is None.
+    """
+    rows = [
+        a for a in (getattr(board, "completed", None) or [])
+        if getattr(a, "type", None) in WORK_LIKE_TYPES
+    ]
+    exact = [a for a in rows if a.assignment_id == key]
+    if exact:
+        return exact
+    if "#" in key:
+        repo_part, _, issue_part = key.rpartition("#")
+        try:
+            issue_number = int(issue_part)
+        except ValueError:
+            return []
+        return [
+            a for a in rows
+            if a.issue_number == issue_number and a.repo_name == repo_part
+        ]
+    try:
+        bare_issue_number: int | None = int(key)
+    except ValueError:
+        bare_issue_number = None
+    if bare_issue_number is not None:
+        matches = [a for a in rows if a.issue_number == bare_issue_number]
+        if matches:
+            return matches
+    return [a for a in rows if a.branch == key]
 
 
 # ── Plan-status constants (#776) ─────────────────────────────────────────────
