@@ -574,6 +574,162 @@ class TestDispatch:
             dispatch(p, cfg)
 
 
+class TestOverlapFenceWiring:
+    """#1720: dispatch() prepends a live file-overlap fence — derived from
+    OTHER currently-running work-like assignments' actual branch diffs, not
+    the brain.py prompt-only heuristic — to the top of every -p WORK
+    briefing (right alongside the #603 issue-context digest, same no-op
+    shape when there's nothing to report)."""
+
+    def _record_running(
+        self, *, assignment_id: str, issue_number: int, branch: str | None,
+        type_: str = "work",
+    ) -> None:
+        from coord.models import Assignment
+        from coord.state import record_dispatched_assignment
+
+        record_dispatched_assignment(
+            assignment=Assignment(
+                machine_name="laptop",
+                repo_name="api",
+                issue_number=issue_number,
+                issue_title=f"issue {issue_number}",
+                assignment_id=assignment_id,
+                type=type_,
+                branch=branch,
+            ),
+            repo_github="acme/api",
+        )
+
+    @patch("coord.github_ops.get_compare_files")
+    @patch("coord.dispatch.httpx.post")
+    def test_names_other_running_issue_and_overlapping_files(
+        self, mock_post: MagicMock, mock_compare: MagicMock,
+        config: Config, proposal: Proposal, coord_db,
+    ) -> None:
+        self._record_running(assignment_id="run-9", issue_number=9, branch="fix-9")
+        mock_compare.return_value = ["auth.py", "session.py"]
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        dispatch(proposal, config)
+
+        briefing = mock_post.call_args.kwargs["json"]["briefing"]
+        assert "#9" in briefing
+        assert "fix-9" in briefing
+        assert "auth.py" in briefing
+        assert "session.py" in briefing
+        assert "Fix the auth module" in briefing  # original briefing preserved
+        mock_compare.assert_called_once_with("acme/api", "main", "fix-9")
+
+    @patch("coord.github_ops.get_compare_files")
+    @patch("coord.dispatch.httpx.post")
+    def test_no_running_assignments_briefing_unchanged(
+        self, mock_post: MagicMock, mock_compare: MagicMock,
+        config: Config, proposal: Proposal, coord_db,
+    ) -> None:
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        dispatch(proposal, config)
+
+        # Byte-identical to the pre-#1720 no-context case: no empty section,
+        # no noise.
+        assert mock_post.call_args.kwargs["json"]["briefing"] == "Fix the auth module"
+        mock_compare.assert_not_called()
+
+    @patch("coord.github_ops.get_compare_files")
+    @patch("coord.dispatch.httpx.post")
+    def test_running_assignment_with_no_pushed_branch_is_silent(
+        self, mock_post: MagicMock, mock_compare: MagicMock,
+        config: Config, proposal: Proposal, coord_db,
+    ) -> None:
+        self._record_running(assignment_id="run-9", issue_number=9, branch=None)
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        dispatch(proposal, config)
+
+        assert mock_post.call_args.kwargs["json"]["briefing"] == "Fix the auth module"
+        mock_compare.assert_not_called()
+
+    @patch("coord.github_ops.get_compare_files")
+    @patch("coord.dispatch.httpx.post")
+    def test_unreadable_branch_skipped_dispatch_still_proceeds(
+        self, mock_post: MagicMock, mock_compare: MagicMock,
+        config: Config, proposal: Proposal, coord_db,
+    ) -> None:
+        self._record_running(assignment_id="run-9", issue_number=9, branch="gone")
+        mock_compare.side_effect = RuntimeError("gh: branch not found")
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        result = dispatch(proposal, config)
+
+        assert result["ok"] is True  # never blocks the dispatch
+        assert mock_post.call_args.kwargs["json"]["briefing"] == "Fix the auth module"
+
+    @patch("coord.github_ops.get_compare_files")
+    @patch("coord.dispatch.httpx.post")
+    def test_overlap_never_blocks_dispatch(
+        self, mock_post: MagicMock, mock_compare: MagicMock,
+        config: Config, proposal: Proposal, coord_db,
+    ) -> None:
+        self._record_running(assignment_id="run-9", issue_number=9, branch="fix-9")
+        mock_compare.return_value = ["auth.py"]  # same file `proposal` touches
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        result = dispatch(proposal, config)
+
+        assert result["ok"] is True
+        mock_post.assert_called_once()
+
+    @patch("coord.github_ops.get_compare_files")
+    @patch("coord.dispatch.httpx.post")
+    def test_regenerated_not_accumulated_across_redispatch(
+        self, mock_post: MagicMock, mock_compare: MagicMock,
+        config: Config, proposal: Proposal, coord_db,
+    ) -> None:
+        """Dispatching the same issue twice must not stack two fences."""
+        self._record_running(assignment_id="run-9", issue_number=9, branch="fix-9")
+        mock_compare.return_value = ["auth.py"]
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        dispatch(proposal, config)
+        dispatch(proposal, config)
+
+        briefing = mock_post.call_args.kwargs["json"]["briefing"]
+        assert briefing.count("#9") == 1
+        assert briefing.count("auth.py") == 1
+
+    @patch("coord.github_ops.get_compare_files")
+    @patch("coord.dispatch.httpx.post")
+    def test_excludes_a_running_row_for_the_same_issue(
+        self, mock_post: MagicMock, mock_compare: MagicMock,
+        config: Config, proposal: Proposal, coord_db,
+    ) -> None:
+        # proposal.issue_number == 10 — a running row for #10 itself (e.g. a
+        # resumed/redispatched session) must not fence against itself.
+        self._record_running(assignment_id="run-10", issue_number=10, branch="fix-10")
+        mock_compare.return_value = ["auth.py"]
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"ok": True}
+        mock_post.return_value = mock_resp
+
+        dispatch(proposal, config)
+
+        assert mock_post.call_args.kwargs["json"]["briefing"] == "Fix the auth module"
+        mock_compare.assert_not_called()
+
+
 class TestModelResolution:
     """#1430: dispatch() resolves models.labels for type="work" proposals
     that carry issue_labels, with proposal.model (explicit override) always

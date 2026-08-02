@@ -1473,6 +1473,36 @@ def get_compare_diff(repo: str, base: str, head: str) -> str | None:
         return None
 
 
+def get_compare_files(repo: str, base: str, head: str) -> list[str] | None:
+    """Return the list of file paths changed in the three-dot ``base...head``
+    compare, or ``None`` on any ``gh`` failure.
+
+    #1720: the dispatch-time file-overlap fence needs *which files*, not the
+    diff content — asking the compare API for ``.files[].filename`` directly
+    is cheaper and simpler than fetching :func:`get_compare_diff`'s full
+    unified-diff text and parsing ``diff --git a/... b/...`` headers out of
+    it. Uses the GitHub API (not a local checkout) so it works from any host
+    with `gh` on PATH, matching this module's existing checkout-independent
+    diff helpers (:func:`pr_diff`, :func:`get_compare_diff`) rather than the
+    coordinator assuming it has a local clone of every dispatched repo.
+
+    ``--jq`` on a leaf-string selector (``.filename``, unlike the object
+    selector in :func:`get_repo_milestones`) emits *raw* text, one path per
+    line, not JSON-quoted — so this reads lines directly rather than
+    JSON-decoding them. Returns ``None`` (not ``[]``) on failure so callers
+    can distinguish "no files changed" from "couldn't ask" and fail open
+    accordingly.
+    """
+    try:
+        raw = _gh(
+            "api", f"repos/{repo}/compare/{base}...{head}",
+            "--jq", ".files[].filename",
+        )
+    except RuntimeError:
+        return None
+    return [line for line in (ln.strip() for ln in raw.splitlines()) if line]
+
+
 def branch_commits_ahead(repo: str, base: str, branch: str) -> int | None:
     """Commits *branch* is ahead of *base* on the remote, or ``None``.
 
