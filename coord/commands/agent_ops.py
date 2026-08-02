@@ -167,7 +167,6 @@ def _load_agent_config(
     attempts: int = 3,
     retry_delay: float = 2.0,
     sleep: "Callable[[float], None]" = time.sleep,
-    load_config: "Callable[[Path], Config]" = _load_config,
 ) -> Config:
     """Load the coordinator config for `coord agent`, retrying a thin-client
     fetch before giving up — and NEVER degrading to config-free mode (#1712).
@@ -185,7 +184,7 @@ def _load_agent_config(
     last_exit: SystemExit | None = None
     for attempt in range(1, max(1, attempts) + 1):
         try:
-            return load_config(config_path)
+            return _load_config(config_path)
         except SystemExit as exc:
             last_exit = exc
             # Only a remote source is worth retrying; a malformed/absent local
@@ -218,8 +217,6 @@ def _resolve_agent_startup(
     config_path: Path,
     machine_name: str | None,
     *,
-    resolve_service: "Callable[[], Any] | None" = None,
-    load_config: "Callable[[Path], Config]" = _load_config,
     sleep: "Callable[[float], None]" = time.sleep,
     attempts: int = 3,
     retry_delay: float = 2.0,
@@ -254,7 +251,7 @@ def _resolve_agent_startup(
     from coord.client import resolve_board_service  # noqa: PLC0415
     from coord.config import ConcurrencyConfig as _ConcurrencyConfig  # noqa: PLC0415
 
-    svc = (resolve_service or resolve_board_service)()
+    svc = resolve_board_service()
     has_local = config_path.exists()
 
     if not has_local and svc is None:
@@ -294,12 +291,7 @@ def _resolve_agent_startup(
         )
 
     cfg = _load_agent_config(
-        config_path,
-        svc,
-        attempts=attempts,
-        retry_delay=retry_delay,
-        sleep=sleep,
-        load_config=load_config,
+        config_path, svc, attempts=attempts, retry_delay=retry_delay, sleep=sleep
     )
     machine = _resolve_machine(cfg, machine_name)
 
