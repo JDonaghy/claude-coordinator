@@ -1815,8 +1815,10 @@ def _free_branch_in_worktrees(
                     f"# worktree-free: NOT removing {wt_path!r} — it is the "
                     f"base checkout, not a linked worktree, even though it "
                     f"holds branch {branch_name!r} (#1659). The `worktree "
-                    f"add` below will refuse the branch and raise, naming "
-                    f"this checkout (#1693) — it will NOT delete it.\n",
+                    f"add` below will try to move this checkout back to the "
+                    f"default branch non-destructively (#1694), and raise "
+                    f"naming it if that is not safe (#1693) — either way it "
+                    f"will NOT delete it.\n",
                 )
             continue
         # Found a conflicting worktree — force-remove it.
@@ -1846,11 +1848,253 @@ def _free_branch_in_worktrees(
             pass
 
 
+# ── #1694: putting the base checkout back on its default branch ─────────────
+#
+# The base checkout's steady state is the repo's default branch.  It gets
+# parked on a feature branch when something operates in ``~/src/<repo>``
+# directly instead of in a worktree — the #1642 family, plus every stage whose
+# briefing tells a worker to `git checkout <branch>` without saying *where*
+# (`coord.smoke`, `coord.conflict_fix`).  Once parked, `git worktree add` for
+# that branch collides forever: #1693 made the collision non-destructive, but
+# a refusal is not a resolution, so every retry against that branch on that
+# machine is a permanent dispatch failure until a human runs `git checkout`.
+#
+# Two users of the helpers below:
+#   * Part A — `_cleanup_worktree_locked` puts the base back at teardown when
+#     THIS assignment's branch is what it is parked on.  Scoped that tightly
+#     on purpose: an operator's own checkout, parked on their own branch, is
+#     none of the agent's business and is left alone.
+#   * Part B — `_git_worktree_add` clears the collision in-line and retries
+#     the add exactly once.
+#
+# Both refuse unless the base is *genuinely* clean.  Never discard or strand
+# work to unblock a dispatch: a failed dispatch is recoverable, lost work is
+# not (#1693's whole lesson).  The one thing ignored is untracked test output.
+
+# Untracked files that never count as "the base checkout has work in it".
+# These are test-runner droppings the fleet writes into checkouts routinely.
+_BASE_RESTORE_IGNORABLE_UNTRACKED: frozenset[str] = frozenset({
+    ".pytest.out",
+    ".cargo.out",
+})
+
+
+def _current_branch(repo_path: Path) -> str | None:
+    """The branch checked out at *repo_path*, or ``None``.
+
+    ``None`` covers detached HEAD and every error (not a repo, git missing,
+    timeout) — callers treat it as "not parked on a branch", which is the
+    safe reading in both directions: nothing to restore, nothing to clear.
+    """
+    try:
+        ref = _git(repo_path, "symbolic-ref", "--quiet", "HEAD").strip()
+    except (_GitError, OSError, subprocess.SubprocessError):
+        return None
+    if not ref.startswith("refs/heads/"):
+        return None
+    return ref[len("refs/heads/"):] or None
+
+
+def _base_checkout_move_blockers(repo_path: Path, branch: str) -> list[str]:
+    """Reasons *repo_path* must NOT be moved off *branch*.  Empty means safe.
+
+    Every check fails **closed**: a git command that errors out contributes a
+    blocker rather than being skipped, because "I could not tell whether there
+    was work here" and "there was no work here" must never collapse into the
+    same answer.  That asymmetry is the entire safety property.
+
+    The checks, and why each one is load-bearing:
+
+    1. *The base really is the main worktree and really holds the branch.*
+       Guards against moving something that is actually a linked worktree
+       (git would refuse anyway, but a clear refusal beats a git error) and
+       against a stale caller belief about who holds *branch*.
+    2. *No uncommitted changes.*  ``--untracked-files=all`` so an untracked
+       directory cannot hide a thousand files behind one ``?? dir/`` line.
+       Untracked test output (:data:`_BASE_RESTORE_IGNORABLE_UNTRACKED`) is
+       the one allowed exception.
+    3. *No unpushed commits.*  ``origin/<branch>..HEAD`` when the branch has a
+       remote counterpart; otherwise "is HEAD contained in *any* remote ref".
+       A branch that exists nowhere on origin is refused — that is somebody's
+       only copy of something.
+    4. *No stash entries.*  The stash is repo-wide (shared by every worktree)
+       and a stash pop after a branch switch is a merge conflict at best, so
+       any stash at all blocks the move.
+    """
+    blockers: list[str] = []
+
+    # 1. Identity: main worktree, and it is the holder of `branch`.
+    try:
+        porcelain = _git(repo_path, "worktree", "list", "--porcelain")
+    except (_GitError, OSError, subprocess.SubprocessError) as exc:
+        return [f"could not read `git worktree list` ({exc})"]
+    resolved_base = _resolve_path(repo_path)
+    holder_index: int | None = None
+    for index, wt in enumerate(_parse_worktree_porcelain(porcelain)):
+        if wt.get("branch", "") != branch:
+            continue
+        if _resolve_path(wt.get("worktree", "")) == resolved_base:
+            holder_index = index
+        else:
+            blockers.append(
+                f"branch {branch!r} is held by the linked worktree "
+                f"{wt.get('worktree', '')!r}, not by the base checkout"
+            )
+    if holder_index is None:
+        blockers.append(
+            f"the base checkout is not the worktree holding branch {branch!r}"
+        )
+    elif holder_index != 0:
+        blockers.append(
+            f"{str(repo_path)!r} is not the main worktree "
+            f"(`git worktree list` entry {holder_index})"
+        )
+
+    # 2. Uncommitted changes.
+    try:
+        status = _git(
+            repo_path, "status", "--porcelain", "--untracked-files=all",
+            timeout=60.0,
+        )
+    except (_GitError, OSError, subprocess.SubprocessError) as exc:
+        blockers.append(f"could not read `git status` ({exc})")
+    else:
+        dirty: list[str] = []
+        for line in status.splitlines():
+            if not line.strip():
+                continue
+            path = line[3:].strip().strip('"')
+            if line.startswith("??") and path in _BASE_RESTORE_IGNORABLE_UNTRACKED:
+                continue
+            dirty.append(path)
+        if dirty:
+            shown = ", ".join(dirty[:5])
+            more = f" (+{len(dirty) - 5} more)" if len(dirty) > 5 else ""
+            blockers.append(f"uncommitted changes: {shown}{more}")
+
+    # 3. Unpushed commits.
+    pushed = False
+    try:
+        ahead = _git(
+            repo_path, "rev-list", "--count", f"origin/{branch}..HEAD"
+        ).strip()
+        pushed = ahead == "0"
+        if not pushed:
+            blockers.append(
+                f"{ahead} commit(s) on {branch!r} are not on origin/{branch}"
+            )
+    except (_GitError, OSError, subprocess.SubprocessError):
+        # No `origin/<branch>` (never pushed, or no remote at all).  HEAD may
+        # still be published under some other remote ref — check before
+        # declaring the commits unpublished.
+        try:
+            contained = _git(
+                repo_path, "for-each-ref", "--contains", "HEAD",
+                "--format=%(refname)", "refs/remotes/", timeout=60.0,
+            ).strip()
+        except (_GitError, OSError, subprocess.SubprocessError) as exc:
+            blockers.append(f"could not check for unpushed commits ({exc})")
+        else:
+            if contained:
+                pushed = True
+            else:
+                blockers.append(
+                    f"branch {branch!r} has no counterpart on origin and its "
+                    "HEAD is on no remote ref — its commits exist only here"
+                )
+
+    # 4. Stash.
+    try:
+        stash = _git(repo_path, "stash", "list").strip()
+    except (_GitError, OSError, subprocess.SubprocessError) as exc:
+        blockers.append(f"could not read `git stash list` ({exc})")
+    else:
+        if stash:
+            blockers.append(
+                f"{len(stash.splitlines())} stash entr(ies) present"
+            )
+
+    return blockers
+
+
+def _restore_base_checkout_branch(
+    repo_path: Path,
+    branch: str,
+    default_branch: str,
+    *,
+    log_path: str | None = None,
+    context: str = "base-restore",
+) -> str | None:
+    """Move the base checkout off *branch*, non-destructively.  (#1694)
+
+    Returns the ref it ended up on (``default_branch``, or ``"HEAD (detached)"``
+    when the default branch could not be checked out), or ``None`` when the
+    move was refused or failed.  Never raises, never deletes anything, and
+    never touches the working tree contents — the only mutation is which
+    commit HEAD points at, and only from a state proven clean first.
+
+    *default_branch* is preferred over ``--detach`` deliberately: a human who
+    later opens ``~/src/<repo>`` expects ``main``/``develop``, which is also
+    the state every other recovery path in coord restores to (``coord test``'s
+    #271 restore, ``coord diagnose``'s base-checkout unblock).  A detached
+    HEAD would be the more surprising of the two.  ``--detach`` is only the
+    fallback for when the default branch itself cannot be checked out (it does
+    not exist locally, or a linked worktree holds it) — freeing the branch
+    still beats leaving the collision in place.
+
+    Every outcome is logged.  A base checkout silently changing branch under
+    an operator is exactly the kind of magic that makes a fleet unreadable.
+    """
+
+    def _log(msg: str) -> None:
+        if log_path:
+            _append_log_line(log_path, msg if msg.endswith("\n") else msg + "\n")
+
+    if branch == default_branch:
+        _log(
+            f"# {context}: base checkout {str(repo_path)!r} is on "
+            f"{branch!r}, which IS the default branch — nothing to do."
+        )
+        return None
+
+    blockers = _base_checkout_move_blockers(repo_path, branch)
+    if blockers:
+        _log(
+            f"# {context}: REFUSING to move base checkout {str(repo_path)!r} "
+            f"off branch {branch!r} (#1694) — {'; '.join(blockers)}. "
+            f"Nothing was changed; free it by hand with "
+            f"`git -C {repo_path} checkout {default_branch}` once the work "
+            f"above is safe."
+        )
+        return None
+
+    try:
+        _git(repo_path, "checkout", default_branch, timeout=60.0)
+    except (_GitError, OSError, subprocess.SubprocessError) as exc:
+        _log(
+            f"# {context}: `git -C {repo_path} checkout {default_branch}` "
+            f"failed ({exc}) — falling back to a detached HEAD, which frees "
+            f"branch {branch!r} just as well."
+        )
+        try:
+            _git(repo_path, "checkout", "--detach", timeout=60.0)
+        except (_GitError, OSError, subprocess.SubprocessError) as exc2:
+            _log(
+                f"# {context}: could not move base checkout "
+                f"{str(repo_path)!r} off {branch!r} at all ({exc2}) — it is "
+                f"unchanged and still parked."
+            )
+            return None
+        return "HEAD (detached)"
+    return default_branch
+
+
 def _git_worktree_add(
     repo_path: Path,
     add_args: list[str],
     *,
     log_path: str | None = None,
+    default_branch: str | None = None,
 ) -> None:
     """Run ``git worktree add <add_args>``, retrying once on a branch collision.
 
@@ -1872,6 +2116,19 @@ def _git_worktree_add(
     dellserver.  Removal now goes through :func:`_safe_remove_worktree`, and a
     collision naming the base checkout is re-raised with the branch and the
     checkout path named, never removed and never retried.
+
+    #1694: refusing is safe but it is not a *resolution* — the base is still
+    parked on the branch, so every subsequent dispatch against that branch on
+    this machine fails identically, forever, until a human intervenes.  When
+    *default_branch* is supplied the collision is now cleared
+    **non-destructively** first: the base checkout is moved back to its
+    default branch (see :func:`_restore_base_checkout_branch` for the safety
+    gate — clean tree, nothing unpushed, no stash, or it refuses) and the add
+    is retried exactly once.  Nothing is ever deleted on this path.
+
+    *default_branch* is deliberately optional and the remedy is skipped
+    without it: the helper has to know where to put the base, and a caller
+    that cannot say keeps #1693's behaviour unchanged (refuse and re-raise).
     """
     try:
         _git(repo_path, "worktree", "add", *add_args)
@@ -1888,6 +2145,36 @@ def _git_worktree_add(
     # this machine — so report it instead of "fixing" it.
     if _classify_worktree(repo_path, conflicting_path) == _WT_KIND_MAIN:
         branch = _branch_from_add_args(add_args)
+
+        # #1694: try to clear the collision instead of only reporting it.  The
+        # base checkout has no business sitting on a feature branch, so moving
+        # it back to the default branch both fixes this dispatch and restores
+        # the invariant.  `_restore_base_checkout_branch` refuses outright
+        # unless the base is genuinely clean, so this can never trade a failed
+        # dispatch for lost work.
+        if default_branch:
+            parked_on = _current_branch(Path(conflicting_path))
+            if parked_on == branch:
+                moved_to = _restore_base_checkout_branch(
+                    Path(conflicting_path),
+                    branch,
+                    default_branch,
+                    log_path=log_path,
+                    context="worktree-add",
+                )
+                if moved_to is not None:
+                    if log_path:
+                        _append_log_line(
+                            log_path,
+                            f"# worktree-add: base checkout was parked on "
+                            f"{branch!r}; moved it to {moved_to} to clear the "
+                            f"collision (#1694). Nothing was deleted. "
+                            f"Retrying the add once.\n",
+                        )
+                    # One retry only — raises if it fails again.
+                    _git(repo_path, "worktree", "add", *add_args)
+                    return
+
         if log_path:
             _append_log_line(
                 log_path,
@@ -2119,6 +2406,7 @@ def setup_interactive_worktree(
             repo_path,
             ["-B", branch_name, str(worktree_path), f"origin/{branch_name}"],
             log_path=log_path,
+            default_branch=default_branch,
         )
     elif local_has_branch and not has_origin:
         # Local-only repo (no remote) — reuse the local branch.
@@ -2126,6 +2414,7 @@ def setup_interactive_worktree(
             repo_path,
             [str(worktree_path), branch_name],
             log_path=log_path,
+            default_branch=default_branch,
         )
     else:
         # Fresh branch, or an untrusted local-only leftover in a repo that has a
@@ -2138,6 +2427,7 @@ def setup_interactive_worktree(
             repo_path,
             ["-b", branch_name, str(worktree_path), start_point],
             log_path=log_path,
+            default_branch=default_branch,
         )
 
     # #1468: same worktree-scoped `pull.rebase` default as
@@ -4749,6 +5039,7 @@ class AgentServer:
                 repo_path,
                 ["-B", branch_name, str(worktree_path), f"origin/{branch_name}"],
                 log_path=assignment.log_path,
+                default_branch=default_branch,
             )
         elif local_has_branch and not has_origin:
             # Local-only repo (no remote) — reuse the local branch as before.
@@ -4756,6 +5047,7 @@ class AgentServer:
                 repo_path,
                 [str(worktree_path), branch_name],
                 log_path=assignment.log_path,
+                default_branch=default_branch,
             )
         else:
             # Fresh branch, OR an untrusted local-only leftover in a repo that
@@ -4779,6 +5071,7 @@ class AgentServer:
                 repo_path,
                 ["-b", branch_name, str(worktree_path), start_point],
                 log_path=assignment.log_path,
+                default_branch=default_branch,
             )
 
         # #1468: default this worktree's `pull.rebase` to true — see
@@ -5122,6 +5415,12 @@ class AgentServer:
         wt_path = Path(assignment.worktree_path)
         repo_path = Path(assignment.spec.repo_path).expanduser()
 
+        # #1694 (Part A): read the worktree's branch BEFORE it is removed.  A
+        # stage that escaped its worktree and checked this branch out in the
+        # base checkout is what leaves `~/src/<repo>` parked, and after the
+        # removal there is no way left to tell which branch was ours.
+        owned_branches = self._assignment_branches(assignment, wt_path)
+
         # #1394: check for uncommitted work BEFORE any destructive step.  The
         # removal below can still fall through to `shutil.rmtree` (inside
         # `_safe_remove_worktree`), which no amount of git-level care would
@@ -5137,6 +5436,7 @@ class AgentServer:
                 _git(repo_path, "worktree", "prune")
             except _GitError:
                 pass
+            self._restore_base_checkout(assignment, repo_path, owned_branches)
             return
 
         if wt_path.exists():
@@ -5156,6 +5456,75 @@ class AgentServer:
                 _git(repo_path, "worktree", "prune")
             except _GitError:
                 pass
+
+        self._restore_base_checkout(assignment, repo_path, owned_branches)
+
+    @staticmethod
+    def _assignment_branches(
+        assignment: AgentAssignment, wt_path: Path
+    ) -> set[str]:
+        """Every branch name this assignment can legitimately claim (#1694).
+
+        Used to scope the base-checkout restore below: the agent puts the base
+        back only when it is parked on a branch that belongs to the assignment
+        it just finished.  An operator's own checkout, parked on the
+        operator's own branch, must be left exactly where they left it —
+        switching it out from under them would be a different bug, not a fix.
+
+        Sources, most to least authoritative: the worktree's live HEAD (read
+        before teardown removes it), the branch the reap captured, and the
+        explicit ``target_branch`` from the dispatch.
+        """
+        candidates = {
+            _current_branch(wt_path),
+            assignment.branch,
+            assignment.spec.target_branch,
+        }
+        return {b for b in candidates if b and b != "HEAD"}
+
+    def _restore_base_checkout(
+        self,
+        assignment: AgentAssignment,
+        repo_path: Path,
+        owned_branches: set[str],
+    ) -> None:
+        """Put the base checkout back on its default branch (#1694, Part A).
+
+        The base checkout's steady state is the repo's default branch.  When a
+        stage operates in ``~/src/<repo>`` directly rather than in its
+        worktree — the #1642 family, and every briefing that says
+        ``git checkout <branch>`` without saying where — the base is left
+        parked on the work branch.  From then on ``git worktree add`` for that
+        branch collides on this machine forever (#1693 refuses; #1659's
+        docstring calls the state "routine", and a ``coord fix`` retry against
+        the same branch makes it "near-certain").
+
+        So: whatever checked a branch out in the base puts it back.  Scoped to
+        branches this assignment owns, gated on the base being genuinely clean
+        (:func:`_base_checkout_move_blockers`), and always logged.  A refusal
+        is a no-op — never a deletion, never a discarded change.
+        """
+        if not owned_branches:
+            return
+        parked_on = _current_branch(repo_path)
+        if parked_on is None or parked_on not in owned_branches:
+            return  # detached, on the default branch, or somebody else's work
+        default_branch = assignment.spec.branch or "main"
+        moved_to = _restore_base_checkout_branch(
+            repo_path,
+            parked_on,
+            default_branch,
+            log_path=assignment.log_path,
+            context="base-restore",
+        )
+        if moved_to is not None:
+            self._log_line(
+                assignment,
+                f"# base-restore: base checkout {str(repo_path)!r} was left "
+                f"parked on this assignment's branch {parked_on!r}; moved it "
+                f"to {moved_to} (#1694). Nothing was deleted — the branch and "
+                f"its commits are untouched.",
+            )
 
     def _pull_then_spawn(self, assignment: AgentAssignment, repo_path: Path) -> None:
         """Pull each dep before spawning the worker. Logs to the assignment log.

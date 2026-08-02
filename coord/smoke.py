@@ -67,8 +67,17 @@ Rules:
 fail. Print a final line `SMOKE: pass` or `SMOKE: fail <one-line reason>` \
 before exiting so logs are readable.
 
+Where you are:
+- You are in a dedicated git worktree created for this run. Every git command \
+below runs THERE, in your current directory.
+- Do NOT `cd` to the machine's shared base checkout (`~/src/<repo>`), and do \
+NOT `git checkout` / `git switch` inside it. Leaving that checkout parked on a \
+feature branch makes every later dispatch against that branch on this machine \
+fail (#1694).
+
 Steps:
-1. `git fetch origin && git checkout <branch>` (the branch is in your briefing).
+1. `git fetch origin && git checkout <branch>` (the branch is in your \
+briefing) — in your worktree, never in the base checkout.
 2. Run the smoke command from the briefing. Capture stdout/stderr.
 3. If it exits 0 → print `SMOKE: pass` and exit 0.
 4. If it fails → print `SMOKE: fail <short reason>` and exit non-zero.
@@ -314,6 +323,13 @@ def build_smoke_briefing(
     lines.append(f"- Timeout: {timeout_seconds}s")
     lines.append("")
     lines.append("## What to do")
+    lines.append("")
+    lines.append(
+        "Run these in your **worktree** (your current directory). Do NOT "
+        "`cd` into the machine's shared base checkout and do NOT "
+        "`git checkout` there — leaving it parked on a feature branch breaks "
+        "every later dispatch against that branch on this machine (#1694)."
+    )
     lines.append("")
     lines.append("```bash")
     lines.append("git fetch origin")
