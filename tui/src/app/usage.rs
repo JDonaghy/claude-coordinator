@@ -396,7 +396,11 @@ pub(crate) fn aggregate_usage(
         let key = UsageGroupKey {
             repo: a.repo.clone(),
             issue_number: match group_by {
-                UsageGroupBy::Issue => Some(a.issue_number),
+                // #1553: group by the *attributed* issue so an oracle-loop
+                // acceptance slice's spend shows under the child it was
+                // authored for, not under the milestone's tracking issue.
+                // Mirrors `coord.usage_rollup.row_issue_number`.
+                UsageGroupBy::Issue => Some(a.effective_issue_number()),
                 UsageGroupBy::Repo => None,
             },
         };
@@ -423,7 +427,12 @@ pub(crate) fn issue_legs<'a>(
 ) -> Vec<&'a Assignment> {
     let mut legs: Vec<&Assignment> = assignments
         .iter()
-        .filter(|a| a.repo == repo && a.issue_number == issue_number && leg_in_window(a, window))
+        // #1553: select by the attributed issue, matching `aggregate_usage`'s
+        // group key above — otherwise the drill-down would disagree with the
+        // grid row the user just opened it from.
+        .filter(|a| {
+            a.repo == repo && a.effective_issue_number() == issue_number && leg_in_window(a, window)
+        })
         .collect();
     legs.sort_by(|a, b| {
         let ts = |x: &Assignment| x.dispatched_at.or(x.finished_at).unwrap_or(f64::INFINITY);

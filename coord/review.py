@@ -1925,6 +1925,14 @@ def dispatch_review(
             model=review_model_alias,
             review_head_sha=review_head_sha,
             review_patch_id=review_patch_id,
+            # #1553: a review of an oracle-loop acceptance slice is work for
+            # the CHILD issue, not for the milestone's tracking issue that
+            # `completed.issue_number` carries. Inherit the slice attribution
+            # so the child's Pipeline row shows the review as activity and
+            # its cost rolls up to the child. None for every ordinary review
+            # (the parent has no `for_issue_number`), so nothing changes for
+            # non-slice work. See `coord.models.effective_issue_number`.
+            for_issue_number=completed.for_issue_number,
         )
         board.active.append(review_assignment)
 

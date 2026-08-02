@@ -446,7 +446,16 @@ class Assignment:
     # shares one branch/PR, so `issue_number` alone can't distinguish "this
     # is issue #1039's slice" from "issue #1042's slice" — see #1084's
     # friction log). None for milestone-mode (Gate A) authoring and for
-    # every other assignment type; only test-author's JIT mode sets it.
+    # every other assignment type.
+    #
+    # #1553: this is now the *attribution* field for the whole oracle-loop
+    # slice chain, not just the originating test-author dispatch. Every
+    # follow-up derived from a slice (its review, its `[fix-N]` bounces, its
+    # smoke, a retry) inherits the same value, either explicitly at the
+    # dispatch site or via the parent lookup in
+    # `coord.state._record_dispatched_assignment_local`. Read it through
+    # :func:`effective_issue_number` rather than by hand so "which issue is
+    # this work actually for" has one answer everywhere.
     for_issue_number: int | None = None
     # #1499: durable provenance — set when this assignment was dispatched by
     # `coord drive` (never by a hand `coord assign`). Carries
@@ -461,6 +470,63 @@ class Assignment:
     # `coord/drive.py`'s work-stage `Action` sets on every `coord assign` it
     # shells out to.
     driven_by: str | None = None
+
+
+def effective_issue_number(assignment: "Assignment | dict") -> int:
+    """The issue this assignment's work is *attributed* to (#1553).
+
+    For ordinary work this is simply ``issue_number``. For oracle-loop
+    acceptance-slice work (``coord acceptance author <repo> <tracking>
+    --issue N`` and everything derived from it — its review, its
+    ``[fix-N]`` bounces, its smoke, a retry) ``issue_number`` is the
+    milestone's **tracking/epic** issue, because the whole milestone's JIT
+    slices share one branch and one PR. The child issue the work is really
+    *for* lives in ``for_issue_number``; this helper prefers it.
+
+    Both halves are deliberately kept on the row:
+
+    * ``issue_number`` stays the tracking issue, so the epic keeps its
+      parent link, the shared branch/PR bookkeeping keeps working, and
+      ``coord.stage_projection``'s merge attribution keeps deliberately
+      skipping non-``CLOSES_ISSUE_TYPES`` rows (re-attributing *that* was
+      tried in #1203 and reverted in #1652 — do not repeat it).
+    * ``for_issue_number`` is the effective/attributed issue, which is what
+      "is this child being worked on right now?" and "what did this child
+      cost?" must key on.
+
+    Accepts either an :class:`Assignment` or a wire/DB ``dict`` row so the
+    board-JSON consumers (``coord.usage_rollup``) share one definition.
+    Returns ``0`` for a row carrying neither field rather than raising —
+    every caller here is a display/aggregation path.
+
+    Readers that deliberately still key on the RAW ``issue_number``, so a
+    future change doesn't "fix" them by accident:
+
+    * ``coord.stage_projection.compute_board_stage_projection`` — the
+      per-issue stage grouping and its merge-queue attribution. #1203 tried
+      re-attributing that half by ``for_issue_number`` and #1652 reverted it
+      (it moved a false "merged/Done" green from the epic onto the child).
+    * ``coord.notify`` — ``_pipeline_heads``/``_has_live_session_for`` and
+      every GitHub-comment target. Stall notices are posted to the issue
+      whose branch/PR the work lives on, which for a slice IS the tracking
+      issue; re-keying only the heads would desync the two.
+    * ``coord.pipeline.PipelineView.issue_number`` — the CLI's per-assignment
+      pipeline view, which reports the row as dispatched.
+    """
+    if isinstance(assignment, dict):
+        raw_for = assignment.get("for_issue_number")
+        raw_own = assignment.get("issue_number")
+    else:
+        raw_for = getattr(assignment, "for_issue_number", None)
+        raw_own = getattr(assignment, "issue_number", None)
+    for raw in (raw_for, raw_own):
+        if raw is None or raw == "":
+            continue
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            continue
+    return 0
 
 
 @dataclass

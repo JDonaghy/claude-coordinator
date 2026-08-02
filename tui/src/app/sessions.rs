@@ -75,13 +75,19 @@ impl CoordApp {
     /// "Drop to backlog" off for such rows so completed or in-flight work is
     /// never silently orphaned (#618).  Rows whose only assignments are scoping
     /// chats or *failed* attempts have nothing to preserve and stay droppable.
+    ///
+    /// #1553: matched on [`Assignment::effective_issue_number`] so an
+    /// oracle-loop child with a live (or completed) acceptance slice counts
+    /// as having progress. Before this, that slice was booked under the
+    /// milestone's tracking issue, so a child with six sessions running for
+    /// it was still offered "Drop to backlog".
     pub(crate) fn selected_issue_has_work_progress(&self) -> bool {
         let Some((repo, issue_key)) = self.selected_issue_repo_and_key() else {
             return false;
         };
         let issue_num = issue_key.1;
         self.data.assignments.iter().any(|a| {
-            a.issue_number == issue_num
+            a.effective_issue_number() == issue_num
                 && a.repo == repo
                 && a.assignment_type
                     .as_deref()

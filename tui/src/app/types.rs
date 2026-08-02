@@ -458,6 +458,32 @@ where
 }
 
 impl Assignment {
+    /// #1553: the issue this assignment's work is *attributed* to.
+    ///
+    /// For ordinary work this is just `issue_number`. For oracle-loop
+    /// acceptance-slice work (`coord acceptance author <repo> <tracking>
+    /// --issue N`, and everything derived from it — its review, its
+    /// `[fix-N]` bounces, its smoke, a retry) `issue_number` is the
+    /// milestone's **tracking/epic** issue, because the whole milestone's
+    /// JIT slices share one branch and one PR. The child issue the work is
+    /// really *for* lives in `for_issue_number`; this prefers it.
+    ///
+    /// Use this for "is this issue being worked on right now?" and "what
+    /// did this issue cost?" — the questions where booking a child's six
+    /// live sessions against the epic left the child's Pipeline row looking
+    /// idle (the exact operator report in #1553).
+    ///
+    /// Do NOT use it for *merge/completion* attribution: `issue_number`
+    /// deliberately stays the tracking issue so the shared branch/PR
+    /// bookkeeping keeps working, and re-attributing merge state by
+    /// `for_issue_number` was tried in #1203 and reverted in #1652 (it just
+    /// moved a false green from the epic onto the child).
+    ///
+    /// Mirrors `coord.models.effective_issue_number`.
+    pub(crate) fn effective_issue_number(&self) -> u64 {
+        self.for_issue_number.unwrap_or(self.issue_number)
+    }
+
     /// Return the colour for this assignment's status badge, drawn from the
     /// active theme palette.
     ///

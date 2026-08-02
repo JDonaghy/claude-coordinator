@@ -580,3 +580,47 @@ def test_find_work_claim_still_blocks_unmerged_remote_branch(monkeypatch) -> Non
     claim = find_work_claim(319, "api", "acme/api", Board())
     assert claim is not None
     assert claim.branch == "issue-319-active"
+
+
+# ── #1553: has_active_work_followup keys on the EFFECTIVE issue ─────────────
+
+
+def test_has_active_work_followup_keys_on_for_issue_number() -> None:
+    """A slice fix booked under a tracking issue guards the CHILD, not the epic.
+
+    `coord acceptance author <repo> <tracking> --issue N` records
+    `issue_number = <tracking>` (the whole milestone's slices share one
+    branch/PR) and `for_issue_number = N`. The guard must follow the child.
+    """
+    fix = _active(issue=1120, repo="api", type_="work", aid="fix-1124")
+    fix.for_issue_number = 1124
+    board = Board(active=[fix])
+    assert has_active_work_followup(board, repo_name="api", issue_number=1124)
+
+
+def test_has_active_work_followup_does_not_block_the_tracking_issue() -> None:
+    """A child's slice fix must not block review dispatch on the epic itself."""
+    fix = _active(issue=1120, repo="api", type_="work", aid="fix-1124")
+    fix.for_issue_number = 1124
+    board = Board(active=[fix])
+    assert not has_active_work_followup(board, repo_name="api", issue_number=1120)
+
+
+def test_has_active_work_followup_does_not_block_a_sibling_child() -> None:
+    """#1553's cross-child stall: two children's slices share one issue_number.
+
+    Before the effective-issue keying, an in-flight fix for child #1124 made
+    the guard fire for child #1125 too (both rows carry issue_number 1120),
+    silently stalling review dispatch for an unrelated issue.
+    """
+    fix = _active(issue=1120, repo="api", type_="work", aid="fix-1124")
+    fix.for_issue_number = 1124
+    board = Board(active=[fix])
+    assert not has_active_work_followup(board, repo_name="api", issue_number=1125)
+
+
+def test_has_active_work_followup_unchanged_for_ordinary_work() -> None:
+    """No `for_issue_number` → identical behaviour to before #1553."""
+    board = Board(active=[_active(issue=16, repo="api", type_="work", aid="w")])
+    assert has_active_work_followup(board, repo_name="api", issue_number=16)
+    assert not has_active_work_followup(board, repo_name="api", issue_number=17)
