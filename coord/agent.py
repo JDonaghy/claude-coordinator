@@ -1555,6 +1555,197 @@ def _is_same_path(candidate: str, resolved_target: Path) -> bool:
         return candidate == str(resolved_target)
 
 
+# ── #1693: the single chokepoint for deleting a worktree directory ──────────
+#
+# #1659 removed the `shutil.rmtree` fallback from `_free_branch_in_worktrees`
+# and added a base-checkout identity check — but the *sibling* deleter 60
+# lines below (`_git_worktree_add`'s collision retry) kept both, and it was
+# the one that recursively deleted `~/src/claude-coordinator` on dellserver on
+# 2026-08-02.  Four call sites had grown the same "`git worktree remove`
+# refused → rmtree it anyway" idiom independently; fixing one and missing the
+# others is exactly how #1659 became #1693.
+#
+# So: `_safe_remove_worktree` is now the ONLY place in coord that may call
+# `shutil.rmtree` on a worktree path.  `tests/test_worktree_rmtree_chokepoint.py`
+# enforces that at the source level so a fifth site cannot quietly appear.
+#
+# The invariants it enforces, in order:
+#   1. Never the main worktree.  `repo_path` and the candidate are both
+#      `resolve()`d before comparison, because `~/src/<repo>` can itself be a
+#      symlink (dellserver has `~/src/quadraui.broken-backup-… ->
+#      ~/.coord/worktrees/<id>`), and `git worktree list --porcelain` always
+#      reports the main worktree first.
+#   2. A path git does not report as a *linked* worktree is only removable
+#      when it lives strictly inside an explicit *sandbox_root* (always
+#      `<state_dir>/worktrees/`).  Resolving both sides means a
+#      `worktrees/<id> -> ~/src/<repo>` symlink resolves outside the sandbox
+#      and is refused rather than followed.
+#   3. `git worktree remove --force` is always tried first; `shutil.rmtree`
+#      only runs after git declines, and only for a path that already cleared
+#      (1) and (2).
+
+_WT_KIND_MAIN = "main"
+_WT_KIND_LINKED = "linked"
+_WT_KIND_UNREGISTERED = "unregistered"
+
+
+def _resolve_path(candidate: str | Path) -> Path:
+    """``Path(candidate).resolve()``, degrading to an unresolved Path on error.
+
+    Resolution failures must never be fatal here — every caller is about to
+    make a *safety* decision, and the only acceptable failure mode is "compare
+    the literal path", never "raise out of a cleanup routine".
+    """
+    try:
+        return Path(candidate).resolve()
+    except OSError:
+        return Path(candidate)
+
+
+def _classify_worktree(repo_path: Path | None, target: str | Path) -> str:
+    """Return ``"main"``/``"linked"``/``"unregistered"`` for *target*.
+
+    ``"main"`` means *target* is the base checkout — the thing #1693 deleted.
+    It is decided by a direct ``repo_path`` comparison FIRST (so it holds even
+    when git is unavailable) and then by position in ``git worktree list
+    --porcelain``, which documents the main worktree as entry 0.
+
+    With *repo_path* ``None`` there is no repository to interrogate, so every
+    path is ``"unregistered"`` and the caller's sandbox check is the only gate.
+    """
+    resolved = _resolve_path(target)
+    if repo_path is None:
+        return _WT_KIND_UNREGISTERED
+    if resolved == _resolve_path(repo_path):
+        return _WT_KIND_MAIN
+    try:
+        output = _git(repo_path, "worktree", "list", "--porcelain")
+    except (_GitError, OSError, subprocess.SubprocessError):
+        # Can't ask git.  Fall back to "unregistered" — the strictest answer
+        # short of "main", which the comparison above has already ruled out.
+        return _WT_KIND_UNREGISTERED
+    for index, wt in enumerate(_parse_worktree_porcelain(output)):
+        wt_path = wt.get("worktree", "")
+        if not wt_path or _resolve_path(wt_path) != resolved:
+            continue
+        return _WT_KIND_MAIN if index == 0 else _WT_KIND_LINKED
+    return _WT_KIND_UNREGISTERED
+
+
+def _is_strictly_inside(candidate: str | Path, root: str | Path) -> bool:
+    """True when *candidate* resolves to a proper descendant of *root*.
+
+    Both sides are resolved, so a symlink pointing out of the sandbox (the
+    `worktrees/<id> -> ~/src/<repo>` shape) lands outside and returns False.
+    ``candidate == root`` is False on purpose: the sweep root itself is never
+    a removable worktree.
+    """
+    resolved_root = _resolve_path(root)
+    resolved = _resolve_path(candidate)
+    return resolved != resolved_root and resolved_root in resolved.parents
+
+
+def _safe_remove_worktree(
+    repo_path: Path | None,
+    worktree_path: str | Path,
+    *,
+    log_path: str | None = None,
+    sandbox_root: str | Path | None = None,
+    prune: bool = True,
+) -> bool:
+    """Remove a git worktree directory, refusing anything that isn't one (#1693).
+
+    This is the only function in coord permitted to ``shutil.rmtree`` a
+    worktree path; see the block comment above for the invariants and why they
+    exist.
+
+    Args:
+        repo_path: The base checkout the worktree belongs to, or ``None`` when
+            the caller could not resolve one (a sweep over orphaned
+            directories).  ``None`` disables the git-level checks and makes
+            *sandbox_root* mandatory.
+        worktree_path: The directory to remove.
+        log_path: Optional assignment log to append refusal/removal notes to.
+        sandbox_root: Directory that a git-*unregistered* path must live
+            strictly inside to be removable — always ``<state_dir>/worktrees``
+            in practice.  ``None`` means unregistered paths are refused
+            outright.
+        prune: Run ``git worktree prune`` afterwards (needs *repo_path*).
+
+    Returns:
+        ``True`` when the directory is gone (including "was already absent"),
+        ``False`` when removal was refused or failed.  Never raises.
+
+    Note:
+        This function deliberately does NOT implement the #1394 uncommitted-work
+        gate — that lives in :meth:`AgentServer._rescue_uncommitted_work` and
+        still runs at its existing call site, *before* the destructive step.
+        Duplicating it here would need an ``AgentAssignment`` the sweep paths
+        do not have.
+    """
+    target = Path(worktree_path)
+
+    def _log(msg: str) -> None:
+        if log_path:
+            _append_log_line(log_path, msg if msg.endswith("\n") else msg + "\n")
+
+    kind = _classify_worktree(repo_path, target)
+    if kind == _WT_KIND_MAIN:
+        _log(
+            f"# worktree-remove: REFUSING {str(target)!r} — it is the base "
+            f"checkout (main worktree), not a linked worktree (#1693). "
+            f"Nothing was deleted."
+        )
+        return False
+    if kind == _WT_KIND_UNREGISTERED and (
+        sandbox_root is None or not _is_strictly_inside(target, sandbox_root)
+    ):
+        _log(
+            f"# worktree-remove: REFUSING {str(target)!r} — git does not "
+            f"report it as a linked worktree and it is not inside "
+            f"{str(sandbox_root)!r} (#1693). Nothing was deleted."
+        )
+        return False
+
+    try:
+        exists = target.exists()
+    except OSError:  # pragma: no cover - defensive
+        exists = True
+
+    removed = True
+    if exists:
+        removed = False
+        if repo_path is not None:
+            try:
+                _git(repo_path, "worktree", "remove", str(target), "--force")
+                removed = True
+            except (_GitError, OSError, subprocess.SubprocessError):
+                removed = False
+        if not removed:
+            # #1693: the one sanctioned recursive delete.  The path has already
+            # been proven to be either a linked worktree or a sandboxed orphan.
+            try:
+                shutil.rmtree(target, ignore_errors=True)
+            except OSError:  # pragma: no cover - ignore_errors makes this rare
+                pass
+            try:
+                removed = not target.exists()
+            except OSError:  # pragma: no cover - defensive
+                removed = False
+            if not removed:
+                _log(
+                    f"# worktree-remove: {str(target)!r} could not be removed "
+                    f"by git or by rmtree — leaving it on disk."
+                )
+
+    if prune and repo_path is not None:
+        try:
+            _git(repo_path, "worktree", "prune")
+        except (_GitError, OSError, subprocess.SubprocessError):
+            pass
+    return removed
+
+
 def _free_branch_in_worktrees(
     repo_path: Path,
     branch_name: str,
@@ -1587,6 +1778,12 @@ def _free_branch_in_worktrees(
     with ``rm -rf`` destroyed precision's base checkout on 2026-07-31.  A
     failed removal is logged and left alone, which is exactly what this
     docstring already promised: the subsequent ``worktree add`` surfaces it.
+
+    #1693: this function deliberately does NOT route through
+    :func:`_safe_remove_worktree`.  The chokepoint still falls back to
+    ``shutil.rmtree`` for a genuine linked worktree; this function refuses
+    even that, which is strictly more conservative.  What #1693 fixed is the
+    sibling that was *less* conservative — see :func:`_git_worktree_add`.
     """
     try:
         output = _git(repo_path, "worktree", "list", "--porcelain")
@@ -1618,8 +1815,8 @@ def _free_branch_in_worktrees(
                     f"# worktree-free: NOT removing {wt_path!r} — it is the "
                     f"base checkout, not a linked worktree, even though it "
                     f"holds branch {branch_name!r} (#1659). The `worktree "
-                    f"add` below will fail loudly if the branch is truly "
-                    f"unavailable.\n",
+                    f"add` below will refuse the branch and raise, naming "
+                    f"this checkout (#1693) — it will NOT delete it.\n",
                 )
             continue
         # Found a conflicting worktree — force-remove it.
@@ -1663,6 +1860,18 @@ def _git_worktree_add(
     conflicting worktree is force-removed, git prunes the stale admin entry, and
     the add is retried exactly once.  Any other git error, or a failure after the
     single retry, is re-raised so the caller sees a clear ``_GitError``.
+
+    #1693: the conflicting path is *scraped out of git's error text*, so it can
+    name anything git happens to mention — including the **base checkout**,
+    which is the common case when the operator's own ``~/src/<repo>`` is parked
+    on the branch (#1623 makes that routine; ``coord fix``'s same-branch
+    re-dispatch makes it likely).  ``git worktree remove`` always refuses the
+    main working tree, so the old ``except _GitError: shutil.rmtree(...)``
+    fallback was not a rare safety net for that input — it was the guaranteed
+    outcome, and it recursively deleted ``~/src/claude-coordinator`` on
+    dellserver.  Removal now goes through :func:`_safe_remove_worktree`, and a
+    collision naming the base checkout is re-raised with the branch and the
+    checkout path named, never removed and never retried.
     """
     try:
         _git(repo_path, "worktree", "add", *add_args)
@@ -1672,6 +1881,27 @@ def _git_worktree_add(
         if not m:
             raise  # unrelated error — propagate unchanged
         conflicting_path = m.group(1)
+        original = exc
+
+    # #1693: refuse before removing.  The base checkout is not a recoverable
+    # collision — deleting it breaks every future dispatch for the repo on
+    # this machine — so report it instead of "fixing" it.
+    if _classify_worktree(repo_path, conflicting_path) == _WT_KIND_MAIN:
+        branch = _branch_from_add_args(add_args)
+        if log_path:
+            _append_log_line(
+                log_path,
+                f"# worktree-add: collision on {conflicting_path!r}, which is "
+                f"the BASE CHECKOUT — not removing, not retrying (#1693). "
+                f"Move it off branch {branch!r} and re-dispatch.\n",
+            )
+        raise _GitError(
+            f"cannot create a worktree for branch {branch!r}: the base "
+            f"checkout {conflicting_path!r} is itself parked on that branch. "
+            f"Refusing to remove it (#1693) — run "
+            f"`git -C {conflicting_path} switch <default-branch>` and "
+            f"re-dispatch."
+        ) from original
 
     # Retry path: free the conflicting worktree and try again once.
     if log_path:
@@ -1680,19 +1910,32 @@ def _git_worktree_add(
             f"# worktree-add: collision on {conflicting_path!r}; "
             "force-removing and retrying\n",
         )
-    try:
-        _git(repo_path, "worktree", "remove", conflicting_path, "--force")
-    except _GitError:
-        try:
-            shutil.rmtree(conflicting_path, ignore_errors=True)
-        except OSError:
-            pass
-    try:
-        _git(repo_path, "worktree", "prune")
-    except _GitError:
-        pass
+    _safe_remove_worktree(
+        repo_path,
+        conflicting_path,
+        log_path=log_path,
+        # No sandbox_root: a collision path must be a genuine LINKED worktree
+        # to be removable here.  Anything else is refused and the retry below
+        # raises the real error.
+    )
     # One retry only — raises if it fails again.
     _git(repo_path, "worktree", "add", *add_args)
+
+
+def _branch_from_add_args(add_args: list[str]) -> str:
+    """Best-effort branch name out of a ``git worktree add`` argv (#1693).
+
+    Only used to make the base-checkout refusal message actionable, so an
+    unrecognised shape degrades to the raw argv rather than raising.  Covers
+    the three forms coord builds: ``-b/-B <branch> <path> <start>`` and the
+    bare ``<path> <branch>``.
+    """
+    for index, arg in enumerate(add_args):
+        if arg in ("-b", "-B") and index + 1 < len(add_args):
+            return add_args[index + 1]
+    if len(add_args) == 2:
+        return add_args[1]
+    return " ".join(add_args)
 
 
 def _set_worktree_pull_rebase(repo_path: Path, worktree_path: Path) -> None:
@@ -1784,11 +2027,16 @@ def setup_interactive_worktree(
     worktree_path = worktree_base / assignment_id
 
     # Clean up stale worktree if it exists from a prior (crashed) run.
+    # #1693: via the single chokepoint — `worktree_base` is the sandbox that
+    # makes an unregistered leftover removable and anything else refused.
     if worktree_path.exists():
-        try:
-            _git(repo_path, "worktree", "remove", str(worktree_path), "--force")
-        except (_GitError, FileNotFoundError, OSError):
-            shutil.rmtree(worktree_path, ignore_errors=True)
+        _safe_remove_worktree(
+            repo_path,
+            worktree_path,
+            log_path=log_path,
+            sandbox_root=worktree_base,
+            prune=False,
+        )
 
     worktree_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -3645,10 +3893,12 @@ class AgentServer:
             # #1295: never chase symlinks out of state_dir/worktrees/.
             # `Path.is_dir()` follows symlinks, so a bare `not is_dir()`
             # would still admit a symlink-to-directory into the sweep and
-            # the eventual `shutil.rmtree(entry, ignore_errors=True)` /
-            # `git worktree remove --force` could touch whatever the
-            # symlink pointed at.  Excluding symlinks up front is the
+            # the eventual `_safe_remove_worktree(...)` could touch whatever
+            # the symlink pointed at.  Excluding symlinks up front is the
             # simplest correct guard — the agent never creates them here.
+            # (#1693 resolves both sides of the sandbox check as a second
+            # line of defence, so a symlink out of `worktrees/` is now
+            # refused there too.)
             if entry.is_symlink():
                 kept += 1
                 continue
@@ -3742,24 +3992,20 @@ class AgentServer:
 
             # Try a proper git worktree remove first (updates the main
             # repo's worktree bookkeeping).  Fall back to brute-force rmtree
-            # if git isn't available or the main repo has moved.
-            removed = False
+            # if git isn't available or the main repo has moved — but only
+            # inside `worktree_base` (#1693): an orphaned sweep entry whose
+            # admin record git has already pruned is still removable, while
+            # anything resolving outside the sandbox (or onto the base
+            # checkout) is refused and counted as kept.
+            repo_path_str: str | None = None
             if a is not None:
                 repo_path_str = self.repo_paths.get(a.spec.repo_name)
-                if repo_path_str:
-                    repo_path = Path(repo_path_str)
-                    try:
-                        _git(repo_path, "worktree", "remove", str(entry), "--force")
-                        removed = True
-                    except (_GitError, OSError):
-                        pass
-
-            if not removed:
-                try:
-                    shutil.rmtree(entry, ignore_errors=True)
-                    removed = True
-                except OSError:
-                    pass
+            removed = _safe_remove_worktree(
+                Path(repo_path_str) if repo_path_str else None,
+                entry,
+                sandbox_root=worktree_base,
+                prune=False,
+            )
 
             if removed:
                 bytes_freed += dir_size
@@ -4243,12 +4489,16 @@ class AgentServer:
         worktree_base = self.state_dir / "worktrees"
         worktree_path = worktree_base / assignment.id
 
-        # Clean up stale worktree if it exists
+        # Clean up stale worktree if it exists.  #1693: via the single
+        # chokepoint, sandboxed to `<state_dir>/worktrees`.
         if worktree_path.exists():
-            try:
-                _git(repo_path, "worktree", "remove", str(worktree_path), "--force")
-            except (_GitError, FileNotFoundError, OSError):
-                shutil.rmtree(worktree_path, ignore_errors=True)
+            _safe_remove_worktree(
+                repo_path,
+                worktree_path,
+                log_path=assignment.log_path,
+                sandbox_root=worktree_base,
+                prune=False,
+            )
 
         worktree_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -4786,8 +5036,10 @@ class AgentServer:
         repo_path = Path(assignment.spec.repo_path).expanduser()
 
         # #1394: check for uncommitted work BEFORE any destructive step.  The
-        # `except _GitError` fallback below runs `shutil.rmtree`, which no
-        # amount of git-level care would survive, so the gate has to be here.
+        # removal below can still fall through to `shutil.rmtree` (inside
+        # `_safe_remove_worktree`), which no amount of git-level care would
+        # survive, so the gate has to be here — `_safe_remove_worktree`
+        # deliberately does not duplicate it (#1693).
         if wt_path.exists() and not self._rescue_uncommitted_work(
             assignment, wt_path, push_mode=push_mode
         ):
@@ -4800,18 +5052,19 @@ class AgentServer:
                 pass
             return
 
-        try:
-            if wt_path.exists():
-                _git(repo_path, "worktree", "remove", str(wt_path), "--force")
-            else:
-                # Directory already gone (crash / rmtree before prune) — prune
-                # the stale git admin entry so the branch is freed immediately.
-                _git(repo_path, "worktree", "prune")
-        except _GitError:
-            try:
-                shutil.rmtree(wt_path, ignore_errors=True)
-            except OSError:
-                pass
+        if wt_path.exists():
+            # #1693: removal (including any rmtree fallback) goes through the
+            # single chokepoint, sandboxed to `<state_dir>/worktrees`.  A
+            # refusal is logged there and simply leaves the tree on disk.
+            _safe_remove_worktree(
+                repo_path,
+                wt_path,
+                log_path=assignment.log_path,
+                sandbox_root=self.state_dir / "worktrees",
+            )
+        else:
+            # Directory already gone (crash / rmtree before prune) — prune
+            # the stale git admin entry so the branch is freed immediately.
             try:
                 _git(repo_path, "worktree", "prune")
             except _GitError:
