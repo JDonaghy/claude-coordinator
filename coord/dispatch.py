@@ -389,8 +389,28 @@ def dispatch(
                 proposal.issue_number,
             )
 
+        # #1720: dispatch-time file-overlap fence — the union of file
+        # footprints of every OTHER currently-running work-like assignment
+        # in this repo, derived from live branch diffs (not the brain.py
+        # prompt-only heuristic, which only covers `coord plan` and guesses
+        # from issue body text). Advisory only; never blocks this dispatch —
+        # see coord.overlap_fence.compute_overlap_fence's docstring for the
+        # fail-open contract. "" when there's nothing running (or nothing
+        # with a pushed branch), same no-op-prefix shape as issue_context_block.
+        overlap_fence = ""
+        if repo is not None and repo.github:
+            from coord.overlap_fence import compute_overlap_fence  # noqa: PLC0415
+
+            overlap_fence = compute_overlap_fence(
+                proposal.repo_name,
+                repo.github,
+                default_branch,
+                exclude_issue_number=proposal.issue_number,
+            )
+
         briefing_text = (
             issue_context_block(proposal.repo_name, proposal.issue_number)
+            + overlap_fence
             + oracle_contract
             + briefing_text
         )
