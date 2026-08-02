@@ -16,7 +16,10 @@ exactly once each, at this CLI layer, and hands the results to the pure
 - :func:`coord.usage.fetch_usage_rows` — the same board-row fetch
   ``coord usage`` uses (daemon ``/board`` when configured, local DB else).
 - :func:`coord.state.list_audit_log` — a best-effort durability cross-check
-  for "merged" (see :mod:`coord.scorecard`'s docstring).
+  for "merged" (see :mod:`coord.scorecard`'s docstring). Paginated back to
+  the milestone's own creation date (see ``_AUDIT_LOG_MAX_PAGES`` below) —
+  a single newest-first page can't be trusted to reach an old milestone in
+  a repo with a long merge history.
 - :func:`coord.github_ops.get_milestone_issues` — milestone membership
   (open+closed) with labels, the source for the two label conventions.
 """
@@ -29,6 +32,33 @@ from pathlib import Path
 import click
 
 from coord.commands._common import _CONFIG_OPTION, _load_config
+
+
+# The audit log is paginated at audit.MAX_LIMIT (500) per page, newest-first.
+# For a repo with a long merge history, "the 500 most recent merged events"
+# may not reach back to an older milestone at all — silently emptying the
+# merge-durability cross-check for exactly the historical-validation case
+# #1559 cares about. We bound the query with the milestone's own creation
+# date (nothing can have merged for it before it existed) and paginate the
+# rest of the way back to that bound, capped so one CLI invocation can't
+# turn into an unbounded DB scan.
+_AUDIT_LOG_PAGE_SIZE = 500
+_AUDIT_LOG_MAX_PAGES = 20  # 20 * 500 = 10,000 entries
+
+
+def _parse_github_timestamp(value: object) -> float | None:
+    """Parse a GitHub REST API ISO-8601 timestamp (e.g.
+    ``"2024-01-01T00:00:00Z"``) into a Unix epoch float. Returns ``None`` for
+    missing/malformed input so callers degrade to "no time bound" instead of
+    raising — the audit cross-check is best-effort end to end."""
+    if not value:
+        return None
+    from datetime import datetime  # noqa: PLC0415
+
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return None
 
 
 def _fmt_usd(usd: float) -> str:
@@ -71,7 +101,10 @@ def format_scorecard(card, *, verbose: bool = False) -> str:
         f" nudge={t['interventions']['by_kind']['nudge']}"
         f" abandon={t['interventions']['by_kind']['abandon']})"
         f"   [{t['interventions']['issues_with_unknown_data']} issues have no"
-        f" board data — excluded from the count above]",
+        f" board data — excluded from the count above;"
+        f" {t['interventions']['issues_with_multiple_roots']} issues have a"
+        f" second unrelated root dispatch — first_pass=no but not counted"
+        " in any kind above]",
         f"Cost + wall-clock:      {_fmt_usd(t['cost']['total_usd'])} /"
         f" {_fmt_hms(t['cost']['duration_secs'])}"
         f"   ({t['cost']['issues_with_data']}/{t['issue_count']} issues have"
@@ -98,6 +131,8 @@ def format_scorecard(card, *, verbose: bool = False) -> str:
         for c in card.issues:
             interv = sum(c.interventions.values())
             interv_str = f"{interv}" if c.has_assignment_data else "?"
+            if c.multiple_roots:
+                interv_str += "+multiroot"
             cost_str = _fmt_usd(c.cost_total) if c.has_cost_data else "?"
             time_str = _fmt_hms(c.duration_secs) if c.has_cost_data else "?"
             escaped_str = c.escaped_defect_stage or "-"
@@ -172,11 +207,31 @@ def scorecard(
 
     # Best-effort durability cross-check (see coord.scorecard's docstring) —
     # never fatal; a slow/unreachable audit read just means the cross-check
-    # is skipped, board `status="merged"` remains the primary signal.
+    # is skipped, board `status="merged"` remains the primary signal. Bound
+    # by the milestone's own creation date and paginate back to that bound
+    # (see _AUDIT_LOG_* constants above) rather than trusting a single
+    # newest-first page to reach an old milestone.
     audit_entries: list[dict] = []
+    since_ts = _parse_github_timestamp(ms.get("created_at"))
     try:
-        audit_result = list_audit_log(repo=repo, category="merge", event_type="merged", limit=500)
-        audit_entries = list(audit_result.get("entries") or [])
+        cursor: str | None = None
+        for _page in range(_AUDIT_LOG_MAX_PAGES):
+            audit_result = list_audit_log(
+                repo=repo, category="merge", event_type="merged",
+                since=since_ts, limit=_AUDIT_LOG_PAGE_SIZE, cursor=cursor,
+            )
+            audit_entries.extend(audit_result.get("entries") or [])
+            cursor = audit_result.get("next_cursor")
+            if not audit_result.get("has_more") or not cursor:
+                break
+        else:
+            click.echo(
+                "warning: audit log merge cross-check stopped after "
+                f"{_AUDIT_LOG_MAX_PAGES * _AUDIT_LOG_PAGE_SIZE} entries "
+                "(more were available) — durability cross-check may be "
+                "incomplete for the oldest issues in this milestone",
+                err=True,
+            )
     except Exception as e:  # noqa: BLE001
         click.echo(f"warning: could not fetch audit log: {e}", err=True)
 

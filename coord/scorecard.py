@@ -48,12 +48,27 @@ row with no ``review_of_assignment_id`` and ``review_iteration`` 0 (see
 :func:`is_root_work`). Every follow-up dispatched against that root —
 whether ``coord assign --interactive --fix-of``/``--rework-of`` (human) or
 ``auto_loop``'s headless review→fix bounce (automated) — keeps
-``type="work"`` and sets ``review_of_assignment_id`` to the ROOT's
-assignment id (not the immediately-preceding iteration's — see
-``dispatch_workers.py:_dispatch_fix_of``/``_dispatch_rework_of``), *and*
-both prefix ``issue_title`` with ``"[fix-N] "`` (``auto_loop.py`` uses that
-exact tag too, so title alone can't tell them apart). What DOES distinguish
-a human follow-up is ``provider_name == "claude-pty"`` — the same signal
+``type="work"`` and sets ``review_of_assignment_id`` to the assignment id of
+whatever it's a follow-up *to*, which is the ROOT's id only for the first
+fix/rework iteration dispatched directly off the root's review. A review
+dispatched against a completed FIX (itself ``type="work"``, eligible for
+review the same as the root — see ``review.py:dispatch_review``'s
+``review_of_assignment_id=completed.assignment_id``) sets its own
+``review_of_assignment_id`` to that fix's id, not the root's; a second
+fix/rework chained off *that* review therefore points at the immediately
+preceding iteration, not the root (see
+``dispatch_workers.py:_dispatch_fix_of``/``_dispatch_rework_of`` — both
+resolve ``work`` from the review's own ``review_of_assignment_id``, which
+may itself be a fix — and ``auto_loop.py``'s equivalent bounce-fix dispatch,
+same "whatever the review points at" resolution). This doesn't confuse
+:func:`is_root_work` or :func:`classify_intervention` below — both only
+check whether ``review_of_assignment_id`` is *set*, never its target, so a
+row anywhere in a multi-iteration chain is correctly never mistaken for a
+root and always correctly counted as a follow-up. Every follow-up in the
+chain, human or automated, does prefix ``issue_title`` with ``"[fix-N] "``
+(``auto_loop.py`` uses that exact tag too, so title alone can't tell them
+apart). What DOES distinguish a human follow-up is
+``provider_name == "claude-pty"`` — the same signal
 ``coord.reconcile.is_interactive_merge_session`` and
 ``coord.config.Config.attention_threshold_for`` already key off of for
 "is this an interactive session", set only by the interactive dispatch
@@ -67,6 +82,15 @@ front door) further splits "fix" from "rescue" — see
 ``status="merged"``, with zero human fix/rework descendants.** An issue
 with no board data at all (never dispatched through coord, or the data
 didn't survive) reports ``"unknown"`` — never lumped in with ``"no"``.
+
+A second root (e.g. ``coord retry`` dispatching a fresh, unlinked
+``type="work"`` row with no ``review_of_assignment_id`` after a failure,
+possibly on a different machine) also fails ``first_pass``, but doesn't fit
+any of ``interventions.by_kind`` — it's not a fix/rescue/nudge/abandon, it's
+a second unrelated attempt. That case is its own signal,
+:attr:`IssueScorecard.multiple_roots` / the totals'
+``interventions.issues_with_multiple_roots``, so ``first_pass="no"`` with
+zero interventions counted doesn't read as a mystery.
 """
 
 from __future__ import annotations
@@ -215,6 +239,14 @@ class IssueScorecard:
     interventions: dict[str, int]
     has_assignment_data: bool
 
+    # True when more than one root work assignment exists for this issue
+    # (e.g. `coord retry` dispatching a fresh unlinked `type="work"` row
+    # after a failure, possibly on a different machine) — see
+    # `build_milestone_scorecard`'s docstring. This is why `first_pass` can
+    # be "no" with all four `interventions` counts at 0: none of
+    # fix/rescue/nudge/abandon fit "a second, unrelated root appeared."
+    multiple_roots: bool
+
     # Cost + wall-clock, from coord.usage_rollup.aggregate(by="issue").
     cost_captured: float
     cost_est: float
@@ -251,6 +283,7 @@ def _aggregate_totals(cards: list[IssueScorecard]) -> dict:
         k: sum(c.interventions.get(k, 0) for c in cards) for k in INTERVENTION_KINDS
     }
     issues_with_unknown_data = sum(1 for c in cards if not c.has_assignment_data)
+    issues_with_multiple_roots = sum(1 for c in cards if c.multiple_roots)
 
     cost_total = sum(c.cost_total for c in cards)
     cost_captured = sum(c.cost_captured for c in cards)
@@ -278,6 +311,10 @@ def _aggregate_totals(cards: list[IssueScorecard]) -> dict:
             "by_kind": by_kind,
             "total": sum(by_kind.values()),
             "issues_with_unknown_data": issues_with_unknown_data,
+            # first_pass="no" with all four by_kind counts at 0 means one of
+            # these — a second, unrelated root dispatch, not a fix/rescue/
+            # nudge/abandon. See IssueScorecard.multiple_roots.
+            "issues_with_multiple_roots": issues_with_multiple_roots,
         },
         "cost": {
             "total_usd": cost_total,
@@ -319,6 +356,7 @@ def _score_one_issue(
     has_data = bool(rows)
     merged = audited_merged or any(str(r.get("status")) == "merged" for r in roots)
     human_followups = counts["fix"] + counts["rescue"] + counts["nudge"]
+    multiple_roots = len(roots) > 1
 
     if not has_data:
         first_pass = "unknown"
@@ -353,6 +391,7 @@ def _score_one_issue(
         first_pass=first_pass,
         interventions=counts,
         has_assignment_data=has_data,
+        multiple_roots=multiple_roots,
         cost_captured=cost_captured,
         cost_est=cost_est,
         cost_total=cost_total,

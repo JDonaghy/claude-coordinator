@@ -279,6 +279,39 @@ def test_audit_merged_event_is_a_durability_cross_check():
     assert c.interventions["abandon"] == 0
 
 
+def test_multiple_roots_fails_first_pass_without_any_intervention_kind():
+    """A second, unrelated root (e.g. `coord retry` dispatching a fresh
+    unlinked work row after a failure) fails first_pass but isn't a
+    fix/rescue/nudge/abandon — it needs its own signal so a reader doesn't
+    mistake "no interventions" for "clean first pass"."""
+    issues = [_issue(1)]
+    rows = [
+        _root_row(1, assignment_id="r1", status="failed"),
+        _root_row(1, assignment_id="r2", status="merged"),
+    ]
+    card = build_milestone_scorecard(
+        milestone=49, milestone_title="M49", repo_name="api",
+        issues=issues, assignment_rows=rows,
+    )
+    (c,) = card.issues
+    assert c.first_pass == "no"
+    assert c.multiple_roots is True
+    assert c.interventions == {"fix": 0, "rescue": 0, "nudge": 0, "abandon": 0}
+    assert card.totals["interventions"]["issues_with_multiple_roots"] == 1
+
+
+def test_single_root_is_not_flagged_multiple_roots():
+    issues = [_issue(1)]
+    rows = [_root_row(1, assignment_id="r1", status="merged")]
+    card = build_milestone_scorecard(
+        milestone=49, milestone_title="M49", repo_name="api",
+        issues=issues, assignment_rows=rows,
+    )
+    (c,) = card.issues
+    assert c.multiple_roots is False
+    assert card.totals["interventions"]["issues_with_multiple_roots"] == 0
+
+
 # ── interventions: count + kind aggregation ─────────────────────────────────
 
 
