@@ -158,6 +158,13 @@ def _start_agent_server(
     # no providers and the legacy claude -p spawn path, byte-identical to
     # pre-#425 behaviour.
     providers_registry: dict[str, object] = {}
+    # #1630: the loaded Config, threaded into AgentServer purely so /health's
+    # periodic local check run can resolve this machine's checkouts
+    # (coord.health.context.build_context) the same way `coord health` does.
+    # None in config-free mode — the health engine still reports every
+    # machine-scope check, just with no checkouts to sweep (same fallback
+    # `coord health` itself uses with no coordinator.yml).
+    health_config = None
     if not config_path.exists() and machine_name:
         from coord.models import Machine as _Machine
         machine = _Machine(
@@ -169,6 +176,7 @@ def _start_agent_server(
         )
     else:
         cfg = _load_config(config_path)
+        health_config = cfg
         machine = _resolve_machine(cfg, machine_name)
         concurrency = cfg.concurrency
         # #305: collect artifact_paths per repo for the stash helper.
@@ -205,6 +213,7 @@ def _start_agent_server(
         artifact_paths=artifact_paths_by_repo,
         build_commands=build_commands_by_repo,
         providers=providers_registry,
+        health_config=health_config,
     )
     app = build_app(server)
     # #1671: loud-by-default startup diagnostics — resolved PATH, install

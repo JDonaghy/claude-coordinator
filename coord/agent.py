@@ -23,7 +23,7 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Iterable
+from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 from coord import cargo_cache
 
@@ -2916,6 +2916,13 @@ class AgentServer:
         # fixtures in conftest.py, which exist to prevent exactly this class
         # of bug.
         worktree_writable_settings_files: "Iterable[Path] | None" = None,
+        # #1630: the loaded coordinator.yml (or None in config-free mode),
+        # kept ONLY so /health's periodic local check run
+        # (`_cached_local_health`) can resolve this machine's checkouts the
+        # same way `coord health` does (`coord.health.context.build_context`).
+        # Never used for dispatch/assignment logic — that stays on
+        # `repo_paths`/`capabilities`/`repos` above, exactly as before.
+        health_config: "Any | None" = None,
     ) -> None:
         self.machine_name = machine_name
         self.capabilities = list(capabilities)
@@ -2939,6 +2946,7 @@ class AgentServer:
         # ``capabilities``, ``env``) at call sites.
         self._providers: dict[str, object] = dict(providers or {})
         self._worktree_writable_settings_files = worktree_writable_settings_files
+        self._health_config = health_config
 
         self._lock = threading.Lock()
         self._assignments: dict[str, AgentAssignment] = {}
@@ -2995,6 +3003,23 @@ class AgentServer:
         self._tool_versions_cache: tuple[float, dict] | None = None  # (computed_at, summary)
         self._tool_versions_ttl: float = 300.0  # seconds
 
+        # #1630: cache for /health's "health" block — the H-1 check-registry
+        # run against this machine. Running the full registry (disk/worktree/
+        # cargo-target/repo-state/... probes, each doing real stat/subprocess
+        # work) on every /health poll would repeat #1570 B's mistake at a
+        # larger scale, so this is computed "on a timer" the same way
+        # `_cached_tool_versions` already is: lazily, the first /health poll
+        # after the TTL expires pays for the run and every poll inside the
+        # TTL reads the cached report. Default TTL is 5 minutes — checks are
+        # about slow-moving headroom (disk, staleness), not something that
+        # needs sub-minute freshness, and #1630 explicitly calls out a
+        # multi-hour-old check as the failure mode to make visible, not
+        # something to eliminate by polling harder.
+        self._local_health_cache: tuple[float, dict] | None = None  # (computed_at, payload)
+        self._local_health_ttl: float = float(
+            os.environ.get("COORD_AGENT_HEALTH_INTERVAL", "300")
+        )
+
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self._load_state()
@@ -3047,7 +3072,69 @@ class AgentServer:
             # (`coord doctor`) instead of only discoverable by SSHing in
             # after a mysterious failure, the way #1564's gh skew was.
             "tool_versions": self._cached_tool_versions(),
+            # #1630: this machine's own H-1 check-registry results (disk,
+            # worktrees, cargo target dirs, repo state, agent venv, ...),
+            # cache-refreshed on a timer (see `_local_health_ttl`) rather than
+            # computed inline on every poll. Every result — and the block as
+            # a whole — carries a `checked_at` epoch-seconds stamp so a
+            # renderer (or the daemon aggregating this into board state) can
+            # tell "OK, just measured" from "OK, last measured hours ago"
+            # instead of the two being indistinguishable. Never absent: even
+            # a health engine that raises produces an `unknown`-severity
+            # block (`_cached_local_health`'s own try/except) rather than
+            # omitting the key, so an old/new client can always find it.
+            "health": self._cached_local_health(),
         }
+
+    def _cached_local_health(self) -> dict:
+        """Return `/health`'s `health` block: this machine's H-1 report,
+        cache-refreshed on `_local_health_ttl` (see its docstring).
+
+        Fail-soft like every other H-1 entry point: a raised exception
+        anywhere in the registry (or in building its HealthContext) becomes
+        an `unknown`-severity block carrying the error, never a missing key
+        or a crashed /health poll.
+        """
+        now = time.time()
+        cached = self._local_health_cache
+        if cached is not None and (now - cached[0]) < self._local_health_ttl:
+            return cached[1]
+
+        try:
+            from coord.health.context import build_context
+            from coord.health.registry import run_all
+
+            ctx = build_context(self._health_config, allow_network=False, now=now)
+            report = run_all(ctx, scopes=("machine", "checkout"))
+            report_dict = report.to_dict()
+            payload = {
+                "schema": report_dict["schema"],
+                "checked_at": now,
+                "severity": report_dict["severity"],
+                "counts": report_dict["counts"],
+                "skipped": report_dict["skipped"],
+                # #1630: "per-check timestamp" — each result also carries the
+                # batch's `checked_at` (every check in one run shares a
+                # measurement time; this is a wire-layer addition, not a
+                # change to CheckResult.to_dict()'s own contract, which
+                # coord.health.cli's exact-key-set tests pin down).
+                "results": [
+                    {**r, "checked_at": now} for r in report_dict["results"]
+                ],
+            }
+        except Exception as exc:  # noqa: BLE001 — fail soft, never break /health
+            payload = {
+                "schema": 1,
+                "checked_at": now,
+                "severity": "unknown",
+                "counts": {},
+                "skipped": [],
+                "results": [],
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+        self._local_health_cache = (now, payload)
+        return payload
 
     def _cached_tool_versions(self) -> dict:
         """Return `/health`'s `tool_versions` with a long TTL cache.

@@ -2994,6 +2994,87 @@ def deregister_milestone_drain(*, repo_name: str, tracking_issue: int) -> None:
         )
 
 
+# ── #1630: fleet-health aggregation ─────────────────────────────────────────
+# Local-DB only, like list_milestone_drains above — the only writer is the
+# daemon's own health-poll tick (coord.serve_app), which always runs
+# against the canonical DB directly, and the only reader is the /board
+# handler on that same daemon.  A thin client never calls these; it reads
+# the aggregated snapshot the daemon already embedded in /board's JSON body
+# (the normal board read path the issue's acceptance bar requires).
+
+
+def save_machine_health(
+    machine_name: str,
+    *,
+    state: str,
+    reason: str = "",
+    latency_ms: float | None,
+    health: dict | None,
+    received_at: float,
+) -> None:
+    """Upsert one machine's latest health snapshot.
+
+    ``received_at`` is stamped by the caller (the daemon's own clock at poll
+    time) — never derived from anything the agent self-reports — so a
+    machine that stops responding but whose last-known payload still has an
+    old ``checked_at`` inside it cannot be mistaken for "just polled".
+    ``health`` is the agent's own H-1 report dict (``{"schema":1,
+    "checked_at":..., "results": [...]}"``) when the agent is reachable and
+    new enough to report one; ``None`` for an unreachable machine or an
+    agent too old to have this feature (forward/backward compatible: an old
+    agent's /health with no ``"health"`` key just means ``health=None`` here).
+    """
+    conn = get_connection()
+    with conn:
+        conn.execute(
+            """
+            INSERT INTO machine_health
+                (machine_name, state, reason, latency_ms, health_json, received_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(machine_name) DO UPDATE SET
+                state=excluded.state,
+                reason=excluded.reason,
+                latency_ms=excluded.latency_ms,
+                health_json=excluded.health_json,
+                received_at=excluded.received_at
+            """,
+            (
+                machine_name,
+                state,
+                reason,
+                latency_ms,
+                json.dumps(health) if health is not None else None,
+                received_at,
+            ),
+        )
+
+
+def load_machine_health() -> dict[str, dict]:
+    """Every machine's latest health snapshot, keyed by machine name.
+
+    Each value: ``{"state": ..., "reason": ..., "latency_ms": ...,
+    "received_at": ..., "health": <dict | None>}``.  A machine with no row
+    yet (daemon never polled it — e.g. right after a fresh install) is
+    simply absent; callers must treat "absent" the same as "state=unknown",
+    never as healthy (#1485's whole failure mode).
+    """
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT machine_name, state, reason, latency_ms, health_json, received_at "
+        "FROM machine_health"
+    ).fetchall()
+    out: dict[str, dict] = {}
+    for r in rows:
+        out[r["machine_name"]] = {
+            "state": r["state"],
+            "reason": r["reason"] or "",
+            "latency_ms": r["latency_ms"],
+            "received_at": r["received_at"],
+            "health": _json_loads(r["health_json"]) if r["health_json"] else None,
+        }
+    return out
+
+
 def _infer_review_state(board: Board, conn: sqlite3.Connection) -> None:
     """Set review_state on completed work assignments from their linked reviews.
 
