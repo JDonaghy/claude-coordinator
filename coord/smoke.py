@@ -17,10 +17,12 @@ Public entry points:
 
 - `match_rules(touched_files, rules)`  — pure: returns the union of required
   capabilities for any rule whose `files` prefix matches a touched file.
+- `rank_smoke_machines(required_caps, repo, worker_machine, board, config)` —
+  every capability-matched machine, best first (#1672).
 - `pick_smoke_machine(required_caps, worker_machine, board, config)` — picks
   a capable machine, preferring the worker's own (its build cache is warm —
   #1402); pass `prefer_worker=False` for the old different-machine-first
-  order.
+  order. Thin wrapper over `rank_smoke_machines` — the head of the ranking.
 - `dispatch_smoke(completed, board, config, ...)` — the full path; called
   from reconcile when a work assignment transitions to done.
 
@@ -108,7 +110,7 @@ class SmokeMachineChoice:
     rationale: str
 
 
-def pick_smoke_machine(
+def rank_smoke_machines(
     required_caps: list[str],
     repo_name: str,
     worker_machine_name: str,
@@ -116,15 +118,33 @@ def pick_smoke_machine(
     config: Config,
     *,
     prefer_worker: bool = True,
-) -> SmokeMachineChoice | None:
-    """Pick a machine with all `required_caps` for `repo_name`.
+) -> list[SmokeMachineChoice]:
+    """Every machine that can smoke-test `repo_name` with all `required_caps`,
+    best candidate first (#1672).
 
     Preference order (#1402):
     1. The worker's own machine, if capable and idle
-    2. Idle, capable, different from worker
+    2. Idle, capable, different from worker (config order)
     3. The worker's own machine, if capable (busy — smoke will queue)
-    4. Busy, capable, different from worker (smoke will queue)
-    5. None — no machine can validate this change
+    4. Busy, capable, different from worker (config order; smoke will queue)
+
+    Every candidate appears exactly once; the head of the list is exactly what
+    :func:`pick_smoke_machine` used to return on its own.
+
+    **Why a ranking and not a single pick (#1672).** ``dispatch_smoke`` has to
+    reject a candidate *after* choosing it — its live ``/health`` probe can
+    contradict the capabilities ``coordinator.yml`` declares for it (#1570 D),
+    or it can turn out to have no ``repo_paths`` entry. Returning one machine
+    meant a single bad candidate ended the whole Test stage: on 2026-08-01
+    (#1678) the router picked the same unhealthy machine every 30 s forever
+    while two other machines declared the same capability and were never
+    tried. The caller now walks this list.
+
+    **Capability matching is unchanged and is never relaxed.** Only machines
+    that genuinely declare every required capability (and can work on the
+    repo) are in the list at all — a fallback that dispatched to a machine
+    lacking the capability would produce a green verdict from a machine that
+    cannot run the suite, which is worse than refusing.
 
     **Why the worker machine is preferred.** This used to prefer a machine
     *different* from the worker.  That preference is right for **review**,
@@ -142,7 +162,7 @@ def pick_smoke_machine(
     ordering (used by callers that want independence, and by tests pinning
     the old behaviour).
 
-    Returns None when capabilities can't be matched.
+    Returns an empty list when capabilities can't be matched.
     """
     candidates = [
         m for m in config.machines
@@ -150,68 +170,98 @@ def pick_smoke_machine(
         and all(cap in m.capabilities for cap in required_caps)
     ]
     if not candidates:
-        return None
+        return []
 
     busy = {a.machine_name for a in board.active if a.status in ("pending", "running")}
 
     same = next((m for m in candidates if m.name == worker_machine_name), None)
 
+    ranked: list[SmokeMachineChoice] = []
+    seen: set[str] = set()
+
+    def _add(choice: SmokeMachineChoice) -> None:
+        if choice.machine.name in seen:
+            return
+        seen.add(choice.machine.name)
+        ranked.append(choice)
+
     if prefer_worker and same is not None and same.name not in busy:
-        return SmokeMachineChoice(
+        _add(SmokeMachineChoice(
             machine=same,
             is_worker=True,
             rationale=(
                 f"chose {same.name} — the worker machine, idle and has "
                 f"{required_caps}; its build cache is already warm"
             ),
-        )
+        ))
 
-    idle_different = [
-        m for m in candidates
-        if m.name != worker_machine_name and m.name not in busy
-    ]
-    if idle_different:
-        return SmokeMachineChoice(
-            machine=idle_different[0],
+    for m in candidates:
+        if m.name == worker_machine_name or m.name in busy:
+            continue
+        _add(SmokeMachineChoice(
+            machine=m,
             is_worker=False,
             rationale=(
-                f"chose {idle_different[0].name} — idle and has {required_caps} "
+                f"chose {m.name} — idle and has {required_caps} "
                 f"(worker was {worker_machine_name})"
             ),
-        )
+        ))
 
     if prefer_worker and same is not None:
-        return SmokeMachineChoice(
+        _add(SmokeMachineChoice(
             machine=same,
             is_worker=True,
             rationale=(
                 f"chose {same.name} — the worker machine has {required_caps} and a "
                 "warm build cache; capable but busy, smoke will queue"
             ),
-        )
+        ))
 
-    busy_different = [
-        m for m in candidates if m.name != worker_machine_name
-    ]
-    if busy_different:
-        return SmokeMachineChoice(
-            machine=busy_different[0],
+    for m in candidates:
+        if m.name == worker_machine_name:
+            continue
+        _add(SmokeMachineChoice(
+            machine=m,
             is_worker=False,
             rationale=(
-                f"chose {busy_different[0].name} — capable but busy; smoke will queue"
+                f"chose {m.name} — capable but busy; smoke will queue"
             ),
-        )
+        ))
 
     if same is not None:
-        return SmokeMachineChoice(
+        _add(SmokeMachineChoice(
             machine=same,
             is_worker=True,
             rationale=(
                 f"only the worker machine ({worker_machine_name}) has {required_caps}; "
                 "smoke runs on the same machine"
             ),
-        )
-    return None
+        ))
+    return ranked
+
+
+def pick_smoke_machine(
+    required_caps: list[str],
+    repo_name: str,
+    worker_machine_name: str,
+    board: Board,
+    config: Config,
+    *,
+    prefer_worker: bool = True,
+) -> SmokeMachineChoice | None:
+    """The single best machine with all `required_caps` for `repo_name`.
+
+    The head of :func:`rank_smoke_machines` — see there for the preference
+    order and the reasoning. Returns None when capabilities can't be matched.
+
+    ``dispatch_smoke`` uses the full ranking (#1672); this stays for callers
+    that only ever want the first choice.
+    """
+    ranked = rank_smoke_machines(
+        required_caps, repo_name, worker_machine_name, board, config,
+        prefer_worker=prefer_worker,
+    )
+    return ranked[0] if ranked else None
 
 
 def _capability_probe_reasons(
@@ -363,6 +413,156 @@ def _fetch_touched_files(repo_github: str, branch: str) -> list[str]:
     return [f.get("path", "") for f in files if f.get("path")]
 
 
+# ── Unroutable reporting (#1672) ────────────────────────────────────────────
+
+
+#: ``test_state`` recorded on the parent work row when no capability-matched
+#: machine can run the Test stage and the condition will NOT clear on its own
+#: (#1672). Deliberately distinct from ``"failed"``: nothing is wrong with the
+#: branch, so this must never trigger a fix round — it is a fleet/config fault,
+#: and every gate that asks for ``"passed"``/``"skipped"`` keeps the merge shut
+#: exactly as it did while the state was NULL.
+TEST_STATE_BLOCKED = "blocked"
+
+
+#: Soft (transient) unroutable reports already logged this process, keyed by
+#: ``(assignment_id, message)``. Transient conditions — a machine that is
+#: merely unreachable right now — are left re-dispatchable so the stage
+#: self-heals on a later tick; this memo is what stops the retry from also
+#: re-logging every 30 s (#1672). Bounded so a long-lived daemon can't grow it
+#: without limit.
+_SOFT_REPORTS_SEEN: set[tuple[str, str]] = set()
+_SOFT_REPORTS_MAX = 512
+
+
+@dataclass
+class SmokeAttempt:
+    """One machine `dispatch_smoke` tried and could not use (#1672)."""
+
+    machine_name: str
+    reason: str
+    #: True when the reason is expected to clear without operator action (a
+    #: connectivity blip). False for durable faults — an explicit `/health`
+    #: probe contradiction (#1570 D) or a missing `repo_paths` entry — which
+    #: stay broken until somebody fixes the machine or the config.
+    transient: bool = False
+
+    def describe(self) -> str:
+        return f"{self.machine_name}: {self.reason}"
+
+
+def _report_unroutable_smoke(
+    completed: Assignment,
+    required_caps: list[str],
+    attempts: list[SmokeAttempt],
+) -> None:
+    """Report — once — that the Test stage has no machine it can run on.
+
+    #1672/#1678: the old code logged a WARNING and returned. Nothing was
+    written anywhere the TUI, `coord gates` or the board could show it, and
+    the daemon re-ran the identical refusal every 30 s forever. The Test stage
+    simply never started and the only trace was `journalctl` on the daemon
+    host — the #1616 failure shape again: the pipeline stops and the product
+    says nothing.
+
+    Two outcomes, split on whether the condition can clear by itself:
+
+    * **Durable** (every candidate hard-refused, or there were no candidates
+      at all) — record ``test_state=TEST_STATE_BLOCKED`` with the full reason
+      on the parent work row. That is board state: `coord gates` prints it,
+      the TUI reads it off the row, and `record_test_verdict` writes an
+      ``test_blocked`` audit row. It also ends the spin, because
+      `dispatch_pending_smoke` skips rows that already carry a verdict — the
+      escalation happens once, not every tick.
+    * **Transient** (at least one candidate failed only on connectivity) — do
+      NOT poison the row. A machine that is rebooting comes back, and marking
+      the row blocked would demand a manual `coord diagnose --reset` for what
+      the next tick would have fixed for free. Log it once per process
+      instead, and leave the row re-dispatchable.
+
+    Never raises: a board-write failure must not take the caller down.
+    """
+    transient = any(a.transient for a in attempts)
+    caps = ", ".join(required_caps) if required_caps else "(none — any capable machine)"
+    if attempts:
+        message = (
+            f"Test stage cannot be routed: every machine that declares "
+            f"capability [{caps}] for repo {completed.repo_name!r} refused. "
+            f"Tried {len(attempts)} — "
+            + "; ".join(a.describe() for a in attempts)
+            + "."
+        )
+    else:
+        message = (
+            f"Test stage cannot be routed: no configured machine declares "
+            f"capability [{caps}] AND can build repo "
+            f"{completed.repo_name!r} — the Test stage cannot run for this "
+            f"completion until a capable machine is added."
+        )
+
+    def _log_once(level: int, text: str) -> None:
+        """Log `text` at most once per (row, message) for this process.
+
+        The board row is what normally makes the durable report fire once; a
+        transient dead end deliberately does NOT write to the row (it must
+        stay re-dispatchable), and a row with no assignment_id has nowhere to
+        write at all — so both need this memo instead. Either way the daemon
+        journal gets ONE line, never one every 30 s.
+        """
+        key = (completed.assignment_id or "", text)
+        if key in _SOFT_REPORTS_SEEN:
+            return
+        if len(_SOFT_REPORTS_SEEN) >= _SOFT_REPORTS_MAX:
+            _SOFT_REPORTS_SEEN.clear()
+        _SOFT_REPORTS_SEEN.add(key)
+        logger.log(
+            level, "dispatch_smoke: %s#%s — %s",
+            completed.repo_name, completed.issue_number, text,
+        )
+
+    if transient:
+        _log_once(
+            logging.WARNING,
+            f"{message} Leaving the row re-dispatchable; a later tick "
+            "retries. (#1672)",
+        )
+        return
+
+    reason = (
+        f"{message} Fix the machine (or add a capable one) and clear this "
+        f"with `coord diagnose {completed.repo_name} "
+        f"{completed.issue_number} --stage test --reset` to re-dispatch. "
+        "(#1672)"
+    )
+    if completed.test_state == TEST_STATE_BLOCKED:
+        return  # already recorded on the row — the report has been made
+    if completed.assignment_id is None:
+        # No row to write to (shouldn't happen for a board completion) — the
+        # log is the only surface left, so at least don't repeat it forever.
+        _log_once(logging.ERROR, reason)
+        return
+    logger.error(
+        "dispatch_smoke: %s#%s — %s", completed.repo_name,
+        completed.issue_number, reason,
+    )
+    try:
+        from coord.state import record_test_verdict
+
+        record_test_verdict(
+            assignment_id=completed.assignment_id,
+            test_state=TEST_STATE_BLOCKED,
+            test_reason=reason,
+        )
+    except Exception:  # noqa: BLE001 — reporting must never break dispatch
+        logger.exception(
+            "dispatch_smoke: failed to record the blocked Test verdict for %s",
+            completed.assignment_id,
+        )
+        return
+    completed.test_state = TEST_STATE_BLOCKED
+    completed.test_reason = reason
+
+
 # ── Dispatch ────────────────────────────────────────────────────────────────
 
 
@@ -385,6 +585,11 @@ def dispatch_smoke(
     Returns the new smoke `Assignment`, or None when no smoke is needed
     (no rules matched, no capable machine, smoke disabled, etc.). The
     caller is responsible for persisting the board.
+
+    #1672: routing walks the FULL capability-matched candidate list (see
+    :func:`rank_smoke_machines`) instead of standing or falling on one
+    machine, and a dead end is reported on the row rather than re-logged on
+    every daemon tick — see :func:`_report_unroutable_smoke`.
     """
     smoke_cfg = getattr(config, "smoke_tests", SmokeTestsConfig())
     if not smoke_cfg.auto_queue:
@@ -394,6 +599,14 @@ def dispatch_smoke(
     if completed.status != "done":
         return None
     if not completed.branch:
+        return None
+    if completed.test_state == TEST_STATE_BLOCKED:
+        # #1672: already reported as unroutable, with the reason on the row.
+        # Re-probing the same broken fleet on every tick is exactly the spin
+        # this issue is about — an operator clears it (`coord diagnose
+        # --stage test --reset`) once the fleet is fixed. `dispatch_pending_
+        # smoke` already skips rows with a verdict; this covers the callers
+        # that hand us a row directly (reconcile).
         return None
 
     # Dedupe: don't fire a second smoke if one's already in flight.
@@ -447,85 +660,130 @@ def dispatch_smoke(
         )
         return None
 
-    choice = pick_smoke_machine(
+    # #1672: the FULL capability-matched candidate list, best first. Picking
+    # one machine and giving up on it meant a single bad candidate ended the
+    # whole Test stage — #1678, where the router re-chose the same unhealthy
+    # machine every 30 s while two other machines declared the same
+    # capability and were never tried. Capability matching itself is NOT
+    # relaxed: `rank_smoke_machines` only ever yields machines that genuinely
+    # declare every required capability.
+    candidates = rank_smoke_machines(
         required_caps, completed.repo_name, completed.machine_name, board, config
     )
-    if choice is None:
-        logger.warning(
-            "dispatch_smoke: %s#%s needs capabilities %s but no configured "
-            "machine has them (and can build repo %r) — the Test stage will "
-            "not run for this completion until a capable machine is added.",
-            completed.repo_name, completed.issue_number, required_caps,
-            completed.repo_name,
-        )
-        return None
-
-    if required_caps:
-        unmet = _capability_probe_reasons(
-            choice.machine, required_caps, http_client=http_client
-        )
-        if unmet:
-            # #1570 D: the machine *claims* every required capability in
-            # `coordinator.yml`, but its own `/health` probe (#1570 B) says
-            # otherwise — refuse to route here rather than dispatch a worker
-            # that fails 20 minutes in with a confusing, unrelated error.
-            logger.warning(
-                "dispatch_smoke: chose machine %s for %s#%s but its own "
-                "/health probe disagrees with its declared capabilities "
-                "%s — %s — refusing to route (#1570 D). Run `coord doctor` "
-                "to check the fleet.",
-                choice.machine.name, completed.repo_name,
-                completed.issue_number, required_caps, unmet,
-            )
-            return None
-
-    repo_path = choice.machine.repo_path(completed.repo_name)
-    if repo_path is None:
-        logger.warning(
-            "dispatch_smoke: chose machine %s for %s#%s but it has no "
-            "repo_paths entry for %r — cannot dispatch.",
-            choice.machine.name, completed.repo_name, completed.issue_number,
-            completed.repo_name,
-        )
-        return None
-
-    briefing = build_smoke_briefing(
-        repo_github=repo.github,
-        repo_name=repo.name,
-        branch=completed.branch,
-        issue_number=completed.issue_number,
-        issue_title=completed.issue_title,
-        smoke_command=smoke_command,
-        required_caps=required_caps,
-        timeout_seconds=smoke_cfg.timeout_seconds,
-        is_worker=choice.is_worker,
-    )
-
-    payload = {
-        "repo_name": completed.repo_name,
-        "repo_path": repo_path,
-        "issue_number": completed.issue_number,
-        "issue_title": f"[smoke] {completed.issue_title}",
-        "briefing": briefing,
-        "files_allowed": [],
-        "files_forbidden": [],
-        "pull_repos": [],
-        "type": "smoke",
-        "system_prompt": SMOKE_SYSTEM_PROMPT,
-        "review_target": completed.branch,
-        # #255: smoke checks out the worker's PR branch but the agent still
-        # consults `branch` as the integration base.
-        "branch": repo.default_branch or "main",
-    }
-
-    url = f"http://{choice.machine.host}:{AGENT_PORT}/assign"
+    attempts: list[SmokeAttempt] = []
     client = http_client or httpx
-    try:
-        resp = client.post(url, json=payload, timeout=15)
-        resp.raise_for_status()
-        agent_response = resp.json()
-    except (httpx.HTTPError, httpx.TimeoutException):
+    dispatched: tuple[SmokeMachineChoice, str, dict] | None = None
+
+    for choice in candidates:
+        if required_caps:
+            unmet = _capability_probe_reasons(
+                choice.machine, required_caps, http_client=http_client
+            )
+            if unmet:
+                # #1570 D: the machine *claims* every required capability in
+                # `coordinator.yml`, but its own `/health` probe (#1570 B)
+                # says otherwise — refuse to route HERE rather than dispatch
+                # a worker that fails 20 minutes in with a confusing,
+                # unrelated error. #1672: that refusal is per-machine, so
+                # keep walking the candidate list instead of ending the
+                # stage. Durable, not transient — the probe disagrees until
+                # somebody installs the tool.
+                logger.warning(
+                    "dispatch_smoke: skipping machine %s for %s#%s — its own "
+                    "/health probe disagrees with its declared capabilities "
+                    "%s — %s — refusing to route (#1570 D). Trying the next "
+                    "capability-matched machine (#1672); run `coord doctor` "
+                    "to check the fleet.",
+                    choice.machine.name, completed.repo_name,
+                    completed.issue_number, required_caps, unmet,
+                )
+                attempts.append(SmokeAttempt(
+                    machine_name=choice.machine.name,
+                    reason=(
+                        f"/health probe contradicts its declared capabilities "
+                        f"{required_caps} — {unmet} (#1570 D)"
+                    ),
+                ))
+                continue
+
+        repo_path = choice.machine.repo_path(completed.repo_name)
+        if repo_path is None:
+            logger.warning(
+                "dispatch_smoke: skipping machine %s for %s#%s — it has no "
+                "repo_paths entry for %r.",
+                choice.machine.name, completed.repo_name,
+                completed.issue_number, completed.repo_name,
+            )
+            attempts.append(SmokeAttempt(
+                machine_name=choice.machine.name,
+                reason=f"no repo_paths entry for {completed.repo_name!r}",
+            ))
+            continue
+
+        briefing = build_smoke_briefing(
+            repo_github=repo.github,
+            repo_name=repo.name,
+            branch=completed.branch,
+            issue_number=completed.issue_number,
+            issue_title=completed.issue_title,
+            smoke_command=smoke_command,
+            required_caps=required_caps,
+            timeout_seconds=smoke_cfg.timeout_seconds,
+            is_worker=choice.is_worker,
+        )
+
+        payload = {
+            "repo_name": completed.repo_name,
+            "repo_path": repo_path,
+            "issue_number": completed.issue_number,
+            "issue_title": f"[smoke] {completed.issue_title}",
+            "briefing": briefing,
+            "files_allowed": [],
+            "files_forbidden": [],
+            "pull_repos": [],
+            "type": "smoke",
+            "system_prompt": SMOKE_SYSTEM_PROMPT,
+            "review_target": completed.branch,
+            # #255: smoke checks out the worker's PR branch but the agent still
+            # consults `branch` as the integration base.
+            "branch": repo.default_branch or "main",
+        }
+
+        url = f"http://{choice.machine.host}:{AGENT_PORT}/assign"
+        try:
+            resp = client.post(url, json=payload, timeout=15)
+            resp.raise_for_status()
+            agent_response = resp.json()
+        except (httpx.HTTPError, httpx.TimeoutException) as exc:
+            # #1672: TRANSIENT — the machine is capable and its probe agreed,
+            # it just didn't answer. Try the next candidate, but if none is
+            # left the row stays re-dispatchable rather than blocked: a
+            # rebooting machine comes back, and poisoning the row would cost
+            # an operator a manual reset for something the next tick fixes.
+            logger.warning(
+                "dispatch_smoke: POST /assign to %s for %s#%s failed (%s) — "
+                "trying the next capability-matched machine (#1672).",
+                choice.machine.name, completed.repo_name,
+                completed.issue_number, exc,
+            )
+            attempts.append(SmokeAttempt(
+                machine_name=choice.machine.name,
+                reason=f"POST /assign failed — {exc}",
+                transient=True,
+            ))
+            continue
+
+        dispatched = (choice, briefing, agent_response)
+        break
+
+    if dispatched is None:
+        # Every capability-matched machine was tried and none could take it
+        # (or there were none at all). Report it where the board can show it,
+        # exactly once — never the silent 30 s spin of #1678.
+        _report_unroutable_smoke(completed, required_caps, attempts)
         return None
+
+    choice, briefing, agent_response = dispatched
 
     smoke_assignment = Assignment(
         machine_name=choice.machine.name,
@@ -621,6 +879,14 @@ def dispatch_pending_smoke(
             # Already has a verdict ("passed"/"failed"/"skipped"), or is
             # "running" — someone (an interactive --smoke-of session, or a
             # smoke assignment already in flight) is already handling it.
+            #
+            # #1672: this is also what makes the unroutable report fire ONCE.
+            # `dispatch_smoke` records `test_state="blocked"` when no
+            # capability-matched machine can take the stage, so the next tick
+            # lands here and skips instead of re-probing a fleet that is
+            # still broken and re-logging the identical refusal every 30 s
+            # (#1678). Clearing it (`coord diagnose <repo> <issue> --stage
+            # test --reset`) puts the row back in this scan.
             continue
 
         # #685: per-issue test-mode policy gates auto-smoke dispatch.
