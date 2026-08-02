@@ -8,8 +8,8 @@ from pathlib import Path
 import pytest
 
 from coord.acceptance import (
-    MOCK_EXT_TO_DRIVER_KIND,
     ForPathResolutionError,
+    MOCK_EXT_TO_DRIVER_KIND,
     ManifestData,
     ManifestError,
     acceptance_capability_gap,
