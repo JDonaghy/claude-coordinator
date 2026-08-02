@@ -1379,17 +1379,26 @@ def stop(assignment_id: str, rescue: bool, config_path: Path) -> None:
 
 @click.command(
     help=(
-        "Re-dispatch a failed assignment to a different machine. Also "
-        "accepts a genuine zero-commit ADVISORY (#1606) — an advisory whose "
-        "branch carries real commits is refused; use `coord drive "
-        "--accept-advisory` for that shape instead."
+        "Re-dispatch a failed WORK-LIKE assignment (work/mock-author/"
+        "test-author) to a different machine. Also accepts a genuine "
+        "zero-commit ADVISORY (#1606) — an advisory whose branch carries "
+        "real commits is refused; use `coord drive --accept-advisory` for "
+        "that shape instead. A failed 'smoke' or 'review' assignment is "
+        "refused with the command that re-runs its stage (#1636) — this "
+        "never silently re-dispatches one as a fresh work worker."
     )
 )
 @click.argument("assignment_id")
 @_CONFIG_OPTION
 def retry(assignment_id: str, config_path: Path) -> None:
     from coord.board_service import read_board, write_board
-    from coord.reconcile import _reassign, describe_no_candidate_machines
+    from coord.models import WORK_LIKE_TYPES
+    from coord.reconcile import (
+        UnsupportedRetryType,
+        _reassign,
+        describe_no_candidate_machines,
+        describe_unsupported_retry_type,
+    )
 
     cfg = _load_config(config_path)
     board = read_board()
@@ -1436,13 +1445,35 @@ def retry(assignment_id: str, config_path: Path) -> None:
             )
             sys.exit(1)
 
+    # #1636: `coord retry` only knows how to re-dispatch WORK_LIKE_TYPES
+    # ("work", "mock-author", "test-author") through this path — it drives a
+    # fresh worker down the Work→Test→Review→Merge pipeline. A "smoke" or
+    # "review" (or other) row has its own re-dispatch command that re-runs
+    # the right stage instead of silently spinning up a work worker on the
+    # already-complete branch (#1636's reported bug). Checked up front, before
+    # the model-escalation message, so a refusal doesn't first print a
+    # reassuring "escalating model" line for a retry that's about to be
+    # refused anyway.
+    if assignment.type not in WORK_LIKE_TYPES:
+        exc = UnsupportedRetryType(assignment.type, assignment.review_of_assignment_id)
+        click.echo(f"error: {describe_unsupported_retry_type(exc)}", err=True)
+        sys.exit(1)
+
     # Determine escalated model for the retry.
     original_model = assignment.model or cfg.models.default
     escalated = cfg.models.next_model(original_model)
     if escalated != original_model:
         click.echo(f"  escalating model: {original_model} → {escalated}")
 
-    result = _reassign(assignment, board, cfg, model=escalated)
+    try:
+        result = _reassign(assignment, board, cfg, model=escalated)
+    except UnsupportedRetryType as exc:
+        # Defense in depth — the precheck above already covers this, but
+        # `_reassign` is shared with `auto_reassign` and must never silently
+        # downgrade a non-work retry even if a future caller skips the
+        # precheck.
+        click.echo(f"error: {describe_unsupported_retry_type(exc)}", err=True)
+        sys.exit(1)
     if result is None:
         # #1396: name the blocking machines and their apparent load instead
         # of a bare "no available machine" — the usual cause is a phantom
@@ -1456,7 +1487,8 @@ def retry(assignment_id: str, config_path: Path) -> None:
     write_board(board)
     click.echo(
         f"Retried: {result.machine_name} → {result.repo_name} "
-        f"#{result.issue_number} (assignment {result.assignment_id})"
+        f"#{result.issue_number} (assignment {result.assignment_id}, "
+        f"type={result.type})"
     )
     # #1101: surface the continued branch so it's obvious the retry picked
     # up existing work instead of forking a fresh branch off the default.
