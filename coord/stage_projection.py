@@ -224,6 +224,16 @@ def test_stage_status_for(
         return DONE
     if verdict == "failed":
         return FAILED
+    # #1672: ``"blocked"`` (``coord.smoke.TEST_STATE_BLOCKED`` — no
+    # capability-matched machine could run the Test stage) deliberately falls
+    # through to PENDING here rather than mapping to FAILED. FAILED is a
+    # statement about the BRANCH, and the TUI acts on it: it would flip
+    # `can_redispatch_work_after_test_failure` on (offering to re-dispatch
+    # Work that is perfectly fine) and `test_gate_actionable` off (taking away
+    # the operator's `B`/verdict keys on the one row that needs them). The
+    # blocked reason reaches the operator through `test_reason` instead —
+    # rendered by `coord gates` and, since no smoke row exists in this case,
+    # by the TUI Summary tab's `board_assignment_reason` on the work row.
     return PENDING
 
 

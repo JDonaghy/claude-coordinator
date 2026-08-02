@@ -685,6 +685,547 @@ def test_dispatch_smoke_returns_none_when_no_capable_machine(
     assert result is None
 
 
+# ── #1672: candidate-list fallback + one-shot unroutable report ─────────────
+#
+# #1678 (2026-08-01): `dispatch_smoke` picked ONE capability-matched machine,
+# its `/health` probe read UNMET, and the router refused — correctly (#1570 D)
+# — and then stopped, even though two other machines declared the same
+# capability. The Test stage never started, no smoke row was ever created, and
+# the identical refusal re-logged every 30 s to the daemon journal with nothing
+# on the board to show for it.
+
+
+def _gtk_probe(*, found: bool) -> dict:
+    """A `/health` body whose gtk4 probe reports `found`."""
+    return {
+        "tool_versions": {
+            "gtk4": {
+                "found": found,
+                "version": "4.12.0" if found else None,
+                "min_version": None,
+                "meets_floor": True if found else None,
+                "capability": "gtk",
+                "ok": found,
+            },
+        }
+    }
+
+
+class _MultiHostClient:
+    """Fake httpx client with PER-HOST `/health` and `/assign` behaviour.
+
+    `_FakeClient` answers every host identically, which cannot express the
+    #1672 case at all (first machine unhealthy, second healthy). Keyed by
+    hostname so a test can say exactly which machine is broken and how.
+    """
+
+    def __init__(
+        self,
+        *,
+        health: dict[str, dict] | None = None,
+        assign: dict[str, dict | Exception] | None = None,
+        default_assign: dict | None = None,
+    ) -> None:
+        self._health = health or {}
+        self._assign = assign or {}
+        self._default_assign = default_assign or {"id": "smoke-ok"}
+        self.get_calls: list[str] = []
+        self.calls: list[tuple[str, dict]] = []
+
+    @staticmethod
+    def _host(url: str) -> str:
+        return url.split("//", 1)[1].split(":", 1)[0]
+
+    @property
+    def probed_hosts(self) -> list[str]:
+        return [self._host(u) for u in self.get_calls]
+
+    @property
+    def assigned_hosts(self) -> list[str]:
+        return [self._host(u) for u, _ in self.calls]
+
+    def get(self, url, *, timeout) -> _FakeResp:
+        self.get_calls.append(url)
+        return _FakeResp(self._health.get(self._host(url), {}))
+
+    def post(self, url, *, json, timeout) -> _FakeResp:
+        self.calls.append((url, json))
+        outcome = self._assign.get(self._host(url), self._default_assign)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return _FakeResp(outcome)
+
+
+@pytest.fixture
+def three_gtk_config(repo: Repo) -> Config:
+    """One incapable worker machine + THREE machines declaring `gtk`.
+
+    Mirrors the #1678 fleet shape (three machines declared `rust`; the router
+    only ever tried one). `server` deliberately lacks gtk so every test here
+    also proves capability matching is never relaxed to make routing succeed.
+    """
+    return Config(
+        repos=[repo],
+        machines=[
+            _machine("server", "server.tail", caps=["python"], path="/srv/api"),
+            _machine("desktop-a", "desktop-a.tail", caps=["python", "gtk"], path="/a/api"),
+            _machine("desktop-b", "desktop-b.tail", caps=["python", "gtk"], path="/b/api"),
+            _machine("desktop-c", "desktop-c.tail", caps=["python", "gtk"], path="/c/api"),
+        ],
+        smoke_tests=SmokeTestsConfig(
+            auto_queue=True,
+            capability_rules=[SmokeRule(files=["src/gtk/"], requires=["gtk"])],
+        ),
+    )
+
+
+_GTK_DIFF = ["src/gtk/window.c"]
+
+
+@pytest.fixture(autouse=True)
+def _clear_soft_report_memo():
+    """`coord.smoke._SOFT_REPORTS_SEEN` is process-global (it is what makes a
+    transient dead end log once per daemon rather than every 30 s) — reset it
+    around every test so one test's report can't silence another's."""
+    from coord.smoke import _SOFT_REPORTS_SEEN
+
+    _SOFT_REPORTS_SEEN.clear()
+    yield
+    _SOFT_REPORTS_SEEN.clear()
+
+
+# ── rank_smoke_machines ─────────────────────────────────────────────────────
+
+
+def test_rank_smoke_machines_returns_every_capable_machine_best_first(
+    three_gtk_config: Config,
+) -> None:
+    from coord.smoke import rank_smoke_machines
+
+    ranked = rank_smoke_machines(["gtk"], "api", "server", Board(), three_gtk_config)
+    assert [c.machine.name for c in ranked] == ["desktop-a", "desktop-b", "desktop-c"]
+    # The incapable worker machine is NOT in the list — capability matching is
+    # the one thing a fallback must never relax.
+    assert "server" not in [c.machine.name for c in ranked]
+
+
+def test_rank_smoke_machines_head_is_exactly_pick_smoke_machine(
+    three_gtk_config: Config, gtk_and_server_config: Config,
+) -> None:
+    """The refactor must not move the FIRST choice — only add the tail."""
+    from coord.smoke import rank_smoke_machines
+
+    boards = [
+        Board(),
+        Board(active=[replace(_completed(machine="desktop-a"), status="running")]),
+    ]
+    for cfg in (three_gtk_config, gtk_and_server_config):
+        for board in boards:
+            for worker in ("server", "desktop-a", "nowhere"):
+                for prefer in (True, False):
+                    ranked = rank_smoke_machines(
+                        ["gtk"], "api", worker, board, cfg, prefer_worker=prefer,
+                    )
+                    pick = pick_smoke_machine(
+                        ["gtk"], "api", worker, board, cfg, prefer_worker=prefer,
+                    )
+                    head = ranked[0].machine.name if ranked else None
+                    assert head == (pick.machine.name if pick else None)
+
+
+def test_rank_smoke_machines_puts_idle_before_busy(
+    three_gtk_config: Config,
+) -> None:
+    busy = replace(_completed(machine="desktop-a"), status="running")
+    board = Board(active=[busy])
+    from coord.smoke import rank_smoke_machines
+
+    ranked = rank_smoke_machines(["gtk"], "api", "server", board, three_gtk_config)
+    names = [c.machine.name for c in ranked]
+    assert names == ["desktop-b", "desktop-c", "desktop-a"]
+    assert len(set(names)) == len(names)  # each candidate appears once
+
+
+def test_rank_smoke_machines_empty_when_capability_unmatched(
+    three_gtk_config: Config,
+) -> None:
+    from coord.smoke import rank_smoke_machines
+
+    assert rank_smoke_machines(["cuda"], "api", "server", Board(), three_gtk_config) == []
+
+
+# ── Fallback: try the NEXT capability-matched machine ───────────────────────
+
+
+def test_dispatch_smoke_falls_back_to_next_machine_when_first_probe_unhealthy(
+    three_gtk_config: Config,
+) -> None:
+    """#1672 acceptance: N machines declare C, the first probes unhealthy —
+    route to the next healthy candidate instead of ending the stage."""
+    board = Board()
+    completed = _completed(machine="server")
+    client = _MultiHostClient(health={
+        "desktop-a.tail": _gtk_probe(found=False),   # declared gtk, probe says no
+        "desktop-b.tail": _gtk_probe(found=True),
+        "desktop-c.tail": _gtk_probe(found=True),
+    })
+    result = dispatch_smoke(
+        completed, board, three_gtk_config,
+        http_client=client, diff_lookup=lambda r, b: _GTK_DIFF,
+    )
+    assert result is not None
+    assert result.machine_name == "desktop-b"
+    assert board.active == [result]
+    # Probed a then b, stopped as soon as one was healthy — c untouched.
+    assert client.probed_hosts == ["desktop-a.tail", "desktop-b.tail"]
+    assert client.assigned_hosts == ["desktop-b.tail"]
+    assert client.calls[0][1]["repo_path"] == "/b/api"
+    assert completed.test_state == "running"
+
+
+def test_dispatch_smoke_walks_past_several_unhealthy_machines(
+    three_gtk_config: Config,
+) -> None:
+    board = Board()
+    client = _MultiHostClient(health={
+        "desktop-a.tail": _gtk_probe(found=False),
+        "desktop-b.tail": _gtk_probe(found=False),
+        "desktop-c.tail": _gtk_probe(found=True),
+    })
+    result = dispatch_smoke(
+        _completed(machine="server"), board, three_gtk_config,
+        http_client=client, diff_lookup=lambda r, b: _GTK_DIFF,
+    )
+    assert result is not None
+    assert result.machine_name == "desktop-c"
+    assert client.probed_hosts == [
+        "desktop-a.tail", "desktop-b.tail", "desktop-c.tail",
+    ]
+
+
+def test_dispatch_smoke_falls_back_when_first_machine_has_no_repo_path(
+    repo: Repo,
+) -> None:
+    """A machine that declares the capability but has no `repo_paths` entry is
+    the same class of dead end as an unhealthy probe — skip it, don't stop."""
+    no_path = Machine(
+        name="desktop-a", host="desktop-a.tail",
+        capabilities=["python", "gtk"], repos=["api"], repo_paths={},
+    )
+    cfg = Config(
+        repos=[repo],
+        machines=[
+            _machine("server", "server.tail", caps=["python"]),
+            no_path,
+            _machine("desktop-b", "desktop-b.tail", caps=["python", "gtk"], path="/b/api"),
+        ],
+        smoke_tests=SmokeTestsConfig(
+            auto_queue=True,
+            capability_rules=[SmokeRule(files=["src/gtk/"], requires=["gtk"])],
+        ),
+    )
+    client = _MultiHostClient(health={
+        "desktop-a.tail": _gtk_probe(found=True),
+        "desktop-b.tail": _gtk_probe(found=True),
+    })
+    result = dispatch_smoke(
+        _completed(machine="server"), Board(), cfg,
+        http_client=client, diff_lookup=lambda r, b: _GTK_DIFF,
+    )
+    assert result is not None
+    assert result.machine_name == "desktop-b"
+
+
+def test_dispatch_smoke_healthy_first_machine_dispatches_with_no_extra_probing(
+    three_gtk_config: Config,
+) -> None:
+    """The ordinary case is unchanged: one probe, one POST, first candidate."""
+    board = Board()
+    client = _MultiHostClient(health={
+        "desktop-a.tail": _gtk_probe(found=True),
+        "desktop-b.tail": _gtk_probe(found=True),
+        "desktop-c.tail": _gtk_probe(found=True),
+    })
+    result = dispatch_smoke(
+        _completed(machine="server"), board, three_gtk_config,
+        http_client=client, diff_lookup=lambda r, b: _GTK_DIFF,
+    )
+    assert result is not None
+    assert result.machine_name == "desktop-a"
+    assert client.probed_hosts == ["desktop-a.tail"]
+    assert client.assigned_hosts == ["desktop-a.tail"]
+
+
+def test_dispatch_smoke_fallback_never_routes_to_an_incapable_machine(
+    three_gtk_config: Config,
+) -> None:
+    """The guardrail: a green Test verdict from a machine that cannot run the
+    suite is far worse than a refusal. When EVERY gtk machine is unhealthy the
+    router must not fall back to `server`, which never declared gtk."""
+    board = Board()
+    completed = _completed(machine="server")
+    client = _MultiHostClient(health={
+        "desktop-a.tail": _gtk_probe(found=False),
+        "desktop-b.tail": _gtk_probe(found=False),
+        "desktop-c.tail": _gtk_probe(found=False),
+    })
+    result = dispatch_smoke(
+        completed, board, three_gtk_config,
+        http_client=client, diff_lookup=lambda r, b: _GTK_DIFF,
+    )
+    assert result is None
+    assert board.active == []
+    assert client.calls == []                      # nothing dispatched anywhere
+    assert "server.tail" not in client.probed_hosts
+    assert completed.test_state == "blocked"       # not "passed", not "skipped"
+
+
+# ── Dead end: reported once, on the row ─────────────────────────────────────
+
+
+def test_dispatch_smoke_records_blocked_reason_when_all_candidates_unhealthy(
+    three_gtk_config: Config,
+) -> None:
+    """#1672 acceptance: with no healthy candidate the reason is persisted
+    where the TUI/CLI can render it — not only in the daemon log."""
+    completed = _completed(machine="server")
+    board = Board(completed=[completed])
+    client = _MultiHostClient(health={
+        f"desktop-{s}.tail": _gtk_probe(found=False) for s in "abc"
+    })
+    result = dispatch_smoke(
+        completed, board, three_gtk_config,
+        http_client=client, diff_lookup=lambda r, b: _GTK_DIFF,
+    )
+    assert result is None
+    assert completed.test_state == "blocked"
+    reason = completed.test_reason or ""
+    # Names the capability and EVERY machine it tried, so the operator can act
+    # from the board alone.
+    assert "gtk" in reason
+    for name in ("desktop-a", "desktop-b", "desktop-c"):
+        assert name in reason
+    assert "coord diagnose" in reason  # states the recovery command
+    assert "#1672" in reason
+
+
+def test_dispatch_smoke_blocked_reason_is_persisted_to_the_db(
+    three_gtk_config: Config, coord_db,
+) -> None:
+    """The row the CLI (`coord gates`) and the TUI read is the DB row."""
+    from coord.state import record_dispatched_assignment
+
+    completed = _completed(machine="server")
+    record_dispatched_assignment(assignment=completed, repo_github="acme/api")
+    board = Board(completed=[completed])
+    client = _MultiHostClient(health={
+        f"desktop-{s}.tail": _gtk_probe(found=False) for s in "abc"
+    })
+    assert dispatch_smoke(
+        completed, board, three_gtk_config,
+        http_client=client, diff_lookup=lambda r, b: _GTK_DIFF,
+    ) is None
+
+    row = coord_db.execute(
+        "SELECT test_state, test_reason, smoke_test FROM assignments "
+        "WHERE assignment_id=?", (completed.assignment_id,),
+    ).fetchone()
+    assert row["test_state"] == "blocked"
+    assert "desktop-a" in row["test_reason"]
+    # The legacy pass/fail mirror stays NULL: nothing is wrong with the
+    # branch, so `coord fix` must not become dispatchable off the back of it.
+    assert row["smoke_test"] is None
+
+
+def test_dispatch_smoke_blocked_report_fires_once_not_every_tick(
+    three_gtk_config: Config, caplog,
+) -> None:
+    """#1672 acceptance: a single visible reason, not a silent retry loop.
+
+    The second pass must not re-probe the fleet, must not re-record and must
+    not re-log — that 30 s spin (#1678) is as much the bug as picking one
+    machine was."""
+    completed = _completed(machine="server")
+    board = Board(completed=[completed])
+    client = _MultiHostClient(health={
+        f"desktop-{s}.tail": _gtk_probe(found=False) for s in "abc"
+    })
+    with caplog.at_level("WARNING", logger="coord.smoke"):
+        assert dispatch_smoke(
+            completed, board, three_gtk_config,
+            http_client=client, diff_lookup=lambda r, b: _GTK_DIFF,
+        ) is None
+        first_round_probes = list(client.probed_hosts)
+        assert len(first_round_probes) == 3
+
+        for _ in range(5):
+            assert dispatch_smoke(
+                completed, board, three_gtk_config,
+                http_client=client, diff_lookup=lambda r, b: _GTK_DIFF,
+            ) is None
+    assert client.probed_hosts == first_round_probes  # no re-probing
+    assert client.calls == []
+    summaries = [
+        r for r in caplog.records if "cannot be routed" in r.getMessage()
+    ]
+    assert len(summaries) == 1
+    assert summaries[0].levelname == "ERROR"  # loud, not a routine warning
+
+
+def test_dispatch_pending_smoke_skips_a_blocked_row(
+    three_gtk_config: Config, monkeypatch,
+) -> None:
+    """The bulk scan is the tick loop — a reported row must drop out of it."""
+    monkeypatch.setattr("coord.state.get_issue_test_mode", lambda *a, **k: None)
+
+    completed = _completed(machine="server")
+    board = Board(completed=[completed])
+    client = _MultiHostClient(health={
+        f"desktop-{s}.tail": _gtk_probe(found=False) for s in "abc"
+    })
+    import coord.smoke as _smoke
+
+    real = _smoke.dispatch_smoke
+    monkeypatch.setattr(
+        _smoke, "dispatch_smoke",
+        lambda c, b, cfg, **kw: real(
+            c, b, cfg, http_client=client,
+            diff_lookup=lambda r, br: _GTK_DIFF, **kw,
+        ),
+    )
+    assert dispatch_pending_smoke(board, three_gtk_config) == []
+    assert completed.test_state == "blocked"
+    probes_after_first_tick = list(client.probed_hosts)
+
+    # Later ticks: the row carries a verdict now, so the scan skips it.
+    assert dispatch_pending_smoke(board, three_gtk_config) == []
+    assert dispatch_pending_smoke(board, three_gtk_config) == []
+    assert client.probed_hosts == probes_after_first_tick
+
+
+def test_dispatch_smoke_records_blocked_when_zero_capable_machines(
+    repo: Repo,
+) -> None:
+    """Zero capability-matched machines is the same loud single report — the
+    pre-#1672 code logged a WARNING and left the row indistinguishable from
+    "not started yet"."""
+    cfg = Config(
+        repos=[repo],
+        machines=[_machine("server", "server.tail", caps=["python"])],
+        smoke_tests=SmokeTestsConfig(
+            auto_queue=True,
+            capability_rules=[SmokeRule(files=["src/gtk/"], requires=["gtk"])],
+        ),
+    )
+    completed = _completed()
+    result = dispatch_smoke(
+        completed, Board(), cfg,
+        http_client=_MultiHostClient(),
+        diff_lookup=lambda r, b: _GTK_DIFF,
+    )
+    assert result is None
+    assert completed.test_state == "blocked"
+    assert "gtk" in (completed.test_reason or "")
+
+
+def test_dispatch_smoke_transient_post_failure_leaves_the_row_redispatchable(
+    three_gtk_config: Config,
+) -> None:
+    """A machine that is merely unreachable must NOT poison the row.
+
+    It comes back; marking it blocked would cost the operator a manual reset
+    for something the next tick fixes for free. Distinct from an explicit
+    probe contradiction, which stays broken until somebody acts."""
+    import httpx
+
+    completed = _completed(machine="server")
+    board = Board()
+    client = _MultiHostClient(
+        health={f"desktop-{s}.tail": _gtk_probe(found=True) for s in "abc"},
+        assign={
+            f"desktop-{s}.tail": httpx.ConnectError("unreachable") for s in "abc"
+        },
+    )
+    result = dispatch_smoke(
+        completed, board, three_gtk_config,
+        http_client=client, diff_lookup=lambda r, b: _GTK_DIFF,
+    )
+    assert result is None
+    assert board.active == []
+    assert completed.test_state is None          # still eligible next tick
+    # It genuinely tried every capable machine before giving up.
+    assert client.assigned_hosts == [
+        "desktop-a.tail", "desktop-b.tail", "desktop-c.tail",
+    ]
+
+
+def test_dispatch_smoke_transient_dead_end_is_logged_once_per_row(
+    three_gtk_config: Config, caplog,
+) -> None:
+    """Re-dispatchable is not a licence to re-log every tick (#1672)."""
+    import httpx
+
+    completed = _completed(machine="server")
+    client = _MultiHostClient(
+        health={f"desktop-{s}.tail": _gtk_probe(found=True) for s in "abc"},
+        assign={
+            f"desktop-{s}.tail": httpx.ConnectError("unreachable") for s in "abc"
+        },
+    )
+    with caplog.at_level("WARNING", logger="coord.smoke"):
+        for _ in range(4):
+            assert dispatch_smoke(
+                completed, Board(), three_gtk_config,
+                http_client=client, diff_lookup=lambda r, b: _GTK_DIFF,
+            ) is None
+    summaries = [
+        r for r in caplog.records if "cannot be routed" in r.getMessage()
+    ]
+    assert len(summaries) == 1
+    assert "re-dispatchable" in summaries[0].getMessage()
+
+
+def test_dispatch_smoke_falls_back_from_an_unreachable_machine_to_a_live_one(
+    three_gtk_config: Config,
+) -> None:
+    import httpx
+
+    board = Board()
+    client = _MultiHostClient(
+        health={f"desktop-{s}.tail": _gtk_probe(found=True) for s in "abc"},
+        assign={"desktop-a.tail": httpx.ConnectError("unreachable")},
+    )
+    result = dispatch_smoke(
+        _completed(machine="server"), board, three_gtk_config,
+        http_client=client, diff_lookup=lambda r, b: _GTK_DIFF,
+    )
+    assert result is not None
+    assert result.machine_name == "desktop-b"
+
+
+def test_dispatch_smoke_mixed_hard_and_transient_failures_do_not_block(
+    three_gtk_config: Config,
+) -> None:
+    """Two machines are durably broken, one is just down — still transient
+    overall, because the fleet may route successfully on the next tick."""
+    import httpx
+
+    completed = _completed(machine="server")
+    client = _MultiHostClient(
+        health={
+            "desktop-a.tail": _gtk_probe(found=False),
+            "desktop-b.tail": _gtk_probe(found=False),
+            "desktop-c.tail": _gtk_probe(found=True),
+        },
+        assign={"desktop-c.tail": httpx.ConnectError("unreachable")},
+    )
+    assert dispatch_smoke(
+        completed, Board(), three_gtk_config,
+        http_client=client, diff_lookup=lambda r, b: _GTK_DIFF,
+    ) is None
+    assert completed.test_state is None
+
+
 # ── #685: get_issue_test_mode ───────────────────────────────────────────────
 
 
