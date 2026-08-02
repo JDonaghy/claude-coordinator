@@ -83,6 +83,37 @@ def test_enabled_false(tmp_path) -> None:
     assert cfg.health.enabled is False
 
 
+def test_daemon_host_deploy_lane_paths_round_trip(tmp_path) -> None:
+    """#1630: the three daemon-host lane paths must be settable from YAML.
+
+    Before this existed, adding any of them to `health:` rejected the whole
+    config load — and the tui lane could only ever report UNKNOWN.
+    """
+    cfg = load(
+        _write(
+            tmp_path,
+            """
+            health:
+              cli_venv_python: /opt/cli-venv/bin/python3
+              tui_binary_path: /opt/bin/coord-tui
+              tui_source_dir: /src/coordinator/tui/src
+            """,
+        )
+    )
+    assert cfg.health.cli_venv_python == "/opt/cli-venv/bin/python3"
+    assert cfg.health.tui_binary_path == "/opt/bin/coord-tui"
+    assert cfg.health.tui_source_dir == "/src/coordinator/tui/src"
+
+
+def test_daemon_host_lane_paths_default_to_none_meaning_documented_location() -> None:
+    """``None`` is "use the default location", not "disable the lane" — the
+    fallbacks live in ``fleet_snapshot`` so a stock install has live lanes."""
+    cfg = _parse_health({})
+    assert cfg.cli_venv_python is None
+    assert cfg.tui_binary_path is None
+    assert cfg.tui_source_dir is None
+
+
 # ── validation ───────────────────────────────────────────────────────────────
 
 
@@ -112,6 +143,10 @@ def test_unknown_option_is_rejected() -> None:
         ({"enabled": "yes"}, "must be a boolean"),
         ({"pypi_index_url": ""}, "non-empty string"),
         ({"agent_venv_python": 5}, "string or null"),
+        ({"cli_venv_python": 5}, "string or null"),
+        ({"tui_binary_path": 5}, "string or null"),
+        ({"tui_source_dir": []}, "string or null"),
+        ({"tui_binary_path": "   "}, "non-empty string or null"),
     ],
 )
 def test_invalid_values_are_rejected(block, match) -> None:
@@ -161,14 +196,16 @@ def test_every_health_config_field_is_parseable() -> None:
     from coord.config import (
         _HEALTH_FLOAT_FIELDS,
         _HEALTH_INT_FIELDS,
+        _HEALTH_OPT_STR_FIELDS,
         _HEALTH_STR_LIST_FIELDS,
     )
 
     handled = (
         set(_HEALTH_FLOAT_FIELDS)
         | set(_HEALTH_INT_FIELDS)
+        | set(_HEALTH_OPT_STR_FIELDS)
         | set(_HEALTH_STR_LIST_FIELDS)
-        | {"enabled", "agent_venv_python", "pypi_index_url"}
+        | {"enabled", "pypi_index_url"}
     )
     declared = {f.name for f in fields(HealthConfig)}
     assert declared == handled, f"unparsed health fields: {sorted(declared - handled)}"
