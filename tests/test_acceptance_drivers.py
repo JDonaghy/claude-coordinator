@@ -67,6 +67,7 @@ from pathlib import Path
 
 import pytest
 
+from coord.acceptance import build_verdict
 from coord.acceptance_drivers import (
     DriverError,
     SUPPORTED_KINDS,
@@ -562,3 +563,45 @@ class TestRunDriverWebPlaywright:
         )
         assert result.exit_code == 0
         assert len(result.tests) == 4
+
+
+class TestZeroTestPlaywrightRunIsAFailureNotAPass:
+    """#1540 acceptance criteria: "A zero-test Playwright run is reported as
+    a failure, not a pass" — the #1552-shaped wiring bug in Playwright form
+    (docs/ORACLE_LOOP.md "Discovery"): a `testDir`/path-filter mismatch makes
+    Playwright exit 0 with 0 tests, which must never render as a green
+    verdict. #1539 already built each half (this module's DriverError for a
+    crash-shaped zero, and ``coord.acceptance.build_verdict``'s ``green =
+    failed == 0 and len(tests) > 0`` for a legitimate zero) — these two tests
+    are #1540's assertion that wiring the ``run_driver`` -> ``build_verdict``
+    path together for ``web-playwright`` actually produces a failing verdict
+    in BOTH the "crashed" and the "legitimately found nothing" case, not just
+    that each half in isolation behaves.
+    """
+
+    def test_legitimate_zero_tests_is_not_green(self, tmp_path) -> None:
+        # Well-formed report, genuinely zero specs matched (Playwright's own
+        # --pass-with-no-tests shape), no top-level errors — run_driver
+        # returns an empty list rather than raising (see
+        # test_legitimate_zero_tests_with_no_errors_returns_empty_list
+        # above), but that empty list must still fail build_verdict's gate.
+        report_src = tmp_path / "zero_tests_report.json"
+        report_src.write_text(json.dumps({"suites": [], "errors": [], "stats": {}}))
+        run_command = f'cp "{report_src}" "$PLAYWRIGHT_JSON_OUTPUT_FILE" #'
+        result = run_driver("web-playwright", run_command, cwd=str(tmp_path))
+        assert result.tests == []
+        verdict = build_verdict(result.tests, scope="repo")
+        assert verdict["green"] is False
+        assert verdict["total"] == 0
+
+    def test_crashed_run_never_reaches_build_verdict_as_a_pass(self, tmp_path) -> None:
+        # The other zero-tests shape: Playwright dies before ever exercising
+        # a spec (bad config, browser launch failure, --grep matching
+        # nothing without --pass-with-no-tests). run_driver must raise
+        # DriverError here — a caller that let this fall through to
+        # build_verdict([], ...) would render it identically to "0 tests,
+        # nothing wrong", silently losing the crash signal.
+        fixture = FIXTURES / "global_setup_crash.json"
+        run_command = f'cp "{fixture}" "$PLAYWRIGHT_JSON_OUTPUT_FILE" #'
+        with pytest.raises(DriverError, match="top-level error"):
+            run_driver("web-playwright", run_command, cwd=str(tmp_path))

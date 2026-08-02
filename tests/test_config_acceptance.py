@@ -186,6 +186,11 @@ acceptance:
   drivers:
     claude-coordinator:
       routes:
+        - match: "coord/dashboard/webapp/**"
+          kind: web-playwright
+          run: "cd coord/dashboard/webapp && npm run test:acceptance -- {ms}"
+          mock: "*.html"
+          capability: browser
         - match: "coord/**"
           kind: cli-pytest
           run: "pytest tests/acceptance/{ms}"
@@ -220,6 +225,72 @@ def test_driver_for_routes_rust_path_to_tui_tuidriver(tmp_path: Path) -> None:
     assert driver.kind == "tui-tuidriver"
     assert driver.match == "tui/**"
     assert driver.mock == "*.screen"
+    assert driver.capability == "rust"
+
+
+# ── #1540: coord/dashboard/webapp/** -> web-playwright + browser ─────────────
+#
+# A change under coord/dashboard/webapp/** used to match the coord/**
+# route above and get handed to cli-pytest, which is wrong — the webapp's
+# acceptance suite is Playwright and needs a browser-capable machine. The
+# fix is ordering, not new resolution logic: driver_for() already resolves
+# first-match-wins (#1125), so the webapp route just has to be listed before
+# coord/** in ROUTED_CONFIG (verified above) — these tests pin that behavior
+# so a future reorder or an accidental duplicate `coord/**`-only route
+# regresses loudly instead of silently routing webapp changes to pytest.
+
+
+def test_driver_for_routes_webapp_path_to_web_playwright(tmp_path: Path) -> None:
+    cfg = _routed_cfg(tmp_path)
+    driver = cfg.acceptance.driver_for(
+        "claude-coordinator", "coord/dashboard/webapp/src/x.tsx"
+    )
+    assert driver.kind == "web-playwright"
+    assert driver.match == "coord/dashboard/webapp/**"
+    assert driver.mock == "*.html"
+    assert driver.capability == "browser"
+
+
+def test_driver_for_routes_webapp_route_declares_no_entrypoint(tmp_path: Path) -> None:
+    # #1552 decision, made deliberately rather than by omission: Playwright
+    # discovers specs by walking testDir (playwright.acceptance.config.ts),
+    # exactly like cli-pytest's directory walk — there is no crate-root-style
+    # file a slice must be wired into before it's reachable, so this route
+    # has no `entrypoint:` and contributes nothing extra to sealed_paths().
+    cfg = _routed_cfg(tmp_path)
+    driver = cfg.acceptance.driver_for(
+        "claude-coordinator", "coord/dashboard/webapp/src/x.tsx"
+    )
+    assert driver.entrypoint == ""
+    assert cfg.acceptance.sealed_paths("claude-coordinator") == ["tests/acceptance/"]
+
+
+def test_driver_for_routes_webapp_wins_over_coord_catchall(tmp_path: Path) -> None:
+    # coord/dashboard/webapp/** is a strict subset of coord/** — this proves
+    # the more specific route wins because it is ORDERED first, not because
+    # driver_for() does any most-specific-match reasoning (it doesn't, see
+    # test_driver_for_routes_first_match_wins below).
+    cfg = _routed_cfg(tmp_path)
+    driver = cfg.acceptance.driver_for(
+        "claude-coordinator", "coord/dashboard/webapp/src/components/Panel.tsx"
+    )
+    assert driver.kind == "web-playwright"
+    assert driver.kind != "cli-pytest"
+
+
+def test_driver_for_routes_no_regression_python_path(tmp_path: Path) -> None:
+    # A non-webapp coord/** path must still resolve to cli-pytest/python —
+    # the new webapp route must not shadow the rest of coord/**.
+    cfg = _routed_cfg(tmp_path)
+    driver = cfg.acceptance.driver_for("claude-coordinator", "coord/state.py")
+    assert driver.kind == "cli-pytest"
+    assert driver.capability == "python"
+
+
+def test_driver_for_routes_no_regression_rust_path(tmp_path: Path) -> None:
+    cfg = _routed_cfg(tmp_path)
+    driver = cfg.acceptance.driver_for("claude-coordinator", "tui/src/app.rs")
+    assert driver.kind == "tui-tuidriver"
     assert driver.capability == "rust"
 
 

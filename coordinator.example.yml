@@ -89,6 +89,34 @@ machines:
     repo_paths:
       claude-coordinator: ~/src/claude-coordinator
 
+acceptance:
+  # The oracle loop (docs/ORACLE_LOOP.md, #944) for this repo's own
+  # milestone-scoped acceptance suites (tests/acceptance/ms-NN/). #1125's
+  # in-repo path routing: `driver_for(repo, path)` resolves the FIRST route
+  # whose `match` glob matches `path` (fnmatch semantics) — first-match, not
+  # most-specific-match (coord.config.AcceptanceConfig.driver_for). Because
+  # `coord/dashboard/webapp/**` is a strict subset of `coord/**`, it MUST be
+  # listed before the `coord/**` route below, or every webapp change would
+  # silently resolve to cli-pytest instead of web-playwright (#1540).
+  drivers:
+    claude-coordinator:
+      routes:
+        - match: coord/dashboard/webapp/**
+          kind: web-playwright
+          run: "cd coord/dashboard/webapp && npm run test:acceptance -- {ms}"
+          mock: "*.html"
+          capability: browser
+        - match: coord/**
+          kind: cli-pytest
+          run: "pytest tests/acceptance/{ms}"
+          mock: "*.out"
+          capability: python
+        - match: tui/**
+          kind: tui-tuidriver
+          run: "cargo test --test acceptance -- --format json"
+          mock: "*.screen"
+          capability: rust
+
 smoke_tests:
   # #1021/#1426: auto-dispatch a headless smoke (Test-stage) assignment when
   # a work assignment completes, on both `coord resume` (reconcile()) and the
