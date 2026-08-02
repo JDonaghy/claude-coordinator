@@ -1310,18 +1310,147 @@ def test_a_usage_limit_killed_review_waits_instead_of_retrying_or_dying():
     assert any("usage-limit" in w for w in action.warnings)
 
 
-def test_request_changes_waits_for_coords_auto_loop_to_dispatch_the_fix():
-    """This driver must NOT dispatch a review fix itself — #476/#477."""
+def requested_changes(**kw) -> IssueState:
+    base = dict(
+        review_aid="r1",
+        review_verdict="request-changes",
+        work_review_iter=1,
+        max_review_iterations=5,
+    )
+    base.update(kw)
+    return work_tested(**base)
+
+
+def test_request_changes_dispatches_coord_fix_against_the_REVIEW_id():
+    """#1692: this arm used to `_wait()` on a comment reading "the auto-loop
+    dispatches the fix". That stopped being true when #1616 replaced the
+    `coord notify` timer with the daemon drain — the drain deliberately
+    excludes fix dispatch (#476/#477), `run_for_review_transition` never sees
+    a transition the drain already consumed, and the #1478 stalled sweeper is
+    off by default. The observed cost was a 50-minute park to the deadline
+    with nothing dispatched (drive-batch 2026-08-02, #1630).
+
+    The REVIEW id is the whole point: `coord fix <work_aid>` gates on the
+    legacy `smoke_test == "fail"` field and would be refused here; `coord fix
+    <review_aid>` is the #1622 door, built for exactly this and never wired up.
+    """
+    counters = DriveCounters()
+    action = step(requested_changes(), counters=counters)
+    assert action.kind == RUN
+    assert action.command == ("fix", "r1")  # the REVIEW id, never work_aid
+    assert counters.fix_rounds == 1
+    assert action.on_error == "die"
+    assert "--fix-of" in action.error_message  # the manual door, named
+
+
+def test_the_review_fix_arm_shares_one_fix_budget_with_the_test_arm():
+    """Not a parallel counter (#1692): a failing test and a request-changes
+    review are two shapes of one loop, so a drive that bounces between them
+    spends ONE budget. Two rounds of mixed kinds exhaust --max-fix-rounds 2."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_fix_rounds=2)
+
+    first = step(done_work(work_test_state="failed"), opts, counters=counters)
+    assert first.command == ("fix", "w1")  # test arm, round 1
+
+    second = step(requested_changes(), opts, counters=counters)
+    assert second.command == ("fix", "r1")  # review arm, round 2
+    assert counters.fix_rounds == 2
+
+    # A THIRD round of either kind is over budget.
+    exhausted = step(requested_changes(review_aid="r2"), opts, counters=counters)
+    assert exhausted.is_exit
+    assert exhausted.exit_code == EXIT_TERMINAL_FAILURE
+    assert "after 2 fix round(s)" in exhausted.message
+    assert "NOT exhausted" in exhausted.message  # says WHICH cap was hit
+
+    still_exhausted = step(
+        done_work(work_test_state="failed"), opts, counters=counters
+    )
+    assert still_exhausted.is_exit
+
+
+def test_a_second_decide_on_an_unchanged_board_does_not_dispatch_a_second_fix():
+    """THE guard against re-opening #476/#477 in a new dispatcher.
+
+    `coord fix` returns as soon as the fix worker is dispatched, but the board
+    this driver polls needs a beat to show the new row. Until it does, the
+    state is byte-for-byte the one that triggered the dispatch — and a driver
+    that re-fires on it puts a SECOND fix worker on the SAME branch. That is
+    the #476/#477 incident shape (two uncoordinated dispatchers, conflicting
+    branches, real money), and `max_fix_rounds` alone does not prevent it: it
+    only decides how many duplicates get spawned before the drive gives up.
+
+    Delete `counters.review_fix_dispatched_for` and this test must fail.
+    """
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_fix_rounds=3)
+    s = requested_changes()  # one board snapshot, reused verbatim
+
+    assert step(s, opts, counters=counters).command == ("fix", "r1")
+    assert counters.fix_rounds == 1
+
+    for _ in range(3):
+        again = step(s, opts, counters=counters)
+        assert again.kind == WAIT, "re-dispatched a duplicate fix worker"
+        assert again.command == ()
+        assert counters.fix_rounds == 1, "burned a fix round on a no-op"
+        assert "already dispatched" in again.label
+
+
+def test_the_next_review_round_is_a_new_row_so_the_latch_does_not_wedge():
+    """The de-dup latch keys on the review's assignment id, and a fix round
+    produces a new work row and therefore a new review row (`drive_state.
+    project` keys the review on the current work id). So the latch clears
+    itself — it must not turn the second genuine round into a permanent wait.
+    """
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_fix_rounds=3)
+
+    assert step(requested_changes(), opts, counters=counters).command == ("fix", "r1")
+    second_round = step(
+        requested_changes(review_aid="r2", work_review_iter=2),
+        opts,
+        counters=counters,
+    )
+    assert second_round.command == ("fix", "r2")
+    assert counters.fix_rounds == 2
+
+
+def test_an_in_flight_fix_row_parks_on_the_active_guard_not_a_second_dispatch():
+    """Once the dispatched fix row DOES appear on the board, `decide()`'s
+    `active_count > 0` guard takes over before the review gate is reached."""
+    counters = DriveCounters()
     action = step(
-        work_tested(
-            review_aid="r1",
-            review_verdict="request-changes",
-            work_review_iter=1,
-            max_review_iterations=5,
-        )
+        requested_changes(active_count=1, active_types=("work",)), counters=counters
     )
     assert action.kind == WAIT
+    assert counters.fix_rounds == 0
+
+
+def test_request_changes_with_no_review_id_refuses_rather_than_guessing():
+    """`review_verdict` and `review_aid` come off the same board row, so this
+    is impossible today — assert it anyway. Everything past this point spends
+    money keyed on that id, and `coord fix ""` is not a refusal this arm
+    should have to interpret."""
+    counters = DriveCounters()
+    action = step(requested_changes(review_aid=""), counters=counters)
+    assert action.is_exit
     assert action.command == ()
+    assert counters.fix_rounds == 0
+
+
+def test_request_changes_with_the_auto_loop_off_reports_and_stops():
+    """`coord fix` routes through `auto_loop.process_review_completion`, whose
+    first line refuses when `pipeline.auto_loop` is off. Dispatching a
+    subprocess that can only fail would report a subprocess error; the
+    preflight warning already promises "report the verdict and stop"."""
+    counters = DriveCounters()
+    action = step(requested_changes(auto_loop=False), counters=counters)
+    assert action.is_exit
+    assert action.exit_code == EXIT_TERMINAL_FAILURE
+    assert "auto_loop is OFF" in action.message
+    assert counters.fix_rounds == 0
 
 
 def test_request_changes_stops_when_the_review_fix_loop_is_exhausted():
@@ -1335,6 +1464,41 @@ def test_request_changes_stops_when_the_review_fix_loop_is_exhausted():
     )
     assert action.is_exit
     assert "fix loop is exhausted" in action.message
+
+
+def test_max_review_iterations_dies_BEFORE_any_fix_is_dispatched():
+    """#1692: the outer cap stays first. With the whole fix budget untouched
+    the driver must still refuse — `max_review_iterations` bounds the ISSUE's
+    review loop across every drive that ever touches it, and
+    `_dispatch_fix_for_review` would refuse this dispatch anyway
+    (`next_iteration > max_iter`), turning a clear cap message into an opaque
+    subprocess failure. Nothing is spawned and no round is spent."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_fix_rounds=99)
+    action = step(
+        requested_changes(work_review_iter=5, max_review_iterations=5),
+        opts,
+        counters=counters,
+    )
+    assert action.is_exit
+    assert action.command == ()
+    assert counters.fix_rounds == 0
+    assert counters.review_fix_dispatched_for == ""
+    assert "fix loop is exhausted" in action.message
+
+
+def test_max_fix_rounds_zero_never_dispatches_a_review_fix():
+    """The test arm's `max_fix_rounds=0` guard, mirrored: a drive told to
+    spend nothing must spend nothing on the review arm either."""
+    counters = DriveCounters()
+    action = step(
+        requested_changes(),
+        DriveOptions(machine="precision", max_fix_rounds=0),
+        counters=counters,
+    )
+    assert action.is_exit
+    assert action.command == ()
+    assert counters.fix_rounds == 0
 
 
 def test_interactive_work_requests_its_review_exactly_once_under_force_review():
