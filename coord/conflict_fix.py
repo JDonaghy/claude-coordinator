@@ -530,7 +530,22 @@ def dispatch_conflict_fix(
         "type": "conflict-fix",
         "system_prompt": system_prompt,
         "review_target": entry.branch,
-        "branch": entry.branch,
+        # #1694 (review finding): `branch` is the wire field every other
+        # dispatcher (dispatch.py/review.py/smoke.py/gate_b.py/auto_loop.py/
+        # reconcile.py) fills with the REPO'S REAL default/integration branch
+        # — `_setup_worktree`'s and `_restore_base_checkout`'s `default_branch`
+        # come straight from it (`assignment.spec.branch or "main"`). This
+        # dispatcher used to send `entry.branch` here too — the SAME value as
+        # `target_branch` below (the work branch) — so a base checkout parked
+        # on `entry.branch` looked identical to "already on the default
+        # branch" and both Part A's restore and Part B's `_git_worktree_add`
+        # remedy silently no-op'd (`branch == default_branch` short-circuit).
+        # `entry.target_branch` is the merge target `QueuedMerge` actually
+        # carries for this entry (repo.default_branch, or the milestone
+        # feature branch when the repo opted into that git model — see
+        # merge_queue.enqueue) — exactly the "default branch" Part A/B need,
+        # and never equal to `entry.branch` by construction.
+        "branch": entry.target_branch or "main",
         # #277: pin the agent to the original branch — otherwise it derives a
         # slug from the "[conflict-fix] …" issue_title and pushes the rebase
         # to an orphan branch, leaving the real PR stale.

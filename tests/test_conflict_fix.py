@@ -269,7 +269,12 @@ class TestDispatch:
         assert payload["type"] == "conflict-fix"
         assert payload["system_prompt"] == CONFLICT_FIX_SYSTEM_PROMPT
         assert payload["review_target"] == "issue-1-fix"
-        assert payload["branch"] == "issue-1-fix"
+        # #1694: `branch` must carry the repo's real default/merge-target
+        # branch (`entry.target_branch`), NOT the work branch — otherwise it
+        # is indistinguishable from `target_branch` below and Part A/B's
+        # `branch == default_branch` short-circuit silently no-ops.
+        assert payload["branch"] == "main"
+        assert payload["target_branch"] == "issue-1-fix"
         assert payload["repo_path"] == "/work/api"
 
     def test_returns_none_if_already_in_flight(

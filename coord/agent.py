@@ -2029,9 +2029,11 @@ def _restore_base_checkout_branch(
 
     Returns the ref it ended up on (``default_branch``, or ``"HEAD (detached)"``
     when the default branch could not be checked out), or ``None`` when the
-    move was refused or failed.  Never raises, never deletes anything, and
-    never touches the working tree contents — the only mutation is which
-    commit HEAD points at, and only from a state proven clean first.
+    move was refused or failed.  Never raises and never deletes or discards
+    anything — the tracked files ARE rewritten to match ``default_branch``'s
+    tree (that's the point: HEAD moves off *branch*), but only from a state
+    :func:`_base_checkout_move_blockers` has proven clean first, so nothing
+    uncommitted, unpushed, or stashed is ever at risk.
 
     *default_branch* is preferred over ``--detach`` deliberately: a human who
     later opens ``~/src/<repo>`` expects ``main``/``develop``, which is also
