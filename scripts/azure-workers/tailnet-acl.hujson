@@ -1,0 +1,80 @@
+// Tailnet policy for johnfdonaghy@gmail.com
+// Phase 0: isolate ephemeral coord worker VMs from the rest of the tailnet.
+//
+// WARNING: defining "acls" switches the tailnet from default-allow to default-deny.
+// The first rule below preserves your current device-to-device access. Do not omit it.
+{
+  "tagOwners": {
+    "tag:coord-worker": ["autogroup:admin"],
+  },
+
+  "hosts": {
+    "dellserver": "100.97.107.88",
+  },
+
+  "acls": [
+    // 1. Your own (untagged) devices keep full access to each other.
+    //    precision, elitebook, dellserver, pixel-8a — unchanged from today.
+    {
+      "action": "accept",
+      "src":    ["autogroup:member"],
+      "dst":    ["autogroup:member:*"],
+    },
+
+    // 2. Your devices may reach a worker VM: coord agent (7433) + SSH for debug.
+    {
+      "action": "accept",
+      "src":    ["autogroup:member"],
+      "dst":    ["tag:coord-worker:22,7433"],
+    },
+
+    // 3. A worker VM may reach the board daemon ONLY. This is the rule that
+    //    contains a compromised worker — no lateral movement to your machines.
+    {
+      "action": "accept",
+      "src":    ["tag:coord-worker"],
+      "dst":    ["dellserver:7435"],
+    },
+
+    // 4. SUBNET ROUTES — uncomment and set your real VNet CIDR if you still use
+    //    vm-acme-dev-platform as a subnet router. Default-deny will otherwise
+    //    break your private Azure VNet access. Workers are deliberately excluded.
+    // {
+    //   "action": "accept",
+    //   "src":    ["autogroup:member"],
+    //   "dst":    ["10.0.0.0/16:*"],
+    // },
+  ],
+
+  // Workers never advertise routes and never act as an exit node.
+  "autoApprovers": {},
+
+  "tests": [
+    // A worker can reach the board daemon...
+    {
+      "src":    "tag:coord-worker",
+      "accept": ["dellserver:7435"],
+    },
+    // ...and nothing else on your tailnet.
+    {
+      "src":  "tag:coord-worker",
+      "deny": [
+        "100.116.209.7:22",   // precision
+        "100.85.221.28:22",   // elitebook
+        "100.97.107.88:22",   // dellserver SSH
+        "100.84.66.33:22",    // pixel-8a  (a concrete port: ACL tests reject "*")
+      ],
+    },
+    // Your machines can still reach each other.
+    {
+      "src":    "100.116.209.7",
+      "accept": ["100.97.107.88:7435", "100.85.221.28:22"],
+    },
+    // The live operator SSH path: elitebook -> precision. If a future edit
+    // would break this, the save is rejected rather than cutting the session.
+    {
+      "src":    "100.85.221.28",
+      "accept": ["100.116.209.7:22", "100.97.107.88:7435"],
+    },
+  ],
+}
