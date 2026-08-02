@@ -3550,6 +3550,76 @@ def test_flood_guard_skips_active_fix_followup(fake_dispatch) -> None:
     assert fake_dispatch == ["w2"]
 
 
+def test_flood_guard_skips_active_fix_followup_keyed_on_the_child(
+    fake_dispatch,
+) -> None:
+    """#1553 regression: the #459 guard must match a slice's retry.
+
+    Both completed rows share the oracle-loop tracking issue's number
+    (``issue_number=1120``) — that's how every JIT acceptance slice under one
+    milestone is dispatched — but are attributed to different children via
+    ``for_issue_number``. A generic ``coord retry`` of a *different* round for
+    child #1124 lands on the board as ``type="work"`` carrying
+    ``for_issue_number=1124`` (``coord.reconcile._reassign``), while
+    ``issue_number`` stays the tracking issue. Before #1553's call-site fix,
+    ``has_active_work_followup`` was invoked with the raw (tracking) issue
+    number here, so it matched nothing (the active row's raw ``issue_number``
+    also reads 1120, but effective-vs-raw comparisons no longer align) and
+    silently let the review through against code that was actively being
+    rewritten. Only #1124's round must be deferred; the sibling round for
+    #1125, which has no active work, must still be dispatched.
+    """
+    rows = [
+        Assignment(
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=1120,  # shared tracking issue
+            issue_title="[test-author] ms-38 slice #1124",
+            assignment_id="w1124",
+            status="done",
+            branch="ms-38-acceptance",
+            type="test-author",
+            for_issue_number=1124,
+            review_state=None,
+            dispatched_at=0.0,
+            finished_at=1.0,
+        ),
+        Assignment(
+            machine_name="laptop",
+            repo_name="api",
+            issue_number=1120,  # shared tracking issue
+            issue_title="[test-author] ms-38 slice #1125",
+            assignment_id="w1125",
+            status="done",
+            branch="ms-38-acceptance",
+            type="test-author",
+            for_issue_number=1125,
+            review_state=None,
+            dispatched_at=0.0,
+            finished_at=1.0,
+        ),
+    ]
+    board = Board(
+        completed=rows,
+        active=[
+            Assignment(
+                machine_name="laptop",
+                repo_name="api",
+                issue_number=1120,  # tracking issue, unchanged by the retry
+                issue_title="[fix] retry of slice #1124",
+                assignment_id="retry1124",
+                status="running",
+                type="work",
+                for_issue_number=1124,  # attribution the retry inherits
+            )
+        ],
+    )
+    cfg = _flood_config(max_auto_dispatch_per_pass=5, flood_threshold=12)
+    out = dispatch_pending_reviews(board, cfg)
+    assert len(out) == 1  # only #1125's round; #1124's is mid-rewrite
+    assert fake_dispatch == ["w1125"]
+
+
 def test_flood_guard_respects_test_gate(fake_dispatch) -> None:
     rows = _pending_work(4)
     rows[0].test_state = "passed"
