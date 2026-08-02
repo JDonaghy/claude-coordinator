@@ -512,6 +512,19 @@ def effective_issue_number(assignment: "Assignment | dict") -> int:
       issue; re-keying only the heads would desync the two.
     * ``coord.pipeline.PipelineView.issue_number`` — the CLI's per-assignment
       pipeline view, which reports the row as dispatched.
+
+    ``coord.claim.has_active_work_followup`` itself keys its scan on the
+    effective issue (it calls this helper internally), so BOTH of its
+    callers — ``coord.review.dispatch_review`` and
+    ``coord.review.dispatch_pending_reviews`` — must pass
+    ``effective_issue_number(...)`` too, not the raw ``.issue_number``.
+    Passing the raw value there silently reopens the #459 stale-review
+    guard for exactly the oracle-loop slices this function exists for: an
+    in-flight ``type="work"`` retry for child A (carrying
+    ``for_issue_number``) would no longer be detected as "actively
+    rewriting the branch" when checking a completed round for that same
+    child, because the two sides would be comparing effective-vs-raw
+    instead of effective-vs-effective.
     """
     if isinstance(assignment, dict):
         raw_for = assignment.get("for_issue_number")

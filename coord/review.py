@@ -1537,10 +1537,22 @@ def dispatch_review(
     # stale code now would produce a verdict on code that's about to change.
     # Leave the caller's review_state as "pending" so the next reconcile pass
     # retries once the active fix finishes.
+    #
+    # #1553: compare on the *effective* issue (see
+    # ``coord.models.effective_issue_number``), not the raw
+    # ``completed.issue_number``. For an oracle-loop acceptance slice,
+    # ``issue_number`` is the shared tracking issue, so keying on it here
+    # would match ANY in-flight work/conflict-fix under that milestone (an
+    # unrelated child) rather than only a live rewrite of THIS row's branch.
+    # ``has_active_work_followup`` itself already keys its scan on the
+    # effective issue; this call site has to match or the guard silently
+    # stops firing for exactly the slices #1553 restored visibility for.
+    from coord.models import effective_issue_number
+
     if has_active_work_followup(
         board,
         repo_name=completed.repo_name,
-        issue_number=completed.issue_number,
+        issue_number=effective_issue_number(completed),
     ):
         return _deny(
             "a work or fix assignment is actively rewriting the branch for "
@@ -2020,6 +2032,7 @@ def dispatch_pending_reviews(board, config, *, test_gate_active: bool = False, n
     import os
 
     from coord.claim import has_active_work_followup
+    from coord.models import effective_issue_number
 
     logger = logging.getLogger("coord.review")
 
@@ -2173,8 +2186,11 @@ def dispatch_pending_reviews(board, config, *, test_gate_active: bool = False, n
         # lets a human deliberately request a headless review if they want one.
         and c.provider_name != "claude-pty"
         and (not gate_test or c.test_state in ("passed", "skipped"))
+        # #1553: effective issue, not raw — see the matching comment on the
+        # ``dispatch_review`` call site above; both must key on the same
+        # thing has_active_work_followup itself keys on internally.
         and not has_active_work_followup(
-            board, repo_name=c.repo_name, issue_number=c.issue_number
+            board, repo_name=c.repo_name, issue_number=effective_issue_number(c)
         )
     ]
     if not eligible:

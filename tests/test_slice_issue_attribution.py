@@ -224,6 +224,78 @@ def test_dispatch_review_of_a_slice_books_the_review_to_the_child() -> None:
     assert effective_issue_number(review) == 1124
 
 
+def test_dispatch_review_defers_when_a_sibling_round_has_an_active_retry() -> None:
+    """#1553 regression: the #459 guard must key on the effective issue.
+
+    A different round for the SAME child (#1124) is actively being retried
+    (``type="work"``, the generic ``coord retry`` path — see
+    ``coord.reconcile._reassign``): it carries ``for_issue_number=1124`` but
+    keeps ``issue_number`` as the shared tracking issue, exactly like
+    ``author-1`` below. Before the call-site fix, ``dispatch_review`` passed
+    the raw (tracking) ``issue_number`` to ``has_active_work_followup``,
+    which internally compares by the effective issue — an effective-vs-raw
+    mismatch that let the guard silently stop firing. The review must be
+    deferred (``dispatch_review`` returns ``None``) rather than dispatched
+    against code that's mid-rewrite.
+    """
+    from coord.models import Assignment, Board
+    from coord.review import dispatch_review
+
+    active_retry = Assignment(
+        assignment_id="retry-1124",
+        machine_name="laptop",
+        repo_name="api",
+        issue_number=1120,
+        issue_title="[fix] retry of slice #1124",
+        type="work",
+        status="running",
+        for_issue_number=1124,
+    )
+    board = Board(active=[active_retry])
+    completed = _slice_assignment(
+        assignment_id="author-1", status="done", branch="ms-38-acceptance",
+    )
+    result = dispatch_review(
+        completed, board, _review_config(),
+        http_client=_OkClient(),
+        pr_lookup=lambda repo_github, **kw: {"number": 1, "url": "u", "existed": True},
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+    )
+    assert result is None
+
+
+def test_dispatch_review_does_not_defer_for_an_unrelated_sibling_child() -> None:
+    """The guard must not over-match: an active retry for a DIFFERENT child
+    under the same tracking issue must not block this child's review."""
+    from coord.models import Assignment, Board
+    from coord.review import dispatch_review
+
+    active_retry = Assignment(
+        assignment_id="retry-1125",
+        machine_name="laptop",
+        repo_name="api",
+        issue_number=1120,
+        issue_title="[fix] retry of slice #1125",
+        type="work",
+        status="running",
+        for_issue_number=1125,  # different child from `completed` below
+    )
+    board = Board(active=[active_retry])
+    completed = _slice_assignment(
+        assignment_id="author-1", status="done", branch="ms-38-acceptance",
+    )
+    result = dispatch_review(
+        completed, board, _review_config(),
+        http_client=_OkClient(),
+        pr_lookup=lambda repo_github, **kw: {"number": 1, "url": "u", "existed": True},
+        claude_md_reader=lambda p: None,
+        issue_body_fetcher=lambda repo, num: "",
+    )
+    assert result is not None
+    assert result.for_issue_number == 1124
+
+
 def test_dispatch_review_of_ordinary_work_is_unchanged() -> None:
     a = Assignment(
         machine_name="laptop", repo_name="api", issue_number=16,
