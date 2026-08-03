@@ -86,6 +86,9 @@ _JSON_COLUMNS: dict[str, set[str]] = {
     "merge_queue": {"required_gates"},
     "issues": {"labels"},
     "machines": {"capabilities", "repos"},
+    # #1753: the drive queue's pre-req list — ["repo#N", ...] on the wire, a
+    # JSON string in SQLite.
+    "drive_queue": {"after_json"},
 }
 
 # Columns omitted from the board projection.  ``assignments.briefing`` is ~8 MB
@@ -112,6 +115,7 @@ class CoordStore(Protocol):
     def list_machines(self) -> list[dict]: ...
     def list_merge_queue(self) -> list[dict]: ...
     def list_drive_escalations(self) -> list[dict]: ...
+    def list_drive_queue(self) -> list[dict]: ...
     def list_proposals(self) -> list[dict]: ...
     def list_issues(self) -> list[dict]: ...
     def list_plans(self) -> dict[str, Any]: ...
@@ -321,6 +325,10 @@ class SqliteStore:
         with closing(self._connect()) as conn:
             return self._table(conn, "drive_escalations", order="id")
 
+    def list_drive_queue(self) -> list[dict]:
+        with closing(self._connect()) as conn:
+            return self._table(conn, "drive_queue", order="position")
+
     def list_proposals(self) -> list[dict]:
         with closing(self._connect()) as conn:
             return self._table(conn, "proposals", order="id")
@@ -450,6 +458,11 @@ class SqliteStore:
                 # on dismiss), so no retention cap like assignments/
                 # notifications above.
                 "escalations": self._table(conn, "drive_escalations", order="id"),
+                # #1753: the operator-declared `coord drive` queue, in the
+                # order it will run (dense, 0-based `position`). Same
+                # rationale as `escalations` above — bounded by hand, so no
+                # retention cap; `after_json` arrives decoded as a real list.
+                "drive_queue": self._table(conn, "drive_queue", order="position"),
             }
 
     # ── writes (deferred to #590) ────────────────────────────────────────────────
