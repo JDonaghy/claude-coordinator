@@ -1,0 +1,46 @@
+# Acceptance manifest for milestone ms-51 ("Web acceptance oracle
+# (web-playwright)", tracking issue #1537). Maps each acceptance test-id -> the
+# work-order issue it covers.
+#
+# Driver: web-playwright
+#   cd coord/dashboard/webapp && npm run test:acceptance -- ms-51
+#
+# Test-ids are the shape coord.acceptance_drivers.parse_playwright_json_report
+# derives from Playwright's built-in json reporter:
+#   "[{project}] {file} › {describe path} › {test title}"
+# `{file}` is relative to the report's rootDir (tests/acceptance/), hence the
+# `ms-51/` prefix. The ids below were copied from a real report parsed by that
+# function, not hand-composed — `coord acceptance run --issue N` matches them
+# EXACTLY, and a near-miss reads as a wiring failure (#1552).
+#
+# There is no entry point to register: Playwright discovers specs by walking
+# `testDir` (playwright.acceptance.config.ts), so a slice file dropped in this
+# directory is executed as-is.
+#
+# Merged (never clobbered) across issues by coord.acceptance.load_manifest —
+# later ms-51 slices append their own entries here.
+tests:
+  # ── #1544 (W0-7) — Home / Active tab, the M-W0 exit-gate proving slice ────
+  # Contract: tests/acceptance/ms-51/contract.md · mock: mocks/home-active.html
+  # §1a/§1b — header title + subtitle
+  "[chromium] ms-51/home-active.spec.ts › ms-51 Home Active tab (#1544) › header shows the coord title and the pipeline subtitle": 1544
+  # §2a/§2b/§2c — tablist, its two tabs, Active selected by default
+  "[chromium] ms-51/home-active.spec.ts › ms-51 Home Active tab (#1544) › filter tablist offers Active and Needs me with Active selected by default": 1544
+  # §2d — non-zero count rendered, zero count absent, count != visible cards
+  "[chromium] ms-51/home-active.spec.ts › ms-51 Home Active tab (#1544) › Active tab counts every non-merged item while Needs me shows no count": 1544
+  # §2e — activating Needs me moves the selection and hides the cards
+  "[chromium] ms-51/home-active.spec.ts › ms-51 Home Active tab (#1544) › activating Needs me selects it and hides the pipeline cards": 1544
+  # §3a/§3b — the Active items region, one button card per in-flight item
+  "[chromium] ms-51/home-active.spec.ts › ms-51 Home Active tab (#1544) › Active items region holds one button card per in-flight item": 1544
+  # §4a/§4b/§4c — card content for #42 + the status badge
+  "[chromium] ms-51/home-active.spec.ts › ms-51 Home Active tab (#1544) › pipeline card for issue 42 shows title, repo, number, machine and status": 1544
+  # §4b — the issue number is monospace ("a value the machine owns")
+  "[chromium] ms-51/home-active.spec.ts › ms-51 Home Active tab (#1544) › issue number is rendered in a monospace element": 1544
+  # §4d — four stage chips: work, review, test, merge (order pins bug #1724)
+  "[chromium] ms-51/home-active.spec.ts › ms-51 Home Active tab (#1544) › pipeline card renders four stage chips in work review test merge order": 1544
+  # §4e — chip state is per-stage, not one global status (#99)
+  "[chromium] ms-51/home-active.spec.ts › ms-51 Home Active tab (#1544) › chip state is derived per stage on issue 99 not from one global status": 1544
+  # §4f — the test chip renders dimmed/skipped (pins bug #1724)
+  "[chromium] ms-51/home-active.spec.ts › ms-51 Home Active tab (#1544) › test chip renders dimmed in the skipped style": 1544
+  # §5a/§5b/§5c — Work done section, collapsed by default, with its count
+  "[chromium] ms-51/home-active.spec.ts › ms-51 Home Active tab (#1544) › Work done section is collapsed by default and shows its item count": 1544
