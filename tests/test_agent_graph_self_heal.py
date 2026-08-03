@@ -289,6 +289,84 @@ def test_graphify_update_never_passes_force(monkeypatch, tmp_path: Path) -> None
     assert "--force" not in captured["argv"]
 
 
+# ── concurrent pollers: never a duplicate rebuild against one checkout ──────
+
+
+def test_concurrent_health_polls_do_not_launch_duplicate_rebuilds(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """#1729 fix iteration 1: `_cached_local_health`'s cache check-then-
+    recompute is deliberately unlocked, so two `/health` calls landing on
+    separate threads (real life: `asyncio.to_thread(server.health)` in
+    `coord/agent_app.py`, hit by the dashboard, TUI, `coord status`, and the
+    board-daemon reconcile all at once) can both see a stale cache and both
+    decide the same checkout is "stale, not yet attempted". Without
+    `self._graph_rebuild_in_progress`, both would launch their own
+    `graphify update .` against the same checkout — two writers racing on
+    `graphify-out/graph.json`/`manifest.json` is a real corruption vector,
+    not just wasted CPU. The second poller must skip the rebuild outright,
+    not queue behind the first one (health stays advisory: a `/health` call
+    must never block on another poller's rebuild).
+    """
+    repo = _init_repo(tmp_path / "repo")
+    _write_graph(repo, built_sha="0" * 8)
+    server = _server(tmp_path, repo)
+
+    calls = []
+    max_concurrent = []
+    in_flight = 0
+    counter_lock = threading.Lock()
+    rebuild_started = threading.Event()
+    release_rebuild = threading.Event()
+
+    def _fake_update(repo_path: Path):
+        nonlocal in_flight
+        with counter_lock:
+            in_flight += 1
+            max_concurrent.append(in_flight)
+        calls.append(repo_path)
+        rebuild_started.set()
+        release_rebuild.wait(timeout=5.0)
+        with counter_lock:
+            in_flight -= 1
+        head = _git(repo_path, "rev-parse", "HEAD")
+        _write_graph(repo_path, built_sha=head)
+        return True, "ok"
+
+    monkeypatch.setattr("coord.agent._graphify_update", _fake_update)
+
+    results: list[dict] = []
+
+    def _poll() -> None:
+        results.append(server.health())
+
+    t1 = threading.Thread(target=_poll)
+    t1.start()
+    try:
+        assert rebuild_started.wait(timeout=5.0), "fake rebuild never started"
+
+        # A second poller landing while the first is still mid-rebuild must
+        # not launch a second `graphify update .`, and must not block
+        # waiting for the first one to finish either.
+        t2 = threading.Thread(target=_poll)
+        t2.start()
+        t2.join(timeout=2.0)
+        assert not t2.is_alive(), "second /health call blocked on the first poller's rebuild"
+    finally:
+        release_rebuild.set()
+        t1.join(timeout=5.0)
+
+    assert calls == [repo], "a second concurrent poller must not launch its own rebuild"
+    assert max_concurrent == [1], "at most one graphify update . in flight at a time"
+
+    # The second poller finishes well before the first (it skips the
+    # rebuild rather than waiting on it), so it's `results[0]` regardless of
+    # thread-start order. Its own report reflects the pre-heal stale state
+    # (skipped, not faked as healed) rather than fabricating success.
+    (second_graph,) = [r for r in results[0]["health"]["results"] if r["check_id"] == "graph"]
+    assert second_graph["values"]["stale"] is True
+
+
 # ── #1625 decision 3 / #1485 precedent: health must stay advisory ──────────
 
 

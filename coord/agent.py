@@ -3743,6 +3743,27 @@ class AgentServer:
         # `systemctl --user restart coord-agent` anyway.
         self._graph_rebuild_failed: dict[str, tuple[str, str]] = {}
 
+        # #1729 fix iteration 1: `/health` is served via
+        # `asyncio.to_thread(server.health)` (`coord/agent_app.py`), so
+        # concurrent `/health` requests routinely land on separate threads.
+        # `_cached_local_health`'s cache check-then-recompute is
+        # deliberately unlocked (see its docstring — locking it would
+        # serialize /health itself), so once the cache goes stale, every
+        # poller that lands during the recompute window independently
+        # decides "stale, not yet attempted" and would otherwise each
+        # launch its own `graphify update .` against the same checkout —
+        # two `update` processes racing to write the same
+        # `graphify-out/graph.json`/`manifest.json` is a real corruption
+        # vector (guard 4), not just wasted CPU (guard 1). This set of
+        # checkout paths with a rebuild currently in flight closes that gap
+        # without serializing `/health` itself: whichever thread claims a
+        # path first proceeds, every other thread skips that path this poll
+        # rather than starting a second `graphify update .`. Guarded by
+        # `self._lock`, held only for the add/remove — never across the
+        # subprocess call itself, same "never block a dispatch" rule guard 1
+        # already follows.
+        self._graph_rebuild_in_progress: set[str] = set()
+
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self._load_state()
@@ -3930,9 +3951,25 @@ class AgentServer:
         gets the WARN replacement described above. Never raises — the
         caller (`_cached_local_health`) wraps this in its own try/except
         so a bug here can never blind the rest of the health block.
-        """
-        from coord.health.models import Severity  # noqa: PLC0415
 
+        Concurrent-poller note (#1729 fix iteration 1): `_cached_local_health`
+        recomputes without a lock, so more than one thread can reach this
+        method at once, each having independently decided the same checkout
+        is stale and unattempted. `self._graph_rebuild_in_progress` (see its
+        docstring in `__init__`) is what stops that from becoming two
+        concurrent `graphify update .` runs against one checkout — claimed
+        right before the subprocess call, released in a `finally` around it.
+
+        The per-checkout loop below is sequential: a slow or hung
+        `graphify update .` (up to `_graphify_update`'s 600s timeout) on one
+        stale checkout delays this poll's report for every other stale
+        checkout considered after it. Acceptable for the common
+        one-repo-per-machine case this issue targets; a multi-repo machine
+        with more than one simultaneously-stale checkout would notice one
+        checkout's rebuild holding up another's — worth revisiting (e.g.
+        running rebuilds concurrently, bounded by the in-progress set above)
+        if that setup becomes common.
+        """
         with self._lock:
             active = sum(1 for a in self._assignments.values() if a.status == RUNNING)
         if active:
@@ -3963,7 +4000,24 @@ class AgentServer:
                 report.results[i] = self._graph_failure_result(result, values, previously_failed[1])
                 continue
 
-            ok, detail = _graphify_update(repo_path)
+            # Concurrent-poller guard (see this method's docstring and
+            # `self._graph_rebuild_in_progress`'s docstring in `__init__`):
+            # claim this path before starting the subprocess, release it
+            # unconditionally afterwards. A thread that finds the path
+            # already claimed skips it this poll rather than launching a
+            # second `graphify update .` against the same checkout — the
+            # lock is held only for the set add/remove, never across
+            # `_graphify_update` itself, so this never blocks a dispatch.
+            with self._lock:
+                if path_str in self._graph_rebuild_in_progress:
+                    continue
+                self._graph_rebuild_in_progress.add(path_str)
+
+            try:
+                ok, detail = _graphify_update(repo_path)
+            finally:
+                with self._lock:
+                    self._graph_rebuild_in_progress.discard(path_str)
 
             if not ok:
                 # Guard 4.
@@ -3978,7 +4032,13 @@ class AgentServer:
 
             from coord.health.registry import run_all as _run_graph_only  # noqa: PLC0415
 
-            refreshed = _run_graph_only(ctx, scopes=("checkout",), only=("graph",))
+            # Probe only the checkout that just healed, not every checkout
+            # `ctx` knows about — the check itself is cheap, but there's no
+            # reason to re-run it fleet-wide just to pick one result out.
+            healed_ctx = replace(
+                ctx, checkouts=tuple(c for c in ctx.checkouts if str(c.path) == path_str)
+            )
+            refreshed = _run_graph_only(healed_ctx, scopes=("checkout",), only=("graph",))
             replacement = next(
                 (r for r in refreshed.results if (r.values or {}).get("path") == path_str),
                 None,
