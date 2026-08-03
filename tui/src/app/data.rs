@@ -1457,6 +1457,12 @@ pub(crate) fn load_data() -> BoardData {
         // server-side only, same posture as merge_plan above). Pass empty;
         // the Pipeline row/menu simply show no escalation on this path.
         Vec::new(),
+        // #1631 (H-4): local SQLite path has no daemon-in-process to poll
+        // agent /health or run the fleet-scope registry either — same
+        // posture as merge_plan/escalations above. Pass the empty default;
+        // the status-bar indicator renders "FLEET: OK" (zero units, not a
+        // fabricated warning) and the detail overlay is empty on this path.
+        FleetHealthBlock::default(),
     )
 }
 
@@ -1496,6 +1502,7 @@ pub(crate) fn assemble_board_data(
     goal_header: GoalHeader,
     audit_recent_count: u64,
     escalations: Vec<EscalationEntry>,
+    fleet_health: FleetHealthBlock,
 ) -> BoardData {
     // ── Machine reachability probes + health fetches ──────────────────────
     // Probe using the Tailscale host (fixes #121: machine name ≠ Tailscale hostname).
@@ -1615,6 +1622,7 @@ pub(crate) fn assemble_board_data(
         goal_header,
         audit_recent_count,
         escalations,
+        fleet_health,
     }
 }
 
@@ -2220,6 +2228,10 @@ pub(crate) fn load_data_remote(url: &str, token: Option<&str>) -> BoardData {
         // #1505: server-computed driver-escalation records; empty on
         // daemons that predate #1505.
         payload.escalations,
+        // #1631 (H-4): server-computed fleet-health aggregate; empty
+        // (`FleetHealthBlock::default()`, via `#[serde(default)]`) on
+        // daemons that predate #1630.
+        payload.fleet_health,
     )
 }
 

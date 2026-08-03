@@ -40551,3 +40551,175 @@ Milestone tracking issue.
             "the child's Acceptance-Authoring box must still find its slice"
         );
     }
+
+    // ── #1631 (H-4): fleet-health status-bar indicator + detail overlay ────
+
+    /// One machine, CRIT disk check — the seed the acceptance bar itself
+    /// specifies ("seed BoardData with a CRIT disk value").
+    fn crit_fleet_health() -> FleetHealthBlock {
+        FleetHealthBlock {
+            machine_health: vec![FleetMachineHealth {
+                machine: "laptop".to_string(),
+                state: "online".to_string(),
+                severity: "crit".to_string(),
+                stale: false,
+                checked_at: Some(1_700_000_000.0),
+                results: vec![FleetHealthCheckResult {
+                    title: "disk".to_string(),
+                    label: "disk /".to_string(),
+                    severity: "crit".to_string(),
+                    headroom: "2% free (1G free)".to_string(),
+                    threshold: "crit at 7%".to_string(),
+                    ..FleetHealthCheckResult::default()
+                }],
+                ..FleetMachineHealth::default()
+            }],
+            fleet_checks: vec![],
+        }
+    }
+
+    /// The acceptance bar's black-box scenario, end to end: seed a CRIT
+    /// disk value, assert the status-bar indicator renders CRIT, open the
+    /// detail overlay (right-click the status bar -> "Fleet health…" menu
+    /// entry, its accelerator shown inside the menu -> click it), assert the
+    /// offending machine and its headroom string appear.
+    #[test]
+    fn tuidriver_fleet_health_status_bar_crit_and_overlay_show_machine_and_headroom() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let data = BoardData {
+            fleet_health: crit_fleet_health(),
+            ..BoardData::default()
+        };
+        let app = make_test_app(data);
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+
+        // The aggregate indicator is always present (not just on trouble) and
+        // reflects the seeded CRIT machine — one unit, one CRIT.
+        let screen = driver.screen();
+        assert!(
+            screen.contains("FLEET: CRIT 1"),
+            "#1631: status bar must render the CRIT aggregate:\n{}",
+            screen
+        );
+
+        // Reached by right-click — not a status-bar letter row the operator
+        // has to already know about.
+        let (x, y) = driver.find("FLEET").unwrap_or_else(|| {
+            panic!(
+                "#1631: fleet-health status-bar segment not found:\n{}",
+                driver.screen()
+            )
+        });
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: MouseButton::Right,
+            position: Point::new(x, y),
+            modifiers: Modifiers::default(),
+        });
+        let menu_screen = driver.screen();
+        assert!(
+            menu_screen.contains("Fleet health"),
+            "#1631: right-click on the status bar must open the 'Fleet health…' \
+             menu entry:\n{}",
+            menu_screen
+        );
+
+        // Activate the pre-selected (only) item via Enter, not a second
+        // mouse click on the menu row — a mouse click on context-menu item
+        // rows hits a pre-existing quadraui hit-test/paint offset (see
+        // `tuidriver_send_to_pipeline_posts_directly_to_daemon_no_subprocess`'s
+        // comment on the same caveat); Enter drives `selected_idx` directly.
+        driver.press_named(NamedKey::Enter);
+
+        let overlay_screen = driver.screen();
+        assert!(
+            overlay_screen.contains("laptop"),
+            "#1631: detail overlay must name the offending machine:\n{}",
+            overlay_screen
+        );
+        assert!(
+            overlay_screen.contains("2% free (1G free)"),
+            "#1631: detail overlay must show the check's headroom string:\n{}",
+            overlay_screen
+        );
+    }
+
+    /// A machine reporting no health at all (never polled — the shape
+    /// `coord.health.fleet_snapshot._machine_health_rows` produces for an
+    /// absent DB row) must render as `unknown`/`?`, visually distinct from
+    /// an `OK` machine — never silently green (#1485's failure mode).
+    #[test]
+    fn tuidriver_fleet_health_unknown_machine_distinct_from_ok() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let data = BoardData {
+            fleet_health: FleetHealthBlock {
+                machine_health: vec![
+                    FleetMachineHealth {
+                        machine: "server".to_string(),
+                        state: "online".to_string(),
+                        severity: "ok".to_string(),
+                        stale: false,
+                        checked_at: Some(1_700_000_000.0),
+                        results: vec![],
+                    },
+                    FleetMachineHealth {
+                        machine: "ghost".to_string(),
+                        state: "unknown".to_string(),
+                        severity: "unknown".to_string(),
+                        stale: false,
+                        checked_at: None,
+                        results: vec![],
+                    },
+                ],
+                fleet_checks: vec![],
+            },
+            ..BoardData::default()
+        };
+        let app = make_test_app(data);
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("FLEET: OK"),
+            "#1631: a machine with no health data must not render the fleet \
+             as OK:\n{}",
+            screen
+        );
+        assert!(
+            screen.contains("FLEET: ? 1"),
+            "#1631: the unknown machine must be counted and surfaced, \
+             distinct from OK:\n{}",
+            screen
+        );
+
+        // Open the overlay and confirm the unknown machine renders visibly
+        // differently from the healthy one (its header carries "unknown").
+        let (x, y) = driver.find("FLEET").expect("status bar must render");
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: MouseButton::Right,
+            position: Point::new(x, y),
+            modifiers: Modifiers::default(),
+        });
+        driver
+            .find("Fleet health")
+            .expect("'Fleet health…' menu entry must render");
+        // Enter, not a second click — see the sibling CRIT test's comment
+        // for why a mouse click on the menu row itself is unreliable here.
+        driver.press_named(NamedKey::Enter);
+
+        let overlay_screen = driver.screen();
+        assert!(
+            overlay_screen.contains("ghost"),
+            "#1631: overlay must list the unknown machine:\n{}",
+            overlay_screen
+        );
+        assert!(
+            overlay_screen.contains("stale/unknown"),
+            "#1631: the unknown machine's row must be visibly marked distinct \
+             from a healthy one:\n{}",
+            overlay_screen
+        );
+    }

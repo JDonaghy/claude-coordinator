@@ -770,6 +770,20 @@ impl CoordApp {
             }
         }
 
+        // ── #1631 (H-4): fleet-health detail overlay owns ALL input while
+        // open — Esc is the only thing it responds to (a read-only report,
+        // nothing to submit). Checked before the file-issue modal block
+        // below on general "small global overlay" priority, mirroring how
+        // `help_overlay`'s own Esc-close is checked ahead of narrower modals.
+        if self.fleet_health_overlay_open {
+            if let UiEvent::KeyPressed { key, .. } = &event {
+                if matches!(key, Key::Named(NamedKey::Escape)) {
+                    self.close_fleet_health_overlay();
+                }
+            }
+            return Reaction::Redraw;
+        }
+
         // ── #316 Phase B: file-issue modal owns ALL input while open ───
         // Esc cancels; Ctrl+Y submits via `gh issue create`.
         if self.file_issue_modal.is_some() {
@@ -4326,6 +4340,16 @@ impl CoordApp {
                         if self.open_context_menu(pos, target) {
                             return true;
                         }
+                    }
+                } else if ctx.in_status_bar(pos.x, pos.y) {
+                    // #1631 (H-4): right-click anywhere on the status bar
+                    // opens the "Fleet health…" menu — the always-visible
+                    // indicator itself carries no `action_id` (see
+                    // `fleet_health.rs`'s module doc comment), so this is
+                    // the discovery path the issue asks for instead of a
+                    // status-bar letter row.
+                    if self.open_context_menu(pos, ContextMenuTarget::FleetHealth) {
+                        return true;
                     }
                 } else if ctx.in_main(pos.x, pos.y) {
                     // #1003 fix-up: the Plans-panel roster lives in the MAIN

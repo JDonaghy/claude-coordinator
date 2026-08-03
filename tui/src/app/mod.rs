@@ -104,6 +104,7 @@ pub(crate) mod fleet_sessions;
 pub(crate) mod workspace;
 pub(crate) mod drive;
 pub(crate) mod escalation;
+pub(crate) mod fleet_health;
 #[allow(unused_imports)]
 use self::types::*;
 #[allow(unused_imports)]
@@ -2279,6 +2280,14 @@ pub struct CoordApp {
     /// `&self` render path; populated on every frame while a menu is open and
     /// cleared when it dismisses.
     context_menu_layout: std::cell::RefCell<Vec<(ContextMenu, ContextMenuLayout)>>,
+    /// #1631 (H-4): the fleet-health detail overlay — opened via the status
+    /// bar's "Fleet health…" right-click menu entry (`fleet_health.rs`).
+    /// Owns ALL input while open (Esc closes it; see `events.rs`), same
+    /// posture as `help_overlay` below. A plain `bool` rather than a
+    /// quadraui `HelpOverlayController`: the content here (per-machine check
+    /// rows grouped under a machine header, sourced from `self.data.
+    /// fleet_health`) doesn't fit that controller's notes/actions shape.
+    fleet_health_overlay_open: bool,
     /// Cached `DialogLayout` from the last prompt-dialog render — used for
     /// click hit-testing on dialog buttons.  Populated while any
     /// `pending_*` prompt dialog is visible; cleared when it dismisses.
@@ -3397,6 +3406,7 @@ impl CoordApp {
             pending_merge_all_ready: None,
             pending_context_menu: None,
             context_menu_layout: std::cell::RefCell::new(Vec::new()),
+            fleet_health_overlay_open: false,
             dialog_layout: std::cell::RefCell::new(None),
             pending_restart: None,
             machine_last_contact: std::collections::HashMap::new(),
@@ -7294,6 +7304,13 @@ impl CoordApp {
                 action_id: None,
             },
         ];
+        // #1631 (H-4): the always-visible fleet-health indicator — present
+        // in every view's status bar regardless of severity ("OK states its
+        // OK-ness rather than printing nothing"), colour-coded by
+        // `FleetSeverity`. Right-click anywhere on the status bar to open
+        // the detail overlay (`events.rs`); see `fleet_health.rs`'s module
+        // doc comment for why this isn't itself clickable.
+        left.push(self.fleet_health_status_bar_segment());
         // Non-blocking warning if the last load failed.
         if let Some((err_msg, when)) = &self.fetch_error {
             if when.elapsed() < Duration::from_secs(10) {

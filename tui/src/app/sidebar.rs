@@ -214,6 +214,8 @@ impl CoordApp {
             // own ALL input while open (see `events.rs`'s dispatch block).
             || self.help_overlay.is_open()
             || self.command_palette.is_some()
+            // #1631: the fleet-health detail overlay owns ALL input while open.
+            || self.fleet_health_overlay_open
     }
 
     /// an `action_id` of the form `"toolbar:<verb>"` resolved by
