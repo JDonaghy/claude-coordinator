@@ -39,6 +39,7 @@ def _work(
     test_head_sha: str | None = None,
     test_base_sha: str | None = None,
     test_patch_id: str | None = None,
+    test_toolchain: str | None = None,
     review_state: str | None = None,
     review_verdict: str | None = None,
     required_gates: list[str] | None = None,
@@ -58,6 +59,7 @@ def _work(
         test_head_sha=test_head_sha,
         test_base_sha=test_base_sha,
         test_patch_id=test_patch_id,
+        test_toolchain=test_toolchain,
         review_state=review_state,
         review_verdict=review_verdict,
         required_gates=required_gates or [],
@@ -123,6 +125,7 @@ class TestRows:
     def test_row_dump_matches_assignment_columns(self, config: Config) -> None:
         work = _work(
             test_state="passed", test_reason="headless smoke",
+            test_toolchain="rustc 1.95.0",
             review_state="done", review_verdict="approve",
         )
         board = Board(active=[], completed=[work])
@@ -135,9 +138,20 @@ class TestRows:
         assert row.branch == "issue-42-foo"
         assert row.test_state == "passed"
         assert row.test_reason == "headless smoke"
+        assert row.test_toolchain == "rustc 1.95.0"
         assert row.review_state == "done"
         assert row.review_verdict == "approve"
         assert row.review_of_assignment_id is None
+
+    def test_row_dump_toolchain_defaults_to_none_for_a_historical_verdict(
+        self, config: Config
+    ) -> None:
+        """#1629: a verdict recorded before this field existed must render as
+        unknown (None), not break the report."""
+        work = _work(test_state="passed")
+        board = Board(active=[], completed=[work])
+        report = build_gate_report(board, config, "api", 42)
+        assert report.rows[0].test_toolchain is None
 
     def test_rows_scoped_to_repo_and_issue(self, config: Config) -> None:
         matching = _work(aid="w1", issue=42)
@@ -349,8 +363,19 @@ class TestFormatting:
         assert "newbase"[:7] in text
         assert "BLOCKED" in text
 
+    def test_format_shows_toolchain_and_falls_back_to_unknown(self, config: Config) -> None:
+        with_toolchain = _work(test_state="passed", test_toolchain="rustc 1.95.0")
+        board = Board(active=[], completed=[with_toolchain])
+        report = build_gate_report(board, config, "api", 42)
+        assert "test_toolchain=rustc 1.95.0" in format_gate_report(report)
+
+        no_toolchain = _work(test_state="passed")
+        board2 = Board(active=[], completed=[no_toolchain])
+        report2 = build_gate_report(board2, config, "api", 42)
+        assert "test_toolchain=unknown" in format_gate_report(report2)
+
     def test_report_to_dict_is_json_serializable(self, config: Config) -> None:
-        work = _work(test_state="passed")
+        work = _work(test_state="passed", test_toolchain="node 20.11.0")
         review = _review("w1", verdict="approve")
         board = Board(active=[], completed=[work, review])
         report = build_gate_report(board, config, "api", 42, gh_ops=FakeGh())
@@ -363,6 +388,7 @@ class TestFormatting:
         assert reloaded["issue_number"] == 42
         assert len(reloaded["rows"]) == 2
         assert len(reloaded["decisions"]) == 3
+        assert reloaded["rows"][0]["test_toolchain"] == "node 20.11.0"
 
     def test_never_mutates_board_or_calls_write_seams(
         self, config: Config, monkeypatch,

@@ -44,7 +44,7 @@ def _gates_via_daemon(svc, params: dict) -> None:
 @click.command(
     help=(
         "Print a work row's gate columns (test_state, smoke_test, test_reason, "
-        "review_state, review_verdict, review_of_assignment_id) plus the LIVE "
+        "test_toolchain, review_state, review_verdict, review_of_assignment_id) plus the LIVE "
         "review/test/merge gate decision — including whether a recorded verdict "
         "is #1479-stale (recorded against a base/branch SHA that has since "
         "moved) and the SHAs compared. Read-only: never mutates board state."

@@ -4152,6 +4152,9 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                 test_reason=body.get("test_reason"),
                 smoke_test=body.get("smoke_test"),
                 smoke_test_reason=body.get("smoke_test_reason"),
+                # #1629: absent on a client older than this field — `.get`
+                # defaults to None, same as no toolchain having been resolved.
+                test_toolchain=body.get("test_toolchain"),
             )
         except Exception as e:  # noqa: BLE001
             return JSONResponse(

@@ -326,6 +326,16 @@ class Assignment:
     test_head_sha: str | None = None
     test_patch_id: str | None = None
     test_base_sha: str | None = None
+    # #1629 (H-2): the toolchain that produced this verdict — e.g.
+    # "rustc 1.95.0" or "python 3.12.4, node 20.11.0" — captured (best-effort,
+    # via coord.health.checks.toolchain) alongside a terminal test_state
+    # write. Annotation only: no gate reads this field to block anything (see
+    # coord.health.checks.toolchain.probe_toolchain_skew, the fleet-scope
+    # check that judges skew — it is advisory, same as every other fleet
+    # check). None for every row predating this feature or where the
+    # producing toolchain could not be resolved — renders as "unknown", not
+    # as a mismatch.
+    test_toolchain: str | None = None
     # #253: parsed adversarial-review verdict for type="review" assignments.
     # None | "approve" | "request-changes". Set when notify or auto_loop
     # extracts the structured REVIEW_VERDICT from the reviewer's log; consumed

@@ -274,6 +274,85 @@ def test_board_dataclass_carries_no_health_field(coord_db) -> None:
     assert not any("health" in name for name in field_names)
 
 
+def test_toolchain_skew_crit_never_touches_dispatch_routing_or_merge(coord_db) -> None:
+    """#1629 (H-2)'s own acceptance bullet, ship as a test not a comment: a
+    CRIT `fleet_toolchain_skew` result — the whole point of this check is to
+    surface a real, actionable disagreement — must leave dispatch targets,
+    review routing, and merge-queue ordering byte-identical, exactly like
+    every other fleet check per #1630's guarantee above.
+    """
+    from coord.milestone_dispatch import pick_machine
+    from coord import merge_queue as mq
+    from coord.review import pick_reviewer_machine
+
+    cfg = Config(repos=[], machines=[_machine("laptop"), _machine("server")])
+    board = Board()
+
+    conn = coord_db
+    for aid, branch, issue in (("work1", "issue-10-a", 10), ("work2", "issue-11-b", 11)):
+        conn.execute(
+            "INSERT INTO merge_queue (assignment_id, repo_name, repo_github, "
+            "branch, target_branch, issue_number, issue_title, state, pr_number) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (aid, "api", "acme/api", branch, "main", issue, f"issue {issue}", "pending", issue),
+        )
+    conn.commit()
+
+    baseline_pick = pick_machine("api", board, cfg)
+    baseline_plan = [json.dumps(p.__dict__, sort_keys=True, default=str) for p in mq.plan(board, cfg)]
+    baseline_reviewer = pick_reviewer_machine("laptop", "api", board, cfg)
+
+    # Seed a genuine CRIT toolchain-skew condition: two machines report
+    # different rustc versions for a repo whose CI pins a third.
+    now = time.time()
+    for name, version in (("laptop", "1.95.0"), ("server", "1.93.1")):
+        state.save_machine_health(
+            name, state="online", reason="", latency_ms=5.0,
+            health={
+                "schema": 1, "checked_at": now, "severity": "ok",
+                "results": [{
+                    "check_id": "toolchain_versions", "scope": "machine",
+                    "subject": "rustc", "severity": "ok",
+                    "headroom": version, "values": {"version": version},
+                }],
+            },
+            received_at=now,
+        )
+    from coord.health.context import build_context
+    from coord.health.models import FleetSnapshot
+    from coord.health.registry import run_all
+
+    fleet = FleetSnapshot(
+        machines={
+            "laptop": {"state": "online", "checks": {"results": [{
+                "check_id": "toolchain_versions", "scope": "machine",
+                "subject": "rustc", "values": {"version": "1.95.0"},
+            }]}},
+            "server": {"state": "online", "checks": {"results": [{
+                "check_id": "toolchain_versions", "scope": "machine",
+                "subject": "rustc", "values": {"version": "1.93.1"},
+            }]}},
+        },
+        daemon_host={
+            "repo_toolchain_kinds": {"api": ["rustc"]},
+            "ci_toolchains": {"api": {"rustc": "1.97.1"}},
+        },
+    )
+    ctx = build_context(cfg, now=now, allow_network=False)
+    ctx.fleet = fleet
+    report = run_all(ctx, scopes=("fleet",))
+    skew = next(r for r in report.results if r.check_id == "fleet_toolchain_skew")
+    assert skew.severity.value == "crit"  # sanity: this test seeded a real CRIT
+
+    seeded_pick = pick_machine("api", board, cfg)
+    seeded_plan = [json.dumps(p.__dict__, sort_keys=True, default=str) for p in mq.plan(board, cfg)]
+    seeded_reviewer = pick_reviewer_machine("laptop", "api", board, cfg)
+
+    assert seeded_pick == baseline_pick
+    assert seeded_plan == baseline_plan
+    assert seeded_reviewer == baseline_reviewer
+
+
 # ── 3. stale-health: unknown after a bounded interval, not forever-green ────
 
 
