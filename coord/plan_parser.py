@@ -102,7 +102,18 @@ class WorkerPlan:
 
 
 def _extract_text_from_stream_json(log_path: Path) -> str:
-    """Concatenate all assistant text blocks from a stream-json log."""
+    """Concatenate all assistant text blocks from a stream-json log.
+
+    #1710 inventory: kept as a direct ``coord.worker_events`` import rather
+    than routed through ``provider.parse_log()`` — this decodes the generic
+    Anthropic-Messages-API ``type: "assistant"`` / ``message.content``
+    envelope (a wire-format detail, not claude business semantics), and
+    ``WorkerSummary`` has no "raw assistant text" field to route through
+    without adding a new abstract ``Provider`` method (which would force a
+    change in every concrete provider, including the out-of-scope
+    ``opencode.py``). Same reasoning as ``coord.review``'s equivalent
+    helpers; see ``tests/test_provider_seam.py``.
+    """
     from coord.worker_events import _assistant_text, parse_event  # noqa: PLC0415
 
     parts: list[str] = []
@@ -177,6 +188,10 @@ def parse_plan_from_log(log_path: str | Path) -> WorkerPlan | None:
     Handles both stream-json (``--output-format stream-json``) and plain-text
     log formats.  Returns ``None`` if the file does not exist or contains no
     recognised plan sections.
+
+    #1710 inventory: ``is_stream_json`` is a generic on-disk-shape sniff, not
+    claude-specific parsing — kept direct. See the note on
+    ``_extract_text_from_stream_json`` above.
     """
     from coord.worker_events import is_stream_json  # noqa: PLC0415
 

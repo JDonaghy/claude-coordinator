@@ -224,6 +224,17 @@ def _decode_transcript_for_diagnostic(text: str) -> str | None:
     first-non-comment-line heuristic misses, even on a log that IS valid
     NDJSON) handed the strict regex raw, undecoded text — silently dropping
     well-formed verdicts whose newlines were still JSON-escaped on disk.
+
+    #1710 inventory: kept as a direct ``coord.worker_events`` import, not
+    routed through ``provider.parse_log()``. This decodes the generic
+    Anthropic-Messages-API ``type: "assistant"`` / ``message.content``
+    envelope — a wire-format detail any Agent-SDK-shaped backend can share —
+    not claude-*business* semantics, and ``Provider``/``WorkerSummary`` have
+    no equivalent "raw assistant text" primitive to route through (adding
+    one would mean a new abstract ``Provider`` method, touching every
+    concrete provider including ``opencode.py`` — out of scope here). See
+    ``tests/test_provider_seam.py::TestReviewExtractionForASecondProvider``
+    for a second-provider log that this already decodes correctly today.
     """
     from coord.worker_events import _assistant_text, parse_event  # noqa: PLC0415
 
@@ -580,6 +591,11 @@ def _parse_review_from_lines(
     `lines` may be any iterable of strings (file iterator, ``str.splitlines()``,
     ``httpx.Response.text.splitlines()``). Used by both `parse_review_from_log`
     (local file) and `parse_review_from_agent` (HTTP fetch).
+
+    #1710 inventory: kept direct — see the identical note on
+    ``_decode_transcript_for_diagnostic`` above. `stream_json` here is the
+    generic "is this NDJSON at all" detection (`is_stream_json`'s
+    first-non-comment-line heuristic), not a claude-specific check.
     """
     from coord.worker_events import _assistant_text, parse_event  # noqa: PLC0415
 
@@ -611,6 +627,11 @@ def parse_review_from_log(log_path: str | Path) -> ReviewFindings | None:
     Handles both stream-json (``--output-format stream-json``) and plain-text
     log formats. Returns ``None`` if the file does not exist or contains no
     structured review output.
+
+    #1710 inventory: ``is_stream_json`` here is a generic on-disk-shape sniff
+    (does the first non-comment line start with ``{``?), not claude-specific
+    parsing — kept direct rather than routed through a ``Provider``. See the
+    note on ``_decode_transcript_for_diagnostic``.
     """
     from coord.worker_events import is_stream_json  # noqa: PLC0415
 

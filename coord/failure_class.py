@@ -55,16 +55,31 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+#1710 inventory — these four stay as direct ``coord.worker_events`` imports
+# rather than routed through a ``Provider``:
+# * ``is_usage_limit_reason``/``USAGE_LIMIT_REASON_PREFIX`` are a trivial
+#   string-prefix predicate over an already-derived ``failure_reason`` value,
+#   not a log-format parse (mirrors the identical note in ``coord.notify``).
+# * ``detect_usage_limit_kill``/``detect_usage_limit_kill_in_log`` scan for
+#   the literal ``claude`` CLI's own subscription "You've hit your session
+#   limit" wording — inherently claude-specific business text with no
+#   generic equivalent; ``Capabilities``/``WorkerSummary`` don't model a
+#   generic "usage limit kill" concept, and inventing one is out of scope
+#   (non-goal: rewriting ``coord.worker_events``).
+# ``classify_log`` (below) is the one function here that DOES read a
+# provider's own log shape, and it routes through ``provider.parse_log()``.
 from coord.worker_events import (
     detect_usage_limit_kill,
     detect_usage_limit_kill_in_log,
     is_usage_limit_reason,
-    iter_events,
     USAGE_LIMIT_REASON_PREFIX,
 )
+
+if TYPE_CHECKING:
+    from coord.providers.base import Provider
 
 # ── the two classes ─────────────────────────────────────────────────────────
 
@@ -428,14 +443,46 @@ def classify_log(
     *,
     failure_reason: str | None = None,
     tail_bytes: int = 65536,
+    provider_name: str | None = None,
+    provider: "Provider | None" = None,
 ) -> FailureClassification:
-    """Classify a worker's terminal state from its stream-json log.
+    """Classify a worker's terminal state from its log.
 
     Checks the usage-limit kill message (via
     :func:`coord.worker_events.detect_usage_limit_kill_in_log`, which is
-    bounded to the transcript's literal last line) and the **last** ``result``
-    event. A missing/unreadable log with no ``failure_reason`` classifies
-    :data:`WORK` — an unreadable log is not evidence of an outage.
+    bounded to the transcript's literal last line — this is the literal
+    ``claude`` CLI subscription-limit message, so it stays a direct
+    ``coord.worker_events`` call regardless of provider; see the #1710
+    inventory) and the terminal state of the log, parsed via the
+    assignment's resolved :class:`~coord.providers.base.Provider`
+    (``provider.parse_log()`` — #1710) rather than assuming every log is
+    claude's stream-json shape. A missing/unreadable log with no
+    ``failure_reason`` classifies :data:`WORK` — an unreadable log is not
+    evidence of an outage.
+
+    *provider_name* (typically ``Assignment.provider_name`` /
+    ``IssueState.work_provider``) resolves via
+    :func:`coord.providers.get_provider`; ``None`` defaults to
+    :class:`~coord.providers.claude.ClaudeProvider`, matching pre-#1710
+    behaviour for every existing caller that doesn't pass it. *provider* is
+    an escape hatch for tests to pass an already-constructed provider
+    directly, bypassing name resolution.
+
+    #1710 NOTE — a documented, narrow behaviour difference from the
+    pre-#1710 implementation: that version additionally scanned the raw
+    ``result`` event's ``error`` and bare ``subtype`` fields (via
+    :func:`classify_result_event`) for an environmental token/phrase when
+    ``result`` itself carried none.
+    :class:`~coord.providers.base.WorkerSummary` (the ``parse_log()`` seam's
+    return shape) only carries ``result_text`` (``raw.get("result")``), not
+    ``error``/``subtype`` — so a claude result event whose *only*
+    environmental signal lives in ``error`` or a bare ``subtype`` phrase
+    (no matching ``api_error_status``, no ``result`` text) would classify
+    differently here than before. No test in ``tests/test_failure_class.py``
+    exercises that narrow combination, and ``classify_log`` itself has no
+    production caller today — but this is exactly the "say so and stop for a
+    decision" case #1710 asks for if a fix proves ``WorkerSummary``'s shape
+    claude-specific. Flagged rather than silently accepted.
     """
     if is_usage_limit_reason(failure_reason):
         return _usage_limit(_reset_at_from_reason(failure_reason), "usage_limit_reason")
@@ -444,15 +491,19 @@ def classify_log(
     if kill is not None:
         return _usage_limit(kill.reset_at_raw, "usage limit kill message")
 
-    last_result: dict | None = None
-    for event in iter_events(log_path, tail_bytes=tail_bytes):
-        if event.type == "result":
-            last_result = event.raw
+    if provider is None:
+        from coord.providers import get_provider  # noqa: PLC0415
+        provider = get_provider(provider_name)
+    summary = provider.parse_log(log_path, tail_bytes=tail_bytes)
 
-    if last_result is not None:
-        classification = classify_result_event(last_result)
-        if classification.is_environmental:
-            return classification
+    classification = classify_failure(
+        api_error_status=summary.api_error_status,
+        is_error=summary.is_error,
+        result_text=summary.result_text,
+        terminal_reason=None,
+    )
+    if classification.is_environmental:
+        return classification
 
     return classify_failure(failure_reason=failure_reason)
 

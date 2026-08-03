@@ -50,6 +50,13 @@ from coord.state import (
     mark_review_posted,
     save_plan,
 )
+
+# #1710 inventory: kept as a direct import — `is_usage_limit_reason` is a
+# trivial string-prefix predicate over `Assignment.failure_reason` (a
+# coordinator-authored value stamped by `format_usage_limit_reason`, itself
+# only ever produced by the reap path's claude-specific kill detection), not
+# a per-provider log-format parse. Any provider's `failure_reason` would be
+# checked the same way.
 from coord.worker_events import is_usage_limit_reason
 
 
@@ -1247,7 +1254,12 @@ def detect_stuck(config: Config) -> list[tuple[StuckDetection, dict]]:
             entry_log = entry.get("log_path")
             if entry_log and not stuck_message:
                 try:
-                    parsed = parse_progress(entry_log)
+                    # #1710: thread the dispatch record's resolved provider
+                    # name through so a non-claude worker's log parses via
+                    # its own provider rather than always assuming claude.
+                    parsed = parse_progress(
+                        entry_log, provider_name=record.get("provider_name"),
+                    )
                     if parsed.stuck:
                         stuck_message = parsed.stuck
                         log_path = entry_log
@@ -1387,7 +1399,7 @@ def _capture_smoke_tests(transition: Transition, entry: dict) -> None:
         )
 
 
-def _capture_cost(transition: Transition, entry: dict) -> None:
+def _capture_cost(transition: Transition, entry: dict, record: dict | None = None) -> None:
     """#208/#546: parse the worker's final cost+tokens and persist them.
 
     Preferred source is the local stream-json log (cheap, no network).
@@ -1396,6 +1408,12 @@ def _capture_cost(transition: Transition, entry: dict) -> None:
     available from the log (not from the agent status dict), so they are
     captured when the local log exists.  Either path is best-effort —
     failure is silent so it can't block the comment post.
+
+    #1710: *record* (the dispatch record from ``load_dispatched()``) carries
+    ``provider_name`` — threaded into :func:`coord.usage.parse_usage_from_log`
+    so cost/token parsing uses the assignment's actual provider instead of
+    always assuming claude. ``None`` (no record, or predates #324) falls back
+    to the claude default, unchanged from before #1710.
     """
     from coord.state import update_assignment_cost, update_assignment_tokens  # noqa: PLC0415
     from coord.usage import parse_usage_from_log  # noqa: PLC0415
@@ -1405,11 +1423,12 @@ def _capture_cost(transition: Transition, entry: dict) -> None:
     output_tokens: int = 0
     cache_creation_tokens: int = 0
     cache_read_tokens: int = 0
+    provider_name = (record or {}).get("provider_name")
 
     log_path = entry.get("log_path")
     if log_path:
         try:
-            parsed = parse_usage_from_log(Path(log_path))
+            parsed = parse_usage_from_log(Path(log_path), provider_name=provider_name)
             if parsed is not None:
                 if parsed.total_cost_usd > 0:
                     cost = parsed.total_cost_usd
@@ -1753,7 +1772,7 @@ def post_transition(transition: Transition, record: dict, entry: dict) -> None:
     # value is in the worker's final stream-json result event and would
     # otherwise be lost when the agent prunes the log.  Best-effort:
     # local log → remote agent entry → skip.
-    _capture_cost(transition, entry)
+    _capture_cost(transition, entry, record)
     # #252: capture the worker-emitted SMOKE_TESTS block at the same
     # moment so the TUI can render it under the Test stage.  Same
     # best-effort discipline — failure is silent.
