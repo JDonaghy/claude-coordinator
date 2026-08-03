@@ -725,10 +725,21 @@ def test_provider_is_abstract() -> None:
 
 # ── OpenCodeProvider ──────────────────────────────────────────────────────────
 #
-# IMPORTANT: opencode is not installed on the build machine.  All tests below
-# exercise the provider in isolation (no subprocess execution).  The assumed
-# command structure, result marker, and NDJSON parse logic are tested against
-# the documented schema in tests/fixtures/opencode_run_sample.jsonl.
+# All tests below exercise the provider in isolation (no subprocess
+# execution) against its still-unverified, still-assumed command structure,
+# result marker, and NDJSON parse logic — see the module docstring in
+# coord/providers/opencode.py.
+#
+# #1703 replaced tests/fixtures/opencode_run_sample.jsonl with a VERBATIM
+# capture from a real opencode binary (see docs/OPENCODE_VERIFICATION.md for
+# the machine, version, and full findings) and added
+# tests/fixtures/opencode_run_failure_sample.jsonl for a real failing run.
+# The provider's parsing logic was deliberately left unchanged — see
+# test_opencode_result_marker_not_in_real_fixture and
+# test_opencode_parse_log_extracts_nothing_from_real_fixture below, which pin
+# the resulting (expected) mismatch pending the follow-up provider-correction
+# issue. Tests that construct their own inline fixtures still exercise the
+# assumed schema and are unaffected.
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -970,17 +981,33 @@ def test_opencode_result_marker() -> None:
     assert OpenCodeProvider().result_marker() == RESULT_MARKER
 
 
-def test_opencode_result_marker_in_fixture() -> None:
-    """result_marker() appears in the last line of the sample fixture."""
+def test_opencode_result_marker_not_in_real_fixture() -> None:
+    """KNOWN GAP (#1703 → next issue): the assumed RESULT_MARKER
+    ('"type":"session.complete"') does NOT appear anywhere in a real
+    ``opencode run --format json`` capture.
+
+    #1703 replaced ``opencode_run_sample.jsonl`` with a verbatim capture from
+    a real opencode binary (see ``docs/OPENCODE_VERIFICATION.md``).  The real
+    completion signal is the last ``step_finish`` event whose
+    ``part.reason == "stop"`` — a shape RESULT_MARKER does not match.  This
+    test pins that mismatch so it is not silently "fixed" by editing the
+    fixture; the actual fix (updating RESULT_MARKER and parse_log in
+    coord/providers/opencode.py) is explicitly out of scope for #1703 and
+    belongs to the follow-up provider-correction issue.
+    """
     fixtures_dir = Path(__file__).parent / "fixtures"
     fixture = fixtures_dir / "opencode_run_sample.jsonl"
     assert fixture.exists(), "opencode_run_sample.jsonl fixture is missing"
     lines = [ln for ln in fixture.read_text().splitlines() if ln.strip()]
-    # The result marker should appear in the fixture (completion event present).
     marker = OpenCodeProvider().result_marker()
-    assert any(marker in line for line in lines), (
-        f"result_marker {marker!r} not found in fixture — "
-        f"update the fixture or result_marker() to agree"
+    assert not any(marker in line for line in lines), (
+        f"result_marker {marker!r} unexpectedly found in the real fixture — "
+        f"if RESULT_MARKER was corrected, update this test to match the "
+        f"provider-correction issue's changes"
+    )
+    # The real terminal signal, for reference (see OPENCODE_VERIFICATION.md):
+    assert any('"reason":"stop"' in line for line in lines), (
+        "expected the real fixture to contain a step_finish/reason=stop event"
     )
 
 
@@ -1091,19 +1118,38 @@ def test_opencode_parse_log_session_complete_with_usage() -> None:
         os.unlink(name)
 
 
-def test_opencode_parse_log_fixture(tmp_path: Path) -> None:
-    """parse_log correctly parses the sample fixture."""
+def test_opencode_parse_log_extracts_nothing_from_real_fixture(tmp_path: Path) -> None:
+    """KNOWN GAP (#1703 → next issue): parse_log() extracts NOTHING useful
+    from a real ``opencode run --format json`` capture.
+
+    #1703 replaced ``opencode_run_sample.jsonl`` with a verbatim real
+    capture (see ``docs/OPENCODE_VERIFICATION.md``).  Real opencode events
+    are shaped ``{"type":"step_start"|"tool_use"|"text"|"step_finish"|
+    "error", "sessionID": "...", "part": {...}}`` — nothing like the
+    invented ``session.start`` / ``message.complete`` / ``session.complete``
+    shapes :func:`~coord.providers.opencode._update_opencode_summary` looks
+    for.  Every field this unmodified parser extracts from the real fixture
+    is therefore blank/zero.  This test pins that gap so it is not silently
+    papered over; correcting parse_log() to understand the real ``part``
+    shape (session id from the top-level ``sessionID`` field, cost/tokens
+    from ``part.tokens`` / ``part.cost`` on step_finish events, etc.) is
+    explicitly out of scope for #1703 and belongs to the follow-up
+    provider-correction issue.
+    """
     fixture = Path(__file__).parent / "fixtures" / "opencode_run_sample.jsonl"
     assert fixture.exists(), "opencode_run_sample.jsonl fixture is missing"
     summary = OpenCodeProvider().parse_log(fixture, tail_bytes=0)
     assert isinstance(summary, WorkerSummary)
-    # Fixture has a session.start event with session_id and model.
-    assert summary.session_id == "oc-sess-abc123"
-    assert summary.model_used == "claude-sonnet-4-5"
-    # Fixture has a session.complete event with num_turns=3.
-    assert summary.num_turns == 3
-    # Fixture has cost_usd=0.0092 in the usage block.
-    assert abs(summary.total_cost_usd - 0.0092) < 1e-9
+    # None of the real event types ("step_start", "tool_use", "text",
+    # "step_finish") match the assumed "session.start" / "session.complete" /
+    # "message.complete" shapes, so every field stays at its blank default.
+    assert summary.session_id is None
+    assert summary.model_used is None
+    assert summary.num_turns == 0
+    assert summary.total_cost_usd == 0.0
+    assert summary.input_tokens == 0
+    assert summary.output_tokens == 0
+    assert summary.stop_reason is None
 
 
 def test_opencode_parse_log_unknown_events_ignored(tmp_path: Path) -> None:
