@@ -30,6 +30,7 @@ from coord import __version__
 
 from coord.commands.acceptance import acceptance_group
 from coord.commands.audit import audit
+from coord.commands.report import report_group
 from coord.commands.scorecard import scorecard
 
 # Re-exported for back-compat: some tests do `from coord.cli import
@@ -364,6 +365,7 @@ main.add_command(health)
 main.add_command(issue_group)
 main.add_command(context_group)
 main.add_command(audit)
+main.add_command(report_group)
 main.add_command(scorecard)
 main.add_command(milestone_group)
 main.add_command(plans_cmd)

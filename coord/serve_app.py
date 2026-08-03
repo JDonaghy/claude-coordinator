@@ -2901,6 +2901,98 @@ def _openapi_spec() -> dict:
                 },
             }
         },
+        "/report": {
+            "get": {
+                "summary": (
+                    "#1742: the report catalogue — ids, titles, descriptions "
+                    "and full parameter metadata (kind/choices/default), so a "
+                    "client builds its parameter form from here rather than "
+                    "hardcoding it"
+                ),
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "reports": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "id": {"type": "string"},
+                                                    "title": {"type": "string"},
+                                                    "description": {"type": "string"},
+                                                    "params": {
+                                                        "type": "array",
+                                                        "items": {
+                                                            "type": "object",
+                                                            "properties": {
+                                                                "id": {"type": "string"},
+                                                                "label": {"type": "string"},
+                                                                "kind": {"type": "string", "description": "choice|text"},
+                                                                "choices": {"type": "array", "items": {"type": "string"}},
+                                                                "default": {"type": "string"},
+                                                                "help": {"type": "string"},
+                                                                "free_form": {"type": "boolean", "description": "choices are presets, not a whitelist"},
+                                                            },
+                                                        },
+                                                    },
+                                                },
+                                            },
+                                        }
+                                    },
+                                    "required": ["reports"],
+                                }
+                            }
+                        },
+                    }
+                },
+            }
+        },
+        "/report/{report_id}": {
+            "get": {
+                "summary": (
+                    "#1742: run a report and return its ReportResult. "
+                    "Read-only — no board write, no reconcile side effect. "
+                    "Query parameters are the report's own params (see /report)"
+                ),
+                "parameters": [
+                    {"name": "report_id", "in": "path", "required": True, "schema": {"type": "string"}},
+                    {"name": "since", "in": "query", "schema": {"type": "string"}, "description": "issue-activity: window length, e.g. 13h"},
+                    {"name": "until", "in": "query", "schema": {"type": "string"}, "description": "issue-activity: epoch or ISO-8601 window end; empty = now"},
+                    {"name": "repo", "in": "query", "schema": {"type": "string"}, "description": "issue-activity: restrict to one repo"},
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "report_id": {"type": "string"},
+                                        "generated_at": {"type": "number"},
+                                        "window": {"type": "array", "items": {"type": "number"}},
+                                        "columns": {"type": "array", "items": {"type": "string"}},
+                                        "rows": {"type": "array", "items": {"type": "object"}},
+                                        "notes": {"type": "array", "items": {"type": "string"}},
+                                    },
+                                    "required": [
+                                        "report_id", "generated_at", "window",
+                                        "columns", "rows", "notes",
+                                    ],
+                                }
+                            }
+                        },
+                    },
+                    "400": {"description": "Unknown parameter / bad parameter value"},
+                    "404": {"description": "Unknown report id"},
+                },
+            }
+        },
         "/merge": {
             "post": {
                 "summary": "Run `coord merge` against the canonical DB (#584)",
@@ -5173,6 +5265,37 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             return JSONResponse({"error": "audit read failed", "detail": str(e)}, status_code=503)
         return JSONResponse(result)
 
+    async def get_report_catalogue(request: Request) -> Response:  # noqa: ARG001 — Starlette handler signature
+        # #1742: the catalogue is static metadata (ids, titles, params with
+        # their kind/choices/default). The coord-tui Reports panel (#1741)
+        # builds its parameter form from THIS — nothing about the params is
+        # hardcoded client-side.
+        from coord import reports as _reports  # noqa: PLC0415
+
+        return JSONResponse(_reports.catalogue())
+
+    async def get_report(request: Request) -> Response:
+        # #1742: run a report and return its ReportResult. READ-ONLY — the
+        # engine issues SELECTs against audit_log/issues/assignments and
+        # nothing else. No board write, no reconcile side effect.
+        from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
+
+        from coord import reports as _reports  # noqa: PLC0415
+
+        report_id = request.path_params["report_id"]
+        params = dict(request.query_params)
+        try:
+            result = await run_in_threadpool(_reports.run_report, report_id, params)
+        except _reports.UnknownReportError as e:
+            return JSONResponse({"error": str(e)}, status_code=404)
+        except _reports.ReportError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+        except Exception as e:  # noqa: BLE001 — surface a clean 503 rather than a stack trace
+            return JSONResponse(
+                {"error": "report run failed", "detail": str(e)}, status_code=503
+            )
+        return JSONResponse(result.to_dict())
+
     async def post_merge(request: Request) -> Response:
         # #584: the merge queue + board live in THIS (canonical) DB, and gh is
         # authenticated here — so a thin client's `coord merge` / TUI 'Go' routes
@@ -6048,6 +6171,10 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/assignment/{assignment_id}", get_assignment, methods=["GET"]),
         Route("/issue/{repo_name}/{number}", get_issue, methods=["GET"]),
         Route("/audit", get_audit, methods=["GET"]),
+        # #1742: report engine. Catalogue first, then the run route — both
+        # read-only, both alongside /audit because they read the same data.
+        Route("/report", get_report_catalogue, methods=["GET"]),
+        Route("/report/{report_id}", get_report, methods=["GET"]),
         Route("/config", serve_config, methods=["GET"]),
         Route("/result", post_result, methods=["POST"]),
         Route("/completion", post_completion, methods=["POST"]),
