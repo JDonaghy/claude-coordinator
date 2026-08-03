@@ -726,20 +726,18 @@ def test_provider_is_abstract() -> None:
 # ── OpenCodeProvider ──────────────────────────────────────────────────────────
 #
 # All tests below exercise the provider in isolation (no subprocess
-# execution) against its still-unverified, still-assumed command structure,
-# result marker, and NDJSON parse logic — see the module docstring in
-# coord/providers/opencode.py.
+# execution) against its command structure, result marker, and NDJSON parse
+# logic — see the module docstring in coord/providers/opencode.py.
 #
 # #1703 replaced tests/fixtures/opencode_run_sample.jsonl with a VERBATIM
 # capture from a real opencode binary (see docs/OPENCODE_VERIFICATION.md for
 # the machine, version, and full findings) and added
 # tests/fixtures/opencode_run_failure_sample.jsonl for a real failing run.
-# The provider's parsing logic was deliberately left unchanged — see
-# test_opencode_result_marker_not_in_real_fixture and
-# test_opencode_parse_log_extracts_nothing_from_real_fixture below, which pin
-# the resulting (expected) mismatch pending the follow-up provider-correction
-# issue. Tests that construct their own inline fixtures still exercise the
-# assumed schema and are unaffected.
+# #1704 (this issue) corrected the provider to match that captured evidence:
+# RESULT_MARKER, build_command's flag set, parse_log's event mapping, and
+# the capabilities flags cost_reporting / true_system_prompt now all cite
+# the verification doc directly. The tests below exercise the CORRECTED
+# behaviour against the real fixtures (both success and failure).
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -747,16 +745,29 @@ def test_provider_is_abstract() -> None:
 
 
 def test_opencode_capabilities_declared_values() -> None:
-    """OpenCodeProvider.capabilities() returns the documented conservative values."""
+    """OpenCodeProvider.capabilities() returns the #1704-corrected values."""
     caps = OpenCodeProvider().capabilities()
     assert isinstance(caps, Capabilities)
-    assert caps.resume is True          # --session flag enables resume (assumed)
-    assert caps.inject is False         # no mid-session injection path
-    assert caps.cost_reporting is False # format unverified — conservative False
-    assert caps.true_system_prompt is False  # no --system-prompt equivalent yet
-    assert caps.enforces_deny_list is False  # SAFETY: coord deny-list not enforced
+    assert caps.resume is True          # --session/--continue confirmed to resume
+    assert caps.inject is False         # no mid-session injection path (still unknown)
+    assert caps.cost_reporting is True  # part.cost summed across step_finish events
+    assert caps.true_system_prompt is True  # --agent's prompt field is a real system prompt
+    assert caps.enforces_deny_list is False  # SAFETY: coord-side enforcement still unproven
     assert caps.billing_mode == "byo_key"   # uses operator's own API keys
     assert caps.human_attended_only is False  # headless run mode is automatable
+
+
+def test_opencode_capabilities_cost_reporting_is_true() -> None:
+    """cost_reporting must be True — pins the #1704 flip so an accidental
+    regression back to False (which silences real cost data in the TUI) is
+    caught immediately."""
+    assert OpenCodeProvider().capabilities().cost_reporting is True
+
+
+def test_opencode_capabilities_true_system_prompt_is_true() -> None:
+    """true_system_prompt must be True — pins the #1704 flip: --agent's
+    'prompt' field is a confirmed real system-prompt equivalent."""
+    assert OpenCodeProvider().capabilities().true_system_prompt is True
 
 
 def test_opencode_capabilities_billing_mode_is_valid() -> None:
@@ -956,6 +967,86 @@ def test_opencode_build_command_returns_list_of_strings() -> None:
         assert isinstance(item, str)
 
 
+# ── #1704: --format json / --agent / --auto ────────────────────────────────────
+
+
+def test_opencode_build_command_always_includes_format_json() -> None:
+    """--format json is always present — without it there is no NDJSON
+    stream for result_marker()/parse_log() to work against."""
+    spec = _make_spec(type="work", briefing="do stuff")
+    argv = OpenCodeProvider().build_command(spec)
+    assert "--format" in argv
+    idx = argv.index("--format")
+    assert argv[idx + 1] == "json"
+
+
+@pytest.mark.parametrize(
+    ("spec_type", "expected_agent"),
+    [
+        ("work", "coord-work"),
+        ("plan", "coord-plan"),
+        ("review", "coord-review"),
+        ("conflict-fix", "coord-conflict-fix"),
+        ("smoke", "coord-smoke"),
+        ("refinement", "coord-refinement"),
+        ("test-chat", "coord-test-chat"),
+        ("new-issue-chat", "coord-new-issue-chat"),
+        ("milestone-chat", "coord-milestone-chat"),
+        ("mock-author", "coord-mock-author"),
+    ],
+)
+def test_opencode_build_command_agent_flag_follows_spec_type(
+    spec_type: str, expected_agent: str
+) -> None:
+    """--agent NAME is derived from spec.type via the coord-<type> naming
+    contract (see _agent_name_for_type's docstring) — this is what
+    replaces the ignored system_prompt/allowed_tools kwargs."""
+    spec = _make_spec(type=spec_type, briefing="do stuff")
+    argv = OpenCodeProvider().build_command(spec)
+    assert "--agent" in argv
+    idx = argv.index("--agent")
+    assert argv[idx + 1] == expected_agent
+
+
+def test_opencode_build_command_agent_flag_default_type_is_work() -> None:
+    """AssignmentSpec.type defaults to 'work' → --agent coord-work."""
+    spec = _make_spec(briefing="do stuff")
+    argv = OpenCodeProvider().build_command(spec)
+    idx = argv.index("--agent")
+    assert argv[idx + 1] == "coord-work"
+
+
+def test_opencode_build_command_agent_ignores_explicit_system_prompt_text() -> None:
+    """Even when system_prompt/allowed_tools text is passed, --agent's value
+    is still derived from spec.type, never from that text — --agent
+    REPLACES those kwargs rather than being built from them."""
+    spec = _make_spec(type="plan", briefing="do stuff")
+    argv = OpenCodeProvider().build_command(
+        spec, system_prompt="ignore me", allowed_tools="Read,Bash"
+    )
+    idx = argv.index("--agent")
+    assert argv[idx + 1] == "coord-plan"
+
+
+def test_opencode_build_command_always_includes_auto() -> None:
+    """--auto is always passed (headless-safety; see build_command's
+    docstring for the deny-list safety note)."""
+    spec = _make_spec(type="work", briefing="do stuff")
+    argv = OpenCodeProvider().build_command(spec)
+    assert "--auto" in argv
+
+
+def test_opencode_build_command_format_agent_auto_precede_extra_args_and_briefing() -> None:
+    """--format/--agent/--auto are inserted before extra_args and the
+    trailing briefing — never after (the briefing must stay last)."""
+    spec = _make_spec(type="work", briefing="THE-BRIEFING")
+    argv = OpenCodeProvider(extra_args=["--foo", "bar"]).build_command(spec)
+    assert argv[-1] == "THE-BRIEFING"
+    assert argv[-3:-1] == ["--foo", "bar"]
+    for flag in ("--format", "--agent", "--auto"):
+        assert argv.index(flag) < argv.index("--foo")
+
+
 # ── initial_input ─────────────────────────────────────────────────────────────
 
 
@@ -981,34 +1072,40 @@ def test_opencode_result_marker() -> None:
     assert OpenCodeProvider().result_marker() == RESULT_MARKER
 
 
-def test_opencode_result_marker_not_in_real_fixture() -> None:
-    """KNOWN GAP (#1703 → next issue): the assumed RESULT_MARKER
-    ('"type":"session.complete"') does NOT appear anywhere in a real
-    ``opencode run --format json`` capture.
+def test_opencode_result_marker_matches_real_success_fixture() -> None:
+    """#1704 FIX PINNED: the corrected RESULT_MARKER ('"reason":"stop"')
+    DOES appear in a real successful ``opencode run --format json`` capture.
 
     #1703 replaced ``opencode_run_sample.jsonl`` with a verbatim capture from
-    a real opencode binary (see ``docs/OPENCODE_VERIFICATION.md``).  The real
-    completion signal is the last ``step_finish`` event whose
-    ``part.reason == "stop"`` — a shape RESULT_MARKER does not match.  This
-    test pins that mismatch so it is not silently "fixed" by editing the
-    fixture; the actual fix (updating RESULT_MARKER and parse_log in
-    coord/providers/opencode.py) is explicitly out of scope for #1703 and
-    belongs to the follow-up provider-correction issue.
+    a real opencode binary (see ``docs/OPENCODE_VERIFICATION.md``) and
+    proved the FIRST-PASS marker ('"type":"session.complete"') never
+    matched real output. #1704 corrected RESULT_MARKER to the real
+    terminal signal — the last ``step_finish`` event's
+    ``part.reason == "stop"`` — this test pins that the fix actually landed.
     """
     fixtures_dir = Path(__file__).parent / "fixtures"
     fixture = fixtures_dir / "opencode_run_sample.jsonl"
     assert fixture.exists(), "opencode_run_sample.jsonl fixture is missing"
     lines = [ln for ln in fixture.read_text().splitlines() if ln.strip()]
     marker = OpenCodeProvider().result_marker()
-    assert not any(marker in line for line in lines), (
-        f"result_marker {marker!r} unexpectedly found in the real fixture — "
-        f"if RESULT_MARKER was corrected, update this test to match the "
-        f"provider-correction issue's changes"
+    assert any(marker in line for line in lines), (
+        f"result_marker {marker!r} not found in the real success fixture — "
+        "RESULT_MARKER regressed away from the verified 'reason':'stop' signal"
     )
-    # The real terminal signal, for reference (see OPENCODE_VERIFICATION.md):
-    assert any('"reason":"stop"' in line for line in lines), (
-        "expected the real fixture to contain a step_finish/reason=stop event"
-    )
+    # The old, invented marker must never match either (regression guard).
+    assert not any('"type":"session.complete"' in line for line in lines)
+
+
+def test_opencode_result_marker_absent_from_real_failure_fixture() -> None:
+    """A failing run has NO terminal step_finish at all (confirmed: it ends
+    with a top-level error event instead), so the success marker correctly
+    never matches — this is expected, not a gap. Failure is detected via
+    exit code / parse_log's error-event handling, not this marker."""
+    fixture = Path(__file__).parent / "fixtures" / "opencode_run_failure_sample.jsonl"
+    assert fixture.exists(), "opencode_run_failure_sample.jsonl fixture is missing"
+    lines = [ln for ln in fixture.read_text().splitlines() if ln.strip()]
+    marker = OpenCodeProvider().result_marker()
+    assert not any(marker in line for line in lines)
 
 
 def test_opencode_result_marker_is_string() -> None:
@@ -1069,119 +1166,308 @@ def test_opencode_parse_log_never_raises_on_mixed_lines(tmp_path: Path) -> None:
     log = tmp_path / "mixed.log"
     log.write_text(
         "# agent=precision repo=myrepo issue=#42 argv=opencode run ...\n"
-        '{"type":"session.start","session_id":"s1","model":"claude-sonnet"}\n'
+        '{"type":"tool_use","sessionID":"s1",'
+        '"part":{"type":"tool","tool":"glob","state":{"status":"completed"}}}\n'
         "plain text output from opencode\n"
-        '{"type":"session.complete","session_id":"s1","num_turns":2}\n'
+        '{"type":"step_finish","sessionID":"s1",'
+        '"part":{"type":"step-finish","reason":"stop",'
+        '"tokens":{"input":1,"output":1,"cache":{"write":0,"read":0}},"cost":0}}\n'
     )
     summary = OpenCodeProvider().parse_log(log, tail_bytes=0)
     assert summary.session_id == "s1"
-    assert summary.num_turns == 2
+    assert summary.num_turns == 1
+    assert summary.stop_reason == "stop"
 
 
-def test_opencode_parse_log_session_start() -> None:
-    """parse_log extracts session_id and model from session.start event."""
+def test_opencode_parse_log_session_id_from_any_event() -> None:
+    """sessionID is captured off the FIRST event seen, regardless of type —
+    confirmed real opencode has no dedicated session.start/init event."""
     import tempfile
     with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as f:
-        f.write('{"type":"session.start","session_id":"oc-123","model":"claude-haiku"}\n')
+        f.write(json.dumps({
+            "type": "step_start", "sessionID": "oc-123",
+            "part": {"type": "step-start"},
+        }) + "\n")
         name = f.name
     try:
         summary = OpenCodeProvider().parse_log(name, tail_bytes=0)
         assert summary.session_id == "oc-123"
-        assert summary.model_used == "claude-haiku"
+        # Known, named gap: no event carries a model identifier — never
+        # invent one.
+        assert summary.model_used is None
     finally:
         os.unlink(name)
 
 
-def test_opencode_parse_log_session_complete_with_usage() -> None:
-    """parse_log extracts num_turns and cost from session.complete event."""
+def test_opencode_parse_log_step_finish_sums_tokens_and_cost_across_events() -> None:
+    """Confirmed (OPENCODE_VERIFICATION.md): there is no cumulative
+    session-total field anywhere in the stream — cost/tokens must be SUMMED
+    across every step_finish event, not read off a single one."""
     import tempfile
-    line = json.dumps({
-        "type": "session.complete",
-        "session_id": "oc-456",
-        "num_turns": 5,
-        "usage": {
-            "input_tokens": 1000,
-            "output_tokens": 500,
-            "cost_usd": 0.0072,
-        },
-    })
+    lines = [
+        json.dumps({
+            "type": "step_finish", "sessionID": "oc-456",
+            "part": {"type": "step-finish", "reason": "tool-calls",
+                     "tokens": {"input": 100, "output": 20,
+                                "cache": {"write": 5, "read": 50}},
+                     "cost": 0.001},
+        }),
+        json.dumps({
+            "type": "step_finish", "sessionID": "oc-456",
+            "part": {"type": "step-finish", "reason": "stop",
+                     "tokens": {"input": 30, "output": 10,
+                                "cache": {"write": 0, "read": 15}},
+                     "cost": 0.0002},
+        }),
+    ]
     with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as f:
-        f.write(line + "\n")
+        f.write("\n".join(lines) + "\n")
         name = f.name
     try:
         summary = OpenCodeProvider().parse_log(name, tail_bytes=0)
-        assert summary.num_turns == 5
-        assert summary.input_tokens == 1000
-        assert summary.output_tokens == 500
-        assert abs(summary.total_cost_usd - 0.0072) < 1e-9
+        assert summary.num_turns == 2
+        assert summary.input_tokens == 130
+        assert summary.output_tokens == 30
+        assert summary.cache_creation_tokens == 5
+        assert summary.cache_read_tokens == 65
+        assert abs(summary.total_cost_usd - 0.0012) < 1e-9
+        # Last step_finish's reason wins.
+        assert summary.stop_reason == "stop"
     finally:
         os.unlink(name)
 
 
-def test_opencode_parse_log_extracts_nothing_from_real_fixture(tmp_path: Path) -> None:
-    """KNOWN GAP (#1703 → next issue): parse_log() extracts NOTHING useful
-    from a real ``opencode run --format json`` capture.
+def test_opencode_parse_log_tool_use_bash_and_edit_tracked(tmp_path: Path) -> None:
+    """tool_use events populate tools_used/last_tool, and bash/edit calls
+    populate bash_commands/files_edited from their real input shape."""
+    log = tmp_path / "tools.log"
+    lines = [
+        json.dumps({
+            "type": "tool_use", "sessionID": "s1",
+            "part": {"type": "tool", "tool": "bash",
+                     "state": {"status": "completed",
+                               "input": {"command": "git status"}}},
+        }),
+        json.dumps({
+            "type": "tool_use", "sessionID": "s1",
+            "part": {"type": "tool", "tool": "edit",
+                     "state": {"status": "completed",
+                               "input": {"filePath": "/repo/foo.py"}}},
+        }),
+    ]
+    log.write_text("\n".join(lines) + "\n")
+    summary = OpenCodeProvider().parse_log(log, tail_bytes=0)
+    assert summary.tools_used == ["bash", "edit"]
+    assert summary.last_tool == "edit"
+    assert summary.bash_commands == ["git status"]
+    assert summary.files_edited == ["/repo/foo.py"]
 
-    #1703 replaced ``opencode_run_sample.jsonl`` with a verbatim real
-    capture (see ``docs/OPENCODE_VERIFICATION.md``).  Real opencode events
-    are shaped ``{"type":"step_start"|"tool_use"|"text"|"step_finish"|
-    "error", "sessionID": "...", "part": {...}}`` — nothing like the
-    invented ``session.start`` / ``message.complete`` / ``session.complete``
-    shapes :func:`~coord.providers.opencode._update_opencode_summary` looks
-    for.  Every field this unmodified parser extracts from the real fixture
-    is therefore blank/zero.  This test pins that gap so it is not silently
-    papered over; correcting parse_log() to understand the real ``part``
-    shape (session id from the top-level ``sessionID`` field, cost/tokens
-    from ``part.tokens`` / ``part.cost`` on step_finish events, etc.) is
-    explicitly out of scope for #1703 and belongs to the follow-up
-    provider-correction issue.
-    """
+
+def test_opencode_parse_log_permission_denial_recorded(tmp_path: Path) -> None:
+    """A tool_use with state.status=='error' whose message mentions
+    'permission' (the confirmed permission-denial shape, which quotes the
+    matching rules verbatim) is recorded in permission_denials."""
+    log = tmp_path / "denied.log"
+    denial_msg = (
+        "The user has specified a rule which prevents you from using this "
+        'specific tool call. Here are some of the relevant rules '
+        '[{"permission":"*","action":"allow","pattern":"*"}]'
+    )
+    log.write_text(json.dumps({
+        "type": "tool_use", "sessionID": "s1",
+        "part": {"type": "tool", "tool": "bash",
+                 "state": {"status": "error",
+                           "input": {"command": "gh issue list"},
+                           "error": denial_msg}},
+    }) + "\n")
+    summary = OpenCodeProvider().parse_log(log, tail_bytes=0)
+    assert summary.permission_denials == [denial_msg]
+
+
+def test_opencode_parse_log_text_event_result_text_last_wins(tmp_path: Path) -> None:
+    """Confirmed: the assistant's final answer is the LAST text event
+    before the terminal step_finish — each text event overwrites
+    result_text so the final value is the true last one."""
+    log = tmp_path / "text.log"
+    lines = [
+        json.dumps({"type": "text", "sessionID": "s1",
+                    "part": {"type": "text", "text": "thinking out loud"}}),
+        json.dumps({"type": "text", "sessionID": "s1",
+                    "part": {"type": "text", "text": "final answer"}}),
+    ]
+    log.write_text("\n".join(lines) + "\n")
+    summary = OpenCodeProvider().parse_log(log, tail_bytes=0)
+    assert summary.result_text == "final answer"
+
+
+def test_opencode_parse_log_error_event_sets_is_error(tmp_path: Path) -> None:
+    """Confirmed run-level failure shape: top-level error event, no more
+    events follow. Sets is_error/stop_reason/terminal_reason/result_text."""
+    log = tmp_path / "error.log"
+    log.write_text(json.dumps({
+        "type": "error", "sessionID": "s1",
+        "error": {"name": "UnknownError",
+                  "data": {"message": '"Streaming response failed: [503] boom"'}},
+    }) + "\n")
+    summary = OpenCodeProvider().parse_log(log, tail_bytes=0)
+    assert summary.is_error is True
+    assert summary.stop_reason == "error"
+    assert summary.terminal_reason == "UnknownError"
+    # The literal captured message includes its own embedded quote chars —
+    # preserved verbatim, not stripped.
+    assert summary.result_text == '"Streaming response failed: [503] boom"'
+
+
+def test_opencode_parse_log_unknown_events_ignored(tmp_path: Path) -> None:
+    """parse_log silently ignores unrecognised event types, but still
+    captures sessionID off them (sessionID capture doesn't depend on the
+    event type being one this parser understands)."""
+    log = tmp_path / "unknown.log"
+    lines = [
+        json.dumps({"type": "some.future.event", "sessionID": "s99", "data": "ignored"}),
+        json.dumps({"type": "another.unknown", "x": 42}),
+        json.dumps({
+            "type": "step_finish", "sessionID": "s99",
+            "part": {"type": "step-finish", "reason": "stop",
+                     "tokens": {"input": 1, "output": 1,
+                                "cache": {"write": 0, "read": 0}},
+                     "cost": 0},
+        }),
+    ]
+    log.write_text("\n".join(lines) + "\n")
+    summary = OpenCodeProvider().parse_log(log, tail_bytes=0)
+    # Unknown events are silently skipped for extraction purposes, but the
+    # session id off the FIRST (unknown-typed) event still lands.
+    assert summary.session_id == "s99"
+    assert summary.num_turns == 1
+    assert summary.stop_reason == "stop"
+
+
+def test_opencode_parse_log_tail_bytes(tmp_path: Path) -> None:
+    """parse_log with tail_bytes>0 reads only the end of the file — and,
+    because a real opencode event carries sessionID on EVERY line (not just
+    a synthetic first one), the session id captured is whichever event
+    survives the tail cut, not necessarily the run's first line."""
+    log = tmp_path / "big.log"
+    lines = []
+    # An event early in the file, under a DIFFERENT sessionID, that
+    # tail_bytes will cut off entirely.
+    lines.append(json.dumps({
+        "type": "step_start", "sessionID": "early-session",
+        "part": {"type": "step-start"},
+    }))
+    # Padding so the tail read genuinely misses the line above.
+    for i in range(200):
+        lines.append(json.dumps({
+            "type": "text", "sessionID": "early-session",
+            "part": {"type": "text", "text": "x" * 50},
+        }))
+    # A real step_finish near the end, in the tail, under a different
+    # (later/resumed) session id.
+    lines.append(json.dumps({
+        "type": "step_finish", "sessionID": "tail-session",
+        "part": {"type": "step-finish", "reason": "stop",
+                 "tokens": {"input": 10, "output": 20,
+                            "cache": {"write": 0, "read": 0}},
+                 "cost": 0},
+    }))
+    log.write_text("\n".join(lines) + "\n")
+    # 250 bytes is enough to land inside the LAST padding line (discarded as
+    # the partial leading line) and still capture the full trailing
+    # step_finish line — any padding line surviving intact would leak
+    # "early-session" back in, since session_id capture takes the first one
+    # seen in read order.
+    summary = OpenCodeProvider().parse_log(log, tail_bytes=250)
+    # The tail-read summary picks up the trailing step_finish.
+    assert summary.num_turns == 1
+    assert summary.stop_reason == "stop"
+    assert summary.session_id == "tail-session"
+
+
+# ── parse_log against the REAL #1703 fixtures ──────────────────────────────────
+
+
+def test_opencode_parse_log_real_success_fixture() -> None:
+    """#1704 FIX PINNED: parse_log() now correctly extracts real data from
+    the verbatim successful capture (see docs/OPENCODE_VERIFICATION.md).
+    Expected values were computed directly from the fixture's step_finish
+    events (4 of them: 8083+103+99+107 input, 48+55+121+19 output,
+    0+8064+8192+8320 cache-read tokens, 0 cost — a free-tier model)."""
     fixture = Path(__file__).parent / "fixtures" / "opencode_run_sample.jsonl"
     assert fixture.exists(), "opencode_run_sample.jsonl fixture is missing"
     summary = OpenCodeProvider().parse_log(fixture, tail_bytes=0)
     assert isinstance(summary, WorkerSummary)
-    # None of the real event types ("step_start", "tool_use", "text",
-    # "step_finish") match the assumed "session.start" / "session.complete" /
-    # "message.complete" shapes, so every field stays at its blank default.
-    assert summary.session_id is None
+    assert summary.session_id == "ses_036b4a104ffeIOILOMFtWVIoOb"
+    # Known, named gap: no event in the real schema carries a model
+    # identifier — never invent one.
     assert summary.model_used is None
-    assert summary.num_turns == 0
+    assert summary.num_turns == 4
+    assert summary.stop_reason == "stop"
+    assert summary.is_error is False
+    assert summary.tools_used == ["glob", "read", "edit"]
+    assert summary.last_tool == "edit"
+    assert summary.files_edited == ["/tmp/oc-throwaway/math_utils.py"]
+    assert summary.bash_commands == []
+    assert summary.input_tokens == 8392
+    assert summary.output_tokens == 243
+    assert summary.cache_read_tokens == 24576
+    assert summary.cache_creation_tokens == 0
+    # Free-tier model (opencode/big-pickle) — correctly summed to 0.0, not a
+    # parsing gap (see OPENCODE_VERIFICATION.md "Token usage and cost").
     assert summary.total_cost_usd == 0.0
-    assert summary.input_tokens == 0
-    assert summary.output_tokens == 0
-    assert summary.stop_reason is None
 
 
-def test_opencode_parse_log_unknown_events_ignored(tmp_path: Path) -> None:
-    """parse_log silently ignores unknown event types."""
-    log = tmp_path / "unknown.log"
-    lines = [
-        json.dumps({"type": "some.future.event", "data": "ignored"}),
-        json.dumps({"type": "another.unknown", "x": 42}),
-        json.dumps({"type": "session.start", "session_id": "s99", "model": "gpt-4o"}),
-    ]
-    log.write_text("\n".join(lines) + "\n")
-    summary = OpenCodeProvider().parse_log(log, tail_bytes=0)
-    # Unknown events are silently skipped; known events still parse.
-    assert summary.session_id == "s99"
-    assert summary.model_used == "gpt-4o"
+def test_opencode_parse_log_real_failure_fixture() -> None:
+    """#1704: parse_log() correctly extracts the real failing-run capture —
+    one glob tool call, one intermediate step_finish, then a top-level
+    error event (a real 503 from the model's request queue) with no
+    terminal step_finish at all."""
+    fixture = Path(__file__).parent / "fixtures" / "opencode_run_failure_sample.jsonl"
+    assert fixture.exists(), "opencode_run_failure_sample.jsonl fixture is missing"
+    summary = OpenCodeProvider().parse_log(fixture, tail_bytes=0)
+    assert isinstance(summary, WorkerSummary)
+    assert summary.session_id == "ses_036b53a0cffeKyzq3jsYZhULzj"
+    assert summary.is_error is True
+    assert summary.terminal_reason == "UnknownError"
+    assert summary.stop_reason == "error"
+    assert "Streaming response failed" in summary.result_text
+    assert "503" in summary.result_text
+    assert summary.num_turns == 1  # one step_finish before the error
+    assert summary.tools_used == ["glob"]
+    assert summary.input_tokens == 6258
+    assert summary.output_tokens == 56
+    assert summary.cache_read_tokens == 1792
+    assert summary.total_cost_usd == 0.0
+    # The success marker must never match a run that never terminated
+    # cleanly.
+    assert OpenCodeProvider().result_marker() not in fixture.read_text()
 
 
-def test_opencode_parse_log_tail_bytes(tmp_path: Path) -> None:
-    """parse_log with tail_bytes>0 reads only the end of the file."""
-    log = tmp_path / "big.log"
-    lines = []
-    # Write a 'session.start' early in the file that tail would miss.
-    lines.append(json.dumps({"type": "session.start", "session_id": "early", "model": "m1"}))
-    # Pad with enough lines that the tail won't reach the start.
-    for i in range(200):
-        lines.append(json.dumps({"type": "message.partial", "i": i, "text": "x" * 50}))
-    # Write a session.complete near the end (will be in the tail).
-    lines.append(json.dumps({"type": "session.complete", "session_id": "tail-id", "num_turns": 7}))
-    log.write_text("\n".join(lines) + "\n")
-    summary = OpenCodeProvider().parse_log(log, tail_bytes=512)
-    # The tail-read summary picks up the session.complete event.
-    assert summary.num_turns == 7
+def test_opencode_parse_log_real_success_fixture_truncated_tail_read() -> None:
+    """A small tail_bytes read against the REAL success fixture must not
+    raise, must discard the leading partial line, and must still recover
+    the trailing step_finish/stop event and its session id."""
+    fixture = Path(__file__).parent / "fixtures" / "opencode_run_sample.jsonl"
+    # 600 bytes lands inside the second-to-last line (346+1 + 424+1 = 772
+    # bytes for the last two lines combined) — the leading partial line is
+    # discarded, but the full final step_finish line survives intact.
+    summary = OpenCodeProvider().parse_log(fixture, tail_bytes=600)
+    assert isinstance(summary, WorkerSummary)
+    assert summary.stop_reason == "stop"
+    assert summary.session_id == "ses_036b4a104ffeIOILOMFtWVIoOb"
+
+
+def test_opencode_parse_log_real_failure_fixture_truncated_tail_read() -> None:
+    """Same truncated-tail-read guarantee against the REAL failure fixture:
+    must not raise and must still recover the terminal error event."""
+    fixture = Path(__file__).parent / "fixtures" / "opencode_run_failure_sample.jsonl"
+    # 300 bytes lands inside the second-to-last line (303+1 + 204+1 = 509
+    # bytes for the last two lines combined) — the partial line 4 is
+    # discarded, but the full error line (line 5) survives intact.
+    summary = OpenCodeProvider().parse_log(fixture, tail_bytes=300)
+    assert isinstance(summary, WorkerSummary)
+    assert summary.is_error is True
+    assert summary.terminal_reason == "UnknownError"
 
 
 # ── Registry: build_provider with opencode type ───────────────────────────────
@@ -1317,18 +1603,56 @@ def test_opencode_oneshot_command_returns_run_subcommand() -> None:
 
 
 def test_opencode_oneshot_command_ignores_system_prompt() -> None:
-    """system_prompt is silently dropped — OpenCode has no --system-prompt."""
+    """system_prompt is silently dropped — no CLI flag accepts ad hoc
+    system-prompt text (only --agent NAME selecting a pre-configured
+    agent, and oneshot_command has no spec context to name one from)."""
     cmd = OpenCodeProvider().oneshot_command(system_prompt="My system prompt")
     assert "--system-prompt" not in cmd
     assert "My system prompt" not in cmd
+    assert "--agent" not in cmd
 
 
-def test_opencode_oneshot_command_ignores_output_format() -> None:
-    """output_format is silently ignored — OpenCode has no --output-format."""
+def test_opencode_oneshot_command_default_json_includes_format_flag() -> None:
+    """#1704: output_format='json' (the default) now maps to --format json —
+    the only usable structured-output flag confirmed to exist."""
+    cmd = OpenCodeProvider().oneshot_command(system_prompt="sp")
+    assert "--format" in cmd
+    idx = cmd.index("--format")
+    assert cmd[idx + 1] == "json"
+
+
+def test_opencode_oneshot_command_none_output_format_omits_format_flag() -> None:
+    """output_format=None omits --format entirely, falling back to
+    opencode's human-transcript default — the dashboard-streaming case."""
+    cmd = OpenCodeProvider().oneshot_command(system_prompt="sp", output_format=None)
+    assert "--format" not in cmd
+
+
+def test_opencode_oneshot_command_custom_output_format_forwarded_verbatim() -> None:
+    """A non-'json' output_format string is forwarded as-is (mirrors
+    ClaudeProvider.oneshot_command's behaviour for --output-format)."""
+    cmd = OpenCodeProvider().oneshot_command(system_prompt="sp", output_format="text")
+    idx = cmd.index("--format")
+    assert cmd[idx + 1] == "text"
+
+
+def test_opencode_oneshot_command_no_output_format_still_differs_from_claude_shape() -> None:
+    """The 'no --output-format' shape is opencode's OWN flag name, never
+    claude's --output-format spelling."""
     cmd_json = OpenCodeProvider().oneshot_command(system_prompt="sp", output_format="json")
     cmd_none = OpenCodeProvider().oneshot_command(system_prompt="sp", output_format=None)
     assert "--output-format" not in cmd_json
-    assert cmd_json == cmd_none
+    assert "--output-format" not in cmd_none
+    assert cmd_json != cmd_none  # #1704: these now differ (--format json vs. omitted)
+
+
+def test_opencode_oneshot_command_always_includes_auto() -> None:
+    """#1704: --auto is always appended, for the same headless-safety
+    reason as build_command."""
+    cmd_json = OpenCodeProvider().oneshot_command(system_prompt="sp", output_format="json")
+    cmd_none = OpenCodeProvider().oneshot_command(system_prompt="sp", output_format=None)
+    assert "--auto" in cmd_json
+    assert "--auto" in cmd_none
 
 
 def test_opencode_oneshot_command_custom_binary() -> None:
