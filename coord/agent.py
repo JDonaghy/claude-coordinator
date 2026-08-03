@@ -6189,9 +6189,12 @@ class AgentServer:
         # successful ``Popen()`` would leak both descriptors unless we
         # guard the entire setup with ``try``.  ``_worker_subprocess_env``
         # and ``provider.env()`` should not raise in practice (the former
-        # just copies ``os.environ``; the latter returns ``{}`` for the
-        # PTY provider in this PR), but a defensive wrap costs nothing
-        # and survives future provider implementations.  We track ``proc``
+        # just copies ``os.environ``; the latter returns a copy of the
+        # provider definition's ``env:`` overrides, merged on top of the
+        # base environment below — per #1706, no longer always ``{}`` for
+        # the PTY provider; it's only ``{}`` when the definition sets no
+        # ``env:`` entries), but a defensive wrap costs nothing and
+        # survives future provider implementations.  We track ``proc``
         # explicitly so the ``BaseException`` guard below can tell whether
         # the child has taken ownership of the fds yet.
         proc: subprocess.Popen | None = None

@@ -302,17 +302,52 @@ def approve(
             )
             if label_model:
                 p.model = label_model
-        if not p.model:
-            p.model = cfg.models.default
-        click.echo(
-            "     model: "
-            + describe_model_choice(
-                resolved_model=p.model,
-                explicit_reason="resolved at plan time" if plan_time_model else None,
-                matched_label=matched_label,
-                shadowed_labels=shadowed_labels,
-            )
+        # #1707: needed regardless of whether p.model still needs resolving
+        # below — also used by the "model:" echo's provider-pin branch.
+        from coord.providers import resolve_provider_name  # noqa: PLC0415
+
+        repo_for_provider = cfg.repo(p.repo_name)
+        effective_provider_name = resolve_provider_name(
+            p.provider,
+            repo_for_provider.provider if repo_for_provider is not None else None,
+            cfg.providers,
         )
+        if not p.model:
+            # #1706 review fix: don't force `models.default` (a Claude
+            # model alias) onto a non-claude/claude-pty provider that pins
+            # its own `model` in `providers.definitions.<name>.model` —
+            # see `resolve_dispatch_model_alias`'s docstring. Without this,
+            # `p.model` was always truthy by the time `dispatch()` saw it,
+            # so its own (also provider-aware) fallback could never fire
+            # for a plain `coord approve`.
+            from coord.dispatch import resolve_dispatch_model_alias  # noqa: PLC0415
+
+            p.model = resolve_dispatch_model_alias(
+                explicit_model=None,
+                label_model=None,
+                config=cfg,
+                effective_provider_name=effective_provider_name,
+            )
+        if p.model:
+            click.echo(
+                "     model: "
+                + describe_model_choice(
+                    resolved_model=p.model,
+                    explicit_reason="resolved at plan time" if plan_time_model else None,
+                    matched_label=matched_label,
+                    shadowed_labels=shadowed_labels,
+                )
+            )
+        else:
+            # #1706: p.model is None only when the effective provider's own
+            # `providers.definitions.<name>.model` is pinned and neither an
+            # explicit/plan-time model nor a label matched.
+            _pinned = cfg.providers.definitions.get(effective_provider_name)
+            if _pinned is not None and _pinned.model:
+                click.echo(
+                    f"     model: {_pinned.model} "
+                    f"(via providers.definitions[{effective_provider_name!r}].model)"
+                )
         # Resolve required_gates: fall back to config default for proposals
         # that were saved before label-based gate resolution was wired in.
         if not p.required_gates:

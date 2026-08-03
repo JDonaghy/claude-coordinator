@@ -541,7 +541,12 @@ def dispatch_entry(
     """
     from coord import github_ops  # noqa: PLC0415
     from coord.claim import claim_message, find_work_claim  # noqa: PLC0415
-    from coord.dispatch import dispatch, post_briefing  # noqa: PLC0415
+    from coord.dispatch import (  # noqa: PLC0415
+        dispatch,
+        post_briefing,
+        resolve_dispatch_model_alias,
+    )
+    from coord.providers import resolve_provider_name  # noqa: PLC0415
     from coord.state import record_dispatched  # noqa: PLC0415
 
     issue_number = pick.entry.issue_number
@@ -614,7 +619,24 @@ def dispatch_entry(
         if proposal_type == "work"
         else (None, None, [])
     )
-    resolved_model = label_model or config.models.default
+    # #1706 review fix: milestone dispatch has no per-call `--provider`
+    # override, so the effective provider is spec(None) → repo → default —
+    # same chain `coord.dispatch.dispatch()` uses. Route model resolution
+    # through `resolve_dispatch_model_alias` so a non-claude/claude-pty
+    # provider's own pinned `model` isn't shadowed by `models.default`; see
+    # that function's docstring for the full rationale. Without this,
+    # `resolved_model` was always truthy by the time it reached
+    # `Proposal.model`, so `dispatch()`'s own provider-aware fallback could
+    # never fire for `coord milestone dispatch`.
+    effective_provider_name = resolve_provider_name(
+        None, repo_cfg.provider, config.providers,
+    )
+    resolved_model = resolve_dispatch_model_alias(
+        explicit_model=None,
+        label_model=label_model,
+        config=config,
+        effective_provider_name=effective_provider_name,
+    )
     # #1454: surfaced on the outcome so `coord milestone dispatch`'s CLI
     # output states *why* this model was picked, same as `coord assign` /
     # `coord approve`. `issue_labels` (above, line ~572) came from
@@ -623,11 +645,23 @@ def dispatch_entry(
     # earlier `coord plan`/`coord milestone plan` run.
     from coord.config import describe_model_choice  # noqa: PLC0415
 
-    model_reason = describe_model_choice(
-        resolved_model=resolved_model,
-        matched_label=matched_label,
-        shadowed_labels=shadowed_labels,
-    )
+    if resolved_model:
+        model_reason = describe_model_choice(
+            resolved_model=resolved_model,
+            matched_label=matched_label,
+            shadowed_labels=shadowed_labels,
+        )
+    else:
+        # #1706: resolved_model is None only when the effective provider's
+        # own `providers.definitions.<name>.model` is pinned and no label
+        # matched — state that explicitly rather than feeding `None` to
+        # describe_model_choice (which expects a str).
+        _pinned = config.providers.definitions.get(effective_provider_name)
+        model_reason = (
+            f"{_pinned.model} (via providers.definitions[{effective_provider_name!r}].model)"
+            if _pinned is not None and _pinned.model
+            else "none (provider default; no --model support at this call site)"
+        )
 
     proposal = Proposal(
         id=0,

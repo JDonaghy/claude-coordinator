@@ -234,6 +234,14 @@ class ClaudeProvider(Provider):
         passes ``input=`` to :func:`subprocess.run` or writes to
         ``proc.stdin`` in the async path).
 
+        Note: unlike :meth:`build_command`, this does **not** thread in
+        ``self._model`` / ``self._extra_args`` / ``self._env`` (#1706) —
+        oneshot calls (brain planning, dashboard assistant) don't take an
+        ``AssignmentSpec`` and sit outside the assignment spawn path that
+        #1706 wires provider-definition config into. A future reader
+        should not assume oneshot calls honour ``providers.definitions.
+        <name>.{model,extra_args,env}``.
+
         Args:
             system_prompt: The system prompt for the one-shot call.
             output_format: Output format flag value.  ``"json"`` produces

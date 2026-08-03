@@ -4556,7 +4556,12 @@ def _dispatch_headless(
     precedence chain falls through to the repo/global default unchanged.
     """
     from coord.board_service import read_board, write_board  # noqa: PLC0415
-    from coord.dispatch import dispatch, post_briefing  # noqa: PLC0415
+    from coord.dispatch import (  # noqa: PLC0415
+        dispatch,
+        post_briefing,
+        resolve_dispatch_model_alias,
+    )
+    from coord.providers import resolve_provider_name  # noqa: PLC0415
     from coord.state import record_dispatched  # noqa: PLC0415
 
 
@@ -4579,17 +4584,35 @@ def _dispatch_headless(
     # otherwise dispatch.require_plan sets the default.
     effective_plan_only = plan_only or (cfg.dispatch.require_plan and not no_plan)
 
+    # #1707: resolve the effective provider BEFORE the model, so model
+    # resolution can be provider-aware (#1706 review fix, below).
+    effective_provider_name = resolve_provider_name(
+        provider, repo_cfg.provider, cfg.providers,
+    )
+
     # Resolve model: --model flag → models.labels (work dispatch only) →
-    # config default. #1430: plan workers are read-only/cheap and must not
-    # inherit a tier:large -> opus routing meant for the eventual work
-    # dispatch, so label resolution only applies when this is a work
-    # dispatch, not a plan-only one.
+    # the effective provider's own pinned model (non-claude/claude-pty
+    # only) → config default. #1430: plan workers are read-only/cheap and
+    # must not inherit a tier:large -> opus routing meant for the eventual
+    # work dispatch, so label resolution only applies when this is a work
+    # dispatch, not a plan-only one. #1706: `resolve_dispatch_model_alias`
+    # is the single place the provider-aware exception to `models.default`
+    # lives — see its docstring. Without this, `resolved_model` was always
+    # truthy by the time it reached `Proposal.model`, which meant
+    # `coord.dispatch.dispatch()`'s own (also provider-aware)
+    # `definition.model` fallback could never fire for a plain `coord
+    # assign` — the primary scenario #1706 was meant to unblock.
     label_model, matched_label, shadowed_labels = (
         cfg.models.model_for_labels_with_reason(issue_labels)
         if not effective_plan_only
         else (None, None, [])
     )
-    resolved_model = model or label_model or cfg.models.default
+    resolved_model = resolve_dispatch_model_alias(
+        explicit_model=model,
+        label_model=label_model,
+        config=cfg,
+        effective_provider_name=effective_provider_name,
+    )
 
     proposal = Proposal(
         id=0,
@@ -4630,6 +4653,18 @@ def _dispatch_headless(
                 shadowed_labels=shadowed_labels,
             )
         )
+    else:
+        # #1706: resolved_model is None only when the effective provider's
+        # own `providers.definitions.<name>.model` is pinned and neither
+        # --model nor a label matched — state that explicitly instead of
+        # silently printing nothing, so the operator can see --model was
+        # deliberately left off the wire payload in favor of the pin.
+        _pinned = cfg.providers.definitions.get(effective_provider_name)
+        if _pinned is not None and _pinned.model:
+            click.echo(
+                f"  model: {_pinned.model} "
+                f"(via providers.definitions[{effective_provider_name!r}].model)"
+            )
 
     # #1707: mirror the --model reasoning line above — state which link of
     # the spec (--provider) → repo (Repo.provider) → providers.default chain

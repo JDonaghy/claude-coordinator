@@ -534,6 +534,11 @@ class ClaudePtyProvider(Provider):
         same shape as :class:`~.claude.ClaudeProvider`) rather than raising,
         so callers still get a workable command list.
 
+        Note: like :class:`~.claude.ClaudeProvider`'s ``oneshot_command``,
+        this does **not** thread in ``self._model`` / ``self._extra_args``
+        / ``self._env`` (#1706) — oneshot calls don't take an
+        ``AssignmentSpec`` and sit outside the assignment spawn path.
+
         Args:
             system_prompt: The system prompt for the call.
             output_format: Forwarded to the argv exactly as for

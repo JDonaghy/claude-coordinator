@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 import pytest
 
-from coord.config import Config, ModelsConfig
+from coord.config import Config, ModelsConfig, ProviderDef, ProvidersConfig
 from coord.milestone_dispatch import (
     MilestoneContext,
     MilestoneDispatchError,
@@ -580,6 +580,51 @@ class TestDispatchEntry:
         # batch/tick sees "laptop" as busy.
         assert any(a.assignment_id == "asn-1" and a.status == "running" for a in board.active)
         assert pick_machine("api", board, cfg) is None
+
+    def test_opencode_provider_definition_model_wins_over_models_default(
+        self, coord_db,
+    ) -> None:
+        """#1706 review fix: `coord milestone dispatch` — like `coord
+        assign`/`coord approve` — must not force `models.default` (a
+        Claude alias) onto a repo routed through a non-claude/claude-pty
+        provider that pins its own `model`. Milestone dispatch has no
+        per-call --model override, so this is the only lever an operator
+        has to pick a non-default model for it."""
+        cfg = _config(
+            [_machine("laptop", ["api"])],
+            repos=[Repo(name="api", github="acme/api", provider="opencode")],
+        )
+        cfg.providers = ProvidersConfig(
+            default="claude",
+            definitions={
+                "claude": ProviderDef(type="claude"),
+                "opencode": ProviderDef(type="opencode", model="zhipuai/glm-4.6"),
+            },
+        )
+        board = Board()
+        pick = self._pick(cfg, board)
+        repo = cfg.repo("api")
+
+        proposals = []
+
+        def fake_dispatch(proposal, config):
+            proposals.append(proposal)
+            return {"id": "asn-oc-1"}
+
+        with patch("coord.github_ops.get_issue", return_value={"title": "Fix X", "body": "b", "labels": []}), \
+             patch("coord.dispatch.dispatch", side_effect=fake_dispatch), \
+             patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.github_ops.check_branch_exists", return_value=False):
+            outcome = dispatch_entry(pick, repo, cfg, board, tracking_issue=100)
+
+        assert outcome.ok is True
+        assert len(proposals) == 1
+        assert proposals[0].model is None, (
+            "expected proposal.model=None so OpenCodeProvider's own "
+            f"definition.model wins; got {proposals[0].model!r}"
+        )
+        assert outcome.model_reason is not None
+        assert "zhipuai/glm-4.6" in outcome.model_reason
 
     def test_claimed_issue_is_not_dispatched(self, coord_db) -> None:
         cfg = _config([_machine("laptop", ["api"])])
