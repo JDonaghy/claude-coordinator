@@ -21,10 +21,13 @@ from coord.agent import (
     FAILED,
     PENDING,
     RUNNING,
+    MOCK_AUTHOR_SYSTEM_PROMPT,
+    WORKER_SYSTEM_PROMPT,
     AgentAssignment,
     AgentServer,
     AssignmentSpec,
     _COMPLETED_HISTORY_CAP,
+    _base_checkout_write_guard_tools,
     _git,
     _sealed_write_guard_tools,
     _worker_subprocess_env,
@@ -933,9 +936,98 @@ def test_sealed_write_guard_tools_dedupes():
     assert patterns.count("Write(tests/acceptance/**)") == 1
 
 
-def test_default_worker_command_omits_disallowed_tools_when_not_sealed() -> None:
-    """A normal work spec with nothing forbidden gets no --disallowedTools —
-    the flag must not appear unconditionally for every worker."""
+# ── #1642: base-checkout write guard ─────────────────────────────────────────
+
+
+def test_base_checkout_write_guard_tools_blocks_edit_and_write():
+    patterns = _base_checkout_write_guard_tools("/home/john/src/api")
+    assert "Edit(//home/john/src/api/**)" in patterns
+    assert "Write(//home/john/src/api/**)" in patterns
+
+
+def test_base_checkout_write_guard_tools_strips_trailing_slash():
+    """A trailing slash on repo_path must not produce a double-slash pattern
+    (Edit(//home/john/src/api//**)) that would fail to match anything."""
+    patterns = _base_checkout_write_guard_tools("/home/john/src/api/")
+    assert "Edit(//home/john/src/api/**)" in patterns
+    assert "Write(//home/john/src/api/**)" in patterns
+
+
+def test_base_checkout_write_guard_tools_empty_for_empty_path():
+    assert _base_checkout_write_guard_tools("") == []
+
+
+def test_base_checkout_write_guard_tools_empty_for_relative_path():
+    """The //<abs-path> marker only makes sense for an absolute path — a
+    relative repo_path (should never happen in production) must not produce
+    a malformed pattern that silently matches nothing."""
+    assert _base_checkout_write_guard_tools("relative/repo") == []
+
+
+def test_worker_system_prompt_forbids_the_base_checkout():
+    """#1642: a haiku-routed worker given a correct worktree still edited
+    the shared base checkout by absolute path — the cwd convention was
+    never actually stated as a rule. Guard the rule against being silently
+    dropped in a future prompt edit (mirrors
+    test_smoke_briefing_scopes_its_checkout_to_the_worktree for the smoke
+    prompt)."""
+    assert "current working directory" in WORKER_SYSTEM_PROMPT
+    assert "~/src/<repo>" in WORKER_SYSTEM_PROMPT
+
+
+def test_mock_author_system_prompt_forbids_the_base_checkout():
+    assert "current working directory" in MOCK_AUTHOR_SYSTEM_PROMPT
+    assert "~/src/<repo>" in MOCK_AUTHOR_SYSTEM_PROMPT
+
+
+def test_assign_wires_the_base_checkout_guard_into_the_real_dispatch(tmp_path: Path) -> None:
+    """#1642 end-to-end: dispatch a real ``work`` assignment (not a fake
+    fixed argv — this uses the real ``default_worker_command`` so the wiring
+    from ``AgentServer.assign()`` through ``spec.repo_path`` is exercised for
+    real) and assert the argv the agent actually launched carries a
+    --disallowedTools guard naming THIS run's base checkout — the assertion
+    this bug would have failed, since before #1642 no such guard existed at
+    all and a worker's only constraint was its subprocess cwd.
+
+    The base checkout is asserted clean afterwards too: the worker here is
+    ``/bin/true`` (never touches the filesystem), so this also pins that a
+    normal, well-behaved dispatch leaves the base checkout untouched.
+    """
+    repo = _init_repo(tmp_path / "repo")
+    server = AgentServer(
+        machine_name="test",
+        capabilities=["python"],
+        repos=["api"],
+        state_dir=tmp_path / "state",
+        worker_command=lambda spec: default_worker_command(spec, binary="/bin/true"),
+        repo_paths={"api": str(repo)},
+    )
+    spec = _spec(repo)
+    a = server.assign(spec)
+    final = server.wait_for(a.id, timeout=30)
+    assert final.exit_code == 0
+
+    log = Path(final.log_path).read_text()
+    header = log.splitlines()[0]
+    assert "--disallowedTools" in header
+    for pattern in _base_checkout_write_guard_tools(str(repo)):
+        assert pattern in header
+
+    # And the base checkout itself — the shared, non-worktree, non-disposable
+    # checkout this guard exists to protect — is untouched.
+    status = subprocess.run(
+        ["git", "status", "--short"], cwd=str(repo), capture_output=True, text=True, check=True
+    )
+    assert status.stdout == ""
+
+
+def test_default_worker_command_omits_sealed_guard_when_not_sealed() -> None:
+    """A normal work spec with nothing forbidden gets no sealed-oracle
+    --disallowedTools entries — that guard must not fire unconditionally
+    for every worker. (#1642's base-checkout guard below DOES fire
+    unconditionally for any Edit-capable worker, so --disallowedTools
+    itself is still present — see
+    test_default_worker_command_blocks_base_checkout_writes.)"""
     spec = AssignmentSpec(
         repo_name="api",
         repo_path="/tmp/repo",
@@ -945,7 +1037,44 @@ def test_default_worker_command_omits_disallowed_tools_when_not_sealed() -> None
         files_forbidden=[],
     )
     argv = default_worker_command(spec)
-    assert "--disallowedTools" not in argv
+    assert "--disallowedTools" in argv
+    idx = argv.index("--disallowedTools")
+    disallowed = argv[idx + 1]
+    assert "tests/acceptance/" not in disallowed
+
+
+def test_default_worker_command_blocks_base_checkout_writes() -> None:
+    """#1642: a worker given a correct worktree can still construct an
+    absolute path back into the shared base checkout (spec.repo_path) and
+    edit it directly — worktree isolation was enforced by cwd alone. Any
+    spec.type that gets Edit in --allowedTools must get a real
+    --disallowedTools guard blocking Edit/Write anywhere under
+    spec.repo_path, regardless of files_forbidden."""
+    spec = AssignmentSpec(
+        repo_name="api",
+        repo_path="/tmp/repo",
+        issue_number=1,
+        issue_title="t",
+        briefing="b",
+        files_forbidden=[],
+    )
+    argv = default_worker_command(spec)
+    assert "--disallowedTools" in argv
+    idx = argv.index("--disallowedTools")
+    disallowed = argv[idx + 1]
+    assert "Edit(//tmp/repo/**)" in disallowed
+    assert "Write(//tmp/repo/**)" in disallowed
+    # Read-only spec types (no Edit in --allowedTools) get no guard at all —
+    # they can't write anywhere so the flag would be a no-op.
+    plan_spec = AssignmentSpec(
+        repo_name="api",
+        repo_path="/tmp/repo",
+        issue_number=1,
+        issue_title="t",
+        briefing="b",
+        type="plan",
+    )
+    assert "--disallowedTools" not in default_worker_command(plan_spec)
 
 
 def test_default_worker_command_blocks_sealed_oracle_writes() -> None:
@@ -976,8 +1105,10 @@ def test_default_worker_command_blocks_sealed_oracle_writes() -> None:
 
 def test_default_worker_command_mock_author_not_sealed() -> None:
     """mock-author's entire job is writing under tests/acceptance/ — dispatch.py
-    never adds it to files_forbidden for that type, so it must get no write
-    guard (mirrors the dispatch-time exemption, not re-derived here)."""
+    never adds it to files_forbidden for that type, so it must get no
+    sealed-oracle write guard (mirrors the dispatch-time exemption, not
+    re-derived here). It still gets the #1642 base-checkout guard, same as
+    every other Edit-capable worker type."""
     spec = AssignmentSpec(
         repo_name="api",
         repo_path="/tmp/repo",
@@ -988,7 +1119,12 @@ def test_default_worker_command_mock_author_not_sealed() -> None:
         files_forbidden=[],
     )
     argv = default_worker_command(spec)
-    assert "--disallowedTools" not in argv
+    assert "--disallowedTools" in argv
+    idx = argv.index("--disallowedTools")
+    disallowed = argv[idx + 1]
+    assert "tests/acceptance/" not in disallowed
+    assert "Edit(//tmp/repo/**)" in disallowed
+    assert "Write(//tmp/repo/**)" in disallowed
 
 
 # ── #1445: worktree-writability preflight ───────────────────────────────────
