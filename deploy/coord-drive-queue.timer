@@ -1,0 +1,25 @@
+# coord drive-queue tick — fires coord-drive-queue.service (Type=oneshot) on
+# a cadence. See that unit's header for the full rationale and the
+# COORD_BIN / #1523 pinned-runner requirement.
+#
+# 15 minutes, not shorter. A drive takes ~85 minutes end-to-end on this repo
+# (see scripts/drive-batch.sh's DEADLINE comment), so between launches the
+# tick is only ever OBSERVING — reconciling a running entry against board
+# state and deciding there's nothing new to do. A tighter interval buys
+# nothing but load; `Type=oneshot` + the tick's own flock means it cannot
+# stack even if it did fire faster than a tick takes to run.
+#
+# Install: see deploy/coord-drive-queue.service's header, or
+# docs/DRIVE_QUEUE.md.
+
+[Unit]
+Description=Run coord drive-queue tick every 15 minutes (#1756)
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

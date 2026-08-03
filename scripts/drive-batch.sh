@@ -13,6 +13,21 @@
 # stop the batch — the remaining issues still run and the failure is recorded
 # in the summary. For a DEPENDENT chain (each issue needs the previous one
 # MERGED, because the next worker branches off main) set STOP_ON_FAIL=1.
+#
+# `coord drive-queue` (#1750, docs/DRIVE_QUEUE.md) IS THE NEWER TOOL for most
+# of what this script does, and is usually the better default: the queue is
+# durable across a crash/reboot (state lives in the board, not a bash loop's
+# stack), reorderable and enqueueable live from the TUI or CLI while it runs,
+# and drained by a systemd timer instead of a tmux session someone has to
+# remember to keep alive. Reach for THIS script instead when you want a
+# one-off, strictly-sequential, foreground run you intend to babysit in tmux
+# tonight — it has no install step and nothing to leave configured afterward.
+# Not yet a full replacement: `coord drive-queue` has no equivalent of
+# STOP_ON_FAIL's dependent-chain semantics beyond `--after`, and per #1715 a
+# queue longer than ~2 issues on one repo is not yet unattended-safe (see
+# docs/DRIVE_QUEUE.md's top section) — this script's per-issue independence
+# and single failure summary can still be the safer choice for a long batch
+# until that lands.
 # ─────────────────────────────────────────────────────────────────────────────
 
 # -e is deliberately NOT set: the loop must survive a failed issue.
