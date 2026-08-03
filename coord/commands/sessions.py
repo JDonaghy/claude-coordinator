@@ -138,7 +138,28 @@ def _resolve_log_machine_via_daemon(assignment_id: str, config_path: Path):
 
 
 def _emit_log_text(text: str, *, raw: bool) -> None:
-    """Print *text* either as-is (raw mode or plain-text log) or rendered."""
+    """Print *text* either as-is (raw mode or plain-text log) or rendered.
+
+    #1710 inventory: kept as a direct ``coord.worker_events`` import rather
+    than routed through ``provider.parse_log()``. This — and the three other
+    ``parse_event``/``render_event``/``format_important_event`` sites in this
+    module (``_log_local``'s follow branch, ``_watch_remote``, ``watch``) —
+    is display-only live/local/remote log-tailing for ``coord logs``/
+    ``coord watch``: it decodes the generic Anthropic-Messages-API NDJSON
+    envelope one event at a time and renders each into a human-readable
+    line, streaming as the log grows. ``Provider.parse_log()`` returns a
+    single terminal ``WorkerSummary`` once the whole log is available — no
+    per-event streaming-render primitive exists to route through without a
+    new abstract ``Provider`` method touching every concrete provider,
+    including the out-of-scope ``opencode.py`` (same reasoning as
+    ``coord.review``/``coord.plan_parser``'s equivalent kept-direct sites).
+    Degradation is not silent either way: any line that fails to parse as an
+    event already falls through to a verbatim ``click.echo`` of the raw
+    line below, so a non-claude worker's log renders as unrendered raw text
+    rather than vanishing — distinct from the silent-empty-result failure
+    mode #1710 targets in the coordinator-side analytics functions
+    (progress/usage/failure-class) this migration is scoped to.
+    """
     if not text:
         return
     if raw:
@@ -197,6 +218,7 @@ def _log_local(assignment_id: str, follow: bool, *, raw: bool = False) -> None:
         sys.exit(1)
 
     if follow:
+        # #1710 inventory: kept direct — see the note on `_emit_log_text` above.
         from coord.worker_events import parse_event, render_event
 
         is_json: bool | None = None
@@ -1676,6 +1698,8 @@ def _watch_remote(
     Streams log bytes from the remote agent and routes them through the same
     worker_events rendering pipeline used by local watch.  Never returns —
     exits via sys.exit().
+
+    #1710 inventory: kept direct — see the note on `_emit_log_text` above.
     """
     from coord.network import fetch_log
     from coord.worker_events import format_important_event, parse_event, render_event
@@ -1784,6 +1808,8 @@ def watch(
     timeout: int,
 ) -> None:
     from coord.state import load_dispatched
+
+    # #1710 inventory: kept direct — see the note on `_emit_log_text` above.
     from coord.worker_events import format_important_event, parse_event, render_event
 
     cfg = _load_config(config_path)
