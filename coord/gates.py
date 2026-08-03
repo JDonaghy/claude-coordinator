@@ -5,11 +5,12 @@ bearer token and a raw ``/board`` curl.
 Two things were missing before this module existed:
 
 1. A CLI surface for the raw columns every gate reads — ``test_state``,
-   ``smoke_test``, ``test_reason``, ``test_toolchain`` (#1629), ``review_state``,
-   ``review_verdict``, ``review_of_assignment_id`` — none of which ``coord status`` or ``coord
-   diagnose --stage test`` prints (see #1657's "diagnose --stage test"
-   repro: it reports the *assignment row*'s status, never ``test_state``
-   itself, which was ``"running"`` at the moment that mattered).
+   ``smoke_test``, ``test_reason``, ``test_toolchain`` (#1629),
+   ``review_state``, ``review_verdict``, ``review_of_assignment_id`` — none
+   of which ``coord status`` or ``coord diagnose --stage test`` prints (see
+   #1657's "diagnose --stage test" repro: it reports the *assignment row*'s
+   status, never ``test_state`` itself, which was ``"running"`` at the
+   moment that mattered).
 2. The gate *decision*, not just the columns — in particular whether a
    recorded verdict is #1479-stale (recorded against a base/branch SHA that
    has since moved), which is otherwise unexplainable from any surface the

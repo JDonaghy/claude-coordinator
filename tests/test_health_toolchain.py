@@ -227,6 +227,35 @@ def test_ci_toolchain_versions_explicit_rust_pin_via_ref(tmp_path: Path) -> None
     assert out["rustc"] == "1.75.0"
 
 
+def test_ci_toolchain_versions_setup_node_no_with_block_is_unknown(tmp_path: Path) -> None:
+    """Regression (#1629 review): `actions/setup-node@v4` with no explicit
+    `with: node-version:` is the common CI pattern (`.nvmrc`-driven Node) —
+    `v4` is the ACTION's own release tag, not a Node version, and must never
+    be fabricated into a pin. Reproduces the exact false-CRIT report from the
+    review: this used to resolve to `"v4"`, and `ci_matches_machine("v4",
+    "20.11.0")` is False, which surfaced as a bogus fleet_toolchain_skew CRIT."""
+    _write_workflow(
+        tmp_path, "test.yml",
+        "on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n"
+        "      - uses: actions/checkout@v4\n"
+        "      - uses: actions/setup-node@v4\n",
+    )
+    out = toolchain.ci_toolchain_versions(tmp_path)
+    assert out["node"] is None
+
+
+def test_ci_toolchain_versions_setup_python_no_with_block_is_unknown(tmp_path: Path) -> None:
+    """Same regression as above for `actions/setup-python@v5` with no
+    explicit `with: python-version:` (default runner Python)."""
+    _write_workflow(
+        tmp_path, "test.yml",
+        "on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n"
+        "      - uses: actions/setup-python@v5\n",
+    )
+    out = toolchain.ci_toolchain_versions(tmp_path)
+    assert out["python"] is None
+
+
 def test_ci_toolchain_versions_unrelated_action_is_ignored(tmp_path: Path) -> None:
     _write_workflow(
         tmp_path, "test.yml",
