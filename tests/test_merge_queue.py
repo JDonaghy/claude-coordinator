@@ -295,6 +295,12 @@ class FakeGh:
         # path runs, matching get_branch_sha's default above.
         return None
 
+    def get_compare_files(self, repo: str, base: str, head: str) -> list[str] | None:
+        # #1738: tests don't exercise the inert-base-move check by default;
+        # return None so `_base_move_is_inert` fails closed ("not proven
+        # inert" → stale on SHA mismatch), matching the two defaults above.
+        return None
+
     def get_pr_body(self, repo: str, number: int) -> str:
         return self.pr_bodies.get(number, "")
 
@@ -5309,12 +5315,19 @@ class TestStaleSmokeVerdictReporting:
 
         base_sha: str = "base-new"
         branch_sha: str = "branch-sha"
+        # #1738: files the base-move compare (`test_base_sha`..`base_sha`)
+        # reports as changed. None (default) means "compare unavailable" —
+        # the inert-base check fails closed, same as the pre-#1738 behaviour.
+        compare_files: list[str] | None = None
 
         def get_branch_sha(self, repo: str, branch: str) -> str | None:
             return self.base_sha if branch == "main" else self.branch_sha
 
         def get_branch_patch_id(self, repo: str, base: str, branch: str) -> str | None:
             return "patch-1"
+
+        def get_compare_files(self, repo: str, base: str, head: str) -> list[str] | None:
+            return self.compare_files
 
     # ── defect 1: the message names the case ──────────────────────────────
 
@@ -5426,6 +5439,102 @@ class TestStaleSmokeVerdictReporting:
 
         assert verdict.ok is False
         assert verdict.kind == mq.SMOKE_STALE
+
+    # ── #1738: a content-irrelevant base move must not stale a verdict ────
+    #
+    # The base SHA moving is not, by itself, evidence that anything the test
+    # suite could see actually changed — #1631's regression: a sibling merge
+    # touched only `scripts/drive-batch.sh` and staled an otherwise-green
+    # verdict, burning ~15 minutes of re-proof for nothing. When *gh_ops* can
+    # confirm the base..base diff touches ONLY the #1738 inert allowlist
+    # (docs/**, scripts/**, .github/ISSUE_TEMPLATE/**, top-level *.md), the
+    # verdict stays fresh. Anything else — including a `.md` nested under a
+    # non-allowlisted directory — stales exactly as before.
+
+    def test_base_move_touching_only_scripts_stays_fresh(self) -> None:
+        """The #1631 regression itself: base moved, diff is scripts-only."""
+        board = self._board(completed=[self._tested_work()])
+        entry = _q("w1", target="main")
+        entry.target_branch_head_sha = "base-new"
+        gh = self._Gh(compare_files=["scripts/drive-batch.sh"])
+
+        verdict = mq.evaluate_smoke_verdict(entry, board, gh)
+
+        assert verdict.ok is True
+        assert verdict.kind == mq.SMOKE_OK
+
+    def test_base_move_touching_coord_stays_stale(self) -> None:
+        """Must not regress: a base move that touches `coord/**` is exactly
+        the case #1479 exists to catch — stays stale."""
+        board = self._board(completed=[self._tested_work()])
+        entry = _q("w1", target="main")
+        entry.target_branch_head_sha = "base-new"
+        gh = self._Gh(compare_files=["coord/merge_queue.py"])
+
+        verdict = mq.evaluate_smoke_verdict(entry, board, gh)
+
+        assert verdict.ok is False
+        assert verdict.kind == mq.SMOKE_STALE
+        assert verdict.anchor == "base"
+
+    def test_base_move_touching_docs_and_coord_stays_stale(self) -> None:
+        """The allowlist is all-or-nothing — one non-inert file in the diff
+        stales the whole move, even alongside inert ones."""
+        board = self._board(completed=[self._tested_work()])
+        entry = _q("w1", target="main")
+        entry.target_branch_head_sha = "base-new"
+        gh = self._Gh(compare_files=["docs/README.md", "coord/drive.py"])
+
+        verdict = mq.evaluate_smoke_verdict(entry, board, gh)
+
+        assert verdict.ok is False
+        assert verdict.kind == mq.SMOKE_STALE
+
+    def test_base_move_touching_nested_markdown_stays_stale(self) -> None:
+        """Extension alone never qualifies: a `.md` nested under a
+        non-allowlisted directory (e.g. a test contract, #1738) is NOT
+        inert just because it ends in `.md` — only a top-level `*.md`
+        (README.md, CONTRIBUTING.md, ...) is."""
+        board = self._board(completed=[self._tested_work()])
+        entry = _q("w1", target="main")
+        entry.target_branch_head_sha = "base-new"
+        gh = self._Gh(compare_files=["tests/acceptance/contract.md"])
+
+        verdict = mq.evaluate_smoke_verdict(entry, board, gh)
+
+        assert verdict.ok is False
+        assert verdict.kind == mq.SMOKE_STALE
+
+    def test_base_move_with_unreadable_compare_stays_stale(self) -> None:
+        """`get_compare_files` returning None (compare unreadable) fails
+        closed — #1738's "bias hard toward staling"."""
+        board = self._board(completed=[self._tested_work()])
+        entry = _q("w1", target="main")
+        entry.target_branch_head_sha = "base-new"
+        gh = self._Gh(compare_files=None)
+
+        verdict = mq.evaluate_smoke_verdict(entry, board, gh)
+
+        assert verdict.ok is False
+        assert verdict.kind == mq.SMOKE_STALE
+
+    def test_base_move_inert_but_branch_content_also_changed_stays_stale(
+        self,
+    ) -> None:
+        """An inert base move does not short-circuit the branch-content
+        check that follows it — both anchors must be fresh."""
+        board = self._board(completed=[self._tested_work()])
+        entry = _q("w1", target="main")
+        entry.target_branch_head_sha = "base-new"
+        entry.branch_head_sha = "branch-new"   # new commit pushed
+        entry.branch_patch_id = "patch-2"       # content actually changed
+        gh = self._Gh(compare_files=["scripts/drive-batch.sh"])
+
+        verdict = mq.evaluate_smoke_verdict(entry, board, gh)
+
+        assert verdict.ok is False
+        assert verdict.kind == mq.SMOKE_STALE
+        assert verdict.anchor == "branch"
 
     def test_has_smoke_verdict_still_returns_the_same_booleans(self) -> None:
         """The boolean seam every gate call site uses is unchanged."""
