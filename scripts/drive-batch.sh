@@ -80,6 +80,15 @@ DEADLINE="${DEADLINE:-120}"
 STOP_ON_FAIL="${STOP_ON_FAIL:-0}"
 DRY_RUN="${DRY_RUN:-0}"
 
+# Wait this long before the FIRST dispatch — "start it now, begin at 22:00".
+# Accepts `90s`, `30m`, `6h`, or a bare number of seconds; `--delay` overrides.
+#
+# The wait happens AFTER preflight, not before. Preflight is where a wrong
+# MACHINE, a missing checkout or an issue that is not ready gets caught, and
+# those must surface while you are still at the keyboard — discovering them
+# six hours later is the whole failure this script exists to avoid.
+DELAY="${DELAY:-0}"
+
 # Issues come from argv, each `ISSUE` or `REPO#ISSUE`:
 #
 #   ./drive-batch.sh 1645 1650 1654
@@ -96,13 +105,21 @@ DRY_RUN="${DRY_RUN:-0}"
 # so the second one's branch does not age against the first one's merge.
 usage() {
   cat <<'USAGE'
-usage: MACHINE=<name> drive-batch.sh ISSUE|REPO#ISSUE ...
+usage: MACHINE=<name> drive-batch.sh [--delay DURATION] ISSUE|REPO#ISSUE ...
        drive-batch.sh --help
 
   Drives each issue to completion, one at a time, in the order given.
   A bare ISSUE uses $REPO (default: claude-coordinator).
 
+  --delay DURATION  wait before the FIRST dispatch. `90s`, `30m`, `6h`, or a
+                    bare number of seconds. Preflight still runs immediately,
+                    so a bad MACHINE or an unready issue fails now rather than
+                    after the wait. The single-instance lock is held for the
+                    whole delay, so a delayed batch blocks a second one.
+                    Ignored under DRY_RUN=1 (reported, not slept).
+
   env: MACHINE      target machine (REQUIRED — no default)
+       DELAY        same as --delay (the flag wins)
        DEADLINE     minutes per issue (default 120; see the note in-file
                     before lowering it — a short deadline does not save
                     time, it makes the run concurrent)
@@ -113,7 +130,28 @@ usage: MACHINE=<name> drive-batch.sh ISSUE|REPO#ISSUE ...
        DRY_RUN=1    preflight only, dispatch nothing
 
   example:  MACHINE=dellserver DEADLINE=120 ./drive-batch.sh 1645 1650 1654
+            MACHINE=dellserver ./drive-batch.sh --delay 6h 1645 1650 1654
 USAGE
+}
+
+# Parse `90s` / `30m` / `6h` / bare-seconds into seconds on stdout.
+#
+# Strict on purpose: an unparseable duration is FATAL, never silently 0. A
+# typo'd --delay that quietly became "no delay" would dispatch a whole batch
+# hours early, onto a fleet the operator believed was idle.
+parse_duration() {
+  local raw="$1" num unit
+  if [[ "$raw" =~ ^([0-9]+)([smh]?)$ ]]; then
+    num="${BASH_REMATCH[1]}"; unit="${BASH_REMATCH[2]}"
+  else
+    echo "FATAL: --delay '$raw' is not a duration (use 90s, 30m, 6h, or seconds)" >&2
+    return 1
+  fi
+  case "$unit" in
+    h)    echo $(( num * 3600 )) ;;
+    m)    echo $(( num * 60 )) ;;
+    s|'') echo "$num" ;;
+  esac
 }
 
 # --help before every other check: it must work with no MACHINE, no coord
@@ -124,6 +162,24 @@ for arg in "$@"; do
     -h|--help|help) usage; exit 0 ;;
   esac
 done
+
+# Strip flags out of the positional list; whatever survives is issues.
+# Validated here — before the MACHINE/COORD checks — so a malformed --delay
+# is reported on its own terms rather than behind an unrelated error.
+declare -a POSITIONAL=()
+while (( $# )); do
+  case "$1" in
+    --delay)   [[ $# -ge 2 ]] || { echo "FATAL: --delay needs a value" >&2; exit 64; }
+               DELAY="$2"; shift 2 ;;
+    --delay=*) DELAY="${1#--delay=}"; shift ;;
+    --)        shift; POSITIONAL+=("$@"); break ;;
+    -*)        echo "FATAL: unknown option '$1'" >&2; usage >&2; exit 64 ;;
+    *)         POSITIONAL+=("$1"); shift ;;
+  esac
+done
+set -- ${POSITIONAL[@]+"${POSITIONAL[@]}"}
+
+DELAY_SECS=$(parse_duration "$DELAY") || exit 64
 
 (( $# )) || { usage >&2; exit 64; }
 if [[ -z "$MACHINE" ]]; then
@@ -167,6 +223,37 @@ log() { echo "[$(date -Is)] $*" >> "$LOG"; }
 
 hms() { printf '%dh%02dm%02ds' $(($1/3600)) $(($1%3600/60)) $(($1%60)); }
 
+# Count live drive sessions, or 0 if that cannot be determined.
+#
+# Read the declared machine contract, not the prose. `coord drive-sessions
+# --json` emits an array of {repo, issue, session_name, attached} and is
+# already consumed by coord-tui (`coord/commands/drive.py:394-398`). The
+# human output is NOT parseable: `grep -c .` counts the literal "No live
+# drive sessions." as one session — that false positive fired on the
+# 2026-08-01 run — and each real row is followed by two "attach with:" /
+# "stop with:" continuation lines. #1523 forbids CLI-prose parsing on a
+# control path; a --json contract one flag away leaves no excuse.
+#
+# Degrades to 0 (not a spurious warning) on any older coord without --json.
+# NOTE: the failure path must ASSIGN 0, never `|| echo 0` — under `pipefail`
+# a failing `$COORD` makes the whole pipeline non-zero even though python
+# already printed its own 0, so appending produced "0\n0" and the caller's
+# `(( live > 0 ))` died with a syntax error. That silently disabled this
+# warning in exactly the degraded case the paragraph above promises to
+# handle. The regex guard catches any other non-numeric surprise.
+live_drive_sessions() {
+  local out
+  out=$("$COORD" drive-sessions --json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    print(len(json.load(sys.stdin)))
+except Exception:
+    print(0)
+' 2>/dev/null) || out=0
+  [[ "$out" =~ ^[0-9]+$ ]] || out=0
+  echo "$out"
+}
+
 # ── Single-instance guard ────────────────────────────────────────────────────
 # Stops a second invocation stacking on the first (the ad-hoc sequencer once
 # ran 4 concurrent drives against a cap of 2 and burned the 5h window from
@@ -185,6 +272,7 @@ say "=== drive-batch starting ==="
 say "log:      $LOG  (also: $LOG_LATEST)"
 say "issues:   ${ISSUES[*]}"
 say "machine:  $MACHINE   deadline: ${DEADLINE}m/issue   stop_on_fail: $STOP_ON_FAIL"
+(( DELAY_SECS > 0 )) && say "delay:    $(hms "$DELAY_SECS") after preflight, before the first dispatch"
 
 # ── Preflight ────────────────────────────────────────────────────────────────
 say "coord:    $COORD ($("$COORD" --version 2>&1 | tail -1))"
@@ -258,24 +346,7 @@ for r in "${ISSUE_REPOS[@]}"; do
 done
 
 # A live drive from an earlier run would contend for the same machine.
-#
-# Read the declared machine contract, not the prose. `coord drive-sessions
-# --json` emits an array of {repo, issue, session_name, attached} and is
-# already consumed by coord-tui (`coord/commands/drive.py:394-398`). The
-# human output is NOT parseable: `grep -c .` counts the literal "No live
-# drive sessions." as one session — that false positive fired on the
-# 2026-08-01 run — and each real row is followed by two "attach with:" /
-# "stop with:" continuation lines. #1523 forbids CLI-prose parsing on a
-# control path; a --json contract one flag away leaves no excuse.
-#
-# Degrades to 0 (not a spurious warning) on any older coord without --json.
-live=$("$COORD" drive-sessions --json 2>/dev/null | python3 -c '
-import json, sys
-try:
-    print(len(json.load(sys.stdin)))
-except Exception:
-    print(0)
-' 2>/dev/null || echo 0)
+live=$(live_drive_sessions)
 (( live > 0 )) && say "WARNING: $live live drive session(s) already exist — check before continuing"
 
 # Validate every issue before dispatching any of them: config, machine, repo
@@ -297,7 +368,28 @@ if (( ${#RUN_IDX[@]} == 0 )); then
 fi
 
 if [[ "$DRY_RUN" == "1" ]]; then
+  (( DELAY_SECS > 0 )) && say "DRY_RUN=1 — would have delayed $(hms "$DELAY_SECS") here"
   say "DRY_RUN=1 — stopping before the real loop"; exit 0
+fi
+
+# ── Delay ────────────────────────────────────────────────────────────────────
+# Deliberately AFTER preflight: a wrong MACHINE, a missing checkout or an
+# issue that is not ready must fail while the operator is still watching, not
+# six hours later against an empty terminal.
+#
+# The flock is already held (taken above), so a delayed batch blocks a second
+# invocation for its whole wait. That is the intended reading — a scheduled
+# run is still a run — but it does mean `--delay 6h` reserves the runner.
+if (( DELAY_SECS > 0 )); then
+  say "delaying $(hms "$DELAY_SECS") — first dispatch at ~$(date -Is -d "+$DELAY_SECS seconds")"
+  sleep "$DELAY_SECS"
+  say "delay elapsed — starting the batch"
+
+  # Preflight's live-session check is now hours stale, and the hazard it
+  # guards (a concurrent drive contending for the same machine) is exactly
+  # what a long delay invites. Re-check. Advisory, like the original.
+  live=$(live_drive_sessions)
+  (( live > 0 )) && say "WARNING: $live live drive session(s) started during the delay — check before continuing"
 fi
 
 # ── Main loop ────────────────────────────────────────────────────────────────
