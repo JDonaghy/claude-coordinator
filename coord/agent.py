@@ -21,7 +21,7 @@ import tempfile
 import threading
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterable
 
@@ -516,6 +516,77 @@ def _git(cwd: Path, *args: str, timeout: float = 15.0) -> str:
     if result.returncode != 0:
         raise _GitError(f"git {' '.join(args)} failed: {result.stderr.strip()}")
     return result.stdout.strip()
+
+
+def _is_linked_worktree(repo_path: Path) -> bool:
+    """True when *repo_path* is a linked ``git worktree`` rather than the
+    checkout that owns its ``.git`` directory (#1729, H-6's guard 2).
+
+    Ports ``.githooks/_lib.sh``'s ``gfy_is_linked_worktree`` predicate to
+    Python instead of re-deriving it: a linked worktree's own ``--git-dir``
+    (a ``.git/worktrees/<name>`` subdirectory of the *common* dir) differs
+    from ``--git-common-dir``; the base checkout's are the same path. The
+    self-heal rebuild must never run here — a linked worktree's
+    ``graphify-out/`` entries are symlinks to the shared base graph (see
+    ``coord.graph_health``'s module docstring), so a rebuild in the
+    worktree would overwrite the base graph from a feature-branch tree,
+    and the worktree itself can be reaped mid-rebuild.
+
+    Best-effort like the rest of this module's git helpers: a *repo_path*
+    git can't read (already gone, not a repo at all) reports ``False`` so
+    the caller's "skip it" branch never fires on a wrong answer either way
+    — the caller separately requires the path to exist and be a real
+    checkout before it gets here.
+    """
+    try:
+        git_dir = _git(repo_path, "rev-parse", "--git-dir")
+        common_dir = _git(repo_path, "rev-parse", "--git-common-dir")
+    except (_GitError, FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return False
+
+    def _abs(raw: str) -> Path:
+        p = Path(raw)
+        try:
+            return (repo_path / p).resolve() if not p.is_absolute() else p.resolve()
+        except OSError:
+            return repo_path / p
+
+    return _abs(git_dir) != _abs(common_dir)
+
+
+def _graphify_update(repo_path: Path, *, timeout: float = 600.0) -> tuple[bool, str]:
+    """Run ``graphify update .`` in *repo_path* (#1729, H-6's self-heal).
+
+    Deliberately the plain, no-flags command graphify's own hooks run (see
+    ``docs/GRAPHIFY_SETUP.md``) — **never** ``--force``: that flag exists
+    only to defeat graphify's node-count refusal guard, and defeating it
+    automatically is exactly what turns a visible stall into silent
+    corruption of the graph agents navigate by (#1729 guard 4).
+
+    Returns ``(ok, detail)``. ``ok`` is False on a non-zero exit, a missing
+    ``graphify`` binary, or a timeout — the caller treats all three the
+    same way: surface the reason on the health check and remember this
+    HEAD as attempted so the next tick does not retry it (guard 3).
+    """
+    try:
+        result = subprocess.run(
+            ["graphify", "update", "."],
+            cwd=str(repo_path),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except FileNotFoundError:
+        return False, "graphify: command not found on this machine's PATH"
+    except subprocess.TimeoutExpired:
+        return False, f"graphify update . timed out after {timeout:.0f}s"
+    except OSError as exc:
+        return False, f"graphify update . failed to start: {exc}"
+
+    if result.returncode != 0:
+        reason = (result.stderr or result.stdout or "").strip()
+        return False, reason or f"graphify update . exited {result.returncode}"
+    return True, (result.stdout or "").strip()
 
 
 def _infer_repo_github_slug(repo_path: str) -> str | None:
@@ -3653,6 +3724,25 @@ class AgentServer:
             os.environ.get("COORD_AGENT_HEALTH_INTERVAL", "300")
         )
 
+        # #1729 (H-6): self-healing graph rebuild, riding the same cached
+        # health-check tick as `_local_health_cache` above. `path -> (HEAD
+        # sha, reason)` for the last checkout whose automatic `graphify
+        # update .` *failed* — guard 3's "once per HEAD, never a retry
+        # loop". The 2026-08-02 incident this issue closes out was a
+        # rebuild that ran to completion and then lost to graphify's own
+        # node-count guard; without this a naive reconciler re-runs the
+        # full AST pass every `_local_health_ttl` forever against that
+        # same refusal. The reason is kept (not just the sha) so every
+        # poll on this HEAD keeps surfacing *why* — not just the one poll
+        # that made the attempt — per guard 4's "fail loud". Cleared for a
+        # path as soon as a rebuild against it succeeds, so a fresh bout of
+        # drift on the same sha (should that ever happen) still gets one
+        # fresh attempt rather than being suppressed forever. In-memory
+        # only, by design: it resets on agent restart, and #404 means an
+        # `/update` self-restart never applies without a manual
+        # `systemctl --user restart coord-agent` anyway.
+        self._graph_rebuild_failed: dict[str, tuple[str, str]] = {}
+
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self._load_state()
@@ -3748,6 +3838,14 @@ class AgentServer:
 
             ctx = build_context(self._health_config, allow_network=False, now=now)
             report = run_all(ctx, scopes=("machine", "checkout"))
+            try:
+                # #1729 (H-6): best-effort and deliberately its own
+                # try/except — a bug in the self-heal pass must never
+                # blind this whole health block (the outer except below
+                # would turn a perfectly good report into "unknown").
+                self._self_heal_stale_graphs(ctx, report)
+            except Exception as exc:  # noqa: BLE001 — self-heal is best-effort
+                _log.warning("graph self-heal pass failed: %s", exc)
             report_dict = report.to_dict()
             payload = {
                 "schema": report_dict["schema"],
@@ -3777,6 +3875,138 @@ class AgentServer:
 
         self._local_health_cache = (now, payload)
         return payload
+
+    def _self_heal_stale_graphs(self, ctx: Any, report: Any) -> None:
+        """React to the ``graph`` check's STATE verdict instead of chasing
+        the git events that produced it (#1729, H-6).
+
+        The git hooks (`.githooks/`) are event-driven and structurally
+        cannot cover every ref-moving operation — rebase/merge/cherry-pick
+        `exit 0`, `git reset --hard` fires no hook at all, and every hook
+        failure path is a silent `exit 0` behind a detached background
+        process (see `coord.graph_health`'s module docstring). The `stale`
+        predicate H-5 already computes, by contrast, is total: it compares
+        the graph's stamp against HEAD and does not care how the drift
+        happened. So this runs on the same TTL tick as the rest of the
+        cached local-health report (`_cached_local_health`) and, for every
+        `graph`-check result the just-completed *report* calls stale, runs
+        `graphify update .` right there — subject to four load-bearing
+        guards:
+
+        1. **Idle-gate.** Only when this machine has no RUNNING assignment.
+           A rebuild is hundreds of files across many workers; running it
+           while a worker is mid-build steals the CPU that worker was
+           dispatched for. This reads `self._assignments` under a brief
+           lock and releases it before the (possibly slow) rebuild runs —
+           load-bearing for guard-adjacent requirement #1625 decision 3:
+           health must stay advisory, so a dispatch landing mid-rebuild
+           must never be delayed by it (see `_graphify_update`, called
+           with the lock already released).
+        2. **Base checkouts only.** Never a linked worktree — its
+           `graphify-out/` entries are symlinks to the shared base graph
+           (a rebuild there would clobber the base graph from a
+           feature-branch tree), and the worktree can be reaped mid-
+           rebuild. Belt (`values["is_symlink"]`, the graph-level signal)
+           and suspenders (`_is_linked_worktree`, ported straight from
+           `.githooks/_lib.sh`'s `gfy_is_linked_worktree`).
+        3. **Once per HEAD, never a retry loop.** `_graph_rebuild_failed`
+           remembers the last HEAD a rebuild failed against (and why), per
+           checkout path; this tick skips re-running it until HEAD moves,
+           while still surfacing the same reason every poll. This is the guard
+           the 2026-08-02 incident demands — a reconciler that just
+           retries on failure re-runs a full AST pass every tick forever
+           against the same node-count refusal.
+        4. **Fail loud, never `--force`.** A refusal or error rewrites this
+           checkout's `graph` result to WARN with the real reason attached
+           (`report.results` is mutated in place, so this same /health
+           poll reflects it — H-4, #1631, is what an operator actually
+           reads) — never re-run with `--force`, which exists to defeat
+           the very node-count guard that caused the 2026-08-02 incident.
+
+        Mutates *report* in place: a checkout that rebuilds successfully
+        gets its `graph` result replaced with a freshly-probed one (so a
+        poll that triggers the fix also reports it fixed, rather than
+        "stale" for one more TTL window); a checkout whose rebuild fails
+        gets the WARN replacement described above. Never raises — the
+        caller (`_cached_local_health`) wraps this in its own try/except
+        so a bug here can never blind the rest of the health block.
+        """
+        from coord.health.models import Severity  # noqa: PLC0415
+
+        with self._lock:
+            active = sum(1 for a in self._assignments.values() if a.status == RUNNING)
+        if active:
+            return
+
+        for i, result in enumerate(report.results):
+            if result.check_id != "graph":
+                continue
+            values = result.values or {}
+            if not values.get("stale"):
+                continue
+            path_str = values.get("path")
+            if not path_str:
+                continue
+            repo_path = Path(path_str)
+
+            # Guard 2.
+            if values.get("is_symlink") or _is_linked_worktree(repo_path):
+                continue
+
+            head_sha = values.get("head_sha")
+            # Guard 3. A HEAD this checkout already failed against keeps
+            # surfacing that failure (guard 4) on every poll, not just the
+            # one that made the attempt — but never attempts again until
+            # HEAD moves.
+            previously_failed = self._graph_rebuild_failed.get(path_str)
+            if head_sha and previously_failed and previously_failed[0] == head_sha:
+                report.results[i] = self._graph_failure_result(result, values, previously_failed[1])
+                continue
+
+            ok, detail = _graphify_update(repo_path)
+
+            if not ok:
+                # Guard 4.
+                if head_sha:
+                    self._graph_rebuild_failed[path_str] = (head_sha, detail)
+                report.results[i] = self._graph_failure_result(result, values, detail)
+                continue
+
+            # Success: HEAD hasn't moved, so any earlier failure recorded
+            # against it no longer applies.
+            self._graph_rebuild_failed.pop(path_str, None)
+
+            from coord.health.registry import run_all as _run_graph_only  # noqa: PLC0415
+
+            refreshed = _run_graph_only(ctx, scopes=("checkout",), only=("graph",))
+            replacement = next(
+                (r for r in refreshed.results if (r.values or {}).get("path") == path_str),
+                None,
+            )
+            if replacement is not None:
+                report.results[i] = replacement
+
+    @staticmethod
+    def _graph_failure_result(result: Any, values: dict, detail: str) -> Any:
+        """Guard 4's WARN replacement, shared by the attempt and the
+        already-attempted-this-HEAD skip path — so an operator reading H-4
+        (#1631) sees the same reason on the poll that tried the rebuild and
+        on every poll after it, until HEAD moves.  Never `--force`: the
+        fix-by-hand suggestion below is the same plain command the agent
+        itself just ran.
+        """
+        from coord.health.models import Severity  # noqa: PLC0415
+
+        return replace(
+            result,
+            severity=Severity.WARN,
+            headroom=f"self-heal failed: {detail}",
+            detail=(
+                f"agent's automatic `graphify update .` refused/failed "
+                f"— {detail}. Fix by hand: graphify update {values.get('path')}"
+            ),
+            values={**values, "self_heal_failed_reason": detail},
+        )
 
     def _cached_tool_versions(self) -> dict:
         """Return `/health`'s `tool_versions` with a long TTL cache.
