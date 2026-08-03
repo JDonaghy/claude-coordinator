@@ -1765,6 +1765,105 @@ def test_smoke_gate_agreeing_with_a_missing_verdict_still_retries():
     assert action.kind == WAIT
 
 
+def test_stale_smoke_divergence_redispatches_the_test_stage_instead_of_escalating():
+    """#1738: unlike the "missing verdict" divergence above, a STALE verdict
+    (recorded, but against a base/branch that has since moved) has a safe,
+    bounded self-service fix — re-run the Test stage — so the very first
+    encounter must NOT escalate; it must clear the verdict via `coord
+    diagnose --stage test --reset` (which `dispatch_pending_smoke` then
+    re-dispatches on its own next tick)."""
+    counters = DriveCounters()
+    action = step(
+        approved_work(
+            merge_status="READY",
+            merge_reason=(
+                "smoke test verdict is stale: recorded against base "
+                "23acfbb, base is now b263929 — re-verify against the "
+                "current base, then `coord test w1 --passed`"
+            ),
+        ),
+        counters=counters,
+    )
+    assert action.kind == RUN
+    assert not action.is_exit
+    assert action.command == (
+        "diagnose", REPO, str(ISSUE), "--stage", "test", "--reset",
+    )
+    assert counters.fix_rounds == 1
+    assert counters.merge_attempts == 0  # never even tried the doomed merge
+
+
+def test_stale_smoke_divergence_also_matches_the_plan_wording():
+    """`merge_queue.plan()`'s board-render wording ("test verdict stale
+    (...)") names the identical stale-verdict case in different words — same
+    remedy."""
+    counters = DriveCounters()
+    action = step(
+        approved_work(
+            merge_status="BLOCKED",
+            merge_reason="test verdict stale (base moved b263929)",
+        ),
+        counters=counters,
+    )
+    assert action.kind == RUN
+    assert action.command == (
+        "diagnose", REPO, str(ISSUE), "--stage", "test", "--reset",
+    )
+
+
+def test_stale_smoke_redispatch_is_bounded_by_max_fix_rounds():
+    """The re-test arm shares the SAME `fix_rounds` budget as the test-failed
+    and review-fix arms (#1738) — it must converge to an escalation, not spin
+    forever, if the verdict keeps going stale."""
+    counters = DriveCounters()
+    opts = DriveOptions(machine="precision", max_fix_rounds=2)
+    s = approved_work(
+        merge_status="READY",
+        merge_reason="smoke test verdict is stale: recorded against base X, base is now Y",
+    )
+
+    first = step(s, opts, counters=counters)
+    assert first.kind == RUN
+    second = step(s, opts, counters=counters)
+    assert second.kind == RUN
+    exhausted = step(s, opts, counters=counters)
+    assert exhausted.is_exit
+    assert exhausted.exit_code == EXIT_ESCALATED
+    assert "smoke" in exhausted.message.lower()
+
+
+def test_stale_smoke_redispatch_respects_max_fix_rounds_zero():
+    """A drive told to spend zero fix rounds escalates on the very first
+    stale-smoke encounter rather than dispatching a re-test it isn't allowed
+    to spend budget on."""
+    action = step(
+        approved_work(
+            merge_status="READY",
+            merge_reason="smoke test verdict is stale: recorded against base X, base is now Y",
+        ),
+        DriveOptions(machine="precision", max_fix_rounds=0),
+    )
+    assert action.is_exit
+    assert action.exit_code == EXIT_ESCALATED
+
+
+def test_missing_smoke_verdict_divergence_still_escalates_immediately():
+    """Restates the #1526 "missing verdict" case side by side with the new
+    #1738 "stale verdict" arm above so the two can't silently drift onto the
+    same (wrong) behaviour — only staleness gets the automated re-test."""
+    counters = DriveCounters()
+    action = step(
+        approved_work(
+            merge_status="READY",
+            merge_reason="smoke test required but no verdict recorded",
+        ),
+        counters=counters,
+    )
+    assert action.is_exit
+    assert action.exit_code == EXIT_ESCALATED
+    assert counters.fix_rounds == 0
+
+
 def test_review_required_with_an_approved_verdict_escalates_instead_of_retrying():
     """#1526 instance 2 (#1483): board shows review=approve, but a rebase
     onto a moved `main` correctly voided the approval (#1475's patch-id
@@ -1854,6 +1953,23 @@ def test_merge_gate_kind_recognises_both_process_and_plan_wordings():
     assert _merge_gate_kind("review not approved") == "review"
     assert _merge_gate_kind("checks failed: build (failure)") is None
     assert _merge_gate_kind("") is None
+
+
+def test_is_stale_smoke_reason_distinguishes_stale_from_missing():
+    """#1738: the narrower predicate the re-test arm gates on — only the two
+    STALE wordings qualify; "no verdict at all" wordings (still `_merge_gate_
+    kind`'s "smoke") must not."""
+    from coord.drive import _is_stale_smoke_reason
+
+    assert _is_stale_smoke_reason(
+        "smoke test verdict is stale: recorded against base X, base is now Y"
+    )
+    assert _is_stale_smoke_reason("test verdict stale (base moved)")
+    assert not _is_stale_smoke_reason("smoke test required but no verdict recorded")
+    assert not _is_stale_smoke_reason("test verdict missing")
+    assert not _is_stale_smoke_reason("review required but not approved")
+    assert not _is_stale_smoke_reason("")
+    assert not _is_stale_smoke_reason(None)
 
 
 # ── terminal: merged, verified ───────────────────────────────────────────────

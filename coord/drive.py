@@ -1488,6 +1488,25 @@ def _merge_gate_kind(reason: str) -> str | None:
     return None
 
 
+# #1738: the two wordings that name a verdict recorded-but-STALE specifically
+# (`merge_queue.process`'s live-attempt text and `merge_queue.plan`'s
+# board-render text — see the module comment above `_SMOKE_GATE_MARKERS`) —
+# a strict subset of `_SMOKE_GATE_MARKERS`, which also matches "no verdict at
+# all" ("smoke test required"/"test verdict missing"). Only the stale case
+# has a safe, bounded, fully-automatable fix: re-run the Test stage against
+# the CURRENT base and let a fresh verdict land. A missing-verdict divergence
+# is the #1640 lost-write shape instead — driver and gate disagree about
+# whether a verdict exists at all, which a re-test can't safely paper over —
+# so that one still escalates to a human on first encounter, unchanged.
+_STALE_SMOKE_MARKERS = ("smoke test verdict is stale", "test verdict stale")
+
+
+def _is_stale_smoke_reason(reason: str | None) -> bool:
+    """True when *reason* names a STALE (not missing) smoke verdict (#1738)."""
+    r = (reason or "").lower()
+    return any(marker in r for marker in _STALE_SMOKE_MARKERS)
+
+
 def _merge_gate_divergence(state: IssueState) -> str | None:
     """``"smoke"``/``"review"`` when *state* shows the #1526 divergence,
     else ``None``.
@@ -1540,10 +1559,23 @@ def _escalate_merge(
     """
     pr_number = _extract_pr_number(state.merge_pr_url)
     if gate_kind == "smoke":
+        # #1738: lead with re-dispatching the Test stage, not with the
+        # hand-recorded `coord test --passed` — that command records a
+        # verdict for a run that never happened if pasted without actually
+        # re-running the suite, and it was the path of least resistance at
+        # 2am on an issue everyone already believed was green. This
+        # escalation only fires once the automated re-test arm in
+        # `_decide_merge` has already spent its `fix_rounds` budget (or hit
+        # the "missing verdict" divergence that arm deliberately doesn't
+        # touch), so the safe, verified remedy is offered FIRST; the
+        # hand-recorded form is still here as the explicit fallback for a
+        # human who has actually re-run the suite themselves.
         proposed = (
-            f"coord test {state.work_aid} --passed   # ONLY if the suite "
-            "genuinely still passes against the CURRENT base — otherwise "
-            f"dispatch a fresh smoke test for {state.work_aid}"
+            f"coord diagnose {state.repo} {state.issue} --stage test "
+            "--reset   # re-run the Test stage against the CURRENT base "
+            "(preferred) — or, ONLY if you have personally just re-run the "
+            f"suite against the current base yourself: coord test "
+            f"{state.work_aid} --passed"
         )
     elif gate_kind == "review":
         proposed = (
@@ -1660,6 +1692,39 @@ def _decide_merge(
     side of the disagreement.
     """
     divergence = _merge_gate_divergence(state)
+    if divergence == "smoke" and _is_stale_smoke_reason(state.merge_reason):
+        # #1738: a STALE (not missing) smoke verdict has a safe, bounded
+        # self-service fix this driver can take without a human — re-run the
+        # Test stage against the current base via the same non-destructive
+        # reset `coord diagnose --stage test --reset` already performs
+        # (clears `test_state` so `dispatch_pending_smoke` picks the work
+        # back up on its own next tick; the branch/commits are untouched).
+        # Bounded by the SAME `fix_rounds` budget the test-failed and
+        # review-request-changes arms already share, so a verdict that keeps
+        # going stale (e.g. a base that keeps moving under it) still
+        # converges to an escalation instead of spinning forever.
+        if counters.fix_rounds >= opts.max_fix_rounds:
+            return _escalate_merge(state, state.merge_status, gate_kind=divergence)
+        counters.fix_rounds += 1
+        return Action(
+            kind=RUN,
+            label=(
+                "MERGE: smoke verdict stale → re-test round "
+                f"{counters.fix_rounds}/{opts.max_fix_rounds} "
+                f"(coord diagnose {state.repo} {state.issue} --stage test --reset)"
+            ),
+            command=(
+                "diagnose", state.repo, str(state.issue),
+                "--stage", "test", "--reset",
+            ),
+            error_message=(
+                f"coord diagnose {state.repo} {state.issue} --stage test "
+                "--reset failed to clear the stale verdict.\n"
+                f"   Continue by hand: coord test {state.work_aid} --passed   "
+                "# ONLY if the suite genuinely still passes against the "
+                "CURRENT base — otherwise dispatch a fresh smoke test"
+            ),
+        )
     if divergence is not None:
         return _escalate_merge(state, state.merge_status, gate_kind=divergence)
 

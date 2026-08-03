@@ -923,6 +923,62 @@ class SmokeVerdictStatus:
         return "smoke test required but no verdict recorded"
 
 
+# #1738: paths whose content cannot affect a pytest/cargo test result — the
+# allowlist a base-SHA move is checked against before staling an otherwise-
+# fresh verdict. Deliberately small and additive (start conservative, widen
+# later if a real false-stale shows up outside it). Two shapes:
+#   - a directory prefix ("docs/", "scripts/", ...) — everything under it,
+#     recursively, is inert;
+#   - a bare top-level filename pattern ("*.md") — matches ONLY files with no
+#     directory component. This is why `tests/acceptance/foo.md` is NOT
+#     inert despite the `.md` extension: extension alone never qualifies, only
+#     a top-level `*.md` (README.md, CONTRIBUTING.md, ...) does. Any other
+#     path — including any `coord/**`, `tests/**`, `tui/**`, `pyproject.toml`,
+#     or `.github/workflows/**` — stales the verdict exactly as before.
+_INERT_BASE_DIR_PREFIXES = ("docs/", "scripts/", ".github/ISSUE_TEMPLATE/")
+
+
+def _path_is_inert(path: str) -> bool:
+    """True when *path* matches the #1738 inert-base allowlist."""
+    if any(path.startswith(prefix) for prefix in _INERT_BASE_DIR_PREFIXES):
+        return True
+    return "/" not in path and path.endswith(".md")
+
+
+def _base_move_is_inert(
+    gh_ops: "GhOps | None", repo_github: str | None, old_sha: str, new_sha: str
+) -> bool:
+    """True when every file the base moved through (*old_sha*..*new_sha*) is
+    provably inert (#1738) — content that cannot alter a test result, so a
+    fresh verdict recorded against *old_sha* still covers *new_sha*.
+
+    Fails closed (returns ``False``, i.e. "not proven inert, stale as
+    before") whenever inertness can't be established: no *gh_ops*/*repo_github*
+    to ask, the compare call raises, or it comes back ``None`` (unreadable) or
+    empty-but-unconfirmed. The bar set by #1738 is "bias hard toward staling":
+    a false "fresh" merges untested code; a false "stale" only costs a re-run.
+
+    Note: :class:`coord.gate_snapshot.GateSnapshot` (the ``/board`` display
+    path's ``gh_ops`` stand-in) does not yet cache ``get_compare_files``, so a
+    plain ``AttributeError`` lands here and this fails closed exactly as it
+    does for a genuine lookup failure — the display can show STALE for a
+    base move that a live ``coord merge``/``coord drive`` (real
+    ``coord.github_ops``) correctly treats as fresh. That's the safe
+    direction of disagreement (pessimistic display, correct live gate) —
+    the opposite of the #1640 incident — but wiring this cache through
+    :class:`~coord.gate_snapshot.GateSnapshotRefresher` would close it too.
+    """
+    if gh_ops is None or not repo_github:
+        return False
+    try:
+        files = gh_ops.get_compare_files(repo_github, old_sha, new_sha)
+    except Exception:  # noqa: BLE001 — fail-safe: unknown diff is not "inert"
+        return False
+    if files is None:
+        return False
+    return all(_path_is_inert(f) for f in files)
+
+
 def has_smoke_verdict(
     entry: "QueuedMerge", board, gh_ops: "GhOps | None" = None
 ) -> bool:
@@ -1080,6 +1136,17 @@ def evaluate_smoke_verdict(
             test_base_sha is not None
             and current_base_sha is not None
             and test_base_sha != current_base_sha
+            # #1738: the base moved, but a moved SHA doesn't necessarily mean
+            # a content change that could affect a test result — same
+            # reasoning the branch-side check below already applies via
+            # patch-id, just answered here by "what files actually moved"
+            # instead of "is the diff byte-identical". A base move whose
+            # entire diff is docs/scripts/issue-template content is provably
+            # inert and does not invalidate the verdict — fall through to the
+            # branch-content check below instead of staling here.
+            and not _base_move_is_inert(
+                gh_ops, repo_github, test_base_sha, current_base_sha
+            )
         ):
             # stale: re-verify against the new base
             if stale is None:
@@ -1341,6 +1408,17 @@ class GhOps(Protocol):
         rebase (#1475) even though the branch's HEAD SHA changed. Returning
         ``None`` is safe — the gate falls back to the pre-#1475 SHA-only
         staleness check.
+        """
+        ...
+
+    def get_compare_files(self, repo: str, base: str, head: str) -> list[str] | None:
+        """Return the file paths changed in the three-dot *base*...*head*
+        compare, or None on failure.
+
+        #1738: used by :func:`_base_move_is_inert` to tell a content-
+        irrelevant base move (docs/scripts/issue-template only) from one that
+        could actually affect a test result, before staling an otherwise-
+        fresh smoke verdict just because the merge base's SHA moved.
         """
         ...
 
