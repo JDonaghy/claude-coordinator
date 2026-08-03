@@ -5,8 +5,8 @@ bearer token and a raw ``/board`` curl.
 Two things were missing before this module existed:
 
 1. A CLI surface for the raw columns every gate reads — ``test_state``,
-   ``smoke_test``, ``test_reason``, ``review_state``, ``review_verdict``,
-   ``review_of_assignment_id`` — none of which ``coord status`` or ``coord
+   ``smoke_test``, ``test_reason``, ``test_toolchain`` (#1629), ``review_state``,
+   ``review_verdict``, ``review_of_assignment_id`` — none of which ``coord status`` or ``coord
    diagnose --stage test`` prints (see #1657's "diagnose --stage test"
    repro: it reports the *assignment row*'s status, never ``test_state``
    itself, which was ``"running"`` at the moment that mattered).
@@ -65,6 +65,10 @@ class AssignmentGateRow:
     test_state: str | None
     smoke_test: str | None
     test_reason: str | None
+    # #1629 (H-2): the toolchain that produced test_state, when resolvable.
+    # None for pre-1629 rows or an unresolvable toolchain — rendered as
+    # "unknown", never as a mismatch.
+    test_toolchain: str | None
     review_state: str | None
     review_verdict: str | None
     review_of_assignment_id: str | None
@@ -109,6 +113,7 @@ def _row_from_assignment(a: "Assignment") -> AssignmentGateRow:
         test_state=a.test_state,
         smoke_test=a.smoke_test,
         test_reason=a.test_reason,
+        test_toolchain=a.test_toolchain,
         review_state=a.review_state,
         review_verdict=a.review_verdict,
         review_of_assignment_id=a.review_of_assignment_id,
@@ -338,6 +343,9 @@ def format_gate_report(report: GateReport) -> str:
         lines.append(
             f"      test_state={row.test_state}  smoke_test={row.smoke_test}  "
             f"test_reason={row.test_reason!r}"
+        )
+        lines.append(
+            f"      test_toolchain={row.test_toolchain or 'unknown'}"
         )
         lines.append(
             f"      review_state={row.review_state}  review_verdict={row.review_verdict}  "

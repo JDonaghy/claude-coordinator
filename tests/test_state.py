@@ -1773,3 +1773,92 @@ class TestTestVerdictStalenessAnchor:
         ).fetchone()
         assert row["test_base_sha"] == "sha-for-feature/ms-7"
         assert "feature/ms-7" in seen_bases
+
+
+class TestRecordTestVerdictToolchain:
+    """#1629 (H-2): `test_toolchain` — the toolchain that produced a Test
+    verdict — round-trips through `record_test_verdict` -> the DB -> the
+    board projection, and a historical verdict with no toolchain renders as
+    unknown rather than breaking anything."""
+
+    @staticmethod
+    def _seed_assignment(coord_db, *, assignment_id="aid-1"):
+        coord_db.execute(
+            "INSERT INTO assignments (assignment_id, machine_name, repo_name, "
+            "issue_number, issue_title, branch) VALUES (?, 'm1', 'api', 1, 't', ?)",
+            (assignment_id, f"worker/{assignment_id}"),
+        )
+        coord_db.commit()
+
+    def test_toolchain_round_trips_through_the_db(self, coord_db) -> None:
+        self._seed_assignment(coord_db)
+
+        record_test_verdict(
+            assignment_id="aid-1", test_state="passed", test_toolchain="rustc 1.95.0",
+        )
+
+        row = coord_db.execute(
+            "SELECT test_state, test_toolchain FROM assignments WHERE assignment_id='aid-1'"
+        ).fetchone()
+        assert row["test_state"] == "passed"
+        assert row["test_toolchain"] == "rustc 1.95.0"
+
+    def test_toolchain_round_trips_through_build_board(self, coord_db) -> None:
+        from coord.state import build_board
+
+        self._seed_assignment(coord_db)
+
+        record_test_verdict(
+            assignment_id="aid-1", test_state="failed",
+            test_reason="boom", test_toolchain="python 3.12.4, node 20.11.0",
+        )
+
+        board = build_board()
+        row = next(a for a in board.active if a.assignment_id == "aid-1")
+        assert row.test_toolchain == "python 3.12.4, node 20.11.0"
+
+    def test_omitted_toolchain_defaults_to_none(self, coord_db) -> None:
+        """Every caller predating #1629 (and any that just doesn't have a
+        toolchain to report) must keep working unchanged."""
+        self._seed_assignment(coord_db)
+
+        record_test_verdict(assignment_id="aid-1", test_state="passed")
+
+        row = coord_db.execute(
+            "SELECT test_toolchain FROM assignments WHERE assignment_id='aid-1'"
+        ).fetchone()
+        assert row["test_toolchain"] is None
+
+    def test_a_later_verdict_without_a_toolchain_clears_the_old_one(self, coord_db) -> None:
+        """test_toolchain describes THIS verdict — it must not survive a
+        re-test that didn't resolve one, or a stale toolchain would
+        misattribute the new result to hardware that didn't produce it."""
+        self._seed_assignment(coord_db)
+        record_test_verdict(
+            assignment_id="aid-1", test_state="passed", test_toolchain="rustc 1.95.0",
+        )
+
+        record_test_verdict(assignment_id="aid-1", test_state="passed")
+
+        row = coord_db.execute(
+            "SELECT test_toolchain FROM assignments WHERE assignment_id='aid-1'"
+        ).fetchone()
+        assert row["test_toolchain"] is None
+
+    def test_historical_row_with_no_toolchain_column_value_is_none_not_a_crash(
+        self, coord_db
+    ) -> None:
+        """A row written before #1629 has test_toolchain=NULL by construction
+        (the ALTER TABLE migration adds the column with no default) — assert
+        the read path (build_board -> Assignment) tolerates it."""
+        from coord.state import build_board
+
+        self._seed_assignment(coord_db, assignment_id="aid-old")
+        coord_db.execute(
+            "UPDATE assignments SET test_state='passed' WHERE assignment_id='aid-old'"
+        )
+        coord_db.commit()
+
+        board = build_board()
+        row = next(a for a in board.active if a.assignment_id == "aid-old")
+        assert row.test_toolchain is None

@@ -70,13 +70,14 @@ def _agent(version: str | None, *, errored: bool = False) -> dict:
 # ── every fleet probe is actually registered ─────────────────────────────────
 
 
-def test_all_four_fleet_probes_run() -> None:
+def test_all_five_fleet_probes_run() -> None:
     results = _run(_ctx())
     assert set(results) == {
         "fleet_deploy_lanes",
         "fleet_tui_binary",
         "fleet_board_latency",
         "fleet_phantom_running",
+        "fleet_toolchain_skew",
     }
 
 

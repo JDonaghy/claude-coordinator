@@ -523,6 +523,31 @@ class FleetHealthRefresher:
             facts["tui_source_dir"] = str(source_dir)
             facts["tui_source_mtime"] = _newest_rust_source_mtime(source_dir)
 
+        # #1629 (H-2): per-repo toolchain kinds + CI's pinned version, read
+        # from whichever local checkouts exist on THIS (daemon) host — same
+        # "derive from configured checkouts, never guess a path" rule as the
+        # tui/ source dir above. A repo with no local checkout on the daemon
+        # host simply has no entry — `probe_toolchain_skew` reads that as "no
+        # repo has a resolvable toolchain" for it, not as "in sync".
+        facts["repo_toolchain_kinds"] = {}
+        facts["ci_toolchains"] = {}
+        try:
+            from coord.health.checks.toolchain import (  # noqa: PLC0415
+                ci_toolchain_versions,
+                repo_toolchain_kinds,
+            )
+            from coord.health.context import local_checkouts  # noqa: PLC0415
+
+            for checkout in local_checkouts(config):
+                kinds = repo_toolchain_kinds(checkout.path)
+                if kinds:
+                    facts["repo_toolchain_kinds"][checkout.name] = kinds
+                    facts["ci_toolchains"][checkout.name] = ci_toolchain_versions(
+                        checkout.path
+                    )
+        except Exception:  # noqa: BLE001 — a fact gatherer must never break the tick
+            pass
+
         return facts
 
     @staticmethod

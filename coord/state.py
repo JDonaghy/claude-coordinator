@@ -1023,6 +1023,7 @@ def record_test_verdict(
     test_reason: str | None = None,
     smoke_test: str | None = None,
     smoke_test_reason: str | None = None,
+    test_toolchain: str | None = None,
 ) -> None:
     """Record a Test-gate verdict on one assignment — routes to the daemon when set.
 
@@ -1041,6 +1042,14 @@ def record_test_verdict(
     than reporting pass/fail, so :func:`coord.smoke.dispatch_pending_smoke`'s
     ``test_state is not None`` eligibility check picks the work row back up
     for a fresh dispatch instead of leaving it wedged or wrongly `failed`.
+
+    ``test_toolchain`` (#1629, H-2) is **optional and purely informational**:
+    the toolchain string (e.g. ``"rustc 1.95.0"``) that produced this
+    verdict, if the caller could resolve one (see
+    ``coord.health.checks.toolchain``).  ``None`` — the default, and every
+    caller predating this parameter — records no toolchain; nothing treats
+    that as a failure, only as "unknown", same as every other advisory
+    health signal in this codebase.
     """
     svc = _board_service()
     resp = _route_write(
@@ -1052,6 +1061,7 @@ def record_test_verdict(
             "test_reason": test_reason,
             "smoke_test": smoke_test,
             "smoke_test_reason": smoke_test_reason,
+            "test_toolchain": test_toolchain,
         },
     )
     if resp is not None:
@@ -1062,6 +1072,7 @@ def record_test_verdict(
         test_reason=test_reason,
         smoke_test=smoke_test,
         smoke_test_reason=smoke_test_reason,
+        test_toolchain=test_toolchain,
     )
 
 
@@ -1072,6 +1083,7 @@ def _record_test_verdict_local(
     test_reason: str | None = None,
     smoke_test: str | None = None,
     smoke_test_reason: str | None = None,
+    test_toolchain: str | None = None,
 ) -> None:
     """UPDATE the assignment's test_state/test_reason (+ smoke_test mirror).
 
@@ -1090,6 +1102,13 @@ def _record_test_verdict_local(
     (``tui/src/app/settings_ui.rs``): ``passed``→``pass``, ``failed``→``fail``
     (carrying ``test_reason`` as the smoke reason), ``skipped``→ leave the
     mirror untouched.
+
+    #1629 (H-2): ``test_toolchain`` is written in the SAME statement as
+    ``test_state`` — including when both are ``None`` — so it never goes
+    stale by surviving a later verdict that didn't supply one. It describes
+    THIS verdict; carrying a previous verdict's toolchain forward across a
+    re-test would misattribute the new result to hardware that didn't
+    produce it.
     """
     if smoke_test is None:
         # Derive the legacy mirror from the canonical verdict.
@@ -1102,8 +1121,9 @@ def _record_test_verdict_local(
 
     conn = get_connection()
     conn.execute(
-        "UPDATE assignments SET test_state=?, test_reason=? WHERE assignment_id=?",
-        (test_state, test_reason, assignment_id),
+        "UPDATE assignments SET test_state=?, test_reason=?, test_toolchain=? "
+        "WHERE assignment_id=?",
+        (test_state, test_reason, test_toolchain, assignment_id),
     )
     # Mirror to legacy smoke_test only for pass/fail, matching coord test /
     # the TUI's record_test_verdict_conn.

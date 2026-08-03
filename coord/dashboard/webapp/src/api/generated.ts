@@ -123,6 +123,7 @@ export interface Assignment {
   test_head_sha: string | null
   test_patch_id: string | null
   test_base_sha: string | null
+  test_toolchain: string | null
   review_verdict: 'approve' | 'request-changes' | null
   review_verdict_original: string | null
   review_verdict_override_reason: string | null

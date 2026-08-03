@@ -526,6 +526,16 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # predating this column. This is the piece that survives the
         # driver process exiting — see coord.models.Assignment.driven_by.
         "ALTER TABLE assignments ADD COLUMN driven_by TEXT",
+        # #1629 (H-2): the toolchain string that produced a Test-gate
+        # verdict — e.g. "rustc 1.95.0" or "python 3.12.4, node 20.11.0" —
+        # captured (best-effort) alongside `test_state` in
+        # `coord.state._record_test_verdict_local`. Annotation only: nothing
+        # reads this to gate dispatch/review/merge (see
+        # coord.health.checks.toolchain's fleet_toolchain_skew, which is the
+        # thing that actually judges skew). NULL for every row predating
+        # this column and for any verdict recorded without a resolvable
+        # toolchain — a historical/unknown value, never treated as a mismatch.
+        "ALTER TABLE assignments ADD COLUMN test_toolchain TEXT",
     ]
     for sql in migrations:
         try:

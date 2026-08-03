@@ -496,6 +496,23 @@ def test(assignment_id: str, config_path: Path, verdict: str | None, reason: str
             else:
                 click.echo(f"  warning: output file not found: {output_file}", err=True)
 
+        # #1629 (H-2): best-effort — which toolchain, on THIS machine, ran the
+        # suite that produced a pass/fail verdict. "skip"/"running" carry no
+        # test run, so there's nothing to attribute. Never blocks the verdict
+        # write: any failure here (repo path unresolved, no known toolchain,
+        # the binary not on PATH) just leaves it None, same as every
+        # pre-#1629 verdict.
+        test_toolchain = None
+        if verdict in ("pass", "fail"):
+            try:
+                from coord.health.checks.toolchain import local_toolchain_label
+
+                repo_dir = _local_repo_dir(cfg, assignment.repo_name)
+                if repo_dir is not None:
+                    test_toolchain = local_toolchain_label(repo_dir)
+            except Exception:  # noqa: BLE001 — annotation only, never fatal
+                test_toolchain = None
+
         # #1337: single-row verdict write on BOTH paths (record_test_verdict
         # self-routes: daemon when board_service is set, direct UPDATE
         # locally).  The old local-path save_board() relied on the whole-board
@@ -508,6 +525,7 @@ def test(assignment_id: str, config_path: Path, verdict: str | None, reason: str
             test_reason=assignment.test_reason,
             smoke_test=assignment.smoke_test,
             smoke_test_reason=assignment.smoke_test_reason,
+            test_toolchain=test_toolchain,
         )
         verdict_word = {
             "pass": "PASSED", "fail": "FAILED", "skip": "SKIPPED", "running": "RUNNING",

@@ -104,6 +104,9 @@ def row_to_assignment(row: object) -> Assignment:
         test_head_sha=d.get("test_head_sha"),
         test_patch_id=d.get("test_patch_id"),
         test_base_sha=d.get("test_base_sha"),
+        # #1629: the toolchain that produced test_state; None for pre-1629
+        # rows or an unresolvable toolchain (renders as "unknown").
+        test_toolchain=d.get("test_toolchain"),
         review_verdict=d.get("review_verdict"),
         # #1456: coordinator-override audit trail; None when the reviewer's
         # verdict stands (the normal case) and for pre-1456 rows.
