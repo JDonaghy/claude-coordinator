@@ -374,6 +374,10 @@ machines:
     repos: [api]
     repo_paths:
       api: /tmp/api
+    # #1711: opencode is a non-implicit provider TYPE — the target machine
+    # must declare it can run it, or dispatch() refuses before this test's
+    # actual concern (model resolution) ever runs.
+    capabilities: ["provider:opencode"]
 providers:
   default: claude
   definitions:

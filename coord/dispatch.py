@@ -339,6 +339,45 @@ def resolve_dispatch_model(
     return config.models.resolve(alias)
 
 
+def _wire_payload_needs_provider_field(
+    effective_provider_name: str, config: Config,
+) -> bool:
+    """Whether :func:`dispatch`'s wire payload must include ``"provider"``
+    (#1711 review of #324's payload-omission gap).
+
+    The historical rule (send ``provider`` only when the effective name is
+    not ``"claude"``) was deliberate old-agent compatibility, but it hid a
+    reachable divergence: the ``"claude"`` entry in
+    ``providers.definitions`` can be **customized** (a redefined
+    ``binary``, ``env``, or ``extra_args`` — legal per ``ProviderDef``'s
+    docstring, e.g. to point ``claude`` at a wrapped binary) without ever
+    changing its NAME. Omitting the field for name ``"claude"``
+    unconditionally sends the agent down its hardcoded legacy spawn path
+    (``coord.agent.default_worker_command``, always the bare ``"claude"``
+    binary with no env/extra_args) instead of through the provider seam
+    that would apply those customizations — so the coordinator's recorded
+    ``provider_name="claude"`` would silently stop matching what actually
+    ran on the agent, corrupting exactly the kind of comparison this
+    provider-plumbing epic (#1709) exists to make trustworthy.
+
+    Fix: still omit the field for the vanilla (uncustomized) ``"claude"``
+    definition — preserving byte-identical payloads for every no-
+    ``providers:``-block deployment and genuine old-agent compatibility —
+    but include it the moment that definition carries ANY customization,
+    so the agent is told to route through the provider seam and actually
+    apply it. A non-``"claude"`` effective name always needs the field
+    regardless (unchanged from #324).
+    """
+    if effective_provider_name != "claude":
+        return True
+    definition = config.providers.definitions.get("claude")
+    if definition is None:
+        return False
+    return bool(
+        definition.binary or definition.model or definition.env or definition.extra_args
+    )
+
+
 def dispatch(
     proposal: Proposal,
     config: Config,
@@ -405,6 +444,25 @@ def dispatch(
         repo_provider=repo.provider if repo is not None else None,
         providers_cfg=config.providers,
         models_cfg=config.models,
+        where="coord approve / dispatch",
+    )
+
+    # #1711: STRUCTURAL PROVIDER-AVAILABILITY GATE — refuse to route a
+    # dispatch to a machine that hasn't declared it can run the resolved
+    # provider (e.g. an `opencode` assignment landing on a machine with no
+    # `provider:opencode` capability). Without this, the failure only
+    # surfaced at spawn time inside the agent process as an ENOENT-shaped
+    # subprocess error, after the assignment row existed and the worktree
+    # was built. Placed right after the TOS gate above, for the same
+    # reason: both are structural refusals keyed off the same resolved
+    # provider name, before any repo/worktree/HTTP work happens.
+    from coord.providers import guard_provider_machine_capability  # noqa: PLC0415
+
+    guard_provider_machine_capability(
+        provider_name=effective_provider_name,
+        machine=machine,
+        all_machines=config.machines,
+        providers_cfg=config.providers,
         where="coord approve / dispatch",
     )
     deny_commands: list[str] = []
@@ -574,15 +632,18 @@ def dispatch(
     # field reject unknown payload keys with a 400.
     if getattr(proposal, "resume_session_id", None):
         payload["resume_session_id"] = proposal.resume_session_id
-    # #324: send the resolved provider name when it differs from the implicit
-    # default ("claude").  Older agents that don't know about providers ignore
-    # the field (AssignmentSpec(**body) accepts unknown kwargs since Python
-    # 3.12 dataclasses don't reject extras — actually they DO reject extras,
-    # but spec.provider was added in #425 so agents with that field already
-    # accept it).  When the effective provider IS "claude", omitting the
-    # field keeps the wire payload identical to pre-#324 for all default-
-    # configured deployments (no-config parity requirement).
-    if effective_provider_name and effective_provider_name != "claude":
+    # #324/#1711: send the resolved provider name unless it's the vanilla
+    # (uncustomized) implicit "claude" default — see
+    # _wire_payload_needs_provider_field's docstring for why a customized
+    # "claude" definition must NOT be silently omitted (#1711 review of the
+    # #324 payload-omission gap). Older agents that predate #425's
+    # spec.provider field would reject an unknown payload key; omitting the
+    # field for the untouched default keeps every no-providers.-block
+    # deployment's wire payload byte-identical to pre-#324 (no-config
+    # parity requirement).
+    if effective_provider_name and _wire_payload_needs_provider_field(
+        effective_provider_name, config,
+    ):
         payload["provider"] = effective_provider_name
 
     resp = httpx.post(url, json=payload, timeout=15)

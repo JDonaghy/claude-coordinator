@@ -425,6 +425,91 @@ class TestBrowserCapabilityManifest:
         assert "PATH" in node.what_breaks
 
 
+class TestProviderOpencodeCapabilityManifest:
+    """#1711: the `provider:opencode` capability is backed by exactly one
+    prereq — the `opencode` binary itself — probed leniently since its CLI
+    surface is unverified (see coord.providers.opencode's module docstring).
+    """
+
+    def _opencode_prereqs(self):
+        return [
+            p for p in prereqs.CAPABILITY_PREREQS
+            if p.capability == "provider:opencode"
+        ]
+
+    def test_capability_name_matches_the_config_convention(self) -> None:
+        from coord.config import provider_capability
+
+        assert provider_capability("opencode") == "provider:opencode"
+        assert {p.capability for p in self._opencode_prereqs()} == {
+            provider_capability("opencode"),
+        }
+
+    def test_backed_by_the_opencode_binary(self) -> None:
+        assert {p.tool for p in self._opencode_prereqs()} == {"opencode"}
+        assert {p.binary for p in self._opencode_prereqs()} == {"opencode"}
+
+    def test_tool_name_matches_provider_default_binary_constant(self) -> None:
+        """Keeps this manifest entry in sync with
+        `coord.providers.opencode.DEFAULT_OPENCODE_BINARY` — the probe and
+        the actual spawned binary must never silently drift apart."""
+        from coord.providers.opencode import DEFAULT_OPENCODE_BINARY
+
+        assert self._opencode_prereqs()[0].tool == DEFAULT_OPENCODE_BINARY
+
+    def test_probe_all_covers_it_only_when_declared(self) -> None:
+        with patch("coord.prereqs.shutil.which", return_value=None):
+            probes = prereqs.probe_all(["provider:opencode"])
+        assert "opencode" in probes
+        assert "cargo" not in probes
+
+        with patch("coord.prereqs.shutil.which", return_value=None):
+            probes_undeclared = prereqs.probe_all(["rust"])
+        assert "opencode" not in probes_undeclared
+
+    def test_binary_absent_reports_not_found(self) -> None:
+        with patch("coord.prereqs.shutil.which", return_value=None):
+            probes = prereqs.probe_all(["provider:opencode"])
+        assert probes["opencode"].found is False
+        assert probes["opencode"].ok is False
+
+    def test_binary_present_but_version_flag_fails_still_reports_found(self) -> None:
+        """The generic `probe()` path treats a non-zero exit as "not
+        found" (correct for pkg-config-shaped subcommand lookups) — that
+        would be a false negative here, since opencode's real `--version`
+        support is unverified. `shutil.which` alone must decide `found`."""
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/opencode"), \
+             patch(
+                 "coord.prereqs.subprocess.run",
+                 return_value=_Result(returncode=1, stderr="unknown flag"),
+             ):
+            probes = prereqs.probe_all(["provider:opencode"])
+        assert probes["opencode"].found is True
+        assert probes["opencode"].version is None
+        assert probes["opencode"].ok is True
+
+    def test_binary_present_and_version_succeeds_extracts_version(self) -> None:
+        with patch("coord.prereqs.shutil.which", return_value="/usr/bin/opencode"), \
+             patch(
+                 "coord.prereqs.subprocess.run",
+                 return_value=_Result(stdout="opencode 0.4.2\n", returncode=0),
+             ):
+            probes = prereqs.probe_all(["provider:opencode"])
+        assert probes["opencode"].found is True
+        assert probes["opencode"].version == "0.4.2"
+
+    def test_unmet_when_binary_not_found(self) -> None:
+        probes = {
+            "opencode": prereqs.ToolProbe(
+                tool="opencode", capability="provider:opencode", found=False,
+                version=None, min_version=None, meets_floor=None, what_breaks="",
+            ),
+        }
+        unmet = prereqs.unmet_capabilities(["provider:opencode"], probes)
+        assert "provider:opencode" in unmet
+        assert "not found" in unmet["provider:opencode"][0]
+
+
 class TestGhFloorIsSingleSourceOfTruth:
     def test_baseline_gh_prereq_imports_the_floor(self) -> None:
         """#1564's constant stays the single source of truth — this module

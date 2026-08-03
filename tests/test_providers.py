@@ -26,9 +26,14 @@ from coord.agent import (
     default_worker_command,
 )
 from coord.config import ModelsConfig, ProviderDef, ProvidersConfig
+from coord.models import Machine
 from coord.providers import (
     build_provider,
     describe_provider_choice,
+    guard_provider_machine_capability,
+    machine_supports_provider,
+    machines_supporting_provider,
+    provider_type_for,
     resolve_default_provider,
     resolve_provider_name,
 )
@@ -477,6 +482,152 @@ def test_resolve_spec_none_repo_none_uses_default() -> None:
     """Double-None falls back to configured default."""
     cfg = _make_providers_cfg(default="claude")
     assert resolve_provider_name(None, None, cfg) == "claude"
+
+
+# ── provider-availability machine capability gate (#1711) ──────────────────────
+
+
+def _machine(name: str, capabilities: list[str] | None = None) -> Machine:
+    return Machine(
+        name=name, host=f"{name}.tailnet", capabilities=capabilities or [],
+        repos=["api"], repo_paths={"api": f"/home/user/src/{name}"},
+    )
+
+
+class TestProviderTypeFor:
+    def test_resolves_registered_name_to_its_type(self) -> None:
+        cfg = ProvidersConfig(
+            definitions={"claude": ProviderDef(type="claude"), "oc": ProviderDef(type="opencode")},
+        )
+        assert provider_type_for("oc", cfg) == "opencode"
+        assert provider_type_for("claude", cfg) == "claude"
+
+    def test_unknown_name_falls_back_to_itself(self) -> None:
+        """A typo'd / removed-after-dispatch provider name isn't fabricated
+        into a refusal here — the existing unknown-provider error path
+        handles it (mirrors guard_unattended_dispatch's posture)."""
+        cfg = ProvidersConfig()
+        assert provider_type_for("totally-unregistered", cfg) == "totally-unregistered"
+
+
+class TestMachineSupportsProvider:
+    def test_claude_is_implicit_baseline_with_no_capability_declared(self) -> None:
+        cfg = ProvidersConfig()
+        machine = _machine("laptop")  # capabilities=[]
+        assert machine_supports_provider(machine, "claude", cfg) is True
+
+    def test_claude_pty_is_implicit_baseline_by_type_not_name(self) -> None:
+        cfg = ProvidersConfig(definitions={"interactive": ProviderDef(type="claude-pty")})
+        machine = _machine("laptop")
+        assert machine_supports_provider(machine, "interactive", cfg) is True
+
+    def test_claude_typed_alias_needs_no_capability_either(self) -> None:
+        """A claude-backed provider registered under a different NAME (the
+        `fast-claude` pattern) is still implicit — keyed off type, not name."""
+        cfg = ProvidersConfig(definitions={"fast-claude": ProviderDef(type="claude")})
+        machine = _machine("laptop")
+        assert machine_supports_provider(machine, "fast-claude", cfg) is True
+
+    def test_opencode_requires_the_declared_capability(self) -> None:
+        cfg = ProvidersConfig(definitions={"opencode": ProviderDef(type="opencode")})
+        bare_machine = _machine("laptop")
+        capable_machine = _machine("workstation", ["provider:opencode"])
+        assert machine_supports_provider(bare_machine, "opencode", cfg) is False
+        assert machine_supports_provider(capable_machine, "opencode", cfg) is True
+
+    def test_opencode_alias_keyed_by_type_not_registered_name(self) -> None:
+        """A definition named 'my-oc' of type opencode still needs
+        `provider:opencode` (the TYPE), not `provider:my-oc`."""
+        cfg = ProvidersConfig(definitions={"my-oc": ProviderDef(type="opencode")})
+        machine = _machine("workstation", ["provider:opencode"])
+        assert machine_supports_provider(machine, "my-oc", cfg) is True
+        machine_wrong_cap = _machine("other", ["provider:my-oc"])
+        assert machine_supports_provider(machine_wrong_cap, "my-oc", cfg) is False
+
+
+class TestMachinesSupportingProvider:
+    def test_lists_only_capable_machines_sorted(self) -> None:
+        cfg = ProvidersConfig(definitions={"opencode": ProviderDef(type="opencode")})
+        machines = [
+            _machine("zeta", ["provider:opencode"]),
+            _machine("bare"),
+            _machine("alpha", ["provider:opencode"]),
+        ]
+        assert machines_supporting_provider(machines, "opencode", cfg) == ["alpha", "zeta"]
+
+    def test_empty_when_nobody_declares_it(self) -> None:
+        cfg = ProvidersConfig(definitions={"opencode": ProviderDef(type="opencode")})
+        machines = [_machine("laptop"), _machine("desktop")]
+        assert machines_supporting_provider(machines, "opencode", cfg) == []
+
+    def test_every_machine_for_claude(self) -> None:
+        cfg = ProvidersConfig()
+        machines = [_machine("laptop"), _machine("desktop")]
+        assert machines_supporting_provider(machines, "claude", cfg) == ["desktop", "laptop"]
+
+
+class TestGuardProviderMachineCapability:
+    def test_noop_when_machine_supports_it(self) -> None:
+        cfg = ProvidersConfig(definitions={"opencode": ProviderDef(type="opencode")})
+        machine = _machine("workstation", ["provider:opencode"])
+        guard_provider_machine_capability(
+            provider_name="opencode", machine=machine, all_machines=[machine],
+            providers_cfg=cfg,
+        )  # must not raise
+
+    def test_noop_for_claude_on_a_bare_machine(self) -> None:
+        cfg = ProvidersConfig()
+        machine = _machine("laptop")
+        guard_provider_machine_capability(
+            provider_name="claude", machine=machine, all_machines=[machine],
+            providers_cfg=cfg,
+        )  # must not raise
+
+    def test_raises_naming_machine_provider_and_type(self) -> None:
+        cfg = ProvidersConfig(definitions={"opencode": ProviderDef(type="opencode")})
+        machine = _machine("laptop")
+        with pytest.raises(ValueError) as exc_info:
+            guard_provider_machine_capability(
+                provider_name="opencode", machine=machine, all_machines=[machine],
+                providers_cfg=cfg, where="coord assign",
+            )
+        message = str(exc_info.value)
+        assert "laptop" in message
+        assert "opencode" in message
+        assert "provider:opencode" in message
+        assert "coord assign" in message
+
+    def test_names_the_machines_that_do_support_it(self) -> None:
+        cfg = ProvidersConfig(definitions={"opencode": ProviderDef(type="opencode")})
+        bare = _machine("laptop")
+        capable = _machine("workstation", ["provider:opencode"])
+        with pytest.raises(ValueError, match="workstation"):
+            guard_provider_machine_capability(
+                provider_name="opencode", machine=bare, all_machines=[bare, capable],
+                providers_cfg=cfg,
+            )
+
+    def test_states_plainly_when_no_machine_supports_it_yet(self) -> None:
+        cfg = ProvidersConfig(definitions={"opencode": ProviderDef(type="opencode")})
+        machine = _machine("laptop")
+        with pytest.raises(ValueError, match="no configured machine advertises"):
+            guard_provider_machine_capability(
+                provider_name="opencode", machine=machine, all_machines=[machine],
+                providers_cfg=cfg,
+            )
+
+    def test_unregistered_provider_name_does_not_crash(self) -> None:
+        """A typo'd/unregistered name resolves to itself (provider_type_for's
+        fallback) — the gate can still refuse cleanly rather than raising a
+        KeyError, deferring the "is this even a real provider" question to
+        the existing unknown-provider error path."""
+        cfg = ProvidersConfig()
+        machine = _machine("laptop")
+        with pytest.raises(ValueError, match="totally-unregistered"):
+            guard_provider_machine_capability(
+                provider_name="totally-unregistered", machine=machine,
+                all_machines=[machine], providers_cfg=cfg,
+            )
 
 
 # ── describe_provider_choice (#1707) ───────────────────────────────────────────

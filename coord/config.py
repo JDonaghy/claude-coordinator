@@ -1154,6 +1154,50 @@ class ProvidersConfig:
             self.definitions["claude"] = ProviderDef(type="claude")
 
 
+# #1711: provider-availability capability vocabulary.
+#
+# A machine advertises support for a given provider *backend type* the same
+# way it advertises "rust"/"gtk"/"browser" — one more string in
+# `machines[].capabilities`, e.g. `"provider:opencode"`. A dedicated
+# `Machine.provider` field was considered and rejected: provider and machine
+# are already orthogonal in this data model (a machine has no provider
+# opinion of its own — `Repo.provider`/`providers.default` decide that), and
+# "can this machine run backend X" is exactly the shape `smoke_tests.
+# capability_rules` and `coord.prereqs` already solve for "rust"/"gtk"/
+# "browser". Reusing that machinery (rather than inventing a parallel
+# provider-routing concept) means `coord doctor`'s declared-vs-probed report
+# and the `coordinator.yml` capability list both fall out for free.
+#
+# Keyed off `ProviderDef.type` (not the definition's arbitrary registered
+# NAME) because type is what actually determines which binary a machine
+# needs installed. An operator-named alias of a claude-backed provider (e.g.
+# `fast-claude` in `coordinator.example.yml`, `type: claude`) never needs a
+# capability declared — it still just runs the `claude` CLI. Only a
+# genuinely different backend TYPE (today: `opencode`) needs one.
+#
+# `claude` and `claude-pty` are the IMPLICIT baseline: every machine is
+# assumed to already have the `claude` CLI (this predates #1711, and
+# probing for the `claude` binary itself is out of this issue's scope —
+# see its non-goals), so neither needs a capability declared. This is what
+# keeps every existing no-``providers:``-block deployment unaffected.
+IMPLICIT_PROVIDER_TYPES: frozenset[str] = frozenset({"claude", "claude-pty"})
+
+
+def provider_capability(provider_type: str) -> str:
+    """The ``capabilities:`` string a machine advertises to declare it can
+    run *provider_type* (#1711).
+
+    ``provider_capability("opencode") == "provider:opencode"``. Single
+    source of truth for the naming convention — every caller that declares,
+    checks, or probes provider availability (`coord doctor`'s prereq
+    manifest, `coord.providers.guard_provider_machine_capability`, `coord
+    plan`'s proposal filter) calls this rather than hand-formatting the
+    ``"provider:" + name`` string, so the convention can't drift between
+    call sites.
+    """
+    return f"provider:{provider_type}"
+
+
 # #1628: default disk mount points the health engine probes.  "/" and "/home"
 # are usually the two that matter (and were the two that mattered on
 # 2026-07-30 — elitebook's /home hit 0 bytes free); "~/.coord" is separate
