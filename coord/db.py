@@ -297,6 +297,43 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             UNIQUE(repo_name, issue_number)
         );
 
+        -- #1753 (DQ-1): the operator-declared `coord drive` work queue.  One
+        -- row per (repo_name, issue_number) — enqueueing an issue that is
+        -- already queued updates it in place (`ON CONFLICT ... DO UPDATE`,
+        -- coord/state.py `_enqueue_drive_queue_local`) rather than creating a
+        -- second row, so the queue can never hold the same issue twice.
+        -- Written by `coord drive-queue` (DQ-2) and by the tick processor that
+        -- launches entries; cleared by `coord drive-queue remove` (dequeue) —
+        -- terminal rows (`done`/`failed`) stay put until an operator removes
+        -- them, so the list doubles as a short run history.
+        --
+        -- `position` is DENSE and 0-BASED: enqueue-without-a-position appends
+        -- at max(position)+1 and `move` renumbers the affected span in one
+        -- transaction (no fractional positions — the queue is short by nature
+        -- and `coord drive-queue list` prints a dense integer order).
+        -- `machine` NULL means "let `coord drive` route it".  `after_json` is
+        -- a JSON list of FULLY QUALIFIED pre-req keys (`["repo#N", ...]`) so a
+        -- cross-repo queue needs no second column; it is decoded to a real
+        -- list on the wire via coord/dao.py's `_JSON_COLUMNS`.  This table
+        -- only STORES `after_json` — interpreting it (pre-req satisfaction) is
+        -- the tick processor's job, not the schema's.
+        CREATE TABLE IF NOT EXISTS drive_queue (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            repo_name     TEXT    NOT NULL,
+            issue_number  INTEGER NOT NULL,
+            position      INTEGER NOT NULL,
+            machine       TEXT,
+            after_json    TEXT    NOT NULL DEFAULT '[]',
+            state         TEXT    NOT NULL DEFAULT 'waiting',
+            attempts      INTEGER NOT NULL DEFAULT 0,
+            deferrals     INTEGER NOT NULL DEFAULT 0,
+            last_reason   TEXT    NOT NULL DEFAULT '',
+            session_name  TEXT,
+            launched_at   REAL,
+            enqueued_at   REAL    NOT NULL,
+            UNIQUE(repo_name, issue_number)
+        );
+
         -- #1630: daemon's aggregated view of each agent's /health payload
         -- (H-1's check-registry results, when the agent reports them) plus
         -- the poll's own reachability verdict.  One row per machine, always
@@ -330,6 +367,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             ON issue_comments(repo_name, issue_number);
         CREATE INDEX IF NOT EXISTS idx_drive_escalations_issue
             ON drive_escalations(repo_name, issue_number);
+        CREATE INDEX IF NOT EXISTS idx_drive_queue_state
+            ON drive_queue(state, position);
 
         INSERT OR IGNORE INTO schema_version VALUES (1);
     """)

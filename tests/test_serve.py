@@ -2792,6 +2792,291 @@ def test_dismiss_drive_escalation_local_reports_whether_a_row_existed(coord_db):
     assert state._get_drive_escalation_local("api", 7) is None
 
 
+# ── #1753 (DQ-1): drive queue ───────────────────────────────────────────────
+
+def test_serve_drive_queue_enqueue_list_move_update_dequeue(
+    tmp_path: Path, valid_config_path: Path, rw_db
+):
+    """Black-box: drive the running daemon over HTTP through the whole
+    lifecycle and assert on the responses (the #1753 acceptance bar)."""
+    app = build_app(SqliteStore(tmp_path / "rw.db"), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        r = cli.post("/drive-queue", json={
+            "action": "enqueue", "repo_name": "claude-coordinator",
+            "issue_number": 1, "machine": "dellserver",
+            "after": ["claude-coordinator#2"],
+        })
+        assert r.status_code == 200
+        assert isinstance(r.json()["entry_id"], int)
+
+        # Two more so there's a span to renumber.
+        cli.post("/drive-queue", json={
+            "action": "enqueue", "repo_name": "claude-coordinator",
+            "issue_number": 2, "after": [],
+        })
+        cli.post("/drive-queue", json={
+            "action": "enqueue", "repo_name": "api", "issue_number": 9,
+        })
+
+        entries = cli.get("/drive-queue").json()["entries"]
+        assert [(e["repo_name"], e["issue_number"], e["position"]) for e in entries] == [
+            ("claude-coordinator", 1, 0), ("claude-coordinator", 2, 1), ("api", 9, 2),
+        ]
+        first = entries[0]
+        # after_json is a REAL list on the wire, not a JSON string.
+        assert first["after_json"] == ["claude-coordinator#2"]
+        assert first["machine"] == "dellserver"
+        assert first["state"] == "waiting"
+        assert first["attempts"] == 0 and first["deferrals"] == 0
+        assert entries[2]["machine"] is None  # NULL = let `coord drive` route it
+
+        # move to the head → dense, 0-based, no gaps or collisions.
+        m = cli.post("/drive-queue", json={
+            "action": "move", "repo_name": "api", "issue_number": 9,
+            "to_position": 0,
+        })
+        assert m.json()["moved"] is True
+        moved = cli.get("/drive-queue").json()["entries"]
+        assert [(e["repo_name"], e["issue_number"]) for e in moved] == [
+            ("api", 9), ("claude-coordinator", 1), ("claude-coordinator", 2),
+        ]
+        assert [e["position"] for e in moved] == [0, 1, 2]
+
+        u = cli.post("/drive-queue", json={
+            "action": "update", "repo_name": "api", "issue_number": 9,
+            "fields": {
+                "state": "running", "attempts": 1, "session_name": "drive-api-9",
+                "launched_at": 1234.5, "last_reason": "",
+            },
+        })
+        assert u.json()["updated"] is True
+        one = cli.get("/drive-queue", params={
+            "repo_name": "api", "issue_number": 9,
+        }).json()["entries"]
+        assert len(one) == 1
+        assert one[0]["state"] == "running"
+        assert one[0]["attempts"] == 1
+        assert one[0]["session_name"] == "drive-api-9"
+        assert one[0]["launched_at"] == 1234.5
+
+        d = cli.post("/drive-queue", json={
+            "action": "dequeue", "repo_name": "api", "issue_number": 9,
+        })
+        assert d.json()["deleted"] is True
+        after = cli.get("/drive-queue").json()["entries"]
+        # Removal renumbers what's left back to a dense 0-based run.
+        assert [e["position"] for e in after] == [0, 1]
+        assert [e["issue_number"] for e in after] == [1, 2]
+
+    assert rw_db.execute(
+        "SELECT COUNT(*) c FROM drive_queue WHERE repo_name='api'"
+    ).fetchone()["c"] == 0
+
+
+def test_serve_drive_queue_enqueue_existing_updates_in_place(
+    tmp_path: Path, valid_config_path: Path, rw_db
+):
+    app = build_app(SqliteStore(tmp_path / "rw.db"), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        first = cli.post("/drive-queue", json={
+            "action": "enqueue", "repo_name": "api", "issue_number": 7,
+            "machine": "laptop", "after": [],
+        }).json()["entry_id"]
+        second = cli.post("/drive-queue", json={
+            "action": "enqueue", "repo_name": "api", "issue_number": 7,
+            "machine": "dellserver", "after": ["api#6"],
+        }).json()["entry_id"]
+        assert first == second  # same row, not a duplicate
+        entries = cli.get("/drive-queue").json()["entries"]
+    assert len(entries) == 1
+    assert entries[0]["machine"] == "dellserver"
+    assert entries[0]["after_json"] == ["api#6"]
+
+
+def test_serve_drive_queue_filters_by_repo(
+    tmp_path: Path, valid_config_path: Path, rw_db
+):
+    app = build_app(SqliteStore(tmp_path / "rw.db"), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        cli.post("/drive-queue", json={
+            "action": "enqueue", "repo_name": "api", "issue_number": 1,
+        })
+        cli.post("/drive-queue", json={
+            "action": "enqueue", "repo_name": "other", "issue_number": 2,
+        })
+        everything = cli.get("/drive-queue").json()["entries"]
+        assert {e["repo_name"] for e in everything} == {"api", "other"}
+        just_api = cli.get("/drive-queue", params={"repo_name": "api"}).json()["entries"]
+    assert [e["repo_name"] for e in just_api] == ["api"]
+
+
+def test_serve_drive_queue_bad_requests_are_400(
+    tmp_path: Path, valid_config_path: Path, rw_db
+):
+    app = build_app(SqliteStore(tmp_path / "rw.db"), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        assert cli.post("/drive-queue", json={
+            "action": "bogus", "repo_name": "api", "issue_number": 7,
+        }).status_code == 400
+        assert cli.post("/drive-queue", json={
+            "action": "enqueue", "issue_number": 7,
+        }).status_code == 400
+        assert cli.get("/drive-queue", params={
+            "repo_name": "api", "issue_number": "nope",
+        }).status_code == 400
+        cli.post("/drive-queue", json={
+            "action": "enqueue", "repo_name": "api", "issue_number": 7,
+        })
+        # `position` is owned by enqueue/move — a tick may not smuggle it in.
+        bad = cli.post("/drive-queue", json={
+            "action": "update", "repo_name": "api", "issue_number": 7,
+            "fields": {"position": 5},
+        })
+        assert bad.status_code == 400
+        assert "position" in bad.json()["error"]
+
+
+def test_serve_drive_queue_enqueue_at_explicit_position(
+    tmp_path: Path, valid_config_path: Path, rw_db
+):
+    app = build_app(SqliteStore(tmp_path / "rw.db"), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        for n in (1, 2, 3):
+            cli.post("/drive-queue", json={
+                "action": "enqueue", "repo_name": "api", "issue_number": n,
+            })
+        cli.post("/drive-queue", json={
+            "action": "enqueue", "repo_name": "api", "issue_number": 4,
+            "position": 1,
+        })
+        entries = cli.get("/drive-queue").json()["entries"]
+    assert [e["issue_number"] for e in entries] == [1, 4, 2, 3]
+    assert [e["position"] for e in entries] == [0, 1, 2, 3]
+
+
+def test_board_projection_carries_drive_queue(tmp_path: Path, valid_config_path: Path, rw_db):
+    db_path = tmp_path / "rw.db"
+    app = build_app(SqliteStore(db_path), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        cli.post("/drive-queue", json={
+            "action": "enqueue", "repo_name": "api", "issue_number": 7,
+            "machine": "dellserver", "after": ["api#6"],
+        })
+    proj = SqliteStore(db_path).board_projection()
+    assert [e["issue_number"] for e in proj["drive_queue"]] == [7]
+    # Same JSON-column decoding as /drive-queue — a list, never a string.
+    assert proj["drive_queue"][0]["after_json"] == ["api#6"]
+    assert proj["drive_queue"][0]["position"] == 0
+
+
+def test_openapi_exposes_board_drive_queue_entry(file_db: Path, valid_config_path: Path):
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        spec = cli.get("/openapi.json").json()
+    entry = spec["components"]["schemas"]["BoardDriveQueueEntry"]
+    assert {"position", "after_json", "state", "enqueued_at"} <= set(entry["properties"])
+    assert "/drive-queue" in spec["paths"]
+    board_props = (
+        spec["paths"]["/board"]["get"]["responses"]["200"]
+        ["content"]["application/json"]["schema"]["properties"]
+    )
+    assert board_props["drive_queue"]["items"]["$ref"].endswith("BoardDriveQueueEntry")
+
+
+def _routing_svc(monkeypatch):
+    from coord import client as cc
+
+    monkeypatch.setattr(
+        cc, "resolve_board_service", lambda *a, **k: cc.ServiceConfig("http://d:7435")
+    )
+    captured: dict = {}
+    return cc, captured
+
+
+def test_drive_queue_writes_route_when_service_set(coord_db, monkeypatch):
+    """Thin-client posture: every write routes and touches NO local row."""
+    from coord import state
+
+    cc, captured = _routing_svc(monkeypatch)
+    replies = {
+        "enqueue": {"entry_id": 42},
+        "dequeue": {"deleted": True},
+        "update": {"updated": True},
+        "move": {"moved": True},
+    }
+    calls: list[dict] = []
+
+    def _post(svc, path, payload, **kw):
+        calls.append({"path": path, "payload": payload})
+        return replies[payload["action"]]
+
+    monkeypatch.setattr(cc, "post_record", _post)
+
+    assert state.enqueue_drive_queue(
+        "api", 7, machine="dellserver", after=["api#6"]
+    ) == 42
+    assert state.update_drive_queue_entry("api", 7, state="running") is True
+    assert state.move_drive_queue_entry("api", 7, 0) is True
+    assert state.dequeue_drive_queue("api", 7) is True
+
+    assert {c["path"] for c in calls} == {"/drive-queue"}
+    assert [c["payload"]["action"] for c in calls] == [
+        "enqueue", "update", "move", "dequeue",
+    ]
+    assert calls[0]["payload"]["after"] == ["api#6"]
+    assert calls[1]["payload"]["fields"] == {"state": "running"}
+    # Routed → the local DB was never written.
+    assert coord_db.execute("SELECT COUNT(*) c FROM drive_queue").fetchone()["c"] == 0
+
+
+def test_drive_queue_reads_route_when_service_set(coord_db, monkeypatch):
+    from coord import state
+
+    cc, _ = _routing_svc(monkeypatch)
+    monkeypatch.setattr(
+        cc, "fetch_drive_queue",
+        lambda svc, repo=None: [{"repo_name": "api", "issue_number": 7}],
+    )
+    monkeypatch.setattr(
+        cc, "fetch_drive_queue_entry",
+        lambda svc, repo, num: {"repo_name": repo, "issue_number": num, "state": "running"},
+    )
+    assert state.list_drive_queue()[0]["issue_number"] == 7
+    assert state.get_drive_queue_entry("api", 7)["state"] == "running"
+    assert coord_db.execute("SELECT COUNT(*) c FROM drive_queue").fetchone()["c"] == 0
+
+
+def test_drive_queue_local_rejects_non_updatable_field(coord_db):
+    from coord import state
+
+    state._enqueue_drive_queue_local("api", 7)
+    with pytest.raises(ValueError, match="machine"):
+        state._update_drive_queue_entry_local("api", 7, machine="laptop")
+
+
+def test_drive_queue_local_move_clamps_out_of_range(coord_db):
+    from coord import state
+
+    for n in (1, 2, 3):
+        state._enqueue_drive_queue_local("api", n)
+    assert state._move_drive_queue_entry_local("api", 1, 99) is True
+    assert [e["issue_number"] for e in state._list_drive_queue_local()] == [2, 3, 1]
+    assert [e["position"] for e in state._list_drive_queue_local()] == [0, 1, 2]
+    assert state._move_drive_queue_entry_local("api", 1, -5) is True
+    assert [e["issue_number"] for e in state._list_drive_queue_local()] == [1, 2, 3]
+    # Nothing to move → False, not an exception.
+    assert state._move_drive_queue_entry_local("api", 99, 0) is False
+
+
+def test_drive_queue_local_decodes_bad_after_json_to_empty_list(coord_db):
+    from coord import state
+
+    state._enqueue_drive_queue_local("api", 7, after=["api#6"])
+    coord_db.execute("UPDATE drive_queue SET after_json = 'not json'")
+    coord_db.commit()
+    assert state._get_drive_queue_entry_local("api", 7)["after_json"] == []
+
+
 # ── #873: durable issue_comments mirror ─────────────────────────────────────
 
 def test_serve_issue_comments_capture_then_get(file_db: Path, valid_config_path: Path, rw_db):

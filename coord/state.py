@@ -4528,6 +4528,343 @@ def _list_drive_escalations_local(repo_name: str | None = None) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+# ── Drive queue (#1753, DQ-1) ───────────────────────────────────────────────
+#
+# The operator-declared `coord drive` work queue — see coord/db.py's
+# drive_queue table comment for the storage contract. One row per (repo_name,
+# issue_number); `position` is dense and 0-based at all times, which is why
+# enqueue/dequeue/move all renumber rather than leaving gaps.
+#
+# Same routed-public + `_*_local` twin split as the escalation functions
+# above, so an identical call works on the daemon host and on a thin client.
+# This layer STORES `after` (the pre-req list); interpreting it is the tick
+# processor's job (DQ-2), not this module's.
+
+_DRIVE_QUEUE_COLUMNS = (
+    "id, repo_name, issue_number, position, machine, after_json, state, "
+    "attempts, deferrals, last_reason, session_name, launched_at, enqueued_at"
+)
+
+# Fields `update_drive_queue_entry` may write. Deliberately excludes the
+# operator-declared columns (position/machine/after_json) — those move via
+# `enqueue`/`move`, so a tick can never silently reorder the queue.
+_DRIVE_QUEUE_UPDATABLE = frozenset(
+    {"state", "attempts", "deferrals", "last_reason", "session_name", "launched_at"}
+)
+
+
+def _decode_drive_queue_row(row) -> dict:
+    """One ``drive_queue`` row as a dict with ``after_json`` decoded to a list.
+
+    Mirrors ``coord.dao._JSON_COLUMNS`` handling so the ``/drive-queue`` and
+    ``/board`` payloads agree: ``after_json`` is a real JSON array on the wire,
+    never a string. A row written by hand with unparseable JSON degrades to
+    ``[]`` rather than blowing up the whole list read.
+    """
+    entry = dict(row)
+    raw = entry.get("after_json")
+    if isinstance(raw, str):
+        try:
+            decoded = json.loads(raw)
+        except (TypeError, ValueError):
+            decoded = []
+        entry["after_json"] = decoded if isinstance(decoded, list) else []
+    elif raw is None:
+        entry["after_json"] = []
+    return entry
+
+
+def _renumber_drive_queue(conn) -> None:
+    """Rewrite every ``position`` to a dense 0-based sequence in current order.
+
+    Caller commits. Ties on ``position`` fall back to ``id`` so the result is
+    deterministic even if a row was written out-of-band.
+    """
+    rows = conn.execute(
+        "SELECT id FROM drive_queue ORDER BY position, id"
+    ).fetchall()
+    for index, row in enumerate(rows):
+        conn.execute(
+            "UPDATE drive_queue SET position = ? WHERE id = ?", (index, row["id"])
+        )
+
+
+def enqueue_drive_queue(
+    repo_name: str,
+    issue_number: int,
+    *,
+    machine: str | None = None,
+    after: list[str] | None = None,
+    position: int | None = None,
+) -> int | None:
+    """Add an issue to the drive queue (or update the entry already there).
+
+    ``after`` is a list of fully-qualified pre-req keys (``"repo#N"``).
+    ``machine=None`` means "let ``coord drive`` route it". ``position=None``
+    appends at the tail; an explicit ``position`` inserts at that slot and
+    renumbers the rest.
+
+    Routes to the daemon when ``board_service`` is set, else writes the local
+    DB. Returns the local row id on the local path; the daemon's row id when
+    routed.
+    """
+    svc = _board_service()
+    resp = _route_write(
+        svc,
+        "/drive-queue",
+        {
+            "action": "enqueue",
+            "repo_name": repo_name,
+            "issue_number": issue_number,
+            "machine": machine,
+            "after": list(after or []),
+            "position": position,
+        },
+    )
+    if resp is not None:
+        return resp.get("entry_id")
+    return _enqueue_drive_queue_local(
+        repo_name, issue_number, machine=machine, after=after, position=position
+    )
+
+
+def _enqueue_drive_queue_local(
+    repo_name: str,
+    issue_number: int,
+    *,
+    machine: str | None = None,
+    after: list[str] | None = None,
+    position: int | None = None,
+) -> int:
+    conn = get_connection()
+    now = time.time()
+    after_json = json.dumps([str(a) for a in (after or [])])
+    existing = conn.execute(
+        "SELECT id FROM drive_queue WHERE repo_name = ? AND issue_number = ?",
+        (repo_name, issue_number),
+    ).fetchone()
+    if existing is not None:
+        # Already queued → update the operator-declared fields in place rather
+        # than creating a second row for the same issue.  Run state (attempts /
+        # state / last_reason) is deliberately left alone: that is the tick's
+        # column set, written via `update_drive_queue_entry`.
+        conn.execute(
+            "UPDATE drive_queue SET machine = ?, after_json = ? WHERE id = ?",
+            (machine, after_json, existing["id"]),
+        )
+        conn.commit()
+        entry_id = int(existing["id"])
+    else:
+        tail = conn.execute(
+            "SELECT MAX(position) AS m FROM drive_queue"
+        ).fetchone()
+        next_pos = 0 if tail is None or tail["m"] is None else int(tail["m"]) + 1
+        cur = conn.execute(
+            "INSERT INTO drive_queue "
+            "(repo_name, issue_number, position, machine, after_json, enqueued_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (repo_name, issue_number, next_pos, machine, after_json, now),
+        )
+        conn.commit()
+        entry_id = int(cur.lastrowid)
+    if position is not None:
+        _move_drive_queue_entry_local(repo_name, issue_number, position)
+    return entry_id
+
+
+def dequeue_drive_queue(repo_name: str, issue_number: int) -> bool:
+    """Remove an issue from the drive queue, renumbering what's left.
+
+    Routes to the daemon when ``board_service`` is set. Returns whether a row
+    was actually removed.
+    """
+    svc = _board_service()
+    resp = _route_write(
+        svc,
+        "/drive-queue",
+        {
+            "action": "dequeue",
+            "repo_name": repo_name,
+            "issue_number": issue_number,
+        },
+    )
+    if resp is not None:
+        return bool(resp.get("deleted"))
+    return _dequeue_drive_queue_local(repo_name, issue_number)
+
+
+def _dequeue_drive_queue_local(repo_name: str, issue_number: int) -> bool:
+    conn = get_connection()
+    cur = conn.execute(
+        "DELETE FROM drive_queue WHERE repo_name = ? AND issue_number = ?",
+        (repo_name, issue_number),
+    )
+    removed = cur.rowcount > 0
+    if removed:
+        _renumber_drive_queue(conn)
+    conn.commit()
+    return removed
+
+
+def update_drive_queue_entry(repo_name: str, issue_number: int, **fields) -> bool:
+    """Write the tick-owned columns of a queue entry.
+
+    Accepts any of ``state`` / ``attempts`` / ``deferrals`` / ``last_reason`` /
+    ``session_name`` / ``launched_at``; anything else raises ``ValueError``
+    (the queue's order is owned by ``enqueue``/``move``, not by a tick).
+
+    Routes to the daemon when ``board_service`` is set. Returns whether a row
+    was actually updated.
+    """
+    unknown = set(fields) - _DRIVE_QUEUE_UPDATABLE
+    if unknown:
+        raise ValueError(f"not updatable on drive_queue: {sorted(unknown)}")
+    svc = _board_service()
+    resp = _route_write(
+        svc,
+        "/drive-queue",
+        {
+            "action": "update",
+            "repo_name": repo_name,
+            "issue_number": issue_number,
+            "fields": fields,
+        },
+    )
+    if resp is not None:
+        return bool(resp.get("updated"))
+    return _update_drive_queue_entry_local(repo_name, issue_number, **fields)
+
+
+def _update_drive_queue_entry_local(
+    repo_name: str, issue_number: int, **fields
+) -> bool:
+    unknown = set(fields) - _DRIVE_QUEUE_UPDATABLE
+    if unknown:
+        raise ValueError(f"not updatable on drive_queue: {sorted(unknown)}")
+    if not fields:
+        return False
+    conn = get_connection()
+    assignments = ", ".join(f"{name} = ?" for name in fields)
+    cur = conn.execute(
+        f"UPDATE drive_queue SET {assignments} "  # noqa: S608 — names whitelisted above
+        "WHERE repo_name = ? AND issue_number = ?",
+        (*fields.values(), repo_name, issue_number),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def move_drive_queue_entry(
+    repo_name: str, issue_number: int, to_position: int
+) -> bool:
+    """Move a queue entry to *to_position*, renumbering the affected span.
+
+    ``to_position`` is clamped into range, and the whole queue is rewritten to
+    a dense 0-based sequence in one transaction — no gaps, no collisions, no
+    fractional positions.
+
+    Routes to the daemon when ``board_service`` is set. Returns whether the
+    entry exists (``False`` when there is nothing to move).
+    """
+    svc = _board_service()
+    resp = _route_write(
+        svc,
+        "/drive-queue",
+        {
+            "action": "move",
+            "repo_name": repo_name,
+            "issue_number": issue_number,
+            "to_position": to_position,
+        },
+    )
+    if resp is not None:
+        return bool(resp.get("moved"))
+    return _move_drive_queue_entry_local(repo_name, issue_number, to_position)
+
+
+def _move_drive_queue_entry_local(
+    repo_name: str, issue_number: int, to_position: int
+) -> bool:
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT id, repo_name, issue_number FROM drive_queue ORDER BY position, id"
+    ).fetchall()
+    order = [int(r["id"]) for r in rows]
+    target = next(
+        (
+            int(r["id"])
+            for r in rows
+            if r["repo_name"] == repo_name and int(r["issue_number"]) == issue_number
+        ),
+        None,
+    )
+    if target is None:
+        return False
+    order.remove(target)
+    dest = max(0, min(int(to_position), len(order)))
+    order.insert(dest, target)
+    for index, row_id in enumerate(order):
+        conn.execute(
+            "UPDATE drive_queue SET position = ? WHERE id = ?", (index, row_id)
+        )
+    conn.commit()
+    return True
+
+
+def get_drive_queue_entry(repo_name: str, issue_number: int) -> dict | None:
+    """The (at most one) drive-queue entry for an issue, or ``None``.
+
+    Routes to the daemon when ``board_service`` is set, else reads the local
+    DB directly. ``after_json`` comes back as a list either way.
+    """
+    svc = _board_service()
+    if svc is not None:
+        from coord.client import fetch_drive_queue_entry  # noqa: PLC0415
+
+        return fetch_drive_queue_entry(svc, repo_name, issue_number)
+    return _get_drive_queue_entry_local(repo_name, issue_number)
+
+
+def _get_drive_queue_entry_local(repo_name: str, issue_number: int) -> dict | None:
+    conn = get_connection()
+    row = conn.execute(
+        f"SELECT {_DRIVE_QUEUE_COLUMNS} FROM drive_queue "  # noqa: S608 — constant
+        "WHERE repo_name = ? AND issue_number = ?",
+        (repo_name, issue_number),
+    ).fetchone()
+    return _decode_drive_queue_row(row) if row is not None else None
+
+
+def list_drive_queue(repo_name: str | None = None) -> list[dict]:
+    """Every drive-queue entry in run order, optionally filtered to one repo.
+
+    Routes to the daemon when ``board_service`` is set, else reads the local
+    DB directly. ``after_json`` comes back as a list either way.
+    """
+    svc = _board_service()
+    if svc is not None:
+        from coord.client import fetch_drive_queue  # noqa: PLC0415
+
+        return fetch_drive_queue(svc, repo_name)
+    return _list_drive_queue_local(repo_name)
+
+
+def _list_drive_queue_local(repo_name: str | None = None) -> list[dict]:
+    conn = get_connection()
+    if repo_name:
+        rows = conn.execute(
+            f"SELECT {_DRIVE_QUEUE_COLUMNS} FROM drive_queue "  # noqa: S608 — constant
+            "WHERE repo_name = ? ORDER BY position, id",
+            (repo_name,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            f"SELECT {_DRIVE_QUEUE_COLUMNS} FROM drive_queue "  # noqa: S608 — constant
+            "ORDER BY position, id"
+        ).fetchall()
+    return [_decode_drive_queue_row(r) for r in rows]
+
+
 def list_audit_log(
     *,
     since: float | None = None,

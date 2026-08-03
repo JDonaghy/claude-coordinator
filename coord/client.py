@@ -336,6 +336,64 @@ def fetch_drive_escalations(
     return entries if isinstance(entries, list) else []
 
 
+def fetch_drive_queue(
+    svc: ServiceConfig,
+    repo_name: str | None = None,
+    *,
+    timeout: float = _DEFAULT_TIMEOUT,
+) -> list[dict]:
+    """GET the drive queue in run order, optionally filtered to one repo (#1753).
+
+    ``[]`` on ANY failure (404 from a daemon predating this route, network
+    error, bad JSON, or a genuinely empty queue) — fail-soft, mirrors
+    :func:`fetch_drive_escalations`. ``after_json`` arrives already decoded to
+    a list; this helper does not re-parse it.
+    """
+    try:
+        params = {"repo_name": repo_name} if repo_name else {}
+        resp = httpx.get(
+            f"{svc.url}/drive-queue",
+            params=params,
+            headers=_headers(svc),
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:  # noqa: BLE001
+        return []
+    entries = data.get("entries") if isinstance(data, dict) else None
+    return entries if isinstance(entries, list) else []
+
+
+def fetch_drive_queue_entry(
+    svc: ServiceConfig,
+    repo_name: str,
+    issue_number: int,
+    *,
+    timeout: float = _DEFAULT_TIMEOUT,
+) -> dict | None:
+    """GET the (at most one) drive-queue entry for an issue (#1753).
+
+    ``None`` on ANY failure or when the issue is not queued — fail-soft,
+    mirrors :func:`fetch_drive_escalation`.
+    """
+    try:
+        resp = httpx.get(
+            f"{svc.url}/drive-queue",
+            params={"repo_name": repo_name, "issue_number": issue_number},
+            headers=_headers(svc),
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:  # noqa: BLE001
+        return None
+    entries = data.get("entries") if isinstance(data, dict) else None
+    if isinstance(entries, list) and entries:
+        return entries[0]
+    return None
+
+
 def fetch_audit_log(
     svc: ServiceConfig,
     *,

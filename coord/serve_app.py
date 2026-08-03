@@ -1481,6 +1481,7 @@ def _board_response_schema(components: dict) -> dict:
             ("proposals", "BoardProposal"),
             ("issues", "BoardIssue"),
             ("drive_escalations", "BoardDriveEscalation"),
+            ("drive_queue", "BoardDriveQueueEntry"),
         ):
             components[key] = sqlite_table_schema(
                 conn,
@@ -1554,6 +1555,17 @@ def _board_response_schema(components: dict) -> dict:
                     "item)."
                 ),
                 "items": {"$ref": "#/components/schemas/BoardDriveEscalation"},
+            },
+            "drive_queue": {
+                "type": "array",
+                "description": (
+                    "#1753: the operator-declared `coord drive` work queue, "
+                    "in run order (`position` is dense and 0-based). Carried "
+                    "on /board so a client renders the queue without a second "
+                    "request; `after_json` is a decoded list of fully-"
+                    "qualified pre-req keys (\"repo#N\")."
+                ),
+                "items": {"$ref": "#/components/schemas/BoardDriveQueueEntry"},
             },
             "issue_stage_projection": {
                 "type": "array",
@@ -2749,6 +2761,84 @@ def _openapi_spec() -> dict:
                 "responses": {
                     "200": {"description": "OK"},
                     "400": {"description": "Missing field / unknown action"},
+                },
+            },
+        },
+        "/drive-queue": {
+            "get": {
+                "summary": (
+                    "#1753: read the operator-declared `coord drive` work "
+                    "queue in run order. Filter by repo_name (+ optional "
+                    "issue_number); omit both to list the whole queue."
+                ),
+                "parameters": [
+                    {
+                        "name": "repo_name", "in": "query", "required": False,
+                        "schema": {"type": "string"},
+                    },
+                    {
+                        "name": "issue_number", "in": "query", "required": False,
+                        "schema": {"type": "integer"},
+                    },
+                ],
+                "responses": {
+                    "200": {"description": "OK"},
+                    "400": {"description": "issue_number not an int"},
+                },
+            },
+            "post": {
+                "summary": (
+                    "#1753: enqueue / dequeue / update / move a drive-queue "
+                    "entry. `position` stays dense and 0-based throughout."
+                ),
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "action": {
+                                        "type": "string",
+                                        "enum": [
+                                            "enqueue", "dequeue", "update", "move",
+                                        ],
+                                    },
+                                    "repo_name": {"type": "string"},
+                                    "issue_number": {"type": "integer"},
+                                    "machine": {"type": "string", "nullable": True},
+                                    "after": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                        "description": "pre-reqs as \"repo#N\"",
+                                    },
+                                    "position": {
+                                        "type": "integer", "nullable": True,
+                                        "description": "enqueue: omit to append at the tail",
+                                    },
+                                    "to_position": {
+                                        "type": "integer",
+                                        "description": "move: destination slot (clamped)",
+                                    },
+                                    "fields": {
+                                        "type": "object",
+                                        "description": (
+                                            "update: any of state / attempts / "
+                                            "deferrals / last_reason / "
+                                            "session_name / launched_at"
+                                        ),
+                                    },
+                                },
+                                "required": ["action", "repo_name", "issue_number"],
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {"description": "OK"},
+                    "400": {
+                        "description": "Missing field / unknown action / non-updatable field",
+                    },
                 },
             },
         },
@@ -5119,6 +5209,96 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
             )
         return JSONResponse({"error": f"unknown action: {action!r}"}, status_code=400)
 
+    async def get_drive_queue(request: Request) -> Response:
+        # #1753: read drive-queue entries in run order — `repo_name` alone
+        # filters to that repo; `repo_name` + `issue_number` narrows to the (at
+        # most one) entry for that issue; neither given lists the whole queue
+        # (hand-sized by definition — one row per issue an operator queued).
+        from coord import state  # noqa: PLC0415
+
+        repo_name = request.query_params.get("repo_name")
+        raw_issue = request.query_params.get("issue_number")
+        issue_number = None
+        if raw_issue is not None:
+            try:
+                issue_number = int(raw_issue)
+            except (TypeError, ValueError):
+                return JSONResponse(
+                    {"error": "issue_number must be an int"}, status_code=400
+                )
+        try:
+            if repo_name and issue_number is not None:
+                entry = state._get_drive_queue_entry_local(repo_name, issue_number)
+                entries = [entry] if entry else []
+            else:
+                entries = state._list_drive_queue_local(repo_name)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "drive-queue read failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"entries": entries})
+
+    async def post_drive_queue(request: Request) -> Response:
+        # #1753: enqueue / dequeue / update / move a drive-queue entry on the
+        # shared DB.  `position` stays dense and 0-based across all four —
+        # enqueue appends at max(position)+1, dequeue and move renumber.
+        from coord import state  # noqa: PLC0415
+
+        body = await _read_json(request)
+        if body is None:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        action = body.get("action")
+        try:
+            if action == "enqueue":
+                entry_id = state._enqueue_drive_queue_local(
+                    body["repo_name"],
+                    body["issue_number"],
+                    machine=body.get("machine"),
+                    after=body.get("after") or [],
+                    position=body.get("position"),
+                )
+                return JSONResponse({"entry_id": entry_id})
+            if action == "dequeue":
+                deleted = state._dequeue_drive_queue_local(
+                    body["repo_name"], body["issue_number"]
+                )
+                return JSONResponse({"deleted": bool(deleted)})
+            if action == "update":
+                fields = body.get("fields")
+                if not isinstance(fields, dict):
+                    return JSONResponse(
+                        {"error": "fields must be an object"}, status_code=400
+                    )
+                updated = state._update_drive_queue_entry_local(
+                    body["repo_name"], body["issue_number"], **fields
+                )
+                return JSONResponse({"updated": bool(updated)})
+            if action == "move":
+                to_position = body["to_position"]
+                try:
+                    to_position = int(to_position)
+                except (TypeError, ValueError):
+                    return JSONResponse(
+                        {"error": "to_position must be an int"}, status_code=400
+                    )
+                moved = state._move_drive_queue_entry_local(
+                    body["repo_name"], body["issue_number"], to_position
+                )
+                return JSONResponse({"moved": bool(moved)})
+        except KeyError as e:
+            return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        except ValueError as e:
+            # `update` with a column the tick doesn't own — an operator/caller
+            # mistake, not a server fault, so 400 rather than 503.
+            return JSONResponse({"error": str(e)}, status_code=400)
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(
+                {"error": "drive-queue write failed", "detail": str(e)},
+                status_code=503,
+            )
+        return JSONResponse({"error": f"unknown action: {action!r}"}, status_code=400)
+
     async def get_pause(request: Request) -> Response:  # noqa: ARG001
         # #1563: the daemon's own view of the paused-machine set. ALWAYS the
         # local-only store (coord.machine_pause.local_paused_set()), never
@@ -6216,6 +6396,8 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
         Route("/issue-context", post_issue_context, methods=["POST"]),
         Route("/drive-escalations", get_drive_escalations, methods=["GET"]),
         Route("/drive-escalations", post_drive_escalations, methods=["POST"]),
+        Route("/drive-queue", get_drive_queue, methods=["GET"]),
+        Route("/drive-queue", post_drive_queue, methods=["POST"]),
         Route("/pause", get_pause, methods=["GET"]),
         Route("/pause", post_pause, methods=["POST"]),
         Route("/issue-comments", get_issue_comments, methods=["GET"]),

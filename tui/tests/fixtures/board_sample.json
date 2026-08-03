@@ -213,6 +213,7 @@
     "pipeline_default_gates": "[\"test\", \"review\", \"merge\"]",
     "round_number": "3"
   },
+  "drive_queue": [],
   "escalations": [],
   "issues": [
     {
