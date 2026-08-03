@@ -2388,6 +2388,41 @@ class TestSmokeGate:
         assert any(e.kind == "merged" for e in events)
         assert items[0].state == MERGED
 
+    def test_process_gate_a_test_author_skipped_verdict_merges_despite_moved_base(
+        self,
+    ) -> None:
+        """#1732 acceptance: a Gate-A test-author slice recorded `skipped`
+        ("contract/fixture-only diff, nothing to smoke-test" — #1076/#1152)
+        must merge on its own — no `--skip-smoke`, no human — even though a
+        sibling merge has since moved the target branch out from under the
+        recorded anchor. This is the unattended oracle-loop path #1732 was
+        filed to unblock: `skipped` is a structural statement about the
+        diff's shape, not a measurement at a SHA, so it cannot go stale."""
+        cfg = self._config()
+        work = self._work("w1", test_state="skipped")
+        work.type = "test-author"
+        work.test_head_sha = "branch-sha"
+        work.test_patch_id = "patch-1"
+        work.test_base_sha = "base-old"
+        board = self._board(completed=[work])
+        items = [_q("w1", size=10, assignment_type="test-author")]
+
+        class _MovedBaseGh(FakeGh):
+            def get_branch_sha(self, repo: str, branch: str) -> str | None:
+                return "base-new" if branch == "main" else "branch-sha"
+
+            def get_branch_patch_id(self, repo: str, base: str, branch: str) -> str | None:
+                return "patch-1"
+
+        events = process(items, _MovedBaseGh(), config=cfg, board=board)
+
+        kinds = [e.kind for e in events]
+        assert "smoke_required" not in kinds, (
+            "a `skipped` verdict must never be treated as #1479-stale (#1732)"
+        )
+        assert "merged" in kinds
+        assert items[0].state == MERGED
+
     def test_process_skip_smoke_bypasses_gate(self) -> None:
         """--skip-smoke must let a no-verdict merge proceed."""
         cfg = self._config()
@@ -5337,6 +5372,60 @@ class TestStaleSmokeVerdictReporting:
         assert verdict.ok is True
         assert verdict.kind == mq.SMOKE_OK
         assert verdict.message is None
+
+    # ── #1732: `skipped` is not subject to #1479 base-SHA freshness ───────
+    #
+    # `skipped` is a structural claim about the diff ("contract/fixture-only,
+    # nothing to smoke-test" — #1076/#1152), not a measurement of code at a
+    # SHA the way `passed` is. It must never be reported STALE just because
+    # the base or branch moved — there is nothing to re-verify, and the only
+    # way through used to be `--skip-smoke`, waiving a gate that had already
+    # been correctly waived.
+
+    def test_skipped_verdict_is_not_stale_when_base_moved(self) -> None:
+        """The direct regression: a `skipped` verdict recorded against base X
+        must not block when the base is now Y."""
+        work = self._tested_work()
+        work.test_state = "skipped"
+        board = self._board(completed=[work])
+        entry = _q("w1", target="main")
+        entry.target_branch_head_sha = "base-new"  # base moved since recording
+
+        verdict = mq.evaluate_smoke_verdict(entry, board)
+
+        assert verdict.ok is True
+        assert verdict.kind == mq.SMOKE_OK
+        assert verdict.message is None
+
+    def test_skipped_verdict_is_not_stale_when_branch_content_changed(self) -> None:
+        """Same exemption applies to the branch-content-changed anchor, not
+        just the base-moved one — `skipped` doesn't decay under either."""
+        work = self._tested_work()
+        work.test_state = "skipped"
+        board = self._board(completed=[work])
+        entry = _q("w1", target="main")
+        entry.branch_head_sha = "branch-new"   # new commit pushed
+        entry.branch_patch_id = "patch-2"       # content actually changed
+
+        verdict = mq.evaluate_smoke_verdict(entry, board)
+
+        assert verdict.ok is True
+        assert verdict.kind == mq.SMOKE_OK
+
+    def test_passed_verdict_still_goes_stale_when_base_moves(self) -> None:
+        """#1479 must stay intact for `passed` — this fix must not over-reach
+        into auto-waiving stale verdicts generally. Restates
+        ``test_moved_base_is_reported_as_stale_not_missing`` side by side
+        with the `skipped` exemption above so the two can't silently drift
+        onto the same (wrong) behaviour."""
+        board = self._board(completed=[self._tested_work()])  # test_state="passed"
+        entry = _q("w1", target="main")
+        entry.target_branch_head_sha = "base-new"
+
+        verdict = mq.evaluate_smoke_verdict(entry, board)
+
+        assert verdict.ok is False
+        assert verdict.kind == mq.SMOKE_STALE
 
     def test_has_smoke_verdict_still_returns_the_same_booleans(self) -> None:
         """The boolean seam every gate call site uses is unchanged."""

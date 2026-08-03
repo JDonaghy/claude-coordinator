@@ -843,9 +843,12 @@ def passes_merge_gates(a, config, board, gh_ops: "GhOps | None" = None) -> bool:
 # cases an operator has to act on differently:
 #
 #   SMOKE_MISSING — nothing terminal was ever recorded. Run the Test stage.
-#   SMOKE_STALE   — a passing/skipped verdict EXISTS but was recorded against
-#                   a branch/base combination that no longer exists (#1479).
+#   SMOKE_STALE   — a passing verdict EXISTS but was recorded against a
+#                   branch/base combination that no longer exists (#1479).
 #                   Re-verify against the current base, then re-record.
+#                   (#1732: a ``skipped`` verdict is never SMOKE_STALE — it's
+#                   a structural claim about the diff, not a measurement at
+#                   a SHA, so it can't go stale when the base moves.)
 #
 # Before #1640 both collapsed to "smoke test required but no verdict
 # recorded", which is a false statement in the stale case and is exactly what
@@ -952,9 +955,9 @@ def evaluate_smoke_verdict(
     catches fix workers dispatched with ``branch=NULL`` (the #557 remote-
     interactive-rework gap) — to handle bounce/fix-work chains.
 
-    #1479: unlike the pre-existing behaviour, a terminal verdict is not
-    trusted unconditionally — it is checked against the branch/base state it
-    was recorded against (``test_head_sha``/``test_patch_id``/
+    #1479: unlike the pre-existing behaviour, a terminal ``passed`` verdict is
+    not trusted unconditionally — it is checked against the branch/base state
+    it was recorded against (``test_head_sha``/``test_patch_id``/
     ``test_base_sha``, stamped by ``coord.state._record_test_verdict_local``)
     the same way ``has_approved_review`` checks ``review_head_sha``/
     ``review_patch_id``, **plus** one condition the review gate deliberately
@@ -967,6 +970,16 @@ def evaluate_smoke_verdict(
     anchor missing on either side skips that half of the check (fail open —
     #821/#1475's existing convention), so rows/entries predating this
     feature behave exactly as before.
+
+    #1732: ``skipped`` is deliberately excluded from all of the above. It is
+    not a measurement of code at a SHA the way ``passed`` is — it is a
+    structural claim about the diff itself ("contract/fixture-only, nothing
+    to smoke-test", #1076/#1152) that cannot be falsified by the base or
+    branch moving. Treating it like ``passed`` meant a Gate-A slice approved
+    and merge-ready would get refused as "STALE" with an unperformable
+    remedy: there is no suite to re-run, and recording ``passed`` would be a
+    lie about a suite that does not apply. A ``skipped`` verdict short-
+    circuits straight to :data:`SMOKE_OK` before any SHA comparison runs.
 
     #1601: *gh_ops* (optional, mirroring :func:`has_approved_review`) fetches
     the branch's/base's *live* SHA (and, via :func:`_backfill_branch_patch_id`,
@@ -1030,8 +1043,22 @@ def evaluate_smoke_verdict(
 
     # Work found — check whether any carries a fresh terminal smoke verdict.
     for a in branch_work:
-        if getattr(a, "test_state", None) not in ("passed", "skipped"):
+        test_state = getattr(a, "test_state", None)
+        if test_state not in ("passed", "skipped"):
             continue
+
+        # #1732: `skipped` is a structural claim about the *shape of the
+        # diff* ("contract/fixture-only, nothing to smoke-test" — #1076/
+        # #1152), not a claim about code behaving correctly at a particular
+        # SHA. Unlike `passed`, it does not decay when the base or branch
+        # moves — a rename upstream, or new commits on the branch, can't
+        # turn "there is nothing here a smoke test could exercise" into
+        # false. Only `passed` verdicts go through the #1479 base/branch
+        # staleness check below; `skipped` is accepted unconditionally.
+        if test_state == "skipped":
+            return SmokeVerdictStatus(
+                ok=True, kind=SMOKE_OK, assignment_id=getattr(a, "assignment_id", None)
+            )
 
         # Merge base moved: the tested combination (this branch + that base)
         # no longer exists, even if the branch's own diff is unchanged.
