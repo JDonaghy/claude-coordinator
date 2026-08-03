@@ -634,6 +634,82 @@ def test_graph_verified_current_is_not_reported_stale(tmp_path, monkeypatch) -> 
     assert "content current" in result.headroom
 
 
+def _init_git_repo_with_commits(repo: Path, n_commits: int) -> list[str]:
+    """A real repo on disk with *n_commits* commits; returns each commit's sha,
+    oldest first.  Real git, because ``_commits_behind`` shells out to it —
+    faking ``GraphStatus`` (as the rest of this section does) says nothing
+    about whether the ``rev-list --count`` call itself is right."""
+    import subprocess
+
+    repo.mkdir(parents=True, exist_ok=True)
+    run = lambda *args: subprocess.run(  # noqa: E731
+        ["git", *args], cwd=repo, check=True, capture_output=True, text=True
+    )
+    run("init", "-q")
+    run("config", "user.email", "test@example.com")
+    run("config", "user.name", "test")
+    shas = []
+    for i in range(n_commits):
+        (repo / "f.txt").write_text(str(i))
+        run("add", ".")
+        run("commit", "-q", "-m", f"commit {i}")
+        shas.append(run("rev-parse", "HEAD").stdout.strip())
+    return shas
+
+
+def test_graph_stale_headroom_reports_commit_distance(tmp_path, monkeypatch) -> None:
+    """#1728: the acceptance bar asks for the commit distance on a WARN, not
+    just an age — "13 commits stale" is how the vimcode incident that
+    motivated this check was actually described."""
+    repo = tmp_path / "repo"
+    shas = _init_git_repo_with_commits(repo, 4)
+    built_sha, head_sha = shas[0], shas[-1]
+
+    _fake_graph(
+        monkeypatch,
+        _graph_status(present=True, built_sha=built_sha, head_sha=head_sha,
+                      in_sync=False, age_seconds=30 * 3600.0),
+        (True, "core.hooksPath=.githooks"),
+    )
+    ctx = make_ctx(tmp_path, checkouts=(Checkout(name="vimcode", path=repo),))
+    (result,) = graph.probe_graph(ctx)
+    assert result.severity is Severity.WARN
+    assert "3 commits behind" in result.headroom
+    assert result.values["commits_behind"] == 3
+
+
+def test_graph_commit_distance_is_none_when_it_cannot_be_resolved(
+    tmp_path, monkeypatch
+) -> None:
+    """No real repo at the checkout path (or an abbreviated sha git can't
+    resolve) must not raise — the message just omits the count, exactly as
+    it did before #1728 added it."""
+    _fake_graph(
+        monkeypatch,
+        _graph_status(present=True, built_sha="aaaa1111", head_sha="bbbb2222",
+                      in_sync=False, age_seconds=30 * 3600.0),
+        (True, "core.hooksPath=.githooks"),
+    )
+    ctx = make_ctx(tmp_path, checkouts=(_checkout(tmp_path),))
+    (result,) = graph.probe_graph(ctx)
+    assert result.severity is Severity.WARN
+    assert result.values["commits_behind"] is None
+    assert "commits behind" not in result.headroom
+
+
+def test_graph_in_sync_never_computes_commit_distance(tmp_path, monkeypatch) -> None:
+    """Not stale -> no git shell-out for a number nothing will render."""
+    _fake_graph(
+        monkeypatch,
+        _graph_status(present=True, built_sha="abc12345", head_sha="abc12345",
+                      in_sync=True, age_seconds=3600.0),
+        (True, "core.hooksPath=.githooks"),
+    )
+    ctx = make_ctx(tmp_path, checkouts=(_checkout(tmp_path),))
+    (result,) = graph.probe_graph(ctx)
+    assert result.values["commits_behind"] is None
+
+
 # ── plan usage ───────────────────────────────────────────────────────────────
 
 

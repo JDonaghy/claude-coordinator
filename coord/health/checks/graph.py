@@ -27,9 +27,42 @@ hooks-disabled skips straight to CRIT because time cannot fix it.
 
 from __future__ import annotations
 
+import subprocess
+
 from coord.health.models import CheckResult, HealthContext, Severity
 from coord.health.registry import check
 from coord.health.units import human_hours
+
+
+def _commits_behind(repo_path: str, built_sha: str, head_sha: str) -> int | None:
+    """How many commits separate ``built_sha`` from ``head_sha``.
+
+    Purely informational — an operator (and #1728's H-6 successor, deciding
+    how urgently to rebuild) reads better from "13 commits behind" than from
+    an age in hours, which conflates "how stale" with "how busy was the
+    repo". This does NOT feed severity: :func:`~coord.graph_health.graph_status`
+    already decided ``stale`` from the SHA comparison plus the
+    manifest-mtime escape hatch, and duplicating that decision here from a
+    commit count would be exactly the second copy this module's docstring
+    warns against. Best-effort: returns ``None`` (never raises) when the
+    shas are abbreviated past what git can resolve, the repo can't be read,
+    or the call times out.
+    """
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(repo_path), "rev-list", "--count", f"{built_sha}..{head_sha}"],
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if r.returncode != 0:
+        return None
+    try:
+        return int(r.stdout.strip())
+    except ValueError:
+        return None
 
 
 @check(
@@ -104,6 +137,22 @@ def probe_graph(ctx: HealthContext) -> list[CheckResult]:
         age_hours = (status.age_seconds or 0.0) / 3600.0
         age_text = human_hours(status.age_seconds) if status.age_seconds is not None else "?h"
 
+        # #1728: how many commits separate the stamp from HEAD.  Purely
+        # additive to the message — severity above is still `status.stale`
+        # (SHA comparison + the manifest-mtime escape hatch), never this
+        # count, so a repo that made 1 commit vs. 100 since the graph was
+        # built is still judged identically on "is it stale", only described
+        # differently.
+        commits_behind: int | None = None
+        if status.stale and status.built_sha and status.head_sha:
+            commits_behind = _commits_behind(checkout.path, status.built_sha, status.head_sha)
+        values["commits_behind"] = commits_behind
+        commits_suffix = (
+            ""
+            if commits_behind is None
+            else f", {commits_behind} commit{'' if commits_behind == 1 else 's'} behind"
+        )
+
         if not status.stale:
             severity = Severity.OK
             headroom = f"in sync ({(status.built_sha or '')[:8]}), {age_text} old"
@@ -111,16 +160,16 @@ def probe_graph(ctx: HealthContext) -> list[CheckResult]:
                 headroom = f"content current (stamp {(status.built_sha or '')[:8]}), {age_text} old"
         elif not hooks_ok:
             severity = Severity.CRIT
-            headroom = f"{age_text} stale, hooks disabled -> will not self-heal"
+            headroom = f"{age_text} stale{commits_suffix}, hooks disabled -> will not self-heal"
         elif age_hours >= th.graph_stale_crit_hours:
             severity = Severity.CRIT
-            headroom = f"{age_text} stale (HEAD {(status.head_sha or '')[:8]})"
+            headroom = f"{age_text} stale{commits_suffix} (HEAD {(status.head_sha or '')[:8]})"
         elif age_hours >= th.graph_stale_warn_hours:
             severity = Severity.WARN
-            headroom = f"{age_text} stale (HEAD {(status.head_sha or '')[:8]})"
+            headroom = f"{age_text} stale{commits_suffix} (HEAD {(status.head_sha or '')[:8]})"
         else:
             severity = Severity.WARN
-            headroom = f"stale, {age_text} old (HEAD {(status.head_sha or '')[:8]})"
+            headroom = f"stale, {age_text} old{commits_suffix} (HEAD {(status.head_sha or '')[:8]})"
 
         detail = ""
         if severity is not Severity.OK:
