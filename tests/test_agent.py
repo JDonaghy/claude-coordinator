@@ -964,6 +964,22 @@ def test_base_checkout_write_guard_tools_empty_for_relative_path():
     assert _base_checkout_write_guard_tools("relative/repo") == []
 
 
+def test_base_checkout_write_guard_tools_expands_tilde(monkeypatch):
+    """Regression for the #1642 fix-review finding: production
+    spec.repo_path is the raw, un-expanded string straight from
+    coordinator.yml's machines[].repo_paths, and this project's own
+    coordinator.example.yml documents that field with tilde-shorthand (e.g.
+    ``~/src/claude-coordinator``). dispatch.py sends that raw string over
+    the wire unexpanded and nothing downstream normalizes it before it
+    reaches this function, so a tilde-form repo_path must still produce a
+    real guard rather than silently returning [] (the exact silent-escape
+    failure #1642 exists to close)."""
+    monkeypatch.setenv("HOME", "/home/john")
+    patterns = _base_checkout_write_guard_tools("~/src/claude-coordinator")
+    assert "Edit(//home/john/src/claude-coordinator/**)" in patterns
+    assert "Write(//home/john/src/claude-coordinator/**)" in patterns
+
+
 def test_worker_system_prompt_forbids_the_base_checkout():
     """#1642: a haiku-routed worker given a correct worktree still edited
     the shared base checkout by absolute path — the cwd convention was
