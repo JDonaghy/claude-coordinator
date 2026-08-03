@@ -372,3 +372,54 @@ def fetch_audit_log(
     )
     resp.raise_for_status()
     return resp.json()
+
+
+# #1742: the report engine lives on the daemon (the audit trail it folds
+# does), so a thin client fetches both the catalogue and the rendered result
+# over HTTP. Like fetch_audit_log, these do NOT fail-soft — `coord report` is
+# an explicit ask, and a 404 from a daemon predating these routes must read
+# as "restart coord-serve", not as "no reports".
+_REPORT_TIMEOUT = 30.0
+
+
+def fetch_report_catalogue(
+    svc: ServiceConfig, *, timeout: float = _DEFAULT_TIMEOUT
+) -> dict:
+    """GET the report catalogue (``{"reports": [...]}``) from the daemon."""
+    resp = httpx.get(f"{svc.url}/report", headers=_headers(svc), timeout=timeout)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def fetch_report(
+    svc: ServiceConfig,
+    report_id: str,
+    params: dict[str, Any] | None = None,
+    *,
+    timeout: float = _REPORT_TIMEOUT,
+) -> dict:
+    """GET a rendered ``ReportResult`` from the daemon.
+
+    Timeout is deliberately far above ``_DEFAULT_TIMEOUT``: a wide window
+    walks several 500-row audit pages server-side, which is slower than any
+    point read but still bounded.
+    """
+    resp = httpx.get(
+        f"{svc.url}/report/{report_id}",
+        params={k: v for k, v in (params or {}).items() if v not in (None, "")},
+        headers=_headers(svc),
+        timeout=timeout,
+    )
+    if resp.status_code in (400, 404):
+        # A bad param / unknown report is a user error with a message the
+        # daemon already worded — surface it as a plain error, not as an
+        # httpx status traceback.
+        detail = ""
+        try:
+            body = resp.json()
+            detail = body.get("error") or body.get("detail") or ""
+        except Exception:  # noqa: BLE001 — non-JSON error body; fall through
+            detail = resp.text.strip()
+        raise ValueError(detail or f"report request rejected ({resp.status_code})")
+    resp.raise_for_status()
+    return resp.json()

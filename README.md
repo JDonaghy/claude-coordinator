@@ -286,6 +286,7 @@ Verdict-relay helpers: `coord report-result`, `coord set-review-findings`, `coor
 | `coord usage [--today\|--week\|--month\|--since S] [--by-issue\|--issue N\|--by repo\|week\|month\|issue] [--by-time]` | Per-issue/repo/window cost, tokens, and time-spent |
 | `coord gates <repo> <issue> [--json]` | A work row's gate columns (`test_state`, `smoke_test`, `review_verdict`, ...) plus the live review/test/merge decision — including whether a verdict is #1479-stale and the SHAs compared. Read-only |
 | `coord audit [--category C] [--repo N] [--issue N] [--since T] [--json]` | Query the durable, ordered event log |
+| `coord report list` / `coord report run <id> [--param k=v ...] [--json]` | Named reports folded out of the audit trail. One today: `issue-activity` — one row per issue that moved in a window (start, machines, fix iterations, Test/Review verdicts, merge, driver exit, outcome) plus derived anomaly notes |
 | `coord sessions [--remote] [--prune] [--reap-merged]` | List interactive tmux sessions; reap dead/merged ones |
 | `coord terminal new\|list\|kill\|attach` | Persistent fleet-wide shell sessions |
 
@@ -473,7 +474,7 @@ Transitions: `coord refine` → `coord ready` marks an issue New → Refining �
 - **Milestones & epics** — group issues under an epic with a `## Work order` DAG; amortize architecture and acceptance gates across the milestone; ship as one unit (`coord milestone ship`).
 - **Merge queue** — dependency-aware sequencing, CI gating (`gh pr checks`), auto-rebase of mechanical conflicts, and escalation of semantic ones.
 - **Capability-aware testing** — `smoke_tests.capability_rules` route platform-specific suites to capable hardware (a GTK box, a browser box).
-- **Observability** — `coord usage` (per-issue/repo/window cost, tokens, time), `coord audit` (durable event log), stream-json `coord watch`, and `STATUS:`/`STUCK:` progress lines.
+- **Observability** — `coord usage` (per-issue/repo/window cost, tokens, time), `coord audit` (durable event log), `coord report` (the event log folded into per-issue outcomes), stream-json `coord watch`, and `STATUS:`/`STUCK:` progress lines.
 - **Crash recovery** — `coord resume` / `coord diagnose` reconcile the board with live agent and git state; interactive tmux sessions survive a TUI crash and are reattachable.
 - **Web dashboard + phone PWA** — a board view and a React/Vite phone control-center at port 7434, served over Tailscale.
 

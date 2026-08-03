@@ -4568,6 +4568,44 @@ def list_audit_log(
     )
 
 
+def list_reports() -> dict:
+    """The report catalogue (#1742) — daemon when ``board_service`` is set,
+    local registry otherwise.
+
+    Same seam shape as :func:`list_audit_log`, and the same fail-loud
+    policy: ``coord report list`` is an explicit read, so a transport error
+    surfaces rather than rendering an empty catalogue.
+    """
+    svc = _board_service()
+    if svc is not None:
+        from coord.client import fetch_report_catalogue  # noqa: PLC0415
+
+        return fetch_report_catalogue(svc)
+    from coord.reports import catalogue  # noqa: PLC0415
+
+    return catalogue()
+
+
+def run_report(report_id: str, params: dict[str, str] | None = None) -> dict:
+    """Run a report (#1742) and return its ``ReportResult`` as a dict.
+
+    The fold is deliberately **server-side**: a thin client's
+    ``~/.coord/coordinator.remote.yml`` is a cache, the audit trail lives on
+    the daemon host, and a client-side fold would both be wrong off-host and
+    drift from the daemon's answer. So when ``board_service`` is set this is
+    a ``GET /report/{id}``, and the CLI renders exactly what the daemon
+    computed.
+    """
+    svc = _board_service()
+    if svc is not None:
+        from coord.client import fetch_report  # noqa: PLC0415
+
+        return fetch_report(svc, report_id, params or {})
+    from coord.reports import run_report as _run_report  # noqa: PLC0415
+
+    return _run_report(report_id, params or {}).to_dict()
+
+
 def _list_issue_context_local(repo_name: str, issue_number: int) -> list[dict]:
     conn = get_connection()
     rows = conn.execute(
