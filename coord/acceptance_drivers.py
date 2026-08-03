@@ -25,6 +25,12 @@ report rather than its built-in ``--reporter=junit`` one — see
 collapses retries into one opaque CDATA blob with no per-attempt status,
 which loses the "did this flake" signal this driver exists to capture; json
 keeps a ``results[]`` entry per attempt).
+
+:func:`run_driver` also runs a driver's optional ``setup:`` provisioning
+command (#1733, ``AcceptanceDriverConfig.setup``) once before its suite —
+e.g. ``npm ci`` for ``web-playwright``, which otherwise fails with a bare
+``exit 127`` (playwright not found) the first time it runs against ``coord
+acceptance record``'s throwaway, dependency-less worktree.
 """
 
 from __future__ import annotations
@@ -119,6 +125,7 @@ def render_run_command(run_command: str, *, ms: str | None = None) -> str:
 
 def run_driver(
     kind: str, run_command: str, cwd: str, *, timeout: int = 900, ms: str | None = None,
+    setup_command: str = "",
 ) -> DriverResult:
     """Execute *run_command* in *cwd* and parse its output for *kind*.
 
@@ -129,6 +136,16 @@ def run_driver(
 
     *ms*, when given, renders the ``{ms}`` template in *run_command* first
     (see :func:`render_run_command`).
+
+    *setup_command* (#1733, ``AcceptanceDriverConfig.setup``), when
+    non-empty, runs ONCE in *cwd* before *run_command* — the provisioning
+    step a driver needs a bare checkout doesn't provide (e.g. ``npm ci`` for
+    ``web-playwright`` in ``coord acceptance record``'s throwaway,
+    dependency-less worktree). Unlike a non-zero *run_command* exit, a
+    failing *setup_command* DOES raise :class:`DriverError` — immediately,
+    before *run_command* ever executes — with a message that names it as a
+    provisioning failure so it isn't mistaken for a test failure or folded
+    into a driver's own "wrote no report" crash message.
     """
     if kind not in SUPPORTED_KINDS:
         raise DriverError(
@@ -137,6 +154,9 @@ def run_driver(
             "lands in a later oracle-loop issue — see docs/ORACLE_LOOP.md."
         )
 
+    if setup_command:
+        _run_setup(setup_command, cwd, timeout=timeout)
+
     run_command = render_run_command(run_command, ms=ms)
 
     if kind == "cli-pytest":
@@ -144,6 +164,43 @@ def run_driver(
     if kind == "web-playwright":
         return _run_web_playwright(run_command, cwd, timeout=timeout)
     return _run_generic(run_command, cwd, timeout=timeout)
+
+
+def _run_setup(setup_command: str, cwd: str, *, timeout: int) -> None:
+    """Run a driver's ``setup:`` provisioning command (#1733) in *cwd*,
+    before its suite ever runs.
+
+    Raises :class:`DriverError` — distinctly worded as a provisioning
+    failure, not a test failure — for a non-zero exit, a timeout, or the
+    command failing to start at all. Callers must not proceed to
+    ``run_command`` when this raises: a driver whose dependencies never
+    installed cannot produce a meaningful verdict.
+    """
+    try:
+        proc = subprocess.run(
+            setup_command,
+            shell=True,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise DriverError(
+            f"acceptance driver provisioning timed out after {timeout}s: "
+            f"{setup_command!r}"
+        ) from e
+    except OSError as e:
+        raise DriverError(
+            f"acceptance driver provisioning failed to start: {setup_command!r}: {e}"
+        ) from e
+
+    if proc.returncode != 0:
+        stderr_tail = "\n".join((proc.stderr or "").splitlines()[-20:])
+        raise DriverError(
+            f"acceptance driver provisioning failed (exit {proc.returncode}): "
+            f"{setup_command!r}\n{stderr_tail}"
+        )
 
 
 def _run_generic(run_command: str, cwd: str, *, timeout: int) -> DriverResult:

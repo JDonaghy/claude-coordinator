@@ -184,6 +184,23 @@ class AcceptanceDriverConfig:
     driver, intended to be routed the same way ``smoke_tests.capability_rules``
     routes smoke tests.
 
+    ``setup`` (#1733) is an optional shell command run once, before ``run``,
+    to provision whatever a driver needs that a bare ``git checkout``
+    doesn't provide — e.g. ``npm ci`` for ``web-playwright``. It exists
+    because ``coord acceptance record``'s whole design is a throwaway ``git
+    worktree add --detach`` the worker never touches: that worktree has no
+    ``node_modules`` (gitignored, never checked out) and no way to get one
+    short of an explicit install step, so a JS driver's ``run`` failed with
+    a bare ``exit 127`` (playwright not found) before ever producing a
+    parsed verdict. ``tui-tuidriver`` (cargo fetches its own deps) and
+    ``cli-pytest`` (runs against the ambient env) happen to self-provision,
+    which is exactly why this went unnoticed until the first JS driver ran.
+    Left empty (the default), no provisioning step runs — unchanged
+    behaviour for every driver that doesn't need one. A non-zero exit from
+    ``setup`` is reported as a distinct "provisioning failed" error rather
+    than being folded into "tests failed"/"wrote no report" (see
+    :func:`coord.acceptance_drivers.run_driver`).
+
     ``entrypoint`` (#1552) is the repo-root-relative file this driver's
     ``run`` command links its slices through — the sealed oracle's *crate
     root*, for a driver whose framework discovers tests via an entry point
@@ -201,26 +218,35 @@ class AcceptanceDriverConfig:
 
     ``match`` and ``routes`` implement #1125's in-repo path routing: a repo
     entry with a non-empty ``routes`` list is a *router* — its own
-    ``kind``/``run``/``mock``/``capability``/``entrypoint`` are unused and
-    each element of ``routes`` is itself an ``AcceptanceDriverConfig`` with
-    ``match`` set (a repo-root-relative glob, e.g. ``"coord/**"``). A route
-    entry's own ``routes`` is always empty — nesting one level is the whole
-    feature, not a recursive router. See :meth:`AcceptanceConfig.driver_for`
-    for the resolution rule.
+    ``kind``/``run``/``mock``/``capability``/``setup``/``entrypoint`` are
+    unused and each element of ``routes`` is itself an
+    ``AcceptanceDriverConfig`` with ``match`` set (a repo-root-relative
+    glob, e.g. ``"coord/**"``). A route entry's own ``routes`` is always
+    empty — nesting one level is the whole feature, not a recursive router.
+    See :meth:`AcceptanceConfig.driver_for` for the resolution rule.
 
-    NOTE (#944 review): parsed and validated here, but not yet *consulted* —
-    ``coord acceptance record``'s daemon-routed run (#944) always executes on
-    whatever host ``resolve_board_service()`` points at, with no capability
-    check. Wiring ``record`` through ``capability_rules``-style routing (the
-    way ``coord test``'s ``pick_smoke_machine``/``match_rules`` route smoke
-    runs to capable hardware) is left to #932, which owns dispatching the
-    run stage.
+    ``capability`` IS consulted (#966): both ``coord acceptance run --all``
+    and ``coord acceptance record`` preflight-check it against the invoking
+    host via :func:`coord.acceptance.acceptance_capability_gap` and refuse
+    loudly, naming a capable machine, rather than silently running on
+    hardware that may not support the driver. #966 deliberately stopped
+    there rather than building actual remote-exec routing (the way ``coord
+    test``'s ``pick_smoke_machine``/``match_rules`` route smoke runs to
+    capable hardware) — that's real new plumbing, unjustified until a driver
+    with an *unroutable* capability mismatch actually exists; "fail loud
+    instead of silently running wrong" was enough to unblock #944's only
+    driver at the time. A daemon host must still satisfy every declared
+    driver's capability itself, since ``record`` always executes wherever
+    the daemon is (see ``coord.commands.acceptance._acceptance_record_via_daemon``)
+    — that is a real, operator-facing constraint on which machine can be the
+    daemon, not something this preflight check can route around.
     """
 
     kind: str = ""
     run: str = ""
     mock: str = ""
     capability: str = ""
+    setup: str = ""
     entrypoint: str = ""
     match: str = ""
     routes: list["AcceptanceDriverConfig"] = field(default_factory=list)
@@ -1737,7 +1763,7 @@ def _parse_acceptance(raw: Any) -> AcceptanceConfig:
             # other, so reject it rather than silently discarding the flat
             # fields.
             flat_fields = [
-                f for f in ("kind", "run", "mock", "capability", "entrypoint")
+                f for f in ("kind", "run", "mock", "capability", "setup", "entrypoint")
                 if entry.get(f)
             ]
             if flat_fields:
@@ -1770,12 +1796,16 @@ def _parse_acceptance(raw: Any) -> AcceptanceConfig:
                 f"acceptance.drivers[{repo_name!r}].capability must be a string"
             )
 
+        setup = entry.get("setup", "") or ""
+        if not isinstance(setup, str):
+            raise ConfigError(f"acceptance.drivers[{repo_name!r}].setup must be a string")
+
         entrypoint = _acceptance_entrypoint(
             entry, f"acceptance.drivers[{repo_name!r}].entrypoint"
         )
 
         drivers[repo_name] = AcceptanceDriverConfig(
-            kind=kind, run=run, mock=mock, capability=capability,
+            kind=kind, run=run, mock=mock, capability=capability, setup=setup,
             entrypoint=entrypoint,
         )
 
@@ -1789,8 +1819,8 @@ def _parse_acceptance_routes(
     ``AcceptanceDriverConfig`` route entries, each with ``match`` set.
 
     Each element is validated the same way as a flat driver entry
-    (``kind``/``run`` required, ``mock``/``capability`` optional strings),
-    plus a required ``match`` glob.
+    (``kind``/``run`` required, ``mock``/``capability``/``setup`` optional
+    strings), plus a required ``match`` glob.
     """
     if not isinstance(routes_raw, list) or not routes_raw:
         raise ConfigError(
@@ -1834,14 +1864,20 @@ def _parse_acceptance_routes(
                 f"acceptance.drivers[{repo_name!r}].routes[{i}].capability must be a string"
             )
 
+        setup = route_entry.get("setup", "") or ""
+        if not isinstance(setup, str):
+            raise ConfigError(
+                f"acceptance.drivers[{repo_name!r}].routes[{i}].setup must be a string"
+            )
+
         entrypoint = _acceptance_entrypoint(
             route_entry, f"acceptance.drivers[{repo_name!r}].routes[{i}].entrypoint"
         )
 
         routes.append(
             AcceptanceDriverConfig(
-                kind=kind, run=run, mock=mock, capability=capability, match=match,
-                entrypoint=entrypoint,
+                kind=kind, run=run, mock=mock, capability=capability, setup=setup,
+                match=match, entrypoint=entrypoint,
             )
         )
 

@@ -696,3 +696,131 @@ acceptance:
     )
     with pytest.raises(ConfigError, match="sets both 'routes' and flat field"):
         load(p)
+
+
+# ── #1733: driver `setup:` — the provisioning step ───────────────────────────
+#
+# `coord acceptance record`'s throwaway `git worktree add --detach` never has
+# `node_modules` (gitignored, never checked out), so a JS driver's `run` alone
+# fails with a bare `exit 127` (playwright not found) before ever producing a
+# verdict. `setup` is an optional shell command run once, before `run`, to
+# provision whatever a driver needs beyond a bare checkout — e.g. `npm ci`.
+
+def test_acceptance_driver_setup_optional_defaults_empty(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE
+        + """\
+acceptance:
+  drivers:
+    coord-tui:
+      kind: tui-tuidriver
+      run: "cargo test --test acceptance"
+"""
+    )
+    cfg = load(p)
+    driver = cfg.acceptance.driver_for("coord-tui")
+    assert driver.setup == ""
+
+
+def test_flat_driver_setup_parses(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE
+        + """\
+acceptance:
+  drivers:
+    coord-tui:
+      kind: web-playwright
+      run: "npx playwright test tests/acceptance/{ms}"
+      setup: "npm ci"
+"""
+    )
+    cfg = load(p)
+    driver = cfg.acceptance.driver_for("coord-tui")
+    assert driver.setup == "npm ci"
+
+
+def test_route_setup_parses(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE.replace("coord-tui", "claude-coordinator")
+        + """\
+acceptance:
+  drivers:
+    claude-coordinator:
+      routes:
+        - match: "coord/dashboard/webapp/**"
+          kind: web-playwright
+          run: "cd coord/dashboard/webapp && npm run test:acceptance -- {ms}"
+          setup: "cd coord/dashboard/webapp && npm ci"
+        - match: "coord/**"
+          kind: cli-pytest
+          run: "pytest tests/acceptance/{ms}"
+"""
+    )
+    cfg = load(p)
+    webapp = cfg.acceptance.driver_for("claude-coordinator", "coord/dashboard/webapp/app.ts")
+    assert webapp is not None
+    assert webapp.setup == "cd coord/dashboard/webapp && npm ci"
+    pyroute = cfg.acceptance.driver_for("claude-coordinator", "coord/review.py")
+    assert pyroute is not None
+    assert pyroute.setup == ""
+
+
+def test_flat_driver_setup_non_string_raises(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE
+        + """\
+acceptance:
+  drivers:
+    coord-tui:
+      kind: tui-tuidriver
+      run: "cargo test"
+      setup: 42
+"""
+    )
+    with pytest.raises(ConfigError, match="setup must be a string"):
+        load(p)
+
+
+def test_route_setup_non_string_raises(tmp_path: Path) -> None:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE.replace("coord-tui", "claude-coordinator")
+        + """\
+acceptance:
+  drivers:
+    claude-coordinator:
+      routes:
+        - match: "coord/**"
+          kind: cli-pytest
+          run: "pytest tests/acceptance/{ms}"
+          setup: true
+"""
+    )
+    with pytest.raises(ConfigError, match="setup must be a string"):
+        load(p)
+
+
+def test_routes_and_flat_setup_raises(tmp_path: Path) -> None:
+    """Mirrors test_routes_and_flat_entrypoint_raises — a routed entry's
+    driver is entirely per-route (#1125 finding 5), now covering `setup`
+    too, or it would be silently discarded."""
+    p = tmp_path / "coordinator.yml"
+    p.write_text(
+        BASE.replace("coord-tui", "claude-coordinator")
+        + """\
+acceptance:
+  drivers:
+    claude-coordinator:
+      setup: "npm ci"
+      routes:
+        - match: "coord/**"
+          kind: cli-pytest
+          run: "pytest tests/acceptance/{ms}"
+"""
+    )
+    with pytest.raises(ConfigError, match="sets both 'routes' and flat field"):
+        load(p)

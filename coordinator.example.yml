@@ -103,6 +103,14 @@ acceptance:
       routes:
         - match: coord/dashboard/webapp/**
           kind: web-playwright
+          # #1733: `coord acceptance record`'s throwaway `git worktree
+          # add --detach` never has `node_modules` (gitignored, never
+          # checked out) — `run` alone fails with a bare `exit 127`
+          # (playwright not found) the first time it runs there. `setup`
+          # provisions the checkout once, before `run`, and a failure here
+          # is reported as "provisioning failed", distinct from a test
+          # failure.
+          setup: "cd coord/dashboard/webapp && npm ci"
           run: "cd coord/dashboard/webapp && npm run test:acceptance -- {ms}"
           mock: "*.html"
           capability: browser

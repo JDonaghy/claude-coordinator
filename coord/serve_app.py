@@ -4249,14 +4249,25 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
 
             from coord.commands.acceptance import acceptance_record  # noqa: PLC0415
 
-            stdout_proxy, _stderr_proxy = _ensure_stdio_capture_proxies()
+            stdout_proxy, stderr_proxy = _ensure_stdio_capture_proxies()
             buf = io.StringIO()
             code = 0
             err = None
             prev = os.environ.get("COORD_ACCEPTANCE_ON_DAEMON")
             os.environ["COORD_ACCEPTANCE_ON_DAEMON"] = "1"  # guard against re-routing
             try:
-                with stdout_proxy.capture(buf):
+                # #1733: fold stderr into the same buffer as stdout — mirrors
+                # the #1251 /merge fix. Every LOCAL failure path in
+                # coord.commands.acceptance (a DriverError, a missing work
+                # assignment, a manifest error, ...) does `click.echo(...,
+                # err=True)` before `sys.exit(1)`; that resolves sys.stderr
+                # fresh at call time, so without capturing it too those
+                # messages vanish into the daemon's own journal instead of
+                # reaching the client — a daemon-routed `acceptance record`
+                # would exit 1 with zero output, indistinguishable from a
+                # hang (the exact #1733 report: "exit 1, no error message on
+                # the client at all").
+                with stdout_proxy.capture(buf), stderr_proxy.capture(buf):
                     acceptance_record.callback(
                         repo=body.get("repo"),
                         issue_number=int(body.get("issue")),

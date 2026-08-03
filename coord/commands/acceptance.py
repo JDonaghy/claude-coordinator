@@ -241,7 +241,10 @@ def acceptance_run(
             ms = None
 
     try:
-        result = run_driver(driver_cfg.kind, driver_cfg.run, cwd=str(cwd), ms=ms)
+        result = run_driver(
+            driver_cfg.kind, driver_cfg.run, cwd=str(cwd), ms=ms,
+            setup_command=driver_cfg.setup,
+        )
     except DriverError as e:
         click.echo(f"error: {e}", err=True)
         sys.exit(1)
@@ -536,7 +539,10 @@ def _acceptance_record_local(
         ms = None
 
     try:
-        result = run_driver(driver_cfg.kind, driver_cfg.run, cwd=str(wt_path), ms=ms)
+        result = run_driver(
+            driver_cfg.kind, driver_cfg.run, cwd=str(wt_path), ms=ms,
+            setup_command=driver_cfg.setup,
+        )
     except DriverError as e:
         click.echo(f"error: {e}", err=True)
         _remove_acceptance_worktree(repo_dir, wt_path)

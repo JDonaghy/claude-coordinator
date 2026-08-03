@@ -354,6 +354,54 @@ class TestAcceptanceRunRouted:
         assert captured["kind"] == "cli-pytest"
         assert captured["ms"] == "ms-37"
 
+    def test_run_wires_driver_setup_into_run_driver(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """#1733: `AcceptanceDriverConfig.setup` (e.g. `npm ci` for
+        web-playwright) must actually reach `run_driver`'s `setup_command`
+        — otherwise the config field is parsed but never consulted, the
+        exact "declared but ignored" shape #1733 reports for capability
+        routing before #966 fixed it."""
+        cwd = tmp_path / "repo"
+        cwd.mkdir()
+        config_path = tmp_path / "coordinator.yml"
+        config_path.write_text(f"""\
+repos:
+  - name: coord-tui
+    github: acme/coord-tui
+machines:
+  - name: laptop
+    host: laptop.tail
+    repos: [coord-tui]
+    repo_paths:
+      coord-tui: {cwd}
+acceptance:
+  drivers:
+    coord-tui:
+      routes:
+        - match: "coord/dashboard/webapp/**"
+          kind: web-playwright
+          run: "npx playwright test tests/acceptance/{{ms}}"
+          setup: "npm ci"
+""")
+
+        captured = {}
+
+        def fake_run_driver(kind, run_command, cwd, **kwargs):
+            captured["setup_command"] = kwargs.get("setup_command")
+            from coord.acceptance_drivers import DriverResult
+            return DriverResult(exit_code=0, tests=[{"id": "a", "status": "pass"}])
+
+        monkeypatch.setattr("coord.commands.acceptance.run_driver", fake_run_driver)
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "run", "--repo", "coord-tui", "--all",
+            "--for-path", "coord/dashboard/webapp/app.ts",
+            "--path", str(cwd), "--config", str(config_path),
+        ])
+        assert result.exit_code == 0, result.output
+        assert captured["setup_command"] == "npm ci"
+
 
 def _init_git_repo(
     path: Path, *, manifest: dict[str, int] | None = None, manifest_ms_dir: str = "ms01",
@@ -550,6 +598,67 @@ class TestAcceptanceRecord:
         assert captured["ms"] == "ms-37"
 
         row = _acceptance_row(coord_db, "aid-routed")
+        assert row["acceptance_state"] == "passed"
+
+    def test_record_runs_setup_before_run_in_the_throwaway_worktree(
+        self, tmp_path: Path, coord_db,
+    ) -> None:
+        """#1733 direct regression: `acceptance record`'s throwaway `git
+        worktree add --detach` checkout is dependency-less (`node_modules`
+        is gitignored, never checked out) — a JS driver's `run` alone fails
+        with a bare `exit 127` there. `setup` must actually run, IN that
+        worktree, BEFORE `run` — not just be parsed and ignored (the #1733
+        report's root cause). `run` here only succeeds if it finds a marker
+        file `setup` created in the same (worktree) cwd, so this proves
+        ordering + cwd, not merely that both commands happened to run
+        somewhere.
+        """
+        from coord import state
+
+        repo_dir = tmp_path / "repo"
+        sha = _init_git_repo(repo_dir, manifest={"ms01::a": 944})
+
+        blob = json.dumps({"tests": [{"id": "ms01::a", "status": "pass"}]})
+        run_cmd = (
+            f"test -f provisioned && echo '{blob}' "
+            "|| (echo 'MISSING MARKER — setup did not run first' >&2 && exit 1)"
+        )
+        config_path = tmp_path / "coordinator.yml"
+        config_path.write_text(f"""\
+repos:
+  - name: coord-tui
+    github: acme/coord-tui
+machines:
+  - name: laptop
+    host: laptop.tail
+    repos: [coord-tui]
+    repo_paths:
+      coord-tui: {repo_dir}
+acceptance:
+  drivers:
+    coord-tui:
+      kind: tui-tuidriver
+      run: {json.dumps(run_cmd)}
+      setup: "touch provisioned"
+""")
+
+        state.record_dispatched(
+            assignment_id="aid-setup",
+            proposal=Proposal(
+                id=1, machine_name="laptop", repo_name="coord-tui",
+                issue_number=944, issue_title="oracle loop runner", rationale="",
+            ),
+            repo_github="acme/coord-tui",
+        )
+
+        result = CliRunner().invoke(main, [
+            "acceptance", "record", "--repo", "coord-tui", "--issue", "944",
+            "--sha", sha, "--config", str(config_path),
+        ])
+        assert result.exit_code == 0, result.output
+        assert "Acceptance PASSED" in result.output
+
+        row = _acceptance_row(coord_db, "aid-setup")
         assert row["acceptance_state"] == "passed"
 
     def test_record_no_work_assignment_errors(self, tmp_path: Path, coord_db) -> None:
