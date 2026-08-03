@@ -127,6 +127,7 @@ from coord.commands.drive import (
     drive_stop,
     escalate_group,
 )
+from coord.commands.drive_queue import drive_queue_group
 from coord.commands.lifecycle import done, housekeeping, notify, resume, serve, web
 from coord.commands.milestone import milestone_group
 from coord.commands.plans import plans_cmd
@@ -397,6 +398,7 @@ main.add_command(drive)
 main.add_command(drive_sessions)
 main.add_command(drive_attach)
 main.add_command(drive_stop)
+main.add_command(drive_queue_group)
 main.add_command(escalate_group)
 main.add_command(pr)
 main.add_command(fix)

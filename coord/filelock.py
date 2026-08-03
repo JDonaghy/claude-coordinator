@@ -87,3 +87,18 @@ def notify_lock_path() -> Path:
     the daemon is process start.
     """
     return Path.home() / ".coord" / "notify.lock"
+
+
+def drive_queue_lock_path() -> Path:
+    """The lock that keeps ``coord drive-queue tick`` from stacking (#1754).
+
+    Deliberately NOT :func:`notify_lock_path`: a tick fetches the board and
+    may spend several seconds waiting for ``coord drive --tmux`` to confirm a
+    live session, and holding the pipeline's own lock for that would stall
+    ``coord notify``/``run_drain`` for no reason.  A tick advances nothing by
+    itself — it launches a drive, and *that* drive takes the notify lock when
+    it nudges.
+
+    Same call-time resolution rationale as above.
+    """
+    return Path.home() / ".coord" / "drive-queue.lock"
