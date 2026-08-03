@@ -1602,6 +1602,12 @@ pub(crate) fn load_data() -> BoardData {
         // the status-bar indicator renders "FLEET: OK" (zero units, not a
         // fabricated warning) and the detail overlay is empty on this path.
         FleetHealthBlock::default(),
+        // #1753/#1755 (DQ-3): the `drive_queue` table lives in the daemon
+        // host's DB and reaches a client only through `/board` — same
+        // posture as `escalations` above. Pass empty; the status-bar
+        // segment renders "QUEUE: empty" (which is the truth for this
+        // client, and never a fabricated alert) on this path.
+        Vec::new(),
     )
 }
 
@@ -1642,6 +1648,7 @@ pub(crate) fn assemble_board_data(
     audit_recent_count: u64,
     escalations: Vec<EscalationEntry>,
     fleet_health: FleetHealthBlock,
+    drive_queue: Vec<BoardDriveQueueEntry>,
 ) -> BoardData {
     // ── Machine reachability probes + health fetches ──────────────────────
     // Probe using the Tailscale host (fixes #121: machine name ≠ Tailscale hostname).
@@ -1762,6 +1769,7 @@ pub(crate) fn assemble_board_data(
         audit_recent_count,
         escalations,
         fleet_health,
+        drive_queue,
     }
 }
 
@@ -2371,6 +2379,10 @@ pub(crate) fn load_data_remote(url: &str, token: Option<&str>) -> BoardData {
         // (`FleetHealthBlock::default()`, via `#[serde(default)]`) on
         // daemons that predate #1630.
         payload.fleet_health,
+        // #1753/#1755 (DQ-3): the drive queue in run order; empty (via
+        // `#[serde(default)]`) on daemons that predate #1753, which never
+        // emit this key at all.
+        payload.drive_queue,
     )
 }
 

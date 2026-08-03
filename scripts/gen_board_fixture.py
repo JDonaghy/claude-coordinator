@@ -139,6 +139,38 @@ def build_fixture_db(conn: sqlite3.Connection) -> None:
         ),
     )
 
+    # ── drive_queue ──────────────────────────────────────────────────────
+    # #1753/#1755: two rows so the golden fixture exercises BOTH shapes the
+    # Rust `BoardDriveQueueEntry` has to survive — a bare appended entry
+    # (NULL machine, empty `after_json`, zeroed counters) and a fully-
+    # populated one (pinned machine, a decoded `after_json` LIST, non-zero
+    # attempts/deferrals, a `last_reason` string, a REAL `launched_at`).
+    # The `after_json` column in particular is the trap this guards: it is a
+    # JSON *string* in SQLite and a decoded array on the wire (see
+    # `coord.dao._JSON_COLUMNS`), so a Rust field typed `Vec<String>` without
+    # the `after_json` rename silently stays empty — and a field typed
+    # `String` fails the whole BoardPayload parse and blanks every panel.
+    conn.execute(
+        "INSERT INTO drive_queue (repo_name, issue_number, position, machine, "
+        "after_json, state, attempts, deferrals, last_reason, session_name, "
+        "launched_at, enqueued_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "claude-coordinator", 748, 0, None, "[]", "waiting", 0, 0, "",
+            None, None, 1000001200.0,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO drive_queue (repo_name, issue_number, position, machine, "
+        "after_json, state, attempts, deferrals, last_reason, session_name, "
+        "launched_at, enqueued_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "claude-coordinator", 750, 1, "dellserver",
+            '["claude-coordinator#748"]', "waiting", 1, 2,
+            "pre-req claude-coordinator#748 has not merged", None, None,
+            1000001250.0,
+        ),
+    )
+
     # ── board_meta ───────────────────────────────────────────────────────
     conn.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('round_number', '3')")
     conn.execute("INSERT OR REPLACE INTO board_meta (key, value) VALUES ('board_initialized', '1')")

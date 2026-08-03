@@ -623,6 +623,13 @@ impl ShellApp for CoordApp {
         // above — a global overlay, not scoped to any one view's main
         // content. No-op when closed.
         self.render_fleet_health_overlay(backend, layout.main_content_bounds);
+
+        // ── #1755 (DQ-3): drive-queue detail overlay ────────────────────
+        // Same global-overlay z-order as fleet health above; no-op when
+        // closed. Only one of the two can be open at a time (each owns ALL
+        // input while open, and the status-bar menu opens exactly one), so
+        // the paint order between them never matters in practice.
+        self.render_drive_queue_overlay(backend, layout.main_content_bounds);
     }
 
     fn handle(

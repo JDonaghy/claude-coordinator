@@ -74,6 +74,90 @@
             payload.machines.iter().all(|m| !m.name.is_empty()),
             "every machine has a name"
         );
+
+        // #1755 (DQ-3): the drive queue rides the SAME payload — a type
+        // mismatch on any one of its fields would fail this whole parse and
+        // blank every panel above, so these assertions are also the
+        // "`drive_queue` does not blank any other panel" acceptance bullet
+        // (the assertions above still pass with it present).
+        assert_eq!(
+            payload.drive_queue.len(),
+            2,
+            "golden fixture seeds two drive_queue rows"
+        );
+        let bare = &payload.drive_queue[0];
+        assert_eq!(bare.repo_name, "claude-coordinator");
+        assert_eq!(bare.issue_number, 748);
+        assert_eq!(bare.position, 0);
+        assert!(bare.machine.is_none(), "an unpinned row's machine is NULL");
+        assert!(bare.after.is_empty(), "empty after_json → empty Vec");
+        assert_eq!(bare.state, "waiting");
+
+        let rich = &payload.drive_queue[1];
+        assert_eq!(rich.issue_number, 750);
+        assert_eq!(rich.machine.as_deref(), Some("dellserver"));
+        // The trap this fixture exists for: `after_json` is a JSON *string*
+        // in SQLite and a decoded ARRAY on the wire. A `Vec<String>` field
+        // named `after` without the rename would silently be empty here.
+        assert_eq!(
+            rich.after,
+            vec!["claude-coordinator#748".to_string()],
+            "after_json must decode into `after` as a real list"
+        );
+        assert_eq!(rich.attempts, 1);
+        assert_eq!(rich.deferrals, 2);
+        assert_eq!(
+            rich.last_reason,
+            "pre-req claude-coordinator#748 has not merged"
+        );
+    }
+
+    /// #1755 (DQ-3): a `/board` payload carrying `drive_queue` must not blank
+    /// any other panel — the #632/#546/#628 class. Asserted directly on a
+    /// hand-built payload (rather than only via the golden fixture) so the
+    /// failure mode is unambiguous if it ever regresses: every sibling key
+    /// still populated WHILE `drive_queue` parses, including a `drive_queue`
+    /// row carrying a field this build has never heard of.
+    #[test]
+    fn board_payload_with_drive_queue_does_not_blank_other_panels() {
+        let json = r#"{
+            "round_number": 7,
+            "assignments": [
+                {"assignment_id":"a1","machine_name":"m","repo_name":"r","issue_number":1,
+                 "issue_title":"t","status":"running","type":"work"}
+            ],
+            "machines": [{"name":"m","host":"h","repos":[]}],
+            "drive_queue": [
+                {"repo_name":"r","issue_number":1,"position":0,"machine":null,
+                 "after_json":[],"state":"waiting","attempts":0,"deferrals":0,
+                 "last_reason":"","session_name":null,"launched_at":null,
+                 "enqueued_at":1.0,"id":1,
+                 "a_field_from_a_newer_daemon":"ignored"}
+            ]
+        }"#;
+        let payload: BoardPayload = serde_json::from_str(json)
+            .expect("a payload carrying drive_queue must still parse");
+        assert_eq!(payload.round_number, 7, "round_number survived");
+        assert_eq!(payload.assignments.len(), 1, "assignments survived");
+        assert_eq!(payload.machines.len(), 1, "machines survived");
+        assert_eq!(payload.drive_queue.len(), 1, "drive_queue parsed");
+        assert_eq!(payload.drive_queue[0].state, "waiting");
+    }
+
+    /// A daemon older than #1753 emits no `drive_queue` key at all — that
+    /// must degrade to an empty queue, not fail the parse.
+    #[test]
+    fn board_payload_without_drive_queue_defaults_to_empty() {
+        let json = r#"{
+            "assignments": [],
+            "machines": [{"name":"m","host":"h","repos":[]}]
+        }"#;
+        let payload: BoardPayload =
+            serde_json::from_str(json).expect("a pre-#1753 payload must still parse");
+        assert!(
+            payload.drive_queue.is_empty(),
+            "absent drive_queue → empty, via #[serde(default)]"
+        );
     }
 
     #[test]

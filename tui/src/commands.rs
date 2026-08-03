@@ -164,7 +164,18 @@ fn find_config_with(
 /// live TUI silently did nothing even though every test that only inspected
 /// `spawn_queued`'s raw argv (not the real `build_full_args`-processed argv)
 /// passed.
-const BARE_GROUPS: &[&str] = &["milestone", "issue", "context", "acceptance", "terminal", "escalate"];
+const BARE_GROUPS: &[&str] = &[
+    "milestone",
+    "issue",
+    "context",
+    "acceptance",
+    "terminal",
+    "escalate",
+    // #1755 (DQ-3): `coord drive-queue` is a bare Click group too — only its
+    // leaf verbs (`add`/`remove`/`move`/…) declare `--config`, so the option
+    // must land after argv[1] or Click rejects it at the group parser.
+    "drive-queue",
+];
 
 /// Pure builder for the real argv `do_spawn` hands to `Command::new("coord")`.
 /// Split out (rather than inlined in `do_spawn`) so it's unit-testable
