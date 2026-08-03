@@ -1368,6 +1368,41 @@ def _stamp_test_staleness_anchor(
     conn.commit()
 
 
+def record_test_staleness_anchor(
+    *,
+    assignment_id: str,
+    test_head_sha: str | None,
+    test_base_sha: str | None,
+    test_patch_id: str | None,
+) -> None:
+    """Write the #1479 freshness anchors for a verdict whose caller already
+    KNOWS which commits it validated (#1769).
+
+    :func:`_stamp_test_staleness_anchor` discovers them after the fact with
+    three live ``gh`` reads, which is right for ``coord test`` (a human says
+    "passed"; nobody recorded what they ran against) but wrong for
+    ``coord merge --revalidate``, which composed specific commits into a
+    worktree and ran the suite on exactly them. Re-reading GitHub there would
+    (a) depend on ``config.load()`` resolving the same config the merge is
+    using and (b) race a base that moved again between the suite finishing and
+    the stamp — recording a verdict against a base it was never validated on,
+    which is the one thing this whole feature must not do.
+
+    Host-local write, deliberately: revalidation only runs where the repo is
+    checked out, which is the same host that owns the canonical DB (a thin
+    client's ``coord merge --revalidate`` routes to the daemon and executes
+    there). Mirrors :func:`_stamp_test_staleness_anchor`'s statement exactly so
+    the two can't disagree about which columns constitute "the anchor".
+    """
+    conn = get_connection()
+    conn.execute(
+        "UPDATE assignments SET test_head_sha=?, test_patch_id=?, test_base_sha=? "
+        "WHERE assignment_id=?",
+        (test_head_sha, test_patch_id, test_base_sha, assignment_id),
+    )
+    conn.commit()
+
+
 # ── Notification ledger ────────────────────────────────────────────────────────
 
 def load_notified() -> dict[str, dict]:

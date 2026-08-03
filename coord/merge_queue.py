@@ -923,6 +923,46 @@ class SmokeVerdictStatus:
         return "smoke test required but no verdict recorded"
 
 
+# ── Stale-vs-missing: the ONE implementation (#1769) ────────────────────────
+#
+# Both wordings a stale (as opposed to never-recorded) smoke verdict can be
+# reported under are produced *by this module*: `SmokeVerdictStatus.message`
+# ("smoke test verdict is stale: …", what `process()` stores on `entry.error`
+# and what lands on the board as `merge_reason`) and
+# `SmokeVerdictStatus.short_reason` ("test verdict stale (…)", what `plan()` /
+# the staging rows render). So the predicate that recognises them belongs
+# here, next to the code that emits them, and NOT copied into every consumer.
+#
+# #1738 put a private copy in `coord/drive.py` to give `coord drive` its
+# re-test arm. #1769 adds the second consumer — `coord merge --revalidate` —
+# and a *third* string-matching copy in a third module is exactly how #1141
+# went stale, so the copy was lifted here instead: `coord.drive` and
+# `coord.revalidate` both import THIS function, and `tests/test_merge_queue.py`
+# asserts they are the same object.
+#
+# Deliberately a strict subset of `coord.drive._SMOKE_GATE_MARKERS`, which
+# also matches "no verdict at all" ("smoke test required" / "test verdict
+# missing"). Only the stale case has a safe, bounded, automatable fix:
+# re-verify against the CURRENT base and let a fresh verdict land. A
+# missing-verdict block is the #1640 lost-write shape instead — the driver and
+# the gate disagree about whether a verdict exists at all — which a re-test
+# cannot safely paper over, so it still escalates to a human.
+STALE_SMOKE_MARKERS = ("smoke test verdict is stale", "test verdict stale")
+
+
+def is_stale_smoke_reason(reason: str | None) -> bool:
+    """True when *reason* names a STALE (not missing) smoke verdict.
+
+    The single implementation of the stale-vs-missing distinction over merge
+    *prose* (#1738/#1769). The structured form of the same question is
+    ``evaluate_smoke_verdict(...).kind == SMOKE_STALE``; this string-matching
+    variant exists only for the consumers whose input is a persisted
+    ``merge_reason``/``entry.error`` rather than a live gate evaluation.
+    """
+    r = (reason or "").lower()
+    return any(marker in r for marker in STALE_SMOKE_MARKERS)
+
+
 # #1738: paths whose content cannot affect a pytest/cargo test result — the
 # allowlist a base-SHA move is checked against before staling an otherwise-
 # fresh verdict. Deliberately small and additive (start conservative, widen
@@ -1219,6 +1259,76 @@ def evaluate_smoke_verdict(
         kind=SMOKE_MISSING,
         assignment_id=getattr(branch_work[0], "assignment_id", None),
     )
+
+
+@dataclass(frozen=True)
+class RevalidationCandidate:
+    """One queue entry that ``coord merge --revalidate`` may re-test (#1769).
+
+    Built only for entries blocked **solely** on a stale-but-``passed`` smoke
+    verdict — see :func:`revalidation_candidates`, which is the whole of the
+    eligibility policy. ``work_assignment_id`` is the row whose verdict has to
+    be re-recorded for the entry to clear its gate (the one
+    :func:`evaluate_smoke_verdict` named as carrying the stale verdict).
+    """
+
+    entry: "QueuedMerge"
+    work_assignment_id: str | None
+    smoke: SmokeVerdictStatus
+
+
+def revalidation_candidates(
+    items: Iterable["QueuedMerge"],
+    board,
+    config,
+    gh_ops: "GhOps | None" = None,
+) -> list[RevalidationCandidate]:
+    """The subset of *items* ``--revalidate`` is allowed to re-test (#1769).
+
+    An entry qualifies **only** when every one of these holds:
+
+    * it is ``PENDING`` (a ``CONFLICT``/``HUMAN_REQUIRED``/``MERGED`` entry is
+      never re-tested — a conflict is not a staleness problem);
+    * the smoke gate applies to it (:func:`requires_smoke`) and
+      :func:`evaluate_smoke_verdict` reports :data:`SMOKE_STALE` — i.e. a
+      terminal ``passed`` verdict exists but was recorded against a branch/base
+      combination that no longer exists. :data:`SMOKE_MISSING` is deliberately
+      excluded: a re-test cannot safely paper over the #1640 "was a verdict
+      ever written?" disagreement, and #1769's acceptance criteria name a
+      genuinely-missing verdict as out of scope;
+    * **no other gate is failing.** Concretely, the smoke failure is the only
+      entry in :func:`merge_gate_failures`, so an entry that also needs a
+      review is left alone. CI is not evaluated here (it needs a PR number and
+      a live ``gh`` round trip); :func:`process` still enforces it afterwards,
+      so a red-CI entry that was revalidated simply stays blocked on CI —
+      it is never merged.
+
+    This is the *eligibility* half of ``--revalidate``. The re-test itself and
+    the verdict write live in :mod:`coord.revalidate`; nothing here mutates
+    anything, so it is safe to call from ``--dry-run``.
+    """
+    out: list[RevalidationCandidate] = []
+    for entry in items:
+        if getattr(entry, "state", None) != PENDING:
+            continue
+        if config is None or board is None:
+            continue
+        if not requires_smoke(entry, config):
+            continue
+        failures = merge_gate_failures(entry, config, board, gh_ops)
+        # Blocked *solely* on smoke — a review/other block means a human (or
+        # another stage) still owes this entry something a re-test can't give.
+        if len(failures) != 1 or failures[0].gate != "smoke":
+            continue
+        smoke = evaluate_smoke_verdict(entry, board, gh_ops)
+        if smoke.ok or smoke.kind != SMOKE_STALE:
+            continue
+        out.append(RevalidationCandidate(
+            entry=entry,
+            work_assignment_id=smoke.assignment_id,
+            smoke=smoke,
+        ))
+    return out
 
 
 # Stored error strings that only reflect the gate state *at the moment a

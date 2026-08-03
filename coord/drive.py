@@ -116,6 +116,13 @@ from coord.usage_limits import PlanLimits, evaluate_usage_gate, get_plan_limits
 # per-provider log-format parse. Any provider's failure_reason is checked the
 # same way, so there is no `provider.parse_log()` equivalent to route through.
 from coord.worker_events import is_usage_limit_reason
+# #1769: the stale-vs-missing smoke-verdict predicate has exactly ONE
+# implementation, in the module that emits both of the wordings it matches.
+# See `_STALE_SMOKE_MARKERS` / `_is_stale_smoke_reason` below.
+from coord.merge_queue import (
+    STALE_SMOKE_MARKERS as _mq_stale_smoke_markers,
+    is_stale_smoke_reason as _mq_is_stale_smoke_reason,
+)
 
 # ── exit codes (unchanged from drive-issue.sh) ───────────────────────────────
 
@@ -1498,13 +1505,16 @@ def _merge_gate_kind(reason: str) -> str | None:
 # is the #1640 lost-write shape instead — driver and gate disagree about
 # whether a verdict exists at all, which a re-test can't safely paper over —
 # so that one still escalates to a human on first encounter, unchanged.
-_STALE_SMOKE_MARKERS = ("smoke test verdict is stale", "test verdict stale")
-
-
-def _is_stale_smoke_reason(reason: str | None) -> bool:
-    """True when *reason* names a STALE (not missing) smoke verdict (#1738)."""
-    r = (reason or "").lower()
-    return any(marker in r for marker in _STALE_SMOKE_MARKERS)
+#
+# #1769: this used to be defined HERE, and #1769 added a second consumer in
+# the merge lane (`coord merge --revalidate`). Rather than let a second copy
+# of the same string matching drift silently apart from the code that emits
+# the strings, the definition was lifted to `coord.merge_queue` — which is
+# where both wordings are actually produced (`SmokeVerdictStatus.message` /
+# `.short_reason`) and which both lanes already depend on. These are aliases,
+# not copies: `tests/test_merge_queue.py` asserts identity.
+_STALE_SMOKE_MARKERS = _mq_stale_smoke_markers
+_is_stale_smoke_reason = _mq_is_stale_smoke_reason
 
 
 def _merge_gate_divergence(state: IssueState) -> str | None:
