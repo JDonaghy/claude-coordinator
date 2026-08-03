@@ -584,9 +584,21 @@ impl ShellApp for CoordApp {
         // The viewport unions the sidebar + main panel so a menu anchored
         // in the sidebar can flow rightward into the main area without
         // being clipped to the (narrow) sidebar width.
+        //
+        // EXCEPT when the drive-queue overlay is open (#1757): that overlay is
+        // painted LAST (see the bottom of this function), so a menu drawn here
+        // would be covered by it — the overlay's own right-click menu would
+        // open, own input, and be invisible. Deferred to just after the
+        // overlay instead. No prompt dialog can be open at the same time (the
+        // overlay owns all input while it is up), so the "dialogs sit on top"
+        // rule above is not weakened by the deferral.
+        let defer_menu_over_overlay = self.drive_queue_overlay_open;
         if self.pending_context_menu.is_some() {
-            let viewport = union_rects(layout.sidebar_content_bounds, layout.main_content_bounds);
-            self.render_context_menu(backend, viewport);
+            if !defer_menu_over_overlay {
+                let viewport =
+                    union_rects(layout.sidebar_content_bounds, layout.main_content_bounds);
+                self.render_context_menu(backend, viewport);
+            }
         } else {
             // Keep the cached layout in sync — clear it once the menu
             // is no longer rendered so a stale layout can't satisfy a
@@ -630,6 +642,14 @@ impl ShellApp for CoordApp {
         // input while open, and the status-bar menu opens exactly one), so
         // the paint order between them never matters in practice.
         self.render_drive_queue_overlay(backend, layout.main_content_bounds);
+
+        // …and the deferred context menu on top of it, so the overlay's own
+        // per-row menu (Resume / Move / Unblock / Remove) is actually visible
+        // rather than painted under the panel that raised it.
+        if defer_menu_over_overlay && self.pending_context_menu.is_some() {
+            let viewport = union_rects(layout.sidebar_content_bounds, layout.main_content_bounds);
+            self.render_context_menu(backend, viewport);
+        }
     }
 
     fn handle(

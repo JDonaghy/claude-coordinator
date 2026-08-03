@@ -17,6 +17,10 @@ import pytest
 
 from coord.drive_queue import (
     DEFAULT_MAX_ATTEMPTS,
+    HOLD_ARMED,
+    HOLD_FIRED,
+    HOLD_RELEASED,
+    ProbeResult,
     STATE_BLOCKED,
     STATE_DONE,
     STATE_RUNNING,
@@ -427,3 +431,156 @@ def test_render_plan_names_the_launch_and_the_defer_reason():
     assert "would launch claude-coordinator#1654 on dellserver" in text
     assert "defer claude-coordinator#1650" in text
     assert "0/1 occupied" in text
+
+
+# ── plan_tick: deploy gates (#1757) ──────────────────────────────────────────
+#
+# `merged != live`. These pin the decision half of the gate: what fires it,
+# what does NOT fire it, and the fact that a fired gate outranks every other
+# reason the walk might have had to launch something.
+
+
+def held(issue: int, **kw) -> QueueEntry:
+    """A `--hold-after` entry whose gate has already fired."""
+    base = {
+        "state": STATE_DONE,
+        "hold_after": True,
+        "hold_reason": "restart coord-serve",
+        "hold_state": HOLD_FIRED,
+    }
+    base.update(kw)
+    return entry(issue, **base)
+
+
+def test_a_gate_fires_the_tick_its_entry_reaches_done():
+    plan = plan_tick(
+        [
+            entry(
+                1,
+                state=STATE_RUNNING,
+                hold_after=True,
+                hold_reason="deploy",
+                hold_state=HOLD_ARMED,
+            ),
+            entry(2),
+        ],
+        board(merged=(1,), open_=(2,)),
+        capacity=1,
+    )
+    assert plan.launch is None
+    assert plan.held is not None
+    assert plan.held.outcome == "fired"
+    assert dict(plan.writes())[entry_key(REPO, 1)]["hold_state"] == HOLD_FIRED
+
+
+def test_a_fired_gate_blocks_a_fully_eligible_successor_with_free_capacity():
+    """The whole feature in one assertion."""
+    plan = plan_tick(
+        [held(1), entry(2)],
+        board(open_=(2,)),
+        capacity=4,
+    )
+    assert plan.free_slots == 4
+    assert plan.launch is None
+    assert plan.deferrals == ()
+    assert "restart coord-serve" in plan.alert.reason
+    assert plan.alert.command == "coord drive-queue resume"
+
+
+def test_an_armed_gate_on_an_unlanded_entry_holds_nothing():
+    plan = plan_tick(
+        [entry(1, hold_after=True, hold_state=HOLD_ARMED), entry(2)],
+        board(open_=(1, 2)),
+        capacity=1,
+    )
+    assert plan.held is None
+    assert plan.launch is not None and plan.launch.issue == 1
+
+
+def test_a_released_gate_holds_nothing():
+    plan = plan_tick(
+        [held(1, hold_state=HOLD_RELEASED), entry(2)],
+        board(open_=(2,)),
+        capacity=1,
+    )
+    assert plan.held is None
+    assert plan.launch is not None and plan.launch.issue == 2
+
+
+def test_a_hold_after_entry_that_dies_out_of_attempts_blocks_and_never_fires():
+    """`blocked` already stops the queue — a second alert would just be noise."""
+    plan = plan_tick(
+        [
+            entry(
+                1,
+                state=STATE_RUNNING,
+                attempts=DEFAULT_MAX_ATTEMPTS - 1,
+                hold_after=True,
+                hold_state=HOLD_ARMED,
+            )
+        ],
+        board(),
+        capacity=1,
+    )
+    assert plan.held is None
+    assert plan.holds == ()
+    assert [b.key for b in plan.blocked] == [entry_key(REPO, 1)]
+    assert "HELD" not in (plan.alert.reason if plan.alert else "")
+
+
+def test_a_failing_probe_stays_held_and_increments_a_typed_attempt_count():
+    key = entry_key(REPO, 1)
+    plan = plan_tick(
+        [held(1, resume_when="curl -sf x", hold_probes=2), entry(2)],
+        board(open_=(2,)),
+        capacity=1,
+        probes={key: ProbeResult(key, False, "exit 7")},
+    )
+    assert plan.launch is None
+    assert plan.held.probes == 3
+    assert dict(plan.writes())[key]["hold_probes"] == 3
+    assert "attempt 3 failed" in " ".join(plan.alert.details)
+
+
+def test_a_passing_probe_releases_and_launches_in_the_same_tick():
+    key = entry_key(REPO, 1)
+    plan = plan_tick(
+        [held(1, resume_when="curl -sf x", hold_probes=4), entry(2)],
+        board(open_=(2,)),
+        capacity=1,
+        probes={key: ProbeResult(key, True, "exit 0")},
+    )
+    assert plan.held is None
+    assert plan.launch is not None and plan.launch.issue == 2
+    writes = dict(plan.writes())
+    assert writes[key]["hold_state"] == HOLD_RELEASED
+    assert writes[key]["hold_probes"] == 0
+    assert plan.alert is None
+
+
+def test_a_gate_with_no_probe_result_stays_held_and_writes_nothing():
+    """Manual-resume-only, and a probe the shell could not run. Fail closed."""
+    plan = plan_tick([held(1), entry(2)], board(open_=(2,)), capacity=1)
+    assert plan.launch is None
+    assert plan.writes() == []
+    assert "release manually" in " ".join(plan.alert.details)
+
+
+def test_only_an_already_fired_gate_is_offered_for_probing():
+    from coord.drive_queue import pending_probe_targets
+
+    entries = [
+        entry(1, hold_after=True, hold_state=HOLD_ARMED, resume_when="a"),
+        held(2, resume_when="b"),
+        held(3),  # fired, but no probe declared
+        held(4, hold_state=HOLD_RELEASED, resume_when="d"),
+    ]
+    assert [e.issue for e in pending_probe_targets(entries)] == [2]
+
+
+def test_render_plan_says_why_nothing_launched():
+    plan = plan_tick([held(1), entry(2)], board(open_=(2,)), capacity=1)
+    text = "\n".join(render_plan(plan))
+    assert "hold claude-coordinator#1: held" in text
+    assert "no launch — HELD" in text
+    assert "coord drive-queue resume" in text

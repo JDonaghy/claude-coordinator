@@ -862,6 +862,32 @@ pub(crate) struct BoardDriveQueueEntry {
     #[allow(dead_code)] // wire parity; the overlay shows `state`, not the clock
     #[serde(default)]
     pub(crate) launched_at: Option<f64>,
+    /// #1757: this entry ends with a DEPLOY GATE — when it completes, the
+    /// tick launches nothing until a human deploys and releases it.
+    ///
+    /// SQLite stores 0/1 in an `INTEGER` column, so this is `i64`, not
+    /// `bool`: an `INTEGER` column deserialised into a Rust `bool` is the
+    /// exact #632/#546/#628 type mismatch that blanks the whole board (see
+    /// `tests/test_board_fixture.py::
+    /// test_no_unguarded_integer_bool_columns_reach_the_wire`).
+    #[serde(default)]
+    pub(crate) hold_after: i64,
+    /// What the operator must do while the gate is held — rendered verbatim.
+    #[serde(default)]
+    pub(crate) hold_reason: String,
+    /// Optional probe command re-run each tick while the gate is held; exit 0
+    /// auto-releases it. Empty = manual `coord drive-queue resume` only.
+    #[serde(default)]
+    pub(crate) resume_when: String,
+    /// `""` | `armed` | `fired` | `released` — decided by the tick, consumed
+    /// verbatim here (same posture as `state` above).
+    #[serde(default)]
+    pub(crate) hold_state: String,
+    /// Consecutive failed `resume_when` runs since the gate fired. A rising
+    /// count is how a gate that never clears becomes visible instead of
+    /// silent, so it is carried on the wire rather than re-derived.
+    #[serde(default)]
+    pub(crate) hold_probes: i64,
 }
 
 impl BoardDriveQueueEntry {
@@ -1018,6 +1044,10 @@ pub(crate) enum ContextMenuTarget {
         position: i64,
         /// Total queue length — the other half of the end-of-queue gate.
         queue_len: usize,
+        /// #1757: this row's DEPLOY GATE has fired and is holding the queue —
+        /// gates "Resume". Captured here rather than re-read at click time
+        /// for the same reason `state` is: the selection may have moved.
+        held: bool,
     },
 }
 
