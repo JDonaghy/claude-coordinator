@@ -115,6 +115,7 @@ pub(crate) mod workspace;
 pub(crate) mod drive;
 pub(crate) mod escalation;
 pub(crate) mod fleet_health;
+pub(crate) mod drive_queue;
 #[allow(unused_imports)]
 use self::types::*;
 #[allow(unused_imports)]
@@ -150,6 +151,8 @@ use self::workspace::*;
 use self::drive::*;
 #[allow(unused_imports)]
 use self::msv::*;
+#[allow(unused_imports)]
+use self::drive_queue::*;
 
 // ─── Auto-refresh interval ────────────────────────────────────────────────────
 
@@ -2300,6 +2303,21 @@ pub struct CoordApp {
     /// rows grouped under a machine header, sourced from `self.data.
     /// fleet_health`) doesn't fit that controller's notes/actions shape.
     fleet_health_overlay_open: bool,
+    /// #1755 (DQ-3): the drive-queue detail overlay — opened via the status
+    /// bar's "Drive queue…" right-click menu entry (`drive_queue.rs`). Owns
+    /// ALL input while open, same posture as `fleet_health_overlay_open`
+    /// above, but unlike that read-only report this one is *actionable*
+    /// (remove / move / unblock), so it also tracks a selection.
+    drive_queue_overlay_open: bool,
+    /// Selected row index into `drive_queue_entries()` (position order), not
+    /// into the unsorted `data.drive_queue`. Clamped on open and after every
+    /// removal so a shrinking queue can never leave it dangling.
+    drive_queue_sel: usize,
+    /// #1755: the "Add to drive queue after…" prompt. `Some` while the
+    /// operator is typing pre-req issue numbers; owns ALL keys until Enter
+    /// (submit) or Esc (cancel), same posture as
+    /// `pending_milestone_row_input`.
+    pending_drive_queue_after: Option<PendingDriveQueueAfter>,
     /// Cached `DialogLayout` from the last prompt-dialog render — used for
     /// click hit-testing on dialog buttons.  Populated while any
     /// `pending_*` prompt dialog is visible; cleared when it dismisses.
@@ -3478,6 +3496,9 @@ impl CoordApp {
             pending_context_menu: None,
             context_menu_layout: std::cell::RefCell::new(Vec::new()),
             fleet_health_overlay_open: false,
+            drive_queue_overlay_open: false,
+            drive_queue_sel: 0,
+            pending_drive_queue_after: None,
             dialog_layout: std::cell::RefCell::new(None),
             pending_restart: None,
             machine_last_contact: std::collections::HashMap::new(),
@@ -7408,6 +7429,25 @@ impl CoordApp {
         // `FleetSeverity`. Right-click anywhere on the status bar to open
         // the detail overlay (`events.rs`); see `fleet_health.rs`'s module
         // doc comment for why this isn't itself clickable.
+        // #1755 (DQ-3): the always-visible drive-queue indicator, same rule
+        // as the fleet-health segment below — an empty queue reads "QUEUE:
+        // empty", never nothing, because silence is indistinguishable from a
+        // broken feature. Escalates to warn (STALLED: rows waiting, none
+        // eligible) / crit (BLOCKED) so the epic's "if nothing can start,
+        // alert the operator" requirement has a surface. Right-click the
+        // status bar → "Drive queue…" for the detail overlay
+        // (`drive_queue.rs`).
+        //
+        // **Ordered BEFORE fleet health deliberately.** The bar drops whole
+        // trailing `left` segments once the view hints claim the rest of the
+        // row, and "FLEET: OK  (coord health for detail)" is 38 columns —
+        // appended after it, `QUEUE:` vanished entirely below ~150 columns,
+        // which breaks the "always shows a QUEUE: segment" rule at every
+        // realistic terminal width. Ahead of it, both indicators fit and the
+        // only thing that can be squeezed out is fleet health's parenthetical
+        // "(coord health for detail)" hint — the least load-bearing text on
+        // the bar. Neither verdict is ever hidden.
+        left.push(self.drive_queue_status_bar_segment());
         left.push(self.fleet_health_status_bar_segment());
         // Non-blocking warning if the last load failed.
         if let Some((err_msg, when)) = &self.fetch_error {

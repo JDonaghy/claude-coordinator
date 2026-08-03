@@ -216,6 +216,9 @@ impl CoordApp {
             || self.command_palette.is_some()
             // #1631: the fleet-health detail overlay owns ALL input while open.
             || self.fleet_health_overlay_open
+            // #1755: so does the drive-queue overlay and its "after…" prompt.
+            || self.drive_queue_overlay_open
+            || self.pending_drive_queue_after.is_some()
     }
 
     /// an `action_id` of the form `"toolbar:<verb>"` resolved by

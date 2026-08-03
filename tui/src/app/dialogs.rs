@@ -891,6 +891,17 @@ impl CoordApp {
                     _ => "Mark ready".to_string(),
                 };
                 items.push(ContextMenuItem::action("mark-ready", &mark_ready_label));
+                // #1755 (DQ-3): "Add to drive queue" sits beside "Mark
+                // ready" — both express the same kind of operator intent
+                // ("this one next") about a row no worker has touched yet,
+                // so they belong in the same block. Swaps to "Remove from
+                // drive queue" for a row already queued; empty for a row
+                // with no issue/repo mapping (see the helper's doc comment).
+                items.extend(self.drive_queue_menu_items_for_pipeline_row(
+                    issue_number,
+                    repo_name,
+                    true,
+                ));
                 // #266: Drop a not-yet-started pipeline item back to Backlog
                 // (strips `status:ready`).  Always enabled for New — no work
                 // has been dispatched, so there is nothing to interrupt.
@@ -941,6 +952,15 @@ impl CoordApp {
                 if is_staged && !has_real_progress {
                     items.push(ContextMenuItem::action("unmark-ready", "Unmark ready"));
                 }
+                // #1755 (DQ-3): a row queued while New and since started must
+                // stay dequeueable from the row it is actually on — `offer_
+                // add: false` so this contributes ONLY "Remove from drive
+                // queue", never a fresh Add (see the helper's doc comment).
+                items.extend(self.drive_queue_menu_items_for_pipeline_row(
+                    issue_number,
+                    repo_name,
+                    false,
+                ));
                 // #266: Drop an In-progress *idle* item back to Backlog (strips
                 // `status:ready`).  Disabled when (a) a live session is attached
                 // — a row whose work is actively running must not be yanked out
@@ -1106,8 +1126,23 @@ impl CoordApp {
             ContextMenuTarget::PlansStub { repo_name, milestone } => {
                 self.context_menu_items_for_plans_stub(repo_name.as_deref(), milestone.as_ref())
             }
-            // #1631 (H-4): right-click anywhere on the status bar.
-            ContextMenuTarget::FleetHealth => self.context_menu_items_for_fleet_health(),
+            // #1631 (H-4) / #1755 (DQ-3): right-click anywhere on the status
+            // bar. One target covers the WHOLE bar (there is no per-segment
+            // click dispatch in this codebase — see `fleet_health.rs`'s
+            // module doc comment), so its menu is the union of the bar's
+            // detail overlays: "Fleet health…" then "Drive queue…".
+            ContextMenuTarget::FleetHealth => {
+                let mut v = self.context_menu_items_for_fleet_health();
+                v.extend(self.context_menu_items_for_drive_queue_segment());
+                v
+            }
+            // #1755 (DQ-3): right-click on a drive-queue overlay row.
+            ContextMenuTarget::DriveQueueRow {
+                state,
+                position,
+                queue_len,
+                ..
+            } => self.context_menu_items_for_drive_queue_row(state, *position, *queue_len),
         };
         if items.is_empty() {
             return false;
@@ -1873,6 +1908,46 @@ impl CoordApp {
                 input: Some(DialogInput::TextInput(DialogTextInput {
                     value: input.buf.clone(),
                     placeholder: placeholder.into(),
+                    cursor: Some(input.buf.len()),
+                })),
+            });
+        }
+
+        // ── #1755 (DQ-3) "Add to drive queue after…" ────────────────────────
+        // Same single-field shape as the Plans-row input just above; Enter
+        // submits, Esc cancels (`events.rs`).
+        if let Some(ref input) = self.pending_drive_queue_after {
+            return Some(Dialog {
+                table: None,
+                id: WidgetId::new("dialog:drive-queue-after"),
+                title: StyledText::plain("Add to drive queue after…"),
+                body: vec![StyledText::plain(format!(
+                    "Pre-req issue(s) that must land before {} #{} is driven. \
+                     Comma- or space-separated; bare numbers resolve against \
+                     {}, or use REPO#N for a cross-repo pre-req:",
+                    input.repo_name, input.issue_number, input.repo_name
+                ))],
+                buttons: vec![
+                    DialogButton {
+                        id: WidgetId::new("submit"),
+                        label: "Submit".into(),
+                        is_default: true,
+                        is_cancel: false,
+                        tint: None,
+                    },
+                    DialogButton {
+                        id: WidgetId::new("cancel"),
+                        label: "Cancel".into(),
+                        is_default: false,
+                        is_cancel: true,
+                        tint: None,
+                    },
+                ],
+                severity: None,
+                vertical_buttons: false,
+                input: Some(DialogInput::TextInput(DialogTextInput {
+                    value: input.buf.clone(),
+                    placeholder: "e.g. 1753, 1754 or otherrepo#12…".into(),
                     cursor: Some(input.buf.len()),
                 })),
             });
@@ -3417,6 +3492,22 @@ impl CoordApp {
                 }
                 _ => {
                     self.pending_milestone_row_input = None;
+                }
+            }
+            *self.dialog_layout.borrow_mut() = None;
+            return;
+        }
+
+        // ── #1755 (DQ-3) "Add to drive queue after…" ────────────────────────
+        if self.pending_drive_queue_after.is_some() {
+            match id {
+                "submit" => {
+                    if let Some(input) = self.pending_drive_queue_after.take() {
+                        self.submit_drive_queue_after_input(input);
+                    }
+                }
+                _ => {
+                    self.pending_drive_queue_after = None;
                 }
             }
             *self.dialog_layout.borrow_mut() = None;
@@ -5895,6 +5986,12 @@ impl CoordApp {
                     ContextMenuTarget::TerminalRow { .. } => 0,
                     ContextMenuTarget::PlansStub { .. } => 0,
                     ContextMenuTarget::FleetHealth => 0,
+                    // #1755: the drive-queue overlay rows carry an issue
+                    // number, and it's an `i64` on the wire — clamp rather
+                    // than silently reporting 0 for a legitimate row.
+                    ContextMenuTarget::DriveQueueRow { issue_number, .. } => {
+                        (*issue_number).max(0) as u64
+                    }
                 };
                 self.push_toast(
                     "Copy",
@@ -5915,6 +6012,86 @@ impl CoordApp {
             // render_fleet_health_overlay`); Esc closes it (`events.rs`).
             "open-fleet-health-detail" => {
                 self.open_fleet_health_overlay();
+                true
+            }
+            // #1755 (DQ-3): the status bar's "Drive queue…" menu item —
+            // opens the detail overlay (`drive_queue.rs::
+            // render_drive_queue_overlay`); Esc closes it (`events.rs`).
+            "open-drive-queue-detail" => {
+                self.open_drive_queue_overlay();
+                true
+            }
+            // #1755 (DQ-3): drive-queue overlay row actions. Each shells the
+            // matching `coord drive-queue` verb through the spawn-and-toast
+            // seam — no direct DB access, same posture as every other TUI
+            // action.
+            "drive-queue-remove" => {
+                if let ContextMenuTarget::DriveQueueRow {
+                    repo_name,
+                    issue_number,
+                    ..
+                } = target
+                {
+                    self.dispatch_drive_queue_remove(repo_name, *issue_number);
+                }
+                true
+            }
+            "drive-queue-move-up" | "drive-queue-move-down" => {
+                if let ContextMenuTarget::DriveQueueRow {
+                    repo_name,
+                    issue_number,
+                    position,
+                    ..
+                } = target
+                {
+                    let delta = if action_id == "drive-queue-move-up" { -1 } else { 1 };
+                    let (repo, issue, to) = (repo_name.clone(), *issue_number, *position + delta);
+                    self.dispatch_drive_queue_move(&repo, issue, to);
+                }
+                true
+            }
+            "drive-queue-unblock" => {
+                if let ContextMenuTarget::DriveQueueRow {
+                    repo_name,
+                    issue_number,
+                    ..
+                } = target
+                {
+                    let (repo, issue) = (repo_name.clone(), *issue_number);
+                    self.dispatch_drive_queue_unblock(&repo, issue);
+                }
+                true
+            }
+            // #1755 (DQ-3): Pipeline-row enqueue items. `drive-queue-add-on:
+            // <machine>` is the submenu variant — the machine name rides in
+            // the action id (the `start-*-on:` precedent) because
+            // `ContextMenuItem` carries no per-item payload.
+            "drive-queue-add" => {
+                if let Some((repo, issue)) = self.pipeline_menu_repo_issue(target) {
+                    self.dispatch_drive_queue_add(&repo, issue, None, &[]);
+                }
+                true
+            }
+            "drive-queue-add-after" => {
+                if let Some((repo, issue)) = self.pipeline_menu_repo_issue(target) {
+                    self.open_drive_queue_after_input(&repo, issue);
+                }
+                true
+            }
+            "drive-queue-row-remove" => {
+                if let Some((repo, issue)) = self.pipeline_menu_repo_issue(target) {
+                    self.dispatch_drive_queue_remove(&repo, issue as i64);
+                }
+                true
+            }
+            _ if action_id.starts_with("drive-queue-add-on:") => {
+                let machine = action_id
+                    .strip_prefix("drive-queue-add-on:")
+                    .unwrap_or_default()
+                    .to_string();
+                if let Some((repo, issue)) = self.pipeline_menu_repo_issue(target) {
+                    self.dispatch_drive_queue_add(&repo, issue, Some(&machine), &[]);
+                }
                 true
             }
             // #1123 (contract §4c): "New plan > Quick capture" — the

@@ -697,6 +697,12 @@ pub(crate) struct BoardPayload {
     /// whichever host runs `coord serve`) and on daemons older than #1630.
     #[serde(default)]
     pub(crate) fleet_health: FleetHealthBlock,
+    /// #1753 (DQ-1) / #1755 (DQ-3): the operator-declared `coord drive` work
+    /// queue, in run order. Empty on the local-SQLite-mode read path (the
+    /// table lives in the daemon host's DB, same posture as `escalations`)
+    /// and on daemons older than #1753, which never emit this key.
+    #[serde(default)]
+    pub(crate) drive_queue: Vec<BoardDriveQueueEntry>,
 }
 
 /// #1631 (H-4): one already-rendered health-check row — the wire shape of
@@ -799,6 +805,72 @@ pub(crate) struct EscalationEntry {
     #[serde(default)]
     #[allow(dead_code)]
     pub(crate) created_at: Option<f64>,
+}
+
+/// #1753 (DQ-1) / #1755 (DQ-3): one row of the operator-declared `coord
+/// drive` work queue — the wire shape of `/board`'s `drive_queue` array
+/// (OpenAPI component `BoardDriveQueueEntry`, a raw `drive_queue` table dump
+/// via `coord.dao.SqliteStore.board_projection`; see `coord/db.py`'s table
+/// comment for the storage contract).
+///
+/// **Every field is `#[serde(default)]` on purpose.** `/board` is one
+/// payload: a single type mismatch on a single field fails the *entire*
+/// `BoardPayload` parse and blanks every panel with no error message — the
+/// #632/#546/#628 class this repo has been bitten by three times.
+/// `tests.rs`'s `board_payload_deserializes_real_sample` round-trips the
+/// golden fixture (which now carries a populated `drive_queue`) so schema
+/// drift fails a test instead.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub(crate) struct BoardDriveQueueEntry {
+    #[serde(default)]
+    pub(crate) repo_name: String,
+    #[serde(default)]
+    pub(crate) issue_number: i64,
+    /// Dense, 0-based run order (`coord/db.py`: no fractional positions —
+    /// `move` renumbers the affected span in one transaction).
+    #[serde(default)]
+    pub(crate) position: i64,
+    /// `None`/absent means "let `coord drive` route it" — NOT "unpinned is
+    /// an error".
+    #[serde(default)]
+    pub(crate) machine: Option<String>,
+    /// Pre-req keys (`"repo#N"`) that must land before this entry may start.
+    ///
+    /// Named `after` here but renamed from the wire's `after_json`: the
+    /// column is a JSON *string* in SQLite and `coord.dao._JSON_COLUMNS`
+    /// decodes it to a real array on the way out, keeping the column name.
+    /// A plain `after` field would silently stay empty forever.
+    #[serde(default, rename = "after_json")]
+    pub(crate) after: Vec<String>,
+    /// `waiting` | `running` | `blocked` | `done` | … — decided by DQ-2's
+    /// tick, never re-derived here (same posture as `fleet_health.rs`'s
+    /// "renderers consume `severity` verbatim").
+    #[serde(default)]
+    pub(crate) state: String,
+    #[serde(default)]
+    pub(crate) attempts: i64,
+    /// How many ticks skipped this entry because it wasn't eligible yet.
+    /// Surfaced in the overlay next to `last_reason` — a row that keeps
+    /// being passed over is the thing an operator most needs to see.
+    #[serde(default)]
+    pub(crate) deferrals: i64,
+    #[serde(default)]
+    pub(crate) last_reason: String,
+    /// tmux session name for a `running` entry (`coord drive --tmux`).
+    #[serde(default)]
+    pub(crate) session_name: Option<String>,
+    #[allow(dead_code)] // wire parity; the overlay shows `state`, not the clock
+    #[serde(default)]
+    pub(crate) launched_at: Option<f64>,
+}
+
+impl BoardDriveQueueEntry {
+    /// `"repo#N"` — the same fully-qualified key `coord.drive_queue`'s
+    /// `entry_key` builds, so a TUI-rendered key and a CLI-rendered one are
+    /// always byte-identical.
+    pub(crate) fn key(&self) -> String {
+        format!("{}#{}", self.repo_name, self.issue_number)
+    }
 }
 
 /// #584: serde deserializer for `Assignment::test_plan` on the remote
@@ -922,9 +994,31 @@ pub(crate) enum ContextMenuTarget {
         milestone: Option<(i64, String)>,
     },
     /// #1631 (H-4): right-click anywhere on the status bar. Carries no
-    /// payload — the menu it opens has exactly one item ("Fleet health…"),
-    /// unconditionally, regardless of where in the bar the click landed.
+    /// payload — the menu it opens lists the bar's own detail overlays
+    /// ("Fleet health…", and since #1755 "Drive queue…"), unconditionally,
+    /// regardless of where in the bar the click landed.
+    ///
+    /// **Deliberately still one target for the whole bar**, not one per
+    /// segment: `StatusBarSegment::action_id` exists on the wire but this
+    /// codebase wires no per-segment click dispatch anywhere, and adding one
+    /// was explicitly out of scope for #1755. See `fleet_health.rs`'s module
+    /// doc comment.
     FleetHealth,
+    /// #1755 (DQ-3): right-click on a row of the drive-queue detail overlay.
+    /// Carries the row's identity + state so the menu can offer Remove /
+    /// Move / Unblock without re-reading a selection that may have moved.
+    DriveQueueRow {
+        repo_name: String,
+        issue_number: i64,
+        /// `waiting` / `running` / `blocked` / … — gates "Unblock" (only a
+        /// `blocked` row has anything to unblock).
+        state: String,
+        /// 0-based position, so "Move up"/"Move down" can be disabled at the
+        /// ends rather than silently no-op'ing.
+        position: i64,
+        /// Total queue length — the other half of the end-of-queue gate.
+        queue_len: usize,
+    },
 }
 
 /// #262: lifecycle bucket for a Pipeline sidebar row at right-click
@@ -2143,6 +2237,11 @@ pub struct BoardData {
     /// doc comment. Consumed by `fleet_health.rs`'s status-bar segment and
     /// detail overlay; never re-derives severity from raw values.
     pub(crate) fleet_health: FleetHealthBlock,
+    /// #1755 (DQ-3): mirrors `BoardPayload::drive_queue` — the drive queue in
+    /// run order. Consumed by `drive_queue.rs`'s status-bar segment, detail
+    /// overlay and Pipeline-row menu items. Empty on the local-SQLite-mode
+    /// read path and on daemons older than #1753.
+    pub(crate) drive_queue: Vec<BoardDriveQueueEntry>,
 }
 
 /// Parsed plan data, mirroring `coord.plan_parser.WorkerPlan.to_dict()`.

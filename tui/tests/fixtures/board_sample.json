@@ -213,7 +213,40 @@
     "pipeline_default_gates": "[\"test\", \"review\", \"merge\"]",
     "round_number": "3"
   },
-  "drive_queue": [],
+  "drive_queue": [
+    {
+      "after_json": [],
+      "attempts": 0,
+      "deferrals": 0,
+      "enqueued_at": 1000001200.0,
+      "id": 1,
+      "issue_number": 748,
+      "last_reason": "",
+      "launched_at": null,
+      "machine": null,
+      "position": 0,
+      "repo_name": "claude-coordinator",
+      "session_name": null,
+      "state": "waiting"
+    },
+    {
+      "after_json": [
+        "claude-coordinator#748"
+      ],
+      "attempts": 1,
+      "deferrals": 2,
+      "enqueued_at": 1000001250.0,
+      "id": 2,
+      "issue_number": 750,
+      "last_reason": "pre-req claude-coordinator#748 has not merged",
+      "launched_at": null,
+      "machine": "dellserver",
+      "position": 1,
+      "repo_name": "claude-coordinator",
+      "session_name": null,
+      "state": "waiting"
+    }
+  ],
   "escalations": [],
   "issues": [
     {
