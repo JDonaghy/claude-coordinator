@@ -78,6 +78,14 @@ class ToolchainSpec:
     # `with:`/`@ref` values that mean "CI floats, no literal pin to read" —
     # dtolnay/rust-toolchain@stable being the textbook case from #1629 itself.
     ci_floating_values: tuple[str, ...] = ("stable", "beta", "nightly")
+    # True only for actions where the `@ref` itself IS the toolchain version
+    # (``dtolnay/rust-toolchain@1.97.1``) — the ref-as-version fallback in
+    # ``_parse_ci_pin`` is gated on this. Actions like ``actions/setup-python``
+    # / ``actions/setup-node`` version their OWN release tag in `@ref`
+    # (``actions/setup-node@v4``), which has nothing to do with the
+    # interpreter version installed — falling back to it fabricates a pin
+    # that was never configured. Default False; only the rust spec sets it.
+    ci_ref_is_version: bool = False
 
 
 # Scope item 1's starting table: "rustc/cargo for tui/** and the Rust repos,
@@ -91,6 +99,7 @@ TOOLCHAIN_SPECS: tuple[ToolchainSpec, ...] = (
         root_markers=("Cargo.toml",),
         ci_actions=("dtolnay/rust-toolchain", "actions-rs/toolchain"),
         ci_version_key="toolchain",
+        ci_ref_is_version=True,
     ),
     ToolchainSpec(
         kind="python",
@@ -323,6 +332,12 @@ def _parse_ci_pin(spec: ToolchainSpec, step: dict) -> str | None:
         if pinned_s and pinned_s not in spec.ci_floating_values and _version_tuple(pinned_s):
             return pinned_s
         return None  # explicit but floating ("stable") or unparseable — honestly unknown
+    if not spec.ci_ref_is_version:
+        # No `with:` pin, and this action's `@ref` is the ACTION's own release
+        # tag (e.g. actions/setup-node@v4), not the toolchain version — that's
+        # the common "default runner version" / ".nvmrc-driven" CI pattern,
+        # honestly unknown, never fabricated from the action's tag (#1629 fix).
+        return None
     action_ref = action_ref.strip()
     if action_ref and action_ref not in spec.ci_floating_values and _version_tuple(action_ref):
         return action_ref
