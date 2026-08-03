@@ -68,6 +68,19 @@ def plan(config_path: Path, dry_run: bool) -> None:
         click.echo(f"error: {e}", err=True)
         sys.exit(1)
 
+    # #1711: never show a proposal `coord approve` would immediately refuse
+    # for lacking the resolved provider's machine capability (e.g. an
+    # opencode-routed repo proposed against a machine with no
+    # `provider:opencode`) — see coord.brain.filter_unroutable_provider_proposals.
+    from coord.brain import filter_unroutable_provider_proposals
+
+    proposals, dropped = filter_unroutable_provider_proposals(proposals, cfg)
+    for p, reason in dropped:
+        click.echo(
+            f"  ⚠ dropped proposal: {p.machine_name} → {p.repo_name} "
+            f"#{p.issue_number}: {reason}"
+        )
+
     if splits:
         click.echo(f"{len(splits)} split proposal(s):\n")
         for s in splits:

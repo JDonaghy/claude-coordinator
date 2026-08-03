@@ -849,6 +849,94 @@ class TestCliPlanCallsResolveModels:
         mock_gates.assert_called_once()
 
 
+class TestCliPlanFiltersUnroutableProviders:
+    """#1711: `coord plan` never shows a proposal `coord approve` would
+    immediately refuse for lacking the resolved provider's machine
+    capability — the CLI wrapper reports what it dropped and why."""
+
+    def test_plan_reports_and_drops_unroutable_opencode_proposal(
+        self, tmp_path: Path, cli_coord_dir: Path,
+    ) -> None:
+        config_path = tmp_path / "coordinator.yml"
+        config_path.write_text(
+            "repos:\n"
+            "  - name: api\n    github: acme/api\n    provider: opencode\n"
+            "machines:\n"
+            "  - name: laptop\n    host: laptop.tailnet\n    repos: [api]\n"
+            "providers:\n"
+            "  definitions:\n"
+            "    opencode:\n"
+            "      type: opencode\n"
+        )
+        from coord.models import Proposal
+
+        proposal = Proposal(
+            id=1, machine_name="laptop", repo_name="api", issue_number=42,
+            issue_title="t", rationale="r",
+        )
+        with patch(
+            "coord.brain.gather_context",
+            return_value={"issues_by_repo": {}, "machine_status": {}},
+        ), patch(
+            "coord.brain.build_prompt", return_value="prompt"
+        ), patch(
+            "coord.brain.call_claude", return_value="[]"
+        ), patch(
+            "coord.brain.parse_proposals", return_value=[proposal]
+        ), patch(
+            "coord.brain.parse_split_proposals", return_value=[]
+        ):
+            result = CliRunner().invoke(
+                main,
+                ["plan", "--dry-run", "--config", str(config_path)],
+            )
+        assert result.exit_code == 0, result.output
+        assert "dropped proposal" in result.output
+        assert "opencode" in result.output
+        assert "No assignments to propose." in result.output
+
+    def test_plan_keeps_proposal_when_machine_declares_the_capability(
+        self, tmp_path: Path, cli_coord_dir: Path,
+    ) -> None:
+        config_path = tmp_path / "coordinator.yml"
+        config_path.write_text(
+            "repos:\n"
+            "  - name: api\n    github: acme/api\n    provider: opencode\n"
+            "machines:\n"
+            "  - name: laptop\n    host: laptop.tailnet\n    repos: [api]\n"
+            "    capabilities: [\"provider:opencode\"]\n"
+            "providers:\n"
+            "  definitions:\n"
+            "    opencode:\n"
+            "      type: opencode\n"
+        )
+        from coord.models import Proposal
+
+        proposal = Proposal(
+            id=1, machine_name="laptop", repo_name="api", issue_number=42,
+            issue_title="t", rationale="r",
+        )
+        with patch(
+            "coord.brain.gather_context",
+            return_value={"issues_by_repo": {}, "machine_status": {}},
+        ), patch(
+            "coord.brain.build_prompt", return_value="prompt"
+        ), patch(
+            "coord.brain.call_claude", return_value="[]"
+        ), patch(
+            "coord.brain.parse_proposals", return_value=[proposal]
+        ), patch(
+            "coord.brain.parse_split_proposals", return_value=[]
+        ):
+            result = CliRunner().invoke(
+                main,
+                ["plan", "--dry-run", "--config", str(config_path)],
+            )
+        assert result.exit_code == 0, result.output
+        assert "dropped proposal" not in result.output
+        assert "1 assignment proposal(s)" in result.output
+
+
 # ── Escalation on follow-up commands ───────────────────────────────────────
 
 

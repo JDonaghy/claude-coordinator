@@ -255,6 +255,101 @@ class TestProviderDryRun:
         disp.assert_not_called()
 
 
+# A provider definition of a genuinely different backend TYPE (opencode) —
+# used to prove a machine that hasn't declared `provider:opencode` gets
+# refused, naming the machine that DOES (#1711). Deliberately does NOT mock
+# `coord.dispatch.dispatch` (unlike the classes above) — this is a
+# black-box exercise of the real dispatch() refusal path end-to-end through
+# the CLI, only the HTTP boundary (`coord.dispatch.httpx.post`) is stubbed.
+CONFIG_YAML_MIXED_OPENCODE_FLEET = """\
+repos:
+  - name: api
+    github: acme/api
+    default_branch: main
+    provider: opencode
+machines:
+  - name: laptop
+    host: laptop.tailnet
+    repos: [api]
+    repo_paths:
+      api: /tmp/api
+  - name: workstation
+    host: workstation.tailnet
+    repos: [api]
+    repo_paths:
+      api: /tmp/api
+    capabilities: ["provider:opencode"]
+providers:
+  definitions:
+    opencode:
+      type: opencode
+"""
+
+
+@pytest.fixture
+def config_file_mixed_opencode_fleet(tmp_path: Path) -> Path:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(CONFIG_YAML_MIXED_OPENCODE_FLEET)
+    return p
+
+
+class TestProviderMachineCapabilityRefusalBlackBox:
+    """#1711 black-box: `coord assign` end-to-end against the real
+    `coord.dispatch.dispatch()` — a machine without the declared
+    `provider:opencode` capability is refused at dispatch, naming the
+    machine that DOES advertise it, never reaching the agent server."""
+
+    def test_assign_refuses_opencode_on_a_machine_without_the_capability(
+        self, config_file_mixed_opencode_fleet: Path, coord_dir: Path,
+    ) -> None:
+        with patch("coord.github_ops.get_issue", return_value={"title": "t", "labels": []}), \
+             patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.github_ops.check_branch_exists", return_value=False), \
+             patch("coord.claim.find_work_claim", return_value=None), \
+             patch("coord.dispatch.httpx.post") as post:
+            result = CliRunner().invoke(
+                main,
+                [
+                    "assign", "laptop", "api", "7",
+                    "--config", str(config_file_mixed_opencode_fleet),
+                    "--skip-freshness",
+                ],
+            )
+        assert result.exit_code == 1, result.output
+        assert "laptop" in result.output
+        assert "opencode" in result.output
+        assert "workstation" in result.output, (
+            "the refusal must name the machine that DOES advertise the "
+            f"capability; got: {result.output}"
+        )
+        post.assert_not_called()
+
+    def test_assign_succeeds_on_the_capable_machine(
+        self, config_file_mixed_opencode_fleet: Path, coord_dir: Path,
+    ) -> None:
+        import httpx as _httpx
+
+        mock_resp = _httpx.Response(
+            200, json={"id": "asn-1"},
+            request=_httpx.Request("POST", "http://workstation.tailnet:7433/assign"),
+        )
+        with patch("coord.github_ops.get_issue", return_value={"title": "t", "labels": []}), \
+             patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.github_ops.check_branch_exists", return_value=False), \
+             patch("coord.claim.find_work_claim", return_value=None), \
+             patch("coord.dispatch.httpx.post", return_value=mock_resp) as post:
+            result = CliRunner().invoke(
+                main,
+                [
+                    "assign", "workstation", "api", "7",
+                    "--config", str(config_file_mixed_opencode_fleet),
+                    "--skip-freshness",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        post.assert_called_once()
+
+
 class TestProviderDispatch:
     def test_provider_threaded_to_proposal(
         self, config_file_with_providers: Path, coord_dir: Path

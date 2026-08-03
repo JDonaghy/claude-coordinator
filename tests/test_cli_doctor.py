@@ -6,6 +6,9 @@ command's actual output and exit code.
 
 from __future__ import annotations
 
+from pathlib import Path
+
+import pytest
 from click.testing import CliRunner
 
 import coord.network as network_mod
@@ -180,3 +183,99 @@ def test_doctor_unknown_machine_filter_errors(valid_config_path, monkeypatch) ->
         valid_config_path, monkeypatch, [], extra_args=["--machine", "nope"],
     )
     assert result.exit_code == 2
+
+
+# ── #1711: provider:opencode availability — declared vs. probed-and-met ────
+
+OPENCODE_CONFIG = """\
+repos:
+  - name: api
+    github: acme/api
+    provider: opencode
+machines:
+  - name: laptop
+    host: laptop.tailnet
+    capabilities: ["provider:opencode"]
+    repos: [api]
+providers:
+  definitions:
+    opencode:
+      type: opencode
+"""
+
+
+@pytest.fixture
+def opencode_config_path(tmp_path: Path) -> Path:
+    p = tmp_path / "coordinator.yml"
+    p.write_text(OPENCODE_CONFIG)
+    return p
+
+
+def test_doctor_reports_provider_declared_and_probed_met(
+    opencode_config_path, monkeypatch,
+) -> None:
+    """A machine that DECLARES `provider:opencode` AND whose probe found
+    the binary reads green — same shape as any other capability."""
+    from coord.config import load
+
+    cfg = load(opencode_config_path)
+    statuses = [
+        MachineStatus(
+            machine=m, state=ONLINE,
+            health=_health({
+                "git": _ok_probe(), "gh": _ok_probe(),
+                "opencode": _ok_probe("provider:opencode"),
+            }, m),
+        )
+        for m in cfg.machines
+    ]
+    result = _run_doctor(opencode_config_path, monkeypatch, statuses)
+    assert result.exit_code == 0, result.output
+    assert "✓ opencode" in result.output
+
+
+def test_doctor_flags_declared_provider_the_probe_contradicts(
+    opencode_config_path, monkeypatch,
+) -> None:
+    """DECLARED (`provider:opencode` in capabilities) but PROBED-AND-UNMET
+    (the opencode binary isn't actually on that machine) must surface as an
+    unmet-capability line — the same "claimed but unmet" shape #1570 D
+    already gives rust/gtk/browser, now covering provider availability too."""
+    from coord.config import load
+
+    cfg = load(opencode_config_path)
+    statuses = [
+        MachineStatus(
+            machine=m, state=ONLINE,
+            health=_health({
+                "git": _ok_probe(), "gh": _ok_probe(),
+                "opencode": _missing_probe("provider:opencode"),
+            }, m),
+        )
+        for m in cfg.machines
+    ]
+    result = _run_doctor(opencode_config_path, monkeypatch, statuses)
+    assert result.exit_code == 1
+    assert "✗ opencode: not found" in result.output
+    assert "capability 'provider:opencode' claimed but unmet" in result.output
+
+
+def test_doctor_does_not_probe_undeclared_provider_capability(
+    valid_config_path, monkeypatch,
+) -> None:
+    """A machine that never declared `provider:opencode` gets no opencode
+    row at all — matches the existing "docker has no registered prereq /
+    unclaimed capability isn't probed" posture for every other capability."""
+    from coord.config import load
+
+    cfg = load(valid_config_path)  # laptop/server declare only python/docker
+    statuses = [
+        MachineStatus(
+            machine=m, state=ONLINE,
+            health=_health({"git": _ok_probe(), "gh": _ok_probe()}, m),
+        )
+        for m in cfg.machines
+    ]
+    result = _run_doctor(valid_config_path, monkeypatch, statuses)
+    assert result.exit_code == 0, result.output
+    assert "opencode" not in result.output

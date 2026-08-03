@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
+from coord.config import provider_capability
 from coord.github_ops import GH_PR_CHECKS_JSON_MIN_VERSION
 
 DEFAULT_PROBE_TIMEOUT = 10.0
@@ -220,6 +221,50 @@ def installed_chromium_builds(root: Path | None = None) -> list[int]:
     return sorted(builds)
 
 
+def _probe_opencode(prereq: Prereq, timeout: float) -> ToolProbe:
+    """``custom_probe`` for the ``opencode`` CLI backing the ``provider:
+    opencode`` capability (#1711).
+
+    Deliberately more lenient than the generic binary-probe path in
+    :func:`probe`: :class:`coord.providers.opencode.OpenCodeProvider`'s own
+    module docstring flags EVERY CLI-flag assumption as unverified — the
+    real binary was never installed on the machine that wrote the
+    provider, so a wrong ``--version`` flag is a real possibility. The
+    generic :func:`probe` path treats any non-zero exit as "not found"
+    (correct for a subcommand-lookup probe like ``pkg-config --modversion
+    gtk4``, wrong here) — that would false-negative a machine that
+    genuinely has ``opencode`` installed under a CLI surface this module
+    hasn't confirmed yet. So: ``shutil.which`` alone decides ``found``;
+    ``--version``'s output, only if the call happens to succeed, is a
+    best-effort version string and never a reason to report
+    ``found=False``.
+    """
+    binary_path = shutil.which(prereq.binary)
+    if binary_path is None:
+        return ToolProbe(
+            tool=prereq.tool, capability=prereq.capability, found=False,
+            version=None, min_version=prereq.min_version, meets_floor=None,
+            what_breaks=prereq.what_breaks,
+        )
+    version: str | None = None
+    try:
+        result = subprocess.run(
+            [prereq.binary, *prereq.version_args],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if result.returncode == 0:
+            version = _parse_version(
+                (result.stdout or "") + (result.stderr or ""), prereq.version_re
+            )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return ToolProbe(
+        tool=prereq.tool, capability=prereq.capability, found=True,
+        version=version, min_version=prereq.min_version, meets_floor=None,
+        what_breaks=prereq.what_breaks,
+    )
+
+
 def _probe_playwright_browsers(prereq: Prereq, _timeout: float) -> ToolProbe:
     """`custom_probe` for the Playwright browser cache — no binary to run."""
     builds = installed_chromium_builds()
@@ -310,6 +355,24 @@ CAPABILITY_PREREQS: tuple[Prereq, ...] = (
             "`npx playwright install chromium` on this machine"
         ),
         custom_probe=_probe_playwright_browsers,
+    ),
+    # #1711: backs the `provider:opencode` capability (see
+    # `coord.config.provider_capability` / `coord.providers.
+    # guard_provider_machine_capability`) — a machine that declares it can
+    # run the `opencode` provider gets probed here so `coord doctor`
+    # distinguishes DECLARED (capability string present in
+    # machines[].capabilities) from PROBED-AND-MET (the binary this probe
+    # found on PATH), the same way `rust`/`gtk`/`browser` already do. Tool
+    # name matches `coord.providers.opencode.DEFAULT_OPENCODE_BINARY`.
+    Prereq(
+        tool="opencode", binary="opencode", version_args=("--version",),
+        version_re=r"v?(\d\S*)", min_version=None, capability=provider_capability("opencode"),
+        what_breaks=(
+            "an opencode-provider assignment cannot spawn on this machine "
+            "— install the opencode CLI (https://github.com/sst/opencode) "
+            "or drop `provider:opencode` from this machine's capabilities"
+        ),
+        custom_probe=_probe_opencode,
     ),
 )
 

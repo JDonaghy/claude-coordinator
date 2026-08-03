@@ -623,6 +623,123 @@ class TestApplyRequirePlan:
         _apply_require_plan([], cfg)  # should not raise
 
 
+# ---------------------------------------------------------------------------
+# #1711: provider-availability-aware planning
+# ---------------------------------------------------------------------------
+
+
+def _opencode_cfg(machine_capabilities: list[str] | None = None) -> Config:
+    return Config(
+        repos=[Repo(name="api", github="acme/api", provider="opencode")],
+        machines=[
+            Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                capabilities=machine_capabilities or [],
+            ),
+        ],
+        providers=ProvidersConfig(definitions={"opencode": ProviderDef(type="opencode")}),
+    )
+
+
+def _opencode_proposal() -> Proposal:
+    return Proposal(
+        id=1, machine_name="laptop", repo_name="api",
+        issue_number=10, issue_title="Fix auth", rationale="best fit",
+    )
+
+
+class TestFilterUnroutableProviderProposals:
+    def test_drops_proposal_when_machine_lacks_the_capability(self) -> None:
+        from coord.brain import filter_unroutable_provider_proposals
+
+        cfg = _opencode_cfg()  # laptop declares no capabilities
+        kept, dropped = filter_unroutable_provider_proposals([_opencode_proposal()], cfg)
+        assert kept == []
+        assert len(dropped) == 1
+        assert dropped[0][0].machine_name == "laptop"
+        assert "opencode" in dropped[0][1]
+
+    def test_keeps_proposal_when_machine_has_the_capability(self) -> None:
+        from coord.brain import filter_unroutable_provider_proposals
+
+        cfg = _opencode_cfg(["provider:opencode"])
+        kept, dropped = filter_unroutable_provider_proposals([_opencode_proposal()], cfg)
+        assert len(kept) == 1
+        assert dropped == []
+
+    def test_claude_proposals_always_kept(self, config: Config) -> None:
+        """No-config parity: a plain claude proposal against the fixture
+        config (no provider capabilities declared anywhere) is untouched."""
+        from coord.brain import filter_unroutable_provider_proposals
+
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=10, issue_title="Fix auth", rationale="best fit",
+        )
+        kept, dropped = filter_unroutable_provider_proposals([p], config)
+        assert kept == [p]
+        assert dropped == []
+
+    def test_unknown_machine_name_is_left_for_approve_time_to_catch(self) -> None:
+        """A typo'd/removed machine name is a different, pre-existing
+        failure mode (coord approve's "Unknown machine" error) — not this
+        filter's concern, so it passes through untouched."""
+        from coord.brain import filter_unroutable_provider_proposals
+
+        cfg = _opencode_cfg()
+        p = Proposal(
+            id=1, machine_name="does-not-exist", repo_name="api",
+            issue_number=10, issue_title="Fix auth", rationale="best fit",
+        )
+        kept, dropped = filter_unroutable_provider_proposals([p], cfg)
+        assert kept == [p]
+        assert dropped == []
+
+    def test_propose_never_returns_an_unroutable_proposal(self) -> None:
+        """Integration: propose()'s full cycle applies the filter too."""
+        cfg = _opencode_cfg()  # laptop cannot run opencode
+        response = json.dumps([{
+            "machine_name": "laptop",
+            "repo_name": "api",
+            "issue_number": 10,
+            "issue_title": "Fix auth",
+            "rationale": "best fit",
+            "files_likely": [],
+            "briefing": "do the thing",
+        }])
+        with patch("coord.brain.gather_context", return_value={
+            "issues_by_repo": {"api": [{"number": 10, "title": "Fix auth", "labels": [], "body": ""}]},
+            "machine_status": {"laptop": {"status": "idle"}},
+        }), patch("coord.brain.call_claude", return_value=response):
+            proposals, _splits = propose(cfg)
+        assert proposals == []
+
+
+class TestBuildPromptProviderHints:
+    def test_opencode_repo_names_eligible_machines(self) -> None:
+        cfg = _opencode_cfg(["provider:opencode"])
+        context = {
+            "issues_by_repo": {"api": []},
+            "machine_status": {"laptop": {"status": "idle"}},
+        }
+        prompt = build_prompt(cfg, context)
+        assert "provider=opencode" in prompt
+        assert "laptop" in prompt.split("provider=opencode")[1].split("]")[0]
+
+    def test_opencode_repo_with_no_capable_machine_says_so(self) -> None:
+        cfg = _opencode_cfg()  # nobody declares provider:opencode
+        context = {
+            "issues_by_repo": {"api": []},
+            "machine_status": {"laptop": {"status": "idle"}},
+        }
+        prompt = build_prompt(cfg, context)
+        assert "NO machine can run this yet" in prompt
+
+    def test_claude_repo_gets_no_provider_hint(self, config: Config, sample_context: dict) -> None:
+        prompt = build_prompt(config, sample_context)
+        assert "provider=" not in prompt
+
+
 class TestProposeRequirePlan:
     """Integration tests: propose() respects dispatch.require_plan."""
 

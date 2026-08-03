@@ -25,8 +25,9 @@ Public API
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterable
 
+from coord.config import IMPLICIT_PROVIDER_TYPES, provider_capability
 from coord.providers.base import Capabilities, Provider, WorkerSummary
 from coord.providers.claude import ClaudeProvider
 from coord.providers.claude_pty import ClaudePtyProvider
@@ -34,6 +35,7 @@ from coord.providers.opencode import OpenCodeProvider
 
 if TYPE_CHECKING:
     from coord.config import Config, ModelsConfig, ProviderDef, ProvidersConfig
+    from coord.models import Machine
 
 __all__ = [
     "Capabilities",
@@ -45,7 +47,11 @@ __all__ = [
     "build_provider",
     "describe_provider_choice",
     "get_provider",
+    "guard_provider_machine_capability",
     "guard_unattended_dispatch",
+    "machine_supports_provider",
+    "machines_supporting_provider",
+    "provider_type_for",
     "resolve_default_provider",
     "resolve_provider_name",
 ]
@@ -188,6 +194,121 @@ def describe_provider_choice(
     if repo_provider is not None:
         return f"{name} (repo default: Repo.provider)"
     return f"{name} (providers.default)"
+
+
+def provider_type_for(provider_name: str, providers_cfg: "ProvidersConfig") -> str:
+    """Resolve *provider_name* to its backend ``type`` (#1711).
+
+    Falls back to *provider_name* itself when the name isn't registered in
+    ``providers_cfg.definitions`` (a typo'd name, or one removed from config
+    after an assignment was dispatched with it) — mirrors
+    :func:`guard_unattended_dispatch`'s posture of not fabricating a refusal
+    for an already-broken reference and letting the existing "unknown
+    provider" error path surface it instead.
+    """
+    definition = providers_cfg.definitions.get(provider_name)
+    return definition.type if definition is not None else provider_name
+
+
+def machine_supports_provider(
+    machine: "Machine", provider_name: str, providers_cfg: "ProvidersConfig",
+) -> bool:
+    """Whether *machine* can run *provider_name* (#1711).
+
+    ``claude``/``claude-pty`` — by resolved TYPE, not registered name, see
+    :data:`coord.config.IMPLICIT_PROVIDER_TYPES` — are the implicit
+    baseline every machine is assumed to support (unchanged from before
+    #1711). Any other backend type requires ``machine.capabilities`` to
+    include ``coord.config.provider_capability(type)``, e.g.
+    ``"provider:opencode"``.
+    """
+    ptype = provider_type_for(provider_name, providers_cfg)
+    if ptype in IMPLICIT_PROVIDER_TYPES:
+        return True
+    return provider_capability(ptype) in machine.capabilities
+
+
+def machines_supporting_provider(
+    machines: Iterable["Machine"], provider_name: str, providers_cfg: "ProvidersConfig",
+) -> list[str]:
+    """Names of every machine in *machines* that can run *provider_name*,
+    sorted (#1711). Used to compose the "here's where you CAN dispatch
+    this" half of :func:`guard_provider_machine_capability`'s refusal.
+    """
+    return sorted(
+        m.name for m in machines
+        if machine_supports_provider(m, provider_name, providers_cfg)
+    )
+
+
+def guard_provider_machine_capability(
+    *,
+    provider_name: str,
+    machine: "Machine",
+    all_machines: Iterable["Machine"],
+    providers_cfg: "ProvidersConfig",
+    where: str = "dispatch",
+) -> None:
+    """STRUCTURAL PROVIDER-AVAILABILITY GATE (#1711).
+
+    Refuses to route *provider_name* to *machine* when *machine* can't run
+    it (see :func:`machine_supports_provider`) — e.g. an ``opencode``
+    assignment routed to a machine that never declared
+    ``provider:opencode`` in ``coordinator.yml``. Before this gate, that
+    combination failed only at spawn time, deep inside the agent process,
+    with an ENOENT-shaped subprocess error discovered minutes into a
+    worker — after the assignment row was created and the worktree built.
+    This turns it into a clean refusal at the same dispatch chokepoint as
+    the #437 TOS gate (:func:`guard_unattended_dispatch`), before any of
+    that happens.
+
+    A machine's own repo/capabilities are matched exactly as
+    :func:`machine_supports_provider` defines it — this function adds only
+    the refusal message, naming *machine*, the requested provider and its
+    resolved type, and every OTHER configured machine that DOES advertise
+    the required capability (so an operator can immediately re-target the
+    dispatch), or states plainly that no machine advertises it yet.
+
+    This is a **declaration** check only — whether *machine* actually has
+    the backing binary installed is a separate, best-effort concern
+    (:mod:`coord.prereqs`, surfaced via ``coord doctor``); a machine that
+    lies about a capability it doesn't actually have is caught there, not
+    here (mirrors the existing ``rust``/``gtk``/``browser`` split between
+    "declared" and "probed-and-met").
+
+    Args:
+        provider_name: The already-resolved effective provider name (spec →
+            repo → ``providers.default``), as returned by
+            :func:`resolve_provider_name` or :func:`guard_unattended_dispatch`.
+        machine: The machine the dispatch is being routed to.
+        all_machines: Every configured machine (``config.machines``) —
+            scanned to compose the "these machines DO support it" hint.
+        providers_cfg: The coordinator's :class:`~coord.config.ProvidersConfig`.
+        where: Short description of the calling site, interpolated into the
+            error message (mirrors :func:`guard_unattended_dispatch`).
+
+    Raises:
+        ValueError: When *machine* cannot run *provider_name*.
+    """
+    if machine_supports_provider(machine, provider_name, providers_cfg):
+        return
+    ptype = provider_type_for(provider_name, providers_cfg)
+    cap = provider_capability(ptype)
+    candidates = [
+        name for name in machines_supporting_provider(all_machines, provider_name, providers_cfg)
+        if name != machine.name
+    ]
+    if candidates:
+        hint = f"machines that DO advertise {cap!r}: {', '.join(candidates)}"
+    else:
+        hint = f"no configured machine advertises {cap!r} yet"
+    raise ValueError(
+        f"refusing {where}: machine {machine.name!r} cannot run provider "
+        f"{provider_name!r} (type {ptype!r}) — it does not advertise "
+        f"{cap!r} in coordinator.yml machines[].capabilities; {hint}. Add "
+        f"{cap!r} to a machine that has the {ptype} binary installed, or "
+        f"dispatch to one of the machines named above."
+    )
 
 
 def get_provider(

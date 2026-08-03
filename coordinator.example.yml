@@ -233,4 +233,32 @@ models:
 #       binary: /opt/claude-fast/bin/claude
 #       env:
 #         ANTHROPIC_API_KEY: "${FAST_CLAUDE_KEY}"
+#
+#     # Example: opencode (#325/#1711) — a genuinely different backend TYPE
+#     # (not just a differently-configured `claude`), so it needs a machine
+#     # to opt in before anything gets dispatched to it. See the
+#     # `provider:opencode` capability note just below.
+#     opencode:
+#       type: opencode
+#       model: zhipuai/glm-4.6        # optional: pin this provider to a model
+#
+# #1711: provider availability is a per-machine CAPABILITY, exactly like
+# `gtk`/`rust`/`browser` above — NOT a `Machine.provider` field, because
+# provider and machine are orthogonal (a repo/assignment picks the provider
+# via the precedence chain above; a machine only says what it CAN run).
+# `claude`/`claude-pty` are the implicit baseline — every machine is assumed
+# to already have the `claude` CLI, so neither needs a capability declared.
+# Any OTHER provider TYPE (keyed by `providers.definitions.<name>.type`, not
+# the definition's name — `fast-claude` above is `type: claude` and needs
+# nothing extra) needs `"provider:<type>"` added to a machine's
+# `capabilities:` list before `coord assign`/`coord approve`/`coord plan`
+# will route anything there — e.g. a machine with `opencode` installed:
+#
+#   capabilities: [rust, python, "provider:opencode"]
+#
+# `coord doctor` then probes that the `opencode` binary is actually on that
+# machine's PATH (declared vs. probed-and-met, same as every other
+# capability); a dispatch naming a machine that hasn't declared the
+# capability is refused up front (`coord.providers.
+# guard_provider_machine_capability`) rather than failing at spawn time.
 

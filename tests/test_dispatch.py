@@ -1559,6 +1559,188 @@ class TestProviderDispatch:
         assert payload.get("provider") == "spec-provider"
 
 
+class TestCustomizedClaudeProviderIncludedInPayload:
+    """#1711 review of #324's payload-omission gap: a CUSTOMIZED `claude`
+    definition (redefined binary/env/extra_args, still named "claude") must
+    not be silently dropped by the "omit when effective name is claude"
+    shortcut — that shortcut exists for old-agent compatibility with the
+    VANILLA default, not to hide a real customization from the agent."""
+
+    @patch("coord.dispatch.httpx.post")
+    def test_vanilla_claude_still_omitted(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal,
+    ) -> None:
+        """No-config-parity guard: unchanged from #324 when the "claude"
+        definition carries no customization at all."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "abc"}
+        mock_post.return_value = mock_resp
+        dispatch(proposal, config)
+        payload = mock_post.call_args.kwargs["json"]
+        assert "provider" not in payload
+
+    @patch("coord.dispatch.httpx.post")
+    def test_custom_binary_forces_inclusion(self, mock_post: MagicMock) -> None:
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "abc"}
+        mock_post.return_value = mock_resp
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+            )],
+            providers=ProvidersConfig(
+                definitions={"claude": ProviderDef(type="claude", binary="/opt/claude/bin/claude")},
+            ),
+        )
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=10, issue_title="Fix auth", rationale="ok",
+        )
+        dispatch(p, cfg)
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload.get("provider") == "claude", (
+            "a customized 'claude' definition (custom binary) must be sent "
+            "on the wire so the agent routes through the provider seam "
+            "instead of its hardcoded legacy claude spawn path"
+        )
+
+    @patch("coord.dispatch.httpx.post")
+    def test_custom_env_forces_inclusion(self, mock_post: MagicMock) -> None:
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "abc"}
+        mock_post.return_value = mock_resp
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+            )],
+            providers=ProvidersConfig(
+                definitions={"claude": ProviderDef(type="claude", env={"FOO": "bar"})},
+            ),
+        )
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=10, issue_title="Fix auth", rationale="ok",
+        )
+        dispatch(p, cfg)
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload.get("provider") == "claude"
+
+    @patch("coord.dispatch.httpx.post")
+    def test_custom_extra_args_forces_inclusion(self, mock_post: MagicMock) -> None:
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "abc"}
+        mock_post.return_value = mock_resp
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api")],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+            )],
+            providers=ProvidersConfig(
+                definitions={"claude": ProviderDef(type="claude", extra_args=["--foo"])},
+            ),
+        )
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=10, issue_title="Fix auth", rationale="ok",
+        )
+        dispatch(p, cfg)
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload.get("provider") == "claude"
+
+
+class TestProviderMachineCapabilityGate:
+    """#1711: dispatch() refuses a provider/machine pairing the target
+    machine hasn't declared it can run, BEFORE any HTTP POST happens."""
+
+    @patch("coord.dispatch.httpx.post")
+    def test_refuses_opencode_on_a_machine_without_the_capability(
+        self, mock_post: MagicMock,
+    ) -> None:
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api", provider="opencode")],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+            )],
+            providers=ProvidersConfig(
+                definitions={"opencode": ProviderDef(type="opencode")},
+            ),
+        )
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=10, issue_title="Fix auth", rationale="ok",
+        )
+        with pytest.raises(ValueError, match="opencode"):
+            dispatch(p, cfg)
+        mock_post.assert_not_called()
+
+    @patch("coord.dispatch.httpx.post")
+    def test_names_a_machine_that_does_support_it(self, mock_post: MagicMock) -> None:
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api", provider="opencode")],
+            machines=[
+                Machine(
+                    name="laptop", host="laptop.tailnet", repos=["api"],
+                    repo_paths={"api": "/home/user/src/api"},
+                ),
+                Machine(
+                    name="workstation", host="workstation.tailnet", repos=["api"],
+                    repo_paths={"api": "/home/user/src/api"},
+                    capabilities=["provider:opencode"],
+                ),
+            ],
+            providers=ProvidersConfig(
+                definitions={"opencode": ProviderDef(type="opencode")},
+            ),
+        )
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=10, issue_title="Fix auth", rationale="ok",
+        )
+        with pytest.raises(ValueError, match="workstation"):
+            dispatch(p, cfg)
+
+    @patch("coord.dispatch.httpx.post")
+    def test_allows_opencode_on_a_capable_machine(self, mock_post: MagicMock) -> None:
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "abc"}
+        mock_post.return_value = mock_resp
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api", provider="opencode")],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+                capabilities=["provider:opencode"],
+            )],
+            providers=ProvidersConfig(
+                definitions={"opencode": ProviderDef(type="opencode")},
+            ),
+        )
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=10, issue_title="Fix auth", rationale="ok",
+        )
+        dispatch(p, cfg)
+        mock_post.assert_called_once()
+
+    @patch("coord.dispatch.httpx.post")
+    def test_claude_needs_no_capability_declared(
+        self, mock_post: MagicMock, config: Config, proposal: Proposal,
+    ) -> None:
+        """No-config parity: the default config fixture declares no
+        capabilities at all, and a plain claude dispatch still works."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "abc"}
+        mock_post.return_value = mock_resp
+        dispatch(proposal, config)
+        mock_post.assert_called_once()
+
+
 class TestProviderAwareModelResolution:
     """#1706 review fix: `config.models.default` is a Claude alias and must
     not silently shadow a non-Claude provider's own pinned `model`. Model
@@ -1583,6 +1765,11 @@ class TestProviderAwareModelResolution:
             machines=[Machine(
                 name="laptop", host="laptop.tailnet", repos=["api"],
                 repo_paths={"api": "/home/user/src/api"},
+                # #1711: opencode is a non-implicit provider TYPE — the
+                # target machine must declare it can run it, or dispatch()
+                # refuses before these tests' actual concern (model
+                # resolution) ever runs.
+                capabilities=["provider:opencode"],
             )],
             providers=ProvidersConfig(
                 default="claude",
@@ -1621,6 +1808,11 @@ class TestProviderAwareModelResolution:
             machines=[Machine(
                 name="laptop", host="laptop.tailnet", repos=["api"],
                 repo_paths={"api": "/home/user/src/api"},
+                # #1711: opencode is a non-implicit provider TYPE — the
+                # target machine must declare it can run it, or dispatch()
+                # refuses before these tests' actual concern (model
+                # resolution) ever runs.
+                capabilities=["provider:opencode"],
             )],
             providers=ProvidersConfig(
                 default="claude",

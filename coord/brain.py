@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import subprocess
 import httpx
@@ -16,6 +17,8 @@ if TYPE_CHECKING:
     from coord.providers.base import Provider
 
 AGENT_PORT = 7433
+
+_log = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """\
 You are the coordinator brain for a multi-repo, multi-machine Claude Code system.
@@ -105,15 +108,47 @@ def gather_context(config: Config) -> dict:
 
 def build_prompt(config: Config, context: dict) -> str:
     """Assemble the user prompt from config and gathered context."""
+    from coord.config import IMPLICIT_PROVIDER_TYPES
     from coord.deps import blocked_repos
     from coord.models import Assignment
+    from coord.providers import (
+        machines_supporting_provider,
+        provider_type_for,
+        resolve_provider_name,
+    )
 
     lines: list[str] = []
 
     lines.append("## Repos")
     for repo in config.repos:
         deps = f" (depends on: {', '.join(repo.depends_on)})" if repo.depends_on else ""
-        lines.append(f"- {repo.name} ({repo.github}){deps}")
+        # #1711: name the repo's resolved provider and which machines can
+        # actually run it whenever that's a non-implicit backend (today:
+        # opencode) — steers the brain away from proposing a
+        # machine/provider pairing coord.dispatch.dispatch() (and
+        # coord.brain.filter_unroutable_provider_proposals, the
+        # deterministic backstop applied to whatever the brain returns)
+        # would refuse anyway.
+        provider_hint = ""
+        effective_provider_name = resolve_provider_name(
+            None, repo.provider, config.providers,
+        )
+        ptype = provider_type_for(effective_provider_name, config.providers)
+        if ptype not in IMPLICIT_PROVIDER_TYPES:
+            eligible = machines_supporting_provider(
+                config.machines, effective_provider_name, config.providers,
+            )
+            if eligible:
+                provider_hint = (
+                    f" [provider={effective_provider_name} — ONLY propose "
+                    f"machines: {', '.join(eligible)}]"
+                )
+            else:
+                provider_hint = (
+                    f" [provider={effective_provider_name} — NO machine can "
+                    "run this yet; do not propose an assignment here]"
+                )
+        lines.append(f"- {repo.name} ({repo.github}){deps}{provider_hint}")
 
     lines.append("")
     from coord.machine_pause import paused_set
@@ -437,6 +472,77 @@ def _apply_require_plan(proposals: list[Proposal], config: Config) -> None:
             p.type = "plan"
 
 
+def filter_unroutable_provider_proposals(
+    proposals: list[Proposal], config: Config,
+) -> tuple[list[Proposal], list[tuple[Proposal, str]]]:
+    """#1711: drop any brain-proposed assignment whose target machine
+    cannot run the repo's resolved provider.
+
+    The brain is a free-text LLM planner (see ``SYSTEM_PROMPT``) — nothing
+    stops it proposing ``machine_name="laptop"`` for a repo whose resolved
+    provider is ``opencode`` when ``laptop`` never declared
+    ``provider:opencode`` in ``coordinator.yml``.
+    :func:`coord.dispatch.dispatch` would refuse that exact combination at
+    dispatch time anyway (:func:`coord.providers.
+    guard_provider_machine_capability` — the same #1711 gate), but only
+    once the proposal has already been shown to the operator and approved.
+    This runs the identical deterministic check at planning time instead,
+    so ``coord plan`` never shows a proposal ``coord approve`` would
+    immediately refuse.
+
+    A brain-authored :class:`~coord.models.Proposal` never carries a
+    per-proposal ``provider`` override — the JSON schema documented in
+    ``SYSTEM_PROMPT`` has no such field, only ``machine_name``/
+    ``repo_name``/etc — so the effective provider for each proposal comes
+    from ``Repo.provider`` / ``providers.default`` alone, exactly like any
+    other dispatch with no explicit ``--provider``.
+
+    An unresolvable ``machine_name`` (typo, or a machine removed from
+    config after the brain call started) is left in ``kept`` — that's a
+    different, pre-existing failure mode (``coord approve``'s own "Unknown
+    machine" error), not this filter's concern.
+
+    Returns:
+        ``(kept, dropped)`` — ``dropped`` pairs each rejected proposal with
+        the human-readable refusal reason (the same message
+        :func:`~coord.providers.guard_provider_machine_capability` would
+        raise at dispatch time), so a caller can report exactly why a
+        proposal disappeared instead of it just silently not showing up.
+    """
+    from coord.providers import (  # noqa: PLC0415
+        guard_provider_machine_capability,
+        resolve_provider_name,
+    )
+
+    kept: list[Proposal] = []
+    dropped: list[tuple[Proposal, str]] = []
+    for p in proposals:
+        machine = next((m for m in config.machines if m.name == p.machine_name), None)
+        if machine is None:
+            kept.append(p)
+            continue
+        repo = config.repo(p.repo_name)
+        effective_provider_name = resolve_provider_name(
+            getattr(p, "provider", None),
+            repo.provider if repo is not None else None,
+            config.providers,
+        )
+        try:
+            guard_provider_machine_capability(
+                provider_name=effective_provider_name,
+                machine=machine,
+                all_machines=config.machines,
+                providers_cfg=config.providers,
+                where="coord plan",
+            )
+        except ValueError as e:
+            _log.warning("coord plan: dropping unroutable proposal: %s", e)
+            dropped.append((p, str(e)))
+            continue
+        kept.append(p)
+    return kept, dropped
+
+
 def propose(config: Config) -> tuple[list[Proposal], list[SplitProposal]]:
     """Full brain cycle: gather context, call the provider, return proposals and splits."""
     provider = _resolve_default_provider(config)
@@ -448,4 +554,12 @@ def propose(config: Config) -> tuple[list[Proposal], list[SplitProposal]]:
     resolve_required_gates(proposals, config, context["issues_by_repo"])
     resolve_models(proposals, config, context["issues_by_repo"])
     _annotate_large_proposals(proposals, config)
+    # #1711: never return a proposal `coord approve` would immediately
+    # refuse for lacking the resolved provider's capability — see
+    # filter_unroutable_provider_proposals's docstring. Dropped proposals
+    # are logged (above) rather than surfaced here; `propose()` is used by
+    # both `coord plan`'s CLI wrapper (which reports drops itself, see
+    # coord.commands.dispatch.plan) and non-CLI callers (e.g. the
+    # dashboard) that have no click.echo to report through.
+    proposals, _dropped = filter_unroutable_provider_proposals(proposals, config)
     return proposals, parse_split_proposals(response)
