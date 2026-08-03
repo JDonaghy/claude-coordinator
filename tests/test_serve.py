@@ -3675,6 +3675,47 @@ def test_serve_acceptance_record_relays_nonzero_exit(
     assert resp.json()["exit_code"] == 1
 
 
+def test_serve_acceptance_record_relays_stderr_failure(
+    file_db: Path, valid_config_path: Path, rw_db, monkeypatch
+):
+    """#1733: every LOCAL failure path in ``coord acceptance record``
+    (a DriverError from a fresh worktree with no ``node_modules``, a missing
+    work assignment, a manifest error, ...) does ``click.echo(f"error:
+    {e}", err=True)`` before ``sys.exit(1)`` — that resolves ``sys.stderr``
+    fresh at call time, so without capturing stderr too (only
+    ``stdout_proxy`` was wrapped before this fix) that message vanished into
+    the daemon's own journal and never reached the client. A daemon-routed
+    `coord acceptance record` then exited 1 with a totally empty
+    output/error — indistinguishable from a hang, exactly the #1733 repro
+    (mirrors #1251's identical /merge bug, see
+    test_serve_merge_relays_stderr_usage_errors). Assert the message now
+    survives the relay.
+    """
+    import sys
+    import click
+    from coord.commands.acceptance import acceptance_record
+
+    def fake_callback(**kwargs):
+        click.echo(
+            "error: web-playwright run wrote no report (exit 127): boom",
+            err=True,
+        )
+        sys.exit(1)
+
+    monkeypatch.setattr(acceptance_record, "callback", fake_callback)
+    app = build_app(SqliteStore(file_db), load_config(valid_config_path))
+    with TestClient(app) as cli:
+        resp = cli.post(
+            "/acceptance-record",
+            json={"repo": "api", "issue": 944, "sha": "deadbeef"},
+        )
+    body = resp.json()
+    assert body["exit_code"] == 1
+    assert "wrote no report" in body["output"], (
+        f"stderr failure message did not reach the client: {body!r}"
+    )
+
+
 def test_acceptance_record_routes_to_daemon_when_service_set(coord_db, monkeypatch):
     # `coord acceptance record` on a thin client POSTs to /acceptance-record
     # and relays the output, instead of trying to run against an empty local
@@ -3701,6 +3742,46 @@ def test_acceptance_record_routes_to_daemon_when_service_set(coord_db, monkeypat
     assert captured["payload"]["issue"] == 944
     assert captured["payload"]["sha"] == "deadbeef"
     assert "DAEMON ACCEPTANCE RECORD OUTPUT" in out.output
+
+
+def test_acceptance_record_daemon_failure_exits_nonzero_and_prints_reason(
+    coord_db, monkeypatch
+):
+    """#1733 client-side half of the fix: a daemon-routed `coord acceptance
+    record` failure must not just exit non-zero — it must print WHY on the
+    client. Before this, the daemon-relayed payload for a driver crash
+    (DriverError from a fresh worktree missing node_modules) carried the
+    reason only in ``output`` (stderr wasn't captured server-side — see
+    test_serve_acceptance_record_relays_stderr_failure), so a thin client
+    saw exit 1 with nothing printed at all — indistinguishable from a hang.
+    This asserts the CLI's own stdout (not just the exit code) carries the
+    reason once the daemon relays it correctly.
+    """
+    from coord import client as cc
+    from click.testing import CliRunner
+    from coord.cli import main
+
+    monkeypatch.setattr(
+        cc, "resolve_board_service", lambda *a, **k: cc.ServiceConfig("http://d:7435")
+    )
+    monkeypatch.setattr(
+        cc, "post_record",
+        lambda svc, path, payload, **kw: {
+            "output": (
+                "error: web-playwright run wrote no report (exit 127): "
+                "playwright: not found\n"
+            ),
+            "exit_code": 1,
+            "error": None,
+        },
+    )
+    out = CliRunner().invoke(main, [
+        "acceptance", "record", "--repo", "api", "--issue", "944", "--sha", "deadbeef",
+    ])
+    assert out.exit_code == 1
+    assert "wrote no report" in out.output, (
+        f"daemon failure reason did not reach client-visible output: {out.output!r}"
+    )
 
 
 def test_serve_test_plan_runs_callback_and_captures_output(

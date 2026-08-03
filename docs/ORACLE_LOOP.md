@@ -91,6 +91,13 @@ acceptance:
       capability: rust
     webapp:
       kind: web-playwright             # drives Electron too
+      setup: "npm ci"                  # provisioning step, run once before `run` (#1733) —
+                                        # `coord acceptance record`'s throwaway worktree has
+                                        # no node_modules (gitignored); without this, `run`
+                                        # fails `exit 127` (playwright not found) before ever
+                                        # producing a verdict. Empty/omitted for a driver that
+                                        # self-provisions (tui-tuidriver fetches its own cargo
+                                        # deps; cli-pytest runs against the ambient env).
       run: "npx playwright test tests/acceptance"
       mock: "*.html"                   # static wireframe: reviewed, then asserted against
       capability: browser

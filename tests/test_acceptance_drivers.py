@@ -195,6 +195,65 @@ class TestRunDriver:
             run_driver("tui-tuidriver", "sleep 5", cwd=str(tmp_path), timeout=1)
 
 
+class TestRunDriverSetup:
+    """#1733: the `setup:` provisioning step, run once before `run` — the
+    fix for `coord acceptance record`'s throwaway worktree having no
+    `node_modules` for a JS driver (web-playwright's `run` failed with a
+    bare `exit 127` there, before this existed)."""
+
+    def test_no_setup_command_is_unchanged_behavior(self, tmp_path) -> None:
+        blob = json.dumps({"tests": [{"id": "a", "status": "pass"}]})
+        result = run_driver(
+            "tui-tuidriver", f"echo '{blob}'", cwd=str(tmp_path), setup_command="",
+        )
+        assert result.exit_code == 0
+        assert result.tests == [{"id": "a", "status": "pass", "message": ""}]
+
+    def test_setup_runs_before_run_command(self, tmp_path) -> None:
+        # `setup` writes a marker file; `run` only succeeds (prints a
+        # passing verdict) if that marker exists yet — proves ordering, not
+        # just that both commands happened to run somehow.
+        marker = tmp_path / "provisioned"
+        blob = json.dumps({"tests": [{"id": "a", "status": "pass"}]})
+        run_command = f"test -f {marker} && echo '{blob}' || (echo 'MISSING MARKER' && exit 1)"
+        result = run_driver(
+            "tui-tuidriver", run_command, cwd=str(tmp_path),
+            setup_command=f"touch {marker}",
+        )
+        assert result.exit_code == 0
+        assert result.tests == [{"id": "a", "status": "pass", "message": ""}]
+
+    def test_setup_failure_raises_distinct_provisioning_error(self, tmp_path) -> None:
+        marker = tmp_path / "should-not-exist"
+        with pytest.raises(DriverError, match="provisioning failed") as exc_info:
+            run_driver(
+                "web-playwright", f"touch {marker}; exit 0", cwd=str(tmp_path),
+                setup_command="echo 'npm ci boom' 1>&2; exit 1",
+            )
+        message = str(exc_info.value)
+        assert "npm ci boom" in message
+        # `run` must never have executed — a driver whose dependencies
+        # never installed cannot produce a meaningful verdict.
+        assert not marker.exists()
+
+    def test_setup_failure_message_is_not_mistaken_for_a_test_failure(self, tmp_path) -> None:
+        with pytest.raises(DriverError) as exc_info:
+            run_driver(
+                "web-playwright", "exit 0", cwd=str(tmp_path),
+                setup_command="exit 1",
+            )
+        message = str(exc_info.value)
+        assert "wrote no report" not in message
+        assert "provisioning failed" in message
+
+    def test_setup_timeout_raises_driver_error(self, tmp_path) -> None:
+        with pytest.raises(DriverError, match="provisioning timed out"):
+            run_driver(
+                "tui-tuidriver", "exit 0", cwd=str(tmp_path),
+                setup_command="sleep 5", timeout=1,
+            )
+
+
 class TestRenderRunCommand:
     def test_no_ms_leaves_template_unsubstituted(self) -> None:
         assert (
