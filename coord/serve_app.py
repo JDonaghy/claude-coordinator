@@ -1113,6 +1113,14 @@ def _auto_drain_tick(config: Config) -> "list":
     must not silence the enqueue/reconcile steps — the caller wraps this in its
     own ``try/except``.
 
+    #1769: and **no revalidation**.  ``coord merge --revalidate`` re-tests a
+    stale-but-``passed`` verdict against the current base, but this unattended
+    tick deliberately does not: a merge path that starts suite runs on its own
+    schedule is the shape that was gated off after the 2026-06-07 auto-loop
+    incident — the same reason ``merge.auto_drain`` itself defaults to
+    ``false``.  A stale entry stays ``BLOCKED`` here until an operator asks for
+    the re-test explicitly.
+
     Mutates merge-queue rows in place and persists the changes.  Returns the
     list of :class:`~coord.merge_queue.MergeEvent` objects so the caller can
     log each event.  Returns an empty list when there are no READY entries.
@@ -3114,6 +3122,18 @@ def _openapi_spec() -> dict:
                                         ),
                                     },
                                     "skip_smoke": {"type": "boolean"},
+                                    "revalidate": {
+                                        "type": "boolean",
+                                        "description": (
+                                            "#1769: re-test entries blocked solely "
+                                            "on a stale-but-passed test verdict "
+                                            "against the current base, then merge. "
+                                            "Honoured verbatim — it satisfies the "
+                                            "smoke gate by running the suite here, "
+                                            "it does not bypass it, and a failing "
+                                            "run merges nothing."
+                                        ),
+                                    },
                                     "drop": {"type": "string", "nullable": True},
                                     "only": {"type": "string", "nullable": True},
                                     "override_human_required": {"type": "string", "nullable": True},
@@ -5598,6 +5618,19 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                             # removes that early check.
                             skip_review=False,
                             skip_smoke=bool(body.get("skip_smoke")),
+                            # #1769: `--revalidate` is honoured from the client
+                            # verbatim — unlike skip_review it does not *bypass*
+                            # a gate, it *satisfies* one by actually re-running
+                            # the suite against the current base and refusing to
+                            # merge when that run fails. It is also the only way
+                            # a thin client can reach the resolution at all: the
+                            # suite has to run where the repo is checked out,
+                            # which is this host. Never set by the periodic
+                            # auto-drain (see `_auto_drain_tick`), which always
+                            # passes revalidate=False — an unattended merge path
+                            # that starts test runs on its own is the 2026-06-07
+                            # token-burn shape this stays opt-in to avoid.
+                            revalidate=bool(body.get("revalidate")),
                             drop_assignment=None,  # already handled above
                             only_assignment=body.get("only"),  # #780: single-entry merge
                             # #1251: audited HUMAN_REQUIRED override — unlike

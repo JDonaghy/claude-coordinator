@@ -27,6 +27,79 @@ def _machine_for_assignment(board, assignment_id: str | None) -> str | None:
     return target.machine_name if target is not None else None
 
 
+def _apply_revalidation(items, board, config, gh_ops, *, dry_run: bool):
+    """#1769: the ``--revalidate`` arm for the merge lane.
+
+    Finds the entries in *items* blocked **solely** on a stale-but-``passed``
+    smoke verdict (:func:`coord.merge_queue.revalidation_candidates` is the
+    whole eligibility policy — review/CI/conflict/missing-verdict blocks are
+    never touched), re-tests them against the current base, and lets
+    :func:`coord.merge_queue.process` re-evaluate afterwards.
+
+    Batch (#1715 option 3): candidates are grouped by ``(repo, target_branch)``
+    and each group is composed onto its current base and validated by ONE suite
+    run — which is exactly what the operator did by hand three times in the
+    2026-08-03 session that motivated this. A group whose composite fails is
+    left blocked, with the failure quoted; no verdict is written for any of its
+    entries, so a re-test that fails can never launder a merge.
+
+    Under ``--dry-run`` this only *names* the candidates — no worktree, no
+    suite, no verdict write.
+
+    Returns the board to hand to ``process()``: a freshly-loaded one when any
+    verdict was actually recorded (the in-memory board predates that write and
+    would still show the entries as stale), otherwise *board* unchanged.
+    """
+    from coord import merge_queue as _mq  # noqa: PLC0415
+    from coord import revalidate as _rv  # noqa: PLC0415
+
+    candidates = _mq.revalidation_candidates(items, board, config, gh_ops)
+    if not candidates:
+        click.echo(
+            "  --revalidate: no entry is blocked solely on a stale test "
+            "verdict — nothing to revalidate (review/CI/conflict/missing-"
+            "verdict blocks are never revalidated)"
+        )
+        return board
+
+    for line in _rv.describe_candidates(candidates):
+        click.echo(line)
+
+    if dry_run:
+        click.echo(
+            f"  --revalidate: (dry run) would re-test {len(candidates)} "
+            "entry(ies) against the current base before merging"
+        )
+        return board
+
+    groups: dict[tuple[str, str], list] = {}
+    for c in candidates:
+        groups.setdefault((c.entry.repo_name, c.entry.target_branch), []).append(c)
+
+    recorded_any = False
+    for (repo_name, target_branch), group in sorted(groups.items()):
+        click.echo(
+            f"  --revalidate: {repo_name} → {target_branch}: "
+            f"{len(group)} entry(ies)"
+        )
+        result = _rv.revalidate(group, config, echo=click.echo)
+        if result.ok:
+            recorded_any = recorded_any or bool(result.recorded)
+            click.echo(f"  --revalidate: PASSED — {result.reason}")
+        else:
+            for line in _rv.format_failure(result):
+                click.echo(line, err=True)
+
+    if not recorded_any:
+        return board
+
+    from coord.models import Board as _Board  # noqa: PLC0415
+    from coord.state import load_board as _load_board  # noqa: PLC0415
+
+    refreshed = _load_board()
+    return refreshed if refreshed is not None else _Board(active=[], completed=[])
+
+
 def _dispatch_conflict_fixes(events, config, *, dry_run: bool) -> None:
     """#241: classify any conflict events and dispatch a conflict-fix worker
     for the eligible ones.  Mutates each conflict event's ``ev.entry.state``
@@ -762,11 +835,24 @@ def _merge_via_daemon(svc, params: dict) -> None:
     """#584: run ``coord merge`` on the daemon host (where the canonical DB +
     merge queue + gh live) and relay its output, so the TUI 'Go' button and
     ``coord merge`` work from any thin client.  Merges can take minutes (PR
-    creation, CI waits), hence the long timeout."""
+    creation, CI waits), hence the long timeout.
+
+    #1769: a ``--revalidate`` run additionally executes the repo's whole test
+    suite on the daemon host, which is minutes-to-tens-of-minutes on its own —
+    the default 900 s ceiling would abandon the client mid-suite (the daemon
+    keeps going and finishes the merge, so the operator sees a timeout error
+    for a run that actually succeeded). Give that case a window comfortably
+    above :data:`coord.revalidate.DEFAULT_TIMEOUT_SECONDS`, which is the
+    ceiling the suite itself is killed at."""
     from coord.client import post_record  # noqa: PLC0415
+    from coord.revalidate import DEFAULT_TIMEOUT_SECONDS  # noqa: PLC0415
+
+    timeout = 900.0
+    if params.get("revalidate"):
+        timeout = float(DEFAULT_TIMEOUT_SECONDS) + 300.0
 
     try:
-        resp = post_record(svc, "/merge", params, timeout=900.0)
+        resp = post_record(svc, "/merge", params, timeout=timeout)
     except Exception as exc:  # noqa: BLE001
         click.echo(f"error: merge via daemon failed: {exc}", err=True)
         sys.exit(1)
@@ -844,6 +930,27 @@ def _merge_via_daemon(svc, params: dict) -> None:
 
 
 @click.option(
+    "--revalidate",
+    is_flag=True,
+    help=(
+        "#1769: re-test entries blocked SOLELY on a stale-but-passed test "
+        "verdict against the current base, then merge them. Off by default — "
+        "`coord merge` with no flag is unchanged. Applies only to the stale "
+        "case: an entry blocked on review, CI, conflict, or a genuinely "
+        "missing verdict is left untouched. When it covers several entries "
+        "they are composed onto the current base together and validated by ONE "
+        "suite run (#1715 option 3), so a failure does not identify its "
+        "culprit — but a failure never merges anything: every entry in the "
+        "batch stays blocked with the failure quoted. Runs the repo's own "
+        "build/test commands locally, so it must run where the repo is checked "
+        "out (on a thin client it routes to the daemon host, like the rest of "
+        "`coord merge`). Distinct from --skip-smoke, which waives the gate "
+        "instead of satisfying it."
+    ),
+)
+
+
+@click.option(
     "--drop",
     "drop_assignment",
     default=None,
@@ -903,6 +1010,7 @@ def merge(
     force_merge: bool,
     skip_review: bool,
     skip_smoke: bool,
+    revalidate: bool,
     drop_assignment: str | None,
     only_assignment: str | None,
     override_human_required: str | None,
@@ -955,7 +1063,8 @@ def merge(
             "dry_run": dry_run, "order": order,
             "repo_filter": repo_filter, "method": method,
             "force_merge": force_merge, "skip_review": skip_review,
-            "skip_smoke": skip_smoke, "drop": drop_assignment,
+            "skip_smoke": skip_smoke, "revalidate": revalidate,
+            "drop": drop_assignment,
             "only": only_assignment,
             "override_human_required": override_human_required,
         })
@@ -1169,6 +1278,14 @@ def merge(
         if skip_smoke:
             click.echo("  --skip-smoke: interactive smoke-test gate bypassed (#465)")
         only_items = [only_entry]
+        # #1769: re-test a stale-but-passed verdict against the current base
+        # before the gate runs. Opt-in only; `--skip-smoke` is unaffected (it
+        # waives the gate, this satisfies it), and a failing re-test leaves the
+        # entry blocked exactly as it was.
+        if revalidate and not skip_smoke:
+            board_only = _apply_revalidation(
+                only_items, board_only, cfg_only, gh_ops, dry_run=dry_run,
+            )
         events_only = mq.process(
             only_items, gh_ops,
             method=method, dry_run=dry_run, presorted=True,
@@ -1435,6 +1552,11 @@ def merge(
         click.echo("  --skip-review: review-approval gate bypassed (#253)")
     if skip_smoke:
         click.echo("  --skip-smoke: interactive smoke-test gate bypassed (#465)")
+    # #1769: the merge lane's stale-verdict resolution. Off unless the operator
+    # asked for it — with no `--revalidate` this block does not run at all and
+    # `coord merge` behaves byte-identically to before.
+    if revalidate and not skip_smoke:
+        board = _apply_revalidation(pending, board, cfg, gh_ops, dry_run=dry_run)
     events = mq.process(
         items, gh_ops,
         method=method, dry_run=dry_run, presorted=presorted,

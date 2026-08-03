@@ -161,6 +161,14 @@ COMMANDS_ALLOWLIST: dict[str, set[tuple[str, str]]] = {
         ("_dispatch_conflict_fixes", "load_board"),
         ("_dispatch_conflict_fixes", "save_board"),
         ("_explain_missing_only_entry", "load_board"),
+        # #1769-routed: `_apply_revalidation` is only reached from inside the
+        # `merge` command body, which already returned early via
+        # `daemon_reroute_target("COORD_MERGE_ON_DAEMON")` on a thin client —
+        # so this re-read of the board (needed because the revalidation just
+        # wrote fresh Test verdicts the in-memory board predates) only ever
+        # runs on the daemon host / a standalone dev environment, exactly like
+        # `merge`'s own `load_board` above.
+        ("_apply_revalidation", "load_board"),
     },
     # #1337: `coord test` no longer calls save_board at all — the verdict is
     # recorded via the single-row `record_test_verdict` on both paths (it
