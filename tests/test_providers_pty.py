@@ -161,6 +161,31 @@ def test_pty_build_command_custom_binary() -> None:
     assert argv[0] == "my-claude"
 
 
+def test_pty_build_command_definition_model_is_lowest_precedence() -> None:
+    """#1706: the provider-definition model is used only when neither
+    resolved_model nor spec.model is set."""
+    argv = ClaudePtyProvider(model="glm-4.6").build_command(_make_spec(model=None))
+    assert argv[argv.index("--model") + 1] == "glm-4.6"
+
+
+def test_pty_build_command_spec_model_beats_definition_model() -> None:
+    argv = ClaudePtyProvider(model="glm-4.6").build_command(_make_spec(model="haiku"))
+    assert argv[argv.index("--model") + 1] == "haiku"
+
+
+def test_pty_build_command_resolved_model_beats_definition_model() -> None:
+    argv = ClaudePtyProvider(model="glm-4.6").build_command(
+        _make_spec(model="haiku"), resolved_model="opus"
+    )
+    assert argv[argv.index("--model") + 1] == "opus"
+
+
+def test_pty_build_command_extra_args_appended_last() -> None:
+    """#1706: extra_args land at the end of the argv."""
+    argv = ClaudePtyProvider(extra_args=["--foo", "bar"]).build_command(_make_spec())
+    assert argv[-2:] == ["--foo", "bar"]
+
+
 def test_pty_build_command_branches_match_claude_for_plan_type() -> None:
     """spec.type=plan still gets the plan system prompt + Read,Bash tools."""
     spec = _make_spec(type="plan")
@@ -268,6 +293,12 @@ def test_pty_env_is_empty() -> None:
     assert ClaudePtyProvider().env() == {}
 
 
+def test_pty_env_returns_definition_env() -> None:
+    """#1706: env() returns a copy of the definition's env dict."""
+    provider = ClaudePtyProvider(env={"FOO": "bar"})
+    assert provider.env() == {"FOO": "bar"}
+
+
 def test_pty_parse_log_handles_non_json_bytes(tmp_path: Path) -> None:
     """parse_log degrades gracefully on raw TTY bytes (no stream-json)."""
     log = tmp_path / "worker.log"
@@ -335,6 +366,23 @@ def test_build_provider_claude_pty_type() -> None:
     defn = ProviderDef(type="claude-pty")
     provider = build_provider("claude-pty", defn, None)
     assert isinstance(provider, ClaudePtyProvider)
+
+
+def test_build_provider_claude_pty_threads_model_env_extra_args() -> None:
+    """#1706: build_provider threads model / env / extra_args into
+    ClaudePtyProvider the same way as the "claude" backend."""
+    defn = ProviderDef(
+        type="claude-pty",
+        model="glm-4.6",
+        env={"FOO": "bar"},
+        extra_args=["--foo"],
+    )
+    provider = build_provider("claude-pty", defn, None)
+    assert isinstance(provider, ClaudePtyProvider)
+    assert provider.env() == {"FOO": "bar"}
+    argv = provider.build_command(_make_spec(model=None))
+    assert argv[argv.index("--model") + 1] == "glm-4.6"
+    assert argv[-1] == "--foo"
 
 
 def test_build_provider_claude_pty_with_binary() -> None:

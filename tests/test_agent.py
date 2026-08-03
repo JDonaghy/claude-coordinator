@@ -3553,6 +3553,45 @@ class TestProviderLayerDispatch:
         assert custom_briefing in log, f"provider.initial_input bytes not in log: {log!r}"
         server.shutdown()
 
+    def test_provider_definition_env_reaches_actual_spawn_env(self, tmp_path: Path) -> None:
+        """#1706: ProviderDef.env, threaded through build_provider() into a
+        real ClaudeProvider, must land in the ACTUAL spawned worker
+        subprocess's environment — not just be returned by env() in
+        isolation. The worker binary is a stub script that ignores its argv
+        (ClaudeProvider.build_command builds a real `claude -p ...` argv the
+        stub can't parse) and just echoes the env var it cares about."""
+        from coord.config import ProviderDef
+        from coord.providers import build_provider
+
+        repo = _init_repo(tmp_path / "repo")
+        stub = tmp_path / "fake-claude.sh"
+        stub.write_text('#!/bin/sh\necho "SPAWN_ENV_FOO=$SPAWN_ENV_FOO"\n')
+        stub.chmod(0o755)
+
+        defn = ProviderDef(
+            type="claude", binary=str(stub), env={"SPAWN_ENV_FOO": "bar"}
+        )
+        provider = build_provider("myprovider", defn, None)
+
+        server = AgentServer(
+            machine_name="test",
+            repos=["api"],
+            state_dir=tmp_path / "state",
+            worker_command=lambda spec: ["/bin/sh", "-c", "echo legacy-SHOULD-NOT-RUN"],
+            repo_paths={"api": str(repo)},
+            providers={"myprovider": provider},
+            bash_wrap_spawn=False,
+        )
+        spec = _spec(repo, provider="myprovider")
+        a = server.assign(spec)
+        final = server.wait_for(a.id, timeout=5)
+        log = Path(final.log_path).read_text()
+        assert "SPAWN_ENV_FOO=bar" in log, (
+            f"provider-definition env did not reach the spawned subprocess: {log!r}"
+        )
+        assert "legacy-SHOULD-NOT-RUN" not in log
+        server.shutdown()
+
 
 class TestCapabilityGates:
     """#324/#425: assign() enforces capability gates before spawning."""

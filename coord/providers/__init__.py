@@ -63,27 +63,41 @@ def build_provider(
     """
     ptype = definition.type
     if ptype == "claude":
-        # TODO(#322 wiring issue): also thread definition.model,
-        # definition.env, and definition.extra_args through to the spawn
-        # path.  Today only `binary` is consumed because ClaudeProvider
-        # is not yet wired into AgentServer.spawn() — see the next child
-        # issue of #322.  Until then these fields are parsed and
-        # validated but ignored when build_provider() is called.
-        return ClaudeProvider(binary=definition.binary)
+        # #1706: thread model / env / extra_args from the provider
+        # definition into the instance.  build_command() / env() apply
+        # them with the documented precedence (explicit resolved_model >
+        # spec.model > definition.model for the model fallback; env and
+        # extra_args are additive).
+        return ClaudeProvider(
+            binary=definition.binary,
+            model=definition.model,
+            env=definition.env,
+            extra_args=definition.extra_args,
+        )
     if ptype == "claude-pty":
         # #425: interactive `claude` driven through a PTY — the
         # subscription-billed escape hatch from the 2026-06-15 metering
-        # change.  Like the "claude" branch above, only `binary` is
-        # consumed in this PR; threading `model` / `env` / `extra_args`
-        # is left to a follow-up wiring issue.
-        return ClaudePtyProvider(binary=definition.binary)
+        # change.  #1706: same model / env / extra_args threading as the
+        # "claude" branch above.
+        return ClaudePtyProvider(
+            binary=definition.binary,
+            model=definition.model,
+            env=definition.env,
+            extra_args=definition.extra_args,
+        )
     if ptype == "opencode":
         # #325: OpenCode (sst/opencode) worker backend — uses the operator's
         # own API keys, runs `opencode run BRIEFING`.  `attach_url` is wired
         # here because it is OpenCode-specific (not a cross-provider concern).
-        # `model` / `env` / `extra_args` threading is left to the follow-up
-        # wiring issue (#324).
-        return OpenCodeProvider(binary=definition.binary, attach_url=definition.attach_url)
+        # #1706: model / env / extra_args threaded the same way as the other
+        # provider types.
+        return OpenCodeProvider(
+            binary=definition.binary,
+            attach_url=definition.attach_url,
+            model=definition.model,
+            env=definition.env,
+            extra_args=definition.extra_args,
+        )
     raise ValueError(
         f"Unknown provider type {ptype!r} (provider name: {name!r}). "
         f"Supported types: ['claude', 'claude-pty', 'opencode']"

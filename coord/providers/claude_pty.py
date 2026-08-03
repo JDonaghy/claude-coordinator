@@ -328,10 +328,30 @@ class ClaudePtyProvider(Provider):
     Args:
         binary: Override the worker binary name/path.  ``None`` falls back to
             :data:`coord.agent.DEFAULT_WORKER_BINARY` (``"claude"``).
+        model: Fallback model id/alias from the provider definition
+            (``ProviderDef.model``).  Used only when neither an explicit
+            ``resolved_model`` nor ``spec.model`` is set — see
+            :meth:`build_command`.
+        env: Extra environment variables from the provider definition
+            (``ProviderDef.env``, already ``${VAR}``-expanded by config
+            parsing).  Returned verbatim by :meth:`env`.
+        extra_args: Additional argv entries from the provider definition
+            (``ProviderDef.extra_args``).  Appended to the end of the argv
+            built by :meth:`build_command`.
     """
 
-    def __init__(self, binary: str | None = None) -> None:
+    def __init__(
+        self,
+        binary: str | None = None,
+        *,
+        model: str | None = None,
+        env: dict[str, str] | None = None,
+        extra_args: list[str] | None = None,
+    ) -> None:
         self._binary = binary
+        self._model = model
+        self._env = dict(env) if env else {}
+        self._extra_args = list(extra_args) if extra_args else []
 
     # ── Capabilities ──────────────────────────────────────────────────────────
 
@@ -421,9 +441,16 @@ class ClaudePtyProvider(Provider):
 
         binary = self._binary if self._binary is not None else DEFAULT_WORKER_BINARY
 
-        # Use resolved_model when provided; fall back to spec.model so a plain
-        # ClaudePtyProvider().build_command(spec) is self-consistent.
-        effective_model = resolved_model if resolved_model is not None else spec.model
+        # Precedence: explicit resolved_model > spec.model > provider-
+        # definition model (ProviderDef.model, threaded in via __init__) —
+        # a plain ClaudePtyProvider().build_command(spec) with no definition
+        # model stays self-consistent (self._model is None).
+        if resolved_model is not None:
+            effective_model = resolved_model
+        elif spec.model is not None:
+            effective_model = spec.model
+        else:
+            effective_model = self._model
 
         # Compute system_prompt / allowed_tools from spec.type when not
         # provided — same logic as ClaudeProvider so the safety hedge flags
@@ -480,6 +507,10 @@ class ClaudePtyProvider(Provider):
         ]
         if effective_model:
             argv.extend(["--model", effective_model])
+        # #1706: provider-definition extra_args go last, after every flag
+        # this method itself constructs.
+        if self._extra_args:
+            argv.extend(self._extra_args)
         return argv
 
     def oneshot_command(
@@ -546,12 +577,16 @@ class ClaudePtyProvider(Provider):
         return PTY_RESULT_MARKER
 
     def env(self) -> dict[str, str]:
-        """No extra environment variables required for interactive ``claude``.
+        """Extra environment variables from the provider definition (#1706).
 
-        The agent already forces ``TERM`` via the PTY setup; nothing else
-        needs to be injected for this provider in this PR.
+        The agent already forces ``TERM`` via the PTY setup (see
+        ``AgentServer._spawn_pty``); this returns a copy of
+        ``ProviderDef.env`` (already ``${VAR}``-expanded by config parsing)
+        threaded in via ``__init__``, merged on top by the spawn path. Empty
+        dict when the provider was constructed with no ``env`` (matches
+        pre-#1706 behaviour for no-config deployments).
         """
-        return {}
+        return dict(self._env)
 
     def parse_log(
         self, log_path: str | Path, tail_bytes: int = 65536
