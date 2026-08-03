@@ -322,6 +322,86 @@ class TestAssignDispatch:
         assert "briefing post failed" in result.output
 
 
+class TestAssignProviderAwareModel:
+    """#1706 review fix: `coord assign` with no `--model` flag must not
+    force `models.default` (a Claude alias) onto a repo routed through a
+    non-claude/claude-pty provider that pins its own `model` — the primary
+    scenario the #1706 issue was meant to unblock (opencode/GLM/Kimi
+    selection via coordinator.yml, not a per-dispatch --model flag)."""
+
+    @pytest.fixture
+    def opencode_config_file(self, tmp_path: Path) -> Path:
+        cfg = """\
+repos:
+  - name: api
+    github: acme/api
+    default_branch: main
+    provider: opencode
+machines:
+  - name: laptop
+    host: laptop.tailnet
+    repos: [api]
+    repo_paths:
+      api: /tmp/api
+providers:
+  default: claude
+  definitions:
+    opencode:
+      type: opencode
+      model: zhipuai/glm-4.6
+"""
+        p = tmp_path / "coordinator.yml"
+        p.write_text(cfg)
+        return p
+
+    def test_assign_leaves_model_unset_so_provider_pin_wins(
+        self, opencode_config_file: Path, coord_dir: Path,
+    ) -> None:
+        """A plain `coord assign` (no --model) against a repo pinned to the
+        `opencode` provider must send `proposal.model=None` — NOT
+        `models.default` ("sonnet") — so `OpenCodeProvider.build_command`
+        falls back to its own definition.model."""
+        with patch("coord.github_ops.get_issue", return_value={"title": "Fix bug"}), \
+             patch("coord.dispatch.dispatch", return_value={"id": "oc-1"}) as disp, \
+             patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.github_ops.check_branch_exists", return_value=False), \
+             patch("coord.claim.find_work_claim", return_value=None):
+            result = CliRunner().invoke(
+                main,
+                ["assign", "laptop", "api", "7", "--config", str(opencode_config_file)],
+            )
+        assert result.exit_code == 0, result.output
+        proposal = disp.call_args[0][0]
+        assert proposal.model is None, (
+            "expected proposal.model=None so dispatch()'s provider-aware "
+            f"fallback (and OpenCodeProvider's own definition.model) wins; "
+            f"got {proposal.model!r}"
+        )
+        assert "zhipuai/glm-4.6" in result.output
+        assert "providers.definitions" in result.output
+
+    def test_assign_explicit_model_flag_still_wins(
+        self, opencode_config_file: Path, coord_dir: Path,
+    ) -> None:
+        """An explicit `--model` still overrides the provider's pin."""
+        with patch("coord.github_ops.get_issue", return_value={"title": "Fix bug"}), \
+             patch("coord.dispatch.dispatch", return_value={"id": "oc-2"}) as disp, \
+             patch("coord.github_ops.post_issue_comment"), \
+             patch("coord.github_ops.check_branch_exists", return_value=False), \
+             patch("coord.claim.find_work_claim", return_value=None):
+            result = CliRunner().invoke(
+                main,
+                [
+                    "assign", "laptop", "api", "7",
+                    "--config", str(opencode_config_file),
+                    "--model", "kimi/moonshot-v1",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        proposal = disp.call_args[0][0]
+        assert proposal.model == "kimi/moonshot-v1"
+
+
 class TestAssignLabelGateResolution:
     """Tests for label→required_gates resolution in coord assign (cli.py:1200-1207)."""
 

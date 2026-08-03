@@ -20,6 +20,7 @@ from coord.dispatch import (
     enforce_epic_dispatch_guard,
     enforce_oracle_readiness,
     post_briefing,
+    resolve_dispatch_model,
 )
 from coord.models import Machine, Proposal, Repo
 
@@ -1556,6 +1557,163 @@ class TestProviderDispatch:
         assert result["_provider_name"] == "spec-provider"
         payload = mock_post.call_args.kwargs["json"]
         assert payload.get("provider") == "spec-provider"
+
+
+class TestProviderAwareModelResolution:
+    """#1706 review fix: `config.models.default` is a Claude alias and must
+    not silently shadow a non-Claude provider's own pinned `model`. Model
+    resolution in `dispatch()` is now provider-aware: keyed off the
+    effective provider's `ProviderDef.type`, not its registered name."""
+
+    @patch("coord.dispatch.httpx.post")
+    def test_opencode_definition_model_wins_when_no_explicit_override(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """A `coord assign`/`coord approve` with no --model and no label
+        routing must NOT force `models.default` ("sonnet") onto an
+        opencode dispatch when the provider definition pins its own model —
+        the exact scenario from the #1706 issue motivation (GLM/Kimi via
+        opencode, pinned once in coordinator.yml)."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "abc"}
+        mock_post.return_value = mock_resp
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api", provider="opencode")],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+            )],
+            providers=ProvidersConfig(
+                default="claude",
+                definitions={
+                    "claude": ProviderDef(type="claude"),
+                    "opencode": ProviderDef(
+                        type="opencode", model="zhipuai/glm-4.6",
+                    ),
+                },
+            ),
+        )
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=10, issue_title="Fix auth", rationale="ok",
+        )
+        dispatch(p, cfg)
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["model"] is None, (
+            "spec.model must be left unset so OpenCodeProvider.build_command "
+            "falls back to its own definition.model, instead of carrying "
+            f"models.default through as a nonsensical opencode --model; got {payload['model']!r}"
+        )
+
+    @patch("coord.dispatch.httpx.post")
+    def test_explicit_proposal_model_beats_opencode_definition_pin(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """An explicit --model override still wins over the provider's
+        pinned model — the provider pin is only a fallback default."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "abc"}
+        mock_post.return_value = mock_resp
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api", provider="opencode")],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+            )],
+            providers=ProvidersConfig(
+                default="claude",
+                definitions={
+                    "claude": ProviderDef(type="claude"),
+                    "opencode": ProviderDef(
+                        type="opencode", model="zhipuai/glm-4.6",
+                    ),
+                },
+            ),
+        )
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=10, issue_title="Fix auth", rationale="ok",
+            model="kimi/moonshot-v1",
+        )
+        dispatch(p, cfg)
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["model"] == "kimi/moonshot-v1"
+
+    def test_claude_pty_definition_model_pin_does_not_bypass_models_default(
+        self,
+    ) -> None:
+        """A `claude-pty` definition's pinned `model` must NOT suppress
+        `models.default` — that backend's --model has to flow through
+        `models.resolve()`'s alias->exact-id translation, which bypassing
+        models.default here would sidestep.
+
+        Exercised directly against `resolve_dispatch_model()` rather than
+        through `dispatch()` end-to-end: `dispatch()`'s TOS-compliance gate
+        (#437) unconditionally refuses `claude-pty` (`human_attended_only=
+        True`) regardless of `proposal.type`, before model resolution ever
+        runs — the `--interactive` human-attended launcher bypasses
+        `dispatch()` entirely instead. `resolve_dispatch_model()` is the
+        unit under test for the provider-aware precedence rule itself.
+        """
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api", provider="interactive")],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+            )],
+            providers=ProvidersConfig(
+                default="claude",
+                definitions={
+                    "claude": ProviderDef(type="claude"),
+                    "interactive": ProviderDef(type="claude-pty", model="opus"),
+                },
+            ),
+        )
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=10, issue_title="Fix auth", rationale="ok",
+        )
+        wire_model = resolve_dispatch_model(p, cfg, "interactive")
+        assert wire_model == "sonnet", (
+            "models.default must still win for a claude-pty definition "
+            f"regardless of its own model pin; got {wire_model!r}"
+        )
+
+    @patch("coord.dispatch.httpx.post")
+    def test_definition_named_unlike_its_type_is_keyed_by_type_not_name(
+        self, mock_post: MagicMock,
+    ) -> None:
+        """A `claude`-typed definition registered under a non-'claude' name
+        (e.g. 'fast-claude') must still defer to models.default — the
+        provider-aware skip is keyed off ProviderDef.type, not the
+        definition's registered name."""
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "abc"}
+        mock_post.return_value = mock_resp
+
+        cfg = Config(
+            repos=[Repo(name="api", github="acme/api", provider="fast-claude")],
+            machines=[Machine(
+                name="laptop", host="laptop.tailnet", repos=["api"],
+                repo_paths={"api": "/home/user/src/api"},
+            )],
+            providers=ProvidersConfig(
+                default="claude",
+                definitions={
+                    "claude": ProviderDef(type="claude"),
+                    "fast-claude": ProviderDef(type="claude", model="opus"),
+                },
+            ),
+        )
+        p = Proposal(
+            id=1, machine_name="laptop", repo_name="api",
+            issue_number=10, issue_title="Fix auth", rationale="ok",
+        )
+        dispatch(p, cfg)
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["model"] == "sonnet"
 
 
 class TestDispatchErrorSurfacing:

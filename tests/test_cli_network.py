@@ -361,3 +361,71 @@ class TestApproveNetworkErrors:
         assert "dispatch failed" in result.output
         assert "laptop" in result.output
         assert "offline" in result.output or "refused" in result.output
+
+
+OPENCODE_CONFIG_YAML = """\
+repos:
+  - name: api
+    github: acme/api
+    provider: opencode
+machines:
+  - name: laptop
+    host: laptop.tailnet
+    repos: [api]
+    repo_paths:
+      api: /tmp/api
+providers:
+  default: claude
+  definitions:
+    opencode:
+      type: opencode
+      model: zhipuai/glm-4.6
+"""
+
+
+class TestApproveProviderAwareModel:
+    """#1706 review fix: `coord approve` — like `coord assign` — must not
+    force `models.default` onto a proposal routed through a non-claude/
+    claude-pty provider that pins its own `model` when the saved proposal
+    has no model (the usual case: `coord plan` doesn't set one unless a
+    label matched)."""
+
+    @pytest.fixture
+    def opencode_config_file(self, tmp_path: Path) -> Path:
+        p = tmp_path / "coordinator.yml"
+        p.write_text(OPENCODE_CONFIG_YAML)
+        return p
+
+    def test_approve_leaves_model_unset_so_provider_pin_wins(
+        self, opencode_config_file: Path, coord_dir: Path,
+    ) -> None:
+        from coord.models import Proposal
+
+        state_mod.save_proposals(
+            [
+                Proposal(
+                    id=1, machine_name="laptop", repo_name="api",
+                    issue_number=10, issue_title="t", rationale="r",
+                    files_likely=["a.py"], briefing="b", type="work",
+                ),
+            ]
+        )
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"id": "oc-approve-1"}
+        mock_resp.raise_for_status.return_value = None
+        with patch("coord.dispatch.httpx.post", return_value=mock_resp) as mock_post, \
+             patch("coord.github_ops.get_issue", return_value={"labels": []}), \
+             patch("coord.github_ops.post_issue_comment"):
+            result = CliRunner().invoke(
+                main, ["approve", "1", "--config", str(opencode_config_file)]
+            )
+        assert result.exit_code == 0, result.output
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["model"] is None, (
+            "expected the wire payload's model to be None so "
+            f"OpenCodeProvider falls back to its own definition.model; "
+            f"got {payload['model']!r}"
+        )
+        assert "zhipuai/glm-4.6" in result.output
+        assert "providers.definitions" in result.output

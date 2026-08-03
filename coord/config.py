@@ -1094,9 +1094,25 @@ class ProviderDef:
         binary: Override the worker binary path/name.  ``None`` means the
             provider uses its own default (``"claude"`` for the claude
             backend).
-        model: Pin this provider to a specific model id or alias.  Takes
-            precedence over ``models.default`` for assignments routed to
-            this provider.
+        model: Pin this provider to a specific model id or alias.  Used as
+            the ``--model`` fallback in the provider's ``build_command``
+            when neither an explicit per-call ``resolved_model`` nor
+            ``AssignmentSpec.model`` is set. For definitions whose ``type``
+            is **not** ``"claude"``/``"claude-pty"`` (e.g. ``"opencode"``),
+            ``coord/dispatch.py``'s model resolution is provider-aware
+            (#1706 review fix): when a dispatch has no explicit ``--model``
+            and no label-routed model, and the effective provider's
+            definition pins a ``model`` here, ``models.default`` is *not*
+            applied and ``AssignmentSpec.model`` is left unset — so this
+            field wins for the common "pin opencode to a model once" case.
+            For definitions whose ``type`` IS ``claude``/``claude-pty``
+            (regardless of what name they're registered under — see the
+            ``fast-claude`` example in ``coordinator.example.yml``),
+            ``models.default`` still always wins over this field when no
+            explicit override is given, because ``AssignmentSpec.model``
+            for those backends must go through ``models.resolve()``'s
+            alias -> exact-id translation (``models.versions``), which a
+            raw ``model`` value here would bypass.
         attach_url: Reserved for future attach-mode providers.
         env: Extra environment variables for the worker subprocess.
             Values may contain ``${VAR}`` placeholders which are expanded

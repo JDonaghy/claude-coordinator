@@ -325,6 +325,11 @@ class OpenCodeProvider(Provider):
         ASSUMPTION: ``opencode run`` is the headless subcommand.  This
         must be verified against a real ``opencode`` binary.
 
+        Note: unlike :meth:`build_command`, this does **not** thread in
+        ``self._model`` / ``self._extra_args`` / ``self._env`` (#1706) —
+        oneshot calls don't take an ``AssignmentSpec`` and sit outside the
+        assignment spawn path #1706 wires provider-definition config into.
+
         Args:
             system_prompt: Accepted but **ignored** — OpenCode has no
                 ``--system-prompt`` equivalent.

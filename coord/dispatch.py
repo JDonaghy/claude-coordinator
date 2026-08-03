@@ -197,6 +197,148 @@ def _reraise_with_body(
     return httpx.HTTPStatusError(message, request=exc.request, response=exc.response)
 
 
+def resolve_dispatch_model_alias(
+    *,
+    explicit_model: str | None,
+    label_model: str | None,
+    config: Config,
+    effective_provider_name: str,
+) -> str | None:
+    """Resolve the dispatch model *alias* (before ``models.resolve()``).
+
+    Precedence: *explicit_model* → *label_model* → the effective provider's
+    own pinned ``ProviderDef.model`` (for non-claude/claude-pty backends
+    only) → ``models.default``. The board/DB stores this alias for
+    legibility; the caller is responsible for the final
+    ``config.models.resolve()`` translation to an exact model id (typically
+    deferred to :func:`dispatch`/:func:`resolve_dispatch_model`, which run
+    at actual-wire-payload time — see the module docstring of each CLI
+    entry point that calls this function for why: re-resolving here would
+    bake an exact id into ``Proposal.model``/board bookkeeping instead of
+    the human-legible alias).
+
+    #1430: label routing (*label_model*) is gated to ``type="work"`` by
+    every caller — plan workers are read-only/cheap and must not inherit a
+    ``tier:large`` -> opus routing meant for the eventual work dispatch.
+    Callers for which label routing doesn't apply (plan-only, review,
+    smoke, chat, etc.) pass ``label_model=None``.
+
+    #1706 review fix: ``config.models.default`` (e.g. ``"sonnet"``) is a
+    Claude model alias and means nothing to a non-Claude backend — passing
+    it through as ``--model sonnet`` to ``opencode run`` (or any future
+    non-Claude provider) is nonsensical. When neither *explicit_model* nor
+    *label_model* supplied a model, and the effective provider's backend
+    *type* is NOT ``claude``/``claude-pty``, check whether that provider's
+    own ``ProviderDef.model`` (coordinator.yml ``providers.
+    definitions.<name>.model``) is pinned; if so, return ``None`` instead
+    of ``models.default`` so the eventual wire payload omits ``--model``
+    entirely and the provider instance's own ``build_command`` falls back
+    to its ``self._model`` (threaded in from ``ProviderDef.model`` at
+    construction — see ``coord/providers/opencode.py`` and
+    ``coord/providers/claude.py``). This makes ``providers.definitions.
+    <name>.model`` actually reachable for a normal ``coord assign``/``coord
+    approve``/``coord milestone dispatch`` with no explicit ``--model``,
+    instead of being permanently shadowed by ``config.models.default``.
+    Explicit overrides (``--model``, label routing) still win over the
+    provider's pin, matching the precedence already implemented in each
+    provider's ``build_command``: resolved_model > spec.model >
+    definition.model.
+
+    This function is called from every site that used to inline the
+    ``explicit or label or config.models.default`` rule so the
+    provider-aware exception lives in exactly one place:
+    ``coord.dispatch.dispatch`` (the fallback, for callers that pass
+    ``proposal.model=None``), ``coord.commands.dispatch_workers.
+    _dispatch_headless`` (``coord assign``), the ``approve`` command's
+    per-proposal loop in ``coord.commands.dispatch``, and
+    ``coord.milestone_dispatch.dispatch_entry`` (``coord milestone
+    dispatch``).
+
+    Deliberately keyed off ``ProviderDef.type``, not the definition's name:
+    an operator can register a ``claude``/``claude-pty`` backend under an
+    arbitrary name (e.g. ``fast-claude`` in ``coordinator.example.yml``),
+    and that backend's ``--model`` must still flow through
+    ``config.models.resolve()``'s alias -> exact-id translation
+    (``models.versions``) — bypassing ``models.default`` for it here would
+    let an unresolved alias leak through instead (see ``ProviderDef.model``'s
+    docstring for the caveat).
+
+    Args:
+        explicit_model: The explicit per-dispatch override (``--model``
+            flag, or an already-resolved ``proposal.model`` from an earlier
+            stage), if any.
+        label_model: The issue-label-routed model (``type="work"`` only),
+            or ``None`` when label routing doesn't apply.
+        config: The coordinator config (``models`` and ``providers``).
+        effective_provider_name: The already-resolved effective provider
+            name (spec > repo > ``providers.default``), as returned by
+            :func:`coord.providers.resolve_provider_name` or
+            :func:`coord.providers.guard_unattended_dispatch`.
+
+    Returns:
+        The model alias (NOT yet passed through ``config.models.resolve()``),
+        or ``None`` to omit ``--model``.
+    """
+    provider_def = config.providers.definitions.get(effective_provider_name)
+    provider_pins_model = (
+        provider_def is not None
+        and provider_def.type not in ("claude", "claude-pty")
+        and provider_def.model is not None
+    )
+    if explicit_model or label_model:
+        return explicit_model or label_model
+    if provider_pins_model:
+        return None
+    return config.models.default
+
+
+def resolve_dispatch_model(
+    proposal: Proposal, config: Config, effective_provider_name: str,
+) -> str | None:
+    """Resolve the wire-payload ``model`` for a :func:`dispatch` call.
+
+    Thin wrapper around :func:`resolve_dispatch_model_alias`: computes
+    *label_model* from ``proposal.issue_labels`` (gated to ``type="work"``,
+    per #1430 — see that function's docstring), then translates the
+    resulting alias to an exact model id via ``config.models.resolve()``
+    (``models.versions``, when configured) for the actual wire payload.
+
+    #1430: most callers (``coord approve``, ``coord assign``, ``coord
+    milestone dispatch``) already pre-resolve ``proposal.model`` via
+    :func:`resolve_dispatch_model_alias` themselves before calling
+    :func:`dispatch` — for bookkeeping, so the dispatched record/board
+    reflect what actually ran. This function is the fallback for any
+    caller that doesn't: it repeats the same rule so :func:`dispatch` is
+    correct on its own, not just when every caller remembers to do the
+    work upfront.
+
+    Args:
+        proposal: The dispatch proposal (``proposal.model`` is the explicit
+            per-dispatch override, if any — already resolved by an earlier
+            stage for most callers).
+        config: The coordinator config (``models`` and ``providers``).
+        effective_provider_name: The already-resolved effective provider
+            name (spec > repo > ``providers.default``), as returned by
+            :func:`coord.providers.guard_unattended_dispatch`.
+
+    Returns:
+        The wire-ready model id/alias (already passed through
+        ``config.models.resolve()``), or ``None`` to omit ``--model``.
+    """
+    label_model = (
+        config.models.model_for_labels(proposal.issue_labels)
+        if proposal.type == "work"
+        else None
+    )
+    alias = resolve_dispatch_model_alias(
+        explicit_model=proposal.model,
+        label_model=label_model,
+        config=config,
+        effective_provider_name=effective_provider_name,
+    )
+    return config.models.resolve(alias)
+
+
 def dispatch(
     proposal: Proposal,
     config: Config,
@@ -295,29 +437,10 @@ def dispatch(
                 files_forbidden.append(sealed)
 
     # Resolve model: proposal override → models.labels (type="work" only) →
-    # config default. The board/DB stores the alias for legibility; only the
-    # wire payload is translated to an exact model id via models.versions
-    # (when configured).
-    #
-    # #1430: most callers (coord approve, coord assign, coord milestone
-    # dispatch) already pre-resolve `proposal.model` via
-    # `config.models.model_for_labels()` before calling dispatch() — for
-    # bookkeeping, so the dispatched record/board reflect what actually ran.
-    # This is the fallback for any caller that doesn't: it repeats the same
-    # rule so dispatch() is correct on its own, not just when every caller
-    # remembers to do the work upfront. Label routing is gated to
-    # `type="work"` — plan workers are read-only/cheap and must not inherit
-    # a `tier:large` -> opus routing meant for the eventual work dispatch
-    # (plan/review/smoke/etc. either bypass dispatch() entirely with their
-    # own payload, or deliberately stay on `default`; see gate_b.py,
-    # review.py, refine_chat.py, milestone_chat.py).
-    label_model = (
-        config.models.model_for_labels(proposal.issue_labels)
-        if proposal.type == "work"
-        else None
-    )
-    model = proposal.model or label_model or config.models.default
-    wire_model = config.models.resolve(model)
+    # provider-definition pin (non-claude/claude-pty only) → config default.
+    # See resolve_dispatch_model()'s docstring for the full precedence
+    # rationale (#1430, #1706).
+    wire_model = resolve_dispatch_model(proposal, config, effective_provider_name)
 
     # #255: pin the worker's branch base to the repo's configured default
     # branch.  Without this the agent fell back to a hardcoded "main", which
