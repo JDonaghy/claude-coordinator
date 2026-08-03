@@ -5257,6 +5257,11 @@ def build_app(store: CoordStore, config: Config, *, token: str | None = None) ->
                     machine=body.get("machine"),
                     after=body.get("after") or [],
                     position=body.get("position"),
+                    # #1757 deploy gate. Absent keys mean "no gate" so a
+                    # client predating this feature keeps working unchanged.
+                    hold_after=bool(body.get("hold_after")),
+                    hold_reason=body.get("hold_reason") or "",
+                    resume_when=body.get("resume_when") or "",
                 )
                 return JSONResponse({"entry_id": entry_id})
             if action == "dequeue":

@@ -128,6 +128,122 @@ class TestIssueCommentsSchema:
         assert "body_ref" in cols
 
 
+# ── drive_queue deploy-gate columns (#1757) ───────────────────────────────────
+
+# DQ-1 (#1753) shipped `drive_queue` WITHOUT the gate columns and merged on
+# 2026-08-03, so the "fold them into the CREATE TABLE" window closed. The
+# upgrade-in-place path below is therefore the one that runs on every existing
+# ~/.coord/coord.db, and it is the one that must be tested — a fresh-DB-only
+# test would pass while every real installation kept the old five-column-short
+# table and every `coord drive-queue` read blew up on `no such column`.
+
+_DQ1_ORIGINAL_TABLE = """
+    CREATE TABLE drive_queue (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo_name     TEXT    NOT NULL,
+        issue_number  INTEGER NOT NULL,
+        position      INTEGER NOT NULL,
+        machine       TEXT,
+        after_json    TEXT    NOT NULL DEFAULT '[]',
+        state         TEXT    NOT NULL DEFAULT 'waiting',
+        attempts      INTEGER NOT NULL DEFAULT 0,
+        deferrals     INTEGER NOT NULL DEFAULT 0,
+        last_reason   TEXT    NOT NULL DEFAULT '',
+        session_name  TEXT,
+        launched_at   REAL,
+        enqueued_at   REAL    NOT NULL,
+        UNIQUE(repo_name, issue_number)
+    )
+"""
+
+_GATE_COLUMNS = {
+    "hold_after",
+    "hold_reason",
+    "resume_when",
+    "hold_state",
+    "hold_probes",
+}
+
+
+def _drive_queue_columns(conn: sqlite3.Connection) -> set[str]:
+    return {r[1] for r in conn.execute("PRAGMA table_info(drive_queue)").fetchall()}
+
+
+class TestDriveQueueDeployGateColumns:
+    def test_fresh_database_has_them_from_the_create(
+        self, isolated_conn: sqlite3.Connection
+    ) -> None:
+        assert _GATE_COLUMNS <= _drive_queue_columns(isolated_conn)
+
+    def test_existing_dq1_database_gains_them_in_place(self) -> None:
+        """The real path: a coord.db created by DQ-1, upgraded by _ensure_schema.
+
+        Built with DQ-1's ORIGINAL `CREATE TABLE` (not the current one) so this
+        test keeps asserting the migration even after the CREATE grew the
+        columns — otherwise `CREATE TABLE IF NOT EXISTS` would quietly make the
+        migration untested.
+        """
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(_DQ1_ORIGINAL_TABLE)
+        conn.execute(
+            "INSERT INTO drive_queue "
+            "(repo_name, issue_number, position, after_json, enqueued_at) "
+            "VALUES ('api', 7, 0, '[]', 100.0)"
+        )
+        conn.commit()
+        assert not (_GATE_COLUMNS & _drive_queue_columns(conn))
+
+        _ensure_schema(conn)
+
+        assert _GATE_COLUMNS <= _drive_queue_columns(conn)
+        # The pre-existing row survives and reads as "no gate" — an upgraded
+        # database must not spontaneously hold anybody's queue.
+        row = conn.execute(
+            "SELECT hold_after, hold_reason, resume_when, hold_state, hold_probes "
+            "FROM drive_queue WHERE issue_number = 7"
+        ).fetchone()
+        assert row["hold_after"] == 0
+        assert row["hold_reason"] == ""
+        assert row["resume_when"] == ""
+        assert row["hold_state"] == ""
+        assert row["hold_probes"] == 0
+        conn.close()
+
+    def test_migration_is_idempotent(self) -> None:
+        """Re-running _ensure_schema on an already-migrated DB must not raise."""
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(_DQ1_ORIGINAL_TABLE)
+        conn.commit()
+        _ensure_schema(conn)
+        _ensure_schema(conn)
+        _ensure_schema(conn)
+        assert _GATE_COLUMNS <= _drive_queue_columns(conn)
+        conn.close()
+
+    def test_state_accessors_read_the_upgraded_columns(self) -> None:
+        """`_DRIVE_QUEUE_COLUMNS` names them, so a stale table would 500 here."""
+        from coord import state
+
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(_DQ1_ORIGINAL_TABLE)
+        conn.commit()
+        _ensure_schema(conn)
+        override_connection(conn)
+        try:
+            state._enqueue_drive_queue_local(
+                "api", 9, hold_after=True, hold_reason="restart coord-serve"
+            )
+            entry = state._get_drive_queue_entry_local("api", 9)
+        finally:
+            close()
+        assert entry["hold_after"] == 1
+        assert entry["hold_reason"] == "restart coord-serve"
+        assert entry["hold_state"] == "armed"
+
+
 # ── override_connection ────────────────────────────────────────────────────────
 
 class TestOverrideConnection:

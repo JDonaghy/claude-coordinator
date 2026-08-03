@@ -219,6 +219,10 @@
       "attempts": 0,
       "deferrals": 0,
       "enqueued_at": 1000001200.0,
+      "hold_after": 0,
+      "hold_probes": 0,
+      "hold_reason": "",
+      "hold_state": "",
       "id": 1,
       "issue_number": 748,
       "last_reason": "",
@@ -226,6 +230,7 @@
       "machine": null,
       "position": 0,
       "repo_name": "claude-coordinator",
+      "resume_when": "",
       "session_name": null,
       "state": "waiting"
     },
@@ -236,6 +241,10 @@
       "attempts": 1,
       "deferrals": 2,
       "enqueued_at": 1000001250.0,
+      "hold_after": 0,
+      "hold_probes": 0,
+      "hold_reason": "",
+      "hold_state": "",
       "id": 2,
       "issue_number": 750,
       "last_reason": "pre-req claude-coordinator#748 has not merged",
@@ -243,6 +252,7 @@
       "machine": "dellserver",
       "position": 1,
       "repo_name": "claude-coordinator",
+      "resume_when": "",
       "session_name": null,
       "state": "waiting"
     }
