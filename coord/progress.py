@@ -4,10 +4,18 @@ Two paths are supported:
 
 * **stream-json**: when the worker was launched with
   ``--output-format stream-json --verbose`` (the new default), each log line
-  is a structured event. We delegate to :mod:`coord.worker_events`.
+  is a structured event. We delegate to the assignment's resolved
+  :class:`~coord.providers.base.Provider` (``provider.parse_log()`` — #1710),
+  defaulting to :class:`~coord.providers.claude.ClaudeProvider` (which itself
+  delegates to :mod:`coord.worker_events`) when no provider is known — so
+  ``parse_progress`` produces byte-identical output to before #1710 for every
+  existing (claude) caller that doesn't pass ``provider``/``provider_name``.
 * **plain text** (legacy): we fall back to the old ``STATUS:``/``STUCK:``
   regex scan for backwards compatibility with logs from older agents and
-  for non-claude worker commands used in tests.
+  for non-claude worker commands used in tests. This path is
+  provider-agnostic by construction — any worker that emits ``STATUS:``/
+  ``STUCK:`` lines in plain text is handled the same way regardless of which
+  provider ran it.
 """
 
 from __future__ import annotations
@@ -15,6 +23,10 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from coord.providers.base import Provider
 
 
 STATUS_RE = re.compile(r"^STATUS:\s*(.+)$", re.MULTILINE)
@@ -51,20 +63,43 @@ class WorkerProgress:
         }
 
 
-def parse_progress(log_path: str | Path, tail_bytes: int = 32_768) -> WorkerProgress:
+def parse_progress(
+    log_path: str | Path,
+    tail_bytes: int = 32_768,
+    *,
+    provider_name: str | None = None,
+    provider: "Provider | None" = None,
+) -> WorkerProgress:
     """Parse progress from a worker log.
 
     Detects stream-json automatically and switches parsing strategies. Reads
     only the tail of the log to stay cheap on large files.
+
+    Args:
+        log_path: Path to the worker's log file.
+        tail_bytes: Only the last *tail_bytes* of the file is read.
+        provider_name: The assignment's resolved provider name (e.g.
+            ``Assignment.provider_name``). ``None`` (the default) resolves to
+            :class:`~coord.providers.claude.ClaudeProvider` — the pre-#1710
+            behaviour — so existing callers that don't pass this are
+            unaffected.
+        provider: An already-constructed :class:`~coord.providers.base.Provider`
+            to use directly, bypassing name resolution entirely. Takes
+            precedence over *provider_name*. Mainly for tests that want to
+            exercise a specific (e.g. fake, non-claude) provider without
+            wiring up a full :class:`~coord.config.Config`.
     """
-    from coord.worker_events import detect_anomalies, is_stream_json, parse_log
+    from coord.worker_events import detect_anomalies, is_stream_json
 
     p = Path(log_path)
     if not p.exists():
         return WorkerProgress()
 
     if is_stream_json(p):
-        summary = parse_log(p, tail_bytes=tail_bytes)
+        if provider is None:
+            from coord.providers import get_provider  # noqa: PLC0415
+            provider = get_provider(provider_name)
+        summary = provider.parse_log(p, tail_bytes=tail_bytes)
         progress = WorkerProgress()
         # Synthesise a single rolling "update" line so coord status keeps
         # showing recent activity for stream-json workers.

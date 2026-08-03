@@ -15,14 +15,21 @@ Usage data is collected from two sources:
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from coord.models import Assignment
 
 # Re-export COORD_DIR so callers don't need to import state directly.
 from coord.state import COORD_DIR
+
+if TYPE_CHECKING:
+    from coord.providers.base import Provider
+
+_log = logging.getLogger(__name__)
 
 LOGS_DIR = COORD_DIR / "logs"
 
@@ -128,22 +135,53 @@ class SessionUsage:
 # ── Log parsing ───────────────────────────────────────────────────────────────
 
 
-def parse_usage_from_log(log_path: Path) -> AssignmentUsage | None:
-    """Parse an :class:`AssignmentUsage` from a stream-json log file.
+def parse_usage_from_log(
+    log_path: Path,
+    *,
+    provider_name: str | None = None,
+    provider: "Provider | None" = None,
+) -> AssignmentUsage | None:
+    """Parse an :class:`AssignmentUsage` from a worker log file.
 
     Returns ``None`` if the file doesn't exist, isn't stream-json, or can't
     be parsed.  The returned object has placeholder values for fields that
     aren't available from the log alone (``assignment_id``, ``repo_name``,
     etc.) — callers must fill those in from the board.
+
+    #1710: cost/token parsing is routed through the assignment's resolved
+    :class:`~coord.providers.base.Provider` (``provider.parse_log()``)
+    instead of assuming :mod:`coord.worker_events`'s claude-shaped parser.
+    *provider_name* (typically ``Assignment.provider_name``) resolves via
+    :func:`coord.providers.get_provider`; ``None`` defaults to
+    :class:`~coord.providers.claude.ClaudeProvider`, matching pre-#1710
+    behaviour byte-for-byte for every caller that doesn't pass it. *provider*
+    is an escape hatch to pass an already-constructed provider directly
+    (tests; bypasses name resolution).
     """
-    from coord.worker_events import is_stream_json, parse_log
+    from coord.worker_events import is_stream_json
 
     if not log_path.exists():
         return None
+    if provider is None:
+        from coord.providers import get_provider  # noqa: PLC0415
+        provider = get_provider(provider_name)
     if not is_stream_json(log_path):
+        # #1710: a provider that claims it reports cost but whose log isn't
+        # stream-json shaped gets NO cost/token data here — that mismatch is
+        # worth a loud signal rather than a silent, indistinguishable-from-
+        # "no cost yet" None. A provider that legitimately never reports cost
+        # (e.g. claude-pty, subscription-billed) sets
+        # capabilities().cost_reporting=False and stays silent, as before.
+        if provider.capabilities().cost_reporting:
+            _log.warning(
+                "parse_usage_from_log: %s is not stream-json but provider "
+                "%r reports capabilities().cost_reporting=True — no cost/"
+                "token data will be captured for this assignment (#1710)",
+                log_path, provider_name or "claude",
+            )
         return None
     try:
-        summary = parse_log(log_path, tail_bytes=0)
+        summary = provider.parse_log(log_path, tail_bytes=0)
     except OSError:
         return None
     return AssignmentUsage(
@@ -196,7 +234,10 @@ def _assignment_to_usage(
     # Try local log first.
     if a.assignment_id:
         log_path = _logs_dir / f"{a.assignment_id}.log"
-        parsed = parse_usage_from_log(log_path)
+        # #1710: thread the assignment's resolved provider name through so
+        # the parse uses the right provider's parse_log() rather than always
+        # assuming claude.
+        parsed = parse_usage_from_log(log_path, provider_name=a.provider_name)
         if parsed is not None:
             usage.model = parsed.model or a.model
             usage.total_cost_usd = parsed.total_cost_usd

@@ -11,10 +11,20 @@ Public API
     Apply the precedence chain
     ``spec → repo → providers.default → "claude"``
     and return the winning provider name.
+
+``get_provider(provider_name, cfg=None) -> Provider``
+    #1710: the single coordinator-side helper that turns a bare
+    ``provider_name`` string (e.g. ``Assignment.provider_name``, persisted at
+    dispatch time — see ``coord/models.py``) into a ready-to-use
+    :class:`~.base.Provider` instance, so log consumers (``coord.progress``,
+    ``coord.usage``, ``coord.failure_class``, ...) can call
+    ``provider.parse_log()`` instead of importing ``coord.worker_events``
+    directly and assuming every worker log is claude-shaped.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 from coord.providers.base import Capabilities, Provider, WorkerSummary
@@ -23,7 +33,7 @@ from coord.providers.claude_pty import ClaudePtyProvider
 from coord.providers.opencode import OpenCodeProvider
 
 if TYPE_CHECKING:
-    from coord.config import ModelsConfig, ProviderDef, ProvidersConfig
+    from coord.config import Config, ModelsConfig, ProviderDef, ProvidersConfig
 
 __all__ = [
     "Capabilities",
@@ -34,10 +44,26 @@ __all__ = [
     "WorkerSummary",
     "build_provider",
     "describe_provider_choice",
+    "get_provider",
     "guard_unattended_dispatch",
     "resolve_default_provider",
     "resolve_provider_name",
 ]
+
+_log = logging.getLogger(__name__)
+
+# Built-in provider types constructible with no ``ProviderDef`` at all (no
+# model/env/extra_args threading — see #1706 comments on ``build_provider``).
+# Used by :func:`get_provider` as the fallback when no ``Config`` is passed
+# (many coordinator-side log consumers only ever had a bare provider_name
+# string in scope — see #1710) or when the name isn't in
+# ``cfg.providers.definitions`` (predates the definition, or a config-free
+# test/CLI context).
+_BUILTIN_PROVIDER_TYPES: dict[str, type[Provider]] = {
+    "claude": ClaudeProvider,
+    "claude-pty": ClaudePtyProvider,
+    "opencode": OpenCodeProvider,
+}
 
 
 def build_provider(
@@ -162,6 +188,82 @@ def describe_provider_choice(
     if repo_provider is not None:
         return f"{name} (repo default: Repo.provider)"
     return f"{name} (providers.default)"
+
+
+def get_provider(
+    provider_name: str | None,
+    cfg: "Config | None" = None,
+) -> Provider:
+    """Resolve a bare *provider_name* string to a :class:`Provider` instance.
+
+    #1710: this is the seam coordinator-side log consumers (``coord.progress``,
+    ``coord.usage``, ``coord.failure_class``, ...) use to turn the
+    already-*resolved* provider name persisted on an assignment
+    (``Assignment.provider_name`` — see ``coord/models.py``, set via
+    :func:`resolve_provider_name` at dispatch time) into a live
+    :class:`Provider` so they can call ``provider.parse_log()`` instead of
+    reaching into :mod:`coord.worker_events` directly and assuming every log
+    is claude-shaped.
+
+    Unlike :func:`build_provider`, *cfg* is optional: many call sites (e.g.
+    ``coord/notify.py``'s completion-capture helpers) only ever had a bare
+    ``provider_name`` string in scope, never a loaded
+    :class:`~coord.config.Config` — see the #1710 inventory. Log parsing
+    itself doesn't depend on ``ProviderDef.{model,env,extra_args}`` (none of
+    the concrete providers' ``parse_log()`` reads those instance attributes),
+    so a config-free construction is always correct for this purpose, even
+    though it can't honour a custom ``binary`` override.
+
+    Resolution order:
+
+    1. ``provider_name is None`` → ``"claude"`` (the documented implicit
+       default for assignments dispatched before #324, or via a path that
+       never set the field).
+    2. *cfg* given and *provider_name* found in ``cfg.providers.definitions``
+       → :func:`build_provider` (honours ``binary``/``model``/``env``/
+       ``extra_args`` from the definition).
+    3. *provider_name* is one of the built-in type names (``"claude"``,
+       ``"claude-pty"``, ``"opencode"``) → a bare, no-``ProviderDef``
+       instance of that type.
+    4. Anything else (a name that is neither configured nor a built-in type —
+       a typo, or a provider removed from config after dispatch) →
+       :class:`ClaudeProvider`, with a **logged warning**. #1710's whole point
+       is that a silent fallback here is the bug; the warning names the
+       assignment's actual provider so an operator can tell "misparsed
+       because we guessed wrong" apart from "genuinely claude."
+
+    Args:
+        provider_name: The *resolved* provider name, or ``None``.
+        cfg: The coordinator's :class:`~coord.config.Config`, when available.
+
+    Returns:
+        A ready-to-use :class:`Provider` instance. Never raises — an unknown
+        name degrades to :class:`ClaudeProvider` (loudly) rather than
+        blocking whatever best-effort log parsing called this.
+    """
+    name = provider_name or "claude"
+    if cfg is not None:
+        definition = cfg.providers.definitions.get(name)
+        if definition is not None:
+            try:
+                return build_provider(name, definition, cfg.models)
+            except ValueError:
+                # Unknown ProviderDef.type — fall through to the built-in /
+                # warning path below rather than raising out of a best-effort
+                # log-parsing caller.
+                pass
+    ctor = _BUILTIN_PROVIDER_TYPES.get(name)
+    if ctor is not None:
+        return ctor()
+    _log.warning(
+        "get_provider: unknown provider_name %r — no matching entry in "
+        "providers.definitions and not a built-in provider type. Falling "
+        "back to ClaudeProvider for log parsing; if this assignment's "
+        "worker is NOT claude, its log will misparse silently downstream "
+        "of this warning (#1710).",
+        name,
+    )
+    return ClaudeProvider()
 
 
 def resolve_default_provider(

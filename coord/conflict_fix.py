@@ -246,6 +246,12 @@ def _decode_worker_text(raw: str) -> str:
     JSON event) the agent writes by default — in the latter case the
     assistant text blocks are concatenated.  Mirrors the detection used by
     :func:`coord.progress.parse_completion_summary_from_agent`.
+
+    #1710 inventory: kept as a direct ``coord.worker_events`` import — this
+    decodes the generic Anthropic-Messages-API ``type: "assistant"`` /
+    ``message.content`` envelope (not claude business semantics), same
+    reasoning as the equivalent helpers in ``coord.review``/
+    ``coord.plan_parser``.
     """
     stream_json = False
     for line in raw.splitlines():
