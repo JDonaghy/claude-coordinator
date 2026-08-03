@@ -202,10 +202,13 @@ models:
 #   default: claude                 # name in `definitions` to use by default
 #   definitions:
 #     claude:                       # built-in; redefining is optional
-#       type: claude                # only "claude" is supported today
+#       type: claude                # "claude", "claude-pty", or "opencode"
 #       binary: claude              # path/name of the worker binary
-#       # model / extra_args / env are parsed but not yet wired into the
-#       # spawn path — they will be honoured by the next #322 child issue.
+#       # model / extra_args / env (#1706) are threaded straight into the
+#       # spawn path: model is the fallback --model value used only when
+#       # neither an explicit per-call resolved_model nor the assignment's
+#       # own spec.model is set; extra_args is appended to the built argv;
+#       # env is merged into the worker subprocess's environment.
 #       model: sonnet               # optional: pin this provider to a model
 #       extra_args: []              # optional: extra args appended to argv
 #       env: {}                     # optional: extra env vars (${VAR} expanded)

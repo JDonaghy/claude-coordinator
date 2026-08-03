@@ -97,6 +97,19 @@ class OpenCodeProvider(Provider):
             a new session.  Corresponds to ``ProviderDef.attach_url`` in
             ``coordinator.yml``.  ``None`` omits the flag (default headless
             ``opencode run`` starts its own session).
+        model: Fallback model id from the provider definition
+            (``ProviderDef.model``) — e.g. an opencode ``provider/model``
+            string such as ``"zhipuai/glm-4.6"``.  Used only when neither an
+            explicit ``resolved_model`` nor ``spec.model`` is set — see
+            :meth:`build_command`.
+        env: Extra environment variables from the provider definition
+            (``ProviderDef.env``, already ``${VAR}``-expanded by config
+            parsing) — this is how an operator points OpenCode's own
+            provider config (e.g. API keys) at a specific backend.  Returned
+            verbatim by :meth:`env`.
+        extra_args: Additional argv entries from the provider definition
+            (``ProviderDef.extra_args``).  Inserted after this method's own
+            flags and before the trailing positional briefing argument.
     """
 
     def __init__(
@@ -104,9 +117,15 @@ class OpenCodeProvider(Provider):
         binary: str | None = None,
         *,
         attach_url: str | None = None,
+        model: str | None = None,
+        env: dict[str, str] | None = None,
+        extra_args: list[str] | None = None,
     ) -> None:
         self._binary = binary
         self._attach_url = attach_url
+        self._model = model
+        self._env = dict(env) if env else {}
+        self._extra_args = list(extra_args) if extra_args else []
 
     # ── Capabilities ──────────────────────────────────────────────────────────
 
@@ -208,9 +227,11 @@ class OpenCodeProvider(Provider):
 
         Flag name assumptions (to be verified against real binary):
 
-        * ``--model`` — select model by name or alias (e.g.
-          ``claude-sonnet-4-5``).  Omitted when *resolved_model* and
-          ``spec.model`` are both ``None``.
+        * ``--model`` — select model by name or ``provider/model`` string
+          (e.g. ``"anthropic/claude-sonnet-4-5"``).  Precedence: explicit
+          *resolved_model* > ``spec.model`` > the provider definition's
+          ``model`` (threaded in via ``__init__``, #1706).  Omitted when
+          all three are ``None``.
         * ``--session SESSION_ID`` — resume a prior session by ID.  Omitted
           when ``spec.resume_session_id`` is ``None``.
 
@@ -227,7 +248,8 @@ class OpenCodeProvider(Provider):
             spec: The assignment spec being dispatched.
             resolved_model: The resolved model identifier to pass.  When
                 provided, takes precedence over ``spec.model``.  ``None``
-                falls back to ``spec.model``; if that is also ``None``, the
+                falls back to ``spec.model``, then to the provider
+                definition's ``model``; if all three are ``None``, the
                 ``--model`` flag is omitted (OpenCode picks its configured
                 default).
             system_prompt: Accepted but **ignored** — no OpenCode equivalent
@@ -239,8 +261,14 @@ class OpenCodeProvider(Provider):
         """
         binary = self._binary if self._binary is not None else DEFAULT_OPENCODE_BINARY
 
-        # resolved_model takes precedence; fall back to spec.model.
-        effective_model = resolved_model if resolved_model is not None else spec.model
+        # Precedence: explicit resolved_model > spec.model > provider-
+        # definition model (ProviderDef.model, threaded in via __init__).
+        if resolved_model is not None:
+            effective_model = resolved_model
+        elif spec.model is not None:
+            effective_model = spec.model
+        else:
+            effective_model = self._model
 
         # ASSUMPTION: subcommand is "run" for non-interactive / headless mode.
         argv: list[str] = [binary, "run"]
@@ -257,6 +285,12 @@ class OpenCodeProvider(Provider):
         # ASSUMPTION: --session flag resumes a prior session by ID.
         if spec.resume_session_id:
             argv.extend(["--session", spec.resume_session_id])
+
+        # #1706: provider-definition extra_args go after this method's own
+        # flags but BEFORE the trailing positional briefing — OpenCode's
+        # argv parsing assumes the briefing is the last argument.
+        if self._extra_args:
+            argv.extend(self._extra_args)
 
         # Briefing is the final positional argument — passed on argv, NOT stdin.
         # Multi-line briefings are safe here because subprocess.Popen passes
@@ -331,14 +365,18 @@ class OpenCodeProvider(Provider):
         return RESULT_MARKER
 
     def env(self) -> dict[str, str]:
-        """No extra environment variables required for ``opencode run``.
+        """Extra environment variables from the provider definition (#1706).
 
         OpenCode reads its own API key configuration from its credentials
         store (typically ``~/.config/opencode/`` or via ``OPENCODE_*``
-        environment variables).  The coordinator does not need to inject any
-        variables in this first pass.
+        environment variables) — ``ProviderDef.env`` (already
+        ``${VAR}``-expanded by config parsing) is exactly how an operator
+        points a named ``opencode`` provider definition at a specific set of
+        credentials without baking them into the machine's agent unit.
+        Returns a copy; empty dict when the provider was constructed with no
+        ``env`` (matches pre-#1706 behaviour for no-config deployments).
         """
-        return {}
+        return dict(self._env)
 
     def parse_log(
         self, log_path: str | Path, tail_bytes: int = 65536

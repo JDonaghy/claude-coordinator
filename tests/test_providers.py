@@ -224,6 +224,81 @@ def test_custom_binary() -> None:
     assert result[0] == "my-claude"
 
 
+# ── #1706: definition model / env / extra_args threading ──────────────────────
+
+
+def test_definition_model_used_when_no_resolved_or_spec_model() -> None:
+    """Provider-definition model is the lowest-precedence fallback."""
+    spec = _make_spec(type="work", model=None)
+    result = ClaudeProvider(model="glm-4.6").build_command(spec)
+    idx = result.index("--model")
+    assert result[idx + 1] == "glm-4.6"
+
+
+def test_spec_model_beats_definition_model() -> None:
+    """spec.model outranks the provider-definition model."""
+    spec = _make_spec(type="work", model="haiku")
+    result = ClaudeProvider(model="glm-4.6").build_command(spec)
+    idx = result.index("--model")
+    assert result[idx + 1] == "haiku"
+
+
+def test_resolved_model_beats_definition_model() -> None:
+    """An explicit resolved_model outranks both spec.model and the
+    provider-definition model — the full precedence chain."""
+    spec = _make_spec(type="work", model="haiku")
+    result = ClaudeProvider(model="glm-4.6").build_command(
+        spec, resolved_model="opus"
+    )
+    idx = result.index("--model")
+    assert result[idx + 1] == "opus"
+
+
+def test_no_model_anywhere_omits_flag() -> None:
+    """No --model flag when resolved_model, spec.model, and the definition
+    model are all None (no-config parity)."""
+    spec = _make_spec(type="work", model=None)
+    result = ClaudeProvider().build_command(spec)
+    assert "--model" not in result
+
+
+def test_definition_env_returned_by_env() -> None:
+    """env() returns a copy of the definition's env dict."""
+    provider = ClaudeProvider(env={"FOO": "bar", "BAZ": "qux"})
+    assert provider.env() == {"FOO": "bar", "BAZ": "qux"}
+
+
+def test_definition_env_is_copied_not_aliased() -> None:
+    """Mutating the dict returned by env() must not affect the provider's
+    internal state (or a caller's original dict passed to __init__)."""
+    source = {"FOO": "bar"}
+    provider = ClaudeProvider(env=source)
+    returned = provider.env()
+    returned["FOO"] = "mutated"
+    source["FOO"] = "also-mutated"
+    assert provider.env() == {"FOO": "bar"}
+
+
+def test_definition_extra_args_appended_after_own_flags() -> None:
+    """extra_args land at the end of the argv, after every flag build_command
+    itself constructs (including --resume when a resume_session_id is set)."""
+    spec = _make_spec(type="work", resume_session_id="sess1")
+    result = ClaudeProvider(extra_args=["--foo", "bar"]).build_command(spec)
+    assert result[-2:] == ["--foo", "bar"]
+    # And --resume (the last flag build_command constructs itself) still
+    # precedes the extra_args.
+    resume_idx = result.index("--resume")
+    assert resume_idx < len(result) - 2
+
+
+def test_no_extra_args_no_trailing_entries() -> None:
+    """No definition extra_args → argv is unchanged (no-config parity)."""
+    spec = _make_spec(type="work")
+    legacy = default_worker_command(spec)
+    result = ClaudeProvider().build_command(spec)
+    assert result == legacy
+
+
 # ── initial_input ─────────────────────────────────────────────────────────────
 
 
@@ -307,6 +382,38 @@ def test_build_provider_claude_with_binary() -> None:
     spec = _make_spec(type="work")
     argv = provider.build_command(spec)
     assert argv[0] == "my-claude"
+
+
+def test_build_provider_threads_model_env_extra_args() -> None:
+    """#1706: build_provider threads ProviderDef.model / env / extra_args
+    into the constructed ClaudeProvider instance."""
+    defn = ProviderDef(
+        type="claude",
+        model="glm-4.6",
+        env={"FOO": "bar"},
+        extra_args=["--verbose-extra"],
+    )
+    provider = build_provider("claude", defn, None)
+    assert isinstance(provider, ClaudeProvider)
+    assert provider.env() == {"FOO": "bar"}
+
+    spec = _make_spec(type="work", model=None)
+    argv = provider.build_command(spec)
+    idx = argv.index("--model")
+    assert argv[idx + 1] == "glm-4.6"
+    assert argv[-1] == "--verbose-extra"
+
+
+def test_build_provider_no_config_parity() -> None:
+    """A bare ProviderDef(type='claude') (no model/env/extra_args) produces
+    a provider byte-identical to a plain ClaudeProvider() — the regression
+    that matters most: deployments with no providers: block are unaffected."""
+    defn = ProviderDef(type="claude")
+    provider = build_provider("claude", defn, None)
+    assert provider.env() == {}
+    spec = _make_spec(type="work")
+    assert provider.build_command(spec) == ClaudeProvider().build_command(spec)
+    assert provider.build_command(spec) == default_worker_command(spec)
 
 
 def test_build_provider_unknown_type_raises() -> None:
@@ -558,6 +665,43 @@ def test_opencode_build_command_resolved_model_overrides_spec() -> None:
     assert argv[idx + 1] == "opus"
 
 
+def test_opencode_definition_model_used_when_no_resolved_or_spec_model() -> None:
+    """#1706: the provider-definition model is the lowest-precedence
+    fallback — this is opencode's `--model provider/model` selection, the
+    whole point of the opencode backend."""
+    spec = _make_spec(type="work", briefing="do stuff", model=None)
+    argv = OpenCodeProvider(model="zhipuai/glm-4.6").build_command(spec)
+    idx = argv.index("--model")
+    assert argv[idx + 1] == "zhipuai/glm-4.6"
+
+
+def test_opencode_spec_model_beats_definition_model() -> None:
+    """spec.model outranks the provider-definition model."""
+    spec = _make_spec(type="work", briefing="do stuff", model="sonnet")
+    argv = OpenCodeProvider(model="zhipuai/glm-4.6").build_command(spec)
+    idx = argv.index("--model")
+    assert argv[idx + 1] == "sonnet"
+
+
+def test_opencode_resolved_model_beats_definition_model() -> None:
+    """resolved_model outranks both spec.model and the definition model."""
+    spec = _make_spec(type="work", briefing="do stuff", model="sonnet")
+    argv = OpenCodeProvider(model="zhipuai/glm-4.6").build_command(
+        spec, resolved_model="opus"
+    )
+    idx = argv.index("--model")
+    assert argv[idx + 1] == "opus"
+
+
+def test_opencode_definition_extra_args_before_briefing() -> None:
+    """extra_args land after this method's own flags but before the
+    trailing positional briefing argument."""
+    spec = _make_spec(type="work", briefing="THE-BRIEFING")
+    argv = OpenCodeProvider(extra_args=["--foo", "bar"]).build_command(spec)
+    assert argv[-1] == "THE-BRIEFING"
+    assert argv[-3:-1] == ["--foo", "bar"]
+
+
 def test_opencode_build_command_with_resume_session_id() -> None:
     """--session SESSION_ID is included when spec.resume_session_id is set."""
     spec = _make_spec(type="work", briefing="continue", resume_session_id="oc-sess-xyz")
@@ -702,6 +846,14 @@ def test_opencode_result_marker_is_string() -> None:
 def test_opencode_env_empty() -> None:
     """env() returns an empty dict for OpenCodeProvider."""
     assert OpenCodeProvider().env() == {}
+
+
+def test_opencode_definition_env_returned_by_env() -> None:
+    """#1706: env() returns a copy of the definition's env dict — this is
+    how an operator points a named opencode provider at ANTHROPIC_BASE_URL /
+    ANTHROPIC_AUTH_TOKEN / an API key without baking it into the machine."""
+    provider = OpenCodeProvider(env={"ANTHROPIC_BASE_URL": "https://example.test"})
+    assert provider.env() == {"ANTHROPIC_BASE_URL": "https://example.test"}
 
 
 # ── parse_log ─────────────────────────────────────────────────────────────────
@@ -865,6 +1017,29 @@ def test_build_provider_opencode_with_attach_url() -> None:
     assert "--attach" in argv
     idx = argv.index("--attach")
     assert argv[idx + 1] == "http://localhost:4242"
+
+
+def test_build_provider_opencode_threads_model_env_extra_args() -> None:
+    """#1706: build_provider threads model / env / extra_args into
+    OpenCodeProvider the same way as the claude backends."""
+    defn = ProviderDef(
+        type="opencode",
+        model="zhipuai/glm-4.6",
+        env={"OPENCODE_API_KEY": "secret"},
+        extra_args=["--verbose"],
+    )
+    provider = build_provider("oc", defn, None)
+    assert isinstance(provider, OpenCodeProvider)
+    assert provider.env() == {"OPENCODE_API_KEY": "secret"}
+
+    spec = _make_spec(type="work", briefing="hi", model=None)
+    argv = provider.build_command(spec)
+    idx = argv.index("--model")
+    assert argv[idx + 1] == "zhipuai/glm-4.6"
+    assert "--verbose" in argv
+    # extra_args precede the trailing positional briefing.
+    assert argv[-1] == "hi"
+    assert argv[argv.index("--verbose") + 1] == "hi"
 
 
 def test_build_provider_unknown_type_still_raises() -> None:
