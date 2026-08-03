@@ -33,6 +33,17 @@ TWO RULES THIS FILE EXISTS TO ENFORCE, both learned the hard way:
 DELIBERATELY NOT HERE: auto-demotion.  A deferral increments a counter and
 records a reason; it never reorders the queue (see #1750's design note).  The
 head of the queue stays the head until an operator moves it.
+
+#1757 (DEPLOY GATES) adds a third rule: **merged is not live.**  An entry may
+be marked ``--hold-after``, and when the tick transitions THAT entry to
+``done`` the queue stops launching — even with free capacity and a fully
+eligible successor — until a human deploys and releases it.  That is not a
+niche case; it is the shape of every change here that crosses a deploy lane
+(``docs/OPERATING_GOTCHAS.md`` opens with the matrix).  A queue that models
+merge but not deploy would confidently sequence work into that trap overnight.
+The gate's decision half is :func:`plan_tick`'s hold resolution below; running
+the optional ``resume_when`` probe is the shell's job, and its result comes
+back in as data (:class:`ProbeResult`) so this file stays pure.
 """
 
 from __future__ import annotations
@@ -59,6 +70,28 @@ STATE_FAILED = "failed"
 TERMINAL_QUEUE_STATES: frozenset[str] = frozenset(
     {STATE_DONE, STATE_BLOCKED, STATE_FAILED}
 )
+
+# ── deploy-gate states (#1757) ───────────────────────────────────────────────
+#
+# `hold_state` is the gate's LIFECYCLE, orthogonal to the entry's queue
+# `state`.  A gate is `armed` from the moment the operator declares it
+# (`coord drive-queue add --hold-after`, written by `enqueue_drive_queue`),
+# `fired` the tick the entry reaches `done`, and `released` once a human ran
+# `coord drive-queue resume` or the entry's `resume_when` probe exited 0.
+# `''` means the entry carries no gate at all.
+#
+# The queue is held for exactly as long as SOME entry sits at `fired` — the
+# release, not the entry leaving the queue, is what unblocks the successors.
+HOLD_NONE = ""
+HOLD_ARMED = "armed"
+HOLD_FIRED = "fired"
+HOLD_RELEASED = "released"
+
+# Wall-clock ceiling for one `resume_when` run.  The shell enforces it; it
+# lives here so the CLI's help text, the alert prose and the test all quote one
+# number.  A wedged probe must never wedge the tick (a tick that stops running
+# is indistinguishable from a queue with nothing to do — #1616's lesson).
+RESUME_PROBE_TIMEOUT_SECONDS = 5.0
 
 # Launch attempts a single entry gets before it is blocked and escalated.  An
 # attempt is only consumed when a launched drive DIED without landing the work
@@ -187,10 +220,28 @@ class QueueEntry:
     last_reason: str = ""
     session_name: str = ""
     launched_at: float | None = None
+    # #1757 deploy gate.  `hold_after`/`hold_reason`/`resume_when` are
+    # operator-declared (written by `enqueue`); `hold_state`/`hold_probes` are
+    # the tick's run state.
+    hold_after: bool = False
+    hold_reason: str = ""
+    resume_when: str = ""
+    hold_state: str = HOLD_NONE
+    hold_probes: int = 0
 
     @property
     def key(self) -> str:
         return entry_key(self.repo, self.issue)
+
+    @property
+    def gate_reason(self) -> str:
+        """What to tell the operator when this entry's gate fires.
+
+        Never empty: an operator who used ``--hold-after`` without a reason
+        still gets a sentence naming the entry, because an alert that says
+        only "HELD" is one the operator has to go and reconstruct.
+        """
+        return self.hold_reason or f"deploy gate declared on {self.key}"
 
     @classmethod
     def from_row(cls, row: Mapping[str, Any]) -> "QueueEntry":
@@ -222,6 +273,15 @@ class QueueEntry:
             last_reason=str(row.get("last_reason") or ""),
             session_name=str(row.get("session_name") or ""),
             launched_at=None if launched_at is None else float(launched_at),
+            # SQLite hands `hold_after` back as 0/1; a JSON client may send a
+            # real bool.  `bool(...)` accepts both and, for a row written
+            # before #1757's migration ran, an absent key reads as False —
+            # i.e. no gate, which is the pre-#1757 behaviour exactly.
+            hold_after=bool(row.get("hold_after") or 0),
+            hold_reason=str(row.get("hold_reason") or ""),
+            resume_when=str(row.get("resume_when") or ""),
+            hold_state=str(row.get("hold_state") or HOLD_NONE),
+            hold_probes=int(row.get("hold_probes") or 0),
         )
 
 
@@ -387,11 +447,62 @@ class Deferral:
 
 
 @dataclass(frozen=True)
+class ProbeResult:
+    """The outcome of ONE ``resume_when`` run, handed back in by the shell.
+
+    Exit 0 (``ok=True``) releases the gate; anything else — non-zero, a
+    timeout, or a command that could not be spawned at all — keeps it held.
+    Fail-CLOSED is the only safe default here: a gate that releases because
+    its probe blew up is a gate that did not exist.
+    """
+
+    key: str
+    ok: bool
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class Hold:
+    """One entry's deploy gate, as resolved by this tick (#1757).
+
+    ``outcome``:
+
+    * ``fired``    — the entry reached ``done`` on THIS tick and the gate has
+      just closed the queue.  ``updates`` arms the run state.
+    * ``held``     — the gate was already ``fired`` and is still closed
+      (either no probe is declared, or the probe ran and failed).
+    * ``released`` — the probe exited 0; the walk continues in this same tick.
+
+    ``blocking`` is the single thing the tick acts on, so a future outcome
+    can be added without every caller re-deriving the rule.
+    """
+
+    key: str
+    outcome: str
+    reason: str
+    resume_when: str = ""
+    probes: int = 0
+    probe_detail: str = ""
+    updates: Mapping[str, Any] = field(default_factory=dict)
+
+    @property
+    def blocking(self) -> bool:
+        return self.outcome in ("fired", "held")
+
+
+@dataclass(frozen=True)
 class QueueAlert:
-    """The one queue-level record a tick may raise (see QUEUE_ALERT_REPO)."""
+    """The one queue-level record a tick may raise (see QUEUE_ALERT_REPO).
+
+    ``command`` is the proposed fix written into the escalation record. It is
+    carried here rather than derived in the shell so the alert's prose and its
+    one-key remedy are decided together — a "HELD" alert whose command says
+    ``coord drive-queue list`` teaches the operator to ignore the field.
+    """
 
     reason: str
     details: tuple[str, ...] = ()
+    command: str = "coord drive-queue list"
 
 
 @dataclass(frozen=True)
@@ -402,6 +513,7 @@ class TickPlan:
     launch: QueueEntry | None = None
     blocked: tuple[Blocked, ...] = ()
     deferrals: tuple[Deferral, ...] = ()
+    holds: tuple[Hold, ...] = ()
     alert: QueueAlert | None = None
     occupied: int = 0
     capacity: int = 0
@@ -410,6 +522,14 @@ class TickPlan:
     def free_slots(self) -> int:
         return max(0, self.capacity - self.occupied)
 
+    @property
+    def held(self) -> Hold | None:
+        """The gate holding the queue shut, if any (lowest position wins)."""
+        for item in self.holds:
+            if item.blocking:
+                return item
+        return None
+
     def writes(self) -> list[tuple[str, Mapping[str, Any]]]:
         """``(key, updates)`` for every row this plan mutates, in apply order.
 
@@ -417,9 +537,13 @@ class TickPlan:
         ``coord drive --tmux`` has confirmed a live session, so a launch that
         dies immediately is recorded as a failed attempt rather than as a
         running entry (#1606 makes that exit code trustworthy).
+
+        Holds come straight after reconciles: the reconcile that moved an
+        entry to ``done`` and the hold that fires off it touch the same row,
+        and the gate's run state must land after the state that triggered it.
         """
         out: list[tuple[str, Mapping[str, Any]]] = []
-        for item in (*self.reconciles, *self.blocked, *self.deferrals):
+        for item in (*self.reconciles, *self.holds, *self.blocked, *self.deferrals):
             if item.updates:
                 out.append((item.key, dict(item.updates)))
         return out
@@ -655,6 +779,157 @@ def _reconcile_running(
     )
 
 
+# ── deploy gates (#1757) ─────────────────────────────────────────────────────
+
+
+def pending_probe_targets(entries: Sequence[QueueEntry]) -> list[QueueEntry]:
+    """Entries whose ``resume_when`` the shell should run BEFORE this tick.
+
+    Only an ALREADY-``fired`` gate is probed: a gate that fires during this
+    tick's own reconcile holds unconditionally for one interval, which is the
+    issue's rule ("a ``fired`` hold makes each SUBSEQUENT tick run the
+    command") and also the honest one — the deploy cannot have happened in the
+    microseconds since the merge was observed.
+
+    Pure and position-ordered, so the shell has no decision left to make: it
+    runs exactly this list, in this order, and hands the results back to
+    :func:`plan_tick`.
+    """
+    return [
+        e
+        for e in sorted(entries, key=lambda e: (e.position, e.key))
+        if e.hold_state == HOLD_FIRED and e.resume_when
+    ]
+
+
+def fired_holds(entries: Sequence[QueueEntry]) -> list[QueueEntry]:
+    """Entries whose gate has fired and is still holding the queue shut.
+
+    What ``coord drive-queue resume`` releases and what ``status`` reports.
+    Position-ordered so "the hold" is always the same entry in both.
+    """
+    return [
+        e
+        for e in sorted(entries, key=lambda e: (e.position, e.key))
+        if e.hold_state == HOLD_FIRED
+    ]
+
+
+def _resolve_holds(
+    ordered: Sequence[QueueEntry],
+    reconciled_states: Mapping[str, str],
+    probes: Mapping[str, ProbeResult],
+) -> list[Hold]:
+    """Fire / probe / release every gate, in position order.
+
+    *reconciled_states* is each entry's queue state AFTER step 1 of the tick,
+    which is what makes "fires on ``done`` only" checkable here: a
+    ``--hold-after`` entry that reconciled to ``blocked`` never reaches this
+    branch, so it produces the existing escalation and NOT a second alert (the
+    issue's explicit rule — two alerts for one condition is how an alert
+    channel gets muted).
+    """
+    holds: list[Hold] = []
+    for entry in ordered:
+        if not entry.hold_after:
+            continue
+
+        # ARMED → FIRED, the tick the entry lands.  Nothing else fires a gate:
+        # `blocked`/`failed` already stop the queue through the escalation
+        # path, and `waiting`/`running` have not finished anything yet.
+        if (
+            entry.hold_state == HOLD_ARMED
+            and reconciled_states.get(entry.key) == STATE_DONE
+        ):
+            holds.append(
+                Hold(
+                    key=entry.key,
+                    outcome="fired",
+                    reason=entry.gate_reason,
+                    resume_when=entry.resume_when,
+                    probes=0,
+                    updates={"hold_state": HOLD_FIRED, "hold_probes": 0},
+                )
+            )
+            continue
+
+        if entry.hold_state != HOLD_FIRED:
+            # `''` (no gate yet armed), `armed` on an entry that has not
+            # landed, or `released` — none of which hold anything.
+            continue
+
+        probe = probes.get(entry.key)
+        if probe is None:
+            # No probe declared, or the shell did not run one.  Manual resume
+            # only; the count does not move, so a hold that nobody probes
+            # never grows a fake attempt number.
+            holds.append(
+                Hold(
+                    key=entry.key,
+                    outcome="held",
+                    reason=entry.gate_reason,
+                    resume_when=entry.resume_when,
+                    probes=entry.hold_probes,
+                )
+            )
+            continue
+
+        if probe.ok:
+            holds.append(
+                Hold(
+                    key=entry.key,
+                    outcome="released",
+                    reason=entry.gate_reason,
+                    resume_when=entry.resume_when,
+                    probes=entry.hold_probes,
+                    probe_detail=probe.detail,
+                    updates={"hold_state": HOLD_RELEASED, "hold_probes": 0},
+                )
+            )
+            continue
+
+        attempts = entry.hold_probes + 1
+        holds.append(
+            Hold(
+                key=entry.key,
+                outcome="held",
+                reason=entry.gate_reason,
+                resume_when=entry.resume_when,
+                probes=attempts,
+                probe_detail=probe.detail,
+                updates={"hold_probes": attempts},
+            )
+        )
+    return holds
+
+
+def _hold_alert(hold: Hold) -> QueueAlert:
+    """The one queue-level record a closed gate raises.
+
+    Carries the operator's own ``hold_reason`` verbatim in ``reason`` — that
+    string is the entire point of the feature (it is the runbook line for the
+    deploy the queue is waiting on), so it must survive into the alert without
+    being summarised.
+    """
+    details = [f"held after {hold.key} — nothing will launch until this is released"]
+    if hold.resume_when:
+        outcome = (
+            f"attempt {hold.probes} failed"
+            if hold.probes
+            else "not probed yet (fires on the next tick)"
+        )
+        if hold.probe_detail:
+            outcome += f": {hold.probe_detail}"
+        details.append(f"resume-when: {hold.resume_when} ({outcome})")
+    else:
+        details.append("no --resume-when probe: release manually")
+    return QueueAlert(
+        reason=f"QUEUE HELD — {hold.reason}",
+        details=tuple(details),
+        command="coord drive-queue resume",
+    )
+
+
 # ── the tick ─────────────────────────────────────────────────────────────────
 
 
@@ -664,6 +939,7 @@ def plan_tick(
     capacity: int,
     *,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    probes: Mapping[str, ProbeResult] | None = None,
 ) -> TickPlan:
     """Decide one tick.  Pure; the caller executes the returned plan.
 
@@ -671,23 +947,36 @@ def plan_tick(
     slots — how many slots are already occupied is a decision (rule 1 above),
     and decisions live in here, not in the shell.
 
-    The algorithm, from #1754:
+    *probes* maps an entry key to the :class:`ProbeResult` the shell got from
+    running that entry's ``resume_when`` (see :func:`pending_probe_targets`);
+    an absent key simply means no probe ran.
+
+    The algorithm, from #1754, plus #1757's step 2:
 
     1. Reconcile every ``running`` entry (:func:`_reconcile_running`).
-    2. ``free = capacity - occupied``; ``<= 0`` returns with no launch and no
+    2. Resolve deploy gates (:func:`_resolve_holds`).  ANY gate left closed
+       returns immediately with no launch and a HELD alert — before the
+       capacity check, and regardless of how eligible the rest of the queue
+       is.  That "even with free capacity and an eligible successor" clause is
+       the entire feature: the successor is exactly the thing that must not
+       run until the deploy lands.
+    3. ``free = capacity - occupied``; ``<= 0`` returns with no launch and no
        alert — being at capacity is the queue working, not a problem to
        report.
-    3. Walk ``waiting`` by ``position``, FIRST ELIGIBLE WINS: unsatisfiable
+    4. Walk ``waiting`` by ``position``, FIRST ELIGIBLE WINS: unsatisfiable
        blocks and escalates, unsatisfied defers (position unchanged), the
        first eligible entry is the launch.  Everything after the launch is
        walked in REPORT-ONLY mode (``Deferral.counted=False``, no updates) so
        ``--dry-run`` can explain the rest of the queue.
-    4. No launch with at least one waiting entry ⇒ exactly ONE queue-level
+    5. No launch with at least one waiting entry ⇒ exactly ONE queue-level
        alert.
 
     An entry reconciled from ``running`` back to ``waiting`` in step 1 IS
-    walked in step 3 — its attempt was already consumed, so a drive that died
-    early relaunches on the same tick instead of idling a whole interval.
+    walked in step 4 — its attempt was already consumed, so a drive that died
+    early relaunches on the same tick instead of idling a whole interval.  A
+    gate RELEASED in step 2 likewise falls straight through into step 4, so a
+    probe that starts passing launches in the same tick rather than costing
+    the queue a whole interval.
     """
     ordered = sorted(entries, key=lambda e: (e.position, e.key))
     states: dict[str, str] = {e.key: e.state for e in ordered}
@@ -712,11 +1001,31 @@ def plan_tick(
             blocked.append(block)
             states[entry.key] = STATE_BLOCKED
 
+    # #1757 step 2: deploy gates.  Resolved from the POST-reconcile states, so
+    # a `--hold-after` entry that reconciled to `blocked` cannot also fire a
+    # gate, and `released` falls through to the walk below in this same tick.
+    holds = _resolve_holds(ordered, states, probes or {})
+
     plan_base = {
         "reconciles": tuple(reconciles),
+        "holds": tuple(holds),
         "occupied": occupied,
         "capacity": capacity,
     }
+
+    gate = next((h for h in holds if h.blocking), None)
+    if gate is not None:
+        # Launch NOTHING.  Not "launch if there is spare capacity", not
+        # "launch anything whose pre-reqs don't mention the held entry" — the
+        # deploy this gate is waiting on is invisible to the dependency graph,
+        # which is exactly why an explicit operator-declared gate exists.
+        return TickPlan(
+            **plan_base,
+            blocked=tuple(blocked),
+            deferrals=(),
+            alert=_hold_alert(gate),
+            launch=None,
+        )
 
     if capacity - occupied <= 0:
         return TickPlan(
@@ -816,6 +1125,19 @@ def render_plan(plan: TickPlan, *, dry_run: bool = False) -> list[str]:
     ]
     for item in plan.reconciles:
         lines.append(f"  reconcile {item.key}: {item.outcome} — {item.reason}")
+    # #1757: the gate line goes directly under its reconcile, because "1753
+    # done" immediately followed by "and therefore nothing launches" is the
+    # sentence an operator reading a timer log needs to read as one thought.
+    for item in plan.holds:
+        probe = ""
+        if item.resume_when:
+            probe = f" [resume-when: {item.resume_when}"
+            if item.probes:
+                probe += f", {item.probes} failed attempt(s)"
+            if item.probe_detail:
+                probe += f" — {item.probe_detail}"
+            probe += "]"
+        lines.append(f"  hold {item.key}: {item.outcome} — {item.reason}{probe}")
     for item in plan.blocked:
         lines.append(f"  {prefix}block {item.key}: {item.reason}")
     # Counted deferrals come BEFORE the launch line and report-only ones after,
@@ -829,6 +1151,11 @@ def render_plan(plan: TickPlan, *, dry_run: bool = False) -> list[str]:
         target = plan.launch
         pinned = f" on {target.machine}" if target.machine else ""
         lines.append(f"  {prefix}launch {target.key}{pinned}")
+    elif plan.held is not None:
+        lines.append(
+            f"  no launch — HELD by the deploy gate on {plan.held.key} "
+            f"(release with `coord drive-queue resume`)"
+        )
     else:
         lines.append("  no launch")
     for item in plan.deferrals:

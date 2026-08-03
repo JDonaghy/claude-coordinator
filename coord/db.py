@@ -317,6 +317,13 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         -- list on the wire via coord/dao.py's `_JSON_COLUMNS`.  This table
         -- only STORES `after_json` — interpreting it (pre-req satisfaction) is
         -- the tick processor's job, not the schema's.
+        --
+        -- #1757 (deploy gates) added the five `hold_*`/`resume_when` columns
+        -- below.  They are declared here so a FRESH database gets them from
+        -- the CREATE, and repeated in `_migrate_add_columns` so an EXISTING
+        -- ~/.coord/coord.db (DQ-1 shipped before this) gains them in place —
+        -- SQLite has no "ADD COLUMN IF NOT EXISTS", hence both.  See
+        -- coord/drive_queue.py for the lifecycle those columns encode.
         CREATE TABLE IF NOT EXISTS drive_queue (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
             repo_name     TEXT    NOT NULL,
@@ -331,6 +338,11 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             session_name  TEXT,
             launched_at   REAL,
             enqueued_at   REAL    NOT NULL,
+            hold_after    INTEGER NOT NULL DEFAULT 0,
+            hold_reason   TEXT    NOT NULL DEFAULT '',
+            resume_when   TEXT    NOT NULL DEFAULT '',
+            hold_state    TEXT    NOT NULL DEFAULT '',
+            hold_probes   INTEGER NOT NULL DEFAULT 0,
             UNIQUE(repo_name, issue_number)
         );
 
@@ -575,6 +587,28 @@ def _migrate_add_columns(conn: sqlite3.Connection) -> None:
         # this column and for any verdict recorded without a resolvable
         # toolchain — a historical/unknown value, never treated as a mismatch.
         "ALTER TABLE assignments ADD COLUMN test_toolchain TEXT",
+        # #1757 (deploy gates): mark a queue entry so that when it completes,
+        # the tick STOPS launching and waits for a human deploy step —
+        # `merged != live` is this repo's most-repeated operational lesson and
+        # a queue that models merge but not deploy sequences work straight into
+        # it, unattended.  DQ-1 shipped before this, so an existing
+        # ~/.coord/coord.db is upgraded in place here (the same columns are in
+        # `_ensure_schema`'s CREATE for fresh databases; the duplicate-column
+        # OperationalError is swallowed below).
+        #
+        #   hold_after   0/1 — this entry ends with a deploy gate
+        #   hold_reason  shown to the operator when the gate fires
+        #   resume_when  optional probe command; '' = manual resume only
+        #   hold_state   ''|armed|fired|released (coord/drive_queue.py)
+        #   hold_probes  consecutive failed `resume_when` runs since the gate
+        #                fired — a TYPED count, so the alert's rising attempt
+        #                number never has to be parsed back out of prose
+        #                (#1523 §2: typed state, never CLI prose).
+        "ALTER TABLE drive_queue ADD COLUMN hold_after INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE drive_queue ADD COLUMN hold_reason TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE drive_queue ADD COLUMN resume_when TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE drive_queue ADD COLUMN hold_state TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE drive_queue ADD COLUMN hold_probes INTEGER NOT NULL DEFAULT 0",
     ]
     for sql in migrations:
         try:

@@ -171,7 +171,7 @@ def queued(issue: int) -> dict | None:
 def test_drive_queue_is_registered_with_every_verb():
     assert "drive-queue" in main.commands
     assert set(main.commands["drive-queue"].commands) == {
-        "add", "list", "remove", "move", "status", "tick",
+        "add", "list", "remove", "move", "status", "tick", "resume",
     }
 
 
@@ -534,3 +534,343 @@ def test_status_on_an_empty_queue_says_so(cli):
     assert result.exit_code == 0
     assert "empty" in result.output
     assert "alert: (none)" in result.output
+
+
+# ── deploy gates (#1757) ─────────────────────────────────────────────────────
+#
+# The acceptance bar for `--hold-after`.  `merged != live`: a queue that
+# launches the next entry the moment the previous one merges fires work that
+# depends on a PyPI release / a `coord-serve` restart / a rebuilt binary well
+# before any of those exist.  Every test below drives the REAL CLI; the only
+# things stubbed remain the two process boundaries the module docstring names,
+# plus (here) the `resume_when` probe, which is itself a subprocess.
+
+
+@pytest.fixture
+def probes(monkeypatch):
+    """Fake `resume_when` outcomes without spawning a shell.
+
+    Keyed by entry key so a test can hold one gate and pass another. Records
+    every invocation so "the tick ran the probe" is assertable, not assumed.
+    """
+
+    calls: list[str] = []
+    outcomes: dict[str, bool] = {}
+
+    def fake_probe(entry):
+        from coord.drive_queue import ProbeResult
+
+        calls.append(entry.resume_when)
+        ok = outcomes.get(entry.key, False)
+        return ProbeResult(entry.key, ok, "exit 0" if ok else "exit 7: not deployed yet")
+
+    monkeypatch.setattr("coord.commands.drive_queue._run_resume_probe", fake_probe)
+    return type("P", (), {"calls": calls, "outcomes": outcomes})()
+
+
+def _land(seed, issue: int) -> None:
+    """Make the board say `issue` merged, the way a finished drive would."""
+    seed(
+        issues={issue: "closed"},
+        assignments=[{"issue_number": issue, "status": "merged"}],
+    )
+
+
+# ── add: flags and validation ────────────────────────────────────────────────
+
+
+def test_add_hold_after_stores_the_flag_and_reason_and_list_renders_both(cli):
+    reason = "release + upgrade ~/.coord-venv on dellserver + restart coord-serve"
+    result = cli("add", REPO, "1753", "--hold-after", "--hold-reason", reason)
+    assert result.exit_code == 0, result.output
+
+    entry = queued(1753)
+    assert entry["hold_after"] == 1
+    assert entry["hold_reason"] == reason
+    # Armed at enqueue — the gate exists before the entry ever runs.
+    assert entry["hold_state"] == "armed"
+
+    listed = cli("list")
+    assert listed.exit_code == 0, listed.output
+    assert "hold=armed" in listed.output
+    assert reason in listed.output
+
+
+def test_add_stores_the_resume_when_probe(cli):
+    probe = "curl -sf http://dellserver:7435/drive-queue"
+    assert cli("add", REPO, "1753", "--hold-after", "--resume-when", probe).exit_code == 0
+    assert queued(1753)["resume_when"] == probe
+    assert probe in cli("list").output
+
+
+def test_resume_when_without_hold_after_is_a_usage_error_not_a_silent_noop(cli):
+    result = cli("add", REPO, "1753", "--resume-when", "true")
+    assert result.exit_code != 0
+    assert "--resume-when" in result.output
+    assert "--hold-after" in result.output
+    assert state._list_drive_queue_local() == []
+
+
+def test_hold_reason_without_hold_after_is_also_refused(cli):
+    result = cli("add", REPO, "1753", "--hold-reason", "deploy first")
+    assert result.exit_code != 0
+    assert state._list_drive_queue_local() == []
+
+
+def test_re_adding_without_hold_after_withdraws_the_gate(cli):
+    cli("add", REPO, "1753", "--hold-after", "--hold-reason", "deploy")
+    assert cli("add", REPO, "1753").exit_code == 0
+    entry = queued(1753)
+    assert entry["hold_after"] == 0
+    assert entry["hold_state"] == ""
+
+
+# ── tick: the gate fires and blocks an eligible successor ────────────────────
+
+
+def test_a_fired_gate_launches_nothing_even_with_an_eligible_successor(
+    cli, seed, launches
+):
+    """THE test. Free capacity, a fully eligible #1754 — and still no launch."""
+    cli("add", REPO, "1753", "--hold-after", "--hold-reason", "restart coord-serve")
+    cli("add", REPO, "1754")
+    state._update_drive_queue_entry_local(REPO, 1753, state="running")
+    seed(
+        issues={1753: "closed", 1754: "open"},
+        assignments=[{"issue_number": 1753, "status": "merged"}],
+    )
+
+    result = cli("tick", "--max-parallel", "1")
+    assert result.exit_code == 0, result.output
+    assert launches == []
+    assert queued(1753)["state"] == "done"
+    assert queued(1753)["hold_state"] == "fired"
+    # 1754 was NOT touched — not launched, not deferred, not blocked.
+    assert queued(1754)["state"] == "waiting"
+    assert queued(1754)["deferrals"] == 0
+
+    # Exactly one alert, and it carries the operator's own reason verbatim.
+    alert = state._get_drive_escalation_local(QUEUE_ALERT_REPO, QUEUE_ALERT_ISSUE)
+    assert alert is not None
+    assert "restart coord-serve" in alert["reason"]
+    assert "resume" in alert["proposed_command"]
+    assert state._get_drive_escalation_local(REPO, 1753) is None
+
+
+def test_a_hold_does_not_decay_across_ticks(cli, seed, launches):
+    cli("add", REPO, "1753", "--hold-after", "--hold-reason", "deploy")
+    cli("add", REPO, "1754")
+    state._update_drive_queue_entry_local(REPO, 1753, state="running")
+    seed(
+        issues={1753: "closed", 1754: "open"},
+        assignments=[{"issue_number": 1753, "status": "merged"}],
+    )
+
+    for _ in range(3):
+        assert cli("tick").exit_code == 0
+    assert launches == []
+    assert queued(1753)["hold_state"] == "fired"
+
+
+def test_status_reports_the_hold_and_its_reason(cli, seed, launches):
+    cli("add", REPO, "1753", "--hold-after", "--hold-reason", "restart coord-serve")
+    state._update_drive_queue_entry_local(REPO, 1753, state="running")
+    _land(seed, 1753)
+    cli("tick")
+
+    result = cli("status")
+    assert result.exit_code == 0, result.output
+    assert "HELD" in result.output
+    assert "restart coord-serve" in result.output
+    assert "coord drive-queue resume" in result.output
+
+    payload = json.loads(cli("status", "--json").output)
+    assert [h["key"] for h in payload["held"]] == [f"{REPO}#1753"]
+
+
+# ── resume ───────────────────────────────────────────────────────────────────
+
+
+def test_resume_clears_the_hold_and_the_very_next_tick_launches(
+    cli, seed, launches
+):
+    cli("add", REPO, "1753", "--hold-after", "--hold-reason", "deploy")
+    cli("add", REPO, "1754")
+    state._update_drive_queue_entry_local(REPO, 1753, state="running")
+    seed(
+        issues={1753: "closed", 1754: "open"},
+        assignments=[{"issue_number": 1753, "status": "merged"}],
+    )
+    cli("tick")
+    assert launches == []
+
+    released = cli("resume")
+    assert released.exit_code == 0, released.output
+    assert f"{REPO}#1753" in released.output
+    assert queued(1753)["hold_state"] == "released"
+    # The entry stays in the queue as history — the RELEASE is what unblocks.
+    assert queued(1753)["state"] == "done"
+
+    result = cli("tick")
+    assert result.exit_code == 0, result.output
+    assert "1754" in " ".join(launches[0])
+
+
+def test_resume_with_nothing_held_exits_non_zero(cli):
+    cli("add", REPO, "1753", "--hold-after", "--hold-reason", "deploy")
+    result = cli("resume")
+    assert result.exit_code != 0
+    assert "no deploy gate" in result.output
+    # An armed-but-unfired gate is untouched — resume must not disarm it.
+    assert queued(1753)["hold_state"] == "armed"
+
+
+def test_resume_can_name_one_entry(cli, seed, launches):
+    cli("add", REPO, "1753", "--hold-after", "--hold-reason", "deploy")
+    state._update_drive_queue_entry_local(REPO, 1753, state="running")
+    _land(seed, 1753)
+    cli("tick")
+
+    assert cli("resume", REPO, "9999").exit_code != 0
+    assert queued(1753)["hold_state"] == "fired"
+    assert cli("resume", REPO, "1753").exit_code == 0
+    assert queued(1753)["hold_state"] == "released"
+
+
+# ── --resume-when auto-release ───────────────────────────────────────────────
+
+
+def test_a_failing_probe_keeps_the_gate_held_with_a_rising_attempt_count(
+    cli, seed, launches, probes
+):
+    cli(
+        "add", REPO, "1753",
+        "--hold-after", "--hold-reason", "deploy",
+        "--resume-when", "curl -sf http://dellserver:7435/drive-queue",
+    )
+    cli("add", REPO, "1754")
+    state._update_drive_queue_entry_local(REPO, 1753, state="running")
+    seed(
+        issues={1753: "closed", 1754: "open"},
+        assignments=[{"issue_number": 1753, "status": "merged"}],
+    )
+
+    # Tick 1 FIRES the gate; per the design the probe does not run yet.
+    cli("tick")
+    assert probes.calls == []
+    assert queued(1753)["hold_probes"] == 0
+
+    for expected in (1, 2, 3):
+        assert cli("tick").exit_code == 0
+        assert queued(1753)["hold_probes"] == expected
+        alert = state._get_drive_escalation_local(QUEUE_ALERT_REPO, QUEUE_ALERT_ISSUE)
+        assert f"attempt {expected} failed" in alert["gate_readings"]
+
+    assert launches == []
+    assert len(probes.calls) == 3
+    assert "failed 3×" in cli("status").output
+
+
+def test_a_passing_probe_releases_and_launches_in_the_same_tick(
+    cli, seed, launches, probes
+):
+    cli(
+        "add", REPO, "1753",
+        "--hold-after", "--hold-reason", "deploy",
+        "--resume-when", "curl -sf http://dellserver:7435/drive-queue",
+    )
+    cli("add", REPO, "1754")
+    state._update_drive_queue_entry_local(REPO, 1753, state="running")
+    seed(
+        issues={1753: "closed", 1754: "open"},
+        assignments=[{"issue_number": 1753, "status": "merged"}],
+    )
+    cli("tick")               # fires
+    assert launches == []
+
+    probes.outcomes[f"{REPO}#1753"] = True
+    result = cli("tick")      # probes, releases, AND launches — one tick
+    assert result.exit_code == 0, result.output
+    assert queued(1753)["hold_state"] == "released"
+    assert "1754" in " ".join(launches[0])
+    # The HELD alert must not survive the release.
+    assert state._get_drive_escalation_local(QUEUE_ALERT_REPO, QUEUE_ALERT_ISSUE) is None
+
+
+def test_a_hanging_probe_is_killed_and_treated_as_a_failure(cli, seed, launches):
+    """The REAL `_run_resume_probe`, against a command that never returns.
+
+    A wedged probe must not wedge the tick — a tick that stops ticking is
+    indistinguishable from a queue with nothing to do.
+    """
+    import time as _time
+
+    from coord.commands import drive_queue as dq
+
+    cli(
+        "add", REPO, "1753",
+        "--hold-after", "--hold-reason", "deploy",
+        "--resume-when", "sleep 120",
+    )
+    state._update_drive_queue_entry_local(REPO, 1753, state="running")
+    _land(seed, 1753)
+    cli("tick")  # fires
+
+    original = dq.RESUME_PROBE_TIMEOUT_SECONDS
+    dq.RESUME_PROBE_TIMEOUT_SECONDS = 0.4
+    try:
+        started = _time.monotonic()
+        result = cli("tick")
+        elapsed = _time.monotonic() - started
+    finally:
+        dq.RESUME_PROBE_TIMEOUT_SECONDS = original
+
+    assert result.exit_code == 0, result.output
+    assert elapsed < 20.0, "the probe timeout did not bound the tick"
+    assert queued(1753)["hold_state"] == "fired"
+    assert queued(1753)["hold_probes"] == 1
+    assert launches == []
+
+
+def test_dry_run_does_not_run_the_probe(cli, seed, launches, probes):
+    cli(
+        "add", REPO, "1753",
+        "--hold-after", "--hold-reason", "deploy", "--resume-when", "true",
+    )
+    state._update_drive_queue_entry_local(REPO, 1753, state="running")
+    _land(seed, 1753)
+    cli("tick")
+
+    result = cli("tick", "--dry-run")
+    assert result.exit_code == 0, result.output
+    assert probes.calls == []
+    assert "--dry-run" in result.output
+
+
+# ── the gate never doubles up with the escalation path ───────────────────────
+
+
+def test_a_hold_after_entry_that_ends_blocked_raises_no_second_alert(
+    cli, seed, launches
+):
+    """`blocked` already stops the queue — two alerts for one condition is
+    how an alert channel gets muted."""
+    cli("add", REPO, "1753", "--hold-after", "--hold-reason", "deploy")
+    state._update_drive_queue_entry_local(
+        REPO, 1753, state="running", attempts=1
+    )
+    # Board says: no session, no merge, no active work → the drive died.
+    seed(issues={1753: "open"})
+
+    result = cli("tick", "--max-parallel", "1")
+    assert result.exit_code == 0, result.output
+    entry = queued(1753)
+    assert entry["state"] == "blocked"
+    # The gate never fired: it fires on `done` only.
+    assert entry["hold_state"] == "armed"
+
+    # The per-issue escalation exists…
+    assert state._get_drive_escalation_local(REPO, 1753) is not None
+    # …and the queue-level record is the ordinary stall line, not a HELD one.
+    alert = state._get_drive_escalation_local(QUEUE_ALERT_REPO, QUEUE_ALERT_ISSUE)
+    assert alert is None or "HELD" not in alert["reason"]

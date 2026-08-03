@@ -4577,14 +4577,27 @@ def _list_drive_escalations_local(repo_name: str | None = None) -> list[dict]:
 
 _DRIVE_QUEUE_COLUMNS = (
     "id, repo_name, issue_number, position, machine, after_json, state, "
-    "attempts, deferrals, last_reason, session_name, launched_at, enqueued_at"
+    "attempts, deferrals, last_reason, session_name, launched_at, enqueued_at, "
+    "hold_after, hold_reason, resume_when, hold_state, hold_probes"
 )
 
 # Fields `update_drive_queue_entry` may write. Deliberately excludes the
-# operator-declared columns (position/machine/after_json) — those move via
-# `enqueue`/`move`, so a tick can never silently reorder the queue.
+# operator-declared columns (position/machine/after_json, and #1757's
+# hold_after/hold_reason/resume_when) — those move via `enqueue`/`move`, so a
+# tick can never silently reorder the queue or re-author a deploy gate. The
+# gate's RUN state (`hold_state`/`hold_probes`) IS the tick's to write, the
+# same split `state`/`attempts` already draw.
 _DRIVE_QUEUE_UPDATABLE = frozenset(
-    {"state", "attempts", "deferrals", "last_reason", "session_name", "launched_at"}
+    {
+        "state",
+        "attempts",
+        "deferrals",
+        "last_reason",
+        "session_name",
+        "launched_at",
+        "hold_state",
+        "hold_probes",
+    }
 )
 
 
@@ -4631,6 +4644,9 @@ def enqueue_drive_queue(
     machine: str | None = None,
     after: list[str] | None = None,
     position: int | None = None,
+    hold_after: bool = False,
+    hold_reason: str = "",
+    resume_when: str = "",
 ) -> int | None:
     """Add an issue to the drive queue (or update the entry already there).
 
@@ -4638,6 +4654,12 @@ def enqueue_drive_queue(
     ``machine=None`` means "let ``coord drive`` route it". ``position=None``
     appends at the tail; an explicit ``position`` inserts at that slot and
     renumbers the rest.
+
+    ``hold_after`` (#1757) arms a DEPLOY GATE on the entry: when the tick
+    transitions it to ``done`` the queue stops launching until a human deploys
+    and runs ``coord drive-queue resume`` (or ``resume_when`` starts exiting
+    0). Arming happens HERE, at enqueue — ``hold_state`` goes ``armed`` — so
+    the gate is declared by the same operator write that declared the order.
 
     Routes to the daemon when ``board_service`` is set, else writes the local
     DB. Returns the local row id on the local path; the daemon's row id when
@@ -4654,12 +4676,22 @@ def enqueue_drive_queue(
             "machine": machine,
             "after": list(after or []),
             "position": position,
+            "hold_after": bool(hold_after),
+            "hold_reason": hold_reason,
+            "resume_when": resume_when,
         },
     )
     if resp is not None:
         return resp.get("entry_id")
     return _enqueue_drive_queue_local(
-        repo_name, issue_number, machine=machine, after=after, position=position
+        repo_name,
+        issue_number,
+        machine=machine,
+        after=after,
+        position=position,
+        hold_after=hold_after,
+        hold_reason=hold_reason,
+        resume_when=resume_when,
     )
 
 
@@ -4670,10 +4702,21 @@ def _enqueue_drive_queue_local(
     machine: str | None = None,
     after: list[str] | None = None,
     position: int | None = None,
+    hold_after: bool = False,
+    hold_reason: str = "",
+    resume_when: str = "",
 ) -> int:
     conn = get_connection()
     now = time.time()
     after_json = json.dumps([str(a) for a in (after or [])])
+    # #1757: the gate's declared shape AND its starting run state, derived
+    # together so "armed" can never disagree with "hold_after".  An `add`
+    # without `--hold-after` clears any previous gate rather than leaving a
+    # stale `armed` behind — re-declaring the entry re-declares the gate.
+    hold_after_int = 1 if hold_after else 0
+    hold_state = "armed" if hold_after else ""
+    hold_reason = str(hold_reason or "")
+    resume_when = str(resume_when or "")
     existing = conn.execute(
         "SELECT id FROM drive_queue WHERE repo_name = ? AND issue_number = ?",
         (repo_name, issue_number),
@@ -4682,10 +4725,23 @@ def _enqueue_drive_queue_local(
         # Already queued → update the operator-declared fields in place rather
         # than creating a second row for the same issue.  Run state (attempts /
         # state / last_reason) is deliberately left alone: that is the tick's
-        # column set, written via `update_drive_queue_entry`.
+        # column set, written via `update_drive_queue_entry`.  The gate is the
+        # exception, because `hold_state`/`hold_probes` are derived from the
+        # operator-declared `hold_after` and would otherwise survive their own
+        # declaration being withdrawn.
         conn.execute(
-            "UPDATE drive_queue SET machine = ?, after_json = ? WHERE id = ?",
-            (machine, after_json, existing["id"]),
+            "UPDATE drive_queue SET machine = ?, after_json = ?, hold_after = ?, "
+            "hold_reason = ?, resume_when = ?, hold_state = ?, hold_probes = 0 "
+            "WHERE id = ?",
+            (
+                machine,
+                after_json,
+                hold_after_int,
+                hold_reason,
+                resume_when,
+                hold_state,
+                existing["id"],
+            ),
         )
         conn.commit()
         entry_id = int(existing["id"])
@@ -4696,9 +4752,21 @@ def _enqueue_drive_queue_local(
         next_pos = 0 if tail is None or tail["m"] is None else int(tail["m"]) + 1
         cur = conn.execute(
             "INSERT INTO drive_queue "
-            "(repo_name, issue_number, position, machine, after_json, enqueued_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (repo_name, issue_number, next_pos, machine, after_json, now),
+            "(repo_name, issue_number, position, machine, after_json, enqueued_at, "
+            " hold_after, hold_reason, resume_when, hold_state) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                repo_name,
+                issue_number,
+                next_pos,
+                machine,
+                after_json,
+                now,
+                hold_after_int,
+                hold_reason,
+                resume_when,
+                hold_state,
+            ),
         )
         conn.commit()
         entry_id = int(cur.lastrowid)

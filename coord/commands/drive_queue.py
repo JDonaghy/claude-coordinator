@@ -40,21 +40,26 @@ import click
 from coord.commands._common import _CONFIG_OPTION
 from coord.drive_queue import (
     DEFAULT_MAX_ATTEMPTS,
+    HOLD_RELEASED,
     QUEUE_ALERT_ISSUE,
     QUEUE_ALERT_REPO,
     QUEUE_ALERT_STAGE,
+    RESUME_PROBE_TIMEOUT_SECONDS,
     STATE_BLOCKED,
     STATE_RUNNING,
     STATE_WAITING,
     BoardView,
+    ProbeResult,
     QueueEntry,
     QueueError,
     TickPlan,
     build_board_view,
     entries_from_rows,
     entry_key,
+    fired_holds,
     parse_after_spec,
     parse_key,
+    pending_probe_targets,
     plan_tick,
     render_plan,
     validate_enqueue,
@@ -112,6 +117,30 @@ def drive_queue_group() -> None:
     default=None,
     help="Insert at this 0-based slot instead of appending at the tail.",
 )
+@click.option(
+    "--hold-after",
+    is_flag=True,
+    default=False,
+    help=(
+        "Deploy gate: when this entry completes, hold the queue — launch "
+        "NOTHING until a human deploys and runs `drive-queue resume` (or "
+        "`--resume-when` starts passing). `merged` is not `live`."
+    ),
+)
+@click.option(
+    "--hold-reason",
+    default="",
+    help="What the operator must do while the gate is held. Shown in the alert.",
+)
+@click.option(
+    "--resume-when",
+    default="",
+    help=(
+        "Optional shell probe re-run each tick while the gate is held; exit 0 "
+        f"auto-releases it. Killed at {RESUME_PROBE_TIMEOUT_SECONDS:.0f}s and "
+        "treated as a failure. Requires --hold-after."
+    ),
+)
 @_CONFIG_OPTION
 def drive_queue_add(
     repo: str,
@@ -119,6 +148,9 @@ def drive_queue_add(
     machine: str,
     after_specs: tuple[str, ...],
     position: int | None,
+    hold_after: bool,
+    hold_reason: str,
+    resume_when: str,
     config_path: Path,
 ) -> None:
     """Queue REPO ISSUE for `coord drive`, or update it if already queued.
@@ -132,6 +164,7 @@ def drive_queue_add(
     try:
         after = parse_after_spec(after_specs, repo)
         validate_config_repo(config_path, repo)
+        validate_hold_flags(hold_after, hold_reason, resume_when)
         validate_enqueue(entries_from_rows(list_drive_queue()), repo, issue, after)
     except QueueError as exc:
         raise click.ClickException(str(exc)) from None
@@ -142,10 +175,41 @@ def drive_queue_add(
         machine=machine or None,
         after=after,
         position=position,
+        hold_after=hold_after,
+        hold_reason=hold_reason,
+        resume_when=resume_when,
     )
     suffix = f" after {', '.join(after)}" if after else ""
     pinned = f" on {machine}" if machine else ""
-    click.echo(f"queued {entry_key(repo, issue)}{pinned}{suffix}")
+    gate = ""
+    if hold_after:
+        gate = " · holds the queue when done"
+        if resume_when:
+            gate += f" (auto-resume when `{resume_when}` passes)"
+    click.echo(f"queued {entry_key(repo, issue)}{pinned}{suffix}{gate}")
+
+
+def validate_hold_flags(hold_after: bool, hold_reason: str, resume_when: str) -> None:
+    """Refuse gate detail without a gate (#1757).
+
+    `--resume-when` / `--hold-reason` on an entry with no `--hold-after` would
+    be stored and then never read — a silent no-op on the ONE flag whose whole
+    job is to stop the queue.  An operator who mistyped that has no signal at
+    all that overnight sequencing will now blow straight through the deploy
+    step, so this is a usage error, not a warning.
+    """
+    if hold_after:
+        return
+    offenders = [
+        flag
+        for flag, value in (("--resume-when", resume_when), ("--hold-reason", hold_reason))
+        if value
+    ]
+    if offenders:
+        raise QueueError(
+            f"{' and '.join(offenders)} require --hold-after "
+            "(without it there is no gate to resume or explain)"
+        )
 
 
 def validate_config_repo(config_path: Path, repo: str) -> None:
@@ -196,9 +260,31 @@ def drive_queue_list(repo: str | None, output_json: bool, config_path: Path) -> 
             bits.append(f"attempts={entry.attempts}")
         if entry.deferrals:
             bits.append(f"deferrals={entry.deferrals}")
+        if entry.hold_after:
+            bits.append(f"hold={entry.hold_state or 'armed'}")
         click.echo("  ".join(bits))
         if entry.last_reason:
             click.echo(f"      last: {entry.last_reason}")
+        for line in _hold_lines(entry):
+            click.echo(line)
+
+
+def _hold_lines(entry: QueueEntry) -> list[str]:
+    """The gate's rendering for `list` / `status`, or `[]` when there is none.
+
+    Both verbs render through this one function so `list` and `status` can
+    never disagree about whether the queue is held — the failure mode that
+    makes an operator stop trusting either.
+    """
+    if not entry.hold_after:
+        return []
+    lines = [f"      hold-after: {entry.gate_reason}"]
+    if entry.resume_when:
+        probe = f"      resume-when: {entry.resume_when}"
+        if entry.hold_probes:
+            probe += f"  (failed {entry.hold_probes}×)"
+        lines.append(probe)
+    return lines
 
 
 # ── remove / move ────────────────────────────────────────────────────────────
@@ -266,9 +352,29 @@ def drive_queue_status(output_json: bool, config_path: Path) -> None:
     rows = list_drive_queue()
     counts = _counts(rows)
     alert = _queue_alert()
+    held = fired_holds(entries_from_rows(rows))
 
     if output_json:
-        click.echo(_json.dumps({"total": len(rows), "counts": counts, "alert": alert}))
+        click.echo(
+            _json.dumps(
+                {
+                    "total": len(rows),
+                    "counts": counts,
+                    "alert": alert,
+                    # #1757: typed, so a client (or a test) reads the gate
+                    # without parsing the rendered sentence back out.
+                    "held": [
+                        {
+                            "key": e.key,
+                            "reason": e.gate_reason,
+                            "resume_when": e.resume_when,
+                            "probes": e.hold_probes,
+                        }
+                        for e in held
+                    ],
+                }
+            )
+        )
         return
 
     if not rows:
@@ -279,6 +385,14 @@ def drive_queue_status(output_json: bool, config_path: Path) -> None:
         click.echo(
             "drive queue: " + " · ".join(f"{counts[s]} {s}" for s in ordered)
         )
+    # The gate goes ABOVE the alert: "HELD" is the state, the alert is the
+    # note about it, and an operator scanning the first line must not have to
+    # read three more to learn the queue has stopped.
+    for entry in held:
+        click.echo(f"HELD — {entry.gate_reason}")
+        for line in _hold_lines(entry):
+            click.echo(line)
+        click.echo("      release with: coord drive-queue resume")
     if alert is not None:
         click.echo(f"alert: {alert.get('reason') or ''}")
         for detail in (alert.get("gate_readings") or "").split(" | "):
@@ -286,6 +400,67 @@ def drive_queue_status(output_json: bool, config_path: Path) -> None:
                 click.echo(f"  {detail}")
     else:
         click.echo("alert: (none)")
+
+
+# ── resume (#1757) ───────────────────────────────────────────────────────────
+
+
+@drive_queue_group.command("resume")
+@click.argument("repo", required=False)
+@click.argument("issue", type=int, required=False)
+@_CONFIG_OPTION
+def drive_queue_resume(repo: str | None, issue: int | None, config_path: Path) -> None:
+    """Release a fired deploy gate so the next tick can launch again.
+
+    With no arguments this releases every held gate — in practice there is at
+    most one, because a held queue launches nothing and therefore cannot reach
+    a second one. Pass REPO ISSUE to name a specific entry.
+
+    The entry itself is NOT removed or re-run: the release is what unblocks
+    the queue, not the held entry leaving it, so `list` keeps its run history.
+    """
+    from coord.state import list_drive_queue, update_drive_queue_entry  # noqa: PLC0415
+
+    held = fired_holds(entries_from_rows(list_drive_queue()))
+    if repo is not None:
+        if issue is None:
+            raise click.ClickException("give both REPO and ISSUE, or neither")
+        wanted = entry_key(repo, issue)
+        held = [e for e in held if e.key == wanted]
+        if not held:
+            raise click.ClickException(
+                f"{wanted} has no fired deploy gate to release "
+                "(see `coord drive-queue status`)"
+            )
+    if not held:
+        # Exit non-zero: "resume" on a queue that was never held is an
+        # operator misreading the board, and a silent success would confirm
+        # the misreading.
+        raise click.ClickException("no deploy gate is currently held")
+
+    for entry in held:
+        update_drive_queue_entry(
+            entry.repo, entry.issue, hold_state=HOLD_RELEASED, hold_probes=0
+        )
+        click.echo(f"released the deploy gate on {entry.key}")
+    _clear_queue_alert()
+    click.echo("the next tick will launch the next eligible entry")
+
+
+def _clear_queue_alert() -> None:
+    """Drop the queue-level HELD alert once its gate is released.
+
+    Best-effort: the next tick overwrites (or re-raises) this record anyway,
+    but leaving a stale "QUEUE HELD" sitting in `status` between the release
+    and the next timer fire is exactly the kind of contradiction that trains
+    an operator to stop reading alerts.
+    """
+    try:
+        from coord.state import dismiss_drive_escalation  # noqa: PLC0415
+
+        dismiss_drive_escalation(QUEUE_ALERT_REPO, QUEUE_ALERT_ISSUE)
+    except Exception:  # noqa: BLE001 — cosmetic; never fail a release on it
+        pass
 
 
 # ── tick ─────────────────────────────────────────────────────────────────────
@@ -350,6 +525,75 @@ def _launch_argv(entry: QueueEntry, config_path: Path | None) -> list[str]:
     if config_path:
         argv += ["--config", str(config_path)]
     return argv
+
+
+def _run_resume_probe(entry: QueueEntry) -> ProbeResult:
+    """Run one entry's ``--resume-when`` probe with a hard timeout.
+
+    TRUST BOUNDARY — READ THIS BEFORE TOUCHING THE FUNCTION.
+    ``resume_when`` is a SHELL command, executed by the tick, as the tick's
+    user, on the daemon host.  That is deliberate, and it is acceptable for
+    exactly one reason: the string is **operator-authored and
+    operator-scoped**, the same trust level as the ``ExecStart=`` line of the
+    systemd timer unit that invokes this tick in the first place.  It is:
+
+    * NOT sent to a worker and never executed on a worker machine;
+    * NOT derived from an issue body, a PR, a review comment, a plan, or any
+      other model output;
+    * NOT reachable by anything an agent writes — ``coord drive-queue add`` is
+      the only writer of this column, and DQ-1's update whitelist
+      (``coord.state._DRIVE_QUEUE_UPDATABLE``) deliberately excludes it, so
+      not even the tick can rewrite its own probe.
+
+    If any of those three ever stops being true, this is remote code execution
+    on the daemon host and the feature must be redesigned — not patched.
+
+    Fails CLOSED: a non-zero exit, a timeout, or a command that could not be
+    spawned at all all keep the gate held.  A gate that releases because its
+    probe crashed is a gate that never existed.
+    """
+    import os  # noqa: PLC0415
+    import signal  # noqa: PLC0415
+
+    try:
+        proc = subprocess.Popen(  # noqa: S602 — operator-authored; see the trust note
+            entry.resume_when,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            # Its own process GROUP, so a timeout can kill the whole tree.
+            # `sh -c 'a | b'` leaves children that outlive the shell; killing
+            # only the shell would leave a wedged probe holding the pipe and
+            # the tick blocked in communicate() — a tick that stops ticking is
+            # indistinguishable from a queue with nothing to do (#1616).
+            start_new_session=True,
+        )
+    except (OSError, ValueError) as exc:
+        return ProbeResult(entry.key, False, f"could not run the probe: {exc}")
+
+    try:
+        out, _ = proc.communicate(timeout=RESUME_PROBE_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except OSError:
+            proc.kill()
+        try:
+            proc.communicate(timeout=2.0)
+        except (subprocess.SubprocessError, OSError):
+            pass
+        return ProbeResult(
+            entry.key,
+            False,
+            f"timed out after {RESUME_PROBE_TIMEOUT_SECONDS:.0f}s (killed)",
+        )
+
+    tail = (out or "").strip().splitlines()
+    detail = f"exit {proc.returncode}"
+    if proc.returncode != 0 and tail:
+        detail += f": {tail[-1][:160]}"
+    return ProbeResult(entry.key, proc.returncode == 0, detail)
 
 
 def _apply_writes(plan: TickPlan) -> None:
@@ -451,7 +695,26 @@ def drive_queue_tick(max_parallel: int, dry_run: bool, config_path: Path) -> Non
             ) from None
 
         entries = entries_from_rows(list_drive_queue())
-        plan = plan_tick(entries, board, max_parallel)
+
+        # #1757: run each held gate's `--resume-when` BEFORE deciding
+        # anything, and hand the results to `plan_tick` as data so the
+        # decision half stays pure.  Deliberately skipped under `--dry-run`:
+        # the probe is an arbitrary operator-authored shell command and
+        # `--dry-run` promises to touch nothing.  The consequence — a dry run
+        # reports the gate as still held even if the deploy just landed — is
+        # stated in the output rather than left for the operator to discover.
+        probes: dict[str, ProbeResult] = {}
+        pending = pending_probe_targets(entries)
+        if pending and dry_run:
+            click.echo(
+                f"(--dry-run: not running {len(pending)} --resume-when probe(s); "
+                "a held gate below may already be releasable)"
+            )
+        elif not dry_run:
+            for target in pending:
+                probes[target.key] = _run_resume_probe(target)
+
+        plan = plan_tick(entries, board, max_parallel, probes=probes)
 
         for line in render_plan(plan, dry_run=dry_run):
             click.echo(line)
@@ -484,8 +747,14 @@ def drive_queue_tick(max_parallel: int, dry_run: bool, config_path: Path) -> Non
                 QUEUE_ALERT_ISSUE,
                 reason=plan.alert.reason,
                 gates=" | ".join(plan.alert.details),
-                command="coord drive-queue list",
+                command=plan.alert.command,
             )
+        elif any(h.outcome == "released" for h in plan.holds):
+            # A probe just auto-released the gate.  Drop the "QUEUE HELD"
+            # record in the same tick, or `status` keeps shouting HELD while
+            # the queue is demonstrably running again — the contradiction that
+            # teaches an operator to stop reading alerts.
+            _clear_queue_alert()
 
         target = plan.launch
         if target is None:
