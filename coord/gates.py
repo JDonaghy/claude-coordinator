@@ -37,7 +37,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING
 
-from coord.models import WORK_LIKE_TYPES
+from coord.models import WORK_LIKE_TYPES, effective_issue_number
 
 if TYPE_CHECKING:  # avoid import cycles / heavy imports at module load
     from coord.config import Config
@@ -63,6 +63,14 @@ class AssignmentGateRow:
     provider_name: str | None
     dispatched_at: float | None
     is_interactive: bool | None
+    # #1730: the two-number reality #1553 introduced — `issue_number` is what
+    # the row is BOOKED to (the tracking/epic issue for an oracle-loop
+    # slice), `for_issue_number` is what it's actually FOR (the child), when
+    # set. Surfaced on every row so a query that only matched via
+    # `effective_issue_number` (see `build_gate_report`) is legible rather
+    # than silently showing rows under the "wrong" issue with no explanation.
+    issue_number: int
+    for_issue_number: int | None
     test_state: str | None
     smoke_test: str | None
     test_reason: str | None
@@ -111,6 +119,8 @@ def _row_from_assignment(a: "Assignment") -> AssignmentGateRow:
         provider_name=a.provider_name,
         dispatched_at=a.dispatched_at,
         is_interactive=None,  # backfilled by _backfill_is_interactive, best-effort
+        issue_number=a.issue_number,
+        for_issue_number=a.for_issue_number,
         test_state=a.test_state,
         smoke_test=a.smoke_test,
         test_reason=a.test_reason,
@@ -193,10 +203,19 @@ def build_gate_report(
     """
     from coord import merge_queue as mq  # noqa: PLC0415
 
+    # #1730: match on the raw `issue_number` (the tracking issue keeps
+    # finding its own rows) OR the #1553 *effective* issue — a `for_issue_number`
+    # that resolves to *issue_number* means this row's work is FOR the issue
+    # being queried even though it's booked to a different (tracking) issue.
+    # #1553 taught the TUI this resolution (`Assignment::effective_issue_number`);
+    # this CLI had never been updated to match, so `coord gates <repo>
+    # <child>` reported "no assignments found" for oracle-loop slices whose
+    # only board row carried the tracking issue in `issue_number`.
     matching = [
         a
         for a in (list(board.active) + list(board.completed))
-        if a.repo_name == repo_name and a.issue_number == issue_number
+        if a.repo_name == repo_name
+        and (a.issue_number == issue_number or effective_issue_number(a) == issue_number)
     ]
     report = GateReport(repo_name=repo_name, issue_number=issue_number)
     if not matching:
@@ -340,6 +359,16 @@ def format_gate_report(report: GateReport) -> str:
             f"branch={row.branch or '-'}  machine={row.machine_name or '-'}"
             + (f"  provider={row.provider_name}" if row.provider_name else "")
             + (f"  interactive={row.is_interactive}" if row.is_interactive is not None else "")
+            # #1730: legible two-number reality — only printed when the row's
+            # attribution differs from the issue it's booked to, so an
+            # ordinary row (no `for_issue_number`, or one equal to
+            # `issue_number`) renders exactly as it did before this field
+            # existed.
+            + (
+                f"  booked_to=#{row.issue_number} for=#{row.for_issue_number}"
+                if row.for_issue_number is not None and row.for_issue_number != row.issue_number
+                else ""
+            )
         )
         lines.append(
             f"      test_state={row.test_state}  smoke_test={row.smoke_test}  "

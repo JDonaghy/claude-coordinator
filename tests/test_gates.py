@@ -93,6 +93,32 @@ def _review(
     )
 
 
+def _slice_test_author(
+    *,
+    aid: str = "ta1",
+    tracking_issue: int = 1537,
+    for_issue: int = 1544,
+    status: str = "done",
+    branch: str | None = "issue-1537-oracle-loop",
+    dispatched_at: float | None = 1.0,
+) -> Assignment:
+    """A `test-author` row booked to the milestone's tracking issue but
+    attributed (#1553's `for_issue_number`) to the child issue it's really
+    for — the shape `coord acceptance author` dispatches."""
+    return Assignment(
+        machine_name="precision",
+        repo_name="api",
+        issue_number=tracking_issue,
+        issue_title="[test-author] slice",
+        assignment_id=aid,
+        type="test-author",
+        status=status,
+        branch=branch,
+        for_issue_number=for_issue,
+        dispatched_at=dispatched_at,
+    )
+
+
 class FakeGh:
     """Stub gh_ops — returns fixed SHAs/patch-ids, records calls made."""
 
@@ -206,6 +232,83 @@ class TestRows:
         board = Board(active=[], completed=[original, fix])
         report = build_gate_report(board, config, "api", 42)
         assert report.branch == "issue-42-fix"
+
+
+# ── #1730: oracle-loop slice attribution (for_issue_number) ─────────────────
+
+class TestSliceAttribution:
+    """#1553 taught the TUI to resolve `for_issue_number` when attributing an
+    oracle-loop slice's work to its child issue; `coord gates` never got the
+    same fix, so it reported "no assignments found" for a child issue with a
+    finished, reviewed, PR-open slice in flight (#1730)."""
+
+    def test_finds_slice_by_the_child_issue_it_is_for(self, config: Config) -> None:
+        ta = _slice_test_author(tracking_issue=1537, for_issue=1544)
+        board = Board(active=[], completed=[ta])
+
+        report = build_gate_report(board, config, "api", 1544)
+
+        assert [r.assignment_id for r in report.rows] == ["ta1"]
+        assert report.notes == []  # no "no assignments found"
+
+    def test_still_finds_it_when_queried_by_the_tracking_issue(self, config: Config) -> None:
+        # Do not "fix" this by moving the row to the child — the tracking
+        # issue must keep finding its own rows too.
+        ta = _slice_test_author(tracking_issue=1537, for_issue=1544)
+        board = Board(active=[], completed=[ta])
+
+        report = build_gate_report(board, config, "api", 1537)
+
+        assert [r.assignment_id for r in report.rows] == ["ta1"]
+
+    def test_does_not_leak_into_an_unrelated_child(self, config: Config) -> None:
+        ta = _slice_test_author(tracking_issue=1537, for_issue=1544)
+        board = Board(active=[], completed=[ta])
+
+        report = build_gate_report(board, config, "api", 1999)
+
+        assert report.rows == []
+        assert any("no assignments found" in n for n in report.notes)
+
+    def test_ordinary_assignment_with_no_for_issue_number_is_unchanged(
+        self, config: Config
+    ) -> None:
+        work = _work(aid="w1", issue=42)
+        board = Board(active=[], completed=[work])
+
+        report = build_gate_report(board, config, "api", 42)
+
+        assert [r.assignment_id for r in report.rows] == ["w1"]
+        row = report.rows[0]
+        assert row.issue_number == 42
+        assert row.for_issue_number is None
+
+    def test_row_carries_both_the_booked_and_for_issue_numbers(self, config: Config) -> None:
+        ta = _slice_test_author(tracking_issue=1537, for_issue=1544)
+        board = Board(active=[], completed=[ta])
+
+        report = build_gate_report(board, config, "api", 1544)
+
+        row = report.rows[0]
+        assert row.issue_number == 1537
+        assert row.for_issue_number == 1544
+
+    def test_format_makes_the_two_numbers_legible(self, config: Config) -> None:
+        ta = _slice_test_author(tracking_issue=1537, for_issue=1544)
+        board = Board(active=[], completed=[ta])
+        report = build_gate_report(board, config, "api", 1544)
+
+        text = format_gate_report(report)
+
+        assert "booked_to=#1537" in text
+        assert "for=#1544" in text
+
+    def test_format_omits_attribution_suffix_for_ordinary_rows(self, config: Config) -> None:
+        work = _work(aid="w1", issue=42)
+        board = Board(active=[], completed=[work])
+        report = build_gate_report(board, config, "api", 42)
+
+        assert "booked_to=" not in format_gate_report(report)
 
 
 # ── gate decision ────────────────────────────────────────────────────────────
