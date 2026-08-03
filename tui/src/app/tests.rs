@@ -40723,3 +40723,781 @@ Milestone tracking issue.
             overlay_screen
         );
     }
+
+    // ── #1741: Reports panel (MultiSectionView) ─────────────────────────────
+    //
+    // There is no sealed acceptance slice for #1741 (`tests/acceptance/**`
+    // has no ms- directory for it), so these in-crate `TuiDriver` tests are
+    // the gate. Every one of them locates its target with `driver.find(...)`
+    // — never a hardcoded coordinate — so a layout change fails loudly at
+    // the assertion rather than silently clicking empty space.
+    //
+    // The catalogue JSON below is deliberately a *fixture*, not a copy of
+    // `coord/reports.py`'s real catalogue: the panel's whole contract is
+    // that it renders whatever the daemon sends, so the tests exercise
+    // shapes the real catalogue doesn't have (a second report, a second
+    // param, > 5 choices) to prove no report is baked into Rust.
+
+    /// One report, two params: a 5-choice `choice` (→ SegmentedControl) and
+    /// a free-text one (→ TextInput). Mirrors #1742's `issue-activity`
+    /// wire shape (`ReportParam.to_dict`).
+    fn reports_catalogue_json() -> &'static str {
+        r#"{
+                "reports": [
+                    {
+                        "id": "issue-activity",
+                        "title": "Issue Activity",
+                        "description": "What happened to each issue in a window",
+                        "params": [
+                            {
+                                "id": "since", "label": "Time range", "kind": "choice",
+                                "choices": ["1h", "6h", "24h", "3d", "7d"],
+                                "default": "24h", "help": "Window length",
+                                "free_form": true
+                            },
+                            {
+                                "id": "repo", "label": "Repo", "kind": "text",
+                                "choices": [], "default": "", "help": "Empty means all repos",
+                                "free_form": false
+                            }
+                        ]
+                    }
+                ]
+            }"#
+    }
+
+    /// A *different* catalogue with a second report and differently-named
+    /// params — the "adding report #2 needs zero tui/** changes" proof.
+    fn reports_catalogue_json_two_reports() -> &'static str {
+        r#"{
+                "reports": [
+                    {
+                        "id": "issue-activity",
+                        "title": "Issue Activity",
+                        "description": "d1",
+                        "params": [
+                            {
+                                "id": "since", "label": "Time range", "kind": "choice",
+                                "choices": ["1h", "6h", "24h"], "default": "24h",
+                                "help": "", "free_form": true
+                            }
+                        ]
+                    },
+                    {
+                        "id": "worker-throughput",
+                        "title": "Worker Throughput",
+                        "description": "d2",
+                        "params": [
+                            {
+                                "id": "machine", "label": "Machine", "kind": "text",
+                                "choices": [], "default": "dellserver", "help": "", "free_form": false
+                            },
+                            {
+                                "id": "bucket", "label": "Bucket", "kind": "choice",
+                                "choices": ["hour", "day"], "default": "day",
+                                "help": "", "free_form": false
+                            }
+                        ]
+                    }
+                ]
+            }"#
+    }
+
+    /// A completed `GET /report/{id}` body: two rows + one note.
+    fn reports_result_json() -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        format!(
+            r#"{{
+                    "report_id": "issue-activity",
+                    "generated_at": {now},
+                    "window": [{start}, {now}],
+                    "columns": ["issue", "outcome", "iterations"],
+                    "rows": [
+                        {{"issue": "claude-coordinator#1629", "outcome": "merged",
+                          "iterations": 1, "extra_key": "ignored"}},
+                        {{"issue": "claude-coordinator#1631", "outcome": "merged",
+                          "iterations": 0}}
+                    ],
+                    "notes": ["ANOMALY_MARKER: #1631 exit_code=1 but merged"]
+                }}"#,
+            now = now,
+            start = now - 3600.0,
+        )
+    }
+
+    /// An empty-window result — zero rows, no notes.
+    fn reports_result_json_empty() -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        format!(
+            r#"{{
+                    "report_id": "issue-activity",
+                    "generated_at": {now},
+                    "window": [{start}, {now}],
+                    "columns": ["issue", "outcome"],
+                    "rows": [],
+                    "notes": []
+                }}"#,
+            now = now,
+            start = now - 3600.0,
+        )
+    }
+
+    #[test]
+    fn reports_activity_bar_button_opens_the_panel() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_app_with_reports(BoardData::default(), reports_catalogue_json(), None);
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "▤");
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("REPORTS"),
+            "#1741: clicking the ▤ activity-bar button must make REPORTS the \
+                 sidebar panel title:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn reports_renders_one_section_per_catalogue_entry_with_its_form() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_app_with_reports(BoardData::default(), reports_catalogue_json(), None);
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "▤");
+        driver.render();
+
+        let screen = driver.screen();
+        // Title from the catalogue, expanded chevron, both param labels,
+        // every choice the catalogue offered, and the Run button.
+        for needle in ["▾ Issue Activity", "Time range", "1h", "7d", "Repo", "Run"] {
+            assert!(
+                screen.contains(needle),
+                "#1741: expanded section must render {needle:?}:\n{screen}"
+            );
+        }
+    }
+
+    #[test]
+    fn reports_section_header_click_collapses_and_expands() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_app_with_reports(BoardData::default(), reports_catalogue_json(), None);
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "▤");
+        driver.render();
+
+        // Target the chevron-prefixed header, which only the main pane
+        // renders — the sidebar also carries a "Selected: Issue Activity"
+        // line, and a bare `find("Issue Activity")` could land on either.
+        let (x, y) = driver
+            .find("▾ Issue Activity")
+            .unwrap_or_else(|| panic!("section header not rendered:\n{}", driver.screen()));
+        driver.click(x, y);
+        driver.render();
+
+        let collapsed = driver.screen();
+        assert!(
+            collapsed.contains("▸ Issue Activity"),
+            "#1741: a collapsed section must show the ▸ chevron:\n{collapsed}"
+        );
+        // `7d` and `Run` are form-only strings (the sidebar's parameter
+        // lines show the *selected* value, `24h`, not every option).
+        assert!(
+            !collapsed.contains("7d"),
+            "#1741: a collapsed section must hide its parameter form \
+                 (asserted on the rendered grid, not on internal state):\n{collapsed}"
+        );
+        assert!(
+            !collapsed.contains("Run"),
+            "#1741: a collapsed section must hide its Run button — a hidden \
+                 form with a live trigger is worse than either:\n{collapsed}"
+        );
+
+        // Clicking the header again restores it. Click the *title* this
+        // time, not the chevron — both are `HeaderHit`s that toggle, and a
+        // second click on the identical cell would be folded into a
+        // `DoubleClick` by the backend's detector and never reach
+        // `mouse_main_click` at all.
+        let (x, y) = driver
+            .find("▸ Issue Activity")
+            .expect("collapsed header must still render");
+        driver.click(x + 5.0, y);
+        driver.render();
+
+        let expanded = driver.screen();
+        assert!(
+            expanded.contains("▾ Issue Activity") && expanded.contains("7d"),
+            "#1741: clicking a collapsed header must re-expand it:\n{expanded}"
+        );
+    }
+
+    #[test]
+    fn reports_two_report_catalogue_renders_both_with_no_rust_change() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        // The acceptance proof that nothing about any specific report is
+        // hardcoded: a catalogue this codebase has never seen, with a report
+        // that does not exist in `coord/reports.py`, renders in full.
+        let app = make_app_with_reports(
+            BoardData::default(),
+            reports_catalogue_json_two_reports(),
+            None,
+        );
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "▤");
+        driver.render();
+
+        let screen = driver.screen();
+        for needle in [
+            "▾ Issue Activity",
+            "▾ Worker Throughput",
+            "Machine",
+            "dellserver",
+            "Bucket",
+            "hour",
+            "day",
+        ] {
+            assert!(
+                screen.contains(needle),
+                "#1741: a two-report, differently-parameterised catalogue must \
+                     render {needle:?} with zero tui/** changes:\n{screen}"
+            );
+        }
+        assert!(
+            screen.contains("2 reports"),
+            "#1741: the sidebar must count the catalogue it was given:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn reports_segmented_control_click_selects_that_option() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_app_with_reports(BoardData::default(), reports_catalogue_json(), None);
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "▤");
+        driver.render();
+
+        assert!(
+            driver.screen().contains("Time range: 24h"),
+            "#1741: the sidebar must show the catalogue's default before any \
+                 edit:\n{}",
+            driver.screen()
+        );
+
+        // The segmented control's per-option hit regions come from the form
+        // layout's synthetic `__seg_<idx>` ids — clicking the option text
+        // must select exactly that option.
+        let (x, y) = driver
+            .find("6h")
+            .unwrap_or_else(|| panic!("6h option not rendered:\n{}", driver.screen()));
+        driver.click(x, y);
+        driver.render();
+
+        assert!(
+            driver.screen().contains("Time range: 6h"),
+            "#1741: clicking a segmented option must select it:\n{}",
+            driver.screen()
+        );
+    }
+
+    #[test]
+    fn reports_arrow_keys_step_the_focused_choice_param() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_app_with_reports(BoardData::default(), reports_catalogue_json(), None);
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "▤");
+        driver.render();
+
+        // Field 0 of the selected section is `since` — → steps forward
+        // through the catalogue's own choices (24h → 3d), ← comes back.
+        driver.press_named(NamedKey::Right);
+        driver.render();
+        assert!(
+            driver.screen().contains("Time range: 3d"),
+            "#1741: → must step the focused choice param forward:\n{}",
+            driver.screen()
+        );
+
+        driver.press_named(NamedKey::Left);
+        driver.render();
+        assert!(
+            driver.screen().contains("Time range: 24h"),
+            "#1741: ← must step it back:\n{}",
+            driver.screen()
+        );
+    }
+
+    #[test]
+    fn reports_seeded_result_renders_table_and_notes_below_the_stack() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let result = reports_result_json();
+        let app = make_app_with_reports(
+            BoardData::default(),
+            reports_catalogue_json(),
+            Some(&result),
+        );
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "▤");
+        driver.render();
+
+        let screen = driver.screen();
+        // Column headers come from `ReportResult.columns`; one row per issue;
+        // notes render beneath.
+        for needle in [
+            "issue",
+            "outcome",
+            "iterations",
+            "claude-coordinator#1629",
+            "claude-coordinator#1631",
+            "Notes",
+            "ANOMALY_MARKER",
+        ] {
+            assert!(
+                screen.contains(needle),
+                "#1741: a completed run must render {needle:?}:\n{screen}"
+            );
+        }
+
+        let (_, table_y) = driver
+            .find("claude-coordinator#1629")
+            .expect("result row must render");
+        let (_, notes_y) = driver.find("ANOMALY_MARKER").expect("note must render");
+        assert!(
+            notes_y > table_y,
+            "#1741: the notes block must render BELOW the table \
+                 (table_y={table_y} notes_y={notes_y})"
+        );
+        let (_, section_y) = driver
+            .find("Issue Activity")
+            .expect("section header must render");
+        assert!(
+            table_y > section_y,
+            "#1741: the result must render below the section stack \
+                 (section_y={section_y} table_y={table_y})"
+        );
+        assert!(
+            screen.contains("2 rows"),
+            "#1741: the section badge must summarise the last run:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn reports_empty_result_says_no_activity_instead_of_an_empty_table() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let result = reports_result_json_empty();
+        let app = make_app_with_reports(
+            BoardData::default(),
+            reports_catalogue_json(),
+            Some(&result),
+        );
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "▤");
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("No activity in this window"),
+            "#1741: a zero-row result must say so explicitly — a bare header \
+                 row reads like a broken fetch:\n{screen}"
+        );
+        assert!(
+            !screen.contains("outcome"),
+            "#1741: a zero-row result must NOT render the table's column \
+                 headers:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn reports_failed_run_shows_the_error_not_a_stale_result() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let result = reports_result_json();
+        let mut app = make_app_with_reports(
+            BoardData::default(),
+            reports_catalogue_json(),
+            Some(&result),
+        );
+        // Exactly the state the poll loop leaves behind on a failed run
+        // (`ReportRunOutcome::Unreachable`), minus the result clearing that
+        // `reports_start_run` does — so this asserts the *renderer* refuses
+        // to show a stale table under a fresh failure, belt and braces.
+        app.reports_error = Some("HTTP 405: Method Not Allowed".to_string());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "▤");
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Report failed") && screen.contains("405"),
+            "#1741: a failed run must surface the daemon's own message:\n{screen}"
+        );
+        assert!(
+            !screen.contains("claude-coordinator#1629"),
+            "#1741: a failed run must not leave the previous result on \
+                 screen:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn reports_empty_catalogue_is_distinguishable_from_a_failed_fetch() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        // A daemon predating #1742 answers 404/405 on `/report`; a daemon
+        // that has the routes but no reports answers `{"reports": []}`.
+        // Those are different problems and must read differently.
+        let mut app = make_app_with_reports(BoardData::default(), r#"{"reports": []}"#, None);
+        app.reports_error = Some("HTTP 404: Not Found".to_string());
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "▤");
+        driver.render();
+        assert!(
+            driver.screen().contains("catalogue fetch failed"),
+            "#1741: an unreachable /report must say so:\n{}",
+            driver.screen()
+        );
+
+        let app = make_app_with_reports(BoardData::default(), r#"{"reports": []}"#, None);
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "▤");
+        driver.render();
+        assert!(
+            driver.screen().contains("the daemon's catalogue is empty"),
+            "#1741: a reachable-but-empty catalogue must read differently \
+                 from a failed fetch:\n{}",
+            driver.screen()
+        );
+    }
+
+    #[test]
+    fn reports_run_click_marks_the_report_in_flight() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_app_with_reports(BoardData::default(), reports_catalogue_json(), None);
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "▤");
+        driver.render();
+
+        let (x, y) = driver
+            .find("Run")
+            .unwrap_or_else(|| panic!("Run button not rendered:\n{}", driver.screen()));
+        driver.click(x, y);
+        driver.render();
+
+        // No board service is resolvable under `cfg(test)` (see
+        // `resolve_board_service`), so the run never completes here — what
+        // this asserts is that the click reached `reports_start_run` at all,
+        // which is the routing this panel exists to get right.
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Running issue-activity") && screen.contains("running…"),
+            "#1741: clicking Run must put the report in flight (result area \
+                 line + section badge):\n{screen}"
+        );
+    }
+
+    #[test]
+    fn reports_r_key_reruns_the_selected_report() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let result = reports_result_json();
+        let app = make_app_with_reports(
+            BoardData::default(),
+            reports_catalogue_json(),
+            Some(&result),
+        );
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "▤");
+        driver.render();
+        assert!(driver.screen().contains("claude-coordinator#1629"));
+
+        driver.type_char('r');
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Running issue-activity"),
+            "#1741: `r` must re-run the selected report:\n{screen}"
+        );
+        assert!(
+            !screen.contains("claude-coordinator#1629"),
+            "#1741: a re-run must clear the previous result rather than \
+                 leave them on screen under a running report:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn reports_space_toggles_the_selected_section() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_app_with_reports(BoardData::default(), reports_catalogue_json(), None);
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "▤");
+        driver.render();
+
+        driver.type_char(' ');
+        driver.render();
+        assert!(
+            driver.screen().contains("▸ Issue Activity"),
+            "#1741: Space must collapse the selected section:\n{}",
+            driver.screen()
+        );
+
+        driver.type_char(' ');
+        driver.render();
+        assert!(
+            driver.screen().contains("▾ Issue Activity"),
+            "#1741: Space must re-expand it:\n{}",
+            driver.screen()
+        );
+    }
+
+    #[test]
+    fn reports_tab_moves_focus_and_enter_edits_a_text_param() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_app_with_reports(BoardData::default(), reports_catalogue_json(), None);
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "▤");
+        driver.render();
+
+        // Tab: since → repo (a free-text param). Enter starts editing it, so
+        // subsequent characters land in the field rather than firing the
+        // panel's own single-key bindings.
+        driver.press_named(NamedKey::Tab);
+        driver.press_named(NamedKey::Enter);
+        for ch in "quadraui".chars() {
+            driver.type_char(ch);
+        }
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Repo: quadraui"),
+            "#1741: typing into a focused text param must edit it:\n{screen}"
+        );
+        assert!(
+            !driver.exited(),
+            "#1741: the `q` in the typed text must NOT quit the app while a \
+                 text param is being edited"
+        );
+        assert!(
+            screen.contains("Enter=done"),
+            "#1741: the hints line must switch to the editing hint set:\n{screen}"
+        );
+
+        driver.press_named(NamedKey::Enter);
+        driver.render();
+        assert!(
+            driver.screen().contains("Enter=run"),
+            "#1741: Enter must leave edit mode and restore the normal hints:\n{}",
+            driver.screen()
+        );
+    }
+
+    #[test]
+    fn reports_backspace_deletes_from_the_focused_text_param() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_app_with_reports(BoardData::default(), reports_catalogue_json(), None);
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "▤");
+        driver.render();
+
+        driver.press_named(NamedKey::Tab);
+        driver.press_named(NamedKey::Enter);
+        for ch in "abc".chars() {
+            driver.type_char(ch);
+        }
+        driver.press_named(NamedKey::Backspace);
+        driver.render();
+
+        assert!(
+            driver.screen().contains("Repo: ab"),
+            "#1741: Backspace must delete from the focused text param:\n{}",
+            driver.screen()
+        );
+    }
+
+    #[test]
+    fn reports_j_k_move_between_sections() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let app = make_app_with_reports(
+            BoardData::default(),
+            reports_catalogue_json_two_reports(),
+            None,
+        );
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 140, 40);
+        click_activity_icon(&mut driver, "▤");
+        driver.render();
+        assert!(driver.screen().contains("Selected: Issue Activity"));
+
+        driver.type_char('j');
+        driver.render();
+        assert!(
+            driver.screen().contains("Selected: Worker Throughput"),
+            "#1741: j must move to the next section:\n{}",
+            driver.screen()
+        );
+
+        driver.type_char('k');
+        driver.render();
+        assert!(
+            driver.screen().contains("Selected: Issue Activity"),
+            "#1741: k must move back:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// The gating test the acceptance criteria call out by name: this is the
+    /// class of bug that had the Audit panel polling forever from every
+    /// other view (#1039). The catalogue fetch must be armed ONLY while
+    /// Reports is the active view.
+    #[test]
+    fn reports_background_fetch_is_gated_to_the_active_view() {
+        let mut app = make_test_app(BoardData::default());
+
+        // Every other view: no fetch, ever, no matter how many ticks.
+        for view in [
+            SidebarView::Board,
+            SidebarView::Audit,
+            SidebarView::Usage,
+            SidebarView::Settings,
+        ] {
+            app.active_view = view;
+            app.run_periodic_work();
+            assert!(
+                app.reports_catalogue_rx.is_none() && !app.reports_catalogue_fetched,
+                "#1741: the Reports catalogue fetch must not be armed while \
+                     {view:?} is the active view"
+            );
+        }
+
+        // On the Reports panel it arms exactly once…
+        app.active_view = SidebarView::Reports;
+        app.run_periodic_work();
+        assert!(
+            app.reports_catalogue_rx.is_some(),
+            "#1741: the catalogue fetch must arm on the first tick with \
+                 Reports active"
+        );
+
+        // …and, once drained, is not re-armed on every subsequent tick (the
+        // catalogue is static metadata — unlike /audit there is no TTL).
+        app.run_periodic_work();
+        assert!(
+            app.reports_catalogue_fetched,
+            "#1741: the outcome must be drained on the next tick"
+        );
+        assert!(
+            app.reports_catalogue_rx.is_none(),
+            "#1741: a drained catalogue fetch must not immediately re-arm"
+        );
+        app.run_periodic_work();
+        assert!(
+            app.reports_catalogue_rx.is_none(),
+            "#1741: the catalogue must not be re-fetched on every tick"
+        );
+    }
+
+    /// Navigating away mid-run must not leave the poll loop draining (or
+    /// re-arming) anything — the receiver is only touched under the gate.
+    #[test]
+    fn reports_run_is_not_drained_from_another_view() {
+        let mut app = make_test_app(BoardData::default());
+        app.active_view = SidebarView::Reports;
+        app.reports_catalogue_fetched = true;
+        app.reports_catalogue = Some(
+            serde_json::from_str::<super::types::ReportCatalogue>(reports_catalogue_json())
+                .expect("fixture catalogue must parse")
+                .reports,
+        );
+        app.reports_start_run("issue-activity");
+        assert!(app.reports_running.is_some() && app.reports_run_rx.is_some());
+
+        app.active_view = SidebarView::Board;
+        app.run_periodic_work();
+        assert!(
+            app.reports_run_rx.is_some() && app.reports_running.is_some(),
+            "#1741: an in-flight run must not be drained while another view \
+                 is active — the gate covers the run poll too, not just the \
+                 catalogue fetch"
+        );
+    }
+
+    /// The id scheme that ties form construction to click routing. A break
+    /// here is a click that silently does nothing, which no screen assertion
+    /// would notice.
+    #[test]
+    fn reports_field_ids_round_trip() {
+        let param = CoordApp::reports_param_field_id("issue-activity", "since");
+        assert_eq!(
+            CoordApp::reports_parse_field_id(param.as_str()),
+            Some(("issue-activity".to_string(), Some("since".to_string())))
+        );
+        let run = CoordApp::reports_run_field_id("issue-activity");
+        assert_eq!(
+            CoordApp::reports_parse_field_id(run.as_str()),
+            Some(("issue-activity".to_string(), None))
+        );
+        assert_eq!(CoordApp::reports_parse_field_id("audit-list"), None);
+
+        // The synthetic per-option id a SegmentedControl reports.
+        assert_eq!(
+            split_segment_id("report:issue-activity:param:since__seg_2"),
+            ("report:issue-activity:param:since", Some(2))
+        );
+        assert_eq!(split_segment_id("report:x:run"), ("report:x:run", None));
+        assert_eq!(
+            split_segment_id("weird__seg_notanumber"),
+            ("weird__seg_notanumber", None)
+        );
+    }
+
+    /// A choice param with more options than fit a segmented row falls back
+    /// to a Dropdown — again decided from the catalogue alone.
+    #[test]
+    fn reports_many_choice_param_uses_a_dropdown() {
+        let catalogue = r#"{
+                "reports": [{
+                    "id": "r", "title": "R", "description": "",
+                    "params": [{
+                        "id": "p", "label": "P", "kind": "choice",
+                        "choices": ["a", "b", "c", "d", "e", "f", "g"],
+                        "default": "c", "help": "", "free_form": false
+                    }]
+                }]
+            }"#;
+        let app = make_app_with_reports(BoardData::default(), catalogue, None);
+        let def = &app.reports_catalogue()[0];
+        let form = app.reports_param_form(def, None);
+        assert!(
+            matches!(
+                form.fields[0].kind,
+                FieldKind::Dropdown {
+                    selected_idx: 2,
+                    ..
+                }
+            ),
+            "#1741: > 5 choices must render as a Dropdown selected on the \
+                 catalogue's default, got {:?}",
+            form.fields[0].kind
+        );
+        // …and the trailing field is always the Run button.
+        assert!(matches!(
+            form.fields[form.fields.len() - 1].kind,
+            FieldKind::Button
+        ));
+    }

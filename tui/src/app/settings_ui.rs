@@ -1083,6 +1083,97 @@ impl CoordApp {
             }
         }
 
+        // #1741: Reports panel fetches — same view-gating as the Audit block
+        // above, for the same reason: this is the class of bug that had the
+        // audit panel polling forever from other views. Both the catalogue
+        // fetch and the in-flight run drain are inside the gate, so
+        // navigating away stops the panel doing any background work at all.
+        //
+        // Unlike `/audit` there is no TTL: the catalogue is static metadata
+        // (fetched once per session, re-armed by `r` via
+        // `reports_refresh_catalogue`), and a run only happens when the
+        // operator asks for one.
+        if self.active_view == SidebarView::Reports {
+            if let Some(rx) = &self.reports_catalogue_rx {
+                match rx.try_recv() {
+                    Ok(ReportsCatalogueOutcome::Catalogue(reports)) => {
+                        self.reports_catalogue = Some(reports);
+                        self.reports_error = None;
+                        self.reports_no_service = false;
+                        self.reports_catalogue_fetched = true;
+                        self.reports_catalogue_rx = None;
+                        self.reports_sel = 0;
+                        self.reports_field_sel = 0;
+                        // Open every untouched section so the first frame
+                        // shows usable parameter forms, not a stack of
+                        // collapsed titles.
+                        self.reports_seed_expansion();
+                        needs_redraw = true;
+                    }
+                    Ok(ReportsCatalogueOutcome::NoBoardService) => {
+                        self.reports_error = None;
+                        self.reports_no_service = true;
+                        self.reports_catalogue_fetched = true;
+                        self.reports_catalogue_rx = None;
+                        needs_redraw = true;
+                    }
+                    Ok(ReportsCatalogueOutcome::Unreachable(reason)) => {
+                        self.reports_error = Some(reason);
+                        self.reports_no_service = false;
+                        self.reports_catalogue_fetched = true;
+                        self.reports_catalogue_rx = None;
+                        needs_redraw = true;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        // Still in flight.
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        self.reports_catalogue_rx = None;
+                        self.reports_catalogue_fetched = true;
+                    }
+                }
+            } else if !self.reports_catalogue_fetched {
+                self.reports_catalogue_rx = Some(spawn_reports_catalogue_fetch());
+            }
+
+            if let Some(rx) = &self.reports_run_rx {
+                match rx.try_recv() {
+                    Ok(ReportRunOutcome::Result(result)) => {
+                        self.reports_result = Some(*result);
+                        self.reports_error = None;
+                        self.reports_no_service = false;
+                        self.reports_running = None;
+                        self.reports_run_rx = None;
+                        self.reports_result_scroll = 0;
+                        needs_redraw = true;
+                    }
+                    Ok(ReportRunOutcome::NoBoardService) => {
+                        // Surfaced as an error here (unlike the catalogue
+                        // case): the operator explicitly asked for a run, so
+                        // silence would read as a hung request.
+                        self.reports_error = Some("no board service configured".to_string());
+                        self.reports_no_service = true;
+                        self.reports_running = None;
+                        self.reports_run_rx = None;
+                        needs_redraw = true;
+                    }
+                    Ok(ReportRunOutcome::Unreachable(reason)) => {
+                        self.reports_error = Some(reason);
+                        self.reports_running = None;
+                        self.reports_run_rx = None;
+                        needs_redraw = true;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        // Still in flight — the section badge shows "running…".
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        self.reports_run_rx = None;
+                        self.reports_running = None;
+                    }
+                }
+            }
+        }
+
         needs_redraw
     }
 

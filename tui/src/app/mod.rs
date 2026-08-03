@@ -72,6 +72,12 @@ use quadraui::{
     Column, ColumnAlign, ColumnWidth, DataRow, DataTable, DataTableHit, DataTableLayout,
     // #1116: Usage panel grid/drill sort-arrow indicator.
     SortDirection,
+    // #1741: Reports panel — coord-tui's first `MultiSectionView` (the
+    // collapsible per-report section stack) plus the `Form` layout/hit types
+    // its bodies route through. `ScrollMode`/`SectionSize` are already
+    // imported above (they come from the same primitive).
+    FormHit, FormLayout, HeaderHit, MultiSectionView, MultiSectionViewHit,
+    MultiSectionViewLayout, MsvAxis, Section, SectionBody, SectionHeader,
     // #953: Terminal-view left-pane machine tree — the app's first direct
     // `backend.draw_tree` sidebar (bypassing `SidebarSystem`).
     SelectionMode, TreePath, TreeStyle, TreeView,
@@ -99,6 +105,10 @@ pub(crate) mod milestone_dag;
 pub(crate) mod plans;
 pub(crate) mod audit;
 pub(crate) mod usage;
+// #1741: Reports panel + the reusable `MultiSectionView` routing it is the
+// first consumer of (epic #571's panel consolidation is the next).
+pub(crate) mod msv;
+pub(crate) mod reports;
 pub(crate) mod fleet_terminals;
 pub(crate) mod fleet_sessions;
 pub(crate) mod workspace;
@@ -138,6 +148,8 @@ use self::fleet_sessions::*;
 use self::workspace::*;
 #[allow(unused_imports)]
 use self::drive::*;
+#[allow(unused_imports)]
+use self::msv::*;
 
 // ─── Auto-refresh interval ────────────────────────────────────────────────────
 
@@ -3116,6 +3128,65 @@ pub struct CoordApp {
     /// this step.
     pending_usage_range_end: Option<PendingUsageRangeEnd>,
 
+    // ── #1741: Reports ActivityBar panel ─────────────────────────────────────
+    //
+    // Everything here is keyed by the *catalogue's* report ids and param ids
+    // — no field names a specific report. See `app/reports.rs`.
+    /// Report catalogue from `GET /report` (#1742). `None` until the first
+    /// fetch completes, which the panel renders as "Loading reports…";
+    /// `Some(vec![])` means the daemon answered with an empty catalogue,
+    /// which is a different (and separately diagnosable) state.
+    reports_catalogue: Option<Vec<ReportDef>>,
+    /// In-flight catalogue fetch, drained by the same view-gated poll loop
+    /// that drains `audit_fetch_rx` (`settings_ui.rs`).
+    reports_catalogue_rx: Option<std::sync::mpsc::Receiver<ReportsCatalogueOutcome>>,
+    /// Whether a catalogue fetch has already been attempted this session.
+    /// The catalogue is static metadata, so unlike `/audit` it is fetched
+    /// once rather than on a TTL; `r` with no prior run re-arms it.
+    reports_catalogue_fetched: bool,
+    /// Operator-edited parameter values: report id → param id → value.
+    /// Anything absent falls back to the catalogue's `default`, so this map
+    /// only ever holds deliberate edits.
+    reports_params: std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+    /// Which sections are currently expanded (by report id).
+    reports_expanded: std::collections::HashSet<String>,
+    /// Report ids whose section the operator has explicitly collapsed or
+    /// expanded. Sections default to expanded, so `reports_seed_expansion`
+    /// needs to know which ones not to re-open behind the operator's back
+    /// when a fresh catalogue lands.
+    reports_touched: std::collections::HashSet<String>,
+    /// Id of the report whose run is currently in flight, or `None`.
+    reports_running: Option<String>,
+    /// In-flight run, delivering a `ReportResult` (or a failure).
+    reports_run_rx: Option<std::sync::mpsc::Receiver<ReportRunOutcome>>,
+    /// The last completed run's result. Cleared when a new run starts, so a
+    /// stale table can never sit under a fresh run or a fresh failure.
+    reports_result: Option<ReportResult>,
+    /// Why the last catalogue fetch or run failed, surfaced in the result
+    /// area instead of leaving the old result on screen.
+    reports_error: Option<String>,
+    /// `true` when the last completed fetch resolved `NoBoardService` —
+    /// same diagnosability rationale as `audit_no_service`.
+    reports_no_service: bool,
+    /// Selected section index (0-based) into the catalogue. Clamped on
+    /// navigation, same pattern as `audit_sel`.
+    reports_sel: usize,
+    /// Focused field index within the selected section's form (params, then
+    /// the trailing Run button). Clamped by `reports_clamp_field_sel`.
+    reports_field_sel: usize,
+    /// `true` while typing edits the focused free-text param rather than
+    /// hitting the panel's own single-key bindings (`r`, `j`/`k`, …).
+    /// Entered by clicking a text field or pressing Enter on it; left by
+    /// Enter/Esc. Mirrors `audit_type_filter.focused`'s role.
+    reports_text_editing: bool,
+    /// Vertical scroll offset into the result `DataTable` (wheel-driven —
+    /// the keyboard's `j`/`k` belong to section navigation here).
+    reports_result_scroll: usize,
+    /// The most recently painted section-stack geometry (plus each form
+    /// body's own), cached by `render_reports_panel` so `events.rs` can
+    /// hit-test without a `Backend` handle. See `app/msv.rs`.
+    reports_layout: std::cell::RefCell<MsvLayoutCache>,
+
     // ── #541: global Telescope-style issue fuzzy finder ──────────────────────
     /// Active state of the issue fuzzy-finder overlay.  `None` when the
     /// overlay is closed.  Opened with Ctrl+P from any non-PTY view; closed
@@ -3621,6 +3692,24 @@ impl CoordApp {
             usage_table_layout: std::cell::RefCell::new(None),
             pending_usage_range_start: None,
             pending_usage_range_end: None,
+            // #1741: Reports panel — nothing fetched yet; the first tick with
+            // active_view == Reports arms the catalogue fetch (settings_ui.rs).
+            reports_catalogue: None,
+            reports_catalogue_rx: None,
+            reports_catalogue_fetched: false,
+            reports_params: std::collections::HashMap::new(),
+            reports_expanded: std::collections::HashSet::new(),
+            reports_touched: std::collections::HashSet::new(),
+            reports_running: None,
+            reports_run_rx: None,
+            reports_result: None,
+            reports_error: None,
+            reports_no_service: false,
+            reports_sel: 0,
+            reports_field_sel: 0,
+            reports_text_editing: false,
+            reports_result_scroll: 0,
+            reports_layout: std::cell::RefCell::new(MsvLayoutCache::default()),
             // #217: resolved theme palette — computed from settings + optional
             // ~/.coord/theme.toml override file.
             active_theme: {
@@ -3777,6 +3866,15 @@ impl CoordApp {
                     icon: "$".into(),
                     tooltip: "Usage".into(),
                     title: "USAGE".into(),
+                },
+                // #1741: Reports panel — one collapsible section per entry in
+                // the `GET /report` catalogue (#1742). `▤` collides with none
+                // of the icons above (B M ▶ >_ ▦ ≣ ◆ ◉ § $) or the pinned ⚙.
+                PanelDefinition {
+                    id: WidgetId::new("panel:reports"),
+                    icon: "▤".into(),
+                    tooltip: "Reports".into(),
+                    title: "REPORTS".into(),
                 },
             ],
         )
@@ -7632,6 +7730,20 @@ impl CoordApp {
                     self.usage_scope.label(),
                     self.usage_group_by.label(),
                 )
+            }
+        } else if self.active_view == SidebarView::Reports {
+            // #1741: three hint sets — editing a free-text param (where
+            // every typed character belongs to the field, so `q=quit` would
+            // be a lie, same reasoning as the Audit type-filter above),
+            // an empty/unfetched catalogue, and the normal stack.
+            if self.reports_text_editing {
+                " type to edit  Enter=done  Esc=cancel ".to_string()
+            } else if self.reports_catalogue().is_empty() {
+                " r=refresh catalogue  q=quit ".to_string()
+            } else {
+                " j/k=section  Space=collapse  Tab=field  ←/→=value  \
+                 Enter=run  r=re-run  q=quit "
+                    .to_string()
             }
         } else {
             // #192: `p` / `a` / `A` retired alongside the PROPOSALS

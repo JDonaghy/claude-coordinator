@@ -2096,6 +2096,43 @@ impl CoordApp {
                         needs_redraw = true;
                     }
 
+                    // ── #1741: Reports free-text parameter editing ───────
+                    // Same placement rationale as the Audit type-filter arms
+                    // directly above: while `reports_text_editing` is set,
+                    // every printable character (including `q`) belongs to
+                    // the parameter being typed, so these arms must precede
+                    // the unguarded global `q`/Esc = Exit catch-all below.
+                    // The rest of the Reports keymap lives with the other
+                    // panels further down.
+                    Key::Named(NamedKey::Escape)
+                        if self.active_view == SidebarView::Reports
+                            && self.reports_text_editing =>
+                    {
+                        self.reports_text_editing = false;
+                        needs_redraw = true;
+                    }
+                    Key::Named(NamedKey::Enter)
+                        if self.active_view == SidebarView::Reports
+                            && self.reports_text_editing =>
+                    {
+                        self.reports_text_editing = false;
+                        needs_redraw = true;
+                    }
+                    Key::Named(NamedKey::Backspace)
+                        if self.active_view == SidebarView::Reports
+                            && self.reports_text_editing =>
+                    {
+                        self.reports_text_backspace();
+                        needs_redraw = true;
+                    }
+                    Key::Char(ch)
+                        if self.active_view == SidebarView::Reports
+                            && self.reports_text_editing =>
+                    {
+                        self.reports_text_insert(*ch);
+                        needs_redraw = true;
+                    }
+
                     // ── Watch overlay: control keys ─────────────────────
                     // 'b' opens the ChatController guidance overlay. When the
                     // overlay is open, ALL events are intercepted earlier in
@@ -2468,6 +2505,90 @@ impl CoordApp {
                     {
                         self.audit_category = self.audit_category.next();
                         self.on_audit_filters_changed();
+                        needs_redraw = true;
+                    }
+
+                    // ── Reports panel keyboard nav (#1741) ───────────────
+                    // The free-text-param editing arms are NOT here: they
+                    // have to run before the unguarded global `q`/Esc =
+                    // Exit catch-all above, so they live alongside the Audit
+                    // type-filter typing block near the top of this match.
+                    //
+                    // j/k walk the section stack (not the result table — the
+                    // wheel owns that, see `mouse_main_scroll`).
+                    Key::Char('j') | Key::Named(NamedKey::Down)
+                        if self.active_view == SidebarView::Reports =>
+                    {
+                        let n = self.reports_catalogue().len();
+                        if n > 0 {
+                            self.reports_sel = (self.reports_sel + 1).min(n - 1);
+                        }
+                        self.reports_field_sel = 0;
+                        self.reports_clamp_field_sel();
+                        needs_redraw = true;
+                    }
+                    Key::Char('k') | Key::Named(NamedKey::Up)
+                        if self.active_view == SidebarView::Reports =>
+                    {
+                        self.reports_sel = self.reports_sel.saturating_sub(1);
+                        self.reports_field_sel = 0;
+                        self.reports_clamp_field_sel();
+                        needs_redraw = true;
+                    }
+                    // Space toggles the selected section's collapse; Enter
+                    // runs it. (The issue body lists both keys against both
+                    // verbs — they can't share, and "Enter runs the thing
+                    // whose form I'm looking at" is the one an operator
+                    // reaches for, with the chevron a click or Space away.)
+                    Key::Char(' ') if self.active_view == SidebarView::Reports => {
+                        if let Some(id) = self.reports_selected().map(|d| d.id.clone()) {
+                            self.reports_toggle_expanded(&id);
+                            self.reports_field_sel = 0;
+                        }
+                        needs_redraw = true;
+                    }
+                    Key::Named(NamedKey::Enter) if self.active_view == SidebarView::Reports => {
+                        // Enter on a focused free-text param starts editing
+                        // it; anywhere else it fires the run.
+                        if self.reports_focus_is_text() {
+                            self.reports_text_editing = true;
+                        } else if self.reports_running.is_none() {
+                            self.reports_rerun_selected();
+                        }
+                        needs_redraw = true;
+                    }
+                    // Tab cycles focus within the selected section's form
+                    // (params, then the Run button).
+                    Key::Named(NamedKey::Tab) if self.active_view == SidebarView::Reports => {
+                        if let Some(def) = self.reports_selected() {
+                            let n = CoordApp::reports_field_count(def);
+                            self.reports_field_sel = (self.reports_field_sel + 1) % n.max(1);
+                        }
+                        needs_redraw = true;
+                    }
+                    // ←/→ (and h/l) step a focused choice param through its
+                    // catalogue-supplied options.
+                    Key::Char('l') | Key::Named(NamedKey::Right)
+                        if self.active_view == SidebarView::Reports =>
+                    {
+                        self.reports_step_choice(true);
+                        needs_redraw = true;
+                    }
+                    Key::Char('h') | Key::Named(NamedKey::Left)
+                        if self.active_view == SidebarView::Reports =>
+                    {
+                        self.reports_step_choice(false);
+                        needs_redraw = true;
+                    }
+                    // `r` re-runs the selected report — or, with no
+                    // catalogue yet, re-arms the catalogue fetch (the
+                    // "daemon was restarted after #1742 landed" case).
+                    Key::Char('r') if self.active_view == SidebarView::Reports => {
+                        if self.reports_catalogue().is_empty() {
+                            self.reports_refresh_catalogue();
+                        } else if self.reports_running.is_none() {
+                            self.reports_rerun_selected();
+                        }
                         needs_redraw = true;
                     }
 
@@ -3027,6 +3148,9 @@ impl CoordApp {
                             // #1116: list-mode j/k handled by the earlier
                             // guarded arm (below); a no-op here.
                             SidebarView::Usage => {}
+                            // #1741: section-stack j/k handled by the earlier
+                            // guarded arm; a no-op here.
+                            SidebarView::Reports => {}
                         }
                         needs_redraw = true;
                     }
@@ -3095,6 +3219,8 @@ impl CoordApp {
                             SidebarView::Audit => {}
                             // #1116: see Down/j arm above.
                             SidebarView::Usage => {}
+                            // #1741: see Down/j arm above.
+                            SidebarView::Reports => {}
                         }
                         needs_redraw = true;
                     }
@@ -3343,6 +3469,13 @@ impl CoordApp {
                                 self.usage_sel = 0;
                                 self.usage_scroll = 0;
                             }
+                            // #1741: Reports — Home jumps to the first
+                            // section (and its first field).
+                            SidebarView::Reports => {
+                                self.reports_sel = 0;
+                                self.reports_field_sel = 0;
+                                self.reports_clamp_field_sel();
+                            }
                         }
                         needs_redraw = true;
                     }
@@ -3435,6 +3568,15 @@ impl CoordApp {
                                     self.usage_sel = n - 1;
                                 }
                                 self.fix_usage_scroll(content_visible_rows(ctx.main_bounds(), lh));
+                            }
+                            // #1741: Reports — End jumps to the last section.
+                            SidebarView::Reports => {
+                                let n = self.reports_catalogue().len();
+                                if n > 0 {
+                                    self.reports_sel = n - 1;
+                                }
+                                self.reports_field_sel = 0;
+                                self.reports_clamp_field_sel();
                             }
                         }
                         needs_redraw = true;
@@ -5137,6 +5279,9 @@ impl CoordApp {
             // total); the grid/drill live in the main panel
             // (`mouse_main_click`), same as Audit.
             SidebarView::Usage => false,
+            // #1741: Reports sidebar is a summary (catalogue size + last-run
+            // line); the section stack lives in the main panel.
+            SidebarView::Reports => false,
         }
     }
 
@@ -5464,6 +5609,38 @@ impl CoordApp {
                 | Some(DataTableHit::Footer)
                 | Some(DataTableHit::Empty)
                 | None => false,
+            };
+        }
+        // #1741: Reports panel — the section stack is a `MultiSectionView`.
+        // Routing goes through the reusable `MsvLayoutCache` (`app/msv.rs`),
+        // which hit-tests the exact layout that was painted and, for a click
+        // inside a section body, descends into that body's own `Form`
+        // layout (in form-local coordinates). A header hit toggles collapse;
+        // a field hit is applied by `reports_apply_field_click` (segmented
+        // option → set the value, Run → fire the run, text → focus it).
+        //
+        // Nothing here knows what any parameter means — that is the whole
+        // point of the panel, and it is why the routing could be lifted out
+        // report-agnostic for #571's later consumers.
+        if self.active_view == SidebarView::Reports {
+            let route = self.reports_layout.borrow().route_click(pos);
+            return match route {
+                MsvClick::ToggleSection(section) => {
+                    let id = self.reports_catalogue().get(section).map(|d| d.id.clone());
+                    if let Some(id) = id {
+                        self.reports_sel = section;
+                        self.reports_field_sel = 0;
+                        self.reports_toggle_expanded(&id);
+                        return true;
+                    }
+                    false
+                }
+                MsvClick::Field { section, field } => {
+                    self.reports_apply_field_click(section, &field)
+                }
+                // The current sections carry no header actions; a future
+                // consumer (or a later Reports slice) routes them here.
+                MsvClick::HeaderAction { .. } | MsvClick::Inert | MsvClick::Outside => false,
             };
         }
         // #1116: Usage panel grid/drill is a `DataTable` painted straight
@@ -5829,6 +6006,8 @@ impl CoordApp {
             // #1116: Usage sidebar is a placeholder (scope/group-by/Σ
             // total) — no sidebar scroll.
             SidebarView::Usage => false,
+            // #1741: Reports sidebar is a short summary — no sidebar scroll.
+            SidebarView::Reports => false,
         }
     }
 
@@ -6097,6 +6276,24 @@ impl CoordApp {
                 } else if delta.y < 0.0 {
                     let max = n.saturating_sub(visible.max(1));
                     self.usage_scroll = (self.usage_scroll + 3).min(max);
+                }
+                true
+            }
+            // #1741: Reports panel — j/k navigate the *section stack*, so
+            // the wheel is given to the thing keyboard nav can't reach: the
+            // result table below it, which can run long (one row per issue
+            // in the window).
+            SidebarView::Reports => {
+                let n = self
+                    .reports_result
+                    .as_ref()
+                    .map(|r| r.rows.len())
+                    .unwrap_or(0);
+                if delta.y > 0.0 {
+                    self.reports_result_scroll = self.reports_result_scroll.saturating_sub(3);
+                } else if delta.y < 0.0 {
+                    let max = n.saturating_sub(visible.max(1));
+                    self.reports_result_scroll = (self.reports_result_scroll + 3).min(max);
                 }
                 true
             }

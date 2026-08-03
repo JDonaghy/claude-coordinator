@@ -516,6 +516,145 @@ pub(crate) fn spawn_audit_fetch(
     rx
 }
 
+// ── #1741: Reports panel fetches (`GET /report`, `GET /report/{id}`) ──────
+//
+// Both mirror `spawn_audit_fetch` above: thread-per-request, `ureq` query
+// params (never hand-interpolated — a free-text `repo` param would otherwise
+// need its own percent-encoding), and armed by the caller only while
+// `active_view == SidebarView::Reports` (see the poll loop in
+// `settings_ui.rs`), so no background thread runs while the operator is
+// elsewhere.
+
+/// Outcome of the one-per-session `GET /report` catalogue fetch (#1741).
+pub(crate) enum ReportsCatalogueOutcome {
+    /// HTTP 200 with a parsed catalogue (may legitimately be empty).
+    Catalogue(Vec<ReportDef>),
+    /// No board service configured — nothing to fetch from (the report
+    /// engine is a daemon-side surface; there is no local-SQLite path).
+    NoBoardService,
+    /// Network / parse error, or a non-2xx status. A daemon predating #1742
+    /// answers 404/405 here, which is exactly why the message is surfaced
+    /// in the panel rather than swallowed.
+    Unreachable(String),
+}
+
+/// Outcome of one `GET /report/{id}` run (#1741).
+pub(crate) enum ReportRunOutcome {
+    /// HTTP 200 with a parsed `ReportResult` (may have zero rows — that is a
+    /// real answer, not an error).
+    Result(Box<ReportResult>),
+    NoBoardService,
+    /// Network / parse error, or a non-2xx status. The engine answers 400
+    /// (bad param) / 404 (unknown report) / 503 (run failed) with a JSON
+    /// `{"error": ...}` body, which `report_http_error` unwraps so the
+    /// operator sees the engine's own message.
+    Unreachable(String),
+}
+
+/// Turn a `ureq` failure into the message the panel shows. A non-2xx status
+/// from the report routes carries a JSON `{"error": "..."}` body written to
+/// read well on its own (`coord/reports.py`'s `ReportError` docstring says
+/// so explicitly) — surface that rather than a bare "HTTP 400".
+fn report_http_error(err: ureq::Error) -> String {
+    match err {
+        ureq::Error::Status(code, resp) => {
+            let body = resp.into_string().unwrap_or_default();
+            let detail = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| {
+                    v.get("error")
+                        .and_then(|e| e.as_str().map(|s| s.to_string()))
+                })
+                .unwrap_or_else(|| body.trim().to_string());
+            if detail.is_empty() {
+                format!("HTTP {code}")
+            } else {
+                format!("HTTP {code}: {detail}")
+            }
+        }
+        other => other.to_string(),
+    }
+}
+
+/// Shared `ureq` agent settings for both report requests. A report run reads
+/// the audit trail over a window, so it gets a longer read timeout than
+/// `/audit`'s 8s page fetch.
+fn report_agent(read_timeout_secs: u64) -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(read_timeout_secs))
+        .build()
+}
+
+/// Fetch the report catalogue. Static metadata, so the caller fetches it
+/// once per session rather than on a TTL.
+pub(crate) fn spawn_reports_catalogue_fetch() -> std::sync::mpsc::Receiver<ReportsCatalogueOutcome>
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    let Some((url, token)) = resolve_board_service() else {
+        let _ = tx.send(ReportsCatalogueOutcome::NoBoardService);
+        return rx;
+    };
+    std::thread::spawn(move || {
+        let mut req = report_agent(8).get(&format!("{url}/report"));
+        if let Some(t) = &token {
+            req = req.set("Authorization", &format!("Bearer {t}"));
+        }
+        let outcome = match req.call() {
+            Ok(resp) => match resp.into_string() {
+                Ok(body) => match serde_json::from_str::<ReportCatalogue>(&body) {
+                    Ok(cat) => ReportsCatalogueOutcome::Catalogue(cat.reports),
+                    Err(e) => ReportsCatalogueOutcome::Unreachable(format!("json: {e}")),
+                },
+                Err(e) => ReportsCatalogueOutcome::Unreachable(e.to_string()),
+            },
+            Err(e) => ReportsCatalogueOutcome::Unreachable(report_http_error(e)),
+        };
+        let _ = tx.send(outcome);
+    });
+    rx
+}
+
+/// Run one report. `params` is `(param_id, value)` straight from the
+/// catalogue's own param list — this function knows nothing about which
+/// parameters any report has.
+pub(crate) fn spawn_report_run(
+    report_id: &str,
+    params: Vec<(String, String)>,
+) -> std::sync::mpsc::Receiver<ReportRunOutcome> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let Some((url, token)) = resolve_board_service() else {
+        let _ = tx.send(ReportRunOutcome::NoBoardService);
+        return rx;
+    };
+    let report_id = report_id.to_string();
+    std::thread::spawn(move || {
+        let mut req = report_agent(30).get(&format!("{url}/report/{report_id}"));
+        for (key, value) in &params {
+            // An empty value means "the server's default" — `resolve_params`
+            // treats absent and empty identically, so don't send it.
+            if !value.is_empty() {
+                req = req.query(key, value);
+            }
+        }
+        if let Some(t) = &token {
+            req = req.set("Authorization", &format!("Bearer {t}"));
+        }
+        let outcome = match req.call() {
+            Ok(resp) => match resp.into_string() {
+                Ok(body) => match serde_json::from_str::<ReportResult>(&body) {
+                    Ok(result) => ReportRunOutcome::Result(Box::new(result)),
+                    Err(e) => ReportRunOutcome::Unreachable(format!("json: {e}")),
+                },
+                Err(e) => ReportRunOutcome::Unreachable(e.to_string()),
+            },
+            Err(e) => ReportRunOutcome::Unreachable(report_http_error(e)),
+        };
+        let _ = tx.send(outcome);
+    });
+    rx
+}
+
 /// #315: signal that `spawn_inject_post` sends to the main thread when
 /// the /inject POST returns HTTP 409 ("assignment is `done`") or 410
 /// (BrokenPipeError — worker stdin closed).  Both mean the worker exited

@@ -115,6 +115,10 @@ impl ShellApp for CoordApp {
                 SidebarView::Usage => {
                     backend.draw_list(sidebar_rect, &self.usage_sidebar());
                 }
+                // #1741: Reports sidebar — catalogue size + last run summary.
+                SidebarView::Reports => {
+                    backend.draw_list(sidebar_rect, &self.reports_sidebar());
+                }
             }
         }
 
@@ -527,6 +531,11 @@ impl ShellApp for CoordApp {
             SidebarView::Usage => {
                 self.render_usage_panel(backend, m, lh);
             }
+            // #1741: Reports panel — collapsible per-report section stack,
+            // with the last run's table + notes below it.
+            SidebarView::Reports => {
+                self.render_reports_panel(backend, m, lh);
+            }
         }
 
         // ── Inject chat overlay — renders over the main panel ───────────
@@ -685,6 +694,8 @@ impl ShellApp for CoordApp {
             "panel:audit" => SidebarView::Audit,
             // #1116: Usage panel — per-issue/repo cost/token grid.
             "panel:usage" => SidebarView::Usage,
+            // #1741: Reports panel — catalogue-driven collapsible sections.
+            "panel:reports" => SidebarView::Reports,
             _ => return,
         };
         // #1124: the `?` help overlay / `/` command palette are scoped to
