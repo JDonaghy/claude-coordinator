@@ -329,6 +329,7 @@ The deployment picture, end to end:
 | `coord serve` | 7435 | dellserver only (owns the DB) | `deploy/coord-serve.service` |
 | `coord web` | 7434 | dellserver only (reads the local DB) | `deploy/coord-web.service` |
 | `coord notify` (periodic) | n/a (CLI, not a listener) | dellserver only (owns the DB) | `deploy/coord-notify.service` + `deploy/coord-notify.timer` |
+| `coord drive-queue tick` (periodic) | n/a (CLI, not a listener) | dellserver only (tmux + repo checkouts) | `deploy/coord-drive-queue.service` + `deploy/coord-drive-queue.timer` |
 
 The phone is just a browser: open `http://<dellserver-host>:7434` on the tailnet
 and Add to Home Screen (the API is same-origin, so no client config).
@@ -413,6 +414,38 @@ auto-loop dispatch path. Low risk today (flat headless-only dispatch has no
 `--interactive` involved), and deliberately **deferred as a fast-follow** rather
 than blocking this timer — flag it if it ever bites (a fix worker firing while
 someone is mid-`--fix-of` on the same issue).
+
+## Periodic `coord drive-queue tick` (`coord-drive-queue` timer, #1756)
+
+Same shape as the `coord-notify` timer above — a `Type=oneshot` unit fired on
+a cadence by its own timer — but for a different job: draining the operator-
+declared `coord drive-queue` work queue (#1750) instead of the pipeline's
+completion/failure notifications. Install on the same host (dellserver): the
+tick subprocess-launches `coord drive --tmux`, which needs a local tmux
+server and the repo checkouts under `SRC_ROOT`, so unlike `coord notify` it
+does **not** have a daemon re-route that makes it safe to run from anywhere.
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp deploy/coord-drive-queue.service deploy/coord-drive-queue.timer \
+    ~/.config/systemd/user/
+loginctl enable-linger "$USER"          # survive logout / reboot
+systemctl --user daemon-reload
+systemctl --user enable --now coord-drive-queue.timer
+```
+
+Verify / logs:
+
+```bash
+systemctl --user list-timers coord-drive-queue.timer
+journalctl --user -u coord-drive-queue.service -f
+```
+
+`Type=oneshot` plus the tick's own flock means a slow tick cannot stack — a
+timer fire while the previous tick is still running exits 0 without touching
+the queue. Full runbook, including the enqueue commands, the `QUEUE: STALLED`
+vs `QUEUE: BLOCKED` status-bar reading, the pinned-CLI upgrade trap, and the
+`#1715` "don't queue more than ~2" caveat: [`docs/DRIVE_QUEUE.md`](DRIVE_QUEUE.md).
 
 ## Graphify graph: reseed a machine's local clone
 

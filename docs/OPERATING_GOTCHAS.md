@@ -361,6 +361,17 @@ covers other repos and **refuses** rather than recording a false `skipped`
 (#1408); the Test stage is board-visible (#1395 `running` marker, then #1426);
 merges serialize fleet-wide rather than per-machine (#1400).
 
+**`coord drive-queue` (#1750, [`docs/DRIVE_QUEUE.md`](DRIVE_QUEUE.md)) is the
+durable, timer-driven successor to typing `coord drive` by hand or to
+`drive-batch.sh`'s bash loop** — it does not replace this section's deadline
+trap, it inherits it: an expired `--deadline` still stops only the observer,
+and the queue's capacity accounting is deliberately board-state-based (not a
+session count) so it does not launch on top of that still-running work. The
+operator-visible consequence is that `coord drive-sessions` will show *fewer*
+drives than are actually running once a queued drive's observer has hit its
+deadline — check `coord drive-queue status` instead. See
+[`docs/DRIVE_QUEUE.md`](DRIVE_QUEUE.md) for the full runbook.
+
 ## 10. A stuck merge (`NEEDS_ATTENTION`) escalates instead of retrying — the `gh pr merge` escape hatch
 
 `coord drive`'s merge stage (`_decide_merge` in `coord/drive.py`) only retries
@@ -519,3 +530,40 @@ It prints a `GRAPH_HEALTH: checkouts=N stale=M` trailer. Fix a stale one with
 `graphify update .` in that checkout. Worth running after any `reset --hard`,
 after a rebase-heavy session, and on each machine periodically — the first real
 run of it caught `~/src/vimcode` sitting 55 commits behind its own graph.
+
+## 13. The `coord-drive-queue` timer runs a pinned CLI nothing upgrades for you, and a short queue is not unattended-safe
+
+Two traps specific to the `coord drive-queue` timer (#1756,
+[`docs/DRIVE_QUEUE.md`](DRIVE_QUEUE.md)), on top of everything section 9
+already says about `coord drive` itself.
+
+**The timer's `coord` is whatever `~/.local/bin/coord` resolves to — it does
+not notice a merged fix until that install is upgraded**, and it is easy to
+forget because the unit just keeps running "successfully" against stale
+code. This is the same class of trap as item 1 (a merged fix is not a live
+fix) and as the epic sequencer's separate `~/.coord-cli-venv` lane (§
+"The fourth lane" in `docs/AGENT_OPERATIONS.md`, found **three releases
+stale** on 2026-07-29) — but NOT the same venv. On dellserver,
+`~/.local/bin/coord` is a symlink into `~/.coord-venv`, the same pinned,
+non-editable venv `coord-agent` itself runs from (`deploy/coord-agent.service`),
+so it rides the ordinary agent upgrade lane rather than needing a bespoke one:
+
+```bash
+coord agent update --machine dellserver   # or --all — the standard lane
+~/.local/bin/coord --version              # VERIFY it took — an upgrade
+                                           # silently no-ops more often than
+                                           # you would think
+```
+
+The topology is **per-machine**: a dev box's `~/.local/bin/coord` is commonly
+an *editable* install pointing at a checkout, which is fine interactively but
+unsafe under this timer (`pip show claude-coordinator | grep -i editable`
+must print nothing before you install the unit there).
+
+**A queue longer than ~2 issues on one repo is not yet unattended-safe
+(#1715).** Every merge stales every other queued branch's Test verdict on
+that repo, and `coord drive` escalates to a human on a stale verdict rather
+than re-testing — so *N* queued issues can cost *N−1* human interventions
+overnight, the opposite of what a queue is for. Full reasoning and the
+smaller, partially-mitigated `#1738` sibling trap (a content-irrelevant base
+move) are in [`docs/DRIVE_QUEUE.md`](DRIVE_QUEUE.md)'s top section.
