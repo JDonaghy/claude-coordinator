@@ -3133,9 +3133,22 @@ def _base_checkout_write_guard_tools(repo_path: str) -> list[str]:
     under the shared base checkout *repo_path*.
 
     Pure function, easy to test in isolation. Returns ``[]`` for an empty or
-    non-absolute *repo_path* (defensive — every real spec has an absolute
-    one) so callers can unconditionally combine the result with
-    ``_sealed_write_guard_tools``.
+    non-absolute (after expansion) *repo_path* (defensive — every real spec
+    resolves to an absolute one) so callers can unconditionally combine the
+    result with ``_sealed_write_guard_tools``.
+
+    *repo_path* is expanded with ``Path.expanduser()`` before the
+    absolute-path check: production ``spec.repo_path`` is the raw string
+    straight from ``coordinator.yml``'s ``machines[].repo_paths``, and this
+    project's own ``coordinator.example.yml`` documents that field with
+    tilde-shorthand (e.g. ``~/src/claude-coordinator``) — ``dispatch.py``
+    sends it over the wire unexpanded, and neither ``AssignmentSpec`` nor the
+    ``/assign`` handler normalizes it. Without expansion here, a tilde-form
+    *repo_path* silently produces no patterns at all, reproducing the exact
+    silent-escape failure #1642 exists to close, inside the fix itself.
+    Every other real filesystem use of ``spec.repo_path`` in this module
+    (``AgentServer.assign``, ``_cleanup_worktree_locked``, and others) already
+    calls ``Path(...).expanduser()`` first — this mirrors that.
 
     Claude Code's ``//<abs-path>`` marker already embeds the path's leading
     ``/`` in the doubled slash — i.e. absolute path ``/home/john/src/api``
@@ -3146,7 +3159,7 @@ def _base_checkout_write_guard_tools(repo_path: str) -> list[str]:
     """
     if not repo_path:
         return []
-    normalized = repo_path.rstrip("/")
+    normalized = str(Path(repo_path).expanduser()).rstrip("/")
     if not normalized.startswith("/"):
         return []
     body = normalized[1:]
