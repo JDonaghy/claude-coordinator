@@ -681,6 +681,81 @@ pub(crate) struct BoardPayload {
     /// only) and on daemons older than #1505.
     #[serde(default)]
     pub(crate) escalations: Vec<EscalationEntry>,
+    /// #1631 (H-4): the fleet-health aggregate H-3 computes — see
+    /// `coord.health.fleet_snapshot.FleetHealthSnapshot.to_dict`. Empty
+    /// (`FleetHealthBlock::default()`) on the local-SQLite-mode read path
+    /// (no daemon to compute it — H-3's snapshot lives in-process on
+    /// whichever host runs `coord serve`) and on daemons older than #1630.
+    #[serde(default)]
+    pub(crate) fleet_health: FleetHealthBlock,
+}
+
+/// #1631 (H-4): one already-rendered health-check row — the wire shape of
+/// `coord.health.models.CheckResult.to_dict()`. `severity`/`headroom` are
+/// already decided by the probe that produced this row; nothing on the TUI
+/// side may re-derive either from raw numbers (see `fleet_health.rs`'s
+/// module doc for why that invariant matters).
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub(crate) struct FleetHealthCheckResult {
+    // Parsed for wire parity / a future per-row selection or drill-down
+    // (mirrors `EscalationEntry::id`/`stage` above); the overlay renders
+    // `label`/`headroom`/`threshold`/`detail` today, not these.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub(crate) key: String,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub(crate) check_id: String,
+    #[serde(default)]
+    pub(crate) title: String,
+    #[serde(default)]
+    pub(crate) label: String,
+    // Wire parity only — `label` already carries the subject when the
+    // check has one (see `CheckResult.label` in `coord/health/models.py`).
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub(crate) subject: Option<String>,
+    #[serde(default)]
+    pub(crate) severity: String,
+    #[serde(default)]
+    pub(crate) headroom: String,
+    #[serde(default)]
+    pub(crate) threshold: String,
+    #[serde(default)]
+    pub(crate) detail: String,
+}
+
+/// #1631 (H-4): one machine's rolled-up health — the wire shape of one
+/// entry in `fleet_health.machine_health` (see
+/// `coord.health.fleet_snapshot._machine_health_rows`). `severity` is
+/// already stale-aware ("unknown" when the machine never reported or its
+/// last report is too old — never silently carried forward as green); it is
+/// NOT recomputed from `results` on this side.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub(crate) struct FleetMachineHealth {
+    pub(crate) machine: String,
+    #[serde(default)]
+    pub(crate) state: String,
+    #[serde(default)]
+    pub(crate) severity: String,
+    #[serde(default)]
+    pub(crate) stale: bool,
+    #[serde(default)]
+    pub(crate) checked_at: Option<f64>,
+    #[serde(default)]
+    pub(crate) results: Vec<FleetHealthCheckResult>,
+}
+
+/// #1631 (H-4): the wire shape of `/board`'s `fleet_health` key —
+/// `coord.health.fleet_snapshot.FleetHealthSnapshot.to_dict()`.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub(crate) struct FleetHealthBlock {
+    #[serde(default)]
+    pub(crate) machine_health: Vec<FleetMachineHealth>,
+    /// Fleet-scope checks (board latency, phantom-running rows, deploy-lane
+    /// skew, …) that have no single owning machine.
+    #[serde(default)]
+    pub(crate) fleet_checks: Vec<FleetHealthCheckResult>,
 }
 
 /// #1505: one board-visible "driver stuck" record — `coord drive`'s merge
@@ -837,6 +912,10 @@ pub(crate) enum ContextMenuTarget {
         /// the repo-header/empty-space case (contract §4c).
         milestone: Option<(i64, String)>,
     },
+    /// #1631 (H-4): right-click anywhere on the status bar. Carries no
+    /// payload — the menu it opens has exactly one item ("Fleet health…"),
+    /// unconditionally, regardless of where in the bar the click landed.
+    FleetHealth,
 }
 
 /// #262: lifecycle bucket for a Pipeline sidebar row at right-click
@@ -1970,6 +2049,10 @@ pub struct BoardData {
     /// escalation records. Empty on the local-SQLite-mode read path and on
     /// daemons older than #1505.
     pub(crate) escalations: Vec<EscalationEntry>,
+    /// #1631 (H-4): mirrors `BoardPayload::fleet_health` — see that field's
+    /// doc comment. Consumed by `fleet_health.rs`'s status-bar segment and
+    /// detail overlay; never re-derives severity from raw values.
+    pub(crate) fleet_health: FleetHealthBlock,
 }
 
 /// Parsed plan data, mirroring `coord.plan_parser.WorkerPlan.to_dict()`.

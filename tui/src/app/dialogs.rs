@@ -1106,6 +1106,8 @@ impl CoordApp {
             ContextMenuTarget::PlansStub { repo_name, milestone } => {
                 self.context_menu_items_for_plans_stub(repo_name.as_deref(), milestone.as_ref())
             }
+            // #1631 (H-4): right-click anywhere on the status bar.
+            ContextMenuTarget::FleetHealth => self.context_menu_items_for_fleet_health(),
         };
         if items.is_empty() {
             return false;
@@ -5892,6 +5894,7 @@ impl CoordApp {
                     ContextMenuTarget::MilestoneHeader { tracking_issue, .. } => *tracking_issue,
                     ContextMenuTarget::TerminalRow { .. } => 0,
                     ContextMenuTarget::PlansStub { .. } => 0,
+                    ContextMenuTarget::FleetHealth => 0,
                 };
                 self.push_toast(
                     "Copy",
@@ -5905,6 +5908,13 @@ impl CoordApp {
             }
             "refresh" => {
                 self.refresh();
+                true
+            }
+            // #1631 (H-4): the status bar's "Fleet health…" menu item —
+            // opens the detail overlay (`fleet_health.rs::
+            // render_fleet_health_overlay`); Esc closes it (`events.rs`).
+            "open-fleet-health-detail" => {
+                self.open_fleet_health_overlay();
                 true
             }
             // #1123 (contract §4c): "New plan > Quick capture" — the

@@ -608,6 +608,12 @@ impl ShellApp for CoordApp {
         // `SidebarView::help_view_id`). Both are no-ops when closed.
         self.render_help_overlay(backend, layout.main_content_bounds, lh);
         self.render_command_palette(backend, layout.main_content_bounds, lh);
+
+        // ── #1631 (H-4): fleet-health detail overlay (topmost) ──────────
+        // Same z-order reasoning as the help overlay/command palette just
+        // above — a global overlay, not scoped to any one view's main
+        // content. No-op when closed.
+        self.render_fleet_health_overlay(backend, layout.main_content_bounds);
     }
 
     fn handle(

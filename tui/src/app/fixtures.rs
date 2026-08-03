@@ -120,6 +120,7 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         pending_merge_all_ready: None,
         pending_context_menu: None,
         context_menu_layout: std::cell::RefCell::new(Vec::new()),
+        fleet_health_overlay_open: false,
         dialog_layout: std::cell::RefCell::new(None),
         pending_restart: None,
         machine_last_contact: std::collections::HashMap::new(),

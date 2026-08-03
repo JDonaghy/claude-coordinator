@@ -215,7 +215,27 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
                     click.echo(f"    latest: {updates[-1]}")
 
     # Reconcile board with live agent data
-    board = read_board()
+    #
+    # #1631 (H-4): the fleet-health footer needs the SAME `fleet_health`
+    # block a thin client's `/board` GET already carries — fetching it a
+    # second time would double the board round-trip (this repo has hit
+    # multi-MB /board payloads before; see fleet_snapshot.py's own budget
+    # comment), so on a thin client this replaces the plain `read_board()`
+    # call with the raw-payload equivalent and pulls `fleet_health` off the
+    # SAME response instead of issuing a second GET. Host mode (no
+    # board_service) has no such payload to share, so it falls back to
+    # reassembling an equivalent block from the local DB.
+    if svc is not None:
+        from coord.client import board_from_payload, fetch_board_payload
+
+        board_payload = fetch_board_payload(svc)
+        board = board_from_payload(board_payload)
+        fleet_health_block = board_payload.get("fleet_health")
+    else:
+        from coord.health.aggregate import local_fleet_health_block
+
+        board = read_board()
+        fleet_health_block = local_fleet_health_block([m.name for m in cfg.machines])
     if not no_reconcile and agent_completed:
         # #749: write_board() routes to the daemon's /board upsert when a
         # board service is configured, so a thin client's reconciliation now
@@ -556,6 +576,21 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
             click.echo(burn_line)
     except (ImportError, OSError, ValueError, KeyError):
         pass  # Never let usage tracking break the status command.
+
+    # #1631 (H-4): the always-visible fleet-health footer. Printed
+    # unconditionally, every run — including the all-OK case ("OK states its
+    # OK-ness rather than printing nothing": a check nobody ever sees run is
+    # indistinguishable from a check that's silently broken, the exact
+    # failure mode #1631 exists to close). Aggregation itself lives in
+    # coord.health.aggregate — this command only renders it.
+    try:
+        from coord.health.aggregate import render_fleet_footer, summarize_fleet_health
+
+        click.echo("")
+        click.echo(render_fleet_footer(summarize_fleet_health(fleet_health_block)))
+    except Exception:  # noqa: BLE001 — the footer must never break `coord status`
+        click.echo("")
+        click.echo("FLEET: ?  (health footer unavailable — coord health for detail)")
 
 
 def _health_vs_config_lines(machine, health: dict) -> list[tuple[bool, str]]:
