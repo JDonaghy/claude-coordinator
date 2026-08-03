@@ -108,6 +108,13 @@ from coord.usage_limits import PlanLimits, evaluate_usage_gate, get_plan_limits
 # same source as coord/notify.py:53 — deliberately NOT re-pointed at #1590's
 # newer classify_failure(), which would change reviewed behaviour during a
 # conflict resolution.
+#
+# #1710 inventory: kept as a direct import — same trivial-predicate reasoning
+# as coord/notify.py's identical import: `is_usage_limit_reason` is a
+# string-prefix check over `Assignment.failure_reason`/`review_failure_reason`
+# (a coordinator-authored value stamped by `format_usage_limit_reason`), not a
+# per-provider log-format parse. Any provider's failure_reason is checked the
+# same way, so there is no `provider.parse_log()` equivalent to route through.
 from coord.worker_events import is_usage_limit_reason
 
 # ── exit codes (unchanged from drive-issue.sh) ───────────────────────────────
