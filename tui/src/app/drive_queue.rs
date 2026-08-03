@@ -44,6 +44,13 @@ pub(crate) const QUEUE_STATE_RUNNING: &str = "running";
 pub(crate) const QUEUE_STATE_BLOCKED: &str = "blocked";
 pub(crate) const QUEUE_STATE_DONE: &str = "done";
 
+/// #1757: wire values of `drive_queue.hold_state` — the DEPLOY GATE's
+/// lifecycle, orthogonal to the entry's queue `state` above. `fired` is the
+/// only one that stops the queue; `armed` is a gate that has not triggered
+/// yet and `released` one a human (or a passing `resume_when`) has cleared.
+/// Mirrors `HOLD_*` in `coord/drive_queue.py`.
+pub(crate) const HOLD_STATE_FIRED: &str = "fired";
+
 /// #1755: pending "Add to drive queue after…" text input. Mirrors
 /// `PendingMilestoneRowInput`'s single-buffer shape (Enter submits, Esc
 /// cancels) rather than a full form — the whole payload is a short list of
@@ -73,6 +80,14 @@ pub(crate) enum DriveQueueLevel {
     /// alert case: the queue looks busy but nothing will ever move without
     /// the operator.
     Stalled,
+    /// #1757: an entry's DEPLOY GATE has fired. The queue is deliberately
+    /// stopped and will not launch anything — including a fully eligible
+    /// successor — until a human deploys and releases it.
+    ///
+    /// Outranks `Stalled` (this is a definite stop, not "nothing happens to
+    /// be eligible right now") and ranks below `Blocked` (a gate is the
+    /// system working as designed; `blocked` is something that failed).
+    Held,
     /// At least one row is `blocked` — a hard stop DQ-2 already gave up on.
     Blocked,
 }
@@ -86,7 +101,12 @@ impl DriveQueueLevel {
             // Muted grey-on-dark: present, legible, visibly *not* an alert.
             DriveQueueLevel::Empty => (Color::rgb(150, 150, 160), Color::rgb(30, 30, 40)),
             DriveQueueLevel::Normal => (Color::rgb(200, 220, 255), Color::rgb(40, 60, 90)),
-            DriveQueueLevel::Stalled => (Color::rgb(255, 210, 100), Color::rgb(70, 45, 10)),
+            // Same warn amber as `Stalled`: both mean "the queue has stopped
+            // and needs you", and two different ambers for one meaning is how
+            // a status bar stops being readable at a glance.
+            DriveQueueLevel::Stalled | DriveQueueLevel::Held => {
+                (Color::rgb(255, 210, 100), Color::rgb(70, 45, 10))
+            }
             DriveQueueLevel::Blocked => (Color::rgb(255, 255, 255), Color::rgb(150, 30, 30)),
         }
     }
@@ -96,6 +116,31 @@ impl DriveQueueLevel {
 /// must not inflate "N waiting" or keep the segment shouting forever.
 fn is_pending(e: &BoardDriveQueueEntry) -> bool {
     e.state != QUEUE_STATE_DONE
+}
+
+/// #1757: is this row's deploy gate currently holding the queue shut?
+///
+/// Read straight off `hold_state`, which the tick owns — the TUI never
+/// re-derives "should this be held" from `hold_after` + `state`, for the same
+/// reason it never re-derives `waiting`/`running`: two implementations of one
+/// rule drift, and the one an operator is reading is the wrong one.
+///
+/// Deliberately NOT gated on `is_pending`: a fired gate lives on a `done`
+/// entry by construction (the gate fires when the entry lands), so filtering
+/// `done` rows out here would hide every hold that exists.
+pub(crate) fn is_holding(e: &BoardDriveQueueEntry) -> bool {
+    e.hold_state == HOLD_STATE_FIRED
+}
+
+/// The sentence shown for a held gate — the operator's own `hold_reason`
+/// when there is one, else a fallback naming the entry. Never empty: a status
+/// bar that says only "HELD" makes the operator go and reconstruct why.
+fn hold_headline(e: &BoardDriveQueueEntry) -> String {
+    if e.hold_reason.is_empty() {
+        format!("deploy gate after {}", e.key())
+    } else {
+        e.hold_reason.clone()
+    }
 }
 
 /// Is this row's `after` list satisfied by the queue it sits in?
@@ -126,11 +171,17 @@ pub(crate) struct DriveQueueSummary {
     /// Waiting rows whose in-queue pre-reqs are all satisfied — i.e. rows a
     /// tick could plausibly pick up. Zero-with-waiting-rows is the stall.
     pub(crate) eligible: usize,
+    /// #1757: rows whose deploy gate has fired. Non-zero means the tick will
+    /// launch nothing at all, whatever `eligible` says.
+    pub(crate) held: usize,
 }
 
 /// Summarise the queue. Pure over the board rows — no clock, no self.
 pub(crate) fn summarize_drive_queue(entries: &[BoardDriveQueueEntry]) -> DriveQueueSummary {
     let mut s = DriveQueueSummary::default();
+    // Counted over ALL entries, not just pending ones: a fired gate sits on a
+    // `done` row by construction.
+    s.held = entries.iter().filter(|e| is_holding(e)).count();
     for e in entries.iter().filter(|e| is_pending(e)) {
         match e.state.as_str() {
             QUEUE_STATE_RUNNING => s.running += 1,
@@ -151,6 +202,12 @@ pub(crate) fn summarize_drive_queue(entries: &[BoardDriveQueueEntry]) -> DriveQu
         // Blocked outranks stalled — a hard stop is worse news than a queue
         // that is merely waiting for capacity.
         DriveQueueLevel::Blocked
+    } else if s.held > 0 {
+        // #1757: a fired gate outranks a stall, and it outranks it even when
+        // the stall is REAL — "3 waiting, none eligible" is a symptom here,
+        // and "you have a deploy to do" is the cause. Showing the symptom
+        // would send the operator looking for a dependency bug.
+        DriveQueueLevel::Held
     } else if s.waiting > 0 && s.eligible == 0 && s.running == 0 {
         // Nothing running AND nothing that could start: the epic's "if
         // nothing can start, alert the operator" case. A row running means
@@ -172,12 +229,33 @@ pub(crate) fn summarize_drive_queue(entries: &[BoardDriveQueueEntry]) -> DriveQu
 /// QUEUE: empty
 /// QUEUE: 1 running · 3 waiting
 /// QUEUE: STALLED — 3 waiting, none eligible
+/// QUEUE: HELD — release + restart coord-serve
 /// QUEUE: BLOCKED 2 · 1 waiting
 /// ```
 pub(crate) fn drive_queue_status_text(entries: &[BoardDriveQueueEntry]) -> String {
     let s = summarize_drive_queue(entries);
     match s.level {
         DriveQueueLevel::Empty => "QUEUE: empty".to_string(),
+        DriveQueueLevel::Held => {
+            let gate = entries
+                .iter()
+                .find(|e| is_holding(e))
+                .map(hold_headline)
+                .unwrap_or_else(|| "deploy gate".to_string());
+            let mut out = format!("QUEUE: HELD — {gate}");
+            // A rising probe count is the difference between "the deploy is
+            // pending" and "the probe has been failing for two hours" — the
+            // second is the one that needs a human, so it must be on the bar.
+            if let Some(p) = entries
+                .iter()
+                .find(|e| is_holding(e))
+                .map(|e| e.hold_probes)
+                .filter(|p| *p > 0)
+            {
+                out.push_str(&format!(" (probe failed {p}×)"));
+            }
+            out
+        }
         DriveQueueLevel::Blocked => {
             let mut out = format!("QUEUE: BLOCKED {}", s.blocked);
             if s.running > 0 {
@@ -220,7 +298,10 @@ impl CoordApp {
             bg,
             // Bold only when it's news — an idle/normal queue shouldn't
             // compete with the fleet-health segment next to it for attention.
-            bold: matches!(level, DriveQueueLevel::Stalled | DriveQueueLevel::Blocked),
+            bold: matches!(
+                level,
+                DriveQueueLevel::Stalled | DriveQueueLevel::Held | DriveQueueLevel::Blocked
+            ),
             action_id: None,
         }
     }
@@ -444,6 +525,17 @@ impl CoordApp {
             if !e.after.is_empty() {
                 line.push_str(&format!("  after {}", e.after.join(",")));
             }
+            // #1757: a deploy gate is on the ROW, not just in the aggregate —
+            // an operator scanning the queue has to be able to see which entry
+            // is going to stop it before it stops.
+            if e.hold_after != 0 {
+                let state = if e.hold_state.is_empty() {
+                    "armed"
+                } else {
+                    e.hold_state.as_str()
+                };
+                line.push_str(&format!("  hold:{state}"));
+            }
             items.push(ListItem {
                 text: StyledText {
                     spans: vec![StyledSpan::with_fg(line, fg)],
@@ -474,12 +566,32 @@ impl CoordApp {
                 items.push(dq_muted_row(&format!("      {}", bits.join("  ·  "))));
                 targets.push(Some(idx));
             }
+
+            // The gate's own line: what the operator has to DO, and (when a
+            // probe is declared) whether it is failing. Shown for an `armed`
+            // gate too — knowing the deploy step is coming is what lets an
+            // operator queue the work and walk away.
+            if e.hold_after != 0 {
+                items.push(dq_muted_row(&format!(
+                    "      hold-after: {}",
+                    hold_headline(e)
+                )));
+                targets.push(Some(idx));
+                if !e.resume_when.is_empty() {
+                    let mut probe = format!("      resume-when: {}", e.resume_when);
+                    if e.hold_probes > 0 {
+                        probe.push_str(&format!("  (failed {}×)", e.hold_probes));
+                    }
+                    items.push(dq_muted_row(&probe));
+                    targets.push(Some(idx));
+                }
+            }
         }
 
         items.push(dq_muted_row(""));
         targets.push(None);
         items.push(dq_muted_row(
-            "(j/k select · x remove · K/J move up/down · u unblock · right-click for the menu · Esc closes)",
+            "(j/k select · x remove · K/J move up/down · u unblock · r resume · right-click for the menu · Esc closes)",
         ));
         targets.push(None);
         (items, targets)
@@ -552,19 +664,32 @@ impl CoordApp {
             state: e.state.clone(),
             position: e.position,
             queue_len,
+            held: is_holding(e),
         })
     }
 
-    /// Per-row menu: Remove / Move up / Move down / Unblock. End-of-queue
-    /// moves are DISABLED with a reason rather than silently no-op'ing
-    /// (#1598's `disabled_because` precedent).
+    /// Per-row menu: Resume / Move up / Move down / Unblock / Remove.
+    /// End-of-queue moves are DISABLED with a reason rather than silently
+    /// no-op'ing (#1598's `disabled_because` precedent).
     pub(crate) fn context_menu_items_for_drive_queue_row(
         &self,
         state: &str,
         position: i64,
         queue_len: usize,
+        held: bool,
     ) -> Vec<ContextMenuItem> {
         let mut items = Vec::new();
+        // #1757: FIRST, and only on a row that is actually holding the
+        // queue. When a gate has fired this is the only action that changes
+        // anything — everything below it just rearranges work that cannot
+        // start — so it must not be buried under three moves.
+        if held {
+            items.push(
+                ContextMenuItem::action("drive-queue-resume", "Resume (release deploy gate)")
+                    .with_shortcut("r"),
+            );
+            items.push(ContextMenuItem::separator());
+        }
         let mut up = ContextMenuItem::action("drive-queue-move-up", "Move up").with_shortcut("K");
         if position <= 0 {
             up = up.disabled_because("already first");
@@ -753,6 +878,36 @@ impl CoordApp {
         );
     }
 
+    /// `coord drive-queue resume <repo> <issue>` — release a fired deploy
+    /// gate (#1757).
+    ///
+    /// The entry is NAMED rather than relying on the CLI's bare-`resume`
+    /// "release whatever is held": the operator clicked a specific row, and a
+    /// command that silently acts on a different one is the kind of surprise
+    /// that ends with a deploy gate released before the deploy.
+    ///
+    /// Optimistic, the `dispatch_drive_queue_unblock` precedent: the row's
+    /// `hold_state` goes `released` locally so the status bar drops out of
+    /// HELD on the next paint rather than on the next board poll. The next
+    /// `/board` refresh overwrites it with the truth, including a rejected
+    /// resume simply reverting.
+    pub(crate) fn dispatch_drive_queue_resume(&mut self, repo: &str, issue: i64) {
+        let issue_str = issue.to_string();
+        self.command_runner
+            .spawn_queued(&["drive-queue", "resume", repo, &issue_str]);
+        for e in self.data.drive_queue.iter_mut() {
+            if e.repo_name == repo && e.issue_number == issue {
+                e.hold_state = "released".to_string();
+                e.hold_probes = 0;
+            }
+        }
+        self.push_toast(
+            "Drive queue",
+            &format!("releasing the deploy gate on {repo} #{issue}…"),
+            ToastSeverity::Info,
+        );
+    }
+
     /// Open the "Add to drive queue after…" prompt for (repo, issue).
     pub(crate) fn open_drive_queue_after_input(&mut self, repo: &str, issue: u64) {
         self.pending_drive_queue_after = Some(PendingDriveQueueAfter {
@@ -816,6 +971,24 @@ impl CoordApp {
                     None => self.push_toast(
                         "Drive queue",
                         "only a blocked entry can be unblocked.",
+                        ToastSeverity::Warning,
+                    ),
+                }
+            }
+            // #1757: release the selected row's fired deploy gate. Refuses on
+            // any other row rather than falling back to "resume whatever is
+            // held" — see `dispatch_drive_queue_resume`.
+            Key::Char('r') => {
+                let target = self
+                    .drive_queue_entries()
+                    .get(self.drive_queue_sel)
+                    .filter(|e| is_holding(e))
+                    .map(|e| (e.repo_name.clone(), e.issue_number));
+                match target {
+                    Some((repo, issue)) => self.dispatch_drive_queue_resume(&repo, issue),
+                    None => self.push_toast(
+                        "Drive queue",
+                        "only an entry whose deploy gate has fired can be resumed.",
                         ToastSeverity::Warning,
                     ),
                 }
@@ -1195,7 +1368,7 @@ mod tests {
     #[test]
     fn overlay_row_menu_gates_moves_at_the_ends_and_unblock_off_waiting() {
         let app = make_test_app(BoardData::default());
-        let first = app.context_menu_items_for_drive_queue_row(QUEUE_STATE_WAITING, 0, 3);
+        let first = app.context_menu_items_for_drive_queue_row(QUEUE_STATE_WAITING, 0, 3, false);
         assert!(first[0].disabled, "'Move up' disabled at position 0");
         assert_eq!(first[0].disabled_reason.as_deref(), Some("already first"));
         assert!(!first[1].disabled, "'Move down' enabled mid-queue");
@@ -1204,7 +1377,7 @@ mod tests {
             "a waiting row has nothing to unblock"
         );
 
-        let last = app.context_menu_items_for_drive_queue_row(QUEUE_STATE_BLOCKED, 2, 3);
+        let last = app.context_menu_items_for_drive_queue_row(QUEUE_STATE_BLOCKED, 2, 3, false);
         assert!(last[1].disabled, "'Move down' disabled at the tail");
         assert!(last.iter().any(|i| i.label == "Unblock"));
     }
@@ -1495,8 +1668,10 @@ mod tests {
                 state,
                 position,
                 queue_len,
+                held,
             } => {
                 assert_eq!(repo_name, "myrepo");
+                assert!(!held, "an unheld row must not offer Resume");
                 assert_eq!(issue_number, 2);
                 assert_eq!(state, QUEUE_STATE_BLOCKED);
                 assert_eq!(position, 1);
@@ -1729,6 +1904,269 @@ mod tests {
         assert!(
             !queued.contains("Add to drive queue"),
             "…and NOT the Add variants:\n{queued}"
+        );
+    }
+
+    // ── deploy gates (#1757) ─────────────────────────────────────────────
+    //
+    // The status-bar state and the overlay's Resume item are both reachable
+    // through `driver_with_shell` + `make_test_app`, so per this repo's
+    // CLAUDE.md they belong HERE, in-crate, not in a SMOKE_TESTS bullet.
+
+    /// A held entry, as the wire delivers it: the gate fires when the entry
+    /// lands, so the row is `done` AND `hold_state == "fired"` at once.
+    fn held_entry(issue: i64, position: i64, reason: &str) -> BoardDriveQueueEntry {
+        BoardDriveQueueEntry {
+            hold_after: 1,
+            hold_reason: reason.to_string(),
+            hold_state: HOLD_STATE_FIRED.to_string(),
+            ..entry(issue, position, QUEUE_STATE_DONE, &[])
+        }
+    }
+
+    #[test]
+    fn status_text_held_names_the_operators_own_reason() {
+        let rows = vec![
+            held_entry(1753, 0, "release + restart coord-serve"),
+            entry(1754, 1, QUEUE_STATE_WAITING, &[]),
+        ];
+        assert_eq!(
+            drive_queue_status_text(&rows),
+            "QUEUE: HELD — release + restart coord-serve"
+        );
+        let s = summarize_drive_queue(&rows);
+        assert_eq!(s.level, DriveQueueLevel::Held);
+        assert_eq!(s.held, 1);
+    }
+
+    /// A `--hold-after` entry with no `--hold-reason` still gets a sentence:
+    /// a bar that reads only "HELD" makes the operator reconstruct why.
+    #[test]
+    fn status_text_held_falls_back_to_naming_the_entry() {
+        let rows = vec![held_entry(1753, 0, "")];
+        assert_eq!(
+            drive_queue_status_text(&rows),
+            "QUEUE: HELD — deploy gate after myrepo#1753"
+        );
+    }
+
+    /// A probe that keeps failing must be visible on the bar, not only in
+    /// the overlay — "held" and "held and the probe has failed 40 times"
+    /// need different responses from the operator.
+    #[test]
+    fn status_text_held_surfaces_a_rising_probe_count() {
+        let rows = vec![BoardDriveQueueEntry {
+            resume_when: "curl -sf http://dellserver:7435/drive-queue".to_string(),
+            hold_probes: 7,
+            ..held_entry(1753, 0, "restart coord-serve")
+        }];
+        assert_eq!(
+            drive_queue_status_text(&rows),
+            "QUEUE: HELD — restart coord-serve (probe failed 7×)"
+        );
+    }
+
+    /// The issue's explicit ranking rule: HELD outranks a SIMULTANEOUS
+    /// stall. The stall is the symptom (nothing is eligible *because* the
+    /// queue is held); showing it would send the operator hunting a
+    /// dependency bug that does not exist.
+    #[test]
+    fn status_text_held_outranks_a_simultaneous_stall() {
+        let rows = vec![
+            held_entry(1753, 0, "deploy the release"),
+            // Ineligible: waiting on a pre-req still in the queue → this
+            // board is ALSO stalled by `summarize_drive_queue`'s own rule.
+            entry(1754, 1, QUEUE_STATE_WAITING, &["myrepo#1755"]),
+            entry(1755, 2, QUEUE_STATE_WAITING, &["myrepo#1754"]),
+        ];
+        let s = summarize_drive_queue(&rows);
+        assert_eq!(s.eligible, 0, "precondition: this board is stalled too");
+        assert_eq!(s.level, DriveQueueLevel::Held);
+        assert!(drive_queue_status_text(&rows).starts_with("QUEUE: HELD"));
+    }
+
+    /// …and BLOCKED still outranks HELD: a gate is the system working as
+    /// designed, a blocked row is something that failed.
+    #[test]
+    fn status_text_blocked_outranks_a_simultaneous_hold() {
+        let rows = vec![
+            held_entry(1753, 0, "deploy"),
+            entry(1754, 1, QUEUE_STATE_BLOCKED, &[]),
+        ];
+        assert_eq!(summarize_drive_queue(&rows).level, DriveQueueLevel::Blocked);
+    }
+
+    #[test]
+    fn held_renders_in_warn_colours_and_bolds() {
+        assert_eq!(
+            DriveQueueLevel::Held.colors(),
+            DriveQueueLevel::Stalled.colors(),
+            "HELD and STALLED both mean 'stopped, needs you' — one amber"
+        );
+        let app = make_test_app(BoardData {
+            drive_queue: vec![held_entry(1753, 0, "deploy")],
+            ..BoardData::default()
+        });
+        let seg = app.drive_queue_status_bar_segment();
+        assert!(seg.bold, "a held queue is news");
+        assert!(seg.text.contains("HELD"));
+    }
+
+    /// An `armed` gate has NOT fired — the queue is running normally and
+    /// must not read HELD until the entry actually lands.
+    #[test]
+    fn an_armed_gate_does_not_hold_the_queue() {
+        let rows = vec![BoardDriveQueueEntry {
+            hold_after: 1,
+            hold_reason: "deploy".to_string(),
+            hold_state: "armed".to_string(),
+            ..entry(1753, 0, QUEUE_STATE_RUNNING, &[])
+        }];
+        assert_eq!(summarize_drive_queue(&rows).held, 0);
+        assert_eq!(drive_queue_status_text(&rows), "QUEUE: 1 running");
+    }
+
+    /// …and a `released` gate stops holding it, even though the row keeps
+    /// `hold_after=1` forever as run history.
+    #[test]
+    fn a_released_gate_stops_holding_the_queue() {
+        let rows = vec![
+            BoardDriveQueueEntry {
+                hold_state: "released".to_string(),
+                ..held_entry(1753, 0, "deploy")
+            },
+            entry(1754, 1, QUEUE_STATE_WAITING, &[]),
+        ];
+        assert_eq!(summarize_drive_queue(&rows).held, 0);
+        assert_eq!(drive_queue_status_text(&rows), "QUEUE: 1 waiting");
+    }
+
+    #[test]
+    fn overlay_row_menu_offers_resume_only_on_a_held_row() {
+        let app = make_test_app(BoardData::default());
+        let held = app.context_menu_items_for_drive_queue_row(QUEUE_STATE_DONE, 0, 2, true);
+        assert_eq!(
+            held[0].action_id.as_deref(),
+            Some("drive-queue-resume"),
+            "Resume is the only action that changes anything on a held queue, \
+             so it must be first"
+        );
+        assert!(!held[0].disabled);
+
+        let plain = app.context_menu_items_for_drive_queue_row(QUEUE_STATE_WAITING, 0, 2, false);
+        assert!(
+            !plain.iter().any(|i| i.action_id.as_deref() == Some("drive-queue-resume")),
+            "an unheld row has no gate to release"
+        );
+    }
+
+    #[test]
+    fn overlay_context_target_marks_a_held_row_as_held() {
+        let mut app = make_test_app(BoardData {
+            drive_queue: vec![held_entry(1753, 0, "deploy")],
+            ..BoardData::default()
+        });
+        app.open_drive_queue_overlay();
+        app.drive_queue_sel = 0;
+        match app.drive_queue_context_target().expect("a target") {
+            ContextMenuTarget::DriveQueueRow { held, .. } => assert!(held),
+            other => panic!("wrong target: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_resume_names_the_entry_and_clears_the_hold_optimistically() {
+        let mut app = make_test_app(BoardData {
+            drive_queue: vec![held_entry(1753, 0, "deploy")],
+            ..BoardData::default()
+        });
+        app.dispatch_drive_queue_resume("myrepo", 1753);
+        assert_eq!(
+            app.command_runner.spawned_calls,
+            vec![vec!["drive-queue", "resume", "myrepo", "1753"]]
+        );
+        // Optimistic: the bar leaves HELD on the next paint, not the next poll.
+        assert_eq!(app.data.drive_queue[0].hold_state, "released");
+        assert_eq!(
+            drive_queue_status_text(&app.data.drive_queue),
+            "QUEUE: empty"
+        );
+    }
+
+    #[test]
+    fn overlay_key_r_resumes_a_held_row_and_refuses_any_other() {
+        let mut app = make_test_app(BoardData {
+            drive_queue: vec![
+                entry(1, 0, QUEUE_STATE_WAITING, &[]),
+                held_entry(1753, 1, "deploy"),
+            ],
+            ..BoardData::default()
+        });
+        app.open_drive_queue_overlay();
+
+        app.drive_queue_sel = 0;
+        app.drive_queue_overlay_key(&Key::Char('r'));
+        assert!(
+            app.command_runner.spawned_calls.is_empty(),
+            "`r` on a row with no fired gate must spawn nothing"
+        );
+
+        app.drive_queue_sel = 1;
+        app.drive_queue_overlay_key(&Key::Char('r'));
+        assert_eq!(
+            app.command_runner.spawned_calls,
+            vec![vec!["drive-queue", "resume", "myrepo", "1753"]]
+        );
+    }
+
+    /// The overlay must SAY what the operator has to do, not just that
+    /// something is held — the `hold_reason` is the runbook line.
+    #[test]
+    fn tuidriver_overlay_shows_the_gate_and_offers_resume() {
+        use quadraui::tui::testing::driver_with_shell;
+
+        let mut app = make_test_app(BoardData {
+            drive_queue: vec![
+                BoardDriveQueueEntry {
+                    resume_when: "curl -sf http://dellserver:7435/drive-queue".to_string(),
+                    hold_probes: 3,
+                    ..held_entry(1753, 0, "release + restart coord-serve")
+                },
+                entry(1754, 1, QUEUE_STATE_WAITING, &[]),
+            ],
+            ..BoardData::default()
+        });
+        app.open_drive_queue_overlay();
+        app.drive_queue_sel = 0;
+
+        let mut driver = driver_with_shell(app, CoordApp::shell_config(), 160, 40);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("HELD"),
+            "the status bar must read HELD while a gate is fired:\n{screen}"
+        );
+        assert!(
+            screen.contains("release + restart coord-serve"),
+            "the overlay must render the operator's own hold reason:\n{screen}"
+        );
+        assert!(
+            screen.contains("failed 3"),
+            "a failing probe must show its rising attempt count:\n{screen}"
+        );
+
+        let (x, y) = driver
+            .find("myrepo#1753")
+            .unwrap_or_else(|| panic!("held row not found:\n{}", driver.screen()));
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: MouseButton::Right,
+            position: Point::new(x, y),
+            modifiers: Modifiers::default(),
+        });
+        let menu = driver.screen();
+        assert!(
+            menu.contains("Resume"),
+            "right-click on a held row must offer Resume:\n{menu}"
         );
     }
 }

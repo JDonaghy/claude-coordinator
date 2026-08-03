@@ -1141,8 +1141,10 @@ impl CoordApp {
                 state,
                 position,
                 queue_len,
+                held,
                 ..
-            } => self.context_menu_items_for_drive_queue_row(state, *position, *queue_len),
+            } => self
+                .context_menu_items_for_drive_queue_row(state, *position, *queue_len, *held),
         };
         if items.is_empty() {
             return false;
@@ -6059,6 +6061,21 @@ impl CoordApp {
                 {
                     let (repo, issue) = (repo_name.clone(), *issue_number);
                     self.dispatch_drive_queue_unblock(&repo, issue);
+                }
+                true
+            }
+            // #1757: release a fired deploy gate on the named row. Offered
+            // only when that row's gate is actually holding the queue (see
+            // `context_menu_items_for_drive_queue_row`).
+            "drive-queue-resume" => {
+                if let ContextMenuTarget::DriveQueueRow {
+                    repo_name,
+                    issue_number,
+                    ..
+                } = target
+                {
+                    let (repo, issue) = (repo_name.clone(), *issue_number);
+                    self.dispatch_drive_queue_resume(&repo, issue);
                 }
                 true
             }
