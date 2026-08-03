@@ -149,9 +149,16 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
                         target_str = f" smoking branch `{target}`"
                     else:
                         target_str = ""
+                    # #1707: the wire payload only carries `provider` when
+                    # the resolved name differs from the implicit "claude"
+                    # default (coord/dispatch.py's dispatch()), so this is
+                    # absent for the common case and present exactly when a
+                    # mixed fleet needs it surfaced.
+                    provider_val = spec.get("provider")
+                    provider_str = f" (provider={provider_val})" if provider_val else ""
                     detail = (
                         f"busy — {badge}#{spec.get('issue_number', '?')}: "
-                        f"{spec.get('issue_title', '?')}{target_str}"
+                        f"{spec.get('issue_title', '?')}{target_str}{provider_str}"
                     )
                 else:
                     detail = "idle"
@@ -535,8 +542,20 @@ def status(config_path: Path, machine_filter: str | None, no_reconcile: bool, ti
             else:
                 rs_tag = _REVIEW_STATE_TAGS.get(a.review_state or "", "")
             rs_suffix = f"  {rs_tag}" if rs_tag else ""
+            # #1707: surface the resolved provider (already persisted at
+            # dispatch time, coord/models.py Assignment.provider_name) so a
+            # mixed claude/opencode fleet is legible here — not just in
+            # `coord gates`. Omit the plain "claude" case (the overwhelming
+            # majority of rows) so the common path stays uncluttered; only a
+            # non-default backend earns the tag.
+            provider_tag = (
+                f"  [provider={a.provider_name}]"
+                if a.provider_name and a.provider_name != "claude"
+                else ""
+            )
             click.echo(
-                f"  #{a.issue_number}: {a.issue_title} ({a.repo_name}){rs_suffix}"
+                f"  #{a.issue_number}: {a.issue_title} ({a.repo_name})"
+                f"{provider_tag}{rs_suffix}"
             )
 
     notified = {} if svc else load_notified()

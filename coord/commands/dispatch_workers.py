@@ -4538,6 +4538,7 @@ def _dispatch_headless(
     issue_data: dict,
     issue_title: str,
     driven_by: str | None = None,
+    provider: str | None = None,
 ) -> None:
     """The plain (non --interactive) HTTP-dispatch path: build a Proposal,
     run the claim + dependency-freshness checks, POST to the agent server,
@@ -4546,6 +4547,13 @@ def _dispatch_headless(
     ``driven_by`` (#1499): durable provenance threaded from ``coord assign
     --driven-by`` (set by ``coord drive``'s work-stage dispatch). ``None``
     for a hand ``coord assign`` — the overwhelming majority of callers.
+
+    ``provider`` (#1707): the raw ``--provider`` flag value, already
+    validated against ``cfg.providers.definitions`` by ``assign()`` before
+    this function runs. ``None`` (the default — no flag given) reproduces
+    pre-#1707 behaviour exactly: ``Proposal.provider`` stays ``None`` and
+    ``coord.dispatch.dispatch()``'s spec → repo → providers.default
+    precedence chain falls through to the repo/global default unchanged.
     """
     from coord.board_service import read_board, write_board  # noqa: PLC0415
     from coord.dispatch import dispatch, post_briefing  # noqa: PLC0415
@@ -4596,6 +4604,7 @@ def _dispatch_headless(
         required_gates=resolved_gates,
         issue_labels=issue_labels,
         driven_by=driven_by,
+        provider=provider,
     )
 
     click.echo(f"{machine} → {repo} #{issue}: {issue_title}")
@@ -4621,6 +4630,22 @@ def _dispatch_headless(
                 shadowed_labels=shadowed_labels,
             )
         )
+
+    # #1707: mirror the --model reasoning line above — state which link of
+    # the spec (--provider) → repo (Repo.provider) → providers.default chain
+    # (coord.providers.resolve_provider_name) won, so a mixed claude/opencode
+    # fleet is legible at dispatch time (including under --dry-run, before
+    # any of it is committed) instead of only discoverable via coordinator.yml.
+    from coord.providers import describe_provider_choice  # noqa: PLC0415
+
+    click.echo(
+        "  provider: "
+        + describe_provider_choice(
+            spec_provider=provider,
+            repo_provider=repo_cfg.provider,
+            providers_cfg=cfg.providers,
+        )
+    )
 
     if dry_run:
         click.echo("  (dry run — not dispatched)")

@@ -433,6 +433,27 @@ def approve(
 )
 
 
+@click.option(
+    "--provider",
+    "cli_provider",
+    default=None,
+    help=(
+        "#1707: per-assignment worker-backend override — the human escape "
+        "hatch for the precedence chain this flag > Repo.provider > "
+        "providers.default (coord/providers/__init__.py's "
+        "resolve_provider_name). Must name a key in providers.definitions "
+        "(coordinator.yml); validated here, before dispatch, and the error "
+        "lists the valid names. Lets two concurrent `coord assign`s in the "
+        "SAME repo run different backends (e.g. claude on one issue, "
+        "opencode on another) since worktrees are already per-assignment. "
+        "Not supported with --interactive, which always spawns the "
+        "human-attended claude-pty provider directly. A human-attended-only "
+        "backend (capabilities().human_attended_only) is still refused for "
+        "this unattended path — see guard_unattended_dispatch."
+    ),
+)
+
+
 @click.option("--dry-run", is_flag=True, help="Show what would be dispatched.")
 @click.option(
     "--driven-by",
@@ -689,6 +710,11 @@ def assign(
     config_path: Path,
     briefing: str,
     model: str | None,
+    # #1707: named `cli_provider`, not `provider` — the --interactive branch
+    # below reuses the bare name `provider` for the ClaudePtyProvider
+    # *instance* it always spawns (see `_build_interactive_launch_setup`);
+    # colliding names here would shadow one with the other mid-function.
+    cli_provider: str | None,
     dry_run: bool,
     driven_by: str | None,
     plan_only: bool,
@@ -747,6 +773,37 @@ def assign(
     if _is_paused(machine):
         click.echo(
             f"error: machine {machine!r} is paused; run `coord unpause {machine}` first",
+            err=True,
+        )
+        sys.exit(2)
+
+    # #1707: validate --provider at the CLI, before any network call or
+    # dispatch — an unknown name must never reach dispatch() (where it would
+    # currently just fall through to the agent's own unknown-provider
+    # handling per guard_unattended_dispatch's docstring). "claude" is always
+    # valid even on a bare config because ProvidersConfig.__post_init__
+    # always materialises the implicit entry, so cfg.providers.definitions
+    # is the complete, authoritative set of valid names.
+    if cli_provider is not None and cli_provider not in cfg.providers.definitions:
+        click.echo(
+            f"error: provider {cli_provider!r} not in providers.definitions "
+            f"(have: {sorted(cfg.providers.definitions)})",
+            err=True,
+        )
+        sys.exit(2)
+
+    # --provider only has meaning on the headless (config-driven provider
+    # registry) dispatch path below. --interactive always spawns
+    # ClaudePtyProvider() directly (_build_interactive_launch_setup) — it
+    # never looks a name up in providers.definitions — so accepting
+    # --provider there would either silently do nothing or read as though it
+    # could steer an interactive session onto a different backend. Refuse
+    # instead of guessing.
+    if cli_provider is not None and interactive:
+        click.echo(
+            "error: --provider is not supported with --interactive "
+            "(interactive sessions always use the human-attended claude-pty "
+            "provider directly; there is no name to select)",
             err=True,
         )
         sys.exit(2)
@@ -981,7 +1038,8 @@ def assign(
 
     _dispatch_headless(
         machine=machine, repo=repo, issue=issue, briefing=briefing,
-        model=model, dry_run=dry_run, plan_only=plan_only, no_plan=no_plan,
+        model=model, provider=cli_provider, dry_run=dry_run,
+        plan_only=plan_only, no_plan=no_plan,
         force=force, no_pull=no_pull, skip_freshness=skip_freshness,
         cfg=cfg, machine_obj=machine_obj, repo_cfg=repo_cfg,
         issue_data=issue_data, issue_title=issue_title, driven_by=driven_by,

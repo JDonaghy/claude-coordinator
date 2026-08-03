@@ -33,6 +33,7 @@ __all__ = [
     "Provider",
     "WorkerSummary",
     "build_provider",
+    "describe_provider_choice",
     "guard_unattended_dispatch",
     "resolve_default_provider",
     "resolve_provider_name",
@@ -114,6 +115,39 @@ def resolve_provider_name(
     if repo_provider is not None:
         return repo_provider
     return providers_cfg.default
+
+
+def describe_provider_choice(
+    spec_provider: str | None,
+    repo_provider: str | None,
+    providers_cfg: "ProvidersConfig",
+) -> str:
+    """Format a one-line explanation of why the effective provider was chosen.
+
+    #1707: mirrors ``coord.config.describe_model_choice``'s shape — state the
+    winning name AND which link of the ``spec → repo → providers.default``
+    precedence chain (:func:`resolve_provider_name`) supplied it, so
+    ``coord assign --dry-run --provider ...`` (and any other dry-run/status
+    caller) never leaves an operator guessing whether a provider came from an
+    explicit ``--provider``, a repo default, or the global fallback — the
+    exact ambiguity #1454 fixed for models.
+
+    Args:
+        spec_provider: Provider name from the assignment spec / CLI flag, or
+            ``None``.
+        repo_provider: Provider name from the repo config, or ``None``.
+        providers_cfg: The parsed :class:`~coord.config.ProvidersConfig`.
+
+    Returns:
+        E.g. ``"opencode (explicit --provider)"`` or
+        ``"claude (providers.default)"``.
+    """
+    name = resolve_provider_name(spec_provider, repo_provider, providers_cfg)
+    if spec_provider is not None:
+        return f"{name} (explicit --provider)"
+    if repo_provider is not None:
+        return f"{name} (repo default: Repo.provider)"
+    return f"{name} (providers.default)"
 
 
 def resolve_default_provider(

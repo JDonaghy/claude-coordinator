@@ -26,7 +26,12 @@ from coord.agent import (
     default_worker_command,
 )
 from coord.config import ModelsConfig, ProviderDef, ProvidersConfig
-from coord.providers import build_provider, resolve_default_provider, resolve_provider_name
+from coord.providers import (
+    build_provider,
+    describe_provider_choice,
+    resolve_default_provider,
+    resolve_provider_name,
+)
 from coord.providers.base import Capabilities, Provider, WorkerSummary
 from coord.providers.claude import ClaudeProvider
 from coord.providers.opencode import (
@@ -365,6 +370,45 @@ def test_resolve_spec_none_repo_none_uses_default() -> None:
     """Double-None falls back to configured default."""
     cfg = _make_providers_cfg(default="claude")
     assert resolve_provider_name(None, None, cfg) == "claude"
+
+
+# ── describe_provider_choice (#1707) ───────────────────────────────────────────
+
+
+def test_describe_provider_choice_explicit_spec_wins() -> None:
+    """An explicit spec override (e.g. `coord assign --provider`) is labelled
+    as such, even when a repo default is also configured."""
+    cfg = _make_providers_cfg(default="claude")
+    reason = describe_provider_choice("fast-claude", "repo-provider", cfg)
+    assert reason == "fast-claude (explicit --provider)"
+
+
+def test_describe_provider_choice_repo_default() -> None:
+    """No spec override: the repo's Repo.provider is named as the source."""
+    cfg = _make_providers_cfg(default="claude")
+    reason = describe_provider_choice(None, "repo-provider", cfg)
+    assert reason == "repo-provider (repo default: Repo.provider)"
+
+
+def test_describe_provider_choice_global_default() -> None:
+    """Neither spec nor repo override: falls through to providers.default."""
+    cfg = _make_providers_cfg(default="my-default")
+    reason = describe_provider_choice(None, None, cfg)
+    assert reason == "my-default (providers.default)"
+
+
+def test_describe_provider_choice_matches_resolve_provider_name() -> None:
+    """The resolved name embedded in the description always matches what
+    resolve_provider_name itself would return for the same inputs — the
+    description can never disagree with the resolution it's explaining."""
+    cfg = ProvidersConfig(
+        default="claude",
+        definitions={"claude": ProviderDef(type="claude"), "x": ProviderDef(type="claude")},
+    )
+    for spec, repo in [(None, None), (None, "x"), ("x", None), ("x", "claude")]:
+        resolved = resolve_provider_name(spec, repo, cfg)
+        reason = describe_provider_choice(spec, repo, cfg)
+        assert reason.startswith(resolved + " (")
 
 
 # ── parse_log delegation ──────────────────────────────────────────────────────

@@ -586,9 +586,11 @@ class Proposal:
     # #324: optional provider override for this proposal's worker.  Mirrors
     # ``Repo.provider`` and ``AssignmentSpec.provider`` — uses the same
     # precedence chain: spec > repo > providers.default.  When None the
-    # coordinator and agent both fall back to the global default.  Set by the
-    # brain when a repo's configured provider should be overridden for this
-    # specific dispatch.
+    # coordinator and agent both fall back to the global default.  Set by
+    # ``coord assign --provider`` (#1707, the human escape hatch — validated
+    # against ``providers.definitions`` at the CLI before it ever reaches
+    # here) for a hand dispatch; brain-side automatic selection is not yet
+    # implemented (deliberately out of scope for #1707).
     provider: str | None = None
     # #934: the GitHub Milestone number the target issue belongs to, when
     # known. Set by callers that already fetched the issue (e.g.

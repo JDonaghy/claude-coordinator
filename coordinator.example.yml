@@ -212,7 +212,7 @@ models:
 #
 #     # Example: a hypothetical alternative backend.  Pass per-repo with
 #     # `provider: fast-claude` in the repo entry, or per-assignment with
-#     # `--provider fast-claude` on `coord assign` (once wired).
+#     # `--provider fast-claude` on `coord assign` (#1707).
 #     fast-claude:
 #       type: claude
 #       binary: /opt/claude-fast/bin/claude
