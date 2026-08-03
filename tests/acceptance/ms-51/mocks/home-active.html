@@ -97,6 +97,8 @@
   }
   .chip.current { background: var(--primary); color: var(--primary-foreground); border-color: transparent; }
   .chip.completed { background: var(--green); color: #fff; border-color: transparent; }
+  /* "skipped" — the greyed-out state. The test chip is ALWAYS this today; see #1724. */
+  .chip.skipped { opacity: .4; }
 
   /* Work done (collapsed) */
   .done-toggle {
@@ -143,9 +145,21 @@
         <span class="badge">running</span>
       </div>
       <p class="card-meta">api <span class="mono">#42</span> · laptop</p>
+      <!--
+        FOUR chips, and the order is work, review, TEST, merge — Review before
+        Test. That is what the API emits today (`coding, review, smoke, merge`,
+        hardcoded in coord/pipeline.py) even though pipeline.default_gates is
+        ["test","review","merge"]. The test chip is greyed because the projection
+        calls the gate "smoke" while the config calls it "test", so the lookup
+        never matches and it is emitted as `skipped` on every item. Both are
+        BUGS — see #1724 — pinned here deliberately because this contract must
+        describe the app as it is, or #1544's first run goes red for the wrong
+        reason. Amend this mock when #1724 lands.
+      -->
       <div class="chips">
         <span class="chip current">work</span>
         <span class="chip">review</span>
+        <span class="chip skipped">test</span>
         <span class="chip">merge</span>
       </div>
     </button>
@@ -159,6 +173,7 @@
       <div class="chips">
         <span class="chip completed">work</span>
         <span class="chip current">review</span>
+        <span class="chip skipped">test</span>
         <span class="chip">merge</span>
       </div>
     </button>

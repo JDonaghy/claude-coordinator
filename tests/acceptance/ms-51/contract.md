@@ -86,12 +86,32 @@ For the seeded item `#42`:
   all visible on the card. The issue number is rendered in a monospace element —
   monospace means "a value the machine owns".
 - **§4c** A status badge with the text `running`.
-- **§4d** Stage chips labelled `work`, `review`, `merge`, in that order.
-  **The labels are display names, not the API's stage names** — the API emits
-  `coding`/`smoke`/`review`/`merge` and the card maps `coding → work` and `smoke → test`.
+- **§4d** **Four** stage chips, labelled `work`, `review`, `test`, `merge` — **in that
+  order**. The labels are display names, not the API's stage names: the API emits
+  `coding`, `review`, `smoke`, `merge`, and the card maps `coding → work`, `smoke → test`.
   Asserting the API name here would pass against the wrong thing.
 - **§4e** For item `#99`, the `work` chip renders as completed and `review` as the
-  current stage — i.e. chip state is derived per stage, not from one global status.
+  current stage — chip state is derived per stage, not from one global status.
+- **§4f** The `test` chip renders in the **skipped** style (dimmed).
+
+  > ### §4d/§4f pin two known bugs on purpose — see #1724
+  >
+  > Both of these are **wrong**, and are pinned anyway because this contract must describe
+  > the app as it *is*, or #1544's first run goes red for a reason that has nothing to do
+  > with the machinery it exists to prove.
+  >
+  > 1. **The order is Review-before-Test.** `coord/pipeline.py:258` hardcodes
+  >    `["coding","review","smoke","merge"]` and never reads `pipeline.default_gates`,
+  >    which is `["test","review","merge"]`. The web stage strip still shows the #520-era
+  >    order that everything else abandoned.
+  > 2. **The test chip is `skipped` on every item, always** — 616 of 616 measured. The
+  >    projection calls the gate `smoke`; the config calls it `test`; `"smoke" not in
+  >    ["test","review","merge"]` is always true, so it is emitted as skipped regardless of
+  >    the real verdict. A recorded `passed` test is invisible on the web stage strip.
+  >
+  > **When #1724 lands, amend this contract and re-author the affected slice** — do not
+  > let the suite keep asserting the buggy shape once the app is correct. That is precisely
+  > the amendment path the section below describes.
 
 ## §5 — Work done section
 
