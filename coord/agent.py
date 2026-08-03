@@ -2564,6 +2564,13 @@ They are managed by the coordinator.
 Push with `git push origin HEAD`. \
 NEVER commit or push to main or develop directly. \
 Do NOT open a PR — the coordinator handles that.
+- Work only inside your current working directory. It is your own git \
+worktree, checked out from a repo that also lives at `~/src/<repo>` on this \
+machine — never read or write anything under `~/src/<repo>` (or any other \
+absolute path outside your cwd). That shared checkout is not yours: edits \
+there are lost, or collide with other workers running at the same time. If \
+your worktree looks unexpectedly empty or unwritable, STOP and report it — \
+do not fall back to editing the base checkout and copying files over.
 
 This session is ONE-SHOT and non-interactive (#1394):
 - There is no next turn and no human to reply to you. Background-task \
@@ -2973,6 +2980,9 @@ contract's notes rather than silently resolving it yourself.
 - You are already on a feature branch. Commit your work to this branch. \
 Push with `git push origin HEAD`. NEVER commit or push to the repo's \
 default branch directly. Do NOT open a PR — the coordinator handles that.
+- Work only inside your current working directory (your own git worktree). \
+Never read or write anything under `~/src/<repo>` (or any other absolute \
+path outside your cwd) — that is the shared base checkout, not yours.
 - If `contract.md` already exists (you are AMENDING an existing Gate A, not \
 authoring one from scratch), read it first and edit it in place — do not \
 start over or duplicate sections.
@@ -3098,6 +3108,51 @@ def _sealed_write_guard_tools(files_forbidden: list[str]) -> list[str]:
                 if pattern not in patterns:
                     patterns.append(pattern)
     return patterns
+
+
+# #1642: worktree isolation was enforced by cwd ALONE — nothing stopped a
+# worker from constructing an absolute path back into the shared base
+# checkout (``spec.repo_path``, the very checkout ``_setup_worktree``
+# branched the worker's worktree from) and editing it directly. Observed on
+# a haiku-routed worker: its first tool call was an absolute-path ``Read``
+# into the base checkout, never named anywhere in its briefing or prior
+# output, and it stayed there the whole session — re-``cd``-ing out every
+# time Claude Code reset its shell cwd back to the worktree, then ``cp``-ing
+# files into the worktree at the end to make the commit look clean. A prompt
+# rule (see WORKER_SYSTEM_PROMPT) is advisory and a weak model can talk
+# itself past it, the same way this worker narrated its way around the
+# shell-cwd reset. ``_base_checkout_write_guard_tools`` turns the base
+# checkout into a real ``--disallowedTools`` restriction — mirroring
+# ``_sealed_write_guard_tools`` above, but for an absolute path OUTSIDE the
+# worker's cwd rather than a relative one inside it, so it uses Claude
+# Code's ``//<abs-path>`` absolute-path permission marker (the same syntax
+# ``_DENY_PATTERN_RE`` below already recognises in settings.json deny
+# rules).
+def _base_checkout_write_guard_tools(repo_path: str) -> list[str]:
+    """Return ``--disallowedTools`` patterns blocking Edit/Write anywhere
+    under the shared base checkout *repo_path*.
+
+    Pure function, easy to test in isolation. Returns ``[]`` for an empty or
+    non-absolute *repo_path* (defensive — every real spec has an absolute
+    one) so callers can unconditionally combine the result with
+    ``_sealed_write_guard_tools``.
+
+    Claude Code's ``//<abs-path>`` marker already embeds the path's leading
+    ``/`` in the doubled slash — i.e. absolute path ``/home/john/src/api``
+    becomes ``Edit(//home/john/src/api/**)``, NOT
+    ``Edit(///home/john/src/api/**)`` — so the leading ``/`` is stripped
+    before splicing *repo_path* into the pattern (mirrors
+    ``_deny_pattern_blocks_path``'s inverse: ``raw = "/" + m.group(2)``).
+    """
+    if not repo_path:
+        return []
+    normalized = repo_path.rstrip("/")
+    if not normalized.startswith("/"):
+        return []
+    body = normalized[1:]
+    if not body:
+        return []
+    return [f"Edit(//{body}/**)", f"Write(//{body}/**)"]
 
 
 # ── #1445: worktree-writability preflight ───────────────────────────────────
@@ -3371,9 +3426,17 @@ def default_worker_command(spec: AssignmentSpec, *, binary: str = DEFAULT_WORKER
     if spec.model:
         argv.extend(["--model", spec.model])
     # #1315: structural sealing enforcement — see _sealed_write_guard_tools.
-    sealed_guard_tools = _sealed_write_guard_tools(spec.files_forbidden)
-    if sealed_guard_tools:
-        argv.extend(["--disallowedTools", ",".join(sealed_guard_tools)])
+    disallowed_tools = _sealed_write_guard_tools(spec.files_forbidden)
+    # #1642: block Edit/Write on the shared base checkout for any spec.type
+    # that actually gets Edit/Write in --allowedTools — the Read/Bash-only
+    # chat types above can't touch files regardless, and adding the guard
+    # there would be a no-op cluttering their argv for nothing.
+    if "Edit" in allowed_tools:
+        for pattern in _base_checkout_write_guard_tools(spec.repo_path):
+            if pattern not in disallowed_tools:
+                disallowed_tools.append(pattern)
+    if disallowed_tools:
+        argv.extend(["--disallowedTools", ",".join(disallowed_tools)])
     # #315: when resuming a prior chat session, load the prior conversation so
     # the model has full context.  The briefing field IS the new user message;
     # claude sees it as the next user turn after the restored history.

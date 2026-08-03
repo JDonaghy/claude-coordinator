@@ -96,6 +96,8 @@ class ClaudeProvider(Provider):
             TEST_CHAT_SYSTEM_PROMPT,
             WORKER_PLAN_PROMPT,
             WORKER_SYSTEM_PROMPT,
+            _base_checkout_write_guard_tools,
+            _sealed_write_guard_tools,
             build_deny_prompt,
         )
 
@@ -166,6 +168,16 @@ class ClaudeProvider(Provider):
         ]
         if effective_model:
             argv.extend(["--model", effective_model])
+        # #1315 / #1642: same structural write guards as
+        # default_worker_command — sealed-oracle prefix plus (for any type
+        # with Edit in --allowedTools) the shared base checkout.
+        disallowed_tools = _sealed_write_guard_tools(spec.files_forbidden)
+        if "Edit" in allowed_tools:
+            for pattern in _base_checkout_write_guard_tools(spec.repo_path):
+                if pattern not in disallowed_tools:
+                    disallowed_tools.append(pattern)
+        if disallowed_tools:
+            argv.extend(["--disallowedTools", ",".join(disallowed_tools)])
         if spec.resume_session_id:
             argv.extend(["--resume", spec.resume_session_id])
         return argv
