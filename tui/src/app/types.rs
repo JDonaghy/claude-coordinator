@@ -162,6 +162,13 @@ pub(crate) enum SidebarView {
     /// round-trip), with a scope selector (today/week/month/custom range),
     /// group-by, and a click-to-expand per-stage drill. See `app/usage.rs`.
     Usage,
+    /// #1741: Reports panel — a `MultiSectionView` stack with one collapsible
+    /// section per entry in `GET /report`'s catalogue (#1742), each section
+    /// body being that report's parameter `Form` plus a `Run` button. The
+    /// completed run's `ReportResult` renders as a `DataTable` + notes block
+    /// beneath the stack. Nothing about any specific report is hardcoded
+    /// here — see `app/reports.rs`.
+    Reports,
 }
 
 impl SidebarView {
@@ -179,6 +186,7 @@ impl SidebarView {
             SidebarView::Sessions => "Sessions",
             SidebarView::Audit => "Audit",
             SidebarView::Usage => "Usage",
+            SidebarView::Reports => "Reports",
         }
     }
 
@@ -206,6 +214,7 @@ impl SidebarView {
             SidebarView::Sessions => Some(WidgetId::new("panel:sessions")),
             SidebarView::Audit => Some(WidgetId::new("panel:audit")),
             SidebarView::Usage => Some(WidgetId::new("panel:usage")),
+            SidebarView::Reports => Some(WidgetId::new("panel:reports")),
             SidebarView::MilestoneDag => None,
         }
     }
@@ -1463,6 +1472,87 @@ pub struct AuditPage {
     #[serde(default)]
     #[allow(dead_code)]
     pub has_more: bool,
+}
+
+// ── #1741: Reports panel wire shapes (`GET /report`, `GET /report/{id}`) ──
+//
+// These mirror `coord/reports.py`'s `ReportParam.to_dict` / `ReportDef.
+// to_dict` / `ReportResult.to_dict` (#1742) field-for-field. They are the
+// ONLY report-shaped types in `tui/**`: the panel builds its section list
+// and every parameter control from the catalogue at runtime, so adding a
+// second report to `coord/reports.py` must require zero Rust changes.
+//
+// `pub`, not `pub(crate)`, for the same E0446 reason `AuditEntry` above is:
+// they are named by the `test-support`-gated `app::fixtures` helpers.
+
+/// One parameter of a report, as described by `GET /report`'s catalogue.
+///
+/// `kind` is `"choice"` (render a picker over `choices`) or `"text"` (free
+/// text). `free_form` marks a `choice` whose `choices` are presets rather
+/// than a whitelist — the server-side validator is the authority either way,
+/// so the panel never rejects a value locally.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub struct ReportParamDef {
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub choices: Vec<String>,
+    #[serde(default)]
+    pub default: String,
+    #[serde(default)]
+    pub help: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub free_form: bool,
+}
+
+/// One catalogue entry from `GET /report` — everything needed to build a
+/// section header and its parameter form, minus the server-side callable.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub struct ReportDef {
+    pub id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub params: Vec<ReportParamDef>,
+}
+
+/// The `GET /report` response envelope (`{"reports": [...]}`).
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub struct ReportCatalogue {
+    #[serde(default)]
+    pub reports: Vec<ReportDef>,
+}
+
+/// The `GET /report/{id}` response — one completed run.
+///
+/// `columns` is the ordered list of row keys worth tabulating; `rows` may
+/// carry extra keys beyond it (the engine's docstring calls this out), so
+/// cells are looked up **by column name**, never by position. `notes` holds
+/// derived anomalies and renders under the table.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub struct ReportResult {
+    #[serde(default)]
+    pub report_id: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub generated_at: f64,
+    /// `[start, end]` epoch seconds. Kept as a `Vec` rather than a tuple so a
+    /// malformed/absent value degrades to "unknown window" instead of
+    /// failing the whole deserialize.
+    #[serde(default)]
+    pub window: Vec<f64>,
+    #[serde(default)]
+    pub columns: Vec<String>,
+    #[serde(default)]
+    pub rows: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub notes: Vec<String>,
 }
 
 /// #1040: time-range filter for the Audit panel, cycled forward by the `t`

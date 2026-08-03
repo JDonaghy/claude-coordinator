@@ -322,6 +322,25 @@ pub fn make_test_app(data: BoardData) -> CoordApp {
         usage_table_layout: std::cell::RefCell::new(None),
         pending_usage_range_start: None,
         pending_usage_range_end: None,
+        // #1741: Reports panel — nothing seeded by default; use
+        // `make_app_with_reports` to pre-populate the catalogue (and
+        // optionally a completed run) with no daemon and no fetch thread.
+        reports_catalogue: None,
+        reports_catalogue_rx: None,
+        reports_catalogue_fetched: false,
+        reports_params: std::collections::HashMap::new(),
+        reports_expanded: std::collections::HashSet::new(),
+        reports_touched: std::collections::HashSet::new(),
+        reports_running: None,
+        reports_run_rx: None,
+        reports_result: None,
+        reports_error: None,
+        reports_no_service: false,
+        reports_sel: 0,
+        reports_field_sel: 0,
+        reports_text_editing: false,
+        reports_result_scroll: 0,
+        reports_layout: std::cell::RefCell::new(MsvLayoutCache::default()),
         // #217: use the default dark palette for test helpers.
         active_theme: crate::settings::Theme::Dark.to_quadraui_theme(),
         // #728: default 2h window for tests (can be overridden per test).
@@ -361,6 +380,41 @@ pub fn make_app_with_audit_json(data: BoardData, audit_json: &str) -> CoordApp {
     let mut app = make_test_app(data);
     if let Ok(page) = serde_json::from_str::<super::types::AuditPage>(audit_json) {
         app.audit_page = Some(page);
+    }
+    app
+}
+
+/// #1741 data-model seam: build a [`CoordApp`] with the Reports panel's
+/// catalogue (and optionally one completed run) pre-seeded from raw JSON
+/// strings shaped exactly like `GET /report` / `GET /report/{id}` (#1742) —
+/// no live daemon, no background fetch thread.
+///
+/// `catalogue_json` is the `{"reports": [...]}` envelope; `result_json` is a
+/// `ReportResult` body, or `None` for "no run yet". Sections are seeded
+/// expanded, matching what the real catalogue-fetch drain does
+/// (`reports_seed_expansion` in `settings_ui.rs`), so a test renders the
+/// same first frame the operator sees. `reports_catalogue_fetched` is set so
+/// a driver test that ticks `run_periodic_work` never arms a real fetch on
+/// top of the seeded data.
+///
+/// Malformed JSON is a silent no-op (the panel then renders its own
+/// empty/loading state) rather than a panic — assert on the resulting
+/// screen, not on this function's return.
+pub fn make_app_with_reports(
+    data: BoardData,
+    catalogue_json: &str,
+    result_json: Option<&str>,
+) -> CoordApp {
+    let mut app = make_test_app(data);
+    if let Ok(cat) = serde_json::from_str::<super::types::ReportCatalogue>(catalogue_json) {
+        app.reports_catalogue = Some(cat.reports);
+        app.reports_catalogue_fetched = true;
+        app.reports_seed_expansion();
+    }
+    if let Some(json) = result_json {
+        if let Ok(result) = serde_json::from_str::<super::types::ReportResult>(json) {
+            app.reports_result = Some(result);
+        }
     }
     app
 }
